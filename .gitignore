@@ -1,0 +1,35 @@
+# Code Memory — .gitignore
+# =========================
+
+# Rust 编译产物
+/target/
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+*.wasm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 环境变量
+.env
+.env.local
+
+# 模型文件（CodeBERT 等，由用户自行下载）
+*.safetensors
+*.onnx
+*.pt
+
+# 临时文件
+*.tmp
+*.log
