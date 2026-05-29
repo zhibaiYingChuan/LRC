@@ -136,7 +136,43 @@ Loong Recall 提取了道枢层的编码-检索范式，将其工程化为独立
 2. **编码**：每个片段通过语义编码器转换为高维向量
 3. **检索**：查询文本同样编码后，在向量空间中通过余弦相似度匹配 Top-K 片段
 
-默认使用快速词袋编码器（零外部依赖），可选启用 CodeBERT 获取更高精度的语义理解。
+### 两种编码模式
+
+Loong Recall 内置两种编码器，编译时通过 Cargo feature 切换：
+
+| | 🚀 快速模式（默认） | 🧠 CodeBERT 模式（`--features ml`） |
+|------|------|------|
+| **编码器** | `FastEncoder`（内联词袋编码器） | `CodeBertEncoder`（candle + CodeBERT） |
+| **外部依赖** | **零**，纯 Rust 实现 | 需下载 CodeBERT 模型（~200MB，仅首次） |
+| **编译命令** | `cargo build --features server` | `cargo build --features server,ml` |
+| **启动时间** | 即时（毫秒级） | 首次需下载模型（视网络 1~5 分钟），后续即时 |
+| **检索精度** | 基于 token 关键词匹配 | 真实语义理解（同义词、自然语言查询） |
+| **内存占用** | < 10 MB | ~500 MB（模型加载后） |
+| **适用场景** | 精确函数名/变量名查找、日常开发 | 自然语言描述查询、模糊意图检索 |
+
+#### 快速模式（默认，推荐日常使用）
+
+```bash
+cargo build --features server
+./target/release/code-memory-server --src-dir ./src --port 3099
+```
+
+无需任何额外配置，编译后立即可用。编码器基于代码 token 分割和词袋匹配——如果你用函数名、变量名或代码片段检索，精度完全够用。这也是忆在 Loong Agent OS 中作为默认模式运行的方式。
+
+#### CodeBERT 模式（高精度，按需启用）
+
+```bash
+cargo build --features server,ml
+./target/release/code-memory-server --src-dir ./src --port 3099
+```
+
+**首次启动时会自动从 HuggingFace Hub 下载 `microsoft/codebert-base` 模型（~200MB）**，存储在本地缓存目录。下载仅执行一次，后续启动直接加载缓存。
+
+CodeBERT 模式的优势在于你可以用**自然语言描述**来检索代码，例如：
+- "处理用户登录的逻辑在哪里？" → 匹配到 `fn authenticate_user()`
+- "错误重试的代码" → 匹配到 `fn retry_with_backoff()`
+
+> ⚠️ **请勿在未理解上述差异的情况下贸然启用 `ml` feature**。如果只需要按函数名/关键词查代码，快速模式完全够用，且零成本启动。
 
 ## 开发
 
