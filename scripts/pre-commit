@@ -37,13 +37,26 @@ echo "  测试通过。"
 # 3. 核心算法泄露检测
 echo ""
 echo "[3/3] 核心算法泄露检测..."
-python3 scripts/check_algorithm_leak.py || python scripts/check_algorithm_leak.py || {
+PYTHON_CMD=""
+for cmd in py python3 python; do
+    if command -v "$cmd" > /dev/null 2>&1 && $cmd -c "print('ok')" > /dev/null 2>&1; then
+        PYTHON_CMD="$cmd"
+        break
+    fi
+done
+if [ -z "$PYTHON_CMD" ]; then
+    echo ""
+    echo "  警告: 未找到 Python 解释器，跳过泄露检测"
+    echo "  请确保已安装 Python 3 并加入 PATH"
+else
+    $PYTHON_CMD scripts/check_algorithm_leak.py || {
     echo ""
     echo "  泄露检测未通过！"
     echo "  请确保公开层文件中不包含受保护的核心算法逻辑。"
     echo "  公开层文件: src/chunker.rs, src/server.rs, src/bin/server.rs, src/lib.rs"
     exit 1
 }
+fi
 
 echo ""
 echo "============================================================"
