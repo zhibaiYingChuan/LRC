@@ -9,7 +9,9 @@
 //
 // 启动后 IDE 可通过 MCP 配置连接此服务，AI 助手即可调用 search_code 工具。
 
-use code_memory::{server, CodeMemoryManager};
+use code_memory::{
+    server, CodeMemoryManager, JsonPersistence, MemoryStore,
+};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -21,6 +23,8 @@ async fn main() {
     let mut host = String::from("127.0.0.1");
     let mut port: u16 = 3099;
     let mut stdio_mode = false;
+    let mut global_mode = false;
+    let mut db_path: Option<String> = None;
 
     // CLI 参数解析
     let mut i = 1;
@@ -46,6 +50,15 @@ async fn main() {
             }
             "--stdio" => {
                 stdio_mode = true;
+            }
+            "--global" => {
+                global_mode = true;
+            }
+            "--db-path" => {
+                i += 1;
+                if i < args.len() {
+                    db_path = Some(args[i].clone());
+                }
             }
             "--help" | "-h" => {
                 print_help();
@@ -91,6 +104,33 @@ async fn main() {
         src_dir
     };
 
+    // 确定记忆数据目录
+    // 优先级: --db-path > --global > 默认路径
+    let data_dir = if let Some(ref custom_path) = db_path {
+        custom_path.clone()
+    } else if global_mode {
+        // 全局记忆目录: ~/.loong-recall/data/
+        let home = dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        home.join(".loong-recall").join("data")
+            .to_string_lossy()
+            .to_string()
+    } else {
+        // 默认：源码目录下的 .loong-recall/data/
+        std::path::PathBuf::from(&src_dir)
+            .join(".loong-recall")
+            .join("data")
+            .to_string_lossy()
+            .to_string()
+    };
+
+    log(&format!("   记忆数据目录: {}", data_dir));
+
+    // 创建持久化后端和记忆存储
+    let persistence = JsonPersistence::new(&data_dir)
+        .expect("创建持久化后端失败");
+    let memory_store = Arc::new(Mutex::new(MemoryStore::new(persistence)));
+
     // 根据 feature 选择编码器类型
     #[cfg(feature = "ml")]
     let manager: Box<dyn server::IndexedCodebase> = {
@@ -108,6 +148,7 @@ async fn main() {
 
     let state = Arc::new(server::AppState {
         manager: Arc::new(Mutex::new(manager)),
+        memory_store: memory_store.clone(),
         src_dir: src_dir.clone(),
     });
 
@@ -180,7 +221,7 @@ fn index_and_report<E: code_memory::engine::encoder::CodeEncoder>(
 }
 
 fn print_help() {
-    println!("Loong Recall (L-RC / 忆) — 代码语义记忆 MCP 服务");
+    println!("Loong Recall (L-RC / 忆) — 通用语义记忆 MCP 服务");
     println!();
     println!("用法: code-memory-server [选项]");
     println!();
@@ -189,13 +230,21 @@ fn print_help() {
     println!("  --host <地址>       HTTP 绑定地址 [默认: 127.0.0.1]");
     println!("  --port <端口>       HTTP 绑定端口 [默认: 3099]");
     println!("  --stdio             使用 stdio 传输模式（IDE 标准 MCP）");
+    println!("  --global            使用全局记忆目录 (~/.loong-recall/data/)");
+    println!("  --db-path <路径>    指定记忆数据库路径（优先级最高）");
     println!("  --help, -h          显示此帮助信息");
     println!();
     println!("HTTP 模式示例:");
     println!("  code-memory-server --src-dir ./src --port 3099");
     println!();
     println!("Stdio 模式示例（推荐 IDE 全局部署）:");
-    println!("  code-memory-server --src-dir ./src --stdio");
+    println!("  code-memory-server --src-dir ./src --stdio --global");
+    println!();
+    println!("全局记忆模式（跨项目共享记忆）:");
+    println!("  code-memory-server --global --stdio");
+    println!();
+    println!("自定义数据库路径:");
+    println!("  code-memory-server --db-path /path/to/memories --stdio");
     println!();
     println!("启动后在 IDE 中配置 MCP 连接即可使用。");
 }

@@ -8,7 +8,7 @@
 // 整合切分、编码、检索三阶段流水线。
 // 按文件扩展名自动选择多语言切分策略。
 
-use crate::chunker::{chunk_by_language, is_supported_file};
+use crate::chunker::{chunk_by_language, is_supported_file, CodeChunk};
 use crate::engine::encoder::{CodeEncoder, FastEncoder};
 use crate::engine::retriever::{CodeRetriever, LocalRetriever, RetrievalResult};
 use serde::Serialize;
@@ -195,6 +195,23 @@ impl<E: CodeEncoder> CoreManager<E> {
     pub fn export_chunks_json(&self) -> serde_json::Result<String> {
         serde_json::to_string_pretty(self.retriever.all_chunks())
     }
+
+    /// 保存代码片段到 JSON 字符串（持久化用）
+    pub fn save_chunks(&self) -> serde_json::Result<String> {
+        self.export_chunks_json()
+    }
+
+    /// 从 JSON 字符串加载代码片段并重建索引
+    ///
+    /// 会清空现有索引，然后从 JSON 数据重新构建。
+    pub fn load_chunks(&mut self, json: &str) -> serde_json::Result<usize> {
+        let chunks: Vec<CodeChunk> = serde_json::from_str(json)?;
+        self.clear();
+        let count = chunks.len();
+        self.retriever.index_batch(chunks);
+        self.file_count = count;
+        Ok(count)
+    }
 }
 
 impl Default for CoreManager {
@@ -357,5 +374,23 @@ class AppConfig:
     fn test_nonexistent_dir() {
         let mut mgr = CoreManager::new();
         assert!(mgr.index_project("/nonexistent/12345").is_err());
+    }
+
+    #[test]
+    fn test_save_load_chunks() {
+        let mut mgr = CoreManager::new();
+        mgr.index_file("test.rs", "fn hello() {}\nstruct Foo {}\n");
+
+        let json = mgr.save_chunks().expect("应成功保存");
+        assert!(json.contains("hello"));
+
+        let mut mgr2 = CoreManager::new();
+        let count = mgr2.load_chunks(&json).expect("应成功加载");
+        assert_eq!(count, 2);
+        assert_eq!(mgr2.indexed_count(), 2);
+
+        // 搜索应能命中（使用编码器关键词中的术语）
+        let result = mgr2.search("struct", 3);
+        assert!(result.returned > 0, "加载后的片段应能搜索到");
     }
 }

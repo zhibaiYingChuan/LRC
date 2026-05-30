@@ -5,6 +5,8 @@
 // ============================================================
 
 pub mod encoder;
+pub mod encoder_registry;
+pub mod hnsw;
 pub mod retriever;
 pub mod manager;
 
@@ -12,6 +14,8 @@ pub mod manager;
 pub mod encoder_codebert;
 
 pub use encoder::{CodeEncoder, EmbeddingVector, FastEncoder};
+pub use encoder_registry::EncoderRegistry;
+pub use hnsw::HnswRetriever;
 pub use manager::{ChunkStats, CoreManager};
 pub use retriever::{CodeRetriever, LocalRetriever, RetrievalResult, ScoredChunk};
 
