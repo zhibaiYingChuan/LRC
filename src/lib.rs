@@ -19,6 +19,9 @@
 
 // === Layer 1: 公开层 (Apache 2.0) ===
 pub mod chunker;
+pub mod memory_store;
+pub mod memory_types;
+pub mod persistence;
 
 // === Layer 2: 受保护核心引擎 (DaoTi Research License v1.0) ===
 pub mod engine;
@@ -30,11 +33,22 @@ pub mod server;
 // === 公开重导出 ===
 pub use chunker::{
     chunk_by_language, detect_language, is_supported_file, CodeChunk, CodeChunker,
-    GenericChunker, GoChunker, PythonChunker, RustChunker, TsJsChunker,
+    ConversationChunker, GenericChunker, GoChunker, PythonChunker, RustChunker, TsJsChunker,
+};
+
+pub use memory_store::{
+    ListFilter, MemoryStats, MemoryStore, RecallFilter, RecallResult, SortBy, SortOrder,
+};
+
+pub use memory_types::{Importance, Memory, MemoryType};
+
+pub use persistence::{
+    create_json_persistence, json::JsonPersistence, Persistence, PersistenceError,
 };
 
 // === 受保护核心重导出（仅导出接口类型，实现细节在 engine/ 中） ===
 pub use engine::encoder::{CodeEncoder, EmbeddingVector};
+pub use engine::hnsw::HnswRetriever;
 pub use engine::manager::{ChunkStats, CoreManager as CodeMemoryManager};
 pub use engine::retriever::{CodeRetriever, RetrievalResult, ScoredChunk};
 

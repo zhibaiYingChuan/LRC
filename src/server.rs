@@ -6,7 +6,12 @@
 // 协议参考: https://spec.modelcontextprotocol.io/
 // 当前暴露 search_code + codebase_stats 两个工具
 
-use crate::{ChunkStats, CodeMemoryManager, RetrievalResult};
+use crate::{
+    ChunkStats, CodeMemoryManager, Importance, Memory, MemoryType,
+    RetrievalResult,
+};
+use crate::memory_store::{ListFilter, MemoryStore, RecallFilter, SortBy, SortOrder};
+use crate::persistence::json::JsonPersistence;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -127,6 +132,7 @@ impl<E: crate::engine::encoder::CodeEncoder> IndexedCodebase for CodeMemoryManag
 
 pub struct AppState {
     pub manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
+    pub memory_store: Arc<Mutex<MemoryStore<JsonPersistence>>>,
     pub src_dir: String,
 }
 
@@ -169,6 +175,176 @@ fn handle_initialize(id: Option<serde_json::Value>) -> JsonRpcResponse {
 
 fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
     let tools = vec![
+        ToolDefinition {
+            name: "remember".into(),
+            description: "写入一条永久记忆。AI 助手调用此工具将需要跨会话保留的信息存入记忆库。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "content": {
+                        "type": "string",
+                        "description": "记忆内容，如 '用户偏好使用 pnpm 而非 npm'"
+                    },
+                    "memory_type": {
+                        "type": "string",
+                        "description": "记忆类型: fact | preference | decision | code_context | conversation",
+                        "default": "fact"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "关联项目名称（空=全局记忆）"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "标签列表，如 ['pnpm', 'tooling']"
+                    },
+                    "importance": {
+                        "type": "integer",
+                        "description": "重要性 1-10（默认 5）",
+                        "default": 5
+                    },
+                    "ttl_days": {
+                        "type": "integer",
+                        "description": "存活天数（默认 0=永久）"
+                    }
+                }),
+                required: vec!["content".into()],
+            },
+        },
+        ToolDefinition {
+            name: "recall".into(),
+            description: "语义检索历史记忆。搜索所有已存储的记忆，返回最相关的结果。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "query": {
+                        "type": "string",
+                        "description": "自然语言查询，如 '用户的包管理器偏好'"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返回结果数（默认 5，最大 20）",
+                        "default": 5
+                    },
+                    "memory_type": {
+                        "type": "string",
+                        "description": "按类型过滤: fact | preference | decision | code_context | conversation"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "按项目过滤"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "按标签过滤"
+                    },
+                    "min_importance": {
+                        "type": "integer",
+                        "description": "最低重要性阈值（0-10）"
+                    }
+                }),
+                required: vec!["query".into()],
+            },
+        },
+        ToolDefinition {
+            name: "forget".into(),
+            description: "删除一条记忆。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "memory_id": {
+                        "type": "string",
+                        "description": "要删除的记忆 ID"
+                    }
+                }),
+                required: vec!["memory_id".into()],
+            },
+        },
+        ToolDefinition {
+            name: "update_memory".into(),
+            description: "更新一条已有记忆的内容。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "memory_id": {
+                        "type": "string",
+                        "description": "要更新的记忆 ID"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "新的记忆内容"
+                    },
+                    "importance": {
+                        "type": "integer",
+                        "description": "新的重要性（可选）"
+                    }
+                }),
+                required: vec!["memory_id".into(), "content".into()],
+            },
+        },
+        ToolDefinition {
+            name: "list_memories".into(),
+            description: "列出记忆库中的记忆，支持分页、过滤和排序。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "memory_type": {
+                        "type": "string",
+                        "description": "按类型过滤"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "按项目过滤"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "按标签过滤"
+                    },
+                    "sort_by": {
+                        "type": "string",
+                        "description": "排序字段: created_at | importance | last_accessed",
+                        "default": "created_at"
+                    },
+                    "order": {
+                        "type": "string",
+                        "description": "排序方向: desc | asc",
+                        "default": "desc"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "分页大小（默认 20）",
+                        "default": 20
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "分页偏移（默认 0）",
+                        "default": 0
+                    }
+                }),
+                required: vec![],
+            },
+        },
+        ToolDefinition {
+            name: "memory_stats".into(),
+            description: "获取记忆库的统计信息：总数、类型分布、项目分布。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({}),
+                required: vec![],
+            },
+        },
+        ToolDefinition {
+            name: "archive".into(),
+            description: "归档过期记忆。将已过期的记忆从活跃记忆库迁移到冷存储，释放检索空间。返回归档的记忆数量。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({}),
+                required: vec![],
+            },
+        },
         ToolDefinition {
             name: "search_code".into(),
             description: "在项目代码库中语义搜索相关代码片段。输入自然语言查询，返回最相关的 Top-K 代码（含文件路径、行号、评分）。".into(),
@@ -216,6 +392,372 @@ async fn handle_tools_call(
     let arguments = params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
 
     match name {
+        "remember" => {
+            let content = match arguments.get("content").and_then(|q| q.as_str()) {
+                Some(q) => q,
+                None => return make_error(id, -32602, "缺少参数: content"),
+            };
+
+            let memory_type_str = arguments
+                .get("memory_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("fact");
+            let memory_type = MemoryType::try_parse(memory_type_str)
+                .unwrap_or(MemoryType::Fact);
+
+            let project = arguments
+                .get("project")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let tags: Vec<String> = arguments
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let importance = arguments
+                .get("importance")
+                .and_then(|v| v.as_u64())
+                .map(|v| Importance::new(v as u8))
+                .unwrap_or_default();
+
+            let ttl_days = arguments
+                .get("ttl_days")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+
+            let memory = Memory::new(
+                content.to_string(),
+                memory_type,
+                project,
+                tags,
+                importance,
+                ttl_days,
+            );
+
+            let mut store = state.memory_store.lock().await;
+            match store.remember(memory) {
+                Ok(saved) => {
+                    let text = format!(
+                        "已记住 (ID: {})\n类型: {}\n内容: {}\n重要性: {}/10",
+                        saved.id,
+                        saved.memory_type.as_str(),
+                        saved.content,
+                        saved.importance.value()
+                    );
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Err(e) => make_error(id, -32603, &format!("写入失败: {}", e)),
+            }
+        }
+
+        "recall" => {
+            let query = match arguments.get("query").and_then(|q| q.as_str()) {
+                Some(q) => q,
+                None => return make_error(id, -32602, "缺少参数: query"),
+            };
+            let top_k = arguments
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5)
+                .min(20) as usize;
+
+            let memory_type = arguments
+                .get("memory_type")
+                .and_then(|v| v.as_str())
+                .and_then(MemoryType::try_parse);
+
+            let project = arguments
+                .get("project")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let tags: Vec<String> = arguments
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let min_importance = arguments
+                .get("min_importance")
+                .and_then(|v| v.as_u64())
+                .map(|v| Importance::new(v as u8));
+
+            let filter = RecallFilter {
+                memory_type,
+                project,
+                tags,
+                min_importance,
+                top_k,
+            };
+
+            let mut store = state.memory_store.lock().await;
+            match store.recall(query, &filter) {
+                Ok(result) => {
+                    let mut text = format!(
+                        "记忆检索结果 (共 {} 条匹配，记忆库共 {} 条)\n\n",
+                        result.memories.len(),
+                        result.total
+                    );
+
+                    if result.memories.is_empty() {
+                        text.push_str("未找到相关记忆。使用 remember 工具添加新记忆。\n");
+                    } else {
+                        for (i, m) in result.memories.iter().enumerate() {
+                            let score = result.scores.get(i).unwrap_or(&0.0);
+                            text.push_str(&format!(
+                                "### #{}. {} (匹配度: {:.1}%)\n",
+                                i + 1,
+                                m.summary(),
+                                score * 100.0
+                            ));
+                            text.push_str(&format!("ID: `{}`\n", m.id));
+                            text.push_str(&format!(
+                                "类型: {} | 重要性: {}/10 | 标签: {}\n",
+                                m.memory_type.as_str(),
+                                m.importance.value(),
+                                m.tags.join(", ")
+                            ));
+                            if let Some(ref proj) = m.project {
+                                text.push_str(&format!("项目: {}\n", proj));
+                            }
+                            text.push('\n');
+                        }
+                    }
+
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Err(e) => make_error(id, -32603, &format!("检索失败: {}", e)),
+            }
+        }
+
+        "forget" => {
+            let memory_id = match arguments.get("memory_id").and_then(|q| q.as_str()) {
+                Some(q) => q,
+                None => return make_error(id, -32602, "缺少参数: memory_id"),
+            };
+
+            let mut store = state.memory_store.lock().await;
+            match store.forget(memory_id) {
+                Ok(true) => {
+                    let text = format!("已删除记忆: {}", memory_id);
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Ok(false) => {
+                    let text = format!("未找到记忆: {}（可能已被删除）", memory_id);
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Err(e) => make_error(id, -32603, &format!("删除失败: {}", e)),
+            }
+        }
+
+        "update_memory" => {
+            let memory_id = match arguments.get("memory_id").and_then(|q| q.as_str()) {
+                Some(q) => q,
+                None => return make_error(id, -32602, "缺少参数: memory_id"),
+            };
+            let new_content = match arguments.get("content").and_then(|q| q.as_str()) {
+                Some(q) => q,
+                None => return make_error(id, -32602, "缺少参数: content"),
+            };
+            let new_importance = arguments
+                .get("importance")
+                .and_then(|v| v.as_u64())
+                .map(|v| Importance::new(v as u8));
+
+            let mut store = state.memory_store.lock().await;
+            match store.update_memory(memory_id, new_content, new_importance) {
+                Ok(Some(old)) => {
+                    let text = format!(
+                        "已更新记忆: {}\n旧内容: {}\n新内容: {}",
+                        memory_id, old.content, new_content
+                    );
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Ok(None) => {
+                    let text = format!("未找到记忆: {}", memory_id);
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Err(e) => make_error(id, -32603, &format!("更新失败: {}", e)),
+            }
+        }
+
+        "list_memories" => {
+            let memory_type = arguments
+                .get("memory_type")
+                .and_then(|v| v.as_str())
+                .and_then(MemoryType::try_parse);
+
+            let project = arguments
+                .get("project")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let tags: Vec<String> = arguments
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let sort_by = arguments
+                .get("sort_by")
+                .and_then(|v| v.as_str())
+                .map(|s| match s {
+                    "importance" => SortBy::Importance,
+                    "last_accessed" => SortBy::LastAccessed,
+                    _ => SortBy::CreatedAt,
+                })
+                .unwrap_or_default();
+
+            let order = arguments
+                .get("order")
+                .and_then(|v| v.as_str())
+                .map(|s| match s {
+                    "asc" => SortOrder::Asc,
+                    _ => SortOrder::Desc,
+                })
+                .unwrap_or_default();
+
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20)
+                .min(100) as usize;
+
+            let offset = arguments
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+
+            let filter = ListFilter {
+                memory_type,
+                project,
+                tags,
+                sort_by,
+                order,
+                limit,
+                offset,
+            };
+
+            let store = state.memory_store.lock().await;
+            match store.list_memories(&filter) {
+                Ok((memories, total)) => {
+                    let mut text = format!(
+                        "记忆列表 (共 {} 条，本页 {} 条)\n\n",
+                        total,
+                        memories.len()
+                    );
+
+                    if memories.is_empty() {
+                        text.push_str("暂无记忆。使用 remember 工具添加记忆。\n");
+                    } else {
+                        for m in &memories {
+                            text.push_str(&format!("### {}\n", m.summary()));
+                            text.push_str(&format!("ID: `{}`\n", m.id));
+                            text.push_str(&format!(
+                                "类型: {} | 重要性: {}/10 | 创建: {}\n",
+                                m.memory_type.as_str(),
+                                m.importance.value(),
+                                m.created_at.format("%Y-%m-%d %H:%M")
+                            ));
+                            if let Some(ref proj) = m.project {
+                                text.push_str(&format!("项目: {}\n", proj));
+                            }
+                            if !m.tags.is_empty() {
+                                text.push_str(&format!("标签: {}\n", m.tags.join(", ")));
+                            }
+                            text.push('\n');
+                        }
+                    }
+
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Err(e) => make_error(id, -32603, &format!("列表查询失败: {}", e)),
+            }
+        }
+
+        "memory_stats" => {
+            let store = state.memory_store.lock().await;
+            match store.stats() {
+                Ok(stats) => {
+                    let mut text = String::from("记忆库统计\n\n");
+                    text.push_str(&format!("- 记忆总数: {} 条\n", stats.total_memories));
+                    text.push_str(&format!("- 已过期: {} 条\n", stats.expired_count));
+                    text.push_str(&format!("- 存储大小: {} bytes\n\n", stats.storage_size_bytes));
+
+                    text.push_str("### 类型分布\n");
+                    let mut types: Vec<(&String, &usize)> = stats.by_type.iter().collect();
+                    types.sort_by(|a, b| b.1.cmp(a.1));
+                    for (t, count) in types {
+                        text.push_str(&format!("- `{}`: {} 条\n", t, count));
+                    }
+
+                    text.push_str("\n### 项目分布\n");
+                    let mut projects: Vec<(&String, &usize)> = stats.by_project.iter().collect();
+                    projects.sort_by(|a, b| b.1.cmp(a.1));
+                    for (proj, count) in projects {
+                        text.push_str(&format!("- `{}`: {} 条\n", proj, count));
+                    }
+
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Err(e) => make_error(id, -32603, &format!("统计查询失败: {}", e)),
+            }
+        }
+        "archive" => {
+            let mut store = state.memory_store.lock().await;
+            match store.archive_expired() {
+                Ok(count) => {
+                    let text = if count > 0 {
+                        format!("已归档 {} 条过期记忆到冷存储。", count)
+                    } else {
+                        "当前无过期记忆需要归档。".to_string()
+                    };
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Err(e) => make_error(id, -32603, &format!("归档失败: {}", e)),
+            }
+        }
         "search_code" => {
             let query = match arguments.get("query").and_then(|q| q.as_str()) {
                 Some(q) => q,
@@ -437,7 +979,7 @@ mod tests {
     use super::*;
     use crate::CodeMemoryManager;
 
-    /// 构建测试用 AppState（带已索引的 manager）
+    /// 构建测试用 AppState（带已索引的 manager 和记忆存储）
     fn test_state() -> Arc<AppState> {
         let mut manager = CodeMemoryManager::new();
         manager.index_file(
@@ -449,8 +991,16 @@ mod tests {
             "fn store_memory() {}\n\nfn retrieve_memory() {}\n",
         );
 
+        // 为测试创建临时持久化后端
+        let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
+        let data_dir = tmp.path().to_string_lossy().to_string();
+        let persistence = crate::persistence::create_json_persistence(&data_dir)
+            .expect("持久化创建失败");
+        let memory_store = Arc::new(Mutex::new(MemoryStore::new(persistence)));
+
         Arc::new(AppState {
             manager: Arc::new(Mutex::new(Box::new(manager))),
+            memory_store,
             src_dir: "fixture/src".into(),
         })
     }
@@ -481,12 +1031,21 @@ mod tests {
         let json = to_json(&resp);
 
         let tools = json["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2, "应注册 2 个工具");
+        assert_eq!(tools.len(), 9, "应注册 9 个工具（7 个记忆 + 2 个代码）");
 
-        assert_eq!(tools[0]["name"], "search_code");
-        assert!(!tools[0]["description"].as_str().unwrap().is_empty());
-
-        assert_eq!(tools[1]["name"], "codebase_stats");
+        // 验证记忆工具存在
+        let tool_names: Vec<&str> = tools.iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(tool_names.contains(&"remember"), "缺少 remember 工具");
+        assert!(tool_names.contains(&"recall"), "缺少 recall 工具");
+        assert!(tool_names.contains(&"forget"), "缺少 forget 工具");
+        assert!(tool_names.contains(&"update_memory"), "缺少 update_memory 工具");
+        assert!(tool_names.contains(&"list_memories"), "缺少 list_memories 工具");
+        assert!(tool_names.contains(&"memory_stats"), "缺少 memory_stats 工具");
+        assert!(tool_names.contains(&"archive"), "缺少 archive 工具");
+        assert!(tool_names.contains(&"search_code"), "缺少 search_code 工具");
+        assert!(tool_names.contains(&"codebase_stats"), "缺少 codebase_stats 工具");
     }
 
     // ---- search_code 工具调用 ----
@@ -633,5 +1192,353 @@ mod tests {
         let json = to_json(&resp);
         assert!(json.get("result").is_none());
         assert!(json.get("error").is_none());
+    }
+
+    // ---- remember 记忆写入工具测试 ----
+
+    #[tokio::test]
+    async fn test_remember() {
+        let state = test_state();
+        let params = serde_json::json!({
+            "name": "remember",
+            "arguments": {
+                "content": "用户偏好使用 pnpm 作为包管理器",
+                "memory_type": "preference",
+                "tags": ["pnpm", "tooling"],
+                "importance": 8
+            }
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(100.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["result"].is_object(), "remember 应返回成功结果");
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("已记住"), "应包含确认信息: {}", text);
+        assert!(text.contains("pnpm"), "应包含记忆内容: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_remember_missing_content() {
+        let state = test_state();
+        let params = serde_json::json!({
+            "name": "remember",
+            "arguments": {}
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(101.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["error"].is_object(), "缺少 content 应返回错误");
+        assert_eq!(json["error"]["code"], -32602);
+    }
+
+    // ---- recall 记忆检索工具测试 ----
+
+    #[tokio::test]
+    async fn test_recall() {
+        let state = test_state();
+
+        // 先写入一条记忆
+        let remember_params = serde_json::json!({
+            "name": "remember",
+            "arguments": {
+                "content": "该项目使用 PostgreSQL 作为主数据库",
+                "memory_type": "fact",
+                "tags": ["database", "postgresql"]
+            }
+        });
+        handle_tools_call(&state, &remember_params, None).await;
+
+        // 再检索
+        let params = serde_json::json!({
+            "name": "recall",
+            "arguments": {
+                "query": "PostgreSQL 数据库",
+                "top_k": 5
+            }
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(102.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["result"].is_object(), "recall 应返回成功结果");
+        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("PostgreSQL"), "应包含检索到的内容: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_recall_missing_query() {
+        let state = test_state();
+        let params = serde_json::json!({
+            "name": "recall",
+            "arguments": {}
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(103.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["error"].is_object());
+        assert_eq!(json["error"]["code"], -32602);
+    }
+
+    // ---- forget 记忆删除工具测试 ----
+
+    #[tokio::test]
+    async fn test_forget() {
+        let state = test_state();
+
+        // 先写入一条记忆
+        let remember_params = serde_json::json!({
+            "name": "remember",
+            "arguments": {
+                "content": "待删除的测试记忆"
+            }
+        });
+        let remember_resp =
+            handle_tools_call(&state, &remember_params, None).await;
+        let remember_json = to_json(&remember_resp);
+        // 从响应中提取记忆 ID
+        let text = remember_json["result"]["content"][0]["text"].as_str().unwrap();
+        let id_start = text.find("ID: ").unwrap() + 4;
+        let id_end = text[id_start..].find(')').unwrap() + id_start;
+        let memory_id = &text[id_start..id_end];
+
+        // 删除该记忆
+        let params = serde_json::json!({
+            "name": "forget",
+            "arguments": {
+                "memory_id": memory_id
+            }
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(104.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["result"].is_object());
+        let forget_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(forget_text.contains("已删除"), "应确认删除: {}", forget_text);
+    }
+
+    #[tokio::test]
+    async fn test_forget_missing_id() {
+        let state = test_state();
+        let params = serde_json::json!({
+            "name": "forget",
+            "arguments": {}
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(105.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["error"].is_object());
+        assert_eq!(json["error"]["code"], -32602);
+    }
+
+    // ---- update_memory 记忆更新工具测试 ----
+
+    #[tokio::test]
+    async fn test_update_memory() {
+        let state = test_state();
+
+        // 先写入一条记忆
+        let remember_params = serde_json::json!({
+            "name": "remember",
+            "arguments": {
+                "content": "旧版本内容"
+            }
+        });
+        let remember_resp =
+            handle_tools_call(&state, &remember_params, None).await;
+        let remember_json = to_json(&remember_resp);
+        let text = remember_json["result"]["content"][0]["text"].as_str().unwrap();
+        let id_start = text.find("ID: ").unwrap() + 4;
+        let id_end = text[id_start..].find(')').unwrap() + id_start;
+        let memory_id = &text[id_start..id_end];
+
+        // 更新该记忆
+        let params = serde_json::json!({
+            "name": "update_memory",
+            "arguments": {
+                "memory_id": memory_id,
+                "content": "新版本内容",
+                "importance": 9
+            }
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(106.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["result"].is_object());
+        let update_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(update_text.contains("已更新"), "应确认更新: {}", update_text);
+        assert!(update_text.contains("新版本内容"), "应包含新内容: {}", update_text);
+    }
+
+    #[tokio::test]
+    async fn test_update_memory_missing_params() {
+        let state = test_state();
+        let params = serde_json::json!({
+            "name": "update_memory",
+            "arguments": {
+                "memory_id": "test-id"
+            }
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(107.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["error"].is_object());
+        assert_eq!(json["error"]["code"], -32602);
+    }
+
+    // ---- list_memories 记忆列表工具测试 ----
+
+    #[tokio::test]
+    async fn test_list_memories() {
+        let state = test_state();
+
+        // 写入多条记忆
+        for content in &["记忆 A", "记忆 B", "记忆 C"] {
+            let params = serde_json::json!({
+                "name": "remember",
+                "arguments": {
+                    "content": *content
+                }
+            });
+            handle_tools_call(&state, &params, None).await;
+        }
+
+        let params = serde_json::json!({
+            "name": "list_memories",
+            "arguments": {
+                "limit": 10
+            }
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(108.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["result"].is_object(), "list_memories 应返回成功结果");
+        let list_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(list_text.contains("记忆列表"), "应包含标题: {}", list_text);
+        assert!(list_text.contains("共"), "应包含总数: {}", list_text);
+    }
+
+    // ---- memory_stats 记忆统计工具测试 ----
+
+    #[tokio::test]
+    async fn test_memory_stats() {
+        let state = test_state();
+
+        // 写入不同类型的记忆
+        let facts_params = serde_json::json!({
+            "name": "remember",
+            "arguments": {
+                "content": "事实记忆",
+                "memory_type": "fact"
+            }
+        });
+        handle_tools_call(&state, &facts_params, None).await;
+
+        let pref_params = serde_json::json!({
+            "name": "remember",
+            "arguments": {
+                "content": "偏好记忆",
+                "memory_type": "preference"
+            }
+        });
+        handle_tools_call(&state, &pref_params, None).await;
+
+        let params = serde_json::json!({
+            "name": "memory_stats",
+            "arguments": {}
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(109.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["result"].is_object(), "memory_stats 应返回成功结果");
+        let stats_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(stats_text.contains("记忆库统计"), "应包含标题: {}", stats_text);
+        assert!(stats_text.contains("fact"), "应包含 fact 类型: {}", stats_text);
+        assert!(stats_text.contains("preference"), "应包含 preference 类型: {}", stats_text);
+    }
+
+    // ---- archive 记忆归档工具测试 ----
+
+    #[tokio::test]
+    async fn test_archive_no_expired() {
+        let state = test_state();
+
+        let params = serde_json::json!({
+            "name": "archive",
+            "arguments": {}
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(110.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["result"].is_object(), "archive 应返回成功结果");
+        let archive_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            archive_text.contains("无过期记忆"),
+            "无过期记忆时应给出提示: {}",
+            archive_text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_archive_with_expired() {
+        let state = test_state();
+
+        // 写入一条过期记忆（2 天前创建，ttl=1 天）
+        use chrono::{Duration, Utc};
+        let mut expired_memory = crate::Memory::new(
+            "已过期的记忆".to_string(),
+            crate::MemoryType::Fact,
+            None,
+            vec![],
+            crate::Importance::default(),
+            Some(1),
+        );
+        expired_memory.created_at = Utc::now() - Duration::days(2);
+
+        let mut store = state.memory_store.lock().await;
+        store.remember(expired_memory).expect("应成功写入过期记忆");
+        drop(store); // 释放锁
+
+        let params = serde_json::json!({
+            "name": "archive",
+            "arguments": {}
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(111.into())))
+                .await;
+        let json = to_json(&resp);
+
+        assert!(json["result"].is_object(), "archive 应返回成功结果");
+        let archive_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            archive_text.contains("已归档"),
+            "有过期记忆时应确认归档: {}",
+            archive_text
+        );
+        assert!(
+            archive_text.contains("条过期记忆"),
+            "应显示归档数量: {}",
+            archive_text
+        );
     }
 }

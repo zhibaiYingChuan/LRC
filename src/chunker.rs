@@ -652,6 +652,150 @@ impl CodeChunker for GoChunker {
     }
 }
 
+// ==================== 对话切分器 ====================
+
+/// 对话切分器 — 按角色轮次对对话文本进行结构化切分
+///
+/// 支持中英文角色前缀识别（如 "用户:", "助手:", "User:", "Assistant:"），
+/// 每轮对话作为一个独立片段，保留角色标识和内容。
+pub struct ConversationChunker;
+
+impl ConversationChunker {
+    /// 检测行首是否为已知的角色前缀
+    ///
+    /// 返回 `Some(角色名)` 如果匹配，否则返回 `None`。
+    /// 支持中文全角冒号（：）和英文半角冒号（:）。
+    fn detect_role(line: &str) -> Option<String> {
+        let trimmed = line.trim_start();
+
+        let role_patterns: &[(&[&str], &str)] = &[
+            (&["用户:", "用户："], "用户"),
+            (&["助手:", "助手："], "助手"),
+            (&["系统:", "系统："], "系统"),
+            (&["User:", "USER:"], "User"),
+            (&["Assistant:", "ASSISTANT:"], "Assistant"),
+            (&["System:", "SYSTEM:"], "System"),
+            (&["AI:", "ai:"], "AI"),
+            (&["Human:", "HUMAN:", "human:"], "Human"),
+        ];
+
+        for (prefixes, role_name) in role_patterns {
+            for prefix in *prefixes {
+                if trimmed.starts_with(prefix) {
+                    return Some(role_name.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// 提取角色前缀后的内容
+    fn extract_content(line: &str) -> &str {
+        let trimmed = line.trim_start();
+        // 先检查半角冒号 ':'
+        if let Some(colon_pos) = trimmed.find(':') {
+            if colon_pos > 0 {
+                let colon_end = colon_pos + 1; // ':' 占 1 字节
+                let prefix = &trimmed[..colon_end];
+                let remaining = trimmed[colon_end..].trim();
+                if Self::detect_role(prefix).is_some() {
+                    return remaining;
+                }
+            }
+        }
+        // 再检查全角冒号 '：'
+        if let Some(colon_pos) = trimmed.find('：') {
+            if colon_pos > 0 {
+                let colon_end = colon_pos + '：'.len_utf8(); // '：' 占 3 字节
+                let prefix = &trimmed[..colon_end];
+                let remaining = trimmed[colon_end..].trim();
+                if Self::detect_role(prefix).is_some() {
+                    return remaining;
+                }
+            }
+        }
+        trimmed
+    }
+}
+
+impl CodeChunker for ConversationChunker {
+    fn chunk_file(&self, file_path: &str, content: &str) -> Vec<CodeChunk> {
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.is_empty() || (lines.len() == 1 && lines[0].trim().is_empty()) {
+            return vec![];
+        }
+
+        let mut chunks = Vec::new();
+        let mut turn_start: Option<usize> = None;
+        let mut current_role: Option<String> = None;
+
+        for (idx, line) in lines.iter().enumerate() {
+            let detected_role = Self::detect_role(line);
+
+            if let Some(role) = detected_role {
+                // 保存上一轮对话
+                if let Some(start) = turn_start {
+                    if start < idx {
+                        let end = idx.saturating_sub(1).max(start);
+                        let turn_lines = &lines[start..=end];
+                        let content = turn_lines.join("\n");
+                        let role_name = current_role.unwrap_or_else(|| "未知".to_string());
+
+                        let first_line = Self::extract_content(lines[start]);
+                        let name = format!("{}: {}", role_name,
+                            first_line.chars().take(40).collect::<String>());
+
+                        chunks.push(CodeChunk {
+                            id: format!("{}:L{}-L{}", file_path, start + 1, end + 1),
+                            file_path: file_path.to_string(),
+                            start_line: start + 1,
+                            end_line: end + 1,
+                            chunk_type: "conversation_turn".to_string(),
+                            name,
+                            signature: role_name.clone(),
+                            content,
+                            doc_comment: None,
+                            language: "conversation".to_string(),
+                        });
+                    }
+                }
+                turn_start = Some(idx);
+                current_role = Some(role);
+            }
+        }
+
+        // 保存最后一轮对话
+        if let Some(start) = turn_start {
+            if start < lines.len() {
+                let turn_lines = &lines[start..];
+                let content = turn_lines.join("\n");
+                let role_name = current_role.unwrap_or_else(|| "未知".to_string());
+
+                let first_line = Self::extract_content(lines[start]);
+                let name = format!("{}: {}",
+                    role_name,
+                    first_line.chars().take(40).collect::<String>());
+
+                chunks.push(CodeChunk {
+                    id: format!("{}:L{}-L{}", file_path, start + 1, lines.len()),
+                    file_path: file_path.to_string(),
+                    start_line: start + 1,
+                    end_line: lines.len(),
+                    chunk_type: "conversation_turn".to_string(),
+                    name,
+                    signature: role_name.clone(),
+                    content,
+                    doc_comment: None,
+                    language: "conversation".to_string(),
+                });
+            }
+        }
+
+        chunks
+    }
+}
+
 // ==================== 通用文档切分器 ====================
 
 pub struct GenericChunker;
@@ -1077,5 +1221,108 @@ mod tests {
 
         let txt = chunk_by_language("readme.md", "# Hello\n\nWorld\n");
         assert_eq!(txt[0].language, "markdown");
+    }
+
+    // === 对话切分测试 ===
+
+    #[test]
+    fn test_conversation_empty() {
+        let chunks = ConversationChunker.chunk_file("chat.txt", "");
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_conversation_chinese_simple() {
+        let text = "用户: 你好\n助手: 你好！有什么可以帮你的？\n用户: 我想了解 Rust\n";
+        let chunks = ConversationChunker.chunk_file("chat.txt", text);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].chunk_type, "conversation_turn");
+        assert_eq!(chunks[0].signature, "用户");
+        assert!(chunks[0].content.contains("你好"));
+        assert_eq!(chunks[0].language, "conversation");
+
+        assert_eq!(chunks[1].signature, "助手");
+        assert!(chunks[1].content.contains("有什么可以帮你的"));
+
+        assert_eq!(chunks[2].signature, "用户");
+        assert!(chunks[2].content.contains("Rust"));
+    }
+
+    #[test]
+    fn test_conversation_english_simple() {
+        let text = "User: Hello\nAssistant: Hi there!\nUser: How are you?\n";
+        let chunks = ConversationChunker.chunk_file("chat.txt", text);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].signature, "User");
+        assert!(chunks[0].content.contains("Hello"));
+        assert_eq!(chunks[1].signature, "Assistant");
+        assert!(chunks[1].content.contains("Hi there"));
+        assert_eq!(chunks[2].signature, "User");
+        assert!(chunks[2].content.contains("How are you"));
+    }
+
+    #[test]
+    fn test_conversation_multiline_turns() {
+        let text = concat!(
+            "用户: 我有一个问题\n",
+            "关于 Rust 的所有权系统\n",
+            "能帮我理解一下吗？\n",
+            "助手: 当然可以！\n",
+            "Rust 的所有权系统是它最独特的特性\n",
+            "它确保内存安全而无需垃圾回收\n",
+        );
+        let chunks = ConversationChunker.chunk_file("chat.txt", text);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].signature, "用户");
+        assert_eq!(chunks[0].start_line, 1);
+        assert_eq!(chunks[0].end_line, 3);
+        assert!(chunks[0].content.contains("所有权系统"));
+
+        assert_eq!(chunks[1].signature, "助手");
+        assert_eq!(chunks[1].start_line, 4);
+        assert_eq!(chunks[1].end_line, 6);
+        assert!(chunks[1].content.contains("内存安全"));
+    }
+
+    #[test]
+    fn test_conversation_single_turn() {
+        let text = "用户: 只有一条消息\n";
+        let chunks = ConversationChunker.chunk_file("chat.txt", text);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].signature, "用户");
+        assert!(chunks[0].content.contains("只有一条消息"));
+    }
+
+    #[test]
+    fn test_conversation_fullwidth_colon() {
+        let text = "用户：你好\n助手：你好！\n";
+        let chunks = ConversationChunker.chunk_file("chat.txt", text);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].signature, "用户");
+        assert_eq!(chunks[1].signature, "助手");
+    }
+
+    #[test]
+    fn test_conversation_system_role() {
+        let text = "系统: 你是一个有用的助手\n用户: 你好\n";
+        let chunks = ConversationChunker.chunk_file("chat.txt", text);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].signature, "系统");
+        assert_eq!(chunks[1].signature, "用户");
+    }
+
+    #[test]
+    fn test_conversation_no_role_prefix() {
+        let text = "这是第一行\n这是第二行\n这是第三行\n";
+        let chunks = ConversationChunker.chunk_file("chat.txt", text);
+
+        assert_eq!(chunks.len(), 0,
+            "无角色前缀的文本不应产生对话切分");
     }
 }

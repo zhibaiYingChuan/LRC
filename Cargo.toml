@@ -8,7 +8,7 @@ license = "Apache-2.0 OR LicenseRef-DaoTi-Research"
 repository = "https://github.com/zhibaiYingChuan/LRC"
 
 [features]
-default = []
+default = ["server"]
 # 启用 candle + CodeBERT 真实语义编码（体积大 ~200MB）
 ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
 # 启用 MCP HTTP 服务（axum + tokio）
@@ -18,6 +18,9 @@ server = ["axum", "tokio", "tower-http"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+dirs-next = "2"
 
 # CodeBERT 真实语义编码依赖（optional，ml feature 启用）
 candle-core = { version = "0.10", optional = true }
