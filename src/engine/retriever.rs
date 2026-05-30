@@ -99,6 +99,7 @@ impl<E: CodeEncoder> CodeRetriever for LocalRetriever<E> {
             signature: query.to_string(),
             content: query.to_string(),
             doc_comment: None,
+            language: "text".to_string(),
         };
         let query_vector = self.encoder.encode(&query_chunk);
 
@@ -165,6 +166,7 @@ mod tests {
             signature: format!("{} {}()", chunk_type, name),
             content: content.to_string(),
             doc_comment: None,
+            language: "rust".to_string(),
         }
     }
 

@@ -6,8 +6,9 @@
 //
 // 编排模块
 // 整合切分、编码、检索三阶段流水线。
+// 按文件扩展名自动选择多语言切分策略。
 
-use crate::chunker::{CodeChunker, RegexChunker};
+use crate::chunker::{chunk_by_language, is_supported_file};
 use crate::engine::encoder::{CodeEncoder, FastEncoder};
 use crate::engine::retriever::{CodeRetriever, LocalRetriever, RetrievalResult};
 use serde::Serialize;
@@ -21,12 +22,12 @@ pub struct ChunkStats {
     pub file_count: usize,
     pub total_chunks: usize,
     pub type_counts: HashMap<String, usize>,
+    pub language_counts: HashMap<String, usize>,
     pub avg_lines: f32,
 }
 
 /// 核心编排器
 pub struct CoreManager<E: CodeEncoder = FastEncoder> {
-    chunker: Box<dyn CodeChunker>,
     retriever: LocalRetriever<E>,
     file_count: usize,
 }
@@ -34,10 +35,51 @@ pub struct CoreManager<E: CodeEncoder = FastEncoder> {
 impl CoreManager {
     pub fn new() -> Self {
         let terms = vec![
-            "fn", "struct", "impl", "trait", "enum", "mod", "pub", "async", "await",
-            "self", "mut", "ref", "let", "use", "type", "where", "for", "loop",
-            "memory", "retrieve", "encode", "decode", "search", "index", "session",
-            "config", "user", "task", "workflow", "engine", "handler", "manager",
+            "fn",
+            "struct",
+            "impl",
+            "trait",
+            "enum",
+            "mod",
+            "pub",
+            "async",
+            "await",
+            "def",
+            "class",
+            "self",
+            "function",
+            "export",
+            "import",
+            "const",
+            "let",
+            "var",
+            "interface",
+            "type",
+            "func",
+            "return",
+            "memory",
+            "retrieve",
+            "encode",
+            "decode",
+            "search",
+            "index",
+            "session",
+            "config",
+            "user",
+            "task",
+            "workflow",
+            "engine",
+            "handler",
+            "manager",
+            "store",
+            "cache",
+            "query",
+            "fetch",
+            "build",
+            "init",
+            "setup",
+            "load",
+            "save",
         ];
 
         let encoder = Arc::new(FastEncoder::new(
@@ -46,7 +88,6 @@ impl CoreManager {
         let retriever = LocalRetriever::new(encoder, 0.01);
 
         Self {
-            chunker: Box::new(RegexChunker),
             retriever,
             file_count: 0,
         }
@@ -56,12 +97,12 @@ impl CoreManager {
 impl<E: CodeEncoder> CoreManager<E> {
     pub fn with_encoder(encoder: Arc<E>) -> Self {
         Self {
-            chunker: Box::new(RegexChunker),
             retriever: LocalRetriever::new(encoder, 0.01),
             file_count: 0,
         }
     }
 
+    /// 索引整个项目目录，自动识别所有支持的文本文件格式
     pub fn index_project(&mut self, src_dir: &str) -> std::io::Result<usize> {
         let src_path = Path::new(src_dir);
         if !src_path.is_dir() {
@@ -77,7 +118,7 @@ impl<E: CodeEncoder> CoreManager<E> {
         for entry in walkdir::WalkDir::new(src_dir)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+            .filter(|e| e.path().is_file() && is_supported_file(e.path()))
         {
             let content = match std::fs::read_to_string(entry.path()) {
                 Ok(c) => c,
@@ -91,7 +132,7 @@ impl<E: CodeEncoder> CoreManager<E> {
                 .to_string_lossy()
                 .to_string();
 
-            let chunks = self.chunker.chunk_file(&file_path, &content);
+            let chunks = chunk_by_language(&file_path, &content);
             let count = chunks.len();
             self.retriever.index_batch(chunks);
             total_chunks += count;
@@ -110,8 +151,9 @@ impl<E: CodeEncoder> CoreManager<E> {
         self.retriever.indexed_count()
     }
 
+    /// 索引单个文件，自动按扩展名选择切分策略
     pub fn index_file(&mut self, file_path: &str, content: &str) -> usize {
-        let chunks = self.chunker.chunk_file(file_path, content);
+        let chunks = chunk_by_language(file_path, content);
         let count = chunks.len();
         self.retriever.index_batch(chunks);
         self.file_count += 1;
@@ -121,12 +163,12 @@ impl<E: CodeEncoder> CoreManager<E> {
     pub fn get_stats(&self) -> ChunkStats {
         let chunks = self.retriever.all_chunks();
         let mut type_counts: HashMap<String, usize> = HashMap::new();
+        let mut language_counts: HashMap<String, usize> = HashMap::new();
         let mut total_lines = 0usize;
 
         for chunk in chunks {
-            *type_counts
-                .entry(chunk.chunk_type.clone())
-                .or_insert(0) += 1;
+            *type_counts.entry(chunk.chunk_type.clone()).or_insert(0) += 1;
+            *language_counts.entry(chunk.language.clone()).or_insert(0) += 1;
             total_lines += chunk.end_line.saturating_sub(chunk.start_line) + 1;
         }
 
@@ -140,6 +182,7 @@ impl<E: CodeEncoder> CoreManager<E> {
             file_count: self.file_count,
             total_chunks: chunks.len(),
             type_counts,
+            language_counts,
             avg_lines,
         }
     }
@@ -175,7 +218,9 @@ mod tests {
 
         let f1 = src_dir.join("module_a.rs");
         let mut f = std::fs::File::create(&f1).expect("应创建文件");
-        writeln!(f, r#"
+        writeln!(
+            f,
+            r#"
 pub struct Container {{
     path: String,
 }}
@@ -189,11 +234,15 @@ impl Container {{
         vec![]
     }}
 }}
-"#).expect("应写入");
+"#
+        )
+        .expect("应写入");
 
         let f2 = src_dir.join("settings.rs");
         let mut f = std::fs::File::create(&f2).expect("应创建文件");
-        writeln!(f, r#"
+        writeln!(
+            f,
+            r#"
 pub struct Settings {{
     pub port: u16,
     pub host: String,
@@ -202,7 +251,26 @@ pub struct Settings {{
 fn defaults() -> Settings {{
     Settings {{ port: 8080, host: "localhost".into() }}
 }}
-"#).expect("应写入");
+"#
+        )
+        .expect("应写入");
+
+        // 添加一个 Python 文件
+        let f3 = src_dir.join("utils.py");
+        let mut f = std::fs::File::create(&f3).expect("应创建文件");
+        writeln!(
+            f,
+            r#"
+def get_config(key: str) -> str:
+    """获取配置"""
+    return "default"
+
+class AppConfig:
+    def __init__(self):
+        self.port = 8080
+"#
+        )
+        .expect("应写入");
 
         (dir, src_dir.to_string_lossy().to_string())
     }
@@ -220,6 +288,11 @@ fn defaults() -> Settings {{
         let count = mgr.index_project(&src_dir).expect("应成功索引");
         assert!(count > 0);
         assert_eq!(mgr.indexed_count(), count);
+        // 应包含 Rust 和 Python 文件
+        let stats = mgr.get_stats();
+        assert!(stats.file_count >= 2);
+        assert!(stats.language_counts.contains_key("rust"));
+        assert!(stats.language_counts.contains_key("python"));
     }
 
     #[test]
@@ -241,6 +314,18 @@ fn defaults() -> Settings {{
         assert_eq!(stats.type_counts.get("fn"), Some(&1));
         assert_eq!(stats.type_counts.get("struct"), Some(&1));
         assert_eq!(stats.type_counts.get("impl"), Some(&1));
+        // language 字段也应正确
+        assert_eq!(stats.language_counts.get("rust"), Some(&3));
+    }
+
+    #[test]
+    fn test_python_index() {
+        let mut mgr = CoreManager::new();
+        mgr.index_file("test.py", "def a():\n    pass\n\nclass B:\n    pass\n");
+        let stats = mgr.get_stats();
+        assert_eq!(stats.file_count, 1);
+        assert!(stats.total_chunks >= 2);
+        assert_eq!(stats.language_counts.get("python"), Some(&2));
     }
 
     #[test]
@@ -259,6 +344,7 @@ fn defaults() -> Settings {{
         let json = mgr.export_chunks_json().expect("应导出");
         assert!(json.contains("hello"));
         assert!(json.contains("test.rs"));
+        assert!(json.contains("\"language\""));
     }
 
     #[test]

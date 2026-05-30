@@ -120,6 +120,7 @@ mod tests {
             signature: format!("fn {}()", name),
             content: content.to_string(),
             doc_comment: None,
+            language: "rust".to_string(),
         }
     }
 

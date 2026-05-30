@@ -256,7 +256,7 @@ async fn handle_tools_call(
                     if let Some(ref doc) = r.chunk.doc_comment {
                         text.push_str(&format!("{}\n", doc));
                     }
-                    text.push_str(&format!("```rust\n{}\n```\n\n", r.chunk.content));
+                    text.push_str(&format!("```{}\n{}\n```\n\n", r.chunk.language, r.chunk.content));
                 }
             }
 
@@ -344,7 +344,7 @@ async fn dispatch_request(
             Some(handle_tools_call(state, params, id).await)
         }
         // 通知类请求：MCP 协议规定通知不需要响应
-        "notifications/initialized" | _ if method.starts_with("notifications/") => None,
+        method if method.starts_with("notifications/") => None,
         _ => Some(make_error(id, -32601, &format!("未知方法: {}", method))),
     }
 }
