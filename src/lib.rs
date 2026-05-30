@@ -23,6 +23,9 @@ pub mod memory_store;
 pub mod memory_types;
 pub mod persistence;
 
+/// 运行时防护模块：反调试、完整性校验、防篡改
+pub mod guard;
+
 // === Layer 2: 受保护核心引擎 (DaoTi Research License v1.0) ===
 pub mod engine;
 

@@ -41,3 +41,20 @@ tempfile = "3"
 name = "code-memory-server"
 path = "src/bin/server.rs"
 required-features = ["server"]
+
+[build-dependencies]
+sha2 = "0.10"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false
+debug = false
+debug-assertions = false
+incremental = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Threading", "Win32_Foundation"] }

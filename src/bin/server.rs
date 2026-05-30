@@ -17,6 +17,9 @@ use tokio::sync::Mutex;
 
 #[tokio::main]
 async fn main() {
+    // 运行时防护：反调试 + 完整性校验（必须在任何业务逻辑之前执行）
+    code_memory::guard::risk_aware_guard();
+
     let args: Vec<String> = std::env::args().collect();
 
     let mut src_dir = String::new();
