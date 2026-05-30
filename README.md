@@ -1,6 +1,6 @@
 # Loong Recall (L-RC / 忆)
 
-**源于道体·道枢层 —— 代码语义记忆 MCP 服务**
+**源于道体·道枢层 —— 通用语义记忆 MCP 服务**
 
 [![License](https://img.shields.io/badge/Code-Apache%202.0-blue.svg)](LICENSE_CODE)
 [![License](https://img.shields.io/badge/Engine-DaoTi%20Research%20License-red.svg)](LICENSE)
@@ -9,11 +9,11 @@
 
 ## 简介
 
-**Loong Recall**（缩写 **L-RC**，中文名 **"忆"**）是 Loong Agent OS 的代码语义记忆子系统。
+**Loong Recall**（缩写 **L-RC**，中文名 **"忆"**）是 Loong Agent OS 的通用语义记忆子系统。
 
 其核心算法源于 [**道体（DaoTi）基座模型**](https://github.com/zhibaiYingChuan/DaoTi) 的 **道枢层（Core Layer）**——道体是一个预训练的神经网络语义基座模型，采用"冻结道体 + 轻量适配器"范式，在消费级 CPU 上完成训练。
 
-Loong Recall 将道枢层的语义编码与检索能力独立为 MCP (Model Context Protocol) 服务，为 AI 助手提供代码上下文记忆，突破上下文窗口限制。
+Loong Recall 将道枢层的语义编码与检索能力独立为 MCP (Model Context Protocol) 服务，为 AI 助手提供跨项目、跨语言的永久记忆能力。支持多语言代码（Rust / Python / TypeScript / JavaScript / Go）及通用文档（Markdown / YAML / TOML / JSON / HTML 等），不局限于编程场景，AI 助手在任何工作中都能保持语义记忆。
 
 ## 快速开始
 
@@ -45,10 +45,10 @@ cargo build --release --features server
 
 | 组件 | 文件 | 说明 |
 |------|------|------|
-| **切分器** | `src/chunker.rs` | 按 fn/struct/trait/impl 边界切分 Rust 代码 |
+| **切分器** | `src/chunker.rs` | 按语法边界切分多语言代码和文档（Rust/Python/TS/JS/Go/MD...） |
 | **编码器** | `src/engine/encoder.rs` | 语义向量编码（快速模式 / CodeBERT 模式） |
 | **检索器** | `src/engine/retriever.rs` | 向量相似度 Top-K 检索 |
-| **编排器** | `src/engine/manager.rs` | 整合三阶段流水线 |
+| **编排器** | `src/engine/manager.rs` | 整合三阶段流水线，按扩展名自动路由切分策略 |
 | **MCP 服务** | `src/server.rs` | HTTP + JSON-RPC 2.0 / Stdio 双传输 |
 
 ## MCP 工具
@@ -72,8 +72,26 @@ cargo build --release --features server
 
 ```
 输出:
-  已索引文件数、代码片段数、类型分布（fn/struct/trait/impl/enum）
+  已索引文件数、代码片段数、类型分布（多语言）及语言分布统计
 ```
+
+## 支持的语言
+
+按文件扩展名自动选择切分策略：
+
+| 语言/格式 | 扩展名 | 切分策略 | 识别单元 |
+|-----------|--------|----------|----------|
+| Rust | `.rs` | `RustChunker` | fn / struct / trait / impl / enum / mod |
+| Python | `.py` | `PythonChunker` | def / async def / class |
+| TypeScript | `.ts`, `.tsx` | `TsJsChunker` | function / class / interface / type / enum |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | `TsJsChunker` | function / class / 箭头函数 |
+| Go | `.go` | `GoChunker` | func / type |
+| Markdown | `.md`, `.mdx` | `GenericChunker` | `#` / `##` 标题段落 |
+| YAML | `.yaml`, `.yml` | `GenericChunker` | 段落 |
+| TOML | `.toml` | `GenericChunker` | 段落 |
+| JSON | `.json` | `GenericChunker` | 段落 |
+| HTML/CSS | `.html`, `.css`, `.scss`... | `GenericChunker` | 段落 |
+| 纯文本 | `.txt`, `.rst` 等 | `GenericChunker` | 段落双换行分割 |
 
 ## IDE 配置
 
