@@ -3,7 +3,7 @@ name = "code-memory"
 version = "0.1.0"
 edition = "2021"
 authors = ["Open Source Contributors"]
-description = "Loong Recall (L-RC / 忆) — 源于道体道枢层的代码语义记忆 MCP 服务，为 AI 助手提供项目代码上下文记忆"
+description = "Loong Recall (L-RC / 忆) — 几何坐标驱动的 AI 永久记忆系统，为 AI 助手提供语义代码搜索与跨会话记忆演化"
 license = "Apache-2.0 OR LicenseRef-DaoTi-Research"
 repository = "https://github.com/zhibaiYingChuan/LRC"
 
