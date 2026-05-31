@@ -253,8 +253,13 @@ mod windows_guard {
             }
 
             // 遍历节表找到 .text 段
-            let section_header = (module_base.add(dos_header.e_lfanew as usize)
-                .add(std::mem::size_of::<ImageNtHeaders>()))
+            // 计算节表起始偏移 = NT头 + FileHeader(20) + OptionalHeader(SizeOfOptionalHeader)
+            let optional_header_size =
+                nt_header.file_header._size_of_optional_header as usize;
+            let section_header = (module_base
+                .add(dos_header.e_lfanew as usize)
+                .add(std::mem::size_of::<ImageNtHeaders>())
+                .add(optional_header_size))
                 as *const ImageSectionHeader;
 
             let num_sections =
