@@ -271,21 +271,21 @@ mod tests {
     fn test_comparison_dim() {
         if should_skip() { return; }
         let cb = CodeBertEncoder::load().expect("load");
-        let mock = FastEncoder::new(vec!["fn".into(), "struct".into(), "alpha".into(), "beta".into(), "gamma".into()]);
+        let fast = FastEncoder::new(vec!["fn".into(), "struct".into(), "alpha".into(), "beta".into(), "gamma".into()]);
 
         let chunk = make_chunk("hello", "fn hello() {}");
         let cb_vec = cb.encode(&chunk);
-        let mock_vec = mock.encode(&chunk);
+        let fast_vec = fast.encode(&chunk);
 
         assert_eq!(cb_vec.dim, 768);
-        assert_eq!(mock_vec.dim, 5);
+        assert_eq!(fast_vec.dim, 5);
     }
 
     #[test]
     fn test_comparison_gap() {
         if should_skip() { return; }
         let cb = CodeBertEncoder::load().expect("load");
-        let mock = FastEncoder::new(vec![
+        let fast = FastEncoder::new(vec![
             "fn".into(), "db".into(), "insert".into(), "save".into(), "render".into(),
             "html".into(), "template".into(), "user".into(), "record".into(),
         ]);
@@ -296,27 +296,27 @@ mod tests {
 
         let cb_related = cb.encode(&c1).cosine_similarity(&cb.encode(&c2));
         let cb_unrelated = cb.encode(&c1).cosine_similarity(&cb.encode(&c3));
-        let mock_related = mock.encode(&c1).cosine_similarity(&mock.encode(&c2));
-        let mock_unrelated = mock.encode(&c1).cosine_similarity(&mock.encode(&c3));
+        let fast_related = fast.encode(&c1).cosine_similarity(&fast.encode(&c2));
+        let fast_unrelated = fast.encode(&c1).cosine_similarity(&fast.encode(&c3));
 
-        println!("gap: cb=related={:.4} unrelated={:.4}, mock=related={:.4} unrelated={:.4}",
-            cb_related, cb_unrelated, mock_related, mock_unrelated);
+        println!("gap: cb=related={:.4} unrelated={:.4}, fast=related={:.4} unrelated={:.4}",
+            cb_related, cb_unrelated, fast_related, fast_unrelated);
 
         assert!(cb_related > cb_unrelated);
-        assert!(mock_related > mock_unrelated);
-        assert!(cb_related - cb_unrelated >= (mock_related - mock_unrelated) * 0.8);
+        assert!(fast_related > fast_unrelated);
+        assert!(cb_related - cb_unrelated >= (fast_related - fast_unrelated) * 0.8);
     }
 
     #[test]
     fn test_comparison_retriever() {
         if should_skip() { return; }
         let cb = CodeBertEncoder::load().expect("load");
-        let mock = Arc::new(FastEncoder::new(vec![
+        let fast = Arc::new(FastEncoder::new(vec![
             "fn".into(), "alpha".into(), "beta".into(), "gamma".into(), "delta".into(),
             "epsilon".into(), "zeta".into(), "eta".into(), "theta".into(), "iota".into(),
         ]));
 
-        let mut mock_ret = LocalRetriever::new(mock, 0.01);
+        let mut fast_ret = LocalRetriever::new(fast, 0.01);
         let mut cb_ret = LocalRetriever::new(Arc::new(cb), 0.01);
 
         let chunks = vec![
@@ -327,16 +327,16 @@ mod tests {
         ];
 
         for c in &chunks {
-            mock_ret.index_chunk(c.clone());
+            fast_ret.index_chunk(c.clone());
             cb_ret.index_chunk(c.clone());
         }
 
-        let mock_res = mock_ret.search("fetch cache", 3);
+        let fast_res = fast_ret.search("fetch cache", 3);
         let cb_res = cb_ret.search("fetch cache", 3);
 
-        assert!(mock_res.returned > 0);
+        assert!(fast_res.returned > 0);
         assert!(cb_res.returned > 0);
-        assert_eq!(mock_res.total_indexed, cb_res.total_indexed);
+        assert_eq!(fast_res.total_indexed, cb_res.total_indexed);
     }
 
     #[test]

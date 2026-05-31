@@ -497,7 +497,7 @@ impl<P: Persistence> MemoryStore<P> {
             }
         }
 
-        stats.storage_size_bytes = self.persistence.size_bytes().unwrap_or(0);
+        stats.storage_size_bytes = self.persistence.size_bytes()?;
 
         Ok(stats)
     }

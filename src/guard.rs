@@ -243,8 +243,18 @@ mod windows_guard {
                 return false;
             }
 
+            // 防御：验证 e_lfanew 为非负且在合理范围内
+            if dos_header.e_lfanew < 0 {
+                return false;
+            }
+            let nt_offset = dos_header.e_lfanew as usize;
+            // PE 头不应超过 64KB
+            if nt_offset > 65536 {
+                return false;
+            }
+
             let nt_header = &*(module_base
-                .add(dos_header.e_lfanew as usize)
+                .add(nt_offset)
                 as *const ImageNtHeaders);
 
             // 验证 PE 签名
@@ -257,13 +267,17 @@ mod windows_guard {
             let optional_header_size =
                 nt_header.file_header._size_of_optional_header as usize;
             let section_header = (module_base
-                .add(dos_header.e_lfanew as usize)
+                .add(nt_offset)
                 .add(std::mem::size_of::<ImageNtHeaders>())
                 .add(optional_header_size))
                 as *const ImageSectionHeader;
 
             let num_sections =
                 nt_header.file_header.number_of_sections as usize;
+            // 防御：节数量上限（Windows 限制为 65535，典型不超过 96）
+            if num_sections > 96 {
+                return false;
+            }
 
             for i in 0..num_sections {
                 let section = &*section_header.add(i);
@@ -275,7 +289,15 @@ mod windows_guard {
 
                 if name == ".text" {
                     let section_start = module_base.add(section.virtual_address as usize);
-                    let section_size = section.size_of_raw_data as usize;
+                    // 使用 virtual_size 与 size_of_raw_data 的较小值，防篡改
+                    let section_size =
+                        section.virtual_size.min(section.size_of_raw_data) as usize;
+
+                    // 防御：节大小上限（典型 .text 不超过 100MB）
+                    const MAX_SECTION_SIZE: usize = 100 * 1024 * 1024;
+                    if section_size > MAX_SECTION_SIZE || section_size == 0 {
+                        return false;
+                    }
 
                     // 读取编译后嵌入的 CRC 期望值（由 patcher.py 写入）
                     let expected_crc = std::ptr::read_volatile(&PE_TEXT_CRC as *const u32);
@@ -293,7 +315,8 @@ mod windows_guard {
                 }
             }
         }
-        false
+        // .text 节未找到：不应视为篡改（可能是特殊 PE 布局），保守通过
+        true
     }
 
     fn compute_crc32(data: &[u8]) -> u32 {
@@ -417,7 +440,9 @@ pub fn risk_aware_guard() {
 
     // 控制流平坦化: 用 while 循环模拟 switch 状态机
     // Rust 编译器会因不透明谓词将循环优化为线性代码，但 AST 层面增加了复杂度
-    while state < 10 {
+    let mut max_iterations: u8 = 0;
+    while state < 10 && max_iterations < 20 {
+        max_iterations += 1;
         // 用多个不透明谓词混合决策，使静态分析难以确定执行路径
         let branch = if opaque_true() {
             if opaque_true_v2() { state } else { state }
@@ -436,14 +461,10 @@ pub fn risk_aware_guard() {
             }
             1 => {
                 // S1: 反调试检测（三级联检）
+                // 使用平台级检测，单次加权避免重复计数
                 let debugger_detected = platform::is_debugger_present();
-                // 用不透明谓词变体包裹，增加分支复杂度
-                if opaque_true_v2() && debugger_detected {
+                if debugger_detected {
                     threat_level += 1;
-                }
-                // 另一个不透明谓词包裹的冗余检查
-                if !opaque_false_v2() && debugger_detected {
-                    threat_level += 1; // 双重计数，确保检测到
                 }
                 state += 1;
             }

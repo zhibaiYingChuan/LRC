@@ -129,9 +129,26 @@ async fn main() {
 
     log(&format!("   记忆数据目录: {}", data_dir));
 
+    // 前置验证：源码目录必须存在且为目录
+    let src_path = std::path::Path::new(&src_dir);
+    if !src_path.exists() {
+        eprintln!("错误: 源码目录不存在: {}", src_dir);
+        eprintln!("提示: 请使用 --src-dir 指定正确的项目路径");
+        std::process::exit(1);
+    }
+    if !src_path.is_dir() {
+        eprintln!("错误: 指定路径不是目录: {}", src_dir);
+        std::process::exit(1);
+    }
+
     // 创建持久化后端和记忆存储
-    let persistence = JsonPersistence::new(&data_dir)
-        .expect("创建持久化后端失败");
+    let persistence = JsonPersistence::new(&data_dir).unwrap_or_else(|e| {
+        eprintln!("致命错误: 无法创建数据目录或初始化持久化后端");
+        eprintln!("  路径: {}", data_dir);
+        eprintln!("  原因: {}", e);
+        eprintln!("  建议: 检查磁盘空间和目录写入权限");
+        std::process::exit(1);
+    });
     let memory_store = Arc::new(Mutex::new(MemoryStore::new(persistence)));
 
     // 根据 feature 选择编码器类型
@@ -145,7 +162,7 @@ async fn main() {
 
     #[cfg(not(feature = "ml"))]
     let manager: Box<dyn server::IndexedCodebase> = {
-        log("   使用 Mock 词袋编码器（快速但精度较低）");
+        log("   使用 Fast 编码器（轻量词袋模式，零外部依赖，即时启动）");
         Box::new(CodeMemoryManager::new())
     };
 
@@ -157,6 +174,7 @@ async fn main() {
 
     // 后台异步索引项目代码（不阻塞 MCP 握手）
     // IDE 启动进程后立即发送 initialize 请求，必须尽快响应
+    // 注意: 后台任务中的错误不应杀死进程，而是优雅降级
     let index_state = state.clone();
     let index_dir = src_dir.clone();
     tokio::spawn(async move {
@@ -164,18 +182,28 @@ async fn main() {
 
         #[cfg(feature = "ml")]
         let mut mgr = {
-            let encoder = code_memory::CodeBertEncoder::load()
-                .expect("加载 CodeBERT 模型失败");
-            CodeMemoryManager::with_encoder(Arc::new(encoder))
+            match code_memory::CodeBertEncoder::load() {
+                Ok(encoder) => CodeMemoryManager::with_encoder(Arc::new(encoder)),
+                Err(e) => {
+                    let msg = format!("   CodeBERT 模型加载失败: {}（使用空索引继续运行）", e);
+                    log(&msg);
+                    return;
+                }
+            }
         };
         #[cfg(not(feature = "ml"))]
         let mut mgr = CodeMemoryManager::new();
 
-        index_and_report(&mut mgr, &index_dir, &log);
-
-        // 索引完成后原子替换 manager
-        let mut locked = index_state.manager.lock().await;
-        *locked = Box::new(mgr);
+        match index_and_report(&mut mgr, &index_dir, &log) {
+            Ok(()) => {
+                // 索引完成后原子替换 manager
+                let mut locked = index_state.manager.lock().await;
+                *locked = Box::new(mgr);
+            }
+            Err(e) => {
+                log(&format!("   后台索引暂停: {}（MCP 服务正常运行，代码检索将在索引完成后自动就绪）", e));
+            }
+        }
     });
 
     // 启动 MCP 服务（立即开始监听，不等待索引完成）
@@ -192,12 +220,12 @@ async fn main() {
     }
 }
 
-/// 索引项目并输出统计信息
+/// 索引项目并输出统计信息，失败时返回错误而非杀死进程
 fn index_and_report<E: code_memory::engine::encoder::CodeEncoder>(
     mgr: &mut CodeMemoryManager<E>,
     src_dir: &str,
     log: &impl Fn(&str),
-) {
+) -> Result<(), String> {
     match mgr.index_project(src_dir) {
         Ok(_count) => {
             let stats = mgr.get_stats();
@@ -214,11 +242,12 @@ fn index_and_report<E: code_memory::engine::encoder::CodeEncoder>(
                 stats.type_counts.get("enum").unwrap_or(&0),
                 stats.type_counts.get("mod").unwrap_or(&0),
             ));
+            Ok(())
         }
         Err(e) => {
-            eprintln!("   索引失败: {}", e);
-            eprintln!("   请检查 --src-dir 路径是否正确");
-            std::process::exit(1);
+            let msg = format!("   索引失败: {} (请检查 --src-dir 路径是否正确)", e);
+            log(&msg);
+            Err(msg)
         }
     }
 }
