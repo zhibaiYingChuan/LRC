@@ -80,20 +80,20 @@ curl -X POST http://127.0.0.1:3099/mcp \
   "mcpServers": {
     "loong-recall": {
       "command": "C:/path/to/code-memory-server.exe",
-      "args": ["--src-dir", "C:/path/to/your/project/src", "--stdio"],
-      "type": "stdio"
+      "args": ["--src-dir", "C:/path/to/your/project/src", "--stdio"]
     }
   }
 }
 ```
 
-| IDE | 配置文件位置（Windows） |
-|-----|----------------------|
-| Trae | `%APPDATA%/Trae/mcp/settings.json` |
-| Cursor | `%APPDATA%/Cursor/mcp/settings.json` |
-| VS Code | `.vscode/mcp.json` 或用户级全局配置 |
+| IDE | 配置文件位置（Windows） | 配置说明 |
+|-----|----------------------|----------|
+| Trae | `%APPDATA%/Trae/User/mcp.json` | 直接编辑此 JSON 文件，或通过 Trae 的 MCP 设置界面添加 |
+| Cursor | `%APPDATA%/Cursor/mcp.json` | 在 Cursor 设置 → MCP 中添加 |
+| VS Code | `.vscode/mcp.json` 或用户级全局配置 | 需安装 MCP 扩展 |
 
-> **路径注意**：Windows 下需使用正斜杠 `/` 或双反斜杠 `\\`，如 `C:/tools/code-memory-server.exe`。
+> **路径注意**：Windows 下需使用正斜杠 `/`（如 `G:/code-memory/target/release/code-memory-server.exe`），不要使用反斜杠。
+> 如果已有其他 MCP 服务器，将 `loong-recall` 条目合并到现有 `mcpServers` 对象中即可。
 
 重启 IDE 后，AI 助手自动发现全部 9 个工具，无需任何额外配置。
 
