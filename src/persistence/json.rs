@@ -79,7 +79,7 @@ impl Persistence for JsonPersistence {
         // 防御性检查：确保数据目录存在（应对临时目录被清理等场景）
         self.ensure_data_dir()?;
 
-        let mut memories = self.load_all_memories().unwrap_or_default();
+        let mut memories = self.load_all_memories()?;
 
         // 按 ID 查找并更新，或追加新记忆
         if let Some(existing) = memories.iter_mut().find(|m| m.id == memory.id) {
@@ -89,7 +89,7 @@ impl Persistence for JsonPersistence {
         }
 
         let json = serde_json::to_string_pretty(&memories)?;
-        fs::write(&self.memories_file, json)?;
+        atomic_write(&self.memories_file, &json)?;
         Ok(())
     }
 
@@ -109,7 +109,7 @@ impl Persistence for JsonPersistence {
 
     fn delete_memory(&self, id: &str) -> Result<bool, PersistenceError> {
         self.ensure_data_dir()?;
-        let mut memories = self.load_all_memories().unwrap_or_default();
+        let mut memories = self.load_all_memories()?;
         let original_len = memories.len();
         memories.retain(|m| m.id != id);
 
@@ -118,7 +118,7 @@ impl Persistence for JsonPersistence {
         }
 
         let json = serde_json::to_string_pretty(&memories)?;
-        fs::write(&self.memories_file, json)?;
+        atomic_write(&self.memories_file, &json)?;
         Ok(true)
     }
 
@@ -126,7 +126,7 @@ impl Persistence for JsonPersistence {
         self.ensure_data_dir()?;
         let empty: Vec<Memory> = Vec::new();
         let json = serde_json::to_string_pretty(&empty)?;
-        fs::write(&self.memories_file, json)?;
+        atomic_write(&self.memories_file, &json)?;
         Ok(())
     }
 
@@ -134,7 +134,7 @@ impl Persistence for JsonPersistence {
         self.ensure_data_dir()?;
         let all_chunks: Vec<&CodeChunk> = chunks.iter().collect();
         let json = serde_json::to_string_pretty(&all_chunks)?;
-        fs::write(&self.chunks_file, json)?;
+        atomic_write(&self.chunks_file, &json)?;
         Ok(())
     }
 
@@ -156,7 +156,7 @@ impl Persistence for JsonPersistence {
         self.ensure_data_dir()?;
         let empty: Vec<CodeChunk> = Vec::new();
         let json = serde_json::to_string_pretty(&empty)?;
-        fs::write(&self.chunks_file, json)?;
+        atomic_write(&self.chunks_file, &json)?;
         Ok(())
     }
 
@@ -164,21 +164,15 @@ impl Persistence for JsonPersistence {
         let mut total: u64 = 0;
 
         if self.memories_file.exists() {
-            total += fs::metadata(&self.memories_file)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            total += fs::metadata(&self.memories_file)?.len();
         }
 
         if self.chunks_file.exists() {
-            total += fs::metadata(&self.chunks_file)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            total += fs::metadata(&self.chunks_file)?.len();
         }
 
         if self.archive_file.exists() {
-            total += fs::metadata(&self.archive_file)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            total += fs::metadata(&self.archive_file)?.len();
         }
 
         Ok(total)
@@ -201,13 +195,13 @@ impl Persistence for JsonPersistence {
     fn save_archived_memories(&self, memories: &[Memory]) -> Result<(), PersistenceError> {
         self.ensure_data_dir()?;
         let json = serde_json::to_string_pretty(memories)?;
-        fs::write(&self.archive_file, json)?;
+        atomic_write(&self.archive_file, &json)?;
         Ok(())
     }
 
     fn add_to_archive(&self, memories: &[Memory]) -> Result<(), PersistenceError> {
         self.ensure_data_dir()?;
-        let mut existing = self.load_archived_memories().unwrap_or_default();
+        let mut existing = self.load_archived_memories()?;
 
         // 按 ID 去重，避免重复归档
         let existing_ids: std::collections::HashSet<String> =
@@ -223,7 +217,7 @@ impl Persistence for JsonPersistence {
 
     fn delete_from_archive(&self, id: &str) -> Result<bool, PersistenceError> {
         self.ensure_data_dir()?;
-        let mut archived = self.load_archived_memories().unwrap_or_default();
+        let mut archived = self.load_archived_memories()?;
         let original_len = archived.len();
         archived.retain(|m| m.id != id);
 
@@ -234,6 +228,17 @@ impl Persistence for JsonPersistence {
         self.save_archived_memories(&archived)?;
         Ok(true)
     }
+}
+
+// === 原子写入辅助函数 ===
+
+/// 原子写入：先写临时文件，再重命名（同文件系统内是原子操作）
+/// 防止崩溃时产生损坏的 JSON 文件
+fn atomic_write(path: &Path, content: &str) -> Result<(), PersistenceError> {
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, content)?;
+    fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 // === 测试 ===
