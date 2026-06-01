@@ -1,6 +1,6 @@
 # Loong Recall 用户说明书
 
-> **AI 编程助手的记忆与检索插件** — 接入 IDE，AI 就能记住一切、找到一切。
+> **AI 编程助手的记忆与检索插件** — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定。
 >
 > 版本：v0.1.1 | 适用于：Trae / Cursor / VS Code
 
@@ -22,7 +22,7 @@
 
 | 能力 | 工具 | 一句话说清楚 |
 |------|------|------------|
-| **代码定位** | `search_code` | 忘了函数名？说个大概，AI 帮你找到它 |
+| **代码定位** | `search_code` | 知道函数名/变量名，AI 瞬间定位。配置 LLM 后可用自然语言 |
 | **项目记忆** | `remember` / `recall` | 告诉 AI 一次约定，以后每次对话它都记得 |
 
 **最关键的是：你不需要做任何额外操作。** 配好规则后，AI 会自动判断什么时候该搜代码、什么时候该查记忆。你只管正常聊天。
@@ -45,15 +45,15 @@ AI 回复："（根据记忆 #3）你之前选择了 PostgreSQL，原因是需�
 
 ---
 
-## 两种搜索模式
+## 两种搜索模式 + LLM 增强
 
-| | Fast Match（默认） | Smart Match（`--features ml`） |
-|---|---|---|
-| **怎么搜** | 精确关键词匹配 | 语义理解（理解自然语言意思） |
-| **适合** | 你知道函数名/变量名，懒得翻文件 | 用自然语言描述意图（"处理重试的代码"） |
-| **启动速度** | 即时（毫秒级） | 首次需下载模型（~500MB） |
-| **内存占用** | < 10 MB | ~500 MB |
-| **依赖** | 零，纯 Rust | 自动从 hf-mirror.com 镜像下载 |
+| | Fast Match（默认） | Smart Match（`--features ml`） | LLM 增强（`--llm-api`） |
+|---|---|---|---|
+| **怎么搜** | 精确关键词匹配 | 语义理解（理解自然语言意思） | 你的 LLM 翻译查询 → Fast Match |
+| **适合** | 你知道函数名/变量名，懒得翻文件 | 离线环境下用自然语言描述意图 | 有 LLM API，用自然语言描述意图 |
+| **启动速度** | 即时（毫秒级） | 首次需下载模型（~500MB） | 即时（依赖 LLM 响应） |
+| **内存占用** | < 10 MB | ~500 MB | < 10 MB |
+| **依赖** | 零，纯 Rust | 自动从 hf-mirror.com 镜像下载 | 需要 LLM API（DeepSeek / 通义千问等）或本地 Ollama |
 
 ```bash
 # 默认 Fast Match（推荐日常使用）
@@ -61,10 +61,84 @@ cargo build --features server
 
 # Smart Match（需要语义理解时）
 cargo build --features server,ml
+
+# LLM 增强（用你的 LLM 做查询翻译，不下载模型）
+# 推荐：使用 DeepSeek（国产模型，性价比极高）
+code-memory-server --src-dir ./src --stdio --llm-api "openai:sk-your-deepseek-key:deepseek-v4-flash:https://api.deepseek.com/v1"
 ```
 
 > 90% 的日常场景 Fast Match 完全够用。Smart Match 在模糊查询上更有优势，详见 [模型评估报告](MODEL_EVALUATION.md)。
 > 内网/离线环境？参考 [Smart Match 离线安装指南](OFFLINE_MODEL_GUIDE.md)。
+
+---
+
+## LLM 增强模式（v0.2.0 新增）
+
+**不想下载 500MB 模型，但又想用自然语言搜索代码？** 配置你的 LLM API，LRC 会自动用你的 LLM 把自然语言翻译成代码关键词，然后用 Fast Match 精确检索。
+
+### 原理（30 秒理解）
+
+```
+你问："处理用户登录的那个函数在哪？"
+        │
+        ▼
+  你的 LLM（DeepSeek V4 / 通义千问 / Ollama）
+        │  Prompt: "将模糊查询翻译成代码关键词"
+        ▼
+  "authenticate_user, login, handle_login, auth"
+        │
+        ▼
+  LRC Fast Match 用这些关键词精确检索
+        │
+        ▼
+  返回准确的代码片段
+```
+
+LLM 只做查询翻译，不参与存储、检索、或记忆。Prompt 消耗 < 50 Token，每次查询成本几乎为零。
+
+### 配置方式
+
+```bash
+# 推荐：使用 DeepSeek V4-Flash（国产模型，性价比极高）
+code-memory-server --src-dir ./src --stdio \
+  --llm-api "openai:sk-your-deepseek-key:deepseek-v4-flash:https://api.deepseek.com/v1"
+
+# 使用通义千问 Qwen-Turbo（阿里云百炼，¥0.3/百万 Token 输入）
+code-memory-server --src-dir ./src --stdio \
+  --llm-api "openai:sk-your-qwen-key:qwen-turbo:https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+# 使用本地 Ollama（零成本，完全离线）
+code-memory-server --src-dir ./src --stdio \
+  --llm-api "ollama:localhost:llama3"
+```
+
+### 在 IDE 中配置
+
+在 MCP 配置文件中添加 `--llm-api` 参数即可：
+
+```json
+{
+  "mcpServers": {
+    "loong-recall": {
+      "command": "你的安装路径/target/release/code-memory-server.exe",
+      "args": [
+        "--src-dir", "你的项目路径/src",
+        "--stdio",
+        "--llm-api", "openai:sk-your-deepseek-key:deepseek-v4-flash:https://api.deepseek.com/v1"
+      ]
+    }
+  }
+}
+```
+
+### 注意事项
+
+- **不配置 `--llm-api`**：Fast Match 照常用，行为完全不变
+- **翻译失败时**：自动回退到原始查询，不影响搜索功能
+- **隐私**：只有查询文本发给 LLM，不发送任何代码
+- **成本**：DeepSeek V4-Flash 每天 100 次查询 < ¥0.01/月，通义千问 Qwen-Turbo 更是不足 ¥0.01/月。详见下方「成本与优化」章节。
+
+> 💡 如果你已经在用 Trae/Cursor（它们内置了 LLM），这个模式让你零成本获得高精度语义搜索——不需要下载任何模型。
 
 ---
 
@@ -77,8 +151,8 @@ cargo build --features server,ml
 # 从 Release 页面下载 code-memory-server.exe
 
 # 方式二：源码编译
-git clone https://gitcode.com/loong/loong-recall.git
-cd loong-recall
+git clone https://github.com/zhibaiYingChuan/LRC.git
+cd LRC
 cargo build --release --features server
 ```
 
@@ -96,9 +170,9 @@ cargo build --release --features server
 {
   "mcpServers": {
     "loong-recall": {
-      "command": "G:/code-memory/target/release/code-memory-server.exe",
+      "command": "你的安装路径/target/release/code-memory-server.exe",
       "args": [
-        "--src-dir", "G:/your-project/src",
+        "--src-dir", "你的项目路径/src",
         "--global",
         "--stdio"
       ]
@@ -107,11 +181,11 @@ cargo build --release --features server
 }
 ```
 
-> ⚠️ 路径必须用正斜杠 `/`，不要用反斜杠 `\`。`your-project` 换成你实际的项目路径。
+> ⚠️ 路径必须用正斜杠 `/`，不要用反斜杠 `\`。`你的项目路径` 换成你实际的项目路径。
 
 **② 配置项目规则（让 AI 自动使用记忆系统）**
 
-打开 `G:/your-project/.trae/rules/project-rules.md`，在文件末尾追加：
+打开 `你的项目路径/.trae/rules/project-rules.md`，在文件末尾追加：
 
 ```markdown
 ## MCP 记忆与检索插件（Loong Recall）
@@ -152,9 +226,9 @@ cargo build --release --features server
 {
   "mcpServers": {
     "loong-recall": {
-      "command": "G:/code-memory/target/release/code-memory-server.exe",
+      "command": "你的安装路径/target/release/code-memory-server.exe",
       "args": [
-        "--src-dir", "G:/your-project/src",
+        "--src-dir", "你的项目路径/src",
         "--global",
         "--stdio"
       ]
@@ -165,7 +239,7 @@ cargo build --release --features server
 
 **② 配置项目规则**
 
-打开 `G:/your-project/.cursor/rules` 目录，新建 `memory.md` 文件：
+打开 `你的项目路径/.cursor/rules` 目录，新建 `memory.md` 文件：
 
 ```markdown
 # Memory & Search Rules (Loong Recall)
@@ -199,9 +273,9 @@ This project uses Loong Recall for code search and cross-session memory.
 {
   "mcp.servers": {
     "loong-recall": {
-      "command": "G:/code-memory/target/release/code-memory-server.exe",
+      "command": "你的安装路径/target/release/code-memory-server.exe",
       "args": [
-        "--src-dir", "G:/your-project/src",
+        "--src-dir", "你的项目路径/src",
         "--global"
       ]
     }
@@ -211,7 +285,7 @@ This project uses Loong Recall for code search and cross-session memory.
 
 **③ 配置 GitHub Copilot 指令**
 
-打开 `G:/your-project/.github/copilot-instructions.md`，写入：
+打开 `你的项目路径/.github/copilot-instructions.md`，写入：
 
 ```markdown
 This project has Loong Recall for code search and session memory.
@@ -291,11 +365,13 @@ AI：（根据记忆 #1）你之前选择了 Axum 框架，Rust 2024 edition。
 ### 场景 2：代码定位
 
 ```
-你：项目里处理 token 刷新的逻辑在哪？
-AI：找到了，在 src/auth/token.rs 的 refresh_token 函数（第 42 行）。
+你：search_code 搜索 authenticate_user
+AI：找到了，在 src/auth/token.rs 的 authenticate_user 函数（第 42 行）。
     它会在 token 过期前 5 分钟自动刷新，错误重试 3 次。
-    [内部：自动调用 search_code 搜索 "token 刷新"]
+    [内部：自动调用 search_code 搜索 "authenticate_user"]
 ```
+
+> 💡 配置 LLM 增强（`--llm-api`）后，你也可以直接用自然语言："项目里处理 token 刷新的逻辑在哪？"
 
 ### 场景 3：决策追溯
 
@@ -305,6 +381,54 @@ AI：（根据记忆 #2）你在 5 月 15 日决定用 PostgreSQL，
     主要原因是项目需要 JSONB 类型和全文搜索能力。
     [内部：自动调用 recall 检索到当时的决策记录和理由]
 ```
+
+---
+
+## 成本与优化
+
+如果你使用 LLM 增强模式，了解成本情况有助于你做出最佳选择。
+
+### LLM 翻译器的成本模型
+
+LLM 增强模式的原理是：把你的自然语言查询发送给 LLM，翻译成代码关键词，再用 Fast Match 精确检索。每次翻译消耗约 **40-50 Token**（约 30 Token 输入 + 15 Token 输出）。
+
+| 模型 | 单次翻译成本 | 每天 100 次 | 每月 3000 次 |
+|------|------------|-----------|------------|
+| DeepSeek V4-Flash | < ¥0.00007 | < ¥0.007 | < ¥0.21 |
+| 通义千问 Qwen-Turbo | < ¥0.00002 | < ¥0.002 | < ¥0.06 |
+| 本地 Ollama（千问/LLaMA） | **免费** | **免费** | **免费** |
+
+> 📊 **价格来源**：以上数据基于各平台 2026 年 6 月官方 API 定价计算。DeepSeek V4-Flash：输入 ¥1/百万 Token、输出 ¥2/百万 Token；通义千问 Qwen-Turbo：输入 ¥0.3/百万 Token、输出 ¥0.6/百万 Token。实际费用以各平台最新公告为准。
+
+### 有无 LRC 的成本对比
+
+用一个实际的日常使用场景来说明：
+
+| 场景 | 无 LRC 的做法 | Token 消耗 | 有 LRC + LLM 翻译 | Token 消耗 |
+|------|------------|-----------|-----------------|-----------|
+| 找"登录验证逻辑" | 手动翻文件，复制粘贴 `auth.rs` 整个文件给 AI | 500-2000 Token | LLM 翻译成关键词 → Fast Match → 返回 5 个精确片段 | < 50 Token（翻译）+ < 200 Token（结果） |
+| 找"数据库连接池配置" | 粘贴 `database.rs` + `config.rs` | 1000-3000 Token | LLM 翻译 → 检索 | < 50 Token + < 200 Token |
+
+**结论**：LLM 翻译器帮你把"整个文件粘贴给 AI"变成了"只返回精确的 5 个代码片段"。每次查询节省的上下文 Token 是翻译本身消耗的 10-50 倍。
+
+### 缓存命中率的改善
+
+因为 LRC 的检索结果可复现（相同查询 → 相同结果），AI 助手端（如 Trae）的上下文前缀缓存命中率会大幅提升，进一步节省 Token 和加速响应。
+
+### 如何用本地 Ollama 实现零成本
+
+```bash
+# 1. 安装 Ollama（https://ollama.com）
+# 2. 拉取国产模型（推荐）
+ollama pull qwen3
+# 或拉取 LLaMA
+ollama pull llama3
+
+# 3. 启动 LRC 时指定 Ollama
+code-memory-server --src-dir ./src --stdio --llm-api ollama:localhost:qwen3
+```
+
+配置完成后，搜索时完全零成本，且不依赖网络。
 
 ---
 

@@ -7,7 +7,7 @@
 // 当前暴露 search_code + codebase_stats 两个工具
 
 use crate::{
-    ChunkStats, CodeMemoryManager, Importance, Memory, MemoryType,
+    ChunkStats, CodeMemoryManager, Importance, LlmApiConfig, Memory, MemoryType,
     RetrievalResult,
 };
 use crate::memory_store::{ListFilter, MemoryStore, RecallFilter, SortBy, SortOrder};
@@ -115,6 +115,7 @@ struct TextContent {
 /// 已索引代码库的最小接口 — 服务端只关心检索和统计，不关心编码器类型
 pub trait IndexedCodebase: Send {
     fn search(&self, query: &str, top_k: usize) -> RetrievalResult;
+    fn multi_keyword_search(&self, keywords: &[String], top_k: usize) -> RetrievalResult;
     fn get_stats(&self) -> ChunkStats;
 }
 
@@ -122,6 +123,9 @@ pub trait IndexedCodebase: Send {
 impl<E: crate::engine::encoder::CodeEncoder> IndexedCodebase for CodeMemoryManager<E> {
     fn search(&self, query: &str, top_k: usize) -> RetrievalResult {
         CodeMemoryManager::search(self, query, top_k)
+    }
+    fn multi_keyword_search(&self, keywords: &[String], top_k: usize) -> RetrievalResult {
+        CodeMemoryManager::multi_keyword_search(self, keywords, top_k)
     }
     fn get_stats(&self) -> ChunkStats {
         CodeMemoryManager::get_stats(self)
@@ -134,6 +138,7 @@ pub struct AppState {
     pub manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
     pub memory_store: Arc<Mutex<MemoryStore<JsonPersistence>>>,
     pub src_dir: String,
+    pub llm_api: LlmApiConfig,
 }
 
 // ==================== MCP 请求处理 ====================
@@ -776,8 +781,15 @@ async fn handle_tools_call(
                 .unwrap_or(5)
                 .min(20) as usize;
 
+            // LLM 查询翻译：如果配置了 LLM API，先将自然语言翻译为关键词
+            let keywords = if state.llm_api.is_configured() {
+                crate::engine::llm_translator::translate_query(&state.llm_api, query).await
+            } else {
+                vec![query.to_string()]
+            };
+
             let manager = state.manager.lock().await;
-            let result = manager.search(query, top_k);
+            let result = manager.multi_keyword_search(&keywords, top_k);
 
             // 格式化为可读文本
             let mut text = format!(
@@ -1010,6 +1022,7 @@ mod tests {
             manager: Arc::new(Mutex::new(Box::new(manager))),
             memory_store,
             src_dir: "fixture/src".into(),
+            llm_api: LlmApiConfig::None,
         })
     }
 

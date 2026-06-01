@@ -52,6 +52,7 @@ pub use persistence::{
 // === 受保护核心重导出（仅导出接口类型，实现细节在 engine/ 中） ===
 pub use engine::encoder::{CodeEncoder, EmbeddingVector};
 pub use engine::hnsw::HnswRetriever;
+pub use engine::llm_translator::LlmApiConfig;
 pub use engine::manager::{ChunkStats, CoreManager as CodeMemoryManager};
 pub use engine::retriever::{CodeRetriever, RetrievalResult, ScoredChunk};
 
