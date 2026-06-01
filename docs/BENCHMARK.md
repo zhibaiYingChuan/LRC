@@ -22,6 +22,8 @@
 
 ```bash
 git clone https://github.com/zhibaiYingChuan/LRC.git
+# 国内用户如遇 GitHub 下载缓慢，可使用镜像：
+# git clone https://hub.nuaa.cf/zhibaiYingChuan/LRC.git
 cd LRC
 cargo build --release --features server
 ```
@@ -124,7 +126,7 @@ time curl -s -X POST http://127.0.0.1:3099/mcp \
 
 ### 需注意因素
 
-- **CodeBERT 模式**：启用 `ml` feature 后首次启动需下载模型（~200MB），内存占用增加至 ~500MB
+- **CodeBERT 模式**：启用 `ml` feature 后首次启动需下载模型（~200MB），国内用户自动使用 hf-mirror.com 镜像下载。内存占用增加至 ~500MB
 - **超大项目代码库**：代码索引（`search_code` 路径）的耗时与项目文件数量成正比，与记忆检索（`recall` 路径）相互独立
 - **首次索引**：首次对项目代码建立索引需要遍历全部文件，大型项目可能需要数秒至数十秒
 

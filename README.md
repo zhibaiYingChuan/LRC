@@ -120,6 +120,8 @@ Loong Recall 的记忆系统基于四个核心设计：
 
 ```bash
 git clone https://github.com/zhibaiYingChuan/LRC.git
+# 国内用户如遇 GitHub 下载缓慢，可使用镜像：
+# git clone https://hub.nuaa.cf/zhibaiYingChuan/LRC.git
 cd LRC
 cargo build --release --features server
 ```
@@ -351,7 +353,7 @@ IDE 发送 JSON-RPC 请求
 | **② 引擎编排层** | `src/engine/manager.rs` | 三阶段流水线调度 | 调用了④⑤两层完成索引和检索。`index_project()` 遍历目录、按扩展名过滤文本文件、调用 chunker 切分、调用 encoder 编码、存入 retriever。是代码搜索功能的唯一对外入口。 |
 | **③ 记忆存储层** | `src/memory_store.rs` | 记忆领域聚合根 | 封装所有记忆 CRUD 操作和几何检索逻辑。`recall()` 通过几何坐标定位 + ROI 区域剪枝快速召回候选记忆，深度越大的记忆天然优先返回。同时集成指数衰减模型，让不活跃的记忆自然降权。`archive_expired()` 将过期记忆迁入冷存储（`archive.json`），保持活跃记忆库轻量。 |
 | **④ 切分器层** | `src/chunker.rs` | 按语法边界拆分代码 | 包含 6 个切分器实现。Rust 用大括号深度匹配，Python 用缩进层级检测，TS/JS 支持箭头函数识别，Go 支持接收者方法，Conversation 按角色前缀切分，其余格式（Markdown、YAML 等）按段落边界切分。所有切分器共享同一个 `CodeChunker` trait。 |
-| **⑤-1 编码器** | `src/engine/encoder.rs` | 代码文本 → 向量 | 核心抽象是 `CodeEncoder` trait。默认 `FastEncoder` 基于预定义关键词词袋生成位向量（dim~43），零外部依赖、零模型下载。CodeBERT 模式下 `CodeBertEncoder` 使用 candle 推理框架生成 768 维语义向量。 |
+| **⑤-1 编码器** | `src/engine/encoder.rs` | 代码文本 → 向量 | 核心抽象是 `CodeEncoder` trait。默认 `FastEncoder` 基于预定义关键词词袋生成位向量（dim~250），零外部依赖、零模型下载。CodeBERT 模式下 `CodeBertEncoder` 使用 candle 推理框架生成 768 维语义向量。 |
 | **⑤-2 编码器注册表** | `src/engine/encoder_registry.rs` | 按语言路由编码策略 | 维护 `语言 → 编码器` 的映射表。支持按语言注册专用编码器（如为 Rust 注册更精准的编码器），未注册语言自动回退到默认编码器。实现 Strategy + Registry 组合模式。 |
 | **⑤-3 检索器** | `src/engine/retriever.rs` | 向量相似度匹配 | `LocalRetriever` 维护所有片段向量，查询时计算余弦相似度并排序返回 Top-K。`threshold` 参数过滤低相似度结果。`CodeRetriever` trait 定义统一检索接口，便于替换为远程检索后端。 |
 | **⑤-4 HNSW 索引** | `src/engine/hnsw.rs` | 近似最近邻加速 | 基于 Navigable Small World 图算法。每个节点最多连接 M=16 个邻居，搜索时束宽 ef_search=50。相比暴力遍历，百万级片段下检索延迟从 O(n) 降至 O(log n)。当前 HnswRetriever 同时实现 CodeRetriever trait，与 LocalRetriever 可互换。 |
@@ -450,7 +452,7 @@ cargo build --features server
 cargo build --features server,ml
 ```
 
-首次启动时自动从 HuggingFace Hub 下载 `microsoft/codebert-base` 模型（~200MB），存储在本地缓存。下载仅一次，后续启动直接加载缓存。
+首次启动时自动从 HuggingFace 镜像站（hf-mirror.com）下载 `microsoft/codebert-base` 模型（~200MB），存储在本地缓存。下载仅一次，后续启动直接加载缓存。
 
 CodeBERT 模式的优势：你可以用自然语言描述意图，而不是记函数名：
 
@@ -480,7 +482,7 @@ Loong Recall 提取了道枢层的编码-检索范式，工程化为独立 MCP �
 **不需要。** LRC 是一个完全独立的 MCP 服务。道枢层的编码参数已在预训练后被冻结（"道体"），并直接内置于 LRC 的 `FastEncoder` 中。这意味着：
 
 - 快速模式下，LRC 启动即用，无需下载任何模型文件
-- CodeBERT 模式下，LRC 自动从 HuggingFace Hub 下载开源模型，同样不依赖 DaoTi
+- CodeBERT 模式下，LRC 自动从 HuggingFace 镜像站（hf-mirror.com）下载开源模型，同样不依赖 DaoTi
 - LRC 与 DaoTi 的关系是**算法传承**而非**运行时依赖**——就像一个发动机被独立封装后装入了不同的车型
 
 如果你对底层模型感兴趣，可以访问 [DaoTi 项目主页](https://github.com/zhibaiYingChuan/DaoTi)。
