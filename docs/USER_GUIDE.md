@@ -1,20 +1,31 @@
 # Loong Recall 用户说明书
 
-> 你只管正常对话，AI 自动记住一切。
+> **AI 编程助手的记忆与检索插件** — 接入 IDE，AI 就能记住一切、找到一切。
 >
 > 版本：v0.1.1 | 适用于：Trae / Cursor / VS Code
 
 ---
 
-## 一句话说清楚
+## 它解决什么？
 
-Loong Recall 给 AI 装了一个**长期记忆系统**。装上之后，AI 能：
+用 AI 写代码时，你大概率遇到过这两种尴尬：
 
-- 记住你们聊过的所有决策、约定、偏好
-- 跨会话恢复上下文（"我们上次说到哪了？"）
-- 在海量代码中秒级定位（"处理认证的代码在哪？"）
+**尴尬一：不知道代码在哪**
 
-**最关键的是：你不需要做任何额外操作。** 就像你不需要教搜索引擎怎么搜——你只管问，它自己会找。
+你想让 AI 改某个功能，但不知道它在哪个文件里。你只能手动翻目录 → 搜索关键词 → 复制粘贴几百行代码给 AI。每次都这样。
+
+**尴尬二：AI 每次都失忆**
+
+你跟 AI 聊了很久，约定了"用 pnpm"、"端口 8080"、"数据库 PostgreSQL"。但第二天新开会话，AI 全忘了，你得重新说一遍。
+
+**Loong Recall 就是解决这两个问题的。** 它给 AI 装上两个能力：
+
+| 能力 | 工具 | 一句话说清楚 |
+|------|------|------------|
+| **代码定位** | `search_code` | 忘了函数名？说个大概，AI 帮你找到它 |
+| **项目记忆** | `remember` / `recall` | 告诉 AI 一次约定，以后每次对话它都记得 |
+
+**最关键的是：你不需要做任何额外操作。** 配好规则后，AI 会自动判断什么时候该搜代码、什么时候该查记忆。你只管正常聊天。
 
 ---
 
@@ -25,12 +36,35 @@ Loong Recall 给 AI 装了一个**长期记忆系统**。装上之后，AI 能�
         ↓
 AI 内部自动调用 recall 工具，检索你的历史记忆
         ↓
-AI 回复："根据之前的讨论，你选择了 PostgreSQL，连接串是..."
+AI 回复："（根据记忆 #3）你之前选择了 PostgreSQL，原因是需要 JSONB 和全文搜索"
 ```
 
 整个过程，你只看到 AI 的回答。中间的工具调用对你是**完全透明的**。
 
-就像你开车时不需要关心发动机怎么点火——你踩油门，车就走。MCP 就是 AI 的发动机。
+就像你开车时不需要关心发动机怎么点火——你踩油门，车就走。
+
+---
+
+## 两种搜索模式
+
+| | Fast Match（默认） | Smart Match（`--features ml`） |
+|---|---|---|
+| **怎么搜** | 精确关键词匹配 | 语义理解（理解自然语言意思） |
+| **适合** | 你知道函数名/变量名，懒得翻文件 | 用自然语言描述意图（"处理重试的代码"） |
+| **启动速度** | 即时（毫秒级） | 首次需下载模型（~500MB） |
+| **内存占用** | < 10 MB | ~500 MB |
+| **依赖** | 零，纯 Rust | 自动从 hf-mirror.com 镜像下载 |
+
+```bash
+# 默认 Fast Match（推荐日常使用）
+cargo build --features server
+
+# Smart Match（需要语义理解时）
+cargo build --features server,ml
+```
+
+> 90% 的日常场景 Fast Match 完全够用。Smart Match 在模糊查询上更有优势，详见 [模型评估报告](MODEL_EVALUATION.md)。
+> 内网/离线环境？参考 [Smart Match 离线安装指南](OFFLINE_MODEL_GUIDE.md)。
 
 ---
 
@@ -80,9 +114,9 @@ cargo build --release --features server
 打开 `G:/your-project/.trae/rules/project-rules.md`，在文件末尾追加：
 
 ```markdown
-## MCP 记忆系统（Loong Recall）
+## MCP 记忆与检索插件（Loong Recall）
 
-本项目的 AI 助手已接入 Loong Recall 长期记忆系统。以下规则让 AI 自动、无感地使用它：
+本项目的 AI 助手已接入 Loong Recall。以下规则让 AI 自动、无感地使用它：
 
 ### 自动记忆规则
 - 当用户做出技术决策时（如"我们用 PostgreSQL"），自动用 remember 记录
@@ -94,6 +128,7 @@ cargo build --release --features server
 - 当用户问"我们之前..."、"上次说到..."、"之前决定..."时，先用 recall 检索
 - 当用户问代码位置时（如"XX 功能在哪？"），先用 search_code 搜索
 - 当用户提到某个技术概念但不确定项目里有没有时，先用 search_code 搜索
+- 引用记忆时使用「（根据记忆 #N）」格式标注来源，让用户看见记忆的存在
 
 ### 透明规则
 - 调用工具时不要在回复中显式展示工具调用过程
@@ -101,7 +136,7 @@ cargo build --release --features server
 - 只在用户明确要求时才列出工具调用详情
 ```
 
-> 💡 这就是"零操作"的秘密：有了这些规则，AI 会**自动判断**何时该用记忆、何时该搜索代码。你只管正常对话，AI 自己决定调什么工具。
+> 💡 这就是"零操作"的秘密：有了这些规则，AI 会**自动判断**何时该用记忆、何时该搜代码。你只管正常对话。
 
 **③ 重启 Trae**
 
@@ -133,14 +168,15 @@ cargo build --release --features server
 打开 `G:/your-project/.cursor/rules` 目录，新建 `memory.md` 文件：
 
 ```markdown
-# Memory System Rules
+# Memory & Search Rules (Loong Recall)
 
-This project uses Loong Recall for long-term memory. Follow these rules:
+This project uses Loong Recall for code search and cross-session memory.
 
 - When user makes technical decisions, auto-record with remember tool
 - When user expresses preferences, auto-record with remember tool
 - When user asks "we previously..." or "last time we...", search with recall first
 - When user asks about code location, search with search_code first
+- Cite memories as "（根据记忆 #N）" format
 - Do NOT show tool call details in responses unless explicitly asked
 - Integrate memory results naturally into your answers
 ```
@@ -178,9 +214,10 @@ This project uses Loong Recall for long-term memory. Follow these rules:
 打开 `G:/your-project/.github/copilot-instructions.md`，写入：
 
 ```markdown
-This project has Loong Recall memory system. When user asks about past decisions,
-code locations, or project history, use the MCP tools (recall, search_code, remember)
-to provide accurate answers. Do not mention tool usage in responses.
+This project has Loong Recall for code search and session memory.
+When user asks about past decisions, code locations, or project history,
+use the MCP tools (recall, search_code, remember) to provide accurate answers.
+Cite memories as "（根据记忆 #N）". Do not mention tool usage in responses.
 ```
 
 ### 第 3 步：验证一切正常
@@ -203,24 +240,24 @@ to provide accurate answers. Do not mention tool usage in responses.
 
 ---
 
-## 重点：为什么"零操作"能实现？
+## 核心原理：为什么"零操作"能实现？
 
 ### 对比：有规则 vs 无规则
 
 | 场景 | 无 MCP 规则 | 有 MCP 规则 |
 |------|-----------|-----------|
-| 你问 "我们之前决定用哪个数据库？" | AI 说 "我不记得了，这是新会话" | AI 自动调用 recall，回答 "PostgreSQL，上次你选了它因为..." |
+| 你问 "我们之前决定用哪个数据库？" | AI 说 "我不记得了" | AI 自动调用 recall，回答 "（根据记忆 #3）PostgreSQL，上次你选了它因为..." |
 | 你说 "帮我找一下认证中间件" | AI 猜一个文件路径，可能不对 | AI 自动调用 search_code，精准定位到 `src/auth/middleware.rs` |
-| 你说 "我们以后用 pnpm 吧" | AI 说 "好的"，下次会话忘了 | AI 自动调用 remember 记录，下次主动提醒 |
+| 你说 "我们以后用 pnpm 吧" | AI 说 "好的"，下次忘了 | AI 自动调用 remember，下次主动提醒 |
 | 你问 "这个项目的错误处理怎么做的？" | AI 只能看当前打开的文件 | AI 搜索整个代码库，给出全局视图 |
 
-### 核心原理
+### 规则就是 AI 的工作说明书
 
-MCP 规则本质上就是给 AI 的**工作说明书**。它告诉 AI：
+MCP 规则告诉 AI 三件事：
 
-1. **你有什么工具**（可以通过 `tools/list` 自动获取）
-2. **什么时候该用**（通过规则文件告诉 AI 判断逻辑）
-3. **怎么用不出戏**（"透明规则"让 AI 自然融入，不破坏对话体验）
+1. **你有什么工具**（`remember`、`recall`、`search_code` 等）
+2. **什么时候该用**（技术决策 → remember，回顾历史 → recall，找代码 → search_code）
+3. **怎么用不出戏**（透明规则让 AI 自然地融入回答，不破坏对话体验）
 
 **你不需要**：
 - ❌ 手动输入 `/remember` 指令
@@ -246,7 +283,7 @@ AI：好的，Rust 2024 + Axum，已记录。
 
 === 第 3 天（新会话） ===
 你：继续写 API 吧，我们之前说的框架是什么来着？
-AI：你之前选择了 Axum 框架，Rust 2024 edition。
+AI：（根据记忆 #1）你之前选择了 Axum 框架，Rust 2024 edition。
     需要我帮你搭建基础路由结构吗？
     [内部：自动调用 recall 检索到第 1 天的记忆]
 ```
@@ -264,7 +301,7 @@ AI：找到了，在 src/auth/token.rs 的 refresh_token 函数（第 42 行）�
 
 ```
 你：我们为什么选了 PostgreSQL 而不是 MySQL？
-AI：根据之前的记录，你在 5 月 15 日决定用 PostgreSQL，
+AI：（根据记忆 #2）你在 5 月 15 日决定用 PostgreSQL，
     主要原因是项目需要 JSONB 类型和全文搜索能力。
     [内部：自动调用 recall 检索到当时的决策记录和理由]
 ```
@@ -275,7 +312,7 @@ AI：根据之前的记录，你在 5 月 15 日决定用 PostgreSQL，
 
 ### Q：我需要每次都说"请用 recall 搜索"吗？
 
-**不需要。** 配置好规则文件后，AI 会自动判断何时该搜索。你只需要正常问"我们之前聊到哪了？"。
+**不需要。** 配置好规则文件后，AI 会自动判断何时该搜索。你只需要正常问。
 
 ### Q：AI 会不会滥用记忆，把无关的东西也记下来？
 
@@ -283,22 +320,26 @@ AI：根据之前的记录，你在 5 月 15 日决定用 PostgreSQL，
 
 ### Q：记忆存在哪里？安全吗？
 
-所有记忆存储在本地 SQLite 数据库（默认 `~/.loong-recall/memory.db`），不上传任何服务器。你可以随时用 `forget` 删除、用 `update_memory` 修改。
+所有记忆存储在本地（默认项目目录下的 `.loong-recall/data/` 或全局 `~/.loong-recall/data/`），不上传任何服务器。你可以随时用 `forget` 删除、用 `update_memory` 修改。
 
 ### Q：我换了电脑，记忆能迁移吗？
 
-可以。复制 `~/.loong-recall/` 目录到新电脑即可。后续版本会支持云端同步。
+可以。使用 `--global` 模式时，复制 `~/.loong-recall/` 目录到新电脑即可。后续版本会支持云端同步。
 
-### Q：快速模式和语义模式有什么区别？
+### Q：Fast Match 和 Smart Match 怎么选？
 
-| | 快速模式（默认） | 语义模式（`--features ml`） |
-|---|---|---|
-| 启动速度 | 即时 | 首次需下载模型（~200MB） |
-| 搜索方式 | 关键词匹配 | 语义理解 |
-| 适用场景 | 搜函数名、变量名 | 模糊描述（"处理重试的代码"） |
-| 推荐度 | ⭐⭐⭐ 日常使用 | ⭐⭐⭐⭐ 复杂项目 |
+| 日常推荐 | 特殊场景 |
+|---------|---------|
+| **Fast Match（默认）** | **Smart Match（`--features ml`）** |
+| 搜函数名、变量名 | 模糊描述（"处理重试的代码"） |
+| 零延迟、零依赖 | 首次需下载模型 |
+| 90% 场景够用 | 复杂项目语义搜索 |
 
-> 90% 的场景快速模式完全够用。详见 [模型评估报告](MODEL_EVALUATION.md)。
+> 详见 [模型评估报告](MODEL_EVALUATION.md) 和 [离线安装指南](OFFLINE_MODEL_GUIDE.md)。
+
+### Q：为什么 AI 回复里出现了"（根据记忆 #3）"？
+
+这是我们设计的功能——让记忆**可见**。当 AI 引用了你之前保存的记忆时，会标注来源编号。这样你能看到记忆在起作用，也能信任它的准确性。
 
 ---
 
@@ -343,5 +384,6 @@ AI：根据之前的记录，你在 5 月 15 日决定用 PostgreSQL，
 ## 参考链接
 
 - [模型评估报告](MODEL_EVALUATION.md) — 为什么默认用 GraphCodeBERT
+- [Smart Match 离线安装指南](OFFLINE_MODEL_GUIDE.md) — 内网/离线环境配置
 - [性能测试指南](BENCHMARK.md) — 百万条记忆 < 30ms
 - [算法概述](ALGORITHM_OVERVIEW.md) — 记忆系统的高层原理
