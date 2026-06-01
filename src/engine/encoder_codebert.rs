@@ -29,6 +29,11 @@ impl CodeBertEncoder {
     pub fn load() -> Result<Self, String> {
         let device = Device::Cpu;
 
+        // 国内用户使用 hf-mirror.com 镜像，避免无法访问 huggingface.co
+        if std::env::var("HF_ENDPOINT").is_err() {
+            std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
+        }
+
         let api =
             hf_hub::api::sync::Api::new().map_err(|e| format!("hf-hub init: {e}"))?;
         let repo = api.model("microsoft/codebert-base".to_string());
