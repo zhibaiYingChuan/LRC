@@ -154,15 +154,17 @@ async fn main() {
     // 根据 feature 选择编码器类型
     #[cfg(feature = "ml")]
     let manager: Box<dyn server::IndexedCodebase> = {
-        log("   使用 CodeBERT 语义编码器（candle 本地推理）");
+        log("   搜索模式: Smart Match（语义理解 · 首次启动需下载模型）");
+        log("   默认使用 GraphCodeBERT（代码检索精度比 CodeBERT 高 12.3%）");
         let encoder = code_memory::CodeBertEncoder::load()
-            .expect("加载 CodeBERT 模型失败");
+            .expect("加载模型失败，请检查网络连接或手动下载模型");
         Box::new(CodeMemoryManager::with_encoder(Arc::new(encoder)))
     };
 
     #[cfg(not(feature = "ml"))]
     let manager: Box<dyn server::IndexedCodebase> = {
-        log("   使用 Fast 编码器（轻量词袋模式，零外部依赖，即时启动）");
+        log("   搜索模式: Fast Match（关键词匹配 · 零延迟 · 零依赖）");
+        log("   适合按函数名/变量名查代码，日常开发首选");
         Box::new(CodeMemoryManager::new())
     };
 
@@ -178,7 +180,7 @@ async fn main() {
     let index_state = state.clone();
     let index_dir = src_dir.clone();
     tokio::spawn(async move {
-        log(&format!("\n正在后台索引项目代码: {}", index_dir));
+        log(&format!("\n正在索引项目代码: {}（后台运行，不阻塞服务）", index_dir));
 
         #[cfg(feature = "ml")]
         let mut mgr = {
@@ -253,30 +255,32 @@ fn index_and_report<E: code_memory::engine::encoder::CodeEncoder>(
 }
 
 fn print_help() {
-    println!("Loong Recall (L-RC / 忆) — 通用语义记忆 MCP 服务");
+    println!("Loong Recall (L-RC / 忆) — AI 编程助手的记忆与检索插件");
     println!();
     println!("用法: code-memory-server [选项]");
     println!();
     println!("选项:");
-    println!("  --src-dir <路径>    要索引的源码目录 [默认: 当前目录]");
+    println!("  --src-dir <路径>    要索引的项目源码目录 [默认: 当前目录]");
     println!("  --host <地址>       HTTP 绑定地址 [默认: 127.0.0.1]");
     println!("  --port <端口>       HTTP 绑定端口 [默认: 3099]");
-    println!("  --stdio             使用 stdio 传输模式（IDE 标准 MCP）");
-    println!("  --global            使用全局记忆目录 (~/.loong-recall/data/)");
-    println!("  --db-path <路径>    指定记忆数据库路径（优先级最高）");
+    println!("  --stdio             使用 stdio 传输模式（IDE 标准 MCP，推荐）");
+    println!("  --global            记忆跨项目共享 (~/.loong-recall/data/)");
+    println!("  --db-path <路径>    自定义记忆数据存储路径（优先级最高）");
     println!("  --help, -h          显示此帮助信息");
     println!();
-    println!("HTTP 模式示例:");
+    println!("举个栗子:");
+    println!("  # 给当前项目的 AI 助手装上记忆插件（最常用）");
+    println!("  code-memory-server --src-dir ./src --stdio");
+    println!();
+    println!("  # HTTP 模式调试（看日志、测 API）");
     println!("  code-memory-server --src-dir ./src --port 3099");
     println!();
-    println!("Stdio 模式示例（推荐 IDE 全局部署）:");
-    println!("  code-memory-server --src-dir ./src --stdio --global");
-    println!();
-    println!("全局记忆模式（跨项目共享记忆）:");
+    println!("  # 全局记忆，跨项目共享偏好和知识");
     println!("  code-memory-server --global --stdio");
     println!();
-    println!("自定义数据库路径:");
-    println!("  code-memory-server --db-path /path/to/memories --stdio");
+    println!("  # 自定义记忆存储路径");
+    println!("  code-memory-server --db-path D:/my-data --stdio");
     println!();
-    println!("启动后在 IDE 中配置 MCP 连接即可使用。");
+    println!("启动后在 IDE 中配置 MCP 连接，AI 助手即可使用。");
+    println!("详细使用说明: https://github.com/zhibaiYingChuan/LRC/blob/main/docs/USER_GUIDE.md");
 }

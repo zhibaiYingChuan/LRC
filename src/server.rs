@@ -177,7 +177,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
     let tools = vec![
         ToolDefinition {
             name: "remember".into(),
-            description: "写入一条永久记忆。AI 助手调用此工具将需要跨会话保留的信息存入记忆库。".into(),
+            description: "帮 AI 记住一件事——就像给 AI 装了个记事本。记住的内容会在后续对话中自动被检索到。适用场景：用户表达了技术偏好（'用 pnpm'）、做了项目决策（'数据库选 PostgreSQL'）、或者有重要的约定需要跨会话保留。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
@@ -347,13 +347,13 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
         },
         ToolDefinition {
             name: "search_code".into(),
-            description: "在项目代码库中语义搜索相关代码片段。输入自然语言查询，返回最相关的 Top-K 代码（含文件路径、行号、评分）。".into(),
+            description: "在项目代码中查找代码片段。输入你记得的任何信息：函数名、变量名、文件路径，或者自然语言描述（如「处理用户登录的代码在哪？」）。默认使用精确关键词匹配——零延迟、零下载，适合你知道函数名但懒得手动翻文件的场景。如果你编译时启用了语义模式（--features ml），则能理解模糊的自然语言描述。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
                     "query": {
                         "type": "string",
-                        "description": "自然语言查询，如 'MemoryManager 的 retrieve 方法'"
+                        "description": "你想找什么？输入函数名（如 'authenticate_user'）、变量名、或者自然语言描述（如 '处理登录的代码'）"
                     },
                     "top_k": {
                         "type": "integer",
@@ -444,10 +444,15 @@ async fn handle_tools_call(
             match store.remember(memory) {
                 Ok(saved) => {
                     let text = format!(
-                        "已记住 (ID: {})\n类型: {}\n内容: {}\n重要性: {}/10",
+                        "已记住 (ID: {})\n\
+                         ──────────────────\n\
+                         内容: {}\n\
+                         类型: {} | 重要性: {}/10\n\
+                         \n\
+                         ✅ 下次你问相关问题时，AI 会自动检索到这条记忆。",
                         saved.id,
-                        saved.memory_type.as_str(),
                         saved.content,
+                        saved.memory_type.as_str(),
                         saved.importance.value()
                     );
                     let call_result = ToolCallResult {
@@ -517,24 +522,26 @@ async fn handle_tools_call(
                     } else {
                         for (i, m) in result.memories.iter().enumerate() {
                             let score = result.scores.get(i).unwrap_or(&0.0);
+                            let mem_num = i + 1;
                             text.push_str(&format!(
-                                "### #{}. {} (匹配度: {:.1}%)\n",
-                                i + 1,
-                                m.summary(),
+                                "（记忆 #{mem_num} · 匹配度 {:.1}%）\n",
                                 score * 100.0
                             ));
-                            text.push_str(&format!("ID: `{}`\n", m.id));
+                            text.push_str(&format!("内容: {}\n", m.summary()));
                             text.push_str(&format!(
-                                "类型: {} | 重要性: {}/10 | 标签: {}\n",
+                                "类型: {} | 重要性: {}/10",
                                 m.memory_type.as_str(),
-                                m.importance.value(),
-                                m.tags.join(", ")
+                                m.importance.value()
                             ));
-                            if let Some(ref proj) = m.project {
-                                text.push_str(&format!("项目: {}\n", proj));
+                            if !m.tags.is_empty() {
+                                text.push_str(&format!(" | 标签: {}", m.tags.join(", ")));
                             }
-                            text.push('\n');
+                            if let Some(ref proj) = m.project {
+                                text.push_str(&format!(" | 项目: {}", proj));
+                            }
+                            text.push_str(&format!("\nID: `{}`\n\n", m.id));
                         }
+                        text.push_str("💡 在回复中引用记忆时，请使用「（根据记忆 #N）」的格式标注来源，让用户能看见和信任记忆的存在。\n");
                     }
 
                     let call_result = ToolCallResult {
@@ -855,7 +862,7 @@ async fn mcp_handler(
 
 /// 健康检查端点（非 MCP 协议，便于调试）
 async fn health_handler() -> &'static str {
-    "Loong Recall (L-RC) MCP 服务运行中"
+    "Loong Recall 运行中 — 代码搜索 & 记忆服务"
 }
 
 // ==================== Stdio 传输层（标准 MCP） ====================
@@ -965,9 +972,10 @@ pub async fn serve(state: Arc<AppState>, host: &str, port: u16) -> std::io::Resu
 
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("Loong Recall (L-RC / 忆) MCP 服务启动: http://{}", addr);
-    println!("   MCP 端点: POST http://{}/mcp", addr);
-    println!("   健康检查: GET  http://{}/health", addr);
+    println!("Loong Recall (L-RC) 代码搜索 + 记忆服务");
+    println!("   端点: http://{}", addr);
+    println!("   MCP 协议: POST http://{}/mcp", addr);
+    println!("   状态检查: GET  http://{}/health", addr);
 
     axum::serve(listener, app).await
 }

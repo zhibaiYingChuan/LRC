@@ -1,6 +1,6 @@
-# Loong Recall (L-RC / 忆)
+# Loong Recall (L-RC)
 
-**几何坐标驱动的 AI 永久记忆系统 —— 具备自动深度演化的语义记忆 MCP 服务**
+**AI 编程助手的记忆与检索插件 — 接入 IDE，AI 就能记住一切、找到一切。**
 
 [!\[License\](https://img.shields.io/badge/Code-Apache%202.0-blue.svg null)](LICENSE_CODE)
 [!\[License\](https://img.shields.io/badge/Engine-DaoTi%20Research%20License-red.svg null)](LICENSE)
@@ -8,81 +8,108 @@
 
 ***
 
-## 它不是又一个 RAG 工具
+## 解决两个最痛的场景
 
-大多数记忆系统的工作方式：query → embedding → 全库向量相似度排序 → top-k。这是 RAG 的标准范式，优点是简单，缺点是随着记忆量增长，检索越来越慢，且无法区分"重要的旧知识"和"新鲜的噪音"。
+用 AI 写代码时，你有没有遇到过——
 
-Loong Recall 走了一条完全不同的路：
+**场景一**：你想让 AI 改某个功能，但不知道那个功能在哪个文件里。你只能手动翻目录→搜索关键词→复制粘贴几百行代码给 AI。每次都要重复这个流程。
 
-| <br />    | 传统 RAG / 向量检索  | Loong Recall                 |
-| --------- | -------------- | ---------------------------- |
-| **检索方式**  | 全库 ANN 相似度排序   | 几何坐标定位 + 区域剪枝                |
-| **检索复杂度** | O(N log N) 或更高 | O(roi\_ratio × N)            |
-| **记忆组织**  | 扁平向量空间         | 分层几何坐标空间（洛书九宫格）              |
-| **重要记忆**  | 依赖人工标注重要性分数    | 深度越大的记忆天然居中，自动优先召回           |
-| **知识抽象**  | 不支持            | 递归合成 → 从具体操作自动抽象出通用程序        |
-| **长期记忆**  | 靠 TTL 过期删除     | 中心记忆半衰期无限，外围自然衰减             |
-| **细粒度回溯** | 不支持            | RecursiveUnfold 将程序记忆拆回原始子步骤 |
+**场景二**：你跟 AI 聊了很久，约定了很多事——"数据库用 PostgreSQL"、"端口 8080"、"用 pnpm 别用 npm"。但第二天新开一个会话，AI 全忘了，你得重新说一遍。
+
+**Loong Recall 解决的就是这两个问题。** 它给 AI 助手装上两个能力：
+
+| 能力 | 做什么 | 一句话说清楚 |
+|------|--------|------------|
+| **代码定位** `search_code` | 忘了函数名？说个大概，AI 帮你找到它 | "比 grep 聪明，比 IDE 搜索顺手" |
+| **项目记忆** `remember / recall` | 告诉 AI 一次约定，以后每次对话它都记得 | "给 AI 装个记事本，但它是活的" |
+
+装上之后，你只管正常对话。AI 自己会用这些工具：
+
+```
+你："处理用户登录的代码在哪？"        → AI 自动 search_code → 找到 authenticate_user()
+你："我们之前约定的 API 端口是啥？"   → AI 自动 recall     → "8080，你上次定的"
+你："就用 pnpm 吧"                   → AI 自动 remember   → 下次会话自动记得
+```
+
+> 你不需要说"请用 search_code 搜索"——就像你不需要教搜索引擎怎么搜。你只管问，它自己会找。
+
+LRC 的编码能力源自 [道体（DaoTi）基座模型](https://github.com/zhibaiYingChuan/DaoTi) 的道枢层，但 LRC **不需要安装 DaoTi**——它是一个独立封装的 MCP 插件，零运行时依赖。
 
 ***
 
-## 它是什么
+## 5 分钟体验
 
-把 Loong Recall 接入 IDE 之后，你的 AI 助手获得三个关键能力：
+```bash
+git clone https://github.com/zhibaiYingChuan/LRC.git
+cd LRC
+cargo build --release --features server
 
-1. **语义搜索代码库** — 用自然语言描述你想找的代码，而不是靠盲猜文件名
-2. **跨会话永久记忆** — 让 AI 助手记住你的偏好、决策、项目约定，下次对话自动延续
-3. **记忆自动演化** — 同类记忆自动融合形成高层知识，越重要的知识越容易被检索到
+# 启动
+./target/release/code-memory-server --src-dir ./src --port 3099
+```
 
-> 你问 "处理用户登录的逻辑在哪？" → 它找到 `fn authenticate_user()`
-> 你问 "之前说好的 API 端口是哪个？" → 它从记忆中调出 "API 端口约定为 8080"
-> 你反复讨论数据库选型 → 系统自动合成 "项目数据库选型决策" 的程序记忆
+看到服务启动后，在另一个终端试试：
 
-它的语义编码能力源自 [道体（DaoTi）基座模型](https://github.com/zhibaiYingChuan/DaoTi) 的道枢层——但 LRC **不需要安装 DaoTi**。相关编码参数已冻结并独立封装，作为零运行时外部依赖的 MCP 服务直接使用。
+```bash
+# 搜索代码（用自然语言！）
+curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"memory retrieval","top_k":3}}}'
+
+# 写一条记忆
+curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember","arguments":{"content":"项目使用 pnpm 作为包管理器","memory_type":"preference","tags":["tooling"]}}}'
+
+# 检索记忆
+curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"query":"包管理器偏好","top_k":3}}}'
+```
+
+### 接入 IDE（3 分钟）
+
+在 IDE 的 MCP 配置文件中添加（以 Trae 为例，`%APPDATA%/Trae/User/mcp.json`）：
+
+```json
+{
+  "mcpServers": {
+    "loong-recall": {
+      "command": "G:/code-memory/target/release/code-memory-server.exe",
+      "args": ["--src-dir", "G:/your-project/src", "--stdio"]
+    }
+  }
+}
+```
+
+| IDE | 配置文件位置 | 规则配置（让 AI 自动使用） |
+|-----|------------|-------------------------|
+| **Trae** | `%APPDATA%/Trae/User/mcp.json` | `.trae/rules/project-rules.md` |
+| **Cursor** | `%APPDATA%/Cursor/mcp.json` | `.cursor/rules/memory.md` |
+| **VS Code** | `%APPDATA%/Code/User/settings.json` | `.github/copilot-instructions.md` |
+
+> 💡 详细配置步骤（含 AI 自动调用规则模板）见 [用户使用说明书](docs/USER_GUIDE.md)。
+
+重启 IDE 后，AI 自动发现 9 个工具，无需额外配置。
 
 ***
 
-## 记忆架构（高层原理）
+## 两种搜索模式
 
-Loong Recall 的记忆系统基于四个核心设计：
+| | Fast Match（默认） | Smart Match（`--features ml`） |
+|---|---|---|
+| **怎么搜** | 精确关键词匹配 | 理解自然语言意思 |
+| **适合** | 你知道函数名/变量名，懒得翻文件 | 用自然语言描述意图（"处理重试的代码"） |
+| **启动速度** | 即时（毫秒级） | 首次需下载模型（~200MB） |
+| **内存占用** | < 10 MB | ~500 MB |
+| **依赖** | 零，纯 Rust | 自动从 hf-mirror.com 镜像下载 |
 
-### 1. 几何坐标空间
+```bash
+# 默认 Fast Match（推荐日常使用）
+cargo build --features server
 
-每条记忆不是存储为高维浮点向量，而是被映射到一个**基于洛书九宫格的低维整数坐标空间**。这个坐标空间具有明确的几何结构，记忆之间的关系由它们在空间中的位置决定——相近位置的记忆语义相近，无需每次计算相似度。
-
-### 2. 深度演化
-
-记忆具有 0\~5 层拓扑深度：
-
-```
-感觉记忆 (depth 0) —— 原始输入，如 "用户说要用 pnpm"
-    ↓ 自动合成
-情节记忆 (depth 1) —— 事件片段，如 "用户偏好 pnpm 包管理"
-    ↓ 自动合成
-语义记忆 (depth 2) —— 概念抽象，如 "项目构建工具选型"
-    ↓ 自动合成
-程序记忆 (depth 3) —— 通用模式，如 "新项目初始化流程"
-    ↓ 自动合成
-架构记忆 (depth 4+) —— 系统级知识，半衰期无限，永久存储
+# Smart Match（需要理解模糊描述时）
+cargo build --features server,ml
 ```
 
-当同类记忆积累到一定条件后，系统自动触发**递归合成**，将多条低层记忆融合为一条更高层的抽象记忆。这个过程完全自动，无需人工干预。
-
-### 3. 区域检索
-
-查询时，系统先确定查询在坐标空间中的位置，然后只在一个**可配置的感兴趣区域**内遍历候选记忆——而非扫描全库。这意味着：
-
-* 百万级记忆规模下，检索延迟仍保持在毫秒级
-
-* 深度越大的记忆天然位于坐标空间中心附近，抽象知识总是被优先召回
-
-* 外围的噪声记忆自动边缘化，不会干扰检索结果
-
-### 4. 可逆组合
-
-大多数记忆系统只做"聚合"，无法"展开"。Loong Recall 支持将程序记忆拆解回原始子步骤，便于调试和细粒度回溯。
-
-> 以上为设计原理的高层描述，具体坐标映射、合成阈值等实现细节属于受保护的核心算法，未在公开文档中披露。详见 [算法概述](docs/ALGORITHM_OVERVIEW.md)。
+> 90% 的日常场景 Fast Match 完全够用。Smart Match 默认使用 **GraphCodeBERT**（比 CodeBERT 检索精度高 12.3%），详见 [模型评估报告](docs/MODEL_EVALUATION.md)。
 
 ***
 
