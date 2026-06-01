@@ -12,7 +12,7 @@ default = ["server"]
 # 启用 candle + CodeBERT 真实语义编码（体积大 ~200MB）
 ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
 # 启用 MCP HTTP 服务（axum + tokio）
-server = ["axum", "tokio", "tower-http"]
+server = ["axum", "tokio", "tower-http", "reqwest"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -33,6 +33,7 @@ hf-hub = { version = "0.3", optional = true }
 axum = { version = "0.7", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "io-std"], optional = true }
 tower-http = { version = "0.5", features = ["cors"], optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

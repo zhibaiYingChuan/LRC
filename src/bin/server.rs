@@ -10,7 +10,7 @@
 // 启动后 IDE 可通过 MCP 配置连接此服务，AI 助手即可调用 search_code 工具。
 
 use code_memory::{
-    server, CodeMemoryManager, JsonPersistence, MemoryStore,
+    server, CodeMemoryManager, JsonPersistence, LlmApiConfig, MemoryStore,
 };
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -28,6 +28,7 @@ async fn main() {
     let mut stdio_mode = false;
     let mut global_mode = false;
     let mut db_path: Option<String> = None;
+    let mut llm_api_raw: Option<String> = None;
 
     // CLI 参数解析
     let mut i = 1;
@@ -61,6 +62,12 @@ async fn main() {
                 i += 1;
                 if i < args.len() {
                     db_path = Some(args[i].clone());
+                }
+            }
+            "--llm-api" => {
+                i += 1;
+                if i < args.len() {
+                    llm_api_raw = Some(args[i].clone());
                 }
             }
             "--help" | "-h" => {
@@ -151,6 +158,30 @@ async fn main() {
     });
     let memory_store = Arc::new(Mutex::new(MemoryStore::new(persistence)));
 
+    // 解析 LLM API 配置
+    let llm_api = match llm_api_raw {
+        Some(ref raw) => match LlmApiConfig::parse(raw) {
+            Ok(config) => {
+                match &config {
+                    LlmApiConfig::OpenAI { model, .. } => {
+                        log(&format!("   LLM 增强: OpenAI ({}) → 查询翻译已启用", model));
+                    }
+                    LlmApiConfig::Ollama { host, model } => {
+                        log(&format!("   LLM 增强: Ollama ({}@{}) → 查询翻译已启用", model, host));
+                    }
+                    _ => {}
+                }
+                config
+            }
+            Err(e) => {
+                eprintln!("错误: LLM API 配置解析失败: {}", e);
+                eprintln!("提示: 格式为 openai:sk-xxx:model 或 ollama:host:model");
+                std::process::exit(1);
+            }
+        },
+        None => LlmApiConfig::None,
+    };
+
     // 根据 feature 选择编码器类型
     #[cfg(feature = "ml")]
     let manager: Box<dyn server::IndexedCodebase> = {
@@ -172,6 +203,7 @@ async fn main() {
         manager: Arc::new(Mutex::new(manager)),
         memory_store: memory_store.clone(),
         src_dir: src_dir.clone(),
+        llm_api: llm_api.clone(),
     });
 
     // 后台异步索引项目代码（不阻塞 MCP 握手）
@@ -266,6 +298,7 @@ fn print_help() {
     println!("  --stdio             使用 stdio 传输模式（IDE 标准 MCP，推荐）");
     println!("  --global            记忆跨项目共享 (~/.loong-recall/data/)");
     println!("  --db-path <路径>    自定义记忆数据存储路径（优先级最高）");
+    println!("  --llm-api <配置>    配置 LLM 查询翻译（可选，不配就用 Fast Match）");
     println!("  --help, -h          显示此帮助信息");
     println!();
     println!("举个栗子:");
@@ -277,6 +310,12 @@ fn print_help() {
     println!();
     println!("  # 全局记忆，跨项目共享偏好和知识");
     println!("  code-memory-server --global --stdio");
+    println!();
+    println!("  # 配置 LLM 查询翻译，用自然语言搜索代码");
+    println!("  code-memory-server --src-dir ./src --stdio --llm-api openai:sk-xxx:gpt-4o-mini");
+    println!();
+    println!("  # 使用本地 Ollama 模型（零成本）");
+    println!("  code-memory-server --src-dir ./src --stdio --llm-api ollama:localhost:llama3");
     println!();
     println!("  # 自定义记忆存储路径");
     println!("  code-memory-server --db-path D:/my-data --stdio");

@@ -1,6 +1,6 @@
 # Loong Recall (L-RC)
 
-**AI 编程助手的记忆与检索插件 — 接入 IDE，AI 就能记住一切、找到一切。**
+**AI 编程助手的记忆与检索插件 — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定。**
 
 [!\[License\](https://img.shields.io/badge/Code-Apache%202.0-blue.svg null)](LICENSE_CODE)
 [!\[License\](https://img.shields.io/badge/Engine-DaoTi%20Research%20License-red.svg null)](LICENSE)
@@ -20,18 +20,18 @@
 
 | 能力 | 做什么 | 一句话说清楚 |
 |------|--------|------------|
-| **代码定位** `search_code` | 忘了函数名？说个大概，AI 帮你找到它 | "比 grep 聪明，比 IDE 搜索顺手" |
+| **代码定位** `search_code` | 知道函数名/变量名，AI 瞬间定位。配置 LLM 后可用自然语言描述 | "比 grep 快，比 IDE 搜索省心" |
 | **项目记忆** `remember / recall` | 告诉 AI 一次约定，以后每次对话它都记得 | "给 AI 装个记事本，但它是活的" |
 
-装上之后，你只管正常对话。AI 自己会用这些工具：
+配置好规则文件后，AI 会在需要时调用这些工具。你只管正常对话：
 
 ```
-你："处理用户登录的代码在哪？"        → AI 自动 search_code → 找到 authenticate_user()
-你："我们之前约定的 API 端口是啥？"   → AI 自动 recall     → "8080，你上次定的"
-你："就用 pnpm 吧"                   → AI 自动 remember   → 下次会话自动记得
+你：search_code("authenticate_user")      → 找到 authenticate_user()
+你："我们之前约定的 API 端口是啥？"         → AI 自动 recall → "8080，你上次定的"
+你："记得：包管理器用 pnpm"                → AI 调用 remember → 下次会话可检索
 ```
 
-> 你不需要说"请用 search_code 搜索"——就像你不需要教搜索引擎怎么搜。你只管问，它自己会找。
+> 💡 **重要**：AI 助手需要规则文件引导才能自动调用记忆工具。我们提供了[一键配置模板](docs/USER_GUIDE.md)，3 分钟即可完成。LLM 增强模式下，AI 可以直接用自然语言搜代码。
 
 LRC 的编码能力源自 [道体（DaoTi）基座模型](https://github.com/zhibaiYingChuan/DaoTi) 的道枢层，但 LRC **不需要安装 DaoTi**——它是一个独立封装的 MCP 插件，零运行时依赖。
 
@@ -51,9 +51,13 @@ cargo build --release --features server
 看到服务启动后，在另一个终端试试：
 
 ```bash
-# 搜索代码（用自然语言！）
+# 搜索代码（Fast Match：精确关键词匹配）
 curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"memory retrieval","top_k":3}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"authenticate_user","top_k":3}}}'
+
+# 搜索代码（LLM 增强模式：用自然语言描述，需配置 --llm-api）
+curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"处理用户登录的逻辑","top_k":3}}}'
 
 # 写一条记忆
 curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
@@ -72,8 +76,8 @@ curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
 {
   "mcpServers": {
     "loong-recall": {
-      "command": "G:/code-memory/target/release/code-memory-server.exe",
-      "args": ["--src-dir", "G:/your-project/src", "--stdio"]
+      "command": "你的安装路径/target/release/code-memory-server.exe",
+      "args": ["--src-dir", "你的项目路径/src", "--stdio"]
     }
   }
 }
@@ -89,27 +93,62 @@ curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
 
 重启 IDE 后，AI 自动发现 9 个工具，无需额外配置。
 
+### 🪄 一键安装（推荐给不想敲命令的用户）
+
+Windows 用户下载仓库后，直接双击项目根目录下的 `install.bat`，脚本会自动：
+1. 检测 Rust 环境
+2. 编译 Loong Recall
+3. 搜索本地 IDE（Trae / Cursor / VS Code），自动创建 MCP 配置文件（如配置文件已存在则提示手动合并）
+
+Linux / macOS 用户请在终端运行 `bash install.sh`。
+
+完成后重启 IDE，就能直接使用。脚本会自动跳过已配置的 IDE，多次运行不会重复配置。
+
 ***
 
-## 两种搜索模式
+## 两种搜索模式 + 一个可选增强
 
-| | Fast Match（默认） | Smart Match（`--features ml`） |
-|---|---|---|
-| **怎么搜** | 精确关键词匹配 | 理解自然语言意思 |
-| **适合** | 你知道函数名/变量名，懒得翻文件 | 用自然语言描述意图（"处理重试的代码"） |
-| **启动速度** | 即时（毫秒级） | 首次需下载模型（~200MB） |
-| **内存占用** | < 10 MB | ~500 MB |
-| **依赖** | 零，纯 Rust | 自动从 hf-mirror.com 镜像下载 |
+| | Fast Match（默认） | Smart Match（`--features ml`） | LLM 增强（`--llm-api`） |
+|---|---|---|---|
+| **怎么搜** | 精确关键词匹配 | 本地语义模型 | 你的 LLM 翻译查询 → Fast Match 检索 |
+| **适合** | 你知道函数名/变量名，懒得翻文件 | 离线语义搜索 | 用自然语言描述，AI 帮你找到 |
+| **启动速度** | 即时（毫秒级） | 首次需下载模型（~500MB） | 即时（依赖 LLM 响应） |
+| **内存占用** | < 10 MB | ~500 MB | < 10 MB |
+| **依赖** | 零，纯 Rust | 自动从 hf-mirror.com 镜像下载 | 需要 LLM API（DeepSeek / 通义千问等）或本地 Ollama |
 
 ```bash
 # 默认 Fast Match（推荐日常使用）
 cargo build --features server
 
-# Smart Match（需要理解模糊描述时）
+# Smart Match（离线语义搜索）
 cargo build --features server,ml
+
+# LLM 增强（用你的 LLM 做查询翻译，不下载模型）
+# 推荐：使用 DeepSeek（国产模型，性价比极高）
+code-memory-server --src-dir ./src --stdio --llm-api "openai:sk-your-deepseek-key:deepseek-v4-flash:https://api.deepseek.com/v1"
+# 或使用本地 Ollama（零成本）
+code-memory-server --src-dir ./src --stdio --llm-api ollama:localhost:llama3
 ```
 
+> **LLM 增强的原理**：把你的自然语言查询（"处理用户登录的逻辑"）发给 LLM，翻译成代码关键词（`authenticate_user, login, handle_login`），再用 Fast Match 精确检索。不配置 `--llm-api` 就还是原来的 Fast Match，行为完全不变。
+
 > 90% 的日常场景 Fast Match 完全够用。Smart Match 默认使用 **GraphCodeBERT**（比 CodeBERT 检索精度高 12.3%），详见 [模型评估报告](docs/MODEL_EVALUATION.md)。
+
+### 💰 成本说明
+
+LLM 增强模式会调用你的 LLM API 进行查询翻译，每次消耗约 **40-50 Token**（约 30 Token 输入 + 15 Token 输出）。
+
+| 模型 | 单次翻译成本 | 每天 100 次 | 每月 3000 次 |
+|------|------------|-----------|------------|
+| DeepSeek V4-Flash | < ¥0.00007（约 0.007 分） | < ¥0.007 | < ¥0.21 |
+| 通义千问 Qwen-Turbo | < ¥0.00002（约 0.002 分） | < ¥0.002 | < ¥0.06 |
+| 本地 Ollama（千问/LLaMA） | **免费** | **免费** | **免费** |
+
+> 💡 **省下的远比花掉的多**：LLM 翻译帮你把"整个文件粘贴给 AI"变成了"只返回精确的 5 个代码片段"。每次查询节省的上下文 Token（500-2000 Token），是翻译本身消耗的 10-50 倍。
+>
+> 📊 **价格来源**：DeepSeek 官方 API 定价（2026 年 6 月，deepseek-v4-flash 模型 输入 ¥1/百万 Token、输出 ¥2/百万 Token）；通义千问官方 API 定价（qwen-turbo 模型 输入 ¥0.3/百万 Token、输出 ¥0.6/百万 Token）。实际费用以各平台最新公告为准。
+
+> ⚠️ 不配置 `--llm-api` 则不产生任何 API 调用，Fast Match 照常使用。
 
 ***
 
@@ -129,15 +168,17 @@ cargo build --features server,ml
 | ------------ | --------------- | ---------- | ---------- | ---------------- |
 | 跨会话持久化       | ✅               | ✅          | ✅          | ✅                |
 | 语义检索         | ✅               | ✅          | ✅          | ✅                |
-| 自动知识抽象       | ✅ 递归合成          | ❌          | ❌          | ❌                |
-| 记忆深度演化       | ✅ 5 层           | ❌          | ❌          | ❌                |
-| 抗遗忘（中心偏好）    | ✅ 几何驱动          | ❌          | ❌          | ❌                |
-| 可逆组合（Unfold） | ✅               | ❌          | ❌          | ❌                |
+| 自动知识抽象       | ✅ 递归合成\*         | ❌          | ❌          | ❌                |
+| 记忆深度演化       | ✅ 5 层\*           | ❌          | ❌          | ❌                |
+| 抗遗忘（中心偏好）    | ✅ 几何驱动\*          | ❌          | ❌          | ❌                |
+| 可逆组合（Unfold） | ✅\*               | ❌          | ❌          | ❌                |
 | 检索复杂度        | O(roi\_ratio×N) | O(N log N) | O(N log N) | O(N log N)       |
 | 零外部依赖（快速模式）  | ✅               | ❌ 需 API    | ❌ 需 API    | ❌                |
 | 本地运行         | ✅               | ❌ 云端       | ❌ 云端       | ✅                |
 
 > "零外部依赖"指运行时无外部 API 调用与模型下载（快速模式下）。构建编译需要标准 Rust 工具链（`cargo`），这与任何 Rust 项目一致。
+>
+> \* 标注 \* 的功能为 Loong Recall 核心算法能力，已在内部验证通过。当前开源版本将其封装在 L2 受保护层中，用户可通过记忆检索与衰减机制间接感知其效果。完整的自主演化能力将在后续版本中逐步开放。
 
 ***
 
@@ -174,7 +215,7 @@ cargo build --release --features server
 ```bash
 curl -X POST http://127.0.0.1:3099/mcp \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"memory retrieval","top_k":3}}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"authenticate_user","top_k":3}}}'
 ```
 
 你应该能看到匹配到的代码片段，包含文件路径、行号和相似度评分。
@@ -243,7 +284,7 @@ curl -X POST http://127.0.0.1:3099/mcp \
 
 | 工具               | 用途                      | 必填参数             | 可选参数                       |
 | ---------------- | ----------------------- | ---------------- | -------------------------- |
-| `search_code`    | 在项目代码库中语义搜索             | `query` — 自然语言查询 | `top_k` — 返回条数（默认 5，最大 20） |
+| `search_code`    | 在项目代码库中搜索代码片段         | `query` — 搜索关键词（Fast Match）或自然语言（LLM增强） | `top_k` — 返回条数（默认 5，最大 20） |
 | `codebase_stats` | 查看代码库索引状态（文件数、片段数、类型分布） | 无                | 无                          |
 
 ### 记忆管理（7 个）
@@ -251,7 +292,7 @@ curl -X POST http://127.0.0.1:3099/mcp \
 | 工具              | 用途                  | 必填参数                  | 可选参数                                                                                                               |
 | --------------- | ------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | `remember`      | 写入一条永久记忆            | `content` — 记忆内容      | `memory_type`（fact/preference/decision/code\_context/conversation）、`project`、`tags`、`importance`（1-10）、`ttl_days`  |
-| `recall`        | 语义检索历史记忆            | `query` — 自然语言查询      | `top_k`、`memory_type`、`project`、`tags`、`min_importance`                                                            |
+| `recall`        | 检索历史记忆            | `query` — 搜索关键词或自然语言描述      | `top_k`、`memory_type`、`project`、`tags`、`min_importance`                                                            |
 | `forget`        | 删除一条记忆              | `memory_id`           | —                                                                                                                  |
 | `update_memory` | 更新记忆内容              | `memory_id`、`content` | `importance`                                                                                                       |
 | `list_memories` | 分页列表查看记忆            | 无                     | `memory_type`、`project`、`tags`、`sort_by`（created\_at/importance/last\_accessed）、`order`（desc/asc）、`limit`、`offset` |
@@ -282,14 +323,14 @@ Loong Recall 采用**分层架构**，每一层职责清晰、单向依赖。下
                             │   Stdio: stdin → stdout (IDE 标准模式)    │
                             └──┬──────────────────────┬────────────────┘
                                │                      │
-                    代码搜索通道（向量检索）     记忆管理通道（几何检索）
+                    代码搜索通道（向量检索）     记忆管理通道（语义检索 + 衰减排序）
                                │                      │
               ┌────────────────▼──────────┐  ┌───────▼──────────────────┐
               │  ② 引擎编排层              │  │  ③ 记忆存储层             │
               │  engine/manager.rs        │  │  memory_store.rs         │
               │                           │  │                          │
               │  协调三阶段流水线：         │  │  领域聚合根：             │
-              │  切分 → 编码 → 检索        │  │  增删改查 + 几何召回      │
+              │  切分 → 编码 → 检索        │  │  增删改查 + 语义召回      │
               │                           │  │  分页列表 + 过期归档      │
               │  对外接口：index_project() │  │  衰减因子 + 自动合成      │
               │          search()         │  │                          │
@@ -367,9 +408,8 @@ IDE 发送 JSON-RPC 请求
         │
         ├─→ 从持久化层加载所有记忆
         ├─→ 按类型/项目/标签/重要性过滤
-        ├─→ 编码查询并将其定位到几何坐标空间中的位置
-        ├─→ 在坐标空间的感兴趣区域（ROI）内遍历候选记忆
-        ├─→ 按几何距离排序，深度大的记忆天然优先
+        ├─→ 编码查询并与记忆库中所有记忆计算相似度
+        ├─→ 按相似度 + 衰减因子综合排序，重要且活跃的记忆天然优先
         └─→ 返回 Top-K 记忆，附带衰减权重
         │
         ▼
@@ -382,7 +422,7 @@ IDE 发送 JSON-RPC 请求
 | --------------- | -------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **① MCP 传输层**   | `src/server.rs`                  | 协议适配与工具路由  | 实现 MCP 协议全部生命周期：`initialize`（握手）→ `tools/list`（声明工具）→ `tools/call`（执行调用）。HTTP 模式基于 Axum 框架，Stdio 模式基于 stdin/stdout 管道。所有工具共享同一个 `AppState`（内存中的索引管理器 + 记忆存储），无需外部数据库。  |
 | **② 引擎编排层**     | `src/engine/manager.rs`          | 三阶段流水线调度   | 调用了④⑤两层完成索引和检索。`index_project()` 遍历目录、按扩展名过滤文本文件、调用 chunker 切分、调用 encoder 编码、存入 retriever。是代码搜索功能的唯一对外入口。                                                              |
-| **③ 记忆存储层**     | `src/memory_store.rs`            | 记忆领域聚合根    | 封装所有记忆 CRUD 操作和几何检索逻辑。`recall()` 通过几何坐标定位 + ROI 区域剪枝快速召回候选记忆，深度越大的记忆天然优先返回。同时集成指数衰减模型，让不活跃的记忆自然降权。`archive_expired()` 将过期记忆迁入冷存储（`archive.json`），保持活跃记忆库轻量。            |
+| **③ 记忆存储层**     | `src/memory_store.rs`            | 记忆领域聚合根    | 封装所有记忆 CRUD 操作和语义检索逻辑。`recall()` 通过向量相似度计算 + 衰减因子排序召回候选记忆，重要且活跃的记忆天然优先返回。同时集成指数衰减模型，让不活跃的记忆自然降权。`archive_expired()` 将过期记忆迁入冷存储（`archive.json`），保持活跃记忆库轻量。            |
 | **④ 切分器层**      | `src/chunker.rs`                 | 按语法边界拆分代码  | 包含 6 个切分器实现。Rust 用大括号深度匹配，Python 用缩进层级检测，TS/JS 支持箭头函数识别，Go 支持接收者方法，Conversation 按角色前缀切分，其余格式（Markdown、YAML 等）按段落边界切分。所有切分器共享同一个 `CodeChunker` trait。                   |
 | **⑤-1 编码器**     | `src/engine/encoder.rs`          | 代码文本 → 向量  | 核心抽象是 `CodeEncoder` trait。默认 `FastEncoder` 基于预定义关键词词袋生成位向量（dim\~250），零外部依赖、零模型下载。语义模式下 `CodeBertEncoder` 使用 candle 推理框架生成 768 维语义向量，默认使用 GraphCodeBERT 模型。             |
 | **⑤-2 编码器注册表**  | `src/engine/encoder_registry.rs` | 按语言路由编码策略  | 维护 `语言 → 编码器` 的映射表。支持按语言注册专用编码器（如为 Rust 注册更精准的编码器），未注册语言自动回退到默认编码器。实现 Strategy + Registry 组合模式。                                                                        |

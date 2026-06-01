@@ -173,6 +173,70 @@ impl<E: CodeEncoder> CoreManager<E> {
         self.retriever.search(query, top_k)
     }
 
+    /// 多关键词合并检索：对每个关键词独立检索，合并去重，按相似度排序
+    pub fn multi_keyword_search(&self, keywords: &[String], top_k: usize) -> RetrievalResult {
+        if keywords.is_empty() {
+            return RetrievalResult {
+                query: String::new(),
+                results: vec![],
+                returned: 0,
+                total_indexed: self.retriever.indexed_count(),
+            };
+        }
+
+        if keywords.len() == 1 {
+            return self.search(&keywords[0], top_k);
+        }
+
+        let query_str = keywords.join(", ");
+        let mut all_results = Vec::new();
+        // 按关键词分段检索，每个关键词取 top_k 条
+        for keyword in keywords {
+            let result = self.search(keyword, top_k);
+            all_results.extend(result.results);
+        }
+
+        // 去重：按 (file_path, start_line, end_line) 唯一标识
+        let mut seen = std::collections::HashSet::new();
+        let mut unique: Vec<_> = all_results
+            .into_iter()
+            .filter(|r| {
+                let key = (
+                    r.chunk.file_path.clone(),
+                    r.chunk.start_line,
+                    r.chunk.end_line,
+                );
+                seen.insert(key)
+            })
+            .collect();
+
+        // 按相似度降序排序
+        unique.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 截取 top_k
+        let returned = unique.len().min(top_k);
+        unique.truncate(returned);
+
+        // 重新编号
+        let results: Vec<_> = unique
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                r.rank = i + 1;
+                r
+            })
+            .collect();
+
+        let total_indexed = self.retriever.indexed_count();
+
+        RetrievalResult {
+            query: query_str,
+            returned: results.len(),
+            total_indexed,
+            results,
+        }
+    }
+
     pub fn indexed_count(&self) -> usize {
         self.retriever.indexed_count()
     }
