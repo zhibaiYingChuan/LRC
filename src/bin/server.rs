@@ -29,6 +29,7 @@ async fn main() {
     let mut global_mode = false;
     let mut db_path: Option<String> = None;
     let mut llm_api_raw: Option<String> = None;
+    let mut proxy: Option<String> = None;
 
     // CLI 参数解析
     let mut i = 1;
@@ -74,6 +75,12 @@ async fn main() {
                 print_help();
                 return;
             }
+            "--proxy" => {
+                i += 1;
+                if i < args.len() {
+                    proxy = Some(args[i].clone());
+                }
+            }
             _ => {
                 eprintln!("未知参数: {}", args[i]);
                 print_help();
@@ -98,6 +105,18 @@ async fn main() {
         env!("CARGO_PKG_VERSION")
     ));
     log("═══════════════════════════════════════════");
+
+    // 配置网络代理（在模型下载等网络操作之前设置）
+    if let Some(ref proxy_url) = proxy {
+        std::env::set_var("HTTP_PROXY", proxy_url);
+        std::env::set_var("HTTPS_PROXY", proxy_url);
+        log(&format!("   代理: {} (已应用到 HTTP/HTTPS 请求)", proxy_url));
+    }
+
+    // 设置 HF 镜像端点（在模型下载等网络操作之前，确保使用国内镜像）
+    if std::env::var("HF_ENDPOINT").is_err() {
+        std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
+    }
 
     // 确定源码目录：默认使用当前工作目录
     let src_dir = if src_dir.is_empty() {
@@ -299,6 +318,7 @@ fn print_help() {
     println!("  --global            记忆跨项目共享 (~/.loong-recall/data/)");
     println!("  --db-path <路径>    自定义记忆数据存储路径（优先级最高）");
     println!("  --llm-api <配置>    配置 LLM 查询翻译（可选，不配就用 Fast Match）");
+    println!("  --proxy <代理地址>    HTTP/HTTPS 代理（如 http://127.0.0.1:7890）");
     println!("  --help, -h          显示此帮助信息");
     println!();
     println!("举个栗子:");

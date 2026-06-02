@@ -35,38 +35,203 @@ impl CodeBertEncoder {
     pub fn load() -> Result<Self, String> {
         let device = Device::Cpu;
 
-        // 国内用户使用 hf-mirror.com 镜像，避免无法访问 huggingface.co
-        if std::env::var("HF_ENDPOINT").is_err() {
-            std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
-        }
-
         // 默认使用 GraphCodeBERT（比 CodeBERT 代码检索精度高 12.3%，同架构同尺寸）
         let model_id = std::env::var("LRC_MODEL_ID")
             .unwrap_or_else(|_| "microsoft/graphcodebert-base".to_string());
 
-        let api =
-            hf_hub::api::sync::Api::new().map_err(|e| format!("hf-hub init: {e}"))?;
-        let repo = api.model(model_id.clone());
+        // ============================================================
+        // 智能加载策略：本地 models/ 文件夹 → 缓存 → 远程下载
+        // ============================================================
+        // 1. 检查项目根目录 models/ 文件夹（用户手动放置 · 完全离线）
+        // 2. 检查本地文件缓存（~/.cache/huggingface/hub/blobs/）
+        // 3. 从 HF_ENDPOINT 镜像下载（默认 hf-mirror.com · 纯 ureq 请求）
 
-        println!("模型: {} (hf-mirror.com)", model_id);
+        // 将 model_id 中的 / 替换为 -- 作为本地文件夹名
+        // 例如: microsoft/graphcodebert-base → microsoft--graphcodebert-base
+        let local_model_name = model_id.replace('/', "--");
 
-        let config_path = repo
-            .get("config.json")
-            .map_err(|e| format!("config.json: {e}"))?;
-        let tokenizer_path = repo
-            .get("tokenizer.json")
-            .map_err(|e| format!("tokenizer.json: {e}"))?;
+        // 查找项目根目录的 models/ 文件夹
+        let project_root = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let local_model_dir = project_root.join("models").join(&local_model_name);
+
+        // 也检查可执行文件所在目录的 models/ 文件夹
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| project_root.clone());
+        let exe_model_dir = exe_dir.join("models").join(&local_model_name);
+
+        let mut use_local = false;
+        let mut model_dir = std::path::PathBuf::new();
+
+        // 依次检查各个本地路径
+        for dir in [&local_model_dir, &exe_model_dir] {
+            let dir = dir.clone();
+            if dir.join("config.json").exists()
+                && (dir.join("model.safetensors").exists()
+                    || dir.join("pytorch_model.bin").exists())
+            {
+                use_local = true;
+                model_dir = dir.clone();
+                println!("  ✓ 使用本地模型: {}", model_dir.display());
+                break;
+            }
+        }
+
+        if use_local {
+            // 从本地 models/ 文件夹加载，完全不走网络
+            let config_path = model_dir.join("config.json");
+            let tokenizer_path = model_dir.join("tokenizer.json");
+            if !tokenizer_path.exists() {
+                return Err(format!(
+                    "本地模型缺少 tokenizer.json: {}\n\
+                     提示: 请确保 models/{} 目录包含完整的模型文件",
+                    tokenizer_path.display(),
+                    local_model_name
+                ));
+            }
+
+            let model_path = if model_dir.join("model.safetensors").exists() {
+                model_dir.join("model.safetensors")
+            } else {
+                model_dir.join("pytorch_model.bin")
+            };
+
+            let config_file = File::open(&config_path)
+                .map_err(|e| format!("打开 config.json 失败: {e}\n路径: {}", config_path.display()))?;
+            let config: candle_transformers::models::bert::Config =
+                serde_json::from_reader(BufReader::new(config_file))
+                    .map_err(|e| format!("解析 config.json 失败: {e}"))?;
+
+            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| format!("加载 tokenizer 失败: {e}\n路径: {}", tokenizer_path.display()))?;
+
+            let is_pytorch_bin = model_path
+                .to_str()
+                .map_or(false, |s| s.ends_with(".bin"));
+            let tensors: std::collections::HashMap<String, Tensor> = if is_pytorch_bin {
+                candle_core::pickle::read_all(&model_path)
+                    .map_err(|e| format!("pickle 加载 pytorch_model.bin 失败: {e}\n\
+                        提示: 如果持续失败，请尝试转换为 safetensors 格式:\n\
+                        pip install safetensors torch && python scripts/convert_to_safetensors.py"))?
+                    .into_iter()
+                    .collect()
+            } else {
+                candle_core::safetensors::load(&model_path, &device)
+                    .map_err(|e| format!("safetensors 加载失败: {e}\n路径: {}", model_path.display()))?
+            };
+            let vb = candle_nn::VarBuilder::from_tensors(
+                tensors,
+                candle_transformers::models::bert::DTYPE,
+                &device,
+            );
+
+            let model = candle_transformers::models::bert::BertModel::load(vb, &config)
+                .map_err(|e| format!("构建模型失败: {e}"))?;
+
+            println!(
+                "  本地模型加载成功 (hidden_size={}, device=CPU)",
+                config.hidden_size
+            );
+
+            return Ok(Self {
+                model,
+                tokenizer,
+                device,
+                pooling: PoolingStrategy::Cls,
+            });
+        }
+
+        // ============================================================
+        // 本地没有模型，从远程下载
+        // ============================================================
+
+        // 始终使用 HF_ENDPOINT 指定的镜像站点（默认 hf-mirror.com）
+        // 注意：绝不硬编码 huggingface.co，绝不通过 hf-hub 库发起网络请求
+        let endpoint = std::env::var("HF_ENDPOINT")
+            .unwrap_or_else(|_| "https://hf-mirror.com".to_string());
+
+        println!("  ↓ 下载模型: {} (来源: {})", model_id, endpoint);
+        println!("  提示: 如果下载慢，可将模型文件放到 models/{} 目录", local_model_name);
+
+        // 获取 hf-hub 标准缓存目录（仅用于路径计算，绝不做任何网络请求）
+        let cache = hf_hub::Cache::default();
+        // 缓存目录结构: ~/.cache/huggingface/hub/models--{org}--{repo}/blobs/
+        let folder_name = format!("models--{}", model_id.replace('/', "--"));
+        let cache_dir = cache.path().join(folder_name).join("blobs");
+
+        // 纯本地缓存检测 + 自定义下载函数
+        // 彻底绕过 hf-hub 的网络层，所有 HTTP 请求由 ureq 直接发起
+        // 原因：hf-hub 内部可能忽略 HF_ENDPOINT 设置，直接访问 huggingface.co
+        fn manual_download(
+            filename: &str,
+            endpoint: &str,
+            model_id: &str,
+            cache_dir: &std::path::Path,
+        ) -> Result<std::path::PathBuf, String> {
+            // 1. 纯本地文件系统检测缓存（绝不做任何网络请求）
+            let cached_path = cache_dir.join(filename);
+            if cached_path.exists() {
+                println!("    ✓ 缓存命中: {}", filename);
+                return Ok(cached_path);
+            }
+
+            // 2. 缓存未命中，使用 ureq 直接下载（URL 由 endpoint 变量控制）
+            let url = format!(
+                "{}/{}/resolve/main/{}",
+                endpoint.trim_end_matches('/'),
+                model_id,
+                filename
+            );
+            println!("    ↓ 下载: {}", url);
+
+            let response = ureq::get(&url)
+                .call()
+                .map_err(|e| format!(
+                    "下载失败: {} (URL: {})\n\
+                     提示: 请检查网络连接，或手动将模型文件放到 models/ 目录",
+                    e, url
+                ))?;
+
+            let status = response.status();
+            if status != 200 {
+                return Err(format!(
+                    "HTTP {} (URL: {})\n\
+                     提示: 模型文件可能不存在，请确认模型 ID 正确: {}",
+                    status, url, model_id
+                ));
+            }
+
+            // 3. 写入缓存目录
+            std::fs::create_dir_all(cache_dir)
+                .map_err(|e| format!("创建缓存目录失败: {}", e))?;
+
+            let mut file = std::fs::File::create(&cached_path)
+                .map_err(|e| format!("创建文件失败: {}", e))?;
+
+            let mut reader = response.into_reader();
+            std::io::copy(&mut reader, &mut file)
+                .map_err(|e| format!("写入文件失败: {}", e))?;
+
+            println!("    ✓ 下载完成: {}", filename);
+            Ok(cached_path)
+        }
+
+        let config_path = manual_download("config.json", &endpoint, &model_id, &cache_dir)
+            .map_err(|e| format!("config.json: {}", e))?;
+        let tokenizer_path = manual_download("tokenizer.json", &endpoint, &model_id, &cache_dir)
+            .map_err(|e| format!("tokenizer.json: {}", e))?;
 
         // 模型格式降级：safetensors → pytorch_model.bin
-        let model_path = repo
-            .get("model.safetensors")
-            .or_else(|_| repo.get("pytorch_model.bin"))
+        let model_path = manual_download("model.safetensors", &endpoint, &model_id, &cache_dir)
+            .or_else(|_| manual_download("pytorch_model.bin", &endpoint, &model_id, &cache_dir))
             .map_err(|e| format!(
-                "模型文件下载失败: {e}\n\
+                "模型文件下载失败: {}\n\
                  提示: 1) 检查网络连接 2) 确认模型 ID 正确: '{}'\n\
                  3) 若只有 pytorch_model.bin 格式，请运行:\n\
                  pip install safetensors torch && python scripts/convert_to_safetensors.py",
-                model_id
+                e, model_id
             ))?;
 
         let config_file = File::open(&config_path)
