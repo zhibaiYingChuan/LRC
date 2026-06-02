@@ -2,9 +2,9 @@
 
 **AI 编程助手的记忆与检索插件 — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定。**
 
-[!\[License\](https://img.shields.io/badge/Code-Apache%202.0-blue.svg null)](LICENSE_CODE)
-[!\[License\](https://img.shields.io/badge/Engine-DaoTi%20Research%20License-red.svg null)](LICENSE)
-[!\[Rust\](https://img.shields.io/badge/Rust-1.75%2B-orange.svg null)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/Code-Apache%202.0-blue.svg)](LICENSE_CODE)
+[![License](https://img.shields.io/badge/Engine-DaoTi%20Research%20License-red.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
 ***
 
@@ -255,7 +255,7 @@ curl -X POST http://127.0.0.1:3099/mcp \
 | Cursor  | `%APPDATA%/Cursor/mcp.json`    | 在 Cursor 设置 → MCP 中添加               |
 | VS Code | `.vscode/mcp.json` 或用户级全局配置    | 需安装 MCP 扩展                          |
 
-> **路径注意**：Windows 下需使用正斜杠 `/`（如 `G:/code-memory/target/release/code-memory-server.exe`），不要使用反斜杠。
+> **路径注意**：Windows 下需使用正斜杠 `/`（如 `C:/your-project/target/release/code-memory-server.exe`），不要使用反斜杠。
 > 如果已有其他 MCP 服务器，将 `loong-recall` 条目合并到现有 `mcpServers` 对象中即可。
 
 重启 IDE 后，AI 助手自动发现全部 9 个工具，无需任何额外配置。

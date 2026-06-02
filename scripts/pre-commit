@@ -2,6 +2,10 @@
 # ============================================================
 # Loong Recall (L-RC / 忆) - 预提交钩子
 # ============================================================
+# 安装方法:
+#   cp scripts/pre-commit .git/hooks/pre-commit
+#   chmod +x .git/hooks/pre-commit
+#
 # 每次提交前自动运行核心算法泄露检测，防止受保护代码
 # 意外泄露到公开层文件。
 #
@@ -11,6 +15,10 @@
 # ============================================================
 
 set -e
+
+# 获取仓库根目录（预提交钩子从 .git/hooks/ 运行，返回上一级目录）
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$REPO_ROOT"
 
 echo "============================================================"
 echo "  Loong Recall 预提交检查"
@@ -37,25 +45,53 @@ echo "  测试通过。"
 # 3. 核心算法泄露检测
 echo ""
 echo "[3/3] 核心算法泄露检测..."
+
+# 查找 Python 解释器（避免 Microsoft Store 重定向陷阱）
 PYTHON_CMD=""
-for cmd in py python3 python; do
-    if command -v "$cmd" > /dev/null 2>&1 && $cmd -c "print('ok')" > /dev/null 2>&1; then
-        PYTHON_CMD="$cmd"
-        break
+for cmd in python3 python py; do
+    if command -v "$cmd" > /dev/null 2>&1; then
+        # 验证 Python 能正常工作（排除 Microsoft Store 重定向）
+        PYTHON_OUT="$($cmd -c "import sys; print(sys.executable)" 2>/dev/null)" || true
+        if [ -n "$PYTHON_OUT" ] && [ "$PYTHON_OUT" != "python.exe" ]; then
+            PYTHON_CMD="$cmd"
+            break
+        fi
     fi
 done
+
 if [ -z "$PYTHON_CMD" ]; then
     echo ""
-    echo "  警告: 未找到 Python 解释器，跳过泄露检测"
+    echo "  警告: 未找到可用的 Python 3 解释器，跳过泄露检测"
     echo "  请确保已安装 Python 3 并加入 PATH"
+    echo "  提示: 可从 https://www.python.org/downloads/ 下载"
 else
-    $PYTHON_CMD scripts/check_algorithm_leak.py || {
+    echo "  使用 Python: $($PYTHON_CMD --version 2>&1)"
     echo ""
-    echo "  泄露检测未通过！"
-    echo "  请确保公开层文件中不包含受保护的核心算法逻辑。"
-    echo "  公开层文件: src/chunker.rs, src/server.rs, src/bin/server.rs, src/lib.rs"
-    exit 1
-}
+
+    # 使用绝对路径调用检测脚本，避免路径解析问题
+    LEAK_SCRIPT="$REPO_ROOT/scripts/check_algorithm_leak.py"
+
+    if [ ! -f "$LEAK_SCRIPT" ]; then
+        echo "  错误: 找不到泄露检测脚本: $LEAK_SCRIPT"
+        echo "  请确保 scripts/check_algorithm_leak.py 存在"
+        exit 1
+    fi
+
+    # 运行检测脚本，捕获退出码
+    set +e  # 暂时关闭 set -e，手动处理退出码
+    $PYTHON_CMD "$LEAK_SCRIPT"
+    LEAK_EXIT_CODE=$?
+    set -e
+
+    if [ $LEAK_EXIT_CODE -ne 0 ]; then
+        echo ""
+        echo "  泄露检测未通过！"
+        echo "  请确保公开层文件中不包含受保护的核心算法逻辑。"
+        echo "  公开层文件: src/chunker.rs, src/server.rs, src/bin/server.rs, src/lib.rs"
+        echo ""
+        echo "  提示: 运行 'python scripts/check_algorithm_leak.py --verbose' 查看详情"
+        exit 1
+    fi
 fi
 
 echo ""
