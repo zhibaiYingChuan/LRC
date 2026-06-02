@@ -4,21 +4,9 @@
 
 ---
 
-## 你需要下载什么
+## 方式一：放到项目 `models/` 文件夹（最简单，推荐）
 
-Smart Match 模式默认使用 **GraphCodeBERT**（`microsoft/graphcodebert-base`），共需要 3 个文件：
-
-| 文件名 | 大小 | 作用 |
-|--------|------|------|
-| `config.json` | ~1 KB | 模型结构配置 |
-| `tokenizer.json` | ~800 KB | 代码分词器 |
-| `model.safetensors` | ~500 MB | 模型权重（主力） |
-
-> 总计约 **500 MB**。如果下载的是 `pytorch_model.bin` 格式，大小相近。
-
----
-
-## 方式一：从国内镜像下载（推荐）
+LRC 启动时会优先检查项目根目录下的 `models/` 文件夹。只需把模型文件放进去即可。
 
 ### 1. 下载模型文件
 
@@ -28,14 +16,71 @@ Smart Match 模式默认使用 **GraphCodeBERT**（`microsoft/graphcodebert-base
 https://hf-mirror.com/microsoft/graphcodebert-base/tree/main
 ```
 
-逐个下载上面表格中的 3 个文件，保存到本地任意目录（比如 `D:\models\graphcodebert-base\`）。
+逐个下载以下文件：
 
-> 如果镜像站无法访问，可以尝试原始站：
-> `https://huggingface.co/microsoft/graphcodebert-base/tree/main`
+| 文件名 | 大小 | 作用 |
+|------|------|------|
+| `config.json` | ~1 KB | 模型结构配置 |
+| `tokenizer.json` | ~800 KB | 代码分词器 |
+| `model.safetensors` | ~500 MB | 模型权重 |
 
-### 2. 找到缓存目录
+> 如果只有 `pytorch_model.bin` 格式也可以，LRC 会自动识别。
 
-下载完成后，需要把文件放到 `hf_hub` 的缓存目录中。执行以下命令查看缓存路径：
+### 2. 放到正确位置
+
+在 LRC 项目根目录下创建 `models/microsoft--graphcodebert-base/` 文件夹，把下载的文件放进去：
+
+```
+你的LRC项目目录/
+├── models/
+│   └── microsoft--graphcodebert-base/
+│       ├── config.json
+│       ├── tokenizer.json
+│       └── model.safetensors
+├── Cargo.toml
+└── src/
+```
+
+> 注意：文件夹名是 `microsoft--graphcodebert-base`（`/` 替换为 `--`）。
+
+### 3. 重启服务
+
+LRC 启动时会优先检测 `models/` 文件夹，发现后直接加载，完全不走网络。
+
+```bash
+code-memory-server --src-dir ./src --port 3099
+```
+
+看到以下日志说明加载成功：
+
+```
+✓ 使用本地模型: .../models/microsoft--graphcodebert-base
+本地模型加载成功 (hidden_size=768, device=CPU)
+```
+
+---
+
+## 方式二：使用 huggingface-cli 下载（命令行）
+
+如果你有 Python 环境：
+
+```bash
+# 安装 huggingface_hub
+pip install huggingface_hub
+
+# 从国内镜像下载到 LRC 的 models/ 文件夹
+huggingface-cli download microsoft/graphcodebert-base \
+  --local-dir ./models/microsoft--graphcodebert-base \
+  --endpoint https://hf-mirror.com
+```
+
+---
+
+## 方式三：放到 HuggingFace 缓存目录
+
+如果你已经通过 `huggingface-cli` 或其他方式下载过模型，可以放到缓存目录：
+
+### 1. 找到缓存目录
 
 **Windows（PowerShell）：**
 ```powershell
@@ -47,7 +92,7 @@ echo "$env:USERPROFILE\.cache\huggingface\hub\"
 echo ~/.cache/huggingface/hub/
 ```
 
-### 3. 确认目标路径
+### 2. 确认目标路径
 
 模型缓存目录结构如下：
 
@@ -61,32 +106,14 @@ echo ~/.cache/huggingface/hub/
             └── model.safetensors
 ```
 
-> 问题：`<一串哈希值>` 是什么？这是 HuggingFace 的版本快照 ID。你可以通过以下方式获取：
-
-### 4. 获取快照哈希值
-
-**方法 A：先让程序下载一次（推荐）**
-
-连接网络，启动一次 Smart Match 模式，程序会自动下载模型。下载完成后，缓存目录中就会出现正确的哈希值文件夹。此时：
-
-```bash
-# 启动一次（会下载模型，耗时约 3-5 分钟）
-code-memory-server --src-dir ./src --port 3099
-# Ctrl+C 停止
-```
-
-然后进入缓存目录，记下 `snapshots/` 下的文件夹名（就是一串哈希值）。
-
-**方法 B：从 refs 文件获取**
+### 3. 获取快照哈希值
 
 在 `models--microsoft--graphcodebert-base/refs/` 目录下有一个 `main` 文件，内容是当前版本的哈希值。
 
-### 5. 放置文件并验证
+### 4. 放置文件并验证
 
 ```bash
 # 假设哈希值为 abc123def456...
-# 将下载的 3 个文件复制到该目录下
-
 cp config.json ~/.cache/huggingface/hub/models--microsoft--graphcodebert-base/snapshots/abc123def456.../
 cp tokenizer.json ~/.cache/huggingface/hub/models--microsoft--graphcodebert-base/snapshots/abc123def456.../
 cp model.safetensors ~/.cache/huggingface/hub/models--microsoft--graphcodebert-base/snapshots/abc123def456.../
@@ -94,45 +121,27 @@ cp model.safetensors ~/.cache/huggingface/hub/models--microsoft--graphcodebert-b
 
 ---
 
-## 方式二：使用 huggingface-cli 下载（命令行）
+## 方式四：使用 HF_ENDPOINT 环境变量自动下载
 
-如果你有 Python 环境，这是最简单的方式：
-
-```bash
-# 安装 huggingface_hub
-pip install huggingface_hub
-
-# 从国内镜像下载（推荐）
-huggingface-cli download microsoft/graphcodebert-base \
-  --local-dir ./models/graphcodebert-base \
-  --endpoint https://hf-mirror.com
-
-# 或从官方源下载
-huggingface-cli download microsoft/graphcodebert-base \
-  --local-dir ./models/graphcodebert-base
-```
-
-下载完成后，`./models/graphcodebert-base/` 目录下就是所有需要的文件。
-
----
-
-## 方式三：使用 HF_ENDPOINT 环境变量
-
-如果你能访问网络，只是下载慢，可以设置镜像端点并让程序自动下载：
+如果你能访问网络，LRC 会自动使用国内镜像 `hf-mirror.com` 下载模型：
 
 **Windows（PowerShell）：**
 ```powershell
-$env:HF_ENDPOINT = "https://hf-mirror.com"
+# LRC 默认已设置 HF_ENDPOINT，直接启动即可
 code-memory-server --src-dir ./src --port 3099
 ```
 
 **Linux / macOS：**
 ```bash
-export HF_ENDPOINT=https://hf-mirror.com
+# LRC 默认已设置 HF_ENDPOINT，直接启动即可
 code-memory-server --src-dir ./src --port 3099
 ```
 
-程序会自动从镜像站下载并缓存，无需手动操作。
+如果使用了代理，添加 `--proxy` 参数：
+
+```bash
+code-memory-server --src-dir ./src --port 3099 --proxy http://127.0.0.1:7890
+```
 
 ---
 
@@ -187,11 +196,11 @@ export LRC_MODEL_ID=microsoft/codebert-base-mlm
 
 ### Q：能把模型放在项目目录里吗？
 
-目前 `hf_hub` 固定使用 `~/.cache/huggingface/hub/` 作为缓存目录。后续版本会支持自定义模型路径。
+**可以！** 这是推荐方式。在项目根目录创建 `models/microsoft--graphcodebert-base/` 文件夹，放入模型文件即可。LRC 启动时会优先加载本地模型，完全不走网络。详见上方"方式一"。
 
 ### Q：能完全离线使用吗？
 
-可以。只要模型文件已下载到缓存目录，启动 Smart Match 模式时不会联网。程序只在首次加载（文件缺失）时尝试下载。
+可以。只要模型文件已放到 `models/` 文件夹或缓存目录，启动 Smart Match 模式时不会联网。程序只在首次加载（文件缺失）时尝试下载。
 
 ### Q：模型文件太大，有更小的替代吗？
 

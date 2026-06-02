@@ -27,7 +27,20 @@ SERVER_PATH="$SCRIPT_DIR/target/release/code-memory-server"
 SRC_DIR="$SCRIPT_DIR/src"
 echo "编译完成！"
 
-# 3. 查找可用的 IDE 并配置 MCP
+# 3. 模型下载指引（Smart Match 模式需要）
+echo ""
+echo "[提示] 如果使用 Smart Match 模式（语义搜索），首次启动需要下载模型。"
+echo "自动使用国内镜像 hf-mirror.com，约 500MB。"
+echo ""
+echo "如果下载缓慢，可手动下载模型放到 models/ 目录："
+echo "  1. 访问 https://hf-mirror.com/microsoft/graphcodebert-base"
+echo "  2. 下载所有文件到: $SCRIPT_DIR/models/microsoft--graphcodebert-base/"
+echo "  3. 重启服务即可（LRC 自动优先加载本地模型）"
+echo ""
+echo "如果使用代理，启动时添加 --proxy http://127.0.0.1:端口"
+echo ""
+
+# 4. 查找可用的 IDE 并配置 MCP
 echo "[2/3] 正在搜索本地 IDE..."
 
 # 辅助函数：配置 IDE 的 MCP 连接

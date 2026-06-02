@@ -1,6 +1,6 @@
 [package]
 name = "code-memory"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Open Source Contributors"]
 description = "Loong Recall (L-RC / 忆) — 几何坐标驱动的 AI 永久记忆系统，为 AI 助手提供语义代码搜索与跨会话记忆演化"
@@ -10,7 +10,7 @@ repository = "https://github.com/zhibaiYingChuan/LRC"
 [features]
 default = ["server"]
 # 启用 candle + CodeBERT 真实语义编码（体积大 ~200MB）
-ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]
+ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub", "ureq"]
 # 启用 MCP HTTP 服务（axum + tokio）
 server = ["axum", "tokio", "tower-http", "reqwest"]
 
@@ -27,7 +27,8 @@ candle-core = { version = "0.10", optional = true }
 candle-nn = { version = "0.10", optional = true }
 candle-transformers = { version = "0.10", optional = true }
 tokenizers = { version = "0.20", optional = true }
-hf-hub = { version = "0.3", optional = true }
+hf-hub = { version = "0.4", optional = true }
+ureq = { version = "2", optional = true }
 
 # MCP HTTP 服务依赖（optional，server feature 启用）
 axum = { version = "0.7", optional = true }
