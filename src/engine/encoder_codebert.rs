@@ -82,20 +82,24 @@ impl CodeBertEncoder {
         if use_local {
             // 从本地 models/ 文件夹加载，完全不走网络
             let config_path = model_dir.join("config.json");
-            let tokenizer_path = model_dir.join("tokenizer.json");
-            if !tokenizer_path.exists() {
-                return Err(format!(
-                    "本地模型缺少 tokenizer.json: {}\n\
-                     提示: 请确保 models/{} 目录包含完整的模型文件",
-                    tokenizer_path.display(),
-                    local_model_name
-                ));
-            }
 
+            // 智能选择模型格式：优先 safetensors（原生支持），.bin 格式需转换
             let model_path = if model_dir.join("model.safetensors").exists() {
                 model_dir.join("model.safetensors")
+            } else if model_dir.join("pytorch_model.bin").exists() {
+                return Err(format!(
+                    "本地模型是 pytorch_model.bin 格式（原始 pickle），candle 不直接支持\n\
+                     请转换为 safetensors 格式:\n\
+                     pip install safetensors torch && python scripts/convert_model.py\n\
+                     或手动下载 safetensors 版本放入: {}",
+                    model_dir.display()
+                ));
             } else {
-                model_dir.join("pytorch_model.bin")
+                return Err(format!(
+                    "本地模型目录缺少模型文件: {}\n\
+                     提示: 需要 model.safetensors 或 pytorch_model.bin",
+                    model_dir.display()
+                ));
             };
 
             let config_file = File::open(&config_path)
@@ -104,23 +108,13 @@ impl CodeBertEncoder {
                 serde_json::from_reader(BufReader::new(config_file))
                     .map_err(|e| format!("解析 config.json 失败: {e}"))?;
 
-            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-                .map_err(|e| format!("加载 tokenizer 失败: {e}\n路径: {}", tokenizer_path.display()))?;
+            // 智能加载 tokenizer：优先 tokenizer.json，回退 vocab.json + merges.txt
+            let tokenizer = load_tokenizer_local(&model_dir, &local_model_name)?;
 
-            let is_pytorch_bin = model_path
-                .to_str()
-                .map_or(false, |s| s.ends_with(".bin"));
-            let tensors: std::collections::HashMap<String, Tensor> = if is_pytorch_bin {
-                candle_core::pickle::read_all(&model_path)
-                    .map_err(|e| format!("pickle 加载 pytorch_model.bin 失败: {e}\n\
-                        提示: 如果持续失败，请尝试转换为 safetensors 格式:\n\
-                        pip install safetensors torch && python scripts/convert_to_safetensors.py"))?
-                    .into_iter()
-                    .collect()
-            } else {
+            let tensors: std::collections::HashMap<String, Tensor> =
                 candle_core::safetensors::load(&model_path, &device)
-                    .map_err(|e| format!("safetensors 加载失败: {e}\n路径: {}", model_path.display()))?
-            };
+                    .map_err(|e| format!("safetensors 加载失败: {e}\n路径: {}", model_path.display()))?;
+
             let vb = candle_nn::VarBuilder::from_tensors(
                 tensors,
                 candle_transformers::models::bert::DTYPE,
@@ -164,6 +158,7 @@ impl CodeBertEncoder {
         // 纯本地缓存检测 + 自定义下载函数
         // 彻底绕过 hf-hub 的网络层，所有 HTTP 请求由 ureq 直接发起
         // 原因：hf-hub 内部可能忽略 HF_ENDPOINT 设置，直接访问 huggingface.co
+        // 注意：ureq 2.x 对非 2xx 状态码返回 Err，需用 match 而非 ? 运算符
         fn manual_download(
             filename: &str,
             endpoint: &str,
@@ -173,7 +168,10 @@ impl CodeBertEncoder {
             // 1. 纯本地文件系统检测缓存（绝不做任何网络请求）
             let cached_path = cache_dir.join(filename);
             if cached_path.exists() {
-                println!("    ✓ 缓存命中: {}", filename);
+                let size = std::fs::metadata(&cached_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                println!("    ✓ 缓存命中: {} ({} MB)", filename, size / 1024 / 1024);
                 return Ok(cached_path);
             }
 
@@ -184,46 +182,311 @@ impl CodeBertEncoder {
                 model_id,
                 filename
             );
-            println!("    ↓ 下载: {}", url);
 
-            let response = ureq::get(&url)
-                .call()
-                .map_err(|e| format!(
-                    "下载失败: {} (URL: {})\n\
-                     提示: 请检查网络连接，或手动将模型文件放到 models/ 目录",
-                    e, url
-                ))?;
+            // 最多重试 3 次（处理网络不稳定导致的大文件下载中断）
+            let max_retries = 3;
+            let mut last_error = String::new();
 
-            let status = response.status();
-            if status != 200 {
+            for attempt in 1..=max_retries {
+                if attempt > 1 {
+                    println!("    ↻ 重试 {}/{}: {}", attempt, max_retries, filename);
+                } else {
+                    println!("    ↓ 下载: {}", url);
+                }
+
+                let response = match ureq::get(&url).call() {
+                    Ok(r) => r,
+                    Err(ureq::Error::Status(code, _response)) => {
+                        last_error = format!(
+                            "HTTP {} (URL: {})\n\
+                             提示: 模型文件可能不存在，请确认模型 ID 正确: {}",
+                            code, url, model_id
+                        );
+                        break; // 非网络错误，不重试
+                    }
+                    Err(e) => {
+                        last_error = format!(
+                            "下载失败: {} (URL: {})\n\
+                             提示: 请检查网络连接，或手动将模型文件放到 models/ 目录",
+                            e, url
+                        );
+                        if attempt < max_retries {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                        }
+                        continue;
+                    }
+                };
+
+                // 读取 Content-Length 用于后续完整性校验
+                let expected_size: Option<u64> = response
+                    .header("Content-Length")
+                    .and_then(|v| v.parse().ok());
+
+                // 3. 写入缓存目录
+                if let Err(e) = std::fs::create_dir_all(cache_dir) {
+                    return Err(format!("创建缓存目录失败: {}", e));
+                }
+
+                let mut file = match std::fs::File::create(&cached_path) {
+                    Ok(f) => f,
+                    Err(e) => return Err(format!("创建文件失败: {}", e)),
+                };
+
+                let mut reader = response.into_reader();
+                match std::io::copy(&mut reader, &mut file) {
+                    Ok(bytes_written) => {
+                        // 4. 完整性校验：对比 Content-Length 与实际写入字节数
+                        // 如果大小不匹配，说明下载中断，文件损坏
+                        if let Some(expected) = expected_size {
+                            if bytes_written != expected {
+                                let _ = std::fs::remove_file(&cached_path);
+                                last_error = format!(
+                                    "文件大小校验失败: 期望 {} MB, 实际 {} MB ({} 字节)\n\
+                                     提示: 网络连接不稳定，下载中断。已自动重试 {}/{} 次",
+                                    expected / 1024 / 1024,
+                                    bytes_written / 1024 / 1024,
+                                    bytes_written,
+                                    attempt,
+                                    max_retries
+                                );
+                                // 练习 1 秒后重试，给网络恢复时间
+                                std::thread::sleep(std::time::Duration::from_secs(
+                                    (attempt as u64).min(5),
+                                ));
+                                continue;
+                            }
+                        }
+
+                        let size_mb = bytes_written / 1024 / 1024;
+                        println!("    ✓ 下载完成: {} ({} MB)", filename, size_mb);
+                        return Ok(cached_path);
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&cached_path);
+                        last_error = format!("写入文件失败: {}", e);
+                        if attempt < max_retries {
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            Err(last_error)
+        }
+
+        // 尝试下载文件，404 返回 None 而非错误（用于可选文件下载）
+        // 注意：ureq 2.x 对非 2xx 状态码返回 Err，需用 match 而非 ? 运算符
+        fn try_download(
+            filename: &str,
+            endpoint: &str,
+            model_id: &str,
+            cache_dir: &std::path::Path,
+        ) -> Result<Option<std::path::PathBuf>, String> {
+            let cached_path = cache_dir.join(filename);
+            if cached_path.exists() {
+                let size = std::fs::metadata(&cached_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                println!("    ✓ 缓存命中: {} ({} KB)", filename, size / 1024);
+                return Ok(Some(cached_path));
+            }
+
+            let url = format!(
+                "{}/{}/resolve/main/{}",
+                endpoint.trim_end_matches('/'),
+                model_id,
+                filename
+            );
+            println!("    ↓ 尝试: {}", url);
+
+            // ureq 2.x 对非 2xx 返回 Err(Error::Status(code, response))
+            let response = match ureq::get(&url).call() {
+                Ok(r) => r,
+                Err(ureq::Error::Status(404, _response)) => {
+                    println!("    ✗ 不存在 (404): {}", filename);
+                    return Ok(None);
+                }
+                Err(ureq::Error::Status(code, _response)) => {
+                    return Err(format!("HTTP {} (URL: {})", code, url));
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "下载失败: {} (URL: {})\n提示: 请检查网络连接",
+                        e, url
+                    ));
+                }
+            };
+
+            // 读取 Content-Length 用于完整性校验
+            let expected_size: Option<u64> = response
+                .header("Content-Length")
+                .and_then(|v| v.parse().ok());
+
+            std::fs::create_dir_all(cache_dir)
+                .map_err(|e| format!("创建缓存目录失败: {}", e))?;
+            let mut file = std::fs::File::create(&cached_path)
+                .map_err(|e| format!("创建文件失败: {}", e))?;
+            let mut reader = response.into_reader();
+            let bytes_written = std::io::copy(&mut reader, &mut file)
+                .map_err(|e| format!("写入文件失败: {}", e))?;
+
+            // 完整性校验
+            if let Some(expected) = expected_size {
+                if bytes_written != expected {
+                    let _ = std::fs::remove_file(&cached_path);
+                    return Err(format!(
+                        "文件大小校验失败: {} (期望 {} MB, 实际 {} MB)",
+                        filename,
+                        expected / 1024 / 1024,
+                        bytes_written / 1024 / 1024
+                    ));
+                }
+            }
+
+            let size_kb = bytes_written / 1024;
+            println!("    ✓ 下载完成: {} ({} KB)", filename, size_kb);
+            Ok(Some(cached_path))
+        }
+
+        // 本地 tokenizer 加载：优先 tokenizer.json，回退到 vocab.json + merges.txt
+        fn load_tokenizer_local(
+            model_dir: &std::path::Path,
+            _model_name: &str,
+        ) -> Result<tokenizers::Tokenizer, String> {
+            // 1. 尝试 tokenizer.json
+            let tokenizer_json = model_dir.join("tokenizer.json");
+            if tokenizer_json.exists() {
+                return tokenizers::Tokenizer::from_file(&tokenizer_json)
+                    .map_err(|e| format!("加载 tokenizer.json 失败: {}", e));
+            }
+
+            // 2. 回退到 vocab.json + merges.txt
+            let vocab_path = model_dir.join("vocab.json");
+            let merges_path = model_dir.join("merges.txt");
+
+            if !vocab_path.exists() {
                 return Err(format!(
-                    "HTTP {} (URL: {})\n\
-                     提示: 模型文件可能不存在，请确认模型 ID 正确: {}",
-                    status, url, model_id
+                    "本地模型缺少 tokenizer.json: {}\n\
+                     提示: 请确保 models/{} 目录包含完整的模型文件（vocab.json + merges.txt 或 tokenizer.json）",
+                    tokenizer_json.display(),
+                    model_dir.file_name().unwrap_or_default().to_string_lossy()
                 ));
             }
 
-            // 3. 写入缓存目录
-            std::fs::create_dir_all(cache_dir)
-                .map_err(|e| format!("创建缓存目录失败: {}", e))?;
+            if !merges_path.exists() {
+                return Err(format!(
+                    "本地模型缺少 merges.txt: {}\n\
+                     提示: 请确保 models/{} 目录包含完整的模型文件",
+                    merges_path.display(),
+                    model_dir.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
 
-            let mut file = std::fs::File::create(&cached_path)
-                .map_err(|e| format!("创建文件失败: {}", e))?;
+            // 使用 BPE 模型从 vocab.json + merges.txt 构建 tokenizer
+            let bpe = tokenizers::models::bpe::BPE::from_file(
+                vocab_path.to_str().unwrap(),
+                merges_path.to_str().unwrap(),
+            )
+            .build()
+            .map_err(|e| format!("构建 BPE 模型失败: {}", e))?;
 
-            let mut reader = response.into_reader();
-            std::io::copy(&mut reader, &mut file)
-                .map_err(|e| format!("写入文件失败: {}", e))?;
+            let mut tokenizer = tokenizers::Tokenizer::new(bpe);
 
-            println!("    ✓ 下载完成: {}", filename);
-            Ok(cached_path)
+            // 配置 RoBERTa 风格的 tokenizer 组件
+            let normalizer = tokenizers::normalizers::bert::BertNormalizer::default();
+            tokenizer.with_normalizer(Some(normalizer));
+
+            let pre_tokenizer = tokenizers::pre_tokenizers::byte_level::ByteLevel::default();
+            tokenizer.with_pre_tokenizer(Some(pre_tokenizer));
+
+            let decoder = tokenizers::decoders::byte_level::ByteLevel::default();
+            tokenizer.with_decoder(Some(decoder));
+
+            let post_processor = tokenizers::processors::roberta::RobertaProcessing::default();
+            tokenizer.with_post_processor(Some(post_processor));
+
+            // 添加 RoBERTa 特殊 tokens
+            tokenizer.add_special_tokens(&[
+                tokenizers::AddedToken::from("<s>", true),     // bos_token_id=0
+                tokenizers::AddedToken::from("<pad>", true),   // pad_token_id=1
+                tokenizers::AddedToken::from("</s>", true),    // eos_token_id=2
+                tokenizers::AddedToken::from("<unk>", true),   // unk_token_id=3
+                tokenizers::AddedToken::from("<mask>", true),  // mask_token_id=50264
+            ]);
+
+            println!("    ✓ 使用 vocab.json + merges.txt 格式加载本地 tokenizer");
+            Ok(tokenizer)
+        }
+
+        // 智能加载 tokenizer：优先 tokenizer.json，回退到 vocab.json + merges.txt
+        // GraphCodeBERT 使用 RoBERTa 格式（vocab.json + merges.txt），没有 tokenizer.json
+        fn load_tokenizer(
+            endpoint: &str,
+            model_id: &str,
+            cache_dir: &std::path::Path,
+        ) -> Result<tokenizers::Tokenizer, String> {
+            // 1. 尝试 tokenizer.json（HuggingFace tokenizers 统一格式）
+            if let Some(path) = try_download("tokenizer.json", endpoint, model_id, cache_dir)? {
+                return tokenizers::Tokenizer::from_file(&path)
+                    .map_err(|e| format!("加载 tokenizer.json 失败: {}", e));
+            }
+
+            // 2. 回退到 vocab.json + merges.txt（RoBERTa/GPT-2 等旧格式）
+            println!("    tokenizer.json 不存在，使用 vocab.json + merges.txt 格式...");
+
+            let vocab_path = manual_download("vocab.json", endpoint, model_id, cache_dir)
+                .map_err(|e| format!("vocab.json: {}", e))?;
+            let merges_path = manual_download("merges.txt", endpoint, model_id, cache_dir)
+                .map_err(|e| format!("merges.txt: {}", e))?;
+
+            // 下载辅助配置文件（不影响核心功能，但建议下载）
+            let _ = try_download("special_tokens_map.json", endpoint, model_id, cache_dir);
+            let _ = try_download("tokenizer_config.json", endpoint, model_id, cache_dir);
+
+            // 使用 BPE 模型从 vocab.json + merges.txt 构建 tokenizer
+            let bpe = tokenizers::models::bpe::BPE::from_file(
+                vocab_path.to_str().unwrap(),
+                merges_path.to_str().unwrap(),
+            )
+            .build()
+            .map_err(|e| format!("构建 BPE 模型失败: {}", e))?;
+
+            let mut tokenizer = tokenizers::Tokenizer::new(bpe);
+
+            // 配置 RoBERTa 风格的 tokenizer 组件
+            let normalizer = tokenizers::normalizers::bert::BertNormalizer::default();
+            tokenizer.with_normalizer(Some(normalizer));
+
+            let pre_tokenizer = tokenizers::pre_tokenizers::byte_level::ByteLevel::default();
+            tokenizer.with_pre_tokenizer(Some(pre_tokenizer));
+
+            let decoder = tokenizers::decoders::byte_level::ByteLevel::default();
+            tokenizer.with_decoder(Some(decoder));
+
+            let post_processor = tokenizers::processors::roberta::RobertaProcessing::default();
+            tokenizer.with_post_processor(Some(post_processor));
+
+            // 添加 RoBERTa 特殊 tokens
+            tokenizer.add_special_tokens(&[
+                tokenizers::AddedToken::from("<s>", true),     // bos_token_id=0
+                tokenizers::AddedToken::from("<pad>", true),   // pad_token_id=1
+                tokenizers::AddedToken::from("</s>", true),    // eos_token_id=2
+                tokenizers::AddedToken::from("<unk>", true),   // unk_token_id=3
+                tokenizers::AddedToken::from("<mask>", true),  // mask_token_id=50264
+            ]);
+
+            println!("    ✓ 使用 vocab.json + merges.txt 格式加载 tokenizer");
+            Ok(tokenizer)
         }
 
         let config_path = manual_download("config.json", &endpoint, &model_id, &cache_dir)
             .map_err(|e| format!("config.json: {}", e))?;
-        let tokenizer_path = manual_download("tokenizer.json", &endpoint, &model_id, &cache_dir)
-            .map_err(|e| format!("tokenizer.json: {}", e))?;
+        let tokenizer = load_tokenizer(&endpoint, &model_id, &cache_dir)
+            .map_err(|e| format!("tokenizer 加载失败: {}", e))?;
 
         // 模型格式降级：safetensors → pytorch_model.bin
+        // GraphCodeBERT 只有 pytorch_model.bin，没有 safetensors 格式
         let model_path = manual_download("model.safetensors", &endpoint, &model_id, &cache_dir)
             .or_else(|_| manual_download("pytorch_model.bin", &endpoint, &model_id, &cache_dir))
             .map_err(|e| format!(
@@ -240,20 +503,34 @@ impl CodeBertEncoder {
             serde_json::from_reader(BufReader::new(config_file))
                 .map_err(|e| format!("parse config: {e}"))?;
 
-        let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| format!("tokenizer: {e}"))?;
-
         // 根据文件格式选择加载器：.safetensors 用原生加载，.bin 用 pickle 加载 PyTorch 格式
         let is_pytorch_bin = model_path
             .to_str()
             .map_or(false, |s| s.ends_with(".bin"));
         let tensors: std::collections::HashMap<String, Tensor> = if is_pytorch_bin {
-            candle_core::pickle::read_all(&model_path)
+            // 使用 PthTensors 懒加载器读取 PyTorch checkpoint
+            // 注意：graphcodebert-base 是旧格式 raw pickle（非 zip），
+            // candle_core::pickle::read_all 只支持 zip 格式，需用 PthTensors
+            let pth = candle_core::pickle::PthTensors::new(&model_path, None)
                 .map_err(|e| format!("pickle 加载 pytorch_model.bin 失败: {e}\n\
                     提示: 如果持续失败，请尝试转换为 safetensors 格式:\n\
-                    pip install safetensors torch && python scripts/convert_to_safetensors.py"))?
-                .into_iter()
-                .collect()
+                    pip install safetensors torch && python scripts/convert_to_safetensors.py"))?;
+            let mut tensors = std::collections::HashMap::new();
+            for (name, _info) in pth.tensor_infos() {
+                if let Some(tensor) = pth.get(name)
+                    .map_err(|e| format!("加载 tensor '{}' 失败: {}", name, e))?
+                {
+                    tensors.insert(name.to_string(), tensor);
+                }
+            }
+            if tensors.is_empty() {
+                return Err(format!(
+                    "pytorch_model.bin 中未找到任何 tensor\n\
+                     提示: 文件可能已损坏，请尝试重新下载\n\
+                     cargo run --release --features ml 会自动重新下载"
+                ));
+            }
+            tensors
         } else {
             candle_core::safetensors::load(&model_path, &device)
                 .map_err(|e| format!("safetensors 加载失败: {e}"))?

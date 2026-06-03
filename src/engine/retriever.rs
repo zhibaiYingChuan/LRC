@@ -73,6 +73,17 @@ impl<E: CodeEncoder> LocalRetriever<E> {
         self.chunks.clear();
     }
 
+    /// 获取所有嵌入向量（用于缓存序列化）
+    pub fn get_vectors(&self) -> &[EmbeddingVector] {
+        &self.vectors
+    }
+
+    /// 直接从向量+片段重建索引（从缓存加载，跳过重新编码）
+    pub fn load_from_vectors(&mut self, vectors: Vec<EmbeddingVector>, chunks: Vec<CodeChunk>) {
+        self.vectors = vectors;
+        self.chunks = chunks;
+    }
+
     pub fn all_chunks(&self) -> &[CodeChunk] {
         &self.chunks
     }

@@ -12,7 +12,13 @@ default = ["server"]
 # 启用 candle + CodeBERT 真实语义编码（体积大 ~200MB）
 ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub", "ureq"]
 # 启用 MCP HTTP 服务（axum + tokio）
-server = ["axum", "tokio", "tower-http", "reqwest"]
+server = ["axum", "tokio", "tower", "tower-http", "reqwest"]
+# PostgreSQL 持久化后端（需运行中的 PostgreSQL 服务）
+postgres = ["sqlx", "tokio"]
+# Qdrant 向量存储后端（通过 HTTP API，无需额外依赖）
+qdrant = ["reqwest", "tokio"]
+# Neo4j 图存储后端（通过 HTTP API，无需额外依赖）
+neo4j = ["reqwest", "tokio"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -21,6 +27,10 @@ walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 dirs-next = "2"
+async-trait = "0.1"
+
+# PostgreSQL 依赖（optional，postgres feature 启用）
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"], optional = true }
 
 # CodeBERT 真实语义编码依赖（optional，ml feature 启用）
 candle-core = { version = "0.10", optional = true }
@@ -33,6 +43,7 @@ ureq = { version = "2", optional = true }
 # MCP HTTP 服务依赖（optional，server feature 启用）
 axum = { version = "0.7", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "io-std"], optional = true }
+tower = { version = "0.5", optional = true }
 tower-http = { version = "0.5", features = ["cors"], optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 

@@ -4,16 +4,15 @@
 // 禁止逆向工程、禁止商业再分发、禁止用于训练竞争模型。
 // ============================================================
 //
-// 编排模块
-// 整合切分、编码、检索三阶段流水线。
-// 按文件扩展名自动选择多语言切分策略。
-
+/// 编排模块
+/// 整合切分、编码、检索三阶段流水线。
+/// 按文件扩展名自动选择多语言切分策略。
 use crate::chunker::{chunk_by_language, is_supported_file, CodeChunk};
-use crate::engine::encoder::{CodeEncoder, FastEncoder};
+use crate::engine::encoder::{CodeEncoder, EmbeddingVector, FastEncoder};
 use crate::engine::retriever::{CodeRetriever, LocalRetriever, RetrievalResult};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// 索引统计
@@ -24,6 +23,48 @@ pub struct ChunkStats {
     pub type_counts: HashMap<String, usize>,
     pub language_counts: HashMap<String, usize>,
     pub avg_lines: f32,
+}
+
+/// 嵌入向量缓存（保存到磁盘，重启时秒加载）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EmbeddingCache {
+    /// 代码片段（chunker 输出是确定性的，同一源码产生相同 chunk）
+    chunks: Vec<CodeChunk>,
+    /// 对应的嵌入向量
+    vectors: Vec<Vec<f32>>,
+}
+
+impl EmbeddingCache {
+    /// 缓存文件路径：<data_dir>/../cache/embedding_cache.json
+    fn cache_path(data_dir: &str) -> PathBuf {
+        Path::new(data_dir)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join("cache")
+            .join("embedding_cache.json")
+    }
+
+    fn save(&self, data_dir: &str) -> Result<(), String> {
+        let path = Self::cache_path(data_dir);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建缓存目录失败: {}", e))?;
+        }
+        let json = serde_json::to_string(self)
+            .map_err(|e| format!("缓存序列化失败: {}", e))?;
+        std::fs::write(&path, json)
+            .map_err(|e| format!("写入缓存文件失败: {} → {}", e, path.display()))?;
+        Ok(())
+    }
+
+    fn load(data_dir: &str) -> Option<Self> {
+        let path = Self::cache_path(data_dir);
+        if !path.exists() {
+            return None;
+        }
+        let json = std::fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&json).ok()
+    }
 }
 
 /// 核心编排器
@@ -301,6 +342,53 @@ impl<E: CodeEncoder> CoreManager<E> {
         self.retriever.index_batch(chunks);
         self.file_count = count;
         Ok(count)
+    }
+
+    /// 保存嵌入向量缓存到磁盘（跳过后续启动的重复编码）
+    ///
+    /// 缓存文件位于 <data_dir>/../cache/embedding_cache.json
+    pub fn save_embedding_cache(&self, data_dir: &str) -> Result<(), String> {
+        let chunks = self.retriever.all_chunks().to_vec();
+        let vectors = self.retriever
+            .get_vectors()
+            .iter()
+            .map(|v| v.values.clone())
+            .collect();
+
+        let cache = EmbeddingCache { chunks, vectors };
+        cache.save(data_dir)
+    }
+
+    /// 从磁盘加载嵌入向量缓存（跳过编码，秒级恢复索引）
+    ///
+    /// 返回加载的片段数量，或 None 表示缓存不存在/无效。
+    pub fn load_embedding_cache(&mut self, data_dir: &str) -> Option<usize> {
+        let cache = EmbeddingCache::load(data_dir)?;
+        if cache.chunks.is_empty() || cache.vectors.len() != cache.chunks.len() {
+            return None;
+        }
+
+        let dim = self.retriever.get_vectors().first().map(|v| v.dim).unwrap_or(0);
+        let vectors: Vec<EmbeddingVector> = cache
+            .vectors
+            .into_iter()
+            .map(|values| EmbeddingVector {
+                dim: values.len(),
+                values,
+            })
+            .collect();
+
+        // 校验维度一致性
+        if let Some(first) = vectors.first() {
+            if dim > 0 && first.dim != dim {
+                return None; // 维度不匹配，放弃缓存
+            }
+        }
+
+        let count = vectors.len();
+        self.retriever.load_from_vectors(vectors, cache.chunks);
+        self.file_count = count;
+        Some(count)
     }
 }
 

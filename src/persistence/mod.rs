@@ -15,6 +15,18 @@ use std::fmt;
 
 pub mod json;
 
+/// PostgreSQL 持久化后端（需 `postgres` feature）
+#[cfg(feature = "postgres")]
+pub mod postgres;
+
+/// Qdrant 向量存储后端（需 `qdrant` feature）
+#[cfg(feature = "qdrant")]
+pub mod qdrant;
+
+/// Neo4j 图存储后端（需 `neo4j` feature）
+#[cfg(feature = "neo4j")]
+pub mod neo4j;
+
 /// 持久化错误类型
 #[derive(Debug)]
 pub enum PersistenceError {

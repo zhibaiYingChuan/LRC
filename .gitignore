@@ -36,3 +36,14 @@ Thumbs.db
 
 # 本地开发文档（不入库）
 docs/evaluation-report-2026-05-31.md
+
+# 运行时数据目录
+.loong-recall/
+src/.loong-recall/
+
+# 测试请求文件
+test_req.json
+test_request.json
+
+# 模型文件目录（用户自行下载）
+models/

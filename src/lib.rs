@@ -22,9 +22,19 @@ pub mod chunker;
 pub mod memory_store;
 pub mod memory_types;
 pub mod persistence;
+pub mod graph_store;
 
 /// 运行时防护模块：反调试、完整性校验、防篡改
 pub mod guard;
+
+/// 后台结晶流水线（定时 consolidation job）
+pub mod consolidation;
+
+/// A/B 测试框架与 MRR 评估（Phase 1 影子验证）
+pub mod ab_test;
+
+/// 架构记忆配置（算子参数、衰减曲线、权限策略持久化）
+pub mod arch_config;
 
 // === Layer 2: 受保护核心引擎 (DaoTi Research License v1.0) ===
 pub mod engine;
@@ -32,6 +42,10 @@ pub mod engine;
 // === Layer 1: MCP 服务层 (Apache 2.0) ===
 #[cfg(feature = "server")]
 pub mod server;
+
+// === Layer 1: v1 REST API (Apache 2.0) ===
+#[cfg(feature = "server")]
+pub mod v1_api;
 
 // === 公开重导出 ===
 pub use chunker::{
@@ -43,10 +57,18 @@ pub use memory_store::{
     ListFilter, MemoryStats, MemoryStore, RecallFilter, RecallResult, SortBy, SortOrder,
 };
 
-pub use memory_types::{Importance, Memory, MemoryType};
+pub use memory_types::{DecayConfig, Importance, Memory, MemoryType, MemoryVersion, PrivacyLevel};
 
 pub use persistence::{
     create_json_persistence, json::JsonPersistence, Persistence, PersistenceError,
+};
+
+pub use graph_store::{EdgeType, GraphMemoryStore, GraphQueryResult, MemoryEdge};
+
+// === 架构记忆配置重导出 ===
+pub use arch_config::{
+    ArchConfig, LuoshuArchConfig, PrivacyArchConfig,
+    RetrievalArchConfig, SynthesisArchConfig,
 };
 
 // === 受保护核心重导出（仅导出接口类型，实现细节在 engine/ 中） ===
@@ -58,3 +80,8 @@ pub use engine::retriever::{CodeRetriever, RetrievalResult, ScoredChunk};
 
 #[cfg(feature = "ml")]
 pub use engine::encoder_codebert::{CodeBertEncoder, PoolingStrategy};
+
+#[cfg(feature = "ml")]
+pub use engine::luoshu_encoder_ml::{HybridLuoShuEncoder, LuoShuMlEncoder};
+
+// === 持久化后端重导出 ===

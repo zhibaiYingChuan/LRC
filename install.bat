@@ -6,7 +6,7 @@ echo ========================================
 echo    Loong Recall (L-RC) 一键安装脚本
 echo ========================================
 echo.
-echo 本脚本将依次完成：检测 Rust 环境 → 编译 → 配置 IDE MCP 连接
+echo 本脚本将依次完成：检测 Rust 环境 ^> 编译 ^> 配置 IDE MCP 连接
 echo.
 
 REM 1. 检测 Rust 环境
@@ -24,8 +24,9 @@ set "SCRIPT_DIR=%~dp0"
 set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 cd /d "%SCRIPT_DIR%"
 
-REM 3. 编译项目
-echo [1/3] 正在编译 Loong Recall（首次编译约 2-5 分钟）...
+REM 3. 编译项目（默认 fast 模式，零外部依赖）
+echo [1/3] 正在编译 Loong Recall（首次编译约 5-10 分钟）...
+echo   默认 zero-dependency 模式，无需下载模型
 cargo build --release --features server
 if %errorlevel% neq 0 (
     echo [错误] 编译失败，请检查上方错误信息。
@@ -34,28 +35,25 @@ if %errorlevel% neq 0 (
 )
 echo 编译完成！
 
-REM 4. 模型下载指引（Smart Match 模式需要）
-echo.
-echo [提示] 如果使用 Smart Match 模式（语义搜索），首次启动需要下载模型。
-echo 自动使用国内镜像 hf-mirror.com，约 500MB。
-echo.
-echo 如果下载缓慢，可手动下载模型放到 models/ 目录：
-echo   1. 访问 https://hf-mirror.com/microsoft/graphcodebert-base
-echo   2. 下载所有文件到: %SCRIPT_DIR%\models\microsoft--graphcodebert-base\
-echo   3. 重启服务即可（LRC 自动优先加载本地模型）
-echo.
-echo 如果使用代理，启动时添加 --proxy http://127.0.0.1:端口
-echo.
-
-REM 5. 计算可执行文件路径（使用正斜杠，兼容 JSON）
+REM 4. 计算可执行文件路径（使用正斜杠，兼容 JSON）
 set "SERVER_PATH=%SCRIPT_DIR%\target\release\code-memory-server.exe"
 set "SERVER_PATH_JSON=%SERVER_PATH:\=/%"
 set "SRC_DIR_JSON=%SCRIPT_DIR:\=/%/src"
 
+REM 5. Smart Match 增强模式说明（可选）
+echo.
+echo [可选] 如需更高精度的语义搜索，可启用 ML 模式：
+echo   cargo build --release --features server,ml
+echo   启用后首次运行会自动下载约 500MB 模型文件。
+echo   国内用户可设环境变量 HF_ENDPOINT=https://hf-mirror.com 加速。
+echo.
+echo   当前已编译为 fast 模式（词向量编码），可直接使用：
+echo     "%SERVER_PATH%" --mode fast --src-dir 项目路径
+
 REM 6. 查找可用的 IDE 并配置 MCP
 echo [2/3] 正在搜索本地 IDE...
 
-REM 5a. Trae
+REM 6a. Trae
 set "TRAE_USER=%APPDATA%\Trae\User"
 if exist "%TRAE_USER%" (
     call :config_ide "Trae" "%TRAE_USER%\mcp.json"
@@ -66,13 +64,13 @@ if exist "%TRAE_CN_USER%" (
     call :config_ide "Trae CN" "%TRAE_CN_USER%\mcp.json"
 )
 
-REM 5b. Cursor
+REM 6b. Cursor
 set "CURSOR_DIR=%APPDATA%\Cursor"
 if exist "%CURSOR_DIR%" (
     call :config_ide "Cursor" "%CURSOR_DIR%\mcp.json"
 )
 
-REM 5c. VS Code
+REM 6c. VS Code
 set "CODE_USER=%APPDATA%\Code\User"
 if exist "%CODE_USER%" (
     call :config_ide "VS Code" "%CODE_USER%\mcp.json"

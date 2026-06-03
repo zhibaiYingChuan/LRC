@@ -1,0 +1,42 @@
+# Rust 编译产物
+target/
+debug/
+*.pdb
+
+# IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 数据目录（运行时生成）
+.loong-recall/
+data/
+
+# Git
+.git/
+.gitignore
+
+# 文档
+docs/
+*.md
+!README.md
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 测试和示例
+tests/
+examples/
+fixtures/
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# 操作系统
+.DS_Store
+Thumbs.db

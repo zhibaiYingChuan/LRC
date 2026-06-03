@@ -1,3 +1,5 @@
+// 许可证: Apache 2.0
+//
 // Loong Recall (L-RC / 忆) MCP Server — 独立二进制入口
 // ======================================================
 // 作为独立进程运行，通过 MCP 协议向 IDE 暴露代码检索能力。
@@ -16,6 +18,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 #[tokio::main]
+#[allow(unused_assignments)]
 async fn main() {
     // 运行时防护：反调试 + 完整性校验（必须在任何业务逻辑之前执行）
     code_memory::guard::risk_aware_guard();
@@ -30,6 +33,8 @@ async fn main() {
     let mut db_path: Option<String> = None;
     let mut llm_api_raw: Option<String> = None;
     let mut proxy: Option<String> = None;
+    #[allow(unused_variables, unused_assignments)]
+    let mut mode = String::from("auto"); // "auto" | "fast" | "smart"
 
     // CLI 参数解析
     let mut i = 1;
@@ -79,6 +84,12 @@ async fn main() {
                 i += 1;
                 if i < args.len() {
                     proxy = Some(args[i].clone());
+                }
+            }
+            "--mode" => {
+                i += 1;
+                if i < args.len() {
+                    mode = args[i].clone();
                 }
             }
             _ => {
@@ -201,21 +212,81 @@ async fn main() {
         None => LlmApiConfig::None,
     };
 
-    // 根据 feature 选择编码器类型
+    // 根据 feature 和 --mode 选择编码器类型并索引项目代码
+    // 镜像启动策略：默认模式（auto）下，Fast Match 立即可用，后台异步升级 Smart Match
     #[cfg(feature = "ml")]
     let manager: Box<dyn server::IndexedCodebase> = {
-        log("   搜索模式: Smart Match（语义理解 · 首次启动需下载模型）");
-        log("   默认使用 GraphCodeBERT（代码检索精度比 CodeBERT 高 12.3%）");
-        let encoder = code_memory::CodeBertEncoder::load()
-            .expect("加载模型失败，请检查网络连接或手动下载模型");
-        Box::new(CodeMemoryManager::with_encoder(Arc::new(encoder)))
+        if mode == "fast" {
+            // 用户显式指定 Fast Match：跳过模型加载，零延迟启动
+            log("   搜索模式: Fast Match（关键词匹配 · 零延迟 · 零依赖）");
+            log("   提示: 使用 --mode smart 切换到语义搜索模式");
+            let mut mgr = CodeMemoryManager::new();
+            log(&format!("\n正在索引项目代码: {}...", src_dir));
+            match index_and_report(&mut mgr, &src_dir, &log) {
+                Ok(()) => {}
+                Err(e) => {
+                    log(&format!("   索引警告: {}（部分文件可能无法检索）", e));
+                }
+            }
+            Box::new(mgr)
+        } else if mode == "smart" {
+            // 用户显式指定 Smart Match：直接加载模型，同步等待
+            log("   搜索模式: Smart Match（语义理解 · 首次启动需下载模型）");
+            log("   模型: microsoft/graphcodebert-base (hf-mirror.com)");
+            let encoder = code_memory::CodeBertEncoder::load()
+                .expect("加载模型失败，请检查网络连接或手动下载模型");
+            let mut mgr = CodeMemoryManager::with_encoder(Arc::new(encoder));
+
+            // 尝试加载缓存，跳过重复编码
+            if let Some(n) = mgr.load_embedding_cache(&data_dir) {
+                log(&format!("\n  ✓ 从缓存恢复索引: {} 个代码片段（秒级加载）", n));
+            } else {
+                log(&format!("\n正在索引项目代码: {}...", src_dir));
+                log("   （首次索引较慢，后续启动会使用缓存）");
+                match index_and_report(&mut mgr, &src_dir, &log) {
+                    Ok(()) => {
+                        // 首次索引完成后保存缓存
+                        if let Err(e) = mgr.save_embedding_cache(&data_dir) {
+                            log(&format!("   缓存保存失败: {}", e));
+                        } else {
+                            log("   嵌入向量已缓存（下次启动秒加载）");
+                        }
+                    }
+                    Err(e) => {
+                        log(&format!("   索引警告: {}（部分文件可能无法检索）", e));
+                    }
+                }
+            }
+            Box::new(mgr)
+        } else {
+            // 默认镜像启动：Fast Match 立即可用，后台异步升级 Smart Match
+            log("   搜索模式: 镜像启动（Fast Match 立即可用，后台升级 Smart Match）");
+            log("   提示: 启动后搜索立即就绪，语义搜索在后台自动准备");
+            let mut mgr = CodeMemoryManager::new();
+            log(&format!("\n正在索引项目代码: {}...", src_dir));
+            match index_and_report(&mut mgr, &src_dir, &log) {
+                Ok(()) => {}
+                Err(e) => {
+                    log(&format!("   索引警告: {}（部分文件可能无法检索）", e));
+                }
+            }
+            Box::new(mgr)
+        }
     };
 
     #[cfg(not(feature = "ml"))]
     let manager: Box<dyn server::IndexedCodebase> = {
         log("   搜索模式: Fast Match（关键词匹配 · 零延迟 · 零依赖）");
         log("   适合按函数名/变量名查代码，日常开发首选");
-        Box::new(CodeMemoryManager::new())
+        let mut mgr = CodeMemoryManager::new();
+        log(&format!("\n正在索引项目代码: {}...", src_dir));
+        match index_and_report(&mut mgr, &src_dir, &log) {
+            Ok(()) => {}
+            Err(e) => {
+                log(&format!("   索引警告: {}（部分文件可能无法检索）", e));
+            }
+        }
+        Box::new(mgr)
     };
 
     let state = Arc::new(server::AppState {
@@ -225,46 +296,72 @@ async fn main() {
         llm_api: llm_api.clone(),
     });
 
-    // 后台异步索引项目代码（不阻塞 MCP 握手）
-    // IDE 启动进程后立即发送 initialize 请求，必须尽快响应
-    // 注意: 后台任务中的错误不应杀死进程，而是优雅降级
-    let index_state = state.clone();
-    let index_dir = src_dir.clone();
-    tokio::spawn(async move {
-        log(&format!("\n正在索引项目代码: {}（后台运行，不阻塞服务）", index_dir));
-
-        #[cfg(feature = "ml")]
-        let mut mgr = {
+    // 镜像启动：后台异步加载 Smart Match 模型并升级索引
+    #[cfg(feature = "ml")]
+    if mode != "fast" && mode != "smart" {
+        let upgrade_state = state.clone();
+        let upgrade_src = src_dir.clone();
+        let upgrade_data = data_dir.clone();
+        let is_stdio = stdio_mode;
+        tokio::spawn(async move {
+            let bg_log = |msg: &str| {
+                if is_stdio {
+                    eprintln!("{}", msg);
+                } else {
+                    println!("{}", msg);
+                }
+            };
+            bg_log("\n[后台] 正在加载 Smart Match 语义模型...");
             match code_memory::CodeBertEncoder::load() {
-                Ok(encoder) => CodeMemoryManager::with_encoder(Arc::new(encoder)),
+                Ok(encoder) => {
+                    bg_log("[后台] 模型加载成功，开始语义编码...");
+                    let mut smart_mgr = CodeMemoryManager::with_encoder(Arc::new(encoder));
+
+                    // 优先尝试加载缓存
+                    let cache_hit = smart_mgr.load_embedding_cache(&upgrade_data).is_some();
+                    if cache_hit {
+                        bg_log("[后台] ✓ 从缓存恢复语义索引（秒级加载）");
+                    } else {
+                        bg_log(&format!(
+                            "[后台] 正在语义编码项目代码: {}...",
+                            upgrade_src
+                        ));
+                        match smart_mgr.index_project(&upgrade_src) {
+                            Ok(_) => {
+                                // 保存缓存供下次启动使用
+                                if let Err(e) = smart_mgr.save_embedding_cache(&upgrade_data) {
+                                    bg_log(&format!("[后台] 缓存保存失败: {}", e));
+                                } else {
+                                    bg_log("[后台] 嵌入向量已缓存（下次启动秒加载）");
+                                }
+                            }
+                            Err(e) => {
+                                bg_log(&format!("[后台] 语义索引失败: {}（Fast Match 继续服务）", e));
+                                return;
+                            }
+                        }
+                    }
+
+                    // 原子替换 manager
+                    let mut locked = upgrade_state.manager.lock().await;
+                    *locked = Box::new(smart_mgr);
+                    bg_log("[后台] ✓ Smart Match 已就绪，搜索精度已提升");
+                }
                 Err(e) => {
-                    let msg = format!("   CodeBERT 模型加载失败: {}（使用空索引继续运行）", e);
-                    log(&msg);
-                    return;
+                    bg_log(&format!(
+                        "[后台] 模型加载失败: {}（Fast Match 继续服务，可用 --mode smart 重试）",
+                        e
+                    ));
                 }
             }
-        };
-        #[cfg(not(feature = "ml"))]
-        let mut mgr = CodeMemoryManager::new();
+        });
+    }
 
-        match index_and_report(&mut mgr, &index_dir, &log) {
-            Ok(()) => {
-                // 索引完成后原子替换 manager
-                let mut locked = index_state.manager.lock().await;
-                *locked = Box::new(mgr);
-            }
-            Err(e) => {
-                log(&format!("   后台索引暂停: {}（MCP 服务正常运行，代码检索将在索引完成后自动就绪）", e));
-            }
-        }
-    });
-
-    // 启动 MCP 服务（立即开始监听，不等待索引完成）
+    // 启动 MCP 服务（索引已完成，搜索立即可用）
     if stdio_mode {
         log("\nMCP Stdio 模式启动（通过 stdin/stdout 通信）");
         server::run_stdio(state).await;
     } else {
-        // HTTP 模式也先启动服务，后台索引
         log("\nMCP HTTP 模式启动中...");
         if let Err(e) = server::serve(state, &host, port).await {
             eprintln!("服务启动失败: {}", e);
@@ -319,6 +416,7 @@ fn print_help() {
     println!("  --db-path <路径>    自定义记忆数据存储路径（优先级最高）");
     println!("  --llm-api <配置>    配置 LLM 查询翻译（可选，不配就用 Fast Match）");
     println!("  --proxy <代理地址>    HTTP/HTTPS 代理（如 http://127.0.0.1:7890）");
+    println!("  --mode <模式>        搜索模式: auto(默认) | fast(秒启动) | smart(语义)");
     println!("  --help, -h          显示此帮助信息");
     println!();
     println!("举个栗子:");
@@ -327,6 +425,9 @@ fn print_help() {
     println!();
     println!("  # HTTP 模式调试（看日志、测 API）");
     println!("  code-memory-server --src-dir ./src --port 3099");
+    println!();
+    println!("  # 快速模式：跳过模型下载，秒启动");
+    println!("  code-memory-server --src-dir ./src --port 3099 --mode fast");
     println!();
     println!("  # 全局记忆，跨项目共享偏好和知识");
     println!("  code-memory-server --global --stdio");

@@ -1,0 +1,100 @@
+# ============================================================
+# Loong Recall (L-RC / 忆) — Docker Compose
+# ============================================================
+# 生产级部署编排
+# 基于 6.3.md Phase 2: 查询增强集成
+# ============================================================
+
+version: "3.8"
+
+services:
+  # ---- Loong Recall 主服务 ----
+  loong-recall:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: loong-recall:latest
+    container_name: loong-recall
+    restart: unless-stopped
+    ports:
+      - "${LRC_PORT:-3099}:3099"
+    environment:
+      - LRC_HOST=0.0.0.0
+      - LRC_PORT=3099
+      - LRC_MODE=${LRC_MODE:-fast}
+      # LLM API 配置（可选，用于查询翻译增强）
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_API_BASE=${LLM_API_BASE:-}
+      - LLM_API_MODEL=${LLM_API_MODEL:-}
+    volumes:
+      # 持久化数据目录
+      - loong-data:/app/.loong-recall
+      # 代码库目录（只读，用于索引）
+      - ${CODE_SRC_DIR:-./data}:/app/data:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3099/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    networks:
+      - loong-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---- 可选：PostgreSQL（Phase 3 持久化后端） ----
+  # 启用方式: docker-compose --profile db up
+  postgres:
+    image: postgres:16-alpine
+    container_name: loong-postgres
+    restart: unless-stopped
+    profiles:
+      - db
+    environment:
+      POSTGRES_USER: loong
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-loong_recall_2024}
+      POSTGRES_DB: loong_recall
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks:
+      - loong-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loong -d loong_recall"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- 可选：Qdrant 向量数据库（Phase 3 语义检索后端） ----
+  # 启用方式: docker-compose --profile vector up
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: loong-qdrant
+    restart: unless-stopped
+    profiles:
+      - vector
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - loong-net
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+
+volumes:
+  loong-data:
+    driver: local
+  pg-data:
+    driver: local
+  qdrant-data:
+    driver: local
+
+networks:
+  loong-net:
+    driver: bridge

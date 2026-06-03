@@ -23,7 +23,7 @@
 ```bash
 git clone https://github.com/zhibaiYingChuan/LRC.git
 # 国内用户如遇 GitHub 下载缓慢，可使用镜像：
-# git clone https://hub.nuaa.cf/zhibaiYingChuan/LRC.git
+# git clone https://gitcode.com/gcw_M73FIiUo/LRC
 cd LRC
 cargo build --release --features server
 ```
