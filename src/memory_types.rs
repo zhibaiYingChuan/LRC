@@ -12,6 +12,60 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+/// 衰减曲线配置（Section 3.3 衰减与遗忘 — 可配置参数）
+///
+/// 控制记忆衰减行为的两大参数：
+/// - `decay_rate`: 时间衰减速度（默认 0.05），越大衰减越快
+/// - `topo_weight`: 拓扑深度影响权重（默认 0.3），越大拓扑位置影响越大
+///
+/// 最终衰减因子 = 时间衰减(e^(-decay_rate × days / importance)) × 拓扑保护(1.0 - topological_depth × topo_weight)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecayConfig {
+    /// 时间衰减速率（0.0 ~ 1.0），默认 0.05
+    /// 值越大，记忆随时间衰减越快
+    pub decay_rate: f32,
+    /// 拓扑深度衰减权重（0.0 ~ 1.0），默认 0.3
+    /// 值越大，九宫格边缘位置的记忆衰减越快
+    pub topo_weight: f32,
+}
+
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self {
+            decay_rate: 0.05,
+            topo_weight: 0.3,
+        }
+    }
+}
+
+impl DecayConfig {
+    /// 创建衰减配置（自动 clamp 到合法范围）
+    pub fn new(decay_rate: f32, topo_weight: f32) -> Self {
+        Self {
+            decay_rate: decay_rate.clamp(0.0, 1.0),
+            topo_weight: topo_weight.clamp(0.0, 1.0),
+        }
+    }
+
+    /// 激进衰减模式：记忆快速衰减，适合存储空间有限的场景
+    /// decay_rate=0.15, topo_weight=0.5
+    pub fn aggressive() -> Self {
+        Self {
+            decay_rate: 0.15,
+            topo_weight: 0.5,
+        }
+    }
+
+    /// 保守衰减模式：记忆长期保留，适合知识管理场景
+    /// decay_rate=0.01, topo_weight=0.1
+    pub fn conservative() -> Self {
+        Self {
+            decay_rate: 0.01,
+            topo_weight: 0.1,
+        }
+    }
+}
+
 /// 记忆类型枚举
 ///
 /// 不同记忆类型影响存储策略和检索优先级。
@@ -28,6 +82,8 @@ pub enum MemoryType {
     CodeContext,
     /// 对话 — 对话轮次中提炼的关键信息
     Conversation,
+    /// 合成 — 递归合成产生的抽象知识（多条相关记忆的融合结果）
+    Synthesis,
 }
 
 impl MemoryType {
@@ -46,12 +102,13 @@ impl MemoryType {
             Self::Decision => "decision",
             Self::CodeContext => "code_context",
             Self::Conversation => "conversation",
+            Self::Synthesis => "synthesis",
         }
     }
 
     /// 列出所有有效的类型字符串
     pub fn valid_values() -> &'static [&'static str] {
-        &["fact", "preference", "decision", "code_context", "conversation"]
+        &["fact", "preference", "decision", "code_context", "conversation", "synthesis"]
     }
 }
 
@@ -65,6 +122,7 @@ impl FromStr for MemoryType {
             "decision" => Ok(Self::Decision),
             "code_context" | "codecontext" => Ok(Self::CodeContext),
             "conversation" => Ok(Self::Conversation),
+            "synthesis" => Ok(Self::Synthesis),
             _ => Err(format!("无效的记忆类型: '{}'，有效值: {:?}", s, Self::valid_values())),
         }
     }
@@ -118,6 +176,40 @@ impl From<u8> for Importance {
     }
 }
 
+/// 隐私权限级别（Section 3.3 隐私与权限）
+///
+/// 支持三级隔离：Session 级、User 级、Global 级。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivacyLevel {
+    /// Session 级：仅当前会话可见，会话结束后自动隔离
+    Session,
+    /// User 级：同一用户的所有会话共享
+    #[default]
+    User,
+    /// Global 级：所有用户可见的全局知识
+    Global,
+}
+
+impl PrivacyLevel {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Session => "session",
+            Self::User => "user",
+            Self::Global => "global",
+        }
+    }
+
+    pub fn try_parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "session" => Some(Self::Session),
+            "user" => Some(Self::User),
+            "global" => Some(Self::Global),
+            _ => None,
+        }
+    }
+}
+
 /// 通用记忆项
 ///
 /// 这是面向 AI 助手的通用永久记忆单元，不局限于代码。
@@ -150,6 +242,57 @@ pub struct Memory {
     /// 记忆来源（如 "mcp_client", "code_indexer"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// 合成来源记忆 ID 列表（仅 Synthesis 类型，递归合成时记录源记忆）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_ids: Vec<String>,
+    /// 合成置信度（0.0 ~ 1.0，仅 Synthesis 类型）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+    /// 洛书 9 维坐标向量（序列化为 JSON 数组）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub luoshu_vector: Option<[f32; 9]>,
+    /// 先天八卦分类索引（0-7，由 MirrorProject 自动判定）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bagua_index: Option<u8>,
+    /// 先天八卦分类名称
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bagua_category: Option<String>,
+    /// 隐私权限级别（Session/User/Global，默认 User）
+    #[serde(default)]
+    pub privacy_level: PrivacyLevel,
+    /// 会话 ID（privacy_level=Session 时必填，用于隔离作用域）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// 用户 ID（privacy_level=User/Global 时用于用户级隔离）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// 拓扑深度（0.0 ~ 1.0，0.0=九宫格中心/永久，1.0=边缘/快速衰减）
+    /// 由洛书编码器自动计算：九宫格位置越靠近中心（太极），深度越小，衰减越慢
+    #[serde(default = "default_topological_depth")]
+    pub topological_depth: f32,
+    /// 版本号（用于冲突解决追踪，每次修正 +1）
+    #[serde(default)]
+    pub version: u32,
+    /// 历史版本内容列表（仅保留最近 5 个版本，用于版本回溯）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub version_history: Vec<MemoryVersion>,
+}
+
+/// 记忆版本快照（用于版本回溯）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryVersion {
+    /// 版本号
+    pub version: u32,
+    /// 该版本的内容
+    pub content: String,
+    /// 更新时间
+    pub updated_at: DateTime<Utc>,
+    /// 变更原因（如 "用户修正: 信息已过时"）
+    pub reason: Option<String>,
+}
+
+fn default_topological_depth() -> f32 {
+    0.5 // 默认中等深度
 }
 
 impl Memory {
@@ -176,12 +319,42 @@ impl Memory {
             updated_at: now,
             last_accessed: now,
             source: None,
+            source_ids: Vec::new(),
+            confidence: None,
+            luoshu_vector: None,
+            bagua_index: None,
+            bagua_category: None,
+            privacy_level: PrivacyLevel::default(),
+            session_id: None,
+            user_id: None,
+            topological_depth: default_topological_depth(),
+            version: 1,
+            version_history: Vec::new(),
         }
     }
 
     /// 设置记忆来源
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    /// 设置隐私权限
+    pub fn with_privacy(
+        mut self,
+        level: PrivacyLevel,
+        session_id: Option<String>,
+        user_id: Option<String>,
+    ) -> Self {
+        self.privacy_level = level;
+        self.session_id = session_id;
+        self.user_id = user_id;
+        self
+    }
+
+    /// 设置拓扑深度（由洛书编码器在 remember 时自动计算）
+    pub fn with_topological_depth(mut self, depth: f32) -> Self {
+        self.topological_depth = depth.clamp(0.0, 1.0);
         self
     }
 
@@ -203,9 +376,34 @@ impl Memory {
         self.last_accessed = Utc::now();
     }
 
-    /// 更新内容
+    /// 更新内容（自动增加版本号并保存历史版本）
     pub fn update_content(&mut self, new_content: String) {
-        self.content = new_content;
+        // 保存当前版本到历史
+        if self.version_history.len() >= 5 {
+            self.version_history.remove(0); // 只保留最近 5 个版本
+        }
+        self.version_history.push(MemoryVersion {
+            version: self.version,
+            content: std::mem::replace(&mut self.content, new_content),
+            updated_at: self.updated_at,
+            reason: None,
+        });
+        self.version += 1;
+        self.updated_at = Utc::now();
+    }
+
+    /// 更新内容并记录原因（用于用户修正场景）
+    pub fn update_content_with_reason(&mut self, new_content: String, reason: String) {
+        if self.version_history.len() >= 5 {
+            self.version_history.remove(0);
+        }
+        self.version_history.push(MemoryVersion {
+            version: self.version,
+            content: std::mem::replace(&mut self.content, new_content),
+            updated_at: self.updated_at,
+            reason: Some(reason),
+        });
+        self.version += 1;
         self.updated_at = Utc::now();
     }
 
@@ -222,40 +420,66 @@ impl Memory {
         self.last_accessed = now;
     }
 
-    /// 计算记忆衰减因子（0.0 ~ 1.0）
+    /// 计算记忆衰减因子（0.0 ~ 1.0），使用默认衰减配置
     ///
-    /// 基于指数衰减模型：`e^(-DECAY_RATE * days_since_access / importance)`
-    ///
-    /// - 重要性越高，衰减越慢（importance=10 几乎不衰减）
-    /// - 距上次访问越久，衰减越严重
-    /// - 返回 1.0 表示无衰减，0.0 表示完全衰减
-    ///
-    /// 常数值：
-    /// - DECAY_RATE = 0.05（控制整体衰减速度）
-    ///   * importance=5, 1天后衰减约 1%
-    ///   * importance=5, 30天后衰减约 26%
-    ///   * importance=1, 30天后衰减约 78%
+    /// 基于双重衰减模型，详见 `decay_factor_with_config`。
     pub fn decay_factor(&self) -> f32 {
-        const DECAY_RATE: f64 = 0.05;
+        self.decay_factor_with_config(&DecayConfig::default())
+    }
+
+    /// 计算记忆衰减因子（0.0 ~ 1.0），使用自定义衰减配置
+    ///
+    /// 基于双重衰减模型：
+    ///
+    /// 1. **时间衰减**: `e^(-decay_rate * days_since_access / importance)`
+    ///    - 重要性越高，衰减越慢（importance=10 几乎不衰减）
+    ///    - 距上次访问越久，衰减越严重
+    ///
+    /// 2. **拓扑深度衰减** (Section 3.3 衰减与遗忘):
+    ///    - 九宫格中心（太极位，topological_depth ≈ 0）为永久记忆，几乎不衰减
+    ///    - 九宫格边缘（topological_depth ≈ 1）快速衰减
+    ///    - 合成因子: `1.0 - topological_depth * topo_weight`
+    ///
+    /// 最终衰减因子 = 时间衰减 × 拓扑保护
+    ///
+    /// 参数可通过 `DecayConfig` 配置：
+    /// - `decay_rate`: 时间衰减速度（默认 0.05），越大衰减越快
+    /// - `topo_weight`: 拓扑深度影响程度（默认 0.3），越大拓扑影响越大
+    ///   * 中心节点(depth=0): 保护因子=1.0，完全不受拓扑影响
+    ///   * 边缘节点(depth=1): 保护因子=1.0-topo_weight，受拓扑衰减
+    pub fn decay_factor_with_config(&self, config: &DecayConfig) -> f32 {
+        // 时间衰减分量
         let now = Utc::now();
         let hours_since = (now - self.last_accessed).num_hours() as f64;
         let days_since = hours_since / 24.0;
 
-        if days_since <= 0.0 {
-            return 1.0;
-        }
+        let time_factor = if days_since <= 0.0 {
+            1.0
+        } else {
+            let importance = self.importance.value() as f64;
+            let decay_rate = config.decay_rate as f64;
+            let exponent = -decay_rate * days_since / importance;
+            exponent.exp() as f32
+        };
 
-        let importance = self.importance.value() as f64;
-        let exponent = -DECAY_RATE * days_since / importance;
-        let factor = exponent.exp();
-        factor.clamp(0.0, 1.0) as f32
+        // 拓扑保护因子：中心节点受保护，边缘节点加速衰减
+        let topo_protection = 1.0 - self.topological_depth * config.topo_weight;
+
+        // 合成衰减因子
+        let factor = time_factor * topo_protection;
+        factor.clamp(0.0, 1.0)
     }
 
-    /// 计算衰减后的重要性分值
+    /// 计算衰减后的重要性分值（使用默认衰减配置）
     ///
     /// `importance * decay_factor`，用于检索排序。
     pub fn decayed_importance(&self) -> f32 {
-        self.importance.value() as f32 * self.decay_factor()
+        self.decayed_importance_with_config(&DecayConfig::default())
+    }
+
+    /// 计算衰减后的重要性分值（使用自定义衰减配置）
+    pub fn decayed_importance_with_config(&self, config: &DecayConfig) -> f32 {
+        self.importance.value() as f32 * self.decay_factor_with_config(config)
     }
 
     /// 生成简洁的描述行
@@ -266,6 +490,7 @@ impl Memory {
             MemoryType::Decision => "[决策]",
             MemoryType::CodeContext => "[代码]",
             MemoryType::Conversation => "[对话]",
+            MemoryType::Synthesis => "[合成]",
         };
         let content_preview: String = self
             .content
@@ -427,7 +652,8 @@ mod tests {
 
     #[test]
     fn test_decay_factor_fresh() {
-        // 刚创建的记忆衰减因子应为 1.0（完全不衰减）
+        // 刚创建的记忆，拓扑深度默认 0.5
+        // 衰减因子 = 时间衰减(1.0) × 拓扑保护(1.0 - 0.5*0.3 = 0.85) = 0.85
         let m = Memory::new(
             "测试".to_string(),
             MemoryType::Fact,
@@ -437,7 +663,8 @@ mod tests {
             None,
         );
         let factor = m.decay_factor();
-        assert!((factor - 1.0).abs() < 0.01, "新鲜记忆不应衰减: {}", factor);
+        // 新鲜记忆因拓扑深度默认为 0.5，衰减因子应为 0.85
+        assert!((factor - 0.85).abs() < 0.01, "新鲜记忆默认拓扑深度 0.5，衰减因子 ≈ 0.85: {}", factor);
     }
 
     #[test]

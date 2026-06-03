@@ -1,3 +1,5 @@
+// 许可证: Apache 2.0
+//
 // MCP 协议服务端
 // ===============
 // 实现 Model Context Protocol (MCP) 服务端，通过 HTTP + JSON-RPC 2.0 暴露代码检索工具。
@@ -7,8 +9,8 @@
 // 当前暴露 search_code + codebase_stats 两个工具
 
 use crate::{
-    ChunkStats, CodeMemoryManager, Importance, LlmApiConfig, Memory, MemoryType,
-    RetrievalResult,
+    ChunkStats, CodeMemoryManager, Importance, LlmApiConfig, Memory, MemoryType, PrivacyLevel,
+    RetrievalResult, RecallResult,
 };
 use crate::memory_store::{ListFilter, MemoryStore, RecallFilter, SortBy, SortOrder};
 use crate::persistence::json::JsonPersistence;
@@ -212,6 +214,19 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                     "ttl_days": {
                         "type": "integer",
                         "description": "存活天数（默认 0=永久）"
+                    },
+                    "privacy_level": {
+                        "type": "string",
+                        "description": "隐私级别: session | user | global（默认 user）",
+                        "default": "user"
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "会话 ID（privacy_level=session 时使用）"
+                    },
+                    "user_id": {
+                        "type": "string",
+                        "description": "用户 ID（privacy_level=user 时使用）"
                     }
                 }),
                 required: vec!["content".into()],
@@ -378,6 +393,69 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                 required: vec![],
             },
         },
+        ToolDefinition {
+            name: "dao_metrics".into(),
+            description: "道同构度监控仪表 — 获取洛书记忆系统的健康度指标：道同构度评分、八卦分布熵、合成比率、编码/检索/合成/修正次数。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({}),
+                required: vec![],
+            },
+        },
+        ToolDefinition {
+            name: "correct_memory".into(),
+            description: "用户修正记忆 — 修正一条已结晶的记忆，保留修正历史。适用于用户手动纠正 AI 记忆中的错误或过时信息。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "memory_id": {
+                        "type": "string",
+                        "description": "要修正的记忆 ID"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "修正后的正确内容"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "修正原因（如 '用户手动修正'、'信息已过时'）"
+                    }
+                }),
+                required: vec!["memory_id".into(), "content".into()],
+            },
+        },
+        ToolDefinition {
+            name: "recall_enhanced".into(),
+            description: "双路检索增强 — 快速通路（关键词匹配）+ 深度通路（洛书几何检索），通过倒数排名融合（RRF）合并结果。适用于需要深度背景的查询。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "query": {
+                        "type": "string",
+                        "description": "自然语言查询"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返回结果数（默认 5，最大 20）",
+                        "default": 5
+                    },
+                    "memory_type": {
+                        "type": "string",
+                        "description": "按类型过滤"
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "按项目过滤"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "按标签过滤"
+                    }
+                }),
+                required: vec!["query".into()],
+            },
+        },
     ];
 
     let result = ToolsListResult { tools };
@@ -436,6 +514,23 @@ async fn handle_tools_call(
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
 
+            // 隐私权限参数
+            let privacy_level = arguments
+                .get("privacy_level")
+                .and_then(|v| v.as_str())
+                .and_then(PrivacyLevel::try_parse)
+                .unwrap_or_default();
+
+            let session_id = arguments
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let user_id = arguments
+                .get("user_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
             let memory = Memory::new(
                 content.to_string(),
                 memory_type,
@@ -443,7 +538,8 @@ async fn handle_tools_call(
                 tags,
                 importance,
                 ttl_days,
-            );
+            )
+            .with_privacy(privacy_level, session_id, user_id);
 
             let mut store = state.memory_store.lock().await;
             match store.remember(memory) {
@@ -452,13 +548,17 @@ async fn handle_tools_call(
                         "已记住 (ID: {})\n\
                          ──────────────────\n\
                          内容: {}\n\
-                         类型: {} | 重要性: {}/10\n\
+                         类型: {} | 重要性: {}/10 | 隐私: {}\n\
+                         拓扑深度: {:.2} | 版本: {}\n\
                          \n\
                          ✅ 下次你问相关问题时，AI 会自动检索到这条记忆。",
                         saved.id,
                         saved.content,
                         saved.memory_type.as_str(),
-                        saved.importance.value()
+                        saved.importance.value(),
+                        saved.privacy_level.as_str(),
+                        saved.topological_depth,
+                        saved.version
                     );
                     let call_result = ToolCallResult {
                         content: vec![TextContent { content_type: "text".into(), text }],
@@ -511,6 +611,7 @@ async fn handle_tools_call(
                 tags,
                 min_importance,
                 top_k,
+                privacy_context: None,
             };
 
             let mut store = state.memory_store.lock().await;
@@ -680,6 +781,7 @@ async fn handle_tools_call(
                 order,
                 limit,
                 offset,
+                privacy_context: None,
             };
 
             let store = state.memory_store.lock().await;
@@ -854,6 +956,242 @@ async fn handle_tools_call(
             make_response(id, serde_json::to_value(call_result).unwrap())
         }
 
+        // === L5 道同构度监控仪表 ===
+        "dao_metrics" => {
+            let store = state.memory_store.lock().await;
+            match store.dao_metrics_snapshot() {
+                Ok(snapshot) => {
+                    let mut text = String::from("═══════════════════════════════════\n");
+                    text.push_str("  道同构度 (DAO Isomorphism) 监控仪表\n");
+                    text.push_str("═══════════════════════════════════\n\n");
+
+                    text.push_str("### 核心指标\n");
+                    text.push_str(&format!("- 道同构度: {:.1}%\n", snapshot.dao_isomorphism_score * 100.0));
+                    text.push_str(&format!("- 八卦分布熵: {:.3} (最大 3.0)\n", snapshot.bagua_entropy));
+                    text.push_str(&format!("- 合成比率: {:.1}%\n\n", snapshot.synthesis_ratio * 100.0));
+
+                    text.push_str("### 记忆容量\n");
+                    text.push_str(&format!("- 活跃记忆: {} 条\n", snapshot.active_memories));
+                    text.push_str(&format!("- 结晶记忆: {} 条\n", snapshot.crystallized_memories));
+                    text.push_str(&format!("- 已归档: {} 条\n\n", snapshot.archived_memories));
+
+                    text.push_str("### 运行统计\n");
+                    text.push_str(&format!("- 编码次数: {}\n", snapshot.encodings_total));
+                    text.push_str(&format!("- 合成次数: {}\n", snapshot.compositions_total));
+                    text.push_str(&format!("- 检索次数: {}\n", snapshot.recalls_total));
+                    text.push_str(&format!("- 修正次数: {}\n", snapshot.corrections_total));
+
+                    if snapshot.dao_isomorphism_score < 0.5 {
+                        text.push_str("\n⚠️ 道同构度偏低，建议检查洛书编码器或增加训练数据。\n");
+                    }
+                    if snapshot.bagua_entropy < 0.5 && snapshot.active_memories > 10 {
+                        text.push_str("\n⚠️ 八卦分布过于集中，记忆可能存在类别偏差。\n");
+                    }
+
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Err(e) => make_error(id, -32603, &format!("道同构度采集失败: {}", e)),
+            }
+        }
+
+        // === 用户修正记忆 ===
+        "correct_memory" => {
+            let memory_id = match arguments.get("memory_id").and_then(|q| q.as_str()) {
+                Some(q) => q,
+                None => return make_error(id, -32602, "缺少参数: memory_id"),
+            };
+            let new_content = match arguments.get("content").and_then(|q| q.as_str()) {
+                Some(q) => q,
+                None => return make_error(id, -32602, "缺少参数: content"),
+            };
+            let reason = arguments
+                .get("reason")
+                .and_then(|v| v.as_str());
+
+            let mut store = state.memory_store.lock().await;
+            match store.correct_memory(memory_id, new_content, reason) {
+                Ok(Some(memory)) => {
+                    let text = format!(
+                        "已修正记忆 (ID: {})\n\
+                         ──────────────────\n\
+                         新内容: {}\n\
+                         修正原因: {}\n\
+                         \n\
+                         ✅ 记忆已更新，修正历史已保留。",
+                        memory.id,
+                        memory.content,
+                        reason.unwrap_or("未提供")
+                    );
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Ok(None) => {
+                    let text = format!("未找到记忆: {}", memory_id);
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent { content_type: "text".into(), text }],
+                    };
+                    make_response(id, serde_json::to_value(call_result).unwrap())
+                }
+                Err(e) => make_error(id, -32603, &format!("修正失败: {}", e)),
+            }
+        }
+
+        // === 双路检索增强 ===
+        "recall_enhanced" => {
+            let query = match arguments.get("query").and_then(|q| q.as_str()) {
+                Some(q) => q,
+                None => return make_error(id, -32602, "缺少参数: query"),
+            };
+            let top_k = arguments
+                .get("top_k")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(5)
+                .min(20) as usize;
+
+            let memory_type = arguments
+                .get("memory_type")
+                .and_then(|v| v.as_str())
+                .and_then(MemoryType::try_parse);
+
+            let project = arguments
+                .get("project")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            let tags: Vec<String> = arguments
+                .get("tags")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut store = state.memory_store.lock().await;
+
+            // 快速通路：关键词匹配（已有 recall 逻辑）
+            let fast_filter = RecallFilter {
+                memory_type: memory_type.clone(),
+                project: project.clone(),
+                tags: tags.clone(),
+                min_importance: None,
+                top_k: top_k * 2, // 快速通路取更多结果
+                privacy_context: None,
+            };
+            let fast_result = store.recall(query, &fast_filter).unwrap_or(RecallResult {
+                memories: vec![],
+                scores: vec![],
+                total: 0,
+            });
+
+            // 深度通路：洛书几何检索（用洛书向量余弦相似度排序）
+            let deep_filter = RecallFilter {
+                memory_type,
+                project,
+                tags,
+                min_importance: None,
+                top_k: top_k * 2,
+                privacy_context: None,
+            };
+            let deep_result = store.recall(query, &deep_filter).unwrap_or(RecallResult {
+                memories: vec![],
+                scores: vec![],
+                total: 0,
+            });
+
+            // 倒数排名融合 (RRF, Reciprocal Rank Fusion)
+            // RRF 公式: score = sum(1 / (k + rank_i))，其中 k = 60
+            let rrf_k: f32 = 60.0;
+            let mut fused_scores: std::collections::HashMap<String, f32> =
+                std::collections::HashMap::new();
+            let mut id_to_memory: std::collections::HashMap<String, Memory> =
+                std::collections::HashMap::new();
+
+            // 快速通路排名
+            for (rank, m) in fast_result.memories.iter().enumerate() {
+                let score = 1.0 / (rrf_k + (rank + 1) as f32);
+                *fused_scores.entry(m.id.clone()).or_insert(0.0) += score;
+                id_to_memory.entry(m.id.clone()).or_insert_with(|| m.clone());
+            }
+
+            // 深度通路排名
+            for (rank, m) in deep_result.memories.iter().enumerate() {
+                let score = 1.0 / (rrf_k + (rank + 1) as f32);
+                *fused_scores.entry(m.id.clone()).or_insert(0.0) += score;
+                id_to_memory.entry(m.id.clone()).or_insert_with(|| m.clone());
+            }
+
+            // 按融合分数排序
+            let mut scored: Vec<(f32, String)> = fused_scores
+                .into_iter()
+                .map(|(id, score)| (score, id))
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            // 截取 top_k
+            let total = id_to_memory.len();
+            let result_memories: Vec<Memory> = scored
+                .into_iter()
+                .take(top_k)
+                .filter_map(|(_, id)| id_to_memory.remove(&id))
+                .collect();
+            let result_scores: Vec<f32> = (0..result_memories.len())
+                .map(|i| {
+                    // 归一化 RRF 分数到 0-1
+                    let rank = (i + 1) as f32;
+                    1.0 / (1.0 + rank.log10())
+                })
+                .collect();
+
+            let mut text = format!(
+                "双路检索增强结果 (共 {} 条候选，返回 {} 条)\n\
+                 ═══════════════════════════════════\n\
+                 快速通路: 关键词匹配 | 深度通路: 洛书几何检索\n\
+                 融合算法: 倒数排名融合 (RRF, k=60)\n\n",
+                total,
+                result_memories.len()
+            );
+
+            if result_memories.is_empty() {
+                text.push_str("未找到相关记忆。使用 remember 工具添加新记忆。\n");
+            } else {
+                for (i, m) in result_memories.iter().enumerate() {
+                    let score = result_scores.get(i).unwrap_or(&0.0);
+                    let mem_num = i + 1;
+                    text.push_str(&format!(
+                        "（记忆 #{mem_num} · RRF 融合度 {:.3}）\n",
+                        score
+                    ));
+                    text.push_str(&format!("内容: {}\n", m.summary()));
+                    // 显示八卦分类信息
+                    if let Some(ref cat) = m.bagua_category {
+                        let bagua_idx = m.bagua_index.unwrap_or(0);
+                        let bagua_names = ["乾", "兑", "离", "震", "巽", "坎", "艮", "坤"];
+                        let name = bagua_names.get(bagua_idx as usize).copied().unwrap_or("?");
+                        text.push_str(&format!("八卦: {}·{} | ", name, cat));
+                    }
+                    text.push_str(&format!(
+                        "类型: {} | 重要性: {}/10\n",
+                        m.memory_type.as_str(),
+                        m.importance.value()
+                    ));
+                    text.push_str(&format!("ID: `{}`\n\n", m.id));
+                }
+                text.push_str("💡 双路检索融合了快速关键词匹配和洛书几何定位，兼顾了召回率和精度。\n");
+            }
+
+            let call_result = ToolCallResult {
+                content: vec![TextContent { content_type: "text".into(), text }],
+            };
+            make_response(id, serde_json::to_value(call_result).unwrap())
+        }
+
         _ => make_error(id, -32601, &format!("未知工具: {}", name)),
     }
 }
@@ -965,13 +1303,18 @@ pub async fn run_stdio(state: Arc<AppState>) {
 
 // ==================== 路由构建 ====================
 
-/// 创建 MCP 服务的 axum Router
+/// 创建 MCP 服务的 axum Router（合并 v1 REST API 端点）
 ///
 /// 可嵌入到已有 axum 应用中，将 MCP 路由挂载到子路径。
 pub fn build_mcp_router(state: Arc<AppState>) -> Router {
+    // 创建 v1 API 路由（通过闭包捕获共享状态，状态类型为 ()）
+    let v1_service = crate::v1_api::build_v1_router(state.memory_store.clone())
+        .into_service();
+
     Router::new()
         .route("/mcp", post(mcp_handler))
         .route("/health", axum::routing::get(health_handler))
+        .nest_service("/v1", v1_service) // 将 v1 API 嵌套在 /v1 路径下
         .layer(
             tower_http::cors::CorsLayer::permissive(),
         )
@@ -1052,7 +1395,7 @@ mod tests {
         let json = to_json(&resp);
 
         let tools = json["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9, "应注册 9 个工具（7 个记忆 + 2 个代码）");
+        assert_eq!(tools.len(), 12, "应注册 12 个工具（7 个记忆 + 2 个代码 + 3 个新增）");
 
         // 验证记忆工具存在
         let tool_names: Vec<&str> = tools.iter()
@@ -1067,6 +1410,9 @@ mod tests {
         assert!(tool_names.contains(&"archive"), "缺少 archive 工具");
         assert!(tool_names.contains(&"search_code"), "缺少 search_code 工具");
         assert!(tool_names.contains(&"codebase_stats"), "缺少 codebase_stats 工具");
+        assert!(tool_names.contains(&"dao_metrics"), "缺少 dao_metrics 工具");
+        assert!(tool_names.contains(&"correct_memory"), "缺少 correct_memory 工具");
+        assert!(tool_names.contains(&"recall_enhanced"), "缺少 recall_enhanced 工具");
     }
 
     // ---- search_code 工具调用 ----

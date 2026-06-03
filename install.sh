@@ -19,25 +19,24 @@ if ! command -v cargo &> /dev/null; then
     exit 1
 fi
 
-# 2. 编译项目
-echo "[1/3] 正在编译 Loong Recall（首次编译约 2-5 分钟）..."
+# 2. 编译项目（默认 fast 模式，零外部依赖）
+echo "[1/3] 正在编译 Loong Recall（首次编译约 5-10 分钟）..."
+echo "   默认 zero-dependency 模式，无需下载模型"
 cargo build --release --features server
 
 SERVER_PATH="$SCRIPT_DIR/target/release/code-memory-server"
 SRC_DIR="$SCRIPT_DIR/src"
 echo "编译完成！"
 
-# 3. 模型下载指引（Smart Match 模式需要）
+# 3. Smart Match 增强模式说明（可选）
 echo ""
-echo "[提示] 如果使用 Smart Match 模式（语义搜索），首次启动需要下载模型。"
-echo "自动使用国内镜像 hf-mirror.com，约 500MB。"
+echo "[可选] 如需更高精度的语义搜索，可启用 ML 模式："
+echo "  cargo build --release --features server,ml"
+echo "  启用后首次运行会自动下载约 500MB 模型文件。"
+echo "  国内用户可设环境变量 HF_ENDPOINT=https://hf-mirror.com 加速。"
 echo ""
-echo "如果下载缓慢，可手动下载模型放到 models/ 目录："
-echo "  1. 访问 https://hf-mirror.com/microsoft/graphcodebert-base"
-echo "  2. 下载所有文件到: $SCRIPT_DIR/models/microsoft--graphcodebert-base/"
-echo "  3. 重启服务即可（LRC 自动优先加载本地模型）"
-echo ""
-echo "如果使用代理，启动时添加 --proxy http://127.0.0.1:端口"
+echo "  当前已编译为 fast 模式（词向量编码），可直接使用："
+echo "    \"$SERVER_PATH\" --mode fast --src-dir <项目路径>"
 echo ""
 
 # 4. 查找可用的 IDE 并配置 MCP
@@ -87,28 +86,28 @@ EOF
     fi
 }
 
-# 3a. Trae
+# 4a. Trae
 if [ -d "$HOME/Library/Application Support/Trae" ]; then
     config_ide "Trae" "$HOME/Library/Application Support/Trae/User/mcp.json"
 elif [ -d "$HOME/.config/Trae" ]; then
     config_ide "Trae" "$HOME/.config/Trae/User/mcp.json"
 fi
 
-# 3b. Trae CN
+# 4b. Trae CN
 if [ -d "$HOME/Library/Application Support/Trae CN" ]; then
     config_ide "Trae CN" "$HOME/Library/Application Support/Trae CN/User/mcp.json"
 elif [ -d "$HOME/.config/Trae CN" ]; then
     config_ide "Trae CN" "$HOME/.config/Trae CN/User/mcp.json"
 fi
 
-# 3c. Cursor
+# 4c. Cursor
 if [ -d "$HOME/Library/Application Support/Cursor" ]; then
     config_ide "Cursor" "$HOME/Library/Application Support/Cursor/mcp.json"
 elif [ -d "$HOME/.config/Cursor" ]; then
     config_ide "Cursor" "$HOME/.config/Cursor/mcp.json"
 fi
 
-# 3d. VS Code
+# 4d. VS Code
 if [ -d "$HOME/Library/Application Support/Code" ]; then
     config_ide "VS Code" "$HOME/Library/Application Support/Code/User/mcp.json"
 elif [ -d "$HOME/.config/Code" ]; then
