@@ -24,10 +24,42 @@ set "SCRIPT_DIR=%~dp0"
 set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 cd /d "%SCRIPT_DIR%"
 
-REM 3. 编译项目（默认 fast 模式，零外部依赖）
-echo [1/3] 正在编译 Loong Recall（首次编译约 5-10 分钟）...
-echo   默认 zero-dependency 模式，无需下载模型
-cargo build --release --features server
+REM 2.5 解析命令行参数
+set "WITH_MODELS=0"
+:parse_args
+if "%~1"=="" goto :end_parse
+if /i "%~1"=="--with-models" (
+    set "WITH_MODELS=1"
+) else if /i "%~1"=="-m" (
+    set "WITH_MODELS=1"
+) else (
+    echo 未知参数: %~1
+    echo 用法: install.bat [--with-models]
+    echo   --with-models, -m  编译 ML 增强模式并预下载语义模型
+    exit /b 1
+)
+shift
+goto :parse_args
+:end_parse
+
+REM 3. 编译项目
+if %WITH_MODELS% equ 1 (
+    echo [1/3] 正在编译 Loong Recall（ML 语义增强模式）...
+    echo   包含 ML 模型支持，首次运行会自动下载约 500MB 模型
+    echo   国内用户已自动配置 HF_ENDPOINT=https://hf-mirror.com 镜像加速
+    cargo build --release --features server,ml
+) else (
+    echo [1/3] 正在编译 Loong Recall（首次编译约 5-10 分钟）...
+    echo   默认 zero-dependency 模式，无需下载模型
+    echo   国内用户如遇 crates.io 下载缓慢，可配置 Cargo 镜像：
+    echo   在 %%USERPROFILE%%\.cargo\config.toml 中添加：
+    echo      [source.crates-io]
+    echo      replace-with = "ustc"
+    echo      [source.ustc]
+    echo      registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+    echo.
+    cargo build --release --features server
+)
 if %errorlevel% neq 0 (
     echo [错误] 编译失败，请检查上方错误信息。
     pause
@@ -40,7 +72,36 @@ set "SERVER_PATH=%SCRIPT_DIR%\target\release\code-memory-server.exe"
 set "SERVER_PATH_JSON=%SERVER_PATH:\=/%"
 set "SRC_DIR_JSON=%SCRIPT_DIR:\=/%/src"
 
-REM 5. Smart Match 增强模式说明（可选）
+REM 5. Smart Match 增强模式说明
+if %WITH_MODELS% equ 1 (
+    echo.
+    echo [2/3] 正在预下载语义模型（约 500MB，首次运行需此步骤）...
+    echo   使用 HF 镜像: https://hf-mirror.com
+    echo   模型: microsoft/graphcodebert-base
+    echo   提示: 最多等待 120 秒，超时后模型将在首次启动时自动下载
+    echo.
+    REM 通过临时运行服务来触发模型下载
+    REM 使用 start /B 后台启动，超时后自动终止
+    set "HF_ENDPOINT=https://hf-mirror.com"
+    
+    REM 后台启动服务（使用 start /B 避免阻塞）
+    start /B "" "%SERVER_PATH%" --mode smart --port 18999 --db-path "%SCRIPT_DIR%\.loong-recall\data" --src-dir "%SCRIPT_DIR%\src" > nul 2>&1
+    
+    REM 等待模型下载完成（最多 120 秒，每 5 秒检查一次）
+    set "MODEL_READY=0"
+    for /L %%i in (1,1,24) do (
+        timeout /t 5 /nobreak > nul
+        if exist "%SCRIPT_DIR%\models\microsoft--graphcodebert-base\config.json" (
+            set "MODEL_READY=1"
+        )
+        REM 显示进度
+        <nul set /p ="."
+    )
+    echo.
+    
+    REM 终止后台服务进程
+    taskkill /F /IM code-memory-server.exe > nul 2>&1
+) else (
 echo.
 echo [可选] 如需更高精度的语义搜索，可启用 ML 模式：
 echo   cargo build --release --features server,ml
@@ -49,6 +110,19 @@ echo   国内用户可设环境变量 HF_ENDPOINT=https://hf-mirror.com 加速�
 echo.
 echo   当前已编译为 fast 模式（词向量编码），可直接使用：
 echo     "%SERVER_PATH%" --mode fast --src-dir 项目路径
+)
+
+REM 5a. 检查模型下载结果
+if %WITH_MODELS% equ 1 (
+    if exist "%SCRIPT_DIR%\models\microsoft--graphcodebert-base\config.json" (
+        echo   模型预下载完成，ML 语义搜索已就绪！
+    ) else (
+        echo [提示] 模型下载超时或未完成，首次运行服务时会自动继续下载。
+    )
+    echo.
+    echo   已编译为 ML 语义增强模式，启动时自动启用语义搜索：
+    echo     "%SERVER_PATH%" --mode smart --src-dir 项目路径
+)
 
 REM 6. 查找可用的 IDE 并配置 MCP
 echo [2/3] 正在搜索本地 IDE...

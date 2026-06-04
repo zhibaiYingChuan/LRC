@@ -129,6 +129,18 @@ async fn main() {
         std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
     }
 
+    // P0-2: 启动前检查 ML 模型就绪状态（提前告知用户，不阻塞启动）
+    #[cfg(feature = "ml")]
+    {
+        log(&format!("   ML 模型检查: {}", 
+            if code_memory::engine::model_resolver::check_model_ready("microsoft/graphcodebert-base") {
+                "已就绪，语义搜索立即可用"
+            } else {
+                "未下载，首次使用时会自动下载（约 1-3 分钟）"
+            }
+        ));
+    }
+
     // 确定源码目录：默认使用当前工作目录
     let src_dir = if src_dir.is_empty() {
         let default = std::path::PathBuf::from(".");

@@ -15,7 +15,10 @@
 //   3. SurfaceMemorySource — 表层记忆数据源 trait（可对接任意表层记忆系统）
 //   4. run_consolidation_loop — 后台 tokio 任务入口
 
-use crate::engine::luoshu_encoder::LuoShuEncoder;
+#[cfg(feature = "ml")]
+use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
+#[cfg(not(feature = "ml"))]
+use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
 use crate::memory_store::MemoryStore;
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::Persistence;
@@ -198,7 +201,7 @@ pub struct ConsolidationPipeline<P: Persistence> {
     store: Arc<Mutex<MemoryStore<P>>>,
     /// 洛书编码器（保留供未来直接编码使用）
     #[allow(dead_code)]
-    luoshu_encoder: LuoShuEncoder,
+    luoshu_encoder: HybridLuoShuEncoder,
     /// 上次运行时间（用于增量拉取）
     last_run: DateTime<Utc>,
     /// 累积统计
@@ -211,7 +214,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         Self {
             config,
             store,
-            luoshu_encoder: LuoShuEncoder::new(),
+            luoshu_encoder: HybridLuoShuEncoder::default(),
             last_run: Utc::now(),
             total_stats: CycleStats::default(),
         }

@@ -21,6 +21,7 @@
 
 use super::luoshu_encoder::{LuoShuEncoder, LuoShuVector, LUOSHU_WEIGHTS};
 use candle_core::{Device, Tensor};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// 洛书编码器 ML 增强器
@@ -102,30 +103,63 @@ impl LuoShuMlEncoder {
         // 加载模型
         let (model, hidden_size) = if use_local {
             let config_path = model_dir.join("config.json");
-            let config_content = std::fs::read_to_string(&config_path)
-                .map_err(|e| format!("读取配置失败: {}", e))?;
-            let config: serde_json::Value = serde_json::from_str(&config_content)
-                .map_err(|e| format!("解析配置失败: {}", e))?;
-            let hidden_size = config["hidden_size"]
-                .as_u64()
-                .unwrap_or(384) as usize;
+            // 从 config.json 解析真实的 BERT 配置（与 CodeBertEncoder 一致）
+            // 修复：不能使用 Default::default()，因为不同模型的层数/维度不同
+            // 例如 all-MiniLM-L6-v2 是 6 层 384 维，而 default 是 12 层 768 维
+            let config_file = std::fs::File::open(&config_path)
+                .map_err(|e| format!("打开 config.json 失败: {}\n路径: {}", e, config_path.display()))?;
+            let config: candle_transformers::models::bert::Config =
+                serde_json::from_reader(std::io::BufReader::new(config_file))
+                    .map_err(|e| format!("解析 config.json 失败: {}", e))?;
+            let hidden_size = config.hidden_size;
 
-            let weights_path = if model_dir.join("model.safetensors").exists() {
+            // 智能选择格式：safetensors 原生加载，pytorch_model.bin 使用 PthTensors
+            let is_safetensors = model_dir.join("model.safetensors").exists();
+            let weights_path = if is_safetensors {
                 model_dir.join("model.safetensors")
             } else {
                 model_dir.join("pytorch_model.bin")
             };
 
-            let vb = unsafe {
-                candle_nn::VarBuilder::from_mmaped_safetensors(
-                    &[&weights_path],
-                    candle_core::DType::F32,
-                    &device,
-                )
-                .map_err(|e| format!("加载本地模型失败: {}", e))?
+            let tensors: HashMap<String, Tensor> = if is_safetensors {
+                candle_core::safetensors::load(&weights_path, &device)
+                    .map_err(|e| format!(
+                        "safetensors 加载失败: {}\n路径: {}",
+                        e, weights_path.display()
+                    ))?
+            } else {
+                // pytorch_model.bin 使用 PthTensors 懒加载器（与 CodeBertEncoder 一致）
+                let pth = candle_core::pickle::PthTensors::new(&weights_path, None)
+                    .map_err(|e| format!(
+                        "pickle 加载 pytorch_model.bin 失败: {}\n\
+                         提示: 文件可能已损坏，请尝试转换为 safetensors 格式:\n\
+                         pip install safetensors torch && python scripts/convert_model.py",
+                        e
+                    ))?;
+                let mut tensors = HashMap::new();
+                for (name, _info) in pth.tensor_infos() {
+                    if let Some(tensor) = pth.get(name)
+                        .map_err(|e| format!("加载 tensor '{}' 失败: {}", name, e))?
+                    {
+                        tensors.insert(name.to_string(), tensor);
+                    }
+                }
+                if tensors.is_empty() {
+                    return Err(format!(
+                        "pytorch_model.bin 中未找到任何 tensor\n\
+                         提示: 文件可能已损坏，请尝试重新下载"
+                    ));
+                }
+                tensors
             };
 
-            let model = candle_transformers::models::bert::BertModel::load(vb, &Default::default())
+            let vb = candle_nn::VarBuilder::from_tensors(
+                tensors,
+                candle_core::DType::F32,
+                &device,
+            );
+
+            let model = candle_transformers::models::bert::BertModel::load(vb, &config)
                 .map_err(|e| format!("构建 BERT 模型失败: {}", e))?;
 
             (model, hidden_size)
@@ -136,26 +170,62 @@ impl LuoShuMlEncoder {
 
             let config_path = repo.get("config.json")
                 .map_err(|e| format!("下载配置失败: {}", e))?;
-            let config_content = std::fs::read_to_string(&config_path)
-                .map_err(|e| format!("读取配置失败: {}", e))?;
-            let config: serde_json::Value = serde_json::from_str(&config_content)
-                .map_err(|e| format!("解析配置失败: {}", e))?;
-            let hidden_size = config["hidden_size"]
-                .as_u64()
-                .unwrap_or(384) as usize;
+            // 从 config.json 解析真实的 BERT 配置（与 CodeBertEncoder 一致）
+            let config_file = std::fs::File::open(&config_path)
+                .map_err(|e| format!("打开 config.json 失败: {}", e))?;
+            let config: candle_transformers::models::bert::Config =
+                serde_json::from_reader(std::io::BufReader::new(config_file))
+                    .map_err(|e| format!("解析 config.json 失败: {}", e))?;
+            let hidden_size = config.hidden_size;
 
-            let weights_path = repo.get("model.safetensors")
-                .map_err(|e| format!("下载模型失败: {}", e))?;
-            let vb = unsafe {
-                candle_nn::VarBuilder::from_mmaped_safetensors(
-                    &[&weights_path],
-                    candle_core::DType::F32,
-                    &device,
-                )
-                .map_err(|e| format!("加载模型权重失败: {}", e))?
+            // 模型格式降级：safetensors → pytorch_model.bin（与 CodeBertEncoder 一致）
+            let (weights_path, is_safetensors) = match repo.get("model.safetensors") {
+                Ok(path) => (path, true),
+                Err(_) => {
+                    let path = repo.get("pytorch_model.bin")
+                        .map_err(|e| format!(
+                            "下载模型文件失败（safetensors 和 pytorch_model.bin 均不可用）: {}\n\
+                             提示: 请检查网络连接，或手动将模型文件放到 models/{} 目录",
+                            e, local_model_name
+                        ))?;
+                    (path, false)
+                }
             };
 
-            let model = candle_transformers::models::bert::BertModel::load(vb, &Default::default())
+            let tensors: HashMap<String, Tensor> = if is_safetensors {
+                candle_core::safetensors::load(&weights_path, &device)
+                    .map_err(|e| format!("safetensors 加载失败: {}", e))?
+            } else {
+                let pth = candle_core::pickle::PthTensors::new(&weights_path, None)
+                    .map_err(|e| format!(
+                        "pickle 加载 pytorch_model.bin 失败: {}\n\
+                         提示: 如果持续失败，请尝试转换为 safetensors 格式",
+                        e
+                    ))?;
+                let mut tensors = HashMap::new();
+                for (name, _info) in pth.tensor_infos() {
+                    if let Some(tensor) = pth.get(name)
+                        .map_err(|e| format!("加载 tensor '{}' 失败: {}", name, e))?
+                    {
+                        tensors.insert(name.to_string(), tensor);
+                    }
+                }
+                if tensors.is_empty() {
+                    return Err(
+                        "pytorch_model.bin 中未找到任何 tensor\n\
+                         提示: 文件可能已损坏，请尝试重新下载".to_string()
+                    );
+                }
+                tensors
+            };
+
+            let vb = candle_nn::VarBuilder::from_tensors(
+                tensors,
+                candle_core::DType::F32,
+                &device,
+            );
+
+            let model = candle_transformers::models::bert::BertModel::load(vb, &config)
                 .map_err(|e| format!("构建 BERT 模型失败: {}", e))?;
 
             (model, hidden_size)
@@ -412,6 +482,23 @@ impl HybridLuoShuEncoder {
 
 impl Default for HybridLuoShuEncoder {
     fn default() -> Self {
+        // 当 ml feature 启用时，尝试加载 ML 语义模型
+        // 加载失败则自动降级为统计模式（零依赖，始终可用）
+        #[cfg(feature = "ml")]
+        {
+            match LuoShuMlEncoder::load() {
+                Ok(ml) => {
+                    eprintln!("[LRC·洛书] ML 编码器已启用 (语义增强模式)");
+                    return Self::new_with_ml(ml);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[LRC·洛书] ML 编码器加载失败，降级为统计模式: {}",
+                        e
+                    );
+                }
+            }
+        }
         Self::new_statistical()
     }
 }

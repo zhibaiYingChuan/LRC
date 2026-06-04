@@ -83,17 +83,12 @@ impl CodeBertEncoder {
             // 从本地 models/ 文件夹加载，完全不走网络
             let config_path = model_dir.join("config.json");
 
-            // 智能选择模型格式：优先 safetensors（原生支持），.bin 格式需转换
-            let model_path = if model_dir.join("model.safetensors").exists() {
+            // 智能选择模型格式：safetensors 原生加载，.bin 使用 PthTensors
+            let is_safetensors = model_dir.join("model.safetensors").exists();
+            let model_path = if is_safetensors {
                 model_dir.join("model.safetensors")
             } else if model_dir.join("pytorch_model.bin").exists() {
-                return Err(format!(
-                    "本地模型是 pytorch_model.bin 格式（原始 pickle），candle 不直接支持\n\
-                     请转换为 safetensors 格式:\n\
-                     pip install safetensors torch && python scripts/convert_model.py\n\
-                     或手动下载 safetensors 版本放入: {}",
-                    model_dir.display()
-                ));
+                model_dir.join("pytorch_model.bin")
             } else {
                 return Err(format!(
                     "本地模型目录缺少模型文件: {}\n\
@@ -111,9 +106,33 @@ impl CodeBertEncoder {
             // 智能加载 tokenizer：优先 tokenizer.json，回退 vocab.json + merges.txt
             let tokenizer = load_tokenizer_local(&model_dir, &local_model_name)?;
 
-            let tensors: std::collections::HashMap<String, Tensor> =
+            let tensors: std::collections::HashMap<String, Tensor> = if is_safetensors {
                 candle_core::safetensors::load(&model_path, &device)
-                    .map_err(|e| format!("safetensors 加载失败: {e}\n路径: {}", model_path.display()))?;
+                    .map_err(|e| format!("safetensors 加载失败: {e}\n路径: {}", model_path.display()))?
+            } else {
+                // pytorch_model.bin 使用 PthTensors 懒加载器
+                let pth = candle_core::pickle::PthTensors::new(&model_path, None)
+                    .map_err(|e| format!(
+                        "pickle 加载 pytorch_model.bin 失败: {e}\n\
+                         提示: 如果持续失败，请尝试转换为 safetensors 格式:\n\
+                         pip install safetensors torch && python scripts/convert_model.py"
+                    ))?;
+                let mut tensors = std::collections::HashMap::new();
+                for (name, _info) in pth.tensor_infos() {
+                    if let Some(tensor) = pth.get(name)
+                        .map_err(|e| format!("加载 tensor '{}' 失败: {}", name, e))?
+                    {
+                        tensors.insert(name.to_string(), tensor);
+                    }
+                }
+                if tensors.is_empty() {
+                    return Err(format!(
+                        "pytorch_model.bin 中未找到任何 tensor\n\
+                         提示: 文件可能已损坏，请尝试重新下载"
+                    ));
+                }
+                tensors
+            };
 
             let vb = candle_nn::VarBuilder::from_tensors(
                 tensors,
@@ -667,9 +686,18 @@ impl CodeEncoder for CodeBertEncoder {
 mod tests {
     use super::*;
     use super::super::encoder::FastEncoder;
+    use crate::engine::model_resolver;
 
     fn should_skip() -> bool {
-        std::env::var("SKIP_ML_TESTS").is_ok()
+        // P0-3: 使用模型文件检测代替环境变量，确保有模型时真实执行测试
+        let model_ready =
+            model_resolver::check_model_ready("microsoft/graphcodebert-base");
+        if !model_ready {
+            println!(
+                "[跳过] ML 测试：模型文件未在本地就绪。启动服务时将自动下载。"
+            );
+        }
+        !model_ready
     }
 
     fn make_chunk(name: &str, content: &str) -> CodeChunk {

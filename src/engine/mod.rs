@@ -10,6 +10,7 @@ pub mod hnsw;
 pub mod llm_translator;
 pub mod luoshu_encoder;
 pub mod mirror_trapezoid;
+pub mod model_resolver;
 pub mod retriever;
 pub mod manager;
 pub mod dao_metrics;

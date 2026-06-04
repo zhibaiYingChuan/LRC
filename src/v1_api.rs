@@ -13,7 +13,10 @@
 //   POST /v1/memories/unfold       — 拆解合成记忆为子记忆（RecursiveUnfold）
 //   GET  /v1/health/dao_metrics    — 返回道同构度仪表数据
 
-use crate::engine::luoshu_encoder::LuoShuEncoder;
+#[cfg(feature = "ml")]
+use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
+#[cfg(not(feature = "ml"))]
+use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
 use crate::engine::mirror_trapezoid::mirror_project;
 use crate::memory_store::{ListFilter, MemoryStore, RecallFilter};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
@@ -203,12 +206,16 @@ pub fn build_v1_router(store: SharedStore) -> Router {
     let metrics_store = store.clone();
     let unfold_store = store.clone();
 
+    // P0-1: 编码器创建一次，所有请求复用（避免每次请求都加载 ML 模型）
+    let encode_encoder = std::sync::Arc::new(HybridLuoShuEncoder::default());
+
     Router::new()
         // POST /v1/encode — 将文本编码为洛书 9 维向量
-        .route("/encode", post(move |Json(req): Json<EncodeRequest>| {
-            let encoder = LuoShuEncoder::new(); // encoder 内置嵌入模型缓存，直接新建
-            async move {
-                let luoshu_vec = encoder.encode_text(&req.text);
+        .route("/encode", post({
+            let encoder = encode_encoder.clone();
+            move |Json(req): Json<EncodeRequest>| {
+                async move {
+                    let luoshu_vec = encoder.encode_text(&req.text);
                 let proj = mirror_project(&luoshu_vec);
                 let center_val = luoshu_vec.center_value();
                 let topological_depth: f32 = (1.0 - center_val).clamp(0.0, 1.0);
@@ -221,7 +228,8 @@ pub fn build_v1_router(store: SharedStore) -> Router {
                     topological_depth,
                 }))
             }
-        }))
+        }
+    }))
         // POST /v1/memories/consolidate — 接收表层记忆，触发结晶流程
         .route("/memories/consolidate", post({
             let store = consolidate_store;
