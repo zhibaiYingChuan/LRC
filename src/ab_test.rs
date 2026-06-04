@@ -14,7 +14,10 @@
 //   4. ABTestRunner — 协调实验运行和结果统计
 //   5. mrr_evaluate — MRR 计算函数
 
-use crate::engine::luoshu_encoder::LuoShuEncoder;
+#[cfg(feature = "ml")]
+use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
+#[cfg(not(feature = "ml"))]
+use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
 use crate::engine::mirror_trapezoid::mirror_project;
 use crate::memory_types::Memory;
 use serde::{Deserialize, Serialize};
@@ -416,7 +419,7 @@ pub struct LuoshuSearchEngine {
     /// 记忆存储引用（通过传入所有记忆实现）
     memories: Vec<Memory>,
     /// 洛书编码器
-    encoder: LuoShuEncoder,
+    encoder: HybridLuoShuEncoder,
 }
 
 impl LuoshuSearchEngine {
@@ -424,7 +427,7 @@ impl LuoshuSearchEngine {
     pub fn new(memories: Vec<Memory>) -> Self {
         Self {
             memories,
-            encoder: LuoShuEncoder::new(),
+            encoder: HybridLuoShuEncoder::default(),
         }
     }
 }
@@ -689,6 +692,7 @@ pub fn format_report_markdown(report: &ABTestReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::luoshu_encoder::LuoShuEncoder;
     use crate::memory_types::{Importance, MemoryType};
 
     /// 创建测试用记忆

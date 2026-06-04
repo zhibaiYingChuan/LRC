@@ -41,8 +41,16 @@ LRC 的编码能力源自 [道体（DaoTi）基座模型](https://github.com/zhi
 
 ```bash
 git clone https://github.com/zhibaiYingChuan/LRC.git
+# 国内用户如遇 GitHub 下载缓慢，可使用镜像：
+# git clone https://gitcode.com/gcw_M73FIiUo/LRC
 cd LRC
 cargo build --release --features server
+# 国内用户如遇 crates.io 下载缓慢，可配置 Cargo 镜像：
+# 在 ~/.cargo/config.toml 中添加：
+# [source.crates-io]
+# replace-with = 'ustc'
+# [source.ustc]
+# registry = 'sparse+https://mirrors.ustc.edu.cn/crates.io-index/'
 
 # 启动
 ./target/release/code-memory-server --src-dir ./src --port 3099
@@ -331,6 +339,12 @@ git clone https://github.com/zhibaiYingChuan/LRC.git
 # git clone https://gitcode.com/gcw_M73FIiUo/LRC
 cd LRC
 cargo build --release --features server
+# 国内用户如遇 crates.io 下载缓慢，可配置 Cargo 镜像：
+# 在 ~/.cargo/config.toml 中添加：
+# [source.crates-io]
+# replace-with = 'ustc'
+# [source.ustc]
+# registry = 'sparse+https://mirrors.ustc.edu.cn/crates.io-index/'
 ```
 
 编译产物在 `target/release/code-memory-server.exe`（Windows）或 `target/release/code-memory-server`（Linux/macOS）。

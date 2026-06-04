@@ -10,7 +10,11 @@
 
 use crate::memory_types::{DecayConfig, Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::{Persistence, PersistenceError};
-use crate::engine::luoshu_encoder::{LuoShuEncoder, LuoShuVector};
+use crate::engine::luoshu_encoder::LuoShuVector;
+#[cfg(feature = "ml")]
+use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
+#[cfg(not(feature = "ml"))]
+use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
 use crate::engine::mirror_trapezoid::{mirror_project, recursive_compose, recursive_unfold, TrapezoidROI};
 use crate::engine::dao_metrics::DaoMetrics;
 use crate::graph_store::{EdgeType, GraphMemoryStore};
@@ -167,7 +171,7 @@ pub struct MemoryStore<P: Persistence> {
     /// 合成相似度阈值：记忆相似度超过此值时纳入同一簇（默认 0.4）
     pub synthesis_similarity: f32,
     /// 洛书编码器（用于记忆的 9 维坐标编码 + 八卦分类）
-    luoshu_encoder: LuoShuEncoder,
+    luoshu_encoder: HybridLuoShuEncoder,
     /// 道同构度指标（L5 监控仪表）
     pub dao_metrics: DaoMetrics,
     /// 衰减曲线配置（可外部化，控制记忆衰减行为）
@@ -219,7 +223,7 @@ impl<P: Persistence> MemoryStore<P> {
             similarity_threshold: 0.5,
             synthesis_min_cluster: 3,
             synthesis_similarity: 0.4,
-            luoshu_encoder: LuoShuEncoder::new(),
+            luoshu_encoder: HybridLuoShuEncoder::default(),
             dao_metrics: DaoMetrics::new(),
             decay_config: DecayConfig::default(),
             graph_store: None,
