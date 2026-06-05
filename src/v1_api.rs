@@ -311,7 +311,7 @@ pub fn build_v1_router(store: SharedStore) -> Router {
                         top_k: req.top_k * 2,
                         privacy_context: Some(privacy_ctx),
                     };
-                    let deep_result = store.recall(&req.query, &deep_filter).unwrap_or(RecallResult {
+                    let deep_result = store.trapezoid_focus_recall(&req.query, &deep_filter, 1).unwrap_or(RecallResult {
                         memories: vec![], scores: vec![], total: 0,
                     });
 
