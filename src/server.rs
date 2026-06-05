@@ -234,7 +234,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
         },
         ToolDefinition {
             name: "recall".into(),
-            description: "语义检索历史记忆。搜索所有已存储的记忆，返回最相关的结果。".into(),
+            description: "语义检索历史记忆。支持两种模式：fast（关键词匹配，默认）和 luoshu（洛书几何检索，使用 LuoShuEncoder + TrapezoidFocus）。luoshu 模式将查询投影到洛书九宫格，通过梯形聚焦在几何空间中定位记忆，返回洛书空间中距离最近的记忆。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
@@ -246,6 +246,16 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                         "type": "integer",
                         "description": "返回结果数（默认 5，最大 20）",
                         "default": 5
+                    },
+                    "lrc_mode": {
+                        "type": "string",
+                        "description": "检索模式: fast（关键词匹配，默认）| luoshu（洛书几何检索，使用 LuoShuEncoder 编码 + TrapezoidFocus 梯形聚焦）",
+                        "default": "fast"
+                    },
+                    "focus_depth": {
+                        "type": "integer",
+                        "description": "梯形聚焦深度（仅 lrc_mode=luoshu 时生效）。0=全量检索，1=4分，2=16分。默认 1",
+                        "default": 1
                     },
                     "memory_type": {
                         "type": "string",
@@ -580,6 +590,17 @@ async fn handle_tools_call(
                 .unwrap_or(5)
                 .min(20) as usize;
 
+            // 检索模式：fast（关键词匹配）或 luoshu（洛书几何检索）
+            let lrc_mode = arguments
+                .get("lrc_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("fast");
+            let focus_depth = arguments
+                .get("focus_depth")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .min(3) as u32;
+
             let memory_type = arguments
                 .get("memory_type")
                 .and_then(|v| v.as_str())
@@ -615,12 +636,23 @@ async fn handle_tools_call(
             };
 
             let mut store = state.memory_store.lock().await;
-            match store.recall(query, &filter) {
+
+            // 根据 lrc_mode 选择检索方法
+            let result = if lrc_mode == "luoshu" {
+                // 洛书几何检索：LuoShuEncoder 编码查询 + TrapezoidFocus 梯形聚焦
+                store.trapezoid_focus_recall(query, &filter, focus_depth)
+            } else {
+                // 快速模式：关键词匹配（默认）
+                store.recall(query, &filter)
+            };
+
+            match result {
                 Ok(result) => {
                     let mut text = format!(
-                        "记忆检索结果 (共 {} 条匹配，记忆库共 {} 条)\n\n",
+                        "记忆检索结果 (共 {} 条匹配，记忆库共 {} 条，模式: {})\n\n",
                         result.memories.len(),
-                        result.total
+                        result.total,
+                        if lrc_mode == "luoshu" { "洛书几何检索" } else { "关键词匹配" }
                     );
 
                     if result.memories.is_empty() {
@@ -634,6 +666,13 @@ async fn handle_tools_call(
                                 score * 100.0
                             ));
                             text.push_str(&format!("内容: {}\n", m.summary()));
+                            // 洛书模式显示几何信息
+                            if lrc_mode == "luoshu" {
+                                if let Some(ref cat) = m.bagua_category {
+                                    text.push_str(&format!("八卦类别: {} | ", cat));
+                                }
+                                text.push_str(&format!("拓扑深度: {:.2} | ", m.topological_depth));
+                            }
                             text.push_str(&format!(
                                 "类型: {} | 重要性: {}/10",
                                 m.memory_type.as_str(),
@@ -1090,7 +1129,7 @@ async fn handle_tools_call(
                 total: 0,
             });
 
-            // 深度通路：洛书几何检索（用洛书向量余弦相似度排序）
+            // 深度通路：洛书几何检索（LuoShuEncoder + TrapezoidFocus 梯形聚焦）
             let deep_filter = RecallFilter {
                 memory_type,
                 project,
@@ -1099,7 +1138,7 @@ async fn handle_tools_call(
                 top_k: top_k * 2,
                 privacy_context: None,
             };
-            let deep_result = store.recall(query, &deep_filter).unwrap_or(RecallResult {
+            let deep_result = store.trapezoid_focus_recall(query, &deep_filter, 1).unwrap_or(RecallResult {
                 memories: vec![],
                 scores: vec![],
                 total: 0,
