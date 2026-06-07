@@ -8,7 +8,7 @@
 
 **前置条件**：Windows / Linux / macOS | 无需 Rust 基础 | 无需 GPU | 会基本命令行操作
 
-> 🪄 **不想编译？** 直接下载 [Release 二进制](https://github.com/zhibaiYingChuan/LRC/releases) 或双击 `install.bat` 一键安装，跳过所有命令行。
+> 🪄 **不想手动敲命令？** 双击 `install.bat` 一键安装，自动完成编译和 IDE 配置。
 
 ***
 
