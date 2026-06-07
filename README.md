@@ -8,7 +8,7 @@
 
 **前置条件**：Windows / Linux / macOS | 无需 Rust 基础 | 无需 GPU | 会基本命令行操作
 
-> 🪄 **不想手动敲命令？** 双击 `install.bat` 一键安装，自动完成编译和 IDE 配置。
+> 🪄 **不想手动敲命令？** 双击 `install.bat` 快速安装，自动完成编译和 IDE 配置（需已安装 Rust 环境）。
 
 ***
 
@@ -24,7 +24,7 @@
 
 | 能力 | 做什么 | 一句话说清楚 |
 |------|--------|------------|
-| **代码定位** `search_code` | 知道函数名/变量名，AI 瞬间定位。配置 LLM 后可用自然语言描述 | "比 grep 快，比 IDE 搜索省心" |
+| **代码定位** `search_code` | 知道函数名/变量名，AI 瞬间定位。配置 LLM 后可用自然语言描述 | "关键词匹配定位，无需手动翻文件" |
 | **项目记忆** `remember / recall` | 告诉 AI 一次约定，以后每次对话它都记得 | "给 AI 装个记事本，但它是活的" |
 
 配置好规则文件后，AI 会在需要时调用这些工具。你只管正常对话：
@@ -35,7 +35,7 @@
 你："记得：包管理器用 pnpm"                → AI 调用 remember → 下次会话可检索
 ```
 
-> 💡 **重要**：AI 助手需要规则文件引导才能自动调用记忆工具。我们提供了[一键配置模板](docs/USER_GUIDE.md)，3 分钟即可完成。LLM 增强模式下，AI 可以直接用自然语言搜代码。
+> 💡 **重要**：AI 助手需要规则文件引导才能自动调用记忆工具。我们提供了[配置模板](docs/USER_GUIDE.md)，3 分钟即可完成。LLM 增强模式下，AI 可以直接用自然语言搜代码。
 
 LRC 的编码能力源自 [道体（DaoTi）基座模型](https://github.com/zhibaiYingChuan/DaoTi) 的道枢层，但 LRC **不需要安装 DaoTi**——它是一个独立封装的 MCP 插件，零运行时依赖。
 
@@ -105,11 +105,11 @@ curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
 
 > 💡 详细配置步骤（含 AI 自动调用规则模板）见 [用户使用说明书](docs/USER_GUIDE.md)。
 
-重启 IDE 后，AI 自动发现 12 个工具，无需额外配置。
+重启 IDE 后，AI 自动发现 12 个 MCP 工具。为使 AI 主动调用这些工具，还需配置项目规则文件（见上方各 IDE 的规则配置列）。
 
-### 🪄 一键安装（推荐给不想敲命令的用户）
+### 🪄 快速安装脚本（推荐给不想手动敲命令的用户）
 
-Windows 用户下载仓库后，直接双击项目根目录下的 `install.bat`，脚本会自动：
+Windows 用户下载仓库后，双击项目根目录下的 `install.bat`（需已安装 Rust 环境），脚本会自动：
 1. 检测 Rust 环境
 2. 编译 Loong Recall
 3. 搜索本地 IDE（Trae / Cursor / VS Code），自动创建 MCP 配置文件（如配置文件已存在则提示手动合并）
@@ -146,7 +146,7 @@ code-memory-server --src-dir ./src --stdio --llm-api ollama:localhost:llama3
 
 > **LLM 增强的原理**：把你的自然语言查询（"处理用户登录的逻辑"）发给 LLM，翻译成代码关键词（`authenticate_user, login, handle_login`），再用 Fast Match 精确检索。不配置 `--llm-api` 就还是原来的 Fast Match，行为完全不变。
 
-> 90% 的日常场景 Fast Match 完全够用。Smart Match 默认使用 **GraphCodeBERT**（比 CodeBERT 检索精度高 12.3%），详见 [模型评估报告](docs/MODEL_EVALUATION.md)。
+> 日常场景 Fast Match 完全够用。Smart Match 默认使用 **GraphCodeBERT**（比 CodeBERT 检索精度高 12.3%），详见 [模型评估报告](docs/MODEL_EVALUATION.md)。
 
 ### 💰 成本说明
 
@@ -356,7 +356,7 @@ LRC 默认使用**镜像启动模式**（`--mode auto`），设计目标：**启
   你不需要手动记笔记
 ```
 
-**核心体验**：你只管正常写代码、正常聊天。AI 自动判断什么时候该搜代码、什么时候该查记忆。这就是"零操作"。
+**核心体验**：你只管正常写代码、正常聊天。AI 自动判断什么时候该搜代码、什么时候该查记忆。
 
 > 💡 详细配置步骤（含 AI 自动调用规则模板）见 [用户使用说明书](docs/USER_GUIDE.md)。
 

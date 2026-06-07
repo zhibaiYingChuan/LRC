@@ -69,7 +69,7 @@ cargo build --features server,ml
 code-memory-server --src-dir ./src --stdio --llm-api "openai:sk-your-deepseek-key:deepseek-v4-flash:https://api.deepseek.com/v1"
 ```
 
-> 90% 的日常场景 Fast Match 完全够用。Smart Match 在模糊查询上更有优势，详见 [模型评估报告](MODEL_EVALUATION.md)。
+> 日常场景 Fast Match 完全够用。Smart Match 在模糊查询上更有优势，详见 [模型评估报告](MODEL_EVALUATION.md)。
 > 内网/离线环境？参考 [Smart Match 离线安装指南](OFFLINE_MODEL_GUIDE.md)。
 
 ---
@@ -140,7 +140,7 @@ code-memory-server --src-dir ./src --stdio \
 - **隐私**：只有查询文本发给 LLM，不发送任何代码
 - **成本**：DeepSeek V4-Flash 每天 100 次查询 < ¥0.01/月，通义千问 Qwen-Turbo 更是不足 ¥0.01/月。详见下方「成本与优化」章节。
 
-> 💡 如果你已经在用 Trae/Cursor（它们内置了 LLM），这个模式让你零成本获得高精度语义搜索——不需要下载任何模型。
+> 💡 如果你已经在用 Trae/Cursor（它们内置了 LLM），这个模式让你无需额外下载模型即可获得语义搜索。
 
 ---
 
@@ -345,15 +345,15 @@ Cite memories as "（根据记忆 #N）". Do not mention tool usage in responses
 
 ---
 
-## 🪄 一键安装脚本（不想敲命令？用这个）
+## 🪄 快速安装脚本（不想手动敲命令？用这个）
 
-如果你不想手动敲命令，可以直接用项目自带的一键安装脚本：
+如果你不想手动敲命令，可以用项目自带的安装脚本（需已安装 Rust 环境）：
 
 - **Windows**：双击 `install.bat`
 - **Linux / macOS**：终端运行 `bash install.sh`
 
 脚本会自动完成：
-1. 检测 Rust 环境（没有的话会提示安装）
+1. 检测 Rust 环境（未安装则提示并退出）
 2. 编译 Loong Recall
 3. 搜索本地 IDE（Trae / Cursor / VS Code），自动创建 MCP 配置文件
 
@@ -525,7 +525,7 @@ code-memory-server --src-dir ./src --stdio --llm-api ollama:localhost:qwen3
 
 ### Q：我换了电脑，记忆能迁移吗？
 
-可以。使用 `--global` 模式时，复制 `~/.loong-recall/` 目录到新电脑即可。后续版本会支持云端同步。
+可以。使用 `--global` 模式时，复制 `~/.loong-recall/` 目录到新电脑即可。
 
 ### Q：Fast Match 和 Smart Match 怎么选？
 
