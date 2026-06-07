@@ -59,8 +59,7 @@ pub fn check_model_ready(model_id: &str) -> bool {
 /// 检查模型目录是否包含必需文件
 fn model_files_exist(dir: &std::path::Path) -> bool {
     dir.join("config.json").exists()
-        && (dir.join("model.safetensors").exists()
-            || dir.join("pytorch_model.bin").exists())
+        && (dir.join("model.safetensors").exists() || dir.join("pytorch_model.bin").exists())
 }
 
 #[cfg(test)]

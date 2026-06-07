@@ -76,9 +76,7 @@ impl FastEncoder {
         let count = lower.split_whitespace().count().max(1) as f32;
         self.terms
             .iter()
-            .map(|t| {
-                lower.matches(&t.to_lowercase()).count() as f32 / count
-            })
+            .map(|t| lower.matches(&t.to_lowercase()).count() as f32 / count)
             .collect()
     }
 }
@@ -133,21 +131,36 @@ mod tests {
 
     #[test]
     fn test_similarity_identical() {
-        let v1 = EmbeddingVector { dim: 3, values: vec![1.0, 0.0, 0.0] };
+        let v1 = EmbeddingVector {
+            dim: 3,
+            values: vec![1.0, 0.0, 0.0],
+        };
         let v2 = v1.clone();
         assert!((v1.cosine_similarity(&v2) - 1.0).abs() < 0.001);
     }
 
     #[test]
     fn test_similarity_orthogonal() {
-        let v1 = EmbeddingVector { dim: 3, values: vec![1.0, 0.0, 0.0] };
-        let v2 = EmbeddingVector { dim: 3, values: vec![0.0, 1.0, 0.0] };
+        let v1 = EmbeddingVector {
+            dim: 3,
+            values: vec![1.0, 0.0, 0.0],
+        };
+        let v2 = EmbeddingVector {
+            dim: 3,
+            values: vec![0.0, 1.0, 0.0],
+        };
         assert!((v1.cosine_similarity(&v2) - 0.0).abs() < 0.001);
     }
 
     #[test]
     fn test_encoder_dimension() {
-        let encoder = FastEncoder::new(vec!["a".into(), "b".into(), "c".into(), "d".into(), "e".into()]);
+        let encoder = FastEncoder::new(vec![
+            "a".into(),
+            "b".into(),
+            "c".into(),
+            "d".into(),
+            "e".into(),
+        ]);
         assert_eq!(encoder.dimension(), 5);
     }
 

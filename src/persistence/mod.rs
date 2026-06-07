@@ -105,6 +105,11 @@ pub trait Persistence: Send + Sync {
 
     /// 从归档中删除指定记忆
     fn delete_from_archive(&self, id: &str) -> Result<bool, PersistenceError>;
+
+    /// 清空归档存储（默认实现：覆盖写入空列表）
+    fn clear_archive(&self) -> Result<(), PersistenceError> {
+        self.save_archived_memories(&[])
+    }
 }
 
 /// 创建默认的 JSON 文件持久化后端

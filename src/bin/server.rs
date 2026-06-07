@@ -11,9 +11,8 @@
 //
 // 启动后 IDE 可通过 MCP 配置连接此服务，AI 助手即可调用 search_code 工具。
 
-use code_memory::{
-    server, CodeMemoryManager, JsonPersistence, LlmApiConfig, MemoryStore,
-};
+use code_memory::{server, CodeMemoryManager, JsonPersistence, LlmApiConfig, MemoryStore};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -35,6 +34,9 @@ async fn main() {
     let mut proxy: Option<String> = None;
     #[allow(unused_variables, unused_assignments)]
     let mut mode = String::from("auto"); // "auto" | "fast" | "smart"
+    let mut install_ide: Option<String> = None;
+    let mut benchmark_mode = false;
+    let mut benchmark_json = false;
 
     // CLI 参数解析
     let mut i = 1;
@@ -55,7 +57,13 @@ async fn main() {
             "--port" => {
                 i += 1;
                 if i < args.len() {
-                    port = args[i].parse().unwrap_or(3099);
+                    port = match args[i].parse() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("警告: 无效端口号 '{}', 使用默认端口 3099 ({})", args[i], e);
+                            3099
+                        }
+                    };
                 }
             }
             "--stdio" => {
@@ -76,9 +84,28 @@ async fn main() {
                     llm_api_raw = Some(args[i].clone());
                 }
             }
+            "--install-ide" => {
+                i += 1;
+                if i < args.len() {
+                    install_ide = Some(args[i].clone());
+                } else {
+                    eprintln!("错误: --install-ide 需要指定 IDE 名称");
+                    eprintln!(
+                        "用法: code-memory-server --install-ide <trae|cursor|vscode|windsurf>"
+                    );
+                    std::process::exit(1);
+                }
+            }
             "--help" | "-h" => {
                 print_help();
                 return;
+            }
+            "--benchmark" => {
+                benchmark_mode = true;
+            }
+            "--benchmark-json" => {
+                benchmark_mode = true;
+                benchmark_json = true;
             }
             "--proxy" => {
                 i += 1;
@@ -101,27 +128,40 @@ async fn main() {
         i += 1;
     }
 
+    // 处理 --install-ide 命令（自动配置 IDE 的 MCP 连接）
+    if let Some(ref ide) = install_ide {
+        install_ide_config(ide);
+        return;
+    }
+
+    // 处理 --benchmark 命令（运行三层基准测试）
+    if benchmark_mode {
+        run_benchmark_mode(benchmark_json);
+        return;
+    }
+
     // 在 stdio 模式下，状态信息输出到 stderr（stdout 留给 MCP 协议）
     let log = move |msg: &str| {
         if stdio_mode {
-            eprintln!("{}", msg);
+            eprintln!("{msg}");
         } else {
-            println!("{}", msg);
+            println!("{msg}");
         }
     };
 
     log("═══════════════════════════════════════════");
     log(&format!(
-        "  Loong Recall (L-RC / 忆) MCP Server v{}",
+        "  Loong Recall (L-RC / 忆) v{}",
         env!("CARGO_PKG_VERSION")
     ));
+    log("  你的私人记忆管家 — 代码搜索 + 记忆服务");
     log("═══════════════════════════════════════════");
 
     // 配置网络代理（在模型下载等网络操作之前设置）
     if let Some(ref proxy_url) = proxy {
         std::env::set_var("HTTP_PROXY", proxy_url);
         std::env::set_var("HTTPS_PROXY", proxy_url);
-        log(&format!("   代理: {} (已应用到 HTTP/HTTPS 请求)", proxy_url));
+        log(&format!("   代理: {proxy_url} (已应用到 HTTP/HTTPS 请求)"));
     }
 
     // 设置 HF 镜像端点（在模型下载等网络操作之前，确保使用国内镜像）
@@ -132,20 +172,26 @@ async fn main() {
     // P0-2: 启动前检查 ML 模型就绪状态（提前告知用户，不阻塞启动）
     #[cfg(feature = "ml")]
     {
-        log(&format!("   ML 模型检查: {}", 
-            if code_memory::engine::model_resolver::check_model_ready("microsoft/graphcodebert-base") {
-                "已就绪，语义搜索立即可用"
-            } else {
-                "未下载，首次使用时会自动下载（约 1-3 分钟）"
-            }
-        ));
+        let model_ready =
+            code_memory::engine::model_resolver::check_model_ready("microsoft/graphcodebert-base");
+        if model_ready {
+            log("   ML 模型: 已就绪，语义搜索立即可用");
+        } else {
+            log("   ML 模型: 首次使用时会自动下载（约 1-3 分钟）");
+            log("   提示: 使用 --mode fast 可跳过模型下载，秒级启动");
+        }
+    }
+    #[cfg(not(feature = "ml"))]
+    {
+        log("   模式: 轻量模式（零依赖，零下载，秒级启动）");
     }
 
     // 确定源码目录：默认使用当前工作目录
     let src_dir = if src_dir.is_empty() {
         let default = std::path::PathBuf::from(".");
         if default.exists() {
-            default.canonicalize()
+            default
+                .canonicalize()
                 .unwrap_or(default)
                 .to_string_lossy()
                 .to_string()
@@ -162,9 +208,9 @@ async fn main() {
         custom_path.clone()
     } else if global_mode {
         // 全局记忆目录: ~/.loong-recall/data/
-        let home = dirs_next::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        home.join(".loong-recall").join("data")
+        let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        home.join(".loong-recall")
+            .join("data")
             .to_string_lossy()
             .to_string()
     } else {
@@ -176,25 +222,25 @@ async fn main() {
             .to_string()
     };
 
-    log(&format!("   记忆数据目录: {}", data_dir));
+    log(&format!("   记忆数据目录: {data_dir}"));
 
     // 前置验证：源码目录必须存在且为目录
     let src_path = std::path::Path::new(&src_dir);
     if !src_path.exists() {
-        eprintln!("错误: 源码目录不存在: {}", src_dir);
+        eprintln!("错误: 源码目录不存在: {src_dir}");
         eprintln!("提示: 请使用 --src-dir 指定正确的项目路径");
         std::process::exit(1);
     }
     if !src_path.is_dir() {
-        eprintln!("错误: 指定路径不是目录: {}", src_dir);
+        eprintln!("错误: 指定路径不是目录: {src_dir}");
         std::process::exit(1);
     }
 
     // 创建持久化后端和记忆存储
     let persistence = JsonPersistence::new(&data_dir).unwrap_or_else(|e| {
         eprintln!("致命错误: 无法创建数据目录或初始化持久化后端");
-        eprintln!("  路径: {}", data_dir);
-        eprintln!("  原因: {}", e);
+        eprintln!("  路径: {data_dir}");
+        eprintln!("  原因: {e}");
         eprintln!("  建议: 检查磁盘空间和目录写入权限");
         std::process::exit(1);
     });
@@ -206,17 +252,19 @@ async fn main() {
             Ok(config) => {
                 match &config {
                     LlmApiConfig::OpenAI { model, .. } => {
-                        log(&format!("   LLM 增强: OpenAI ({}) → 查询翻译已启用", model));
+                        log(&format!("   LLM 增强: OpenAI ({model}) → 查询翻译已启用"));
                     }
                     LlmApiConfig::Ollama { host, model } => {
-                        log(&format!("   LLM 增强: Ollama ({}@{}) → 查询翻译已启用", model, host));
+                        log(&format!(
+                            "   LLM 增强: Ollama ({model}@{host}) → 查询翻译已启用"
+                        ));
                     }
                     _ => {}
                 }
                 config
             }
             Err(e) => {
-                eprintln!("错误: LLM API 配置解析失败: {}", e);
+                eprintln!("错误: LLM API 配置解析失败: {e}");
                 eprintln!("提示: 格式为 openai:sk-xxx:model 或 ollama:host:model");
                 std::process::exit(1);
             }
@@ -233,11 +281,11 @@ async fn main() {
             log("   搜索模式: Fast Match（关键词匹配 · 零延迟 · 零依赖）");
             log("   提示: 使用 --mode smart 切换到语义搜索模式");
             let mut mgr = CodeMemoryManager::new();
-            log(&format!("\n正在索引项目代码: {}...", src_dir));
+            log(&format!("\n正在索引项目代码: {src_dir}..."));
             match index_and_report(&mut mgr, &src_dir, &log) {
                 Ok(()) => {}
                 Err(e) => {
-                    log(&format!("   索引警告: {}（部分文件可能无法检索）", e));
+                    log(&format!("   索引警告: {e}（部分文件可能无法检索）"));
                 }
             }
             Box::new(mgr)
@@ -245,27 +293,34 @@ async fn main() {
             // 用户显式指定 Smart Match：直接加载模型，同步等待
             log("   搜索模式: Smart Match（语义理解 · 首次启动需下载模型）");
             log("   模型: microsoft/graphcodebert-base (hf-mirror.com)");
-            let encoder = code_memory::CodeBertEncoder::load()
-                .expect("加载模型失败，请检查网络连接或手动下载模型");
+            let encoder = match code_memory::CodeBertEncoder::load() {
+                Ok(enc) => enc,
+                Err(e) => {
+                    eprintln!("错误: 模型加载失败: {e}");
+                    eprintln!("提示: 请检查网络连接，或使用 --mode fast 跳过模型下载");
+                    eprintln!("提示: 也可手动下载模型到 models/ 目录");
+                    std::process::exit(1);
+                }
+            };
             let mut mgr = CodeMemoryManager::with_encoder(Arc::new(encoder));
 
             // 尝试加载缓存，跳过重复编码
             if let Some(n) = mgr.load_embedding_cache(&data_dir) {
-                log(&format!("\n  ✓ 从缓存恢复索引: {} 个代码片段（秒级加载）", n));
+                log(&format!("\n  ✓ 从缓存恢复索引: {n} 个代码片段（秒级加载）"));
             } else {
-                log(&format!("\n正在索引项目代码: {}...", src_dir));
+                log(&format!("\n正在索引项目代码: {src_dir}..."));
                 log("   （首次索引较慢，后续启动会使用缓存）");
                 match index_and_report(&mut mgr, &src_dir, &log) {
                     Ok(()) => {
                         // 首次索引完成后保存缓存
                         if let Err(e) = mgr.save_embedding_cache(&data_dir) {
-                            log(&format!("   缓存保存失败: {}", e));
+                            log(&format!("   缓存保存失败: {e}"));
                         } else {
                             log("   嵌入向量已缓存（下次启动秒加载）");
                         }
                     }
                     Err(e) => {
-                        log(&format!("   索引警告: {}（部分文件可能无法检索）", e));
+                        log(&format!("   索引警告: {e}（部分文件可能无法检索）"));
                     }
                 }
             }
@@ -275,11 +330,11 @@ async fn main() {
             log("   搜索模式: 镜像启动（Fast Match 立即可用，后台升级 Smart Match）");
             log("   提示: 启动后搜索立即就绪，语义搜索在后台自动准备");
             let mut mgr = CodeMemoryManager::new();
-            log(&format!("\n正在索引项目代码: {}...", src_dir));
+            log(&format!("\n正在索引项目代码: {src_dir}..."));
             match index_and_report(&mut mgr, &src_dir, &log) {
                 Ok(()) => {}
                 Err(e) => {
-                    log(&format!("   索引警告: {}（部分文件可能无法检索）", e));
+                    log(&format!("   索引警告: {e}（部分文件可能无法检索）"));
                 }
             }
             Box::new(mgr)
@@ -318,9 +373,9 @@ async fn main() {
         tokio::spawn(async move {
             let bg_log = |msg: &str| {
                 if is_stdio {
-                    eprintln!("{}", msg);
+                    eprintln!("{msg}");
                 } else {
-                    println!("{}", msg);
+                    println!("{msg}");
                 }
             };
             bg_log("\n[后台] 正在加载 Smart Match 语义模型...");
@@ -334,35 +389,33 @@ async fn main() {
                     if cache_hit {
                         bg_log("[后台] ✓ 从缓存恢复语义索引（秒级加载）");
                     } else {
-                        bg_log(&format!(
-                            "[后台] 正在语义编码项目代码: {}...",
-                            upgrade_src
-                        ));
+                        bg_log(&format!("[后台] 正在语义编码项目代码: {upgrade_src}..."));
                         match smart_mgr.index_project(&upgrade_src) {
                             Ok(_) => {
                                 // 保存缓存供下次启动使用
                                 if let Err(e) = smart_mgr.save_embedding_cache(&upgrade_data) {
-                                    bg_log(&format!("[后台] 缓存保存失败: {}", e));
+                                    bg_log(&format!("[后台] 缓存保存失败: {e}"));
                                 } else {
                                     bg_log("[后台] 嵌入向量已缓存（下次启动秒加载）");
                                 }
                             }
                             Err(e) => {
-                                bg_log(&format!("[后台] 语义索引失败: {}（Fast Match 继续服务）", e));
+                                bg_log(&format!("[后台] 语义索引失败: {e}（Fast Match 继续服务）"));
                                 return;
                             }
                         }
                     }
 
-                    // 原子替换 manager
-                    let mut locked = upgrade_state.manager.lock().await;
-                    *locked = Box::new(smart_mgr);
+                    // 原子替换 manager（限制锁作用域，减少锁持有时间）
+                    {
+                        let mut locked = upgrade_state.manager.lock().await;
+                        *locked = Box::new(smart_mgr);
+                    }
                     bg_log("[后台] ✓ Smart Match 已就绪，搜索精度已提升");
                 }
                 Err(e) => {
                     bg_log(&format!(
-                        "[后台] 模型加载失败: {}（Fast Match 继续服务，可用 --mode smart 重试）",
-                        e
+                        "[后台] 模型加载失败: {e}（Fast Match 继续服务，可用 --mode smart 重试）"
                     ));
                 }
             }
@@ -371,12 +424,16 @@ async fn main() {
 
     // 启动 MCP 服务（索引已完成，搜索立即可用）
     if stdio_mode {
-        log("\nMCP Stdio 模式启动（通过 stdin/stdout 通信）");
+        log("\n🚀 MCP Stdio 模式启动（通过 stdin/stdout 通信）");
+        log("   IDE 已可调用 search_code + remember + recall 等工具");
         server::run_stdio(state).await;
     } else {
-        log("\nMCP HTTP 模式启动中...");
+        log("\n🚀 HTTP 服务启动中...");
+        log(&format!(
+            "   启动后访问 http://localhost:{port}/dashboard 查看可视化仪表盘"
+        ));
         if let Err(e) = server::serve(state, &host, port).await {
-            eprintln!("服务启动失败: {}", e);
+            eprintln!("服务启动失败: {e}");
             std::process::exit(1);
         }
     }
@@ -407,10 +464,291 @@ fn index_and_report<E: code_memory::engine::encoder::CodeEncoder>(
             Ok(())
         }
         Err(e) => {
-            let msg = format!("   索引失败: {} (请检查 --src-dir 路径是否正确)", e);
+            let msg = format!("   索引失败: {e} (请检查 --src-dir 路径是否正确)");
             log(&msg);
             Err(msg)
         }
+    }
+}
+
+/// 根据 IDE 名称返回 MCP 配置文件路径
+///
+/// 支持的 IDE：trae, cursor, vscode, windsurf。
+/// 不支持的 IDE 会打印错误信息并退出进程。
+fn get_ide_config_path(ide: &str) -> PathBuf {
+    let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    match ide.to_lowercase().as_str() {
+        "trae" => home.join(".trae").join("mcp.json"),
+        "cursor" => home.join(".cursor").join("mcp.json"),
+        "vscode" | "code" => {
+            if cfg!(target_os = "windows") {
+                home.join("AppData")
+                    .join("Roaming")
+                    .join("Code")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("mcp.json")
+            } else if cfg!(target_os = "macos") {
+                home.join("Library")
+                    .join("Application Support")
+                    .join("Code")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("mcp.json")
+            } else {
+                home.join(".config")
+                    .join("Code")
+                    .join("User")
+                    .join("globalStorage")
+                    .join("mcp.json")
+            }
+        }
+        "windsurf" => home.join(".windsurf").join("mcp.json"),
+        _ => {
+            eprintln!("错误: 不支持的 IDE: {ide}");
+            eprintln!("支持的 IDE: trae, cursor, vscode, windsurf");
+            eprintln!("用法: code-memory-server --install-ide <trae|cursor|vscode|windsurf>");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 读取或创建空配置
+///
+/// 如果配置文件存在，尝试解析 JSON；解析失败或文件不存在时返回空配置。
+fn read_or_create_config(path: &std::path::Path) -> serde_json::Value {
+    if path.exists() {
+        match std::fs::read_to_string(path) {
+            Ok(content) => match serde_json::from_str(&content) {
+                Ok(v) => {
+                    println!("  ✓ 已读取现有配置");
+                    v
+                }
+                Err(e) => {
+                    eprintln!("  ⚠ 现有配置文件格式错误，将创建新配置: {e}");
+                    serde_json::json!({})
+                }
+            },
+            Err(e) => {
+                eprintln!("  ⚠ 无法读取现有配置，将创建新配置: {e}");
+                serde_json::json!({})
+            }
+        }
+    } else {
+        println!("  配置文件不存在，将创建新配置");
+        serde_json::json!({})
+    }
+}
+
+/// 写入 IDE 配置并打印成功消息
+fn write_ide_config(
+    path: &std::path::Path,
+    _config: &serde_json::Value,
+    config_str: &str,
+    ide: &str,
+    _exe_path: &str,
+) {
+    match std::fs::write(path, config_str) {
+        Ok(()) => {
+            println!("  ✓ 配置已写入: {}", path.display());
+            println!();
+            println!("═══════════════════════════════════════════");
+            println!("  安装完成！");
+            println!("═══════════════════════════════════════════");
+            println!();
+            println!("  下一步:");
+            println!("  1. 重启 {ide}");
+            println!("  2. 在 AI 对话中即可使用以下工具:");
+            println!("     - search_code: 搜索项目代码");
+            println!("     - remember: 让 AI 记住重要信息");
+            println!("     - recall: 检索历史记忆");
+            println!("     - dao_metrics: 查看记忆系统健康度");
+            println!();
+            println!("  提示: 启动 HTTP 服务查看可视化仪表盘:");
+            println!("    code-memory-server --src-dir . --port 3099");
+            println!("    然后访问 http://localhost:3099/dashboard");
+        }
+        Err(e) => {
+            eprintln!("  ✗ 配置写入失败: {e}");
+            eprintln!("  提示: 请检查目录权限或手动编辑配置文件");
+            eprintln!("  手动配置内容:");
+            println!("{config_str}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 自动检测 IDE 并写入 MCP 配置文件
+///
+/// 支持的 IDE：trae, cursor, vscode, windsurf
+/// 工作原理：
+/// 1. 检测 IDE 的 MCP 配置文件路径
+/// 2. 读取现有配置（如果存在）
+/// 3. 将 loong-recall 的 MCP 配置合并进去
+/// 4. 写回配置文件
+fn install_ide_config(ide: &str) {
+    // 获取当前可执行文件路径
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(e) => {
+            eprintln!("错误: 无法获取可执行文件路径: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 确定 IDE 的 MCP 配置文件路径
+    let config_path = get_ide_config_path(ide);
+
+    println!("═══════════════════════════════════════════");
+    println!("  Loong Recall IDE 自动配置工具");
+    println!("═══════════════════════════════════════════");
+    println!();
+    println!("  目标 IDE: {ide}");
+    println!("  配置文件: {}", config_path.display());
+    println!("  可执行文件: {exe_path}");
+    println!();
+
+    // 创建目录（如果不存在）
+    if let Some(parent) = config_path.parent() {
+        if !parent.exists() {
+            match std::fs::create_dir_all(parent) {
+                Ok(()) => println!("  ✓ 已创建配置目录: {}", parent.display()),
+                Err(e) => {
+                    eprintln!("  ✗ 无法创建配置目录: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    // 读取现有配置
+    let mut config = read_or_create_config(&config_path);
+
+    // 构建 loong-recall 的 MCP 配置
+    let mcp_entry = serde_json::json!({
+        "command": exe_path,
+        "args": ["--src-dir", ".", "--stdio"],
+        "env": {}
+    });
+
+    // 检查是否已存在 loong-recall 配置
+    if let Some(mcp_servers) = config.get("mcpServers") {
+        if let Some(existing) = mcp_servers.get("loong-recall") {
+            println!("  ⚠ 已存在 loong-recall 配置，将更新");
+            println!("    旧配置: {existing}");
+        }
+    }
+
+    // 合并配置
+    if config.get("mcpServers").is_none() {
+        config["mcpServers"] = serde_json::json!({});
+    }
+    config["mcpServers"]["loong-recall"] = mcp_entry;
+
+    // 写回配置文件
+    let config_str = serde_json::to_string_pretty(&config).unwrap_or_else(|e| {
+        eprintln!("  ✗ 配置序列化失败: {e}");
+        std::process::exit(1);
+    });
+
+    write_ide_config(&config_path, &config, &config_str, ide, &exe_path);
+}
+
+/// 运行基准测试模式（--benchmark / --benchmark-json）
+///
+/// 调用共享的 benchmark 模块，输出人类可读或 JSON 格式的三层基准测试报告。
+fn run_benchmark_mode(json_output: bool) {
+    use std::time::Instant;
+
+    let total_start = Instant::now();
+    let report = code_memory::benchmark::run_all_benchmarks(None);
+    let total_ms = u64::try_from(total_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    if json_output {
+        let json_str = serde_json::to_string_pretty(&serde_json::json!({
+            "report_version": report.version,
+            "generated_at": report.generated_at,
+            "total_duration_ms": total_ms,
+            "summary": {
+                "total": report.total,
+                "passed": report.passed,
+                "failed": report.failed,
+                "status": if report.failed == 0 { "PASS" } else { "FAIL" },
+                "layers": report.layers.iter().map(|l| serde_json::json!({
+                    "name": l.name,
+                    "total": l.total,
+                    "passed": l.passed,
+                    "status": l.status,
+                })).collect::<Vec<_>>(),
+            },
+            "radar_chart": report.radar_scores,
+            "results": report.results.iter().map(|r| serde_json::json!({
+                "name": r.name,
+                "layer": r.layer,
+                "description": r.description,
+                "industry_problem": r.industry_problem,
+                "passed": r.passed,
+                "score": r.score,
+                "details": r.details,
+                "duration_ms": r.duration_ms,
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap_or_else(|e| format!(r#"{{"error":"序列化失败","message":"{e}"}}"#));
+        println!("{json_str}");
+    } else {
+        println!("═══════════════════════════════════════════════════════════");
+        println!("  Loong Recall 三层基准测试报告");
+        println!("═══════════════════════════════════════════════════════════");
+        println!();
+        for r in &report.results {
+            let status = if r.passed { "✓ 通过" } else { "✗ 失败" };
+            println!(
+                "  [{}] L{}-{} — {} ({:.1}ms)",
+                status, r.layer, r.name, r.description, r.duration_ms
+            );
+            println!("         评分: {:.2} | {}", r.score, r.details);
+        }
+        println!();
+        println!(
+            "  总计: {} 项 | 通过: {} | 失败: {} | 耗时: {}ms",
+            report.total, report.passed, report.failed, total_ms
+        );
+        println!();
+        for layer in &report.layers {
+            let status_icon = if layer.status == "PASS" { "✓" } else { "✗" };
+            println!(
+                "  {} {}: {}/{} 通过",
+                status_icon, layer.name, layer.passed, layer.total
+            );
+        }
+        println!();
+        println!("  雷达图数据（标准化评分 0.0~1.0）：");
+        if let serde_json::Value::Object(map) = &report.radar_scores {
+            for (key, val) in map {
+                let bar_len = (val.as_f64().unwrap_or(0.0).max(0.0) * 20.0) as usize;
+                let bar = "█".repeat(bar_len.min(20));
+                println!(
+                    "    {:<16} [{:<20}] {:.2}",
+                    key,
+                    bar,
+                    val.as_f64().unwrap_or(0.0)
+                );
+            }
+        }
+        println!();
+        if report.failed == 0 {
+            println!("  ✓ 所有基准测试通过！");
+        } else {
+            println!("  ⚠ {} 项测试未通过。", report.failed);
+        }
+        println!();
+        println!("  提示：使用 --benchmark-json 获取 JSON 格式报告。");
+        println!("  提示：也可使用独立工具 code-memory-benchmark 运行。");
+        println!();
+    }
+
+    if report.failed > 0 {
+        std::process::exit(1);
     }
 }
 
@@ -429,9 +767,15 @@ fn print_help() {
     println!("  --llm-api <配置>    配置 LLM 查询翻译（可选，不配就用 Fast Match）");
     println!("  --proxy <代理地址>    HTTP/HTTPS 代理（如 http://127.0.0.1:7890）");
     println!("  --mode <模式>        搜索模式: auto(默认) | fast(秒启动) | smart(语义)");
+    println!("  --install-ide <IDE>  自动配置 IDE 的 MCP 连接 (trae|cursor|vscode|windsurf)");
+    println!("  --benchmark         运行三层基准测试（人类可读输出）");
+    println!("  --benchmark-json    运行三层基准测试（JSON 格式，供 CI/CD 或仪表盘使用）");
     println!("  --help, -h          显示此帮助信息");
     println!();
     println!("举个栗子:");
+    println!("  # 一键安装到 Trae IDE（自动配置 MCP）");
+    println!("  code-memory-server --install-ide trae");
+    println!();
     println!("  # 给当前项目的 AI 助手装上记忆插件（最常用）");
     println!("  code-memory-server --src-dir ./src --stdio");
     println!();
@@ -454,5 +798,6 @@ fn print_help() {
     println!("  code-memory-server --db-path D:/my-data --stdio");
     println!();
     println!("启动后在 IDE 中配置 MCP 连接，AI 助手即可使用。");
+    println!("访问 http://localhost:3099/dashboard 查看可视化记忆管理仪表盘。");
     println!("详细使用说明: https://github.com/zhibaiYingChuan/LRC/blob/main/docs/USER_GUIDE.md");
 }

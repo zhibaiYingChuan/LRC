@@ -47,6 +47,7 @@ impl DecayConfig {
         }
     }
 
+    /// 道枢映射: 乾卦·天 (☰) — 天行健，激进衰减如天道之刚健运行
     /// 激进衰减模式：记忆快速衰减，适合存储空间有限的场景
     /// decay_rate=0.15, topo_weight=0.5
     pub fn aggressive() -> Self {
@@ -56,6 +57,7 @@ impl DecayConfig {
         }
     }
 
+    /// 道枢映射: 坤卦·地 (☷) — 地势坤，保守衰减如大地之沉稳守成
     /// 保守衰减模式：记忆长期保留，适合知识管理场景
     /// decay_rate=0.01, topo_weight=0.1
     pub fn conservative() -> Self {
@@ -108,7 +110,14 @@ impl MemoryType {
 
     /// 列出所有有效的类型字符串
     pub fn valid_values() -> &'static [&'static str] {
-        &["fact", "preference", "decision", "code_context", "conversation", "synthesis"]
+        &[
+            "fact",
+            "preference",
+            "decision",
+            "code_context",
+            "conversation",
+            "synthesis",
+        ]
     }
 }
 
@@ -123,7 +132,11 @@ impl FromStr for MemoryType {
             "code_context" | "codecontext" => Ok(Self::CodeContext),
             "conversation" => Ok(Self::Conversation),
             "synthesis" => Ok(Self::Synthesis),
-            _ => Err(format!("无效的记忆类型: '{}'，有效值: {:?}", s, Self::valid_values())),
+            _ => Err(format!(
+                "无效的记忆类型: '{}'，有效值: {:?}",
+                s,
+                Self::valid_values()
+            )),
         }
     }
 }
@@ -248,6 +261,18 @@ pub struct Memory {
     /// 合成置信度（0.0 ~ 1.0，仅 Synthesis 类型）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
+    /// 信息增量（0.0 ~ 1.0，仅 Synthesis 类型）
+    /// 质疑二：合成向量与源向量的信息差异度。
+    /// 过低表示合成为"空洞抽象"——没有产生新信息，只是压缩了冗余。
+    /// 低于阈值时合成应被阻止，防止模式坍塌。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub information_gain: Option<f32>,
+    /// 解析度标志（质疑二：防止"抽象黑洞"）
+    /// - "detailed": 原始具体记忆，包含完整细节
+    /// - "synthesized": 合成记忆，抽象层次较高，但包含源信息链接
+    /// - "abstract": 高阶抽象，多次合成后的元知识，细节已大幅压缩
+    #[serde(default = "default_resolution")]
+    pub resolution: String,
     /// 洛书 9 维坐标向量（序列化为 JSON 数组）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub luoshu_vector: Option<[f32; 9]>,
@@ -295,6 +320,10 @@ fn default_topological_depth() -> f32 {
     0.5 // 默认中等深度
 }
 
+fn default_resolution() -> String {
+    "detailed".to_string() // 默认原始具体记忆
+}
+
 impl Memory {
     /// 创建新的记忆项
     pub fn new(
@@ -321,6 +350,8 @@ impl Memory {
             source: None,
             source_ids: Vec::new(),
             confidence: None,
+            information_gain: None,
+            resolution: default_resolution(),
             luoshu_vector: None,
             bagua_index: None,
             bagua_category: None,
@@ -420,6 +451,7 @@ impl Memory {
         self.last_accessed = now;
     }
 
+    /// 道枢映射: 兑卦·泽 (☱) — 说万物者莫说乎泽，衰减因子如泽水之自然消长
     /// 计算记忆衰减因子（0.0 ~ 1.0），使用默认衰减配置
     ///
     /// 基于双重衰减模型，详见 `decay_factor_with_config`。
@@ -470,6 +502,7 @@ impl Memory {
         factor.clamp(0.0, 1.0)
     }
 
+    /// 道枢映射: 乾卦·天 (☰) — 天行健，衰减后重要性如天道之运行不息
     /// 计算衰减后的重要性分值（使用默认衰减配置）
     ///
     /// `importance * decay_factor`，用于检索排序。
@@ -477,6 +510,7 @@ impl Memory {
         self.decayed_importance_with_config(&DecayConfig::default())
     }
 
+    /// 道枢映射: 乾卦·天 (☰) — 天行健，带配置的衰减如天道之可调谐运行
     /// 计算衰减后的重要性分值（使用自定义衰减配置）
     pub fn decayed_importance_with_config(&self, config: &DecayConfig) -> f32 {
         self.importance.value() as f32 * self.decay_factor_with_config(config)
@@ -492,11 +526,7 @@ impl Memory {
             MemoryType::Conversation => "[对话]",
             MemoryType::Synthesis => "[合成]",
         };
-        let content_preview: String = self
-            .content
-            .chars()
-            .take(80)
-            .collect();
+        let content_preview: String = self.content.chars().take(80).collect();
         let ellipsis = if self.content.chars().count() > 80 {
             "..."
         } else {
@@ -516,9 +546,18 @@ mod tests {
     fn test_memory_type_from_str() {
         assert_eq!(MemoryType::try_parse("fact"), Some(MemoryType::Fact));
         assert_eq!(MemoryType::try_parse("FACT"), Some(MemoryType::Fact));
-        assert_eq!(MemoryType::try_parse("preference"), Some(MemoryType::Preference));
-        assert_eq!(MemoryType::try_parse("code_context"), Some(MemoryType::CodeContext));
-        assert_eq!(MemoryType::try_parse("codecontext"), Some(MemoryType::CodeContext));
+        assert_eq!(
+            MemoryType::try_parse("preference"),
+            Some(MemoryType::Preference)
+        );
+        assert_eq!(
+            MemoryType::try_parse("code_context"),
+            Some(MemoryType::CodeContext)
+        );
+        assert_eq!(
+            MemoryType::try_parse("codecontext"),
+            Some(MemoryType::CodeContext)
+        );
         assert_eq!(MemoryType::try_parse("unknown"), None);
     }
 
@@ -664,7 +703,11 @@ mod tests {
         );
         let factor = m.decay_factor();
         // 新鲜记忆因拓扑深度默认为 0.5，衰减因子应为 0.85
-        assert!((factor - 0.85).abs() < 0.01, "新鲜记忆默认拓扑深度 0.5，衰减因子 ≈ 0.85: {}", factor);
+        assert!(
+            (factor - 0.85).abs() < 0.01,
+            "新鲜记忆默认拓扑深度 0.5，衰减因子 ≈ 0.85: {}",
+            factor
+        );
     }
 
     #[test]

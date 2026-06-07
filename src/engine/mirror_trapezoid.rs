@@ -58,6 +58,11 @@ pub struct ComposeResult {
     pub confidence: f32,
     /// 各源向量的融合权重
     pub weights: Vec<f32>,
+    /// 信息增量（质疑二：防止模式坍塌）
+    /// 合成向量与源向量的平均余弦距离。
+    /// 过低（< 0.05）表示合成没有产生新信息，只是冗余压缩，
+    /// 此时应阻止合成以防止记忆空间趋向少数抽象节点。
+    pub information_gain: f32,
 }
 
 /// 拆解结果
@@ -97,20 +102,19 @@ pub const BAGUA_BASES: [[f32; 9]; 8] = [
 
 /// 八卦名称
 pub const BAGUA_NAMES: [&str; 8] = [
-    "乾·天", "兑·泽", "离·火", "震·雷",
-    "巽·风", "坎·水", "艮·山", "坤·地",
+    "乾·天", "兑·泽", "离·火", "震·雷", "巽·风", "坎·水", "艮·山", "坤·地",
 ];
 
 /// 八卦的先天类别含义（用于记忆分类）
 pub const BAGUA_CATEGORIES: [&str; 8] = [
-    "刚性法则",   // 乾 — 核心规则、架构约束
-    "愉悦表达",   // 兑 — 用户偏好、界面交互
-    "依附关联",   // 离 — 依赖关系、调用链
-    "变动触发",   // 震 — 事件驱动、变更记录
-    "渗透影响",   // 巽 — 外部 API、环境配置
-    "陷溺困境",   // 坎 — Bug 修复、错误处理
-    "止息积累",   // 艮 — 静态资源、缓存数据
-    "承载基础",   // 坤 — 基础设施、底层模块
+    "刚性法则", // 乾 — 核心规则、架构约束
+    "愉悦表达", // 兑 — 用户偏好、界面交互
+    "依附关联", // 离 — 依赖关系、调用链
+    "变动触发", // 震 — 事件驱动、变更记录
+    "渗透影响", // 巽 — 外部 API、环境配置
+    "陷溺困境", // 坎 — Bug 修复、错误处理
+    "止息积累", // 艮 — 静态资源、缓存数据
+    "承载基础", // 坤 — 基础设施、底层模块
 ];
 
 // ============================================================
@@ -133,7 +137,9 @@ pub fn mirror_project(vector: &LuoShuVector) -> BaguaProjection {
 
     for i in 0..8 {
         // 内积计算
-        let dot: f32 = vector.values.iter()
+        let dot: f32 = vector
+            .values
+            .iter()
             .zip(BAGUA_BASES[i].iter())
             .map(|(a, b)| a * b)
             .sum();
@@ -234,7 +240,9 @@ impl TrapezoidROI {
     ///
     /// 重心位置 = argmax(values)，即向量中最大分量对应的九宫格位置
     pub fn contains_vector(&self, vector: &LuoShuVector) -> bool {
-        let center = vector.values.iter()
+        let center = vector
+            .values
+            .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i)
@@ -242,20 +250,24 @@ impl TrapezoidROI {
         self.contains_position(center)
     }
 
+    /// 道枢映射: 离卦·火 (☲) — 明辨也，过滤如火光之照亮真实
     /// 过滤向量集合，仅保留落在 ROI 内的向量
     pub fn filter_vectors(&self, vectors: &[(usize, &LuoShuVector)]) -> Vec<usize> {
-        vectors.iter()
+        vectors
+            .iter()
             .filter(|(_, v)| self.contains_vector(v))
             .map(|(i, _)| *i)
             .collect()
     }
 
+    /// 道枢映射: 坎卦·水 (☵) — 水流而不盈，面积比是梯形几何的数学精华
     /// 计算 ROI 面积占比（用于估算检索加速比）
     pub fn area_ratio(&self) -> f32 {
         let n_positions = (0..9).filter(|&p| self.contains_position(p)).count() as f32;
         n_positions / 9.0
     }
 
+    /// 道枢映射: 坤卦·地 (☷) — 地势坤，细分如大地之纹理延展
     /// 递归细分：将 ROI 按深度拆分为 4^depth 个子区域
     ///
     /// 每个子区域是矩形边界框的 1/4^depth 分割。
@@ -288,12 +300,7 @@ impl TrapezoidROI {
 
                 if r0 <= r1 && c0 <= c1 {
                     regions.push(TrapezoidROI {
-                        vertices: [
-                            r0 * 3 + c0,
-                            r0 * 3 + c1,
-                            r1 * 3 + c1,
-                            r1 * 3 + c0,
-                        ],
+                        vertices: [r0 * 3 + c0, r0 * 3 + c1, r1 * 3 + c1, r1 * 3 + c0],
                         depth: 0, // 子区域不再递归
                     });
                 }
@@ -302,6 +309,7 @@ impl TrapezoidROI {
         regions
     }
 
+    /// 道枢映射: 离卦·火 (☲) — 日月丽乎天，聚焦召回如日光之聚照
     /// 梯形聚焦检索：在向量集合中执行递归细分检索
     ///
     /// 算法：
@@ -311,10 +319,7 @@ impl TrapezoidROI {
     /// 4. 返回子区域内的向量索引
     ///
     /// 复杂度：O(n × 4^depth)，但由于子区域过滤，实际检索量 = n / 4^depth
-    pub fn focused_recall(
-        &self,
-        vectors: &[(usize, &LuoShuVector)],
-    ) -> TrapezoidFocusResult {
+    pub fn focused_recall(&self, vectors: &[(usize, &LuoShuVector)]) -> TrapezoidFocusResult {
         if self.depth == 0 {
             // 无细分，直接过滤
             let indices = self.filter_vectors(vectors);
@@ -392,6 +397,7 @@ pub fn recursive_compose(vectors: &[LuoShuVector]) -> ComposeResult {
             vector: LuoShuVector::zeros(),
             confidence: 0.0,
             weights: Vec::new(),
+            information_gain: 0.0,
         };
     }
 
@@ -400,6 +406,7 @@ pub fn recursive_compose(vectors: &[LuoShuVector]) -> ComposeResult {
             vector: vectors[0].clone(),
             confidence: 1.0,
             weights: vec![1.0],
+            information_gain: 0.0, // 单条无法合成，信息增量为 0
         };
     }
 
@@ -417,7 +424,8 @@ pub fn recursive_compose(vectors: &[LuoShuVector]) -> ComposeResult {
     let center_vec = LuoShuVector { values: center };
 
     // 步骤 2：计算每个源向量与中心的相似度作为门控权重
-    let mut weights: Vec<f32> = vectors.iter()
+    let mut weights: Vec<f32> = vectors
+        .iter()
         .map(|v| {
             // 使用余弦相似度 + 一个小偏移确保所有权重为正
             let sim = v.cosine_similarity(&center_vec);
@@ -455,7 +463,8 @@ pub fn recursive_compose(vectors: &[LuoShuVector]) -> ComposeResult {
     // 权重分布越集中 → 置信度越低（说明聚类不够紧密）
     // 权重分布越均匀 → 置信度越高（说明各源向量都很接近中心）
     let confidence = {
-        let entropy: f32 = weights.iter()
+        let entropy: f32 = weights
+            .iter()
             .filter(|&&w| w > 1e-6)
             .map(|&w| -w * w.ln())
             .sum();
@@ -467,10 +476,25 @@ pub fn recursive_compose(vectors: &[LuoShuVector]) -> ComposeResult {
         }
     };
 
+    // 步骤 6：信息增量计算（质疑二：防止模式坍塌）
+    // 信息增量 = 合成向量与各源向量的平均余弦距离
+    // 距离越大 → 合成产生了更多"新信息"（抽象层次提升）
+    // 距离越小 → 合成只是"压缩"了冗余，没有产生新信息
+    let information_gain = {
+        let avg_distance: f32 = vectors
+            .iter()
+            .map(|v| 1.0 - composed.cosine_similarity(v).max(0.0))
+            .sum::<f32>()
+            / n as f32;
+        // 限制在 [0, 1] 范围
+        avg_distance.clamp(0.0, 1.0)
+    };
+
     ComposeResult {
         vector: composed,
         confidence,
         weights,
+        information_gain,
     }
 }
 
@@ -492,9 +516,7 @@ pub fn recursive_unfold(vector: &LuoShuVector, min_activation: f32) -> UnfoldRes
     let threshold = min_activation.max(0.01);
 
     // 步骤 1：找出所有激活的九宫格位置（高于阈值）
-    let active_positions: Vec<usize> = (0..9)
-        .filter(|&i| vector.values[i] >= threshold)
-        .collect();
+    let active_positions: Vec<usize> = (0..9).filter(|&i| vector.values[i] >= threshold).collect();
 
     if active_positions.is_empty() {
         return UnfoldResult {
@@ -508,9 +530,7 @@ pub fn recursive_unfold(vector: &LuoShuVector, min_activation: f32) -> UnfoldRes
     let mut sub_vectors = Vec::with_capacity(active_positions.len());
     let mut sub_weights = Vec::with_capacity(active_positions.len());
 
-    let total_activation: f32 = active_positions.iter()
-        .map(|&i| vector.values[i])
-        .sum();
+    let total_activation: f32 = active_positions.iter().map(|&i| vector.values[i]).sum();
 
     for &pos in &active_positions {
         // 创建以该位置为主的子向量
@@ -556,6 +576,7 @@ pub fn recursive_unfold(vector: &LuoShuVector, min_activation: f32) -> UnfoldRes
 // 组合操作：完整的记忆演化流程
 // ============================================================
 
+/// 道枢映射: 乾卦·天 (☰) — 天行健，演化周期如天道运行不息
 /// 执行完整的记忆演化周期
 ///
 /// 1. MirrorProject — 对所有记忆进行分类
@@ -568,16 +589,12 @@ pub fn evolution_cycle(
     // 步骤 1+2：分类 + 分组
     let mut groups: std::collections::HashMap<usize, Vec<&LuoShuVector>> =
         std::collections::HashMap::new();
-    let mut group_names: std::collections::HashMap<usize, &str> =
-        std::collections::HashMap::new();
+    let mut group_names: std::collections::HashMap<usize, &str> = std::collections::HashMap::new();
 
     for (_id, vec) in vectors {
         let proj = mirror_project(vec);
-        groups.entry(proj.best_index)
-            .or_default()
-            .push(vec);
-        group_names.entry(proj.best_index)
-            .or_insert(proj.best_name);
+        groups.entry(proj.best_index).or_default().push(vec);
+        group_names.entry(proj.best_index).or_insert(proj.best_name);
     }
 
     // 步骤 3：每个类别内递归合成
@@ -597,8 +614,8 @@ pub fn evolution_cycle(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::luoshu_encoder::LuoShuEncoder;
+    use super::*;
 
     fn make_vec(text: &str) -> LuoShuVector {
         LuoShuEncoder::new().encode_text(text)
@@ -645,8 +662,8 @@ mod tests {
     fn test_roi_filter_vectors() {
         let encoder = LuoShuEncoder::new();
         let v0 = encoder.encode_text("西北方向的配置信息"); // 应落在乾位 (8)
-        let v1 = encoder.encode_text("核心架构设计");       // 应落在中位 (4)
-        let v2 = encoder.encode_text("北方水源相关的 Bug");  // 应落在坎位 (7)
+        let v1 = encoder.encode_text("核心架构设计"); // 应落在中位 (4)
+        let v2 = encoder.encode_text("北方水源相关的 Bug"); // 应落在坎位 (7)
 
         let vecs: Vec<(usize, &LuoShuVector)> = vec![(0, &v0), (1, &v1), (2, &v2)];
 
@@ -659,12 +676,17 @@ mod tests {
     #[test]
     fn test_roi_area_ratio() {
         let roi_full = TrapezoidROI::full(0);
-        assert!((roi_full.area_ratio() - 1.0).abs() < 1e-6, "全量 ROI 面积比应为 1.0");
+        assert!(
+            (roi_full.area_ratio() - 1.0).abs() < 1e-6,
+            "全量 ROI 面积比应为 1.0"
+        );
 
         let roi_center = TrapezoidROI::centered(4, 0);
         // 以太极位为中心，含 3×3=9 个位置
-        assert!((roi_center.area_ratio() - 1.0).abs() < 1e-6,
-            "太极位 ROI 应覆盖全部 9 格");
+        assert!(
+            (roi_center.area_ratio() - 1.0).abs() < 1e-6,
+            "太极位 ROI 应覆盖全部 9 格"
+        );
     }
 
     // === RecursiveCompose 测试 ===
@@ -672,8 +694,11 @@ mod tests {
     #[test]
     fn test_recursive_compose_single() {
         let v = make_vec("项目使用 PostgreSQL");
-        let result = recursive_compose(&[v.clone()]);
-        assert!((result.confidence - 1.0).abs() < 1e-6, "单向量合成置信度应为 1.0");
+        let result = recursive_compose(std::slice::from_ref(&v));
+        assert!(
+            (result.confidence - 1.0).abs() < 1e-6,
+            "单向量合成置信度应为 1.0"
+        );
         assert_eq!(result.weights, vec![1.0]);
     }
 
@@ -720,7 +745,8 @@ mod tests {
             // 拆解再合成后，保真度应该较高
             assert!(
                 result.fidelity > 0.5,
-                "重构保真度 {} 应 > 0.5", result.fidelity
+                "重构保真度 {} 应 > 0.5",
+                result.fidelity
             );
         }
     }
@@ -738,7 +764,10 @@ mod tests {
     fn test_evolution_cycle() {
         let encoder = LuoShuEncoder::new();
         let vectors: Vec<(String, LuoShuVector)> = vec![
-            ("mem1".into(), encoder.encode_text("PostgreSQL 数据库连接配置")),
+            (
+                "mem1".into(),
+                encoder.encode_text("PostgreSQL 数据库连接配置"),
+            ),
             ("mem2".into(), encoder.encode_text("数据库查询优化策略")),
             ("mem3".into(), encoder.encode_text("React 前端组件设计")),
             ("mem4".into(), encoder.encode_text("前端样式布局方案")),

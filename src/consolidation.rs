@@ -15,10 +15,10 @@
 //   3. SurfaceMemorySource — 表层记忆数据源 trait（可对接任意表层记忆系统）
 //   4. run_consolidation_loop — 后台 tokio 任务入口
 
-#[cfg(feature = "ml")]
-use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 #[cfg(not(feature = "ml"))]
 use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
+#[cfg(feature = "ml")]
+use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 use crate::memory_store::MemoryStore;
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::Persistence;
@@ -151,9 +151,7 @@ impl SurfaceMemorySource for InMemorySource {
             .memories
             .iter()
             .filter(|m| {
-                m.timestamp
-                    .map(|t| t > since)
-                    .unwrap_or(true) // 无时间戳的视为新记忆
+                m.timestamp.map(|t| t > since).unwrap_or(true) // 无时间戳的视为新记忆
             })
             .take(limit)
             .cloned()
@@ -235,9 +233,9 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         let surface_memories = source
             .get_memories_since(self.last_run, self.config.batch_size)
             .await
-            .map_err(|e| PersistenceError::Io(std::io::Error::other(
-                format!("拉取表层记忆失败: {}", e),
-            )))?;
+            .map_err(|e| {
+                PersistenceError::Io(std::io::Error::other(format!("拉取表层记忆失败: {}", e)))
+            })?;
 
         stats.fetched = surface_memories.len();
         if surface_memories.is_empty() {
@@ -258,13 +256,9 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         let mut store = self.store.lock().await;
 
         for sm in &surface_memories {
-            let memory_type = MemoryType::try_parse(&sm.memory_type)
-                .unwrap_or(MemoryType::Fact);
+            let memory_type = MemoryType::try_parse(&sm.memory_type).unwrap_or(MemoryType::Fact);
             let privacy_level = PrivacyLevel::try_parse(
-                sm.session_id
-                    .as_ref()
-                    .map(|_| "session")
-                    .unwrap_or("user"),
+                sm.session_id.as_ref().map(|_| "session").unwrap_or("user"),
             )
             .unwrap_or_default();
 
@@ -277,11 +271,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 None, // 由洛书编码器决定拓扑深度，而非 TTL
             )
             .with_source(format!("consolidation:{}", sm.source))
-            .with_privacy(
-                privacy_level,
-                sm.session_id.clone(),
-                sm.user_id.clone(),
-            );
+            .with_privacy(privacy_level, sm.session_id.clone(), sm.user_id.clone());
 
             match store.remember(memory) {
                 Ok(_) => {
@@ -291,11 +281,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 Err(e) => {
                     stats.failed += 1;
                     if self.config.verbose >= 1 {
-                        eprintln!(
-                            "[LRC·结晶] 写入失败: {} (内容: {:.40}...)",
-                            e,
-                            sm.content
-                        );
+                        eprintln!("[LRC·结晶] 写入失败: {} (内容: {:.40}...)", e, sm.content);
                     }
                 }
             }
@@ -313,10 +299,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 Ok(n) => {
                     stats.synthesized = n;
                     if n > 0 && self.config.verbose >= 1 {
-                        eprintln!(
-                            "[LRC·结晶] 洛书合成完成，生成 {} 条合成记忆",
-                            n
-                        );
+                        eprintln!("[LRC·结晶] 洛书合成完成，生成 {} 条合成记忆", n);
                     }
                 }
                 Err(e) => {
@@ -350,11 +333,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         if self.config.verbose >= 1 {
             eprintln!(
                 "[LRC·结晶] 周期完成: 拉取={}, 写入={}, 合成={}, 失败={}, 耗时={}ms",
-                stats.fetched,
-                stats.stored,
-                stats.synthesized,
-                stats.failed,
-                stats.elapsed_ms
+                stats.fetched, stats.stored, stats.synthesized, stats.failed, stats.elapsed_ms
             );
         }
 
@@ -436,9 +415,7 @@ pub async fn run_consolidation_loop<P: Persistence + Send + 'static>(
     // 停止前输出累积统计
     eprintln!(
         "[LRC·结晶] 流水线已停止。累积统计: 拉取={}, 存储={}, 合成={}",
-        pipeline.total_stats.fetched,
-        pipeline.total_stats.stored,
-        pipeline.total_stats.synthesized
+        pipeline.total_stats.fetched, pipeline.total_stats.stored, pipeline.total_stats.synthesized
     );
 }
 
@@ -568,9 +545,7 @@ mod tests {
         // 应触发了合成（3 条相似 PostgresSQL 记忆）
         let store = store.lock().await;
         let all = store
-            .list_memories(
-                &crate::memory_store::ListFilter::new(),
-            )
+            .list_memories(&crate::memory_store::ListFilter::new())
             .unwrap();
         let synthesis_count = all
             .0

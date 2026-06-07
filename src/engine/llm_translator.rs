@@ -23,10 +23,7 @@ pub enum LlmApiConfig {
         endpoint: String,
     },
     /// Ollama 本地模型
-    Ollama {
-        host: String,
-        model: String,
-    },
+    Ollama { host: String, model: String },
 }
 
 impl LlmApiConfig {
@@ -173,10 +170,7 @@ fn parse_keywords(response: &str) -> Vec<String> {
 /// 如果未配置，则返回原始查询作为关键词。
 ///
 /// 翻译失败时自动回退到原始查询，确保搜索功能不受影响。
-pub async fn translate_query(
-    config: &LlmApiConfig,
-    query: &str,
-) -> Vec<String> {
+pub async fn translate_query(config: &LlmApiConfig, query: &str) -> Vec<String> {
     match config {
         LlmApiConfig::None => {
             vec![query.to_string()]
@@ -185,24 +179,20 @@ pub async fn translate_query(
             api_key,
             model,
             endpoint,
-        } => {
-            match translate_openai(endpoint, api_key, model, query).await {
-                Ok(keywords) if !keywords.is_empty() => keywords,
-                _ => {
-                    eprintln!("[LRC] LLM 翻译失败，回退到原始查询");
-                    vec![query.to_string()]
-                }
+        } => match translate_openai(endpoint, api_key, model, query).await {
+            Ok(keywords) if !keywords.is_empty() => keywords,
+            _ => {
+                eprintln!("[LRC] LLM 翻译失败，回退到原始查询");
+                vec![query.to_string()]
             }
-        }
-        LlmApiConfig::Ollama { host, model } => {
-            match translate_ollama(host, model, query).await {
-                Ok(keywords) if !keywords.is_empty() => keywords,
-                _ => {
-                    eprintln!("[LRC] LLM 翻译失败，回退到原始查询");
-                    vec![query.to_string()]
-                }
+        },
+        LlmApiConfig::Ollama { host, model } => match translate_ollama(host, model, query).await {
+            Ok(keywords) if !keywords.is_empty() => keywords,
+            _ => {
+                eprintln!("[LRC] LLM 翻译失败，回退到原始查询");
+                vec![query.to_string()]
             }
-        }
+        },
     }
 }
 
@@ -258,11 +248,7 @@ async fn translate_openai(
 }
 
 /// 通过 Ollama 本地模型翻译查询
-async fn translate_ollama(
-    host: &str,
-    model: &str,
-    query: &str,
-) -> Result<Vec<String>, String> {
+async fn translate_ollama(host: &str, model: &str, query: &str) -> Result<Vec<String>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -317,10 +303,7 @@ mod tests {
     #[test]
     fn test_parse_keywords_with_spaces() {
         let result = parse_keywords("  authenticate_user ,  login , handle_login  ");
-        assert_eq!(
-            result,
-            vec!["authenticate_user", "login", "handle_login"]
-        );
+        assert_eq!(result, vec!["authenticate_user", "login", "handle_login"]);
     }
 
     #[test]
@@ -348,8 +331,7 @@ mod tests {
 
     #[test]
     fn test_parse_config_openai_custom_endpoint() {
-        let config =
-            LlmApiConfig::parse("openai:sk-test:gpt-4:https://custom.api.com/v1").unwrap();
+        let config = LlmApiConfig::parse("openai:sk-test:gpt-4:https://custom.api.com/v1").unwrap();
         match config {
             LlmApiConfig::OpenAI { endpoint, .. } => {
                 assert_eq!(endpoint, "https://custom.api.com/v1");

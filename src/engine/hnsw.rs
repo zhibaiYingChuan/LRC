@@ -108,7 +108,9 @@ impl HnswGraph {
             let closest_idx = candidates
                 .iter()
                 .enumerate()
-                .min_by(|(_, (_, a)), (_, (_, b))| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .min_by(|(_, (_, a)), (_, (_, b))| {
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .map(|(i, _)| i)
                 .unwrap_or(0);
 
@@ -138,7 +140,8 @@ impl HnswGraph {
                     candidates.push((neighbor_idx, dist));
                     results.push((neighbor_idx, dist));
                     // 保持结果集按距离升序
-                    results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    results
+                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
                     // 截断到 ef
                     if results.len() > ef {
                         results.truncate(ef);
@@ -167,17 +170,11 @@ impl HnswGraph {
         if let Some(entry) = self.entry_point {
             // 搜索最近的 max_connections 个邻居
             let ef = self.ef_search.max(self.max_connections);
-            let (neighbors, _distances) = self.search_layer(
-                &self.nodes[node_idx].vector,
-                entry,
-                ef,
-            );
+            let (neighbors, _distances) =
+                self.search_layer(&self.nodes[node_idx].vector, entry, ef);
 
             // 选择最近的 max_connections 个作为连接
-            let selected: Vec<usize> = neighbors
-                .into_iter()
-                .take(self.max_connections)
-                .collect();
+            let selected: Vec<usize> = neighbors.into_iter().take(self.max_connections).collect();
 
             // 建立双向连接
             for &neighbor_idx in &selected {
@@ -218,8 +215,7 @@ impl HnswGraph {
             .collect();
 
         // 按距离升序排序，保留最近的 max 个
-        neighbor_dists
-            .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        neighbor_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let pruned: Vec<usize> = neighbor_dists
             .into_iter()
@@ -272,12 +268,7 @@ impl<E: CodeEncoder> HnswRetriever<E> {
     /// - `threshold`: 相似度阈值（低于此值的结果被过滤）
     /// - `max_connections`: 每个节点的最大连接数（默认 16）
     /// - `ef_search`: 搜索束宽度（默认 50）
-    pub fn new(
-        encoder: Arc<E>,
-        threshold: f32,
-        max_connections: usize,
-        ef_search: usize,
-    ) -> Self {
+    pub fn new(encoder: Arc<E>, threshold: f32, max_connections: usize, ef_search: usize) -> Self {
         Self {
             encoder,
             graph: HnswGraph::new(max_connections, ef_search),
@@ -346,11 +337,9 @@ impl<E: CodeEncoder> CodeRetriever for HnswRetriever<E> {
 
         // 通过 NSW 图搜索
         let entry = self.graph.entry_point.unwrap_or(0);
-        let (indices, distances) = self.graph.search_layer(
-            &query_vector,
-            entry,
-            self.graph.ef_search.max(top_k),
-        );
+        let (indices, distances) =
+            self.graph
+                .search_layer(&query_vector, entry, self.graph.ef_search.max(top_k));
 
         // 距离转相似度，过滤低于阈值的
         let mut scored: Vec<ScoredChunk> = indices
@@ -423,8 +412,11 @@ mod tests {
 
     fn build_encoder() -> Arc<FastEncoder> {
         Arc::new(FastEncoder::new(vec![
-            "alpha".into(), "beta".into(), "gamma".into(),
-            "delta".into(), "epsilon".into(),
+            "alpha".into(),
+            "beta".into(),
+            "gamma".into(),
+            "delta".into(),
+            "epsilon".into(),
         ]))
     }
 
@@ -443,7 +435,12 @@ mod tests {
     #[test]
     fn test_hnsw_single_insert_search() {
         let mut retriever = build_retriever();
-        retriever.index_chunk(make_chunk("a.rs", "func_a", "fn", "fn func_a() { alpha beta }"));
+        retriever.index_chunk(make_chunk(
+            "a.rs",
+            "func_a",
+            "fn",
+            "fn func_a() { alpha beta }",
+        ));
         let result = retriever.search("alpha", 5);
         assert_eq!(result.returned, 1);
         assert_eq!(result.results[0].chunk.name, "func_a");
@@ -453,11 +450,20 @@ mod tests {
     fn test_hnsw_multiple_insert_search() {
         let mut retriever = build_retriever();
         retriever.index_chunk(make_chunk("a.rs", "fn1", "fn", "fn fn1() { x y }"));
-        retriever.index_chunk(make_chunk("b.rs", "fn2", "fn", "fn fn2() { alpha beta gamma }"));
+        retriever.index_chunk(make_chunk(
+            "b.rs",
+            "fn2",
+            "fn",
+            "fn fn2() { alpha beta gamma }",
+        ));
         retriever.index_chunk(make_chunk("c.rs", "fn3", "fn", "fn fn3() { alpha }"));
 
         let result = retriever.search("alpha beta", 5);
-        assert!(result.returned >= 2, "应至少召回 2 个结果: {}", result.returned);
+        assert!(
+            result.returned >= 2,
+            "应至少召回 2 个结果: {}",
+            result.returned
+        );
     }
 
     #[test]
@@ -500,7 +506,12 @@ mod tests {
     fn test_hnsw_threshold_filter() {
         let mut retriever = HnswRetriever::with_defaults(build_encoder(), 0.9);
         retriever.index_chunk(make_chunk("a.rs", "fn1", "fn", "fn fn1() { x y z w }"));
-        retriever.index_chunk(make_chunk("b.rs", "fn2", "fn", "fn fn2() { alpha beta gamma delta epsilon }"));
+        retriever.index_chunk(make_chunk(
+            "b.rs",
+            "fn2",
+            "fn",
+            "fn fn2() { alpha beta gamma delta epsilon }",
+        ));
 
         let result = retriever.search("alpha beta gamma", 5);
         // 高阈值会过滤掉一些结果

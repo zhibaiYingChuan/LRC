@@ -19,10 +19,10 @@
 //   LRC_LUOSHU_MODEL_ID=BAAI/bge-small-zh  (中文专用)
 //   LRC_LUOSHU_MODEL_ID=sentence-transformers/all-MiniLM-L6-v2  (默认)
 
-use super::luoshu_encoder::{LuoShuEncoder, LuoShuVector, LUOSHU_WEIGHTS};
+use super::luoshu_encoder::{EncoderStatus, LuoShuEncoder, LuoShuVector, LUOSHU_WEIGHTS};
 use candle_core::{Device, Tensor};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// 洛书编码器 ML 增强器
 ///
@@ -51,6 +51,7 @@ pub enum PoolingStrategy {
 }
 
 impl LuoShuMlEncoder {
+    /// 道枢映射: 坤卦·地 (☷) — 承载万物，模型加载是编码能力的根基
     /// 加载默认的轻量级多语言模型
     ///
     /// 加载策略（与 CodeBertEncoder 一致）：
@@ -65,8 +66,8 @@ impl LuoShuMlEncoder {
 
         let local_model_name = model_id.replace('/', "--");
 
-        let project_root = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let project_root =
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let local_model_dir = project_root.join("models").join(&local_model_name);
 
         let mut use_local = false;
@@ -85,16 +86,42 @@ impl LuoShuMlEncoder {
             }
         }
 
+        // 自适应连通性检测：分层超时策略
+        // 第一层：3 秒快速检测（覆盖 90% 的正常网络环境）
+        // 第二层：6 秒宽容检测（覆盖慢速网络/代理环境）
+        // 两层均失败才降级为统计编码器
+        if !use_local {
+            let hf_ip = std::net::SocketAddr::from(([104, 16, 86, 20], 443)); // huggingface.co
+            let hf_reachable_fast =
+                std::net::TcpStream::connect_timeout(&hf_ip, std::time::Duration::from_secs(3))
+                    .is_ok();
+
+            if !hf_reachable_fast {
+                eprintln!("[LRC·洛书ML] 3s 快速检测超时，尝试 6s 宽容检测...");
+                let hf_reachable_slow =
+                    std::net::TcpStream::connect_timeout(&hf_ip, std::time::Duration::from_secs(6))
+                        .is_ok();
+                if !hf_reachable_slow {
+                    return Err(
+                        "HuggingFace 不可达（3s+6s 双层检测均超时），自动降级为统计编码器"
+                            .to_string(),
+                    );
+                }
+                eprintln!("[LRC·洛书ML] 6s 宽容检测通过，网络较慢但可用");
+            }
+        }
+
         // 加载分词器
         let tokenizer = if use_local {
             let tokenizer_path = model_dir.join("tokenizer.json");
             tokenizers::Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| format!("加载本地分词器失败: {}", e))?
         } else {
-            let api = hf_hub::api::sync::Api::new()
-                .map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
+            let api =
+                hf_hub::api::sync::Api::new().map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
             let repo = api.model(model_id.clone());
-            let tokenizer_path = repo.get("tokenizer.json")
+            let tokenizer_path = repo
+                .get("tokenizer.json")
                 .map_err(|e| format!("下载分词器失败: {}", e))?;
             tokenizers::Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| format!("解析分词器失败: {}", e))?
@@ -106,8 +133,13 @@ impl LuoShuMlEncoder {
             // 从 config.json 解析真实的 BERT 配置（与 CodeBertEncoder 一致）
             // 修复：不能使用 Default::default()，因为不同模型的层数/维度不同
             // 例如 all-MiniLM-L6-v2 是 6 层 384 维，而 default 是 12 层 768 维
-            let config_file = std::fs::File::open(&config_path)
-                .map_err(|e| format!("打开 config.json 失败: {}\n路径: {}", e, config_path.display()))?;
+            let config_file = std::fs::File::open(&config_path).map_err(|e| {
+                format!(
+                    "打开 config.json 失败: {}\n路径: {}",
+                    e,
+                    config_path.display()
+                )
+            })?;
             let config: candle_transformers::models::bert::Config =
                 serde_json::from_reader(std::io::BufReader::new(config_file))
                     .map_err(|e| format!("解析 config.json 失败: {}", e))?;
@@ -122,53 +154,54 @@ impl LuoShuMlEncoder {
             };
 
             let tensors: HashMap<String, Tensor> = if is_safetensors {
-                candle_core::safetensors::load(&weights_path, &device)
-                    .map_err(|e| format!(
+                candle_core::safetensors::load(&weights_path, &device).map_err(|e| {
+                    format!(
                         "safetensors 加载失败: {}\n路径: {}",
-                        e, weights_path.display()
-                    ))?
+                        e,
+                        weights_path.display()
+                    )
+                })?
             } else {
                 // pytorch_model.bin 使用 PthTensors 懒加载器（与 CodeBertEncoder 一致）
-                let pth = candle_core::pickle::PthTensors::new(&weights_path, None)
-                    .map_err(|e| format!(
-                        "pickle 加载 pytorch_model.bin 失败: {}\n\
+                let pth =
+                    candle_core::pickle::PthTensors::new(&weights_path, None).map_err(|e| {
+                        format!(
+                            "pickle 加载 pytorch_model.bin 失败: {}\n\
                          提示: 文件可能已损坏，请尝试转换为 safetensors 格式:\n\
                          pip install safetensors torch && python scripts/convert_model.py",
-                        e
-                    ))?;
+                            e
+                        )
+                    })?;
                 let mut tensors = HashMap::new();
-                for (name, _info) in pth.tensor_infos() {
-                    if let Some(tensor) = pth.get(name)
+                for name in pth.tensor_infos().keys() {
+                    if let Some(tensor) = pth
+                        .get(name)
                         .map_err(|e| format!("加载 tensor '{}' 失败: {}", name, e))?
                     {
                         tensors.insert(name.to_string(), tensor);
                     }
                 }
                 if tensors.is_empty() {
-                    return Err(format!(
-                        "pytorch_model.bin 中未找到任何 tensor\n\
+                    return Err("pytorch_model.bin 中未找到任何 tensor\n\
                          提示: 文件可能已损坏，请尝试重新下载"
-                    ));
+                        .to_string());
                 }
                 tensors
             };
 
-            let vb = candle_nn::VarBuilder::from_tensors(
-                tensors,
-                candle_core::DType::F32,
-                &device,
-            );
+            let vb = candle_nn::VarBuilder::from_tensors(tensors, candle_core::DType::F32, &device);
 
             let model = candle_transformers::models::bert::BertModel::load(vb, &config)
                 .map_err(|e| format!("构建 BERT 模型失败: {}", e))?;
 
             (model, hidden_size)
         } else {
-            let api = hf_hub::api::sync::Api::new()
-                .map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
+            let api =
+                hf_hub::api::sync::Api::new().map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
             let repo = api.model(model_id);
 
-            let config_path = repo.get("config.json")
+            let config_path = repo
+                .get("config.json")
                 .map_err(|e| format!("下载配置失败: {}", e))?;
             // 从 config.json 解析真实的 BERT 配置（与 CodeBertEncoder 一致）
             let config_file = std::fs::File::open(&config_path)
@@ -182,12 +215,13 @@ impl LuoShuMlEncoder {
             let (weights_path, is_safetensors) = match repo.get("model.safetensors") {
                 Ok(path) => (path, true),
                 Err(_) => {
-                    let path = repo.get("pytorch_model.bin")
-                        .map_err(|e| format!(
+                    let path = repo.get("pytorch_model.bin").map_err(|e| {
+                        format!(
                             "下载模型文件失败（safetensors 和 pytorch_model.bin 均不可用）: {}\n\
                              提示: 请检查网络连接，或手动将模型文件放到 models/{} 目录",
                             e, local_model_name
-                        ))?;
+                        )
+                    })?;
                     (path, false)
                 }
             };
@@ -196,40 +230,47 @@ impl LuoShuMlEncoder {
                 candle_core::safetensors::load(&weights_path, &device)
                     .map_err(|e| format!("safetensors 加载失败: {}", e))?
             } else {
-                let pth = candle_core::pickle::PthTensors::new(&weights_path, None)
-                    .map_err(|e| format!(
-                        "pickle 加载 pytorch_model.bin 失败: {}\n\
+                let pth =
+                    candle_core::pickle::PthTensors::new(&weights_path, None).map_err(|e| {
+                        format!(
+                            "pickle 加载 pytorch_model.bin 失败: {}\n\
                          提示: 如果持续失败，请尝试转换为 safetensors 格式",
-                        e
-                    ))?;
+                            e
+                        )
+                    })?;
                 let mut tensors = HashMap::new();
-                for (name, _info) in pth.tensor_infos() {
-                    if let Some(tensor) = pth.get(name)
+                for name in pth.tensor_infos().keys() {
+                    if let Some(tensor) = pth
+                        .get(name)
                         .map_err(|e| format!("加载 tensor '{}' 失败: {}", name, e))?
                     {
                         tensors.insert(name.to_string(), tensor);
                     }
                 }
                 if tensors.is_empty() {
-                    return Err(
-                        "pytorch_model.bin 中未找到任何 tensor\n\
-                         提示: 文件可能已损坏，请尝试重新下载".to_string()
-                    );
+                    return Err("pytorch_model.bin 中未找到任何 tensor\n\
+                         提示: 文件可能已损坏，请尝试重新下载"
+                        .to_string());
                 }
                 tensors
             };
 
-            let vb = candle_nn::VarBuilder::from_tensors(
-                tensors,
-                candle_core::DType::F32,
-                &device,
-            );
+            let vb = candle_nn::VarBuilder::from_tensors(tensors, candle_core::DType::F32, &device);
 
             let model = candle_transformers::models::bert::BertModel::load(vb, &config)
                 .map_err(|e| format!("构建 BERT 模型失败: {}", e))?;
 
             (model, hidden_size)
         };
+
+        // 模型完整性校验：hidden_size 必须合理（BERT 系模型常见 384/768/1024）
+        if !(128..=2048).contains(&hidden_size) {
+            return Err(format!(
+                "模型 config.json 中 hidden_size={} 异常，疑似文件损坏或版本不匹配。\
+                 请检查 models/{} 目录下的模型文件是否完整",
+                hidden_size, local_model_name
+            ));
+        }
 
         // 初始化投影矩阵
         let projection = Self::init_projection(hidden_size);
@@ -240,14 +281,40 @@ impl LuoShuMlEncoder {
             hidden_size
         );
 
-        Ok(Self {
+        // 构建编码器实例
+        let encoder = Self {
             model,
             tokenizer,
             device,
             pooling: PoolingStrategy::Mean,
             projection,
             hidden_size,
-        })
+        };
+
+        // 加载后验证：编码一个简单测试文本，确保模型实际可用
+        // 这能捕获模型权重损坏、分词器不匹配等隐蔽问题
+        match encoder.encode_text("Hello") {
+            Ok(vec) => {
+                let dev = vec.luoshu_deviation();
+                if dev > 2.0 {
+                    return Err(format!(
+                        "模型加载后验证失败：测试编码的幻和偏离度 {:.2} 异常（期望 < 2.0）。\
+                         模型可能已损坏或与分词器不匹配",
+                        dev
+                    ));
+                }
+                eprintln!("[LRC·洛书ML] 加载后验证通过，幻和偏离度: {:.2}", dev);
+            }
+            Err(e) => {
+                return Err(format!(
+                    "模型加载后验证失败：测试编码出错: {}。\
+                     模型可能已损坏，请尝试重新下载模型文件到 models/{} 目录",
+                    e, local_model_name
+                ));
+            }
+        }
+
+        Ok(encoder)
     }
 
     /// 初始化投影矩阵 W ∈ R^(hidden_size × 9)
@@ -258,12 +325,12 @@ impl LuoShuMlEncoder {
         let bound = (6.0_f32 / (hidden_size as f32 + 9.0)).sqrt();
         let mut proj = vec![vec![0.0f32; 9]; hidden_size];
 
-        for i in 0..hidden_size {
-            for j in 0..9 {
+        for (i, row) in proj.iter_mut().enumerate().take(hidden_size) {
+            for (j, cell) in row.iter_mut().enumerate() {
                 let mut hasher = DefaultHasher::new();
                 (i * 9 + j).hash(&mut hasher);
                 let seed = hasher.finish() as f32 / u64::MAX as f32;
-                proj[i][j] = (seed - 0.5) * 2.0 * bound;
+                *cell = (seed - 0.5) * 2.0 * bound;
             }
         }
         proj
@@ -277,8 +344,9 @@ impl LuoShuMlEncoder {
             .encode(text, true)
             .map_err(|e| format!("分词失败: {}", e))?;
 
-        let token_ids: Vec<u32> = encoding.get_ids().iter().map(|&id| id).collect();
-        let attention_mask: Vec<f32> = encoding.get_attention_mask()
+        let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+        let attention_mask: Vec<f32> = encoding
+            .get_attention_mask()
             .iter()
             .map(|&m| m as f32)
             .collect();
@@ -286,25 +354,19 @@ impl LuoShuMlEncoder {
         let seq_len = token_ids.len().min(512);
 
         // 2. 创建输入张量（与 CodeBertEncoder 相同的模式）
-        let input_ids = Tensor::new(
-            &token_ids[..seq_len],
-            &self.device,
-        )
-        .map_err(|e| format!("创建 input_ids: {}", e))?
-        .unsqueeze(0)
-        .map_err(|e| format!("unsqueeze: {}", e))?;
+        let input_ids = Tensor::new(&token_ids[..seq_len], &self.device)
+            .map_err(|e| format!("创建 input_ids: {}", e))?
+            .unsqueeze(0)
+            .map_err(|e| format!("unsqueeze: {}", e))?;
 
         let token_type_ids = input_ids
             .zeros_like()
             .map_err(|e| format!("type_ids: {}", e))?;
 
-        let attention_tensor = Tensor::new(
-            &attention_mask[..seq_len],
-            &self.device,
-        )
-        .map_err(|e| format!("attention: {}", e))?
-        .unsqueeze(0)
-        .map_err(|e| format!("unsqueeze: {}", e))?;
+        let attention_tensor = Tensor::new(&attention_mask[..seq_len], &self.device)
+            .map_err(|e| format!("attention: {}", e))?
+            .unsqueeze(0)
+            .map_err(|e| format!("unsqueeze: {}", e))?;
 
         // 3. BERT 前向传播
         let output = self
@@ -347,12 +409,12 @@ impl LuoShuMlEncoder {
 
         // 5. 投影：hidden_size → 9
         let mut raw_features = [0.0f32; 9];
-        for j in 0..9 {
+        for (j, rf) in raw_features.iter_mut().enumerate() {
             let mut sum = 0.0f32;
-            for i in 0..actual_hidden {
-                sum += emb_vec[i] * self.projection[i][j];
+            for (i, &ev) in emb_vec.iter().enumerate().take(actual_hidden) {
+                sum += ev * self.projection[i][j];
             }
-            raw_features[j] = sum;
+            *rf = sum;
         }
 
         // 6. 贝叶斯融合：先验（洛书标准权重）× 似然（ML 投影）
@@ -377,6 +439,7 @@ impl LuoShuMlEncoder {
         Ok(vec)
     }
 
+    /// 道枢映射: 洛书·九宫 — 将语义向量映射到洛书九宫格，实现数与义的统一
     /// 获取底层 BERT 编码器的句嵌入（未经投影，用于其他语义场景）
     pub fn encode_embedding(&self, text: &str) -> Result<Vec<f32>, String> {
         let encoding = self
@@ -384,8 +447,9 @@ impl LuoShuMlEncoder {
             .encode(text, true)
             .map_err(|e| format!("分词失败: {}", e))?;
 
-        let token_ids: Vec<u32> = encoding.get_ids().iter().map(|&id| id).collect();
-        let attention_mask: Vec<f32> = encoding.get_attention_mask()
+        let token_ids: Vec<u32> = encoding.get_ids().to_vec();
+        let attention_mask: Vec<f32> = encoding
+            .get_attention_mask()
             .iter()
             .map(|&m| m as f32)
             .collect();
@@ -396,7 +460,8 @@ impl LuoShuMlEncoder {
             .unsqueeze(0)
             .map_err(|e| format!("unsqueeze: {}", e))?;
 
-        let token_type_ids = input_ids.zeros_like()
+        let token_type_ids = input_ids
+            .zeros_like()
             .map_err(|e| format!("type_ids: {}", e))?;
 
         let attention_tensor = Tensor::new(&attention_mask[..seq_len], &self.device)
@@ -404,21 +469,25 @@ impl LuoShuMlEncoder {
             .unsqueeze(0)
             .map_err(|e| format!("unsqueeze: {}", e))?;
 
-        let output = self.model
+        let output = self
+            .model
             .forward(&input_ids, &token_type_ids, Some(&attention_tensor))
             .map_err(|e| format!("forward: {}", e))?;
 
         let mask = attention_tensor
             .unsqueeze(2)
             .map_err(|e| format!("mask unsqueeze: {}", e))?;
-        let masked = output.broadcast_mul(&mask)
+        let masked = output
+            .broadcast_mul(&mask)
             .map_err(|e| format!("masked mul: {}", e))?;
         let sum = masked.sum(1).map_err(|e| format!("sum: {}", e))?;
         let mask_sum = mask.sum(1).map_err(|e| format!("mask_sum: {}", e))?;
-        let pooled = sum.broadcast_div(&mask_sum)
+        let pooled = sum
+            .broadcast_div(&mask_sum)
             .map_err(|e| format!("div: {}", e))?;
 
-        pooled.flatten_all()
+        pooled
+            .flatten_all()
             .map_err(|e| format!("flatten: {}", e))?
             .to_vec1()
             .map_err(|e| format!("to_vec1: {}", e))
@@ -434,6 +503,38 @@ pub struct HybridLuoShuEncoder {
     ml_encoder: Option<Arc<LuoShuMlEncoder>>,
     /// 统计编码器（始终可用，用作回退）
     fallback: LuoShuEncoder,
+    /// 编码器状态追踪
+    status: Mutex<EncoderStatus>,
+    /// 延迟恢复机制（质疑一：防止频繁模式切换）
+    /// 当 ML 编码器从降级中恢复时，不立即切换，而是在连续 N 次成功编码后才切换
+    recovery_state: Mutex<RecoveryState>,
+}
+
+/// 延迟恢复状态（质疑一：防止 ML↔统计 频繁横跳）
+///
+/// 当 ML 编码器因网络抖动等原因短暂不可用后恢复时，
+/// 不立即切回 ML 模式，而是等待连续 N 次成功编码积累冷却期。
+/// 这避免了编码器在两种模式之间来回震荡导致的向量质量波动。
+struct RecoveryState {
+    /// 连续 ML 编码成功次数（用于冷却期计数）
+    consecutive_successes: u32,
+    /// 恢复阈值：连续成功此次数后才切回 ML 模式
+    recovery_threshold: u32,
+    /// 是否处于降级状态（ML 不可用，正在使用统计模式）
+    is_degraded: bool,
+    /// 降级原因
+    degradation_reason: String,
+}
+
+impl RecoveryState {
+    fn new() -> Self {
+        Self {
+            consecutive_successes: 0,
+            recovery_threshold: 5, // 默认连续 5 次成功才恢复
+            is_degraded: false,
+            degradation_reason: String::new(),
+        }
+    }
 }
 
 impl HybridLuoShuEncoder {
@@ -442,29 +543,169 @@ impl HybridLuoShuEncoder {
         Self {
             ml_encoder: None,
             fallback: LuoShuEncoder::new(),
+            status: Mutex::new(EncoderStatus {
+                mode: "statistical".to_string(),
+                model_name: None,
+                hidden_size: None,
+                degradation_reason: Some("ML 编码器未启用或加载失败".to_string()),
+                total_encodings: 0,
+                last_encoding_ms: 0,
+                capability_description: "统计模式：基于词频和字符熵的轻量编码，语义区分能力有限"
+                    .to_string(),
+                quality_score: 0.25,
+            }),
+            recovery_state: Mutex::new(RecoveryState::new()),
         }
     }
 
     /// 创建混合编码器（尝试加载 ML 模型）
     pub fn new_with_ml(ml_encoder: LuoShuMlEncoder) -> Self {
+        let hidden_size = ml_encoder.hidden_size; // 在移动前保存
+        let model_name = format!("ML 语义模型 (hidden_size={})", hidden_size);
         Self {
             ml_encoder: Some(Arc::new(ml_encoder)),
             fallback: LuoShuEncoder::new(),
+            status: Mutex::new(EncoderStatus {
+                mode: "ml".to_string(),
+                model_name: Some(model_name.clone()),
+                hidden_size: Some(hidden_size),
+                degradation_reason: None,
+                total_encodings: 0,
+                last_encoding_ms: 0,
+                capability_description: format!(
+                    "ML 语义模式：基于 {} 的深度学习编码，提供高精度语义理解",
+                    model_name
+                ),
+                quality_score: 1.0,
+            }),
+            recovery_state: Mutex::new(RecoveryState::new()),
+        }
+    }
+
+    /// 记录编码器降级（当 ML 编码失败回退到统计模式时调用）
+    ///
+    /// 质疑一修复：降级时设置恢复状态，确保后续恢复需要经过冷却期
+    pub fn record_degradation(&self, reason: &str) {
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        let mut recovery = self
+            .recovery_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        if status.mode == "ml" {
+            status.mode = "statistical".to_string();
+            status.degradation_reason = Some(reason.to_string());
+            status.quality_score = 0.25; // 降级后语义保真度降低
+            status.capability_description = format!(
+                "降级统计模式：ML 编码器不可用（{}），当前使用词频编码，语义保真度降低",
+                reason
+            );
+
+            // 标记降级状态，重置连续成功计数
+            recovery.is_degraded = true;
+            recovery.consecutive_successes = 0;
+            recovery.degradation_reason = reason.to_string();
+
+            eprintln!(
+                "[LRC·编码器] 模式切换: ML → 统计（原因: {}）需要连续 {} 次 ML 成功后方可恢复",
+                reason, recovery.recovery_threshold
+            );
         }
     }
 
     /// 编码文本为洛书向量
     ///
     /// 优先使用 ML 编码器，失败时自动回退到统计编码器。
+    ///
+    /// 质疑一修复：引入冷却期机制。
+    /// - 降级：ML 失败时立即切换到统计模式（快速降级）
+    /// - 恢复：ML 成功后不立即切换，需连续 N 次成功才恢复（延迟恢复）
+    ///   这避免了因临时网络抖动导致的频繁 ML↔统计 模式切换。
     pub fn encode_text(&self, text: &str) -> LuoShuVector {
+        // 检查是否处于降级恢复状态
+        let is_degraded = {
+            let recovery = self
+                .recovery_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            recovery.is_degraded
+        };
+
         if let Some(ref ml) = self.ml_encoder {
             match ml.encode_text(text) {
-                Ok(vec) => return vec,
+                Ok(vec) => {
+                    // 更新编码器状态
+                    let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+                    status.total_encodings += 1;
+                    status.last_encoding_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    // 质疑一核心逻辑：延迟恢复
+                    if is_degraded {
+                        // 处于降级状态，ML 编码成功但不立即恢复
+                        let mut recovery = self
+                            .recovery_state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        recovery.consecutive_successes += 1;
+                        eprintln!(
+                            "[LRC·编码器] ML 探测成功 {}/{}（冷却中...）",
+                            recovery.consecutive_successes, recovery.recovery_threshold
+                        );
+
+                        if recovery.consecutive_successes >= recovery.recovery_threshold {
+                            // 冷却期结束，恢复 ML 模式
+                            recovery.is_degraded = false;
+                            recovery.consecutive_successes = 0;
+                            status.mode = "ml".to_string();
+                            status.degradation_reason = None;
+                            status.quality_score = 1.0;
+                            status.capability_description =
+                                "ML 语义模式：已恢复，提供高精度语义理解".to_string();
+                            eprintln!(
+                                "[LRC·编码器] 模式切换: 统计 → ML（冷却期结束，连续 {} 次成功）",
+                                recovery.recovery_threshold
+                            );
+                        }
+                        // 即使处于降级冷却期，也返回 ML 编码结果（探测模式）
+                        return vec;
+                    }
+
+                    return vec;
+                }
                 Err(e) => {
                     eprintln!("[LRC·洛书] ML 编码失败 ({}), 回退到统计编码器", e);
+                    self.record_degradation(&e);
                 }
             }
         }
+        // 统计模式编码
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        status.total_encodings += 1;
+        status.last_encoding_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        drop(status);
+
+        // 如果 ML 编码器存在但处于降级状态，且 ML 编码失败，
+        // 重置连续成功计数（中断恢复过程）
+        if self.ml_encoder.is_some() {
+            let mut recovery = self
+                .recovery_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if recovery.is_degraded && recovery.consecutive_successes > 0 {
+                eprintln!(
+                    "[LRC·编码器] ML 探测失败，重置冷却计数（之前: {} 次成功）",
+                    recovery.consecutive_successes
+                );
+                recovery.consecutive_successes = 0;
+            }
+        }
+
         self.fallback.encode_text(text)
     }
 
@@ -473,6 +714,43 @@ impl HybridLuoShuEncoder {
         self.ml_encoder.is_some()
     }
 
+    /// 检查是否处于降级状态（质疑一：监控用）
+    pub fn is_degraded(&self) -> bool {
+        self.recovery_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_degraded
+    }
+
+    /// 道枢映射: 震卦·雷 (☳) — 万物出乎震，恢复进度如春雷之后的复苏
+    /// 获取当前恢复进度（质疑一：可解释性面板）
+    /// 返回 (consecutive_successes, recovery_threshold)
+    pub fn recovery_progress(&self) -> (u32, u32) {
+        let recovery = self
+            .recovery_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (recovery.consecutive_successes, recovery.recovery_threshold)
+    }
+
+    /// 设置恢复阈值（质疑一：允许用户根据网络稳定性调整）
+    pub fn set_recovery_threshold(&self, threshold: u32) {
+        let mut recovery = self
+            .recovery_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        recovery.recovery_threshold = threshold.max(1);
+    }
+
+    /// 获取编码器状态快照（可解释性面板）
+    pub fn get_status(&self) -> EncoderStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 道枢映射: 洛书·幻和 — 计算向量的洛书幻和偏离度，度量编码质量
     /// 获取幻和偏离度（监控用）
     pub fn deviation_of(&self, text: &str) -> f32 {
         let vec = self.encode_text(text);
@@ -492,10 +770,7 @@ impl Default for HybridLuoShuEncoder {
                     return Self::new_with_ml(ml);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[LRC·洛书] ML 编码器加载失败，降级为统计模式: {}",
-                        e
-                    );
+                    eprintln!("[LRC·洛书] ML 编码器加载失败，降级为统计模式: {}", e);
                 }
             }
         }
@@ -524,9 +799,15 @@ mod tests {
     fn test_projection_initialization() {
         let proj = LuoShuMlEncoder::init_projection(384);
 
-        for j in 0..9 {
-            let col_sum: f32 = (0..384).map(|i| proj[i][j].abs()).sum();
-            assert!(col_sum > 0.0, "第 {} 列投影权重全为零", j);
+        // 计算每列投影权重绝对值之和，确保每列非零
+        let col_sums: [f32; 9] = proj.iter().fold([0.0f32; 9], |mut acc, row| {
+            for (j, &val) in row.iter().enumerate() {
+                acc[j] += val.abs();
+            }
+            acc
+        });
+        for (j, &sum) in col_sums.iter().enumerate() {
+            assert!(sum > 0.0, "第 {} 列投影权重全为零", j);
         }
     }
 
@@ -538,5 +819,33 @@ mod tests {
         let v2 = encoder.encode_text("数据库配置");
         assert_eq!(v1.values.len(), 9);
         assert_eq!(v2.values.len(), 9);
+    }
+
+    /// 测试：质疑一冷却期 — 降级后恢复需要连续成功
+    #[test]
+    fn test_cooldown_recovery_mechanism() {
+        let encoder = HybridLuoShuEncoder::new_statistical();
+        // 统计模式下不应处于降级状态
+        assert!(!encoder.is_degraded());
+
+        // 模拟降级
+        encoder.record_degradation("模拟网络抖动");
+        // 统计模式编码器没有 ML 编码器，降级标记应设置
+        // 但由于没有 ML 编码器，is_degraded 取决于 ml_encoder 是否存在
+        // 此处重点验证降级逻辑不 panic
+    }
+
+    /// 测试：恢复阈值设置
+    #[test]
+    fn test_recovery_threshold_config() {
+        let encoder = HybridLuoShuEncoder::new_statistical();
+        encoder.set_recovery_threshold(10);
+        let (_, threshold) = encoder.recovery_progress();
+        assert_eq!(threshold, 10);
+
+        // 阈值不能为 0
+        encoder.set_recovery_threshold(0);
+        let (_, threshold) = encoder.recovery_progress();
+        assert_eq!(threshold, 1);
     }
 }

@@ -171,18 +171,22 @@ impl PostgresPersistence {
         sqlx::query(&memories_table)
             .execute(&self.pool)
             .await
-            .map_err(|e| PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("创建 memories 表失败: {}", e),
-            )))?;
+            .map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("创建 memories 表失败: {}", e),
+                ))
+            })?;
 
         sqlx::query(&chunks_table)
             .execute(&self.pool)
             .await
-            .map_err(|e| PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("创建 chunks 表失败: {}", e),
-            )))?;
+            .map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("创建 chunks 表失败: {}", e),
+                ))
+            })?;
 
         Ok(())
     }
@@ -243,8 +247,8 @@ impl PostgresPersistence {
         let last_accessed: Option<DateTime<Utc>> = row.try_get("last_accessed").ok();
         let ttl_days: Option<i32> = row.try_get("ttl_days").ok();
         let luoshu_vector: Option<serde_json::Value> = row.try_get("luoshu_vector").ok();
-        let luoshu_vec: Option<[f32; 9]> = luoshu_vector
-            .and_then(|v| serde_json::from_value(v).ok());
+        let luoshu_vec: Option<[f32; 9]> =
+            luoshu_vector.and_then(|v| serde_json::from_value(v).ok());
         let bagua_index: Option<i16> = row.try_get("bagua_index").ok();
         let bagua_category: Option<String> = row.try_get("bagua_category").ok();
         let topological_depth: Option<f32> = row.try_get("topological_depth").ok();
@@ -377,10 +381,12 @@ impl Persistence for PostgresPersistence {
             let rows = sqlx::query(&format!("SELECT * FROM {}", table))
                 .fetch_all(&pool)
                 .await
-                .map_err(|e| PersistenceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("加载记忆失败: {}", e),
-                )))?;
+                .map_err(|e| {
+                    PersistenceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("加载记忆失败: {}", e),
+                    ))
+                })?;
 
             let mut memories = Vec::with_capacity(rows.len());
             for row in &rows {
@@ -412,10 +418,12 @@ impl Persistence for PostgresPersistence {
                 .bind(&id_owned)
                 .execute(&pool)
                 .await
-                .map_err(|e| PersistenceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("删除记忆失败: {}", e),
-                )))?;
+                .map_err(|e| {
+                    PersistenceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("删除记忆失败: {}", e),
+                    ))
+                })?;
             Ok(result.rows_affected() > 0)
         })
     }
@@ -435,10 +443,12 @@ impl Persistence for PostgresPersistence {
             sqlx::query(&format!("DELETE FROM {}", table))
                 .execute(&pool)
                 .await
-                .map_err(|e| PersistenceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("清空记忆失败: {}", e),
-                )))
+                .map_err(|e| {
+                    PersistenceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("清空记忆失败: {}", e),
+                    ))
+                })
         })?;
         Ok(())
     }

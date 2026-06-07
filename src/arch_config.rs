@@ -159,20 +159,18 @@ impl ArchConfig {
     pub fn load_or_default(data_dir: &str) -> Self {
         let path = format!("{}/arch_config.json", data_dir);
         match std::fs::read_to_string(&path) {
-            Ok(content) => {
-                match serde_json::from_str::<ArchConfig>(&content) {
-                    Ok(config) => {
-                        eprintln!("[LRC·架构] 已加载架构配置 v{}", config.version);
-                        config
-                    }
-                    Err(e) => {
-                        eprintln!("[LRC·架构] 配置解析失败 ({}), 使用默认配置", e);
-                        let default = Self::default();
-                        let _ = default.save(data_dir);
-                        default
-                    }
+            Ok(content) => match serde_json::from_str::<ArchConfig>(&content) {
+                Ok(config) => {
+                    eprintln!("[LRC·架构] 已加载架构配置 v{}", config.version);
+                    config
                 }
-            }
+                Err(e) => {
+                    eprintln!("[LRC·架构] 配置解析失败 ({}), 使用默认配置", e);
+                    let default = Self::default();
+                    let _ = default.save(data_dir);
+                    default
+                }
+            },
             Err(_) => {
                 let default = Self::default();
                 eprintln!("[LRC·架构] 未找到配置文件, 已创建默认架构配置");
@@ -191,13 +189,16 @@ impl ArchConfig {
         }
         let mut config = self.clone();
         config.updated_at = chrono::Utc::now().to_rfc3339();
-        let json = serde_json::to_string_pretty(&config)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string_pretty(&config).map_err(std::io::Error::other)?;
         std::fs::write(&path, json)
     }
 
     /// 更新衰减配置并保存
-    pub fn update_decay(&mut self, decay: DecayConfig, data_dir: &str) -> Result<(), std::io::Error> {
+    pub fn update_decay(
+        &mut self,
+        decay: DecayConfig,
+        data_dir: &str,
+    ) -> Result<(), std::io::Error> {
         self.decay = decay;
         self.save(data_dir)
     }
@@ -240,8 +241,10 @@ mod tests {
         let data_dir = dir.path().to_string_lossy().to_string();
 
         // 保存默认配置
-        let mut config = ArchConfig::default();
-        config.decay = DecayConfig::aggressive();
+        let config = ArchConfig {
+            decay: DecayConfig::aggressive(),
+            ..ArchConfig::default()
+        };
         config.save(&data_dir).expect("应成功保存");
 
         // 重新加载

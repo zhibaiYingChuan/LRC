@@ -163,8 +163,8 @@ impl<E: CodeEncoder> CodeRetriever for LocalRetriever<E> {
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::encoder::FastEncoder;
     use super::*;
+    use crate::engine::encoder::FastEncoder;
 
     fn make_chunk(file: &str, name: &str, chunk_type: &str, content: &str) -> CodeChunk {
         CodeChunk {
@@ -183,8 +183,11 @@ mod tests {
 
     fn build_retriever() -> LocalRetriever<FastEncoder> {
         let encoder = Arc::new(FastEncoder::new(vec![
-            "alpha".into(), "beta".into(), "gamma".into(),
-            "delta".into(), "epsilon".into(),
+            "alpha".into(),
+            "beta".into(),
+            "gamma".into(),
+            "delta".into(),
+            "epsilon".into(),
         ]));
         LocalRetriever::new(encoder, 0.01)
     }
@@ -200,7 +203,12 @@ mod tests {
     #[test]
     fn test_single_match() {
         let mut retriever = build_retriever();
-        retriever.index_chunk(make_chunk("a.rs", "func_a", "fn", "fn func_a() { alpha beta }"));
+        retriever.index_chunk(make_chunk(
+            "a.rs",
+            "func_a",
+            "fn",
+            "fn func_a() { alpha beta }",
+        ));
         let result = retriever.search("alpha", 5);
         assert_eq!(result.returned, 1);
         assert_eq!(result.results[0].rank, 1);
@@ -210,7 +218,12 @@ mod tests {
     fn test_ranking() {
         let mut retriever = build_retriever();
         retriever.index_chunk(make_chunk("a.rs", "fn1", "fn", "fn fn1() { x y }"));
-        retriever.index_chunk(make_chunk("b.rs", "fn2", "fn", "fn fn2() { alpha beta gamma }"));
+        retriever.index_chunk(make_chunk(
+            "b.rs",
+            "fn2",
+            "fn",
+            "fn fn2() { alpha beta gamma }",
+        ));
         retriever.index_chunk(make_chunk("c.rs", "fn3", "fn", "fn fn3() { alpha }"));
 
         let result = retriever.search("alpha beta", 5);
@@ -223,7 +236,9 @@ mod tests {
         let mut retriever = build_retriever();
         for i in 0..10 {
             retriever.index_chunk(make_chunk(
-                &format!("file{}.rs", i), &format!("fn_{}", i), "fn",
+                &format!("file{}.rs", i),
+                &format!("fn_{}", i),
+                "fn",
                 &format!("fn fn_{}() {{ alpha }}", i),
             ));
         }

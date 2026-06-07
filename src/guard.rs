@@ -148,8 +148,8 @@ mod windows_guard {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         CheckRemoteDebuggerPresent, IsDebuggerPresent,
     };
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleA;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     type ProcessInformationClass = u32;
     const PROCESS_DEBUG_PORT: ProcessInformationClass = 7;
@@ -253,9 +253,7 @@ mod windows_guard {
                 return false;
             }
 
-            let nt_header = &*(module_base
-                .add(nt_offset)
-                as *const ImageNtHeaders);
+            let nt_header = &*(module_base.add(nt_offset) as *const ImageNtHeaders);
 
             // 验证 PE 签名
             if nt_header.signature != IMAGE_NT_SIGNATURE {
@@ -264,16 +262,14 @@ mod windows_guard {
 
             // 遍历节表找到 .text 段
             // 计算节表起始偏移 = NT头 + FileHeader(20) + OptionalHeader(SizeOfOptionalHeader)
-            let optional_header_size =
-                nt_header.file_header._size_of_optional_header as usize;
+            let optional_header_size = nt_header.file_header._size_of_optional_header as usize;
             let section_header = (module_base
                 .add(nt_offset)
                 .add(std::mem::size_of::<ImageNtHeaders>())
                 .add(optional_header_size))
                 as *const ImageSectionHeader;
 
-            let num_sections =
-                nt_header.file_header.number_of_sections as usize;
+            let num_sections = nt_header.file_header.number_of_sections as usize;
             // 防御：节数量上限（Windows 限制为 65535，典型不超过 96）
             if num_sections > 96 {
                 return false;
@@ -290,8 +286,7 @@ mod windows_guard {
                 if name == ".text" {
                     let section_start = module_base.add(section.virtual_address as usize);
                     // 使用 virtual_size 与 size_of_raw_data 的较小值，防篡改
-                    let section_size =
-                        section.virtual_size.min(section.size_of_raw_data) as usize;
+                    let section_size = section.virtual_size.min(section.size_of_raw_data) as usize;
 
                     // 防御：节大小上限（典型 .text 不超过 100MB）
                     const MAX_SECTION_SIZE: usize = 100 * 1024 * 1024;
@@ -307,9 +302,8 @@ mod windows_guard {
                         return true;
                     }
 
-                    let actual_crc = compute_crc32(
-                        std::slice::from_raw_parts(section_start, section_size),
-                    );
+                    let actual_crc =
+                        compute_crc32(std::slice::from_raw_parts(section_start, section_size));
 
                     return actual_crc == expected_crc;
                 }
@@ -445,7 +439,11 @@ pub fn risk_aware_guard() {
         max_iterations += 1;
         // 用多个不透明谓词混合决策，使静态分析难以确定执行路径
         let branch = if opaque_true() {
-            if opaque_true_v2() { state } else { state }
+            if opaque_true_v2() {
+                state
+            } else {
+                state
+            }
         } else if opaque_false() {
             99
         } else {
@@ -529,7 +527,11 @@ fn guarded_exit(threat_level: u32) {
 
     // 用多个不透明谓词联合模糊延迟计算
     let base_delay = if opaque_true() {
-        if opaque_true_v2() { 150 } else { 300 }
+        if opaque_true_v2() {
+            150
+        } else {
+            300
+        }
     } else {
         500
     };
@@ -620,9 +622,7 @@ mod tests {
 
     #[test]
     fn test_guarded_exit_does_not_panic_on_zero_threat() {
-        // 不应 panic（但也不会退出，因为 threat_level 为 0）
-        // 此测试仅验证函数存在且可被调用时的基本行为
-        assert!(true);
+        // 验证函数存在且可被调用（不 panic，但也不会退出，因为 threat_level 为 0）
     }
 
     #[test]

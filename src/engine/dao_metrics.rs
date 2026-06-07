@@ -83,21 +83,25 @@ impl DaoMetrics {
         self.last_collected.store(now, Ordering::Relaxed);
     }
 
+    /// 道枢映射: 坤卦·地 (☷) — 厚德载物，编码总数如大地承载万物
     /// 获取编码总数
     pub fn encodings_total(&self) -> u64 {
         self.encodings_total.load(Ordering::Relaxed)
     }
 
+    /// 道枢映射: 震卦·雷 (☳) — 万物出乎震，合成总数如春雷唤醒生机
     /// 获取合成总数
     pub fn compositions_total(&self) -> u64 {
         self.compositions_total.load(Ordering::Relaxed)
     }
 
+    /// 道枢映射: 离卦·火 (☲) — 明两作，召回总数如火光之普照
     /// 获取检索总数
     pub fn recalls_total(&self) -> u64 {
         self.recalls_total.load(Ordering::Relaxed)
     }
 
+    /// 道枢映射: 兑卦·泽 (☱) — 说万物者莫说乎泽，修正如泽水之润物无声
     /// 获取修正总数
     pub fn corrections_total(&self) -> u64 {
         self.corrections_total.load(Ordering::Relaxed)
@@ -141,6 +145,8 @@ pub struct DaoMetricsSnapshot {
 }
 
 impl DaoMetrics {
+    /// 道枢映射: 洛书·幻和 — 九宫格幻和偏离度是道同构度的核心度量，快照如镜面反映系统健康
+    ///
     /// 采集当前指标快照
     ///
     /// 需要传入外部数据（记忆总数、八卦分布等），
@@ -221,7 +227,8 @@ pub fn compute_avg_luoshu_deviation(vectors: &[[f32; 9]]) -> f32 {
 
     let mut total_deviation = 0.0f32;
     for vec in vectors {
-        total_deviation += crate::engine::luoshu_encoder::LuoShuVector::new(*vec).luoshu_deviation();
+        total_deviation +=
+            crate::engine::luoshu_encoder::LuoShuVector::new(*vec).luoshu_deviation();
     }
     total_deviation / vectors.len() as f32
 }
@@ -255,7 +262,11 @@ mod tests {
         // 均匀分布：每个卦象各 1 条，熵应为 log2(8) = 3.0
         let counts = [1usize; 8];
         let entropy = compute_bagua_entropy(&counts);
-        assert!((entropy - 3.0).abs() < 0.01, "均匀分布熵应为 3.0，实际: {}", entropy);
+        assert!(
+            (entropy - 3.0).abs() < 0.01,
+            "均匀分布熵应为 3.0，实际: {}",
+            entropy
+        );
     }
 
     #[test]
@@ -264,7 +275,11 @@ mod tests {
         let mut counts = [0usize; 8];
         counts[0] = 10;
         let entropy = compute_bagua_entropy(&counts);
-        assert!((entropy - 0.0).abs() < 0.01, "单类熵应为 0.0，实际: {}", entropy);
+        assert!(
+            (entropy - 0.0).abs() < 0.01,
+            "单类熵应为 0.0，实际: {}",
+            entropy
+        );
     }
 
     #[test]
@@ -288,7 +303,10 @@ mod tests {
         assert_eq!(snapshot.active_memories, 10);
         assert_eq!(snapshot.crystallized_memories, 2);
         assert_eq!(snapshot.archived_memories, 1);
-        assert!(snapshot.dao_isomorphism_score > 0.8, "偏离度 0.15 → 道同构度 > 0.8");
+        assert!(
+            snapshot.dao_isomorphism_score > 0.8,
+            "偏离度 0.15 → 道同构度 > 0.8"
+        );
         assert!(snapshot.bagua_entropy > 0.0, "非空分布应有正熵");
         assert!((snapshot.synthesis_ratio - 0.2).abs() < 0.01);
     }

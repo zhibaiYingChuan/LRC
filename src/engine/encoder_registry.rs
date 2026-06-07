@@ -97,8 +97,14 @@ mod tests {
 
     fn default_terms() -> Vec<String> {
         vec![
-            "fn".into(), "struct".into(), "impl".into(), "pub".into(),
-            "use".into(), "mod".into(), "let".into(), "mut".into(),
+            "fn".into(),
+            "struct".into(),
+            "impl".into(),
+            "pub".into(),
+            "use".into(),
+            "mod".into(),
+            "let".into(),
+            "mut".into(),
         ]
     }
 
