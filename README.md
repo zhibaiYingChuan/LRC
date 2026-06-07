@@ -6,6 +6,10 @@
 [![License](https://img.shields.io/badge/Engine-DaoTi%20Research%20License-red.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
+**前置条件**：Windows / Linux / macOS | 无需 Rust 基础 | 无需 GPU | 会基本命令行操作
+
+> 🪄 **不想编译？** 直接下载 [Release 二进制](https://github.com/zhibaiYingChuan/LRC/releases) 或双击 `install.bat` 一键安装，跳过所有命令行。
+
 ***
 
 ## 解决两个最痛的场景
@@ -57,6 +61,8 @@ cargo build --release --features server
 ```
 
 看到服务启动后，在另一个终端试试：
+
+> 💡 浏览器打开 `http://127.0.0.1:3099/dashboard` 可以看到可视化仪表盘，包含记忆健康度、船长日志和 API 文档。
 
 ```bash
 # 搜索代码（Fast Match：精确关键词匹配）
@@ -182,6 +188,8 @@ LLM 增强模式会调用你的 LLM API 进行查询翻译，每次消耗约 **4
 | 区域聚焦检索       | ✅ | 仅扫描局部区域，检索延迟可控 |
 | 零外部依赖（快速模式）| ✅ | 无需 API 密钥，无需模型下载 |
 | 本地运行           | ✅ | 完全离线，数据不出本机 |
+| Web 仪表盘         | ✅ | 可视化记忆健康度、船长日志、API 文档 |
+| 自动化质量守门      | ✅ | 10 道 CI 守门，零 unwrap 残留、零算法泄露 |
 
 ***
 
@@ -327,89 +335,30 @@ LRC 默认使用**镜像启动模式**（`--mode auto`），设计目标：**启
 
 ***
 
-## 快速开始
+## 日常使用流程
 
-下面 5 步，从零到能用：
+装好之后，你的日常工作流会变成这样：
 
-### 第 1 步：克隆并编译（约 2 分钟）
+```
+早上开工：
+  你："继续写昨天的 API 吧"
+  AI 自动 recall → "（根据记忆 #1）昨天你决定用 Axum + PostgreSQL，路由结构已经搭好了"
+  你不需要重新说一遍上下文
 
-```bash
-git clone https://github.com/zhibaiYingChuan/LRC.git
-# 国内用户如遇 GitHub 下载缓慢，可使用镜像：
-# git clone https://gitcode.com/gcw_M73FIiUo/LRC
-cd LRC
-cargo build --release --features server
-# 国内用户如遇 crates.io 下载缓慢，可配置 Cargo 镜像：
-# 在 ~/.cargo/config.toml 中添加：
-# [source.crates-io]
-# replace-with = 'ustc'
-# [source.ustc]
-# registry = 'sparse+https://mirrors.ustc.edu.cn/crates.io-index/'
+开发中：
+  你："帮我找一下认证中间件的代码"
+  AI 自动 search_code → "在 src/auth/middleware.rs 第 42 行"
+  你不需要手动翻目录
+
+做决策时：
+  你："这个项目我们用 Redis 做缓存"
+  AI 自动 remember → "已记录，下次会话我会记得"
+  你不需要手动记笔记
 ```
 
-编译产物在 `target/release/code-memory-server.exe`（Windows）或 `target/release/code-memory-server`（Linux/macOS）。
+**核心体验**：你只管正常写代码、正常聊天。AI 自动判断什么时候该搜代码、什么时候该查记忆。这就是"零操作"。
 
-### 第 2 步：启动服务验证
-
-先用 HTTP 模式跑起来，确认服务正常：
-
-```bash
-./target/release/code-memory-server --src-dir ./src --port 3099
-```
-
-看到 `Loong Recall (L-RC / 忆) MCP 服务启动: http://127.0.0.1:3099` 就说明服务已启动。
-
-### 第 3 步：试试代码搜索
-
-新开一个终端，发送搜索请求：
-
-```bash
-curl -X POST http://127.0.0.1:3099/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"authenticate_user","top_k":3}}}'
-```
-
-你应该能看到匹配到的代码片段，包含文件路径、行号和相似度评分。
-
-### 第 4 步：试试写入和检索记忆
-
-```bash
-# 写入一条记忆
-curl -X POST http://127.0.0.1:3099/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember","arguments":{"content":"项目使用 pnpm 作为包管理器","memory_type":"preference","tags":["tooling"]}}}'
-
-# 检索记忆
-curl -X POST http://127.0.0.1:3099/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"query":"包管理器偏好","top_k":3}}}'
-```
-
-### 第 5 步：接入 IDE
-
-验证通过后，关掉 HTTP 模式（Ctrl+C），然后配置 IDE 使用 Stdio 模式（推荐）：
-
-```json
-{
-  "mcpServers": {
-    "loong-recall": {
-      "command": "C:/path/to/code-memory-server.exe",
-      "args": ["--src-dir", "C:/path/to/your/project/src", "--stdio"]
-    }
-  }
-}
-```
-
-| IDE     | 配置文件位置（Windows）                | 配置说明                                |
-| ------- | ------------------------------ | ----------------------------------- |
-| Trae    | `%APPDATA%/Trae/User/mcp.json` | 直接编辑此 JSON 文件，或通过 Trae 的 MCP 设置界面添加 |
-| Cursor  | `%APPDATA%/Cursor/mcp.json`    | 在 Cursor 设置 → MCP 中添加               |
-| VS Code | `.vscode/mcp.json` 或用户级全局配置    | 需安装 MCP 扩展                          |
-
-> **路径注意**：Windows 下需使用正斜杠 `/`（如 `C:/your-project/target/release/code-memory-server.exe`），不要使用反斜杠。
-> 如果已有其他 MCP 服务器，将 `loong-recall` 条目合并到现有 `mcpServers` 对象中即可。
-
-重启 IDE 后，AI 助手自动发现全部 12 个工具，无需任何额外配置。
+> 💡 详细配置步骤（含 AI 自动调用规则模板）见 [用户使用说明书](docs/USER_GUIDE.md)。
 
 ***
 
@@ -801,6 +750,10 @@ Loong Recall 提取了道枢层的编码-检索范式，工程化为独立 MCP �
 以下命令供贡献者在修改代码后运行，确保提交质量：
 
 ```bash
+# 一键运行全部质量守门（推荐）
+.\scripts\gatekeeper.ps1
+
+# 或分别运行：
 # 运行测试（200 项）
 cargo test
 
@@ -812,6 +765,9 @@ cargo clippy --features server -- -D warnings
 
 # 核心算法泄露检测（预提交钩子也会自动运行）
 python scripts/check_algorithm_leak.py
+
+# 安装 pre-commit 钩子（提交前自动检查）
+python scripts/install_hooks.py
 ```
 
 ### 运行时安全
@@ -840,6 +796,42 @@ Loong Recall 在启动时自动执行多层运行时防护（详见 `src/guard.r
 | [算法概述](docs/ALGORITHM_OVERVIEW.md) | 记忆架构的高层原理（安全版本，不泄露核心算法）             |
 | [性能测试指南](docs/BENCHMARK.md)        | 如何复现性能测试                            |
 | [使用场景](docs/USE_CASES.md)          | 典型应用场景与最佳实践                         |
+
+***
+
+## 更新日志
+
+### v0.2.0 (2026-06-07) — 本次推送
+
+**🛡️ 代码质量**
+
+- 全项目静态代码审计（200+ 测试 + Clippy pedantic/nursery），修复全部 Clippy 警告
+- 消除所有非测试代码中的 `.unwrap()` / `.expect()` 残留（约 60+ 处），杜绝生产环境 Panic 风险
+- 修复切片越界、类型转换截断等潜在运行时错误
+
+**🔒 核心算法保护**
+
+- 全部 23 个引擎文件添加 DaoTi Research License v1.0 许可证头
+- 实现 `check_algorithm_leak.py` 算法泄露检测脚本，CI 和 pre-commit 钩子自动运行
+- `.github/workflows/ci.yml` 新增独立 `leak-check` Job，确保核心算法不泄露
+
+**🚦 自动化守门人**
+
+- `scripts/gatekeeper.ps1`：10 道质量守门（编译、测试、Clippy、格式、unwrap 检测、代码重复、XSS 安全、算法泄露、长函数、类型转换安全）
+- `.github/workflows/ci.yml`：push/PR 时自动运行全部守门，不合格代码不得合并
+- `scripts/pre-commit`：提交前自动运行核心守门检查，快速反馈
+
+**🖥️ 用户体验**
+
+- 仪表盘新增"📖 指标说明"面板，用大白话解释「道同构度」「八卦分布熵」等专业术语
+- 「船长日志生成器」输入框优化：明确提示示例路径 + 辅助说明文字
+- 修复仪表盘 `app.js` 404 错误，前端功能完全恢复
+- 删除 `index.html` 内联 `<script>`（约 800 行），统一由 `app.js` 管理
+
+**📚 文档**
+
+- 更新 README.md 和 USER_GUIDE.md，补充仪表盘使用说明、一键安装脚本、守门人质量检查
+- 新增 CI 守门人综合报告，每次提交自动生成质量裁决
 
 ***
 
