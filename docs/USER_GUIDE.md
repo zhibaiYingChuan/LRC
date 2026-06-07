@@ -149,10 +149,7 @@ code-memory-server --src-dir ./src --stdio \
 ### 第 1 步：下载
 
 ```bash
-# 方式一：直接下载编译好的二进制（推荐）
-# 从 Release 页面下载 code-memory-server.exe
-
-# 方式二：源码编译
+# 源码编译（需要 Rust 环境）
 git clone https://github.com/zhibaiYingChuan/LRC.git
 # 国内用户如遇 GitHub 下载缓慢，可使用镜像：
 # git clone https://gitcode.com/gcw_M73FIiUo/LRC
