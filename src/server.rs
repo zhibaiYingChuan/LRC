@@ -1324,6 +1324,22 @@ async fn health_handler() -> &'static str {
     "Loong Recall 运行中 — 代码搜索 & 记忆服务"
 }
 
+/// 仪表盘 JavaScript 端点 — 返回编译时嵌入的 app.js
+///
+/// 仪表盘 HTML 引用 app.js 作为外部脚本，此端点将编译时嵌入的
+/// app.js 内容以 `application/javascript` MIME 类型返回。 
+async fn app_js_handler() -> axum::response::Response<String> {
+    const APP_JS: &str = include_str!("../static/app.js");
+    axum::response::Response::builder()
+        .header("Content-Type", "application/javascript; charset=utf-8")
+        .body(APP_JS.to_string())
+        .unwrap_or_else(|_| {
+            axum::response::Response::builder()
+                .body("console.error('app.js 加载失败')".to_string())
+                .unwrap()
+        })
+}
+
 /// 仪表盘端点 — 返回内嵌的 Web UI 仪表盘 HTML
 ///
 /// 产品化核心入口：用户启动服务后访问 http://localhost:3099/dashboard
@@ -1434,6 +1450,7 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/mcp", post(mcp_handler))
         .route("/health", axum::routing::get(health_handler))
+        .route("/app.js", axum::routing::get(app_js_handler))
         .nest_service("/v1", v1_service) // 将 v1 API 嵌套在 /v1 路径下
         // 仪表盘路由：静态文件 + 重定向
         .route("/dashboard", axum::routing::get(dashboard_handler))
