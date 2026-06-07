@@ -39,10 +39,7 @@ impl JsonPersistence {
         let dir = PathBuf::from(data_dir);
         if !dir.exists() {
             fs::create_dir_all(&dir).map_err(|e| {
-                PersistenceError::Other(format!(
-                    "无法创建数据目录 '{}': {}",
-                    data_dir, e
-                ))
+                PersistenceError::Other(format!("无法创建数据目录 '{}': {}", data_dir, e))
             })?;
         }
 
@@ -60,7 +57,8 @@ impl JsonPersistence {
             fs::create_dir_all(&self.data_dir).map_err(|e| {
                 PersistenceError::Other(format!(
                     "无法重建数据目录 '{}': {}",
-                    self.data_dir.display(), e
+                    self.data_dir.display(),
+                    e
                 ))
             })?;
         }
@@ -270,7 +268,11 @@ mod tests {
         let p = JsonPersistence::new(&data_dir).expect("应成功创建");
 
         assert!(Path::new(&data_dir).exists());
-        assert!(p.data_dir().join("memories.json").to_string_lossy().contains("memories"));
+        assert!(p
+            .data_dir()
+            .join("memories.json")
+            .to_string_lossy()
+            .contains("memories"));
     }
 
     #[test]
@@ -349,8 +351,10 @@ mod tests {
         let data_dir = dir.path().to_string_lossy().to_string();
         let p = JsonPersistence::new(&data_dir).expect("应成功创建");
 
-        p.save_memory(&make_test_memory("m1", "内容1")).expect("应成功保存");
-        p.save_memory(&make_test_memory("m2", "内容2")).expect("应成功保存");
+        p.save_memory(&make_test_memory("m1", "内容1"))
+            .expect("应成功保存");
+        p.save_memory(&make_test_memory("m2", "内容2"))
+            .expect("应成功保存");
 
         p.clear_memories().expect("应成功清空");
 

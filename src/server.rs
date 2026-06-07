@@ -8,12 +8,12 @@
 // 协议参考: https://spec.modelcontextprotocol.io/
 // 当前暴露 search_code + codebase_stats 两个工具
 
-use crate::{
-    ChunkStats, CodeMemoryManager, Importance, LlmApiConfig, Memory, MemoryType, PrivacyLevel,
-    RetrievalResult, RecallResult,
-};
 use crate::memory_store::{ListFilter, MemoryStore, RecallFilter, SortBy, SortOrder};
 use crate::persistence::json::JsonPersistence;
+use crate::{
+    ChunkStats, CodeMemoryManager, Importance, LlmApiConfig, Memory, MemoryType, PrivacyLevel,
+    RecallResult, RetrievalResult,
+};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -145,6 +145,11 @@ pub struct AppState {
 
 // ==================== MCP 请求处理 ====================
 
+/// 安全地将可序列化值转为 JSON Value，序列化失败时返回 Null 而非 panic
+fn to_json_value_safe<T: Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+}
+
 fn make_response(id: Option<serde_json::Value>, result: serde_json::Value) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0".into(),
@@ -177,7 +182,7 @@ fn handle_initialize(id: Option<serde_json::Value>) -> JsonRpcResponse {
             version: env!("CARGO_PKG_VERSION").into(),
         },
     };
-    make_response(id, serde_json::to_value(result).unwrap())
+    make_response(id, to_json_value_safe(&result))
 }
 
 fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
@@ -469,7 +474,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
     ];
 
     let result = ToolsListResult { tools };
-    make_response(id, serde_json::to_value(result).unwrap())
+    make_response(id, to_json_value_safe(&result))
 }
 
 async fn handle_tools_call(
@@ -482,7 +487,10 @@ async fn handle_tools_call(
         None => return make_error(id, -32602, "缺少 tool name"),
     };
 
-    let arguments = params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
 
     match name {
         "remember" => {
@@ -495,8 +503,7 @@ async fn handle_tools_call(
                 .get("memory_type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("fact");
-            let memory_type = MemoryType::try_parse(memory_type_str)
-                .unwrap_or(MemoryType::Fact);
+            let memory_type = MemoryType::try_parse(memory_type_str).unwrap_or(MemoryType::Fact);
 
             let project = arguments
                 .get("project")
@@ -571,9 +578,12 @@ async fn handle_tools_call(
                         saved.version
                     );
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("写入失败: {}", e)),
             }
@@ -588,7 +598,7 @@ async fn handle_tools_call(
                 .get("top_k")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5)
-                .min(20) as usize;
+                .clamp(1, 20) as usize;
 
             // 检索模式：fast（关键词匹配）或 luoshu（洛书几何检索）
             let lrc_mode = arguments
@@ -599,7 +609,7 @@ async fn handle_tools_call(
                 .get("focus_depth")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1)
-                .min(3) as u32;
+                .clamp(1, 3) as u32;
 
             let memory_type = arguments
                 .get("memory_type")
@@ -652,7 +662,11 @@ async fn handle_tools_call(
                         "记忆检索结果 (共 {} 条匹配，记忆库共 {} 条，模式: {})\n\n",
                         result.memories.len(),
                         result.total,
-                        if lrc_mode == "luoshu" { "洛书几何检索" } else { "关键词匹配" }
+                        if lrc_mode == "luoshu" {
+                            "洛书几何检索"
+                        } else {
+                            "关键词匹配"
+                        }
                     );
 
                     if result.memories.is_empty() {
@@ -690,9 +704,12 @@ async fn handle_tools_call(
                     }
 
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("检索失败: {}", e)),
             }
@@ -709,16 +726,22 @@ async fn handle_tools_call(
                 Ok(true) => {
                     let text = format!("已删除记忆: {}", memory_id);
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Ok(false) => {
                     let text = format!("未找到记忆: {}（可能已被删除）", memory_id);
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("删除失败: {}", e)),
             }
@@ -746,16 +769,22 @@ async fn handle_tools_call(
                         memory_id, old.content, new_content
                     );
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Ok(None) => {
                     let text = format!("未找到记忆: {}", memory_id);
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("更新失败: {}", e)),
             }
@@ -805,7 +834,7 @@ async fn handle_tools_call(
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(20)
-                .min(100) as usize;
+                .clamp(1, 100) as usize;
 
             let offset = arguments
                 .get("offset")
@@ -826,11 +855,8 @@ async fn handle_tools_call(
             let store = state.memory_store.lock().await;
             match store.list_memories(&filter) {
                 Ok((memories, total)) => {
-                    let mut text = format!(
-                        "记忆列表 (共 {} 条，本页 {} 条)\n\n",
-                        total,
-                        memories.len()
-                    );
+                    let mut text =
+                        format!("记忆列表 (共 {} 条，本页 {} 条)\n\n", total, memories.len());
 
                     if memories.is_empty() {
                         text.push_str("暂无记忆。使用 remember 工具添加记忆。\n");
@@ -855,9 +881,12 @@ async fn handle_tools_call(
                     }
 
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("列表查询失败: {}", e)),
             }
@@ -870,7 +899,10 @@ async fn handle_tools_call(
                     let mut text = String::from("记忆库统计\n\n");
                     text.push_str(&format!("- 记忆总数: {} 条\n", stats.total_memories));
                     text.push_str(&format!("- 已过期: {} 条\n", stats.expired_count));
-                    text.push_str(&format!("- 存储大小: {} bytes\n\n", stats.storage_size_bytes));
+                    text.push_str(&format!(
+                        "- 存储大小: {} bytes\n\n",
+                        stats.storage_size_bytes
+                    ));
 
                     text.push_str("### 类型分布\n");
                     let mut types: Vec<(&String, &usize)> = stats.by_type.iter().collect();
@@ -887,9 +919,12 @@ async fn handle_tools_call(
                     }
 
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("统计查询失败: {}", e)),
             }
@@ -904,9 +939,12 @@ async fn handle_tools_call(
                         "当前无过期记忆需要归档。".to_string()
                     };
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("归档失败: {}", e)),
             }
@@ -920,7 +958,7 @@ async fn handle_tools_call(
                 .get("top_k")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5)
-                .min(20) as usize;
+                .clamp(1, 20) as usize;
 
             // LLM 查询翻译：如果配置了 LLM API，先将自然语言翻译为关键词
             let keywords = if state.llm_api.is_configured() {
@@ -949,7 +987,9 @@ async fn handle_tools_call(
                 for r in &result.results {
                     text.push_str(&format!(
                         "### #{}. {} (相似度: {:.1}%)\n",
-                        r.rank, r.chunk.name, r.score * 100.0
+                        r.rank,
+                        r.chunk.name,
+                        r.score * 100.0
                     ));
                     text.push_str(&format!(
                         "`{}:L{}-L{}`\n",
@@ -958,7 +998,10 @@ async fn handle_tools_call(
                     if let Some(ref doc) = r.chunk.doc_comment {
                         text.push_str(&format!("{}\n", doc));
                     }
-                    text.push_str(&format!("```{}\n{}\n```\n\n", r.chunk.language, r.chunk.content));
+                    text.push_str(&format!(
+                        "```{}\n{}\n```\n\n",
+                        r.chunk.language, r.chunk.content
+                    ));
                 }
             }
 
@@ -968,7 +1011,7 @@ async fn handle_tools_call(
                     text,
                 }],
             };
-            make_response(id, serde_json::to_value(call_result).unwrap())
+            make_response(id, to_json_value_safe(&call_result))
         }
 
         "codebase_stats" => {
@@ -992,7 +1035,7 @@ async fn handle_tools_call(
                     text,
                 }],
             };
-            make_response(id, serde_json::to_value(call_result).unwrap())
+            make_response(id, to_json_value_safe(&call_result))
         }
 
         // === L5 道同构度监控仪表 ===
@@ -1005,13 +1048,25 @@ async fn handle_tools_call(
                     text.push_str("═══════════════════════════════════\n\n");
 
                     text.push_str("### 核心指标\n");
-                    text.push_str(&format!("- 道同构度: {:.1}%\n", snapshot.dao_isomorphism_score * 100.0));
-                    text.push_str(&format!("- 八卦分布熵: {:.3} (最大 3.0)\n", snapshot.bagua_entropy));
-                    text.push_str(&format!("- 合成比率: {:.1}%\n\n", snapshot.synthesis_ratio * 100.0));
+                    text.push_str(&format!(
+                        "- 道同构度: {:.1}%\n",
+                        snapshot.dao_isomorphism_score * 100.0
+                    ));
+                    text.push_str(&format!(
+                        "- 八卦分布熵: {:.3} (最大 3.0)\n",
+                        snapshot.bagua_entropy
+                    ));
+                    text.push_str(&format!(
+                        "- 合成比率: {:.1}%\n\n",
+                        snapshot.synthesis_ratio * 100.0
+                    ));
 
                     text.push_str("### 记忆容量\n");
                     text.push_str(&format!("- 活跃记忆: {} 条\n", snapshot.active_memories));
-                    text.push_str(&format!("- 结晶记忆: {} 条\n", snapshot.crystallized_memories));
+                    text.push_str(&format!(
+                        "- 结晶记忆: {} 条\n",
+                        snapshot.crystallized_memories
+                    ));
                     text.push_str(&format!("- 已归档: {} 条\n\n", snapshot.archived_memories));
 
                     text.push_str("### 运行统计\n");
@@ -1028,9 +1083,12 @@ async fn handle_tools_call(
                     }
 
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("道同构度采集失败: {}", e)),
             }
@@ -1046,9 +1104,7 @@ async fn handle_tools_call(
                 Some(q) => q,
                 None => return make_error(id, -32602, "缺少参数: content"),
             };
-            let reason = arguments
-                .get("reason")
-                .and_then(|v| v.as_str());
+            let reason = arguments.get("reason").and_then(|v| v.as_str());
 
             let mut store = state.memory_store.lock().await;
             match store.correct_memory(memory_id, new_content, reason) {
@@ -1065,16 +1121,22 @@ async fn handle_tools_call(
                         reason.unwrap_or("未提供")
                     );
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Ok(None) => {
                     let text = format!("未找到记忆: {}", memory_id);
                     let call_result = ToolCallResult {
-                        content: vec![TextContent { content_type: "text".into(), text }],
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
                     };
-                    make_response(id, serde_json::to_value(call_result).unwrap())
+                    make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("修正失败: {}", e)),
             }
@@ -1090,7 +1152,7 @@ async fn handle_tools_call(
                 .get("top_k")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5)
-                .min(20) as usize;
+                .clamp(1, 20) as usize;
 
             let memory_type = arguments
                 .get("memory_type")
@@ -1138,11 +1200,13 @@ async fn handle_tools_call(
                 top_k: top_k * 2,
                 privacy_context: None,
             };
-            let deep_result = store.trapezoid_focus_recall(query, &deep_filter, 1).unwrap_or(RecallResult {
-                memories: vec![],
-                scores: vec![],
-                total: 0,
-            });
+            let deep_result = store
+                .trapezoid_focus_recall(query, &deep_filter, 1)
+                .unwrap_or(RecallResult {
+                    memories: vec![],
+                    scores: vec![],
+                    total: 0,
+                });
 
             // 倒数排名融合 (RRF, Reciprocal Rank Fusion)
             // RRF 公式: score = sum(1 / (k + rank_i))，其中 k = 60
@@ -1156,14 +1220,18 @@ async fn handle_tools_call(
             for (rank, m) in fast_result.memories.iter().enumerate() {
                 let score = 1.0 / (rrf_k + (rank + 1) as f32);
                 *fused_scores.entry(m.id.clone()).or_insert(0.0) += score;
-                id_to_memory.entry(m.id.clone()).or_insert_with(|| m.clone());
+                id_to_memory
+                    .entry(m.id.clone())
+                    .or_insert_with(|| m.clone());
             }
 
             // 深度通路排名
             for (rank, m) in deep_result.memories.iter().enumerate() {
                 let score = 1.0 / (rrf_k + (rank + 1) as f32);
                 *fused_scores.entry(m.id.clone()).or_insert(0.0) += score;
-                id_to_memory.entry(m.id.clone()).or_insert_with(|| m.clone());
+                id_to_memory
+                    .entry(m.id.clone())
+                    .or_insert_with(|| m.clone());
             }
 
             // 按融合分数排序
@@ -1203,10 +1271,7 @@ async fn handle_tools_call(
                 for (i, m) in result_memories.iter().enumerate() {
                     let score = result_scores.get(i).unwrap_or(&0.0);
                     let mem_num = i + 1;
-                    text.push_str(&format!(
-                        "（记忆 #{mem_num} · RRF 融合度 {:.3}）\n",
-                        score
-                    ));
+                    text.push_str(&format!("（记忆 #{mem_num} · RRF 融合度 {:.3}）\n", score));
                     text.push_str(&format!("内容: {}\n", m.summary()));
                     // 显示八卦分类信息
                     if let Some(ref cat) = m.bagua_category {
@@ -1222,13 +1287,18 @@ async fn handle_tools_call(
                     ));
                     text.push_str(&format!("ID: `{}`\n\n", m.id));
                 }
-                text.push_str("💡 双路检索融合了快速关键词匹配和洛书几何定位，兼顾了召回率和精度。\n");
+                text.push_str(
+                    "💡 双路检索融合了快速关键词匹配和洛书几何定位，兼顾了召回率和精度。\n",
+                );
             }
 
             let call_result = ToolCallResult {
-                content: vec![TextContent { content_type: "text".into(), text }],
+                content: vec![TextContent {
+                    content_type: "text".into(),
+                    text,
+                }],
             };
-            make_response(id, serde_json::to_value(call_result).unwrap())
+            make_response(id, to_json_value_safe(&call_result))
         }
 
         _ => make_error(id, -32601, &format!("未知工具: {}", name)),
@@ -1252,6 +1322,17 @@ async fn mcp_handler(
 /// 健康检查端点（非 MCP 协议，便于调试）
 async fn health_handler() -> &'static str {
     "Loong Recall 运行中 — 代码搜索 & 记忆服务"
+}
+
+/// 仪表盘端点 — 返回内嵌的 Web UI 仪表盘 HTML
+///
+/// 产品化核心入口：用户启动服务后访问 http://localhost:3099/dashboard
+/// 即可看到可视化记忆统计、健康状态、船长日志和信任中心。
+/// HTML 文件在编译时嵌入，无外部依赖，支持离线使用。
+async fn dashboard_handler() -> axum::response::Html<&'static str> {
+    // 编译时嵌入仪表盘 HTML（单文件，包含内联 CSS + JS）
+    const DASHBOARD_HTML: &str = include_str!("../static/index.html");
+    axum::response::Html(DASHBOARD_HTML)
 }
 
 // ==================== Stdio 传输层（标准 MCP） ====================
@@ -1312,16 +1393,12 @@ pub async fn run_stdio(state: Arc<AppState>) {
         let request: JsonRpcRequest = match serde_json::from_str(&line) {
             Ok(req) => req,
             Err(e) => {
-                let err_resp = make_error(
-                    None,
-                    -32700,
-                    &format!("JSON 解析失败: {}", e),
-                );
-                let _ = stdout
-                    .write_all(
-                        format!("{}\n", serde_json::to_string(&err_resp).unwrap()).as_bytes(),
-                    )
-                    .await;
+                let err_resp = make_error(None, -32700, &format!("JSON 解析失败: {}", e));
+                let json_str = serde_json::to_string(&err_resp).unwrap_or_else(|_| {
+                    r#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"内部序列化错误"}}"#
+                        .to_string()
+                });
+                let _ = stdout.write_all(format!("{}\n", json_str).as_bytes()).await;
                 continue;
             }
         };
@@ -1331,7 +1408,10 @@ pub async fn run_stdio(state: Arc<AppState>) {
 
         // 通知类请求不返回响应，直接跳过
         if let Some(response) = response {
-            let json_str = serde_json::to_string(&response).unwrap();
+            let json_str = serde_json::to_string(&response).unwrap_or_else(|_| {
+                r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"内部序列化错误"}}"#
+                    .to_string()
+            });
             let _ = stdout.write_all(format!("{}\n", json_str).as_bytes()).await;
             let _ = stdout.flush().await;
         }
@@ -1342,21 +1422,23 @@ pub async fn run_stdio(state: Arc<AppState>) {
 
 // ==================== 路由构建 ====================
 
-/// 创建 MCP 服务的 axum Router（合并 v1 REST API 端点）
+/// 创建 MCP 服务的 axum Router（合并 v1 REST API 端点 + 仪表盘）
 ///
 /// 可嵌入到已有 axum 应用中，将 MCP 路由挂载到子路径。
 pub fn build_mcp_router(state: Arc<AppState>) -> Router {
     // 创建 v1 API 路由（通过闭包捕获共享状态，状态类型为 ()）
-    let v1_service = crate::v1_api::build_v1_router(state.memory_store.clone())
-        .into_service();
+    let v1_service =
+        crate::v1_api::build_v1_router(state.memory_store.clone(), state.manager.clone())
+            .into_service();
 
     Router::new()
         .route("/mcp", post(mcp_handler))
         .route("/health", axum::routing::get(health_handler))
         .nest_service("/v1", v1_service) // 将 v1 API 嵌套在 /v1 路径下
-        .layer(
-            tower_http::cors::CorsLayer::permissive(),
-        )
+        // 仪表盘路由：静态文件 + 重定向
+        .route("/dashboard", axum::routing::get(dashboard_handler))
+        .route("/dashboard/", axum::routing::get(dashboard_handler))
+        .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
 
@@ -1368,6 +1450,8 @@ pub async fn serve(state: Arc<AppState>, host: &str, port: u16) -> std::io::Resu
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("Loong Recall (L-RC) 代码搜索 + 记忆服务");
     println!("   端点: http://{}", addr);
+    println!("   仪表盘: http://{}/dashboard  ← 可视化记忆管理面板", addr);
+    println!("   船长日志: GET  http://{}/v1/captains-log", addr);
     println!("   MCP 协议: POST http://{}/mcp", addr);
     println!("   状态检查: GET  http://{}/health", addr);
 
@@ -1396,8 +1480,8 @@ mod tests {
         // 为测试创建临时持久化后端
         let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
         let data_dir = tmp.path().to_string_lossy().to_string();
-        let persistence = crate::persistence::create_json_persistence(&data_dir)
-            .expect("持久化创建失败");
+        let persistence =
+            crate::persistence::create_json_persistence(&data_dir).expect("持久化创建失败");
         let memory_store = Arc::new(Mutex::new(MemoryStore::new(persistence)));
 
         Arc::new(AppState {
@@ -1434,24 +1518,44 @@ mod tests {
         let json = to_json(&resp);
 
         let tools = json["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 12, "应注册 12 个工具（7 个记忆 + 2 个代码 + 3 个新增）");
+        assert_eq!(
+            tools.len(),
+            12,
+            "应注册 12 个工具（7 个记忆 + 2 个代码 + 3 个新增）"
+        );
 
         // 验证记忆工具存在
-        let tool_names: Vec<&str> = tools.iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"remember"), "缺少 remember 工具");
         assert!(tool_names.contains(&"recall"), "缺少 recall 工具");
         assert!(tool_names.contains(&"forget"), "缺少 forget 工具");
-        assert!(tool_names.contains(&"update_memory"), "缺少 update_memory 工具");
-        assert!(tool_names.contains(&"list_memories"), "缺少 list_memories 工具");
-        assert!(tool_names.contains(&"memory_stats"), "缺少 memory_stats 工具");
+        assert!(
+            tool_names.contains(&"update_memory"),
+            "缺少 update_memory 工具"
+        );
+        assert!(
+            tool_names.contains(&"list_memories"),
+            "缺少 list_memories 工具"
+        );
+        assert!(
+            tool_names.contains(&"memory_stats"),
+            "缺少 memory_stats 工具"
+        );
         assert!(tool_names.contains(&"archive"), "缺少 archive 工具");
         assert!(tool_names.contains(&"search_code"), "缺少 search_code 工具");
-        assert!(tool_names.contains(&"codebase_stats"), "缺少 codebase_stats 工具");
+        assert!(
+            tool_names.contains(&"codebase_stats"),
+            "缺少 codebase_stats 工具"
+        );
         assert!(tool_names.contains(&"dao_metrics"), "缺少 dao_metrics 工具");
-        assert!(tool_names.contains(&"correct_memory"), "缺少 correct_memory 工具");
-        assert!(tool_names.contains(&"recall_enhanced"), "缺少 recall_enhanced 工具");
+        assert!(
+            tool_names.contains(&"correct_memory"),
+            "缺少 correct_memory 工具"
+        );
+        assert!(
+            tool_names.contains(&"recall_enhanced"),
+            "缺少 recall_enhanced 工具"
+        );
     }
 
     // ---- search_code 工具调用 ----
@@ -1467,22 +1571,13 @@ mod tests {
             }
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(4.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(4.into()))).await;
         let json = to_json(&resp);
 
         let text = json["result"]["content"][0]["text"].as_str().unwrap();
         assert_eq!(json["result"]["content"][0]["type"], "text");
-        assert!(
-            text.contains("memory"),
-            "搜索结果应包含关键词: {}",
-            text
-        );
-        assert!(
-            text.contains("src/memory.rs"),
-            "应包含文件路径: {}",
-            text
-        );
+        assert!(text.contains("memory"), "搜索结果应包含关键词: {}", text);
+        assert!(text.contains("src/memory.rs"), "应包含文件路径: {}", text);
     }
 
     #[tokio::test]
@@ -1495,8 +1590,7 @@ mod tests {
             }
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(5.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(5.into()))).await;
         let json = to_json(&resp);
 
         let text = json["result"]["content"][0]["text"].as_str().unwrap();
@@ -1515,8 +1609,7 @@ mod tests {
             "arguments": {}
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(6.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(6.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["error"].is_object(), "缺少 query 应返回错误");
@@ -1533,8 +1626,7 @@ mod tests {
             "arguments": {}
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(7.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(7.into()))).await;
         let json = to_json(&resp);
 
         let text = json["result"]["content"][0]["text"].as_str().unwrap();
@@ -1546,7 +1638,11 @@ mod tests {
 
     #[test]
     fn test_unknown_method() {
-        let resp = make_error(Some(serde_json::Value::Number(8.into())), -32601, "未知方法: foo");
+        let resp = make_error(
+            Some(serde_json::Value::Number(8.into())),
+            -32601,
+            "未知方法: foo",
+        );
         let json = to_json(&resp);
 
         assert!(json["error"].is_object());
@@ -1561,8 +1657,7 @@ mod tests {
             "arguments": {}
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(9.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(9.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["error"].is_object());
@@ -1576,8 +1671,7 @@ mod tests {
             "arguments": {}
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(10.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(10.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["error"].is_object());
@@ -1615,8 +1709,7 @@ mod tests {
             }
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(100.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(100.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "remember 应返回成功结果");
@@ -1633,8 +1726,7 @@ mod tests {
             "arguments": {}
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(101.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(101.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["error"].is_object(), "缺少 content 应返回错误");
@@ -1667,8 +1759,7 @@ mod tests {
             }
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(102.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(102.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "recall 应返回成功结果");
@@ -1684,8 +1775,7 @@ mod tests {
             "arguments": {}
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(103.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(103.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["error"].is_object());
@@ -1705,11 +1795,12 @@ mod tests {
                 "content": "待删除的测试记忆"
             }
         });
-        let remember_resp =
-            handle_tools_call(&state, &remember_params, None).await;
+        let remember_resp = handle_tools_call(&state, &remember_params, None).await;
         let remember_json = to_json(&remember_resp);
         // 从响应中提取记忆 ID
-        let text = remember_json["result"]["content"][0]["text"].as_str().unwrap();
+        let text = remember_json["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
         let id_start = text.find("ID: ").unwrap() + 4;
         let id_end = text[id_start..].find(')').unwrap() + id_start;
         let memory_id = &text[id_start..id_end];
@@ -1722,13 +1813,16 @@ mod tests {
             }
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(104.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(104.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["result"].is_object());
         let forget_text = json["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(forget_text.contains("已删除"), "应确认删除: {}", forget_text);
+        assert!(
+            forget_text.contains("已删除"),
+            "应确认删除: {}",
+            forget_text
+        );
     }
 
     #[tokio::test]
@@ -1739,8 +1833,7 @@ mod tests {
             "arguments": {}
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(105.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(105.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["error"].is_object());
@@ -1760,10 +1853,11 @@ mod tests {
                 "content": "旧版本内容"
             }
         });
-        let remember_resp =
-            handle_tools_call(&state, &remember_params, None).await;
+        let remember_resp = handle_tools_call(&state, &remember_params, None).await;
         let remember_json = to_json(&remember_resp);
-        let text = remember_json["result"]["content"][0]["text"].as_str().unwrap();
+        let text = remember_json["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
         let id_start = text.find("ID: ").unwrap() + 4;
         let id_end = text[id_start..].find(')').unwrap() + id_start;
         let memory_id = &text[id_start..id_end];
@@ -1778,14 +1872,21 @@ mod tests {
             }
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(106.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(106.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["result"].is_object());
         let update_text = json["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(update_text.contains("已更新"), "应确认更新: {}", update_text);
-        assert!(update_text.contains("新版本内容"), "应包含新内容: {}", update_text);
+        assert!(
+            update_text.contains("已更新"),
+            "应确认更新: {}",
+            update_text
+        );
+        assert!(
+            update_text.contains("新版本内容"),
+            "应包含新内容: {}",
+            update_text
+        );
     }
 
     #[tokio::test]
@@ -1798,8 +1899,7 @@ mod tests {
             }
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(107.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(107.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["error"].is_object());
@@ -1830,8 +1930,7 @@ mod tests {
             }
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(108.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(108.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "list_memories 应返回成功结果");
@@ -1870,15 +1969,26 @@ mod tests {
             "arguments": {}
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(109.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(109.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "memory_stats 应返回成功结果");
         let stats_text = json["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(stats_text.contains("记忆库统计"), "应包含标题: {}", stats_text);
-        assert!(stats_text.contains("fact"), "应包含 fact 类型: {}", stats_text);
-        assert!(stats_text.contains("preference"), "应包含 preference 类型: {}", stats_text);
+        assert!(
+            stats_text.contains("记忆库统计"),
+            "应包含标题: {}",
+            stats_text
+        );
+        assert!(
+            stats_text.contains("fact"),
+            "应包含 fact 类型: {}",
+            stats_text
+        );
+        assert!(
+            stats_text.contains("preference"),
+            "应包含 preference 类型: {}",
+            stats_text
+        );
     }
 
     // ---- archive 记忆归档工具测试 ----
@@ -1892,8 +2002,7 @@ mod tests {
             "arguments": {}
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(110.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(110.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "archive 应返回成功结果");
@@ -1930,8 +2039,7 @@ mod tests {
             "arguments": {}
         });
         let resp =
-            handle_tools_call(&state, &params, Some(serde_json::Value::Number(111.into())))
-                .await;
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(111.into()))).await;
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "archive 应返回成功结果");

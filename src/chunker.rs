@@ -71,12 +71,48 @@ pub fn detect_language(file_path: &str) -> String {
 
 /// 检查文件是否支持索引（文本文件而非二进制）
 pub fn is_supported_file(file_path: &Path) -> bool {
-    matches!(file_path.extension().and_then(|e| e.to_str()),
-        Some("rs" | "py" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "go"
-        | "md" | "mdx" | "txt" | "rst" | "yaml" | "yml" | "toml" | "json"
-        | "html" | "htm" | "css" | "scss" | "less" | "xml" | "svg"
-        | "sh" | "bash" | "zsh" | "sql" | "java" | "kt" | "swift"
-        | "c" | "h" | "cpp" | "hpp" | "cc" | "cxx" | "hxx"))
+    matches!(
+        file_path.extension().and_then(|e| e.to_str()),
+        Some(
+            "rs" | "py"
+                | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "go"
+                | "md"
+                | "mdx"
+                | "txt"
+                | "rst"
+                | "yaml"
+                | "yml"
+                | "toml"
+                | "json"
+                | "html"
+                | "htm"
+                | "css"
+                | "scss"
+                | "less"
+                | "xml"
+                | "svg"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "sql"
+                | "java"
+                | "kt"
+                | "swift"
+                | "c"
+                | "h"
+                | "cpp"
+                | "hpp"
+                | "cc"
+                | "cxx"
+                | "hxx"
+        )
+    )
 }
 
 // ==================== 共享工具函数 ====================
@@ -230,9 +266,7 @@ impl RustChunker {
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '!')
                     .collect();
-                if !name.is_empty()
-                    && !matches!(name.as_str(), "where" | "for" | "dyn" | "type")
-                {
+                if !name.is_empty() && !matches!(name.as_str(), "where" | "for" | "dyn" | "type") {
                     return Some((keyword, name));
                 }
             }
@@ -242,7 +276,13 @@ impl RustChunker {
 
     fn strip_modifiers(line: &str) -> String {
         let mut s = line.to_string();
-        let pub_patterns = ["pub(crate) ", "pub(super) ", "pub(self) ", "pub(in ", "pub "];
+        let pub_patterns = [
+            "pub(crate) ",
+            "pub(super) ",
+            "pub(self) ",
+            "pub(in ",
+            "pub ",
+        ];
         for pat in &pub_patterns {
             if let Some(rest) = s.strip_prefix(pat) {
                 s = rest.to_string();
@@ -300,6 +340,7 @@ impl CodeChunker for RustChunker {
             let start_line = i + 1;
             let signature = line.to_string();
             let end_idx = find_brace_body_end(&lines, i);
+            let end_idx = end_idx.min(lines.len().saturating_sub(1)); // 边界安全检查
             let end_line = end_idx + 1;
             let chunk_content = lines[i..=end_idx].join("\n");
             let doc = extract_triple_slash_doc(&lines, i);
@@ -406,7 +447,7 @@ impl CodeChunker for PythonChunker {
             }
 
             let end_line = end_idx + 1;
-            let chunk_content = lines[i..=end_idx].join("\n");
+            let chunk_content = lines[i..=end_idx.min(lines.len().saturating_sub(1))].join("\n");
             let doc = extract_hash_or_jsdoc(&lines, i);
 
             chunks.push(CodeChunk {
@@ -436,7 +477,11 @@ pub struct TsJsChunker;
 impl TsJsChunker {
     fn parse_definition(line: &str, lang: &str) -> Option<(&'static str, String)> {
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed == "*" {
+        if trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("/*")
+            || trimmed == "*"
+        {
             return None;
         }
 
@@ -471,7 +516,8 @@ impl TsJsChunker {
         }
 
         // 箭头函数变量：const fnName = (...) => {
-        if let Some(rest) = after.strip_prefix("const ")
+        if let Some(rest) = after
+            .strip_prefix("const ")
             .or_else(|| after.strip_prefix("let "))
             .or_else(|| after.strip_prefix("var "))
         {
@@ -541,6 +587,7 @@ impl CodeChunker for TsJsChunker {
             let start_line = i + 1;
             let signature = line.to_string();
             let end_idx = find_brace_body_end(&lines, i);
+            let end_idx = end_idx.min(lines.len().saturating_sub(1)); // 边界安全检查
             let end_line = end_idx + 1;
             let chunk_content = lines[i..=end_idx].join("\n");
             let doc = extract_hash_or_jsdoc(&lines, i);
@@ -629,6 +676,7 @@ impl CodeChunker for GoChunker {
             let start_line = i + 1;
             let signature = line.to_string();
             let end_idx = find_brace_body_end(&lines, i);
+            let end_idx = end_idx.min(lines.len().saturating_sub(1)); // 边界安全检查
             let end_line = end_idx + 1;
             let chunk_content = lines[i..=end_idx].join("\n");
 
@@ -737,14 +785,20 @@ impl CodeChunker for ConversationChunker {
                 // 保存上一轮对话
                 if let Some(start) = turn_start {
                     if start < idx {
-                        let end = idx.saturating_sub(1).max(start);
+                        let end = idx
+                            .saturating_sub(1)
+                            .max(start)
+                            .min(lines.len().saturating_sub(1)); // 边界安全检查
                         let turn_lines = &lines[start..=end];
                         let content = turn_lines.join("\n");
                         let role_name = current_role.unwrap_or_else(|| "未知".to_string());
 
                         let first_line = Self::extract_content(lines[start]);
-                        let name = format!("{}: {}", role_name,
-                            first_line.chars().take(40).collect::<String>());
+                        let name = format!(
+                            "{}: {}",
+                            role_name,
+                            first_line.chars().take(40).collect::<String>()
+                        );
 
                         chunks.push(CodeChunk {
                             id: format!("{}:L{}-L{}", file_path, start + 1, end + 1),
@@ -768,14 +822,17 @@ impl CodeChunker for ConversationChunker {
         // 保存最后一轮对话
         if let Some(start) = turn_start {
             if start < lines.len() {
+                let start = start.min(lines.len()); // 边界安全检查
                 let turn_lines = &lines[start..];
                 let content = turn_lines.join("\n");
                 let role_name = current_role.unwrap_or_else(|| "未知".to_string());
 
                 let first_line = Self::extract_content(lines[start]);
-                let name = format!("{}: {}",
+                let name = format!(
+                    "{}: {}",
                     role_name,
-                    first_line.chars().take(40).collect::<String>());
+                    first_line.chars().take(40).collect::<String>()
+                );
 
                 chunks.push(CodeChunk {
                     id: format!("{}:L{}-L{}", file_path, start + 1, lines.len()),
@@ -817,7 +874,7 @@ impl GenericChunker {
                 // 保存上一个 section
                 if let Some(start) = section_start {
                     if start < idx {
-                        let end = (idx - 1).max(start);
+                        let end = (idx - 1).max(start).min(lines.len().saturating_sub(1)); // 边界安全检查
                         let chunk_content = lines[start..=end].join("\n");
                         let name = if section_title.is_empty() {
                             lines[start].chars().take(80).collect()
@@ -842,10 +899,7 @@ impl GenericChunker {
 
                 section_start = Some(idx);
                 section_title = if is_heading {
-                    trimmed
-                        .trim_start_matches('#')
-                        .trim()
-                        .to_string()
+                    trimmed.trim_start_matches('#').trim().to_string()
                 } else {
                     String::new()
                 };
@@ -855,6 +909,7 @@ impl GenericChunker {
         // 最后一个 section
         if let Some(start) = section_start {
             if start < lines.len() {
+                let start = start.min(lines.len()); // 边界安全检查
                 let chunk_content = lines[start..].join("\n");
                 let name = if section_title.is_empty() {
                     lines[start].chars().take(80).collect()
@@ -996,11 +1051,7 @@ mod tests {
 
     #[test]
     fn test_rust_multiple_definitions() {
-        let code = concat!(
-            "fn a() {}\n",
-            "struct B {}\n",
-            "fn c() {}\n",
-        );
+        let code = concat!("fn a() {}\n", "struct B {}\n", "fn c() {}\n",);
         let chunks = RustChunker.chunk_file("test.rs", code);
         assert_eq!(chunks.len(), 3);
     }
@@ -1184,7 +1235,8 @@ mod tests {
 
     #[test]
     fn test_markdown_heading_split() {
-        let code = "# 标题\n\n一些介绍文字。\n\n## 第一节\n\n第一节内容。\n\n## 第二节\n\n第二节内容。\n";
+        let code =
+            "# 标题\n\n一些介绍文字。\n\n## 第一节\n\n第一节内容。\n\n## 第二节\n\n第二节内容。\n";
         let chunks = GenericChunker.chunk_file("doc.md", code);
         assert!(chunks.len() >= 3);
         assert_eq!(chunks[0].language, "markdown");
@@ -1322,7 +1374,6 @@ mod tests {
         let text = "这是第一行\n这是第二行\n这是第三行\n";
         let chunks = ConversationChunker.chunk_file("chat.txt", text);
 
-        assert_eq!(chunks.len(), 0,
-            "无角色前缀的文本不应产生对话切分");
+        assert_eq!(chunks.len(), 0, "无角色前缀的文本不应产生对话切分");
     }
 }

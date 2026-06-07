@@ -59,14 +59,11 @@ impl Neo4jConfig {
     /// - `LRC_NEO4J_PASS`：密码
     /// - `LRC_NEO4J_DB`：数据库名
     pub fn from_env() -> Result<Self, String> {
-        let endpoint = std::env::var("LRC_NEO4J_URL")
-            .unwrap_or_else(|_| "http://localhost:7474".to_string());
-        let username = std::env::var("LRC_NEO4J_USER")
-            .unwrap_or_else(|_| "neo4j".to_string());
-        let password = std::env::var("LRC_NEO4J_PASS")
-            .unwrap_or_else(|_| "password".to_string());
-        let database = std::env::var("LRC_NEO4J_DB")
-            .unwrap_or_else(|_| "neo4j".to_string());
+        let endpoint =
+            std::env::var("LRC_NEO4J_URL").unwrap_or_else(|_| "http://localhost:7474".to_string());
+        let username = std::env::var("LRC_NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
+        let password = std::env::var("LRC_NEO4J_PASS").unwrap_or_else(|_| "password".to_string());
+        let database = std::env::var("LRC_NEO4J_DB").unwrap_or_else(|_| "neo4j".to_string());
 
         Ok(Self {
             endpoint,
@@ -141,10 +138,12 @@ impl Neo4jGraphStore {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
-            .map_err(|e| PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("创建 HTTP 客户端失败: {}", e),
-            )))?;
+            .map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("创建 HTTP 客户端失败: {}", e),
+                ))
+            })?;
 
         let this = Self {
             config,
@@ -154,10 +153,7 @@ impl Neo4jGraphStore {
 
         // 尝试连接验证
         if let Err(e) = this.ping().await {
-            eprintln!(
-                "[LRC·Neo4j] 连接验证失败: {}（将使用本地兜底）",
-                e
-            );
+            eprintln!("[LRC·Neo4j] 连接验证失败: {}（将使用本地兜底）", e);
         } else {
             this.ensure_constraints().await?;
         }
@@ -167,7 +163,10 @@ impl Neo4jGraphStore {
 
     /// 验证连接
     async fn ping(&self) -> Result<(), String> {
-        let url = format!("{}/db/{}/tx/commit", self.config.endpoint, self.config.database);
+        let url = format!(
+            "{}/db/{}/tx/commit",
+            self.config.endpoint, self.config.database
+        );
         let auth = base64_auth(&self.config.username, &self.config.password);
 
         let body = Neo4jTransactionRequest {
@@ -197,10 +196,7 @@ impl Neo4jGraphStore {
             .map_err(|e| format!("解析响应失败: {}", e))?;
 
         if !tx_response.errors.is_empty() {
-            return Err(format!(
-                "Cypher 错误: {}",
-                tx_response.errors[0].message
-            ));
+            return Err(format!("Cypher 错误: {}", tx_response.errors[0].message));
         }
 
         eprintln!("[LRC·Neo4j] 连接验证成功");
@@ -210,9 +206,12 @@ impl Neo4jGraphStore {
     /// 确保索引和约束存在
     async fn ensure_constraints(&self) -> Result<(), PersistenceError> {
         let statements = vec![
-            "CREATE CONSTRAINT lrc_memory_id IF NOT EXISTS FOR (m:Memory) REQUIRE m.id IS UNIQUE".to_string(),
-            "CREATE INDEX lrc_memory_type IF NOT EXISTS FOR (m:Memory) ON (m.memory_type)".to_string(),
-            "CREATE INDEX lrc_memory_project IF NOT EXISTS FOR (m:Memory) ON (m.project)".to_string(),
+            "CREATE CONSTRAINT lrc_memory_id IF NOT EXISTS FOR (m:Memory) REQUIRE m.id IS UNIQUE"
+                .to_string(),
+            "CREATE INDEX lrc_memory_type IF NOT EXISTS FOR (m:Memory) ON (m.memory_type)"
+                .to_string(),
+            "CREATE INDEX lrc_memory_project IF NOT EXISTS FOR (m:Memory) ON (m.project)"
+                .to_string(),
         ];
 
         for stmt in &statements {
@@ -231,7 +230,10 @@ impl Neo4jGraphStore {
         cypher: &str,
         params: serde_json::Value,
     ) -> Result<Neo4jTransactionResponse, PersistenceError> {
-        let url = format!("{}/db/{}/tx/commit", self.config.endpoint, self.config.database);
+        let url = format!(
+            "{}/db/{}/tx/commit",
+            self.config.endpoint, self.config.database
+        );
         let auth = base64_auth(&self.config.username, &self.config.password);
 
         let body = Neo4jTransactionRequest {
@@ -249,10 +251,12 @@ impl Neo4jGraphStore {
             .json(&body)
             .send()
             .await
-            .map_err(|e| PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                format!("Neo4j 请求失败: {}", e),
-            )))?;
+            .map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("Neo4j 请求失败: {}", e),
+                ))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -263,13 +267,12 @@ impl Neo4jGraphStore {
             )));
         }
 
-        let tx_response: Neo4jTransactionResponse = response
-            .json()
-            .await
-            .map_err(|e| PersistenceError::Io(std::io::Error::new(
+        let tx_response: Neo4jTransactionResponse = response.json().await.map_err(|e| {
+            PersistenceError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("解析 Neo4j 响应失败: {}", e),
-            )))?;
+            ))
+        })?;
 
         if !tx_response.errors.is_empty() {
             return Err(PersistenceError::Other(format!(

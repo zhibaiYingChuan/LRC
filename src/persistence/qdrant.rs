@@ -52,10 +52,10 @@ impl QdrantConfig {
     /// - `LRC_QDRANT_URL`：Qdrant 服务地址
     /// - `LRC_QDRANT_COLLECTION`：集合名称
     pub fn from_env() -> Self {
-        let endpoint = std::env::var("LRC_QDRANT_URL")
-            .unwrap_or_else(|_| "http://localhost:6333".to_string());
-        let collection = std::env::var("LRC_QDRANT_COLLECTION")
-            .unwrap_or_else(|_| "lrc_memories".to_string());
+        let endpoint =
+            std::env::var("LRC_QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
+        let collection =
+            std::env::var("LRC_QDRANT_COLLECTION").unwrap_or_else(|_| "lrc_memories".to_string());
 
         Self {
             endpoint,
@@ -142,10 +142,12 @@ impl QdrantPersistence {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
-            .map_err(|e| PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("创建 HTTP 客户端失败: {}", e),
-            )))?;
+            .map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("创建 HTTP 客户端失败: {}", e),
+                ))
+            })?;
 
         let this = Self {
             config,
@@ -189,10 +191,12 @@ impl QdrantPersistence {
             .json(&create_body)
             .send()
             .await
-            .map_err(|e| PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::ConnectionRefused,
-                format!("创建 Qdrant 集合失败: {}", e),
-            )))?;
+            .map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("创建 Qdrant 集合失败: {}", e),
+                ))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -202,10 +206,7 @@ impl QdrantPersistence {
                 status, body
             );
         } else {
-            eprintln!(
-                "[LRC·Qdrant] 集合 '{}' 已就绪",
-                self.config.collection
-            );
+            eprintln!("[LRC·Qdrant] 集合 '{}' 已就绪", self.config.collection);
         }
 
         Ok(())
@@ -261,9 +262,7 @@ impl Persistence for QdrantPersistence {
 
             let client = self.client.clone();
             // 忽略 Qdrant 写入错误（使用本地兜底）
-            let _ = handle.block_on(async move {
-                client.put(&url).json(&body).send().await
-            });
+            let _ = handle.block_on(async move { client.put(&url).json(&body).send().await });
         }
 
         Ok(())

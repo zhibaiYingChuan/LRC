@@ -1,0 +1,1817 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>">
+  <title>Loong Recall · 忆 — 仪表盘</title>
+  <style>
+    /* ============================================================
+     * 全局样式 — 极简主义 + 东方美学
+     * 配色：墨色 #1a1a2e、朱砂 #c0392b、玉色 #2ecc71、金色 #f39c12
+     * ============================================================ */
+    :root {
+      --ink: #1a1a2e;
+      --ink-light: #2a2a4a;
+      --ink-lighter: #3a3a5a;
+      --cinnabar: #c0392b;
+      --cinnabar-light: #e74c3c;
+      --jade: #2ecc71;
+      --jade-dark: #27ae60;
+      --gold: #f39c12;
+      --gold-light: #f1c40f;
+      --bg: #f5f0eb;
+      --card-bg: #ffffff;
+      --text: #2c2c2c;
+      --text-dim: #7f8c8d;
+      --text-light: #bdc3c7;
+      --border: #e8e0d8;
+      --shadow: 0 2px 12px rgba(26, 26, 46, 0.06);
+      --shadow-hover: 0 4px 20px rgba(26, 26, 46, 0.10);
+      --radius: 12px;
+      --radius-sm: 8px;
+      --transition: 0.2s ease;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+        "Hiragino Sans GB", "Microsoft YaHei", "WenQuanYi Micro Hei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ==================== 顶部导航栏 ==================== */
+    .navbar {
+      background: var(--ink);
+      color: #fff;
+      padding: 0 24px;
+      height: 60px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 1px 8px rgba(0,0,0,0.15);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .navbar-brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: #fff;
+    }
+
+    .navbar-logo {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      background: linear-gradient(135deg, var(--gold), var(--cinnabar));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .navbar-tagline {
+      font-size: 12px;
+      color: var(--text-light);
+      margin-left: 4px;
+      padding-left: 12px;
+      border-left: 1px solid rgba(255,255,255,0.15);
+    }
+
+    .navbar-nav {
+      display: flex;
+      gap: 4px;
+      list-style: none;
+    }
+
+    .navbar-nav button {
+      background: none;
+      border: none;
+      color: var(--text-light);
+      padding: 8px 16px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      font-size: 14px;
+      transition: all var(--transition);
+      font-family: inherit;
+    }
+
+    .navbar-nav button:hover {
+      color: #fff;
+      background: rgba(255,255,255,0.08);
+    }
+
+    .navbar-nav button.active {
+      color: var(--gold);
+      background: rgba(243, 156, 18, 0.12);
+      font-weight: 600;
+    }
+
+    /* 移动端汉堡菜单 */
+    .navbar-toggle {
+      display: none;
+      background: none;
+      border: none;
+      color: #fff;
+      font-size: 24px;
+      cursor: pointer;
+      padding: 4px 8px;
+    }
+
+    /* ==================== 主内容区 ==================== */
+    .main {
+      flex: 1;
+      max-width: 1200px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 24px 20px 80px;
+    }
+
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* ==================== 卡片 ==================== */
+    .card {
+      background: var(--card-bg);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 20px;
+      margin-bottom: 20px;
+      border: 1px solid var(--border);
+      transition: box-shadow var(--transition);
+    }
+
+    .card:hover { box-shadow: var(--shadow-hover); }
+
+    .card-title {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 16px;
+      color: var(--ink);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .card-title .icon { font-size: 18px; }
+
+    /* ==================== 统计卡片网格 ==================== */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .stat-card {
+      background: var(--card-bg);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      border: 1px solid var(--border);
+      transition: all var(--transition);
+    }
+
+    .stat-card:hover {
+      box-shadow: var(--shadow-hover);
+      transform: translateY(-1px);
+    }
+
+    .stat-icon {
+      width: 48px;
+      height: 48px;
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 22px;
+      flex-shrink: 0;
+    }
+
+    .stat-icon.ink { background: rgba(26,26,46,0.08); color: var(--ink); }
+    .stat-icon.cinnabar { background: rgba(192,57,43,0.08); color: var(--cinnabar); }
+    .stat-icon.jade { background: rgba(46,204,113,0.08); color: var(--jade); }
+    .stat-icon.gold { background: rgba(243,156,18,0.08); color: var(--gold); }
+
+    .stat-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--ink);
+      line-height: 1.2;
+    }
+
+    .stat-label {
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+
+    /* ==================== 双列布局 ==================== */
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+
+    /* ==================== 进度条 ==================== */
+    .progress-bar {
+      height: 8px;
+      background: var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+      margin: 8px 0;
+    }
+
+    .progress-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.6s ease;
+    }
+
+    .progress-fill.gold { background: linear-gradient(90deg, var(--gold), var(--gold-light)); }
+    .progress-fill.jade { background: linear-gradient(90deg, var(--jade-dark), var(--jade)); }
+    .progress-fill.cinnabar { background: linear-gradient(90deg, var(--cinnabar), var(--cinnabar-light)); }
+    .progress-fill.ink { background: linear-gradient(90deg, var(--ink), var(--ink-lighter)); }
+
+    .progress-label {
+      display: flex;
+      justify-content: space-between;
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+
+    .progress-label span:last-child {
+      font-weight: 600;
+      color: var(--ink);
+    }
+
+    /* ==================== 表格 ==================== */
+    .table-wrap {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th {
+      text-align: left;
+      padding: 10px 12px;
+      background: rgba(26,26,46,0.03);
+      color: var(--text-dim);
+      font-weight: 600;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 2px solid var(--border);
+    }
+
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    tr:hover td { background: rgba(243,156,18,0.03); }
+
+    /* ==================== 状态徽章 ==================== */
+    .badge {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      line-height: 1.6;
+    }
+
+    .badge.healthy { background: rgba(46,204,113,0.12); color: var(--jade-dark); }
+    .badge.warning { background: rgba(243,156,18,0.12); color: var(--gold); }
+    .badge.critical { background: rgba(192,57,43,0.12); color: var(--cinnabar); }
+    .badge.info { background: rgba(26,26,46,0.06); color: var(--ink); }
+
+    /* ==================== 按钮 ==================== */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 10px 20px;
+      border: none;
+      border-radius: var(--radius-sm);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all var(--transition);
+      font-family: inherit;
+    }
+
+    .btn-primary {
+      background: var(--ink);
+      color: #fff;
+    }
+
+    .btn-primary:hover {
+      background: var(--ink-light);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(26,26,46,0.2);
+    }
+
+    .btn-primary:disabled {
+      background: var(--text-light);
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .btn-outline {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--border);
+    }
+
+    .btn-outline:hover {
+      border-color: var(--ink);
+      background: rgba(26,26,46,0.04);
+    }
+
+    /* ==================== 输入框 ==================== */
+    .input {
+      width: 100%;
+      padding: 10px 14px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-size: 14px;
+      font-family: inherit;
+      transition: border-color var(--transition);
+      background: var(--card-bg);
+      color: var(--text);
+    }
+
+    .input:focus {
+      outline: none;
+      border-color: var(--gold);
+      box-shadow: 0 0 0 3px rgba(243,156,18,0.1);
+    }
+
+    .input-group {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    .input-group .input { flex: 1; }
+
+    /* ==================== 加载动画 ==================== */
+    .loading-spinner {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 2px solid var(--border);
+      border-top-color: var(--gold);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .loading-overlay {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 40px;
+      color: var(--text-dim);
+      font-size: 14px;
+    }
+
+    .loading-overlay.hidden { display: none; }
+
+    /* ==================== 底部状态栏 ==================== */
+    .status-bar {
+      background: var(--ink);
+      color: var(--text-light);
+      padding: 8px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12px;
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+    }
+
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 6px;
+    }
+
+    .status-dot.online { background: var(--jade); animation: pulse 2s infinite; }
+    .status-dot.offline { background: var(--cinnabar); }
+    .status-dot.unknown { background: var(--gold); }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .status-bar-left, .status-bar-right {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    /* ==================== 信任中心 ==================== */
+    .trust-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+    }
+
+    .trust-card {
+      background: var(--card-bg);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 20px;
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--jade);
+    }
+
+    .trust-card.warn { border-left-color: var(--gold); }
+    .trust-card.info { border-left-color: var(--ink); }
+
+    .trust-card h3 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 10px;
+      color: var(--ink);
+    }
+
+    .trust-card p {
+      font-size: 13px;
+      color: var(--text-dim);
+      line-height: 1.7;
+    }
+
+    /* 信任中心验证结果面板 */
+    .verify-result {
+      margin-top: 12px;
+      padding: 12px;
+      background: rgba(26,26,46,0.03);
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      display: none;
+    }
+
+    .verify-result.show { display: block; }
+
+    .verify-result .result-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 4px 0;
+      border-bottom: 1px solid rgba(26,26,46,0.05);
+    }
+
+    .verify-result .result-row:last-child { border-bottom: none; }
+
+    .verify-result .result-label { color: var(--text-dim); }
+    .verify-result .result-value { font-weight: 600; color: var(--ink); }
+    .verify-result .result-value.valid { color: var(--jade); }
+    .verify-result .result-value.invalid { color: var(--cinnabar); }
+
+    /* 信任中心按钮组 */
+    .trust-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+      flex-wrap: wrap;
+    }
+
+    .btn-sm {
+      padding: 6px 14px;
+      font-size: 13px;
+    }
+
+    .feature-list {
+      list-style: none;
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+
+    .feature-list li {
+      padding: 4px 0;
+      padding-left: 20px;
+      position: relative;
+    }
+
+    .feature-list li::before {
+      content: "✓";
+      position: absolute;
+      left: 0;
+      color: var(--jade);
+      font-weight: 700;
+    }
+
+    /* ==================== 仪表盘·指标说明 ==================== */
+    .glossary-grid-dashboard {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 8px;
+    }
+
+    .glossary-item-dash {
+      background: rgba(0,0,0,0.06);
+      border-radius: 6px;
+      padding: 10px 14px;
+      border-left: 2px solid var(--gold);
+      transition: background 0.2s;
+    }
+
+    .glossary-item-dash:hover {
+      background: rgba(0,0,0,0.1);
+    }
+
+    .term-dash {
+      display: block;
+      font-weight: 700;
+      font-size: 14px;
+      color: var(--gold);
+      margin-bottom: 4px;
+    }
+
+    .desc-dash {
+      color: #888;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    /* ==================== 船长日志 ==================== */
+    .log-result {
+      background: var(--ink);
+      color: #e0e0e0;
+      border-radius: var(--radius-sm);
+      padding: 20px;
+      font-family: "SF Mono", "Cascadia Code", "Consolas", monospace;
+      font-size: 13px;
+      line-height: 1.7;
+      white-space: pre-wrap;
+      max-height: 500px;
+      overflow-y: auto;
+      margin-top: 16px;
+    }
+
+    .log-result .highlight { color: var(--gold); }
+    .log-result .metric { color: var(--jade); }
+    .log-result .warn-text { color: var(--cinnabar-light); }
+
+    /* ==================== 船长日志·名词解释 ==================== */
+    .glossary {
+      margin-top: 16px;
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+    }
+
+    .glossary summary {
+      padding: 10px 16px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      color: #e0e0e0;
+      background: rgba(0,0,0,0.1);
+      user-select: none;
+      transition: background 0.2s;
+      list-style: none;
+    }
+
+    .glossary summary::-webkit-details-marker { display: none; }
+    .glossary summary::marker { display: none; content: ""; }
+    .glossary summary::before {
+      content: '📖';
+      margin-right: 8px;
+    }
+
+    .glossary summary:hover {
+      background: rgba(0,0,0,0.2);
+    }
+
+    .glossary-content {
+      padding: 12px 16px;
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+      gap: 10px;
+    }
+
+    .glossary-item {
+      background: rgba(0,0,0,0.08);
+      border-radius: 4px;
+      padding: 8px 12px;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .glossary-item .term {
+      font-weight: 700;
+      color: var(--gold);
+      display: block;
+      margin-bottom: 2px;
+    }
+
+    .glossary-item .desc {
+      color: #a0a0a0;
+      font-size: 12px;
+    }
+
+    /* ==================== 错误提示 ==================== */
+    .error-msg {
+      background: rgba(192,57,43,0.08);
+      border: 1px solid rgba(192,57,43,0.2);
+      color: var(--cinnabar);
+      padding: 12px 16px;
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      margin-top: 12px;
+      display: none;
+    }
+
+    .error-msg.show { display: block; }
+
+    /* ==================== 快速体验向导 ==================== */
+    .wizard-card {
+      background: linear-gradient(135deg, var(--ink), var(--ink-light));
+      color: #fff;
+      border-radius: var(--radius);
+      padding: 24px;
+      margin-bottom: 20px;
+      border: 1px solid rgba(255,255,255,0.1);
+      box-shadow: 0 4px 24px rgba(26,26,46,0.15);
+    }
+
+    .wizard-card .wizard-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .wizard-card .wizard-subtitle {
+      font-size: 13px;
+      color: var(--text-light);
+      margin-bottom: 20px;
+    }
+
+    .wizard-steps {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 12px;
+    }
+
+    .wizard-step {
+      background: rgba(255,255,255,0.06);
+      border-radius: var(--radius-sm);
+      padding: 16px;
+      border: 1px solid rgba(255,255,255,0.08);
+      transition: all var(--transition);
+    }
+
+    .wizard-step:hover {
+      background: rgba(255,255,255,0.1);
+    }
+
+    .wizard-step.completed {
+      border-color: var(--jade);
+      background: rgba(46,204,113,0.08);
+    }
+
+    .wizard-step-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .wizard-step-num {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.15);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    .wizard-step.completed .wizard-step-num {
+      background: var(--jade);
+    }
+
+    .wizard-step-title {
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .wizard-step.completed .wizard-step-title {
+      color: var(--jade);
+    }
+
+    .wizard-step-desc {
+      font-size: 12px;
+      color: var(--text-light);
+      margin-bottom: 10px;
+    }
+
+    .wizard-step .input {
+      background: rgba(255,255,255,0.1);
+      border-color: rgba(255,255,255,0.15);
+      color: #fff;
+      margin-bottom: 8px;
+    }
+
+    .wizard-step .input::placeholder {
+      color: rgba(255,255,255,0.4);
+    }
+
+    .wizard-step .input:focus {
+      border-color: var(--gold);
+      box-shadow: 0 0 0 3px rgba(243,156,18,0.15);
+    }
+
+    .wizard-step .btn {
+      font-size: 12px;
+      padding: 6px 14px;
+    }
+
+    .wizard-step .btn-accent {
+      background: var(--gold);
+      color: var(--ink);
+    }
+
+    .wizard-step .btn-accent:hover {
+      background: var(--gold-light);
+    }
+
+    .wizard-check {
+      display: none;
+      color: var(--jade);
+      font-size: 16px;
+      margin-left: auto;
+    }
+
+    .wizard-step.completed .wizard-check { display: block; }
+
+    .wizard-result {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--text-light);
+      max-height: 80px;
+      overflow-y: auto;
+      background: rgba(0,0,0,0.2);
+      padding: 8px;
+      border-radius: 4px;
+      display: none;
+    }
+
+    .wizard-result.show { display: block; }
+
+    /* ==================== 响应式 ==================== */
+    @media (max-width: 768px) {
+      .navbar { padding: 0 16px; }
+      .navbar-tagline { display: none; }
+      .navbar-nav { display: none; }
+      .navbar-nav.open {
+        display: flex;
+        flex-direction: column;
+        position: absolute;
+        top: 60px;
+        left: 0;
+        right: 0;
+        background: var(--ink);
+        padding: 8px;
+        gap: 2px;
+      }
+      .navbar-toggle { display: block; }
+      .two-col { grid-template-columns: 1fr; }
+      .stats-grid { grid-template-columns: 1fr 1fr; }
+      .main { padding: 16px 12px 80px; }
+      .status-bar { flex-direction: column; align-items: flex-start; }
+      .trust-grid { grid-template-columns: 1fr; }
+      .wizard-steps { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 480px) {
+      .stats-grid { grid-template-columns: 1fr; }
+      .stat-value { font-size: 24px; }
+    }
+
+    /* ==================== 工具类 ==================== */
+    .text-center { text-align: center; }
+    .text-dim { color: var(--text-dim); }
+    .text-sm { font-size: 13px; }
+    .mt-2 { margin-top: 8px; }
+    .mt-4 { margin-top: 16px; }
+    .mb-2 { margin-bottom: 8px; }
+    .mb-4 { margin-bottom: 16px; }
+    .flex-between { display: flex; justify-content: space-between; align-items: center; }
+    .gap-2 { gap: 8px; }
+
+    /* 系统状态网格 */
+    .sys-info-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px 20px;
+      font-size: 13px;
+    }
+
+    .sys-info-grid .label { color: var(--text-dim); }
+    .sys-info-grid .value { color: var(--ink); font-weight: 500; }
+
+    @media (max-width: 480px) {
+      .sys-info-grid { grid-template-columns: 1fr; }
+    }
+
+    /* ==================== 基准报告 ==================== */
+    /* 力量宣言 */
+    .power-declaration {
+      margin: 20px 0;
+    }
+    .tagline {
+      font-size: 1.2em;
+      font-weight: 600;
+      text-align: center;
+      color: #c0a060;
+      padding: 16px;
+      border-bottom: 1px solid #333;
+      margin-bottom: 20px;
+    }
+    .power-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    .power-card {
+      background: #1a1a2e;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 20px;
+      text-align: center;
+    }
+    .power-card .power-icon {
+      font-size: 2em;
+      margin-bottom: 8px;
+    }
+    .power-card h3 {
+      color: #c0a060;
+      margin: 8px 0;
+      font-size: 1.1em;
+    }
+    .power-card p {
+      color: #999;
+      font-size: 0.9em;
+      line-height: 1.6;
+      margin: 8px 0 12px;
+    }
+    .power-card .power-metric {
+      display: inline-block;
+      background: #1a3a1a;
+      color: #4caf50;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 0.8em;
+    }
+
+    /* 基准报告摘要栏 */
+    .benchmark-summary-bar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 16px 0;
+      padding: 12px;
+      background: #1a1a2e;
+      border-radius: 8px;
+    }
+    .badge {
+      padding: 6px 14px;
+      border-radius: 20px;
+      font-size: 0.85em;
+      font-weight: 600;
+    }
+    .badge-success { background: #1a3a1a; color: #4caf50; }
+    .badge-warning { background: #3a3a1a; color: #ff9800; }
+    .badge-info { background: #1a2a3a; color: #64b5f6; }
+
+    .benchmark-layer {
+      background: #1a1a2e;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .benchmark-layer h3 {
+      color: #c0a060;
+      margin: 0 0 4px 0;
+    }
+    .benchmark-layer .layer-desc {
+      color: #888;
+      font-size: 0.9em;
+      margin: 0 0 12px 0;
+    }
+    .benchmark-test {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 10px 0;
+      border-bottom: 1px solid #2a2a3e;
+    }
+    .benchmark-test:last-child { border-bottom: none; }
+    .test-status {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.8em;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .test-status.pass { background: #1a3a1a; color: #4caf50; }
+    .test-status.fail { background: #3a1a1a; color: #f44336; }
+    .test-info { flex: 1; }
+    .test-info h4 {
+      margin: 0;
+      font-size: 0.95em;
+      color: #ddd;
+    }
+    .test-info .test-desc {
+      font-size: 0.8em;
+      color: #888;
+      margin: 4px 0;
+    }
+    .test-info .test-metric {
+      font-size: 0.75em;
+      color: #64b5f6;
+      margin: 2px 0;
+    }
+    .test-story {
+      font-size: 0.8em;
+      color: #c0a060;
+      font-style: italic;
+      margin: 4px 0 0;
+      padding: 6px 10px;
+      background: #111;
+      border-left: 3px solid #c0a060;
+      border-radius: 0 4px 4px 0;
+    }
+
+    /* 雷达图 */
+    .radar-container {
+      display: flex;
+      justify-content: center;
+      margin: 20px 0;
+    }
+    .radar-container canvas {
+      max-width: 100%;
+    }
+    .chart-note {
+      text-align: center;
+      color: #888;
+      font-size: 0.85em;
+      margin-top: 12px;
+    }
+  /* 叙事导引 */
+.narrative-intro { }
+.narrative-box {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 24px;
+    margin: 16px 0;
+}
+.narrative-lead {
+    color: #c0a060;
+    font-size: 1.05em;
+    margin: 0 0 16px 0;
+}
+.narrative-gaps {
+    list-style: none;
+    padding: 0;
+    margin: 0 0 16px 0;
+}
+.narrative-gaps li {
+    padding: 8px 0;
+    color: #ddd;
+    font-size: 0.95em;
+    border-bottom: 1px solid #2a2a3e;
+}
+.narrative-gaps li:last-child { border-bottom: none; }
+.narrative-gaps li strong {
+    color: #f44336;
+}
+.narrative-call {
+    color: #aaa;
+    font-size: 0.9em;
+    line-height: 1.7;
+    margin: 16px 0;
+}
+.narrative-open {
+    color: #64b5f6;
+    font-size: 0.9em;
+    text-align: center;
+    margin: 12px 0 0;
+    padding: 10px;
+    background: #0d1b2a;
+    border-radius: 6px;
+}
+
+/* 可复现区域 */
+.reproducible-box {
+    background: #1a1a2e;
+    border: 1px solid #333;
+    border-radius: 8px;
+    padding: 20px;
+}
+.reproducible-intro {
+    color: #aaa;
+    font-size: 0.9em;
+    margin: 0 0 16px 0;
+}
+.code-block {
+    display: flex;
+    align-items: center;
+    background: #0d0d1a;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin: 12px 0;
+    overflow-x: auto;
+}
+.code-block code {
+    color: #4caf50;
+    font-family: 'Consolas', 'Monaco', monospace;
+    font-size: 0.85em;
+    flex: 1;
+    word-break: break-all;
+}
+.copy-btn {
+    background: #1a3a2a;
+    color: #4caf50;
+    border: 1px solid #2a5a3a;
+    border-radius: 4px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 0.85em;
+    white-space: nowrap;
+    margin-left: 12px;
+    transition: background 0.2s;
+}
+.copy-btn:hover {
+    background: #2a5a3a;
+}
+.reproducible-features {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 12px;
+    margin: 16px 0;
+}
+.feature-item {
+    display: flex;
+    gap: 10px;
+    padding: 10px;
+    background: #111;
+    border-radius: 6px;
+}
+.feature-icon {
+    font-size: 1.2em;
+    flex-shrink: 0;
+}
+.feature-text strong {
+    color: #ddd;
+    font-size: 0.9em;
+}
+.feature-text p {
+    color: #888;
+    font-size: 0.8em;
+    margin: 4px 0 0;
+}
+.reproducible-note {
+    color: #c0a060;
+    font-size: 0.85em;
+    text-align: center;
+    margin: 12px 0 0;
+    line-height: 1.6;
+}
+
+/* 竞品对比表 */
+.comparison-note {
+    color: #888;
+    font-size: 0.85em;
+    margin: 8px 0 16px;
+}
+.comparison-table-wrapper {
+    overflow-x: auto;
+    margin: 16px 0;
+}
+.comparison-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85em;
+}
+.comparison-table th,
+.comparison-table td {
+    padding: 10px 12px;
+    text-align: center;
+    border: 1px solid #2a2a3e;
+}
+.comparison-table th {
+    background: #1a1a2e;
+    color: #c0a060;
+    font-weight: 600;
+    font-size: 0.85em;
+}
+.comparison-table th:first-child {
+    text-align: left;
+    min-width: 160px;
+}
+.comparison-table td:first-child {
+    text-align: left;
+    color: #ddd;
+    font-weight: 500;
+}
+.comparison-table tbody tr:hover {
+    background: #1a1a3e;
+}
+.cell-pass {
+    color: #4caf50;
+    font-weight: 600;
+}
+.cell-unique {
+    color: #c0a060;
+    font-weight: 600;
+    background: rgba(192, 160, 96, 0.1);
+}
+.cell-fail {
+    color: #666;
+}
+.cell-partial {
+    color: #ff9800;
+}
+.comparison-disclaimer {
+    color: #888;
+    font-size: 0.8em;
+    text-align: center;
+    margin: 12px 0 0;
+    line-height: 1.6;
+}
+  </style>
+</head>
+<body>
+
+<!-- ==================== 顶部导航栏 ==================== -->
+<nav class="navbar">
+  <a class="navbar-brand" href="#">
+    <span class="navbar-logo">Loong Recall · 忆</span>
+    <span class="navbar-tagline">你的私人记忆管家</span>
+  </a>
+  <button class="navbar-toggle" onclick="toggleNav()" aria-label="菜单">☰</button>
+  <ul class="navbar-nav" id="navbarNav">
+    <li><button class="active" data-tab="dashboard">仪表盘</button></li>
+    <li><button data-tab="captain-log">船长日志</button></li>
+    <li><button data-tab="trust-center">信任中心</button></li>
+    <li><button data-tab="api-docs">API 文档</button></li>
+    <li><button data-tab="benchmarks">📊 基准报告</button></li>
+  </ul>
+</nav>
+
+<!-- ==================== 主内容区 ==================== -->
+<main class="main">
+
+  <!-- ========== 仪表盘标签页 ========== -->
+  <section class="tab-content active" id="tab-dashboard">
+
+    <!-- 5分钟快速体验向导 -->
+    <div class="wizard-card" id="quickstart-wizard">
+      <div class="wizard-title">🚀 5分钟快速体验</div>
+      <div class="wizard-subtitle">跟随以下三个步骤，快速上手 Loong Recall 记忆系统</div>
+      <div class="wizard-steps">
+        <!-- 步骤一：搜索代码 -->
+        <div class="wizard-step" id="wizard-step-1">
+          <div class="wizard-step-header">
+            <span class="wizard-step-num">1</span>
+            <span class="wizard-step-title">🔍 搜索代码</span>
+            <span class="wizard-check">✓</span>
+          </div>
+          <div class="wizard-step-desc">搜索代码库中的函数、结构体或关键字</div>
+          <input type="text" class="input" id="wizard-search-path" placeholder="搜索代码关键词（如：struct、fn、MemoryStore）" value="struct">
+          <button class="btn btn-accent" onclick="wizardStep1Search()">搜索代码</button>
+          <div class="wizard-result" id="wizard-step1-result"></div>
+        </div>
+
+        <!-- 步骤二：写入记忆 -->
+        <div class="wizard-step" id="wizard-step-2">
+          <div class="wizard-step-header">
+            <span class="wizard-step-num">2</span>
+            <span class="wizard-step-title">✍️ 写入记忆</span>
+            <span class="wizard-check">✓</span>
+          </div>
+          <div class="wizard-step-desc">将示例内容写入记忆库</div>
+          <input type="text" class="input" id="wizard-memory-content"
+            value="项目使用 Rust 语言开发，采用 Actix-web 框架" placeholder="记忆内容...">
+          <button class="btn btn-accent" onclick="wizardStep2Write()">写入记忆</button>
+          <div class="wizard-result" id="wizard-step2-result"></div>
+        </div>
+
+        <!-- 步骤三：检索记忆 -->
+        <div class="wizard-step" id="wizard-step-3">
+          <div class="wizard-step-header">
+            <span class="wizard-step-num">3</span>
+            <span class="wizard-step-title">🔎 检索记忆</span>
+            <span class="wizard-check">✓</span>
+          </div>
+          <div class="wizard-step-desc">检索刚写入的记忆，验证记忆系统</div>
+          <input type="text" class="input" id="wizard-search-query"
+            value="Rust 开发" placeholder="搜索关键词...">
+          <button class="btn btn-accent" onclick="wizardStep3Search()">检索记忆</button>
+          <div class="wizard-result" id="wizard-step3-result"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== 指标说明 ==================== -->
+    <div class="card" style="border-left: 3px solid var(--gold);">
+      <div class="card-title" style="font-size: 18px; color: var(--gold);">
+        <span class="icon">📖</span> 仪表盘指标说明</div>
+      <p class="text-sm text-dim mb-4">
+        看不懂上面的数字？这里用大白话解释每个指标的含义，帮你快速掌握系统状态。
+      </p>
+      <div class="glossary-grid-dashboard">
+        <div class="glossary-item-dash">
+          <span class="term-dash">道同构度</span>
+          <span class="desc-dash">系统记忆的"整齐度"评分。就像整理房间，越高说明记忆越井井有条。</span>
+        </div>
+        <div class="glossary-item-dash">
+          <span class="term-dash">八卦分布熵</span>
+          <span class="desc-dash">记忆在 8 个分类中分散得是否均匀。就像图书馆的书，如果全堆在一个角落就不健康。</span>
+        </div>
+        <div class="glossary-item-dash">
+          <span class="term-dash">合成比率</span>
+          <span class="desc-dash">系统自动帮你总结了多少。过高说明在"曲解"你的代码，过低说明没帮上忙。</span>
+        </div>
+        <div class="glossary-item-dash">
+          <span class="term-dash">编码质量</span>
+          <span class="desc-dash">系统"读懂"代码的能力。就像翻译质量，太低说明翻译不准。</span>
+        </div>
+        <div class="glossary-item-dash">
+          <span class="term-dash">可维护性</span>
+          <span class="desc-dash">代码的健康体检分。就像体检报告，告诉你代码是否容易维护。</span>
+        </div>
+        <div class="glossary-item-dash">
+          <span class="term-dash">复杂度预算</span>
+          <span class="desc-dash">代码复杂度超标的程度。就像信用卡额度，快花完时就要省着点了。</span>
+        </div>
+        <div class="glossary-item-dash">
+          <span class="term-dash">活跃记忆</span>
+          <span class="desc-dash">你最近还在用的代码片段。</span>
+        </div>
+        <div class="glossary-item-dash">
+          <span class="term-dash">结晶记忆</span>
+          <span class="desc-dash">系统帮你自动总结的代码模式和规律。</span>
+        </div>
+        <div class="glossary-item-dash">
+          <span class="term-dash">诚实度</span>
+          <span class="desc-dash">系统是否在"虚报"复杂度。诚实度低说明系统在隐藏问题。</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 记忆统计卡片组 -->
+    <div class="stats-grid" id="memoryStatsCards">
+      <div class="stat-card">
+        <div class="stat-icon ink">📊</div>
+        <div>
+          <div class="stat-value" id="stat-total">--</div>
+          <div class="stat-label">记忆总数</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon gold">🆕</div>
+        <div>
+          <div class="stat-value" id="stat-today">--</div>
+          <div class="stat-label">今日新增</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon jade">⚡</div>
+        <div>
+          <div class="stat-value" id="stat-active">--</div>
+          <div class="stat-label">活跃记忆</div>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-icon cinnabar">💎</div>
+        <div>
+          <div class="stat-value" id="stat-crystallized">--</div>
+          <div class="stat-label">结晶记忆</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 健康状态 + 系统状态 -->
+    <div class="two-col">
+      <!-- 健康状态卡片 -->
+      <div class="card">
+        <div class="card-title"><span class="icon">🏥</span> 健康状态</div>
+        <div class="mb-4">
+          <div class="progress-label">
+            <span>道同构度</span>
+            <span id="dao-score-text">--</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-fill gold" id="dao-score-bar" style="width:0%"></div>
+          </div>
+        </div>
+        <div class="mb-4">
+          <div class="flex-between">
+            <span class="text-sm text-dim">八卦分布熵</span>
+            <span class="text-sm" id="bagua-entropy" style="font-weight:600">--</span>
+          </div>
+        </div>
+        <div>
+          <div class="progress-label">
+            <span>合成比率</span>
+            <span id="synthesis-ratio-text">--</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-fill jade" id="synthesis-ratio-bar" style="width:0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 系统状态卡片 -->
+      <div class="card">
+        <div class="card-title"><span class="icon">⚙️</span> 系统状态</div>
+        <div class="sys-info-grid">
+          <span class="label">ML 模型状态</span>
+          <span class="value" id="sys-ml-status">--</span>
+          <span class="label">编码器类型</span>
+          <span class="value" id="sys-encoder">--</span>
+          <span class="label">数据目录</span>
+          <span class="value" id="sys-data-dir">--</span>
+          <span class="label">缓存状态</span>
+          <span class="value" id="sys-cache">--</span>
+          <span class="label">系统模式</span>
+          <span class="value" id="sys-mode">--</span>
+          <span class="label">编码质量评分</span>
+          <span class="value" id="sys-quality">--</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 复杂度预算 + 最近决策日志 -->
+    <div class="two-col">
+      <!-- 复杂度预算卡片 -->
+      <div class="card">
+        <div class="card-title"><span class="icon">🧮</span> 复杂度预算</div>
+        <div class="mb-4">
+          <div class="progress-label">
+            <span>复杂度评分</span>
+            <span id="complexity-score">--</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-fill ink" id="complexity-bar" style="width:0%"></div>
+          </div>
+        </div>
+        <div class="mb-4">
+          <div class="progress-label">
+            <span>诚实度评分</span>
+            <span id="honesty-score">--</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-fill jade" id="honesty-bar" style="width:0%"></div>
+          </div>
+        </div>
+        <div>
+          <div class="progress-label">
+            <span>可维护性指数</span>
+            <span id="maintainability-score">--</span>
+          </div>
+          <div class="progress-bar">
+            <div class="progress-fill gold" id="maintainability-bar" style="width:0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 最近决策日志 -->
+      <div class="card">
+        <div class="card-title"><span class="icon">📋</span> 最近决策日志</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>事件类型</th>
+                <th>描述</th>
+              </tr>
+            </thead>
+            <tbody id="audit-log-body">
+              <tr><td colspan="3" class="text-center text-dim">加载中...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- 加载遮罩 -->
+    <div class="loading-overlay hidden" id="dashboard-loading">
+      <span class="loading-spinner"></span> 正在获取仪表盘数据...
+    </div>
+    <div class="error-msg" id="dashboard-error"></div>
+
+  </section>
+
+  <!-- ========== 船长日志标签页 ========== -->
+  <section class="tab-content" id="tab-captain-log">
+    <div class="card">
+      <div class="card-title"><span class="icon">📝</span> 船长日志生成器</div>
+      <p class="text-sm text-dim mb-4">
+        船长日志将分析当前项目的代码库状态、记忆健康度和系统运行指标，
+        生成一份面向开发者的综合报告。
+      </p>
+      <div class="input-group">
+        <input type="text" class="input" id="log-project-path"
+          placeholder="例如：C:\Users\MyProject 或 .（当前目录）" value=".">
+        <button class="btn btn-primary" id="btn-generate-log" onclick="generateCaptainLog()">
+          ⚡ 一键生成船长日志
+        </button>
+      </div>
+      <p class="text-sm text-dim" style="margin-top:6px;">
+        💡 输入你想分析的代码项目路径，系统会扫描该目录下的代码并生成记忆健康报告。
+      </p>
+
+      <div class="loading-overlay hidden" id="log-loading">
+        <span class="loading-spinner"></span> 正在生成船长日志，请稍候...
+      </div>
+      <div class="error-msg" id="log-error"></div>
+      <div class="log-result hidden" id="log-result"></div>
+    </div>
+  </section>
+
+  <!-- ========== 信任中心标签页 ========== -->
+  <section class="tab-content" id="tab-trust-center">
+    <div class="trust-grid">
+      <!-- 数据存储位置 -->
+      <div class="trust-card">
+        <h3>📁 数据存储位置</h3>
+        <p>所有数据<strong>本地优先</strong>，存储在项目目录下的 <code>.loong-recall/data/</code> 中。
+          支持自定义路径（<code>--db-path</code>）和全局模式（<code>--global</code>）。</p>
+        <div class="trust-actions">
+          <button class="btn btn-outline btn-sm" onclick="verifyDataLocation()">📂 查看记忆文件</button>
+        </div>
+        <div class="verify-result" id="data-location-result">
+          <div class="loading-overlay hidden" id="data-location-loading">
+            <span class="loading-spinner"></span> 正在获取...
+          </div>
+        </div>
+      </div>
+
+      <!-- 网络访问策略 -->
+      <div class="trust-card info">
+        <h3>🌐 网络访问策略</h3>
+        <p>核心功能<strong>完全离线</strong>可用。网络仅用于首次模型下载
+          （通过 HuggingFace 镜像）。</p>
+        <div class="trust-actions">
+          <button class="btn btn-outline btn-sm" onclick="verifyNetworkAudit()">🔍 查看网络活动</button>
+        </div>
+        <div class="verify-result" id="network-audit-result">
+          <div class="loading-overlay hidden" id="network-audit-loading">
+            <span class="loading-spinner"></span> 正在获取...
+          </div>
+        </div>
+      </div>
+
+      <!-- 隐私保护承诺 -->
+      <div class="trust-card">
+        <h3>🔒 隐私保护承诺</h3>
+        <p>你的记忆<strong>不会离开你的机器</strong>。所有编码、检索、合成均在本地完成。</p>
+        <ul class="feature-list mt-2">
+          <li>数据不出本地</li>
+          <li>加密混淆存储</li>
+          <li>哈希链防篡改审计</li>
+          <li>完整性封印验证</li>
+        </ul>
+      </div>
+
+      <!-- 开源许可 -->
+      <div class="trust-card info">
+        <h3>📜 开源许可</h3>
+        <p>本项目采用双重许可：</p>
+        <ul class="feature-list mt-2">
+          <li><strong>Apache 2.0</strong> — 基础设施代码</li>
+          <li><strong>DaoTi Research License v1.0</strong> — 核心算法</li>
+          <li>禁止逆向工程与商业再分发核心算法</li>
+        </ul>
+      </div>
+
+      <!-- 隐式反馈开关 -->
+      <div class="trust-card warn" id="feedback-status-card">
+        <h3>🎛️ 隐式反馈</h3>
+        <p id="feedback-status-text">加载中...</p>
+        <p class="text-sm text-dim mt-2">
+          隐式反馈通过分析用户的检索行为自动优化排序，无需手动标注。
+        </p>
+      </div>
+
+      <!-- 审计日志完整性 -->
+      <div class="trust-card" id="audit-integrity-card">
+        <h3>📋 审计日志完整性</h3>
+        <p id="audit-integrity-text">加载中...</p>
+        <div class="trust-actions">
+          <button class="btn btn-outline btn-sm" onclick="verifyAuditIntegrity()">🔐 验证完整性</button>
+        </div>
+        <div class="verify-result" id="audit-integrity-result">
+          <div class="loading-overlay hidden" id="audit-integrity-loading">
+            <span class="loading-spinner"></span> 正在验证...
+          </div>
+        </div>
+        <p class="text-sm text-dim mt-2">
+          所有系统自主行为（合成、删除、调节等）均被记录在不可篡改的哈希链中。
+        </p>
+      </div>
+    </div>
+
+    <div class="loading-overlay hidden" id="trust-loading">
+      <span class="loading-spinner"></span> 正在获取信任中心数据...
+    </div>
+  </section>
+
+  <!-- ========== API 文档标签页 ========== -->
+  <section class="tab-content" id="tab-api-docs">
+    <div class="card">
+      <div class="card-title"><span class="icon">📖</span> REST v1 API 端点</div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>方法</th><th>端点</th><th>说明</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><span class="badge info">POST</span></td><td><code>/v1/encode</code></td><td>将文本转为洛书 9 维向量</td></tr>
+            <tr><td><span class="badge info">POST</span></td><td><code>/v1/memories/consolidate</code></td><td>接收表层记忆，触发结晶流程</td></tr>
+            <tr><td><span class="badge info">POST</span></td><td><code>/v1/memories/enrich</code></td><td>双路检索增强（RRF 融合）</td></tr>
+            <tr><td><span class="badge info">POST</span></td><td><code>/v1/memories/correct</code></td><td>用户手动修正已结晶的事实</td></tr>
+            <tr><td><span class="badge info">POST</span></td><td><code>/v1/memories/unfold</code></td><td>拆解合成记忆为子记忆</td></tr>
+            <tr><td><span class="badge jade">GET</span></td><td><code>/v1/health/dao_metrics</code></td><td>道同构度仪表数据</td></tr>
+            <tr><td><span class="badge jade">GET</span></td><td><code>/v1/health/system</code></td><td>系统健康报告（可解释性面板）</td></tr>
+            <tr><td><span class="badge jade">GET</span></td><td><code>/v1/health/detailed</code></td><td>详细系统健康报告（运维级）</td></tr>
+            <tr><td><span class="badge info">POST</span></td><td><code>/v1/feedback</code></td><td>用户反馈回路</td></tr>
+            <tr><td><span class="badge jade">GET</span></td><td><code>/v1/audit-trail</code></td><td>审计追踪查询</td></tr>
+            <tr><td><span class="badge jade">GET</span></td><td><code>/v1/trust/data-location</code></td><td>数据存储位置信息（可验证性）</td></tr>
+            <tr><td><span class="badge jade">GET</span></td><td><code>/v1/trust/network-audit</code></td><td>网络活动记录（可验证性）</td></tr>
+            <tr><td><span class="badge jade">GET</span></td><td><code>/v1/trust/audit-integrity</code></td><td>审计日志完整性验证（可验证性）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="text-sm text-dim mt-4">
+        API 基础 URL：<code id="api-base-display">http://localhost:3099</code>
+        &nbsp;|&nbsp; 可通过 URL 参数 <code>?api=http://xxx:3099</code> 覆盖
+      </p>
+    </div>
+  </section>
+
+  <!-- ========== 基准报告标签页 ========== -->
+  <section class="tab-content" id="tab-benchmarks">
+    <!-- 叙事导引：从裁判到导游 -->
+    <div class="section narrative-intro">
+      <h2>LRC 基准报告</h2>
+      <div class="narrative-box">
+        <p class="narrative-lead">我们发现，当前所有 AI 记忆系统都存在三个根本性空白：</p>
+        <ul class="narrative-gaps">
+          <li><strong>无法演化</strong>——它们只是存储，从不"反思"记忆之间的关系</li>
+          <li><strong>污染扩散</strong>——无关噪声会混入检索结果，污染后续的推理链路</li>
+          <li><strong>隐私不透明</strong>——用户的数据去了哪里、被如何使用，无法验证</li>
+        </ul>
+        <p class="narrative-call">为此，我们创建了一套开源测试标准，专门衡量记忆系统在这些空白领域的能力。<strong>LRC 是第一个接受这套标准挑战的系统——它不是只通过了"自己的考试"，而是尝试回答了整个行业尚未提出的问题。</strong></p>
+        <p class="narrative-open">最重要的是，我们把整套测试框架开源了。<strong>任何其他系统都可以来跑。</strong>我们欢迎对比，欢迎挑战，欢迎所有人用同一把尺子衡量所有记忆系统。</p>
+      </div>
+    </div>
+
+    <!-- 力量宣言 -->
+    <div class="section">
+      <h2>产品力量宣言</h2>
+      <div class="power-declaration">
+        <p class="tagline">这不是一个普通的记事本，而是一个拥有"灵魂"的私人记忆管家。</p>
+        <div class="power-cards">
+          <div class="power-card">
+            <div class="power-icon">🧠</div>
+            <h3>它自己会"成长"</h3>
+            <p>在基准测试中，面对 10 次相似的故障报告，它成功提炼出了标准的排查方法论，而无需你手动整理。</p>
+            <span class="power-metric">合成触发与质量：通过</span>
+          </div>
+          <div class="power-card">
+            <div class="power-icon">⚖️</div>
+            <h3>它懂得"取舍"</h3>
+            <p>在一年跨度的重要性测试中，高优先级的记忆总能排在检索结果的前面，而无关琐事则被自然淡忘。</p>
+            <span class="power-metric">记忆衰减有效性：通过</span>
+          </div>
+          <div class="power-card">
+            <div class="power-icon">🛡️</div>
+            <h3>它值得你"托付"</h3>
+            <p>在严格的隐私测试中，我们证明了你的所有记忆数据 100% 存储在本地，且所有操作都有防篡改的日志为你保驾护航。</p>
+            <span class="power-metric">数据本地化 + 审计防篡改：通过</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 三层基准详细报告 -->
+    <div class="section">
+      <h2>三层基准测试报告</h2>
+      <div class="benchmark-summary-bar" id="benchmark-summary-bar">
+        <span class="badge badge-info">加载中...</span>
+      </div>
+
+      <div id="benchmark-layers">
+        <div class="loading">正在加载基准报告...</div>
+      </div>
+    </div>
+
+    <!-- 一行复现 -->
+    <div class="section">
+      <h2>一行命令，亲自验证</h2>
+      <div class="reproducible-box">
+        <p class="reproducible-intro">你不必相信我们的报告。所有数据都可以在你的机器上，用一行命令亲自验证：</p>
+        <div class="code-block">
+          <code id="reproCmd">git clone https://github.com/zhibaiYingChuan/LRC.git && cd LRC && cargo test --features server benchmark_</code>
+          <button class="copy-btn" onclick="copyReproCmd()">📋 复制</button>
+        </div>
+        <div class="reproducible-features">
+          <div class="feature-item">
+            <div class="feature-icon">🔒</div>
+            <div class="feature-text">
+              <strong>确定性运行</strong>
+              <p>所有记忆使用确定性 ID，每次运行输入完全一致</p>
+            </div>
+          </div>
+          <div class="feature-item">
+            <div class="feature-icon">🧹</div>
+            <div class="feature-text">
+              <strong>完全隔离</strong>
+              <p>每次测试使用独立的临时目录，绝不交叉污染</p>
+            </div>
+          </div>
+          <div class="feature-item">
+            <div class="feature-icon">📐</div>
+            <div class="feature-text">
+              <strong>数学验证</strong>
+              <p>所有断言基于数学计算（Jaccard 相似度、衰减因子、哈希链），不依赖任何外部服务</p>
+            </div>
+          </div>
+          <div class="feature-item">
+            <div class="feature-icon">🚫</div>
+            <div class="feature-text">
+              <strong>零依赖</strong>
+              <p>不需要 GPU、不需要 API Key、不需要网络连接</p>
+            </div>
+          </div>
+        </div>
+        <p class="reproducible-note">运行上述命令后，如果输出 11 passed，说明在你的机器上得到了与我们完全一致的结果。这就是可复现性——<strong>信任，源于每个人都能亲手验证</strong>。</p>
+      </div>
+    </div>
+
+    <!-- 竞品能力对比 -->
+    <div class="section">
+      <h2>能力对比：LRC vs 业界方案</h2>
+      <p class="comparison-note">以下对比基于各系统的 <strong>公开文档和已知能力</strong>。我们欢迎任何系统使用我们的开源测试框架来挑战这些结论。</p>
+      <div class="comparison-table-wrapper">
+        <table class="comparison-table">
+          <thead>
+            <tr>
+              <th>能力维度</th>
+              <th>Loong Recall</th>
+              <th>传统向量库<br>(FAISS/Chroma)</th>
+              <th>AI 记忆服务<br>(Mem0/Zep)</th>
+              <th>企业搜索<br>(Elasticsearch)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>向量检索</td>
+              <td class="cell-pass">✓</td>
+              <td class="cell-pass">✓</td>
+              <td class="cell-pass">✓</td>
+              <td class="cell-pass">✓</td>
+            </tr>
+            <tr>
+              <td>记忆衰减与优先级排序</td>
+              <td class="cell-unique">✓ 指数衰减</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-partial">△ LRU</td>
+              <td class="cell-fail">✗</td>
+            </tr>
+            <tr>
+              <td>记忆自主合成与演化</td>
+              <td class="cell-unique">✓ 递归合成</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-fail">✗</td>
+            </tr>
+            <tr>
+              <td>内禀健康监控</td>
+              <td class="cell-unique">✓ 道同构度</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-partial">△ 外部监控</td>
+            </tr>
+            <tr>
+              <td>抗噪声污染</td>
+              <td class="cell-unique">✓ 几何中心保护</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-fail">✗</td>
+            </tr>
+            <tr>
+              <td>数据 100% 本地化</td>
+              <td class="cell-unique">✓</td>
+              <td class="cell-pass">✓</td>
+              <td class="cell-fail">✗ 需云服务</td>
+              <td class="cell-pass">✓</td>
+            </tr>
+            <tr>
+              <td>防篡改审计日志</td>
+              <td class="cell-unique">✓ 哈希链+锚点</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-partial">△ 插件</td>
+            </tr>
+            <tr>
+              <td>隐私级别架构隔离</td>
+              <td class="cell-unique">✓ 三级隔离</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-partial">△ API 过滤</td>
+              <td class="cell-partial">△ 索引级</td>
+            </tr>
+            <tr>
+              <td>复杂度预算红线 CI 拦截</td>
+              <td class="cell-unique">✓</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-fail">✗</td>
+              <td class="cell-fail">✗</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="comparison-disclaimer"><strong>坦诚声明</strong>：此对比基于 <strong>2026 年 6 月</strong> 的公开信息。各系统可能在不断更新。如果你发现任何不准确的地方，欢迎提交 Issue。我们也可以用你的系统在我们的测试框架上跑一遍——欢迎来战。</p>
+    </div>
+
+    <!-- 雷达图 -->
+    <div class="section">
+      <h2>能力雷达图</h2>
+      <div class="radar-container">
+        <canvas id="radarChart" width="400" height="400"></canvas>
+      </div>
+      <p class="chart-note">上图展示了 LRC 在八个核心维度的能力评分。与传统记忆库相比，LRC 在隐私保护、审计安全、记忆演化等维度具有独特优势。</p>
+    </div>
+  </section>
+
+</main>
+
+<!-- ==================== 底部状态栏 ==================== -->
+<footer class="status-bar">
+  <div class="status-bar-left">
+    <span><span class="status-dot unknown" id="status-dot"></span><span id="status-text">检测中...</span></span>
+    <span>版本 <strong id="status-version">v0.2.0</strong></span>
+  </div>
+  <div class="status-bar-right">
+    <span>数据目录：<code id="status-data-dir">--</code></span>
+    <span>运行时长：<span id="status-uptime">--</span></span>
+  </div>
+</footer>
+
+<!-- ==================== JavaScript ==================== -->
+<script src="app.js"></script>
+
+</body>
+</html>

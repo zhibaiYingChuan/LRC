@@ -19,10 +19,10 @@
 
 // === Layer 1: 公开层 (Apache 2.0) ===
 pub mod chunker;
+pub mod graph_store;
 pub mod memory_store;
 pub mod memory_types;
 pub mod persistence;
-pub mod graph_store;
 
 /// 运行时防护模块：反调试、完整性校验、防篡改
 pub mod guard;
@@ -35,6 +35,9 @@ pub mod ab_test;
 
 /// 架构记忆配置（算子参数、衰减曲线、权限策略持久化）
 pub mod arch_config;
+
+/// 三层基准测试框架（可被 CLI、仪表盘 API、CI/CD 复用）
+pub mod benchmark;
 
 // === Layer 2: 受保护核心引擎 (DaoTi Research License v1.0) ===
 pub mod engine;
@@ -67,8 +70,7 @@ pub use graph_store::{EdgeType, GraphMemoryStore, GraphQueryResult, MemoryEdge};
 
 // === 架构记忆配置重导出 ===
 pub use arch_config::{
-    ArchConfig, LuoshuArchConfig, PrivacyArchConfig,
-    RetrievalArchConfig, SynthesisArchConfig,
+    ArchConfig, LuoshuArchConfig, PrivacyArchConfig, RetrievalArchConfig, SynthesisArchConfig,
 };
 
 // === 受保护核心重导出（仅导出接口类型，实现细节在 engine/ 中） ===

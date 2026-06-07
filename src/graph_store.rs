@@ -61,12 +61,7 @@ pub struct MemoryEdge {
 
 impl MemoryEdge {
     /// 创建新的记忆边
-    pub fn new(
-        source_id: String,
-        target_id: String,
-        edge_type: EdgeType,
-        weight: f32,
-    ) -> Self {
+    pub fn new(source_id: String, target_id: String, edge_type: EdgeType, weight: f32) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().to_rfc3339();
         Self {
@@ -117,8 +112,8 @@ impl GraphMemoryStore {
     pub fn load(&mut self) -> Result<(), PersistenceError> {
         if let Ok(content) = std::fs::read_to_string(&self.edges_file) {
             if !content.trim().is_empty() {
-                self.edges = serde_json::from_str(&content)
-                    .map_err(PersistenceError::Serialization)?;
+                self.edges =
+                    serde_json::from_str(&content).map_err(PersistenceError::Serialization)?;
             }
         }
         Ok(())
@@ -126,10 +121,9 @@ impl GraphMemoryStore {
 
     /// 持久化边到文件
     pub fn save(&self) -> Result<(), PersistenceError> {
-        let json = serde_json::to_string_pretty(&self.edges)
-            .map_err(PersistenceError::Serialization)?;
-        std::fs::write(&self.edges_file, json)
-            .map_err(PersistenceError::Io)?;
+        let json =
+            serde_json::to_string_pretty(&self.edges).map_err(PersistenceError::Serialization)?;
+        std::fs::write(&self.edges_file, json).map_err(PersistenceError::Io)?;
         Ok(())
     }
 
@@ -145,9 +139,7 @@ impl GraphMemoryStore {
     ) -> Result<(), PersistenceError> {
         // 去重检查
         let exists = self.edges.iter().any(|e| {
-            e.source_id == source_id
-                && e.target_id == target_id
-                && e.edge_type == edge_type
+            e.source_id == source_id && e.target_id == target_id && e.edge_type == edge_type
         });
 
         if !exists {
@@ -340,7 +332,9 @@ mod tests {
         let (_dir, mut store) = make_graph_store();
         store.add_edge("a", "b", EdgeType::Evolves, 0.8).unwrap();
         store.add_edge("a", "c", EdgeType::RelatedTo, 0.3).unwrap();
-        store.add_edge("d", "a", EdgeType::Contradicts, 0.1).unwrap();
+        store
+            .add_edge("d", "a", EdgeType::Contradicts, 0.1)
+            .unwrap();
 
         let edges = store.query_edges("a");
         assert_eq!(edges.len(), 3, "a 应有 3 条关联边");
@@ -372,8 +366,12 @@ mod tests {
     #[test]
     fn test_persistence_roundtrip() {
         let (dir, mut store) = make_graph_store();
-        store.add_edge("mem-1", "mem-2", EdgeType::Evolves, 0.85).unwrap();
-        store.add_edge("mem-2", "mem-3", EdgeType::SynthesizesFrom, 0.92).unwrap();
+        store
+            .add_edge("mem-1", "mem-2", EdgeType::Evolves, 0.85)
+            .unwrap();
+        store
+            .add_edge("mem-2", "mem-3", EdgeType::SynthesizesFrom, 0.92)
+            .unwrap();
         store.save().unwrap();
 
         // 重新加载

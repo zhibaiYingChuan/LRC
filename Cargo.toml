@@ -8,7 +8,10 @@ license = "Apache-2.0 OR LicenseRef-DaoTi-Research"
 repository = "https://github.com/zhibaiYingChuan/LRC"
 
 [features]
-default = ["server"]
+default = ["server", "ml"]
+# 默认启用 ml feature：优先使用语义编码器（BGE-small-zh / all-MiniLM-L6）
+# 如果 HuggingFace 不可达或模型未安装，自动降级为统计编码器
+# 如需纯统计模式（无 ML 依赖、零外部下载），使用 --no-default-features
 # 启用 candle + CodeBERT 真实语义编码（体积大 ~200MB）
 ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub", "ureq"]
 # 启用 MCP HTTP 服务（axum + tokio）
@@ -28,6 +31,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 dirs-next = "2"
 async-trait = "0.1"
+tempfile = "3"
 
 # PostgreSQL 依赖（optional，postgres feature 启用）
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono"], optional = true }
@@ -53,6 +57,11 @@ tempfile = "3"
 [[bin]]
 name = "code-memory-server"
 path = "src/bin/server.rs"
+required-features = ["server"]
+
+[[bin]]
+name = "code-memory-benchmark"
+path = "src/bin/benchmark.rs"
 required-features = ["server"]
 
 [build-dependencies]

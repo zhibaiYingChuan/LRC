@@ -31,8 +31,7 @@ fn main() {
     let guard_rs = out_dir.join("integrity_hash.rs");
     let code = format!(
         "// 自动生成，请勿手动编辑\n\
-         pub const SOURCE_INTEGRITY_HASH: &str = \"{}\";\n",
-        source_hash
+         pub const SOURCE_INTEGRITY_HASH: &str = \"{source_hash}\";\n"
     );
     fs::write(&guard_rs, code).expect("写入完整性哈希失败");
 
@@ -41,11 +40,8 @@ fn main() {
 }
 
 fn hash_directory(dir: &PathBuf, hasher: &mut Sha256) {
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
+    let mut entries: Vec<_> = fs::read_dir(dir).unwrap().filter_map(Result::ok).collect();
+    entries.sort_by_key(std::fs::DirEntry::file_name);
 
     for entry in entries {
         let path = entry.path();
@@ -55,7 +51,10 @@ fn hash_directory(dir: &PathBuf, hasher: &mut Sha256) {
 
         if path.is_dir() {
             hash_directory(&path, hasher);
-        } else if path.extension().is_some_and(|ext| ext == "rs" || ext == "toml") {
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext == "rs" || ext == "toml")
+        {
             let content = fs::read_to_string(&path).unwrap_or_default();
             hasher.update(content.as_bytes());
         }

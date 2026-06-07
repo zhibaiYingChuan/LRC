@@ -14,10 +14,10 @@
 //   4. ABTestRunner — 协调实验运行和结果统计
 //   5. mrr_evaluate — MRR 计算函数
 
-#[cfg(feature = "ml")]
-use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 #[cfg(not(feature = "ml"))]
 use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
+#[cfg(feature = "ml")]
+use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 use crate::engine::mirror_trapezoid::mirror_project;
 use crate::memory_types::Memory;
 use serde::{Deserialize, Serialize};
@@ -138,10 +138,7 @@ pub struct ABTestConfig {
 /// # 返回
 /// - `mrr`: 平均倒数排名
 /// - `per_query_rr`: 每个查询的倒数排名
-pub fn mrr_evaluate(
-    query_results: &[Vec<String>],
-    expected_ids: &[String],
-) -> (f64, Vec<f64>) {
+pub fn mrr_evaluate(query_results: &[Vec<String>], expected_ids: &[String]) -> (f64, Vec<f64>) {
     assert_eq!(
         query_results.len(),
         expected_ids.len(),
@@ -158,11 +155,7 @@ pub fn mrr_evaluate(
             .map(|pos| pos + 1) // 转为 1-based 排名
             .unwrap_or(0);
 
-        let rr = if rank > 0 {
-            1.0 / rank as f64
-        } else {
-            0.0
-        };
+        let rr = if rank > 0 { 1.0 / rank as f64 } else { 0.0 };
         reciprocal_ranks.push(rr);
     }
 
@@ -178,11 +171,7 @@ pub fn mrr_evaluate(
 /// 计算 Recall@K
 ///
 /// Recall@K = (在 top-K 结果中命中的相关记忆数) / (总相关记忆数)
-pub fn recall_at_k(
-    query_results: &[Vec<String>],
-    relevant_ids: &[Vec<String>],
-    k: usize,
-) -> f64 {
+pub fn recall_at_k(query_results: &[Vec<String>], relevant_ids: &[Vec<String>], k: usize) -> f64 {
     assert_eq!(
         query_results.len(),
         relevant_ids.len(),
@@ -245,8 +234,7 @@ impl ABTestRunner {
         let top_k = self.config.top_k;
 
         // 收集期望 ID 和相关 ID
-        let expected_ids: Vec<String> =
-            queries.iter().map(|q| q.expected_id.clone()).collect();
+        let expected_ids: Vec<String> = queries.iter().map(|q| q.expected_id.clone()).collect();
         let relevant_ids: Vec<Vec<String>> =
             queries.iter().map(|q| q.relevant_ids.clone()).collect();
 
@@ -324,10 +312,7 @@ impl ABTestRunner {
                     .position(|id| id == &q.expected_id)
                     .map(|pos| pos + 1)
                     .unwrap_or(0);
-                let hits = results
-                    .iter()
-                    .filter(|id| relevant.contains(id))
-                    .count();
+                let hits = results.iter().filter(|id| relevant.contains(id)).count();
                 PerQueryResult {
                     query: q.query.clone(),
                     rank,
@@ -348,10 +333,7 @@ impl ABTestRunner {
                     .position(|id| id == &q.expected_id)
                     .map(|pos| pos + 1)
                     .unwrap_or(0);
-                let hits = results
-                    .iter()
-                    .filter(|id| relevant.contains(id))
-                    .count();
+                let hits = results.iter().filter(|id| relevant.contains(id)).count();
                 PerQueryResult {
                     query: q.query.clone(),
                     rank,
@@ -487,7 +469,7 @@ impl SearchEngine for LuoshuSearchEngine {
                 if let Some(ref mem_vec) = m.luoshu_vector {
                     let center_val = query_vec.center_value();
                     let mem_center = mem_vec[4]; // 中心位置（索引 4）
-                    // 中心值越接近，奖励越高
+                                                 // 中心值越接近，奖励越高
                     let center_sim = 1.0 - (center_val as f64 - mem_center as f64).abs();
                     score += center_sim * 0.1;
                 }
@@ -597,9 +579,7 @@ pub fn format_report_markdown(report: &ABTestReport) -> String {
     md.push_str("# A/B 测试报告：洛书约束检索 vs 纯向量检索\n\n");
     md.push_str(&format!(
         "**测试时间**: {}  \n**查询总数**: {}  \n**Top-K**: {}\n\n",
-        report.timestamp,
-        report.config.query_count,
-        report.config.top_k,
+        report.timestamp, report.config.query_count, report.config.top_k,
     ));
 
     md.push_str("## 核心指标对比\n\n");
@@ -608,9 +588,7 @@ pub fn format_report_markdown(report: &ABTestReport) -> String {
 
     md.push_str(&format!(
         "| MRR | {:.4} | {:.4} | {:.1}% |\n",
-        report.experiment.mrr,
-        report.baseline.mrr,
-        report.mrr_improvement_pct
+        report.experiment.mrr, report.baseline.mrr, report.mrr_improvement_pct
     ));
 
     md.push_str(&format!(
@@ -634,8 +612,7 @@ pub fn format_report_markdown(report: &ABTestReport) -> String {
 
     md.push_str(&format!(
         "| 平均排名 | {:.2} | {:.2} | — |\n",
-        report.experiment.avg_rank,
-        report.baseline.avg_rank,
+        report.experiment.avg_rank, report.baseline.avg_rank,
     ));
 
     md.push_str(&format!(
@@ -653,7 +630,9 @@ pub fn format_report_markdown(report: &ABTestReport) -> String {
             report.mrr_improvement_pct
         ));
     } else {
-        md.push_str("**结论**: 实验组 MRR 未显著提升，需要进一步优化洛书编码器或增加训练数据。\n\n");
+        md.push_str(
+            "**结论**: 实验组 MRR 未显著提升，需要进一步优化洛书编码器或增加训练数据。\n\n",
+        );
     }
 
     md.push_str("## 逐查询详情\n\n");
@@ -755,7 +734,7 @@ mod tests {
             vec!["x".into(), "y".into(), "a".into(), "z".into(), "w".into()],
         ];
         let relevant = vec![
-            vec!["a".into(), "b".into()], // 2 个相关
+            vec!["a".into(), "b".into()],             // 2 个相关
             vec!["a".into(), "b".into(), "c".into()], // 3 个相关
         ];
 
