@@ -44,7 +44,7 @@
 
 | 模型 | 选择理由 |
 |------|---------|
-| **GraphCodeBERT** | ✅ 代码检索精度最高（比 CodeBERT 高 12.3%），同架构同尺寸，已设为默认 |
+| **GraphCodeBERT** | ✅ 代码检索精度较高（比 CodeBERT 高 12.3%），同架构同尺寸，已设为默认 |
 | **CodeBERT** | ✅ 原始基线，回退选项，通过 `LRC_MODEL_ID=microsoft/codebert-base` 切换 |
 
 ---
@@ -132,7 +132,7 @@ LRC_MODEL_ID=your-org/your-roberta-model code-memory-server --src-dir ./src --st
 ## 六、后续展望
 
 ### 短期（v0.2.x）
-- GraphCodeBERT 已是最佳选择，保持默认
+- GraphCodeBERT 是当前推荐选择，保持默认
 - 允许用户通过环境变量试验任何 RoBERTa 架构模型
 
 ### 中期（v0.3.x）
@@ -151,6 +151,6 @@ LRC_MODEL_ID=your-org/your-roberta-model code-memory-server --src-dir ./src --st
 |------|------|
 | CodeBERT-base 是否"不够聪明"？ | 是，在变量关系和数据流理解方面确实有限 |
 | 有更好的替代吗？ | **GraphCodeBERT**，同架构、同尺寸、检索精度高 12.3% |
-| 切换成本高吗？ | **零成本**，已是 v0.1.1 默认，用户无需任何操作 |
+| 切换成本高吗？ | **用户无需额外操作**，已是 v0.1.1 默认 |
 | 格式兼容问题解决了吗？ | ✅ 已支持 `pytorch_model.bin` + `model.safetensors` 双格式 |
 | 国内能下载吗？ | ✅ 自动使用 `hf-mirror.com` 镜像，无需科学上网 |

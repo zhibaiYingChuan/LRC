@@ -22,7 +22,7 @@
 
 | 能力 | 工具 | 一句话说清楚 |
 |------|------|------------|
-| **代码定位** | `search_code` | 知道函数名/变量名，AI 瞬间定位。配置 LLM 后可用自然语言 |
+| **代码定位** | `search_code` | 知道函数名/变量名，AI 快速定位。配置 LLM 后可用自然语言 |
 | **项目记忆** | `remember` / `recall` | 告诉 AI 一次约定，以后每次对话它都记得 |
 
 **最关键的是：你不需要做任何额外操作。** 配好规则后，AI 会自动判断什么时候该搜代码、什么时候该查记忆。你只管正常聊天。
@@ -53,7 +53,7 @@ AI 回复："（根据记忆 #3）你之前选择了 PostgreSQL，原因是需�
 |---|---|---|---|
 | **怎么搜** | 精确关键词匹配 | 语义理解（理解自然语言意思） | 你的 LLM 翻译查询 → Fast Match |
 | **适合** | 你知道函数名/变量名，懒得翻文件 | 离线环境下用自然语言描述意图 | 有 LLM API，用自然语言描述意图 |
-| **启动速度** | 即时（毫秒级） | 首次需下载模型（~500MB） | 即时（依赖 LLM 响应） |
+| **启动速度** | 即时 | 首次需下载模型（~500MB） | 即时（依赖 LLM 响应） |
 | **内存占用** | < 10 MB | ~500 MB | < 10 MB |
 | **依赖** | 零，纯 Rust | 自动从 hf-mirror.com 镜像下载 | 需要 LLM API（DeepSeek / 通义千问等）或本地 Ollama |
 
@@ -69,7 +69,7 @@ cargo build --features server,ml
 code-memory-server --src-dir ./src --stdio --llm-api "openai:sk-your-deepseek-key:deepseek-v4-flash:https://api.deepseek.com/v1"
 ```
 
-> 日常场景 Fast Match 完全够用。Smart Match 在模糊查询上更有优势，详见 [模型评估报告](MODEL_EVALUATION.md)。
+> 日常场景 Fast Match 够用。Smart Match 在模糊查询上更有优势，详见 [模型评估报告](MODEL_EVALUATION.md)。
 > 内网/离线环境？参考 [Smart Match 离线安装指南](OFFLINE_MODEL_GUIDE.md)。
 
 ---
@@ -96,7 +96,7 @@ code-memory-server --src-dir ./src --stdio --llm-api "openai:sk-your-deepseek-ke
   返回准确的代码片段
 ```
 
-LLM 只做查询翻译，不参与存储、检索、或记忆。Prompt 消耗 < 50 Token，每次查询成本几乎为零。
+LLM 只做查询翻译，不参与存储、检索、或记忆。Prompt 消耗 < 50 Token，每次查询成本极低。
 
 ### 配置方式
 
@@ -109,7 +109,7 @@ code-memory-server --src-dir ./src --stdio \
 code-memory-server --src-dir ./src --stdio \
   --llm-api "openai:sk-your-qwen-key:qwen-turbo:https://dashscope.aliyuncs.com/compatible-mode/v1"
 
-# 使用本地 Ollama（零成本，完全离线）
+# 使用本地 Ollama（完全离线，仅消耗本地算力）
 code-memory-server --src-dir ./src --stdio \
   --llm-api "ollama:localhost:llama3"
 ```
@@ -211,7 +211,7 @@ cargo build --release --features server
 - 只在用户明确要求时才列出工具调用详情
 ```
 
-> 💡 这就是"零操作"的秘密：有了这些规则，AI 会**自动判断**何时该用记忆、何时该搜代码。你只管正常对话。
+> 💡 这就是自动化的核心：有了这些规则，AI 会**自动判断**何时该用记忆、何时该搜代码。你只管正常对话。
 
 **③ 重启 Trae**
 
@@ -326,7 +326,7 @@ Cite memories as "（根据记忆 #N）". Do not mention tool usage in responses
 | 功能 | 说明 |
 |------|------|
 | **记忆健康总览** | 道同构度、八卦分布熵、记忆衰减率等指标实时展示 |
-| **船长日志生成器** | 输入项目路径，一键生成代码库记忆健康全景报告 |
+| **船长日志生成器** | 输入项目路径，生成代码库记忆健康全景报告 |
 | **API 文档浏览器** | 内置 18 个 API 端点的交互式文档，可直接测试 |
 | **指标说明** | 每个专业术语都有大白话解释，新用户也能看懂 |
 
@@ -391,7 +391,7 @@ python scripts/install_hooks.py
 
 ---
 
-## 核心原理：为什么"零操作"能实现？
+## 核心原理：自动化是怎么实现的？
 
 ### 对比：有规则 vs 无规则
 
@@ -463,7 +463,7 @@ AI：（根据记忆 #2）你在 5 月 15 日决定用 PostgreSQL，
 
 ## 成本与优化
 
-如果你使用 LLM 增强模式，了解成本情况有助于你做出最佳选择。
+如果你使用 LLM 增强模式，了解成本情况有助于你做出合适选择。
 
 ### LLM 翻译器的成本模型
 
@@ -492,7 +492,7 @@ LLM 增强模式的原理是：把你的自然语言查询发送给 LLM，翻译
 
 因为 LRC 的检索结果可复现（相同查询 → 相同结果），AI 助手端（如 Trae）的上下文前缀缓存命中率会大幅提升，进一步节省 Token 和加速响应。
 
-### 如何用本地 Ollama 实现零成本
+### 如何用本地 Ollama 降低 API 成本
 
 ```bash
 # 1. 安装 Ollama（https://ollama.com）
@@ -505,7 +505,7 @@ ollama pull llama3
 code-memory-server --src-dir ./src --stdio --llm-api ollama:localhost:qwen3
 ```
 
-配置完成后，搜索时完全零成本，且不依赖网络。
+配置完成后，搜索时不产生 API 费用，且不依赖网络。
 
 ---
 
@@ -533,8 +533,8 @@ code-memory-server --src-dir ./src --stdio --llm-api ollama:localhost:qwen3
 |---------|---------|
 | **Fast Match（默认）** | **Smart Match（`--features ml`）** |
 | 搜函数名、变量名 | 模糊描述（"处理重试的代码"） |
-| 零延迟、零依赖 | 首次需下载模型 |
-| 90% 场景够用 | 复杂项目语义搜索 |
+| 极低延迟、零依赖 | 首次需下载模型 |
+| 多数场景够用 | 复杂项目语义搜索 |
 
 > 详见 [模型评估报告](MODEL_EVALUATION.md) 和 [离线安装指南](OFFLINE_MODEL_GUIDE.md)。
 
@@ -633,7 +633,7 @@ taskkill /PID <进程ID> /F
 
 ## 一句话总结
 
-> **装上 MCP，配好规则，然后忘掉它的存在。** 你只管正常写代码、正常聊天，AI 会自己记住该记住的、找到该找到的。这就是"零操作"——不是没有功能，而是功能自然到你不觉得它是一个功能。
+> **装上 MCP，配好规则，然后忘掉它的存在。** 你只管正常写代码、正常聊天，AI 会自己记住该记住的、找到该找到的。
 
 ---
 
@@ -653,8 +653,8 @@ taskkill /PID <进程ID> /F
 **新增功能**
 - LLM 增强模式：用你的 LLM 做自然语言查询翻译，不下载模型也能语义搜索
 - Web 仪表盘：`http://127.0.0.1:3099/dashboard` 可视化记忆健康度
-- 船长日志生成器：一键生成项目代码库记忆全景报告
-- 一键安装脚本：`install.bat`（Windows）/ `install.sh`（Linux/macOS）
+- 船长日志生成器：生成项目代码库记忆全景报告
+- 快速安装脚本：`install.bat`（Windows）/ `install.sh`（Linux/macOS）
 - 自动化守门人系统：10 道质量检查，CI 自动运行
 
 **问题修复**
@@ -665,6 +665,6 @@ taskkill /PID <进程ID> /F
 
 **文档更新**
 - 新增仪表盘使用说明和专业名词大白话解释
-- 新增一键安装脚本使用说明
+- 新增快速安装脚本使用说明
 - 新增代码质量守门人系统说明
 - README.md 新增完整更新日志

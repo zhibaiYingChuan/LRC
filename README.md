@@ -24,7 +24,7 @@
 
 | 能力 | 做什么 | 一句话说清楚 |
 |------|--------|------------|
-| **代码定位** `search_code` | 知道函数名/变量名，AI 瞬间定位。配置 LLM 后可用自然语言描述 | "关键词匹配定位，无需手动翻文件" |
+| **代码定位** `search_code` | 知道函数名/变量名，AI 快速定位。配置 LLM 后可用自然语言描述 | "关键词匹配定位，无需手动翻文件" |
 | **项目记忆** `remember / recall` | 告诉 AI 一次约定，以后每次对话它都记得 | "给 AI 装个记事本，但它是活的" |
 
 配置好规则文件后，AI 会在需要时调用这些工具。你只管正常对话：
@@ -126,7 +126,7 @@ Linux / macOS 用户请在终端运行 `bash install.sh`。
 |---|---|---|---|
 | **怎么搜** | 精确关键词匹配 | 本地语义模型 | 你的 LLM 翻译查询 → Fast Match 检索 |
 | **适合** | 你知道函数名/变量名，懒得翻文件 | 离线语义搜索 | 用自然语言描述，AI 帮你找到 |
-| **启动速度** | 即时（毫秒级） | 首次需下载模型（~500MB） | 即时（依赖 LLM 响应） |
+| **启动速度** | 即时 | 首次需下载模型（~500MB） | 即时（依赖 LLM 响应） |
 | **内存占用** | < 10 MB | ~500 MB | < 10 MB |
 | **依赖** | 零，纯 Rust | 自动从 hf-mirror.com 镜像下载 | 需要 LLM API（DeepSeek / 通义千问等）或本地 Ollama |
 
@@ -140,13 +140,13 @@ cargo build --features server,ml
 # LLM 增强（用你的 LLM 做查询翻译，不下载模型）
 # 推荐：使用 DeepSeek（国产模型，性价比极高）
 code-memory-server --src-dir ./src --stdio --llm-api "openai:sk-your-deepseek-key:deepseek-v4-flash:https://api.deepseek.com/v1"
-# 或使用本地 Ollama（零成本）
+# 或使用本地 Ollama（无 API 费用）
 code-memory-server --src-dir ./src --stdio --llm-api ollama:localhost:llama3
 ```
 
 > **LLM 增强的原理**：把你的自然语言查询（"处理用户登录的逻辑"）发给 LLM，翻译成代码关键词（`authenticate_user, login, handle_login`），再用 Fast Match 精确检索。不配置 `--llm-api` 就还是原来的 Fast Match，行为完全不变。
 
-> 日常场景 Fast Match 完全够用。Smart Match 默认使用 **GraphCodeBERT**（比 CodeBERT 检索精度高 12.3%），详见 [模型评估报告](docs/MODEL_EVALUATION.md)。
+> 日常场景 Fast Match 够用。Smart Match 默认使用 **GraphCodeBERT**（比 CodeBERT 检索精度高 12.3%），详见 [模型评估报告](docs/MODEL_EVALUATION.md)。
 
 ### 💰 成本说明
 
@@ -180,7 +180,7 @@ LLM 增强模式会调用你的 LLM API 进行查询翻译，每次消耗约 **4
 
 | 能力             | 状态 | 说明               |
 | --------------- | -- | ------------------ |
-| 跨会话持久化       | ✅ | 记忆永不过期，支持 TTL 配置 |
+| 跨会话持久化       | ✅ | 记忆持久化存储，支持 TTL 配置 |
 | 语义检索          | ✅ | 双路检索融合（关键词 + 语义排序） |
 | 自动知识抽象       | ✅ | 递归合成，自动合并同类记忆 |
 | 记忆演化与衰减     | ✅ | 重要记忆天然优先，不活跃记忆自然降权 |
@@ -292,11 +292,11 @@ LRC 默认使用**镜像启动模式**（`--mode auto`），设计目标：**启
 
 ```
 时间线：
-  0s  ─── 启动，Fast Match 索引项目代码（毫秒级）
+  0s  ─── 启动，Fast Match 索引项目代码
   0s  ─── MCP 服务就绪，IDE 可以开始搜索 ← 用户感知：立即可用
   0s  ─── [后台线程] 开始加载 Smart Match 模型
   ... ─── [后台线程] 模型下载/加载中（首次约 1-5 分钟）
-  ... ─── [后台线程] 加载嵌入向量缓存（如果存在，秒级）
+  ... ─── [后台线程] 加载嵌入向量缓存（如果存在）
   Ns  ─── [后台线程] 语义编码完成，原子替换检索器
   Ns  ─── Smart Match 就绪 ← 搜索精度自动提升，用户无感知
 ```
@@ -305,7 +305,7 @@ LRC 默认使用**镜像启动模式**（`--mode auto`），设计目标：**启
 
 | 缓存类型 | 文件位置 | 作用 | 失效条件 |
 |---------|---------|------|---------|
-| **嵌入向量缓存** | `.loong-recall/cache/embedding_cache.json` | 保存代码片段的编码结果，下次启动时秒级恢复索引，无需重新编码 | 源码文件发生变更时需手动删除缓存以触发重新索引 |
+| **嵌入向量缓存** | `.loong-recall/cache/embedding_cache.json` | 保存代码片段的编码结果，下次启动时快速恢复索引，无需重新编码 | 源码文件发生变更时需手动删除缓存以触发重新索引 |
 | **模型缓存** | `models/` 或 HuggingFace 缓存目录 | 保存 GraphCodeBERT 模型文件，避免重复下载 | 手动删除模型文件后需重新下载 |
 | **记忆数据** | `.loong-recall/data/memories.json` | 持久化所有项目记忆 | 不会自动失效，由你手动管理 |
 
@@ -313,8 +313,8 @@ LRC 默认使用**镜像启动模式**（`--mode auto`），设计目标：**启
 
 | | 首次启动 | 后续启动 |
 |---|---|---|
-| Fast Match | 索引项目代码（秒级） | 索引项目代码（秒级） |
-| Smart Match | 下载模型（1-5 分钟）+ 编码（数分钟） | 从缓存恢复（秒级） |
+| Fast Match | 索引项目代码 | 索引项目代码 |
+| Smart Match | 下载模型（1-5 分钟）+ 编码（数分钟） | 从缓存恢复 |
 | 记忆 | 创建空数据库 | 加载已有记忆 |
 
 > **注意**：当前版本中，源码变更后嵌入向量缓存不会自动失效。如果你修改了源代码，需要手动删除 `.loong-recall/cache/embedding_cache.json` 以触发重新索引。后续版本将实现基于文件哈希的自动失效。
@@ -621,7 +621,7 @@ code-memory-server --src-dir ./src --stdio --llm-api openai:sk-xxx:deepseek-v4-f
 | **默认模型** | 无（纯词袋匹配）               | **GraphCodeBERT**（比 CodeBERT 检索精度高 12.3%） |
 | **外部依赖** | **零**，纯 Rust 实现        | 首次启动自动下载模型（\~500MB）                       |
 | **内存占用** | < 10 MB                | \~500 MB（模型加载后）                           |
-| **启动时间** | 即时（毫秒级）                | 首次 1\~5 分钟（下载模型），后续即时                     |
+| **启动时间** | 即时                | 首次 1\~5 分钟（下载模型），后续即时                     |
 | **检索精度** | Token 关键词匹配            | 真实语义理解（同义词、中英文自然语言）                       |
 | **适用场景** | 精确函数名/变量名查找            | 模糊意图描述（"处理重试逻辑的代码"）                       |
 
@@ -631,7 +631,7 @@ code-memory-server --src-dir ./src --stdio --llm-api openai:sk-xxx:deepseek-v4-f
 cargo build --features server
 ```
 
-编译后零配置立即可用。编码器基于代码 token 分割和词袋匹配——如果你习惯用函数名、变量名查代码，精度完全够用。这也是忆在 Loong Agent OS 中作为默认模式运行的方式。
+编译后零配置立即可用。编码器基于代码 token 分割和词袋匹配——如果你习惯用函数名、变量名查代码，精度够用。这也是忆在 Loong Agent OS 中作为默认模式运行的方式。
 
 ### 🧠 语义模式（高精度，按需启用）
 
@@ -672,7 +672,7 @@ code-memory-server --src-dir ./src --stdio --mode smart
 
 * "错误重试的代码" → `fn retry_with_backoff()`
 
-> ⚠️ 如果只需按函数名/关键词查代码，快速模式完全够用，且零成本启动。
+> ⚠️ 如果只需按函数名/关键词查代码，快速模式够用，且无需额外模型下载。
 > 详细模型评估与替代方案对比见 [模型评估报告](docs/MODEL_EVALUATION.md)。
 
 ***
@@ -750,7 +750,7 @@ Loong Recall 提取了道枢层的编码-检索范式，工程化为独立 MCP �
 以下命令供贡献者在修改代码后运行，确保提交质量：
 
 ```bash
-# 一键运行全部质量守门（推荐）
+# 运行全部质量守门（推荐）
 .\scripts\gatekeeper.ps1
 
 # 或分别运行：
@@ -830,7 +830,7 @@ Loong Recall 在启动时自动执行多层运行时防护（详见 `src/guard.r
 
 **📚 文档**
 
-- 更新 README.md 和 USER_GUIDE.md，补充仪表盘使用说明、一键安装脚本、守门人质量检查
+- 更新 README.md 和 USER_GUIDE.md，补充仪表盘使用说明、快速安装脚本、守门人质量检查
 - 新增 CI 守门人综合报告，每次提交自动生成质量裁决
 
 ***

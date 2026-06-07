@@ -18,7 +18,7 @@
 
 ## 编译
 
-使用快速模式（默认，零外部依赖）：
+使用快速模式（默认，除 Rust 工具链外零外部依赖）：
 
 ```bash
 git clone https://github.com/zhibaiYingChuan/LRC.git
@@ -191,7 +191,7 @@ Loong Recall 已在 [LongMemEval](https://github.com/xiaowu0162/LongMemEval) 基
 
 ### 分析
 
-1. **单会话信息抽取表现卓越**（87-96%）：LRC 的 TF-IDF 关键词匹配对精确信息检索非常有效，在 `single-session-user` 和 `single-session-assistant` 类型上接近完美。
+1. **单会话信息抽取表现良好**（87-96%）：LRC 的 TF-IDF 关键词匹配对精确信息检索非常有效，在 `single-session-user` 和 `single-session-assistant` 类型上表现优秀。
 
 2. **拒绝回答能力满分**（100%）：LRC 正确识别了全部 30 条"无法回答"的问题，表明记忆系统能准确判断信息是否存在于记忆中，不会产生幻觉。
 
@@ -272,7 +272,7 @@ python evaluate_qa.py deepseek-chat results/lrc_fast.jsonl data/longmemeval_s_cl
 
 - **快速模式**适合信息抽取类任务（单会话用户/助手问答），精确且高效
 - **LLM 模式**适合知识更新追踪场景，可显著提升变更检测能力
-- **混合策略**是最佳选择：对简单问题用快速模式，对复杂问题启用 LLM 翻译
+- **混合策略**是推荐选择：对简单问题用快速模式，对复杂问题启用 LLM 翻译
 
 ### 性能对比
 
