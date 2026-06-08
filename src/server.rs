@@ -238,6 +238,49 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
             },
         },
         ToolDefinition {
+            name: "batch_remember".into(),
+            description: "批量记忆注入 — 一次性写入多条记忆，大幅提升大批量数据注入性能。适用于 LongMemEval 等需要注入大量会话历史的场景。单次最多 200 条。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "memories": {
+                        "type": "array",
+                        "description": "记忆列表，每条记忆包含 content、memory_type、project、tags、importance 等字段",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {
+                                    "type": "string",
+                                    "description": "记忆内容"
+                                },
+                                "memory_type": {
+                                    "type": "string",
+                                    "description": "记忆类型: fact | preference | decision | code_context | conversation",
+                                    "default": "fact"
+                                },
+                                "project": {
+                                    "type": "string",
+                                    "description": "关联项目名称"
+                                },
+                                "tags": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "标签列表"
+                                },
+                                "importance": {
+                                    "type": "integer",
+                                    "description": "重要性 1-10（默认 5）",
+                                    "default": 5
+                                }
+                            },
+                            "required": ["content"]
+                        }
+                    }
+                }),
+                required: vec!["memories".into()],
+            },
+        },
+        ToolDefinition {
             name: "recall".into(),
             description: "语义检索历史记忆。支持两种模式：fast（关键词匹配，默认）和 luoshu（洛书几何检索，使用 LuoShuEncoder + TrapezoidFocus）。luoshu 模式将查询投影到洛书九宫格，通过梯形聚焦在几何空间中定位记忆，返回洛书空间中距离最近的记忆。".into(),
             input_schema: ToolInputSchema {
@@ -586,6 +629,110 @@ async fn handle_tools_call(
                     make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("写入失败: {}", e)),
+            }
+        }
+
+        "batch_remember" => {
+            let memories_array = match arguments.get("memories").and_then(|v| v.as_array()) {
+                Some(arr) => arr,
+                None => return make_error(id, -32602, "缺少参数: memories (数组)"),
+            };
+
+            if memories_array.is_empty() {
+                let text = "批量注入完成: 0 条记忆（空列表）";
+                let call_result = ToolCallResult {
+                    content: vec![TextContent {
+                        content_type: "text".into(),
+                        text: text.to_string(),
+                    }],
+                };
+                return make_response(id, to_json_value_safe(&call_result));
+            }
+
+            if memories_array.len() > 200 {
+                return make_error(
+                    id,
+                    -32602,
+                    &format!("批量注入上限为 200 条，收到 {} 条", memories_array.len()),
+                );
+            }
+
+            let mut memories = Vec::with_capacity(memories_array.len());
+            for item in memories_array {
+                let content = match item.get("content").and_then(|v| v.as_str()) {
+                    Some(c) => c.to_string(),
+                    None => {
+                        return make_error(id, -32602, "每条记忆必须包含 content 字段");
+                    }
+                };
+
+                let memory_type_str = item
+                    .get("memory_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("fact");
+                let memory_type =
+                    MemoryType::try_parse(memory_type_str).unwrap_or(MemoryType::Fact);
+
+                let project = item
+                    .get("project")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                let tags: Vec<String> = item
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let importance = item
+                    .get("importance")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| Importance::new(v as u8))
+                    .unwrap_or_default();
+
+                let memory = Memory::new(
+                    content,
+                    memory_type,
+                    project,
+                    tags,
+                    importance,
+                    None, // ttl_days
+                );
+
+                memories.push(memory);
+            }
+
+            let total = memories.len();
+            let mut store = state.memory_store.lock().await;
+            match store.remember_batch(memories) {
+                Ok(saved) => {
+                    let text = format!(
+                        "批量注入完成: {} 条记忆\n\
+                         ══════════════════════\n\
+                         总计: {} 条记忆已写入记忆库\n\
+                         \n\
+                         ID 列表:\n{}",
+                        total,
+                        saved.len(),
+                        saved
+                            .iter()
+                            .map(|m| format!("  - {}: {}", m.id, m.summary()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    );
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
+                    };
+                    make_response(id, to_json_value_safe(&call_result))
+                }
+                Err(e) => make_error(id, -32603, &format!("批量注入失败: {}", e)),
             }
         }
 
@@ -1537,13 +1684,14 @@ mod tests {
         let tools = json["result"]["tools"].as_array().unwrap();
         assert_eq!(
             tools.len(),
-            12,
-            "应注册 12 个工具（7 个记忆 + 2 个代码 + 3 个新增）"
+            13,
+            "应注册 13 个工具（8 个记忆 + 2 个代码 + 3 个新增）"
         );
 
         // 验证记忆工具存在
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"remember"), "缺少 remember 工具");
+        assert!(tool_names.contains(&"batch_remember"), "缺少 batch_remember 工具");
         assert!(tool_names.contains(&"recall"), "缺少 recall 工具");
         assert!(tool_names.contains(&"forget"), "缺少 forget 工具");
         assert!(
