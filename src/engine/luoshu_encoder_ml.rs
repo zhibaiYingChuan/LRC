@@ -178,8 +178,7 @@ impl LuoShuMlEncoder {
                     candle_core::pickle::PthTensors::new(&weights_path, None).map_err(|e| {
                         format!(
                             "pickle 加载 pytorch_model.bin 失败: {}\n\
-                         提示: 文件可能已损坏，请尝试转换为 safetensors 格式:\n\
-                         pip install safetensors torch && python scripts/convert_model.py",
+                         提示: 文件可能已损坏，请尝试转换为 safetensors 格式后再试",
                             e
                         )
                     })?;

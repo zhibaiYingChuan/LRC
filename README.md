@@ -747,27 +747,13 @@ Loong Recall 提取了道枢层的编码-检索范式，工程化为独立 MCP �
 
 ## 贡献指南
 
-以下命令供贡献者在修改代码后运行，确保提交质量：
-
 ```bash
-# 运行全部质量守门（推荐）
-.\scripts\gatekeeper.ps1
-
-# 或分别运行：
-# 运行测试（200 项）
-cargo test
-
-# 跳过需下载 CodeBERT 模型的测试（~200MB）
-SKIP_ML_TESTS=1 cargo test
+# 运行测试（347 项）
+cargo test --all-targets --features server
 
 # 代码风格检查
-cargo clippy --features server -- -D warnings
-
-# 核心算法泄露检测（预提交钩子也会自动运行）
-python scripts/check_algorithm_leak.py
-
-# 安装 pre-commit 钩子（提交前自动检查）
-python scripts/install_hooks.py
+cargo clippy --all-targets --features server -- -D warnings
+cargo fmt --check
 ```
 
 ### 运行时安全
@@ -801,25 +787,23 @@ Loong Recall 在启动时自动执行多层运行时防护（详见 `src/guard.r
 
 ## 更新日志
 
-### v0.2.0 (2026-06-07) — 本次推送
+### v0.2.0 (2026-06-07) — 代码质量与安全加固
 
 **🛡️ 代码质量**
 
-- 全项目静态代码审计（200+ 测试 + Clippy pedantic/nursery），修复全部 Clippy 警告
-- 消除所有非测试代码中的 `.unwrap()` / `.expect()` 残留（约 60+ 处），杜绝生产环境 Panic 风险
+- 全项目静态代码审计（347+ 测试 + Clippy pedantic/nursery），修复全部 Clippy 警告
+- 消除所有非测试代码中的 `.unwrap()` / `.expect()` 残留，杜绝生产环境 Panic 风险
 - 修复切片越界、类型转换截断等潜在运行时错误
 
 **🔒 核心算法保护**
 
 - 全部 23 个引擎文件添加 DaoTi Research License v1.0 许可证头
-- 实现 `check_algorithm_leak.py` 算法泄露检测脚本，CI 和 pre-commit 钩子自动运行
-- `.github/workflows/ci.yml` 新增独立 `leak-check` Job，确保核心算法不泄露
+- CI 自动运行算法泄露检测和 pre-commit 钩子检查
 
-**🚦 自动化守门人**
+**🚦 自动化 CI**
 
-- `scripts/gatekeeper.ps1`：10 道质量守门（编译、测试、Clippy、格式、unwrap 检测、代码重复、XSS 安全、算法泄露、长函数、类型转换安全）
-- `.github/workflows/ci.yml`：push/PR 时自动运行全部守门，不合格代码不得合并
-- `scripts/pre-commit`：提交前自动运行核心守门检查，快速反馈
+- `.github/workflows/ci.yml`：push/PR 时自动运行编译、测试、Clippy、格式、unwrap 检测、代码重复、XSS 安全等检查
+- 不合格代码不得合并
 
 **🖥️ 用户体验**
 

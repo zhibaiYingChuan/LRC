@@ -377,14 +377,12 @@ LRC 项目内置了自动化质量守门系统，确保每次提交的代码都�
 如果你要修改 LRC 源码并提交 PR：
 
 ```bash
-# 运行全部质量检查
-.\scripts\gatekeeper.ps1
+# 运行全部测试
+cargo test --all-targets --features server
 
-# 自动修复可修复的问题
-.\scripts\gatekeeper.ps1 -Fix
-
-# 提交前自动检查（需先安装钩子）
-python scripts/install_hooks.py
+# 代码风格检查
+cargo clippy --all-targets --features server -- -D warnings
+cargo fmt --check
 ```
 
 守门人检查在 GitHub Actions 上也会自动运行，不合格的 PR 无法合并。

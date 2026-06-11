@@ -55,8 +55,23 @@ tests/test5_only.ps1
 tests/e2e_v*.ps1
 tests/*_only.ps1
 
-# 临时测试目录
-tmp_test_*/
+# 内部开发工具（不交付用户）
+scripts/check_algorithm_leak.py
+scripts/gatekeeper.ps1
+scripts/install_hooks.py
+scripts/pre-commit
+scripts/pre-commit.ps1
+scripts/patcher.py
+scripts/sync_check.ps1
+scripts/verify_fresh_install.ps1
+scripts/convert_model.py
+
+# 内部测试（不交付用户）
+external_tests/
+tests/dao_annotation_check.rs
+
+# 内部架构文档（不交付用户）
+docs/dao-pivot-mapping.md
 
 # 内部分析文档（不交付用户）
 docs/product-analysis/

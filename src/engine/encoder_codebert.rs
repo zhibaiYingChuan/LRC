@@ -119,8 +119,7 @@ impl CodeBertEncoder {
                 let pth = candle_core::pickle::PthTensors::new(&model_path, None).map_err(|e| {
                     format!(
                         "pickle 加载 pytorch_model.bin 失败: {e}\n\
-                         提示: 如果持续失败，请尝试转换为 safetensors 格式:\n\
-                         pip install safetensors torch && python scripts/convert_model.py"
+                         提示: 如果持续失败，请尝试转换为 safetensors 格式后再试"
                     )
                 })?;
                 let mut tensors = std::collections::HashMap::new();

@@ -225,14 +225,8 @@ cd LongMemEval
 # 下载数据集（如未下载）
 python download_data.py
 
-# 快速模式（关键词检索）
-python lrc_longmemeval.py --data data/longmemeval_s_cleaned.json --output results/lrc_fast.jsonl
-
-# LLM 模式（v0.2.0 查询翻译器）
-python lrc_longmemeval.py --llm-mode --data data/longmemeval_s_cleaned.json --output results/lrc_llm.jsonl
-
-# 评分
-python evaluate_qa.py deepseek-chat results/lrc_fast.jsonl data/longmemeval_s_cleaned.json
+# 使用 LRC 的搜索 API 进行评估
+# 详细评测脚本请参考项目仓库的完整版本
 ```
 
 ---
