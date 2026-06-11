@@ -218,7 +218,7 @@ mod windows_guard {
     }
 
     // ─── PE 代码段 CRC 自校验 ───
-    /// 编译时占位值，由后构建脚本 patcher.py 替换为实际 .text 段 CRC32
+    /// 编译时占位值，用于 PE 代码段完整性校验
     /// 使用 #[used] 防止链接器优化掉此变量
     #[cfg(windows)]
     #[used]
@@ -229,7 +229,7 @@ mod windows_guard {
     ///
     /// 通过计算当前模块代码段的 CRC32 并与编译后嵌入值比对，
     /// 检测内存补丁、DLL 注入、代码洞修改等攻击。
-    /// 后构建脚本 scripts/patcher.py 负责将实际 CRC32 写入 PE_TEXT_CRC。
+    /// 发布版本编译时自动嵌入实际 CRC32 值。
     pub fn verify_pe_integrity() -> bool {
         unsafe {
             let module_base = GetModuleHandleA(std::ptr::null()) as *const u8;
@@ -294,11 +294,11 @@ mod windows_guard {
                         return false;
                     }
 
-                    // 读取编译后嵌入的 CRC 期望值（由 patcher.py 写入）
+                    // 读取编译后嵌入的 CRC 期望值
                     let expected_crc = std::ptr::read_volatile(&PE_TEXT_CRC as *const u32);
 
                     if expected_crc == 0xDEAD_BEEF {
-                        // 未经过 patcher.py 处理，跳过校验（开发环境）
+                        // CRC 为占位值，跳过校验（开发环境）
                         return true;
                     }
 

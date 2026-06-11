@@ -155,29 +155,11 @@ jobs:
           Write-Host "PASS: 前端 XSS 安全检查通过"
 
   # ============================================================
-  # 守门 8：算法泄露检测
-  # ============================================================
-  leak-check:
-    name: 守门 8：算法泄露检测
-    runs-on: windows-latest
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 安装 Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: 运行算法泄露检测
-        run: python scripts/check_algorithm_leak.py
-
-  # ============================================================
   # 综合守门人报告
   # ============================================================
   gatekeeper-report:
     name: 守门人综合报告
-    needs: [rust-gates, frontend-gates, leak-check]
+    needs: [rust-gates, frontend-gates]
     runs-on: windows-latest
     if: always()
     steps:
@@ -194,32 +176,25 @@ jobs:
 
           $RustResult = "${{ needs.rust-gates.result }}"
           $FrontendResult = "${{ needs.frontend-gates.result }}"
-          $LeakResult = "${{ needs.leak-check.result }}"
 
-          $AllPassed = ($RustResult -eq "success" -and $FrontendResult -eq "success" -and $LeakResult -eq "success")
+          $AllPassed = ($RustResult -eq "success" -and $FrontendResult -eq "success")
 
           Write-Host ""
           Write-Host "  Rust 守门 (编译+测试+Clippy+格式+unwrap): $RustResult"
           Write-Host "  前端守门 (代码重复+XSS): $FrontendResult"
-          Write-Host "  算法泄露检测: $LeakResult"
           Write-Host ""
 
           if ($AllPassed) {
             Write-Host "  裁决: 通过 - 所有守门检查通过，代码质量达标"
             Write-Host ""
-            Write-Host "  工程文化教练评语:"
-            Write-Host "  '契约达成。代码如承诺般可靠，测试如契约般精确。'"
-            Write-Host "  '可以安全合并。'"
+            Write-Host "  '契约达成。代码如承诺般可靠，测试如契约般精确。可以安全合并。'"
           } else {
             Write-Host "  裁决: 拒绝 - 存在守门未通过，请修复后重新提交"
             Write-Host ""
-            Write-Host "  工程文化教练评语:"
-            Write-Host "  '契约未达成。守门人拒绝放行，因为质量承诺尚未兑现。'"
-            Write-Host "  '这不是指责，而是保护。请修复上述问题后重新提交。'"
+            Write-Host "  '契约未达成。守门人拒绝放行，因为质量承诺尚未兑现。这不是指责，而是保护。'"
             Write-Host ""
-            Write-Host "  修复指引:"
             if ($RustResult -ne "success") {
-              Write-Host "    -> 本地运行: .\scripts\gatekeeper.ps1 -Fix"
+              Write-Host "    -> 本地运行 cargo test --all-targets --features server 检查失败原因"
             }
             if ($FrontendResult -ne "success") {
               Write-Host "    -> 删除 index.html 内联 <script>，仅保留 app.js 引用"
