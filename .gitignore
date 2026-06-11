@@ -43,10 +43,23 @@ docs/evaluation-report-*.md
 src/.loong-recall/
 data/
 
-# 测试请求文件
+# 本地测试/调试脚本（不交付用户）
+check_data.py
+diagnose_recall.py
 test_req.json
 test_request.json
 test_new_user.ps1
+tests/e2e_test.ps1
+tests/quick_test.ps1
+tests/test5_only.ps1
+tests/e2e_v*.ps1
+tests/*_only.ps1
+
+# 临时测试目录
+tmp_test_*/
+
+# 内部分析文档（不交付用户）
+docs/product-analysis/
 
 # 模型文件目录（用户自行下载）
 models/
