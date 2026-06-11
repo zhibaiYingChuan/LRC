@@ -292,7 +292,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数（默认 5，最大 20）",
+                        "description": "返回结果数（默认 5，最大 100）",
                         "default": 5
                     },
                     "lrc_mode": {
@@ -494,7 +494,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数（默认 5，最大 20）",
+                        "description": "返回结果数（默认 5，最大 100）",
                         "default": 5
                     },
                     "memory_type": {
@@ -745,7 +745,7 @@ async fn handle_tools_call(
                 .get("top_k")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5)
-                .clamp(1, 20) as usize;
+                .clamp(1, 100) as usize;
 
             // 检索模式：fast（关键词匹配）或 luoshu（洛书几何检索）
             let lrc_mode = arguments
@@ -794,13 +794,32 @@ async fn handle_tools_call(
 
             let mut store = state.memory_store.lock().await;
 
-            // 根据 lrc_mode 选择检索方法
+            // LLM 记忆翻译：如果配置了 LLM API，将自然语言问题翻译为答案可能包含的关键词
+            // 然后将关键词拼入原始查询，使 TF-IDF/Luoshu 能跨越"问题词与答案词不重叠"的语义鸿沟
+            // 例如："What degree did I graduate with?" →
+            //   富化查询: "Business Administration major degree graduation college What degree did I graduate with?"
+            let enriched_query = if state.llm_api.is_configured() {
+                let keywords = crate::engine::llm_translator::translate_memory_query(
+                    &state.llm_api, query,
+                )
+                .await;
+                let translated: String = keywords.join(" ");
+                if translated.is_empty() || translated.trim() == query {
+                    query.to_string() // 翻译为空或与原始相同，保持原样
+                } else {
+                    format!("{} {}", translated, query)
+                }
+            } else {
+                query.to_string()
+            };
+
+            // 根据 lrc_mode 选择检索方法（使用富化后的查询）
             let result = if lrc_mode == "luoshu" {
                 // 洛书几何检索：LuoShuEncoder 编码查询 + TrapezoidFocus 梯形聚焦
-                store.trapezoid_focus_recall(query, &filter, focus_depth)
+                store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth)
             } else {
                 // 快速模式：关键词匹配（默认）
-                store.recall(query, &filter)
+                store.recall(&enriched_query, &filter)
             };
 
             match result {
@@ -826,7 +845,7 @@ async fn handle_tools_call(
                                 "（记忆 #{mem_num} · 匹配度 {:.1}%）\n",
                                 score * 100.0
                             ));
-                            text.push_str(&format!("内容: {}\n", m.summary()));
+                            text.push_str(&format!("内容: {}\n", m.content));
                             // 洛书模式显示几何信息
                             if lrc_mode == "luoshu" {
                                 if let Some(ref cat) = m.bagua_category {
@@ -1105,7 +1124,7 @@ async fn handle_tools_call(
                 .get("top_k")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5)
-                .clamp(1, 20) as usize;
+                .clamp(1, 100) as usize;
 
             // LLM 查询翻译：如果配置了 LLM API，先将自然语言翻译为关键词
             let keywords = if state.llm_api.is_configured() {
@@ -1299,7 +1318,7 @@ async fn handle_tools_call(
                 .get("top_k")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(5)
-                .clamp(1, 20) as usize;
+                .clamp(1, 100) as usize;
 
             let memory_type = arguments
                 .get("memory_type")
@@ -1323,7 +1342,23 @@ async fn handle_tools_call(
 
             let mut store = state.memory_store.lock().await;
 
-            // 快速通路：关键词匹配（已有 recall 逻辑）
+            // LLM 记忆翻译：将问题翻译为答案可能包含的关键词，桥接语义鸿沟
+            let enriched_query = if state.llm_api.is_configured() {
+                let keywords = crate::engine::llm_translator::translate_memory_query(
+                    &state.llm_api, query,
+                )
+                .await;
+                let translated: String = keywords.join(" ");
+                if translated.is_empty() || translated.trim() == query {
+                    query.to_string()
+                } else {
+                    format!("{} {}", translated, query)
+                }
+            } else {
+                query.to_string()
+            };
+
+            // 快速通路：关键词匹配（已有 recall 逻辑），使用富化查询
             let fast_filter = RecallFilter {
                 memory_type: memory_type.clone(),
                 project: project.clone(),
@@ -1332,13 +1367,13 @@ async fn handle_tools_call(
                 top_k: top_k * 2, // 快速通路取更多结果
                 privacy_context: None,
             };
-            let fast_result = store.recall(query, &fast_filter).unwrap_or(RecallResult {
+            let fast_result = store.recall(&enriched_query, &fast_filter).unwrap_or(RecallResult {
                 memories: vec![],
                 scores: vec![],
                 total: 0,
             });
 
-            // 深度通路：洛书几何检索（LuoShuEncoder + TrapezoidFocus 梯形聚焦）
+            // 深度通路：洛书几何检索（LuoShuEncoder + TrapezoidFocus 梯形聚焦），使用富化查询
             let deep_filter = RecallFilter {
                 memory_type,
                 project,
@@ -1348,7 +1383,7 @@ async fn handle_tools_call(
                 privacy_context: None,
             };
             let deep_result = store
-                .trapezoid_focus_recall(query, &deep_filter, 1)
+                .trapezoid_focus_recall(&enriched_query, &deep_filter, 1)
                 .unwrap_or(RecallResult {
                     memories: vec![],
                     scores: vec![],
@@ -1419,7 +1454,7 @@ async fn handle_tools_call(
                     let score = result_scores.get(i).unwrap_or(&0.0);
                     let mem_num = i + 1;
                     text.push_str(&format!("（记忆 #{mem_num} · RRF 融合度 {:.3}）\n", score));
-                    text.push_str(&format!("内容: {}\n", m.summary()));
+                    text.push_str(&format!("内容: {}\n", m.content));
                     // 显示八卦分类信息
                     if let Some(ref cat) = m.bagua_category {
                         let bagua_idx = m.bagua_index.unwrap_or(0);
@@ -1608,10 +1643,24 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
 
 /// 快速构建并绑定到指定地址
 pub async fn serve(state: Arc<AppState>, host: &str, port: u16) -> std::io::Result<()> {
+    let addr = format!("{}:{}", host, port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    serve_on_listener(state, host, port, listener).await
+}
+
+/// 在已绑定的 TcpListener 上启动服务（供进程守护模块使用）
+///
+/// 与 serve() 的区别：接受外部预先绑定的 listener，
+/// 以便在绑定之前执行端口自适应逻辑。
+pub async fn serve_on_listener(
+    state: Arc<AppState>,
+    host: &str,
+    port: u16,
+    listener: tokio::net::TcpListener,
+) -> std::io::Result<()> {
     let app = build_mcp_router(state);
 
     let addr = format!("{}:{}", host, port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("Loong Recall (L-RC) 代码搜索 + 记忆服务");
     println!("   端点: http://{}", addr);
     println!("   仪表盘: http://{}/dashboard  ← 可视化记忆管理面板", addr);

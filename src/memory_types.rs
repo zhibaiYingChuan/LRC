@@ -526,8 +526,8 @@ impl Memory {
             MemoryType::Conversation => "[对话]",
             MemoryType::Synthesis => "[合成]",
         };
-        let content_preview: String = self.content.chars().take(80).collect();
-        let ellipsis = if self.content.chars().count() > 80 {
+        let content_preview: String = self.content.chars().take(200).collect();
+        let ellipsis = if self.content.chars().count() > 200 {
             "..."
         } else {
             ""

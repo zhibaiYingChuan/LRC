@@ -1098,7 +1098,7 @@ pub fn build_v1_router(
                     let top_k = params.get("top_k")
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(5)
-                        .clamp(1, 20);
+                        .clamp(1, 100);
                     let keywords_str = params.get("keywords").cloned().unwrap_or_default();
 
                     let manager = manager.lock().await;
