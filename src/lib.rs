@@ -27,6 +27,19 @@ pub mod persistence;
 /// 运行时防护模块：反调试、完整性校验、防篡改
 pub mod guard;
 
+/// 进程守护模块：单例锁、端口自适应、优雅关闭
+pub mod process_guard;
+
+/// 桌面仪表盘模块：双击 exe 打开浏览器查看记忆管理面板
+pub mod dashboard;
+
+/// 配置持久化模块：保存端口、LLM API、源码目录等
+pub mod config;
+
+/// 系统托盘模块：桌面端后台运行，托盘图标+菜单
+#[cfg(feature = "webbrowser")]
+pub mod tray;
+
 /// 后台结晶流水线（定时 consolidation job）
 pub mod consolidation;
 

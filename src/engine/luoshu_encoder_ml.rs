@@ -58,7 +58,18 @@ impl LuoShuMlEncoder {
     /// 1. 检查 `models/` 本地文件夹
     /// 2. 检查 HuggingFace 缓存
     /// 3. 从 HF_ENDPOINT 镜像下载
+    ///
+    /// 镜像守卫：函数入口强制检查 HF_ENDPOINT，确保绝不访问外网。
+    /// 若 HF_ENDPOINT 未设置，自动设为 hf-mirror.com 国内镜像。
     pub fn load() -> Result<Self, String> {
+        // ════════════════════════════════════════════════════════════
+        // 本地镜像守卫 — 确保 hf-hub 库的下载请求走国内镜像
+        // 与 server.rs 中的全局守卫互为冗余，防止任何漏网之鱼
+        // ════════════════════════════════════════════════════════════
+        if std::env::var("HF_ENDPOINT").is_err() {
+            std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
+        }
+
         let device = Device::Cpu;
 
         let model_id = std::env::var("LRC_LUOSHU_MODEL_ID")
@@ -760,20 +771,9 @@ impl HybridLuoShuEncoder {
 
 impl Default for HybridLuoShuEncoder {
     fn default() -> Self {
-        // 当 ml feature 启用时，尝试加载 ML 语义模型
-        // 加载失败则自动降级为统计模式（零依赖，始终可用）
-        #[cfg(feature = "ml")]
-        {
-            match LuoShuMlEncoder::load() {
-                Ok(ml) => {
-                    eprintln!("[LRC·洛书] ML 编码器已启用 (语义增强模式)");
-                    return Self::new_with_ml(ml);
-                }
-                Err(e) => {
-                    eprintln!("[LRC·洛书] ML 编码器加载失败，降级为统计模式: {}", e);
-                }
-            }
-        }
+        // 默认使用统计编码器，零依赖、零下载、秒启动
+        // ML 语义模型仅在用户明确执行 --mode smart 时加载，
+        // 且加载前会先检查本地模型是否存在，不存在则提示用户确认后从国内镜像下载
         Self::new_statistical()
     }
 }

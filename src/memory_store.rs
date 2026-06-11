@@ -499,7 +499,10 @@ impl<P: Persistence> MemoryStore<P> {
             similarity_threshold: 0.5,
             synthesis_min_cluster: 3,
             synthesis_similarity: 0.4,
+            #[cfg(feature = "ml")]
             luoshu_encoder: HybridLuoShuEncoder::new_statistical(),
+            #[cfg(not(feature = "ml"))]
+            luoshu_encoder: HybridLuoShuEncoder::new(),
             dao_metrics: DaoMetrics::new(),
             synthesis_journal: SynthesisJournal::new(),
             dao_regulator: DaoRegulator::new(),
@@ -520,6 +523,28 @@ impl<P: Persistence> MemoryStore<P> {
                 budget
             },
         }
+    }
+
+    /// 检查编码器是否处于降级状态（条件编译：仅 ml feature 时检查）
+    #[cfg(feature = "ml")]
+    fn check_encoder_degraded(encoder: &HybridLuoShuEncoder) -> bool {
+        encoder.is_degraded()
+    }
+
+    #[cfg(not(feature = "ml"))]
+    fn check_encoder_degraded(_encoder: &HybridLuoShuEncoder) -> bool {
+        false // 纯统计编码器永不降级
+    }
+
+    /// 获取编码器恢复进度（条件编译：仅 ml feature 时获取）
+    #[cfg(feature = "ml")]
+    fn get_encoder_recovery_progress(encoder: &HybridLuoShuEncoder) -> (u32, u32) {
+        encoder.recovery_progress()
+    }
+
+    #[cfg(not(feature = "ml"))]
+    fn get_encoder_recovery_progress(_encoder: &HybridLuoShuEncoder) -> (u32, u32) {
+        (0, 0) // 纯统计编码器无恢复进度
     }
 
     /// 设置冲突检测的相似度阈值
@@ -1498,14 +1523,17 @@ impl<P: Persistence> MemoryStore<P> {
 
                         // TF-IDF 词匹配加分（替代原 0.1/词的固定权重）
                         // 对每个查询词，计算其在当前记忆中的词频（TF），乘以 IDF
+                        // 归一化 TF：除以文档长度（词数），避免长文本获得不合理的
+                        // 高分。短文档中关键词密度更高，应获得加权。
+                        let doc_len = content_lower.split_whitespace().count().max(1) as f32;
                         for word in &query_words {
                             if content_lower.contains(word) {
                                 // 计算词频（TF）: 该词在记忆内容中出现的次数
                                 let tf = content_lower.matches(word).count() as f32;
                                 let idf_val = idf.get(word).copied().unwrap_or(1.0);
-                                // TF-IDF 得分: 词频 × 逆文档频率
-                                // 稀有词（出现在少量文档中）获得更高 IDF，从而得到更高分数
-                                score += tf * idf_val;
+                                // 归一化 TF-IDF 得分: (词频/文档长度) × 逆文档频率
+                                // 长文档中的高频常见词不再获得不合理的高分
+                                score += (tf / doc_len) * idf_val;
                             }
                         }
 
@@ -2166,9 +2194,10 @@ impl<P: Persistence> MemoryStore<P> {
         // 编码器状态
         let encoder_status = self.luoshu_encoder.get_status();
         let encoder_mode = encoder_status.mode.clone();
-        let encoder_degraded = encoder_mode == "statistical" || self.luoshu_encoder.is_degraded();
+        let encoder_degraded = encoder_mode == "statistical"
+            || Self::check_encoder_degraded(&self.luoshu_encoder);
         let encoder_recovery_progress = if encoder_degraded {
-            let (successes, threshold) = self.luoshu_encoder.recovery_progress();
+            let (successes, threshold) = Self::get_encoder_recovery_progress(&self.luoshu_encoder);
             if threshold > 0 {
                 Some(successes as f32 / threshold as f32)
             } else {

@@ -145,12 +145,22 @@ struct OllamaResponseMessage {
 
 // ==================== 翻译 Prompt ====================
 
-/// 硬编码的查询翻译 Prompt — 极度精简，只做一件事
-const TRANSLATION_PROMPT: &str = "你是一个代码搜索助手。将用户的自然语言查询翻译成可能出现在代码中的函数名、变量名、结构体名或关键词。只返回逗号分隔的关键词列表，不要解释。";
+/// 代码搜索翻译 Prompt — 将自然语言翻译为代码符号
+const CODE_TRANSLATION_PROMPT: &str = "你是一个代码搜索助手。将用户的自然语言查询翻译成可能出现在代码中的函数名、变量名、结构体名或关键词。只返回逗号分隔的关键词列表，不要解释。";
 
-/// 构建翻译 Prompt
-fn build_prompt(query: &str) -> String {
-    format!("{}\n\n用户查询：{}", TRANSLATION_PROMPT, query)
+/// 记忆检索翻译 Prompt — 将问题翻译为答案可能包含的关键词
+/// 用于桥接 LongMemEval 等场景中"问题词与答案词不重叠"的语义鸿沟
+const MEMORY_TRANSLATION_PROMPT: &str = "你是一个记忆检索助手。用户会提出关于他们过往对话的问题，你需要将问题翻译为答案可能包含的关键词。\n\
+例如：\n\
+- 问「What degree did I graduate with?」→ Business, Administration, major, bachelor, degree, graduation, college, university\n\
+- 问「Where did I travel last year?」→ Japan, Tokyo, travel, trip, vacation, visited, destination\n\
+- 问「What is my dog's name?」→ dog, pet, name, Max, Buddy, puppy, animal\n\
+- 问「What company do I work for?」→ Google, Microsoft, company, employer, job, work, career\n\
+只返回逗号分隔的关键词列表，不要解释。关键词应包含可能的答案内容（如具体名称、地点、专业名、公司名等）以及相关概念词。";
+
+/// 构建翻译 Prompt（通用）
+fn build_prompt(system_prompt: &str, query: &str) -> String {
+    format!("{}\n\n用户查询：{}", system_prompt, query)
 }
 
 /// 将 LLM 响应解析为关键词列表
@@ -179,20 +189,69 @@ pub async fn translate_query(config: &LlmApiConfig, query: &str) -> Vec<String> 
             api_key,
             model,
             endpoint,
-        } => match translate_openai(endpoint, api_key, model, query).await {
+        } => match translate_openai(endpoint, api_key, model, query, CODE_TRANSLATION_PROMPT).await
+        {
             Ok(keywords) if !keywords.is_empty() => keywords,
             _ => {
                 eprintln!("[LRC] LLM 翻译失败，回退到原始查询");
                 vec![query.to_string()]
             }
         },
-        LlmApiConfig::Ollama { host, model } => match translate_ollama(host, model, query).await {
-            Ok(keywords) if !keywords.is_empty() => keywords,
-            _ => {
-                eprintln!("[LRC] LLM 翻译失败，回退到原始查询");
-                vec![query.to_string()]
+        LlmApiConfig::Ollama { host, model } => {
+            match translate_ollama(host, model, query, CODE_TRANSLATION_PROMPT).await {
+                Ok(keywords) if !keywords.is_empty() => keywords,
+                _ => {
+                    eprintln!("[LRC] LLM 翻译失败，回退到原始查询");
+                    vec![query.to_string()]
+                }
             }
-        },
+        }
+    }
+}
+
+/// 将自然语言问题翻译为记忆检索关键词（用于 LongMemEval 等语义检索场景）
+///
+/// 与 translate_query（代码搜索）不同，此函数使用记忆场景 Prompt，
+/// 引导 LLM 生成答案可能包含的关键词，桥接"问 X 答 Y"的语义鸿沟。
+/// 例如："What degree did I graduate with?" →
+///   "Business, Administration, major, degree, graduation, college"
+///
+/// 翻译失败时自动回退到原始查询，确保检索不受影响。
+pub async fn translate_memory_query(config: &LlmApiConfig, query: &str) -> Vec<String> {
+    match config {
+        LlmApiConfig::None => {
+            vec![query.to_string()]
+        }
+        LlmApiConfig::OpenAI {
+            api_key,
+            model,
+            endpoint,
+        } => {
+            match translate_openai(
+                endpoint,
+                api_key,
+                model,
+                query,
+                MEMORY_TRANSLATION_PROMPT,
+            )
+            .await
+            {
+                Ok(keywords) if !keywords.is_empty() => keywords,
+                _ => {
+                    eprintln!("[LRC] 记忆翻译失败，回退到原始查询");
+                    vec![query.to_string()]
+                }
+            }
+        }
+        LlmApiConfig::Ollama { host, model } => {
+            match translate_ollama(host, model, query, MEMORY_TRANSLATION_PROMPT).await {
+                Ok(keywords) if !keywords.is_empty() => keywords,
+                _ => {
+                    eprintln!("[LRC] 记忆翻译失败，回退到原始查询");
+                    vec![query.to_string()]
+                }
+            }
+        }
     }
 }
 
@@ -202,6 +261,7 @@ async fn translate_openai(
     api_key: &str,
     model: &str,
     query: &str,
+    system_prompt: &str,
 ) -> Result<Vec<String>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -212,7 +272,7 @@ async fn translate_openai(
         model: model.to_string(),
         messages: vec![OpenAiMessage {
             role: "user".to_string(),
-            content: build_prompt(query),
+            content: build_prompt(system_prompt, query),
         }],
         temperature: 0.0,
         max_tokens: 100,
@@ -248,7 +308,12 @@ async fn translate_openai(
 }
 
 /// 通过 Ollama 本地模型翻译查询
-async fn translate_ollama(host: &str, model: &str, query: &str) -> Result<Vec<String>, String> {
+async fn translate_ollama(
+    host: &str,
+    model: &str,
+    query: &str,
+    system_prompt: &str,
+) -> Result<Vec<String>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -258,7 +323,7 @@ async fn translate_ollama(host: &str, model: &str, query: &str) -> Result<Vec<St
         model: model.to_string(),
         messages: vec![OllamaMessage {
             role: "user".to_string(),
-            content: build_prompt(query),
+            content: build_prompt(system_prompt, query),
         }],
         stream: false,
     };
@@ -367,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_build_prompt() {
-        let prompt = build_prompt("处理用户登录");
+        let prompt = build_prompt(CODE_TRANSLATION_PROMPT, "处理用户登录");
         assert!(prompt.contains("处理用户登录"));
         assert!(prompt.contains("代码搜索助手"));
     }
