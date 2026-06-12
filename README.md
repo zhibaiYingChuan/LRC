@@ -798,7 +798,7 @@ Loong Recall 在启动时自动执行多层运行时防护（详见 `src/guard.r
 **🔒 核心算法保护**
 
 - 全部 23 个引擎文件添加 DaoTi Research License v1.0 许可证头
-- CI 自动运行算法泄露检测和 pre-commit 钩子检查
+- CI 自动运行代码质量与安全检查，确保核心算法安全
 
 **🚦 自动化 CI**
 
