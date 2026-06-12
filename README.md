@@ -60,9 +60,7 @@ cargo build --release --features server
 ./target/release/code-memory-server --src-dir ./src --port 3099
 ```
 
-看到服务启动后，在另一个终端试试：
-
-> 💡 浏览器打开 `http://127.0.0.1:3099/dashboard` 可以看到可视化仪表盘，包含记忆健康度、船长日志和 API 文档。
+启动后浏览器会自动打开仪表盘（`http://127.0.0.1:3099/dashboard`），无需手动输入网址。在另一个终端试试：
 
 ```bash
 # 搜索代码（Fast Match：精确关键词匹配）
@@ -138,13 +136,20 @@ cargo build --features server
 cargo build --features server,ml
 
 # LLM 增强（用你的 LLM 做查询翻译，不下载模型）
+# 方式一：命令行启动时配置
 # 推荐：使用 DeepSeek（国产模型，性价比极高）
 code-memory-server --src-dir ./src --stdio --llm-api "openai:sk-your-deepseek-key:deepseek-v4-flash:https://api.deepseek.com/v1"
 # 或使用本地 Ollama（无 API 费用）
 code-memory-server --src-dir ./src --stdio --llm-api ollama:localhost:llama3
+#
+# 方式二：HTTP 模式启动后，在仪表盘可视化配置（推荐新用户）
+# code-memory-server --src-dir ./src --port 3099
+# 启动后浏览器自动打开 → 进入「⚙️ 设置」页面 → 填写 LLM API 保存即可
 ```
 
 > **LLM 增强的原理**：把你的自然语言查询（"处理用户登录的逻辑"）发给 LLM，翻译成代码关键词（`authenticate_user, login, handle_login`），再用 Fast Match 精确检索。不配置 `--llm-api` 就还是原来的 Fast Match，行为完全不变。
+>
+> 💡 **推荐**：新用户建议用 HTTP 模式启动，通过仪表盘「设置」页面可视化配置 LLM，配置后即时生效，无需重启。
 
 > 日常场景 Fast Match 够用。Smart Match 默认使用 **GraphCodeBERT**（比 CodeBERT 检索精度高 12.3%），详见 [模型评估报告](docs/MODEL_EVALUATION.md)。
 
@@ -188,8 +193,10 @@ LLM 增强模式会调用你的 LLM API 进行查询翻译，每次消耗约 **4
 | 区域聚焦检索       | ✅ | 仅扫描局部区域，检索延迟可控 |
 | 零外部依赖（快速模式）| ✅ | 无需 API 密钥，无需模型下载 |
 | 本地运行           | ✅ | 完全离线，数据不出本机 |
-| Web 仪表盘         | ✅ | 可视化记忆健康度、船长日志、API 文档 |
+| Web 仪表盘         | ✅ | 可视化记忆健康度、船长日志、API 文档、LLM 设置 |
 | 自动化质量守门      | ✅ | 10 道 CI 守门，零 unwrap 残留、零算法泄露 |
+| 自动打开浏览器      | ✅ | HTTP 模式启动后自动打开仪表盘（v0.3.1+） |
+| LLM 可视化配置      | ✅ | 仪表盘设置页面配置 LLM API，即时生效（v0.3.1+） |
 
 ***
 
@@ -567,8 +574,12 @@ language: "rust"
   --global            记忆数据存到 ~/.loong-recall/data/（跨项目共享）
   --db-path <路径>    自定义记忆数据库路径（优先级最高，覆盖 --global）
   --llm-api <配置>    配置 LLM 查询翻译（格式: openai:sk-xxx:model 或 ollama:host:model）
+                      也可在仪表盘「设置」页面可视化配置
   --mode <模式>       搜索模式: auto（默认，镜像启动）| fast（秒启动）| smart（语义搜索）
   --proxy <代理地址>   HTTP/HTTPS 代理（如 http://127.0.0.1:7890）
+  --daemon            后台守护模式，无控制台窗口
+  --multi-window <N>  允许同项目最多 N 个窗口同时运行 [默认: 1]
+  --tray              启用系统托盘图标（Windows）
   --help, -h          显示帮助信息
 ```
 
@@ -786,6 +797,42 @@ Loong Recall 在启动时自动执行多层运行时防护（详见 `src/guard.r
 ***
 
 ## 更新日志
+
+### v0.3.1 (2026-06-12) — 一键体验优化：自动打开浏览器 + LLM 可视化配置
+
+**🖥️ 用户体验**
+
+- **自动打开浏览器**：HTTP 模式启动后自动打开默认浏览器访问仪表盘，新用户无需手动输入网址
+- **LLM 可视化配置**：仪表盘新增「⚙️ 设置」页面，支持图形界面配置 LLM API，不再需要命令行输入
+  - 支持 OpenAI 兼容 API（DeepSeek、通义千问等）和 Ollama 本地模型两种方式
+  - 配置后即时生效，无需重启服务
+  - API Key 仅保存在本地配置文件，绝不上传服务器
+- 更新终端启动提示，引导新用户通过仪表盘配置 LLM
+
+**🐛 问题修复**
+
+- 添加 `[workspace]` 声明到 Cargo.toml，修复克隆到父级 workspace 目录时的 Cargo 冲突
+
+---
+
+### v0.3.0 (2026-06-09) — 桌面端 Agent 全面支持
+
+**✨ 新增核心功能**
+
+- **配置持久化**：保存端口、LLM API、多窗口设置到 `%APPDATA%\LoongRecall\config.json`，重启不丢失
+- **后台守护模式**（`--daemon`）：无控制台后台运行，供各种桌面端 Agent 长期调用
+- **系统托盘**：Windows 原生托盘图标，右键菜单支持快速打开仪表盘/退出服务
+- **多窗口支持**（`--multi-window N`）：允许同项目最多 N 个窗口同时运行 LRC
+- **进程守护**：单例锁避免僵尸进程、端口自适应避免冲突、优雅关闭自动清理
+
+**🔧 问题修复**
+
+- 全局镜像守卫：程序入口强制设置 `HF_ENDPOINT=https://hf-mirror.com`，绝不触碰 huggingface.co
+- 交互式提示超时：5 秒超时机制，防止 Hidden 窗口环境 stdin 阻塞
+- 搜索模式优先级：Fast Match (第1) > LLM API (第2) > Smart Match (最后)
+- 模型下载：仅用户确认后才从国内镜像下载，绝不访问外网
+
+---
 
 ### v0.2.0 (2026-06-07) — 代码质量与安全加固
 
