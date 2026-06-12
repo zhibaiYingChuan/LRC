@@ -17,7 +17,7 @@ default = ["server", "ml"]
 # 启用 candle + CodeBERT 真实语义编码（体积大 ~200MB）
 ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub", "ureq"]
 # 启用 MCP HTTP 服务（axum + tokio）
-server = ["axum", "tokio", "tower", "tower-http", "reqwest"]
+server = ["axum", "tokio", "tower", "tower-http", "reqwest", "webbrowser"]
 # PostgreSQL 持久化后端（需运行中的 PostgreSQL 服务）
 postgres = ["sqlx", "tokio"]
 # Qdrant 向量存储后端（通过 HTTP API，无需额外依赖）
