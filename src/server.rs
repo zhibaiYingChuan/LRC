@@ -18,12 +18,12 @@ use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Json},
-    routing::post,
+    routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 // ==================== JSON-RPC 2.0 类型 ====================
 
@@ -140,7 +140,8 @@ pub struct AppState {
     pub manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
     pub memory_store: Arc<Mutex<MemoryStore<JsonPersistence>>>,
     pub src_dir: String,
-    pub llm_api: LlmApiConfig,
+    /// LLM API 配置（运行时可变，通过 /api/config/llm 动态更新）
+    pub llm_api: Arc<RwLock<LlmApiConfig>>,
 }
 
 // ==================== MCP 请求处理 ====================
@@ -798,9 +799,9 @@ async fn handle_tools_call(
             // 然后将关键词拼入原始查询，使 TF-IDF/Luoshu 能跨越"问题词与答案词不重叠"的语义鸿沟
             // 例如："What degree did I graduate with?" →
             //   富化查询: "Business Administration major degree graduation college What degree did I graduate with?"
-            let enriched_query = if state.llm_api.is_configured() {
+            let enriched_query = if state.llm_api.read().await.is_configured() {
                 let keywords = crate::engine::llm_translator::translate_memory_query(
-                    &state.llm_api, query,
+                    &*state.llm_api.read().await, query,
                 )
                 .await;
                 let translated: String = keywords.join(" ");
@@ -1127,8 +1128,8 @@ async fn handle_tools_call(
                 .clamp(1, 100) as usize;
 
             // LLM 查询翻译：如果配置了 LLM API，先将自然语言翻译为关键词
-            let keywords = if state.llm_api.is_configured() {
-                crate::engine::llm_translator::translate_query(&state.llm_api, query).await
+            let keywords = if state.llm_api.read().await.is_configured() {
+                crate::engine::llm_translator::translate_query(&*state.llm_api.read().await, query).await
             } else {
                 vec![query.to_string()]
             };
@@ -1343,9 +1344,9 @@ async fn handle_tools_call(
             let mut store = state.memory_store.lock().await;
 
             // LLM 记忆翻译：将问题翻译为答案可能包含的关键词，桥接语义鸿沟
-            let enriched_query = if state.llm_api.is_configured() {
+            let enriched_query = if state.llm_api.read().await.is_configured() {
                 let keywords = crate::engine::llm_translator::translate_memory_query(
-                    &state.llm_api, query,
+                    &*state.llm_api.read().await, query,
                 )
                 .await;
                 let translated: String = keywords.join(" ");
@@ -1533,6 +1534,115 @@ async fn dashboard_handler() -> axum::response::Html<&'static str> {
     axum::response::Html(DASHBOARD_HTML)
 }
 
+// ==================== 配置 API 端点（仪表盘设置页面用） ====================
+
+/// 配置响应结构体
+#[derive(Debug, Serialize)]
+struct ConfigResponse {
+    llm_configured: bool,
+    llm_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    llm_model: Option<String>,
+}
+
+/// GET /api/config — 获取当前 LLM 配置状态
+async fn config_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let llm = state.llm_api.read().await;
+    let (configured, llm_type, llm_model) = match &*llm {
+        LlmApiConfig::OpenAI { model, .. } => (true, "openai".to_string(), Some(model.clone())),
+        LlmApiConfig::Ollama { model, .. } => (true, "ollama".to_string(), Some(model.clone())),
+        LlmApiConfig::None => (false, "none".to_string(), None),
+    };
+    Json(ConfigResponse {
+        llm_configured: configured,
+        llm_type,
+        llm_model,
+    })
+}
+
+/// POST /api/config/llm — 更新 LLM API Key 配置
+///
+/// 请求体: `{ "llm_api": "openai:sk-xxx:gpt-4o-mini" }`
+/// 保存到全局配置文件，并立即生效用于后续查询翻译。
+async fn config_llm_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let llm_str = match body.get("llm_api").and_then(|v| v.as_str()) {
+        Some(s) => s.trim().to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": "缺少 llm_api 字段"
+                })),
+            );
+        }
+    };
+
+    // 空字符串表示清除配置
+    if llm_str.is_empty() {
+        let mut llm = state.llm_api.write().await;
+        *llm = LlmApiConfig::None;
+        // 保存到全局配置文件
+        if let Err(e) = save_llm_to_config(None) {
+            eprintln!("[配置] 清除 LLM API 配置失败: {e}");
+        }
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "message": "LLM API 配置已清除",
+                "llm_configured": false
+            })),
+        );
+    }
+
+    // 解析配置
+    match LlmApiConfig::parse(&llm_str) {
+        Ok(config) => {
+            let (llm_type, model) = match &config {
+                LlmApiConfig::OpenAI { model, .. } => ("openai", model.clone()),
+                LlmApiConfig::Ollama { model, .. } => ("ollama", model.clone()),
+                LlmApiConfig::None => unreachable!(),
+            };
+            let mut llm = state.llm_api.write().await;
+            *llm = config;
+            // 保存到全局配置文件
+            if let Err(e) = save_llm_to_config(Some(&llm_str)) {
+                eprintln!("[配置] 保存 LLM API 配置失败: {e}");
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "message": format!("LLM API 配置成功 ({})", llm_type),
+                    "llm_configured": true,
+                    "llm_type": llm_type,
+                    "llm_model": model
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "message": format!("配置格式错误: {}. 支持格式: openai:sk-xxx:gpt-4o-mini 或 ollama:localhost:llama3", e)
+            })),
+        ),
+    }
+}
+
+/// 保存 LLM API 配置到全局配置文件
+fn save_llm_to_config(llm_api: Option<&str>) -> Result<(), String> {
+    let mut cfg = crate::config::LrcConfig::load();
+    cfg.llm_api = llm_api.map(|s| s.to_string());
+    cfg.save()
+}
+
 // ==================== Stdio 传输层（标准 MCP） ====================
 
 /// MCP 请求分发结果
@@ -1631,12 +1741,15 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/mcp", post(mcp_handler))
-        .route("/health", axum::routing::get(health_handler))
-        .route("/app.js", axum::routing::get(app_js_handler))
+        .route("/health", get(health_handler))
+        .route("/app.js", get(app_js_handler))
         .nest_service("/v1", v1_service) // 将 v1 API 嵌套在 /v1 路径下
         // 仪表盘路由：静态文件 + 重定向
-        .route("/dashboard", axum::routing::get(dashboard_handler))
-        .route("/dashboard/", axum::routing::get(dashboard_handler))
+        .route("/dashboard", get(dashboard_handler))
+        .route("/dashboard/", get(dashboard_handler))
+        // 配置 API：仪表盘设置页面用
+        .route("/api/config", get(config_handler))
+        .route("/api/config/llm", post(config_llm_handler))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
@@ -1701,7 +1814,7 @@ mod tests {
             manager: Arc::new(Mutex::new(Box::new(manager))),
             memory_store,
             src_dir: "fixture/src".into(),
-            llm_api: LlmApiConfig::None,
+            llm_api: Arc::new(RwLock::new(LlmApiConfig::None)),
         })
     }
 

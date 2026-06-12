@@ -384,7 +384,7 @@ async fn main() {
                 log("  → 输入为空，保持 Tier 1 Fast Match");
             }
         } else {
-            log("  → 跳过 LLM API 配置，Tier 1 Fast Match 已足够日常使用");
+            log("  → 跳过 LLM API 配置（可稍后在仪表盘「设置」页面配置）");
         }
     }
 
@@ -443,7 +443,7 @@ async fn main() {
         manager: Arc::new(Mutex::new(manager)),
         memory_store: memory_store.clone(),
         src_dir: src_dir.clone(),
-        llm_api: llm_api.clone(),
+        llm_api: Arc::new(tokio::sync::RwLock::new(llm_api.clone())),
     });
 
     // ╔═══════════════════════════════════════════════════════════════╗
@@ -549,7 +549,7 @@ async fn main() {
             if llm_api_configured {
                 log("║  ✅ 第2位 LLM API Key — 已配置（自然语言查询翻译）         ║");
             } else {
-                log("║  ⊘  第2位 LLM API Key — 未配置（可随时重新运行以配置）     ║");
+                log("║  ⊘  第2位 LLM API Key — 未配置（仪表盘「设置」页面可配置）  ║");
             }
             log("║                                                               ║");
             log("╠═══════════════════════════════════════════════════════════════╣");
@@ -608,11 +608,11 @@ async fn main() {
         };
 
         log(&format!(
-            "   启动后访问 http://localhost:{actual_port}/dashboard 查看可视化仪表盘"
+            "   浏览器即将自动打开仪表盘: http://localhost:{actual_port}/dashboard"
         ));
 
-        // 仪表盘模式：自动打开默认浏览器
-        if dashboard_mode {
+        // HTTP 模式（非 stdio）：自动打开默认浏览器
+        if !stdio_mode {
             let dashboard_url = format!("http://localhost:{actual_port}/dashboard");
             // 延迟 500ms 确保 HTTP 服务已就绪再打开浏览器
             let open_url = dashboard_url.clone();
