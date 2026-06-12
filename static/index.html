@@ -1187,6 +1187,83 @@
     margin: 12px 0 0;
     line-height: 1.6;
 }
+
+/* ==================== 设置页面表单样式 ==================== */
+.form-group {
+  margin-bottom: 16px;
+}
+.form-group label {
+  display: block;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+.form-input, .form-select {
+  width: 100%;
+  max-width: 480px;
+  padding: 10px 14px;
+  border: 1.5px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-family: inherit;
+  background: var(--card-bg);
+  color: var(--text);
+  transition: border-color var(--transition);
+}
+.form-input:focus, .form-select:focus {
+  outline: none;
+  border-color: var(--cinnabar);
+  box-shadow: 0 0 0 3px rgba(192, 57, 43, 0.1);
+}
+.form-hint {
+  display: block;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+.form-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 20px;
+}
+.form-result {
+  margin-top: 16px;
+  padding: 12px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+}
+.form-result.success {
+  background: #e8f5e9;
+  color: #2e7d32;
+  border: 1px solid #c8e6c9;
+}
+.form-result.error {
+  background: #fce4ec;
+  color: #c62828;
+  border: 1px solid #ffcdd2;
+}
+.feature-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.feature-header h3 {
+  margin-bottom: 0;
+}
+.feature-desc {
+  color: var(--text-dim);
+  font-size: 14px;
+  margin-bottom: 20px;
+  line-height: 1.7;
+}
+.section-desc {
+  color: var(--text-dim);
+  font-size: 14px;
+  margin-top: -8px;
+  margin-bottom: 8px;
+}
   </style>
 </head>
 <body>
@@ -1204,6 +1281,7 @@
     <li><button data-tab="trust-center">信任中心</button></li>
     <li><button data-tab="api-docs">API 文档</button></li>
     <li><button data-tab="benchmarks">📊 基准报告</button></li>
+    <li><button data-tab="settings">⚙️ 设置</button></li>
   </ul>
 </nav>
 
@@ -1793,6 +1871,89 @@
         <canvas id="radarChart" width="400" height="400"></canvas>
       </div>
       <p class="chart-note">上图展示了 LRC 在八个核心维度的能力评分。与传统记忆库相比，LRC 在隐私保护、审计安全、记忆演化等维度具有独特优势。</p>
+    </div>
+  </section>
+
+  <!-- ==================== 设置页面 ==================== -->
+  <section class="tab-content" id="tab-settings">
+    <div class="section">
+      <h2>⚙️ 系统设置</h2>
+      <p class="section-desc">配置 Loong Recall 的各项参数，提升搜索理解力。</p>
+    </div>
+
+    <!-- LLM API Key 配置 -->
+    <div class="section">
+      <div class="feature-card">
+        <div class="feature-header">
+          <h3>🤖 LLM 查询翻译</h3>
+          <span id="llm-status-badge" class="badge badge-info">未配置</span>
+        </div>
+        <p class="feature-desc">
+          配置 LLM API 后，可以用自然语言搜索代码（如"帮我查上次登录相关的逻辑"）。
+          支持所有 OpenAI 兼容 API（OpenAI、DeepSeek、通义千问等）和 Ollama 本地模型。
+        </p>
+
+        <div class="form-group">
+          <label for="llm-provider">模型提供商</label>
+          <select id="llm-provider" class="form-select">
+            <option value="openai">OpenAI 兼容 API（推荐）</option>
+            <option value="ollama">Ollama 本地模型</option>
+          </select>
+        </div>
+
+        <div id="openai-fields">
+          <div class="form-group">
+            <label for="llm-api-key">API Key</label>
+            <input type="password" id="llm-api-key" class="form-input"
+              placeholder="sk-..." autocomplete="off">
+            <span class="form-hint">你的 API Key 仅存储在本地，绝不上传。</span>
+          </div>
+          <div class="form-group">
+            <label for="llm-model">模型名称</label>
+            <input type="text" id="llm-model" class="form-input"
+              placeholder="gpt-4o-mini" value="gpt-4o-mini">
+            <span class="form-hint">常用: gpt-4o-mini, gpt-4o, deepseek-chat, qwen-plus</span>
+          </div>
+          <div class="form-group" id="endpoint-group" style="display:none">
+            <label for="llm-endpoint">自定义端点（可选）</label>
+            <input type="text" id="llm-endpoint" class="form-input"
+              placeholder="https://api.openai.com/v1">
+            <span class="form-hint">留空使用默认端点。如使用代理或自定义服务，在此填写。</span>
+          </div>
+        </div>
+
+        <div id="ollama-fields" style="display:none">
+          <div class="form-group">
+            <label for="llm-ollama-host">Ollama 服务地址</label>
+            <input type="text" id="llm-ollama-host" class="form-input"
+              placeholder="localhost" value="localhost">
+            <span class="form-hint">Ollama 默认运行在 localhost:11434</span>
+          </div>
+          <div class="form-group">
+            <label for="llm-ollama-model">模型名称</label>
+            <input type="text" id="llm-ollama-model" class="form-input"
+              placeholder="llama3" value="llama3">
+            <span class="form-hint">常用: llama3, qwen2.5, deepseek-r1, mistral</span>
+          </div>
+        </div>
+
+        <div id="llm-config-actions" class="form-actions">
+          <button id="btn-save-llm" class="btn btn-primary" onclick="saveLlmConfig()">💾 保存配置</button>
+          <button id="btn-clear-llm" class="btn btn-secondary" onclick="clearLlmConfig()">🗑️ 清除配置</button>
+        </div>
+
+        <div id="llm-config-result" class="form-result" style="display:none"></div>
+      </div>
+    </div>
+
+    <!-- 当前配置状态 -->
+    <div class="section" id="current-config-section" style="display:none">
+      <div class="feature-card">
+        <h3>📋 当前配置</h3>
+        <div id="current-config-content">
+          <p>加载中...</p>
+        </div>
+      </div>
     </div>
   </section>
 

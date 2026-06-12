@@ -112,6 +112,8 @@ document.querySelectorAll('.navbar-nav button').forEach(btn => {
     if (tabName === 'trust-center') loadTrustCenter();
     // 切换到基准报告时加载数据
     if (tabName === 'benchmarks') loadBenchmarks();
+    // 切换到设置时加载配置
+    if (tabName === 'settings') loadSettings();
   });
 });
 
@@ -978,5 +980,170 @@ function drawRadarChart(data) {
     const x = cx + labelR * Math.cos(angle);
     const y = cy + labelR * Math.sin(angle) + 4;
     ctx.fillText(keys[i], x, y);
+  }
+}
+
+// ============================================================
+// 设置页面 — LLM API Key 可视化配置
+// ============================================================
+
+/** 加载当前配置状态 */
+async function loadSettings() {
+  // 绑定提供商切换事件
+  const providerSelect = $('llm-provider');
+  if (providerSelect && !providerSelect._bound) {
+    providerSelect._bound = true;
+    providerSelect.addEventListener('change', switchLlmProvider);
+  }
+
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/api/config');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const data = await resp.json();
+
+    updateLlmStatusBadge(data.llm_configured, data.llm_type);
+    showConfigSection(data.llm_configured, data.llm_type, data.llm_model);
+  } catch (e) {
+    console.warn('[设置] 加载配置失败:', e.message);
+    updateLlmStatusBadge(false, 'none');
+  }
+}
+
+/** 更新 LLM 状态徽章 */
+function updateLlmStatusBadge(configured, type) {
+  const badge = $('llm-status-badge');
+  if (!badge) return;
+  if (configured) {
+    badge.textContent = '已配置 · ' + type.toUpperCase();
+    badge.className = 'badge badge-success';
+  } else {
+    badge.textContent = '未配置';
+    badge.className = 'badge badge-info';
+  }
+}
+
+/** 显示当前配置详情 */
+function showConfigSection(configured, type, model) {
+  const section = $('current-config-section');
+  const content = $('current-config-content');
+  if (!section || !content) return;
+
+  if (configured) {
+    section.style.display = '';
+    content.innerHTML =
+      '<p><strong>提供商:</strong> ' + htmlescape(type) + '</p>' +
+      '<p><strong>模型:</strong> ' + htmlescape(model || '--') + '</p>' +
+      '<p style="color: var(--jade); font-size: 13px; margin-top: 8px;">✅ LLM 查询翻译已启用，搜索时会自动将自然语言翻译为精准关键词。</p>';
+  } else {
+    section.style.display = 'none';
+  }
+}
+
+/** 切换 LLM 提供商时显示/隐藏对应字段 */
+function switchLlmProvider() {
+  const provider = $('llm-provider').value;
+  const openaiFields = $('openai-fields');
+  const ollamaFields = $('ollama-fields');
+  if (provider === 'openai') {
+    openaiFields.style.display = '';
+    ollamaFields.style.display = 'none';
+  } else {
+    openaiFields.style.display = 'none';
+    ollamaFields.style.display = '';
+  }
+}
+
+/** 保存 LLM API Key 配置 */
+async function saveLlmConfig() {
+  const resultEl = $('llm-config-result');
+  const btnSave = $('btn-save-llm');
+
+  if (!resultEl) return;
+  resultEl.style.display = '';
+  resultEl.className = 'form-result';
+  resultEl.textContent = '⏳ 正在保存...';
+  if (btnSave) btnSave.disabled = true;
+
+  try {
+    const provider = $('llm-provider').value;
+    let llmConfigStr = '';
+
+    if (provider === 'openai') {
+      const apiKey = $('llm-api-key').value.trim();
+      const model = $('llm-model').value.trim() || 'gpt-4o-mini';
+      const endpoint = $('llm-endpoint').value.trim();
+
+      if (!apiKey) {
+        throw new Error('请输入 API Key');
+      }
+      if (endpoint) {
+        llmConfigStr = 'openai:' + apiKey + ':' + model + ':' + endpoint;
+      } else {
+        llmConfigStr = 'openai:' + apiKey + ':' + model;
+      }
+    } else if (provider === 'ollama') {
+      const host = $('llm-ollama-host').value.trim() || 'localhost';
+      const model = $('llm-ollama-model').value.trim() || 'llama3';
+      llmConfigStr = 'ollama:' + host + ':' + model;
+    }
+
+    const resp = await fetchWithTimeout(API_BASE + '/api/config/llm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ llm_api: llmConfigStr })
+    });
+
+    const data = await resp.json();
+    if (data.success) {
+      resultEl.className = 'form-result success';
+      resultEl.textContent = '✅ ' + data.message + '。下次搜索时将自动使用 LLM 翻译查询。';
+      updateLlmStatusBadge(true, data.llm_type || provider);
+      showConfigSection(true, data.llm_type || provider, data.llm_model);
+    } else {
+      throw new Error(data.message || '保存失败');
+    }
+  } catch (e) {
+    resultEl.className = 'form-result error';
+    resultEl.textContent = '❌ ' + e.message;
+  } finally {
+    if (btnSave) btnSave.disabled = false;
+  }
+}
+
+/** 清除 LLM API Key 配置 */
+async function clearLlmConfig() {
+  const resultEl = $('llm-config-result');
+  if (!resultEl) return;
+
+  if (!confirm('确定要清除 LLM API Key 配置吗？清除后将回退到 Tier 1 Fast Match 模式。')) {
+    return;
+  }
+
+  resultEl.style.display = '';
+  resultEl.className = 'form-result';
+  resultEl.textContent = '⏳ 正在清除...';
+
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/api/config/llm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ llm_api: '' })
+    });
+
+    const data = await resp.json();
+    if (data.success) {
+      resultEl.className = 'form-result success';
+      resultEl.textContent = '✅ LLM API Key 配置已清除。';
+      updateLlmStatusBadge(false, 'none');
+      showConfigSection(false, '', '');
+      // 清空表单
+      const apiKeyInput = $('llm-api-key');
+      if (apiKeyInput) apiKeyInput.value = '';
+    } else {
+      throw new Error(data.message || '清除失败');
+    }
+  } catch (e) {
+    resultEl.className = 'form-result error';
+    resultEl.textContent = '❌ ' + e.message;
   }
 }
