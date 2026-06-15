@@ -2,7 +2,7 @@
 // ============================================================
 // 全局配置
 // ============================================================
-const DEFAULT_API_BASE = 'http://localhost:3099';
+const DEFAULT_API_BASE = window.location.origin || 'http://localhost:3099';
 const API_BASE = new URLSearchParams(window.location.search).get('api') || DEFAULT_API_BASE;
 const REFRESH_INTERVAL = 30000; // 30 秒自动刷新
 let refreshTimer = null;
@@ -113,7 +113,7 @@ document.querySelectorAll('.navbar-nav button').forEach(btn => {
     // 切换到基准报告时加载数据
     if (tabName === 'benchmarks') loadBenchmarks();
     // 切换到设置时加载配置
-    if (tabName === 'settings') loadSettings();
+    if (tabName === 'settings') { loadSettings(); loadProjectInfo(); }
   });
 });
 
@@ -804,9 +804,30 @@ function startAutoRefresh() {
 }
 
 // ============================================================
+// 桌面端嵌入检测
+// ============================================================
+// 当仪表盘被嵌入 Tauri 桌面端时，URL 会带 ?embedded=tauri 参数
+// 此时隐藏 LLM 设置区域（LLM 由桌面端向导统一管理，避免两处配置冲突）
+const IS_DESKTOP_EMBEDDED = new URLSearchParams(window.location.search).get('embedded') === 'tauri';
+
+// ============================================================
 // 初始化
 // ============================================================
 function init() {
+  // ── 桌面端嵌入模式：隐藏 LLM 配置区域，避免与桌面端向导冲突 ──
+  if (IS_DESKTOP_EMBEDDED) {
+    const llmSection = $('llm-setup-section');
+    const configSection = $('current-config-section');
+    if (llmSection) llmSection.style.display = 'none';
+    if (configSection) configSection.style.display = 'none';
+
+    // 更新设置页描述，告知用户 LLM 由桌面端统一管理
+    const settingsDesc = document.querySelector('#tab-settings .section-desc');
+    if (settingsDesc) {
+      settingsDesc.textContent = 'LLM 配置由桌面端统一管理。此处可查看项目信息、备份与恢复记忆数据。';
+    }
+  }
+
   // 初始加载仪表盘
   loadDashboard();
 
@@ -822,6 +843,203 @@ function init() {
 
 // 页面加载完成后初始化
 document.addEventListener('DOMContentLoaded', init);
+
+// ============================================================
+// V2: 项目信息加载
+// ============================================================
+async function loadProjectInfo() {
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/api/project/info');
+    if (!resp.ok) return;
+    const data = await resp.json();
+
+    const el = $('project-fingerprint');
+    if (el) el.textContent = data.fingerprint || '--';
+
+    const el2 = $('project-canonical-path');
+    if (el2) el2.textContent = data.canonical_path || data.src_dir || '--';
+  } catch (e) {
+    console.warn('[项目信息] 加载失败:', e.message);
+  }
+}
+
+// ============================================================
+// V2: 记忆数据导出（浏览器端触发下载）
+// ============================================================
+async function backupMemories() {
+  const btn = $('btn-backup-memories');
+  const result = $('backup-result');
+  if (btn) btn.disabled = true;
+  if (result) {
+    result.style.display = '';
+    result.textContent = '⏳ 正在准备备份文件...';
+    result.className = 'form-result';
+  }
+
+  try {
+    // 从 API 获取记忆数据
+    const [memoriesRes, chunksRes, archiveRes, projectRes] = await Promise.allSettled([
+      fetchWithTimeout(API_BASE + '/v1/memories/list', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ limit: 10000 })
+      }),
+      fetchWithTimeout(API_BASE + '/v1/code/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: '', limit: 10000 })
+      }),
+      fetchWithTimeout(API_BASE + '/v1/memories/archive', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({})
+      }),
+      fetchWithTimeout(API_BASE + '/api/project/info'),
+    ]);
+
+    // 构建导出数据
+    const exportData = {
+      version: '2.0',
+      exported_at: new Date().toISOString(),
+      fingerprint: null,
+      canonical_path: null,
+      source: 'project',
+      memories: [],
+      chunks: [],
+      archive: [],
+    };
+
+    // 获取项目信息
+    if (projectRes.status === 'fulfilled' && projectRes.value.ok) {
+      const projectData = await projectRes.value.json();
+      exportData.fingerprint = projectData.fingerprint || null;
+      exportData.canonical_path = projectData.canonical_path || null;
+    }
+
+    // 获取记忆数据
+    if (memoriesRes.status === 'fulfilled' && memoriesRes.value.ok) {
+      const memoriesData = await memoriesRes.value.json();
+      exportData.memories = memoriesData.memories || memoriesData.data || [];
+    }
+
+    // 获取代码片段
+    if (chunksRes.status === 'fulfilled' && chunksRes.value.ok) {
+      const chunksData = await chunksRes.value.json();
+      exportData.chunks = chunksData.chunks || chunksData.data || [];
+    }
+
+    // 创建下载
+    const blob = new Blob([JSON.stringify(exportData, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const fp = exportData.fingerprint || 'global';
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    a.href = url;
+    a.download = 'lrc-export-' + fp + '-' + ts + '.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    if (result) {
+      result.textContent = '✅ 备份已下载！文件包含 ' +
+        (Array.isArray(exportData.memories) ? exportData.memories.length : 0) + ' 条记忆';
+      result.className = 'form-result form-result-success';
+    }
+  } catch (e) {
+    if (result) {
+      result.textContent = '⚠️ 备份失败: ' + htmlescape(e.message);
+      result.className = 'form-result form-result-error';
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// ============================================================
+// V2: 记忆数据导入（浏览器端上传备份文件）
+// ============================================================
+async function importMemories(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+
+  const result = $('backup-result');
+  if (result) {
+    result.style.display = '';
+    result.textContent = '⏳ 正在验证并导入记忆数据...';
+    result.className = 'form-result';
+  }
+
+  try {
+    // 读取文件内容
+    const content = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result);
+      reader.onerror = (e) => reject(new Error('文件读取失败'));
+      reader.readAsText(file);
+    });
+
+    // 解析 JSON 验证格式
+    let exportData;
+    try {
+      exportData = JSON.parse(content);
+    } catch (e) {
+      throw new Error('无效的 JSON 文件格式: ' + e.message);
+    }
+
+    // 验证导出格式版本
+    if (!exportData.version || exportData.version !== '2.0') {
+      throw new Error('不支持的导出格式版本: ' + (exportData.version || '未知'));
+    }
+
+    const memoryCount = Array.isArray(exportData.memories) ? exportData.memories.length : 0;
+    const chunkCount = Array.isArray(exportData.chunks) ? exportData.chunks.length : 0;
+
+    if (!confirm(
+      '确认导入以下数据？\n\n' +
+      '  记忆：' + memoryCount + ' 条\n' +
+      '  代码片段：' + chunkCount + ' 个\n' +
+      '  来源：' + (exportData.source || '未知') + '\n' +
+      '  指纹：' + (exportData.fingerprint || '无') + '\n\n' +
+      '导入将追加到现有数据，不会覆盖已有记忆。确认继续？'
+    )) {
+      if (result) {
+        result.textContent = '已取消导入';
+        result.className = 'form-result';
+      }
+      return;
+    }
+
+    // 调用后端 API 写入数据
+    if (memoryCount > 0) {
+      for (const mem of exportData.memories) {
+        await fetchWithTimeout(API_BASE + '/v1/memories/remember', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            content: mem.content || JSON.stringify(mem),
+            memory_type: mem.memory_type || 'general',
+            importance: mem.importance || 5,
+            metadata: mem
+          }),
+        });
+      }
+    }
+
+    if (result) {
+      result.textContent = '✅ 导入完成！共导入 ' + memoryCount + ' 条记忆';
+      result.className = 'form-result form-result-success';
+    }
+  } catch (e) {
+    if (result) {
+      result.textContent = '⚠️ 导入失败: ' + htmlescape(e.message);
+      result.className = 'form-result form-result-error';
+    }
+  } finally {
+    // 清除文件选择以便重复选择同一文件
+    event.target.value = '';
+  }
+}
 
 // ============================================================
 // 基准报告加载
@@ -989,6 +1207,9 @@ function drawRadarChart(data) {
 
 /** 加载当前配置状态 */
 async function loadSettings() {
+  // 桌面端嵌入模式下跳过 LLM 配置加载（由桌面端向导统一管理）
+  if (IS_DESKTOP_EMBEDDED) return;
+
   // 绑定提供商切换事件
   const providerSelect = $('llm-provider');
   if (providerSelect && !providerSelect._bound) {
@@ -1024,6 +1245,9 @@ function updateLlmStatusBadge(configured, type) {
 
 /** 显示当前配置详情 */
 function showConfigSection(configured, type, model) {
+  // 桌面端嵌入模式下不显示配置详情（由桌面端向导统一管理）
+  if (IS_DESKTOP_EMBEDDED) return;
+
   const section = $('current-config-section');
   const content = $('current-config-content');
   if (!section || !content) return;

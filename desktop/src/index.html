@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LRC Desktop — AI 代码记忆</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- 配置向导 -->
+    <div id="config-wizard" class="wizard">
+        <div class="wizard-container">
+            <h1>LRC Desktop</h1>
+            <p class="wizard-subtitle">本地优先的 AI 代码记忆 — 自动检测你的 AI 工具</p>
+
+            <!-- 步骤指示器 -->
+            <div class="wizard-steps" id="wizard-steps">
+                <div class="step active" data-step="1">
+                    <span class="step-num">1</span>
+                    <span class="step-label">检测 Agent</span>
+                </div>
+                <div class="step-connector"></div>
+                <div class="step" data-step="2">
+                    <span class="step-num">2</span>
+                    <span class="step-label">选择项目</span>
+                </div>
+                <div class="step-connector"></div>
+                <div class="step" data-step="3">
+                    <span class="step-num">✓</span>
+                    <span class="step-label">完成</span>
+                </div>
+            </div>
+
+            <!-- 步骤 1：自动检测 Agent -->
+            <div class="wizard-panel active" id="panel-step-1">
+                <h2>正在扫描你的 AI 工具...</h2>
+                <p>LRC 将自动检测你电脑上安装的 AI 工具，
+                   <strong>IDE 类型</strong>的会列出已配置的项目供你选择，
+                   <strong>独立应用</strong>的直接配置连接。</p>
+                <div id="agent-list" class="agent-list">
+                    <div class="loading">正在扫描 AI 工具...</div>
+                </div>
+                <div class="wizard-actions">
+                    <button id="btn-step-1-next" class="btn btn-primary" disabled>下一步 →</button>
+                </div>
+            </div>
+
+            <!-- 步骤 2：IDE 项目选择 + 单应用直接配置 -->
+            <div class="wizard-panel" id="panel-step-2">
+                <h2>选择要索引的项目</h2>
+                <p>以下是你 IDE 中已配置的项目，勾选需要 LRC 索引的目录。
+                   <strong>独立应用</strong>将直接写入 MCP 配置。</p>
+                <div id="project-list" class="project-list">
+                    <div class="loading">正在扫描项目...</div>
+                </div>
+
+                <!-- 多窗口 LRC 记录开关 -->
+                <div class="multi-window-toggle" id="multi-window-section">
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="multi-window-enabled">
+                        <span class="toggle-slider"></span>
+                        <span class="toggle-label">
+                            <strong>开启多窗口 LRC 记录</strong>
+                            <span class="toggle-desc">同一项目最多 3 个窗口同时记录记忆</span>
+                        </span>
+                    </label>
+                    <div class="multi-window-info" id="multi-window-info" style="display:none">
+                        <span class="info-badge">已启用</span>
+                        <span class="form-hint">每个编辑器窗口将独立启动一个 LRC 实例，上限 3 个。关闭窗口时自动释放。</span>
+                    </div>
+                </div>
+
+                <!-- LLM 配置（傻瓜化一键配置） -->
+                <details class="llm-details" open>
+                    <summary>可选：配置 LLM 查询翻译（只需填 Key + 点测试）</summary>
+                    <div class="form-row">
+                        <div class="form-group form-group-sm">
+                            <label for="llm-provider">模型提供商</label>
+                            <select id="llm-provider" class="form-select">
+                                <!-- 国产优先，只需选供应商 + 填 Key -->
+                                <option value="deepseek">DeepSeek — 国产性价比之王</option>
+                                <option value="qwen">通义千问 — 阿里云出品</option>
+                                <option value="zhipu">智谱 GLM — 清华系</option>
+                                <option value="minimax">MiniMax — 海螺AI同款</option>
+                                <option value="moonshot">Moonshot (Kimi) — 超长上下文</option>
+                                <option value="bytedance">豆包 — 字节跳动出品</option>
+                                <option value="stepfun">阶跃星辰 — 多模态强</option>
+                                <option value="baichuan">百川智能 — 金融医疗</option>
+                                <option value="openai">OpenAI — GPT-4o</option>
+                                <option value="ollama">Ollama 本地模型（免费）</option>
+                                <option value="custom">自定义 API 地址...</option>
+                            </select>
+                        </div>
+                        <div class="form-group form-group-sm" id="ollama-fields" style="display:none">
+                            <label for="ollama-url">Ollama 地址</label>
+                            <input type="text" id="ollama-url" class="form-input"
+                                value="http://localhost:11434" placeholder="http://localhost:11434">
+                        </div>
+                    </div>
+                    <div id="llm-api-section">
+                        <div class="form-row">
+                            <div class="form-group form-group-grow">
+                                <label for="llm-api-key">API Key</label>
+                                <input type="password" id="llm-api-key" class="form-input"
+                                    placeholder="粘贴你的 API Key，我们帮你自动配置" autocomplete="off">
+                                <span class="form-hint" id="llm-key-hint">格式：sk-...</span>
+                                <a href="https://platform.deepseek.com/api_keys" target="_blank"
+                                   class="key-link" id="llm-key-link">获取 DeepSeek API Key →</a>
+                            </div>
+                            <div class="form-group form-group-btn">
+                                <label>&nbsp;</label>
+                                <button id="btn-test-llm" class="btn btn-outline">测试连接</button>
+                            </div>
+                        </div>
+                        <div id="llm-test-result" class="llm-test-result" style="display:none"></div>
+                        <!-- 模型名称：用户必须明确配置，不同模型 token 成本差异大 -->
+                        <div class="form-row">
+                            <div class="form-group form-group-grow">
+                                <label for="llm-model">模型名称 <span style="color:#f0a040;font-weight:normal;font-size:12px">（必填，影响 token 消耗）</span></label>
+                                <input type="text" id="llm-model" class="form-input"
+                                    placeholder="选择提供商后显示推荐模型，请手动确认"
+                                    autocomplete="off">
+                                <span class="form-hint" id="llm-model-hint">
+                                    不同模型 token 价格差异大，请确认后填写。测试连接成功后会自动检测可用模型
+                                </span>
+                            </div>
+                        </div>
+                        <!-- 高级选项：API 地址等默认自动填写，一般无需修改 -->
+                        <details class="advanced-details" id="llm-advanced-toggle">
+                            <summary>高级选项：API 地址（已自动填写，一般无需修改）</summary>
+                            <div class="form-row form-row-advanced">
+                                <div class="form-group form-group-sm">
+                                    <label for="llm-base-url">API 地址</label>
+                                    <input type="text" id="llm-base-url" class="form-input"
+                                        value="https://api.deepseek.com/v1"
+                                        placeholder="自动填写">
+                                </div>
+                            </div>
+                        </details>
+                        <div class="form-group" id="ollama-model-field" style="display:none">
+                            <label for="ollama-model">模型名称</label>
+                            <input type="text" id="ollama-model" class="form-input"
+                                value="llama3" placeholder="llama3">
+                        </div>
+                    </div>
+                </details>
+                <div class="wizard-actions">
+                    <button id="btn-step-2-prev" class="btn btn-secondary">← 上一步</button>
+                    <button id="btn-step-2-finish" class="btn btn-primary">完成配置</button>
+                </div>
+            </div>
+
+            <!-- 完成页面 -->
+            <div class="wizard-panel" id="panel-step-done">
+                <h2>配置完成</h2>
+                <p>LRC 正在后台运行，托盘图标已就绪。</p>
+                <div id="config-summary"></div>
+                <div class="wizard-actions" style="flex-direction: column; gap: 8px;">
+                    <button id="btn-open-dashboard" class="btn btn-primary">打开仪表盘</button>
+                    <button id="btn-restart-service" class="btn btn-outline" style="font-size:13px;">
+                        🔄 重新启动后台服务
+                    </button>
+                    <span class="form-hint" style="text-align:center;">
+                        如果仪表盘打不开，点这里重启服务即可
+                    </span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 左下角状态栏：实时显示 sidecar 服务状态 -->
+    <div id="status-bar" class="status-bar">
+        <div class="status-item" id="status-sidecar" title="后台服务状态">
+            <span class="status-dot offline"></span>
+            <span class="status-text">服务未启动</span>
+        </div>
+        <div class="status-item" id="status-llm" title="LLM 配置状态">
+            <span class="status-dot offline"></span>
+            <span class="status-text">LLM 未配置</span>
+        </div>
+        <div class="status-item" id="status-agents" title="已连接 Agent">
+            <span class="status-dot offline"></span>
+            <span class="status-text">无 Agent</span>
+        </div>
+    </div>
+
+    <!-- 加载顺序：wizard.js 先定义全局，module script 后启动 -->
+    <script src="wizard.js"></script>
+    <script type="module">
+        // 尝试导入 Tauri v2 API（仅在 dev 环境可用，Release 回退到 __TAURI_INTERNALS__）
+        try {
+            const { invoke } = await import('@tauri-apps/api/core');
+            const { open } = await import('@tauri-apps/plugin-shell');
+            window.__TAURI_INVOKE__ = invoke;
+            window.__TAURI_SHELL_OPEN__ = open;
+        } catch (e) {
+            // Release 环境：wizard.js 内置 __TAURI_INTERNALS__ 回退
+            console.log('[LRC] 使用内置 Tauri IPC（Release 模式）');
+        }
+    </script>
+</body>
+</html>

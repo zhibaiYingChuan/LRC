@@ -47,9 +47,7 @@ pub fn start_tray(dashboard_url: String) -> Result<TrayHandle, String> {
         eprintln!("[托盘] Ctrl+C 退出服务");
     }
 
-    Ok(TrayHandle {
-        dashboard_url,
-    })
+    Ok(TrayHandle { dashboard_url })
 }
 
 /// 系统托盘句柄（仪表盘 URL 包装）
@@ -70,16 +68,15 @@ mod win_tray {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::{
-        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-        NOTIFYICONDATAW,
+        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-        DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW,
-        SetForegroundWindow, TrackPopupMenu, TranslateMessage, CW_USEDEFAULT, HMENU, IDI_APPLICATION,
-        MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_COMMAND, WM_CREATE,
-        WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_USER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-        GWLP_USERDATA, SetWindowLongPtrW, GetWindowLongPtrW,
+        DispatchMessageW, GetCursorPos, GetMessageW, GetWindowLongPtrW, LoadIconW, PostQuitMessage,
+        RegisterClassW, SetForegroundWindow, SetWindowLongPtrW, TrackPopupMenu, TranslateMessage,
+        CW_USEDEFAULT, GWLP_USERDATA, HMENU, IDI_APPLICATION, MF_STRING, MSG, TPM_BOTTOMALIGN,
+        TPM_LEFTALIGN, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_USER,
+        WNDCLASSW, WS_OVERLAPPEDWINDOW,
     };
 
     const WM_TRAYICON: u32 = WM_USER + 1;
@@ -131,7 +128,7 @@ mod win_tray {
             )
         };
 
-        if hwnd != std::ptr::null_mut() {
+        if !hwnd.is_null() {
             // 保存 dashboard_url 到窗口数据
             let url_ptr = Box::into_raw(Box::new(dashboard_url.to_string()));
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, url_ptr as isize) };
@@ -206,7 +203,7 @@ mod win_tray {
             SetForegroundWindow(hwnd);
 
             let menu = CreatePopupMenu();
-            if menu == std::ptr::null_mut() {
+            if menu.is_null() {
                 return;
             }
 

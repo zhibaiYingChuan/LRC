@@ -1881,8 +1881,8 @@
       <p class="section-desc">配置 Loong Recall 的各项参数，提升搜索理解力。</p>
     </div>
 
-    <!-- LLM API Key 配置 -->
-    <div class="section">
+    <!-- LLM API Key 配置（桌面端嵌入时隐藏，由桌面端向导统一管理） -->
+    <div class="section" id="llm-setup-section">
       <div class="feature-card">
         <div class="feature-header">
           <h3>🤖 LLM 查询翻译</h3>
@@ -1946,13 +1946,52 @@
       </div>
     </div>
 
-    <!-- 当前配置状态 -->
+    <!-- 当前配置状态（桌面端嵌入时隐藏） -->
     <div class="section" id="current-config-section" style="display:none">
       <div class="feature-card">
         <h3>📋 当前配置</h3>
         <div id="current-config-content">
           <p>加载中...</p>
         </div>
+      </div>
+    </div>
+
+    <!-- V2: 项目信息（跨IDE项目识别） -->
+    <div class="section" id="project-info-section">
+      <div class="feature-card">
+        <h3>📊 项目信息</h3>
+        <p class="feature-desc">
+          项目指纹用于跨 IDE 识别同一项目，确保记忆数据在多 IDE 间共享。
+        </p>
+        <div class="form-group">
+          <label>项目指纹</label>
+          <div id="project-fingerprint" style="font-family: monospace; font-size: 16px; color: var(--gold); padding: 8px 0;">--</div>
+          <span class="form-hint">基于项目路径的 SHA256 哈希前 16 位，用于跨 IDE 识别同一项目</span>
+        </div>
+        <div class="form-group">
+          <label>规范化路径</label>
+          <div id="project-canonical-path" style="font-size: 13px; color: var(--text-dim); padding: 4px 0; word-break: break-all;">--</div>
+          <span class="form-hint">跨平台一致的项目绝对路径</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- V2: 记忆备份与恢复 -->
+    <div class="section" id="backup-section">
+      <div class="feature-card">
+        <h3>💾 记忆备份与恢复</h3>
+        <p class="feature-desc">
+          导出记忆数据到 JSON 文件进行备份，或从备份文件导入恢复。所有操作仅在本地执行，数据不会上传。
+        </p>
+        <div class="form-actions">
+          <button id="btn-backup-memories" class="btn btn-primary" onclick="backupMemories()">📤 导出记忆</button>
+          <input type="file" id="import-file" style="display:none" accept=".json" onchange="importMemories(event)">
+          <button id="btn-import-memories" class="btn btn-outline" onclick="document.getElementById('import-file').click()">📥 导入记忆</button>
+        </div>
+        <div id="backup-result" class="form-result" style="display:none"></div>
+        <p class="form-hint mt-4" style="font-size: 12px;">
+          提示：也可以通过命令行操作：<code>code-memory-server --export backup.json</code> 和 <code>code-memory-server --import backup.json</code>
+        </p>
       </div>
     </div>
   </section>
