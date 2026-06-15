@@ -9,6 +9,8 @@
 *.dll
 *.exe
 *.wasm
+*.pdb
+*.ilk
 
 # IDE
 .idea/
@@ -34,9 +36,11 @@ Thumbs.db
 *.tmp
 *.log
 
-# 本地开发文档（不入库）
+# 内部开发文档（不交付用户）
 docs/evaluation-report-2026-05-31.md
 docs/evaluation-report-*.md
+docs/PRD_LRC_DESKTOP.md
+docs/PRD_LRC_DESKTOP_V2.md
 
 # 运行时数据目录
 .loong-recall/
@@ -54,6 +58,7 @@ tests/quick_test.ps1
 tests/test5_only.ps1
 tests/e2e_v*.ps1
 tests/*_only.ps1
+tests/new_user_flow.ps1
 
 # 内部开发工具（不交付用户）
 scripts/check_algorithm_leak.py
@@ -75,6 +80,17 @@ docs/dao-pivot-mapping.md
 
 # 内部分析文档（不交付用户）
 docs/product-analysis/
+
+# 本地测试脚本（不交付用户）
+test_server.ps1
+
+# 图标生成工具（开发者本地使用，不交付用户）
+scripts/generate_icon.py
+scripts/generate_icons.py
+
+# 桌面端构建产物（Tauri）
+desktop/src-tauri/target/
+desktop/node_modules/
 
 # 模型文件目录（用户自行下载）
 models/
@@ -99,3 +115,11 @@ flamegraph.svg
 *.key
 *.crt
 *.mobileprovision
+
+# 桌面端测试脚本与产物（开发者本地使用，不交付用户）
+desktop/test_webdriver.py
+desktop/test_desktop_webdriver.py
+desktop/tests/e2e_user_simulation.ps1
+desktop/tests/e2e_results.json
+desktop/tests/screenshots/
+desktop/src/test_ui.html

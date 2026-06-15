@@ -10,6 +10,7 @@
 //   2. 自动保存到用户配置目录 (%APPDATA%\LoongRecall\config.json)
 //   3. 自动加载已有配置，支持增量修改
 //   4. 支持全局配置vs项目级配置分离
+//   5. P2-06 修复：API Key 使用 AES-256-GCM 加密存储（安全第一）
 
 use crate::engine::llm_translator::LlmApiConfig;
 use serde::{Deserialize, Serialize};
@@ -25,8 +26,12 @@ pub struct LrcConfig {
     pub default_port: u16,
     /// 默认绑定主机
     pub default_host: String,
-    /// LLM API 配置（如果启用）
+    /// LLM API 配置（如果启用）— 内存中存储明文，持久化时加密
     pub llm_api: Option<String>,
+    /// API Key 加密存储（Base64 编码的 AES-256-GCM 密文）
+    /// 保存时自动加密 llm_api，加载时自动解密恢复
+    #[serde(default)]
+    pub encrypted_api_key: Option<String>,
     /// 解析后的LLM API配置（内存中，不持久化）
     #[serde(skip_serializing, skip_deserializing)]
     pub parsed_llm_api: Option<LlmApiConfig>,
@@ -48,6 +53,7 @@ impl Default for LrcConfig {
             default_port: 3099,
             default_host: "127.0.0.1".to_string(),
             llm_api: None,
+            encrypted_api_key: None,
             parsed_llm_api: None,
             max_multi_window: 1,
             auto_start_on_boot: false,
@@ -68,6 +74,7 @@ impl LrcConfig {
     ///
     /// 如果文件不存在，返回默认配置。
     /// 如果文件损坏/解析失败，返回默认配置。
+    /// 自动解密 encrypted_api_key 恢复 llm_api（P2-06 修复）。
     pub fn load() -> Self {
         match Self::get_config_path() {
             Ok(path) => {
@@ -75,13 +82,18 @@ impl LrcConfig {
                     return Self::default();
                 }
                 match fs::read_to_string(&path) {
-                    Ok(content) => match serde_json::from_str(&content) {
-                        Ok(config) => config,
-                        Err(e) => {
-                            eprintln!("[配置] 解析配置文件失败，使用默认配置: {}", e);
-                            Self::default()
-                        }
-                    },
+                    Ok(content) => {
+                        let mut config: LrcConfig = match serde_json::from_str(&content) {
+                            Ok(cfg) => cfg,
+                            Err(e) => {
+                                eprintln!("[配置] 解析配置文件失败，使用默认配置: {}", e);
+                                return Self::default();
+                            }
+                        };
+                        // ── P2-06 修复：解密 API Key ──
+                        config.decrypt_llm_api();
+                        config
+                    }
                     Err(e) => {
                         eprintln!("[配置] 读取配置文件失败，使用默认配置: {}", e);
                         Self::default()
@@ -92,23 +104,51 @@ impl LrcConfig {
         }
     }
 
-    /// 保存当前配置到文件
+    /// 从加密存储恢复 llm_api（P2-06 修复）
+    ///
+    /// 优先使用 encrypted_api_key 解密恢复。
+    /// 如果已有明文 llm_api（旧版本配置），保持不变。
+    fn decrypt_llm_api(&mut self) {
+        if let Some(ref encrypted) = self.encrypted_api_key {
+            if !encrypted.is_empty() {
+                match crate::crypto::decrypt_api_key(encrypted) {
+                    Ok(plain) => {
+                        self.llm_api = Some(plain);
+                        eprintln!("[配置] API Key 已从加密存储解密恢复");
+                    }
+                    Err(e) => {
+                        eprintln!("[配置] 解密 API Key 失败: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 保存当前配置到文件（API Key 加密存储，P2-06 修复）
     ///
     /// 自动创建父目录，如果创建失败则返回错误。
+    /// 保存时自动将 llm_api 加密到 encrypted_api_key 字段。
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::get_config_path()
-            .map_err(|e| format!("获取配置路径失败: {}", e))?;
+        let path = Self::get_config_path().map_err(|e| format!("获取配置路径失败: {}", e))?;
 
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("创建配置目录失败: {}", e))?;
+            fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
         }
 
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("序列化配置失败: {}", e))?;
+        // 创建用于序列化的副本，加密 API Key
+        let mut save_config = self.clone();
+        if let Some(ref llm_api) = save_config.llm_api {
+            if !llm_api.is_empty() {
+                save_config.encrypted_api_key =
+                    Some(crate::crypto::encrypt_api_key(llm_api)?);
+                save_config.llm_api = None; // 不保存明文到磁盘
+            }
+        }
 
-        fs::write(&path, json)
-            .map_err(|e| format!("写入配置文件失败: {}", e))?;
+        let json =
+            serde_json::to_string_pretty(&save_config).map_err(|e| format!("序列化配置失败: {}", e))?;
+
+        fs::write(&path, json).map_err(|e| format!("写入配置文件失败: {}", e))?;
 
         Ok(())
     }
@@ -123,9 +163,7 @@ impl LrcConfig {
         {
             let app_data = std::env::var("APPDATA")
                 .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "APPDATA not found"))?;
-            Ok(Path::new(&app_data)
-                .join("LoongRecall")
-                .join("config.json"))
+            Ok(Path::new(&app_data).join("LoongRecall").join("config.json"))
         }
 
         #[cfg(target_os = "linux")]

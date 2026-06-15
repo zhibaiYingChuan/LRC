@@ -20,48 +20,64 @@ use tokio::sync::Mutex;
 use code_memory::process_guard::{self, SingletonLock};
 // 配置持久化：桌面端agent配置保存与加载
 use code_memory::config::LrcConfig;
+// V2 模块：项目指纹、统一数据目录、数据迁移
+use code_memory::data_dir::DataDir;
+use code_memory::migration;
 
 #[tokio::main]
-#[allow(unused_assignments)]
 async fn main() {
     // 运行时防护：反调试 + 完整性校验（必须在任何业务逻辑之前执行）
     code_memory::guard::risk_aware_guard();
 
     // ════════════════════════════════════════════════════════════════
     // 全局镜像守卫 — 在所有代码路径之前强制设置
-    //
-    // 这是最根本的防护措施：确保本程序的任何组件、任何函数、
-    // 任何代码路径在尝试下载模型时，都只能从 hf-mirror.com
-    // 国内镜像获取，绝不触碰 huggingface.co 或其他外网地址。
-    //
-    // 注意：
-    //   - HF_ENDPOINT 被 hf-hub 库内部读取，用于确定下载源
-    //   - 此设置在 CLI 参数解析之前执行，确保 --help 等无副作用命令也受保护
-    //   - 即使用户未设置 HF_ENDPOINT 环境变量，我们也强制使用国内镜像
     // ════════════════════════════════════════════════════════════════
     if std::env::var("HF_ENDPOINT").is_err() {
         std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
     }
 
+    // 核心逻辑放入 try_run()，确保所有 Drop 析构函数执行完毕后再 exit
+    // 这解决了此前 std::process::exit 跳过 SingletonLock Drop 导致僵尸锁残留的问题
+    let exit_code = match try_run().await {
+        Ok(()) => 0,
+        Err(msg) => {
+            eprintln!("{msg}");
+            1
+        }
+    };
+
+    // 这是唯一的 std::process::exit 调用点——此时所有局部变量（包括 _singleton_lock）
+    // 的 Drop 已经执行完毕，锁文件已安全清理
+    std::process::exit(exit_code);
+}
+
+/// 主运行逻辑，返回 Result 以避免 std::process::exit 跳过 Drop 析构
+#[allow(unused_assignments)]
+async fn try_run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
 
     let mut src_dir = String::new();
     let mut host = String::from("127.0.0.1");
     let mut port: u16 = 3099;
+    let mut port_explicitly_set = false; // 追踪用户是否显式指定了 --port
     let mut stdio_mode = false;
     let mut global_mode = false;
     let mut db_path: Option<String> = None;
+    let mut data_dir: Option<String> = None; // V2: --data-dir 统一数据根目录
     let mut llm_api_raw: Option<String> = None;
     let mut proxy: Option<String> = None;
     #[allow(unused_variables, unused_assignments)]
     let mut mode = String::from("fast"); // 默认 Tier 1: 零网络、零下载
     let mut install_ide: Option<String> = None;
+    let mut list_ides_mode = false; // --list-ides：列出支持的 IDE 和工具列表
     let mut benchmark_mode = false;
     let mut benchmark_json = false;
     let mut dashboard_mode = false;
     let mut multi_window: u32 = 1; // 默认单窗口，--multi-window N 可提高上限
     let mut daemon_mode = false; // --daemon：后台守护模式，供桌面端agent使用
     let mut tray_mode = false; // --tray：启用系统托盘图标
+    let mut export_path: Option<String> = None; // V2: --export 导出记忆
+    let mut import_path: Option<String> = None; // V2: --import 导入记忆
 
     // 加载已保存的全局配置（桌面端agent场景）
     let saved_config = LrcConfig::load();
@@ -92,6 +108,7 @@ async fn main() {
                             3099
                         }
                     };
+                    port_explicitly_set = true; // 用户显式指定了端口，不覆盖
                 }
             }
             "--stdio" => {
@@ -106,6 +123,16 @@ async fn main() {
                     db_path = Some(args[i].clone());
                 }
             }
+            "--data-dir" => {
+                i += 1;
+                if i < args.len() {
+                    data_dir = Some(args[i].clone());
+                } else {
+                    return Err("错误: --data-dir 需要指定路径\n\
+                         用法: code-memory-server --data-dir ~/my-lrc-data"
+                        .to_string());
+                }
+            }
             "--llm-api" => {
                 i += 1;
                 if i < args.len() {
@@ -117,16 +144,18 @@ async fn main() {
                 if i < args.len() {
                     install_ide = Some(args[i].clone());
                 } else {
-                    eprintln!("错误: --install-ide 需要指定 IDE 名称");
-                    eprintln!(
-                        "用法: code-memory-server --install-ide <trae|cursor|vscode|windsurf>"
-                    );
-                    std::process::exit(1);
+                    return Err("错误: --install-ide 需要指定 IDE 名称\n\
+                         用法: code-memory-server --install-ide <trae|cursor|vscode|windsurf>\n\
+                         多 IDE 用逗号分隔: code-memory-server --install-ide trae,cursor,vscode"
+                        .to_string());
                 }
+            }
+            "--list-ides" => {
+                list_ides_mode = true;
             }
             "--help" | "-h" => {
                 print_help();
-                return;
+                return Ok(());
             }
             "--benchmark" => {
                 benchmark_mode = true;
@@ -154,7 +183,7 @@ async fn main() {
                 i += 1;
                 if i < args.len() {
                     multi_window = match args[i].parse::<u32>() {
-                        Ok(n) if n >= 1 && n <= 20 => n,
+                        Ok(n) if (1..=20).contains(&n) => n,
                         Ok(n) => {
                             eprintln!(
                                 "警告: --multi-window 值 {} 不合理，已限制为 1~20，使用 1",
@@ -176,34 +205,46 @@ async fn main() {
             "--tray" => {
                 tray_mode = true;
             }
+            "--export" => {
+                i += 1;
+                if i < args.len() {
+                    export_path = Some(args[i].clone());
+                } else {
+                    return Err("错误: --export 需要指定输出文件路径\n\
+                         用法: code-memory-server --export ~/backup/lrc-export.json"
+                        .to_string());
+                }
+            }
+            "--import" => {
+                i += 1;
+                if i < args.len() {
+                    import_path = Some(args[i].clone());
+                } else {
+                    return Err("错误: --import 需要指定导入文件路径\n\
+                         用法: code-memory-server --import ~/backup/lrc-export.json"
+                        .to_string());
+                }
+            }
             _ => {
-                eprintln!("未知参数: {}", args[i]);
-                print_help();
-                std::process::exit(1);
+                return Err(format!("未知参数: {}\n请使用 --help 查看可用选项", args[i]));
             }
         }
         i += 1;
     }
 
     // 无参启动（双击 exe）：默认进入仪表盘模式
-    // 只有 exe 名本身，没有其他参数 → GUI 模式
     if args.len() == 1 && !dashboard_mode {
         dashboard_mode = true;
         eprintln!("[仪表盘] 无参启动，进入桌面仪表盘模式");
     }
 
     // ── 应用已保存的全局配置（仅当CLI未显式指定时） ──
-    // 桌面端agent场景：用户首次配置后，后续启动自动加载
-    if port == 3099 && saved_config.default_port != 3099 {
+    if !port_explicitly_set && saved_config.default_port != 3099 {
         port = saved_config.default_port;
     }
     if host == "127.0.0.1" && saved_config.default_host != "127.0.0.1" {
         host = saved_config.default_host.clone();
     }
-    if multi_window == 1 && saved_config.max_multi_window > 1 {
-        multi_window = saved_config.max_multi_window as u32;
-    }
-    // 若CLI未指定--llm-api但配置文件中存在，自动加载
     if llm_api_raw.is_none() {
         if let Some(ref saved_llm) = saved_config.llm_api {
             if !saved_llm.is_empty() {
@@ -216,16 +257,92 @@ async fn main() {
         }
     }
 
+    // 处理 --list-ides 命令（列出支持的 IDE 和工具列表）
+    if list_ides_mode {
+        print_ides_list();
+        return Ok(());
+    }
+
     // 处理 --install-ide 命令（自动配置 IDE 的 MCP 连接）
+    // V2: 支持逗号分隔多 IDE
     if let Some(ref ide) = install_ide {
-        install_ide_config(ide);
-        return;
+        let ides: Vec<&str> = ide
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ides.is_empty() {
+            return Err("错误: --install-ide 需要至少指定一个有效的 IDE 名称".to_string());
+        }
+        for single_ide in &ides {
+            install_ide_config(single_ide);
+        }
+        return Ok(());
     }
 
     // 处理 --benchmark 命令（运行三层基准测试）
     if benchmark_mode {
         run_benchmark_mode(benchmark_json);
-        return;
+        return Ok(());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // V2: --export 导出记忆数据
+    // ════════════════════════════════════════════════════════════
+    if let Some(ref path) = export_path {
+        let dd = if global_mode {
+            DataDir::for_global()
+        } else {
+            let src_path = std::path::Path::new(&src_dir);
+            DataDir::for_project(src_path)
+        };
+        match code_memory::export::export_memories(
+            &dd,
+            Some(std::path::Path::new(path)),
+            if global_mode {
+                None
+            } else {
+                Some(std::path::Path::new(&src_dir))
+            },
+        ) {
+            Ok(result) => {
+                println!("导出成功!");
+                println!("  文件: {}", result.file_path.display());
+                println!("  记忆: {} 条", result.memory_count);
+                println!("  代码片段: {} 个", result.chunk_count);
+                println!("  文件大小: {} bytes", result.file_size);
+            }
+            Err(e) => {
+                eprintln!("导出失败: {e}");
+                return Err(e);
+            }
+        }
+        return Ok(());
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // V2: --import 导入记忆数据
+    // ════════════════════════════════════════════════════════════
+    if let Some(ref path) = import_path {
+        let dd = if global_mode {
+            DataDir::for_global()
+        } else {
+            let src_path = std::path::Path::new(&src_dir);
+            DataDir::for_project(src_path)
+        };
+        match code_memory::export::import_memories(std::path::Path::new(path), &dd, false) {
+            Ok(result) => {
+                println!("导入成功!");
+                println!("  记忆: {} 条", result.memories_imported);
+                println!("  代码片段: {} 个", result.chunks_imported);
+                println!("  归档: {} 条", result.archive_imported);
+            }
+            Err(e) => {
+                eprintln!("导入失败: {e}");
+                return Err(e);
+            }
+        }
+        return Ok(());
     }
 
     // 在 stdio 模式下，状态信息输出到 stderr（stdout 留给 MCP 协议）
@@ -252,31 +369,6 @@ async fn main() {
         log(&format!("   代理: {proxy_url} (已应用到 HTTP/HTTPS 请求)"));
     }
 
-    // ════════════════════════════════════════════════════════════════
-    // 三层搜索模式（优先级体系，从上到下逐一引导）：
-    //
-    //   第1位 — Tier 1 Fast Match（默认，零网络 · 零下载 · 秒启动）
-    //           ↓ 用户始终先进入 Fast 模式
-    //   第2位 — Tier 2 LLM API Key（提高优先级，紧接其后引导配置）
-    //           ↓ 配置后自然语言查询由 LLM 翻译
-    //   最后   — Tier 3 Smart Match（用户确认 + 国内镜像下载）
-    //
-    // 核心原则：
-    //   - 绝不主动从外网下载任何模型（huggingface.co 等）
-    //   - 所有模型下载必须经用户明确确认
-    //   - 下载仅从 hf-mirror.com 国内镜像获取
-    //   - HF_ENDPOINT 已在 main() 入口全局设置为 hf-mirror.com
-    // ════════════════════════════════════════════════════════════════
-
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║  第1位 — Tier 1: Fast Match（立即启动，零等待）              ║
-    // ║  关键词匹配 · 零网络 · 零下载 · 秒启动                         ║
-    // ║  无需任何配置，开箱即用，适合日常代码搜索                       ║
-    // ╚═══════════════════════════════════════════════════════════════╝
-
-    // ──────────────── 基础设置 ────────────────
-    // 锁/验证失败时不会无谓提示用户配置 API 或下载模型
-
     // 确定源码目录：默认使用当前工作目录
     let src_dir = if src_dir.is_empty() {
         let default = std::path::PathBuf::from(".");
@@ -293,79 +385,87 @@ async fn main() {
         src_dir
     };
 
-    // 确定记忆数据目录
-    // 优先级: --db-path > --global > 默认路径
-    let data_dir = if let Some(ref custom_path) = db_path {
-        custom_path.clone()
+    // 确定记忆数据目录 — V2 统一数据目录结构
+    // 优先级: --db-path > --data-dir > --global > 项目指纹模式
+    let (data_dir, data_dir_manager) = if let Some(ref custom_path) = db_path {
+        // --db-path: 完全自定义路径（向后兼容）
+        (custom_path.clone(), DataDir::for_custom(custom_path))
+    } else if let Some(ref custom_root) = data_dir {
+        // --data-dir: 自定义数据根目录
+        let dd = DataDir::for_custom(custom_root);
+        (custom_root.clone(), dd)
     } else if global_mode {
-        // 全局记忆目录: ~/.loong-recall/data/
-        let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        home.join(".loong-recall")
-            .join("data")
-            .to_string_lossy()
-            .to_string()
+        // --global: 全局模式
+        let dd = DataDir::for_global();
+        (dd.data_path().to_string_lossy().to_string(), dd)
     } else {
-        // 默认：源码目录下的 .loong-recall/data/
-        std::path::PathBuf::from(&src_dir)
-            .join(".loong-recall")
-            .join("data")
-            .to_string_lossy()
-            .to_string()
+        // V2 默认: 项目指纹模式
+        let src_path = std::path::Path::new(&src_dir);
+        let dd = DataDir::for_project(src_path);
+        let (fingerprint, canonical) =
+            code_memory::project_id::project_fingerprint_with_path(src_path);
+        log(&format!("   项目指纹: {fingerprint}"));
+        log(&format!("   规范化路径: {canonical}"));
+        (dd.data_path().to_string_lossy().to_string(), dd)
     };
 
     log(&format!("   记忆数据目录: {data_dir}"));
 
-    // ========== 进程守护：单例锁 + 端口自适应 + 优雅关闭 ==========
-    let _singleton_lock = match SingletonLock::acquire(std::path::Path::new(&data_dir), multi_window) {
-        Ok(lock) => {
-            log(&format!(
-                "   进程锁: 已获取 (PID: {}, 窗口上限: {})",
-                std::process::id(),
-                multi_window
-            ));
-            lock
+    // ════════════════════════════════════════════════════════════
+    // V2: 自动迁移旧版数据（如果存在）
+    // ════════════════════════════════════════════════════════════
+    let src_path = std::path::Path::new(&src_dir);
+    if migration::needs_migration(src_path) {
+        log("  检测到旧版数据，开始自动迁移...");
+        match migration::migrate_legacy_to_v2(
+            src_path,
+            data_dir_manager.data_path(),
+            false, // 实际执行迁移
+        ) {
+            Ok(result) => {
+                log(&migration::format_migration_report(&result));
+                if !result.is_success() {
+                    log("  ⚠ 部分文件迁移失败，旧数据已保留，可稍后重试");
+                }
+            }
+            Err(e) => {
+                log(&format!("  ⚠ 迁移过程中出现错误: {e}，跳过迁移"));
+            }
         }
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-    };
+    }
+
+    // ========== 进程守护：单例锁（Drop 时自动清理 ==========
+    let _singleton_lock = SingletonLock::acquire(std::path::Path::new(&data_dir), multi_window)
+        .map_err(|e| e.to_string())?;
+    log(&format!(
+        "   进程锁: 已获取 (PID: {}, 窗口上限: {})",
+        std::process::id(),
+        multi_window
+    ));
 
     // 前置验证：源码目录必须存在且为目录
     let src_path = std::path::Path::new(&src_dir);
     if !src_path.exists() {
-        eprintln!("错误: 源码目录不存在: {src_dir}");
-        eprintln!("提示: 请使用 --src-dir 指定正确的项目路径");
-        std::process::exit(1);
+        return Err(format!(
+            "错误: 源码目录不存在: {src_dir}\n提示: 请使用 --src-dir 指定正确的项目路径"
+        ));
     }
     if !src_path.is_dir() {
-        eprintln!("错误: 指定路径不是目录: {src_dir}");
-        std::process::exit(1);
+        return Err(format!("错误: 指定路径不是目录: {src_dir}"));
     }
 
     // 创建持久化后端和记忆存储
-    let persistence = JsonPersistence::new(&data_dir).unwrap_or_else(|e| {
-        eprintln!("致命错误: 无法创建数据目录或初始化持久化后端");
-        eprintln!("  路径: {data_dir}");
-        eprintln!("  原因: {e}");
-        eprintln!("  建议: 检查磁盘空间和目录写入权限");
-        std::process::exit(1);
-    });
+    let persistence = JsonPersistence::new(&data_dir).map_err(|e| {
+        format!(
+            "致命错误: 无法创建数据目录或初始化持久化后端\n  路径: {data_dir}\n  原因: {e}\n  建议: 检查磁盘空间和目录写入权限"
+        )
+    })?;
     let memory_store = Arc::new(Mutex::new(MemoryStore::new(persistence)));
 
     // ╔═══════════════════════════════════════════════════════════════╗
     // ║  第2位 — Tier 2: 配置 LLM API Key（优先引导）               ║
-    // ║  提升搜索理解力，用自然语言搜索代码                          ║
-    // ║  如"帮我查上次登录相关的逻辑"→ LLM 翻译为精准查询           ║
-    // ║                                                             ║
-    // ║  支持所有 OpenAI 兼容 API + Ollama 本地模型                 ║
-    // ║  格式: openai:sk-xxx:gpt-4o-mini                           ║
-    // ║  格式: ollama:localhost:llama3                              ║
-    // ║                                                             ║
-    // ║  跳过不影响 — Tier 1 已足够日常开发                         ║
     // ╚═══════════════════════════════════════════════════════════════╝
     let mut llm_api_configured = llm_api_raw.is_some();
-    // 非stdio模式 + 非守护模式 → 交互式引导配置
     if !stdio_mode && !daemon_mode && !llm_api_configured {
         if ask_user_confirmation("  是否现在配置 LLM API Key？") {
             use std::io::{self, Write};
@@ -394,33 +494,25 @@ async fn main() {
 
     // 解析 LLM API 配置
     let llm_api = match llm_api_raw {
-        Some(ref raw) => match LlmApiConfig::parse(raw) {
-            Ok(config) => {
-                match &config {
-                    LlmApiConfig::OpenAI { model, .. } => {
-                        log(&format!("   LLM 增强: OpenAI ({model}) → 查询翻译已启用"));
-                    }
-                    LlmApiConfig::Ollama { host, model } => {
-                        log(&format!(
-                            "   LLM 增强: Ollama ({model}@{host}) → 查询翻译已启用"
-                        ));
-                    }
-                    _ => {}
-                }
-                config
-            }
-            Err(e) => {
-                eprintln!("错误: LLM API 配置解析失败: {e}");
-                eprintln!("提示: 格式为 openai:sk-xxx:model 或 ollama:host:model");
-                std::process::exit(1);
-            }
-        },
+        Some(ref raw) => LlmApiConfig::parse(raw).map_err(|e| {
+            format!("错误: LLM API 配置解析失败: {e}\n提示: 格式为 openai:sk-xxx:model 或 ollama:host:model")
+        })?,
         None => LlmApiConfig::None,
     };
+    match &llm_api {
+        LlmApiConfig::OpenAI { model, .. } => {
+            log(&format!("   LLM 增强: OpenAI ({model}) → 查询翻译已启用"));
+        }
+        LlmApiConfig::Ollama { host: oh, model } => {
+            log(&format!(
+                "   LLM 增强: Ollama ({model}@{oh}) → 查询翻译已启用"
+            ));
+        }
+        _ => {}
+    }
 
     // ════════════════════════════════════════════════════════════
-    // 创建搜索管理器 — 始终使用 Tier 1 Fast Match
-    // 零网络请求、零文件下载，纯本地关键词匹配
+    // 创建搜索管理器 — Tier 1 Fast Match（零网络、零下载）
     // ════════════════════════════════════════════════════════════
     log("\n═══════════════════════════════════════════");
     log("  第1位: Tier 1 — Fast Match（已就绪）");
@@ -429,249 +521,127 @@ async fn main() {
     }
     log("═══════════════════════════════════════════");
     log("   搜索引擎: 关键词匹配 · 零网络 · 零下载");
-    let mut mgr = CodeMemoryManager::new();
+    let mgr = CodeMemoryManager::new();
     log(&format!("\n正在索引项目代码: {src_dir}..."));
-    match index_and_report(&mut mgr, &src_dir, &log) {
-        Ok(()) => {}
-        Err(e) => {
-            log(&format!("   索引警告: {e}（部分文件可能无法检索）"));
-        }
-    }
-    let manager: Box<dyn server::IndexedCodebase> = Box::new(mgr);
+
+    // ── 后台索引：不阻塞 HTTP 服务启动 ──
+    let index_src = src_dir.clone();
+    let index_log = Arc::new(move |msg: &str| {
+        eprintln!("[索引] {msg}");
+    });
 
     let state = Arc::new(server::AppState {
-        manager: Arc::new(Mutex::new(manager)),
+        manager: Arc::new(Mutex::new(Box::new(mgr))),
         memory_store: memory_store.clone(),
         src_dir: src_dir.clone(),
         llm_api: Arc::new(tokio::sync::RwLock::new(llm_api.clone())),
+        // 后台索引状态跟踪（false = 索引中，true = 已完成）
+        indexing_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        // 服务启动时间（用于 /health 端点计算 uptime）
+        started_at: chrono::Utc::now(),
     });
 
-    // ╔═══════════════════════════════════════════════════════════════╗
-    // ║                                                               ║
-    // ║  最后一步 — Tier 3: 预下载语义模型                            ║
-    // ║                                                               ║
-    // ║  ⚠ 这是可选的最后一步，仅在用户主动确认后才执行              ║
-    // ║                                                               ║
-    // ║  核心保障（从根本上杜绝外网下载）：                           ║
-    // ║    1. HF_ENDPOINT 已在程序入口全局锁定为 hf-mirror.com       ║
-    // ║    2. 用户必须明确输入 y/yes 确认后才开始下载                ║
-    // ║    3. 下载为后台异步任务，不阻塞当前 Fast Match 会话          ║
-    // ║    4. 下载后重启使用 --mode smart 即可启用语义搜索            ║
-    // ║                                                               ║
-    // ╚═══════════════════════════════════════════════════════════════╝
-    #[cfg(feature = "ml")]
-    {
-        let user_wants_smart = mode == "smart";
-        if user_wants_smart {
-            // ── --mode smart 显式指定：直接加载并替换管理器 ──
-            log("");
-            log("  请求模式: --mode smart");
-            log("  模型: microsoft/graphcodebert-base (~500MB)");
-            log("  下载源: hf-mirror.com（国内镜像，HF_ENDPOINT 已全局锁定）");
-
-            let model_ready = code_memory::engine::model_resolver::check_model_ready(
-                "microsoft/graphcodebert-base",
-            );
-            if !model_ready {
-                if !stdio_mode {
-                    // HTTP/仪表盘模式：交互式确认下载
-                    log("  ⚠ 本地未找到语义模型");
-                    if !ask_user_confirmation("  确认从 hf-mirror.com 国内镜像下载语义模型？") {
-                        log("  ✗ 已取消下载，回退到 Tier 1 Fast Match");
-                        log("  提示: 可随时使用 --mode smart 重新尝试");
-                        mode = String::from("fast");
-                    } else {
-                        log("  ↓ 开始从国内镜像下载...");
-                    }
-                } else {
-                    // stdio 模式：无法交互确认，给出明确指引
-                    eprintln!("════════════════════════════════════════════");
-                    eprintln!("  错误: --mode smart 需要语义模型，但本地未找到");
-                    eprintln!("════════════════════════════════════════════");
-                    eprintln!("  stdio 模式下无法交互确认，请选择以下方式之一：");
-                    eprintln!();
-                    eprintln!("  方式一（推荐）: 在 HTTP/仪表盘模式下运行并确认下载");
-                    eprintln!("    code-memory-server --mode smart");
-                    eprintln!();
-                    eprintln!("  方式二: 手动下载模型到 models/ 目录");
-                    eprintln!("    从 https://hf-mirror.com/microsoft/graphcodebert-base");
-                    eprintln!("    下载所有文件到: models/microsoft--graphcodebert-base/");
-                    eprintln!();
-                    eprintln!("  方式三: 使用 Fast Match（无需下载，推荐）");
-                    eprintln!("    code-memory-server --mode fast --stdio");
-                    eprintln!("════════════════════════════════════════════");
-                    std::process::exit(1);
-                }
+    // ════════════════════════════════════════════════════════════
+    // 后台索引（所有模式都需要，不阻塞服务启动）
+    // ════════════════════════════════════════════════════════════
+    let index_state = state.clone();
+    let index_log_bg = Arc::clone(&index_log);
+    let indexing_flag = Arc::clone(&state.indexing_complete);
+    tokio::spawn(async move {
+        index_log_bg("[后台] 开始索引项目代码...");
+        let mut bg_mgr = CodeMemoryManager::new();
+        match bg_mgr.index_project(&index_src) {
+            Ok(_count) => {
+                let stats = bg_mgr.get_stats();
+                index_log_bg(&format!(
+                    "索引完成: {} 个文件 → {} 个代码片段",
+                    stats.file_count, stats.total_chunks
+                ));
+                let mut state_mgr = index_state.manager.lock().await;
+                *state_mgr = Box::new(bg_mgr);
+                index_log_bg("索引已生效，搜索服务已就绪");
             }
-
-            // 用户确认或模型已就绪 → 加载语义编码器并重建管理器
-            if mode == "smart" {
-                let encoder = match code_memory::CodeBertEncoder::load() {
-                    Ok(enc) => enc,
-                    Err(e) => {
-                        eprintln!("错误: 模型加载失败: {e}");
-                        eprintln!("提示: 请检查网络连接，或使用 --mode fast 回到快速模式");
-                        std::process::exit(1);
-                    }
-                };
-                let mut smart_mgr = CodeMemoryManager::with_encoder(Arc::new(encoder));
-
-                if let Some(n) = smart_mgr.load_embedding_cache(&data_dir) {
-                    log(&format!("\n  ✓ 从缓存恢复索引: {n} 个代码片段（秒级加载）"));
-                } else {
-                    log(&format!("\n正在索引项目代码（语义编码）: {src_dir}..."));
-                    log("   （首次索引较慢，后续启动会使用缓存）");
-                    match index_and_report(&mut smart_mgr, &src_dir, &log) {
-                        Ok(()) => {
-                            if let Err(e) = smart_mgr.save_embedding_cache(&data_dir) {
-                                log(&format!("   缓存保存失败: {e}"));
-                            } else {
-                                log("   嵌入向量已缓存（下次启动秒加载）");
-                            }
-                        }
-                        Err(e) => {
-                            log(&format!("   索引警告: {e}（部分文件可能无法检索）"));
-                        }
-                    }
-                }
-
-                // 替换 AppState 中的管理器为智能模式
-                let mut state_mgr = state.manager.lock().await;
-                *state_mgr = Box::new(smart_mgr);
-                log("   搜索模式: Tier 3 — Smart Match（语义理解 · 已启用 ✓）");
-            }
-        } else if !stdio_mode {
-            // ── 交互模式（无 --mode smart）：绝对最后一步，询问是否预下载 ──
-            log("");
-            log("╔═══════════════════════════════════════════════════════════════╗");
-            log("║                                                               ║");
-            log("║  ✅ 第1位 Fast Match — 已就绪（关键词匹配 · 秒启动）       ║");
-            if llm_api_configured {
-                log("║  ✅ 第2位 LLM API Key — 已配置（自然语言查询翻译）         ║");
-            } else {
-                log("║  ⊘  第2位 LLM API Key — 未配置（仪表盘「设置」页面可配置）  ║");
-            }
-            log("║                                                               ║");
-            log("╠═══════════════════════════════════════════════════════════════╣");
-            log("║                                                               ║");
-            log("║  最后一步 — Tier 3: 预下载语义模型（完全可选）               ║");
-            log("║                                                               ║");
-            log("║  模型: microsoft/graphcodebert-base (~500MB)                  ║");
-            log("║  来源: hf-mirror.com（国内镜像，绝不访问外网）               ║");
-            log("║  耗时: 首次下载约 1-3 分钟，后台异步执行不阻塞使用          ║");
-            log("║  用途: 重启后用 --mode smart 获得语义级搜索精度              ║");
-            log("║                                                               ║");
-            log("║  ⚠ Tier 1 + Tier 2 已满足 95% 的日常开发搜索需求           ║");
-            log("║     仅在你确实需要'理解代码含义'时才需要 Tier 3              ║");
-            log("║                                                               ║");
-            log("╚═══════════════════════════════════════════════════════════════╝");
-            if ask_user_confirmation("  是否从国内镜像预下载语义模型？") {
-                log("  ✓ 开始后台下载语义模型（当前 Fast Match 会话不受影响）...");
-                // 国内镜像已在 main() 顶部全局锁定，此处无需重复设置
-                // 后台异步任务：仅下载到本地缓存，不替换当前管理器
-                tokio::spawn(async move {
-                    match code_memory::CodeBertEncoder::load() {
-                        Ok(_enc) => {
-                            // 下载成功，静默完成
-                        }
-                        Err(e) => {
-                            eprintln!("  ✗ 模型预下载失败: {e}");
-                        }
-                    }
-                });
-            } else {
-                log("  → 跳过预下载，Tier 1 + Tier 2 已足够日常开发使用");
-                log("  提示: 可随时使用 --mode smart 下载语义模型");
+            Err(e) => {
+                index_log_bg(&format!("索引失败: {e}（部分文件可能无法检索）"));
             }
         }
-    }
+        // 无论成功或失败，标记索引阶段已完成
+        indexing_flag.store(true, std::sync::atomic::Ordering::Release);
+        index_log_bg("[后台] 索引阶段结束");
+    });
 
-    // 启动 MCP 服务（索引已完成，搜索立即可用）
+    // ── 根据运行模式选择通信协议 ──
     if stdio_mode {
-        log("\n🚀 MCP Stdio 模式启动（通过 stdin/stdout 通信）");
-        log("   IDE 已可调用 search_code + remember + recall 等工具");
+        // Stdio 模式：通过 stdin/stdout 进行 JSON-RPC 通信
+        // 这是 IDE MCP 标准通信方式，不启动 HTTP 服务器
+        // 不绑定端口、不打开浏览器、不启动托盘
+        log("\n📡 MCP Stdio 模式已就绪，等待 IDE 连接...");
         server::run_stdio(state).await;
     } else {
-        // ========== 端口自适应 + 优雅关闭 ==========
-        // 从默认端口开始尝试，被占用则自动 +1，最多尝试 100 次
+        // ════════════════════════════════════════════════════════════
+        // HTTP 模式：端口绑定 + axum HTTP 服务启动
+        // ════════════════════════════════════════════════════════════
         log("\n🚀 HTTP 服务启动中（端口自适应）...");
         log(&format!("   从端口 {} 开始尝试绑定...", port));
 
-        let (listener, actual_port) = match process_guard::find_available_port(&host, port, 100).await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("{}", e);
-                eprintln!("提示: 请关闭占用端口的程序后重试，或使用 --port 指定其他起始端口");
-                std::process::exit(1);
-            }
-        };
+        let (listener, actual_port) = process_guard::find_available_port(&host, port, 100)
+            .await
+            .map_err(|e| {
+                format!("{e}\n提示: 请关闭占用端口的程序后重试，或使用 --port 指定其他起始端口")
+            })?;
 
         log(&format!(
             "   浏览器即将自动打开仪表盘: http://localhost:{actual_port}/dashboard"
         ));
 
-        // HTTP 模式（非 stdio）：自动打开默认浏览器
-        if !stdio_mode {
-            let dashboard_url = format!("http://localhost:{actual_port}/dashboard");
-            // 延迟 500ms 确保 HTTP 服务已就绪再打开浏览器
-            let open_url = dashboard_url.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                match code_memory::dashboard::open_dashboard(&open_url) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        eprintln!("[仪表盘] 打开浏览器失败: {e}");
-                        eprintln!("[仪表盘] 请手动访问: {open_url}");
+        // 自动打开浏览器（延迟 500ms 确保服务就绪）
+        let dashboard_url = format!("http://localhost:{actual_port}/dashboard");
+        let open_url = dashboard_url.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            match code_memory::dashboard::open_dashboard(&open_url) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("[仪表盘] 打开浏览器失败: {e}");
+                    eprintln!("[仪表盘] 请手动访问: {open_url}");
+                }
+            }
+        });
+
+        // ── 保存配置到全局配置文件 ──
+        let mut cfg = LrcConfig::load();
+        cfg.default_port = actual_port;
+        cfg.default_host = host.clone();
+        cfg.max_multi_window = multi_window as u8;
+        if let Some(ref llm) = llm_api_raw {
+            if !llm.is_empty() {
+                cfg.llm_api = Some(llm.clone());
+            }
+        }
+        if let Err(e) = cfg.save() {
+            eprintln!("[配置] 保存全局配置失败: {e}");
+        } else {
+            let config_path = LrcConfig::get_config_path().unwrap_or_default();
+            eprintln!("[配置] 已保存到 {}", config_path.display());
+        }
+
+        // ── 系统托盘（Windows 原生） ──
+        if tray_mode || daemon_mode {
+            #[cfg(feature = "webbrowser")]
+            {
+                let tray_url = dashboard_url.clone();
+                std::thread::spawn(move || {
+                    if let Err(e) = code_memory::tray::start_tray(tray_url) {
+                        eprintln!("[托盘] 启动失败: {e}");
                     }
-                }
-            });
-
-            // ── 桌面端agent：保存配置到全局配置文件 ──
-            // 这样下次启动桌面端agent时无需重复指定参数
-            let mut cfg = LrcConfig::load();
-            cfg.default_port = actual_port;
-            cfg.default_host = host.clone();
-            cfg.max_multi_window = multi_window as u8;
-            if let Some(ref llm) = llm_api_raw {
-                if !llm.is_empty() {
-                    cfg.llm_api = Some(llm.clone());
-                }
-            }
-            if let Err(e) = cfg.save() {
-                eprintln!("[配置] 保存全局配置失败: {e}");
-            } else {
-                let config_path = LrcConfig::get_config_path().unwrap_or_default();
-                eprintln!(
-                    "[配置] 已保存到 {}",
-                    config_path.display()
-                );
-            }
-
-            // ── 系统托盘（Windows 原生 + 其他平台降级提示） ──
-            if tray_mode || daemon_mode {
-                #[cfg(feature = "webbrowser")]
-                {
-                    let tray_url = dashboard_url.clone();
-                    std::thread::spawn(move || {
-                        if let Err(e) = code_memory::tray::start_tray(tray_url) {
-                            eprintln!("[托盘] 启动失败: {e}");
-                        }
-                    });
-                }
+                });
             }
         }
 
-        // tokio::select! 实现优雅关闭：
-        //   - 服务正常运行
-        //   - 收到 Ctrl+C / SIGTERM → 触发退出
-        //   - _singleton_lock 的 Drop 自动清理锁文件
+        // tokio::select! 实现优雅关闭 — _singleton_lock 的 Drop 自动清理锁文件
         tokio::select! {
             result = server::serve_on_listener(state, &host, actual_port, listener) => {
-                if let Err(e) = result {
-                    eprintln!("服务启动失败: {e}");
-                    std::process::exit(1);
-                }
+                result.map_err(|e| format!("服务启动失败: {e}"))?;
             }
             _ = process_guard::wait_for_shutdown_signal() => {
                 log("\n收到关闭信号，正在优雅退出...");
@@ -679,6 +649,8 @@ async fn main() {
             }
         }
     }
+
+    Ok(())
 }
 
 /// 交互式询问用户确认（带超时保护，防止 Hidden 窗口环境 stdin 阻塞）
@@ -722,6 +694,7 @@ fn ask_user_confirmation(prompt: &str) -> bool {
 }
 
 /// 索引项目并输出统计信息，失败时返回错误而非杀死进程
+#[allow(dead_code)]
 fn index_and_report<E: code_memory::engine::encoder::CodeEncoder>(
     mgr: &mut CodeMemoryManager<E>,
     src_dir: &str,
@@ -753,14 +726,69 @@ fn index_and_report<E: code_memory::engine::encoder::CodeEncoder>(
     }
 }
 
+/// 列出所有支持的 IDE 和工具（P3-07 修复）
+///
+/// 输出格式化的表格，包含 IDE 名称、配置文件路径和可安装性。
+/// 支持通过 `code-memory-server --list-ides` 调用。
+fn print_ides_list() {
+    println!("支持的 IDE 和 AI 工具列表");
+    println!("═══════════════════════════════════════════");
+    println!();
+    println!("  名称               类别        可安装");
+    println!("  ────────────────   ──────────  ──────");
+
+    // IDE 类
+    for (name, cat, installable) in SUPPORTED_IDES {
+        let mark = if *installable { "✓ 是" } else { "  —" };
+        println!("  {:<20} {:<12} {}", name, cat, mark);
+    }
+    println!();
+    println!("用法:");
+    println!("  安装单个 IDE:   code-memory-server --install-ide <名称>");
+    println!("  安装多个 IDE:   code-memory-server --install-ide <名称1>,<名称2>");
+    println!("  列出所有 IDE:   code-memory-server --list-ides");
+    println!("  查看完整帮助:   code-memory-server --help");
+}
+
+/// 支持的 IDE 数据库
+/// (名称, 分类, 是否支持 --install-ide 自动配置)
+const SUPPORTED_IDES: &[(&str, &str, bool)] = &[
+    ("trae", "IDE", true),
+    ("trae-cn", "IDE", true),
+    ("cursor", "IDE", true),
+    ("vscode", "IDE", true),
+    ("windsurf", "IDE", true),
+    ("kiro", "IDE", true),
+    ("gemini", "CLI/桌面", true),
+    ("gemini-cli", "CLI/桌面", true),
+    ("comate", "AI 助手", true),
+    ("roo", "AI 助手", true),
+    ("roo-code", "AI 助手", true),
+    ("cline", "AI 助手", true),
+    ("cloudbase", "平台", true),
+    ("cloudbase-mcp", "平台", true),
+];
+
 /// 根据 IDE 名称返回 MCP 配置文件路径
 ///
-/// 支持的 IDE：trae, cursor, vscode, windsurf。
+/// 支持的 IDE：trae, trae-cn, cursor, vscode, windsurf。
 /// 不支持的 IDE 会打印错误信息并退出进程。
 fn get_ide_config_path(ide: &str) -> PathBuf {
     let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     match ide.to_lowercase().as_str() {
-        "trae" => home.join(".trae").join("mcp.json"),
+        "trae" | "trae-cn" => {
+            // Trae CN（中文版）使用 ~/.trae-cn/trae-mcp.json
+            let trae_cn_cfg = home.join(".trae-cn").join("trae-mcp.json");
+            // Trae（国际版）使用 ~/.trae/mcp.json
+            let trae_cfg = home.join(".trae").join("mcp.json");
+
+            // 根据安装的版本自动选择正确的配置路径
+            if ide == "trae-cn" || trae_cn_cfg.exists() {
+                trae_cn_cfg
+            } else {
+                trae_cfg
+            }
+        }
         "cursor" => home.join(".cursor").join("mcp.json"),
         "vscode" | "code" => {
             if cfg!(target_os = "windows") {
@@ -786,10 +814,17 @@ fn get_ide_config_path(ide: &str) -> PathBuf {
             }
         }
         "windsurf" => home.join(".windsurf").join("mcp.json"),
+        "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
+        "gemini" | "gemini-cli" => home.join(".gemini").join("settings.json"),
+        "comate" => home.join(".comate").join("mcp.json"),
+        "roo" | "roo-code" => home.join(".roo").join("mcp.json"),
+        "cline" => home.join(".cline").join("mcp.json"),
+        "cloudbase" | "cloudbase-mcp" => home.join(".cloudbase-mcp").join("mcp.json"),
         _ => {
-            eprintln!("错误: 不支持的 IDE: {ide}");
-            eprintln!("支持的 IDE: trae, cursor, vscode, windsurf");
-            eprintln!("用法: code-memory-server --install-ide <trae|cursor|vscode|windsurf>");
+            eprintln!("错误: 不支持的 IDE/工具: {ide}");
+            eprintln!("支持的 IDE: trae, trae-cn, cursor, vscode, windsurf, kiro");
+            eprintln!("支持的 CLI/桌面工具: gemini, gemini-cli, comate, roo, cline, cloudbase");
+            eprintln!("用法: code-memory-server --install-ide <名称>");
             std::process::exit(1);
         }
     }
@@ -850,6 +885,11 @@ fn write_ide_config(
             println!("    如果你在同一个项目中打开了多个聊天窗口，");
             println!("    第二个窗口的 LRC 将不会重复启动（这是正常限制）。");
             println!("    不同项目之间完全隔离，互不影响。");
+            println!();
+            println!(
+                "  💡 卸载保护: 记忆数据存储在用户目录 (~/.loong-recall/)，卸载 IDE 不会丢失。"
+            );
+            println!("    如需备份请使用: code-memory-server --export ~/backup/lrc-data.json");
             println!();
             println!("  提示: 启动 HTTP 服务查看可视化仪表盘:");
             println!("    code-memory-server --port 3099");
@@ -1054,18 +1094,26 @@ fn print_help() {
     println!("  --host <地址>       HTTP 绑定地址 [默认: 127.0.0.1]");
     println!("  --port <端口>       HTTP 绑定端口 [默认: 3099]");
     println!("  --stdio             使用 stdio 传输模式（IDE 标准 MCP，推荐）");
-    println!("  --global            记忆跨项目共享 (~/.loong-recall/data/)");
+    println!("  --global            记忆跨项目共享 (~/.loong-recall/global/data/)");
     println!("  --db-path <路径>    自定义记忆数据存储路径（优先级最高）");
+    println!("  --data-dir <路径>   自定义数据根目录（V2 统一数据目录）");
     println!("  --llm-api <配置>    配置 LLM 查询翻译 (Tier 2)，格式见下方说明");
     println!("  --proxy <代理地址>    HTTP/HTTPS 代理（如 http://127.0.0.1:7890）");
-    println!("  --mode <模式>        搜索模式: fast(默认/Tier1) | smart(Tier3,用户确认+国内镜像下载)");
+    println!(
+        "  --mode <模式>        搜索模式: fast(默认/Tier1) | smart(Tier3,用户确认+国内镜像下载)"
+    );
     println!("  --dashboard          启动桌面仪表盘模式（自动打开浏览器，含完整交互引导）");
     println!("  --daemon             后台守护模式（无控制台运行，供桌面端agent使用）");
     println!("  --tray               启用系统托盘图标（Windows 原生，右键菜单操作）");
     println!("  --multi-window <N>   多窗口上限 (1~20, 默认 1)，允许同项目多窗口运行");
-    println!("  --install-ide <IDE>  自动配置 IDE 的 MCP 连接 (trae|cursor|vscode|windsurf)");
+    println!("  --install-ide <IDE>  自动配置 IDE/工具的 MCP 连接");
+    println!("                       IDE: trae, trae-cn, cursor, vscode, windsurf, kiro");
+    println!("                       CLI/桌面: gemini, comate, roo, cline, cloudbase");
+    println!("                       多工具用逗号分隔: --install-ide trae,cursor");
     println!("  --benchmark         运行三层基准测试（人类可读输出）");
     println!("  --benchmark-json    运行三层基准测试（JSON 格式，供 CI/CD 或仪表盘使用）");
+    println!("  --export <路径>     导出记忆数据到 JSON 文件（备份）");
+    println!("  --import <路径>     从 JSON 文件导入记忆数据（恢复）");
     println!("  --help, -h          显示此帮助信息");
     println!();
     println!("举个栗子:");
@@ -1097,6 +1145,10 @@ fn print_help() {
     println!("  code-memory-server --src-dir ./src --multi-window 3 --stdio");
     println!();
     println!("  code-memory-server --db-path D:/my-data --stdio");
+    println!();
+    println!("  # V2: 导出/导入记忆数据（备份与恢复）");
+    println!("  code-memory-server --export ~/backup/lrc-2026-06-15.json --src-dir ./src");
+    println!("  code-memory-server --import ~/backup/lrc-2026-06-15.json --src-dir ./src");
     println!();
     println!("LLM API 配置格式:");
     println!("  OpenAI:   openai:<sk-key>:<model-name>:<api-base-url>");

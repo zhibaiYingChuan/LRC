@@ -1,0 +1,771 @@
+/* LRC Desktop 配置向导样式 */
+:root {
+    --bg-primary: #0a0a0f;
+    --bg-secondary: #12121a;
+    --bg-card: #1a1a2e;
+    --text-primary: #e0e0e0;
+    --text-secondary: #888;
+    --accent: #6c63ff;
+    --accent-hover: #7b73ff;
+    --success: #4caf50;
+    --warning: #ff9800;
+    --border: #2a2a3e;
+    --radius: 8px;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* 为底部状态栏预留空间 */
+    padding-bottom: 36px;
+}
+
+.wizard {
+    width: 100%;
+    max-width: 560px;
+    padding: 20px;
+}
+
+.wizard-container {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 40px;
+}
+
+.wizard-container h1 {
+    font-size: 24px;
+    text-align: center;
+    margin-bottom: 8px;
+}
+
+.wizard-subtitle {
+    text-align: center;
+    color: var(--text-secondary);
+    margin-bottom: 32px;
+}
+
+/* 步骤指示器 */
+.wizard-steps {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 32px;
+    gap: 0;
+}
+
+.step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+}
+
+.step-num {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: var(--bg-card);
+    border: 2px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    transition: all 0.3s;
+}
+
+.step.active .step-num {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: white;
+}
+
+.step.done .step-num {
+    background: var(--success);
+    border-color: var(--success);
+    color: white;
+}
+
+.step-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.step.active .step-label {
+    color: var(--accent);
+}
+
+.step-connector {
+    width: 40px;
+    height: 2px;
+    background: var(--border);
+    margin: 0 8px;
+    margin-bottom: 20px;
+}
+
+.step-connector.done {
+    background: var(--success);
+}
+
+/* 面板 */
+.wizard-panel {
+    display: none;
+}
+
+.wizard-panel.active {
+    display: block;
+}
+
+.wizard-panel h2 {
+    font-size: 18px;
+    margin-bottom: 8px;
+}
+
+.wizard-panel p {
+    color: var(--text-secondary);
+    margin-bottom: 20px;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+/* 表单 */
+.form-group {
+    margin-bottom: 16px;
+}
+
+.form-group label {
+    display: block;
+    font-size: 13px;
+    font-weight: 500;
+    margin-bottom: 6px;
+    color: var(--text-primary);
+}
+
+.form-input,
+.form-select {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-size: 14px;
+    transition: border-color 0.2s;
+}
+
+.form-input:focus,
+.form-select:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.form-hint {
+    display: block;
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 4px;
+}
+
+/* 获取 API Key 链接 */
+.key-link {
+    display: inline-block;
+    font-size: 12px;
+    color: var(--accent);
+    text-decoration: none;
+    margin-top: 6px;
+    transition: color 0.2s;
+}
+.key-link:hover {
+    color: var(--accent-hover);
+    text-decoration: underline;
+}
+
+.input-with-button {
+    display: flex;
+    gap: 8px;
+}
+
+.input-with-button .form-input {
+    flex: 1;
+}
+
+/* 按钮 */
+.btn {
+    padding: 10px 20px;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-primary {
+    background: var(--accent);
+    color: white;
+}
+
+.btn-primary:hover {
+    background: var(--accent-hover);
+}
+
+.btn-primary:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.btn-secondary {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+}
+
+.btn-secondary:hover {
+    border-color: var(--accent);
+}
+
+.wizard-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 24px;
+}
+
+.wizard-actions .btn:first-child {
+    margin-right: auto;
+}
+
+/* Agent 列表 */
+.agent-list {
+    margin-bottom: 20px;
+}
+
+.agent-item {
+    display: flex;
+    align-items: center;
+    padding: 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 8px;
+    transition: border-color 0.2s;
+}
+
+.agent-item:hover {
+    border-color: var(--accent);
+}
+
+.agent-item.selected {
+    border-color: var(--accent);
+    background: rgba(108, 99, 255, 0.1);
+}
+
+.agent-item input[type="checkbox"] {
+    margin-right: 12px;
+    accent-color: var(--accent);
+}
+
+.agent-icon {
+    font-size: 20px;
+    margin-right: 10px;
+}
+
+.agent-name {
+    font-weight: 500;
+    flex: 1;
+}
+
+.agent-status {
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    background: rgba(76, 175, 80, 0.2);
+    color: var(--success);
+}
+
+.agent-status.not-installed {
+    background: rgba(255, 152, 0, 0.2);
+    color: var(--warning);
+}
+
+/* 完成页 */
+#config-summary {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin-bottom: 20px;
+    font-size: 13px;
+    line-height: 1.8;
+}
+
+/* 加载状态 */
+.loading {
+    text-align: center;
+    color: var(--text-secondary);
+    padding: 20px;
+}
+
+/* ── Agent 分类标题 ── */
+.agent-category-header {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    padding: 12px 0 8px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+}
+
+.cat-desc {
+    font-weight: 400;
+    text-transform: none;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+
+.cat-count {
+    font-size: 11px;
+    color: var(--warning);
+}
+
+/* 可折叠分类 */
+.agent-category-details {
+    margin-bottom: 8px;
+}
+
+.agent-category-details summary {
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    padding: 8px 0;
+    cursor: pointer;
+}
+
+/* IDE 标记 */
+.agent-info {
+    flex: 1;
+}
+
+.ide-badge {
+    display: inline-block;
+    font-size: 10px;
+    background: rgba(108, 99, 255, 0.2);
+    color: var(--accent);
+    padding: 1px 6px;
+    border-radius: 8px;
+    margin-left: 8px;
+}
+
+/* 无 Agent 提示 */
+.no-agents {
+    text-align: center;
+    padding: 16px;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+/* ── 项目列表 ── */
+.project-list {
+    margin-bottom: 16px;
+    max-height: 280px;
+    overflow-y: auto;
+}
+
+.project-group {
+    margin-bottom: 16px;
+}
+
+.project-group-header {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+}
+
+.project-item {
+    display: flex;
+    align-items: flex-start;
+    padding: 10px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 6px;
+    transition: border-color 0.2s;
+}
+
+.project-item:hover {
+    border-color: var(--accent);
+}
+
+.project-item input[type="checkbox"] {
+    margin-right: 10px;
+    margin-top: 3px;
+    accent-color: var(--accent);
+}
+
+.project-info {
+    flex: 1;
+    min-width: 0;
+}
+
+.project-name {
+    font-weight: 500;
+    font-size: 14px;
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.project-path {
+    font-size: 11px;
+    color: var(--text-secondary);
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-top: 2px;
+}
+
+/* 独立应用项（步骤 2） */
+.desktop-agent-item {
+    display: flex;
+    align-items: center;
+    padding: 10px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 6px;
+    gap: 8px;
+}
+
+.desktop-agent-item .agent-name {
+    flex: 1;
+}
+
+.desktop-agent-item .agent-status.installed {
+    color: var(--success);
+    font-size: 11px;
+}
+
+/* 无项目提示 */
+.no-projects {
+    text-align: center;
+    padding: 16px;
+    color: var(--text-secondary);
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+.no-projects .hint {
+    font-size: 12px;
+    margin-top: 8px;
+}
+
+/* 高级选项折叠区 */
+.advanced-details {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.advanced-details summary {
+    padding: 4px 0;
+    list-style: disclosure-closed;
+}
+
+.advanced-details[open] summary {
+    margin-bottom: 4px;
+}
+
+/* LLM 折叠区 */
+.llm-details {
+    margin-bottom: 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px;
+}
+
+.llm-details summary {
+    font-size: 13px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    padding: 4px 0;
+}
+
+.llm-details .form-group {
+    margin-top: 12px;
+}
+
+/* 并列表单行（LLM Key + 测试按钮） */
+.form-row {
+    display: flex;
+    gap: 12px;
+    align-items: flex-end;
+}
+
+.form-group-grow {
+    flex: 1;
+}
+
+.form-group-sm {
+    flex: 1;
+}
+
+.form-group-btn {
+    flex-shrink: 0;
+}
+
+.form-row-advanced {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--border);
+}
+
+/* 轮廓按钮（测试连接） */
+.btn-outline {
+    display: inline-flex;
+    align-items: center;
+    padding: 10px 16px;
+    background: transparent;
+    border: 1.5px solid var(--primary);
+    color: var(--primary);
+    border-radius: var(--radius);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+}
+
+.btn-outline:hover {
+    background: var(--primary);
+    color: #fff;
+}
+
+.btn-outline:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* LLM 连接测试结果 */
+.llm-test-result {
+    margin-top: 8px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.test-success {
+    background: rgba(76, 175, 80, 0.1);
+    color: #2e7d32;
+    border: 1px solid rgba(76, 175, 80, 0.3);
+}
+
+.test-error {
+    background: rgba(244, 67, 54, 0.1);
+    color: #c62828;
+    border: 1px solid rgba(244, 67, 54, 0.3);
+}
+
+.test-warning {
+    background: rgba(255, 152, 0, 0.1);
+    color: #e65100;
+    border: 1px solid rgba(255, 152, 0, 0.3);
+}
+
+/* 摘要列表 */
+.summary-item {
+    padding: 4px 0;
+}
+
+.check {
+    margin-right: 6px;
+}
+
+/* 错误提示 */
+.error-message {
+    color: #f44336;
+    padding: 12px;
+    background: rgba(244, 67, 54, 0.1);
+    border-radius: var(--radius);
+    font-size: 13px;
+}
+
+/* 滚动条 */
+.project-list::-webkit-scrollbar {
+    width: 4px;
+}
+
+.project-list::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 2px;
+}
+
+/* ══════ 左下角状态栏 ══════ */
+.status-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding: 8px 20px;
+    z-index: 100;
+    font-size: 12px;
+}
+
+.status-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-secondary);
+    cursor: default;
+    white-space: nowrap;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    transition: background-color 0.3s ease;
+}
+
+.status-dot.online {
+    background: var(--success);
+    box-shadow: 0 0 6px rgba(76, 175, 80, 0.5);
+}
+
+.status-dot.offline {
+    background: #666;
+}
+
+.status-dot.warning {
+    background: var(--warning);
+    box-shadow: 0 0 6px rgba(255, 152, 0, 0.4);
+}
+
+.status-text {
+    font-size: 11px;
+}
+
+.status-item:hover {
+    color: var(--text-primary);
+}
+
+/* ==================== 多窗口 LRC 开关 ==================== */
+
+.multi-window-toggle {
+    margin: 16px 0;
+    padding: 14px 16px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    transition: border-color 0.2s;
+}
+
+.multi-window-toggle:hover {
+    border-color: var(--accent);
+}
+
+.toggle-switch {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    cursor: pointer;
+    user-select: none;
+}
+
+/* 隐藏原生 checkbox */
+.toggle-switch input[type="checkbox"] {
+    display: none;
+}
+
+/* 滑动开关轨道 */
+.toggle-slider {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    background: #555;
+    border-radius: 12px;
+    transition: background 0.3s ease;
+    flex-shrink: 0;
+}
+
+.toggle-slider::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 20px;
+    height: 20px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform 0.3s ease;
+}
+
+.toggle-switch input:checked + .toggle-slider {
+    background: var(--accent);
+}
+
+.toggle-switch input:checked + .toggle-slider::after {
+    transform: translateX(20px);
+}
+
+.toggle-label {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.toggle-label strong {
+    font-size: 14px;
+    color: var(--text-primary);
+}
+
+.toggle-desc {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.multi-window-info {
+    margin-top: 10px;
+    padding: 8px 12px;
+    background: rgba(108, 99, 255, 0.1);
+    border-radius: 6px;
+    border-left: 3px solid var(--accent);
+}
+
+.info-badge {
+    display: inline-block;
+    background: var(--accent);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-right: 8px;
+}

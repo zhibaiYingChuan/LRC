@@ -27,6 +27,18 @@ pub mod persistence;
 /// 运行时防护模块：反调试、完整性校验、防篡改
 pub mod guard;
 
+/// 项目指纹模块：跨IDE项目身份标准化（SHA256哈希）
+pub mod project_id;
+
+/// 统一数据目录管理：V2 标准化数据目录结构
+pub mod data_dir;
+
+/// 数据迁移模块：旧版 V1 数据自动迁移到 V2 结构
+pub mod migration;
+
+/// 数据导出/导入模块：记忆备份与恢复
+pub mod export;
+
 /// 进程守护模块：单例锁、端口自适应、优雅关闭
 pub mod process_guard;
 
@@ -35,6 +47,9 @@ pub mod dashboard;
 
 /// 配置持久化模块：保存端口、LLM API、源码目录等
 pub mod config;
+
+/// L1 数据加密模块：API Key 安全存储（与桌面端共享密钥文件）
+pub mod crypto;
 
 /// 系统托盘模块：桌面端后台运行，托盘图标+菜单
 #[cfg(feature = "webbrowser")]

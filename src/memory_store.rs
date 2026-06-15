@@ -2194,8 +2194,8 @@ impl<P: Persistence> MemoryStore<P> {
         // 编码器状态
         let encoder_status = self.luoshu_encoder.get_status();
         let encoder_mode = encoder_status.mode.clone();
-        let encoder_degraded = encoder_mode == "statistical"
-            || Self::check_encoder_degraded(&self.luoshu_encoder);
+        let encoder_degraded =
+            encoder_mode == "statistical" || Self::check_encoder_degraded(&self.luoshu_encoder);
         let encoder_recovery_progress = if encoder_degraded {
             let (successes, threshold) = Self::get_encoder_recovery_progress(&self.luoshu_encoder);
             if threshold > 0 {

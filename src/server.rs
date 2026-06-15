@@ -22,6 +22,7 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -136,12 +137,58 @@ impl<E: crate::engine::encoder::CodeEncoder> IndexedCodebase for CodeMemoryManag
 
 // ==================== 共享状态 ====================
 
+/// 健康检查响应 — 提供详细的服务状态信息
+///
+/// 供桌面端 sidecar_manager 健康检查和仪表盘状态页面使用。
+/// 包含服务运行阶段、索引进度、记忆库统计等关键信息。
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    /// 服务状态: "running" | "indexing" | "starting"
+    status: &'static str,
+    /// 服务名称
+    service: &'static str,
+    /// 版本号
+    version: &'static str,
+    /// 已运行秒数
+    uptime_seconds: i64,
+    /// 索引状态
+    indexing: IndexingStatus,
+    /// 记忆库统计
+    memory: MemoryBrief,
+    /// 源码目录
+    src_dir: String,
+    /// LLM 是否已配置
+    llm_configured: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct IndexingStatus {
+    /// 索引是否已完成
+    complete: bool,
+    /// 已索引文件数（索引完成后有效）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_count: Option<usize>,
+    /// 代码片段总数（索引完成后有效）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_chunks: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryBrief {
+    /// 记忆总数
+    total: usize,
+}
+
 pub struct AppState {
     pub manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
     pub memory_store: Arc<Mutex<MemoryStore<JsonPersistence>>>,
     pub src_dir: String,
     /// LLM API 配置（运行时可变，通过 /api/config/llm 动态更新）
     pub llm_api: Arc<RwLock<LlmApiConfig>>,
+    /// 后台索引是否已完成（AtomicBool 支持无锁读取）
+    pub indexing_complete: Arc<AtomicBool>,
+    /// 服务启动时间（用于计算 uptime）
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
 
 // ==================== MCP 请求处理 ====================
@@ -801,7 +848,8 @@ async fn handle_tools_call(
             //   富化查询: "Business Administration major degree graduation college What degree did I graduate with?"
             let enriched_query = if state.llm_api.read().await.is_configured() {
                 let keywords = crate::engine::llm_translator::translate_memory_query(
-                    &*state.llm_api.read().await, query,
+                    &*state.llm_api.read().await,
+                    query,
                 )
                 .await;
                 let translated: String = keywords.join(" ");
@@ -1129,7 +1177,8 @@ async fn handle_tools_call(
 
             // LLM 查询翻译：如果配置了 LLM API，先将自然语言翻译为关键词
             let keywords = if state.llm_api.read().await.is_configured() {
-                crate::engine::llm_translator::translate_query(&*state.llm_api.read().await, query).await
+                crate::engine::llm_translator::translate_query(&*state.llm_api.read().await, query)
+                    .await
             } else {
                 vec![query.to_string()]
             };
@@ -1346,7 +1395,8 @@ async fn handle_tools_call(
             // LLM 记忆翻译：将问题翻译为答案可能包含的关键词，桥接语义鸿沟
             let enriched_query = if state.llm_api.read().await.is_configured() {
                 let keywords = crate::engine::llm_translator::translate_memory_query(
-                    &*state.llm_api.read().await, query,
+                    &*state.llm_api.read().await,
+                    query,
                 )
                 .await;
                 let translated: String = keywords.join(" ");
@@ -1368,11 +1418,13 @@ async fn handle_tools_call(
                 top_k: top_k * 2, // 快速通路取更多结果
                 privacy_context: None,
             };
-            let fast_result = store.recall(&enriched_query, &fast_filter).unwrap_or(RecallResult {
-                memories: vec![],
-                scores: vec![],
-                total: 0,
-            });
+            let fast_result = store
+                .recall(&enriched_query, &fast_filter)
+                .unwrap_or(RecallResult {
+                    memories: vec![],
+                    scores: vec![],
+                    total: 0,
+                });
 
             // 深度通路：洛书几何检索（LuoShuEncoder + TrapezoidFocus 梯形聚焦），使用富化查询
             let deep_filter = RecallFilter {
@@ -1502,15 +1554,72 @@ async fn mcp_handler(
     }
 }
 
-/// 健康检查端点（非 MCP 协议，便于调试）
-async fn health_handler() -> &'static str {
-    "Loong Recall 运行中 — 代码搜索 & 记忆服务"
+/// 健康检查端点 — 返回 JSON 详细状态
+///
+/// 响应包含服务运行阶段、索引进度、记忆库统计等关键信息。
+/// 供桌面端 sidecar_manager 健康检查和仪表盘状态页面使用。
+///
+/// 状态说明：
+///   - "starting": 服务刚启动，后台索引尚未开始
+///   - "indexing": 后台索引正在进行中，代码搜索可能不完整
+///   - "running": 索引已完成，所有功能就绪
+async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let indexing_complete = state
+        .indexing_complete
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let uptime = chrono::Utc::now() - state.started_at;
+    let uptime_seconds = uptime.num_seconds().max(0);
+
+    // 获取索引统计信息
+    let (file_count, total_chunks) = if indexing_complete {
+        let manager = state.manager.lock().await;
+        let stats = manager.get_stats();
+        (Some(stats.file_count), Some(stats.total_chunks))
+    } else {
+        (None, None)
+    };
+
+    // 获取记忆库统计
+    let memory_total = {
+        let store = state.memory_store.lock().await;
+        store.stats().map(|s| s.total_memories).unwrap_or(0)
+    };
+
+    // 判断服务阶段
+    let status = if indexing_complete {
+        "running"
+    } else if uptime_seconds < 5 {
+        "starting"
+    } else {
+        "indexing"
+    };
+
+    let llm_configured = state.llm_api.read().await.is_configured();
+
+    let response = HealthResponse {
+        status,
+        service: "loong-recall",
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_seconds,
+        indexing: IndexingStatus {
+            complete: indexing_complete,
+            file_count,
+            total_chunks,
+        },
+        memory: MemoryBrief {
+            total: memory_total,
+        },
+        src_dir: state.src_dir.clone(),
+        llm_configured,
+    };
+
+    (StatusCode::OK, Json(response))
 }
 
 /// 仪表盘 JavaScript 端点 — 返回编译时嵌入的 app.js
 ///
 /// 仪表盘 HTML 引用 app.js 作为外部脚本，此端点将编译时嵌入的
-/// app.js 内容以 `application/javascript` MIME 类型返回。 
+/// app.js 内容以 `application/javascript` MIME 类型返回。
 async fn app_js_handler() -> axum::response::Response<String> {
     const APP_JS: &str = include_str!("../static/app.js");
     axum::response::Response::builder()
@@ -1534,7 +1643,42 @@ async fn dashboard_handler() -> axum::response::Html<&'static str> {
     axum::response::Html(DASHBOARD_HTML)
 }
 
+/// 根路径重定向到仪表盘
+///
+/// 桌面端在 navigate_main_to_dashboard 时可能访问根路径 `/`，
+/// 此 handler 将其重定向到 `/dashboard`。
+/// 使用 302 临时重定向（兼容性更好）。
+async fn root_redirect_handler() -> impl IntoResponse {
+    (
+        StatusCode::FOUND, // 302 Temporary Redirect
+        [("Location", "/dashboard")],
+    )
+}
+
 // ==================== 配置 API 端点（仪表盘设置页面用） ====================
+
+/// 项目信息响应结构体（V2: 项目指纹 + 规范化路径）
+#[derive(Debug, Serialize)]
+struct ProjectInfoResponse {
+    /// 项目源码目录
+    src_dir: String,
+    /// 规范化后的绝对路径
+    canonical_path: String,
+    /// 项目指纹（SHA256 前 16 字符）
+    fingerprint: String,
+}
+
+/// GET /api/project/info — 获取当前项目的指纹和路径信息
+async fn project_info_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    use crate::project_id;
+    let src_path = std::path::Path::new(&state.src_dir);
+    let (fingerprint, canonical_path) = project_id::project_fingerprint_with_path(src_path);
+    Json(ProjectInfoResponse {
+        src_dir: state.src_dir.clone(),
+        canonical_path,
+        fingerprint,
+    })
+}
 
 /// 配置响应结构体
 #[derive(Debug, Serialize)]
@@ -1546,9 +1690,7 @@ struct ConfigResponse {
 }
 
 /// GET /api/config — 获取当前 LLM 配置状态
-async fn config_handler(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let llm = state.llm_api.read().await;
     let (configured, llm_type, llm_model) = match &*llm {
         LlmApiConfig::OpenAI { model, .. } => (true, "openai".to_string(), Some(model.clone())),
@@ -1747,9 +1889,13 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         // 仪表盘路由：静态文件 + 重定向
         .route("/dashboard", get(dashboard_handler))
         .route("/dashboard/", get(dashboard_handler))
+        // 根路径重定向到仪表盘（方便桌面端直接加载）
+        .route("/", get(root_redirect_handler))
         // 配置 API：仪表盘设置页面用
         .route("/api/config", get(config_handler))
         .route("/api/config/llm", post(config_llm_handler))
+        // V2: 项目信息 API
+        .route("/api/project/info", get(project_info_handler))
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
 }
@@ -1815,6 +1961,8 @@ mod tests {
             memory_store,
             src_dir: "fixture/src".into(),
             llm_api: Arc::new(RwLock::new(LlmApiConfig::None)),
+            indexing_complete: Arc::new(AtomicBool::new(true)), // 测试环境默认索引已完成
+            started_at: chrono::Utc::now(),
         })
     }
 
@@ -1853,7 +2001,10 @@ mod tests {
         // 验证记忆工具存在
         let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"remember"), "缺少 remember 工具");
-        assert!(tool_names.contains(&"batch_remember"), "缺少 batch_remember 工具");
+        assert!(
+            tool_names.contains(&"batch_remember"),
+            "缺少 batch_remember 工具"
+        );
         assert!(tool_names.contains(&"recall"), "缺少 recall 工具");
         assert!(tool_names.contains(&"forget"), "缺少 forget 工具");
         assert!(

@@ -1,8 +1,10 @@
 [workspace]
+# 桌面端 Tauri 项目是独立的 Cargo 工作区，不参与主项目构建
+exclude = ["desktop/src-tauri"]
 
 [package]
 name = "code-memory"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Open Source Contributors"]
 description = "Loong Recall (L-RC / 忆) — 几何坐标驱动的 AI 永久记忆系统，为 AI 助手提供语义代码搜索与跨会话记忆演化"
@@ -36,6 +38,13 @@ uuid = { version = "1", features = ["v4"] }
 dirs-next = "2"
 async-trait = "0.1"
 tempfile = "3"
+# 项目指纹计算（SHA256哈希）
+sha2 = "0.10"
+
+# L1 数据加密（API Key 安全存储）
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
 
 # 桌面仪表盘依赖 — 双击 exe 打开浏览器查看记忆管理面板
 webbrowser = { version = "0.8", optional = true }

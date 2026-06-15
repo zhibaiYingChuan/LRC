@@ -24,8 +24,14 @@ use std::path::{Path, PathBuf};
 /// 遵循 LRC 错误处理规范：每种错误包含描述、原因和修复建议。
 #[derive(Debug)]
 pub enum GuardError {
-    /// 已有 LRC 实例在运行（同一数据目录）
-    AlreadyRunning { pid: u32, data_dir: PathBuf },
+    /// 多窗口记录功能未开启，且已有 LRC 实例在运行
+    MultiWindowDisabled { pid: u32, data_dir: PathBuf },
+    /// 已达多窗口上限（max_windows > 1 时触发）
+    AlreadyRunning {
+        pid: u32,
+        data_dir: PathBuf,
+        limit: u32,
+    },
     /// 无法获取文件锁（权限或磁盘问题）
     LockAcquireFailed { path: PathBuf, reason: String },
     /// 所有候选端口均被占用
@@ -37,17 +43,35 @@ pub enum GuardError {
 impl fmt::Display for GuardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::AlreadyRunning { pid, data_dir } => {
+            Self::MultiWindowDisabled { pid, data_dir } => {
                 write!(
                     f,
-                    "LRC 记忆服务已达窗口上限，无法再启动新实例。\n\
+                    "当前项目已有 LRC 在运行（PID: {}），多窗口记录功能未开启。\n\
                      \n\
-                     原因: 当前项目已运行的 LRC 实例数已达上限。\n\
-                     - 如果你打开了同一个项目的多个窗口，这是正常限制，关闭多余窗口即可。\n\
-                     - 如果你需要更多窗口，使用 --multi-window N 参数提高上限。\n\
-                     - 如果你想重启 LRC，请先关闭旧进程（最早 PID: {}）。\n\
+                     说明: 你可以在桌面端配置中开启「多窗口 LRC 记录」，\n\
+                     开启后同一项目最多支持 3 个 LRC 实例同时运行，\n\
+                     方便你在多个编辑器窗口中分别记录记忆。\n\
                      \n\
                      数据目录: {}",
+                    pid,
+                    data_dir.display()
+                )
+            }
+            Self::AlreadyRunning {
+                pid,
+                data_dir,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "已达到多窗口上限（{} 个），无法再启动新实例。\n\
+                     \n\
+                     说明: 当前项目已有 {} 个 LRC 实例在运行，已达到上限。\n\
+                     如需启动新实例，请先关闭一个旧窗口（最早 PID: {}）。\n\
+                     \n\
+                     数据目录: {}",
+                    limit,
+                    limit,
                     pid,
                     data_dir.display()
                 )
@@ -149,16 +173,10 @@ impl SingletonLock {
                         if is_pid_alive(pid) {
                             alive_pids.push(pid);
                         } else {
-                            eprintln!(
-                                "[进程守护] 检测到残留 PID {} 已不存在，自动清理",
-                                pid
-                            );
+                            eprintln!("[进程守护] 检测到残留 PID {} 已不存在，自动清理", pid);
                         }
                     } else {
-                        eprintln!(
-                            "[进程守护] 锁文件内容异常: '{}'，自动跳过",
-                            trimmed
-                        );
+                        eprintln!("[进程守护] 锁文件内容异常: '{}'，自动跳过", trimmed);
                     }
                 }
             } else {
@@ -171,15 +189,26 @@ impl SingletonLock {
             return Err(GuardError::AlreadyRunning {
                 pid: current_pid,
                 data_dir: data_dir.to_path_buf(),
+                limit: max_windows,
             });
         }
 
         // 检查是否已达最大窗口数
         if alive_pids.len() as u32 >= max_windows {
-            return Err(GuardError::AlreadyRunning {
-                pid: *alive_pids.first().unwrap_or(&0),
-                data_dir: data_dir.to_path_buf(),
-            });
+            // max_windows == 1 → 多窗口功能未开启，返回 MultiWindowDisabled
+            // max_windows > 1  → 已达上限，返回 AlreadyRunning
+            return if max_windows <= 1 {
+                Err(GuardError::MultiWindowDisabled {
+                    pid: *alive_pids.first().unwrap_or(&0),
+                    data_dir: data_dir.to_path_buf(),
+                })
+            } else {
+                Err(GuardError::AlreadyRunning {
+                    pid: *alive_pids.first().unwrap_or(&0),
+                    data_dir: data_dir.to_path_buf(),
+                    limit: max_windows,
+                })
+            };
         }
 
         // 添加当前 PID
@@ -192,11 +221,9 @@ impl SingletonLock {
             .collect::<Vec<_>>()
             .join(",");
 
-        std::fs::write(&lock_path, &new_content).map_err(|e| {
-            GuardError::LockAcquireFailed {
-                path: lock_path.clone(),
-                reason: format!("写入 PID 列表失败: {}", e),
-            }
+        std::fs::write(&lock_path, &new_content).map_err(|e| GuardError::LockAcquireFailed {
+            path: lock_path.clone(),
+            reason: format!("写入 PID 列表失败: {}", e),
         })?;
 
         if alive_pids.len() > 1 {
@@ -502,10 +529,7 @@ mod tests {
         // 验证目录已创建
         assert!(data_dir.exists(), "数据目录应该已被创建");
         // 验证锁文件存在
-        assert!(
-            data_dir.join(".lrc.lock").exists(),
-            "锁文件应该已被创建"
-        );
+        assert!(data_dir.join(".lrc.lock").exists(), "锁文件应该已被创建");
 
         // Drop 锁 → 自动清理
         drop(lock);
@@ -522,16 +546,20 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        // 写入当前进程 PID 作为模拟的"旧锁"
+        // 写入当前进程 PID 作为模拟的"旧锁"（同进程重复启动场景）
         let current_pid = std::process::id();
         std::fs::write(data_dir.join(".lrc.lock"), current_pid.to_string()).unwrap();
 
         let result = SingletonLock::acquire(&data_dir, 1);
         match result {
-            Err(GuardError::AlreadyRunning { pid, .. }) => {
+            Err(GuardError::AlreadyRunning { pid, limit, .. }) => {
                 assert_eq!(pid, current_pid, "应该返回当前进程的 PID");
+                assert_eq!(limit, 1, "上限应为 1");
             }
-            other => panic!("期望 AlreadyRunning 错误，实际得到: {:?}", other),
+            other => panic!(
+                "期望 AlreadyRunning 错误（同进程重复启动），实际得到: {:?}",
+                other
+            ),
         }
     }
 
@@ -548,10 +576,7 @@ mod tests {
         std::fs::write(data_dir.join(".lrc.lock"), fake_pid.to_string()).unwrap();
 
         let lock = SingletonLock::acquire(&data_dir, 1);
-        assert!(
-            lock.is_ok(),
-            "旧 PID 不存在时应该自动清理并成功获取锁"
-        );
+        assert!(lock.is_ok(), "旧 PID 不存在时应该自动清理并成功获取锁");
 
         // 验证新锁包含当前 PID
         let lock_content =
@@ -580,8 +605,7 @@ mod tests {
         assert!(lock.is_ok(), "max_windows=3 时应该能获取锁");
 
         // 验证锁文件包含当前 PID
-        let content =
-            std::fs::read_to_string(data_dir.join(".lrc.lock")).expect("应能读取锁文件");
+        let content = std::fs::read_to_string(data_dir.join(".lrc.lock")).expect("应能读取锁文件");
         assert_eq!(
             content.trim(),
             std::process::id().to_string(),
@@ -629,11 +653,7 @@ mod tests {
         let current_pid = std::process::id();
 
         // 手动构造：锁文件包含当前 PID 和一个假 PID
-        std::fs::write(
-            data_dir.join(".lrc.lock"),
-            format!("{},99999", current_pid),
-        )
-        .unwrap();
+        std::fs::write(data_dir.join(".lrc.lock"), format!("{},99999", current_pid)).unwrap();
 
         // 创建锁对象（手动设置，不通过 acquire）
         let lock = SingletonLock {
@@ -657,10 +677,7 @@ mod tests {
     /// 测试: is_pid_alive 对当前进程返回 true
     #[test]
     fn test_current_pid_is_alive() {
-        assert!(
-            is_pid_alive(std::process::id()),
-            "当前进程应该被检测为存活"
-        );
+        assert!(is_pid_alive(std::process::id()), "当前进程应该被检测为存活");
     }
 
     /// 测试: is_pid_alive 对不可能的 PID 返回 false
@@ -668,10 +685,7 @@ mod tests {
     fn test_impossible_pid_is_dead() {
         // 大多数系统上 PID 0 是 Idle 进程，但无法通过 OpenProcess 打开
         // PID 99999 极不可能存在
-        assert!(
-            !is_pid_alive(99999),
-            "PID 99999 应该不存在"
-        );
+        assert!(!is_pid_alive(99999), "PID 99999 应该不存在");
     }
 
     /// 测试: DefaultConfig 的零配置推导
@@ -713,7 +727,10 @@ mod tests {
     /// 测试: CLI 参数优先于环境变量
     #[test]
     fn test_cli_overrides_env() {
-        std::env::set_var("LRC_LLM_API", "openai:sk-env:env-model:https://env.api.com/v1");
+        std::env::set_var(
+            "LRC_LLM_API",
+            "openai:sk-env:env-model:https://env.api.com/v1",
+        );
 
         let cli_value = "openai:sk-cli:cli-model:https://cli.api.com/v1";
         let config =
@@ -754,31 +771,41 @@ mod tests {
             true, // global 模式
         );
 
-        assert_eq!(
-            config.data_dir, custom,
-            "显式 db_path 应优先于 global 标志"
-        );
+        assert_eq!(config.data_dir, custom, "显式 db_path 应优先于 global 标志");
     }
 
     /// 测试: GuardError Display 格式化
     #[test]
     fn test_guard_error_display() {
-        let err = GuardError::AlreadyRunning {
+        let err = GuardError::MultiWindowDisabled {
             pid: 12345,
             data_dir: PathBuf::from("/tmp/lrc-data"),
         };
         let msg = err.to_string();
         assert!(msg.contains("12345"), "错误信息应包含 PID");
         assert!(msg.contains("/tmp/lrc-data"), "错误信息应包含路径");
+        assert!(msg.contains("多窗口记录功能未开启"), "应提示未开启");
 
-        let err2 = GuardError::NoAvailablePort {
+        let err2 = GuardError::AlreadyRunning {
+            pid: 12345,
+            data_dir: PathBuf::from("/tmp/lrc-data"),
+            limit: 3,
+        };
+        let msg2 = err2.to_string();
+        assert!(msg2.contains("12345"), "错误信息应包含 PID");
+        assert!(msg2.contains("3"), "错误信息应包含上限");
+
+        let err3 = GuardError::NoAvailablePort {
             base: 3099,
             max_attempts: 10,
         };
-        let msg2 = err2.to_string();
-        assert!(msg2.contains("3099"), "错误信息应包含起始端口");
-        assert!(msg2.contains("3108"), "错误信息应包含终点端口 (3099+10-1=3108)");
-        assert!(msg2.contains("10"), "错误信息应包含尝试次数");
+        let msg3 = err3.to_string();
+        assert!(msg3.contains("3099"), "错误信息应包含起始端口");
+        assert!(
+            msg3.contains("3108"),
+            "错误信息应包含终点端口 (3099+10-1=3108)"
+        );
+        assert!(msg3.contains("10"), "错误信息应包含尝试次数");
     }
 
     /// 测试: SingletonLock Drop 时的幂等性（多次 drop 不 panic）
@@ -794,9 +821,6 @@ mod tests {
         drop(lock);
 
         // 验证锁文件确实被删除了
-        assert!(
-            !lock_path.exists(),
-            "最后一个窗口退出后锁文件应被删除"
-        );
+        assert!(!lock_path.exists(), "最后一个窗口退出后锁文件应被删除");
     }
 }

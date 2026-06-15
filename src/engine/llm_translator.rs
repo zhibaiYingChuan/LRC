@@ -227,14 +227,7 @@ pub async fn translate_memory_query(config: &LlmApiConfig, query: &str) -> Vec<S
             model,
             endpoint,
         } => {
-            match translate_openai(
-                endpoint,
-                api_key,
-                model,
-                query,
-                MEMORY_TRANSLATION_PROMPT,
-            )
-            .await
+            match translate_openai(endpoint, api_key, model, query, MEMORY_TRANSLATION_PROMPT).await
             {
                 Ok(keywords) if !keywords.is_empty() => keywords,
                 _ => {
