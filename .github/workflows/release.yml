@@ -68,9 +68,17 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Set reproducible build env vars
+        if: runner.os == 'Linux'
         run: |
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> $GITHUB_ENV
           echo "RUSTFLAGS=-C link-arg=-Wl,--build-id=sha1" >> $GITHUB_ENV
+          echo "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG=false" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Set reproducible build env vars (non-Linux)
+        if: runner.os != 'Linux'
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> $GITHUB_ENV
           echo "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG=false" >> $GITHUB_ENV
         shell: bash
 
@@ -148,6 +156,9 @@ jobs:
           echo "  Loong Recall (LRC) One-Click Install Script"
           echo "==============================================="
 
+          VERSION="${1:-latest}"
+          BASE_URL="https://github.com/zhibaiYingChuan/LRC/releases/${VERSION}/download"
+
           # Detect OS and architecture
           OS=$(uname -s)
           ARCH=$(uname -m)
@@ -164,9 +175,6 @@ jobs:
             echo "Unsupported OS: $OS"
             exit 1
           fi
-
-          VERSION="${1:-latest}"
-          BASE_URL="https://github.com/zhibaiYingChuan/LRC/releases/${VERSION}/download"
 
           echo "  Downloading $BINARY ..."
           curl -L -o /tmp/lrc "$BASE_URL/$BINARY"
