@@ -951,10 +951,10 @@ fn install_ide_config(ide: &str) {
     // 读取现有配置
     let mut config = read_or_create_config(&config_path);
 
-    // 构建 loong-recall 的 MCP 配置
+    // 构建 loong-recall 的 MCP 配置（默认支持 3 窗口）
     let mcp_entry = serde_json::json!({
         "command": exe_path,
-        "args": ["--src-dir", ".", "--stdio"],
+        "args": ["--src-dir", ".", "--stdio", "--multi-window", "3"],
         "env": {}
     });
 
