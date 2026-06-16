@@ -1,14 +1,14 @@
 # ============================================================
-# Loong Recall (LRC) 持续集成工作流
-# 守门人驱动的质量闸门 —— 任何不合规代码不得合并
+# Loong Recall (LRC) CI Workflow
+# Gatekeeper-driven quality gates - non-compliant code shall not merge
 # ============================================================
-# 工程文化信条：
-#   - 契约优先：每个 Job 都是可验证的契约
-#   - TDD 驱动：测试是守门的第一道防线
-#   - 无指责复盘：CI 失败时输出结构化诊断，聚焦流程而非个人
+# Engineering Culture:
+#   - Contract First: Each job is a verifiable contract
+#   - TDD Driven: Tests are the first line of defense
+#   - Blameless Retro: CI failures output structured diagnostics
 # ============================================================
 
-name: 守门人 CI
+name: Gatekeeper CI
 
 on:
   push:
@@ -27,21 +27,21 @@ env:
 
 jobs:
   # ============================================================
-  # 守门 1-5：Rust 后端质量守门
+  # Gate 1-5: Rust Backend Quality Gates
   # ============================================================
   rust-gates:
-    name: Rust 守门 (编译 + 测试 + Clippy + 格式 + unwrap)
+    name: Rust Gates (build + test + clippy + fmt + unwrap)
     runs-on: windows-latest
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 安装 Rust 工具链
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: 缓存 Cargo 依赖
+      - name: Cache Cargo deps
         uses: actions/cache@v4
         with:
           path: |
@@ -51,18 +51,18 @@ jobs:
           key: ${{ runner.os }}-cargo-ci-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-ci-
 
-      - name: 守门 1：编译检查
+      - name: Gate 1: Compile Check
         run: cargo check --all-targets --features server
 
-      - name: 守门 2：单元测试
+      - name: Gate 2: Unit Tests
         run: cargo test --all-targets --features server
 
-      - name: 守门 3：Clippy 标准模式（默认规则零警告）
+      - name: Gate 3: Clippy Standard (zero warnings)
         run: |
           cargo clippy --all-targets --features server -- `
             -D warnings
 
-      - name: 守门 3b：Clippy 严格模式（pedantic + nursery，仅 main 分支 PR）
+      - name: Gate 3b: Clippy Strict (pedantic + nursery, main branch PR only)
         if: github.ref == 'refs/heads/main'
         run: |
           cargo clippy --all-targets --features server -- `
@@ -70,10 +70,10 @@ jobs:
             -W clippy::nursery `
             -D warnings
 
-      - name: 守门 4：代码格式
+      - name: Gate 4: Code Format
         run: cargo fmt --check
 
-      - name: 守门 5：unwrap() 残留检测（排除测试代码）
+      - name: Gate 5: unwrap() residue detection (exclude test code)
         shell: powershell
         run: |
           $Violations = @()
@@ -93,44 +93,42 @@ jobs:
             }
           }
           if ($Violations.Count -gt 0) {
-            Write-Host "ERROR: 发现 $($Violations.Count) 处 .unwrap() 残留（非测试代码）"
+            Write-Host "ERROR: Found $($Violations.Count) .unwrap() residue (non-test code)"
             $Violations | ForEach-Object { Write-Host "  $_" }
             exit 1
           } else {
-            Write-Host "PASS: 零 .unwrap() 残留（非测试代码）"
+            Write-Host "PASS: Zero .unwrap() residue (non-test code)"
           }
 
   # ============================================================
-  # 守门 6-7：前端质量守门
+  # Gate 6-7: Frontend Quality Gates
   # ============================================================
   frontend-gates:
-    name: 前端守门 (代码重复 + XSS 安全)
+    name: Frontend Gates (code duplication + XSS)
     runs-on: windows-latest
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 守门 6：前端代码重复检测
+      - name: Gate 6: Frontend code duplication check
         shell: powershell
         run: |
           $IndexHtml = "static\index.html"
           if (Test-Path $IndexHtml) {
             $Content = Get-Content $IndexHtml -Raw
-            # 检测是否有内联 <script>（非 src 引用）
             $InlineScripts = [regex]::Matches($Content, '<script[^>]*>(?!\s*</script>)([\s\S]*?)</script>')
             $InlineWithoutSrc = $InlineScripts | Where-Object { $_.Value -notmatch 'src=' }
             if ($InlineWithoutSrc.Count -gt 0) {
-              Write-Host "FAIL: index.html 包含 $($InlineWithoutSrc.Count) 个内联 <script>，应迁移到 app.js"
+              Write-Host "FAIL: index.html contains $($InlineWithoutSrc.Count) inline <script> tags, move to app.js"
               exit 1
             }
-            # 检查是否引用了 app.js
             if ($Content -notmatch 'src=["\x27]app\.js["\x27]') {
-              Write-Host "WARN: index.html 未引用 app.js"
+              Write-Host "WARN: index.html does not reference app.js"
             }
-            Write-Host "PASS: 前端代码无重复"
+            Write-Host "PASS: No frontend code duplication"
           }
 
-      - name: 守门 7：前端 XSS 安全检测
+      - name: Gate 7: Frontend XSS security check
         shell: powershell
         run: |
           $JsFiles = @("static\app.js", "static\index.html") | Where-Object { Test-Path $_ }
@@ -140,11 +138,10 @@ jobs:
             $Content = Get-Content $File -Raw
             foreach ($Pattern in $Dangerous) {
               if ($Content -match $Pattern) {
-                # 排除已安全转义的使用
                 if ($Pattern -eq "innerHTML\s*=" -and $Content -match 'htmlescape\(') {
                   continue
                 }
-                Write-Host "  FAIL: $File 包含 $Pattern"
+                Write-Host "  FAIL: $File contains $Pattern"
                 $Found = $true
               }
             }
@@ -152,26 +149,26 @@ jobs:
           if ($Found) {
             exit 1
           }
-          Write-Host "PASS: 前端 XSS 安全检查通过"
+          Write-Host "PASS: Frontend XSS security check passed"
 
   # ============================================================
-  # 综合守门人报告
+  # Gatekeeper Summary Report
   # ============================================================
   gatekeeper-report:
-    name: 守门人综合报告
+    name: Gatekeeper Report
     needs: [rust-gates, frontend-gates]
     runs-on: windows-latest
     if: always()
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 汇总守门结果
+      - name: Summarize gate results
         shell: powershell
         run: |
           Write-Host ""
           Write-Host "============================================================"
-          Write-Host "  守门人 CI 综合报告"
+          Write-Host "  Gatekeeper CI Summary Report"
           Write-Host "============================================================"
 
           $RustResult = "${{ needs.rust-gates.result }}"
@@ -180,24 +177,24 @@ jobs:
           $AllPassed = ($RustResult -eq "success" -and $FrontendResult -eq "success")
 
           Write-Host ""
-          Write-Host "  Rust 守门 (编译+测试+Clippy+格式+unwrap): $RustResult"
-          Write-Host "  前端守门 (代码重复+XSS): $FrontendResult"
+          Write-Host "  Rust Gates  (build+test+clippy+fmt+unwrap): $RustResult"
+          Write-Host "  Frontend Gates (code duplication+XSS): $FrontendResult"
           Write-Host ""
 
           if ($AllPassed) {
-            Write-Host "  裁决: 通过 - 所有守门检查通过，代码质量达标"
+            Write-Host "  VERDICT: PASS - All gates passed, code quality meets standards"
             Write-Host ""
-            Write-Host "  '契约达成。代码如承诺般可靠，测试如契约般精确。可以安全合并。'"
+            Write-Host "  'Contract fulfilled. Code is as reliable as promised, tests as precise as the contract. Safe to merge.'"
           } else {
-            Write-Host "  裁决: 拒绝 - 存在守门未通过，请修复后重新提交"
+            Write-Host "  VERDICT: REJECT - Some gates failed, please fix and resubmit"
             Write-Host ""
-            Write-Host "  '契约未达成。守门人拒绝放行，因为质量承诺尚未兑现。这不是指责，而是保护。'"
+            Write-Host "  'Contract not fulfilled. Gatekeeper denies passage because quality promise is not yet met. This is not blame, it is protection.'"
             Write-Host ""
             if ($RustResult -ne "success") {
-              Write-Host "    -> 本地运行 cargo test --all-targets --features server 检查失败原因"
+              Write-Host "    -> Run: cargo test --all-targets --features server"
             }
             if ($FrontendResult -ne "success") {
-              Write-Host "    -> 删除 index.html 内联 <script>，仅保留 app.js 引用"
+              Write-Host "    -> Remove inline <script> from index.html, keep only app.js reference"
             }
             exit 1
           }

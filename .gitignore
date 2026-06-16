@@ -61,7 +61,6 @@ tests/*_only.ps1
 tests/new_user_flow.ps1
 
 # 内部开发工具（不交付用户）
-scripts/check_algorithm_leak.py
 scripts/gatekeeper.ps1
 scripts/install_hooks.py
 scripts/pre-commit
@@ -77,6 +76,8 @@ tests/dao_annotation_check.rs
 
 # 内部架构文档（不交付用户）
 docs/dao-pivot-mapping.md
+docs/ALGORITHM_OVERVIEW.md
+docs/COMMUNITY_GOVERNANCE.md
 
 # 内部分析文档（不交付用户）
 docs/product-analysis/
@@ -123,3 +124,18 @@ desktop/tests/e2e_user_simulation.ps1
 desktop/tests/e2e_results.json
 desktop/tests/screenshots/
 desktop/src/test_ui.html
+desktop/src/wizard.test.js
+desktop/src/*.test.*
+*.test.js
+*.test.ts
+
+# 根目录临时/工具脚本（开发者本地使用，不交付用户）
+_*
+-*
+.git-commit-msg.txt
+amend_push.ps1
+check_git.ps1
+compare.ps1
+do_git.bat
+do_git.ps1
+run_check.ps1

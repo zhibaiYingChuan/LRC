@@ -330,7 +330,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
         },
         ToolDefinition {
             name: "recall".into(),
-            description: "语义检索历史记忆。支持两种模式：fast（关键词匹配，默认）和 luoshu（洛书几何检索，使用 LuoShuEncoder + TrapezoidFocus）。luoshu 模式将查询投影到洛书九宫格，通过梯形聚焦在几何空间中定位记忆，返回洛书空间中距离最近的记忆。".into(),
+            description: "语义检索历史记忆。支持两种模式：fast（关键词匹配，默认）和 deep（深度语义检索，使用编码器 + 聚焦检索）。deep 模式通过语义空间定位找到距离最近的记忆。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
@@ -345,12 +345,12 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                     },
                     "lrc_mode": {
                         "type": "string",
-                        "description": "检索模式: fast（关键词匹配，默认）| luoshu（洛书几何检索，使用 LuoShuEncoder 编码 + TrapezoidFocus 梯形聚焦）",
+                        "description": "检索模式: fast（关键词匹配，默认）| deep（深度语义检索）",
                         "default": "fast"
                     },
                     "focus_depth": {
                         "type": "integer",
-                        "description": "梯形聚焦深度（仅 lrc_mode=luoshu 时生效）。0=全量检索，1=4分，2=16分。默认 1",
+                        "description": "检索深度（仅 lrc_mode=deep 时生效）。0=全量检索，1=标准，2=深度。默认 1",
                         "default": 1
                     },
                     "memory_type": {
@@ -500,8 +500,8 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
             },
         },
         ToolDefinition {
-            name: "dao_metrics".into(),
-            description: "道同构度监控仪表 — 获取洛书记忆系统的健康度指标：道同构度评分、八卦分布熵、合成比率、编码/检索/合成/修正次数。".into(),
+            name: "system_health".into(),
+            description: "系统健康监控 — 获取记忆系统的健康度指标：一致性评分、分布熵、合成比率、编码/检索/合成/修正次数。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({}),
@@ -532,7 +532,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
         },
         ToolDefinition {
             name: "recall_enhanced".into(),
-            description: "双路检索增强 — 快速通路（关键词匹配）+ 深度通路（洛书几何检索），通过倒数排名融合（RRF）合并结果。适用于需要深度背景的查询。".into(),
+            description: "双路检索增强 — 快速通路（关键词匹配）+ 深度通路（深度语义检索），通过倒数排名融合（RRF）合并结果。适用于需要深度背景的查询。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
@@ -795,7 +795,7 @@ async fn handle_tools_call(
                 .unwrap_or(5)
                 .clamp(1, 100) as usize;
 
-            // 检索模式：fast（关键词匹配）或 luoshu（洛书几何检索）
+            // 检索模式：fast（关键词匹配）或 deep（深度语义检索）
             let lrc_mode = arguments
                 .get("lrc_mode")
                 .and_then(|v| v.as_str())
@@ -843,7 +843,7 @@ async fn handle_tools_call(
             let mut store = state.memory_store.lock().await;
 
             // LLM 记忆翻译：如果配置了 LLM API，将自然语言问题翻译为答案可能包含的关键词
-            // 然后将关键词拼入原始查询，使 TF-IDF/Luoshu 能跨越"问题词与答案词不重叠"的语义鸿沟
+            // 然后将关键词拼入原始查询，使 TF-IDF/语义编码器能跨越"问题词与答案词不重叠"的语义鸿沟
             // 例如："What degree did I graduate with?" →
             //   富化查询: "Business Administration major degree graduation college What degree did I graduate with?"
             let enriched_query = if state.llm_api.read().await.is_configured() {
@@ -863,8 +863,8 @@ async fn handle_tools_call(
             };
 
             // 根据 lrc_mode 选择检索方法（使用富化后的查询）
-            let result = if lrc_mode == "luoshu" {
-                // 洛书几何检索：LuoShuEncoder 编码查询 + TrapezoidFocus 梯形聚焦
+            let result = if lrc_mode == "deep" {
+                // 深度语义检索
                 store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth)
             } else {
                 // 快速模式：关键词匹配（默认）
@@ -877,8 +877,8 @@ async fn handle_tools_call(
                         "记忆检索结果 (共 {} 条匹配，记忆库共 {} 条，模式: {})\n\n",
                         result.memories.len(),
                         result.total,
-                        if lrc_mode == "luoshu" {
-                            "洛书几何检索"
+                        if lrc_mode == "deep" {
+                            "深度语义检索"
                         } else {
                             "关键词匹配"
                         }
@@ -895,12 +895,9 @@ async fn handle_tools_call(
                                 score * 100.0
                             ));
                             text.push_str(&format!("内容: {}\n", m.content));
-                            // 洛书模式显示几何信息
-                            if lrc_mode == "luoshu" {
-                                if let Some(ref cat) = m.bagua_category {
-                                    text.push_str(&format!("八卦类别: {} | ", cat));
-                                }
-                                text.push_str(&format!("拓扑深度: {:.2} | ", m.topological_depth));
+                            // 显示分类信息
+                            if let Some(ref cat) = m.bagua_category {
+                                text.push_str(&format!("分类: {} | ", cat));
                             }
                             text.push_str(&format!(
                                 "类型: {} | 重要性: {}/10",
@@ -1254,22 +1251,22 @@ async fn handle_tools_call(
             make_response(id, to_json_value_safe(&call_result))
         }
 
-        // === L5 道同构度监控仪表 ===
-        "dao_metrics" => {
+        // === 系统健康监控 ===
+        "system_health" => {
             let store = state.memory_store.lock().await;
             match store.dao_metrics_snapshot() {
                 Ok(snapshot) => {
                     let mut text = String::from("═══════════════════════════════════\n");
-                    text.push_str("  道同构度 (DAO Isomorphism) 监控仪表\n");
+                    text.push_str("  系统健康度监控仪表\n");
                     text.push_str("═══════════════════════════════════\n\n");
 
                     text.push_str("### 核心指标\n");
                     text.push_str(&format!(
-                        "- 道同构度: {:.1}%\n",
+                        "- 一致性评分: {:.1}%\n",
                         snapshot.dao_isomorphism_score * 100.0
                     ));
                     text.push_str(&format!(
-                        "- 八卦分布熵: {:.3} (最大 3.0)\n",
+                        "- 分布熵: {:.3} (最大 3.0)\n",
                         snapshot.bagua_entropy
                     ));
                     text.push_str(&format!(
@@ -1277,7 +1274,7 @@ async fn handle_tools_call(
                         snapshot.synthesis_ratio * 100.0
                     ));
 
-                    text.push_str("### 记忆容量\n");
+                    text.push_str("### 记忆库统计\n");
                     text.push_str(&format!("- 活跃记忆: {} 条\n", snapshot.active_memories));
                     text.push_str(&format!(
                         "- 结晶记忆: {} 条\n",
@@ -1292,10 +1289,10 @@ async fn handle_tools_call(
                     text.push_str(&format!("- 修正次数: {}\n", snapshot.corrections_total));
 
                     if snapshot.dao_isomorphism_score < 0.5 {
-                        text.push_str("\n⚠️ 道同构度偏低，建议检查洛书编码器或增加训练数据。\n");
+                        text.push_str("\n⚠️ 一致性评分偏低，建议检查编码器或增加训练数据。\n");
                     }
                     if snapshot.bagua_entropy < 0.5 && snapshot.active_memories > 10 {
-                        text.push_str("\n⚠️ 八卦分布过于集中，记忆可能存在类别偏差。\n");
+                        text.push_str("\n⚠️ 分布过于集中，记忆可能存在类别偏差。\n");
                     }
 
                     let call_result = ToolCallResult {
@@ -1306,7 +1303,7 @@ async fn handle_tools_call(
                     };
                     make_response(id, to_json_value_safe(&call_result))
                 }
-                Err(e) => make_error(id, -32603, &format!("道同构度采集失败: {}", e)),
+                Err(e) => make_error(id, -32603, &format!("健康度采集失败: {}", e)),
             }
         }
 
@@ -1426,7 +1423,7 @@ async fn handle_tools_call(
                     total: 0,
                 });
 
-            // 深度通路：洛书几何检索（LuoShuEncoder + TrapezoidFocus 梯形聚焦），使用富化查询
+            // 深度通路：深度语义检索，使用富化查询
             let deep_filter = RecallFilter {
                 memory_type,
                 project,
@@ -1494,7 +1491,7 @@ async fn handle_tools_call(
             let mut text = format!(
                 "双路检索增强结果 (共 {} 条候选，返回 {} 条)\n\
                  ═══════════════════════════════════\n\
-                 快速通路: 关键词匹配 | 深度通路: 洛书几何检索\n\
+                 快速通路: 关键词匹配 | 深度通路: 深度语义检索\n\
                  融合算法: 倒数排名融合 (RRF, k=60)\n\n",
                 total,
                 result_memories.len()
@@ -1508,12 +1505,9 @@ async fn handle_tools_call(
                     let mem_num = i + 1;
                     text.push_str(&format!("（记忆 #{mem_num} · RRF 融合度 {:.3}）\n", score));
                     text.push_str(&format!("内容: {}\n", m.content));
-                    // 显示八卦分类信息
+                    // 显示分类信息
                     if let Some(ref cat) = m.bagua_category {
-                        let bagua_idx = m.bagua_index.unwrap_or(0);
-                        let bagua_names = ["乾", "兑", "离", "震", "巽", "坎", "艮", "坤"];
-                        let name = bagua_names.get(bagua_idx as usize).copied().unwrap_or("?");
-                        text.push_str(&format!("八卦: {}·{} | ", name, cat));
+                        text.push_str(&format!("分类: {} | ", cat));
                     }
                     text.push_str(&format!(
                         "类型: {} | 重要性: {}/10\n",
@@ -1523,7 +1517,7 @@ async fn handle_tools_call(
                     text.push_str(&format!("ID: `{}`\n\n", m.id));
                 }
                 text.push_str(
-                    "💡 双路检索融合了快速关键词匹配和洛书几何定位，兼顾了召回率和精度。\n",
+                    "💡 双路检索融合了快速关键词匹配和深度语义定位，兼顾了召回率和精度。\n",
                 );
             }
 
@@ -2025,7 +2019,7 @@ mod tests {
             tool_names.contains(&"codebase_stats"),
             "缺少 codebase_stats 工具"
         );
-        assert!(tool_names.contains(&"dao_metrics"), "缺少 dao_metrics 工具");
+        assert!(tool_names.contains(&"system_health"), "缺少 system_health 工具");
         assert!(
             tool_names.contains(&"correct_memory"),
             "缺少 correct_memory 工具"

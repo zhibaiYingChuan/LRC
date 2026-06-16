@@ -1,4 +1,4 @@
-name: 预编译发布
+name: Pre-compiled Release
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '发布版本号 (如 v0.2.0)'
+        description: 'Release version (e.g. v0.2.0)'
         required: true
 
 permissions:
@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    name: 构建 ${{ matrix.target }}
+    name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -34,16 +34,30 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: lrc-windows-x86_64.exe
 
+    outputs:
+      bin_name: ${{ steps.build.outputs.bin_name }}
+
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 安装 Rust 工具链
+      - name: Resolve version
+        id: version
+        run: |
+          # 从 tag 或手动触发输入中获取版本号
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VER=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "VER=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: 缓存 Cargo 依赖
+      - name: Cache Cargo deps
         uses: actions/cache@v4
         with:
           path: |
@@ -53,157 +67,170 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: 设置可重现构建环境变量
+      - name: Set reproducible build env vars
         run: |
-          # 可重现构建（Reproducible Builds）
-          # 质疑三解决方案：让社区中的任何人都能用相同源码编译出与发布完全一致的二进制文件
-          # 这将信任从对"人"的信任，转移为对"代码"和"数学"的信任
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> $GITHUB_ENV
           echo "RUSTFLAGS=-C link-arg=-Wl,--build-id=sha1" >> $GITHUB_ENV
           echo "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG=false" >> $GITHUB_ENV
         shell: bash
 
-      - name: 构建 Release
+      - name: Build and name with version
+        id: build
         run: |
-          cargo build --release --features server,ml --target ${{ matrix.target }}
-          # 重命名二进制文件
+          VERSION="${{ steps.version.outputs.VER }}"
+          # 根据矩阵平台确定短名称
+          case "${{ matrix.os }}" in
+            ubuntu-latest)   PLATFORM="linux-x86_64" ;;
+            macos-latest)    PLATFORM="macos-arm64" ;;
+            macos-13)        PLATFORM="macos-x86_64" ;;
+            windows-latest)  PLATFORM="windows-x86_64" ;;
+            *)               PLATFORM="unknown" ;;
+          esac
+          BIN_NAME="lrc-${VERSION}-${PLATFORM}"
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            cp target/${{ matrix.target }}/release/code-memory-server.exe ${{ matrix.artifact }}
-          else
-            cp target/${{ matrix.target }}/release/code-memory-server ${{ matrix.artifact }}
+            BIN_NAME="${BIN_NAME}.exe"
           fi
+          echo "bin_name=${BIN_NAME}" >> $GITHUB_OUTPUT
+          echo "BIN_NAME=${BIN_NAME}" >> $GITHUB_ENV
+
+          cargo build --release --features server,ml --target ${{ matrix.target }}
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/${{ matrix.target }}/release/code-memory-server.exe "${BIN_NAME}"
+          else
+            cp target/${{ matrix.target }}/release/code-memory-server "${BIN_NAME}"
+          fi
+          echo "Built: ${BIN_NAME}"
         shell: bash
 
-      - name: macOS 代码签名（Ad-Hoc）
+      - name: macOS code signing (Ad-Hoc)
         if: runner.os == 'macOS'
         run: |
-          # Ad-Hoc 签名：允许在本地 macOS 上运行，不触发 Gatekeeper 完全阻止
-          # 注意：要完全消除 Gatekeeper 警告需要 Apple Developer 证书
-          codesign --sign - --force --timestamp=none ${{ matrix.artifact }} 2>/dev/null || \
-            echo "  ⚠ Ad-Hoc 签名完成（如需完全消除 Gatekeeper 警告，请配置 Apple Developer 证书）"
+          codesign --sign - --force --timestamp=none $BIN_NAME 2>/dev/null || \
+            echo "  Ad-Hoc signing complete"
         shell: bash
 
-      - name: 生成 SHA256 校验和
+      - name: Generate SHA256 checksum
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
-            certutil -hashfile ${{ matrix.artifact }} SHA256 > ${{ matrix.artifact }}.sha256
+            certutil -hashfile $BIN_NAME SHA256 > $BIN_NAME.sha256
           else
-            sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+            sha256sum $BIN_NAME > $BIN_NAME.sha256
           fi
         shell: bash
 
-      - name: 上传构建产物
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ steps.build.outputs.bin_name }}
           path: |
-            ${{ matrix.artifact }}
-            ${{ matrix.artifact }}.sha256
+            ${{ steps.build.outputs.bin_name }}
+            ${{ steps.build.outputs.bin_name }}.sha256
 
   release:
-    name: 创建 GitHub Release
+    name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: 检出代码
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 下载所有构建产物
+      - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: 生成安装脚本
+      - name: Generate install script
         run: |
           cat > install.sh << 'SCRIPT'
           #!/bin/bash
           set -e
-          echo "═══════════════════════════════════════════"
-          echo "  Loong Recall (LRC / 忆) 一键安装脚本"
-          echo "═══════════════════════════════════════════"
+          echo "==============================================="
+          echo "  Loong Recall (LRC) One-Click Install Script"
+          echo "==============================================="
 
-          # 检测操作系统和架构
+          # Detect OS and architecture
           OS=$(uname -s)
           ARCH=$(uname -m)
 
           if [ "$OS" = "Linux" ]; then
-            BINARY="lrc-linux-x86_64"
+            BINARY="lrc-${VERSION}-linux-x86_64"
           elif [ "$OS" = "Darwin" ]; then
             if [ "$ARCH" = "arm64" ]; then
-              BINARY="lrc-macos-arm64"
+              BINARY="lrc-${VERSION}-macos-arm64"
             else
-              BINARY="lrc-macos-x86_64"
+              BINARY="lrc-${VERSION}-macos-x86_64"
             fi
           else
-            echo "不支持的操作系统: $OS"
+            echo "Unsupported OS: $OS"
             exit 1
           fi
 
           VERSION="${1:-latest}"
           BASE_URL="https://github.com/zhibaiYingChuan/LRC/releases/${VERSION}/download"
 
-          echo "  下载 $BINARY ..."
+          echo "  Downloading $BINARY ..."
           curl -L -o /tmp/lrc "$BASE_URL/$BINARY"
           chmod +x /tmp/lrc
 
-          # 安装到系统路径
+          # Install to system path
           INSTALL_DIR="${HOME}/.local/bin"
           mkdir -p "$INSTALL_DIR"
           mv /tmp/lrc "$INSTALL_DIR/code-memory-server"
 
-          echo "  ✓ 安装完成！"
-          echo "  可执行文件: $INSTALL_DIR/code-memory-server"
+          echo "  Install complete!"
+          echo "  Binary: $INSTALL_DIR/code-memory-server"
           echo ""
-          echo "  快速开始:"
+          echo "  Quick start:"
           echo "    code-memory-server --src-dir . --port 3099"
-          echo "    然后访问 http://localhost:3099/dashboard"
+          echo "    Then visit http://localhost:3099/dashboard"
           SCRIPT
           chmod +x install.sh
 
-      - name: 生成可重现构建验证说明
+      - name: Generate reproducible build verification guide
         run: |
           cat > REPRODUCIBLE_BUILDS.md << 'DOC'
-          # 可重现构建验证指南
+          # Reproducible Builds Verification Guide
 
-          Loong Recall 支持可重现构建。任何开发者都可以验证发布的二进制文件与源码一致。
+          Loong Recall supports reproducible builds. Any developer can verify that
+          the published binary matches the source code.
 
-          ## 验证步骤
+          ## Verification Steps
 
-          1. 克隆仓库并切换到对应的 tag：
+          1. Clone the repository and checkout the corresponding tag:
              ```
              git clone https://github.com/zhibaiYingChuan/LRC.git
              cd LRC
              git checkout v<VERSION>
              ```
 
-          2. 使用相同的环境变量编译：
+          2. Build with the same environment variables:
              ```
              export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
              export RUSTFLAGS="-C link-arg=-Wl,--build-id=sha1"
              cargo build --release --features server,ml --target <YOUR_TARGET>
              ```
 
-          3. 对比 SHA256：
+          3. Compare SHA256:
              ```
              sha256sum target/<YOUR_TARGET>/release/code-memory-server
              ```
-             应与 GitHub Release 中的 `.sha256` 文件一致。
+             Should match the `.sha256` file in the GitHub Release.
 
-          ## 信任模型
+          ## Trust Model
 
-          可重现构建将信任从"信任开发者"转移为"信任代码"：
-          - 你不需要相信我（开发者）没有在二进制中植入后门
-          - 你只需要相信你可以自己编译出完全相同的二进制文件
-          - 如果 SHA256 不一致，说明二进制文件与源码不匹配
+          Reproducible builds shift trust from "trusting the developer" to "trusting the code":
+          - You don't need to trust me (the developer) didn't embed a backdoor
+          - You only need to trust that you can compile the exact same binary
+          - If SHA256 doesn't match, the binary does not match the source
 
-          ## 已知限制
+          ## Known Limitations
 
-          - macOS 的 codesign 会影响二进制哈希，验证时需跳过签名
-          - 不同 Rust 编译器版本可能产生微小差异，建议使用相同版本
+          - macOS codesign affects binary hash, skip signing during verification
+          - Different Rust compiler versions may produce minor differences, use the same version
           DOC
         shell: bash
 
-      - name: 创建 Release
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
