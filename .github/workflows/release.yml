@@ -27,9 +27,6 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: lrc-macos-arm64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            artifact: lrc-macos-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: lrc-windows-x86_64.exe
@@ -166,11 +163,7 @@ jobs:
           if [ "$OS" = "Linux" ]; then
             BINARY="lrc-${VERSION}-linux-x86_64"
           elif [ "$OS" = "Darwin" ]; then
-            if [ "$ARCH" = "arm64" ]; then
-              BINARY="lrc-${VERSION}-macos-arm64"
-            else
-              BINARY="lrc-${VERSION}-macos-x86_64"
-            fi
+            BINARY="lrc-${VERSION}-macos-arm64"
           else
             echo "Unsupported OS: $OS"
             exit 1
