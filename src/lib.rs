@@ -1,21 +1,17 @@
-// Loong Recall (L-RC / 忆) — 通用语义记忆引擎
+// Loong Recall (LRC) — 通用语义记忆引擎
 // ================================================
 //
-// 源于道体（DaoTi）道枢层（Core Layer）的语义编码与检索技术，
-// 作为 Loong Agent OS 的记忆子系统独立开源。
-//
-// 支持多语言代码（Rust / Python / TypeScript / JavaScript / Go）
-// 及通用文档（Markdown / Text / YAML / TOML / JSON）的自动切分与检索，
 // 为 AI 助手提供跨项目、跨语言的永久记忆能力。
+// 支持多语言代码和通用文档的自动切分与检索。
 //
-// 分层开源架构（遵循 DaoTi 分层协议）:
+// 分层开源架构:
 //   Layer 1 (Public)  — chunker.rs, server.rs, bin/server.rs → Apache 2.0
-//   Layer 2 (Protected) — engine/ 子模块 → DaoTi Research License v1.0
+//   Layer 2 (Protected) — engine/ 子模块 → 专有研究许可
 //   Layer 3 (Binary)  — 编译产物 → 二进制分发，Rust 编译天然混淆
 //
-// 架构：Chunker（多语言切分）→ Encoder（语义编码）→ Retriever（向量检索）→ Manager（编排）
-// 可选：Server（MCP HTTP/Stdio 服务）→ IDE 直接调用
-// 可选：CodeBERT（ml feature）→ 高精度语义编码
+// 架构: Chunker（多语言切分）→ Encoder（语义编码）→ Retriever（向量检索）→ Manager（编排）
+// 可选: Server（MCP HTTP/Stdio 服务）→ IDE 直接调用
+// 可选: CodeBERT（ml feature）→ 高精度语义编码
 
 // === Layer 1: 公开层 (Apache 2.0) ===
 pub mod chunker;
@@ -67,7 +63,7 @@ pub mod arch_config;
 /// 三层基准测试框架（可被 CLI、仪表盘 API、CI/CD 复用）
 pub mod benchmark;
 
-// === Layer 2: 受保护核心引擎 (DaoTi Research License v1.0) ===
+// === Layer 2: 受保护核心引擎（专有研究许可） ===
 pub mod engine;
 
 // === Layer 1: MCP 服务层 (Apache 2.0) ===
@@ -98,7 +94,7 @@ pub use graph_store::{EdgeType, GraphMemoryStore, GraphQueryResult, MemoryEdge};
 
 // === 架构记忆配置重导出 ===
 pub use arch_config::{
-    ArchConfig, LuoshuArchConfig, PrivacyArchConfig, RetrievalArchConfig, SynthesisArchConfig,
+    ArchConfig, EncoderArchConfig, PrivacyArchConfig, RetrievalArchConfig, SynthesisArchConfig,
 };
 
 // === 受保护核心重导出（仅导出接口类型，实现细节在 engine/ 中） ===

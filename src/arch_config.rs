@@ -6,7 +6,7 @@
 // 架构记忆配置（Architecture Memory Config）
 //
 // 架构记忆存储：
-//   存储洛书算子参数、衰减曲线、权限策略等系统级配置，
+//   存储编码器参数、衰减曲线、权限策略等系统级配置，
 //   支持系统自举与演化（服务重启后自动恢复上次运行参数）。
 //
 // 持久化格式：JSON 文件，存储在数据目录下的 `arch_config.json`
@@ -30,8 +30,8 @@ pub struct ArchConfig {
     pub retrieval: RetrievalArchConfig,
     /// 隐私策略配置
     pub privacy: PrivacyArchConfig,
-    /// 洛书编码器参数
-    pub luoshu: LuoshuArchConfig,
+    /// 编码器参数
+    pub encoder: EncoderArchConfig,
     /// 最后一次更新时间
     pub updated_at: String,
 }
@@ -45,8 +45,8 @@ pub struct SynthesisArchConfig {
     pub similarity_threshold: f32,
     /// 合成置信度阈值（低于此值的合成结果被丢弃，默认 0.3）
     pub confidence_threshold: f32,
-    /// 是否启用洛书驱动合成（八卦分类 + 门控融合）
-    pub use_luoshu_synthesis: bool,
+    /// 是否启用分类驱动合成
+    pub use_categorical_synthesis: bool,
     /// 是否启用 Jaccard 驱动合成（词集相似度聚类）
     pub use_jaccard_synthesis: bool,
 }
@@ -77,12 +77,12 @@ pub struct PrivacyArchConfig {
     pub session_ttl_days: Option<u32>,
 }
 
-/// 洛书编码器参数配置（属于架构记忆）
+/// 编码器参数配置（属于架构记忆）
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LuoshuArchConfig {
-    /// 是否使用洛书先验权重
+pub struct EncoderArchConfig {
+    /// 是否使用先验权重
     pub use_prior: bool,
-    /// 迭代投影轮数（幻和收敛迭代次数，默认 5）
+    /// 迭代投影轮数（默认 5）
     pub projection_iterations: u32,
     /// 特征提取权重：字符密度
     pub feature_density_weight: f32,
@@ -98,7 +98,7 @@ impl Default for SynthesisArchConfig {
             min_cluster: 3,
             similarity_threshold: 0.4,
             confidence_threshold: 0.3,
-            use_luoshu_synthesis: true,
+            use_categorical_synthesis: true,
             use_jaccard_synthesis: true,
         }
     }
@@ -126,7 +126,7 @@ impl Default for PrivacyArchConfig {
     }
 }
 
-impl Default for LuoshuArchConfig {
+impl Default for EncoderArchConfig {
     fn default() -> Self {
         Self {
             use_prior: true,
@@ -146,7 +146,7 @@ impl Default for ArchConfig {
             synthesis: SynthesisArchConfig::default(),
             retrieval: RetrievalArchConfig::default(),
             privacy: PrivacyArchConfig::default(),
-            luoshu: LuoshuArchConfig::default(),
+            encoder: EncoderArchConfig::default(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         }
     }
