@@ -5,18 +5,182 @@
 use serde::Serialize;
 use tauri::State;
 use tauri::Manager; // Manager trait 提供 get_webview_window 等方法
+use tauri::Emitter; // v0.5.5 P1-2：Emitter trait 提供 emit 方法（open_settings 命令使用）
+// v0.5.4 修复：移除未使用的 Emitter import（emit 已从 detect_agents 中移除）
 use tokio::sync::Mutex; // 使用 tokio::sync::Mutex 以支持跨 await 持有
 
 use crate::agent_detector::{AgentDetectorRegistry, AgentInfo, ProjectInfo};
 use crate::config_wizard::WizardState;
+use crate::rate_limiter::RateLimiter;
 use crate::sidecar_manager::SidecarManager;
 use crate::tray; // 托盘模块的 open_dashboard 函数
 
+// ── v0.5.1 辅助函数：消除重复代码 ──
+
+/// 从向导配置中获取 LLM API 字符串（消除 3 处重复调用）
+/// 
+/// 此函数统一了 start_sidecar、start_sidecar_for_project、switch_project
+/// 三处获取 LLM 配置的逻辑，避免未来修改时遗漏同步。
+async fn get_llm_api_from_wizard(store: &State<'_, AppStore>) -> Option<String> {
+    let wizard = store.wizard.lock().await;
+    wizard.config().to_llm_api_string()
+}
+
+/// 在主窗口 iframe 中显示仪表盘（统一入口，消除 2 处重复的 JS 注入逻辑）
+/// 
+/// 原先 navigate_main_to_dashboard 和 open_dashboard_window 有几乎相同的逻辑，
+/// 现统一在此函数中。adjust_window 控制是否调整窗口大小和标题。
+fn show_dashboard_in_main_window(
+    app: &tauri::AppHandle,
+    port: u16,
+    adjust_window: bool,
+) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+        // v0.5.4 修复：使用 Wizard 命名空间替代全局函数
+        let js = format!(
+            "if(window.Wizard&&window.Wizard.showDashboardEmbed){{window.Wizard.showDashboardEmbed({})}}else{{window.location.hash='#dashboard'}}",
+            port
+        );
+        window
+            .eval(&js)
+            .map_err(|e| format!("显示仪表盘失败: {e}"))?;
+
+        if adjust_window {
+            window
+                .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(1200, 800)))
+                .map_err(|e| format!("调整窗口大小失败: {e}"))?;
+            window
+                .set_resizable(true)
+                .map_err(|e| format!("设置可缩放失败: {e}"))?;
+            window
+                .set_title("LRC 仪表盘 — AI 工具的记忆")
+                .map_err(|e| format!("设置标题失败: {e}"))?;
+        }
+
+        tracing::info!("仪表盘已在主窗口 iframe 中显示 (port={port}, adjust_window={adjust_window})");
+    } else {
+        // 回退：通过托盘模块（不创建新窗口）
+        tray::open_dashboard(app);
+    }
+    Ok(())
+}
+
+/// v0.5.4 P1-6 新增：用户友好的错误消息映射
+/// 
+/// 将技术错误信息翻译为用户可理解的提示，并附带修复建议。
+/// 覆盖常见的错误模式：ENOENT、Connection refused、RwLock 毒化等。
+fn user_friendly_error(err: &str) -> String {
+    let err_lower = err.to_lowercase();
+
+    // ── Sidecar 相关错误 ──
+    if err_lower.contains("enosys") || err_lower.contains("error 0x80004005") {
+        return "LRC 服务程序无法在当前系统运行，请重新下载安装。".to_string();
+    }
+    if err_lower.contains("sidecar") && err_lower.contains("not found")
+        || err_lower.contains("enoent") && err_lower.contains("sidecar")
+        || err_lower.contains("lrc-sidecar") && err_lower.contains("not found")
+    {
+        return "LRC 服务程序未找到，请重新安装或联系技术支持。".to_string();
+    }
+    if err_lower.contains("sidecar") && (err_lower.contains("not running") || err_lower.contains("未启动"))
+    {
+        return "LRC 服务未启动，请点击「启动服务」按钮。".to_string();
+    }
+    if err_lower.contains("connection refused") || err_lower.contains("connect refused")
+        || err_lower.contains("tcp connect error")
+    {
+        return "无法连接到 LRC 服务，请检查端口是否被占用，或重启应用。".to_string();
+    }
+    // v0.5.4 P2-13 修复：健康检查超时匹配（中英文，更具体的错误优先）
+    // wait_for_health 返回的中文错误 "健康检查超时" 需要正确匹配
+    if (err_lower.contains("health check") && err_lower.contains("timeout"))
+        || err_lower.contains("健康检查超时")
+    {
+        return "LRC 服务启动超时，请检查端口是否被占用，或关闭防火墙后重试。".to_string();
+    }
+    // v0.5.4 P2-13 修复：添加中文超时关键词匹配
+    if err_lower.contains("timeout") || err_lower.contains("timed out") || err_lower.contains("超时")
+    {
+        return "LRC 服务启动超时，请检查系统资源是否充足，或重启应用后重试。".to_string();
+    }
+
+    // ── 配置相关错误 ──
+    if err_lower.contains("rwlock") && (err_lower.contains("poison") || err_lower.contains("poisoned") || err_lower.contains("毒化"))
+    {
+        return "LRC 遇到内部错误（配置锁异常），请重启应用。".to_string();
+    }
+    if err_lower.contains("serialize") || err_lower.contains("deserialize")
+        || err_lower.contains("json") && err_lower.contains("parse")
+    {
+        return "配置文件格式错误，请尝试重置配置或重启应用。".to_string();
+    }
+    if err_lower.contains("permission denied") || err_lower.contains("access denied")
+        || err_lower.contains("eacces")
+    {
+        return "没有权限写入配置文件，请检查磁盘权限或以管理员身份运行。".to_string();
+    }
+    if err_lower.contains("disk") || err_lower.contains("no space")
+        || err_lower.contains("storage") && err_lower.contains("full")
+    {
+        return "磁盘空间不足，无法保存配置。请清理磁盘后重试。".to_string();
+    }
+    if err_lower.contains("config") && (err_lower.contains("save") || err_lower.contains("write") || err_lower.contains("写入"))
+    {
+        return "无法保存配置，请检查磁盘空间和权限，或重启应用。".to_string();
+    }
+
+    // ── 项目目录相关错误 ──
+    if err_lower.contains("project") && err_lower.contains("not found")
+        || err_lower.contains("路径不存在")
+    {
+        return "项目路径不存在，请选择有效的项目目录。".to_string();
+    }
+    if err_lower.contains("not a directory") || err_lower.contains("不是有效的目录")
+    {
+        return "选择的路径不是有效的目录，请选择项目文件夹。".to_string();
+    }
+
+    // ── 网络相关错误 ──
+    if err_lower.contains("dns") || err_lower.contains("resolve") {
+        return "网络无法解析服务器地址，请检查网络连接。".to_string();
+    }
+    if err_lower.contains("ssl") || err_lower.contains("tls") || err_lower.contains("certificate") {
+        return "安全连接失败，请检查系统时间和网络代理设置。".to_string();
+    }
+
+    // ── 端口占用 ──
+    if err_lower.contains("port") && (err_lower.contains("in use") || err_lower.contains("occupied")
+        || err_lower.contains("被占用") || err_lower.contains("already in use"))
+    {
+        return "端口被占用，请关闭占用端口的程序，或重启应用自动切换端口。".to_string();
+    }
+
+    // ── 速率限制 ──
+    if err_lower.contains("429") || err_lower.contains("请求过于频繁") {
+        return "操作过于频繁，请稍后重试。".to_string();
+    }
+
+    // ── 默认：保留原始错误，但添加前缀引导用户 ──
+    format!("操作失败：{}。如果问题持续，请重启应用或联系技术支持。", err)
+}
+
 /// 应用全局状态（线程安全，支持异步）
+/// v0.5.4 锁获取顺序约束（防止死锁）：
+///
+/// 多个锁同时获取时，必须按以下层级顺序，不可逆序：
+///   Level 1（先获取）: sidecar / agent_registry / rate_limiter
+///   Level 2（后获取）: sidecar_port / configured_agent_count / wizard
+///   Level 3（最后）: wizard（仅当 Level 2 为 configured_agent_count 时）
+///
+/// 违反此顺序将导致死锁。所有新增命令必须遵循此约束。
 pub struct AppStore {
     pub wizard: Mutex<WizardState>,
     pub sidecar: Mutex<SidecarManager>,
     pub agent_registry: Mutex<AgentDetectorRegistry>,
+    /// 速率限制器（L3 运行时保护，防止 IPC 命令滥用）
+    pub rate_limiter: Mutex<RateLimiter>,
     /// sidecar 当前端口（启动后记录，供托盘等模块使用）
     pub sidecar_port: Mutex<Option<u16>>,
     /// 已配置的 Agent 数量（供托盘 tooltip 使用）
@@ -38,26 +202,38 @@ pub struct SidecarStatusResponse {
     pub pid: Option<u32>,
 }
 
-/// 获取 sidecar 运行状态
+/// 获取 sidecar 运行状态（返回所有运行中的实例）
+/// v0.5.1 增强：每次查询时自动检测并恢复已崩溃的 sidecar 实例
+/// v0.5.4 修复：崩溃恢复时传入最新 LLM 配置，避免使用旧值
 #[tauri::command]
 pub async fn get_sidecar_status(
     store: State<'_, AppStore>,
-) -> Result<SidecarStatusResponse, String> {
-    let sidecar = store.sidecar.lock().await;
-    let port_guard = store.sidecar_port.lock().await;
-    let status = sidecar.status();
-    Ok(SidecarStatusResponse {
-        running: sidecar.is_running(),
-        state: format!("{:?}", status),
-        port: *port_guard,
-        pid: match status {
-            crate::sidecar_manager::SidecarState::Running { pid, .. } => Some(*pid),
-            _ => None,
-        },
-    })
+) -> Result<Vec<SidecarStatusResponse>, String> {
+    // v0.5.4 修复：先获取最新 LLM 配置，再锁定 sidecar
+    let fresh_llm = get_llm_api_from_wizard(&store).await;
+
+    let mut sidecar = store.sidecar.lock().await;
+    
+    // v0.5.1 新增：崩溃恢复 — 检测已死实例并自动重启
+    let recovered = sidecar.recover_dead_instances(fresh_llm).await;
+    if recovered > 0 {
+        tracing::warn!("get_sidecar_status: 已自动恢复 {} 个崩溃的 sidecar 实例", recovered);
+    }
+    
+    let instances = sidecar.list_instances();
+    Ok(instances
+        .iter()
+        .map(|inst| SidecarStatusResponse {
+            running: true,
+            state: format!("Running (project: {})", inst.project_dir),
+            port: Some(inst.port),
+            pid: Some(inst.pid),
+        })
+        .collect())
 }
 
 /// 启动 sidecar 进程
+/// v0.5.4 P1-6 修复：错误信息人性化
 #[tauri::command]
 pub async fn start_sidecar(
     store: State<'_, AppStore>,
@@ -65,28 +241,121 @@ pub async fn start_sidecar(
     port: Option<u16>,
     multi_window: Option<u32>,
 ) -> Result<u16, String> {
-    // 从向导配置中读取 LLM API 配置，传递给 Sidecar
-    // 修复：桌面端向导配置的 LLM 现在会正确同步到 Sidecar 服务
-    let llm_api = {
-        let wizard = store.wizard.lock().await;
-        wizard.config().to_llm_api_string()
-    };
+    // L3 运行时保护：速率限制检查
+    {
+        let mut limiter = store.rate_limiter.lock().await;
+        if limiter.should_throttle("cmd:start_sidecar") {
+            return Err(user_friendly_error("请求过于频繁"));
+        }
+    }
+
+    // v0.5.1 重构：统一使用 get_llm_api_from_wizard 辅助函数
+    let llm_api = get_llm_api_from_wizard(&store).await;
 
     let mut sidecar = store.sidecar.lock().await;
-    let port = sidecar.start(src_dir, port, multi_window, llm_api).await?;
+    let port = sidecar.start(src_dir, port, multi_window, llm_api).await
+        .map_err(|e| user_friendly_error(&e))?;
     // 保存端口供其他模块（托盘等）使用
     let mut saved_port = store.sidecar_port.lock().await;
     *saved_port = Some(port);
+    drop(saved_port);
+    drop(sidecar);
+
+    // v0.5.5 新增：sidecar 启动后自动检测并升级旧版本 MCP 配置
+    // 这样用户升级 LRC Desktop 后，无需重新运行配置向导，配置自动升级
+    {
+        let project_dir = {
+            let wizard = store.wizard.lock().await;
+            wizard.config().project_dir.clone()
+        };
+        let project_path = project_dir.as_ref().map(|d| std::path::Path::new(d));
+        let registry = store.agent_registry.lock().await;
+        match registry.auto_upgrade_configs(port, project_path) {
+            Ok(upgraded) => {
+                if !upgraded.is_empty() {
+                    tracing::info!("[sidecar] 自动升级完成: {:?}", upgraded);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[sidecar] 自动升级失败（不影响 sidecar 运行）: {}", e);
+            }
+        }
+    }
+
     Ok(port)
 }
 
+/// 为指定项目启动 sidecar（不停止其他项目）
+/// 
+/// 与 start_sidecar 不同，此命令不会停止已有的 sidecar 实例，
+/// 允许同时运行多个项目的 sidecar 服务。
+/// v0.5.4 P1-6 修复：错误信息人性化
+#[tauri::command]
+pub async fn start_sidecar_for_project(
+    store: State<'_, AppStore>,
+    project_key: String,
+    src_dir: Option<String>,
+    port: Option<u16>,
+    multi_window: Option<u32>,
+) -> Result<u16, String> {
+    // v0.5.1 重构：统一使用 get_llm_api_from_wizard 辅助函数
+    let llm_api = get_llm_api_from_wizard(&store).await;
+
+    let mut sidecar = store.sidecar.lock().await;
+    let port = sidecar
+        .start_for_project(&project_key, src_dir, port, multi_window, llm_api)
+        .await
+        .map_err(|e| user_friendly_error(&e))?;
+    // 保存最新端口
+    let mut saved_port = store.sidecar_port.lock().await;
+    *saved_port = Some(port);
+    drop(saved_port);
+    drop(sidecar);
+
+    // v0.5.5 新增：sidecar 启动后自动检测并升级旧版本 MCP 配置
+    {
+        let project_dir = {
+            let wizard = store.wizard.lock().await;
+            wizard.config().project_dir.clone()
+        };
+        let project_path = project_dir.as_ref().map(|d| std::path::Path::new(d));
+        let registry = store.agent_registry.lock().await;
+        match registry.auto_upgrade_configs(port, project_path) {
+            Ok(upgraded) => {
+                if !upgraded.is_empty() {
+                    tracing::info!("[sidecar] 自动升级完成（项目 {}）: {:?}", project_key, upgraded);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("[sidecar] 自动升级失败（不影响 sidecar 运行）: {}", e);
+            }
+        }
+    }
+
+    Ok(port)
+}
+
+/// 停止指定项目的 sidecar 进程
+/// v0.5.4 P1-6 修复：错误信息人性化
+#[tauri::command]
+pub async fn stop_sidecar_for_project(
+    store: State<'_, AppStore>,
+    project_key: String,
+) -> Result<(), String> {
+    let mut sidecar = store.sidecar.lock().await;
+    sidecar.stop_project(&project_key).await
+        .map_err(|e| user_friendly_error(&e))
+}
+
 /// 停止 sidecar 进程
+/// v0.5.4 P1-6 修复：错误信息人性化
 #[tauri::command]
 pub async fn stop_sidecar(
     store: State<'_, AppStore>,
 ) -> Result<(), String> {
     let mut sidecar = store.sidecar.lock().await;
-    sidecar.stop().await?;
+    sidecar.stop().await
+        .map_err(|e| user_friendly_error(&e))?;
     // 清除端口记录
     let mut saved_port = store.sidecar_port.lock().await;
     *saved_port = None;
@@ -118,19 +387,80 @@ pub async fn get_llm_config(
 }
 
 /// 保存 LLM 配置
+/// v0.5.4 P1-6 修复：错误信息人性化
 #[tauri::command]
 pub async fn save_llm_config(
     store: State<'_, AppStore>,
     llm_api: String,
 ) -> Result<LlmConfigResponse, String> {
+    // L3 运行时保护：速率限制检查
+    {
+        let mut limiter = store.rate_limiter.lock().await;
+        if limiter.should_throttle("cmd:save_llm_config") {
+            return Err(user_friendly_error("请求过于频繁"));
+        }
+    }
+
     let mut wizard = store.wizard.lock().await;
-    wizard.save_llm_config(&llm_api)?;
+    wizard.save_llm_config(&llm_api)
+        .map_err(|e| user_friendly_error(&e))?;
     let config = wizard.config();
-    Ok(LlmConfigResponse {
+    let response = LlmConfigResponse {
         configured: config.llm_configured,
         llm_type: config.llm_type.clone(),
         model: config.llm_model.clone(),
-    })
+    };
+
+    // v0.5.4 修复：保存 LLM 配置后，同步到 Sidecar 的内存状态
+    // 否则仪表盘（通过 GET /api/config）仍显示"未配置"
+    let sidecar_port = store.sidecar_port.lock().await;
+    if let Some(port) = *sidecar_port {
+        let llm_api_str = config.to_llm_api_string();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        // 忽略同步失败（Sidecar 可能未启动），不影响主流程
+        let _ = client
+            .post(format!("http://127.0.0.1:{port}/api/config/llm"))
+            .json(&serde_json::json!({ "llm_api": llm_api_str }))
+            .send()
+            .await;
+    }
+
+    Ok(response)
+}
+
+/// 清除 LLM 配置
+#[tauri::command]
+pub async fn clear_llm_config(
+    store: State<'_, AppStore>,
+) -> Result<LlmConfigResponse, String> {
+    let mut wizard = store.wizard.lock().await;
+    // 清除 LLM 配置（保留其他配置不变）
+    wizard.save_llm_config("")
+        .map_err(|e| user_friendly_error(&e))?;
+    let response = LlmConfigResponse {
+        configured: false,
+        llm_type: "none".to_string(),
+        model: None,
+    };
+
+    // v0.5.4 修复：同步清除到 Sidecar 内存状态
+    let sidecar_port = store.sidecar_port.lock().await;
+    if let Some(port) = *sidecar_port {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        let _ = client
+            .post(format!("http://127.0.0.1:{port}/api/config/llm"))
+            .json(&serde_json::json!({ "llm_api": "" }))
+            .send()
+            .await;
+    }
+
+    Ok(response)
 }
 
 /// LLM 连接测试结果
@@ -142,10 +472,23 @@ pub struct LlmTestResult {
     pub models: Option<Vec<String>>,
 }
 
+/// v0.5.4 新增：API Key 输入清洗
+/// 
+/// 用户从网页复制 API Key 时可能带入首尾空格、换行符等不可见字符，
+/// 这些字符会导致 API 请求失败（401/403），且用户难以排查。
+/// 清洗规则：trim 首尾空白 + 移除 \r\n\t 等控制字符。
+fn clean_api_key(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ') // 保留空格，过滤其他控制字符
+        .collect()
+}
+
 /// 测试 LLM API 连接（由 Rust 后端代理，避免浏览器 CSP 限制）
 ///
 /// 前端直接向 LLM 提供商发请求会被 CSP 拦截，
 /// 此命令通过 reqwest 在 Rust 侧完成网络请求，不受 CSP 限制。
+/// v0.5.4 修复：API Key 输入清洗，trim + 过滤不可见字符
 #[tauri::command]
 pub async fn test_llm_connection(
     provider: String,
@@ -153,6 +496,8 @@ pub async fn test_llm_connection(
     base_url: String,
     model: Option<String>,
 ) -> Result<LlmTestResult, String> {
+    // v0.5.4 修复：清洗 API Key — trim 空白 + 过滤 \r\n 等控制字符
+    let api_key = clean_api_key(&api_key);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -165,26 +510,39 @@ pub async fn test_llm_connection(
         let resp = client
             .get(format!("{base}/api/tags"))
             .send()
-            .await
-            .map_err(|e| format!("无法连接 Ollama 服务: {e}"))?;
+            .await;
 
-        if resp.status().is_success() {
-            let data: serde_json::Value = resp.json().await.map_err(|e| format!("解析响应失败: {e}"))?;
-            let models: Vec<String> = data["models"]
-                .as_array()
-                .map(|arr| arr.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect())
-                .unwrap_or_default();
-            Ok(LlmTestResult {
-                success: true,
-                message: format!("Ollama 连接成功！已安装 {} 个模型", models.len()),
-                models: Some(models),
-            })
-        } else {
-            Ok(LlmTestResult {
-                success: false,
-                message: format!("Ollama 返回错误 (HTTP {})", resp.status()),
-                models: None,
-            })
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let data: serde_json::Value = r.json().await.map_err(|e| format!("解析响应失败: {e}"))?;
+                let models: Vec<String> = data["models"]
+                    .as_array()
+                    .map(|arr| arr.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                Ok(LlmTestResult {
+                    success: true,
+                    message: format!("Ollama 连接成功！已安装 {} 个模型", models.len()),
+                    models: Some(models),
+                })
+            }
+            Err(e) => {
+                // v0.5.4 修复：详细错误分类
+                let msg = if e.is_timeout() {
+                    "Ollama 连接超时，请确认服务是否已启动".to_string()
+                } else if e.is_connect() {
+                    format!("无法连接 Ollama 服务（{}），请确认 Ollama 是否在运行", base)
+                } else {
+                    format!("Ollama 连接失败：{e}")
+                };
+                Ok(LlmTestResult { success: false, message: msg, models: None })
+            }
+            Ok(r) => {
+                Ok(LlmTestResult {
+                    success: false,
+                    message: format!("Ollama 返回错误 (HTTP {})", r.status()),
+                    models: None,
+                })
+            }
         }
     } else {
         // 云端 API 测试：先尝试 /models 端点
@@ -220,6 +578,33 @@ pub async fn test_llm_connection(
                     models: None,
                 })
             }
+            Ok(r) if r.status() == 402 => {
+                // v0.5.4 新增：余额不足
+                Ok(LlmTestResult {
+                    success: false,
+                    message: "账户余额不足（402 Payment Required），请充值后重试".to_string(),
+                    models: None,
+                })
+            }
+            Ok(r) if r.status() == 429 => {
+                // v0.5.4 新增：频率限制
+                Ok(LlmTestResult {
+                    success: false,
+                    message: "请求过于频繁（429），请稍后重试".to_string(),
+                    models: None,
+                })
+            }
+            Err(e) => {
+                // v0.5.4 修复：网络错误详细分类
+                let msg = if e.is_timeout() {
+                    format!("连接超时：无法在 10 秒内连接到 {base}，请检查网络或 API 地址")
+                } else if e.is_connect() {
+                    format!("网络不通：无法连接到 {base}，请检查网络连接和 API 地址是否正确")
+                } else {
+                    format!("网络请求失败：{e}")
+                };
+                Ok(LlmTestResult { success: false, message: msg, models: None })
+            }
             _ => {
                 // /models 端点不可用，尝试 chat/completions
                 let test_model = model.unwrap_or_else(|| "gpt-4o-mini".to_string());
@@ -247,7 +632,31 @@ pub async fn test_llm_connection(
                     Ok(r) if r.status() == 401 || r.status() == 403 => {
                         Ok(LlmTestResult {
                             success: false,
-                            message: "API Key 无效，请检查".to_string(),
+                            message: "API Key 无效，请检查 Key 是否正确".to_string(),
+                            models: None,
+                        })
+                    }
+                    Ok(r) if r.status() == 402 => {
+                        // v0.5.4 新增：余额不足
+                        Ok(LlmTestResult {
+                            success: false,
+                            message: "账户余额不足（402），请充值后重试".to_string(),
+                            models: None,
+                        })
+                    }
+                    Ok(r) if r.status() == 429 => {
+                        // v0.5.4 新增：频率限制
+                        Ok(LlmTestResult {
+                            success: false,
+                            message: "请求过于频繁（429），请稍后重试".to_string(),
+                            models: None,
+                        })
+                    }
+                    Ok(r) if r.status() == 404 => {
+                        // v0.5.4 新增：模型不可用
+                        Ok(LlmTestResult {
+                            success: false,
+                            message: format!("模型 \"{test_model}\" 不可用（404），请确认模型名称是否正确"),
                             models: None,
                         })
                     }
@@ -259,11 +668,15 @@ pub async fn test_llm_connection(
                         })
                     }
                     Err(e) => {
-                        Ok(LlmTestResult {
-                            success: false,
-                            message: format!("连接失败：{e}"),
-                            models: None,
-                        })
+                        // v0.5.4 修复：网络错误详细分类
+                        let msg = if e.is_timeout() {
+                            "请求超时：API 响应时间过长，请检查网络或更换 API 地址".to_string()
+                        } else if e.is_connect() {
+                            "网络不通：无法建立连接，请检查网络和 API 地址".to_string()
+                        } else {
+                            format!("网络请求失败：{e}")
+                        };
+                        Ok(LlmTestResult { success: false, message: msg, models: None })
                     }
                 }
             }
@@ -278,8 +691,12 @@ pub async fn test_llm_connection(
 pub async fn detect_agents(
     store: State<'_, AppStore>,
 ) -> Result<Vec<AgentInfo>, String> {
+    // v0.5.4 修复：直接同步调用 detect_all()
+    // 原实现使用 block_in_place + emit 导致事件循环死锁。
+    // emit 已移除，文件检测（Path::exists）是轻量操作，不会阻塞事件循环。
     let registry = store.agent_registry.lock().await;
-    Ok(registry.detect_all())
+    let result = registry.detect_all();
+    Ok(result)
 }
 
 /// 仅返回已安装的 Agent（过滤掉未安装的）
@@ -313,8 +730,25 @@ pub async fn configure_agents(
     agent_ids: Vec<String>,
     port: u16,
 ) -> Result<Vec<String>, String> {
+    // L3 运行时保护：速率限制检查
+    {
+        let mut limiter = store.rate_limiter.lock().await;
+        if limiter.should_throttle("cmd:configure_agents") {
+            return Err(user_friendly_error("请求过于频繁"));
+        }
+    }
+
+    // v0.5.4 修复：获取项目目录，用于写入 AI 规则文件
+    let project_dir = {
+        let wizard = store.wizard.lock().await;
+        wizard.config().project_dir.clone()
+    };
+
     let registry = store.agent_registry.lock().await;
-    let result = registry.configure(&agent_ids, port)?;
+    // v0.5.4 修复：传入项目目录，自动生成 AI 规则文件
+    let project_path = project_dir.as_ref().map(|d| std::path::Path::new(d));
+    let result = registry.configure(&agent_ids, port, project_path)
+        .map_err(|e| user_friendly_error(&e))?;
     // 更新 Agent 计数
     let mut count = store.configured_agent_count.lock().await;
     *count = result.len();
@@ -322,7 +756,8 @@ pub async fn configure_agents(
     tray::update_tooltip(&app, *count);
     // 持久化 configured_agents 到 wizard.json（P2-05 修复）
     let mut wizard = store.wizard.lock().await;
-    wizard.save_configured_agents(agent_ids)?;
+    wizard.save_configured_agents(agent_ids)
+        .map_err(|e| user_friendly_error(&e))?;
     Ok(result)
 }
 
@@ -351,13 +786,34 @@ pub async fn get_project_dir(
 }
 
 /// 设置项目目录
+/// v0.5.4 修复：设置前验证路径存在
+/// v0.5.4 P1-6 修复：错误信息人性化
 #[tauri::command]
 pub async fn set_project_dir(
     store: State<'_, AppStore>,
     project_dir: String,
 ) -> Result<(), String> {
+    // v0.5.4 修复：设置项目目录前验证路径存在
+    let path = std::path::Path::new(&project_dir);
+    if !path.exists() {
+        return Err(user_friendly_error("项目路径不存在"));
+    }
+    if !path.is_dir() {
+        return Err(user_friendly_error("路径不是有效的目录"));
+    }
     let mut wizard = store.wizard.lock().await;
     wizard.set_project_dir(&project_dir)
+        .map_err(|e| user_friendly_error(&e))
+}
+
+/// 打开文件夹选择对话框，让用户选择项目目录
+#[tauri::command]
+pub async fn pick_project_dir() -> Result<Option<String>, String> {
+    let path = rfd::AsyncFileDialog::new()
+        .pick_folder()
+        .await
+        .map(|handle| handle.path().display().to_string());
+    Ok(path)
 }
 
 /// 向导配置状态响应
@@ -369,12 +825,28 @@ pub struct WizardStateResponse {
     pub project_dir: Option<String>,
     /// LLM 是否已配置
     pub llm_configured: bool,
+    /// LLM 提供商类型（openai/ollama/none）
+    pub llm_type: String,
+    /// LLM 模型名
+    pub llm_model: Option<String>,
     /// 已配置的 Agent 列表
     pub configured_agents: Vec<String>,
     /// Sidecar 是否在运行
     pub sidecar_running: bool,
     /// Sidecar 当前端口
     pub sidecar_port: Option<u16>,
+    /// v0.5.4 新增：配置文件是否从损坏状态恢复
+    /// 前端可据此显示"配置已重置，请重新配置"的提示
+    pub config_corrupted: bool,
+}
+
+/// 列出所有运行中的 sidecar 项目（供托盘面板使用）
+#[tauri::command]
+pub async fn list_sidecar_projects(
+    store: State<'_, AppStore>,
+) -> Result<Vec<crate::sidecar_manager::SidecarInstance>, String> {
+    let sidecar = store.sidecar.lock().await;
+    Ok(sidecar.list_instances())
 }
 
 /// 获取向导配置状态
@@ -386,6 +858,7 @@ pub async fn get_wizard_state(
 ) -> Result<WizardStateResponse, String> {
     let wizard = store.wizard.lock().await;
     let config = wizard.config();
+    let corrupted = wizard.corrupted_on_load;
 
     // 检查 sidecar 运行状态
     let sidecar = store.sidecar.lock().await;
@@ -396,66 +869,51 @@ pub async fn get_wizard_state(
         setup_complete: config.setup_complete,
         project_dir: config.project_dir.clone(),
         llm_configured: config.llm_configured,
+        llm_type: config.llm_type.clone(),
+        llm_model: config.llm_model.clone(),
         configured_agents: config.configured_agents.clone(),
         sidecar_running,
         sidecar_port: *sidecar_port,
+        config_corrupted: corrupted,
     })
 }
 
-/// 在 Tauri 内嵌 WebView 中打开仪表盘
-/// 
-/// 前端通过 invoke('open_dashboard_window') 调用，
-/// 代替之前的 window.open() 外部浏览器方式。
-/// 注意：此命令会创建新的独立窗口，托盘菜单使用。
+/// 在 Tauri 主窗口 iframe 中打开仪表盘（统一入口，不建新窗口）
+///
+/// v0.5.1 重构：与 navigate_main_to_dashboard 合并为统一实现，
+/// 通过 show_dashboard_in_main_window 消除重复代码。
+/// adjust_window=false 表示不调整窗口大小（托盘/菜单调用时保持原窗口大小）。
 #[tauri::command]
 pub async fn open_dashboard_window(
     app: tauri::AppHandle,
+    store: State<'_, AppStore>,
 ) -> Result<(), String> {
-    tray::open_dashboard(&app);
-    Ok(())
+    let port = store.sidecar_port.lock().await.unwrap_or(3099);
+    show_dashboard_in_main_window(&app, port, false)
 }
 
-/// 导航主窗口到仪表盘（向导完成后使用，不弹新窗口）
+/// 在主窗口 iframe 中显示仪表盘（向导完成后使用，调整窗口大小）
 ///
-/// 将主窗口直接导航到 sidecar 提供的仪表盘 URL，
-/// 并调整窗口大小为 1200x800、启用可缩放。
-/// 契约：向导完成 → 主窗口变为仪表盘，同一窗口内过渡。
+/// v0.5.1 重构：与 open_dashboard_window 合并为统一实现，
+/// 通过 show_dashboard_in_main_window 消除重复代码。
+/// adjust_window=true 表示调整窗口为 1200x800、可缩放。
 #[tauri::command]
 pub async fn navigate_main_to_dashboard(
     app: tauri::AppHandle,
     store: State<'_, AppStore>,
 ) -> Result<(), String> {
-    let port = store
-        .sidecar_port
-        .lock()
-        .await
-        .unwrap_or(3099);
+    let port = store.sidecar_port.lock().await.unwrap_or(3099);
+    show_dashboard_in_main_window(&app, port, true)
+}
 
-    let url = format!("http://127.0.0.1:{port}/dashboard?embedded=tauri");
-
-    if let Some(window) = app.get_webview_window("main") {
-        // 导航到仪表盘 URL
-        window
-            .eval(&format!("window.location.replace('{url}')"))
-            .map_err(|e| format!("导航失败: {e}"))?;
-
-        // 调整窗口大小和属性
-        window
-            .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(1200, 800)))
-            .map_err(|e| format!("调整窗口大小失败: {e}"))?;
-        window
-            .set_resizable(true)
-            .map_err(|e| format!("设置可缩放失败: {e}"))?;
-        window
-            .set_title("LRC 仪表盘 — AI 代码记忆")
-            .map_err(|e| format!("设置标题失败: {e}"))?;
-
-        tracing::info!("主窗口已导航到仪表盘 (port={port})");
-    } else {
-        // 回退：创建新的仪表盘窗口
-        tray::open_dashboard(&app);
-    }
-
+/// v0.5.5 P1-2：从仪表盘打开桌面端设置面板
+///
+/// 仪表盘嵌入模式下，用户点击"修改配置"按钮时调用。
+/// 通过 Tauri 事件通知前端打开设置面板，实现仪表盘与桌面端的无缝衔接。
+#[tauri::command]
+pub async fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
+    // 发送事件到主窗口，前端监听后打开设置面板
+    app.emit("open-settings", ()).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -472,31 +930,303 @@ pub async fn update_tray_tooltip(
     Ok(())
 }
 
+/// 切换项目目录响应
+#[derive(Serialize)]
+pub struct SwitchProjectResponse {
+    pub success: bool,
+    pub message: String,
+    pub port: u16,
+    pub project_dir: String,
+}
+
 /// 切换项目目录
 /// 
 /// 更新项目路径、重启 sidecar 以重新索引新项目。
 /// 契约：托盘菜单"切换项目"调用此命令。
+/// v0.5.4 修复：返回结构化响应（含端口），前端无需再调用 get_sidecar_status
+/// v0.5.4 P1-6 修复：错误信息人性化
 #[tauri::command]
 pub async fn switch_project(
     store: State<'_, AppStore>,
     project_dir: String,
     multi_window: Option<u32>,
-) -> Result<String, String> {
+) -> Result<SwitchProjectResponse, String> {
+    // L3 运行时保护：速率限制检查
+    {
+        let mut limiter = store.rate_limiter.lock().await;
+        if limiter.should_throttle("cmd:switch_project") {
+            return Err(user_friendly_error("请求过于频繁"));
+        }
+    }
+
+    // v0.5.4 修复：切换项目前验证路径存在
+    let path = std::path::Path::new(&project_dir);
+    if !path.exists() {
+        return Err(user_friendly_error("项目路径不存在"));
+    }
+    if !path.is_dir() {
+        return Err(user_friendly_error("路径不是有效的目录"));
+    }
+
     // 1. 保存新项目路径并提取 LLM 配置
     let llm_api = {
         let mut wizard = store.wizard.lock().await;
-        wizard.set_project_dir(&project_dir)?;
+        wizard.set_project_dir(&project_dir)
+            .map_err(|e| user_friendly_error(&e))?;
         wizard.config().to_llm_api_string()
     };
     
     // 2. 重启 sidecar 以重新索引
     let mut sidecar = store.sidecar.lock().await;
     if sidecar.is_running() {
-        sidecar.stop().await?;
+        sidecar.stop().await
+            .map_err(|e| user_friendly_error(&e))?;
     }
-    let port = sidecar.start(Some(project_dir.clone()), None, multi_window, llm_api).await?;
+    let port = sidecar.start(Some(project_dir.clone()), None, multi_window, llm_api).await
+        .map_err(|e| user_friendly_error(&e))?;
     let mut saved_port = store.sidecar_port.lock().await;
     *saved_port = Some(port);
     
-    Ok(format!("已切换到项目 {}，sidecar 已重启 (port={})", project_dir, port))
+    Ok(SwitchProjectResponse {
+        success: true,
+        port,
+        project_dir: project_dir.clone(),
+        message: format!("已切换到项目 {}，sidecar 已重启 (port={})", project_dir, port),
+    })
+}
+
+/// v0.5.3 新增：重置向导配置，让用户重新进入配置向导
+/// 
+/// 清除 setup_complete 标记和项目/Agent 配置，
+/// 但保留 LLM API Key（避免用户重新输入）。
+/// 调用后用户重新打开应用时将看到配置向导。
+/// v0.5.4 P1-6 修复：错误信息人性化
+#[tauri::command]
+pub async fn reset_wizard(
+    store: State<'_, AppStore>,
+) -> Result<(), String> {
+    let mut wizard = store.wizard.lock().await;
+    wizard.reset()
+        .map_err(|e| user_friendly_error(&e))
+}
+
+/// v0.5.4 P2-16 修复：标记配置完成
+///
+/// 在前端 finishConfiguration() 流程结束后调用，将 setup_complete 设为 true 并持久化。
+/// 修复前：finishConfiguration() 未调用此命令，导致 setup_complete 始终为 false，
+/// 用户每次启动应用都需要重新配置。
+#[tauri::command]
+pub async fn mark_complete(
+    store: State<'_, AppStore>,
+) -> Result<(), String> {
+    let mut wizard = store.wizard.lock().await;
+    wizard.mark_complete()
+        .map_err(|e| user_friendly_error(&e))
+}
+
+/// v0.5.4 P0-4 新增：配置完成后自动验证
+/// 
+/// 验证项：
+/// 1. Sidecar 是否启动成功（通过 /health 端点）
+/// 2. MCP 服务器是否可达（检查端口监听）
+/// 3. LLM 是否配置
+/// 4. Agent 是否已配置
+/// 
+/// 返回结构化验证结果，前端据此显示"一切正常"或具体错误。
+#[derive(Debug, Serialize)]
+pub struct VerifySetupResult {
+    /// 整体状态：true 表示所有检查通过
+    pub all_ok: bool,
+    /// Sidecar 状态
+    pub sidecar_running: bool,
+    pub sidecar_port: Option<u16>,
+    pub sidecar_message: String,
+    /// LLM 状态
+    pub llm_configured: bool,
+    pub llm_message: String,
+    /// Agent 状态
+    pub agents_configured: bool,
+    pub agents_count: usize,
+    pub agents_message: String,
+    /// 项目状态
+    pub project_configured: bool,
+    pub project_message: String,
+    /// 综合建议
+    pub suggestion: String,
+}
+
+#[tauri::command]
+pub async fn verify_setup(
+    store: State<'_, AppStore>,
+) -> Result<VerifySetupResult, String> {
+    let mut result = VerifySetupResult {
+        all_ok: true,
+        sidecar_running: false,
+        sidecar_port: None,
+        sidecar_message: String::new(),
+        llm_configured: false,
+        llm_message: String::new(),
+        agents_configured: false,
+        agents_count: 0,
+        agents_message: String::new(),
+        project_configured: false,
+        project_message: String::new(),
+        suggestion: String::new(),
+    };
+
+    // ── 1. 检查 Sidecar 状态 ──
+    // v0.5.4 修复：端口从 sidecar_port 获取，而非 wizard.config().port（WizardConfig 无此字段）
+    let port = *store.sidecar_port.lock().await;
+    let sidecar = store.sidecar.lock().await;
+    let sidecar_running = sidecar.is_running();
+    drop(sidecar);
+
+    if sidecar_running {
+        if let Some(port) = port {
+            // 通过 /health 端点验证
+            let health_url = format!("http://127.0.0.1:{port}/health");
+            match reqwest::get(&health_url).await {
+                Ok(resp) if resp.status().is_success() => {
+                    result.sidecar_running = true;
+                    result.sidecar_port = Some(port);
+                    result.sidecar_message = format!("服务运行正常（端口 {port}）");
+                }
+                Ok(resp) => {
+                    result.all_ok = false;
+                    result.sidecar_running = false;
+                    result.sidecar_message =
+                        format!("服务响应异常（HTTP {}）", resp.status().as_u16());
+                }
+                Err(e) => {
+                    result.all_ok = false;
+                    result.sidecar_running = false;
+                    result.sidecar_message = format!("服务未响应：{}", e);
+                }
+            }
+        } else {
+            result.all_ok = false;
+            result.sidecar_running = false;
+            result.sidecar_message = "后台服务已启动但端口未知，请重启服务".to_string();
+        }
+    } else {
+        result.all_ok = false;
+        result.sidecar_running = false;
+        result.sidecar_message = "后台服务未启动，请点击「启动服务」按钮".to_string();
+    }
+
+    // ── 2. 检查 LLM 配置 ──
+    // v0.5.4 修复：使用正确的字段名 llm_configured / llm_type（而非 llm_api_key / llm_provider）
+    {
+        let wizard = store.wizard.lock().await;
+        let llm_configured = wizard.config().llm_configured;
+        result.llm_configured = llm_configured;
+        if llm_configured {
+            let provider = wizard.config().llm_type.clone();
+            result.llm_message = format!("LLM 已配置（{}）", provider);
+        } else {
+            // LLM 是可选的，不标记 all_ok = false
+            result.llm_message = "LLM 未配置（可选，不影响基础功能）".to_string();
+        }
+    }
+
+    // ── 3. 检查 Agent 配置 ──
+    {
+        let wizard = store.wizard.lock().await;
+        let agents = wizard.config().configured_agents.clone();
+        result.agents_count = agents.len();
+        if agents.is_empty() {
+            result.all_ok = false;
+            result.agents_message = "未配置任何 AI 工具，请返回步骤 1 重新检测".to_string();
+        } else {
+            result.agents_configured = true;
+            result.agents_message = format!("已配置 {} 个 AI 工具", agents.len());
+        }
+    }
+
+    // ── 4. 检查项目配置 ──
+    {
+        let wizard = store.wizard.lock().await;
+        let project_dir = wizard.config().project_dir.clone();
+        if let Some(dir) = project_dir {
+            result.project_configured = true;
+            result.project_message = format!("项目目录：{}", dir);
+        } else {
+            result.all_ok = false;
+            result.project_message = "未设置项目目录，请返回步骤 1 选择项目".to_string();
+        }
+    }
+
+    // ── 5. 综合建议 ──
+    if result.all_ok {
+        result.suggestion = "一切正常！你的 AI 助手现在可以使用 LRC 记忆功能了。".to_string();
+    } else {
+        let mut issues = Vec::new();
+        if !result.sidecar_running {
+            issues.push("启动后台服务");
+        }
+        if !result.agents_configured {
+            issues.push("配置 AI 工具");
+        }
+        if !result.project_configured {
+            issues.push("选择项目目录");
+        }
+        result.suggestion = format!("请先解决以下问题：{}", issues.join("、"));
+    }
+
+    tracing::info!(
+        "[验证] 配置验证完成: all_ok={}, sidecar={}, llm={}, agents={}, project={}",
+        result.all_ok,
+        result.sidecar_running,
+        result.llm_configured,
+        result.agents_configured,
+        result.project_configured
+    );
+
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v0.5.4 P2-13 修复：验证中文健康检查超时错误能被正确匹配
+    #[test]
+    fn test_user_friendly_error_health_check_timeout_chinese() {
+        let err = "Sidecar 健康检查超时：进程 PID=12345 在端口 3099-3198 范围均不可达，已尝试 20 次（10 秒）。请检查端口是否被占用或防火墙设置。";
+        let friendly = user_friendly_error(err);
+        assert!(
+            friendly.contains("启动超时"),
+            "中文健康检查超时应匹配到友好提示，实际: {}",
+            friendly
+        );
+        assert!(
+            friendly.contains("端口") || friendly.contains("防火墙"),
+            "友好提示应包含端口或防火墙建议，实际: {}",
+            friendly
+        );
+    }
+
+    /// v0.5.4 P2-13 修复：验证英文健康检查超时错误仍能正确匹配
+    #[test]
+    fn test_user_friendly_error_health_check_timeout_english() {
+        let err = "Sidecar health check timeout: process not responding";
+        let friendly = user_friendly_error(err);
+        assert!(
+            friendly.contains("启动超时"),
+            "英文健康检查超时应匹配到友好提示，实际: {}",
+            friendly
+        );
+    }
+
+    /// v0.5.4 P2-13 修复：验证通用中文超时错误能被正确匹配
+    #[test]
+    fn test_user_friendly_error_generic_timeout_chinese() {
+        let err = "操作超时，请重试";
+        let friendly = user_friendly_error(err);
+        assert!(
+            friendly.contains("启动超时") || friendly.contains("超时"),
+            "中文超时应匹配到友好提示，实际: {}",
+            friendly
+        );
+    }
 }

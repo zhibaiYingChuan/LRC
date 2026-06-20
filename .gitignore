@@ -120,6 +120,7 @@ flamegraph.svg
 # 桌面端测试脚本与产物（开发者本地使用，不交付用户）
 desktop/test_webdriver.py
 desktop/test_desktop_webdriver.py
+desktop/tests/
 desktop/tests/e2e_user_simulation.ps1
 desktop/tests/e2e_results.json
 desktop/tests/screenshots/
@@ -128,6 +129,60 @@ desktop/src/wizard.test.js
 desktop/src/*.test.*
 *.test.js
 *.test.ts
+
+# 桌面端测试目录（开发者本地使用，不交付用户）
+desktop-test/
+
+# 桌面端图标生成工具与临时图标（开发者本地使用，不交付用户）
+desktop/IcoGenerator.cs
+desktop/gen_ico.ps1
+desktop/generate_ico.ps1
+desktop/hex_ico.ps1
+desktop/update_icons.ps1
+desktop/verify_ico.ps1
+desktop/src-tauri/sign-binary.ps1
+desktop/src/tauri-init.js
+desktop/src-tauri/build-log.txt
+desktop/src-tauri/icons/894.png
+desktop/src-tauri/icons/894_real.png
+desktop/src-tauri/icons/Square*.png
+desktop/src-tauri/icons/StoreLogo.png
+desktop/src-tauri/icons/android/
+desktop/src-tauri/icons/ios/
+desktop/src-tauri/icons/icon.icns
+desktop/src-tauri/icons/icon.png
+desktop/src-tauri/icons/64x64.png
+
+# 根目录图标生成工具（开发者本地使用，不交付用户）
+check_icon.ps1
+generate_icons.ps1
+
+# 项目级 AI 规则文件（每个用户/项目自动生成，不入库）
+.trae/
+.cursor/
+.codebuddy/
+.clinerules
+.windsurfrules
+.roo/
+.comate/
+.zed/
+
+# 内部开发文档（不交付用户）
+docs/evaluation-report-2026-05-31.md
+docs/evaluation-report-*.md
+docs/PRD_LRC_DESKTOP.md
+docs/PRD_LRC_DESKTOP_V2.md
+docs/v0.5.0_*.md
+docs/v0.5.1_*.md
+docs/v0.5.4_*.md
+docs/v0.5.5_*.md
+docs/audit-report-*.md
+docs/GitHub仓库审计报告_*.md
+docs/LRC_12模型产品深度分析报告.md
+docs/产品功能汇报报告*.md
+docs/产品战略汇报报告.md
+docs/完整代码审计报告_*.md
+docs/桌面生产环境就绪修复计划.md
 
 # 根目录临时/工具脚本（开发者本地使用，不交付用户）
 _*
@@ -139,3 +194,4 @@ compare.ps1
 do_git.bat
 do_git.ps1
 run_check.ps1
+build_release.ps1

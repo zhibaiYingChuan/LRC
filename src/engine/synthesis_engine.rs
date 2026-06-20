@@ -405,6 +405,17 @@ impl SynthesisEngine {
 
         let mut synthesized = 0usize;
 
+        // 去重集合：提前构建，避免循环内重复构建（性能优化 P1-4）
+        let existing_sources: std::collections::HashSet<Vec<String>> = all
+            .iter()
+            .filter(|m| m.memory_type == MemoryType::Synthesis && !m.source_ids.is_empty())
+            .map(|m| {
+                let mut ids = m.source_ids.clone();
+                ids.sort();
+                ids
+            })
+            .collect();
+
         for (bagua_idx, group) in &groups {
             if group.len() < self.config.min_cluster {
                 continue;
@@ -440,16 +451,6 @@ impl SynthesisEngine {
             }
 
             let source_ids: Vec<String> = group.iter().map(|m| m.id.clone()).collect();
-
-            let existing_sources: std::collections::HashSet<Vec<String>> = all
-                .iter()
-                .filter(|m| m.memory_type == MemoryType::Synthesis && !m.source_ids.is_empty())
-                .map(|m| {
-                    let mut ids = m.source_ids.clone();
-                    ids.sort();
-                    ids
-                })
-                .collect();
 
             let mut cluster_ids = source_ids.clone();
             cluster_ids.sort();
@@ -528,5 +529,240 @@ impl SynthesisEngine {
 impl Default for SynthesisEngine {
     fn default() -> Self {
         Self::new(SynthesisConfig::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory_types::{Importance, Memory, MemoryType};
+    use crate::persistence::json::JsonPersistence;
+    use tempfile::TempDir;
+
+    /// 创建测试用记忆
+    fn make_memory(content: &str, tags: Vec<&str>) -> Memory {
+        Memory::new(
+            content.to_string(),
+            MemoryType::Fact,
+            Some("test".to_string()),
+            tags.iter().map(|s| s.to_string()).collect(),
+            Importance::new(5),
+            None,
+        )
+    }
+
+    /// 创建合成类型测试用记忆
+    #[allow(dead_code)]
+    fn make_synthesis_memory(source_ids: Vec<&str>) -> Memory {
+        let mut m = Memory::new(
+            "合成测试".to_string(),
+            MemoryType::Synthesis,
+            Some("test".to_string()),
+            vec![],
+            Importance::new(7),
+            None,
+        );
+        m.source_ids = source_ids.iter().map(|s| s.to_string()).collect();
+        m
+    }
+
+    #[test]
+    fn test_config_defaults() {
+        let config = SynthesisConfig::default();
+        assert_eq!(config.min_cluster, 3);
+        assert!(config.similarity >= 0.3 && config.similarity <= 0.5);
+    }
+
+    #[test]
+    fn test_compute_jaccard_identical() {
+        let engine = SynthesisEngine::default();
+        let sim = engine.compute_jaccard("hello world", "hello world");
+        assert!((sim - 1.0).abs() < 0.001, "相同文本应返回 1.0，实际: {}", sim);
+    }
+
+    #[test]
+    fn test_compute_jaccard_completely_different() {
+        let engine = SynthesisEngine::default();
+        let sim = engine.compute_jaccard("hello world", "foo bar baz");
+        assert!(sim < 0.01, "完全不同的文本应接近 0，实际: {}", sim);
+    }
+
+    #[test]
+    fn test_compute_jaccard_partial_overlap() {
+        let engine = SynthesisEngine::default();
+        let sim = engine.compute_jaccard("hello world foo", "hello world bar");
+        assert!(sim > 0.4 && sim < 0.8, "部分重叠应在 0.4-0.8 之间，实际: {}", sim);
+    }
+
+    #[test]
+    fn test_compute_jaccard_cjk() {
+        let engine = SynthesisEngine::default();
+        let sim = engine.compute_jaccard("你好世界", "你好世界");
+        assert!((sim - 1.0).abs() < 0.001, "相同 CJK 文本应返回 1.0，实际: {}", sim);
+
+        let sim_diff = engine.compute_jaccard("你好世界", "再见朋友");
+        assert!(sim_diff < 0.5, "不同 CJK 文本相似度应较低，实际: {}", sim_diff);
+    }
+
+    #[test]
+    fn test_compute_jaccard_empty() {
+        let engine = SynthesisEngine::default();
+        let sim = engine.compute_jaccard("", "");
+        assert!((sim - 1.0).abs() < 0.001, "两个空字符串应返回 1.0");
+    }
+
+    #[test]
+    fn test_build_synthesis_summary_single_memory() {
+        let engine = SynthesisEngine::default();
+        let cluster = vec![make_memory("这是一条测试记忆", vec!["test"])];
+        let summary = engine.build_synthesis_summary(&cluster);
+        assert!(summary.contains("合成知识"));
+        assert!(summary.contains("测试记忆"));
+    }
+
+    #[test]
+    fn test_build_synthesis_summary_multi_memory() {
+        let engine = SynthesisEngine::default();
+        let cluster = vec![
+            make_memory("项目上线需要准备文档", vec!["deploy"]),
+            make_memory("部署文档已完成编写", vec!["deploy"]),
+            make_memory("文档需要经过审核", vec!["review"]),
+        ];
+        let summary = engine.build_synthesis_summary(&cluster);
+        assert!(summary.contains("合成知识"));
+        assert!(summary.contains("3 条相关记忆"));
+        // 共同主题应包含"文档"（出现 3 次）
+        assert!(summary.contains("文档"), "应包含共同主题词，实际: {}", summary);
+    }
+
+    #[test]
+    fn test_find_synthesis_clusters_empty() {
+        let engine = SynthesisEngine::default();
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+        let clusters = engine.find_synthesis_clusters(&persistence).expect("查找簇失败");
+        assert!(clusters.is_empty(), "空记忆库应返回空簇");
+    }
+
+    #[test]
+    fn test_find_synthesis_clusters_below_min_cluster() {
+        let engine = SynthesisEngine::default();
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+
+        // 只添加 2 条记忆，低于 min_cluster=3
+        persistence
+            .save_memory(&make_memory("记忆 A", vec!["test"]))
+            .expect("保存记忆 A 失败");
+        persistence
+            .save_memory(&make_memory("记忆 B", vec!["test"]))
+            .expect("保存记忆 B 失败");
+
+        let clusters = engine.find_synthesis_clusters(&persistence).expect("查找簇失败");
+        assert!(clusters.is_empty(), "低于最小簇大小时应返回空，实际: {} 簇", clusters.len());
+    }
+
+    #[test]
+    fn test_find_synthesis_clusters_similar() {
+        let engine = SynthesisEngine::default();
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+
+        // 添加 3 条相似记忆
+        persistence
+            .save_memory(&make_memory("部署到生产环境", vec!["deploy"]))
+            .expect("保存失败");
+        persistence
+            .save_memory(&make_memory("生产环境部署步骤", vec!["deploy"]))
+            .expect("保存失败");
+        persistence
+            .save_memory(&make_memory("部署到生产的方法", vec!["deploy"]))
+            .expect("保存失败");
+
+        let clusters = engine.find_synthesis_clusters(&persistence).expect("查找簇失败");
+        // 3 条相似记忆应形成至少 1 个簇
+        assert!(!clusters.is_empty(), "相似记忆应形成簇");
+    }
+
+    #[test]
+    fn test_try_synthesize_empty() {
+        let engine = SynthesisEngine::default();
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+
+        let mut graph_store: Option<GraphMemoryStore> = None;
+        let mut dao_metrics = DaoMetrics::default();
+        let count = engine
+            .try_synthesize(&persistence, &mut graph_store, &mut dao_metrics)
+            .expect("合成失败");
+        assert_eq!(count, 0, "空记忆库应返回 0 条合成");
+    }
+
+    #[test]
+    fn test_try_synthesize_with_similar() {
+        let engine = SynthesisEngine::default();
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+
+        // 添加 3 条相似记忆
+        persistence
+            .save_memory(&make_memory("Python 性能优化技巧", vec!["python"]))
+            .expect("保存失败");
+        persistence
+            .save_memory(&make_memory("Python 代码优化方法", vec!["python"]))
+            .expect("保存失败");
+        persistence
+            .save_memory(&make_memory("优化 Python 程序性能", vec!["python"]))
+            .expect("保存失败");
+
+        let mut graph_store: Option<GraphMemoryStore> = None;
+        let mut dao_metrics = DaoMetrics::default();
+        let count = engine
+            .try_synthesize(&persistence, &mut graph_store, &mut dao_metrics)
+            .expect("合成失败");
+        // 相似记忆应触发合成
+        assert!(count > 0, "相似记忆应触发合成，实际: {} 条", count);
+
+        // 验证合成记忆已保存
+        let all = persistence.load_all_memories().expect("加载失败");
+        let synthesis_count = all
+            .iter()
+            .filter(|m| m.memory_type == MemoryType::Synthesis)
+            .count();
+        assert!(synthesis_count > 0, "应存在合成记忆，实际: {} 条", synthesis_count);
+    }
+
+    #[test]
+    fn test_synthesize_is_idempotent() {
+        let engine = SynthesisEngine::default();
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+
+        // 添加 3 条相似记忆
+        persistence
+            .save_memory(&make_memory("Rust 所有权规则", vec!["rust"]))
+            .expect("保存失败");
+        persistence
+            .save_memory(&make_memory("Rust 所有权和借用", vec!["rust"]))
+            .expect("保存失败");
+        persistence
+            .save_memory(&make_memory("理解 Rust 所有权", vec!["rust"]))
+            .expect("保存失败");
+
+        let mut graph_store: Option<GraphMemoryStore> = None;
+        let mut dao_metrics = DaoMetrics::default();
+
+        // 第一次合成
+        let count1 = engine
+            .try_synthesize(&persistence, &mut graph_store, &mut dao_metrics)
+            .expect("第一次合成失败");
+
+        // 第二次合成 — 应不再产生新合成记忆（幂等）
+        let count2 = engine
+            .try_synthesize(&persistence, &mut graph_store, &mut dao_metrics)
+            .expect("第二次合成失败");
+
+        assert!(count1 > 0, "第一次应产生合成记忆");
+        assert_eq!(count2, 0, "第二次合成应为幂等（无新簇），实际: {} 条", count2);
     }
 }

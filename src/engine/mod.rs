@@ -16,6 +16,8 @@ pub mod hnsw; // HNSW 向量检索
 pub mod llm_translator; // LLM 查询翻译
 pub mod manager;
 pub mod model_resolver; // ML 模型下载/解析
+pub mod pooling; // 池化策略（CodeBERT + 洛书 ML 共享）
+pub mod rrf; // RRF 倒数排名融合（server + v1_api 共享）
 pub mod retriever; // 检索器 // 代码库管理器 (CoreManager)
 
 #[cfg(feature = "ml")]
@@ -83,13 +85,13 @@ pub use user_feedback::{
     UserFeedback,
 };
 
-#[cfg(feature = "ml")]
-pub use encoder_codebert::{CodeBertEncoder, PoolingStrategy};
+pub use pooling::PoolingStrategy;
 
 #[cfg(feature = "ml")]
-pub use luoshu_encoder_ml::{
-    HybridLuoShuEncoder, LuoShuMlEncoder, PoolingStrategy as LuoShuPoolingStrategy,
-};
+pub use encoder_codebert::CodeBertEncoder;
+
+#[cfg(feature = "ml")]
+pub use luoshu_encoder_ml::{HybridLuoShuEncoder, LuoShuMlEncoder};
 
 // 核心引擎设计原则：
 // 1. 每个模块设计遵循"内禀调节"原则，从系统动力学自然涌现

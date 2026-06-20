@@ -234,8 +234,9 @@ pub struct MemoryHealthStats {
 /// v2.0 新增 GC 统计和用户反馈统计，提供运维级可观测性。
 /// v3.0 新增 hint_escalation 参数，支持有状态升级的可操作建议。
 /// v4.0 新增 complexity_budget 参数，纳入复杂度预算追踪。
+/// v0.5.5 新增 llm_configured 参数，LLM 配置后编码器不再视为降级。
 ///
-/// 注意：参数较多（14 个）因为需要聚合所有子系统的状态。
+/// 注意：参数较多（15 个）因为需要聚合所有子系统的状态。
 /// 后续重构时可考虑将参数封装为 HealthReportInput 结构体。
 #[allow(clippy::too_many_arguments)]
 pub fn generate_health_report(
@@ -253,6 +254,7 @@ pub fn generate_health_report(
     feedback_stats: FeedbackStats,
     complexity_budget: ComplexityBudget,
     hint_escalation: &mut HintEscalationTracker,
+    llm_configured: bool,
 ) -> SystemHealthReport {
     // 判断系统运行模式
     let system_mode = determine_system_mode(
@@ -261,6 +263,7 @@ pub fn generate_health_report(
         &journal_snapshot,
         &regulator_state,
         total_memories,
+        llm_configured,
     );
 
     let generated_at_ms = std::time::SystemTime::now()
@@ -469,6 +472,7 @@ fn determine_system_mode(
     journal: &SynthesisJournalSnapshot,
     regulator: &DaoRegulatorState,
     total_memories: usize,
+    llm_configured: bool,
 ) -> SystemMode {
     // 1. 调节器冻结（最高优先级）
     if regulator.is_frozen {
@@ -481,7 +485,9 @@ fn determine_system_mode(
     }
 
     // 3. 编码器降级检测
-    if encoder.mode == "statistical" && encoder.degradation_reason.is_some() {
+    // v0.5.5 P1-1：LLM 配置后替代本地 ML 模型提供语义理解能力
+    // 如果 LLM 已配置，编码器不再视为"降级"，系统模式为 Healthy
+    if !llm_configured && encoder.mode == "statistical" && encoder.degradation_reason.is_some() {
         return SystemMode::Degraded;
     }
 
@@ -623,6 +629,7 @@ mod tests {
             make_feedback_stats(),
             make_complexity_budget(),
             &mut make_escalation(),
+            false,
         );
 
         assert_eq!(report.system_mode, SystemMode::Healthy);
@@ -665,6 +672,7 @@ mod tests {
             make_feedback_stats(),
             make_complexity_budget(),
             &mut make_escalation(),
+            false,
         );
 
         assert_eq!(report.system_mode, SystemMode::Degraded);
@@ -691,6 +699,7 @@ mod tests {
             make_feedback_stats(),
             make_complexity_budget(),
             &mut make_escalation(),
+            false,
         );
 
         assert_eq!(report.system_mode, SystemMode::Oscillating);
@@ -715,6 +724,7 @@ mod tests {
             make_feedback_stats(),
             make_complexity_budget(),
             &mut make_escalation(),
+            false,
         );
 
         assert_eq!(report.system_mode, SystemMode::Overloaded);
@@ -738,6 +748,7 @@ mod tests {
             make_feedback_stats(),
             make_complexity_budget(),
             &mut make_escalation(),
+            false,
         );
 
         let json = serde_json::to_string_pretty(&report).unwrap();

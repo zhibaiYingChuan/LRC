@@ -238,13 +238,15 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             })?;
 
         stats.fetched = surface_memories.len();
-        if surface_memories.is_empty() {
-            stats.last_run = Some(Utc::now());
-            stats.elapsed_ms = cycle_start.elapsed().as_millis() as u64;
-            return Ok(stats);
-        }
 
-        if self.config.verbose >= 2 {
+        // v0.5.4 P2-10 修复：即使没有新的表层记忆，也继续执行合成步骤
+        // 原因：用户通过 HTTP API 直接写入的记忆可能存在重复，需要定期合并
+        // 仅跳过存储循环，但合成检查必须始终运行
+        if surface_memories.is_empty() {
+            if self.config.verbose >= 2 {
+                eprintln!("[LRC·结晶] 无新表层记忆，仅执行合成检查");
+            }
+        } else if self.config.verbose >= 2 {
             eprintln!(
                 "[LRC·结晶] 拉取到 {} 条表层记忆 (来源: {})",
                 stats.fetched,

@@ -17,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
+/// LRC 默认 HTTP 端口
+/// 所有模块（server、sidecar、前端）统一的端口默认值
+pub const DEFAULT_PORT: u16 = 3099;
+
 /// LRC 完整配置结构（可持久化）
 ///
 /// 保存用户所有可配置参数，支持JSON序列化/反序列化。
@@ -50,7 +54,7 @@ pub struct LrcConfig {
 impl Default for LrcConfig {
     fn default() -> Self {
         Self {
-            default_port: 3099,
+            default_port: DEFAULT_PORT,
             default_host: "127.0.0.1".to_string(),
             llm_api: None,
             encrypted_api_key: None,

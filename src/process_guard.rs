@@ -311,13 +311,17 @@ fn is_pid_alive(pid: u32) -> bool {
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         const STILL_ACTIVE: u32 = 259;
 
+        // SAFETY: OpenProcess 是 Windows API，PROCESS_QUERY_LIMITED_INFORMATION 是最低权限访问，
+        // 仅用于检查进程是否存在，不会造成安全风险。pid 来自外部输入但已通过 u32 类型约束
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle == 0 || handle == -1 {
             return false; // 无法打开进程 → 进程不存在
         }
 
         let mut exit_code: u32 = 0;
+        // SAFETY: GetExitCodeProcess 接收有效句柄和栈上 exit_code 指针，handle 已通过非零检查
         let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+        // SAFETY: CloseHandle 用于释放 OpenProcess 返回的句柄，handle 已通过有效性检查
         unsafe { CloseHandle(handle) };
 
         if ok == 0 {

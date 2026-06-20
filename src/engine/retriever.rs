@@ -57,9 +57,15 @@ impl<E: CodeEncoder> LocalRetriever<E> {
     }
 
     pub fn index_chunk(&mut self, chunk: CodeChunk) {
-        let vector = self.encoder.encode(&chunk);
-        self.vectors.push(vector);
-        self.chunks.push(chunk);
+        match self.encoder.encode(&chunk) {
+            Ok(vector) => {
+                self.vectors.push(vector);
+                self.chunks.push(chunk);
+            }
+            Err(e) => {
+                eprintln!("[LRC·检索器] 编码失败，跳过片段 '{}': {}", chunk.name, e);
+            }
+        }
     }
 
     pub fn index_batch(&mut self, chunks: Vec<CodeChunk>) {
@@ -112,7 +118,18 @@ impl<E: CodeEncoder> CodeRetriever for LocalRetriever<E> {
             doc_comment: None,
             language: "text".to_string(),
         };
-        let query_vector = self.encoder.encode(&query_chunk);
+        let query_vector = match self.encoder.encode(&query_chunk) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[LRC·检索器] 查询编码失败: {}", e);
+                return RetrievalResult {
+                    query: query.to_string(),
+                    returned: 0,
+                    total_indexed: self.vectors.len(),
+                    results: Vec::new(),
+                };
+            }
+        };
 
         let mut scored: Vec<ScoredChunk> = self
             .vectors

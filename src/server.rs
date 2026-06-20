@@ -237,7 +237,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
     let tools = vec![
         ToolDefinition {
             name: "remember".into(),
-            description: "帮 AI 记住一件事——就像给 AI 装了个记事本。记住的内容会在后续对话中自动被检索到。适用场景：用户表达了技术偏好（'用 pnpm'）、做了项目决策（'数据库选 PostgreSQL'）、或者有重要的约定需要跨会话保留。".into(),
+            description: "帮 AI 记住一件事——就像给 AI 装了个记事本。记住的内容会在后续对话中自动被检索到。【主动调用时机】1) 用户表达了技术偏好（'用 pnpm'）；2) 做了项目决策（'数据库选 PostgreSQL'）；3) 有重要的约定需要跨会话保留；4) 完成代码修改任务后，自动记录新增的模块、API 端点、架构变更等关键信息（这是任务的自然收尾，无需用户提醒）。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
@@ -330,7 +330,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
         },
         ToolDefinition {
             name: "recall".into(),
-            description: "语义检索历史记忆。支持两种模式：fast（关键词匹配，默认）和 deep（深度语义检索，使用编码器 + 聚焦检索）。deep 模式通过语义空间定位找到距离最近的记忆。".into(),
+            description: "语义检索历史记忆。支持两种模式：fast（关键词匹配，默认）和 deep（深度语义检索，使用编码器 + 聚焦检索）。【主动调用时机】1) 会话开始时，先调用 recall 检索项目架构概览（query='项目架构 模块组织 入口文件'），获取已有上下文；2) 遇到不确定的模块/函数/概念时，优先 recall 而非直接读源文件；3) 用户开始新任务时，recall 相关专题记忆。只有 recall 结果不足时才读取源文件，以减少上下文溢出。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
@@ -376,7 +376,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
         },
         ToolDefinition {
             name: "forget".into(),
-            description: "删除一条记忆。".into(),
+            description: "删除一条记忆。【主动调用时机】当模块/文件被删除时，调用此工具删除对应的记忆，保持记忆库与代码同步。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
@@ -390,7 +390,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
         },
         ToolDefinition {
             name: "update_memory".into(),
-            description: "更新一条已有记忆的内容。".into(),
+            description: "更新一条已有记忆的内容。【主动调用时机】1) 修改了已有模块的职责或入口函数时；2) 重命名了文件或函数时；3) 修改了 API 端点的路径或方法时；4) 修改了项目配置（依赖、构建等）时。先用 recall 找到对应记忆的 memory_id，再调用此工具更新。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
@@ -568,6 +568,618 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
     make_response(id, to_json_value_safe(&result))
 }
 
+/// 处理 recall_enhanced 工具调用 — 双路检索增强（RRF 倒数排名融合）
+///
+/// 快速通路（关键词匹配）+ 深度通路（语义检索）→ RRF 融合 → 归一化排序
+async fn handle_recall_enhanced(
+    state: &AppState,
+    arguments: &serde_json::Value,
+    id: Option<serde_json::Value>,
+) -> JsonRpcResponse {
+    let query = match arguments.get("query").and_then(|q| q.as_str()) {
+        Some(q) => q,
+        None => return make_error(id, -32602, "缺少参数: query"),
+    };
+    let top_k = arguments
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .clamp(1, 100) as usize;
+
+    let memory_type = arguments
+        .get("memory_type")
+        .and_then(|v| v.as_str())
+        .and_then(MemoryType::try_parse);
+
+    let project = arguments
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let tags: Vec<String> = arguments
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut store = state.memory_store.lock().await;
+
+    // LLM 记忆翻译：将问题翻译为答案可能包含的关键词，桥接语义鸿沟
+    // v0.5.4 P2-11 修复：添加翻译状态日志，便于调试 LLM 响应问题
+    let enriched_query = if state.llm_api.read().await.is_configured() {
+        let keywords = crate::engine::llm_translator::translate_memory_query(
+            &*state.llm_api.read().await,
+            query,
+        )
+        .await;
+        let translated: String = keywords.join(" ");
+        if translated.is_empty() || translated.trim() == query {
+            eprintln!("[LRC·LLM] 增强检索翻译未产生有效结果，使用原始查询: {}", query);
+            query.to_string()
+        } else {
+            eprintln!("[LRC·LLM] 增强检索翻译成功: {} → {}", query, translated);
+            format!("{} {}", translated, query)
+        }
+    } else {
+        query.to_string()
+    };
+
+    // 快速通路：关键词匹配，使用富化查询
+    let fast_filter = RecallFilter {
+        memory_type: memory_type.clone(),
+        project: project.clone(),
+        tags: tags.clone(),
+        min_importance: None,
+        top_k: top_k * 2,
+        privacy_context: None,
+    };
+    let fast_result = store
+        .recall(&enriched_query, &fast_filter)
+        .unwrap_or(RecallResult {
+            memories: vec![],
+            scores: vec![],
+            total: 0,
+        });
+
+    // 深度通路：深度语义检索，使用富化查询
+    let deep_filter = RecallFilter {
+        memory_type,
+        project,
+        tags,
+        min_importance: None,
+        top_k: top_k * 2,
+        privacy_context: None,
+    };
+    let deep_result = store
+        .trapezoid_focus_recall(&enriched_query, &deep_filter, 1)
+        .unwrap_or(RecallResult {
+            memories: vec![],
+            scores: vec![],
+            total: 0,
+        });
+
+    // 倒数排名融合 (RRF, Reciprocal Rank Fusion) — 使用共享 rrf_fuse
+    let fused = crate::engine::rrf::rrf_fuse(&fast_result, &deep_result, top_k, crate::engine::rrf::RRF_DEFAULT_K);
+    let result_memories = fused.memories;
+    let result_scores = fused.scores;
+    let total = fused.total_candidates;
+
+    let mut text = format!(
+        "双路检索增强结果 (共 {} 条候选，返回 {} 条)\n\
+         ═══════════════════════════════════\n\
+         快速通路: 关键词匹配 | 深度通路: 深度语义检索\n\
+         融合算法: 倒数排名融合 (RRF, k=60)\n\n",
+        total,
+        result_memories.len()
+    );
+
+    if result_memories.is_empty() {
+        text.push_str("未找到相关记忆。使用 remember 工具添加新记忆。\n");
+    } else {
+        for (i, m) in result_memories.iter().enumerate() {
+            let score = result_scores.get(i).unwrap_or(&0.0);
+            let mem_num = i + 1;
+            text.push_str(&format!("（记忆 #{mem_num} · RRF 融合度 {:.3}）\n", score));
+            text.push_str(&format!("内容: {}\n", m.content));
+            if let Some(ref cat) = m.bagua_category {
+                text.push_str(&format!("分类: {} | ", cat));
+            }
+            text.push_str(&format!(
+                "类型: {} | 重要性: {}/10\n",
+                m.memory_type.as_str(),
+                m.importance.value()
+            ));
+            text.push_str(&format!("ID: `{}`\n\n", m.id));
+        }
+        text.push_str("💡 双路检索融合了快速关键词匹配和深度语义定位，兼顾了召回率和精度。\n");
+    }
+
+    let call_result = ToolCallResult {
+        content: vec![TextContent {
+            content_type: "text".into(),
+            text,
+        }],
+    };
+    make_response(id, to_json_value_safe(&call_result))
+}
+
+/// 处理 recall 工具调用 — 关键词匹配 / 深度语义检索
+///
+/// 支持 lrc_mode: "fast"（关键词匹配，默认）或 "deep"（深度语义检索）
+/// 若配置了 LLM API，自动将查询翻译为答案关键词以桥接语义鸿沟
+async fn handle_recall(
+    state: &AppState,
+    arguments: &serde_json::Value,
+    id: Option<serde_json::Value>,
+) -> JsonRpcResponse {
+    let query = match arguments.get("query").and_then(|q| q.as_str()) {
+        Some(q) => q,
+        None => return make_error(id, -32602, "缺少参数: query"),
+    };
+    let top_k = arguments
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .clamp(1, 100) as usize;
+
+    // 检索模式：fast（关键词匹配）或 deep（深度语义检索）
+    let lrc_mode = arguments
+        .get("lrc_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fast");
+    let focus_depth = arguments
+        .get("focus_depth")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .clamp(1, 3) as u32;
+
+    let memory_type = arguments
+        .get("memory_type")
+        .and_then(|v| v.as_str())
+        .and_then(MemoryType::try_parse);
+
+    let project = arguments
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let tags: Vec<String> = arguments
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let min_importance = arguments
+        .get("min_importance")
+        .and_then(|v| v.as_u64())
+        .map(|v| Importance::new(v as u8));
+
+    let filter = RecallFilter {
+        memory_type,
+        project,
+        tags,
+        min_importance,
+        top_k,
+        privacy_context: None,
+    };
+
+    let mut store = state.memory_store.lock().await;
+
+    // LLM 记忆翻译：将自然语言问题翻译为答案可能包含的关键词
+    // 桥接"问题词与答案词不重叠"的语义鸿沟
+    // v0.5.4 P2-11 修复：添加翻译状态日志，便于调试 LLM 响应问题
+    let enriched_query = if state.llm_api.read().await.is_configured() {
+        let keywords = crate::engine::llm_translator::translate_memory_query(
+            &*state.llm_api.read().await,
+            query,
+        )
+        .await;
+        let translated: String = keywords.join(" ");
+        if translated.is_empty() || translated.trim() == query {
+            eprintln!("[LRC·LLM] 记忆翻译未产生有效结果，使用原始查询: {}", query);
+            query.to_string()
+        } else {
+            eprintln!("[LRC·LLM] 记忆翻译成功: {} → {}", query, translated);
+            format!("{} {}", translated, query)
+        }
+    } else {
+        query.to_string()
+    };
+
+    // 根据 lrc_mode 选择检索方法（使用富化后的查询）
+    let result = if lrc_mode == "deep" {
+        store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth)
+    } else {
+        store.recall(&enriched_query, &filter)
+    };
+
+    match result {
+        Ok(result) => {
+            let mut text = format!(
+                "记忆检索结果 (共 {} 条匹配，记忆库共 {} 条，模式: {})\n\n",
+                result.memories.len(),
+                result.total,
+                if lrc_mode == "deep" {
+                    "深度语义检索"
+                } else {
+                    "关键词匹配"
+                }
+            );
+
+            if result.memories.is_empty() {
+                text.push_str("未找到相关记忆。使用 remember 工具添加新记忆。\n");
+            } else {
+                for (i, m) in result.memories.iter().enumerate() {
+                    let score = result.scores.get(i).unwrap_or(&0.0);
+                    let mem_num = i + 1;
+                    text.push_str(&format!(
+                        "（记忆 #{mem_num} · 匹配度 {:.1}%）\n",
+                        score * 100.0
+                    ));
+                    text.push_str(&format!("内容: {}\n", m.content));
+                    if let Some(ref cat) = m.bagua_category {
+                        text.push_str(&format!("分类: {} | ", cat));
+                    }
+                    text.push_str(&format!(
+                        "类型: {} | 重要性: {}/10",
+                        m.memory_type.as_str(),
+                        m.importance.value()
+                    ));
+                    if !m.tags.is_empty() {
+                        text.push_str(&format!(" | 标签: {}", m.tags.join(", ")));
+                    }
+                    if let Some(ref proj) = m.project {
+                        text.push_str(&format!(" | 项目: {}", proj));
+                    }
+                    text.push_str(&format!("\nID: `{}`\n\n", m.id));
+                }
+                text.push_str("💡 在回复中引用记忆时，请使用「（根据记忆 #N）」的格式标注来源，让用户能看见和信任记忆的存在。\n");
+            }
+
+            let call_result = ToolCallResult {
+                content: vec![TextContent {
+                    content_type: "text".into(),
+                    text,
+                }],
+            };
+            make_response(id, to_json_value_safe(&call_result))
+        }
+        Err(e) => make_error(id, -32603, &format!("检索失败: {}", e)),
+    }
+}
+
+/// 处理 batch_remember 工具调用 — 批量注入多条记忆
+///
+/// 批量上限为 200 条，每条记忆必须包含 content 字段
+async fn handle_batch_remember(
+    state: &AppState,
+    arguments: &serde_json::Value,
+    id: Option<serde_json::Value>,
+) -> JsonRpcResponse {
+    let memories_array = match arguments.get("memories").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return make_error(id, -32602, "缺少参数: memories (数组)"),
+    };
+
+    if memories_array.is_empty() {
+        let text = "批量注入完成: 0 条记忆（空列表）";
+        let call_result = ToolCallResult {
+            content: vec![TextContent {
+                content_type: "text".into(),
+                text: text.to_string(),
+            }],
+        };
+        return make_response(id, to_json_value_safe(&call_result));
+    }
+
+    if memories_array.len() > 200 {
+        return make_error(
+            id,
+            -32602,
+            &format!("批量注入上限为 200 条，收到 {} 条", memories_array.len()),
+        );
+    }
+
+    let mut memories = Vec::with_capacity(memories_array.len());
+    for item in memories_array {
+        let content = match item.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => {
+                return make_error(id, -32602, "每条记忆必须包含 content 字段");
+            }
+        };
+
+        let memory_type_str = item
+            .get("memory_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("fact");
+        let memory_type =
+            MemoryType::try_parse(memory_type_str).unwrap_or(MemoryType::Fact);
+
+        let project = item
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let tags: Vec<String> = item
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let importance = item
+            .get("importance")
+            .and_then(|v| v.as_u64())
+            .map(|v| Importance::new(v as u8))
+            .unwrap_or_default();
+
+        let memory = Memory::new(
+            content,
+            memory_type,
+            project,
+            tags,
+            importance,
+            None, // ttl_days
+        );
+
+        memories.push(memory);
+    }
+
+    let total = memories.len();
+    let mut store = state.memory_store.lock().await;
+    match store.remember_batch(memories) {
+        Ok(saved) => {
+            let text = format!(
+                "批量注入完成: {} 条记忆\n\
+                 ══════════════════════\n\
+                 总计: {} 条记忆已写入记忆库\n\
+                 \n\
+                 ID 列表:\n{}",
+                total,
+                saved.len(),
+                saved
+                    .iter()
+                    .map(|m| format!("  - {}: {}", m.id, m.summary()))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            let call_result = ToolCallResult {
+                content: vec![TextContent {
+                    content_type: "text".into(),
+                    text,
+                }],
+            };
+            make_response(id, to_json_value_safe(&call_result))
+        }
+        Err(e) => make_error(id, -32603, &format!("批量注入失败: {}", e)),
+    }
+}
+
+/// 处理 list_memories 工具调用 — 分页列出记忆
+///
+/// 支持按类型、项目、标签过滤，按重要性/时间排序，分页
+async fn handle_list_memories(
+    state: &AppState,
+    arguments: &serde_json::Value,
+    id: Option<serde_json::Value>,
+) -> JsonRpcResponse {
+    let memory_type = arguments
+        .get("memory_type")
+        .and_then(|v| v.as_str())
+        .and_then(MemoryType::try_parse);
+
+    let project = arguments
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let tags: Vec<String> = arguments
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let sort_by = arguments
+        .get("sort_by")
+        .and_then(|v| v.as_str())
+        .map(|s| match s {
+            "importance" => SortBy::Importance,
+            "last_accessed" => SortBy::LastAccessed,
+            _ => SortBy::CreatedAt,
+        })
+        .unwrap_or_default();
+
+    let order = arguments
+        .get("order")
+        .and_then(|v| v.as_str())
+        .map(|s| match s {
+            "asc" => SortOrder::Asc,
+            _ => SortOrder::Desc,
+        })
+        .unwrap_or_default();
+
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .clamp(1, 100) as usize;
+
+    let offset = arguments
+        .get("offset")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let filter = ListFilter {
+        memory_type,
+        project,
+        tags,
+        sort_by,
+        order,
+        limit,
+        offset,
+        privacy_context: None,
+    };
+
+    let store = state.memory_store.lock().await;
+    match store.list_memories(&filter) {
+        Ok((memories, total)) => {
+            let mut text =
+                format!("记忆列表 (共 {} 条，本页 {} 条)\n\n", total, memories.len());
+
+            if memories.is_empty() {
+                text.push_str("暂无记忆。使用 remember 工具添加记忆。\n");
+            } else {
+                for m in &memories {
+                    text.push_str(&format!("### {}\n", m.summary()));
+                    text.push_str(&format!("ID: `{}`\n", m.id));
+                    text.push_str(&format!(
+                        "类型: {} | 重要性: {}/10 | 创建: {}\n",
+                        m.memory_type.as_str(),
+                        m.importance.value(),
+                        m.created_at.format("%Y-%m-%d %H:%M")
+                    ));
+                    if let Some(ref proj) = m.project {
+                        text.push_str(&format!("项目: {}\n", proj));
+                    }
+                    if !m.tags.is_empty() {
+                        text.push_str(&format!("标签: {}\n", m.tags.join(", ")));
+                    }
+                    text.push('\n');
+                }
+            }
+
+            let call_result = ToolCallResult {
+                content: vec![TextContent {
+                    content_type: "text".into(),
+                    text,
+                }],
+            };
+            make_response(id, to_json_value_safe(&call_result))
+        }
+        Err(e) => make_error(id, -32603, &format!("列表查询失败: {}", e)),
+    }
+}
+
+/// 处理 remember 工具调用 — 写入单条记忆
+///
+/// 支持记忆类型、项目、标签、重要性、TTL、隐私级别等参数
+async fn handle_remember(
+    state: &AppState,
+    arguments: &serde_json::Value,
+    id: Option<serde_json::Value>,
+) -> JsonRpcResponse {
+    let content = match arguments.get("content").and_then(|q| q.as_str()) {
+        Some(q) => q,
+        None => return make_error(id, -32602, "缺少参数: content"),
+    };
+
+    let memory_type_str = arguments
+        .get("memory_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("fact");
+    let memory_type = MemoryType::try_parse(memory_type_str).unwrap_or(MemoryType::Fact);
+
+    let project = arguments
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let tags: Vec<String> = arguments
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let importance = arguments
+        .get("importance")
+        .and_then(|v| v.as_u64())
+        .map(|v| Importance::new(v as u8))
+        .unwrap_or_default();
+
+    let ttl_days = arguments
+        .get("ttl_days")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    // 隐私权限参数
+    let privacy_level = arguments
+        .get("privacy_level")
+        .and_then(|v| v.as_str())
+        .and_then(PrivacyLevel::try_parse)
+        .unwrap_or_default();
+
+    let session_id = arguments
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let user_id = arguments
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let memory = Memory::new(
+        content.to_string(),
+        memory_type,
+        project,
+        tags,
+        importance,
+        ttl_days,
+    )
+    .with_privacy(privacy_level, session_id, user_id);
+
+    let mut store = state.memory_store.lock().await;
+    match store.remember(memory) {
+        Ok(saved) => {
+            let text = format!(
+                "已记住 (ID: {})\n\
+                 ──────────────────\n\
+                 内容: {}\n\
+                 类型: {} | 重要性: {}/10 | 隐私: {}\n\
+                 拓扑深度: {:.2} | 版本: {}\n\
+                 \n\
+                 ✅ 下次你问相关问题时，AI 会自动检索到这条记忆。",
+                saved.id,
+                saved.content,
+                saved.memory_type.as_str(),
+                saved.importance.value(),
+                saved.privacy_level.as_str(),
+                saved.topological_depth,
+                saved.version
+            );
+            let call_result = ToolCallResult {
+                content: vec![TextContent {
+                    content_type: "text".into(),
+                    text,
+                }],
+            };
+            make_response(id, to_json_value_safe(&call_result))
+        }
+        Err(e) => make_error(id, -32603, &format!("写入失败: {}", e)),
+    }
+}
+
+/// 处理 MCP tools/call 请求 — 路由到对应的工具处理函数
 async fn handle_tools_call(
     state: &AppState,
     params: &serde_json::Value,
@@ -584,347 +1196,19 @@ async fn handle_tools_call(
         .unwrap_or(serde_json::Value::Null);
 
     match name {
+        // === 写入记忆（已提取到 handle_remember）===
         "remember" => {
-            let content = match arguments.get("content").and_then(|q| q.as_str()) {
-                Some(q) => q,
-                None => return make_error(id, -32602, "缺少参数: content"),
-            };
-
-            let memory_type_str = arguments
-                .get("memory_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("fact");
-            let memory_type = MemoryType::try_parse(memory_type_str).unwrap_or(MemoryType::Fact);
-
-            let project = arguments
-                .get("project")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let tags: Vec<String> = arguments
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let importance = arguments
-                .get("importance")
-                .and_then(|v| v.as_u64())
-                .map(|v| Importance::new(v as u8))
-                .unwrap_or_default();
-
-            let ttl_days = arguments
-                .get("ttl_days")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-
-            // 隐私权限参数
-            let privacy_level = arguments
-                .get("privacy_level")
-                .and_then(|v| v.as_str())
-                .and_then(PrivacyLevel::try_parse)
-                .unwrap_or_default();
-
-            let session_id = arguments
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let user_id = arguments
-                .get("user_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let memory = Memory::new(
-                content.to_string(),
-                memory_type,
-                project,
-                tags,
-                importance,
-                ttl_days,
-            )
-            .with_privacy(privacy_level, session_id, user_id);
-
-            let mut store = state.memory_store.lock().await;
-            match store.remember(memory) {
-                Ok(saved) => {
-                    let text = format!(
-                        "已记住 (ID: {})\n\
-                         ──────────────────\n\
-                         内容: {}\n\
-                         类型: {} | 重要性: {}/10 | 隐私: {}\n\
-                         拓扑深度: {:.2} | 版本: {}\n\
-                         \n\
-                         ✅ 下次你问相关问题时，AI 会自动检索到这条记忆。",
-                        saved.id,
-                        saved.content,
-                        saved.memory_type.as_str(),
-                        saved.importance.value(),
-                        saved.privacy_level.as_str(),
-                        saved.topological_depth,
-                        saved.version
-                    );
-                    let call_result = ToolCallResult {
-                        content: vec![TextContent {
-                            content_type: "text".into(),
-                            text,
-                        }],
-                    };
-                    make_response(id, to_json_value_safe(&call_result))
-                }
-                Err(e) => make_error(id, -32603, &format!("写入失败: {}", e)),
-            }
+            return handle_remember(state, &arguments, id).await;
         }
 
+        // === 批量注入（已提取到 handle_batch_remember）===
         "batch_remember" => {
-            let memories_array = match arguments.get("memories").and_then(|v| v.as_array()) {
-                Some(arr) => arr,
-                None => return make_error(id, -32602, "缺少参数: memories (数组)"),
-            };
-
-            if memories_array.is_empty() {
-                let text = "批量注入完成: 0 条记忆（空列表）";
-                let call_result = ToolCallResult {
-                    content: vec![TextContent {
-                        content_type: "text".into(),
-                        text: text.to_string(),
-                    }],
-                };
-                return make_response(id, to_json_value_safe(&call_result));
-            }
-
-            if memories_array.len() > 200 {
-                return make_error(
-                    id,
-                    -32602,
-                    &format!("批量注入上限为 200 条，收到 {} 条", memories_array.len()),
-                );
-            }
-
-            let mut memories = Vec::with_capacity(memories_array.len());
-            for item in memories_array {
-                let content = match item.get("content").and_then(|v| v.as_str()) {
-                    Some(c) => c.to_string(),
-                    None => {
-                        return make_error(id, -32602, "每条记忆必须包含 content 字段");
-                    }
-                };
-
-                let memory_type_str = item
-                    .get("memory_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("fact");
-                let memory_type =
-                    MemoryType::try_parse(memory_type_str).unwrap_or(MemoryType::Fact);
-
-                let project = item
-                    .get("project")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let tags: Vec<String> = item
-                    .get("tags")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                let importance = item
-                    .get("importance")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| Importance::new(v as u8))
-                    .unwrap_or_default();
-
-                let memory = Memory::new(
-                    content,
-                    memory_type,
-                    project,
-                    tags,
-                    importance,
-                    None, // ttl_days
-                );
-
-                memories.push(memory);
-            }
-
-            let total = memories.len();
-            let mut store = state.memory_store.lock().await;
-            match store.remember_batch(memories) {
-                Ok(saved) => {
-                    let text = format!(
-                        "批量注入完成: {} 条记忆\n\
-                         ══════════════════════\n\
-                         总计: {} 条记忆已写入记忆库\n\
-                         \n\
-                         ID 列表:\n{}",
-                        total,
-                        saved.len(),
-                        saved
-                            .iter()
-                            .map(|m| format!("  - {}: {}", m.id, m.summary()))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    );
-                    let call_result = ToolCallResult {
-                        content: vec![TextContent {
-                            content_type: "text".into(),
-                            text,
-                        }],
-                    };
-                    make_response(id, to_json_value_safe(&call_result))
-                }
-                Err(e) => make_error(id, -32603, &format!("批量注入失败: {}", e)),
-            }
+            return handle_batch_remember(state, &arguments, id).await;
         }
 
+        // === 记忆检索（已提取到 handle_recall）===
         "recall" => {
-            let query = match arguments.get("query").and_then(|q| q.as_str()) {
-                Some(q) => q,
-                None => return make_error(id, -32602, "缺少参数: query"),
-            };
-            let top_k = arguments
-                .get("top_k")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5)
-                .clamp(1, 100) as usize;
-
-            // 检索模式：fast（关键词匹配）或 deep（深度语义检索）
-            let lrc_mode = arguments
-                .get("lrc_mode")
-                .and_then(|v| v.as_str())
-                .unwrap_or("fast");
-            let focus_depth = arguments
-                .get("focus_depth")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1)
-                .clamp(1, 3) as u32;
-
-            let memory_type = arguments
-                .get("memory_type")
-                .and_then(|v| v.as_str())
-                .and_then(MemoryType::try_parse);
-
-            let project = arguments
-                .get("project")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let tags: Vec<String> = arguments
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let min_importance = arguments
-                .get("min_importance")
-                .and_then(|v| v.as_u64())
-                .map(|v| Importance::new(v as u8));
-
-            let filter = RecallFilter {
-                memory_type,
-                project,
-                tags,
-                min_importance,
-                top_k,
-                privacy_context: None,
-            };
-
-            let mut store = state.memory_store.lock().await;
-
-            // LLM 记忆翻译：如果配置了 LLM API，将自然语言问题翻译为答案可能包含的关键词
-            // 然后将关键词拼入原始查询，使 TF-IDF/语义编码器能跨越"问题词与答案词不重叠"的语义鸿沟
-            // 例如："What degree did I graduate with?" →
-            //   富化查询: "Business Administration major degree graduation college What degree did I graduate with?"
-            let enriched_query = if state.llm_api.read().await.is_configured() {
-                let keywords = crate::engine::llm_translator::translate_memory_query(
-                    &*state.llm_api.read().await,
-                    query,
-                )
-                .await;
-                let translated: String = keywords.join(" ");
-                if translated.is_empty() || translated.trim() == query {
-                    query.to_string() // 翻译为空或与原始相同，保持原样
-                } else {
-                    format!("{} {}", translated, query)
-                }
-            } else {
-                query.to_string()
-            };
-
-            // 根据 lrc_mode 选择检索方法（使用富化后的查询）
-            let result = if lrc_mode == "deep" {
-                // 深度语义检索
-                store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth)
-            } else {
-                // 快速模式：关键词匹配（默认）
-                store.recall(&enriched_query, &filter)
-            };
-
-            match result {
-                Ok(result) => {
-                    let mut text = format!(
-                        "记忆检索结果 (共 {} 条匹配，记忆库共 {} 条，模式: {})\n\n",
-                        result.memories.len(),
-                        result.total,
-                        if lrc_mode == "deep" {
-                            "深度语义检索"
-                        } else {
-                            "关键词匹配"
-                        }
-                    );
-
-                    if result.memories.is_empty() {
-                        text.push_str("未找到相关记忆。使用 remember 工具添加新记忆。\n");
-                    } else {
-                        for (i, m) in result.memories.iter().enumerate() {
-                            let score = result.scores.get(i).unwrap_or(&0.0);
-                            let mem_num = i + 1;
-                            text.push_str(&format!(
-                                "（记忆 #{mem_num} · 匹配度 {:.1}%）\n",
-                                score * 100.0
-                            ));
-                            text.push_str(&format!("内容: {}\n", m.content));
-                            // 显示分类信息
-                            if let Some(ref cat) = m.bagua_category {
-                                text.push_str(&format!("分类: {} | ", cat));
-                            }
-                            text.push_str(&format!(
-                                "类型: {} | 重要性: {}/10",
-                                m.memory_type.as_str(),
-                                m.importance.value()
-                            ));
-                            if !m.tags.is_empty() {
-                                text.push_str(&format!(" | 标签: {}", m.tags.join(", ")));
-                            }
-                            if let Some(ref proj) = m.project {
-                                text.push_str(&format!(" | 项目: {}", proj));
-                            }
-                            text.push_str(&format!("\nID: `{}`\n\n", m.id));
-                        }
-                        text.push_str("💡 在回复中引用记忆时，请使用「（根据记忆 #N）」的格式标注来源，让用户能看见和信任记忆的存在。\n");
-                    }
-
-                    let call_result = ToolCallResult {
-                        content: vec![TextContent {
-                            content_type: "text".into(),
-                            text,
-                        }],
-                    };
-                    make_response(id, to_json_value_safe(&call_result))
-                }
-                Err(e) => make_error(id, -32603, &format!("检索失败: {}", e)),
-            }
+            return handle_recall(state, &arguments, id).await;
         }
 
         "forget" => {
@@ -1002,106 +1286,9 @@ async fn handle_tools_call(
             }
         }
 
+        // === 记忆列表（已提取到 handle_list_memories）===
         "list_memories" => {
-            let memory_type = arguments
-                .get("memory_type")
-                .and_then(|v| v.as_str())
-                .and_then(MemoryType::try_parse);
-
-            let project = arguments
-                .get("project")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let tags: Vec<String> = arguments
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let sort_by = arguments
-                .get("sort_by")
-                .and_then(|v| v.as_str())
-                .map(|s| match s {
-                    "importance" => SortBy::Importance,
-                    "last_accessed" => SortBy::LastAccessed,
-                    _ => SortBy::CreatedAt,
-                })
-                .unwrap_or_default();
-
-            let order = arguments
-                .get("order")
-                .and_then(|v| v.as_str())
-                .map(|s| match s {
-                    "asc" => SortOrder::Asc,
-                    _ => SortOrder::Desc,
-                })
-                .unwrap_or_default();
-
-            let limit = arguments
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20)
-                .clamp(1, 100) as usize;
-
-            let offset = arguments
-                .get("offset")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
-
-            let filter = ListFilter {
-                memory_type,
-                project,
-                tags,
-                sort_by,
-                order,
-                limit,
-                offset,
-                privacy_context: None,
-            };
-
-            let store = state.memory_store.lock().await;
-            match store.list_memories(&filter) {
-                Ok((memories, total)) => {
-                    let mut text =
-                        format!("记忆列表 (共 {} 条，本页 {} 条)\n\n", total, memories.len());
-
-                    if memories.is_empty() {
-                        text.push_str("暂无记忆。使用 remember 工具添加记忆。\n");
-                    } else {
-                        for m in &memories {
-                            text.push_str(&format!("### {}\n", m.summary()));
-                            text.push_str(&format!("ID: `{}`\n", m.id));
-                            text.push_str(&format!(
-                                "类型: {} | 重要性: {}/10 | 创建: {}\n",
-                                m.memory_type.as_str(),
-                                m.importance.value(),
-                                m.created_at.format("%Y-%m-%d %H:%M")
-                            ));
-                            if let Some(ref proj) = m.project {
-                                text.push_str(&format!("项目: {}\n", proj));
-                            }
-                            if !m.tags.is_empty() {
-                                text.push_str(&format!("标签: {}\n", m.tags.join(", ")));
-                            }
-                            text.push('\n');
-                        }
-                    }
-
-                    let call_result = ToolCallResult {
-                        content: vec![TextContent {
-                            content_type: "text".into(),
-                            text,
-                        }],
-                    };
-                    make_response(id, to_json_value_safe(&call_result))
-                }
-                Err(e) => make_error(id, -32603, &format!("列表查询失败: {}", e)),
-            }
+            return handle_list_memories(state, &arguments, id).await;
         }
 
         "memory_stats" => {
@@ -1355,179 +1542,9 @@ async fn handle_tools_call(
             }
         }
 
-        // === 双路检索增强 ===
+        // === 双路检索增强（已提取到 handle_recall_enhanced）===
         "recall_enhanced" => {
-            let query = match arguments.get("query").and_then(|q| q.as_str()) {
-                Some(q) => q,
-                None => return make_error(id, -32602, "缺少参数: query"),
-            };
-            let top_k = arguments
-                .get("top_k")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(5)
-                .clamp(1, 100) as usize;
-
-            let memory_type = arguments
-                .get("memory_type")
-                .and_then(|v| v.as_str())
-                .and_then(MemoryType::try_parse);
-
-            let project = arguments
-                .get("project")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            let tags: Vec<String> = arguments
-                .get("tags")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let mut store = state.memory_store.lock().await;
-
-            // LLM 记忆翻译：将问题翻译为答案可能包含的关键词，桥接语义鸿沟
-            let enriched_query = if state.llm_api.read().await.is_configured() {
-                let keywords = crate::engine::llm_translator::translate_memory_query(
-                    &*state.llm_api.read().await,
-                    query,
-                )
-                .await;
-                let translated: String = keywords.join(" ");
-                if translated.is_empty() || translated.trim() == query {
-                    query.to_string()
-                } else {
-                    format!("{} {}", translated, query)
-                }
-            } else {
-                query.to_string()
-            };
-
-            // 快速通路：关键词匹配（已有 recall 逻辑），使用富化查询
-            let fast_filter = RecallFilter {
-                memory_type: memory_type.clone(),
-                project: project.clone(),
-                tags: tags.clone(),
-                min_importance: None,
-                top_k: top_k * 2, // 快速通路取更多结果
-                privacy_context: None,
-            };
-            let fast_result = store
-                .recall(&enriched_query, &fast_filter)
-                .unwrap_or(RecallResult {
-                    memories: vec![],
-                    scores: vec![],
-                    total: 0,
-                });
-
-            // 深度通路：深度语义检索，使用富化查询
-            let deep_filter = RecallFilter {
-                memory_type,
-                project,
-                tags,
-                min_importance: None,
-                top_k: top_k * 2,
-                privacy_context: None,
-            };
-            let deep_result = store
-                .trapezoid_focus_recall(&enriched_query, &deep_filter, 1)
-                .unwrap_or(RecallResult {
-                    memories: vec![],
-                    scores: vec![],
-                    total: 0,
-                });
-
-            // 倒数排名融合 (RRF, Reciprocal Rank Fusion)
-            // RRF 公式: score = sum(1 / (k + rank_i))，其中 k = 60
-            let rrf_k: f32 = 60.0;
-            let mut fused_scores: std::collections::HashMap<String, f32> =
-                std::collections::HashMap::new();
-            let mut id_to_memory: std::collections::HashMap<String, Memory> =
-                std::collections::HashMap::new();
-
-            // 快速通路排名
-            for (rank, m) in fast_result.memories.iter().enumerate() {
-                let score = 1.0 / (rrf_k + (rank + 1) as f32);
-                *fused_scores.entry(m.id.clone()).or_insert(0.0) += score;
-                id_to_memory
-                    .entry(m.id.clone())
-                    .or_insert_with(|| m.clone());
-            }
-
-            // 深度通路排名
-            for (rank, m) in deep_result.memories.iter().enumerate() {
-                let score = 1.0 / (rrf_k + (rank + 1) as f32);
-                *fused_scores.entry(m.id.clone()).or_insert(0.0) += score;
-                id_to_memory
-                    .entry(m.id.clone())
-                    .or_insert_with(|| m.clone());
-            }
-
-            // 按融合分数排序
-            let mut scored: Vec<(f32, String)> = fused_scores
-                .into_iter()
-                .map(|(id, score)| (score, id))
-                .collect();
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-            // 截取 top_k
-            let total = id_to_memory.len();
-            let result_memories: Vec<Memory> = scored
-                .into_iter()
-                .take(top_k)
-                .filter_map(|(_, id)| id_to_memory.remove(&id))
-                .collect();
-            let result_scores: Vec<f32> = (0..result_memories.len())
-                .map(|i| {
-                    // 归一化 RRF 分数到 0-1
-                    let rank = (i + 1) as f32;
-                    1.0 / (1.0 + rank.log10())
-                })
-                .collect();
-
-            let mut text = format!(
-                "双路检索增强结果 (共 {} 条候选，返回 {} 条)\n\
-                 ═══════════════════════════════════\n\
-                 快速通路: 关键词匹配 | 深度通路: 深度语义检索\n\
-                 融合算法: 倒数排名融合 (RRF, k=60)\n\n",
-                total,
-                result_memories.len()
-            );
-
-            if result_memories.is_empty() {
-                text.push_str("未找到相关记忆。使用 remember 工具添加新记忆。\n");
-            } else {
-                for (i, m) in result_memories.iter().enumerate() {
-                    let score = result_scores.get(i).unwrap_or(&0.0);
-                    let mem_num = i + 1;
-                    text.push_str(&format!("（记忆 #{mem_num} · RRF 融合度 {:.3}）\n", score));
-                    text.push_str(&format!("内容: {}\n", m.content));
-                    // 显示分类信息
-                    if let Some(ref cat) = m.bagua_category {
-                        text.push_str(&format!("分类: {} | ", cat));
-                    }
-                    text.push_str(&format!(
-                        "类型: {} | 重要性: {}/10\n",
-                        m.memory_type.as_str(),
-                        m.importance.value()
-                    ));
-                    text.push_str(&format!("ID: `{}`\n\n", m.id));
-                }
-                text.push_str(
-                    "💡 双路检索融合了快速关键词匹配和深度语义定位，兼顾了召回率和精度。\n",
-                );
-            }
-
-            let call_result = ToolCallResult {
-                content: vec![TextContent {
-                    content_type: "text".into(),
-                    text,
-                }],
-            };
-            make_response(id, to_json_value_safe(&call_result))
+            return handle_recall_enhanced(state, &arguments, id).await;
         }
 
         _ => make_error(id, -32601, &format!("未知工具: {}", name)),
@@ -1610,6 +1627,25 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     (StatusCode::OK, Json(response))
 }
 
+/// 仪表盘 CSS 端点 — 返回编译时嵌入的 app.css
+///
+/// 仪表盘 HTML 引用 app.css 作为外部样式表，此端点将编译时嵌入的
+/// app.css 内容以 `text/css` MIME 类型返回。
+async fn app_css_handler() -> axum::response::Response<String> {
+    const APP_CSS: &str = include_str!("../static/app.css");
+    axum::response::Response::builder()
+        .header("Content-Type", "text/css; charset=utf-8")
+        .body(APP_CSS.to_string())
+        .unwrap_or_else(|e| {
+            eprintln!("[server] app.css 响应构建失败: {}", e);
+            axum::response::Response::builder()
+                .body("/* app.css 加载失败 */".to_string())
+                .unwrap_or_else(|_| {
+                    axum::response::Response::new("/* app.css 加载失败 */".to_string())
+                })
+        })
+}
+
 /// 仪表盘 JavaScript 端点 — 返回编译时嵌入的 app.js
 ///
 /// 仪表盘 HTML 引用 app.js 作为外部脚本，此端点将编译时嵌入的
@@ -1619,10 +1655,13 @@ async fn app_js_handler() -> axum::response::Response<String> {
     axum::response::Response::builder()
         .header("Content-Type", "application/javascript; charset=utf-8")
         .body(APP_JS.to_string())
-        .unwrap_or_else(|_| {
+        .unwrap_or_else(|e| {
+            eprintln!("[server] app.js 响应构建失败: {}", e);
             axum::response::Response::builder()
                 .body("console.error('app.js 加载失败')".to_string())
-                .unwrap()
+                .unwrap_or_else(|_| {
+                    axum::response::Response::new("console.error('app.js 加载失败')".to_string())
+                })
         })
 }
 
@@ -1681,20 +1720,28 @@ struct ConfigResponse {
     llm_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     llm_model: Option<String>,
+    /// v0.5.5 P1-3：LLM API 端点（用于仪表盘显示具体提供商）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    llm_base_url: Option<String>,
 }
 
 /// GET /api/config — 获取当前 LLM 配置状态
 async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let llm = state.llm_api.read().await;
-    let (configured, llm_type, llm_model) = match &*llm {
-        LlmApiConfig::OpenAI { model, .. } => (true, "openai".to_string(), Some(model.clone())),
-        LlmApiConfig::Ollama { model, .. } => (true, "ollama".to_string(), Some(model.clone())),
-        LlmApiConfig::None => (false, "none".to_string(), None),
+    let (configured, llm_type, llm_model, llm_base_url) = match &*llm {
+        LlmApiConfig::OpenAI { model, endpoint, .. } => {
+            (true, "openai".to_string(), Some(model.clone()), Some(endpoint.clone()))
+        }
+        LlmApiConfig::Ollama { model, host } => {
+            (true, "ollama".to_string(), Some(model.clone()), Some(host.clone()))
+        }
+        LlmApiConfig::None => (false, "none".to_string(), None, None),
     };
     Json(ConfigResponse {
         llm_configured: configured,
         llm_type,
         llm_model,
+        llm_base_url,
     })
 }
 
@@ -1727,6 +1774,15 @@ async fn config_llm_handler(
         if let Err(e) = save_llm_to_config(None) {
             eprintln!("[配置] 清除 LLM API 配置失败: {e}");
         }
+        // v0.5.5：同步清除 wizard.json 中的 LLM 配置
+        if let Err(e) = save_llm_to_wizard_json("") {
+            eprintln!("[配置] 同步清除 wizard.json LLM 配置失败: {e}");
+        }
+        // v0.5.5：更新 MemoryStore 的 LLM 配置状态
+        {
+            let store = state.memory_store.lock().await;
+            store.set_llm_configured(false);
+        }
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1740,16 +1796,33 @@ async fn config_llm_handler(
     // 解析配置
     match LlmApiConfig::parse(&llm_str) {
         Ok(config) => {
+            // v0.5.4 修复：unreachable!() 替换为安全的错误返回
+            // parse() 方法理论上不会返回 None，但防御性编程应处理所有情况
             let (llm_type, model) = match &config {
                 LlmApiConfig::OpenAI { model, .. } => ("openai", model.clone()),
                 LlmApiConfig::Ollama { model, .. } => ("ollama", model.clone()),
-                LlmApiConfig::None => unreachable!(),
+                LlmApiConfig::None => {
+                    let err_msg = "内部错误：LLM 配置解析返回了未预期的 None 变体";
+                    eprintln!("[LRC·错误] {}", err_msg);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        "error": err_msg
+                    })));
+                }
             };
             let mut llm = state.llm_api.write().await;
             *llm = config;
             // 保存到全局配置文件
             if let Err(e) = save_llm_to_config(Some(&llm_str)) {
                 eprintln!("[配置] 保存 LLM API 配置失败: {e}");
+            }
+            // v0.5.5：同步保存到 wizard.json，确保桌面端和仪表盘配置一致
+            if let Err(e) = save_llm_to_wizard_json(&llm_str) {
+                eprintln!("[配置] 同步保存 wizard.json LLM 配置失败: {e}");
+            }
+            // v0.5.5：更新 MemoryStore 的 LLM 配置状态
+            {
+                let store = state.memory_store.lock().await;
+                store.set_llm_configured(true);
             }
             (
                 StatusCode::OK,
@@ -1777,6 +1850,99 @@ fn save_llm_to_config(llm_api: Option<&str>) -> Result<(), String> {
     let mut cfg = crate::config::LrcConfig::load();
     cfg.llm_api = llm_api.map(|s| s.to_string());
     cfg.save()
+}
+
+/// v0.5.5 新增：同步保存 LLM 配置到 wizard.json
+///
+/// 仪表盘修改 LLM 配置后，同步到 wizard.json，确保桌面端和仪表盘配置一致。
+/// wizard.json 路径：%APPDATA%\LoongRecall\wizard.json
+/// API Key 使用 AES-256-GCM 加密存储（与桌面端一致）。
+fn save_llm_to_wizard_json(llm_api: &str) -> Result<(), String> {
+    let appdata = std::env::var("APPDATA")
+        .map_err(|e| format!("读取 APPDATA 环境变量失败: {}", e))?;
+    let wizard_path = std::path::PathBuf::from(&appdata)
+        .join("LoongRecall")
+        .join("wizard.json");
+
+    // 读取现有 wizard.json（如果存在），保留非 LLM 字段
+    let mut wizard: serde_json::Value = if wizard_path.exists() {
+        let content = std::fs::read_to_string(&wizard_path)
+            .map_err(|e| format!("读取 wizard.json 失败: {}", e))?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // 解析 LLM API 字符串并更新 wizard.json
+    // 格式：openai:sk-xxx:gpt-4o:https://api.openai.com/v1
+    //       ollama:llama3:http://localhost:11434
+    let parts: Vec<&str> = llm_api.splitn(4, ':').collect();
+
+    match parts.first() {
+        Some(&"openai") => {
+            wizard["llm_configured"] = serde_json::json!(true);
+            wizard["llm_type"] = serde_json::json!("openai");
+            // API Key 加密存储
+            if let Some(api_key) = parts.get(1) {
+                let cleaned_key: String = api_key
+                    .trim()
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == ' ')
+                    .collect();
+                if !cleaned_key.is_empty() {
+                    let encrypted = crate::crypto::encrypt_api_key(&cleaned_key)
+                        .map_err(|e| format!("加密 API Key 失败: {}", e))?;
+                    wizard["encrypted_api_key"] = serde_json::json!(encrypted);
+                }
+            }
+            if let Some(model) = parts.get(2) {
+                if !model.is_empty() {
+                    wizard["llm_model"] = serde_json::json!(model);
+                }
+            }
+            if let Some(base_url) = parts.get(3) {
+                if !base_url.is_empty() {
+                    wizard["llm_base_url"] = serde_json::json!(base_url);
+                }
+            }
+        }
+        Some(&"ollama") => {
+            wizard["llm_configured"] = serde_json::json!(true);
+            wizard["llm_type"] = serde_json::json!("ollama");
+            wizard["encrypted_api_key"] = serde_json::json!("");
+            if let Some(model) = parts.get(1) {
+                if !model.is_empty() {
+                    wizard["llm_model"] = serde_json::json!(model);
+                }
+            }
+            if let Some(host) = parts.get(2) {
+                if !host.is_empty() {
+                    wizard["llm_base_url"] = serde_json::json!(host);
+                }
+            }
+        }
+        _ => {
+            // 清除 LLM 配置
+            wizard["llm_configured"] = serde_json::json!(false);
+            wizard["llm_type"] = serde_json::json!("none");
+            wizard["encrypted_api_key"] = serde_json::json!("");
+        }
+    }
+
+    // 确保目录存在
+    if let Some(parent) = wizard_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建 wizard.json 目录失败: {}", e))?;
+    }
+
+    // 写入 wizard.json
+    let json_str = serde_json::to_string_pretty(&wizard)
+        .map_err(|e| format!("序列化 wizard.json 失败: {}", e))?;
+    std::fs::write(&wizard_path, json_str)
+        .map_err(|e| format!("写入 wizard.json 失败: {}", e))?;
+
+    eprintln!("[配置] LLM 配置已同步到 wizard.json: {}", wizard_path.display());
+    Ok(())
 }
 
 // ==================== Stdio 传输层（标准 MCP） ====================
@@ -1879,6 +2045,7 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         .route("/mcp", post(mcp_handler))
         .route("/health", get(health_handler))
         .route("/app.js", get(app_js_handler))
+        .route("/app.css", get(app_css_handler))
         .nest_service("/v1", v1_service) // 将 v1 API 嵌套在 /v1 路径下
         // 仪表盘路由：静态文件 + 重定向
         .route("/dashboard", get(dashboard_handler))
@@ -1985,7 +2152,9 @@ mod tests {
         let resp = handle_tools_list(Some(serde_json::Value::Number(2.into())));
         let json = to_json(&resp);
 
-        let tools = json["result"]["tools"].as_array().unwrap();
+        let tools = json["result"]["tools"]
+            .as_array()
+            .expect("tools/list 响应中 tools 应为数组，检查工具注册逻辑");
         assert_eq!(
             tools.len(),
             13,
@@ -1993,7 +2162,14 @@ mod tests {
         );
 
         // 验证记忆工具存在
-        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .map(|t| {
+                t["name"]
+                    .as_str()
+                    .expect("工具列表中每个条目应有 name 字符串字段")
+            })
+            .collect();
         assert!(tool_names.contains(&"remember"), "缺少 remember 工具");
         assert!(
             tool_names.contains(&"batch_remember"),
@@ -2046,7 +2222,9 @@ mod tests {
             handle_tools_call(&state, &params, Some(serde_json::Value::Number(4.into()))).await;
         let json = to_json(&resp);
 
-        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("search_code 工具返回的 text 字段应为字符串");
         assert_eq!(json["result"]["content"][0]["type"], "text");
         assert!(text.contains("memory"), "搜索结果应包含关键词: {}", text);
         assert!(text.contains("src/memory.rs"), "应包含文件路径: {}", text);
@@ -2065,7 +2243,9 @@ mod tests {
             handle_tools_call(&state, &params, Some(serde_json::Value::Number(5.into()))).await;
         let json = to_json(&resp);
 
-        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("search_code 工具返回的 text 字段应为字符串");
         assert!(
             text.contains("未找到") || text.contains("提示"),
             "无匹配时应给出提示: {}",
@@ -2101,7 +2281,9 @@ mod tests {
             handle_tools_call(&state, &params, Some(serde_json::Value::Number(7.into()))).await;
         let json = to_json(&resp);
 
-        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("codebase_stats 工具返回的 text 字段应为字符串");
         assert!(text.contains("已索引文件"), "应包含统计信息: {}", text);
         assert!(text.contains("fn"), "应包含类型分布: {}", text);
     }
@@ -2185,7 +2367,9 @@ mod tests {
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "remember 应返回成功结果");
-        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("remember 工具返回的 text 字段应为字符串");
         assert!(text.contains("已记住"), "应包含确认信息: {}", text);
         assert!(text.contains("pnpm"), "应包含记忆内容: {}", text);
     }
@@ -2235,7 +2419,9 @@ mod tests {
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "recall 应返回成功结果");
-        let text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("recall 工具返回的 text 字段应为字符串");
         assert!(text.contains("PostgreSQL"), "应包含检索到的内容: {}", text);
     }
 
@@ -2269,12 +2455,14 @@ mod tests {
         });
         let remember_resp = handle_tools_call(&state, &remember_params, None).await;
         let remember_json = to_json(&remember_resp);
-        // 从响应中提取记忆 ID
+        // 从响应中提取记忆 ID（LLM 响应格式：包含 "ID: xxx)" 模式）
         let text = remember_json["result"]["content"][0]["text"]
             .as_str()
-            .unwrap();
-        let id_start = text.find("ID: ").unwrap() + 4;
-        let id_end = text[id_start..].find(')').unwrap() + id_start;
+            .expect("LLM 响应中 text 字段应为字符串，检查 remember 工具返回格式");
+        let id_start = text.find("ID: ")
+            .expect("LLM 响应中未找到 'ID: ' 前缀，检查 remember 工具输出格式") + 4;
+        let id_end = text[id_start..].find(')')
+            .expect("LLM 响应中未找到 ID 结束括号 ')'，检查 remember 工具输出格式") + id_start;
         let memory_id = &text[id_start..id_end];
 
         // 删除该记忆
@@ -2289,7 +2477,9 @@ mod tests {
         let json = to_json(&resp);
 
         assert!(json["result"].is_object());
-        let forget_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let forget_text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("forget 工具返回的 text 字段应为字符串");
         assert!(
             forget_text.contains("已删除"),
             "应确认删除: {}",
@@ -2329,9 +2519,11 @@ mod tests {
         let remember_json = to_json(&remember_resp);
         let text = remember_json["result"]["content"][0]["text"]
             .as_str()
-            .unwrap();
-        let id_start = text.find("ID: ").unwrap() + 4;
-        let id_end = text[id_start..].find(')').unwrap() + id_start;
+            .expect("LLM 响应中 text 字段应为字符串，检查 remember 工具返回格式");
+        let id_start = text.find("ID: ")
+            .expect("LLM 响应中未找到 'ID: ' 前缀，检查 remember 工具输出格式") + 4;
+        let id_end = text[id_start..].find(')')
+            .expect("LLM 响应中未找到 ID 结束括号 ')'，检查 remember 工具输出格式") + id_start;
         let memory_id = &text[id_start..id_end];
 
         // 更新该记忆
@@ -2348,7 +2540,9 @@ mod tests {
         let json = to_json(&resp);
 
         assert!(json["result"].is_object());
-        let update_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let update_text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("update_memory 工具返回的 text 字段应为字符串");
         assert!(
             update_text.contains("已更新"),
             "应确认更新: {}",
@@ -2406,7 +2600,9 @@ mod tests {
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "list_memories 应返回成功结果");
-        let list_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let list_text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("list_memories 工具返回的 text 字段应为字符串");
         assert!(list_text.contains("记忆列表"), "应包含标题: {}", list_text);
         assert!(list_text.contains("共"), "应包含总数: {}", list_text);
     }
@@ -2445,7 +2641,9 @@ mod tests {
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "memory_stats 应返回成功结果");
-        let stats_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let stats_text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("memory_stats 工具返回的 text 字段应为字符串");
         assert!(
             stats_text.contains("记忆库统计"),
             "应包含标题: {}",
@@ -2478,7 +2676,9 @@ mod tests {
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "archive 应返回成功结果");
-        let archive_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let archive_text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("archive（空记忆库）工具返回的 text 字段应为字符串");
         assert!(
             archive_text.contains("无过期记忆"),
             "无过期记忆时应给出提示: {}",
@@ -2515,10 +2715,12 @@ mod tests {
         let json = to_json(&resp);
 
         assert!(json["result"].is_object(), "archive 应返回成功结果");
-        let archive_text = json["result"]["content"][0]["text"].as_str().unwrap();
+        let archive_text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("archive（单条归档）工具返回的 text 字段应为字符串");
         assert!(
             archive_text.contains("已归档"),
-            "有过期记忆时应确认归档: {}",
+            "应确认归档: {}",
             archive_text
         );
         assert!(

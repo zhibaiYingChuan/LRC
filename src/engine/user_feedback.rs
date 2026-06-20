@@ -640,11 +640,14 @@ impl UserFeedback {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        let pending = pending_map.remove(assessment_id).ok_or_else(|| {
+        // v0.5.4 修复：先 get 验证存在性和有效期，再 remove
+        // 避免先 remove 后检查过期导致记录丢失无法恢复
+        let pending = pending_map.get(assessment_id).ok_or_else(|| {
             "未找到该评估 ID，可能已过期或已被处理。请重新发起影响评估。".to_string()
         })?;
 
         if pending.expires_at_ms < now {
+            // 记录已过期，保留在 map 中供后续清理，不删除
             return Err(format!(
                 "评估 {} 已过期（{} 毫秒前），请重新发起影响评估。",
                 assessment_id,
@@ -652,10 +655,14 @@ impl UserFeedback {
             ));
         }
 
+        // 验证通过，安全移除并返回目标记忆 ID
+        let target_memory_ids = pending.target_memory_ids.clone();
+        pending_map.remove(assessment_id);
+
         // 清理其他过期确认
         pending_map.retain(|_, p| p.expires_at_ms > now);
 
-        Ok(pending.target_memory_ids)
+        Ok(target_memory_ids)
     }
 
     /// 取消待确认操作

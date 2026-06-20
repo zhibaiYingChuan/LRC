@@ -14,15 +14,11 @@
 //   HF_ENDPOINT=https://hf-mirror.com     (国内镜像，默认已设置)
 
 use super::encoder::{CodeEncoder, EmbeddingVector};
+use super::pooling::PoolingStrategy;
 use crate::chunker::CodeChunk;
 use candle_core::{Device, Tensor};
 use std::fs::File;
 use std::io::BufReader;
-
-pub enum PoolingStrategy {
-    Cls,
-    Mean,
-}
 
 pub struct CodeBertEncoder {
     model: candle_transformers::models::bert::BertModel,
@@ -664,7 +660,7 @@ impl CodeBertEncoder {
 }
 
 impl CodeEncoder for CodeBertEncoder {
-    fn encode(&self, chunk: &CodeChunk) -> EmbeddingVector {
+    fn encode(&self, chunk: &CodeChunk) -> Result<EmbeddingVector, String> {
         let text = format!(
             "{} {} {}",
             chunk.signature,
@@ -672,13 +668,7 @@ impl CodeEncoder for CodeBertEncoder {
             chunk.content
         );
 
-        match self.encode_text(&text) {
-            Ok(vec) => vec,
-            Err(e) => {
-                eprintln!("encode failed ({}): {}", chunk.name, e);
-                EmbeddingVector::zeros(self.dimension())
-            }
-        }
+        self.encode_text(&text)
     }
 
     fn dimension(&self) -> usize {
@@ -734,7 +724,7 @@ mod tests {
         }
         let encoder = CodeBertEncoder::load().expect("load");
         let chunk = make_chunk("hello", "fn hello() { println!(\"world\"); }");
-        let vec = encoder.encode(&chunk);
+        let vec = encoder.encode(&chunk).expect("encode");
         assert_eq!(vec.dim, 768);
         assert_eq!(vec.values.len(), 768);
     }
@@ -753,9 +743,9 @@ mod tests {
             "fn render(tpl: &str) -> String { tpl.replace(\"{{\", \"<\") }",
         );
 
-        let v1 = encoder.encode(&c1);
-        let v2 = encoder.encode(&c2);
-        let v3 = encoder.encode(&c3);
+        let v1 = encoder.encode(&c1).unwrap();
+        let v2 = encoder.encode(&c2).unwrap();
+        let v3 = encoder.encode(&c3).unwrap();
 
         let sim_related = v1.cosine_similarity(&v2);
         let sim_unrelated = v1.cosine_similarity(&v3);
@@ -778,8 +768,8 @@ mod tests {
             "fn fetch(key: &str) -> Option<Item> { cache.get(key) }",
         );
 
-        let v1 = encoder.encode(&chunk);
-        let v2 = encoder.encode(&chunk);
+        let v1 = encoder.encode(&chunk).unwrap();
+        let v2 = encoder.encode(&chunk).unwrap();
 
         let sim = v1.cosine_similarity(&v2);
         assert!(sim > 0.999, "self-sim={:.6}", sim);
@@ -792,7 +782,7 @@ mod tests {
         }
         let encoder = CodeBertEncoder::load().expect("load");
         let chunks = vec![make_chunk("a", "fn a() {}"), make_chunk("b", "fn b() {}")];
-        let vectors = encoder.encode_batch(&chunks);
+        let vectors = encoder.encode_batch(&chunks).unwrap();
         assert_eq!(vectors.len(), 2);
     }
 
@@ -814,8 +804,8 @@ mod tests {
         ]);
 
         let chunk = make_chunk("hello", "fn hello() {}");
-        let cb_vec = cb.encode(&chunk);
-        let fast_vec = fast.encode(&chunk);
+        let cb_vec = cb.encode(&chunk).unwrap();
+        let fast_vec = fast.encode(&chunk).unwrap();
 
         assert_eq!(cb_vec.dim, 768);
         assert_eq!(fast_vec.dim, 5);
@@ -852,10 +842,10 @@ mod tests {
             "fn render_page(t: &Template) -> Html { t.render(&ctx).unwrap() }",
         );
 
-        let cb_related = cb.encode(&c1).cosine_similarity(&cb.encode(&c2));
-        let cb_unrelated = cb.encode(&c1).cosine_similarity(&cb.encode(&c3));
-        let fast_related = fast.encode(&c1).cosine_similarity(&fast.encode(&c2));
-        let fast_unrelated = fast.encode(&c1).cosine_similarity(&fast.encode(&c3));
+        let cb_related = cb.encode(&c1).unwrap().cosine_similarity(&cb.encode(&c2).unwrap());
+        let cb_unrelated = cb.encode(&c1).unwrap().cosine_similarity(&cb.encode(&c3).unwrap());
+        let fast_related = fast.encode(&c1).unwrap().cosine_similarity(&fast.encode(&c2).unwrap());
+        let fast_unrelated = fast.encode(&c1).unwrap().cosine_similarity(&fast.encode(&c3).unwrap());
 
         println!(
             "gap: cb=related={:.4} unrelated={:.4}, fast=related={:.4} unrelated={:.4}",
@@ -941,7 +931,7 @@ mod tests {
         );
         let c2 = make_chunk("Repo_get", "impl Repo { fn get(&self, id: u64) -> Option<Item> { self.db.query(\"SELECT * FROM t WHERE id = ?\", id) } }");
 
-        let sim = cb.encode(&c1).cosine_similarity(&cb.encode(&c2));
+        let sim = cb.encode(&c1).unwrap().cosine_similarity(&cb.encode(&c2).unwrap());
         println!("cross-type sim: {:.4}", sim);
         assert!(sim > 0.7);
     }

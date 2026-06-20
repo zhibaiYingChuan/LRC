@@ -1,3 +1,7 @@
+// 隐藏控制台窗口：后台进程不需要 CMD 窗口
+// MCP stdio 模式下 stdin/stdout 仍然可用，不受影响
+#![windows_subsystem = "windows"]
+
 // 许可证: Apache 2.0
 //
 // Loong Recall (L-RC / 忆) MCP Server — 独立二进制入口
@@ -12,6 +16,11 @@
 // 启动后 IDE 可通过 MCP 配置连接此服务，AI 助手即可调用 search_code 工具。
 
 use code_memory::{server, CodeMemoryManager, JsonPersistence, LlmApiConfig, MemoryStore};
+// v0.5.4 P2-10 修复：导入后台结晶流水线组件
+use code_memory::consolidation::{
+    run_consolidation_loop, ConsolidationConfig, ConsolidationPipeline, InMemorySource,
+    SurfaceMemorySource,
+};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -19,7 +28,7 @@ use tokio::sync::Mutex;
 // 进程守护：单例锁避免僵尸进程、端口自适应避免冲突、优雅关闭自动清理
 use code_memory::process_guard::{self, SingletonLock};
 // 配置持久化：桌面端agent配置保存与加载
-use code_memory::config::LrcConfig;
+use code_memory::config::{LrcConfig, DEFAULT_PORT};
 // V2 模块：项目指纹、统一数据目录、数据迁移
 use code_memory::data_dir::DataDir;
 use code_memory::migration;
@@ -58,7 +67,7 @@ async fn try_run() -> Result<(), String> {
 
     let mut src_dir = String::new();
     let mut host = String::from("127.0.0.1");
-    let mut port: u16 = 3099;
+    let mut port: u16 = DEFAULT_PORT;
     let mut port_explicitly_set = false; // 追踪用户是否显式指定了 --port
     let mut stdio_mode = false;
     let mut global_mode = false;
@@ -79,8 +88,14 @@ async fn try_run() -> Result<(), String> {
     let mut export_path: Option<String> = None; // V2: --export 导出记忆
     let mut import_path: Option<String> = None; // V2: --import 导入记忆
 
-    // 加载已保存的全局配置（桌面端agent场景）
-    let saved_config = LrcConfig::load();
+    // 加载已保存的全局配置（仅在非 daemon 模式下加载）
+    // daemon 模式下由桌面端统一管理配置，所有配置通过 CLI 参数传递
+    // 避免 config.json 和 wizard.json 两套配置冲突
+    let saved_config = if daemon_mode {
+        LrcConfig::default()
+    } else {
+        LrcConfig::load()
+    };
 
     // CLI 参数解析
     let mut i = 1;
@@ -104,8 +119,8 @@ async fn try_run() -> Result<(), String> {
                     port = match args[i].parse() {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!("警告: 无效端口号 '{}', 使用默认端口 3099 ({})", args[i], e);
-                            3099
+                            eprintln!("警告: 无效端口号 '{}', 使用默认端口 {} ({})", args[i], DEFAULT_PORT, e);
+                            DEFAULT_PORT
                         }
                     };
                     port_explicitly_set = true; // 用户显式指定了端口，不覆盖
@@ -232,28 +247,84 @@ async fn try_run() -> Result<(), String> {
         i += 1;
     }
 
-    // 无参启动（双击 exe）：默认进入仪表盘模式
-    if args.len() == 1 && !dashboard_mode {
-        dashboard_mode = true;
-        eprintln!("[仪表盘] 无参启动，进入桌面仪表盘模式");
+    // 无参启动（双击 exe）：静默退出，不自动打开任何界面
+    // 桌面端由 Tauri 壳层管理 UI，sidecar 仅作为后台服务运行
+    // 用户如需独立使用，请通过命令行指定参数
+    if args.len() == 1 && !dashboard_mode && !daemon_mode {
+        eprintln!("[LRC] 无参启动被拦截。sidecar 仅作为后台服务运行。");
+        eprintln!("[LRC] 请使用桌面端程序启动，或通过命令行指定参数。");
+        eprintln!("[LRC] 用法: code-memory-server --help");
+        return Ok(());
     }
 
     // ── 应用已保存的全局配置（仅当CLI未显式指定时） ──
-    if !port_explicitly_set && saved_config.default_port != 3099 {
-        port = saved_config.default_port;
+    // daemon 模式下由桌面端统一管理配置，跳过 config.json 的端口/主机加载
+    // 避免 config.json 和 wizard.json 两套配置冲突
+    if !daemon_mode {
+        if !port_explicitly_set && saved_config.default_port != DEFAULT_PORT {
+            port = saved_config.default_port;
+        }
+        if host == "127.0.0.1" && saved_config.default_host != "127.0.0.1" {
+            host = saved_config.default_host.clone();
+        }
+        if llm_api_raw.is_none() {
+            if let Some(ref saved_llm) = saved_config.llm_api {
+                if !saved_llm.is_empty() {
+                    llm_api_raw = Some(saved_llm.clone());
+                    eprintln!(
+                        "[配置] 从全局配置加载 LLM API: {}...",
+                        &saved_llm[..saved_llm.len().min(30)]
+                    );
+                }
+            }
+        }
     }
-    if host == "127.0.0.1" && saved_config.default_host != "127.0.0.1" {
-        host = saved_config.default_host.clone();
-    }
+
+    // v0.5.4 安全修复：从环境变量读取 LLM API（桌面端通过 env 而非命令行参数传递）
+    // v0.5.4 P2-22 修复：环境变量加载移到 daemon 模式判断之外，
+    // 确保 daemon 模式下也能从环境变量加载 LLM 配置。
+    // 修复前：daemon 模式下完全跳过环境变量加载，如果桌面端未正确传递环境变量，
+    //         sidecar 的 state.llm_api 为 None，仪表盘显示"LLM 未配置"。
+    // 修复后：daemon 模式下优先从环境变量加载，确保仪表盘状态与桌面端一致。
     if llm_api_raw.is_none() {
+        if let Ok(env_llm) = std::env::var("LRC_LLM_API") {
+            if !env_llm.is_empty() {
+                eprintln!(
+                    "[配置] 从环境变量 LRC_LLM_API 加载 LLM API: {}...",
+                    &env_llm[..env_llm.len().min(30)]
+                );
+                llm_api_raw = Some(env_llm);
+            }
+        }
+    }
+
+    // v0.5.4 P2-22 修复：daemon 模式下如果环境变量未传递 LLM 配置，
+    // 从 config.json 加载作为后备，确保 sidecar 状态与桌面端一致。
+    // 这解决了"桌面端已配置 LLM 但仪表盘显示未配置"的状态不同步问题。
+    if daemon_mode && llm_api_raw.is_none() {
         if let Some(ref saved_llm) = saved_config.llm_api {
             if !saved_llm.is_empty() {
                 llm_api_raw = Some(saved_llm.clone());
                 eprintln!(
-                    "[配置] 从全局配置加载 LLM API: {}...",
+                    "[配置] daemon 模式从全局配置后备加载 LLM API: {}...",
                     &saved_llm[..saved_llm.len().min(30)]
                 );
             }
+        }
+    }
+
+    // v0.5.4 P2-22 修复：daemon 模式下如果以上都未加载到 LLM 配置，
+    // 从 wizard.json（桌面端向导配置）加载 LLM 配置作为最终后备。
+    // 这确保了 sidecar 状态与桌面端 wizard.json 配置一致。
+    // 注意：wizard.json 的 encrypted_api_key 存储的是纯 API Key，
+    //       需要结合 llm_type/llm_model/llm_base_url 构造完整的 LLM API 字符串。
+    if daemon_mode && llm_api_raw.is_none() {
+        if let Some(wizard_llm) = load_llm_from_wizard_json() {
+            llm_api_raw = Some(wizard_llm.clone());
+            eprintln!(
+                "[配置] daemon 模式从 wizard.json 后备加载 LLM API: {}...",
+                &wizard_llm[..wizard_llm.len().min(30)]
+            );
         }
     }
 
@@ -492,6 +563,18 @@ async fn try_run() -> Result<(), String> {
         log("  搜索增强: Tier 2 LLM API 已启用 ✓");
     }
 
+    // v0.5.5 P1-1：设置 MemoryStore 的 LLM 配置状态
+    // LLM 配置后替代本地 ML 模型提供语义理解能力，编码器不再视为"降级"
+    {
+        let store_guard = memory_store.lock().await;
+        store_guard.set_llm_configured(llm_api_configured);
+        if llm_api_configured {
+            log("  编码器模式: LLM 增强模式（语义理解由 LLM 提供）");
+        } else {
+            log("  编码器模式: 基础模式（建议配置 LLM 增强语义理解）");
+        }
+    }
+
     // 解析 LLM API 配置
     let llm_api = match llm_api_raw {
         Some(ref raw) => LlmApiConfig::parse(raw).map_err(|e| {
@@ -570,6 +653,34 @@ async fn try_run() -> Result<(), String> {
         index_log_bg("[后台] 索引阶段结束");
     });
 
+    // ════════════════════════════════════════════════════════════
+    // v0.5.4 P2-10 修复：启动后台结晶流水线
+    // 定期执行记忆合成，自动合并用户通过 API 写入的重复/相似记忆
+    // 默认间隔 5 分钟，启动时立即执行一次
+    // ════════════════════════════════════════════════════════════
+    let (consolidation_shutdown_tx, consolidation_shutdown_rx) =
+        tokio::sync::watch::channel(false);
+
+    {
+        let consolidation_config = ConsolidationConfig {
+            poll_interval_secs: 300, // 5 分钟轮询
+            batch_size: 100,
+            synthesis_threshold: 3,
+            synthesis_similarity: 0.4,
+            run_on_start: true, // 启动时立即执行一次合成
+            auto_synthesize: true,
+            verbose: 1,
+        };
+        let pipeline = ConsolidationPipeline::new(consolidation_config, memory_store.clone());
+        // 使用空数据源：用户通过 HTTP API / MCP 工具直接写入的记忆已在 store 中
+        // 结晶流水线仅负责定期执行合成（合并重复记忆）
+        let source: Arc<dyn SurfaceMemorySource> = Arc::new(InMemorySource::new("api", vec![]));
+        tokio::spawn(async move {
+            run_consolidation_loop(pipeline, source, consolidation_shutdown_rx).await;
+        });
+        log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，自动合并相似记忆）");
+    }
+
     // ── 根据运行模式选择通信协议 ──
     if stdio_mode {
         // Stdio 模式：通过 stdin/stdout 进行 JSON-RPC 通信
@@ -591,42 +702,53 @@ async fn try_run() -> Result<(), String> {
             })?;
 
         log(&format!(
-            "   浏览器即将自动打开仪表盘: http://localhost:{actual_port}/dashboard"
+            "   仪表盘地址: http://localhost:{actual_port}/dashboard"
         ));
 
         // 自动打开浏览器（延迟 500ms 确保服务就绪）
+        // 仅在用户显式指定 --dashboard 时打开浏览器
+        // daemon 模式下由桌面端管理 UI，绝不打开浏览器
         let dashboard_url = format!("http://localhost:{actual_port}/dashboard");
-        let open_url = dashboard_url.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            match code_memory::dashboard::open_dashboard(&open_url) {
-                Ok(()) => {}
-                Err(e) => {
-                    eprintln!("[仪表盘] 打开浏览器失败: {e}");
-                    eprintln!("[仪表盘] 请手动访问: {open_url}");
+        if !daemon_mode && dashboard_mode {
+            let open_url = dashboard_url.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                match code_memory::dashboard::open_dashboard(&open_url) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("[仪表盘] 打开浏览器失败: {e}");
+                        eprintln!("[仪表盘] 请手动访问: {open_url}");
+                    }
                 }
-            }
-        });
+            });
+        }
 
         // ── 保存配置到全局配置文件 ──
-        let mut cfg = LrcConfig::load();
-        cfg.default_port = actual_port;
-        cfg.default_host = host.clone();
-        cfg.max_multi_window = multi_window as u8;
-        if let Some(ref llm) = llm_api_raw {
-            if !llm.is_empty() {
-                cfg.llm_api = Some(llm.clone());
+        // daemon 模式下不保存独立配置，由桌面端统一管理
+        // 所有配置通过 CLI 参数传递，避免配置分裂
+        if !daemon_mode {
+            let mut cfg = LrcConfig::load();
+            cfg.default_port = actual_port;
+            cfg.default_host = host.clone();
+            cfg.max_multi_window = multi_window as u8;
+            if let Some(ref llm) = llm_api_raw {
+                if !llm.is_empty() {
+                    cfg.llm_api = Some(llm.clone());
+                }
+            }
+            if let Err(e) = cfg.save() {
+                eprintln!("[配置] 保存全局配置失败: {e}");
+            } else {
+                let config_path = LrcConfig::get_config_path().unwrap_or_default();
+                eprintln!("[配置] 已保存到 {}", config_path.display());
             }
         }
-        if let Err(e) = cfg.save() {
-            eprintln!("[配置] 保存全局配置失败: {e}");
-        } else {
-            let config_path = LrcConfig::get_config_path().unwrap_or_default();
-            eprintln!("[配置] 已保存到 {}", config_path.display());
-        }
 
-        // ── 系统托盘（Windows 原生） ──
-        if tray_mode || daemon_mode {
+        // ── 系统托盘（Windows 原生）──
+        // 【已废弃】daemon 模式下由桌面端 Tauri 壳层统一管理托盘
+        // sidecar 仅作为无头 HTTP 服务，不再创建任何 UI 组件
+        // 保留 --tray 参数仅用于独立命令行模式（非桌面端场景）
+        if tray_mode && !daemon_mode {
             #[cfg(feature = "webbrowser")]
             {
                 let tray_url = dashboard_url.clone();
@@ -636,6 +758,9 @@ async fn try_run() -> Result<(), String> {
                     }
                 });
             }
+        }
+        if tray_mode && daemon_mode {
+            eprintln!("[托盘] daemon 模式下托盘由桌面端管理，sidecar 跳过托盘创建");
         }
 
         // tokio::select! 实现优雅关闭 — _singleton_lock 的 Drop 自动清理锁文件
@@ -650,7 +775,109 @@ async fn try_run() -> Result<(), String> {
         }
     }
 
+    // v0.5.4 P2-10 修复：通知后台结晶流水线停止
+    let _ = consolidation_shutdown_tx.send(true);
+
     Ok(())
+}
+
+/// v0.5.4 P2-22 修复：从 wizard.json（桌面端向导配置）加载 LLM 配置
+///
+/// daemon 模式下，如果环境变量和 config.json 都未提供 LLM 配置，
+/// 作为最终后备从 wizard.json 加载，确保 sidecar 状态与桌面端一致。
+///
+/// wizard.json 结构：
+///   - llm_configured: bool — 是否已配置 LLM
+///   - llm_type: String — "openai" 或 "ollama"
+///   - llm_model: Option<String> — 模型名称
+///   - llm_base_url: Option<String> — API 基础 URL
+///   - encrypted_api_key: String — 加密的纯 API Key（非完整 LLM API 字符串）
+///
+/// 返回完整的 LLM API 字符串：
+///   - openai: "openai:{api_key}:{model}:{base_url}"
+///   - ollama: "ollama:{model}:{host}"
+fn load_llm_from_wizard_json() -> Option<String> {
+    // wizard.json 路径：%APPDATA%\LoongRecall\wizard.json
+    let appdata = std::env::var("APPDATA").ok()?;
+    let wizard_path = std::path::PathBuf::from(appdata)
+        .join("LoongRecall")
+        .join("wizard.json");
+
+    if !wizard_path.exists() {
+        return None;
+    }
+
+    let content = match std::fs::read_to_string(&wizard_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[配置] 读取 wizard.json 失败: {}", e);
+            return None;
+        }
+    };
+
+    let wizard: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[配置] 解析 wizard.json 失败: {}", e);
+            return None;
+        }
+    };
+
+    // 检查 llm_configured 标志
+    if !wizard.get("llm_configured").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return None;
+    }
+
+    let llm_type = wizard.get("llm_type").and_then(|v| v.as_str()).unwrap_or("");
+    if llm_type.is_empty() || llm_type == "none" {
+        return None;
+    }
+
+    // 解密 encrypted_api_key 得到纯 API Key
+    let encrypted_key = wizard
+        .get("encrypted_api_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let api_key = if !encrypted_key.is_empty() {
+        match code_memory::crypto::decrypt_api_key(encrypted_key) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("[配置] 解密 wizard.json 的 API Key 失败: {}", e);
+                return None;
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    // 构造完整的 LLM API 字符串
+    let llm_api_str = match llm_type {
+        "openai" => {
+            let model = wizard
+                .get("llm_model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("gpt-4o-mini");
+            let base_url = wizard
+                .get("llm_base_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("https://api.openai.com/v1");
+            format!("openai:{}:{}:{}", api_key, model, base_url)
+        }
+        "ollama" => {
+            let model = wizard
+                .get("llm_model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("llama3");
+            let host = wizard
+                .get("llm_base_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("http://localhost:11434");
+            format!("ollama:{}:{}", model, host)
+        }
+        _ => return None,
+    };
+
+    Some(llm_api_str)
 }
 
 /// 交互式询问用户确认（带超时保护，防止 Hidden 窗口环境 stdin 阻塞）
@@ -892,8 +1119,8 @@ fn write_ide_config(
             println!("    如需备份请使用: code-memory-server --export ~/backup/lrc-data.json");
             println!();
             println!("  提示: 启动 HTTP 服务查看可视化仪表盘:");
-            println!("    code-memory-server --port 3099");
-            println!("    然后访问 http://localhost:3099/dashboard");
+            println!("    code-memory-server --port {}", DEFAULT_PORT);
+            println!("    然后访问 http://localhost:{}/dashboard", DEFAULT_PORT);
         }
         Err(e) => {
             eprintln!("  ✗ 配置写入失败: {e}");
@@ -1092,7 +1319,7 @@ fn print_help() {
     println!("选项:");
     println!("  --src-dir <路径>    要索引的项目源码目录 [默认: 当前目录]");
     println!("  --host <地址>       HTTP 绑定地址 [默认: 127.0.0.1]");
-    println!("  --port <端口>       HTTP 绑定端口 [默认: 3099]");
+    println!("  --port <端口>       HTTP 绑定端口 [默认: {}]", DEFAULT_PORT);
     println!("  --stdio             使用 stdio 传输模式（IDE 标准 MCP，推荐）");
     println!("  --global            记忆跨项目共享 (~/.loong-recall/global/data/)");
     println!("  --db-path <路径>    自定义记忆数据存储路径（优先级最高）");
@@ -1118,7 +1345,7 @@ fn print_help() {
     println!();
     println!("举个栗子:");
     println!("  # Tier 1 — 默认快速模式（零网络、零下载、秒启动）");
-    println!("  code-memory-server --src-dir ./src --port 3099");
+    println!("  code-memory-server --src-dir ./src --port {}", DEFAULT_PORT);
     println!();
     println!("  # Tier 1 — 一键安装到 Trae IDE（自动配置 MCP）");
     println!("  code-memory-server --install-ide trae");
@@ -1155,6 +1382,6 @@ fn print_help() {
     println!("  Ollama:   ollama:<host>:<model-name>");
     println!();
     println!("启动后在 IDE 中配置 MCP 连接，AI 助手即可使用。");
-    println!("访问 http://localhost:3099/dashboard 查看可视化记忆管理仪表盘。");
+    println!("访问 http://localhost:{}/dashboard 查看可视化记忆管理仪表盘。", DEFAULT_PORT);
     println!("详细使用说明: https://github.com/zhibaiYingChuan/LRC/blob/main/docs/USER_GUIDE.md");
 }

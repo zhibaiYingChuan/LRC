@@ -123,6 +123,22 @@ struct QdrantScrollData {
     next_page_offset: Option<serde_json::Value>,
 }
 
+/// Qdrant 滚动请求
+#[derive(Debug, Serialize)]
+struct QdrantScrollRequest {
+    /// 每页返回的点数上限
+    limit: u32,
+    /// 是否返回向量数据
+    #[serde(default)]
+    with_vector: bool,
+    /// 是否返回 payload
+    #[serde(default)]
+    with_payload: bool,
+    /// 分页偏移量（用于下一页）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<serde_json::Value>,
+}
+
 /// Qdrant 持久化后端
 ///
 /// 通过 HTTP REST API 与 Qdrant 向量数据库通信，
@@ -211,6 +227,174 @@ impl QdrantPersistence {
 
         Ok(())
     }
+
+    /// 从 Qdrant 滚动查询所有点（分页获取）
+    ///
+    /// 使用 Qdrant Scroll API 逐页获取所有存储的记忆点，
+    /// 然后将 payload 转换回 Memory 对象。
+    /// 每页最多 100 条，支持分页遍历。
+    async fn scroll_all_points(&self) -> Result<Vec<Memory>, PersistenceError> {
+        let url = format!(
+            "{}/collections/{}/points/scroll",
+            self.config.endpoint, self.config.collection
+        );
+
+        let mut all_memories: Vec<Memory> = Vec::new();
+        let mut next_offset: Option<serde_json::Value> = None;
+
+        loop {
+            let request_body = QdrantScrollRequest {
+                limit: 100,
+                with_vector: false,
+                with_payload: true,
+                offset: next_offset.take(),
+            };
+
+            let response = self
+                .client
+                .post(&url)
+                .json(&request_body)
+                .send()
+                .await
+                .map_err(|e| {
+                    PersistenceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        format!("Qdrant 滚动查询失败: {}", e),
+                    ))
+                })?;
+
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                eprintln!(
+                    "[LRC·Qdrant] 滚动查询返回 HTTP {}: {}",
+                    status, body
+                );
+                break;
+            }
+
+            let scroll_result: QdrantScrollResult = response.json().await.map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("解析 Qdrant 滚动结果失败: {}", e),
+                ))
+            })?;
+
+            let points = scroll_result.result.points;
+            let has_more = scroll_result.result.next_page_offset.is_some();
+
+            // 转换每个点为 Memory 对象
+            for point in &points {
+                if let Some(ref payload) = point.payload {
+                    if let Ok(memory) = Self::payload_to_memory(point, payload) {
+                        all_memories.push(memory);
+                    }
+                }
+            }
+
+            if !has_more || points.is_empty() {
+                break;
+            }
+
+            next_offset = scroll_result.result.next_page_offset;
+        }
+
+        eprintln!(
+            "[LRC·Qdrant] 从 Qdrant 加载了 {} 条记忆",
+            all_memories.len()
+        );
+        Ok(all_memories)
+    }
+
+    /// 将 Qdrant 点的 payload 转换为 Memory 对象
+    fn payload_to_memory(
+        point: &QdrantScoredPoint,
+        payload: &serde_json::Value,
+    ) -> Result<Memory, String> {
+        let id = match &point.id {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => point.id.to_string(),
+        };
+
+        let content = payload
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let memory_type = payload
+            .get("memory_type")
+            .and_then(|v| v.as_str())
+            .and_then(MemoryType::try_parse)
+            .unwrap_or(MemoryType::Fact);
+
+        let importance = payload
+            .get("importance")
+            .and_then(|v| v.as_u64())
+            .map(|v| Importance::new(v as u8))
+            .unwrap_or(Importance::DEFAULT);
+
+        let project = payload
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let tags = payload
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let privacy_level = payload
+            .get("privacy_level")
+            .and_then(|v| v.as_str())
+            .and_then(PrivacyLevel::try_parse)
+            .unwrap_or_default();
+
+        let now = Utc::now();
+
+        Ok(Memory {
+            id,
+            content,
+            memory_type,
+            project,
+            tags,
+            importance,
+            ttl_days: None,
+            created_at: now,
+            updated_at: now,
+            last_accessed: now,
+            source: None,
+            source_ids: Vec::new(),
+            confidence: None,
+            information_gain: None,
+            resolution: "detailed".to_string(),
+            luoshu_vector: None, // 不加载向量（save 时重新计算）
+            bagua_index: payload
+                .get("bagua_index")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u8),
+            bagua_category: payload
+                .get("bagua_category")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            privacy_level,
+            session_id: None,
+            user_id: None,
+            topological_depth: payload
+                .get("topological_depth")
+                .and_then(|v| v.as_f64())
+                .map(|n| n as f32)
+                .unwrap_or(0.5),
+            version: 1,
+            version_history: Vec::new(),
+        })
+    }
 }
 
 #[cfg(feature = "qdrant")]
@@ -261,17 +445,60 @@ impl Persistence for QdrantPersistence {
             };
 
             let client = self.client.clone();
-            // 忽略 Qdrant 写入错误（使用本地兜底）
-            let _ = handle.block_on(async move { client.put(&url).json(&body).send().await });
+            // v0.5.4 修复 C05：Qdrant 写入错误不再静默丢弃，改为传播错误
+            // 用户需要知道数据是否真正写入成功，而非被"假成功"误导
+            let response = handle
+                .block_on(async move { client.put(&url).json(&body).send().await })
+                .map_err(|e| PersistenceError::Other(format!("Qdrant 网络请求失败: {e}")))?;
+
+            if !response.status().is_success() {
+                return Err(PersistenceError::Other(format!(
+                    "Qdrant 写入失败: HTTP {} {}",
+                    response.status().as_u16(),
+                    response.status().canonical_reason().unwrap_or("未知错误")
+                )));
+            }
         }
 
         Ok(())
     }
 
     fn load_all_memories(&self) -> Result<Vec<Memory>, PersistenceError> {
-        // 优先从本地兜底加载
+        // 从 Qdrant 滚动查询所有记忆（修复：重启后数据可恢复）
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            PersistenceError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "QdrantPersistence 需要在 tokio 运行时上下文中使用",
+            ))
+        })?;
+
+        let qdrant_result = handle.block_on(async { self.scroll_all_points().await });
+
+        match qdrant_result {
+            Ok(memories) if !memories.is_empty() => {
+                // Qdrant 数据加载成功，同步到本地兜底缓存
+                if let Ok(mut guard) = self.fallback_memories.lock() {
+                    *guard = memories.clone();
+                }
+                return Ok(memories);
+            }
+            Ok(_) => {
+                // Qdrant 中没有数据，回退到本地兜底
+                eprintln!("[LRC·Qdrant] Qdrant 中无数据，尝试本地兜底加载");
+            }
+            Err(e) => {
+                // Qdrant 查询失败，回退到本地兜底
+                eprintln!("[LRC·Qdrant] Qdrant 查询失败: {}，回退到本地兜底", e);
+            }
+        }
+
+        // 本地兜底：从内存缓存加载
         if let Ok(guard) = self.fallback_memories.lock() {
             if !guard.is_empty() {
+                eprintln!(
+                    "[LRC·Qdrant] 从本地兜底加载 {} 条记忆",
+                    guard.len()
+                );
                 return Ok(guard.clone());
             }
         }
@@ -314,42 +541,113 @@ impl Persistence for QdrantPersistence {
     }
 
     fn clear_memories(&self) -> Result<(), PersistenceError> {
+        // v0.5.4 修复 C06：同步清除 Qdrant 远程向量数据
+        // 此前仅清除本地兜底缓存，远程 Qdrant 数据未删除，导致数据不一致
+        // 用户调用"清除记忆"后期望所有数据都被删除
+        
+        // 1. 清除本地兜底缓存
         if let Ok(mut guard) = self.fallback_memories.lock() {
             guard.clear();
         }
+
+        // 2. 清除 Qdrant 远程集合中的所有向量点
+        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+            PersistenceError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "QdrantPersistence 需要在 tokio 运行时上下文中使用",
+            ))
+        })?;
+
+        let url = format!(
+            "{}/collections/{}/points/delete",
+            self.config.endpoint, self.config.collection
+        );
+
+        let client = self.client.clone();
+        let response = handle
+            .block_on(async move {
+                // 使用空 filter 匹配所有点，一次性删除全部
+                let body = serde_json::json!({
+                    "filter": {}
+                });
+                client.post(&url).json(&body).send().await
+            })
+            .map_err(|e| PersistenceError::Other(format!("Qdrant 清除远程数据失败: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(PersistenceError::Other(format!(
+                "Qdrant 清除远程数据失败: HTTP {} {}",
+                response.status().as_u16(),
+                response.status().canonical_reason().unwrap_or("未知错误")
+            )));
+        }
+
         Ok(())
     }
 
+    /// v0.5.4 修复：不再静默返回 Ok，Qdrant 后端不支持代码片段存储
+    /// 调用方应使用 JSON 文件方案处理代码片段
     fn save_chunks(&self, _chunks: &[CodeChunk]) -> Result<(), PersistenceError> {
-        Ok(())
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Qdrant 后端暂不支持代码片段存储，请使用 JSON 文件方案",
+        )))
     }
 
+    /// v0.5.4 修复：不再静默返回空 Vec，Qdrant 后端不支持代码片段加载
     fn load_chunks(&self) -> Result<Vec<CodeChunk>, PersistenceError> {
-        Ok(Vec::new())
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Qdrant 后端暂不支持代码片段加载，请使用 JSON 文件方案",
+        )))
     }
 
+    /// v0.5.4 修复：不再静默返回 Ok，Qdrant 后端不支持代码片段清除
     fn clear_chunks(&self) -> Result<(), PersistenceError> {
-        Ok(())
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Qdrant 后端暂不支持代码片段清除，请使用 JSON 文件方案",
+        )))
     }
 
+    /// v0.5.4 修复：不再静默返回 0，Qdrant 后端暂不支持文件大小查询
     fn size_bytes(&self) -> Result<u64, PersistenceError> {
-        Ok(0)
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Qdrant 后端暂不支持文件大小查询，请使用 JSON 文件方案",
+        )))
     }
 
+    /// v0.5.4 修复：不再静默返回空 Vec，Qdrant 后端暂不支持归档记忆加载
     fn load_archived_memories(&self) -> Result<Vec<Memory>, PersistenceError> {
-        Ok(Vec::new())
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Qdrant 后端暂不支持归档记忆加载，请使用 JSON 文件方案",
+        )))
     }
 
+    /// v0.5.4 修复：不再静默返回 Ok，Qdrant 后端暂不支持归档记忆存储
     fn save_archived_memories(&self, _memories: &[Memory]) -> Result<(), PersistenceError> {
-        Ok(())
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Qdrant 后端暂不支持归档记忆存储，请使用 JSON 文件方案",
+        )))
     }
 
+    /// v0.5.4 修复：不再静默返回 Ok，Qdrant 后端暂不支持归档添加
     fn add_to_archive(&self, _memories: &[Memory]) -> Result<(), PersistenceError> {
-        Ok(())
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Qdrant 后端暂不支持归档添加，请使用 JSON 文件方案",
+        )))
     }
 
+    /// v0.5.4 修复：不再静默返回 false，Qdrant 后端暂不支持归档删除
     fn delete_from_archive(&self, _id: &str) -> Result<bool, PersistenceError> {
-        Ok(false)
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Qdrant 后端暂不支持归档删除，请使用 JSON 文件方案",
+        )))
     }
 }
 

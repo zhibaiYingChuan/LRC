@@ -105,7 +105,9 @@ pub use engine::manager::{ChunkStats, CoreManager as CodeMemoryManager};
 pub use engine::retriever::{CodeRetriever, RetrievalResult, ScoredChunk};
 
 #[cfg(feature = "ml")]
-pub use engine::encoder_codebert::{CodeBertEncoder, PoolingStrategy};
+pub use engine::encoder_codebert::CodeBertEncoder;
+#[cfg(feature = "ml")]
+pub use engine::pooling::PoolingStrategy;
 
 #[cfg(feature = "ml")]
 pub use engine::luoshu_encoder_ml::{HybridLuoShuEncoder, LuoShuMlEncoder};

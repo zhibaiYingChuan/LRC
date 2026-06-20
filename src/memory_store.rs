@@ -234,12 +234,24 @@ pub struct MemoryStore<P: Persistence> {
     pub memory_gc: MemoryGarbageCollector,
     /// GC 延迟执行标记（质疑三：避免 GC 阻塞用户请求关键路径）
     pub gc_pending: bool,
+    /// v0.5.4 合成延迟执行标记：避免合成阻塞用户请求关键路径
+    /// 写入记忆后设为 true，由后台健康检查或定时任务触发执行
+    pub synthesis_pending: bool,
     /// 审计追踪：记录系统所有自主行为（质疑五：透明度与信任）
     pub audit_trail: AuditTrail,
     /// 提示升级追踪器：防止 ActionHint 重复警告的"狼来了"效应（质疑一）
     pub hint_escalation: HintEscalationTracker,
     /// 复杂度预算（质疑五·终极：防止系统超出人类可理解范围）
     pub complexity_budget: ComplexityBudget,
+    /// v0.5.4 增量缓存：避免每次操作都 O(N) 全量加载记忆
+    /// 使用 RefCell 实现内部可变性，使 &self 方法也能更新缓存
+    memory_cache: std::cell::RefCell<Vec<Memory>>,
+    /// 缓存脏标记：任何写操作（保存/删除）后设为 true，读操作前检查
+    cache_dirty: std::cell::Cell<bool>,
+    /// v0.5.5 P1-1：LLM 是否已配置
+    /// LLM 配置后替代本地 ML 模型提供语义理解能力，编码器不再视为"降级"
+    /// 通过 set_llm_configured() 在 sidecar 启动后设置
+    llm_configured: std::sync::atomic::AtomicBool,
 }
 
 // ============================================================
@@ -250,7 +262,7 @@ impl<P: Persistence> MemoryGraphQuery for MemoryStore<P> {
     /// 查询与指定记忆直接关联的记忆数
     fn count_direct_neighbors(&self, memory_id: &str) -> usize {
         // 通过 source_ids 反向查找：哪些记忆引用了该记忆
-        let all = match self.persistence.load_all_memories() {
+        let all = match self.load_cached() {
             Ok(memories) => memories,
             Err(_) => return 0,
         };
@@ -262,7 +274,7 @@ impl<P: Persistence> MemoryGraphQuery for MemoryStore<P> {
 
     /// 查询与指定记忆关联的记忆 ID 列表及关系类型
     fn get_neighbor_info(&self, memory_id: &str) -> Vec<AffectedMemoryInfo> {
-        let all = match self.persistence.load_all_memories() {
+        let all = match self.load_cached() {
             Ok(memories) => memories,
             Err(_) => return Vec::new(),
         };
@@ -306,7 +318,7 @@ impl<P: Persistence> MemoryGraphQuery for MemoryStore<P> {
     /// 查询记忆是否为核心合成节点（被多条合成边引用）
     fn is_core_synthesis_node(&self, memory_id: &str) -> bool {
         // 核心节点判定：被 ≥ 3 条其他记忆的 source_ids 引用
-        let all = match self.persistence.load_all_memories() {
+        let all = match self.load_cached() {
             Ok(memories) => memories,
             Err(_) => return false,
         };
@@ -319,7 +331,7 @@ impl<P: Persistence> MemoryGraphQuery for MemoryStore<P> {
 
     /// 查询受影响的合成链数量
     fn count_affected_synthesis_chains(&self, memory_ids: &[String]) -> usize {
-        let all = match self.persistence.load_all_memories() {
+        let all = match self.load_cached() {
             Ok(memories) => memories,
             Err(_) => return 0,
         };
@@ -344,28 +356,28 @@ impl<P: Persistence> MemoryGraphQuery for MemoryStore<P> {
 
 impl<P: Persistence> MemoryInfoQuery for MemoryStore<P> {
     fn get_last_accessed_ms(&self, memory_id: &str) -> Option<u64> {
-        let all = self.persistence.load_all_memories().ok()?;
+        let all = self.load_cached().ok()?;
         all.iter()
             .find(|m| m.id == memory_id)
             .map(|m| m.last_accessed.timestamp_millis() as u64)
     }
 
     fn get_importance(&self, memory_id: &str) -> Option<u8> {
-        let all = self.persistence.load_all_memories().ok()?;
+        let all = self.load_cached().ok()?;
         all.iter()
             .find(|m| m.id == memory_id)
             .map(|m| m.importance.value())
     }
 
     fn get_memory_type(&self, memory_id: &str) -> Option<String> {
-        let all = self.persistence.load_all_memories().ok()?;
+        let all = self.load_cached().ok()?;
         all.iter()
             .find(|m| m.id == memory_id)
             .map(|m| m.memory_type.as_str().to_string())
     }
 
     fn get_reference_count(&self, memory_id: &str) -> usize {
-        let all = match self.persistence.load_all_memories() {
+        let all = match self.load_cached() {
             Ok(memories) => memories,
             Err(_) => return 0,
         };
@@ -402,20 +414,115 @@ impl<P: Persistence> MemoryInfoQuery for MemoryStore<P> {
     }
 
     fn get_all_memory_ids(&self) -> Vec<String> {
-        match self.persistence.load_all_memories() {
+        match self.load_cached() {
             Ok(memories) => memories.iter().map(|m| m.id.clone()).collect(),
             Err(_) => Vec::new(),
         }
     }
 
     fn delete_memory(&mut self, memory_id: &str) -> bool {
-        self.persistence
+        let result = self
+            .persistence
             .delete_memory(memory_id)
             .unwrap_or_else(|e| {
                 eprintln!("[memory_store] 删除记忆失败 ({}): {}", memory_id, e);
                 false
-            })
+            });
+        // v0.5.4 写操作后标记缓存为脏
+        self.invalidate_cache();
+        result
     }
+}
+
+// ============================================================
+// v0.5.4 P1-9 修复：中文检索精度 — CJK 分词辅助函数
+// ============================================================
+
+/// 计算 CJK 字符在文本中的比例（0.0 ~ 1.0）
+///
+/// 当 CJK 字符比例超过 30% 时，应使用 bigram 分词策略。
+fn cjk_ratio(text: &str) -> f32 {
+    let total = text.chars().filter(|c| !c.is_whitespace()).count();
+    if total == 0 {
+        return 0.0;
+    }
+    let cjk_count = text
+        .chars()
+        .filter(|c| {
+            let cp = *c as u32;
+            (cp >= 0x4E00 && cp <= 0x9FFF)
+                || (cp >= 0x3400 && cp <= 0x4DBF)
+                || (cp >= 0xF900 && cp <= 0xFAFF)
+        })
+        .count();
+    cjk_count as f32 / total as f32
+}
+
+/// v0.5.4 P1-9 修复：智能分词函数
+///
+/// 根据文本的 CJK 字符比例自动选择分词策略：
+/// - CJK 比例 ≥ 30%：使用字符级 bigram 分词（中文友好）
+/// - CJK 比例 < 30%：使用空格分词（英文/混合文本）
+///
+/// 返回分词后的 token 列表（已转为小写）。
+///
+/// # 示例
+///
+/// ```
+/// // 中文文本 → bigram 分词
+/// let tokens = tokenize_query("数据库连接");
+/// assert!(tokens.contains(&"数据".to_string()));
+/// assert!(tokens.contains(&"据库".to_string()));
+/// assert!(tokens.contains(&"库连".to_string()));
+/// assert!(tokens.contains(&"连接".to_string()));
+///
+/// // 英文文本 → 空格分词
+/// let tokens = tokenize_query("database connection");
+/// assert!(tokens.contains(&"database".to_string()));
+/// ```
+fn tokenize_query(text: &str) -> Vec<String> {
+    let lower = text.to_lowercase();
+
+    // CJK 比例 ≥ 30% 使用 bigram 分词
+    if cjk_ratio(&lower) >= 0.3 {
+        tokenize_cjk(&lower)
+    } else {
+        // 英文/混合文本：空格分词 + 过滤空 token
+        lower
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+}
+
+/// CJK 字符级 bigram 分词
+///
+/// 将中文文本拆分为相邻字符对（bigram），例如 "数据库" → ["数据", "据库"]。
+/// 对于长度 < 2 的文本，返回单字符 token。
+fn tokenize_cjk(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+
+    if chars.is_empty() {
+        return Vec::new();
+    }
+
+    if chars.len() == 1 {
+        return vec![chars[0].to_string()];
+    }
+
+    chars
+        .windows(2)
+        .map(|w| format!("{}{}", w[0], w[1]))
+        .collect()
+}
+
+/// v0.5.4 P1-9 修复：计算文档长度（token 数量）
+///
+/// 与 `tokenize_query` 配合使用，确保 CJK 文本的文档长度基于 bigram 数量，
+/// 而非 `split_whitespace().count()`（对中文无效）。
+fn doc_token_count(text: &str) -> usize {
+    tokenize_query(text).len().max(1)
 }
 
 /// 隐私过滤辅助函数：判断记忆是否对指定隐私上下文可见
@@ -480,6 +587,7 @@ impl<P: Persistence> MemoryStore<P> {
             user_feedback: UserFeedback::new(),
             memory_gc: MemoryGarbageCollector::default(),
             gc_pending: false,
+            synthesis_pending: false, // v0.5.4 初始无待合成任务
             audit_trail: AuditTrail::new(),
             hint_escalation: HintEscalationTracker::new(),
             // 质疑五·终极：初始化复杂度预算
@@ -489,6 +597,11 @@ impl<P: Persistence> MemoryStore<P> {
                 budget.update(20, 200, 40, 5);
                 budget
             },
+            // v0.5.4 增量缓存初始化
+            memory_cache: std::cell::RefCell::new(Vec::new()),
+            cache_dirty: std::cell::Cell::new(true), // 初始为脏，首次读取时加载
+            // v0.5.5 P1-1：LLM 默认未配置，由 sidecar 启动后通过 set_llm_configured() 设置
+            llm_configured: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -515,6 +628,7 @@ impl<P: Persistence> MemoryStore<P> {
             user_feedback: UserFeedback::new(),
             memory_gc: MemoryGarbageCollector::default(),
             gc_pending: false,
+            synthesis_pending: false, // v0.5.4 初始无待合成任务
             audit_trail: AuditTrail::new(),
             hint_escalation: HintEscalationTracker::new(),
             complexity_budget: {
@@ -522,7 +636,26 @@ impl<P: Persistence> MemoryStore<P> {
                 budget.update(20, 200, 40, 5);
                 budget
             },
+            // v0.5.4 增量缓存初始化
+            memory_cache: std::cell::RefCell::new(Vec::new()),
+            cache_dirty: std::cell::Cell::new(true), // 初始为脏，首次读取时加载
+            // v0.5.5 P1-1：LLM 默认未配置
+            llm_configured: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// v0.5.5 P1-1：设置 LLM 配置状态
+    /// LLM 配置后替代本地 ML 模型提供语义理解能力，编码器不再视为"降级"
+    /// 由 sidecar 启动后根据 LLM 配置情况调用
+    pub fn set_llm_configured(&self, configured: bool) {
+        self.llm_configured
+            .store(configured, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// v0.5.5 P1-1：获取 LLM 配置状态
+    pub fn is_llm_configured(&self) -> bool {
+        self.llm_configured
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 检查编码器是否处于降级状态（条件编译：仅 ml feature 时检查）
@@ -545,6 +678,30 @@ impl<P: Persistence> MemoryStore<P> {
     #[cfg(not(feature = "ml"))]
     fn get_encoder_recovery_progress(_encoder: &HybridLuoShuEncoder) -> (u32, u32) {
         (0, 0) // 纯统计编码器无恢复进度
+    }
+
+    // ============================================================
+    // v0.5.4 增量缓存辅助方法
+    // ============================================================
+
+    /// 确保缓存有效并返回记忆列表的克隆
+    /// 使用 RefCell 实现内部可变性，支持 &self 方法调用
+    /// 首次调用或缓存脏时从持久层加载，后续调用直接返回缓存副本
+    fn load_cached(&self) -> Result<Vec<Memory>, PersistenceError> {
+        if self.cache_dirty.get() {
+            let mut cache = self
+                .memory_cache
+                .borrow_mut();
+            *cache = self.persistence.load_all_memories()?;
+            self.cache_dirty.set(false);
+        }
+        Ok(self.memory_cache.borrow().clone())
+    }
+
+    /// 标记缓存为脏：任何写操作（保存/删除/修改）后调用
+    /// 下次 load_cached 时会重新从持久层加载
+    fn invalidate_cache(&self) {
+        self.cache_dirty.set(true);
     }
 
     /// 设置冲突检测的相似度阈值
@@ -591,7 +748,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 返回第一条相似度超过阈值的记忆。
     /// 如果无相似记忆则返回 None。
     pub fn find_similar(&self, content: &str) -> Result<Option<Memory>, PersistenceError> {
-        let all = self.persistence.load_all_memories()?;
+        let all = self.load_cached()?;
 
         for m in &all {
             if m.is_expired() {
@@ -666,6 +823,21 @@ impl<P: Persistence> MemoryStore<P> {
         Ok(jaccard_result)
     }
 
+    /// v0.5.4 运行待处理的合成任务（从关键路径移出，由后台调用）
+    ///
+    /// 检查 `synthesis_pending` 标记，如果为 true 则执行合成并清除标记。
+    /// 此方法设计为从健康检查、定时任务或后台线程中调用，
+    /// 避免合成操作阻塞用户的记忆写入/检索请求。
+    ///
+    /// 返回合成的记忆数量，无待合成任务时返回 0。
+    pub fn run_pending_synthesis(&mut self) -> Result<usize, PersistenceError> {
+        if !self.synthesis_pending {
+            return Ok(0);
+        }
+        self.synthesis_pending = false;
+        self.luoshu_synthesize()
+    }
+
     /// 道枢映射: 道枢·中枢 — 道枢调节的对外接口，连接哲学根基与工程实践
     /// 道同构度自适应调节（感知→行动闭环）
     ///
@@ -678,7 +850,7 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         // 采集当前系统状态
-        let all = match self.persistence.load_all_memories() {
+        let all = match self.load_cached() {
             Ok(memories) => memories,
             Err(_) => return None,
         };
@@ -831,7 +1003,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 2. 处理用户负面反馈 → 主动标记低质量合成
         let stats = self.user_feedback.get_stats();
         if stats.negative_count > 0 {
-            let all = match self.persistence.load_all_memories() {
+            let all = match self.load_cached() {
                 Ok(m) => m,
                 Err(_) => return,
             };
@@ -858,7 +1030,7 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 3. 正面反馈保护：清除低质量标记
         // 如果合成记忆获得了足够的正面反馈，撤销低质量标记
-        let all = match self.persistence.load_all_memories() {
+        let all = match self.load_cached() {
             Ok(m) => m,
             Err(_) => return,
         };
@@ -936,6 +1108,10 @@ impl<P: Persistence> MemoryStore<P> {
         for id in &to_delete {
             let _ = self.persistence.delete_memory(id);
         }
+        // v0.5.4 写操作后标记缓存为脏
+        if !to_delete.is_empty() {
+            self.invalidate_cache();
+        }
 
         if gc_stats.last_removed_count > 0 {
             eprintln!(
@@ -992,6 +1168,8 @@ impl<P: Persistence> MemoryStore<P> {
             if !remaining.is_empty() {
                 self.persistence.add_to_archive(&remaining)?;
             }
+            // v0.5.4 写操作后标记缓存为脏
+            self.invalidate_cache();
         }
 
         Ok(recovered)
@@ -1023,7 +1201,7 @@ impl<P: Persistence> MemoryStore<P> {
         eprintln!("[LRC·清理] 发现 {} 条低质量合成记忆，开始隔离...", count);
 
         // 加载所有记忆，找出低质量合成记忆
-        let all = self.persistence.load_all_memories()?;
+        let all = self.load_cached()?;
         let mut quarantined = 0usize;
         let mut failed = 0usize;
 
@@ -1051,7 +1229,9 @@ impl<P: Persistence> MemoryStore<P> {
             }
         }
 
+        // v0.5.4 写操作后标记缓存为脏
         if quarantined > 0 {
+            self.invalidate_cache();
             eprintln!(
                 "[LRC·清理] 隔离完成: {} 条低质量合成记忆已移入隔离区，{} 条失败",
                 quarantined, failed
@@ -1110,6 +1290,8 @@ impl<P: Persistence> MemoryStore<P> {
             if !retained.is_empty() {
                 self.persistence.add_to_archive(&retained)?;
             }
+            // v0.5.4 写操作后标记缓存为脏
+            self.invalidate_cache();
 
             eprintln!(
                 "[LRC·清理] 隔离区淘汰: {} 条低质量合成记忆已永久删除",
@@ -1205,17 +1387,12 @@ impl<P: Persistence> MemoryStore<P> {
         // 记录指标：编码 + 1
         self.dao_metrics.record_encoding();
 
-        // 写入后触发洛书驱动递归合成（使用 MirrorProject + RecursiveCompose）
+        // v0.5.4 合成触发移出关键路径：标记待合成，由后台运行
         // 洛书合成基于几何分类和门控融合，替代 Jaccard 文本相似度聚类
-        match self.luoshu_synthesize() {
-            Ok(n) if n > 0 => {
-                // 合成成功，静默记录
-            }
-            Err(e) => {
-                eprintln!("[LRC] 洛书递归合成触发失败: {}", e);
-            }
-            _ => {}
-        }
+        self.synthesis_pending = true;
+
+        // v0.5.4 写操作后标记缓存为脏
+        self.invalidate_cache();
 
         Ok(result)
     }
@@ -1267,6 +1444,9 @@ impl<P: Persistence> MemoryStore<P> {
         // 2. 合成在大批量数据下耗时巨大（O(N^2) 级别）
         // 3. 记忆检索依赖 recall / trapezoid_focus_recall，不依赖合成结果
 
+        // v0.5.4 写操作后标记缓存为脏
+        self.invalidate_cache();
+
         Ok(results)
     }
 
@@ -1307,7 +1487,7 @@ impl<P: Persistence> MemoryStore<P> {
             .unwrap_or(4);
         let roi = TrapezoidROI::centered(center, depth);
 
-        let all_memories = self.persistence.load_all_memories()?;
+        let all_memories = self.load_cached()?;
         let total_count = all_memories.iter().filter(|m| !m.is_expired()).count();
 
         // 4. 构建 (索引, 洛书向量) 对 — 增加八卦预过滤
@@ -1381,8 +1561,20 @@ impl<P: Persistence> MemoryStore<P> {
         let mut scored: Vec<(usize, f32)> = (0..memories.len()).map(|i| (i, scores[i])).collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
+        // v0.5.4 P2-12 修复：按 content 哈希去重，保留匹配度最高的那条
+        // 在排序后、截取 top_k 前进行去重，确保深度检索结果中不会出现内容相同的记忆
+        let mut seen_content: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         let top_k = filter.top_k.min(scored.len());
-        let top_indices: Vec<usize> = scored.iter().take(top_k).map(|(i, _)| *i).collect();
+        let top_indices: Vec<usize> = scored
+            .iter()
+            .filter(|(i, _)| {
+                let content_key = memories[*i].content.trim().to_lowercase();
+                seen_content.insert(content_key)
+            })
+            .take(top_k)
+            .map(|(i, _)| *i)
+            .collect();
 
         memories = top_indices.iter().map(|&i| memories[i].clone()).collect();
         scores = top_indices.iter().map(|&i| scores[i]).collect();
@@ -1390,7 +1582,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 8. 更新访问时间
         let matched_ids: std::collections::HashSet<String> =
             memories.iter().map(|m| m.id.clone()).collect();
-        let mut all_memories = self.persistence.load_all_memories()?;
+        let mut all_memories = self.load_cached()?;
         let mut any_modified = false;
         for m in &mut all_memories {
             if matched_ids.contains(&m.id) {
@@ -1403,6 +1595,8 @@ impl<P: Persistence> MemoryStore<P> {
             for m in all_memories {
                 self.persistence.save_memory(&m)?;
             }
+            // v0.5.4 写操作后标记缓存为脏
+            self.invalidate_cache();
         }
 
         self.dao_metrics.record_recall();
@@ -1414,9 +1608,9 @@ impl<P: Persistence> MemoryStore<P> {
             }
         }
 
-        // 检索后触发洛书合成：如果召回的记忆足够多且相关，自动合成抽象知识
+        // v0.5.4 检索后合成标记移出关键路径：由后台运行
         if memories.len() >= self.synthesis_min_cluster {
-            let _ = self.luoshu_synthesize();
+            self.synthesis_pending = true;
         }
 
         Ok(RecallResult {
@@ -1435,11 +1629,14 @@ impl<P: Persistence> MemoryStore<P> {
         query: &str,
         filter: &RecallFilter,
     ) -> Result<RecallResult, PersistenceError> {
-        let mut all_memories = self.persistence.load_all_memories()?;
+        let mut all_memories = self.load_cached()?;
         let total_count = all_memories.iter().filter(|m| !m.is_expired()).count();
 
+        // v0.5.4 P1-9 修复：使用智能分词替代 split_whitespace()
+        // 对中文文本使用 bigram 分词，解决中文检索精度问题
         let query_lower = query.to_lowercase();
-        let query_words: Vec<&str> = query_lower.split_whitespace().collect();
+        let query_words: Vec<String> = tokenize_query(query);
+        let query_word_refs: Vec<&str> = query_words.iter().map(|s| s.as_str()).collect();
 
         // 分两阶段处理以避免借用冲突：
         // 阶段 1: 用不可变引用评分和排序
@@ -1484,12 +1681,13 @@ impl<P: Persistence> MemoryStore<P> {
             // 计算匹配分数（使用 TF-IDF 加权，替代简单的关键词匹配）
             // TF-IDF 能更好地区分相关和无关记忆，尤其是对于长文本记忆
             // 参考: LongMemEval 基准测试验证了 TF-IDF 在长对话记忆检索中的有效性
+            // v0.5.4 P1-9 修复：使用 query_word_refs 替代 query_words，支持 CJK bigram
             let mut scored: Vec<(f32, &Memory)> = {
                 // ========== TF-IDF 预处理 ==========
                 // 计算文档频率（DF）: 每个查询词在多少条候选记忆中出现
                 let mut doc_freq: std::collections::HashMap<&str, usize> =
                     std::collections::HashMap::new();
-                for word in &query_words {
+                for word in &query_word_refs {
                     for m in &candidates {
                         let content_lower = m.content.to_lowercase();
                         if content_lower.contains(word) {
@@ -1500,7 +1698,7 @@ impl<P: Persistence> MemoryStore<P> {
 
                 // 计算 IDF（逆文档频率）: 稀有词获得更高权重
                 let n_docs = candidates.len().max(1) as f32;
-                let idf: std::collections::HashMap<&str, f32> = query_words
+                let idf: std::collections::HashMap<&str, f32> = query_word_refs
                     .iter()
                     .map(|word| {
                         let df = *doc_freq.get(word).unwrap_or(&0) as f32;
@@ -1523,10 +1721,12 @@ impl<P: Persistence> MemoryStore<P> {
 
                         // TF-IDF 词匹配加分（替代原 0.1/词的固定权重）
                         // 对每个查询词，计算其在当前记忆中的词频（TF），乘以 IDF
-                        // 归一化 TF：除以文档长度（词数），避免长文本获得不合理的
+                        // 归一化 TF：除以文档长度（token 数），避免长文本获得不合理的
                         // 高分。短文档中关键词密度更高，应获得加权。
-                        let doc_len = content_lower.split_whitespace().count().max(1) as f32;
-                        for word in &query_words {
+                        // v0.5.4 P1-9 修复：使用 doc_token_count 替代 split_whitespace().count()
+                        // 对 CJK 文本基于 bigram 数量计算文档长度
+                        let doc_len = doc_token_count(&content_lower) as f32;
+                        for word in &query_word_refs {
                             if content_lower.contains(word) {
                                 // 计算词频（TF）: 该词在记忆内容中出现的次数
                                 let tf = content_lower.matches(word).count() as f32;
@@ -1538,8 +1738,9 @@ impl<P: Persistence> MemoryStore<P> {
                         }
 
                         // 标签匹配加分（标签是用户主动标注的元数据，具有高信息量）
+                        // v0.5.4 P1-9 修复：使用 query_word_refs 支持中文标签匹配
                         for tag in &m.tags {
-                            for word in &query_words {
+                            for word in &query_word_refs {
                                 if tag.to_lowercase().contains(word) {
                                     score += 0.15;
                                 }
@@ -1617,9 +1818,20 @@ impl<P: Persistence> MemoryStore<P> {
             // 按分数降序排序
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-            // 截取 top_k
+            // v0.5.4 P2-12 修复：按 content 哈希去重，保留匹配度最高的那条
+            // 在排序后、截取 top_k 前进行去重，确保结果中不会出现内容相同的记忆
+            // 使用规范化内容（trim + lowercase）作为去重键，捕获大小写/空白差异的重复
+            let mut seen_content: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             let top_k = filter.top_k.min(scored.len());
-            let scored: Vec<(f32, &Memory)> = scored.into_iter().take(top_k).collect();
+            let scored: Vec<(f32, &Memory)> = scored
+                .into_iter()
+                .filter(|(_, m)| {
+                    let content_key = m.content.trim().to_lowercase();
+                    seen_content.insert(content_key)
+                })
+                .take(top_k)
+                .collect();
 
             let memories: Vec<Memory> = scored.iter().map(|(_, m)| (*m).clone()).collect();
             let scores: Vec<f32> = scored.iter().map(|(s, _)| *s).collect();
@@ -1647,6 +1859,8 @@ impl<P: Persistence> MemoryStore<P> {
             for m in all_memories {
                 self.persistence.save_memory(&m)?;
             }
+            // v0.5.4 写操作后标记缓存为脏
+            self.invalidate_cache();
         }
 
         // 记录指标：检索 + 1
@@ -1661,7 +1875,10 @@ impl<P: Persistence> MemoryStore<P> {
 
     /// 删除一条记忆
     pub fn forget(&mut self, id: &str) -> Result<bool, PersistenceError> {
-        self.persistence.delete_memory(id)
+        let result = self.persistence.delete_memory(id)?;
+        // v0.5.4 写操作后标记缓存为脏
+        self.invalidate_cache();
+        Ok(result)
     }
 
     /// 更新记忆内容
@@ -1673,7 +1890,7 @@ impl<P: Persistence> MemoryStore<P> {
         new_content: &str,
         new_importance: Option<Importance>,
     ) -> Result<Option<Memory>, PersistenceError> {
-        let all = self.persistence.load_all_memories()?;
+        let all = self.load_cached()?;
         let mut found: Option<Memory> = None;
 
         let updated: Vec<Memory> = all
@@ -1698,6 +1915,8 @@ impl<P: Persistence> MemoryStore<P> {
         for m in updated {
             self.persistence.save_memory(&m)?;
         }
+        // v0.5.4 写操作后标记缓存为脏
+        self.invalidate_cache();
 
         Ok(found)
     }
@@ -1707,7 +1926,7 @@ impl<P: Persistence> MemoryStore<P> {
         &self,
         filter: &ListFilter,
     ) -> Result<(Vec<Memory>, usize), PersistenceError> {
-        let mut all = self.persistence.load_all_memories()?;
+        let mut all = self.load_cached()?;
         let privacy_ctx = filter.privacy_context.clone();
 
         // 过滤
@@ -1759,7 +1978,7 @@ impl<P: Persistence> MemoryStore<P> {
 
     /// 获取记忆库统计信息
     pub fn stats(&self) -> Result<MemoryStats, PersistenceError> {
-        let all = self.persistence.load_all_memories()?;
+        let all = self.load_cached()?;
         let mut stats = MemoryStats {
             total_memories: all.len(),
             ..Default::default()
@@ -1786,7 +2005,7 @@ impl<P: Persistence> MemoryStore<P> {
 
     /// 获取记忆总数
     pub fn total_count(&self) -> Result<usize, PersistenceError> {
-        let all = self.persistence.load_all_memories()?;
+        let all = self.load_cached()?;
         Ok(all.len())
     }
 
@@ -1798,7 +2017,7 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 返回归档的记忆数量，若无可归档记忆则返回 0。
     pub fn archive_expired(&mut self) -> Result<usize, PersistenceError> {
-        let all = self.persistence.load_all_memories()?;
+        let all = self.load_cached()?;
 
         // 筛选过期记忆与活跃记忆
         let (expired, active): (Vec<Memory>, Vec<Memory>) =
@@ -1818,6 +2037,8 @@ impl<P: Persistence> MemoryStore<P> {
         for m in active {
             self.persistence.save_memory(&m)?;
         }
+        // v0.5.4 写操作后标记缓存为脏
+        self.invalidate_cache();
 
         Ok(count)
     }
@@ -1838,7 +2059,7 @@ impl<P: Persistence> MemoryStore<P> {
     pub fn dao_metrics_snapshot(
         &self,
     ) -> Result<crate::engine::dao_metrics::DaoMetricsSnapshot, PersistenceError> {
-        let all = self.persistence.load_all_memories()?;
+        let all = self.load_cached()?;
         let archived = self
             .persistence
             .load_archived_memories()
@@ -1880,7 +2101,7 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 返回结构化的 SystemHealthReport，可序列化为 JSON 通过 API 暴露。
     pub fn health_report(&mut self) -> Result<SystemHealthReport, PersistenceError> {
-        let all = self.persistence.load_all_memories()?;
+        let all = self.load_cached()?;
         let _archived = self
             .persistence
             .load_archived_memories()
@@ -1949,6 +2170,22 @@ impl<P: Persistence> MemoryStore<P> {
                 .unwrap_or(5),
         );
 
+        // v0.5.4 健康检查时运行待合成的任务（从关键路径移出）
+        if self.synthesis_pending {
+            match self.run_pending_synthesis() {
+                Ok(n) if n > 0 => {
+                    eprintln!("[LRC·合成] 后台合成完成: {} 条新合成记忆", n);
+                }
+                Err(e) => {
+                    eprintln!("[LRC·合成] 后台合成失败: {}", e);
+                }
+                _ => {}
+            }
+        }
+
+        // v0.5.5 P1-1：获取 LLM 配置状态，传入健康报告
+        let llm_configured = self.is_llm_configured();
+
         Ok(generate_health_report(
             encoder_status,
             dao_snapshot,
@@ -1964,6 +2201,8 @@ impl<P: Persistence> MemoryStore<P> {
             feedback_stats,
             self.complexity_budget.clone(),
             &mut self.hint_escalation,
+            // v0.5.5 P1-1：传入 LLM 配置状态，LLM 配置后编码器不再视为降级
+            llm_configured,
         ))
     }
 
@@ -2003,7 +2242,7 @@ impl<P: Persistence> MemoryStore<P> {
         id: &str,
         min_activation: f32,
     ) -> Result<Option<(Vec<Memory>, f32)>, PersistenceError> {
-        let all = self.persistence.load_all_memories()?;
+        let all = self.load_cached()?;
 
         // 找到目标记忆
         let memory = match all.iter().find(|m| m.id == id) {
@@ -2066,6 +2305,9 @@ impl<P: Persistence> MemoryStore<P> {
             sub_memories.push(sub_mem);
         }
 
+        // v0.5.4 写操作后标记缓存为脏
+        self.invalidate_cache();
+
         Ok(Some((sub_memories, unfold_result.fidelity)))
     }
 
@@ -2080,7 +2322,7 @@ impl<P: Persistence> MemoryStore<P> {
         new_content: &str,
         reason: Option<&str>,
     ) -> Result<Option<Memory>, PersistenceError> {
-        let all = self.persistence.load_all_memories()?;
+        let all = self.load_cached()?;
         let mut found: Option<Memory> = None;
 
         let updated: Vec<Memory> = all
@@ -2105,6 +2347,8 @@ impl<P: Persistence> MemoryStore<P> {
         for m in updated {
             self.persistence.save_memory(&m)?;
         }
+        // v0.5.4 写操作后标记缓存为脏
+        self.invalidate_cache();
 
         // 记录指标：修正 + 1
         if found.is_some() {
@@ -2130,7 +2374,7 @@ impl<P: Persistence> MemoryStore<P> {
             .as_millis() as u64;
 
         // 采集记忆统计
-        let all = self.persistence.load_all_memories().unwrap_or_default();
+        let all = self.load_cached().unwrap_or_default();
         let total = all.len();
         let active = all.iter().filter(|m| !m.is_expired()).count();
         let expired = all.iter().filter(|m| m.is_expired()).count();
@@ -2194,8 +2438,15 @@ impl<P: Persistence> MemoryStore<P> {
         // 编码器状态
         let encoder_status = self.luoshu_encoder.get_status();
         let encoder_mode = encoder_status.mode.clone();
-        let encoder_degraded =
-            encoder_mode == "statistical" || Self::check_encoder_degraded(&self.luoshu_encoder);
+        // v0.5.5 P1-1：LLM 配置后替代本地 ML 模型提供语义理解能力
+        // 如果 LLM 已配置，编码器不再视为"降级"，系统模式为 Healthy
+        let llm_configured = self.is_llm_configured();
+        let encoder_degraded = if llm_configured {
+            // LLM 已配置 → 编码器不视为降级（LLM 提供语义理解能力）
+            false
+        } else {
+            encoder_mode == "statistical" || Self::check_encoder_degraded(&self.luoshu_encoder)
+        };
         let encoder_recovery_progress = if encoder_degraded {
             let (successes, threshold) = Self::get_encoder_recovery_progress(&self.luoshu_encoder);
             if threshold > 0 {
@@ -2247,6 +2498,7 @@ impl<P: Persistence> MemoryStore<P> {
             audit_seal_verified: self.audit_trail.seal_verified(),
             gc_pending: self.gc_pending,
             gc_last_run_ms: self.memory_gc.last_run_ms(),
+            synthesis_pending: self.synthesis_pending, // v0.5.4
             catastrophic_event_count,
             last_catastrophic_event,
             total_memories: total,
@@ -2316,6 +2568,122 @@ mod tests {
             .expect("应成功召回");
         assert!(!result.memories.is_empty());
         assert!(result.memories[0].content.contains("pnpm"));
+    }
+
+    /// v0.5.4 P1-9 新增：验证中文检索精度修复
+    /// 测试中文 bigram 分词是否能正确检索到包含相关关键词的记忆
+    #[test]
+    fn test_recall_chinese_bigram() {
+        let (_dir, mut store) = make_store();
+
+        // 写入多条中文记忆
+        store
+            .remember(make_test_memory(
+                "项目使用 Rust 语言开发，采用 Actix-web 框架",
+                MemoryType::Fact,
+            ))
+            .expect("应成功记住");
+        store
+            .remember(make_test_memory(
+                "数据库连接配置：PostgreSQL，端口 5432",
+                MemoryType::Fact,
+            ))
+            .expect("应成功记住");
+        store
+            .remember(make_test_memory(
+                "前端使用 React 框架，状态管理用 Redux",
+                MemoryType::Fact,
+            ))
+            .expect("应成功记住");
+
+        // 测试 1：检索"数据库连接"应返回包含数据库的记忆
+        let result = store
+            .recall("数据库连接", &RecallFilter::new().with_top_k(3))
+            .expect("应成功召回");
+        assert!(!result.memories.is_empty(), "中文检索应返回结果");
+        assert!(
+            result.memories[0].content.contains("数据库"),
+            "第一条结果应包含'数据库'，实际: {}",
+            result.memories[0].content
+        );
+
+        // 测试 2：检索"Rust 框架"应返回包含 Rust 的记忆
+        let result = store
+            .recall("Rust 框架", &RecallFilter::new().with_top_k(3))
+            .expect("应成功召回");
+        assert!(!result.memories.is_empty(), "中文检索应返回结果");
+        assert!(
+            result.memories[0].content.contains("Rust"),
+            "第一条结果应包含 'Rust'，实际: {}",
+            result.memories[0].content
+        );
+
+        // 测试 3：验证 CJK 分词函数
+        let tokens = tokenize_query("数据库连接");
+        assert!(tokens.contains(&"数据".to_string()), "应包含 bigram '数据'");
+        assert!(tokens.contains(&"据库".to_string()), "应包含 bigram '据库'");
+        assert!(tokens.contains(&"库连".to_string()), "应包含 bigram '库连'");
+        assert!(tokens.contains(&"连接".to_string()), "应包含 bigram '连接'");
+
+        // 测试 4：验证英文文本仍使用空格分词
+        let tokens = tokenize_query("database connection");
+        assert!(tokens.contains(&"database".to_string()), "英文应使用空格分词");
+        assert!(tokens.contains(&"connection".to_string()), "英文应使用空格分词");
+
+        // 测试 5：验证 CJK 比例计算
+        assert!(cjk_ratio("数据库连接") > 0.9, "纯中文 CJK 比例应 > 0.9");
+        assert!(cjk_ratio("database") < 0.1, "纯英文 CJK 比例应 < 0.1");
+        assert!(cjk_ratio("使用 Rust 开发") > 0.3, "混合文本 CJK 比例应 > 0.3");
+    }
+
+    /// v0.5.4 P2-12 修复：验证检索结果去重
+    /// 写入内容相同的记忆（不同 ID），检索时应只返回一条
+    #[test]
+    fn test_recall_deduplication() {
+        let (_dir, mut store) = make_store();
+
+        // 写入 3 条内容完全相同的记忆（模拟用户重复写入场景）
+        for _ in 0..3 {
+            store
+                .remember(make_test_memory(
+                    "PostgreSQL 数据库连接配置端口 5432",
+                    MemoryType::Fact,
+                ))
+                .expect("应成功记住");
+        }
+        // 写入 1 条不同内容的记忆作为对照
+        store
+            .remember(make_test_memory(
+                "Redis 缓存配置端口 6379",
+                MemoryType::Fact,
+            ))
+            .expect("应成功记住");
+
+        // 检索"数据库"应返回去重后的结果
+        let result = store
+            .recall("数据库", &RecallFilter::new().with_top_k(10))
+            .expect("应成功召回");
+
+        // 统计内容为 "PostgreSQL 数据库连接配置端口 5432" 的记忆数量
+        let pg_count = result
+            .memories
+            .iter()
+            .filter(|m| m.content.contains("PostgreSQL"))
+            .count();
+        assert_eq!(
+            pg_count, 1,
+            "去重后应只剩 1 条 PostgreSQL 记忆，实际: {}",
+            pg_count
+        );
+
+        // 验证总结果数不超过去重后的唯一记忆数
+        let unique_contents: std::collections::HashSet<&str> =
+            result.memories.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            unique_contents.len(),
+            result.memories.len(),
+            "结果中不应有重复内容的记忆"
+        );
     }
 
     #[test]

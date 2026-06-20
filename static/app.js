@@ -1,7 +1,14 @@
 
 // ============================================================
-// 全局配置
+// Loong Recall 仪表盘 — 主应用脚本
+// 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
+(function() {
+  'use strict';
+
+  // ============================================================
+  // 全局配置
+  // ============================================================
 const DEFAULT_API_BASE = window.location.origin || 'http://localhost:3099';
 const API_BASE = new URLSearchParams(window.location.search).get('api') || DEFAULT_API_BASE;
 const REFRESH_INTERVAL = 30000; // 30 秒自动刷新
@@ -171,74 +178,208 @@ async function loadDashboard() {
 }
 
 function renderDashboard(system, detailed, dao) {
-  // --- 记忆统计卡片 ---
+  // --- v0.5.4 P1-7 修复：用户友好的记忆统计卡片 ---
   const memStats = system?.memory_stats || {};
   const daoMetrics = system?.dao_metrics || dao || {};
+
+  // 记忆总数 = 活跃 + 结晶 + 归档
+  const totalMemories = memStats.total_memories
+    || (daoMetrics.active_memories || 0) + (daoMetrics.crystallized_memories || 0) + (daoMetrics.archived_memories || 0);
 
   const statTotal = $('stat-total');
   const statActive = $('stat-active');
   const statCrystallized = $('stat-crystallized');
   const statToday = $('stat-today');
-  if (statTotal) statTotal.textContent = num(memStats.total_memories || daoMetrics.active_memories + (daoMetrics.crystallized_memories || 0) + (daoMetrics.archived_memories || 0));
+  if (statTotal) statTotal.textContent = num(totalMemories);
   if (statActive) statActive.textContent = num(memStats.active_memories || daoMetrics.active_memories);
   if (statCrystallized) statCrystallized.textContent = num(memStats.synthesis_memories || daoMetrics.crystallized_memories);
+  // 今日新增：使用编码次数作为近似值（无专门的"今日"字段）
   if (statToday) statToday.textContent = num(daoMetrics.encodings_total || 0);
 
-  // --- 健康状态 ---
+  // --- v0.5.4 P1-7 修复：系统信息卡片（用户友好） ---
+  const sysHealthStatus = $('sys-health-status');
+  const sysDataDir = $('sys-data-dir');
+  const sysStorageSize = $('sys-storage-size');
+  const sysTypeCount = $('sys-type-count');
+  const sysProjectCount = $('sys-project-count');
+  const sysMode = $('sys-mode');
+
+  // 服务状态：基于 dao_isomorphism_score 判断
   const daoScore = daoMetrics.dao_isomorphism_score ?? 0;
-  const daoScoreText = $('dao-score-text');
-  const daoScoreBar = $('dao-score-bar');
-  if (daoScoreText) daoScoreText.textContent = pct(daoScore);
-  if (daoScoreBar) {
-    daoScoreBar.style.width = (daoScore * 100).toFixed(1) + '%';
-    daoScoreBar.className = 'progress-fill ' + (daoScore < 0.3 ? 'cinnabar' : daoScore < 0.5 ? 'gold' : 'jade');
+  if (sysHealthStatus) {
+    if (daoScore >= 0.5) {
+      sysHealthStatus.innerHTML = '<span class="badge healthy">✓ 正常运行</span>';
+    } else if (daoScore >= 0.3) {
+      sysHealthStatus.innerHTML = '<span class="badge warning">⚠ 需关注</span>';
+    } else {
+      sysHealthStatus.innerHTML = '<span class="badge critical">⚠ 待优化</span>';
+    }
   }
 
-  const entropy = daoMetrics.bagua_entropy ?? 0;
-  const baguaEntropy = $('bagua-entropy');
-  if (baguaEntropy) baguaEntropy.textContent = entropy.toFixed(3) + ' / 3.0';
-
-  const synthRatio = daoMetrics.synthesis_ratio ?? 0;
-  const synthRatioText = $('synthesis-ratio-text');
-  const synthRatioBar = $('synthesis-ratio-bar');
-  if (synthRatioText) synthRatioText.textContent = pct(synthRatio);
-  if (synthRatioBar) synthRatioBar.style.width = (synthRatio * 100).toFixed(1) + '%';
-
-  // --- 系统状态 ---
-  const encoder = system?.encoder || {};
-  const sysMlStatus = $('sys-ml-status');
-  const sysEncoder = $('sys-encoder');
-  const sysDataDir = $('sys-data-dir');
-  const sysCache = $('sys-cache');
-  const sysMode = $('sys-mode');
-  const sysQuality = $('sys-quality');
-  if (sysMlStatus) sysMlStatus.textContent = encoder.mode === 'ml' ? '✅ ML 模式' : '⚠️ 统计模式';
-  if (sysEncoder) sysEncoder.textContent = encoder.model_name || 'LuoShuEncoder (统计)';
   if (sysDataDir) sysDataDir.textContent = '.loong-recall/data/';
-  if (sysCache) sysCache.textContent = encoder.mode === 'ml' ? '已启用' : '统计模式无需缓存';
   if (sysMode) sysMode.innerHTML = statusBadge(system?.system_mode || 'unknown');
-  if (sysQuality) sysQuality.textContent = encoder.quality_score != null ? (encoder.quality_score * 100).toFixed(0) + '%' : '--';
 
-  // --- 复杂度预算 ---
-  const budget = system?.complexity_budget || {};
-  const honesty = budget.complexity_honesty || {};
-
-  const maintainScore = budget.maintainability_score ?? 0;
-  const complexityScore = $('complexity-score');
-  const complexityBar = $('complexity-bar');
-  const honestyScore = $('honesty-score');
-  const honestyBar = $('honesty-bar');
-  const maintainabilityScore = $('maintainability-score');
-  const maintainabilityBar = $('maintainability-bar');
-  if (complexityScore) complexityScore.textContent = pct(budget.budget_consumed || 0);
-  if (complexityBar) complexityBar.style.width = ((budget.budget_consumed || 0) * 100).toFixed(1) + '%';
-  if (honestyScore) honestyScore.textContent = pct(honesty.score ?? 1);
-  if (honestyBar) honestyBar.style.width = ((honesty.score ?? 1) * 100).toFixed(1) + '%';
-  if (maintainabilityScore) maintainabilityScore.textContent = pct(maintainScore);
-  if (maintainabilityBar) maintainabilityBar.style.width = (maintainScore * 100).toFixed(1) + '%';
-
-  // --- 决策日志（从审计追踪获取） ---
+  // --- v0.5.4 P1-7 修复：并行加载最近记忆、项目分布、活动日志 ---
+  loadRecentMemories();
+  loadMemoryStats();
   loadAuditLog();
+}
+
+// ============================================================
+// v0.5.4 P1-7 新增：加载最近记忆（用户友好）
+// ============================================================
+async function loadRecentMemories() {
+  const container = $('recent-memories-list');
+  if (!container) return;
+  container.innerHTML = '<div class="text-center text-dim" style="padding:20px;">加载中...</div>';
+
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/memories/recent?limit=5');
+    if (!res.ok) throw new Error('最近记忆 API 不可用');
+    const data = await res.json();
+    const memories = data.memories || [];
+
+    if (memories.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">📝</div>
+          <div class="empty-text">暂无记忆</div>
+          <div class="empty-hint">使用上方的"5分钟快速体验"向导写入第一条记忆</div>
+        </div>`;
+      return;
+    }
+
+    // 记忆类型中文映射
+    const typeLabels = {
+      fact: '事实', synthesis: '合成', pattern: '模式',
+      preference: '偏好', correction: '修正', general: '通用',
+    };
+    // 类型颜色映射
+    const typeColors = {
+      fact: 'info', synthesis: 'jade', pattern: 'gold',
+      preference: 'ink', correction: 'cinnabar', general: 'info',
+    };
+
+    container.innerHTML = memories.map(m => {
+      const time = new Date(m.created_at_ms).toLocaleString('zh-CN', {
+        month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit'
+      });
+      const typeLabel = typeLabels[m.memory_type] || m.memory_type;
+      const typeColor = typeColors[m.memory_type] || 'info';
+      const project = m.project || '全局';
+      const importance = m.importance || 0;
+      // 重要性星级（1-5星，基于 1-10 分）
+      const stars = '★'.repeat(Math.ceil(importance / 2)) + '☆'.repeat(5 - Math.ceil(importance / 2));
+      return `
+        <div class="recent-memory-item">
+          <div class="recent-memory-header">
+            <span class="badge ${typeColor}">${htmlescape(typeLabel)}</span>
+            <span class="recent-memory-time">${time}</span>
+          </div>
+          <div class="recent-memory-content">${htmlescape(m.content_preview)}</div>
+          <div class="recent-memory-meta">
+            <span class="recent-memory-project">📂 ${htmlescape(project)}</span>
+            <span class="recent-memory-importance" title="重要性 ${importance}/10">${stars}</span>
+          </div>
+        </div>`;
+    }).join('');
+  } catch (e) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">⚠️</div>
+        <div class="empty-text">加载失败</div>
+        <div class="empty-hint">${htmlescape(e.message)}</div>
+      </div>`;
+  }
+}
+
+// ============================================================
+// v0.5.4 P1-7 新增：加载记忆统计（项目分布）
+// ============================================================
+async function loadMemoryStats() {
+  const container = $('project-distribution');
+  const sysStorageSize = $('sys-storage-size');
+  const sysTypeCount = $('sys-type-count');
+  const sysProjectCount = $('sys-project-count');
+  if (!container) return;
+  container.innerHTML = '<div class="text-center text-dim" style="padding:20px;">加载中...</div>';
+
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/memories/stats');
+    if (!res.ok) throw new Error('记忆统计 API 不可用');
+    const data = await res.json();
+
+    // 更新系统信息卡片
+    if (sysStorageSize) {
+      const bytes = data.storage_size_bytes || 0;
+      if (bytes > 1024 * 1024) {
+        sysStorageSize.textContent = (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+      } else if (bytes > 1024) {
+        sysStorageSize.textContent = (bytes / 1024).toFixed(1) + ' KB';
+      } else {
+        sysStorageSize.textContent = bytes + ' B';
+      }
+    }
+    if (sysTypeCount) sysTypeCount.textContent = Object.keys(data.by_type || {}).length;
+    if (sysProjectCount) sysProjectCount.textContent = Object.keys(data.by_project || {}).length;
+
+    // 渲染项目分布
+    const byProject = data.by_project || {};
+    const projectEntries = Object.entries(byProject).sort((a, b) => b[1] - a[1]);
+
+    if (projectEntries.length === 0) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">📂</div>
+          <div class="empty-text">暂无项目数据</div>
+          <div class="empty-hint">写入记忆后将自动统计项目分布</div>
+        </div>`;
+      return;
+    }
+
+    const total = projectEntries.reduce((sum, [_, count]) => sum + count, 0);
+    const maxCount = projectEntries[0][1];
+
+    // 项目名称中文映射
+    const projectNameMap = {
+      '_global_': '全局记忆',
+    };
+
+    container.innerHTML = projectEntries.slice(0, 8).map(([project, count]) => {
+      const displayName = projectNameMap[project] || project;
+      const percentage = total > 0 ? (count / total * 100).toFixed(1) : '0.0';
+      const barWidth = maxCount > 0 ? (count / maxCount * 100).toFixed(1) : '0.0';
+      return `
+        <div class="project-dist-item">
+          <div class="project-dist-header">
+            <span class="project-dist-name">📂 ${htmlescape(displayName)}</span>
+            <span class="project-dist-count">${num(count)} 条 (${percentage}%)</span>
+          </div>
+          <div class="progress-bar" style="margin-top:4px;">
+            <div class="progress-fill jade" style="width:${barWidth}%"></div>
+          </div>
+        </div>`;
+    }).join('');
+
+    if (projectEntries.length > 8) {
+      container.innerHTML += `<div class="text-center text-dim" style="margin-top:8px;font-size:11px;">还有 ${projectEntries.length - 8} 个项目未显示</div>`;
+    }
+  } catch (e) {
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon">⚠️</div>
+        <div class="empty-text">加载失败</div>
+        <div class="empty-hint">${htmlescape(e.message)}</div>
+      </div>`;
+  }
+}
+
+// ============================================================
+// v0.5.4 P1-7 新增：切换标签页（供快速操作区域使用）
+// ============================================================
+function switchToTab(tabName) {
+  const btn = document.querySelector(`.navbar-nav button[data-tab="${tabName}"]`);
+  if (btn) btn.click();
 }
 
 // ============================================================
@@ -309,7 +450,7 @@ function updateStatusBar(online, systemData) {
     }
   }
 
-  if (version) version.textContent = 'v0.2.0';
+  if (version) version.textContent = 'v0.5.4';
   if (dataDir) dataDir.textContent = '.loong-recall/data/';
   if (uptime) uptime.textContent = formatUptime(Date.now() - startTime);
 }
@@ -807,24 +948,33 @@ function startAutoRefresh() {
 // 桌面端嵌入检测
 // ============================================================
 // 当仪表盘被嵌入 Tauri 桌面端时，URL 会带 ?embedded=tauri 参数
-// 此时隐藏 LLM 设置区域（LLM 由桌面端向导统一管理，避免两处配置冲突）
+// v0.5.5：嵌入模式和非嵌入模式统一使用完整的 LLM 配置表单
+// 不管在哪里修改 LLM 配置，都通过 /api/config/llm API 保存，自动同步到 wizard.json
 const IS_DESKTOP_EMBEDDED = new URLSearchParams(window.location.search).get('embedded') === 'tauri';
+
+// v0.5.5：LLM 提供商列表（与桌面端配置向导一致）
+const LLM_PROVIDERS = {
+  deepseek:   { name: 'DeepSeek',       url: 'https://api.deepseek.com/v1',           model: 'deepseek-chat',       keyHint: 'sk-...',    desc: '国产性价比之王，代码能力极强' },
+  qwen:       { name: '通义千问',       url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', keyHint: 'sk-...', desc: '阿里云出品，中文理解出色' },
+  zhipu:      { name: '智谱 GLM',       url: 'https://open.bigmodel.cn/api/paas/v4',   model: 'glm-4',               keyHint: 'xxx.xxx', desc: '清华系，GLM 系列模型' },
+  minimax:    { name: 'MiniMax',         url: 'https://api.minimax.chat/v1',            model: 'abab6.5s-chat',       keyHint: 'eyJ...', desc: '海螺AI同款，长文本支持好' },
+  moonshot:   { name: 'Moonshot (Kimi)', url: 'https://api.moonshot.cn/v1',            model: 'moonshot-v1-8k',      keyHint: 'sk-...', desc: 'Kimi 同款，超长上下文' },
+  openai:     { name: 'OpenAI',          url: 'https://api.openai.com/v1',              model: 'gpt-4o',             keyHint: 'sk-...', desc: 'GPT-4o，综合能力最强' },
+  ollama:     { name: 'Ollama 本地模型', url: 'http://localhost:11434',                 model: 'llama3',             keyHint: '无需 Key（本地运行）', desc: '免费本地运行，数据不出电脑' },
+  custom:     { name: '自定义 API',      url: '',                                        model: '',                   keyHint: '',          desc: '手动填写任何兼容 OpenAI 的 API 地址' },
+};
 
 // ============================================================
 // 初始化
 // ============================================================
 function init() {
-  // ── 桌面端嵌入模式：隐藏 LLM 配置区域，避免与桌面端向导冲突 ──
+  // v0.5.5：统一嵌入模式和非嵌入模式，都使用完整的 LLM 配置表单
+  // 不管在哪里修改 LLM 配置，都通过 /api/config/llm API 保存，自动同步到 wizard.json
   if (IS_DESKTOP_EMBEDDED) {
-    const llmSection = $('llm-setup-section');
-    const configSection = $('current-config-section');
-    if (llmSection) llmSection.style.display = 'none';
-    if (configSection) configSection.style.display = 'none';
-
-    // 更新设置页描述，告知用户 LLM 由桌面端统一管理
+    // 嵌入模式下，更新设置页描述
     const settingsDesc = document.querySelector('#tab-settings .section-desc');
     if (settingsDesc) {
-      settingsDesc.textContent = 'LLM 配置由桌面端统一管理。此处可查看项目信息、备份与恢复记忆数据。';
+      settingsDesc.textContent = '配置 LLM API 以启用自然语言搜索代码。配置后自动生效，无需重启。';
     }
   }
 
@@ -1207,9 +1357,6 @@ function drawRadarChart(data) {
 
 /** 加载当前配置状态 */
 async function loadSettings() {
-  // 桌面端嵌入模式下跳过 LLM 配置加载（由桌面端向导统一管理）
-  if (IS_DESKTOP_EMBEDDED) return;
-
   // 绑定提供商切换事件
   const providerSelect = $('llm-provider');
   if (providerSelect && !providerSelect._bound) {
@@ -1222,12 +1369,85 @@ async function loadSettings() {
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
 
-    updateLlmStatusBadge(data.llm_configured, data.llm_type);
-    showConfigSection(data.llm_configured, data.llm_type, data.llm_model);
+    // v0.5.5：从 base_url 推断具体提供商名称，与桌面端配置保持一致
+    const providerName = inferProviderName(data.llm_type, data.llm_base_url);
+    updateLlmStatusBadge(data.llm_configured, providerName);
+
+    // v0.5.5：根据当前配置自动选择提供商并填充表单
+    if (data.llm_configured) {
+      const providerKey = inferProviderKey(data.llm_type, data.llm_base_url);
+      const providerSelectEl = $('llm-provider');
+      if (providerSelectEl) {
+        providerSelectEl.value = providerKey;
+        switchLlmProvider(); // 触发表单字段更新
+      }
+
+      // 填充当前配置到表单
+      if (providerKey === 'ollama') {
+        const hostEl = $('llm-ollama-host');
+        const modelEl = $('llm-ollama-model');
+        if (hostEl && data.llm_base_url) hostEl.value = data.llm_base_url;
+        if (modelEl && data.llm_model) modelEl.value = data.llm_model;
+      } else {
+        const modelEl = $('llm-model');
+        const endpointEl = $('llm-endpoint');
+        if (modelEl && data.llm_model) modelEl.value = data.llm_model;
+        if (endpointEl && data.llm_base_url) endpointEl.value = data.llm_base_url;
+        // API Key 不回填（安全考虑），只显示提示
+        const keyEl = $('llm-api-key');
+        if (keyEl) keyEl.placeholder = '已配置（如需修改请重新输入）';
+      }
+
+      // 显示当前配置详情
+      showConfigSection(data.llm_configured, providerName, data.llm_model);
+    }
   } catch (e) {
     console.warn('[设置] 加载配置失败:', e.message);
     updateLlmStatusBadge(false, 'none');
   }
+}
+
+/**
+ * v0.5.5：从 LLM 类型和 base_url 推断提供商 key（用于表单自动选择）
+ */
+function inferProviderKey(llmType, baseUrl) {
+  if (!llmType || llmType === 'none') return 'deepseek';
+  if (llmType === 'ollama') return 'ollama';
+  // OpenAI 兼容模式：从 base_url 推断具体提供商 key
+  if (!baseUrl) return 'openai';
+  const url = baseUrl.toLowerCase();
+  if (url.includes('api.deepseek.com')) return 'deepseek';
+  if (url.includes('dashscope.aliyuncs.com')) return 'qwen';
+  if (url.includes('open.bigmodel.cn')) return 'zhipu';
+  if (url.includes('api.minimax.chat')) return 'minimax';
+  if (url.includes('api.moonshot.cn')) return 'moonshot';
+  if (url.includes('api.openai.com')) return 'openai';
+  // 未知提供商 → 自定义
+  return 'custom';
+}
+
+/**
+ * v0.5.5 P1-2：从 LLM 类型和 base_url 推断具体提供商名称
+ * 确保仪表盘显示与桌面端配置一致，避免"配置了 DeepSeek 显示 OpenAI"的困惑
+ */
+function inferProviderName(llmType, baseUrl) {
+  if (!llmType || llmType === 'none') return 'none';
+  if (llmType === 'ollama') return 'Ollama';
+  // OpenAI 兼容模式：从 base_url 推断具体提供商
+  if (!baseUrl) return 'OpenAI';
+  const url = baseUrl.toLowerCase();
+  if (url.includes('api.openai.com')) return 'OpenAI';
+  if (url.includes('api.deepseek.com')) return 'DeepSeek';
+  if (url.includes('api.anthropic.com')) return 'Anthropic';
+  if (url.includes('generativelanguage.googleapis.com')) return 'Google';
+  if (url.includes('api.moonshot.cn')) return 'Moonshot';
+  if (url.includes('open.bigmodel.cn')) return '智谱';
+  if (url.includes('api.lingyiwanwu.com')) return '零一万物';
+  if (url.includes('api.minimax.chat')) return 'MiniMax';
+  if (url.includes('api.baichuan-ai.com')) return '百川';
+  if (url.includes('dashscope.aliyuncs.com')) return '通义千问';
+  // 未知提供商 → 显示"OpenAI 兼容"
+  return 'OpenAI 兼容';
 }
 
 /** 更新 LLM 状态徽章 */
@@ -1235,7 +1455,7 @@ function updateLlmStatusBadge(configured, type) {
   const badge = $('llm-status-badge');
   if (!badge) return;
   if (configured) {
-    badge.textContent = '已配置 · ' + type.toUpperCase();
+    badge.textContent = '已配置 · ' + type;
     badge.className = 'badge badge-success';
   } else {
     badge.textContent = '未配置';
@@ -1243,11 +1463,8 @@ function updateLlmStatusBadge(configured, type) {
   }
 }
 
-/** 显示当前配置详情 */
+/** v0.5.5：显示当前配置详情（嵌入模式和非嵌入模式统一） */
 function showConfigSection(configured, type, model) {
-  // 桌面端嵌入模式下不显示配置详情（由桌面端向导统一管理）
-  if (IS_DESKTOP_EMBEDDED) return;
-
   const section = $('current-config-section');
   const content = $('current-config-content');
   if (!section || !content) return;
@@ -1263,21 +1480,62 @@ function showConfigSection(configured, type, model) {
   }
 }
 
-/** 切换 LLM 提供商时显示/隐藏对应字段 */
+/** v0.5.5：切换 LLM 提供商时自动填充模型和端点，并显示/隐藏对应字段 */
 function switchLlmProvider() {
   const provider = $('llm-provider').value;
   const openaiFields = $('openai-fields');
   const ollamaFields = $('ollama-fields');
-  if (provider === 'openai') {
-    openaiFields.style.display = '';
-    ollamaFields.style.display = 'none';
-  } else {
+  const providerInfo = LLM_PROVIDERS[provider];
+
+  // 更新提供商描述
+  const descEl = $('provider-desc');
+  if (descEl && providerInfo) {
+    descEl.textContent = providerInfo.desc || '';
+  }
+
+  if (provider === 'ollama') {
+    // Ollama 模式：显示 Ollama 字段，隐藏 OpenAI 字段
     openaiFields.style.display = 'none';
     ollamaFields.style.display = '';
+  } else {
+    // OpenAI 兼容模式：显示 OpenAI 字段，隐藏 Ollama 字段
+    openaiFields.style.display = '';
+    ollamaFields.style.display = 'none';
+
+    // 自动填充模型和端点
+    if (providerInfo) {
+      const modelEl = $('llm-model');
+      const endpointEl = $('llm-endpoint');
+      const keyEl = $('llm-api-key');
+      const modelHintEl = $('model-hint');
+
+      if (modelEl) modelEl.value = providerInfo.model || '';
+      if (endpointEl) endpointEl.value = providerInfo.url || '';
+      if (keyEl) keyEl.placeholder = providerInfo.keyHint || 'sk-...';
+
+      // 更新模型提示
+      if (modelHintEl) {
+        const hints = {
+          deepseek: '常用: deepseek-chat, deepseek-coder',
+          qwen: '常用: qwen-plus, qwen-turbo, qwen-max',
+          zhipu: '常用: glm-4, glm-4-flash, glm-3-turbo',
+          minimax: '常用: abab6.5s-chat, abab6.5-chat',
+          moonshot: '常用: moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k',
+          openai: '常用: gpt-4o, gpt-4o-mini, gpt-3.5-turbo',
+          custom: '请输入模型名称',
+        };
+        modelHintEl.textContent = hints[provider] || '';
+      }
+
+      // 自定义模式时端点可编辑，其他模式也可修改
+      if (provider === 'custom') {
+        if (endpointEl) endpointEl.placeholder = 'https://your-api-endpoint.com/v1';
+      }
+    }
   }
 }
 
-/** 保存 LLM API Key 配置 */
+/** v0.5.5：保存 LLM API Key 配置（支持多提供商，与桌面端统一） */
 async function saveLlmConfig() {
   const resultEl = $('llm-config-result');
   const btnSave = $('btn-save-llm');
@@ -1292,23 +1550,27 @@ async function saveLlmConfig() {
     const provider = $('llm-provider').value;
     let llmConfigStr = '';
 
-    if (provider === 'openai') {
+    if (provider === 'ollama') {
+      // Ollama 模式：ollama:model:host
+      const host = $('llm-ollama-host').value.trim() || 'http://localhost:11434';
+      const model = $('llm-ollama-model').value.trim() || 'llama3';
+      llmConfigStr = 'ollama:' + model + ':' + host;
+    } else {
+      // OpenAI 兼容模式：openai:apiKey:model:endpoint
       const apiKey = $('llm-api-key').value.trim();
-      const model = $('llm-model').value.trim() || 'gpt-4o-mini';
-      const endpoint = $('llm-endpoint').value.trim();
+      const model = $('llm-model').value.trim() || LLM_PROVIDERS[provider]?.model || '';
+      const endpoint = $('llm-endpoint').value.trim() || LLM_PROVIDERS[provider]?.url || '';
 
       if (!apiKey) {
         throw new Error('请输入 API Key');
       }
-      if (endpoint) {
-        llmConfigStr = 'openai:' + apiKey + ':' + model + ':' + endpoint;
-      } else {
-        llmConfigStr = 'openai:' + apiKey + ':' + model;
+      if (!model) {
+        throw new Error('请输入模型名称');
       }
-    } else if (provider === 'ollama') {
-      const host = $('llm-ollama-host').value.trim() || 'localhost';
-      const model = $('llm-ollama-model').value.trim() || 'llama3';
-      llmConfigStr = 'ollama:' + host + ':' + model;
+      if (!endpoint) {
+        throw new Error('请输入 API 端点');
+      }
+      llmConfigStr = 'openai:' + apiKey + ':' + model + ':' + endpoint;
     }
 
     const resp = await fetchWithTimeout(API_BASE + '/api/config/llm', {
@@ -1320,9 +1582,12 @@ async function saveLlmConfig() {
     const data = await resp.json();
     if (data.success) {
       resultEl.className = 'form-result success';
-      resultEl.textContent = '✅ ' + data.message + '。下次搜索时将自动使用 LLM 翻译查询。';
-      updateLlmStatusBadge(true, data.llm_type || provider);
-      showConfigSection(true, data.llm_type || provider, data.llm_model);
+      resultEl.textContent = '✅ ' + data.message + '。配置已保存并立即生效，无需重启。';
+      // 更新状态徽章
+      const providerName = LLM_PROVIDERS[provider]?.name || provider;
+      updateLlmStatusBadge(true, providerName);
+      // 更新当前配置详情
+      showConfigSection(true, providerName, data.llm_model);
     } else {
       throw new Error(data.message || '保存失败');
     }
@@ -1334,12 +1599,12 @@ async function saveLlmConfig() {
   }
 }
 
-/** 清除 LLM API Key 配置 */
+/** v0.5.5：清除 LLM API Key 配置 */
 async function clearLlmConfig() {
   const resultEl = $('llm-config-result');
   if (!resultEl) return;
 
-  if (!confirm('确定要清除 LLM API Key 配置吗？清除后将回退到 Tier 1 Fast Match 模式。')) {
+  if (!confirm('确定要清除 LLM 配置吗？清除后将无法使用自然语言搜索代码。')) {
     return;
   }
 
@@ -1357,12 +1622,16 @@ async function clearLlmConfig() {
     const data = await resp.json();
     if (data.success) {
       resultEl.className = 'form-result success';
-      resultEl.textContent = '✅ LLM API Key 配置已清除。';
+      resultEl.textContent = '✅ LLM 配置已清除。';
       updateLlmStatusBadge(false, 'none');
       showConfigSection(false, '', '');
       // 清空表单
       const apiKeyInput = $('llm-api-key');
       if (apiKeyInput) apiKeyInput.value = '';
+      const modelInput = $('llm-model');
+      if (modelInput) modelInput.value = '';
+      const endpointInput = $('llm-endpoint');
+      if (endpointInput) endpointInput.value = '';
     } else {
       throw new Error(data.message || '清除失败');
     }
@@ -1371,3 +1640,27 @@ async function clearLlmConfig() {
     resultEl.textContent = '❌ ' + e.message;
   }
 }
+
+// ============================================================
+// 暴露 HTML onclick 所需的函数到全局作用域
+// 仅暴露 13 个被 index.html 中 onclick 属性引用的函数
+// 其他所有变量和函数均保持 IIFE 私有，避免全局污染
+// ============================================================
+window.toggleNav = toggleNav;
+window.generateCaptainLog = generateCaptainLog;
+window.verifyDataLocation = verifyDataLocation;
+window.verifyNetworkAudit = verifyNetworkAudit;
+window.verifyAuditIntegrity = verifyAuditIntegrity;
+window.wizardStep1Search = wizardStep1Search;
+window.wizardStep2Write = wizardStep2Write;
+window.wizardStep3Search = wizardStep3Search;
+window.backupMemories = backupMemories;
+window.importMemories = importMemories;
+window.copyReproCmd = copyReproCmd;
+window.saveLlmConfig = saveLlmConfig;
+window.clearLlmConfig = clearLlmConfig;
+// v0.5.4 P1-7 新增：仪表盘重构相关函数
+window.loadRecentMemories = loadRecentMemories;
+window.switchToTab = switchToTab;
+
+})();

@@ -2332,6 +2332,8 @@ pub struct SystemHealthReport {
     pub gc_pending: bool,
     /// GC 上次运行时间（毫秒，0 表示从未运行）
     pub gc_last_run_ms: u64,
+    /// v0.5.4 合成是否待执行（从关键路径移出后的延迟标记）
+    pub synthesis_pending: bool,
 
     // ---- 灾难性事件 ----
     /// 灾难性事件数量

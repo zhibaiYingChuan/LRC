@@ -4,7 +4,7 @@ exclude = ["desktop/src-tauri"]
 
 [package]
 name = "code-memory"
-version = "0.4.0"
+version = "0.5.4"
 edition = "2021"
 authors = ["Open Source Contributors"]
 description = "Loong Recall (LRC) — AI 永久记忆系统，为 AI 助手提供语义代码搜索与跨会话记忆"
@@ -89,7 +89,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
-overflow-checks = false
+# v0.5.4 修复：启用溢出检查，防止整数溢出导致的安全漏洞
+overflow-checks = true
 debug = false
 debug-assertions = false
 incremental = false
@@ -103,4 +104,5 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    "Win32_Security_Cryptography",
 ] }

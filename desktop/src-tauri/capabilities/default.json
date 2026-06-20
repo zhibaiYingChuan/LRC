@@ -1,11 +1,34 @@
 {
   "identifier": "default",
-  "description": "LRC Desktop 默认权限配置",
+  "description": "LRC Desktop 默认权限配置（v0.5.4 收紧：添加 scope 白名单）",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "shell:allow-open",
-    "shell:allow-execute",
-    "shell:allow-spawn"
+    {
+      "identifier": "shell:allow-open",
+      "allow": [
+        { "url": "https://**" },
+        { "url": "http://127.0.0.1:3099/**" },
+        { "url": "http://localhost:3099/**" }
+      ]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "lrc-sidecar",
+          "sidecar": true
+        }
+      ]
+    },
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "lrc-sidecar",
+          "sidecar": true
+        }
+      ]
+    }
   ]
 }

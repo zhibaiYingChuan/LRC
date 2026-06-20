@@ -24,8 +24,9 @@ RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo fetch || true
 RUN rm -rf src
 
-# 复制源码
+# 复制源码和静态资源（编译时通过 include_str! 嵌入）
 COPY src/ ./src/
+COPY static/ ./static/
 
 # 编译 release 版本（仅 server feature）
 RUN cargo build --release --features server --bin code-memory-server \

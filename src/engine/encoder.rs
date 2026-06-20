@@ -46,13 +46,19 @@ impl EmbeddingVector {
 
         (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
     }
+
+    /// v0.5.4 检查向量中是否包含 NaN 值
+    /// NaN 值会破坏 HNSW 图的结构和检索精度，必须在插入前检测并拒绝
+    pub fn has_nan(&self) -> bool {
+        self.values.iter().any(|v| v.is_nan())
+    }
 }
 
 /// 编码器契约
 pub trait CodeEncoder: Send + Sync {
-    fn encode(&self, chunk: &CodeChunk) -> EmbeddingVector;
+    fn encode(&self, chunk: &CodeChunk) -> Result<EmbeddingVector, String>;
 
-    fn encode_batch(&self, chunks: &[CodeChunk]) -> Vec<EmbeddingVector> {
+    fn encode_batch(&self, chunks: &[CodeChunk]) -> Result<Vec<EmbeddingVector>, String> {
         chunks.iter().map(|c| self.encode(c)).collect()
     }
 
@@ -82,7 +88,7 @@ impl FastEncoder {
 }
 
 impl CodeEncoder for FastEncoder {
-    fn encode(&self, chunk: &CodeChunk) -> EmbeddingVector {
+    fn encode(&self, chunk: &CodeChunk) -> Result<EmbeddingVector, String> {
         let combined = format!(
             "{} {} {}",
             chunk.signature,
@@ -90,10 +96,10 @@ impl CodeEncoder for FastEncoder {
             chunk.content
         );
         let values = self.signal_map(&combined);
-        EmbeddingVector {
+        Ok(EmbeddingVector {
             dim: self.dim,
             values,
-        }
+        })
     }
 
     fn dimension(&self) -> usize {
@@ -168,7 +174,7 @@ mod tests {
     fn test_encoder_output() {
         let encoder = FastEncoder::new(vec!["alpha".into(), "beta".into()]);
         let chunk = make_chunk("test", "fn test() { alpha beta gamma }");
-        let vec = encoder.encode(&chunk);
+        let vec = encoder.encode(&chunk).unwrap();
         assert_eq!(vec.dim, 2);
         assert!(vec.values[0] > 0.0);
         assert!(vec.values[1] > 0.0);
@@ -182,7 +188,7 @@ mod tests {
             make_chunk("b", "fn b() {}"),
             make_chunk("c", "fn c() {}"),
         ];
-        let vectors = encoder.encode_batch(&chunks);
+        let vectors = encoder.encode_batch(&chunks).unwrap();
         assert_eq!(vectors.len(), 3);
     }
 }

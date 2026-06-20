@@ -109,6 +109,8 @@ impl HnswGraph {
                 .iter()
                 .enumerate()
                 .min_by(|(_, (_, a)), (_, (_, b))| {
+                    // v0.5.4 NaN 防护：NaN 向量已在 insert_node 中拒绝，
+                    // 此处 partial_cmp 不会遇到 NaN，unwrap_or 为防御性保留
                     a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|(i, _)| i)
@@ -141,7 +143,10 @@ impl HnswGraph {
                     results.push((neighbor_idx, dist));
                     // 保持结果集按距离升序
                     results
-                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                        .sort_by(|a, b| {
+                            // v0.5.4 NaN 防护：NaN 向量已在插入时过滤，防御性保留
+                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
                     // 截断到 ef
                     if results.len() > ef {
                         results.truncate(ef);
@@ -162,6 +167,15 @@ impl HnswGraph {
     /// 3. 建立双向连接
     /// 4. 对超限的邻居进行剪枝
     fn insert_node(&mut self, vector: EmbeddingVector, chunk_idx: usize) {
+        // v0.5.4 NaN 值防护：插入前验证向量有效性
+        // NaN 值会破坏 HNSW 图的搜索逻辑（partial_cmp 对所有 NaN 返回 None）
+        if vector.has_nan() {
+            eprintln!(
+                "[LRC·HNSW] 警告：检测到 NaN 向量，拒绝插入 (chunk_idx={})",
+                chunk_idx
+            );
+            return;
+        }
         let node_idx = self.nodes.len();
         // 先推入节点，确保 prune_neighbors 可以访问 self.nodes[node_idx]
         let node = HnswNode::new(vector, chunk_idx);
@@ -215,6 +229,7 @@ impl HnswGraph {
             .collect();
 
         // 按距离升序排序，保留最近的 max 个
+        // v0.5.4 NaN 防护：NaN 向量已在插入时过滤，防御性保留
         neighbor_dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let pruned: Vec<usize> = neighbor_dists
@@ -284,10 +299,16 @@ impl<E: CodeEncoder> HnswRetriever<E> {
 
     /// 索引单个代码片段
     pub fn index_chunk(&mut self, chunk: CodeChunk) {
-        let vector = self.encoder.encode(&chunk);
-        let chunk_idx = self.chunks.len();
-        self.chunks.push(chunk);
-        self.graph.insert_node(vector, chunk_idx);
+        match self.encoder.encode(&chunk) {
+            Ok(vector) => {
+                let chunk_idx = self.chunks.len();
+                self.chunks.push(chunk);
+                self.graph.insert_node(vector, chunk_idx);
+            }
+            Err(e) => {
+                eprintln!("[LRC·HNSW] 编码失败，跳过片段 '{}': {}", chunk.name, e);
+            }
+        }
     }
 
     /// 批量索引
@@ -333,7 +354,18 @@ impl<E: CodeEncoder> CodeRetriever for HnswRetriever<E> {
             doc_comment: None,
             language: "text".to_string(),
         };
-        let query_vector = self.encoder.encode(&query_chunk);
+        let query_vector = match self.encoder.encode(&query_chunk) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[LRC·HNSW] 查询编码失败: {}", e);
+                return RetrievalResult {
+                    query: query.to_string(),
+                    returned: 0,
+                    total_indexed: self.chunks.len(),
+                    results: Vec::new(),
+                };
+            }
+        };
 
         // 通过 NSW 图搜索
         let entry = self.graph.entry_point.unwrap_or(0);

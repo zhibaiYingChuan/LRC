@@ -51,13 +51,13 @@ impl EncoderRegistry {
     }
 
     /// 编码单个代码片段（自动按语言路由）
-    pub fn encode(&self, chunk: &CodeChunk) -> EmbeddingVector {
+    pub fn encode(&self, chunk: &CodeChunk) -> Result<EmbeddingVector, String> {
         let encoder = self.get_encoder(&chunk.language);
         encoder.encode(chunk)
     }
 
     /// 批量编码（自动按语言路由每个片段）
-    pub fn encode_batch(&self, chunks: &[CodeChunk]) -> Vec<EmbeddingVector> {
+    pub fn encode_batch(&self, chunks: &[CodeChunk]) -> Result<Vec<EmbeddingVector>, String> {
         chunks.iter().map(|c| self.encode(c)).collect()
     }
 
@@ -115,7 +115,7 @@ mod tests {
 
         // 使用默认编码器编码任意语言
         let chunk = make_chunk("rust", "fn main() {}");
-        let vec = registry.encode(&chunk);
+        let vec = registry.encode(&chunk).unwrap();
         assert!(vec.dim > 0, "默认编码器应产生向量");
     }
 
@@ -132,12 +132,12 @@ mod tests {
 
         // rust 应路由到专用编码器（dim=2）
         let rust_chunk = make_chunk("rust", "struct Foo { x: i32 }");
-        let rust_vec = registry.encode(&rust_chunk);
+        let rust_vec = registry.encode(&rust_chunk).unwrap();
         assert_eq!(rust_vec.dim, 2, "rust 应使用专用编码器");
 
         // python 应回退到默认编码器（dim=8）
         let py_chunk = make_chunk("python", "def foo(): pass");
-        let py_vec = registry.encode(&py_chunk);
+        let py_vec = registry.encode(&py_chunk).unwrap();
         assert_eq!(py_vec.dim, 8, "python 应回退到默认编码器");
     }
 
@@ -149,7 +149,7 @@ mod tests {
 
         // 大小写不敏感的注册查找
         let chunk = make_chunk("rust", "fn main() { alpha }");
-        let vec = registry.encode(&chunk);
+        let vec = registry.encode(&chunk).unwrap();
         assert_eq!(vec.dim, 1, "大小写不敏感匹配");
     }
 
@@ -165,7 +165,7 @@ mod tests {
         // 覆盖后应只有一个 typescript 编码器
         assert_eq!(registry.encoder_count(), 1);
         let chunk = make_chunk("typescript", "const x = b;");
-        let vec = registry.encode(&chunk);
+        let vec = registry.encode(&chunk).unwrap();
         assert_eq!(vec.dim, 2, "应使用最后注册的编码器");
     }
 
@@ -182,7 +182,7 @@ mod tests {
             make_chunk("go", "func main() {}"),
         ];
 
-        let vectors = registry.encode_batch(&chunks);
+        let vectors = registry.encode_batch(&chunks).unwrap();
         assert_eq!(vectors.len(), 4);
 
         // rust 片段用专用编码器（dim=2），其他用默认编码器（dim=1）

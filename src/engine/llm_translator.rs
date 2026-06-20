@@ -249,6 +249,11 @@ pub async fn translate_memory_query(config: &LlmApiConfig, query: &str) -> Vec<S
 }
 
 /// 通过 OpenAI 兼容 API 翻译查询
+///
+/// v0.5.4 P2-11 修复：LLM 响应解析安全化
+/// - 所有解析失败路径都有详细日志
+/// - 空 choices 数组时记录警告并返回错误
+/// - 响应解析失败时记录原始响应（截断前 200 字符）便于调试
 async fn translate_openai(
     endpoint: &str,
     api_key: &str,
@@ -283,13 +288,31 @@ async fn translate_openai(
         .map_err(|e| format!("LLM 请求失败: {}", e))?;
 
     if !response.status().is_success() {
-        return Err(format!("LLM API 返回错误: {}", response.status()));
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        eprintln!("[LRC·LLM] OpenAI API 返回错误状态: {} (响应: {:.200})", status, body);
+        return Err(format!("LLM API 返回错误: {}", status));
     }
 
-    let body: OpenAiChatResponse = response
-        .json()
+    // v0.5.4 P2-11 修复：先获取原始文本，解析失败时可以记录用于调试
+    let raw_body = response
+        .text()
         .await
-        .map_err(|e| format!("解析 LLM 响应失败: {}", e))?;
+        .map_err(|e| format!("读取 LLM 响应体失败: {}", e))?;
+
+    let body: OpenAiChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
+        eprintln!(
+            "[LRC·LLM] OpenAI 响应 JSON 解析失败: {} (原始响应: {:.200})",
+            e, raw_body
+        );
+        format!("解析 LLM 响应失败: {}", e)
+    })?;
+
+    // v0.5.4 P2-11 修复：防御性检查空 choices 数组
+    if body.choices.is_empty() {
+        eprintln!("[LRC·LLM] OpenAI 返回空 choices 数组，可能模型拒绝回答或发生内部错误");
+        return Err("LLM 返回空 choices 数组".to_string());
+    }
 
     let content = body
         .choices
@@ -297,10 +320,21 @@ async fn translate_openai(
         .map(|c| c.message.content.clone())
         .unwrap_or_default();
 
+    // v0.5.4 P2-11 修复：防御性检查空内容
+    if content.trim().is_empty() {
+        eprintln!("[LRC·LLM] OpenAI 返回空内容，使用原始查询回退");
+        return Err("LLM 返回空内容".to_string());
+    }
+
     Ok(parse_keywords(&content))
 }
 
 /// 通过 Ollama 本地模型翻译查询
+///
+/// v0.5.4 P2-11 修复：LLM 响应解析安全化
+/// - 所有解析失败路径都有详细日志
+/// - 空内容时记录警告并返回错误
+/// - 响应解析失败时记录原始响应（截断前 200 字符）便于调试
 async fn translate_ollama(
     host: &str,
     model: &str,
@@ -332,13 +366,31 @@ async fn translate_ollama(
         .map_err(|e| format!("Ollama 请求失败: {}", e))?;
 
     if !response.status().is_success() {
-        return Err(format!("Ollama API 返回错误: {}", response.status()));
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        eprintln!("[LRC·LLM] Ollama API 返回错误状态: {} (响应: {:.200})", status, body);
+        return Err(format!("Ollama API 返回错误: {}", status));
     }
 
-    let body: OllamaChatResponse = response
-        .json()
+    // v0.5.4 P2-11 修复：先获取原始文本，解析失败时可以记录用于调试
+    let raw_body = response
+        .text()
         .await
-        .map_err(|e| format!("解析 Ollama 响应失败: {}", e))?;
+        .map_err(|e| format!("读取 Ollama 响应体失败: {}", e))?;
+
+    let body: OllamaChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
+        eprintln!(
+            "[LRC·LLM] Ollama 响应 JSON 解析失败: {} (原始响应: {:.200})",
+            e, raw_body
+        );
+        format!("解析 Ollama 响应失败: {}", e)
+    })?;
+
+    // v0.5.4 P2-11 修复：防御性检查空内容
+    if body.message.content.trim().is_empty() {
+        eprintln!("[LRC·LLM] Ollama 返回空内容，使用原始查询回退");
+        return Err("Ollama 返回空内容".to_string());
+    }
 
     Ok(parse_keywords(&body.message.content))
 }

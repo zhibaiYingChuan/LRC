@@ -20,6 +20,7 @@
 //   LRC_LUOSHU_MODEL_ID=sentence-transformers/all-MiniLM-L6-v2  (默认)
 
 use super::luoshu_encoder::{EncoderStatus, LuoShuEncoder, LuoShuVector, LUOSHU_WEIGHTS};
+use super::pooling::PoolingStrategy;
 use candle_core::{Device, Tensor};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -43,13 +44,6 @@ pub struct LuoShuMlEncoder {
     hidden_size: usize,
 }
 
-/// ML 编码器池化策略
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PoolingStrategy {
-    Cls,
-    Mean,
-}
-
 impl LuoShuMlEncoder {
     /// 道枢映射: 坤卦·地 (☷) — 承载万物，模型加载是编码能力的根基
     /// 加载默认的轻量级多语言模型
@@ -64,11 +58,9 @@ impl LuoShuMlEncoder {
     pub fn load() -> Result<Self, String> {
         // ════════════════════════════════════════════════════════════
         // 本地镜像守卫 — 确保 hf-hub 库的下载请求走国内镜像
-        // 与 server.rs 中的全局守卫互为冗余，防止任何漏网之鱼
-        // ════════════════════════════════════════════════════════════
-        if std::env::var("HF_ENDPOINT").is_err() {
-            std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
-        }
+        // v0.5.4 修复：使用 ApiBuilder::with_endpoint 替代 set_var，避免多线程数据竞争
+        let hf_endpoint = std::env::var("HF_ENDPOINT")
+            .unwrap_or_else(|_| "https://hf-mirror.com".to_string());
 
         let device = Device::Cpu;
 
@@ -129,7 +121,10 @@ impl LuoShuMlEncoder {
                 .map_err(|e| format!("加载本地分词器失败: {}", e))?
         } else {
             let api =
-                hf_hub::api::sync::Api::new().map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
+                hf_hub::api::sync::ApiBuilder::new()
+                    .with_endpoint(hf_endpoint.clone())
+                    .build()
+                    .map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
             let repo = api.model(model_id.clone());
             let tokenizer_path = repo
                 .get("tokenizer.json")
@@ -207,7 +202,10 @@ impl LuoShuMlEncoder {
             (model, hidden_size)
         } else {
             let api =
-                hf_hub::api::sync::Api::new().map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
+                hf_hub::api::sync::ApiBuilder::new()
+                    .with_endpoint(hf_endpoint.clone())
+                    .build()
+                    .map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
             let repo = api.model(model_id);
 
             let config_path = repo

@@ -1,12 +1,12 @@
 /// Sidecar 进程管理器
 ///
-/// 管理 code-memory-server 子进程的生命周期。
-/// 对接现有的 server.rs，通过 HTTP 通信。
+/// 管理 lrc-sidecar 子进程的生命周期。
+/// 支持多项目同时运行：每个项目对应一个独立的 sidecar 进程。
 ///
 /// 生命周期保证：
-///   - Drop 时自动 kill 子进程（防止僵尸进程）
+///   - Drop 时自动 kill 所有子进程（防止僵尸进程）
 ///   - 启动时等待健康检查通过（最多 10 秒）
-///   - 端口自适应：扫描起始端口 + 10 范围，匹配 sidecar 实际绑定端口
+///   - 端口自适应：每个 sidecar 自动扫描可用端口
 ///
 /// 默认端口：3099（与 sidecar 默认值一致）。
 /// 注意：不要传 0，因为 0 会导致 sidecar 尝试绑定特权端口（<1024）而失败。
@@ -14,41 +14,77 @@ const DEFAULT_SIDECAR_PORT: u16 = 3099;
 /// 端口扫描范围：实际端口 = 起始端口 + 0..PORT_SCAN_RANGE
 /// 与 server.rs 中 find_available_port 的 scan_range(100) 保持一致
 const PORT_SCAN_RANGE: u16 = 100;
+use std::collections::HashMap;
 use std::process::{Child, Command};
 use std::time::Duration;
 
+// Windows: 隐藏 sidecar 进程的 CMD 窗口
+// 普通用户看到 CMD 窗口会困惑，且误关闭可能导致后端进程异常
+// 使用 CREATE_NO_WINDOW 标志确保进程完全静默运行
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+/// Windows 进程创建标志：CREATE_NO_WINDOW = 0x08000000
+/// 进程在后台静默运行，不显示任何控制台窗口
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// 单个 Sidecar 实例的运行状态（可序列化，供前端使用）
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SidecarInstance {
+    /// 项目路径（用于标识）
+    pub project_dir: String,
+    /// 运行状态
+    pub state: SidecarState,
+    /// 是否正在运行（供前端直接使用布尔值）
+    pub running: bool,
+    /// 实际绑定的端口
+    pub port: u16,
+    /// 进程 PID
+    pub pid: u32,
+}
+
 /// Sidecar 运行状态
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum SidecarState {
     /// 未启动
     Stopped,
     /// 启动中（等待健康检查）
     Starting,
     /// 运行中
-    Running { pid: u32, port: u16 },
+    Running,
     /// 发生错误
     Error(String),
 }
 
-/// Sidecar 进程管理器
+/// Sidecar 进程管理器（支持多项目）
 pub struct SidecarManager {
-    /// 当前状态
-    state: SidecarState,
-    /// 子进程句柄
-    child: Option<Child>,
+    /// 所有运行中的 sidecar 实例，按项目路径索引
+    instances: HashMap<String, SidecarHandle>,
     /// 二进制路径
     binary_path: String,
 }
 
-/// Drop 守卫：确保子进程在管理器被销毁时被 kill
+/// 单个 sidecar 进程句柄
+struct SidecarHandle {
+    child: Child,
+    port: u16,
+    project_dir: String,
+    /// v0.5.1 新增：保存启动参数，用于崩溃恢复时自动重启
+    src_dir: Option<String>,
+    multi_window: Option<u32>,
+    llm_api: Option<String>,
+}
+
+/// Drop 守卫：确保所有子进程在管理器被销毁时被 kill
 impl Drop for SidecarManager {
     fn drop(&mut self) {
-        if let Some(ref mut child) = self.child {
-            tracing::info!("SidecarManager 释放，kill 子进程 PID={}", child.id());
-            // 尝试优雅终止（先 SIGTERM / Ctrl+C），再 SIGKILL
+        for (project_dir, handle) in self.instances.drain() {
+            let pid = handle.child.id();
+            tracing::info!("SidecarManager 释放，kill 子进程 project={}, PID={}", project_dir, pid);
+            // 尝试优雅终止
+            let mut child = handle.child;
             let _ = child.kill();
-            // 不等待退出，避免阻塞 Drop
-            self.child = None;
         }
     }
 }
@@ -58,7 +94,7 @@ impl SidecarManager {
     /// 
     /// 自动搜索多个可能位置（按优先级）：
     /// 1. 指定的 binary_path
-    /// 2. 同目录下的 code-memory-server.exe
+    /// 2. 同目录下的 lrc-sidecar.exe
     /// 3. resources/ 子目录
     pub fn new(binary_path: String) -> Self {
         // 自动搜索 sidecar 二进制（如果指定路径不存在）
@@ -69,8 +105,7 @@ impl SidecarManager {
         };
         tracing::info!("Sidecar 二进制路径: {resolved_path}");
         Self {
-            state: SidecarState::Stopped,
-            child: None,
+            instances: HashMap::new(),
             binary_path: resolved_path,
         }
     }
@@ -82,7 +117,7 @@ impl SidecarManager {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        let binary_name = format!("code-memory-server{}", std::env::consts::EXE_SUFFIX);
+        let binary_name = format!("lrc-sidecar{}", std::env::consts::EXE_SUFFIX);
 
         // 搜索路径（按优先级）
         let search_paths = [
@@ -103,17 +138,63 @@ impl SidecarManager {
         exe_dir.join(&binary_name).display().to_string()
     }
 
-    /// 获取当前状态
-    pub fn status(&self) -> &SidecarState {
-        &self.state
+    /// 获取所有运行中的实例信息
+    pub fn list_instances(&self) -> Vec<SidecarInstance> {
+        self.instances
+            .iter()
+            .map(|(project_dir, handle)| SidecarInstance {
+                project_dir: project_dir.clone(),
+                state: SidecarState::Running,
+                running: true,
+                port: handle.port,
+                pid: handle.child.id(),
+            })
+            .collect()
     }
 
-    /// 检查 sidecar 是否正在运行
+    /// 获取指定项目的实例信息
+    pub fn get_instance(&self, project_dir: &str) -> Option<SidecarInstance> {
+        self.instances.get(project_dir).map(|handle| SidecarInstance {
+            project_dir: handle.project_dir.clone(),
+            state: SidecarState::Running,
+            running: true,
+            port: handle.port,
+            pid: handle.child.id(),
+        })
+    }
+
+    /// 检查是否有 sidecar 正在运行
     pub fn is_running(&self) -> bool {
-        matches!(self.state, SidecarState::Running { .. })
+        !self.instances.is_empty()
     }
 
-    /// 启动 sidecar 进程
+    /// 检查指定项目的 sidecar 是否正在运行
+    pub fn is_project_running(&self, project_dir: &str) -> bool {
+        self.instances.contains_key(project_dir)
+    }
+
+    /// 检查进程是否存活（跨平台，静态方法）
+    ///
+    /// Windows: 通过子进程句柄的 try_wait 检查
+    /// Unix: 发送信号 0 检查进程是否存在
+    fn is_process_alive(child: &mut Child) -> bool {
+        #[cfg(target_os = "windows")]
+        {
+            match child.try_wait() {
+                Ok(None) => true,      // 进程仍在运行
+                Ok(Some(_)) => false,  // 进程已退出
+                Err(_) => true,        // try_wait 失败时保守假设仍在运行
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // SAFETY: kill(pid, 0) 是 POSIX 标准调用，信号 0 仅检查进程是否存在，不发送实际信号
+            unsafe { libc::kill(child.id() as i32, 0) == 0 }
+        }
+    }
+
+    /// 启动 sidecar 进程（兼容旧接口，使用默认项目标识）
     /// 返回实际使用的端口号
     pub async fn start(
         &mut self,
@@ -122,81 +203,213 @@ impl SidecarManager {
         multi_window: Option<u32>,
         llm_api: Option<String>,
     ) -> Result<u16, String> {
-        // 如果已在运行，检查进程是否存活
-        if let SidecarState::Running { pid, port } = self.state {
-            if self.is_process_alive(pid) {
-                return Ok(port);
+        // 使用项目路径作为默认标识，若未指定则使用 "default"
+        let project_key = src_dir.clone().unwrap_or_else(|| "default".to_string());
+        self.start_for_project(&project_key, src_dir, port, multi_window, llm_api).await
+    }
+
+    /// 为指定项目启动 sidecar 进程
+    /// 
+    /// 每个项目可以有独立的 sidecar，绑定不同端口。
+    /// 如果该项目的 sidecar 已在运行，直接返回端口。
+    /// 返回实际使用的端口号。
+    pub async fn start_for_project(
+        &mut self,
+        project_key: &str,
+        src_dir: Option<String>,
+        port: Option<u16>,
+        multi_window: Option<u32>,
+        llm_api: Option<String>,
+    ) -> Result<u16, String> {
+        // 如果该项目的 sidecar 已在运行，检查进程是否存活
+        if let Some(handle) = self.instances.get_mut(project_key) {
+            if Self::is_process_alive(&mut handle.child) {
+                tracing::info!(
+                    "项目 {} 的 sidecar 已在运行 (PID={}, port={})",
+                    project_key, handle.child.id(), handle.port
+                );
+                return Ok(handle.port);
             }
-            // 进程已死，清理状态
-            tracing::warn!("Sidecar PID={pid} 已退出，重新启动");
-            self.child = None;
-            self.state = SidecarState::Stopped;
+            // 进程已死，清理
+            tracing::warn!("项目 {} 的 sidecar 已退出，重新启动", project_key);
+            self.instances.remove(project_key);
         }
 
-        self.state = SidecarState::Starting;
-
-        // 使用 sensible 默认端口（3099），而非 0（0 会导致 sidecar 尝试绑定特权端口）
+        // 使用 sensible 默认端口（3099），而非 0
         let actual_port = port.unwrap_or(DEFAULT_SIDECAR_PORT);
 
         // 构建启动参数
         let mut cmd = Command::new(&self.binary_path);
-        cmd.args(["--port", &actual_port.to_string()]);
+        // Windows: 隐藏 sidecar 进程的 CMD 窗口
+        // 使用 CREATE_NO_WINDOW 确保进程完全静默，不弹出任何控制台
+        #[cfg(target_os = "windows")]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        // 守护模式：不自动打开浏览器（桌面端自行管理 UI）
+        cmd.args(["--daemon", "--port", &actual_port.to_string()]);
 
-        if let Some(dir) = src_dir {
-            cmd.args(["--src-dir", &dir]);
+        if let Some(ref dir) = src_dir {
+            cmd.args(["--src-dir", dir]);
         }
 
-        // 多窗口模式：始终传递 --multi-window 参数给 sidecar（ON=3, OFF=1）
+        // 多窗口模式
         if let Some(mw) = multi_window {
             cmd.args(["--multi-window", &mw.to_string()]);
             tracing::info!("多窗口模式：{} 个 LRC 实例上限", mw);
         }
 
-        // 传递 LLM API 配置（从桌面端向导读取，确保仪表盘感知配置状态）
+        // v0.5.4 安全修复：使用环境变量传递 LLM API Key，而非命令行参数
+        // 命令行参数会暴露在进程列表中，任何系统进程查看工具都能看到 API Key
+        // 环境变量仅在当前进程及子进程中可见，无法被其他进程读取
         if let Some(ref llm) = llm_api {
             if !llm.is_empty() {
-                cmd.args(["--llm-api", llm]);
-                tracing::info!("已传递 LLM 配置到 Sidecar（类型: {}）",
-                    llm.split(':').next().unwrap_or("unknown"));
+                cmd.env("LRC_LLM_API", llm);
+                tracing::info!(
+                    "已通过环境变量传递 LLM 配置到 Sidecar（项目: {}, 类型: {}）",
+                    project_key,
+                    llm.split(':').next().unwrap_or("unknown")
+                );
             }
         }
 
         // 启动子进程
-        let child = cmd
+        let mut child = cmd
             .spawn()
-            .map_err(|e| format!("启动 sidecar 失败: {e}"))?;
+            .map_err(|e| format!("启动 sidecar 失败 (项目: {}): {e}", project_key))?;
 
         let pid = child.id();
-        self.child = Some(child);
 
         // 等待健康检查通过（最多 10 秒）
-        let port = self.wait_for_health(pid, actual_port).await?;
+        let port = self.wait_for_health(&mut child, actual_port).await?;
 
-        self.state = SidecarState::Running { pid, port };
+        // 存储实例（保存启动参数用于崩溃恢复）
+        let project_dir = src_dir.clone().unwrap_or_else(|| project_key.to_string());
+        self.instances.insert(
+            project_key.to_string(),
+            SidecarHandle {
+                child,
+                port,
+                project_dir: project_dir.clone(),
+                src_dir: src_dir.clone(),
+                multi_window,
+                llm_api: llm_api.clone(),
+            },
+        );
 
-        tracing::info!("Sidecar 已启动: PID={pid}, port={port}");
+        tracing::info!(
+            "Sidecar 已启动: 项目={}, PID={}, port={}",
+            project_key, pid, port
+        );
         Ok(port)
     }
 
-    /// 停止 sidecar 进程
+    /// 停止 sidecar 进程（兼容旧接口，停止所有实例）
     pub async fn stop(&mut self) -> Result<(), String> {
-        if let Some(mut child) = self.child.take() {
-            let pid = child.id();
+        self.stop_all().await
+    }
+
+    /// 停止所有项目的 sidecar 进程
+    pub async fn stop_all(&mut self) -> Result<(), String> {
+        let project_keys: Vec<String> = self.instances.keys().cloned().collect();
+        for key in project_keys {
+            let _ = self.stop_project(&key).await;
+        }
+        Ok(())
+    }
+
+    /// 停止指定项目的 sidecar 进程
+    pub async fn stop_project(&mut self, project_key: &str) -> Result<(), String> {
+        if let Some(mut handle) = self.instances.remove(project_key) {
+            let pid = handle.child.id();
             // 先尝试优雅终止
-            let _ = child.kill();
+            let _ = handle.child.kill();
             // 等待进程退出（最多 5 秒）
             let wait_result = tokio::time::timeout(
                 Duration::from_secs(5),
-                tokio::task::spawn_blocking(move || child.wait()),
+                tokio::task::spawn_blocking(move || handle.child.wait()),
             )
             .await
-            .map_err(|_| "等待 sidecar 退出超时".to_string())?
+            .map_err(|_| format!("等待 sidecar 退出超时 (项目: {project_key})"))?
             .map_err(|e| format!("等待 sidecar 退出失败: {e}"))?;
 
-            tracing::info!("Sidecar PID={pid} 已停止: {:?}", wait_result);
+            tracing::info!(
+                "Sidecar 已停止: 项目={}, PID={}: {:?}",
+                project_key, pid, wait_result
+            );
         }
-        self.state = SidecarState::Stopped;
         Ok(())
+    }
+
+    /// v0.5.1 新增：崩溃恢复 — 检测并自动重启已死亡的 sidecar 实例
+    ///
+    /// 遍历所有运行中的实例，检查进程是否存活。
+    /// 如果进程已死亡，自动使用保存的启动参数重新启动。
+    /// 返回恢复的实例数量。
+    pub async fn recover_dead_instances(&mut self, fresh_llm_api: Option<String>) -> usize {
+        let mut recovered = 0usize;
+        // 先收集所有已死亡的实例 key（避免借用冲突）
+        let dead_keys: Vec<String> = {
+            let mut keys = Vec::new();
+            for (key, handle) in self.instances.iter_mut() {
+                if !Self::is_process_alive(&mut handle.child) {
+                    keys.push(key.clone());
+                }
+            }
+            keys
+        };
+
+        for key in dead_keys {
+            // 获取保存的启动参数
+            let (src_dir, multi_window, llm_api) = if let Some(handle) = self.instances.remove(&key) {
+                tracing::warn!(
+                    "检测到 sidecar 已死亡: 项目={}, 端口={}, 尝试自动恢复...",
+                    key, handle.port
+                );
+                // v0.5.4 修复：优先使用传入的最新 LLM 配置，而非崩溃前保存的旧值
+                // 用户可能在 sidecar 崩溃后更新了 LLM 配置，恢复时应使用最新值
+                let effective_llm = fresh_llm_api.clone().or(handle.llm_api);
+                (handle.src_dir, handle.multi_window, effective_llm)
+            } else {
+                continue;
+            };
+
+            // 尝试重新启动
+            match self
+                .start_for_project(&key, src_dir, None, multi_window, llm_api)
+                .await
+            {
+                Ok(port) => {
+                    recovered += 1;
+                    tracing::info!(
+                        "Sidecar 崩溃恢复成功: 项目={}, 新端口={}",
+                        key, port
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Sidecar 崩溃恢复失败: 项目={}, 错误: {}",
+                        key, e
+                    );
+                }
+            }
+        }
+
+        if recovered > 0 {
+            tracing::info!("崩溃恢复完成，共恢复 {} 个实例", recovered);
+        }
+        recovered
+    }
+
+    /// 重启指定项目的 sidecar
+    pub async fn restart_project(
+        &mut self,
+        project_key: &str,
+        src_dir: Option<String>,
+        port: Option<u16>,
+        multi_window: Option<u32>,
+        llm_api: Option<String>,
+    ) -> Result<u16, String> {
+        self.stop_project(project_key).await?;
+        self.start_for_project(project_key, src_dir, port, multi_window, llm_api).await
     }
 
     /// 等待 sidecar 健康检查通过
@@ -205,7 +418,8 @@ impl SidecarManager {
     /// 因此从起始端口开始扫描 PORT_SCAN_RANGE 个端口，找到实际绑定的端口。
     /// 
     /// 每 500ms 检查一次，最多尝试 20 次（10 秒）
-    async fn wait_for_health(&mut self, pid: u32, start_port: u16) -> Result<u16, String> {
+    async fn wait_for_health(&self, child: &mut Child, start_port: u16) -> Result<u16, String> {
+        let pid = child.id();
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
@@ -213,7 +427,7 @@ impl SidecarManager {
 
         for attempt in 1..=20 {
             // 检查进程是否还活着
-            if !self.is_process_alive(pid) {
+            if !Self::is_process_alive(child) {
                 return Err(format!("Sidecar 进程 PID={pid} 启动后意外退出"));
             }
 
@@ -252,39 +466,14 @@ impl SidecarManager {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        // 健康检查超时，但进程还在运行，仍返回起始端口（让用户自行验证）
-        tracing::warn!("Sidecar 健康检查超时，但进程 PID={pid} 仍在运行");
-        Ok(start_port)
-    }
-
-    /// 检查进程是否存活（跨平台）
-    ///
-    /// Windows: 尝试通过 try_wait 检查子进程是否已退出
-    /// Unix: 发送信号 0 检查进程是否存在
-    fn is_process_alive(&mut self, pid: u32) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            // Windows: 使用子进程句柄的 try_wait 检查
-            if let Some(ref mut child) = self.child {
-                match child.try_wait() {
-                    Ok(None) => true,  // 进程仍在运行
-                    Ok(Some(_)) => false, // 进程已退出
-                    Err(_) => {
-                        // try_wait 失败时回退到 PID 检查
-                        let _ = pid;
-                        true
-                    }
-                }
-            } else {
-                false
-            }
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            // Unix：发送信号 0 检查进程是否存在
-            unsafe { libc::kill(pid as i32, 0) == 0 }
-        }
+        // 健康检查超时，返回错误而非假成功（修复 H08）
+        // 用户需要知道 sidecar 未就绪的真实状态，而非被"假成功"误导
+        tracing::error!("Sidecar 健康检查超时（20次/10秒），进程 PID={pid} 仍在运行但不可达");
+        Err(format!(
+            "Sidecar 健康检查超时：进程 PID={pid} 在端口 {}-{} 范围均不可达，已尝试 20 次（10 秒）。请检查端口是否被占用或防火墙设置。",
+            start_port,
+            start_port + PORT_SCAN_RANGE - 1
+        ))
     }
 }
 
@@ -292,16 +481,21 @@ impl SidecarManager {
 mod tests {
     use super::*;
 
-    /// TDD：测试初始状态为 Stopped
+    /// TDD：测试初始状态无运行实例
     #[test]
     fn test_initial_state_is_stopped() {
         let manager = SidecarManager::new("test-server.exe".into());
-        assert!(matches!(manager.status(), SidecarState::Stopped));
+        assert!(!manager.is_running());
+        assert!(manager.list_instances().is_empty());
     }
 
-    /// TDD：测试重复启动返回相同端口
+    /// TDD：测试多实例管理
     #[test]
-    fn test_double_start_returns_same_port() {
-        // 此测试需要 mock 子进程，在集成测试中验证
+    fn test_multiple_instances() {
+        let manager = SidecarManager::new("test-server.exe".into());
+        // 初始状态无实例
+        assert!(!manager.is_project_running("project_a"));
+        assert!(!manager.is_project_running("project_b"));
+        assert_eq!(manager.list_instances().len(), 0);
     }
 }

@@ -65,7 +65,15 @@ impl WizardConfig {
                 // parts: [openai, api_key, model, base_url]
                 if let Some(api_key) = parts.get(1) {
                     if !api_key.is_empty() {
-                        self.encrypted_api_key = crypto::encrypt_api_key(api_key)?;
+                        // v0.5.4 修复：API Key 清洗 — trim + 过滤 \r\n 等控制字符
+                        let cleaned_key: String = api_key
+                            .trim()
+                            .chars()
+                            .filter(|c| !c.is_control() || *c == ' ')
+                            .collect();
+                        if !cleaned_key.is_empty() {
+                            self.encrypted_api_key = crypto::encrypt_api_key(&cleaned_key)?;
+                        }
                     }
                 }
                 if let Some(model) = parts.get(2) {
@@ -173,6 +181,9 @@ impl Default for WizardConfig {
 pub struct WizardState {
     config: WizardConfig,
     config_path: PathBuf,
+    /// v0.5.4 新增：配置是否从损坏状态恢复
+    /// 当配置文件读取或解析失败时设为 true，前端可据此提示用户
+    pub corrupted_on_load: bool,
 }
 
 impl WizardState {
@@ -181,12 +192,38 @@ impl WizardState {
     /// 自动迁移：
     ///   1. 版本不匹配 → 重置配置，重新引导用户完成向导
     ///   2. 已有有效配置（project_dir + llm_configured）但 setup_complete 为 false → 自动完成
-    /// 这解决了从旧版本升级或配置已存在但向导未完成标记的问题。
+    ///      这解决了从旧版本升级或配置已存在但向导未完成标记的问题。
+    /// v0.5.4 修复：配置损坏时记录日志，设置 corrupted_on_load 标记供前端检测
     pub fn load() -> Self {
         let config_path = Self::config_path();
+        let mut corrupted = false;
         let mut config = if config_path.exists() {
-            let json = std::fs::read_to_string(&config_path).unwrap_or_default();
-            serde_json::from_str(&json).unwrap_or_default()
+            match std::fs::read_to_string(&config_path) {
+                Ok(json) => {
+                    match serde_json::from_str::<WizardConfig>(&json) {
+                        Ok(cfg) => cfg,
+                        Err(e) => {
+                            // v0.5.4 修复：JSON 解析失败时记录详细日志
+                            tracing::error!(
+                                "配置文件 {} 解析失败，将使用默认配置。错误：{e}。原始内容（前200字符）：{}",
+                                config_path.display(),
+                                &json[..json.len().min(200)]
+                            );
+                            corrupted = true;
+                            WizardConfig::default()
+                        }
+                    }
+                }
+                Err(e) => {
+                    // v0.5.4 修复：文件读取失败时记录日志
+                    tracing::error!(
+                        "无法读取配置文件 {}，将使用默认配置。错误：{e}",
+                        config_path.display()
+                    );
+                    corrupted = true;
+                    WizardConfig::default()
+                }
+            }
         } else {
             WizardConfig::default()
         };
@@ -229,6 +266,7 @@ impl WizardState {
         Self {
             config,
             config_path,
+            corrupted_on_load: corrupted,
         }
     }
 
@@ -259,6 +297,40 @@ impl WizardState {
     pub fn save_configured_agents(&mut self, agents: Vec<String>) -> Result<(), String> {
         self.config.configured_agents = agents;
         self.save()
+    }
+
+    /// v0.5.3 新增：重置向导状态，让用户重新进入配置向导
+    /// 
+    /// v0.5.4 修复：改用 save() 而非删除文件，确保 API Key 在重置后仍然保留。
+    /// 原逻辑：删除 wizard.json → 下次 load() 创建全新默认配置 → API Key 丢失。
+    /// 新逻辑：save() 写入重置后的配置 → setup_complete=false → API Key 保留。
+    ///
+    /// v0.5.4 P2-22 修复：重置时保留 LLM 配置（llm_configured/llm_type/llm_model/llm_base_url/encrypted_api_key）
+    /// 修复前：reset() 将 llm_configured 重置为 false，但保留了 encrypted_api_key，
+    ///         导致 to_llm_api_string() 返回 None，sidecar 的 state.llm_api 为 None，
+    ///         仪表盘显示"LLM 未配置"，与桌面端实际配置状态不一致。
+    /// 修复后：reset() 只重置 setup_complete 和 configured_agents，保留 LLM 配置，
+    ///         用户重新配置时不需要重新输入 LLM API Key。
+    pub fn reset(&mut self) -> Result<(), String> {
+        let saved_llm_configured = self.config.llm_configured;
+        let saved_llm_type = self.config.llm_type.clone();
+        let saved_llm_model = self.config.llm_model.clone();
+        let saved_llm_base_url = self.config.llm_base_url.clone();
+        let saved_key = self.config.encrypted_api_key.clone();
+
+        self.config = WizardConfig::default();
+
+        // 恢复 LLM 配置（P2-22 修复）
+        self.config.llm_configured = saved_llm_configured;
+        self.config.llm_type = saved_llm_type;
+        self.config.llm_model = saved_llm_model;
+        self.config.llm_base_url = saved_llm_base_url;
+        self.config.encrypted_api_key = saved_key;
+
+        // 保存重置后的配置（而非删除文件），确保 API Key 不丢失
+        self.save()?;
+        tracing::info!("向导状态已重置（LLM 配置和 API Key 已保留），用户下次打开应用时将看到配置向导");
+        Ok(())
     }
 
     /// 配置存储路径
