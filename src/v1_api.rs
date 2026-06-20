@@ -18,6 +18,7 @@
 //   GET  /v1/audit-trail            — 审计追踪（查询系统自主行为日志，质疑五）
 //   GET  /v1/code/search            — 代码库搜索（查询参数: query, top_k, keywords）
 
+use crate::config::DEFAULT_PORT;
 use crate::engine::audit_trail::{AuditEventType, AuditQuery};
 #[cfg(not(feature = "ml"))]
 use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
@@ -223,6 +224,15 @@ pub struct UnfoldedSubMemory {
 /// 共享状态类型别名（避免过长的类型签名）
 pub type SharedStore = Arc<Mutex<MemoryStore<JsonPersistence>>>;
 
+/// v0.5.4 P1-7 新增：/v1/memories/recent 查询参数
+///
+/// 用于控制最近记忆端点的返回数量。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecentMemoriesParams {
+    /// 返回的记忆数量（默认 5，最大 20）
+    pub limit: Option<usize>,
+}
+
 // ==================== 路由构建 ====================
 
 /// 创建 v1 REST API 路由（状态类型为 ()，以便与主路由合并）
@@ -330,7 +340,14 @@ pub fn build_v1_router(
                 let store = store.clone();
                 async move {
                     let mut store = store.lock().await;
-                    let privacy_ctx = (PrivacyLevel::User, req.session_id.clone(), req.user_id.clone());
+                    // v0.5.4 桌面端测试修复：当请求未携带 user_id 时，不设置隐私上下文
+                    // 本地单用户应用场景下，仪表盘检索不应因缺少 user_id 而过滤掉 User 级记忆
+                    // is_visible() 在 privacy_context 为 None 时返回 true（全部可见）
+                    let privacy_ctx = if req.user_id.is_some() {
+                        Some((PrivacyLevel::User, req.session_id.clone(), req.user_id.clone()))
+                    } else {
+                        None
+                    };
 
                     let fast_filter = RecallFilter {
                         memory_type: None,
@@ -338,7 +355,7 @@ pub fn build_v1_router(
                         tags: vec![],
                         min_importance: None,
                         top_k: req.top_k * 2,
-                        privacy_context: Some(privacy_ctx.clone()),
+                        privacy_context: privacy_ctx.clone(),
                     };
                     let fast_result = store.recall(&req.query, &fast_filter).unwrap_or_else(|e| {
                         eprintln!("[v1/enrich] 快速路径检索失败: {}", e);
@@ -351,35 +368,27 @@ pub fn build_v1_router(
                         tags: vec![],
                         min_importance: None,
                         top_k: req.top_k * 2,
-                        privacy_context: Some(privacy_ctx),
+                        privacy_context: privacy_ctx,
                     };
                     let deep_result = store.trapezoid_focus_recall(&req.query, &deep_filter, 1).unwrap_or_else(|e| {
                         eprintln!("[v1/enrich] 深度路径检索失败: {}", e);
                         RecallResult { memories: vec![], scores: vec![], total: 0 }
                     });
 
-                    // RRF 融合
-                    let rrf_k: f32 = 60.0;
-                    let mut fused: std::collections::HashMap<String, (f32, &Memory)> =
-                        std::collections::HashMap::new();
+                    // RRF 融合 — 使用共享 rrf_fuse
+                    let fused = crate::engine::rrf::rrf_fuse(
+                        &fast_result,
+                        &deep_result,
+                        req.top_k,
+                        crate::engine::rrf::RRF_DEFAULT_K,
+                    );
 
-                    for (rank, m) in fast_result.memories.iter().enumerate() {
-                        let score = 1.0 / (rrf_k + (rank + 1) as f32);
-                        fused.entry(m.id.clone()).or_insert((0.0, m)).0 += score;
-                    }
-                    for (rank, m) in deep_result.memories.iter().enumerate() {
-                        let score = 1.0 / (rrf_k + (rank + 1) as f32);
-                        fused.entry(m.id.clone()).or_insert((0.0, m)).0 += score;
-                    }
-
-                    let mut scored: Vec<(f32, &Memory)> = fused.values().cloned().collect();
-                    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-                    let total = scored.len();
-                    let memories: Vec<EnrichedMemory> = scored
-                        .into_iter()
-                        .take(req.top_k)
-                        .map(|(score, m)| EnrichedMemory {
+                    let total = fused.total_candidates;
+                    let memories: Vec<EnrichedMemory> = fused
+                        .memories
+                        .iter()
+                        .zip(fused.scores.iter())
+                        .map(|(m, &score)| EnrichedMemory {
                             id: m.id.clone(),
                             content: m.content.clone(),
                             memory_type: m.memory_type.as_str().to_string(),
@@ -880,6 +889,71 @@ pub fn build_v1_router(
                 }
             }
         }))
+        // v0.5.4 P1-7 新增：GET /v1/memories/recent — 获取最近记忆摘要（仪表盘用）
+        //
+        // 返回最近 N 条记忆的摘要信息（id、内容前 100 字符、类型、项目、创建时间、重要性），
+        // 供仪表盘"最近记忆"区域展示。默认返回 5 条，可通过 ?limit 参数调整（最大 20）。
+        .route("/memories/recent", get({
+            let store = metrics_store.clone();
+            move |Query(params): Query<RecentMemoriesParams>| {
+                let store = store.clone();
+                async move {
+                    // 限制最大返回数量，防止滥用
+                    let limit = params.limit.unwrap_or(5).min(20).max(1);
+                    let store = store.lock().await;
+
+                    // 使用 ListFilter 按创建时间降序获取最近记忆
+                    let filter = crate::memory_store::ListFilter {
+                        limit,
+                        offset: 0,
+                        sort_by: crate::memory_store::SortBy::CreatedAt,
+                        order: crate::memory_store::SortOrder::Desc,
+                        ..Default::default()
+                    };
+
+                    match store.list_memories(&filter) {
+                        Ok((memories, total)) => {
+                            // 转换为摘要格式，避免泄露完整内容
+                            let summaries: Vec<serde_json::Value> = memories
+                                .iter()
+                                .map(|m| {
+                                    // 内容截断：超过 100 字符显示省略号
+                                    let content_preview = if m.content.chars().count() > 100 {
+                                        let truncated: String = m.content.chars().take(100).collect();
+                                        format!("{}...", truncated)
+                                    } else {
+                                        m.content.clone()
+                                    };
+
+                                    serde_json::json!({
+                                        "id": m.id,
+                                        "content_preview": content_preview,
+                                        "memory_type": m.memory_type.as_str(),
+                                        "project": m.project.as_deref().unwrap_or("全局"),
+                                        "created_at_ms": m.created_at.timestamp_millis(),
+                                        "importance": m.importance.value(),
+                                        "tags": m.tags,
+                                    })
+                                })
+                                .collect();
+
+                            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "memories": summaries,
+                                "total": total,
+                                "returned": summaries.len(),
+                            })))
+                        }
+                        Err(e) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "recent_memories_failed",
+                                "message": format!("最近记忆获取失败: {}", e)
+                            })),
+                        )),
+                    }
+                }
+            }
+        }))
         // ============================================================
         // 信任中心可验证性 API（质疑四：完美闭环悖论）
         // ============================================================
@@ -1072,7 +1146,7 @@ pub fn build_v1_router(
 
                     report.push_str("\n═══════════════════════════════════════════\n");
                     report.push_str("  💡 提示：使用 code-memory-server 启动服务后\n");
-                    report.push_str("  访问 http://localhost:3099/dashboard 查看可视化仪表盘\n");
+                    report.push_str(&format!("  访问 http://localhost:{}/dashboard 查看可视化仪表盘\n", DEFAULT_PORT));
                     report.push_str("═══════════════════════════════════════════\n");
 
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({

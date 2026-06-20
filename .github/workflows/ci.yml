@@ -30,8 +30,12 @@ jobs:
   # Gate 1-5: Rust Backend Quality Gates
   # ============================================================
   rust-gates:
-    name: Rust Gates (build + test + clippy + fmt + unwrap)
-    runs-on: windows-latest
+    name: Rust Gates (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,23 +62,17 @@ jobs:
         run: cargo test --all-targets --features server
 
       - name: Gate 3: Clippy Standard (zero warnings)
-        run: |
-          cargo clippy --all-targets --features server -- `
-            -D warnings
+        run: cargo clippy --all-targets --features server -- -D warnings
 
       - name: Gate 3b: Clippy Strict (pedantic + nursery, main branch PR only)
         if: github.ref == 'refs/heads/main'
-        run: |
-          cargo clippy --all-targets --features server -- `
-            -W clippy::pedantic `
-            -W clippy::nursery `
-            -D warnings
+        run: cargo clippy --all-targets --features server -- -W clippy::pedantic -W clippy::nursery -D warnings
 
       - name: Gate 4: Code Format
         run: cargo fmt --check
 
       - name: Gate 5: unwrap() residue detection (exclude test code)
-        shell: powershell
+        shell: pwsh
         run: |
           $Violations = @()
           Get-ChildItem -Path src -Recurse -Filter "*.rs" | ForEach-Object {
@@ -104,16 +102,20 @@ jobs:
   # Gate 6-7: Frontend Quality Gates
   # ============================================================
   frontend-gates:
-    name: Frontend Gates (code duplication + XSS)
-    runs-on: windows-latest
+    name: Frontend Gates (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Gate 6: Frontend code duplication check
-        shell: powershell
+        shell: pwsh
         run: |
-          $IndexHtml = "static\index.html"
+          $IndexHtml = "static/index.html"
           if (Test-Path $IndexHtml) {
             $Content = Get-Content $IndexHtml -Raw
             $InlineScripts = [regex]::Matches($Content, '<script[^>]*>(?!\s*</script>)([\s\S]*?)</script>')
@@ -129,9 +131,9 @@ jobs:
           }
 
       - name: Gate 7: Frontend XSS security check
-        shell: powershell
+        shell: pwsh
         run: |
-          $JsFiles = @("static\app.js", "static\index.html") | Where-Object { Test-Path $_ }
+          $JsFiles = @("static/app.js", "static/index.html") | Where-Object { Test-Path $_ }
           $Dangerous = @("innerHTML\s*=", "document\.write\(", "eval\(")
           $Found = $false
           foreach ($File in $JsFiles) {
@@ -157,44 +159,48 @@ jobs:
   gatekeeper-report:
     name: Gatekeeper Report
     needs: [rust-gates, frontend-gates]
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     if: always()
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Summarize gate results
-        shell: powershell
+        shell: pwsh
         run: |
           Write-Host ""
           Write-Host "============================================================"
           Write-Host "  Gatekeeper CI Summary Report"
           Write-Host "============================================================"
 
-          $RustResult = "${{ needs.rust-gates.result }}"
-          $FrontendResult = "${{ needs.frontend-gates.result }}"
+          # 矩阵作业的 result 是 JSON 数组字符串，如 '["success","success","success"]'
+          $RustResults = '${{ needs.rust-gates.result }}' | ConvertFrom-Json
+          $FrontendResults = '${{ needs.frontend-gates.result }}' | ConvertFrom-Json
 
-          $AllPassed = ($RustResult -eq "success" -and $FrontendResult -eq "success")
+          # 检查所有平台结果是否都通过
+          $RustAllPassed = ($RustResults | Where-Object { $_ -ne "success" }).Count -eq 0
+          $FrontendAllPassed = ($FrontendResults | Where-Object { $_ -ne "success" }).Count -eq 0
+          $AllPassed = $RustAllPassed -and $FrontendAllPassed
 
           Write-Host ""
-          Write-Host "  Rust Gates  (build+test+clippy+fmt+unwrap): $RustResult"
-          Write-Host "  Frontend Gates (code duplication+XSS): $FrontendResult"
+          Write-Host "  Rust Gates  (build+test+clippy+fmt+unwrap): $('${{ needs.rust-gates.result }}')"
+          Write-Host "  Frontend Gates (code duplication+XSS): $('${{ needs.frontend-gates.result }}')"
           Write-Host ""
 
           if ($AllPassed) {
-            Write-Host "  VERDICT: PASS - All gates passed, code quality meets standards"
+            Write-Host "  VERDICT: PASS - All gates passed on all platforms, code quality meets standards"
             Write-Host ""
             Write-Host "  'Contract fulfilled. Code is as reliable as promised, tests as precise as the contract. Safe to merge.'"
           } else {
-            Write-Host "  VERDICT: REJECT - Some gates failed, please fix and resubmit"
+            Write-Host "  VERDICT: REJECT - Some gates failed on some platforms, please fix and resubmit"
             Write-Host ""
             Write-Host "  'Contract not fulfilled. Gatekeeper denies passage because quality promise is not yet met. This is not blame, it is protection.'"
             Write-Host ""
-            if ($RustResult -ne "success") {
-              Write-Host "    -> Run: cargo test --all-targets --features server"
+            if (-not $RustAllPassed) {
+              Write-Host "    -> Rust failures detected on some platforms. Run: cargo test --all-targets --features server"
             }
-            if ($FrontendResult -ne "success") {
-              Write-Host "    -> Remove inline <script> from index.html, keep only app.js reference"
+            if (-not $FrontendAllPassed) {
+              Write-Host "    -> Frontend failures detected on some platforms. Check: inline <script> and XSS patterns"
             }
             exit 1
           }

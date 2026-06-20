@@ -6,9 +6,76 @@
 [![License](https://img.shields.io/badge/Engine-DaoTi%20Research%20License-red.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-**前置条件**：Windows / Linux / macOS | 无需 Rust 基础 | 无需 GPU | 会基本命令行操作
+**前置条件**：Windows / Linux / macOS | 需安装 Rust | 无需 GPU | 会基本命令行操作
 
-> **不想手动敲命令？** 双击 `install.bat` 快速安装，自动完成编译和 IDE 配置（需已安装 Rust 环境）。
+***
+
+## 快速开始（5 分钟）
+
+### 1. 安装 Rust
+
+```bash
+# Windows: 下载安装 https://rustup.rs/
+# macOS/Linux:
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### 2. 克隆并编译
+
+```bash
+git clone https://github.com/zhibaiYingChuan/LRC.git
+cd LRC
+cargo build --release --features server
+```
+
+编译产物在 `target/release/code-memory-server.exe`（Windows）或 `target/release/code-memory-server`（macOS/Linux）。
+
+### 3. 接入 IDE
+
+**推荐方式**：安装 [LRC Desktop 桌面端](#桌面端应用)，启动后会自动检测已安装的 AI 工具并写入 MCP 配置，无需手动编辑任何文件。
+
+**手动配置方式**（仅适用于从源码编译的高级用户）：
+
+在 IDE 的 MCP 配置文件中添加（以 Trae CN 为例，`~/.trae-cn/trae-mcp.json`）：
+
+```json
+{
+  "mcpServers": {
+    "lrc-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:3099/mcp",
+      "description": "LRC — 本地代码记忆与语义搜索"
+    }
+  }
+}
+```
+
+> **重要**：LRC Desktop 总是启动 HTTP 模式的 sidecar（端口 3099），因此所有 AI 工具都应使用 HTTP 模式配置。stdio 模式仅适用于从源码编译并直接通过命令行启动的场景。
+
+| IDE | 配置文件位置 |
+|-----|------------|
+| **Trae CN** | `~/.trae-cn/trae-mcp.json` 或 `%APPDATA%/Trae CN/User/mcp.json` |
+| **Trae** | `~/.trae/mcp.json` 或 `%APPDATA%/Trae/User/mcp.json` |
+| **Cursor** | `%APPDATA%/Cursor/mcp.json` |
+| **VS Code** | `%APPDATA%/Code/User/settings.json` |
+| **Claude Desktop** | `%APPDATA%/Claude/claude_desktop_config.json` |
+| **通用 MCP** | HTTP 端点 `http://127.0.0.1:3099/mcp` |
+
+重启 IDE 后，AI 自动发现 12 个 MCP 工具。
+
+> **AI 自动调用规则**：LRC Desktop 启动时会自动为检测到的 AI 工具写入规则文件（如 `.trae/rules/lrc-memory.md`），引导 AI 在会话开始时主动调用 `recall` 检索记忆，完成任务后调用 `remember` 同步记忆。用户无需手动编写任何规则。详细说明见 [用户使用说明书](docs/USER_GUIDE.md)。
+
+### 可选：桌面端应用
+
+LRC 提供基于 Tauri 2 的原生桌面应用，内置仪表盘和配置向导：
+
+```bash
+cd desktop
+pnpm install
+pnpm tauri build
+```
+
+构建产物位于 `desktop/src-tauri/target/release/bundle/`。
 
 ***
 
@@ -39,40 +106,19 @@
 
 LRC 是一个独立封装的 MCP 插件，零运行时依赖。
 
-***
+---
 
-## 安装（推荐：下载预编译二进制，无需 Rust 环境）
+## HTTP 模式调试（可选）
 
-访问 [GitHub Releases](https://github.com/zhibaiYingChuan/LRC/releases) 查看最新版本（如 `v0.4.0`），下载对应平台的文件：
-
-| 平台 | 文件名（以 v0.4.0 为例） |
-|------|--------------------------|
-| **Windows** | `lrc-v0.4.0-windows-x86_64.exe` |
-| **macOS (Apple Silicon)** | `lrc-v0.4.0-macos-arm64` |
-| **macOS (Intel)** | `lrc-v0.4.0-macos-x86_64` |
-| **Linux** | `lrc-v0.4.0-linux-x86_64` |
-
-下载后直接运行即可，**无需安装 Rust、无需编译**：
+编译后可直接运行 HTTP 模式进行调试：
 
 ```bash
-# Windows
-.\lrc-v0.4.0-windows-x86_64.exe --src-dir .\你的项目\src --port 3099
+# 启动服务
+./target/release/code-memory-server --src-dir ./src --port 3099
 
-# macOS / Linux
-chmod +x ./lrc-v0.4.0-macos-arm64
-./lrc-v0.4.0-macos-arm64 --src-dir ./你的项目/src --port 3099
-```
-
-启动后浏览器会自动打开仪表盘（`http://127.0.0.1:3099/dashboard`）。在另一个终端试试：
-
-```bash
-# 搜索代码（Fast Match：精确关键词匹配）
+# 搜索代码
 curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"authenticate_user","top_k":3}}}'
-
-# 搜索代码（LLM 增强模式：用自然语言描述，需配置 --llm-api）
-curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search_code","arguments":{"query":"处理用户登录的逻辑","top_k":3}}}'
 
 # 写一条记忆
 curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
@@ -82,44 +128,6 @@ curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
 curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"recall","arguments":{"query":"包管理器偏好","top_k":3}}}'
 ```
-
-### 接入 IDE（3 分钟）
-
-在 IDE 的 MCP 配置文件中添加（以 Trae 为例，`%APPDATA%/Trae/User/mcp.json`）：
-
-```json
-{
-  "mcpServers": {
-    "loong-recall": {
-      "command": "你的安装路径/target/release/code-memory-server.exe",
-      "args": ["--src-dir", "你的项目路径/src", "--stdio"]
-    }
-  }
-}
-```
-
-| IDE | 配置文件位置 | 规则配置（让 AI 自动使用） |
-|-----|------------|-------------------------|
-| **Trae** | `%APPDATA%/Trae/User/mcp.json` | `.trae/rules/project-rules.md` |
-| **Cursor** | `%APPDATA%/Cursor/mcp.json` | `.cursor/rules/memory.md` |
-| **VS Code** | `%APPDATA%/Code/User/settings.json` | `.github/copilot-instructions.md` |
-
-> 详细配置步骤（含 AI 自动调用规则模板）见 [用户使用说明书](docs/USER_GUIDE.md)。
-
-重启 IDE 后，AI 自动发现 12 个 MCP 工具。
-
-### 快速安装脚本（适用于开发者/需要自定义编译）
-
-如需从源码编译（例如启用 ML 语义搜索），可使用项目自带的安装脚本：
-
-Windows 用户下载仓库后，双击项目根目录下的 `install.bat`（需已安装 Rust 环境），脚本会自动：
-1. 检测 Rust 环境
-2. 编译 Loong Recall
-3. 搜索本地 IDE（Trae / Cursor / VS Code），自动创建 MCP 配置文件
-
-Linux / macOS 用户请在终端运行 `bash install.sh`。
-
-完成后重启 IDE，就能直接使用。
 
 ***
 
@@ -196,27 +204,16 @@ LLM 增强模式会调用你的 LLM API 进行查询翻译，每次消耗约 **4
 
 ## 桌面端应用
 
-LRC 提供基于 Tauri 2 的原生 Windows 桌面应用，内置仪表盘，无需手动启动命令行。
+LRC 提供基于 Tauri 2 的原生桌面应用（Windows）：
 
-### 功能亮点
-
-- **配置向导**：首次启动自动引导完成项目目录、LLM 配置
-- **系统托盘**：最小化到托盘，右键快捷操作
-- **仪表盘内嵌**：无需浏览器，桌面端直接展示记忆管理面板
+- **配置向导**：首次启动自动引导完成项目目录、LLM 配置和 Agent 连接
+- **LLM 可视化配置**：桌面端内置 LLM 设置面板，支持 DeepSeek、通义千问、Ollama 等 10+ 模型提供商
+- **Agent 配置引导**：分类展示 IDE 类、桌面应用、命令行工具等 AI 产品的 MCP 配置方法
+- **系统托盘**：最小化到托盘，右键快捷操作，启动不自动打开窗口
+- **已就绪迷你面板**：显示后台服务运行状态、Agent 连接数、项目路径
 - **配置加密存储**：API Key 使用 AES-256-GCM 加密存储
-- **Sidecar 自动管理**：桌面端自动管理后台服务生命周期
 
-### 构建桌面端（开发者）
-
-```bash
-cd desktop
-pnpm install
-pnpm tauri build
-```
-
-构建产物位于 `desktop/src-tauri/target/release/bundle/`。
-
-> 普通用户推荐直接下载 [GitHub Releases](https://github.com/zhibaiYingChuan/LRC/releases) 中的预编译桌面安装包。
+构建方式见上方「快速开始 → 可选：桌面端应用」。
 
 ### 数据目录
 
@@ -447,6 +444,73 @@ Loong Recall 在启动时自动执行多层运行时防护，保护核心检索�
 ***
 
 ## 更新日志
+
+### v0.5.5 (2026-06-21) — MCP 配置自动升级 + AI 主动调用修复
+
+**MCP 配置自动升级（重要）**
+
+- Sidecar 启动时自动检测并升级旧版本 MCP 配置（stdio 模式 `loong-recall` → HTTP 模式 `lrc-memory`）
+- 用户升级 LRC Desktop 后无需重新运行配置向导，旧配置自动迁移
+- 合并配置时自动清理旧的 stdio 模式配置项，避免 stdio/http 模式冲突
+
+**AI 主动调用修复（重要）**
+
+- 修复 Trae 规则文件路径（`.trae/rules.md` → `.trae/rules/lrc-memory.md`）
+- 添加 YAML frontmatter（`alwaysApply: true`），确保规则始终生效
+- 修复 Cursor 规则文件路径（`.cursorrules` → `.cursor/rules/lrc-memory.mdc`）
+- 升级时自动清理旧路径规则文件，提取用户自定义内容并迁移
+
+**AI 工具检测改进**
+
+- 改进检测策略：无 `binary_paths` 且无 `mcp_config_template` 的工具不自动检测
+- 避免残留 dot 目录导致的误报（如检测出 9 个实际只有 2 个）
+
+**仪表盘交互统一**
+
+- 移除"修改配置"按钮的只读卡片逻辑
+- 统一使用完整 LLM 配置表单（多提供商选择）
+- 桌面端所有相同功能/内容统一为同一实现
+
+### v0.5.4 (2026-06-20) — 全项目静态审计与修复
+
+- 全项目静态代码审计，修复所有 Clippy 警告
+- 桌面端 URL 导航白名单验证（仅允许 127.0.0.1）
+- 敏感数据使用后内存清零（SecureString 模式）
+- 字符串编译时混淆（obfstr）
+- DPAPI 密钥损坏自动恢复机制
+
+### v0.5.1 (2026-06-18) — 用户体验统一与代码治理
+
+- 前端版本号一致性（统一从 Cargo.toml 读取）
+- 前端 CSS 内联 1260 行提取到 app.css
+- 前端 app.js 全局变量污染（IIFE 隔离）
+- server.rs 巨型函数拆分（964行 → 5个函数）
+- 模型加载逻辑重复（提取共享 PoolingStrategy）
+- RRF 融合逻辑重复（提取共享 rrf.rs 模块）
+
+### v0.5.0 (2026-06-17) — 桌面端体验优化 + MCP 集成修复
+
+**桌面端体验优化**
+
+- 启动不再自动打开仪表盘网页，纯托盘运行
+- 设置面板新增 LLM 配置（支持 DeepSeek、通义千问、智谱、MiniMax、Moonshot、豆包、阶跃星辰、百川、OpenAI、Ollama）
+- 向导完成页新增「配置 LLM 和 Agent」按钮，方便随时修改设置
+- 已就绪迷你面板：显示后台服务状态、Agent 连接数、项目路径
+
+**MCP 集成修复（重要）**
+
+- 修复 TraeDetector 在配置文件不存在时返回 None 导致 MCP 配置从未写入的 Bug
+- MCP 配置使用绝对路径，IDE 无需依赖 PATH 环境变量
+- 新增 AppData 路径检测（`%APPDATA%/Trae CN/User/mcp.json`）
+- stdio 模式配置添加 `LRC_MODE` 环境变量
+- Agent 配置引导支持分类：IDE 类、桌面应用、命令行工具、其他 AI 产品
+
+**代码质量**
+
+- 修复所有 Clippy 警告（doc_lazy_continuation 等）
+- PostgresPersistence 新增 `block_on_async` 封装 tokio 运行时处理
+- encoder_codebert::encode 返回 Result 类型，正确传播错误
+- 消除 tray.rs 中的 unwrap() 调用
 
 ### v0.4.0 (2026-06-15) — 桌面端应用 + 跨 IDE 记忆同步
 

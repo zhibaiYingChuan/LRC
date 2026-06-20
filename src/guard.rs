@@ -168,11 +168,13 @@ mod windows_guard {
     pub fn is_debugger_present() -> bool {
         let mut detected = false;
 
+        // SAFETY: IsDebuggerPresent 是 Windows 标准 API，无参数，调用始终安全
         if unsafe { IsDebuggerPresent() } != 0 {
             detected = true;
         }
 
         let mut debugger_present = 0i32;
+        // SAFETY: GetCurrentProcess 返回伪句柄，CheckRemoteDebuggerPresent 接收有效句柄和栈上布尔指针
         unsafe {
             CheckRemoteDebuggerPresent(GetCurrentProcess(), &mut debugger_present);
         }
@@ -182,6 +184,8 @@ mod windows_guard {
 
         let mut debug_port: HANDLE = std::ptr::null_mut();
         let mut return_length: u32 = 0;
+        // SAFETY: NtQueryInformationProcess 是 NT 内核 API，GetCurrentProcess 返回有效伪句柄，
+        // debug_port 和 return_length 均为栈上变量，PROCESS_DEBUG_PORT 查询不修改进程状态
         let status = unsafe {
             NtQueryInformationProcess(
                 GetCurrentProcess(),
@@ -208,6 +212,8 @@ mod windows_guard {
     pub fn has_software_breakpoints() -> bool {
         let target_fn = detect_bp_target as *const u8;
         for i in 0..8 {
+            // SAFETY: target_fn 指向 detect_bp_target 函数的有效代码段，read_volatile 仅读取 8 字节
+            // 不会越界访问（函数代码段至少包含函数序言，远大于 8 字节）
             unsafe {
                 if target_fn.add(i).read_volatile() == 0xCC {
                     return true;
@@ -231,6 +237,10 @@ mod windows_guard {
     /// 检测内存补丁、DLL 注入、代码洞修改等攻击。
     /// 发布版本编译时自动嵌入实际 CRC32 值。
     pub fn verify_pe_integrity() -> bool {
+        // SAFETY: 以下代码解析当前模块的 PE 头以验证 .text 段完整性。
+        // GetModuleHandleA(nullptr) 返回当前模块基址，始终有效。
+        // DOS/NT 头指针解引用基于已验证的 PE 签名，不会访问无效内存。
+        // 所有指针算术运算均基于 PE 规范定义的偏移量。
         unsafe {
             let module_base = GetModuleHandleA(std::ptr::null()) as *const u8;
             if module_base.is_null() {

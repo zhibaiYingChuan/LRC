@@ -1,10 +1,11 @@
 # ============================================================
-# LRC Desktop - Tauri Desktop CI Workflow
+# LRC Desktop - Tauri Desktop CI/CD Workflow
 # ============================================================
 # Engineering Culture:
 #   - Contract First: Each gate is a verifiable contract
 #   - TDD Driven: Build + Test + Clippy three lines of defense
-#   - Immutable Artifacts: MSI installer as release artifact
+#   - Immutable Artifacts: 多平台预编译二进制发布到 GitHub Release
+# v0.5.4 修复：新增 macOS/Linux 构建矩阵，tag 推送自动发布 Release
 # ============================================================
 
 name: Desktop Gatekeeper CI
@@ -15,14 +16,21 @@ on:
     paths:
       - 'desktop/**'
       - '.github/workflows/desktop-ci.yml'
+    tags:
+      - 'v*'  # v0.5.4 修复：打 tag 时自动触发桌面端构建和发布
   pull_request:
     branches: [main]
     paths:
       - 'desktop/**'
   workflow_dispatch:
+    inputs:
+      release:
+        description: '是否发布到 GitHub Release（仅 tag 推送时自动发布）'
+        type: boolean
+        default: false
 
 permissions:
-  contents: read
+  contents: write  # v0.5.4 修复：Release 发布需要 write 权限
   checks: write
 
 env:
@@ -99,12 +107,34 @@ jobs:
           }
 
   # ============================================================
-  # Gate 2: Desktop Tauri Release Build
+  # Gate 2: Desktop Tauri 多平台构建（v0.5.4 修复：新增 macOS/Linux）
   # ============================================================
   desktop-build:
-    name: Desktop MSI Build
+    name: Desktop Build (${{ matrix.os }})
     needs: desktop-rust-gates
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false  # 一个平台失败不影响其他平台
+      matrix:
+        include:
+          # Windows x86_64 — 生成 .exe + .msi
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundle_type: msi
+            artifact_name: lrc-desktop-windows-x86_64
+            artifact_ext: .exe
+          # macOS arm64 — 生成 .dmg
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bundle_type: dmg
+            artifact_name: lrc-desktop-macos-arm64
+            artifact_ext: .dmg
+          # Linux x86_64 — 生成 .AppImage
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bundle_type: appimage
+            artifact_name: lrc-desktop-linux-x86_64
+            artifact_ext: .AppImage
     defaults:
       run:
         working-directory: desktop
@@ -114,6 +144,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -126,6 +158,15 @@ jobs:
           node-version: 22
           cache: 'pnpm'
           cache-dependency-path: desktop/pnpm-lock.yaml
+
+      # v0.5.4 修复：Linux 需要 webkit2gtk 等系统依赖
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libgtk-3-dev libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
@@ -141,34 +182,77 @@ jobs:
           restore-keys: ${{ runner.os }}-desktop-release-
 
       - name: Generate icons (if script exists)
-        shell: powershell
+        shell: bash
         run: |
-          if (Test-Path "..\scripts\generate_icons.py") {
-            python ..\scripts\generate_icons.py
-          }
+          if [ -f "../scripts/generate_icons.py" ]; then
+            python3 ../scripts/generate_icons.py || python ../scripts/generate_icons.py
+          fi
 
-      - name: Tauri Release Build (MSI)
-        run: pnpm tauri build --bundles msi
+      - name: Tauri Release Build
+        run: pnpm tauri build --bundles ${{ matrix.bundle_type }} --target ${{ matrix.target }}
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
-      - name: Upload MSI artifact
+      - name: Locate and rename artifact
+        id: artifact
+        shell: bash
+        run: |
+          # 查找构建产物并重命名为统一命名
+          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # Windows: 查找 .msi 和 .exe
+            MSI_FILE=$(find "$BUNDLE_DIR" -name "*.msi" -type f | head -1)
+            EXE_FILE=$(find "$BUNDLE_DIR" -name "*.exe" -type f | head -1)
+            if [ -n "$MSI_FILE" ]; then
+              cp "$MSI_FILE" "${{ matrix.artifact_name }}.msi"
+              echo "msi_path=${{ matrix.artifact_name }}.msi" >> $GITHUB_OUTPUT
+            fi
+            if [ -n "$EXE_FILE" ]; then
+              cp "$EXE_FILE" "${{ matrix.artifact_name }}${{ matrix.artifact_ext }}"
+            fi
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            # macOS: 查找 .dmg
+            DMG_FILE=$(find "$BUNDLE_DIR" -name "*.dmg" -type f | head -1)
+            if [ -n "$DMG_FILE" ]; then
+              cp "$DMG_FILE" "${{ matrix.artifact_name }}${{ matrix.artifact_ext }}"
+            fi
+          else
+            # Linux: 查找 .AppImage
+            APPIMAGE_FILE=$(find "$BUNDLE_DIR" -name "*.AppImage" -type f | head -1)
+            if [ -n "$APPIMAGE_FILE" ]; then
+              cp "$APPIMAGE_FILE" "${{ matrix.artifact_name }}${{ matrix.artifact_ext }}"
+            fi
+          fi
+          echo "artifact_path=${{ matrix.artifact_name }}${{ matrix.artifact_ext }}" >> $GITHUB_OUTPUT
+
+      - name: Generate SHA256 checksum
+        shell: bash
+        run: |
+          if [ -f "${{ steps.artifact.outputs.artifact_path }}" ]; then
+            sha256sum "${{ steps.artifact.outputs.artifact_path }}" > "${{ steps.artifact.outputs.artifact_path }}.sha256"
+          fi
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: lrc-desktop-msi
-          path: desktop/src-tauri/target/release/bundle/msi/*.msi
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}*
           retention-days: 7
 
-      - name: Upload Release binary
+      # v0.5.4 修复：tag 推送时同时上传 MSI（Windows）
+      - name: Upload MSI artifact (Windows only)
+        if: runner.os == 'Windows' && steps.artifact.outputs.msi_path != ''
         uses: actions/upload-artifact@v4
         with:
-          name: lrc-desktop-exe
-          path: desktop/src-tauri/target/release/lrc-desktop.exe
+          name: ${{ matrix.artifact_name }}-msi
+          path: ${{ steps.artifact.outputs.msi_path }}
           retention-days: 7
 
   # ============================================================
   # Gate 3: L2 Confidentiality Layer Integrity Verification
+  # v0.5.4 修复：适配多平台构建矩阵，下载 Windows 产物进行验证
   # ============================================================
   desktop-l2-integrity:
     name: L2 Confidentiality Verification
@@ -178,10 +262,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download build artifact
+      - name: Download Windows build artifact
         uses: actions/download-artifact@v4
         with:
-          name: lrc-desktop-exe
+          name: lrc-desktop-windows-x86_64
           path: ./build
 
       - name: L2-01: Symbol stripping verification
@@ -270,3 +354,102 @@ jobs:
             }
             exit 1
           }
+
+  # ============================================================
+  # v0.5.4 修复：桌面端多平台 Release 发布（tag 推送时自动触发）
+  # ============================================================
+  desktop-release:
+    name: Publish Desktop Release
+    needs: [desktop-build, desktop-l2-integrity]
+    runs-on: ubuntu-latest
+    # 仅在 tag 推送时执行发布
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: List artifacts for verification
+        run: |
+          echo "=== 桌面端构建产物清单 ==="
+          find release-artifacts -type f -exec ls -lh {} \;
+
+      - name: Generate desktop install script (Windows PowerShell)
+        run: |
+          cat > install-desktop.ps1 << 'SCRIPT'
+          # LRC Desktop 一键安装脚本 (Windows)
+          # 用法: powershell -ExecutionPolicy Bypass -File install-desktop.ps1
+          Write-Host "==============================================="
+          Write-Host "  LRC Desktop 一键安装脚本"
+          Write-Host "==============================================="
+
+          $Version = "v0.5.4"
+          $BaseUrl = "https://github.com/zhibaiYingChuan/LRC/releases/download/$Version"
+
+          Write-Host "  正在下载 LRC Desktop for Windows..."
+          $Output = "$env:TEMP\lrc-desktop-windows-x86_64.exe"
+          Invoke-WebRequest -Uri "$BaseUrl/lrc-desktop-windows-x86_64.exe" -OutFile $Output
+
+          Write-Host "  下载完成！"
+          Write-Host "  安装程序: $Output"
+          Write-Host ""
+          Write-Host "  双击运行即可完成安装。"
+          SCRIPT
+
+      - name: Generate desktop install script (macOS/Linux)
+        run: |
+          cat > install-desktop.sh << 'SCRIPT'
+          #!/bin/bash
+          set -e
+          echo "==============================================="
+          echo "  LRC Desktop 一键安装脚本"
+          echo "==============================================="
+
+          VERSION="v0.5.4"
+          BASE_URL="https://github.com/zhibaiYingChuan/LRC/releases/download/$VERSION"
+
+          OS=$(uname -s)
+          ARCH=$(uname -m)
+
+          if [ "$OS" = "Linux" ]; then
+            BINARY="lrc-desktop-linux-x86_64.AppImage"
+          elif [ "$OS" = "Darwin" ]; then
+            BINARY="lrc-desktop-macos-arm64.dmg"
+          else
+            echo "不支持的操作系统: $OS"
+            exit 1
+          fi
+
+          echo "  正在下载 LRC Desktop for $OS ..."
+          curl -L -o "/tmp/$BINARY" "$BASE_URL/$BINARY"
+
+          if [ "$OS" = "Linux" ]; then
+            chmod +x "/tmp/$BINARY"
+            echo "  下载完成！运行: /tmp/$BINARY"
+          else
+            echo "  下载完成！双击 /tmp/$BINARY 安装"
+          fi
+          SCRIPT
+          chmod +x install-desktop.sh
+
+      - name: Create/Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/**/*
+            install-desktop.sh
+            install-desktop.ps1
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          # 将桌面端产物附加到已有 Release（由 release.yml 创建）
+          append_body: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

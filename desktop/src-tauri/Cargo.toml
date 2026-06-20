@@ -1,6 +1,6 @@
 [package]
 name = "lrc-desktop"
-version = "0.2.0"
+version = "0.5.4"
 description = "LRC Desktop — 本地优先的 AI 代码记忆桌面应用"
 authors = ["LRC Team"]
 edition = "2021"
@@ -11,10 +11,15 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+sha2 = "0.10"           # SHA-256 哈希（v0.5.1: build.rs 二进制验证）
 
 [dependencies]
 # Tauri 桌面框架（tray-icon feature 内置系统托盘支持）
-tauri = { version = "2", features = ["tray-icon"] }
+# v0.5.4 P2-16 修复：启用 custom-protocol feature，确保生产构建时前端资源被正确嵌入
+# 根因：未启用 custom-protocol 时，tauri::generate_context!() 中 dev=true，
+#       会跳过 frontendDist 资源嵌入，导致 WebView2 显示 about:blank 空白页面
+# 修复：启用 custom-protocol feature，使 dev=false，正确嵌入前端资源
+tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
 tauri-plugin-shell = "2"
 # 序列化
 serde = { version = "1", features = ["derive"] }
@@ -28,14 +33,17 @@ tracing-subscriber = "0.3"
 anyhow = "1"
 # 打开浏览器/文件
 open = "5"
+# 文件选择对话框
+rfd = "0.15"
 # HTTP 客户端（sidecar 健康检查）
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-# 锁定 time crate 版本，避免与 tauri-utils 冲突
-time = "=0.3.36"
+# time crate 版本约束（兼容 0.3.x 系列，避免与 tauri-utils 冲突）
+time = "0.3.36"
 
 # ── L2 保密层依赖 ──
 obfstr = "0.4"          # 编译时字符串混淆（MVP 阶段必须）
 static_assertions = "1"  # 编译时断言
+sha2 = "0.10"           # SHA-256 哈希（完整性校验）
 
 # ── L1 数据加密依赖 ──
 aes-gcm = "0.10"        # AES-256-GCM 加密（API Key 存储）
@@ -48,6 +56,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Threading",
     "Win32_Foundation",
+    "Win32_Security_Cryptography",
 ] }
 
 # ── L2 保密构建配置（反逆向工程）──
@@ -57,6 +66,9 @@ codegen-units = 1      # 单代码生成单元（最大化内联和混淆）
 panic = "abort"        # 避免 panic unwind 信息泄露
 strip = "symbols"      # 剥离符号表（L2-OBF-5）
 opt-level = "s"        # 优化体积（减少特征）
+# v0.5.4 修复：启用溢出检查，防止整数溢出导致的安全漏洞
+# 性能影响约 1-3%，但可防止缓冲区溢出、索引越界等 UB 被利用
+overflow-checks = true
 
 # 注：v1.1 阶段升级为 OLLVM 完整集成
 # [profile.release-obfuscated]

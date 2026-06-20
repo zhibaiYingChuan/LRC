@@ -2,7 +2,20 @@
 
 > **AI 编程助手的记忆与检索插件** — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定。
 >
-> 版本：v0.3.1 | 适用于：Trae / Cursor / VS Code
+> 版本：v0.5.5 | 适用于：Trae / Cursor / VS Code / Claude Desktop 等支持 MCP 协议的 AI 工具
+
+---
+
+## 推荐方式：LRC Desktop 桌面端（v0.5.0+）
+
+**最简单的方式**：下载并安装 [LRC Desktop 桌面端](https://github.com/zhibaiYingChuan/LRC/releases)，启动后会自动完成所有配置：
+
+1. **自动检测 AI 工具**：扫描本机已安装的 Trae / Cursor / VS Code / Claude Desktop 等
+2. **自动写入 MCP 配置**：使用 HTTP 模式（`http://127.0.0.1:3099/mcp`），无需手动编辑任何 JSON 文件
+3. **自动写入 AI 规则文件**：在项目目录下生成 `.trae/rules/lrc-memory.md` 等规则文件，引导 AI 主动调用 `recall` / `remember`
+4. **自动升级旧配置**：从旧版本升级时，sidecar 启动会自动把 stdio 模式 `loong-recall` 升级为 HTTP 模式 `lrc-memory`
+
+> **v0.5.5 重要变更**：LRC Desktop 总是启动 HTTP 模式的 sidecar（端口 3099），因此所有 AI 工具都应使用 HTTP 模式配置。旧的 stdio 模式配置会在 sidecar 启动时自动升级。
 
 ---
 
@@ -126,12 +139,14 @@ code-memory-server --src-dir ./src --stdio \
 
 ### 在 IDE 中配置
 
-在 MCP 配置文件中添加 `--llm-api` 参数即可：
+> **注意**：以下 stdio 模式配置仅适用于从源码编译并直接通过命令行启动的场景。如果你使用 LRC Desktop 桌面端，它会自动使用 HTTP 模式配置，无需手动添加 `--llm-api` 参数（LLM 配置通过仪表盘设置页面完成）。
+
+在 MCP 配置文件中添加 `--llm-api` 参数即可（stdio 模式）：
 
 ```json
 {
   "mcpServers": {
-    "loong-recall": {
+    "lrc-memory": {
       "command": "你的安装路径/target/release/code-memory-server.exe",
       "args": [
         "--src-dir", "你的项目路径/src",
@@ -169,6 +184,10 @@ cargo build --release --features server
 
 ### 第 2 步：配置 IDE
 
+> **推荐**：如果你使用 LRC Desktop 桌面端，这一步会自动完成，跳到第 3 步。
+>
+> 以下手动配置方式仅适用于从源码编译并直接通过命令行启动的高级用户。
+
 把你用的 IDE 的配置，复制粘贴进去就行。
 
 #### 🟢 Trae（推荐）
@@ -180,45 +199,44 @@ cargo build --release --features server
 ```json
 {
   "mcpServers": {
-    "loong-recall": {
-      "command": "你的安装路径/target/release/code-memory-server.exe",
-      "args": [
-        "--src-dir", "你的项目路径/src",
-        "--global",
-        "--stdio"
-      ]
+    "lrc-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:3099/mcp",
+      "description": "LRC — 本地代码记忆与语义搜索"
     }
   }
 }
 ```
 
-> ⚠️ 路径必须用正斜杠 `/`，不要用反斜杠 `\`。`你的项目路径` 换成你实际的项目路径。
+> ⚠️ LRC Desktop 总是启动 HTTP 模式的 sidecar（端口 3099），因此所有 AI 工具都应使用 HTTP 模式配置。旧的 stdio 模式配置（`loong-recall`）会在 sidecar 启动时自动升级。
 
 **② 配置项目规则（让 AI 自动使用记忆系统）**
 
-打开 `你的项目路径/.trae/rules/project-rules.md`，在文件末尾追加：
+LRC Desktop 启动时会自动在项目目录下创建 `.trae/rules/lrc-memory.md` 规则文件（含 `alwaysApply: true` frontmatter），引导 AI 主动调用记忆工具。如果你是手动配置，可以参考以下规则模板：
 
 ```markdown
-## MCP 记忆与检索插件（Loong Recall）
+---
+alwaysApply: true
+description: LRC 记忆系统规则 — 会话开始时必须 recall 检索项目记忆，完成任务后自动同步记忆库
+---
 
-本项目的 AI 助手已接入 Loong Recall。以下规则让 AI 自动、无感地使用它：
+## LRC 记忆系统（Loong Recall Code Memory）
 
-### 自动记忆规则
-- 当用户做出技术决策时（如"我们用 PostgreSQL"），自动用 remember 记录
-- 当用户表达偏好时（如"我喜欢用 pnpm"），自动用 remember 记录
-- 当完成重要功能开发后，自动记录关键设计决策
-- 记录时自动添加合适的类型标签（fact/preference/decision/code_context）
+### 规则 1：会话开始时必须 recall
+在回复用户的任何问题之前，必须先调用 recall 检索项目记忆，获取已有上下文。
 
-### 自动检索规则
-- 当用户问"我们之前..."、"上次说到..."、"之前决定..."时，先用 recall 检索
-- 当用户问代码位置时（如"XX 功能在哪？"），先用 search_code 搜索
-- 当用户提到某个技术概念但不确定项目里有没有时，先用 search_code 搜索
-- 引用记忆时使用「（根据记忆 #N）」格式标注来源，让用户看见记忆的存在
+### 规则 2：遇到不确定的模块时优先 recall
+当需要了解某个模块、函数、概念或实现逻辑时，优先使用 recall 检索记忆，而不是直接读取源文件。
 
-### 透明规则
-- 调用工具时不要在回复中显式展示工具调用过程
-- 把检索结果自然地融入回答，就像你本来就知道一样
-- 只在用户明确要求时才列出工具调用详情
+### 规则 3：完成任务后自动同步记忆
+每次完成代码修改任务后，自动检查并同步记忆库。
+
+### 记忆工具说明
+- `remember` — 记录新记忆
+- `recall` — 语义检索历史记忆
+- `update_memory` — 更新已有记忆
+- `forget` — 删除记忆
+- `list_memories` — 列出记忆库
 ```
 
 > 💡 这就是自动化的核心：有了这些规则，AI 会**自动判断**何时该用记忆、何时该搜代码。你只管正常对话。
@@ -236,13 +254,10 @@ cargo build --release --features server
 ```json
 {
   "mcpServers": {
-    "loong-recall": {
-      "command": "你的安装路径/target/release/code-memory-server.exe",
-      "args": [
-        "--src-dir", "你的项目路径/src",
-        "--global",
-        "--stdio"
-      ]
+    "lrc-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:3099/mcp",
+      "description": "LRC — 本地代码记忆与语义搜索"
     }
   }
 }
@@ -250,12 +265,15 @@ cargo build --release --features server
 
 **② 配置项目规则**
 
-打开 `你的项目路径/.cursor/rules` 目录，新建 `memory.md` 文件：
+LRC Desktop 会自动在项目目录下创建 `.cursor/rules/lrc-memory.mdc` 规则文件（含 frontmatter）。手动配置时，打开 `你的项目路径/.cursor/rules` 目录，新建 `lrc-memory.mdc` 文件：
 
 ```markdown
-# Memory & Search Rules (Loong Recall)
+---
+description: LRC 记忆系统规则 — 会话开始时必须 recall，完成任务后自动同步记忆
+alwaysApply: true
+---
 
-This project uses Loong Recall for code search and cross-session memory.
+# Memory & Search Rules (Loong Recall)
 
 - When user makes technical decisions, auto-record with remember tool
 - When user expresses preferences, auto-record with remember tool
@@ -268,7 +286,7 @@ This project uses Loong Recall for code search and cross-session memory.
 
 **③ 重启 Cursor**
 
-打开 Cursor 设置 → MCP → 确认 loong-recall 状态为 Connected。
+打开 Cursor 设置 → MCP → 确认 lrc-memory 状态为 Connected。
 
 #### 🟣 VS Code
 
@@ -283,12 +301,9 @@ This project uses Loong Recall for code search and cross-session memory.
 ```json
 {
   "mcp.servers": {
-    "loong-recall": {
-      "command": "你的安装路径/target/release/code-memory-server.exe",
-      "args": [
-        "--src-dir", "你的项目路径/src",
-        "--global"
-      ]
+    "lrc-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:3099/mcp"
     }
   }
 }
@@ -296,7 +311,7 @@ This project uses Loong Recall for code search and cross-session memory.
 
 **③ 配置 GitHub Copilot 指令**
 
-打开 `你的项目路径/.github/copilot-instructions.md`，写入：
+LRC Desktop 会自动在项目目录下创建 `.github/copilot-instructions.md`。手动配置时，打开 `你的项目路径/.github/copilot-instructions.md`，写入：
 
 ```markdown
 This project has Loong Recall for code search and session memory.
@@ -666,6 +681,52 @@ taskkill /PID <进程ID> /F
 ---
 
 ## 更新历史
+
+### v0.5.5 (2026-06-21)
+
+**新增功能**
+- MCP 配置自动升级：Sidecar 启动时自动检测并升级旧版本 MCP 配置（stdio `loong-recall` → HTTP `lrc-memory`）
+- AI 主动调用修复：修复 Trae 规则文件路径（`.trae/rules.md` → `.trae/rules/lrc-memory.md`），添加 `alwaysApply: true` frontmatter
+- AI 工具检测改进：避免残留 dot 目录导致的误报
+
+**问题修复**
+- 修复 MCP 工具不显示（"no tools yet"）问题：统一 HTTP 模式配置 + 清理旧配置
+- 修复 AI 主动调用 recall 未生效问题：修复规则文件路径 + 添加 frontmatter
+- 修复仪表盘"修改配置"按钮无反应问题：统一使用完整 LLM 配置表单
+
+### v0.5.4 (2026-06-20)
+
+**新增功能**
+- 全项目静态代码审计，修复所有 Clippy 警告
+- 桌面端 URL 导航白名单验证（仅允许 127.0.0.1）
+- 敏感数据使用后内存清零（SecureString 模式）
+- 字符串编译时混淆（obfstr）
+- DPAPI 密钥损坏自动恢复机制
+
+### v0.5.1 (2026-06-18)
+
+**新增功能**
+- 前端版本号一致性（统一从 Cargo.toml 读取）
+- 前端 CSS 内联 1260 行提取到 app.css
+- 前端 app.js 全局变量污染（IIFE 隔离）
+- server.rs 巨型函数拆分（964行 → 5个函数）
+- 模型加载逻辑重复（提取共享 PoolingStrategy）
+- RRF 融合逻辑重复（提取共享 rrf.rs 模块）
+
+### v0.5.0 (2026-06-17)
+
+**新增功能**
+- LRC Desktop 桌面端应用（基于 Tauri 2）
+- 配置向导：首次启动自动引导完成项目目录、LLM 配置和 Agent 连接
+- LLM 可视化配置：桌面端内置 LLM 设置面板，支持 DeepSeek、通义千问、Ollama 等 10+ 模型提供商
+- Agent 配置引导：分类展示 IDE 类、桌面应用、命令行工具等 AI 产品的 MCP 配置方法
+- 系统托盘：最小化到托盘，右键快捷操作
+- 配置加密存储：API Key 使用 AES-256-GCM 加密存储
+- 一键安装脚本（`scripts/install.ps1` / `scripts/install.sh`）
+
+**问题修复**
+- 修复 TraeDetector 在配置文件不存在时返回 None 导致 MCP 配置从未写入的 Bug
+- MCP 配置使用绝对路径，IDE 无需依赖 PATH 环境变量
 
 ### v0.3.1 (2026-06-12)
 

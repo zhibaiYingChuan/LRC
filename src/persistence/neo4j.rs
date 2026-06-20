@@ -44,7 +44,8 @@ impl Default for Neo4jConfig {
             endpoint: "http://localhost:7474".to_string(),
             database: "neo4j".to_string(),
             username: "neo4j".to_string(),
-            password: "password".to_string(),
+            // v0.5.4 修复：不再硬编码密码，必须通过环境变量设置
+            password: String::new(),
             timeout_secs: 15,
         }
     }
@@ -56,13 +57,19 @@ impl Neo4jConfig {
     /// 环境变量：
     /// - `LRC_NEO4J_URL`：Neo4j 服务地址
     /// - `LRC_NEO4J_USER`：用户名
-    /// - `LRC_NEO4J_PASS`：密码
+    /// - `LRC_NEO4J_PASS`：密码（**必须设置**，v0.5.4 起不再使用硬编码默认值）
     /// - `LRC_NEO4J_DB`：数据库名
     pub fn from_env() -> Result<Self, String> {
         let endpoint =
             std::env::var("LRC_NEO4J_URL").unwrap_or_else(|_| "http://localhost:7474".to_string());
         let username = std::env::var("LRC_NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
-        let password = std::env::var("LRC_NEO4J_PASS").unwrap_or_else(|_| "password".to_string());
+        // v0.5.4 修复：密码必须从环境变量读取，不使用硬编码默认值
+        let password = match std::env::var("LRC_NEO4J_PASS") {
+            Ok(p) if !p.is_empty() => p,
+            _ => return Err(
+                "LRC_NEO4J_PASS 环境变量未设置或为空，请设置 Neo4j 密码".to_string()
+            ),
+        };
         let database = std::env::var("LRC_NEO4J_DB").unwrap_or_else(|_| "neo4j".to_string());
 
         Ok(Self {
@@ -326,6 +333,15 @@ impl Neo4jGraphStore {
             EdgeType::RelatedTo => "RELATED_TO",
         };
 
+        // v0.5.4 修复：纵深防御 — 校验 relation 名称仅含大写字母和下划线
+        // 防止未来新增 EdgeType 变体时引入非预期字符
+        if !relation.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+            return Err(PersistenceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("非法的关系类型名称: {}", relation),
+            )));
+        }
+
         let cypher = format!(
             "MATCH (a:Memory {{id: $from_id}}), (b:Memory {{id: $to_id}}) \
              MERGE (a)-[:{}]->(b)",
@@ -347,12 +363,67 @@ impl Neo4jGraphStore {
         node_id: &str,
         hops: u32,
     ) -> Result<GraphQueryResult, PersistenceError> {
-        // 同时更新本地兜底
-        if let Ok(guard) = self.fallback.lock() {
-            return Ok(guard.query_subgraph(node_id));
+        // v0.5.4 修复：hops 范围校验，防止超大值导致查询性能问题
+        if hops == 0 || hops > 10 {
+            return Err(PersistenceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("hops 必须在 1-10 之间，当前值: {}", hops),
+            )));
         }
 
-        Ok(GraphQueryResult::default())
+        // 使用 Cypher 可变长度路径查询获取 N 跳子图
+        let cypher = format!(
+            "MATCH (m:Memory {{id: $node_id}}) \
+             OPTIONAL MATCH path = (m)-[*1..{}]-(neighbor:Memory) \
+             RETURN m, relationships(path) AS edges, neighbor",
+            hops
+        );
+
+        let params = serde_json::json!({
+            "node_id": node_id,
+        });
+
+        match self.execute_cypher(&cypher, params).await {
+            Ok(response) => {
+                let mut result = GraphQueryResult::default();
+                for data_row in &response.results.first().map(|r| &r.data).unwrap_or(&vec![]) {
+                    // 提取节点和边信息
+                    if let Some(node_val) = data_row.row.get(0) {
+                        if let Some(props) = node_val.as_object() {
+                            result.nodes.push(props.clone());
+                        }
+                    }
+                    if let Some(edges_val) = data_row.row.get(1) {
+                        if let Some(edges_arr) = edges_val.as_array() {
+                            for edge in edges_arr {
+                                if let Some(edge_obj) = edge.as_object() {
+                                    result.edges.push(edge_obj.clone());
+                                }
+                            }
+                        }
+                    }
+                    if let Some(neighbor_val) = data_row.row.get(2) {
+                        if let Some(props) = neighbor_val.as_object() {
+                            if !result.nodes.iter().any(|n| {
+                                n.get("id") == props.get("id")
+                            }) {
+                                result.nodes.push(props.clone());
+                            }
+                        }
+                    }
+                }
+                Ok(result)
+            }
+            Err(e) => {
+                // Neo4j 不可用时回退到本地兜底
+                eprintln!("[LRC·Neo4j] 子图查询失败（回退到本地兜底）: {e}");
+                if let Ok(guard) = self.fallback.lock() {
+                    Ok(guard.query_subgraph(node_id))
+                } else {
+                    Ok(GraphQueryResult::default())
+                }
+            }
+        }
     }
 }
 

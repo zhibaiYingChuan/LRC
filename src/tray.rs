@@ -95,6 +95,7 @@ mod win_tray {
             .chain(std::iter::once(0))
             .collect();
 
+        // SAFETY: GetModuleHandleW(nullptr) 返回当前模块句柄，始终有效，无内存操作
         let hinstance = unsafe { GetModuleHandleW(ptr::null()) };
         let wc = WNDCLASSW {
             style: 0,
@@ -102,6 +103,7 @@ mod win_tray {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance,
+            // SAFETY: LoadIconW(nullptr, IDI_APPLICATION) 加载系统默认图标，两个参数均为常量
             hIcon: unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) },
             hCursor: std::ptr::null_mut(),
             hbrBackground: std::ptr::null_mut(),
@@ -109,8 +111,10 @@ mod win_tray {
             lpszClassName: class_name.as_ptr(),
         };
 
+        // SAFETY: RegisterClassW 注册窗口类，wc 为栈上有效结构体，所有字段已正确初始化
         unsafe { RegisterClassW(&wc) };
 
+        // SAFETY: CreateWindowExW 创建消息窗口，所有参数均为有效值或空指针
         let hwnd = unsafe {
             CreateWindowExW(
                 0,
@@ -131,18 +135,22 @@ mod win_tray {
         if !hwnd.is_null() {
             // 保存 dashboard_url 到窗口数据
             let url_ptr = Box::into_raw(Box::new(dashboard_url.to_string()));
+            // SAFETY: SetWindowLongPtrW 设置窗口用户数据，url_ptr 由 Box::into_raw 分配，生命周期由窗口管理
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, url_ptr as isize) };
 
             // 添加托盘图标
             add_tray_icon(hwnd);
 
             // 消息循环
+            // SAFETY: mem::zeroed 初始化 MSG 结构体，MSG 是 POD 类型，零初始化是安全的
             let mut msg = unsafe { mem::zeroed::<MSG>() };
             loop {
+                // SAFETY: GetMessageW 从消息队列获取消息，msg 是栈上有效变量
                 let ret = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
                 if ret == 0 || ret == -1 {
                     break;
                 }
+                // SAFETY: TranslateMessage 和 DispatchMessageW 是标准消息处理函数，msg 已由 GetMessageW 填充
                 unsafe {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
@@ -150,6 +158,7 @@ mod win_tray {
             }
 
             // 清理
+            // SAFETY: Box::from_raw 从 SetWindowLongPtrW 保存的指针重建 Box，生命周期与窗口一致
             unsafe {
                 let _ = Box::from_raw(url_ptr);
             }
@@ -162,30 +171,37 @@ mod win_tray {
             .chain(std::iter::once(0))
             .collect();
 
+        // SAFETY: mem::zeroed 初始化 NOTIFYICONDATAW 结构体，该结构体是 POD 类型
         let mut nid: NOTIFYICONDATAW = unsafe { mem::zeroed() };
         nid.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
         nid.uID = 1;
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
+        // SAFETY: LoadIconW(nullptr, IDI_APPLICATION) 加载系统默认图标
         nid.hIcon = unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) };
 
         let copy_len = tooltip.len().min(127);
         nid.szTip[..copy_len].copy_from_slice(&tooltip[..copy_len]);
 
+        // SAFETY: Shell_NotifyIconW(NIM_ADD) 添加托盘图标，nid 已正确初始化
         unsafe { Shell_NotifyIconW(NIM_ADD, &nid) };
     }
 
     fn remove_tray_icon(hwnd: HWND) {
+        // SAFETY: mem::zeroed 初始化 NOTIFYICONDATAW 结构体
         let mut nid: NOTIFYICONDATAW = unsafe { mem::zeroed() };
         nid.cbSize = mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
         nid.uID = 1;
+        // SAFETY: Shell_NotifyIconW(NIM_DELETE) 删除托盘图标，nid 已正确初始化
         unsafe { Shell_NotifyIconW(NIM_DELETE, &nid) };
     }
 
     /// 打开仪表盘
     fn open_dashboard(hwnd: HWND) {
+        // SAFETY: GetWindowLongPtrW 读取窗口用户数据，返回由 SetWindowLongPtrW 设置的指针
+        // 解引用前检查 ptr != 0，确保指针有效
         unsafe {
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if ptr != 0 {

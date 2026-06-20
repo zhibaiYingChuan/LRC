@@ -101,6 +101,24 @@ pub struct PostgresPersistence {
 impl PostgresPersistence {
     /// 创建新的 PostgreSQL 持久化后端
     pub async fn new(config: PostgresConfig) -> Result<Self, PersistenceError> {
+        // v0.5.4 修复：table_prefix 白名单校验，防止 SQL 注入
+        // 仅允许字母、数字和下划线，长度 1-30 字符
+        if config.table_prefix.is_empty() || config.table_prefix.len() > 30 {
+            return Err(PersistenceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("table_prefix 长度必须在 1-30 之间，当前值: '{}'", config.table_prefix),
+            )));
+        }
+        if !config.table_prefix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err(PersistenceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "table_prefix 仅允许字母、数字和下划线，当前值: '{}'",
+                    config.table_prefix
+                ),
+            )));
+        }
+
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(config.max_connections)
             .connect(&config.database_url)
@@ -300,22 +318,43 @@ impl PostgresPersistence {
 }
 
 #[cfg(feature = "postgres")]
-impl Persistence for PostgresPersistence {
-    fn save_memory(&self, memory: &Memory) -> Result<(), PersistenceError> {
-        // PostgreSQL 需要异步操作，但 Persistence trait 是同步的。
-        // 使用 tokio::runtime::Handle::block_on 来桥接。
+impl PostgresPersistence {
+    /// 在当前 tokio 运行时中执行异步操作
+    ///
+    /// PostgreSQL 后端需要异步执行，但 `Persistence` trait 是同步接口。
+    /// 此方法桥接同步与异步：获取当前 tokio 运行时句柄并阻塞执行 future。
+    ///
+    /// v0.5.4 修复：使用 `block_in_place` 包裹 `block_on`，
+    /// 通知 tokio 运行时当前线程即将阻塞，允许运行时将其他任务迁移到备用线程，
+    /// 避免阻塞整个异步运行时。
+    ///
+    /// # Errors
+    /// 如果不在 tokio 运行时上下文中调用，返回错误。
+    fn block_on_async<F, T>(&self, future: F) -> Result<T, PersistenceError>
+    where
+        F: std::future::Future<Output = Result<T, PersistenceError>> + Send,
+        T: Send,
+    {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
             PersistenceError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                "PostgresPersistence 需要在 tokio 运行时上下文中使用",
+                "PostgresPersistence 需要在 tokio 运行时上下文中使用。\
+                 请确保在 #[tokio::main] 或 tokio::runtime::Runtime 中调用。",
             ))
         })?;
+        // v0.5.4 修复：block_in_place 通知 tokio 当前线程将阻塞
+        tokio::task::block_in_place(|| handle.block_on(future))
+    }
+}
 
+#[cfg(feature = "postgres")]
+impl Persistence for PostgresPersistence {
+    fn save_memory(&self, memory: &Memory) -> Result<(), PersistenceError> {
         let pool = self.pool.clone();
         let row = Self::memory_to_row(memory);
         let table = format!("{}memories", self.table_prefix);
 
-        handle.block_on(async move {
+        self.block_on_async(async move {
             sqlx::query(&format!(
                 "INSERT INTO {} (id, content, memory_type, project, tags, importance, version, \
                  created_at, updated_at, last_accessed, ttl_days, luoshu_vector, bagua_index, \
@@ -360,24 +399,16 @@ impl Persistence for PostgresPersistence {
             .map_err(|e| PersistenceError::Io(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 format!("保存记忆失败: {}", e),
-            )))
-        })?;
-
-        Ok(())
+            )))?;
+            Ok(())
+        })
     }
 
     fn load_all_memories(&self) -> Result<Vec<Memory>, PersistenceError> {
-        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "PostgresPersistence 需要在 tokio 运行时上下文中使用",
-            ))
-        })?;
-
         let pool = self.pool.clone();
         let table = format!("{}memories", self.table_prefix);
 
-        handle.block_on(async move {
+        self.block_on_async(async move {
             let rows = sqlx::query(&format!("SELECT * FROM {}", table))
                 .fetch_all(&pool)
                 .await
@@ -402,18 +433,11 @@ impl Persistence for PostgresPersistence {
     }
 
     fn delete_memory(&self, id: &str) -> Result<bool, PersistenceError> {
-        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "PostgresPersistence 需要在 tokio 运行时上下文中使用",
-            ))
-        })?;
-
         let pool = self.pool.clone();
         let id_owned = id.to_string();
         let table = format!("{}memories", self.table_prefix);
 
-        handle.block_on(async move {
+        self.block_on_async(async move {
             let result = sqlx::query(&format!("DELETE FROM {} WHERE id = $1", table))
                 .bind(&id_owned)
                 .execute(&pool)
@@ -429,17 +453,10 @@ impl Persistence for PostgresPersistence {
     }
 
     fn clear_memories(&self) -> Result<(), PersistenceError> {
-        let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "PostgresPersistence 需要在 tokio 运行时上下文中使用",
-            ))
-        })?;
-
         let pool = self.pool.clone();
         let table = format!("{}memories", self.table_prefix);
 
-        handle.block_on(async move {
+        self.block_on_async(async move {
             sqlx::query(&format!("DELETE FROM {}", table))
                 .execute(&pool)
                 .await
@@ -448,21 +465,31 @@ impl Persistence for PostgresPersistence {
                         std::io::ErrorKind::Other,
                         format!("清空记忆失败: {}", e),
                     ))
-                })
-        })?;
-        Ok(())
+                })?;
+            Ok(())
+        })
     }
 
     fn save_chunks(&self, _chunks: &[CodeChunk]) -> Result<(), PersistenceError> {
-        Ok(()) // 代码片段存储暂不在 PG 中实现，保持 JSON 文件方案
+        // v0.5.4 修复：不再静默返回 Ok，明确告知调用方操作不支持
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "PostgreSQL 后端暂不支持代码片段存储，请使用 JSON 文件方案",
+        )))
     }
 
     fn load_chunks(&self) -> Result<Vec<CodeChunk>, PersistenceError> {
-        Ok(Vec::new()) // 同上
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "PostgreSQL 后端暂不支持代码片段加载，请使用 JSON 文件方案",
+        )))
     }
 
     fn clear_chunks(&self) -> Result<(), PersistenceError> {
-        Ok(())
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "PostgreSQL 后端暂不支持代码片段清除，请使用 JSON 文件方案",
+        )))
     }
 
     fn size_bytes(&self) -> Result<u64, PersistenceError> {

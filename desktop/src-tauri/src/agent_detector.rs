@@ -12,6 +12,7 @@
 ///   - IDE 内嵌 Agent：Trae, Cursor, VS Code, Windsurf, Kiro
 ///   - 独立桌面 Agent：Claude Desktop, Gemini CLI, Codex CLI
 ///   - AI 编码助手：CodeBuddy, Comate, Roo, Cline, Continue, Cody, Aider, Augment, Amazon Q
+///   - 国产 AI 工具：通义灵码 (阿里云), 豆包 MarsCode (字节), 智谱 CodeGeeX, 腾讯云 AI 代码助手, 华为 CodeArts Snap
 ///   - AI 浏览器/平台：Agent Browser, CloudBase MCP, Playwright MCP, OpenCode
 ///   - 其他 AI 工具：Z-Brain, Functional Hub, Tabby, PearAI, Zed, JetBrains AI
 use serde::{Deserialize, Serialize};
@@ -80,11 +81,17 @@ struct KnownTool {
     /// 检测标记：主目录（相对于 %USERPROFILE% 或 %APPDATA%）
     primary_marker: &'static str,
     /// 辅助检测标记（可选）
+    /// 当前检测策略仅使用 binary_paths，此字段保留供未来扩展
+    #[allow(dead_code)]
     secondary_markers: &'static [&'static str],
     /// MCP 配置路径模板（相对于 %USERPROFILE%，None 表示项目级配置或无 MCP）
     mcp_config_template: Option<&'static str>,
     /// MCP 传输类型："stdio" 或 "http"
     mcp_transport: &'static str,
+    /// 二进制可执行文件路径（多路径，按优先级，相对于 %LOCALAPPDATA% 或 %PROGRAMFILES%）
+    /// 格式：支持环境变量 %LOCALAPPDATA%, %PROGRAMFILES%, %PROGRAMFILES(X86)%
+    /// 例如：%LOCALAPPDATA%/Programs/Trae/Trae.exe
+    binary_paths: &'static [&'static str],
 }
 
 /// 所有已知 AI 工具的数据库
@@ -103,6 +110,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[".trae-cn", "%APPDATA%/Trae", "%APPDATA%/Trae CN"],
         mcp_config_template: Some(".trae/mcp.json"),
         mcp_transport: "stdio",
+        binary_paths: &["%LOCALAPPDATA%/Programs/Trae/Trae.exe", "%PROGRAMFILES%/Trae/Trae.exe"],
     },
     KnownTool {
         id: "trae-cn",
@@ -114,6 +122,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &["%APPDATA%/Trae CN"],
         mcp_config_template: Some(".trae-cn/trae-mcp.json"),
         mcp_transport: "stdio",
+        binary_paths: &["%LOCALAPPDATA%/Programs/Trae CN/Trae CN.exe", "%PROGRAMFILES%/Trae CN/Trae CN.exe"],
     },
     KnownTool {
         id: "cursor",
@@ -125,6 +134,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &["%APPDATA%/Cursor"],
         mcp_config_template: None, // 项目级 .cursor/mcp.json
         mcp_transport: "stdio",
+        binary_paths: &["%LOCALAPPDATA%/Programs/Cursor/Cursor.exe", "%PROGRAMFILES%/Cursor/Cursor.exe"],
     },
     KnownTool {
         id: "vscode",
@@ -136,6 +146,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &["%APPDATA%/Code", "%APPDATA%/Code - Insiders"],
         mcp_config_template: None, // 项目级 .vscode/mcp.json
         mcp_transport: "stdio",
+        binary_paths: &["%LOCALAPPDATA%/Programs/Microsoft VS Code/Code.exe", "%PROGRAMFILES%/Microsoft VS Code/Code.exe"],
     },
     KnownTool {
         id: "windsurf",
@@ -147,6 +158,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &["%APPDATA%/Windsurf"],
         mcp_config_template: Some("%APPDATA%/Windsurf/User/globalStorage/mcp.json"),
         mcp_transport: "stdio",
+        binary_paths: &["%LOCALAPPDATA%/Programs/Windsurf/Windsurf.exe", "%PROGRAMFILES%/Windsurf/Windsurf.exe"],
     },
     KnownTool {
         id: "kiro",
@@ -158,6 +170,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: Some(".kiro/settings/mcp.json"),
         mcp_transport: "stdio",
+        binary_paths: &["%LOCALAPPDATA%/Programs/Kiro/Kiro.exe"],
     },
 
     // ═══ 桌面应用类 ═══
@@ -171,6 +184,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &["%APPDATA%/Claude", "%LOCALAPPDATA%/AnthropicClaude"],
         mcp_config_template: Some("%APPDATA%/Claude/claude_desktop_config.json"),
         mcp_transport: "http",
+        binary_paths: &["%LOCALAPPDATA%/AnthropicClaude/claude.exe"],
     },
     KnownTool {
         id: "gemini-cli",
@@ -182,6 +196,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: Some(".gemini/settings.json"),
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "codex-cli",
@@ -193,19 +208,21 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
 
     // ═══ AI 编码助手类 ═══
     KnownTool {
         id: "codebuddy",
-        name: "CodeBuddy",
+        name: "CodeBuddy (腾讯)",
         icon: "🤝",
         category: "ai-assistant",
-        supports_mcp: false,
+        supports_mcp: true,
         primary_marker: ".codebuddy",
         secondary_markers: &[],
-        mcp_config_template: None,
+        mcp_config_template: Some(".codebuddy/mcp.json"),
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "comate",
@@ -217,6 +234,68 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: Some(".comate/mcp.json"),
         mcp_transport: "stdio",
+        binary_paths: &[],
+    },
+    // ═══ 国产 AI 工具 ═══
+    KnownTool {
+        id: "tongyi-lingma",
+        name: "通义灵码 (阿里云)",
+        icon: "☁️",
+        category: "ai-assistant",
+        supports_mcp: false,
+        primary_marker: ".lingma",
+        secondary_markers: &[".tongyi-lingma"],
+        mcp_config_template: None,
+        mcp_transport: "stdio",
+        binary_paths: &[],
+    },
+    KnownTool {
+        id: "marscode",
+        name: "豆包 MarsCode (字节)",
+        icon: "🫘",
+        category: "ai-assistant",
+        supports_mcp: false,
+        primary_marker: ".marscode",
+        secondary_markers: &[],
+        mcp_config_template: None,
+        mcp_transport: "stdio",
+        binary_paths: &[],
+    },
+    KnownTool {
+        id: "codegeex",
+        name: "智谱 CodeGeeX",
+        icon: "🧠",
+        category: "ai-assistant",
+        supports_mcp: false,
+        primary_marker: ".codegeex",
+        secondary_markers: &[],
+        mcp_config_template: None,
+        mcp_transport: "stdio",
+        binary_paths: &[],
+    },
+    KnownTool {
+        id: "tencent-ai-code",
+        name: "腾讯云 AI 代码助手",
+        icon: "☁️",
+        category: "ai-assistant",
+        supports_mcp: false,
+        primary_marker: ".tencent-ai-code",
+        secondary_markers: &[],
+        mcp_config_template: None,
+        mcp_transport: "stdio",
+        binary_paths: &[],
+    },
+    KnownTool {
+        id: "huawei-codearts",
+        name: "华为 CodeArts Snap",
+        icon: "🔷",
+        category: "ai-assistant",
+        supports_mcp: false,
+        primary_marker: ".codearts-snap",
+        secondary_markers: &[],
+        mcp_config_template: None,
+        mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "roo-code",
@@ -228,6 +307,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: Some(".roo/mcp.json"),
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "cline",
@@ -239,6 +319,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: Some(".cline/mcp.json"),
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "continue",
@@ -250,6 +331,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "cody",
@@ -261,6 +343,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "aider",
@@ -272,6 +355,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "augment",
@@ -283,6 +367,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "amazon-q",
@@ -294,6 +379,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "tabby",
@@ -305,6 +391,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "jetbrains-ai",
@@ -316,6 +403,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &["%PROGRAMFILES%/JetBrains/IntelliJ IDEA/bin/idea64.exe", "%LOCALAPPDATA%/JetBrains/Toolbox/scripts/idea.cmd"],
     },
     KnownTool {
         id: "pearai",
@@ -327,6 +415,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
     KnownTool {
         id: "zed",
@@ -338,6 +427,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &["%LOCALAPPDATA%/Programs/Zed/Zed.exe"],
     },
 
     // ═══ AI 浏览器 / 平台类 ═══
@@ -351,6 +441,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "http",
+        binary_paths: &[],
     },
     KnownTool {
         id: "cloudbase-mcp",
@@ -362,6 +453,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: Some(".cloudbase-mcp/mcp.json"),
         mcp_transport: "http",
+        binary_paths: &[],
     },
     KnownTool {
         id: "playwright-mcp",
@@ -373,6 +465,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: Some(".playwright-mcp/mcp.json"),
         mcp_transport: "http",
+        binary_paths: &[],
     },
     KnownTool {
         id: "opencode",
@@ -384,6 +477,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
+        binary_paths: &[],
     },
 
     // ═══ 其他 AI 工具 ═══
@@ -397,6 +491,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "http",
+        binary_paths: &[],
     },
     KnownTool {
         id: "functional-hub",
@@ -408,6 +503,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &["%APPDATA%/com.functional-hub.agent"],
         mcp_config_template: None,
         mcp_transport: "http",
+        binary_paths: &[],
     },
     KnownTool {
         id: "sillytavern",
@@ -419,6 +515,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &["Documents/SillyTavern"],
         mcp_config_template: None,
         mcp_transport: "http",
+        binary_paths: &[],
     },
     KnownTool {
         id: "memorix",
@@ -430,21 +527,18 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "http",
+        binary_paths: &[],
     },
-    KnownTool {
-        id: "loong-recall",
-        name: "Loong Recall (LRC)",
-        icon: "🐉",
-        category: "desktop",
-        supports_mcp: true,
-        primary_marker: ".loong-recall",
-        secondary_markers: &[],
-        mcp_config_template: Some(".loong-recall/mcp.json"),
-        mcp_transport: "stdio",
-    },
+    // v0.5.4 P2-20 修复：移除 loong-recall 条目
+    // 原因：~/.loong-recall 是 LRC 桌面端自己的数据目录，不是独立的 AI 工具。
+    //       将其作为独立工具检测会导致所有安装了 LRC 的用户都看到"Loong Recall 已安装"，
+    //       这是误导性的。LRC 桌面端应用本身就是 LRC 的入口。
 ];
 
 // ── 通用扫描函数 ──
+
+/// 扫描条目数上限（防止在大目录如 Desktop 中扫描过多条目）
+const MAX_SCAN_ENTRIES: usize = 200;
 
 /// 扫描指定根目录下包含 marker 子目录的项目
 fn scan_marker_projects(
@@ -454,6 +548,7 @@ fn scan_marker_projects(
     ide_name: &str,
 ) -> Vec<ProjectInfo> {
     let mut projects = Vec::new();
+    let mut scanned = 0usize;
     for root in roots {
         if !root.exists() {
             continue;
@@ -471,6 +566,16 @@ fn scan_marker_projects(
         }
         if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
+                // 扫描条目数上限（防止大目录扫描过慢）
+                if scanned >= MAX_SCAN_ENTRIES {
+                    tracing::debug!(
+                        "扫描根目录 {} 达到上限 {} 条，停止扫描",
+                        root.display(),
+                        MAX_SCAN_ENTRIES
+                    );
+                    break;
+                }
+                scanned += 1;
                 let path = entry.path();
                 if path.is_dir() && path.join(marker).exists() {
                     projects.push(ProjectInfo {
@@ -492,6 +597,9 @@ fn scan_marker_projects(
 }
 
 /// 获取项目扫描的根目录列表
+/// 
+/// v0.5.4 修复：移除驱动根目录扫描（C:\, D:\ 等），太慢且无意义。
+/// 只扫描用户主目录下的常见项目目录，外加 IDE 工作区配置中记录的项目。
 fn scan_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(home) = std::env::var("USERPROFILE") {
@@ -504,7 +612,7 @@ fn scan_roots() -> Vec<PathBuf> {
             "Documents\\Projects",
             "Desktop",
             "Documents",
-            "",
+            "",  // 主目录本身
         ] {
             let p = home.join(sub);
             if p.exists() {
@@ -512,13 +620,11 @@ fn scan_roots() -> Vec<PathBuf> {
             }
         }
     }
-    // P3-09 修复：添加 C:\ 到扫描范围
-    for drive in &["C:\\", "D:\\", "E:\\", "F:\\", "G:\\"] {
-        let p = PathBuf::from(drive);
-        if p.exists() {
-            roots.push(p);
-        }
-    }
+    // v0.5.4 修复：移除驱动根目录扫描，避免扫描整个硬盘
+    // 驱动根目录扫描会导致：
+    // 1. 扫描时间过长（可能数分钟）
+    // 2. 大量系统目录误报
+    // 3. 用户体验极差
     roots
 }
 
@@ -544,7 +650,16 @@ fn local_appdata_dir() -> Option<PathBuf> {
 /// - 以 "%APPDATA%/" 开头的路径替换为实际 APPDATA 路径
 /// - 以 "%LOCALAPPDATA%/" 开头的路径替换为实际 LOCALAPPDATA 路径
 /// - 其他路径相对于 %USERPROFILE%
+///
+/// v0.5.4 安全加固：添加路径遍历防护，拒绝包含 ".." 的标记路径
 fn resolve_marker(marker: &str) -> Option<PathBuf> {
+    // v0.5.4 路径遍历防护：拒绝包含 ".." 路径组件的标记
+    // 防止攻击者通过配置恶意标记路径访问系统敏感文件
+    if marker.contains("..") {
+        eprintln!("[LRC·安全] 拒绝包含路径遍历的标记: {}", marker);
+        return None;
+    }
+
     if let Some(rest) = marker.strip_prefix("%APPDATA%/") {
         return appdata_dir().map(|d| d.join(rest));
     }
@@ -555,7 +670,30 @@ fn resolve_marker(marker: &str) -> Option<PathBuf> {
     home_dir().map(|d| d.join(marker))
 }
 
-/// 检查标记路径是否存在
+/// 解析二进制路径中的环境变量
+/// 支持的变量：%LOCALAPPDATA%, %PROGRAMFILES%, %PROGRAMFILES(X86)%, %APPDATA%, %USERPROFILE%
+fn resolve_binary_path(template: &str) -> Option<PathBuf> {
+    let resolved = template
+        .replace("%LOCALAPPDATA%", &std::env::var("LOCALAPPDATA").unwrap_or_default())
+        .replace("%PROGRAMFILES(X86)%", &std::env::var("ProgramFiles(x86)").unwrap_or_default())
+        .replace("%PROGRAMFILES%", &std::env::var("ProgramFiles").unwrap_or_default())
+        .replace("%APPDATA%", &std::env::var("APPDATA").unwrap_or_default())
+        .replace("%USERPROFILE%", &std::env::var("USERPROFILE").unwrap_or_default());
+    let path = PathBuf::from(&resolved);
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// 检查二进制可执行文件是否存在
+/// 返回 true 如果任意一个 binary_path 指向存在的文件
+fn binary_exists(binary_paths: &[&str]) -> bool {
+    binary_paths.iter().any(|p| resolve_binary_path(p).is_some())
+}
+/// 检查标记路径是否存在（保留供未来扩展使用）
+#[allow(dead_code)]
 fn marker_exists(marker: &str) -> bool {
     resolve_marker(marker).is_some_and(|p| p.exists())
 }
@@ -575,17 +713,45 @@ impl DotDirDetector {
     }
 
     /// 使用已知工具数据库中的信息进行检测
+    ///
+    /// v0.5.5 增强：严格检测策略，避免残留目录误报
+    ///
+    /// 策略（按优先级）：
+    ///   1. 有 binary_paths 的工具 → 检测二进制文件是否存在（最准确）
+    ///   2. 无 binary_paths 但有 mcp_config_template 的工具 → 检测配置文件是否存在
+    ///   3. 无 binary_paths 且无 mcp_config_template 的工具 → 不自动检测
+    ///      （避免残留 dot 目录误报，用户可在向导中手动选择）
     fn check_known_tool(&self) -> bool {
-        // 检查主标记
-        if marker_exists(self.tool.primary_marker) {
-            return true;
+        // 策略 1：检测二进制可执行文件（最准确）
+        if !self.tool.binary_paths.is_empty() {
+            return binary_exists(self.tool.binary_paths);
         }
-        // 检查辅助标记
-        for marker in self.tool.secondary_markers {
-            if marker_exists(marker) {
-                return true;
+        // 策略 2：无二进制路径但有 MCP 配置模板 → 检测配置文件是否存在
+        if let Some(config_template) = self.tool.mcp_config_template {
+            if let Some(cp) = resolve_marker(config_template) {
+                if cp.exists() {
+                    tracing::debug!(
+                        "[Agent检测] {} — 通过配置文件检测到: {}",
+                        self.tool.name,
+                        cp.display()
+                    );
+                    return true;
+                }
+                tracing::debug!(
+                    "[Agent检测] {} — 配置文件不存在: {}",
+                    self.tool.name,
+                    cp.display()
+                );
+                return false;
             }
         }
+        // 策略 3：无 binary_paths 且无 mcp_config_template → 不自动检测
+        // v0.5.5 修复：避免残留 dot 目录误报（如 .gemini、.codex、.continue 等）
+        // 这些工具用户可在配置向导中手动选择
+        tracing::debug!(
+            "[Agent检测] {} — 无二进制路径且无配置模板，不自动检测（避免误报）",
+            self.tool.name
+        );
         false
     }
 }
@@ -598,35 +764,24 @@ impl AgentDetector for DotDirDetector {
     fn config_path(&self) -> Option<PathBuf> {
         self.tool
             .mcp_config_template
-            .and_then(|template| resolve_marker(template))
-            .filter(|p| {
-                // 返回配置路径，即使文件不存在也返回（父目录存在即可）
-                p.exists() || p.parent().is_some_and(|parent| parent.exists())
-            })
+            .and_then(resolve_marker)
+            // v0.5.1 修复：移除过于严格的父目录存在检查
+            // write_or_merge_config 会自动创建父目录，无需在此过滤
     }
 
     fn generate_config(&self, port: u16) -> serde_json::Value {
-        if self.tool.mcp_transport == "http" {
-            serde_json::json!({
-                "mcpServers": {
-                    "lrc-memory": {
-                        "type": "http",
-                        "url": format!("http://127.0.0.1:{}/mcp", port),
-                        "description": "LRC — 本地代码记忆与语义搜索"
-                    }
+        // v0.5.5 修复：LRC Desktop 总是启动 HTTP 模式的 sidecar
+        // 因此所有工具都应使用 HTTP 模式配置，直接连接已运行的 sidecar
+        // 避免 stdio 模式启动新 sidecar 进程导致"已有实例运行"冲突
+        serde_json::json!({
+            "mcpServers": {
+                "lrc-memory": {
+                    "type": "http",
+                    "url": format!("http://127.0.0.1:{}/mcp", port),
+                    "description": "LRC — 本地代码记忆与语义搜索"
                 }
-            })
-        } else {
-            serde_json::json!({
-                "mcpServers": {
-                    "lrc-memory": {
-                        "command": "lrc-desktop",
-                        "args": ["--mcp", "--port", port.to_string()],
-                        "env": {}
-                    }
-                }
-            })
-        }
+            }
+        })
     }
 
     fn info(&self) -> AgentInfo {
@@ -682,76 +837,79 @@ impl AgentDetector for TraeDetector {
             return true;
         }
 
-        // 策略 2：检查安装目录
+        // 策略 2：检查安装目录（二进制可执行文件）
         let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-        if PathBuf::from(&local).join("Programs").join("Trae").exists() {
+        if PathBuf::from(&local).join("Programs").join("Trae").join("Trae.exe").exists()
+            || PathBuf::from(&local).join("Programs").join("Trae CN").join("Trae CN.exe").exists()
+        {
             return true;
         }
 
         // 策略 3：检查 Program Files
-        for pf in &["C:\\Program Files\\Trae", "C:\\Program Files (x86)\\Trae"] {
+        for pf in &["C:\\Program Files\\Trae\\Trae.exe", "C:\\Program Files (x86)\\Trae\\Trae.exe"] {
             if std::path::Path::new(pf).exists() {
                 return true;
             }
         }
 
-        // 策略 4：注册表检测
-        #[cfg(target_os = "windows")]
-        {
-            use std::process::Command;
-            for hive in &["HKCU", "HKLM"] {
-                let key = if *hive == "HKCU" {
-                    r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall"
-                } else {
-                    r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
-                };
-                let output = Command::new("reg")
-                    .args(["query", key, "/f", "Trae", "/k", "/e"])
-                    .output();
-                if let Ok(out) = output {
-                    if out.status.success() && !out.stdout.is_empty() {
-                        return true;
-                    }
-                }
-            }
-        }
+        // v0.5.3 修复：移除注册表查询（reg query），速度慢且不可靠
+        // 注册表查询在 Windows 上可能需要 2-5 秒，且可能返回误报
 
         false
     }
 
     fn config_path(&self) -> Option<PathBuf> {
+        // v0.5.4 P2-18 根因修复：Trae 国际版实际读取的是 %APPDATA%/Trae/User/mcp.json
+        // 修复前：优先返回 ~/.trae/mcp.json，但 Trae GUI 不读取此文件，
+        //         导致用户在 Trae 界面中看不到 LRC MCP 服务器
+        // 修复后：优先返回 AppData 路径（Trae 实际读取的路径），
+        //         只有 AppData 不存在时才回退到 ~/.trae/mcp.json
+
         let home = home_dir()?;
+        let home_config = home.join(".trae").join("mcp.json");
 
-        // Trae CN 优先
-        let trae_cn_config = home.join(".trae-cn").join("trae-mcp.json");
-        let trae_config = home.join(".trae").join("mcp.json");
-
-        if trae_cn_config.exists() {
-            return Some(trae_cn_config);
-        }
-        if trae_config.exists() {
-            return Some(trae_config);
-        }
-
-        // 从 AppData 推断
-        let appdata = appdata_dir()?;
-        if appdata.join("Trae CN").exists() {
-            return Some(trae_cn_config);
-        }
-        if appdata.join("Trae").exists() {
-            return Some(trae_config);
+        // 优先级 1：AppData 下的 Trae 配置（Trae 实际读取的路径）
+        let appdata = appdata_dir();
+        if let Some(ref appdata) = appdata {
+            let appdata_config = appdata.join("Trae").join("User").join("mcp.json");
+            if appdata_config.exists() {
+                return Some(appdata_config);
+            }
+            // 优先级 2：如果 AppData/Trae 目录存在但 mcp.json 还没创建，返回该路径用于创建
+            if appdata.join("Trae").exists() {
+                return Some(appdata_config);
+            }
         }
 
-        None
+        // 优先级 3：回退到 ~/.trae/mcp.json（兼容旧路径）
+        if home_config.exists() {
+            return Some(home_config);
+        }
+
+        // 如果 ~/.trae 目录存在，返回对应路径
+        if home.join(".trae").exists() {
+            return Some(home_config);
+        }
+
+        // 最终回退：返回 AppData 路径（如果可用），否则返回 home 路径
+        if let Some(ref appdata) = appdata {
+            Some(appdata.join("Trae").join("User").join("mcp.json"))
+        } else {
+            Some(home_config)
+        }
     }
 
     fn generate_config(&self, port: u16) -> serde_json::Value {
+        // v0.5.4 P2-19 修复：改用 HTTP 模式连接到桌面端 sidecar，避免 stdio 模式启动新实例冲突
+        // 修复前：使用 stdio 模式启动 lrc-sidecar，但桌面端应用已启动 sidecar（PID 锁定），
+        //         新实例检测到已有实例运行后退出，导致 Trae 报 "Connection closed" 错误
+        // 修复后：使用 HTTP 模式连接到桌面端 sidecar 的 MCP 端点（http://127.0.0.1:{port}/mcp）
+        //         参考 Trae 官方文档：https://docs.trae.ai/ide/model-context-protocol
+        let actual_port = if port == 0 { 3099 } else { port };
         serde_json::json!({
             "mcpServers": {
                 "lrc-memory": {
-                    "command": "lrc-desktop",
-                    "args": ["--mcp", "--port", port.to_string()],
-                    "env": {}
+                    "url": format!("http://127.0.0.1:{}/mcp", actual_port)
                 }
             }
         })
@@ -785,27 +943,46 @@ impl AgentDetector for TraeCNDetector {
     }
 
     fn config_path(&self) -> Option<PathBuf> {
-        let home = home_dir()?;
-        let config = home.join(".trae-cn").join("trae-mcp.json");
-        if config.exists() {
-            return Some(config);
-        }
-        // 也返回 AppData 下的配置路径
+        // v0.5.4 P2-18 根因修复：Trae CN 实际读取的是 %APPDATA%/Trae CN/User/mcp.json
+        // 修复前：优先返回 ~/.trae-cn/trae-mcp.json，但 Trae CN GUI 不读取此文件，
+        //         导致用户在 Trae CN 界面中看不到 LRC MCP 服务器
+        // 修复后：优先返回 AppData 路径（Trae CN 实际读取的路径），
+        //         只有 AppData 不存在时才回退到 ~/.trae-cn/trae-mcp.json
+
+        // 优先级 1：AppData 下的 Trae CN 配置（Trae CN 实际读取的路径）
         let appdata = appdata_dir()?;
         let appdata_config = appdata.join("Trae CN").join("User").join("mcp.json");
         if appdata_config.exists() {
             return Some(appdata_config);
         }
-        Some(config) // 返回默认路径，即使不存在也用于创建
+
+        // 优先级 2：如果 AppData/Trae CN 目录存在但 mcp.json 还没创建，返回该路径用于创建
+        if appdata.join("Trae CN").exists() {
+            return Some(appdata_config);
+        }
+
+        // 优先级 3：回退到 ~/.trae-cn/trae-mcp.json（兼容旧路径）
+        let home = home_dir()?;
+        let home_config = home.join(".trae-cn").join("trae-mcp.json");
+        if home_config.exists() {
+            return Some(home_config);
+        }
+
+        // 默认：返回 AppData 路径（即使不存在，也用于创建）
+        Some(appdata_config)
     }
 
     fn generate_config(&self, port: u16) -> serde_json::Value {
+        // v0.5.4 P2-19 修复：改用 HTTP 模式连接到桌面端 sidecar，避免 stdio 模式启动新实例冲突
+        // 修复前：使用 stdio 模式启动 lrc-sidecar，但桌面端应用已启动 sidecar（PID 锁定），
+        //         新实例检测到已有实例运行后退出，导致 Trae CN 报 "Connection closed" 错误
+        // 修复后：使用 HTTP 模式连接到桌面端 sidecar 的 MCP 端点（http://127.0.0.1:{port}/mcp）
+        //         参考 Trae 官方文档：https://docs.trae.ai/ide/model-context-protocol
+        let actual_port = if port == 0 { 3099 } else { port };
         serde_json::json!({
             "mcpServers": {
                 "lrc-memory": {
-                    "command": "lrc-desktop",
-                    "args": ["--mcp", "--port", port.to_string()],
-                    "env": {}
+                    "url": format!("http://127.0.0.1:{}/mcp", actual_port)
                 }
             }
         })
@@ -824,7 +1001,8 @@ impl AgentDetector for TraeCNDetector {
     }
 
     fn scan_project_dirs(&self) -> Vec<ProjectInfo> {
-        scan_marker_projects(&scan_roots(), ".trae", "trae-cn", "Trae CN")
+        // v0.5.4 修复：Trae CN 使用 .trae-cn 标记，而非 .trae
+        scan_marker_projects(&scan_roots(), ".trae-cn", "trae-cn", "Trae CN")
     }
 }
 
@@ -947,7 +1125,9 @@ struct GenericMcpAgent;
 
 impl AgentDetector for GenericMcpAgent {
     fn detect(&self) -> bool {
-        true
+        // v0.5.3 修复：不自动检测为"已安装"，避免误报
+        // 通用 MCP Agent 仅作为手动配置的入口，不在自动检测列表中显示
+        false
     }
 
     fn config_path(&self) -> Option<PathBuf> {
@@ -970,7 +1150,8 @@ impl AgentDetector for GenericMcpAgent {
         AgentInfo {
             id: "generic-mcp".into(),
             name: "通用 MCP Agent".into(),
-            installed: true,
+            // v0.5.4 P2-20 修复：与 detect() 返回值保持一致，避免误报
+            installed: false,
             config_path: None,
             icon: "🔌".into(),
             category: "custom".into(),
@@ -989,6 +1170,9 @@ impl AgentDetector for GenericMcpAgent {
 
 pub struct AgentDetectorRegistry {
     detectors: Vec<Box<dyn AgentDetector + Send + Sync>>,
+    /// LRC 二进制文件的绝对路径（用于 MCP 配置中替换 "lrc" 命令）
+    /// 在桌面端启动时自动设置为当前 exe 同目录下的 lrc-sidecar 路径
+    lrc_binary_path: Option<String>,
 }
 
 impl AgentDetectorRegistry {
@@ -1015,12 +1199,44 @@ impl AgentDetectorRegistry {
             }
         }
 
-        Self { detectors }
+        Self {
+            detectors,
+            lrc_binary_path: None,
+        }
+    }
+
+    /// 设置 LRC 二进制文件的绝对路径
+    ///
+    /// 在桌面端启动时调用，将当前 exe 同目录下的 lrc-sidecar 路径传入。
+    /// 此后所有 MCP 配置中的 "lrc" 命令将被替换为绝对路径，
+    /// 确保 IDE 无需依赖 PATH 环境变量即可找到 LRC。
+    pub fn set_lrc_binary_path(&mut self, path: String) {
+        self.lrc_binary_path = Some(path);
     }
 
     /// 检测所有已安装的 Agent，返回信息列表
     pub fn detect_all(&self) -> Vec<AgentInfo> {
         self.detectors.iter().map(|d| d.info()).collect()
+    }
+
+    /// v0.5.4 新增：带进度回调的 Agent 检测
+    /// 
+    /// 每检测完一个 Agent 就调用 on_progress 回调，
+    /// 前端可据此显示"正在检测 Trae... (3/22)"的进度反馈。
+    pub fn detect_all_with_progress<F>(&self, on_progress: F) -> Vec<AgentInfo>
+    where
+        F: Fn(usize, usize, &AgentInfo),
+    {
+        let total = self.detectors.len();
+        self.detectors
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let info = d.info();
+                on_progress(i + 1, total, &info);
+                info
+            })
+            .collect()
     }
 
     /// 仅返回已安装的 Agent（过滤掉未安装的）
@@ -1117,18 +1333,37 @@ impl AgentDetectorRegistry {
 
     /// 为指定的 Agent 配置 MCP 连接
     ///
+    /// v0.5.1 增强：
+    ///   - 详细日志记录每个 Agent 的配置路径和结果
+    ///   - 二进制路径替换的显式日志
+    ///   - 配置写入失败时明确的错误信息
+    ///
     /// 安全策略：
     ///   - 如果目标文件已存在，尝试合并现有配置（保留用户已有的其他 MCP 配置）
     ///   - 如果合并失败，创建备份后写入新配置
     ///   - API Key 不写入 MCP 配置文件
     ///   - 对于不支持 MCP 的工具，仅返回提示信息
-    pub fn configure(&self, agent_ids: &[String], port: u16) -> Result<Vec<String>, String> {
+    pub fn configure(&self, agent_ids: &[String], port: u16, project_dir: Option<&std::path::Path>) -> Result<Vec<String>, String> {
         let mut configured = Vec::new();
+
+        tracing::info!(
+            "[MCP配置] 开始为 {} 个 Agent 配置 MCP 连接（端口: {}）",
+            agent_ids.len(),
+            port
+        );
+        if let Some(ref binary_path) = self.lrc_binary_path {
+            tracing::info!("[MCP配置] LRC 二进制路径: {}", binary_path);
+        } else {
+            tracing::warn!("[MCP配置] LRC 二进制路径未设置，MCP 配置将使用 'lrc' 命令（需要 PATH 环境变量）");
+        }
 
         for id in agent_ids {
             if let Some(detector) = self.detectors.iter().find(|d| d.info().id == *id) {
                 let info = detector.info();
+                tracing::info!("[MCP配置] 正在配置 Agent: {} ({})", info.name, id);
+
                 if !info.supports_mcp {
+                    tracing::info!("[MCP配置] {} — 不支持 MCP 协议，跳过", info.name);
                     configured.push(format!(
                         "{} — 不支持 MCP 协议，无法自动配置",
                         info.name
@@ -1136,50 +1371,239 @@ impl AgentDetectorRegistry {
                     continue;
                 }
 
-                let config = detector.generate_config(port);
+                let mut config = detector.generate_config(port);
+
+                // 如果设置了二进制路径，将配置中的 "lrc" / "lrc-sidecar" 命令替换为绝对路径
+                // 这样 IDE 无需依赖 PATH 环境变量即可找到 LRC
+                if let Some(ref binary_path) = self.lrc_binary_path {
+                    if let Some(servers) = config.get_mut("mcpServers") {
+                        if let Some(obj) = servers.as_object_mut() {
+                            for (_name, server_config) in obj.iter_mut() {
+                                if let Some(cmd) = server_config.get("command") {
+                                    // v0.5.4 修复：同时匹配 "lrc" 和 "lrc-sidecar"，
+                                    // 确保向后兼容历史配置和手动写入的配置
+                                    let cmd_str = cmd.as_str().unwrap_or("").to_string();
+                                    if cmd_str == "lrc" || cmd_str == "lrc-sidecar" {
+                                        server_config["command"] = serde_json::Value::String(binary_path.clone());
+                                        tracing::info!(
+                                            "[MCP配置] {} — 已将命令 '{}' 替换为绝对路径: {}",
+                                            info.name, cmd_str, binary_path
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if let Some(path) = detector.config_path() {
-                    self.write_or_merge_config(&path, &config)?;
-                    configured.push(format!("{} (全局配置)", info.name));
+                    let path_str = path.display().to_string();
+                    tracing::info!("[MCP配置] {} — 目标配置文件: {}", info.name, path_str);
+                    match self.write_or_merge_config(&path, &config) {
+                        Ok(()) => {
+                            tracing::info!("[MCP配置] {} — 配置写入成功: {}", info.name, path_str);
+                            configured.push(format!("{} (全局配置)", info.name));
+
+                            // v0.5.4 修复：MCP 配置写入成功后，自动写入 AI 规则文件
+                            // 告知 AI 在什么情况下使用 remember/recall 工具
+                            if let Some(ref proj_dir) = project_dir {
+                                match Self::write_ai_rules(proj_dir, &info.id) {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            "[AI规则] {} — 规则文件写入成功（项目: {}）",
+                                            info.name,
+                                            proj_dir.display()
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // AI 规则写入失败不影响主流程（MCP 配置已成功）
+                                        tracing::warn!(
+                                            "[AI规则] {} — 规则文件写入失败（不影响 MCP 功能）: {}",
+                                            info.name, e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("[MCP配置] {} — 配置写入失败: {} — 错误: {}", info.name, path_str, e);
+                            configured.push(format!("{} — 配置写入失败: {}", info.name, e));
+                        }
+                    }
                 } else if info.id == "generic-mcp" {
                     configured.push(format!(
                         "{} — HTTP 端点: http://127.0.0.1:{}/mcp",
                         info.name, port
                     ));
                 } else {
+                    tracing::info!("[MCP配置] {} — 无全局配置路径，需手动配置项目级 mcp.json", info.name);
                     configured.push(format!(
                         "{} — 请手动配置项目级 mcp.json", info.name
                     ));
                 }
+            } else {
+                tracing::warn!("[MCP配置] 未找到 Agent: {}", id);
             }
         }
 
+        tracing::info!("[MCP配置] 完成，共配置 {} 个 Agent", configured.len());
         Ok(configured)
     }
 
     /// 一键配置所有已安装的支持 MCP 的工具
-    pub fn configure_all_installed(&self, port: u16) -> Result<Vec<String>, String> {
+    pub fn configure_all_installed(&self, port: u16, project_dir: Option<&std::path::Path>) -> Result<Vec<String>, String> {
         let installed_ids: Vec<String> = self
             .detect_installed()
             .iter()
             .filter(|info| info.supports_mcp)
             .map(|info| info.id.clone())
             .collect();
-        self.configure(&installed_ids, port)
+        self.configure(&installed_ids, port, project_dir)
+    }
+
+    /// v0.5.5 新增：自动检测并升级旧版本 MCP 配置
+    ///
+    /// 在 sidecar 启动时自动调用，无需用户重新运行配置向导。
+    /// 检测并修复以下旧配置：
+    /// 1. 旧配置名称 `loong-recall`（stdio 模式）→ `lrc-memory`（HTTP 模式）
+    /// 2. 旧路径规则文件 `.trae/rules.md` → `.trae/rules/lrc-memory.md`
+    /// 3. 旧版本规则内容 → v0.5.5 版本（含 frontmatter）
+    ///
+    /// 这样用户升级 LRC Desktop 后，无需手动操作，配置自动升级。
+    pub fn auto_upgrade_configs(&self, port: u16, project_dir: Option<&std::path::Path>) -> Result<Vec<String>, String> {
+        let mut upgraded = Vec::new();
+
+        tracing::info!("[自动升级] 开始检测旧版本 MCP 配置（端口: {}）", port);
+
+        for detector in &self.detectors {
+            let info = detector.info();
+            if !info.supports_mcp {
+                continue;
+            }
+
+            // 检查配置文件是否存在
+            let config_path = match detector.config_path() {
+                Some(p) => p,
+                None => continue,
+            };
+
+            if !config_path.exists() {
+                continue;
+            }
+
+            // 读取现有配置
+            let existing_content = match std::fs::read_to_string(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("[自动升级] {} — 读取配置失败: {} ({})", info.name, config_path.display(), e);
+                    continue;
+                }
+            };
+
+            // 检查是否需要升级
+            let needs_upgrade = self.config_needs_upgrade(&existing_content);
+            if !needs_upgrade {
+                continue;
+            }
+
+            tracing::info!("[自动升级] {} — 检测到旧版本配置，开始升级: {}", info.name, config_path.display());
+
+            // 生成新配置并写入
+            let new_config = detector.generate_config(port);
+            match self.write_or_merge_config(&config_path, &new_config) {
+                Ok(()) => {
+                    tracing::info!("[自动升级] {} — MCP 配置升级成功: {}", info.name, config_path.display());
+                    upgraded.push(format!("{} — MCP 配置已升级为 HTTP 模式", info.name));
+
+                    // 同时升级规则文件
+                    if let Some(ref proj_dir) = project_dir {
+                        match Self::write_ai_rules(proj_dir, &info.id) {
+                            Ok(()) => {
+                                tracing::info!("[自动升级] {} — 规则文件升级成功", info.name);
+                            }
+                            Err(e) => {
+                                tracing::warn!("[自动升级] {} — 规则文件升级失败（不影响 MCP）: {}", info.name, e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("[自动升级] {} — 配置升级失败: {} ({})", info.name, config_path.display(), e);
+                }
+            }
+        }
+
+        if upgraded.is_empty() {
+            tracing::info!("[自动升级] 所有配置均为最新版本，无需升级");
+        } else {
+            tracing::info!("[自动升级] 完成，共升级 {} 个配置", upgraded.len());
+        }
+
+        Ok(upgraded)
+    }
+
+    /// v0.5.5 新增：检查配置是否需要升级
+    ///
+    /// 需要升级的情况：
+    /// 1. 包含旧配置名称 `loong-recall`
+    /// 2. `lrc-memory` 配置使用 stdio 模式（有 `command` 字段）
+    /// 3. `lrc-memory` 配置使用旧的端口号
+    fn config_needs_upgrade(&self, content: &str) -> bool {
+        // 解析 JSON
+        let json: serde_json::Value = match serde_json::from_str(content) {
+            Ok(v) => v,
+            Err(_) => return false, // 无法解析，不升级
+        };
+
+        let servers = match json.get("mcpServers").and_then(|v| v.as_object()) {
+            Some(s) => s,
+            None => return false,
+        };
+
+        // 检查旧配置名称 `loong-recall`
+        if servers.contains_key("loong-recall") {
+            return true;
+        }
+
+        // 检查 `lrc-memory` 是否使用 stdio 模式（有 `command` 字段）
+        if let Some(lrc_config) = servers.get("lrc-memory") {
+            if lrc_config.get("command").is_some() {
+                return true; // stdio 模式，需要升级为 HTTP 模式
+            }
+        }
+
+        // 检查其他旧配置名称
+        let legacy_names = ["lrc", "lrc-memory-stdio", "lrc-stdio"];
+        for name in &legacy_names {
+            if servers.contains_key(*name) {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// 写入或与现有配置合并
+    ///
+    /// v0.5.1 增强：添加详细日志，记录合并/备份/创建操作
     fn write_or_merge_config(
         &self,
         path: &std::path::Path,
         new_config: &serde_json::Value,
     ) -> Result<(), String> {
+        // 确保父目录存在
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                let msg = format!("创建目录失败: {} ({})", parent.display(), e);
+                tracing::error!("[MCP配置] {}", msg);
+                msg
+            })?;
+            tracing::debug!("[MCP配置] 已确保目录存在: {}", parent.display());
         }
 
         if path.exists() {
             let existing_content = std::fs::read_to_string(path).unwrap_or_default();
+            tracing::info!("[MCP配置] 目标文件已存在，尝试合并 ({})", path.display());
             if let Ok(existing_json) = serde_json::from_str::<serde_json::Value>(&existing_content) {
                 if let (Some(existing_servers), Some(new_servers)) = (
                     existing_json.get("mcpServers"),
@@ -1191,6 +1615,25 @@ impl AgentDetectorRegistry {
                             .as_object()
                             .cloned()
                             .unwrap_or_default();
+
+                        // v0.5.5 修复：删除旧的 LRC 配置名称，避免 stdio/http 冲突
+                        // 旧版本可能写入的名称：loong-recall, lrc, lrc-memory-stdio
+                        let legacy_names = ["loong-recall", "lrc", "lrc-memory-stdio", "lrc-stdio"];
+                        for name in &legacy_names {
+                            if servers.remove(*name).is_some() {
+                                tracing::info!("[MCP配置] 已移除旧配置项: {}", name);
+                            }
+                        }
+
+                        // v0.5.5 修复：删除旧的 stdio 模式 lrc-memory 配置
+                        // 如果 lrc-memory 配置中包含 "command" 字段（stdio 模式），则删除
+                        if let Some(existing_lrc) = servers.get("lrc-memory") {
+                            if existing_lrc.get("command").is_some() {
+                                tracing::info!("[MCP配置] 检测到旧的 stdio 模式 lrc-memory 配置，将替换为 HTTP 模式");
+                                servers.remove("lrc-memory");
+                            }
+                        }
+
                         if let Some(new_obj) = new_servers.as_object() {
                             servers.extend(new_obj.clone());
                         }
@@ -1199,17 +1642,343 @@ impl AgentDetectorRegistry {
                             serde_json::Value::Object(servers),
                         );
                     }
+                    // 备份原文件
                     let backup_path = path.with_extension("json.bak");
                     let _ = std::fs::write(&backup_path, &existing_content);
-                    let json = serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?;
-                    std::fs::write(path, json).map_err(|e| e.to_string())?;
+                    tracing::info!("[MCP配置] 已备份原配置到: {}", backup_path.display());
+                    let json = serde_json::to_string_pretty(&merged).map_err(|e| {
+                        let msg = format!("序列化合并配置失败: {}", e);
+                        tracing::error!("[MCP配置] {}", msg);
+                        msg
+                    })?;
+                    std::fs::write(path, json).map_err(|e| {
+                        let msg = format!("写入合并配置失败: {} ({})", path.display(), e);
+                        tracing::error!("[MCP配置] {}", msg);
+                        msg
+                    })?;
+                    tracing::info!("[MCP配置] 配置已合并写入: {}", path.display());
                     return Ok(());
+                }
+            }
+            // 无法合并，备份后覆盖
+            let backup_path = path.with_extension("json.bak");
+            let _ = std::fs::write(&backup_path, &existing_content);
+            tracing::warn!("[MCP配置] 无法合并现有配置，已备份到 {}，将覆盖写入", backup_path.display());
+        } else {
+            tracing::info!("[MCP配置] 目标文件不存在，将创建新文件: {}", path.display());
+        }
+
+        let json = serde_json::to_string_pretty(new_config).map_err(|e| {
+            let msg = format!("序列化配置失败: {}", e);
+            tracing::error!("[MCP配置] {}", msg);
+            msg
+        })?;
+        std::fs::write(path, json).map_err(|e| {
+            let msg = format!("写入配置失败: {} ({})", path.display(), e);
+            tracing::error!("[MCP配置] {}", msg);
+            msg
+        })?;
+        tracing::info!("[MCP配置] 配置已写入: {}", path.display());
+        Ok(())
+    }
+
+    /// v0.5.5 修复：获取 AI 工具的规则文件模板（相对于项目根目录）
+    ///
+    /// 规则文件告知 AI 在什么情况下使用 remember/recall 工具。
+    /// 不同工具使用不同的规则文件格式和位置。
+    ///
+    /// v0.5.5 修复内容：
+    /// - Trae: `.trae/rules.md` → `.trae/rules/lrc-memory.md`（Trae 实际读取 `.trae/rules/` 目录下的 .md 文件）
+    /// - 添加 frontmatter（YAML 头部），设置 `alwaysApply: true`，确保规则始终生效
+    fn get_rules_file_template(tool_id: &str) -> Option<&'static str> {
+        match tool_id {
+            "cursor" => Some(".cursor/rules/lrc-memory.mdc"),
+            "trae" | "trae-cn" => Some(".trae/rules/lrc-memory.md"),
+            "codebuddy" => Some(".codebuddy/rules.md"),
+            "cline" => Some(".clinerules"),
+            "windsurf" => Some(".windsurfrules"),
+            "roo" => Some(".roo/rules.md"),
+            "vscode" => Some(".github/copilot-instructions.md"),
+            "comate" => Some(".comate/rules.md"),
+            // v0.5.5 新增：支持更多工具的规则文件
+            "zed" => Some(".zed/rules.md"),
+            "jetbrains" => Some(".github/copilot-instructions.md"),
+            _ => None, // 其他工具暂不支持规则文件自动配置
+        }
+    }
+
+    /// v0.5.5 修复：生成 AI 规则文件内容
+    ///
+    /// 规则文件告诉 AI 助手在什么情况下调用 LRC 记忆工具。
+    /// 内容根据工具类型生成适配的格式。
+    ///
+    /// v0.5.5 修复内容：
+    /// - Trae: 添加 YAML frontmatter（`alwaysApply: true`），确保规则在所有对话中始终生效
+    /// - Cursor: 添加 MDC frontmatter（`alwaysApply: true`），确保规则始终生效
+    fn generate_ai_rules_content(tool_id: &str) -> String {
+        // v0.5.5 增强：傻瓜式 AI 规则自动注入
+        // 用户无需手动配置任何 rule，LRC 配置 MCP 时自动写入
+        // 规则核心：会话开始必须 recall + 任务感知 recall + 完成后自动同步
+
+        // v0.5.5 修复：为 Trae 和 Cursor 添加 frontmatter，确保规则始终生效
+        let frontmatter = match tool_id {
+            "trae" | "trae-cn" => "---\nalwaysApply: true\ndescription: LRC 记忆系统规则 — 会话开始时必须 recall 检索项目记忆，完成任务后自动同步记忆库\n---\n\n",
+            "cursor" => "---\ndescription: LRC 记忆系统规则 — 会话开始时必须 recall，完成任务后自动同步记忆\nalwaysApply: true\n---\n\n",
+            _ => "",
+        };
+
+        let header = match tool_id {
+            "cursor" => "# Cursor AI Rules — LRC 记忆系统自动配置",
+            "trae" | "trae-cn" => "# Trae AI Rules — LRC 记忆系统自动配置",
+            "codebuddy" => "# CodeBuddy Rules — LRC 记忆系统自动配置",
+            "cline" => "# Cline Rules — LRC 记忆系统自动配置",
+            "windsurf" => "# Windsurf Rules — LRC 记忆系统自动配置",
+            "roo" => "# Roo Rules — LRC 记忆系统自动配置",
+            "vscode" => "# GitHub Copilot Instructions — LRC 记忆系统自动配置",
+            "comate" => "# Comate Rules — LRC 记忆系统自动配置",
+            _ => "# AI Rules — LRC 记忆系统自动配置",
+        };
+
+        format!(
+            r#"{frontmatter}{header}
+<!-- 本文件由 LRC Desktop v0.5.5 自动生成，请勿手动删除 LRC 相关规则 -->
+<!-- 如需自定义规则，请在本文件末尾添加 -->
+
+## LRC 记忆系统（Loong Recall Code Memory）
+
+你已连接 LRC 记忆系统——一个本地代码记忆库。**请严格遵循以下规则，主动使用记忆工具。** 这不是可选项，而是你工作流程的一部分。
+
+---
+
+### 规则 1：会话开始时必须 recall（最高优先级）
+
+**在回复用户的任何问题之前，必须先调用 recall 检索项目记忆，获取已有上下文。** 这是强制性的第一步，不可跳过。
+
+```
+// 第一步：检索项目架构概览
+recall(query="项目架构 模块组织 入口文件", top_k=5)
+
+// 第二步：根据用户任务，提取关键词检索专题记忆
+recall(query="<任务相关的关键词，如：路由 API 认证 数据库>", top_k=3)
+```
+
+**只有当 recall 返回的结果不足以完成任务时，才读取源文件。** 这能减少重复读取源文件导致的上下文溢出。
+
+---
+
+### 规则 2：遇到不确定的模块时优先 recall
+
+当需要了解某个模块、函数、概念或实现逻辑时，**优先使用 recall 检索记忆**，而不是直接读取源文件：
+
+```
+recall(query="<模块名或关键词>", top_k=3)
+```
+
+如果 recall 无相关结果，再读取源文件。读取源文件后，如果发现了重要的架构信息，应调用 remember 记录下来，供后续会话使用。
+
+---
+
+### 规则 3：完成任务后自动同步记忆
+
+每次完成代码修改任务后，**自动检查并同步记忆库**，无需用户提醒。流程：
+
+1. 回顾本次修改了哪些文件/模块
+2. 对照下表判断是否需要同步：
+
+| 本次做了什么 | 记忆同步操作 |
+|---|---|
+| 新增了模块/文件（>100 行） | `remember` 写入新记忆，描述模块职责和入口函数 |
+| 修改了已有模块的职责或入口函数 | `update_memory` 更新对应记忆的 content |
+| 重命名了文件或函数 | `update_memory` 更新记忆中的路径和函数名 |
+| 删除了模块/文件 | `forget` 删除对应记忆 |
+| 新增了 API 端点 | `remember` 写入新记忆，标注路由路径和 handler |
+| 修改了 API 端点的路径或方法 | `update_memory` 更新对应记忆 |
+| 修改了项目配置（依赖、构建等） | `update_memory` 更新依赖列表记忆 |
+| 修改了架构级别的东西（新增分层、引擎等） | `remember` 写入新记忆，并检查是否需要更新架构总览 |
+| 纯 bug 修复（不改变结构） | 无需同步 |
+
+3. 向用户报告同步结果（一句话即可，如"已记录限流模块到记忆库"或"本次无需同步记忆"）
+
+---
+
+### 记忆工具说明
+
+| 工具 | 用途 | 关键参数 |
+|---|---|---|
+| `remember` | 记录新记忆 | content（内容）、memory_type（类型）、tags（标签）、importance（重要性 1-10） |
+| `recall` | 语义检索历史记忆 | query（自然语言查询）、top_k（返回数量，建议 3-5） |
+| `update_memory` | 更新已有记忆 | memory_id（记忆 ID）、content（新内容） |
+| `forget` | 删除记忆 | memory_id（记忆 ID） |
+| `list_memories` | 列出记忆库 | 支持分页、过滤、排序 |
+
+**记忆类型**：
+- `code_context` — 代码位置和结构（如"路由模块位于 routes.rs，核心函数 setup_routes()"）
+- `decision` — 架构决策（如"选择 PostgreSQL 因为需要事务支持"）
+- `preference` — 约定偏好（如"用户偏好使用 pnpm 而非 npm"）
+- `fact` — 事实信息（如"数据库连接字符串在 .env 文件中"）
+
+---
+
+### 最佳实践
+
+- **recall 的 top_k 限制为 3-5**：不让搜索结果占用过多上下文窗口
+- **recall 失败时降级**：如果记忆检索无结果，再读取源文件
+- **不要记住一切**：只记住关键的架构信息、入口点、数据流，不记细枝末节
+- **记录时包含足够的上下文**：文件路径、函数名、关键概念
+- **使用标签分类**：如 ["architecture", "database", "api"]
+- **重要信息设置较高 importance**（1-10，默认 5）
+- **同步是任务的一部分**：完成代码修改后，同步记忆不是额外步骤，而是任务的自然收尾
+
+---
+
+### 示例
+
+**会话开始时**：
+```
+用户：帮我新增一个用户登录的 API
+AI：（先 recall）recall(query="认证 登录 API 路由 auth", top_k=3)
+AI：（根据 recall 结果）根据记忆，项目使用 JWT 认证，路由在 routes.rs...
+```
+
+**完成任务后**：
+```
+AI：已完成用户登录 API，新增了 POST /api/auth/login 端点
+AI：（自动同步）remember(content="用户登录 API：POST /api/auth/login → AuthHandler::login，使用 JWT 签发 token", memory_type="code_context", tags=["auth", "api", "login"], importance=7)
+AI：已记录登录 API 到记忆库
+```
+"#
+        )
+    }
+
+    /// v0.5.5 修复：写入或合并 AI 规则文件
+    ///
+    /// 在项目根目录写入 AI 规则文件，告知 AI 何时使用记忆工具。
+    /// 如果文件已存在，在末尾追加 LRC 规则（不覆盖用户自定义内容）。
+    /// v0.5.5 增强：检测旧版本规则并自动升级到 v0.5.5 版本（保留用户自定义内容）
+    /// v0.5.5 修复：清理旧路径规则文件（.trae/rules.md → .trae/rules/lrc-memory.md）
+    fn write_ai_rules(project_dir: &std::path::Path, tool_id: &str) -> Result<(), String> {
+        let template = match Self::get_rules_file_template(tool_id) {
+            Some(t) => t,
+            None => return Ok(()), // 该工具不支持规则文件，静默跳过
+        };
+
+        let rules_path = project_dir.join(template);
+
+        // v0.5.5 修复：清理旧路径的规则文件
+        // Trae: .trae/rules.md → .trae/rules/lrc-memory.md
+        // Cursor: .cursorrules → .cursor/rules/lrc-memory.mdc
+        let legacy_paths: Vec<&str> = match tool_id {
+            "trae" | "trae-cn" => vec![".trae/rules.md"],
+            "cursor" => vec![".cursorrules"],
+            _ => vec![],
+        };
+
+        let mut user_content_from_legacy = String::new();
+        for legacy in &legacy_paths {
+            let legacy_path = project_dir.join(legacy);
+            if legacy_path.exists() {
+                let legacy_content = std::fs::read_to_string(&legacy_path).unwrap_or_default();
+                if legacy_content.contains("LRC 记忆系统") {
+                    // 提取 LRC 规则之前的用户自定义内容
+                    if let Some(pos) = legacy_content.find("## LRC 记忆系统") {
+                        let user_part = legacy_content[..pos].trim_end();
+                        if !user_part.is_empty() && !user_content_from_legacy.contains(user_part) {
+                            user_content_from_legacy.push_str(user_part);
+                            user_content_from_legacy.push_str("\n\n");
+                        }
+                    }
+                    // 删除旧路径文件
+                    let _ = std::fs::remove_file(&legacy_path);
+                    tracing::info!(
+                        "[AI规则] {} — 已清理旧路径规则文件: {}",
+                        tool_id,
+                        legacy_path.display()
+                    );
                 }
             }
         }
 
-        let json = serde_json::to_string_pretty(new_config).map_err(|e| e.to_string())?;
-        std::fs::write(path, json).map_err(|e| e.to_string())?;
+        // 确保父目录存在
+        if let Some(parent) = rules_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!("创建规则文件目录失败: {} ({})", parent.display(), e)
+            })?;
+        }
+
+        let lrc_rules = Self::generate_ai_rules_content(tool_id);
+
+        // 如果有从旧文件迁移的用户自定义内容，追加到 LRC 规则之前
+        let final_rules = if !user_content_from_legacy.is_empty() {
+            format!("{}{}", user_content_from_legacy, lrc_rules)
+        } else {
+            lrc_rules
+        };
+
+        // 如果文件已存在，检查是否已包含 LRC 规则
+        if rules_path.exists() {
+            let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
+            if existing.contains("LRC 记忆系统") {
+                // v0.5.5 增强：检测旧版本规则并自动升级
+                if !existing.contains("v0.5.5 自动生成") {
+                    // 旧版本规则，需要升级
+                    if let Some(pos) = existing.find("## LRC 记忆系统") {
+                        let user_content = existing[..pos].trim_end();
+                        let merged = if user_content.is_empty() {
+                            final_rules.clone()
+                        } else {
+                            format!("{}\n\n{}", user_content, final_rules)
+                        };
+                        std::fs::write(&rules_path, merged).map_err(|e| {
+                            format!("更新规则文件失败: {} ({})", rules_path.display(), e)
+                        })?;
+                        tracing::info!(
+                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.5 版本: {}",
+                            tool_id,
+                            rules_path.display()
+                        );
+                    } else {
+                        let merged = format!("{}\n\n{}", existing.trim_end(), final_rules);
+                        std::fs::write(&rules_path, merged).map_err(|e| {
+                            format!("更新规则文件失败: {} ({})", rules_path.display(), e)
+                        })?;
+                        tracing::info!(
+                            "[AI规则] {} — 已追加 LRC v0.5.5 规则到现有文件: {}",
+                            tool_id,
+                            rules_path.display()
+                        );
+                    }
+                } else {
+                    // 已是 v0.5.5 版本，跳过
+                    tracing::info!(
+                        "[AI规则] {} — 规则文件已是 v0.5.5 版本，跳过: {}",
+                        tool_id,
+                        rules_path.display()
+                    );
+                }
+                return Ok(());
+            }
+            // 在已有内容末尾追加 LRC 规则
+            let merged = format!("{}\n\n{}", existing.trim_end(), final_rules);
+            std::fs::write(&rules_path, merged).map_err(|e| {
+                format!("更新规则文件失败: {} ({})", rules_path.display(), e)
+            })?;
+            tracing::info!(
+                "[AI规则] {} — 已追加 LRC 规则到现有文件: {}",
+                tool_id,
+                rules_path.display()
+            );
+        } else {
+            // 创建新文件
+            std::fs::write(&rules_path, &final_rules).map_err(|e| {
+                format!("创建规则文件失败: {} ({})", rules_path.display(), e)
+            })?;
+            tracing::info!(
+                "[AI规则] {} — 已创建规则文件: {}",
+                tool_id,
+                rules_path.display()
+            );
+        }
+
         Ok(())
     }
 }

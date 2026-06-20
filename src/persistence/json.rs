@@ -14,8 +14,14 @@ use crate::chunker::CodeChunk;
 use crate::memory_types::Memory;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 
 /// JSON 文件持久化后端
+///
+/// 内存缓存优化：使用 `RwLock<Option<Vec<Memory>>>` 缓存已加载的记忆，
+/// 避免每次写操作（save/delete）都全量读取+反序列化 JSON 文件。
+/// 对于 10,000+ 条记忆的场景，可将写操作延迟从 O(n) 读取+O(n) 写入
+/// 降低为 O(1) 缓存查找+O(n) 写入，约 2x 性能提升。
 pub struct JsonPersistence {
     /// 数据目录路径
     data_dir: PathBuf,
@@ -25,6 +31,10 @@ pub struct JsonPersistence {
     chunks_file: PathBuf,
     /// 归档记忆文件路径
     archive_file: PathBuf,
+    /// 记忆缓存：避免每次写操作都全量读取 JSON 文件
+    /// - `None`：缓存未初始化或已失效
+    /// - `Some(vec)`：已加载的记忆列表
+    cache: RwLock<Option<Vec<Memory>>>,
 }
 
 impl JsonPersistence {
@@ -48,6 +58,7 @@ impl JsonPersistence {
             chunks_file: dir.join("chunks.json"),
             archive_file: dir.join("archive.json"),
             data_dir: dir,
+            cache: RwLock::new(None),
         })
     }
 
@@ -70,6 +81,41 @@ impl JsonPersistence {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
+
+    /// 直接从磁盘加载记忆（不经过缓存，供 load_all_memories 使用）
+    fn load_all_memories_from_disk(&self) -> Result<Vec<Memory>, PersistenceError> {
+        if !self.memories_file.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&self.memories_file)?;
+        if content.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let memories: Vec<Memory> = serde_json::from_str(&content)?;
+        Ok(memories)
+    }
+
+    /// 确保缓存已加载（懒加载）
+    /// 首次调用时从磁盘读取，后续直接使用缓存
+    fn ensure_cache_loaded(&self) -> Result<(), PersistenceError> {
+        {
+            // v0.5.4 修复 C04：RwLock 毒化恢复，避免一个 panic 导致持久化层瘫痪
+            let cache = self.cache.read().unwrap_or_else(|e| e.into_inner());
+            if cache.is_some() {
+                return Ok(());
+            }
+        }
+        // 写锁：加载数据
+        let memories = self.load_all_memories_from_disk()?;
+        *self.cache.write().unwrap_or_else(|e| e.into_inner()) = Some(memories);
+        Ok(())
+    }
+
+    /// 使缓存失效（当外部修改文件时调用）
+    #[allow(dead_code)]
+    pub fn invalidate_cache(&self) {
+        *self.cache.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 impl Persistence for JsonPersistence {
@@ -77,7 +123,10 @@ impl Persistence for JsonPersistence {
         // 防御性检查：确保数据目录存在（应对临时目录被清理等场景）
         self.ensure_data_dir()?;
 
-        let mut memories = self.load_all_memories()?;
+        // 使用缓存优化：避免每次全量读取+反序列化 JSON 文件
+        self.ensure_cache_loaded()?;
+        let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
+        let memories = cache.as_mut().expect("缓存已通过 ensure_cache_loaded 初始化");
 
         // 按 ID 查找并更新，或追加新记忆
         if let Some(existing) = memories.iter_mut().find(|m| m.id == memory.id) {
@@ -86,28 +135,32 @@ impl Persistence for JsonPersistence {
             memories.push(memory.clone());
         }
 
-        let json = serde_json::to_string_pretty(&memories)?;
+        let json = serde_json::to_string_pretty(memories)?;
+        drop(cache); // 释放写锁
         atomic_write(&self.memories_file, &json)?;
         Ok(())
     }
 
     fn load_all_memories(&self) -> Result<Vec<Memory>, PersistenceError> {
-        if !self.memories_file.exists() {
-            return Ok(Vec::new());
+        // 优先从缓存读取（O(1)），缓存失效时从磁盘加载（O(n)）
+        {
+            let cache = self.cache.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref cached) = *cache {
+                return Ok(cached.clone());
+            }
         }
-
-        let content = fs::read_to_string(&self.memories_file)?;
-        if content.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let memories: Vec<Memory> = serde_json::from_str(&content)?;
+        let memories = self.load_all_memories_from_disk()?;
+        *self.cache.write().unwrap_or_else(|e| e.into_inner()) = Some(memories.clone());
         Ok(memories)
     }
 
     fn delete_memory(&self, id: &str) -> Result<bool, PersistenceError> {
         self.ensure_data_dir()?;
-        let mut memories = self.load_all_memories()?;
+
+        // 使用缓存优化：避免全量读取
+        self.ensure_cache_loaded()?;
+        let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
+        let memories = cache.as_mut().expect("缓存已通过 ensure_cache_loaded 初始化");
         let original_len = memories.len();
         memories.retain(|m| m.id != id);
 
@@ -115,13 +168,16 @@ impl Persistence for JsonPersistence {
             return Ok(false); // 未找到
         }
 
-        let json = serde_json::to_string_pretty(&memories)?;
+        let json = serde_json::to_string_pretty(memories)?;
+        drop(cache);
         atomic_write(&self.memories_file, &json)?;
         Ok(true)
     }
 
     fn clear_memories(&self) -> Result<(), PersistenceError> {
         self.ensure_data_dir()?;
+        // 清空缓存
+        *self.cache.write().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
         let empty: Vec<Memory> = Vec::new();
         let json = serde_json::to_string_pretty(&empty)?;
         atomic_write(&self.memories_file, &json)?;

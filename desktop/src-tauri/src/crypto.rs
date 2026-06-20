@@ -1,7 +1,10 @@
 /// L1 数据加密模块
 ///
 /// 提供 API Key 的 AES-256-GCM 加密存储。
-/// 密钥管理：首次启动时生成随机 256-bit 密钥，存储在 %APPDATA%\LoongRecall\.lrc_key。
+/// 密钥管理：使用 Windows DPAPI（CryptProtectData）保护主密钥，
+/// 确保密钥只能由当前 Windows 用户解密。
+/// 非 Windows 平台使用文件权限保护（chmod 600）。
+///
 /// 加密格式：Base64(Nonce[12B] || Ciphertext[变长] || Tag[16B])
 ///
 /// 安全级别：L1（数据隐私层）
@@ -14,22 +17,141 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::RngCore;
 use std::path::PathBuf;
 
-/// 密钥文件路径
+/// 密钥文件路径 — 与密文分离存储，但通过 DPAPI 保护
 fn key_path() -> PathBuf {
     let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
     PathBuf::from(appdata).join("LoongRecall").join(".lrc_key")
 }
 
+/// 使用 DPAPI 加密密钥数据（Windows），非 Windows 平台直接返回原始数据
+///
+/// Windows DPAPI 使用当前用户凭据加密数据，只有同一用户可解密。
+/// 这确保即使密钥文件被复制到其他机器也无法使用。
+#[cfg(target_os = "windows")]
+fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CRYPT_INTEGER_BLOB,
+    };
+
+    let data_in = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+
+    let mut data_out = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+
+    // 使用当前用户凭据加密（不使用 LOCAL_MACHINE，确保用户隔离）
+    // SAFETY: CryptProtectData 是 Windows DPAPI 标准 API，所有参数均为有效指针或空指针，
+    // data_in 指向栈上有效的 CRYPT_INTEGER_BLOB，data_out 初始化为空指针由 API 填充
+    let result = unsafe {
+        CryptProtectData(
+            &data_in,
+            std::ptr::null(),        // 描述字符串（可选）
+            std::ptr::null(),        // 额外的熵（可选）
+            std::ptr::null(),        // 保留
+            std::ptr::null(),        // 提示结构（可选）
+            0,                       // 标志（0 = 用户级别保护）
+            &mut data_out,
+        )
+    };
+
+    if result == 0 {
+        return Err("DPAPI 加密失败".into());
+    }
+
+    // 复制加密后的数据
+    // SAFETY: data_out.pbData 由 CryptProtectData 分配并填充，非空且大小为 cbData 字节
+    let protected = unsafe {
+        std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec()
+    };
+
+    // 释放 DPAPI 分配的内存
+    // SAFETY: data_out.pbData 由 CryptProtectData 通过 LocalAlloc 分配，必须使用 LocalFree 释放
+    unsafe {
+        windows_sys::Win32::Foundation::LocalFree(data_out.pbData as *mut std::ffi::c_void);
+    }
+
+    Ok(protected)
+}
+
+/// 使用 DPAPI 解密密钥数据（Windows），非 Windows 平台直接返回原始数据
+#[cfg(target_os = "windows")]
+fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptUnprotectData, CRYPT_INTEGER_BLOB,
+    };
+
+    let data_in = CRYPT_INTEGER_BLOB {
+        cbData: data.len() as u32,
+        pbData: data.as_ptr() as *mut u8,
+    };
+
+    let mut data_out = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: std::ptr::null_mut(),
+    };
+
+    // SAFETY: CryptUnprotectData 是 Windows DPAPI 标准 API，用法与 CryptProtectData 对称
+    // data_in 指向栈上有效的 CRYPT_INTEGER_BLOB，data_out 初始化为空
+    let result = unsafe {
+        CryptUnprotectData(
+            &data_in,
+            std::ptr::null_mut(),    // 解密后的描述字符串
+            std::ptr::null(),        // 额外的熵（必须与加密时一致）
+            std::ptr::null(),        // 保留
+            std::ptr::null(),        // 提示结构
+            0,                       // 标志
+            &mut data_out,
+        )
+    };
+
+    if result == 0 {
+        return Err("DPAPI 解密失败（密钥可能来自其他用户或机器）".into());
+    }
+
+    // SAFETY: data_out.pbData 由 CryptUnprotectData 分配并填充，大小与加密时一致
+    let unprotected = unsafe {
+        std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec()
+    };
+
+    // SAFETY: data_out.pbData 由 CryptUnprotectData 通过 LocalAlloc 分配，必须使用 LocalFree 释放
+    unsafe {
+        windows_sys::Win32::Foundation::LocalFree(data_out.pbData as *mut std::ffi::c_void);
+    }
+
+    Ok(unprotected)
+}
+
+/// 非 Windows 平台：不进行 DPAPI 保护，但设置文件权限（调用方负责）
+#[cfg(not(target_os = "windows"))]
+fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
+    Ok(data.to_vec())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
+    Ok(data.to_vec())
+}
+
 /// 获取或生成加密密钥（256-bit）
 ///
-/// 首次调用时生成随机密钥并持久化到磁盘。
-/// 后续调用从磁盘读取已有密钥。
+/// 首次调用时生成随机密钥，通过 DPAPI 保护后持久化到磁盘。
+/// 后续调用从磁盘读取并通过 DPAPI 解密恢复。
+/// 密钥文件即使被复制到其他机器也无法使用。
 fn get_or_create_key() -> Result<[u8; 32], String> {
     let path = key_path();
 
     // 尝试读取已有密钥
     if path.exists() {
-        let key_bytes = std::fs::read(&path).map_err(|e| format!("读取密钥文件失败: {e}"))?;
+        let protected_bytes =
+            std::fs::read(&path).map_err(|e| format!("读取密钥文件失败: {e}"))?;
+
+        // 通过 DPAPI 解密恢复原始密钥
+        let key_bytes = dpapi_unprotect(&protected_bytes)?;
+
         if key_bytes.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&key_bytes);
@@ -48,17 +170,22 @@ fn get_or_create_key() -> Result<[u8; 32], String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建密钥目录失败: {e}"))?;
     }
 
-    // 写入密钥文件（仅当前用户可读写，Windows 默认继承目录权限）
-    std::fs::write(&path, key).map_err(|e| format!("写入密钥文件失败: {e}"))?;
+    // 通过 DPAPI 加密后写入密钥文件
+    let protected = dpapi_protect(&key)?;
+    std::fs::write(&path, protected).map_err(|e| format!("写入密钥文件失败: {e}"))?;
 
-    // 设置文件权限为仅当前用户可读写（Windows ACL）
-    #[cfg(target_os = "windows")]
+    // 非 Windows 平台：设置文件权限为仅当前用户可读
+    #[cfg(not(target_os = "windows"))]
     {
-        // Windows 上默认继承父目录权限，已满足 L1-03 要求
-        // 如需更严格限制，可通过 SetNamedSecurityInfoW 实现
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(&path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600); // 仅所有者可读写
+            let _ = std::fs::set_permissions(&path, perms);
+        }
     }
 
-    tracing::info!("已生成新加密密钥 (path={})", path.display());
+    tracing::info!("已生成新加密密钥（通过 DPAPI 保护，path={}）", path.display());
     Ok(key)
 }
 
