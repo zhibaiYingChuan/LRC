@@ -899,7 +899,7 @@ pub fn build_v1_router(
                 let store = store.clone();
                 async move {
                     // 限制最大返回数量，防止滥用
-                    let limit = params.limit.unwrap_or(5).min(20).max(1);
+                    let limit = params.limit.unwrap_or(5).clamp(1, 20);
                     let store = store.lock().await;
 
                     // 使用 ListFilter 按创建时间降序获取最近记忆

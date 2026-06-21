@@ -64,7 +64,7 @@ pub fn project_fingerprint_with_path(src_dir: &Path) -> (String, String) {
     // 修复前：canonical_path 显示为 \\?\C:\Users\Administrator，对用户不友好
     // 修复后：canonical_path 显示为 C:\Users\Administrator
     // 注意：指纹计算仍然使用 normalized（带前缀的小写路径），保持向后兼容
-    let canonical_path = strip_verbatim_prefix(&canonical.to_string_lossy().to_string());
+    let canonical_path = strip_verbatim_prefix(&canonical.to_string_lossy());
 
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
@@ -78,12 +78,12 @@ pub fn project_fingerprint_with_path(src_dir: &Path) -> (String, String) {
 /// 去除 Windows Verbatim 路径前缀（\\?\）和 UNC 前缀（\\?\UNC\）
 /// 使路径显示更友好，如 `\\?\C:\Users\Admin` → `C:\Users\Admin`
 fn strip_verbatim_prefix(path: &str) -> String {
-    if path.starts_with(r"\\?\UNC\") {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
         // UNC 路径：\\?\UNC\server\share → \\server\share
-        format!(r"\\{}", &path[7..])
-    } else if path.starts_with(r"\\?\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
         // Verbatim 路径：\\?\C:\Users → C:\Users
-        path[4..].to_string()
+        rest.to_string()
     } else {
         path.to_string()
     }
