@@ -190,13 +190,15 @@ jobs:
 
       # v0.5.5 修复：必须先编译 sidecar，否则 build.rs 的 sync_sidecar_binary() 找不到二进制
       # 默认使用 Fast Match 模式（--features server），减少 CI 内存占用和编译时间
+      # 注意：不使用 --target 参数，编译产物在 target/release/ 下，build.rs 才能找到
       - name: Build sidecar binary
         shell: bash
         run: |
           cd ..
-          cargo build --release --features server --target ${{ matrix.target }}
+          cargo build --release --features server
           echo "Sidecar binary built successfully"
-          ls -lh target/${{ matrix.target }}/release/code-memory-server* 2>/dev/null || true
+          # 确保 build.rs 能找到 sidecar（target/release/ 目录）
+          ls -lh target/release/code-memory-server* 2>/dev/null || true
 
       - name: Tauri Release Build
         run: pnpm tauri build --bundles ${{ matrix.bundle_type }} --target ${{ matrix.target }}
