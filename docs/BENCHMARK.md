@@ -276,7 +276,19 @@ python download_data.py
 | 每次检索 API 调用 | 0 | 1 次 |
 | Token 消耗 | 0 | ~150 tokens/次 |
 
-> 完整 LongMemEval 适配器和评估脚本位于 `g:\LongMemEval\` 目录下。
+> 完整 LongMemEval 适配器和评估脚本请参考项目仓库的 LongMemEval 目录（如有）。
+
+---
+
+## 基准测试方法论
+
+如需了解 LRC 基准测试的设计哲学、测试维度和实现细节，请参考 [基准测试方法论白皮书](../tests/BENCHMARK_METHODOLOGY.md)。
+
+该文档涵盖：
+- 基准测试的设计哲学和测试维度
+- 各项指标的测量方法和计算公式
+- 测试数据集的生成策略
+- 结果分析和解读指南
 
 ---
 

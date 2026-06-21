@@ -667,7 +667,7 @@ async fn try_run() -> Result<(), String> {
             batch_size: 100,
             synthesis_threshold: 3,
             synthesis_similarity: 0.4,
-            run_on_start: true, // 启动时立即执行一次合成
+            run_on_start: false, // v0.5.5 内存优化：延迟首次合成，避免启动内存峰值
             auto_synthesize: true,
             verbose: 1,
         };
