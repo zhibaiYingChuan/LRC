@@ -194,11 +194,18 @@ jobs:
       - name: Build sidecar binary
         shell: bash
         run: |
-          cd ..
+          cd "${{ github.workspace }}"
           cargo build --release --features server
           echo "Sidecar binary built successfully"
-          # 确保 build.rs 能找到 sidecar（target/release/ 目录）
-          ls -lh target/release/code-memory-server* 2>/dev/null || true
+          # 验证 sidecar 存在
+          if [ -f "target/release/code-memory-server" ]; then
+            ls -lh target/release/code-memory-server
+          elif [ -f "target/release/code-memory-server.exe" ]; then
+            ls -lh target/release/code-memory-server.exe
+          else
+            echo "WARNING: Sidecar binary not found in target/release/"
+            ls -lh target/release/code-memory* 2>/dev/null || true
+          fi
 
       - name: Tauri Release Build
         run: pnpm tauri build --bundles ${{ matrix.bundle_type }} --target ${{ matrix.target }}
@@ -402,7 +409,7 @@ jobs:
           Write-Host "  LRC Desktop 一键安装脚本"
           Write-Host "==============================================="
 
-          $Version = "v0.5.4"
+          $Version = "v0.5.5"
           $BaseUrl = "https://github.com/zhibaiYingChuan/LRC/releases/download/$Version"
 
           Write-Host "  正在下载 LRC Desktop for Windows..."
@@ -424,7 +431,7 @@ jobs:
           echo "  LRC Desktop 一键安装脚本"
           echo "==============================================="
 
-          VERSION="v0.5.4"
+          VERSION="v0.5.5"
           BASE_URL="https://github.com/zhibaiYingChuan/LRC/releases/download/$VERSION"
 
           OS=$(uname -s)

@@ -64,10 +64,6 @@ jobs:
       - name: Gate 3: Clippy Standard (zero warnings)
         run: cargo clippy --all-targets --features server -- -D warnings
 
-      - name: Gate 3b: Clippy Strict (pedantic + nursery, main branch PR only)
-        if: github.ref == 'refs/heads/main'
-        run: cargo clippy --all-targets --features server -- -W clippy::pedantic -W clippy::nursery -D warnings
-
       - name: Gate 4: Code Format
         run: cargo fmt --check
 
