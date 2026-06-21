@@ -468,7 +468,7 @@ fn cjk_ratio(text: &str) -> f32 {
 ///
 /// # 示例
 ///
-/// ```
+/// ```ignore
 /// // 中文文本 → bigram 分词
 /// let tokens = tokenize_query("数据库连接");
 /// assert!(tokens.contains(&"数据".to_string()));

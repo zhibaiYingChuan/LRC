@@ -29,9 +29,7 @@ fn key_path() -> PathBuf {
 /// 这确保即使密钥文件被复制到其他机器也无法使用。
 #[cfg(windows)]
 fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
-    use windows_sys::Win32::Security::Cryptography::{
-        CryptProtectData, CRYPT_INTEGER_BLOB,
-    };
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
 
     let data_in = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
@@ -49,11 +47,11 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
     let result = unsafe {
         CryptProtectData(
             &data_in,
-            std::ptr::null(),        // 描述字符串（可选）
-            std::ptr::null(),        // 额外的熵（可选）
-            std::ptr::null(),        // 保留
-            std::ptr::null(),        // 提示结构（可选）
-            0,                       // 标志（0 = 用户级别保护）
+            std::ptr::null(), // 描述字符串（可选）
+            std::ptr::null(), // 额外的熵（可选）
+            std::ptr::null(), // 保留
+            std::ptr::null(), // 提示结构（可选）
+            0,                // 标志（0 = 用户级别保护）
             &mut data_out,
         )
     };
@@ -65,9 +63,8 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
     // 复制加密后的数据
     // SAFETY: data_out.pbData 由 CryptProtectData 分配并填充，cbData 为有效长度，
     // 从原始指针创建切片后立即调用 to_vec() 复制数据，不持有原始指针
-    let protected = unsafe {
-        std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec()
-    };
+    let protected =
+        unsafe { std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec() };
 
     // 释放 DPAPI 分配的内存
     // SAFETY: data_out.pbData 由 CryptProtectData 通过 LocalAlloc 分配，
@@ -82,9 +79,7 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
 /// 使用 DPAPI 解密密钥数据（Windows），非 Windows 平台直接返回原始数据
 #[cfg(windows)]
 fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
-    use windows_sys::Win32::Security::Cryptography::{
-        CryptUnprotectData, CRYPT_INTEGER_BLOB,
-    };
+    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 
     let data_in = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
@@ -100,11 +95,11 @@ fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
     let result = unsafe {
         CryptUnprotectData(
             &data_in,
-            std::ptr::null_mut(),    // 解密后的描述字符串
-            std::ptr::null(),        // 额外的熵（必须与加密时一致）
-            std::ptr::null(),        // 保留
-            std::ptr::null(),        // 提示结构
-            0,                       // 标志
+            std::ptr::null_mut(), // 解密后的描述字符串
+            std::ptr::null(),     // 额外的熵（必须与加密时一致）
+            std::ptr::null(),     // 保留
+            std::ptr::null(),     // 提示结构
+            0,                    // 标志
             &mut data_out,
         )
     };
@@ -114,9 +109,8 @@ fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     // SAFETY: 与加密路径一致，从 CryptUnprotectData 输出复制数据后立即释放
-    let unprotected = unsafe {
-        std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec()
-    };
+    let unprotected =
+        unsafe { std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec() };
 
     // SAFETY: data_out.pbData 由 CryptUnprotectData 通过 LocalAlloc 分配
     unsafe {
@@ -200,7 +194,10 @@ fn get_or_create_key() -> Result<[u8; 32], String> {
         }
     }
 
-    eprintln!("[加密] 已生成新加密密钥（通过 DPAPI 保护，path={}）", path.display());
+    eprintln!(
+        "[加密] 已生成新加密密钥（通过 DPAPI 保护，path={}）",
+        path.display()
+    );
     Ok(key)
 }
 
@@ -216,8 +213,7 @@ pub fn encrypt_api_key(plaintext: &str) -> Result<String, String> {
     }
 
     let key = get_or_create_key()?;
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|e| format!("创建加密器失败: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("创建加密器失败: {e}"))?;
 
     // 生成随机 nonce（96-bit / 12 bytes）
     let mut nonce_bytes = [0u8; 12];
@@ -247,8 +243,7 @@ pub fn decrypt_api_key(encrypted: &str) -> Result<String, String> {
         return Ok(String::new());
     }
     let key = get_or_create_key()?;
-    let cipher =
-        Aes256Gcm::new_from_slice(&key).map_err(|e| format!("创建解密器失败: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("创建解密器失败: {e}"))?;
 
     // 解码 Base64
     let combined = BASE64

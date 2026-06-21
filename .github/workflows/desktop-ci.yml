@@ -66,20 +66,20 @@ jobs:
           key: ${{ runner.os }}-desktop-cargo-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-desktop-cargo-
 
-      - name: Gate 1a: Compile Check
+      - name: "Gate 1a: Compile Check"
         run: cargo check --all-targets
 
-      - name: Gate 1b: Unit Tests
+      - name: "Gate 1b: Unit Tests"
         run: cargo test --all-targets
 
-      - name: Gate 1c: Clippy Standard
+      - name: "Gate 1c: Clippy Standard"
         run: |
           cargo clippy --all-targets -- -D warnings
 
-      - name: Gate 1d: Code Format
+      - name: "Gate 1d: Code Format"
         run: cargo fmt --check
 
-      - name: Gate 1e: unwrap() residue detection (exclude test code)
+      - name: "Gate 1e: unwrap() residue detection (exclude test code)"
         shell: powershell
         run: |
           $DesktopSrc = "desktop\src-tauri\src"
@@ -287,7 +287,7 @@ jobs:
           name: lrc-desktop-windows-x86_64
           path: ./build
 
-      - name: L2-01: Symbol stripping verification
+      - name: "L2-01: Symbol stripping verification"
         shell: powershell
         run: |
           Write-Host "=== L2 Confidentiality Verification ==="
@@ -296,7 +296,7 @@ jobs:
           Write-Host "  Note: Release builds strip symbols by default, marking as PASS"
           Write-Host "  -> PASS"
 
-      - name: L2-02: String encryption check
+      - name: "L2-02: String encryption check"
         shell: powershell
         run: |
           Write-Host "L2-02: String encryption check"
@@ -312,7 +312,7 @@ jobs:
             Write-Host "  -> SKIP: Build artifact unavailable"
           }
 
-      - name: L2-03: File size reasonableness
+      - name: "L2-03: File size reasonableness"
         shell: powershell
         run: |
           Write-Host "L2-03: File size reasonableness"

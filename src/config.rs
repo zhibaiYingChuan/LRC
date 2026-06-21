@@ -143,14 +143,13 @@ impl LrcConfig {
         let mut save_config = self.clone();
         if let Some(ref llm_api) = save_config.llm_api {
             if !llm_api.is_empty() {
-                save_config.encrypted_api_key =
-                    Some(crate::crypto::encrypt_api_key(llm_api)?);
+                save_config.encrypted_api_key = Some(crate::crypto::encrypt_api_key(llm_api)?);
                 save_config.llm_api = None; // 不保存明文到磁盘
             }
         }
 
-        let json =
-            serde_json::to_string_pretty(&save_config).map_err(|e| format!("序列化配置失败: {}", e))?;
+        let json = serde_json::to_string_pretty(&save_config)
+            .map_err(|e| format!("序列化配置失败: {}", e))?;
 
         fs::write(&path, json).map_err(|e| format!("写入配置文件失败: {}", e))?;
 

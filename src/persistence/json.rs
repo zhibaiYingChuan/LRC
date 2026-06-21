@@ -126,7 +126,9 @@ impl Persistence for JsonPersistence {
         // 使用缓存优化：避免每次全量读取+反序列化 JSON 文件
         self.ensure_cache_loaded()?;
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
-        let memories = cache.as_mut().expect("缓存已通过 ensure_cache_loaded 初始化");
+        let memories = cache
+            .as_mut()
+            .expect("缓存已通过 ensure_cache_loaded 初始化");
 
         // 按 ID 查找并更新，或追加新记忆
         if let Some(existing) = memories.iter_mut().find(|m| m.id == memory.id) {
@@ -160,7 +162,9 @@ impl Persistence for JsonPersistence {
         // 使用缓存优化：避免全量读取
         self.ensure_cache_loaded()?;
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
-        let memories = cache.as_mut().expect("缓存已通过 ensure_cache_loaded 初始化");
+        let memories = cache
+            .as_mut()
+            .expect("缓存已通过 ensure_cache_loaded 初始化");
         let original_len = memories.len();
         memories.retain(|m| m.id != id);
 
