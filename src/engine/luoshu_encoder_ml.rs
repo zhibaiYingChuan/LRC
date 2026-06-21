@@ -59,8 +59,8 @@ impl LuoShuMlEncoder {
         // ════════════════════════════════════════════════════════════
         // 本地镜像守卫 — 确保 hf-hub 库的下载请求走国内镜像
         // v0.5.4 修复：使用 ApiBuilder::with_endpoint 替代 set_var，避免多线程数据竞争
-        let hf_endpoint = std::env::var("HF_ENDPOINT")
-            .unwrap_or_else(|_| "https://hf-mirror.com".to_string());
+        let hf_endpoint =
+            std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://hf-mirror.com".to_string());
 
         let device = Device::Cpu;
 
@@ -120,11 +120,10 @@ impl LuoShuMlEncoder {
             tokenizers::Tokenizer::from_file(&tokenizer_path)
                 .map_err(|e| format!("加载本地分词器失败: {}", e))?
         } else {
-            let api =
-                hf_hub::api::sync::ApiBuilder::new()
-                    .with_endpoint(hf_endpoint.clone())
-                    .build()
-                    .map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
+            let api = hf_hub::api::sync::ApiBuilder::new()
+                .with_endpoint(hf_endpoint.clone())
+                .build()
+                .map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
             let repo = api.model(model_id.clone());
             let tokenizer_path = repo
                 .get("tokenizer.json")
@@ -201,11 +200,10 @@ impl LuoShuMlEncoder {
 
             (model, hidden_size)
         } else {
-            let api =
-                hf_hub::api::sync::ApiBuilder::new()
-                    .with_endpoint(hf_endpoint.clone())
-                    .build()
-                    .map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
+            let api = hf_hub::api::sync::ApiBuilder::new()
+                .with_endpoint(hf_endpoint.clone())
+                .build()
+                .map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
             let repo = api.model(model_id);
 
             let config_path = repo

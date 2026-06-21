@@ -55,19 +55,19 @@ jobs:
           key: ${{ runner.os }}-cargo-ci-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-ci-
 
-      - name: Gate 1: Compile Check
+      - name: "Gate 1: Compile Check"
         run: cargo check --all-targets --features server
 
-      - name: Gate 2: Unit Tests
+      - name: "Gate 2: Unit Tests"
         run: cargo test --all-targets --features server
 
-      - name: Gate 3: Clippy Standard (zero warnings)
+      - name: "Gate 3: Clippy Standard (zero warnings)"
         run: cargo clippy --all-targets --features server -- -D warnings
 
-      - name: Gate 4: Code Format
+      - name: "Gate 4: Code Format"
         run: cargo fmt --check
 
-      - name: Gate 5: unwrap() residue detection (exclude test code)
+      - name: "Gate 5: unwrap() residue detection (exclude test code)"
         shell: pwsh
         run: |
           $Violations = @()
@@ -108,7 +108,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Gate 6: Frontend code duplication check
+      - name: "Gate 6: Frontend code duplication check"
         shell: pwsh
         run: |
           $IndexHtml = "static/index.html"
@@ -126,7 +126,7 @@ jobs:
             Write-Host "PASS: No frontend code duplication"
           }
 
-      - name: Gate 7: Frontend XSS security check
+      - name: "Gate 7: Frontend XSS security check"
         shell: pwsh
         run: |
           $JsFiles = @("static/app.js", "static/index.html") | Where-Object { Test-Path $_ }

@@ -119,7 +119,10 @@ async fn try_run() -> Result<(), String> {
                     port = match args[i].parse() {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!("警告: 无效端口号 '{}', 使用默认端口 {} ({})", args[i], DEFAULT_PORT, e);
+                            eprintln!(
+                                "警告: 无效端口号 '{}', 使用默认端口 {} ({})",
+                                args[i], DEFAULT_PORT, e
+                            );
                             DEFAULT_PORT
                         }
                     };
@@ -658,8 +661,7 @@ async fn try_run() -> Result<(), String> {
     // 定期执行记忆合成，自动合并用户通过 API 写入的重复/相似记忆
     // 默认间隔 5 分钟，启动时立即执行一次
     // ════════════════════════════════════════════════════════════
-    let (consolidation_shutdown_tx, consolidation_shutdown_rx) =
-        tokio::sync::watch::channel(false);
+    let (consolidation_shutdown_tx, consolidation_shutdown_rx) = tokio::sync::watch::channel(false);
 
     {
         let consolidation_config = ConsolidationConfig {
@@ -824,11 +826,18 @@ fn load_llm_from_wizard_json() -> Option<String> {
     };
 
     // 检查 llm_configured 标志
-    if !wizard.get("llm_configured").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if !wizard
+        .get("llm_configured")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return None;
     }
 
-    let llm_type = wizard.get("llm_type").and_then(|v| v.as_str()).unwrap_or("");
+    let llm_type = wizard
+        .get("llm_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if llm_type.is_empty() || llm_type == "none" {
         return None;
     }
@@ -1319,7 +1328,10 @@ fn print_help() {
     println!("选项:");
     println!("  --src-dir <路径>    要索引的项目源码目录 [默认: 当前目录]");
     println!("  --host <地址>       HTTP 绑定地址 [默认: 127.0.0.1]");
-    println!("  --port <端口>       HTTP 绑定端口 [默认: {}]", DEFAULT_PORT);
+    println!(
+        "  --port <端口>       HTTP 绑定端口 [默认: {}]",
+        DEFAULT_PORT
+    );
     println!("  --stdio             使用 stdio 传输模式（IDE 标准 MCP，推荐）");
     println!("  --global            记忆跨项目共享 (~/.loong-recall/global/data/)");
     println!("  --db-path <路径>    自定义记忆数据存储路径（优先级最高）");
@@ -1345,7 +1357,10 @@ fn print_help() {
     println!();
     println!("举个栗子:");
     println!("  # Tier 1 — 默认快速模式（零网络、零下载、秒启动）");
-    println!("  code-memory-server --src-dir ./src --port {}", DEFAULT_PORT);
+    println!(
+        "  code-memory-server --src-dir ./src --port {}",
+        DEFAULT_PORT
+    );
     println!();
     println!("  # Tier 1 — 一键安装到 Trae IDE（自动配置 MCP）");
     println!("  code-memory-server --install-ide trae");
@@ -1382,6 +1397,9 @@ fn print_help() {
     println!("  Ollama:   ollama:<host>:<model-name>");
     println!();
     println!("启动后在 IDE 中配置 MCP 连接，AI 助手即可使用。");
-    println!("访问 http://localhost:{}/dashboard 查看可视化记忆管理仪表盘。", DEFAULT_PORT);
+    println!(
+        "访问 http://localhost:{}/dashboard 查看可视化记忆管理仪表盘。",
+        DEFAULT_PORT
+    );
     println!("详细使用说明: https://github.com/zhibaiYingChuan/LRC/blob/main/docs/USER_GUIDE.md");
 }

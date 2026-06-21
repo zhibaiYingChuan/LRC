@@ -842,10 +842,22 @@ mod tests {
             "fn render_page(t: &Template) -> Html { t.render(&ctx).unwrap() }",
         );
 
-        let cb_related = cb.encode(&c1).unwrap().cosine_similarity(&cb.encode(&c2).unwrap());
-        let cb_unrelated = cb.encode(&c1).unwrap().cosine_similarity(&cb.encode(&c3).unwrap());
-        let fast_related = fast.encode(&c1).unwrap().cosine_similarity(&fast.encode(&c2).unwrap());
-        let fast_unrelated = fast.encode(&c1).unwrap().cosine_similarity(&fast.encode(&c3).unwrap());
+        let cb_related = cb
+            .encode(&c1)
+            .unwrap()
+            .cosine_similarity(&cb.encode(&c2).unwrap());
+        let cb_unrelated = cb
+            .encode(&c1)
+            .unwrap()
+            .cosine_similarity(&cb.encode(&c3).unwrap());
+        let fast_related = fast
+            .encode(&c1)
+            .unwrap()
+            .cosine_similarity(&fast.encode(&c2).unwrap());
+        let fast_unrelated = fast
+            .encode(&c1)
+            .unwrap()
+            .cosine_similarity(&fast.encode(&c3).unwrap());
 
         println!(
             "gap: cb=related={:.4} unrelated={:.4}, fast=related={:.4} unrelated={:.4}",
@@ -931,7 +943,10 @@ mod tests {
         );
         let c2 = make_chunk("Repo_get", "impl Repo { fn get(&self, id: u64) -> Option<Item> { self.db.query(\"SELECT * FROM t WHERE id = ?\", id) } }");
 
-        let sim = cb.encode(&c1).unwrap().cosine_similarity(&cb.encode(&c2).unwrap());
+        let sim = cb
+            .encode(&c1)
+            .unwrap()
+            .cosine_similarity(&cb.encode(&c2).unwrap());
         println!("cross-type sim: {:.4}", sim);
         assert!(sim > 0.7);
     }

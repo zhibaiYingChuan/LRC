@@ -17,8 +17,8 @@ pub mod llm_translator; // LLM 查询翻译
 pub mod manager;
 pub mod model_resolver; // ML 模型下载/解析
 pub mod pooling; // 池化策略（CodeBERT + 洛书 ML 共享）
-pub mod rrf; // RRF 倒数排名融合（server + v1_api 共享）
-pub mod retriever; // 检索器 // 代码库管理器 (CoreManager)
+pub mod retriever;
+pub mod rrf; // RRF 倒数排名融合（server + v1_api 共享） // 检索器 // 代码库管理器 (CoreManager)
 
 #[cfg(feature = "ml")]
 pub mod encoder_codebert; // CodeBERT 编码器实现

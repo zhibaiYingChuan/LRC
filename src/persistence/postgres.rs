@@ -106,10 +106,17 @@ impl PostgresPersistence {
         if config.table_prefix.is_empty() || config.table_prefix.len() > 30 {
             return Err(PersistenceError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("table_prefix 长度必须在 1-30 之间，当前值: '{}'", config.table_prefix),
+                format!(
+                    "table_prefix 长度必须在 1-30 之间，当前值: '{}'",
+                    config.table_prefix
+                ),
             )));
         }
-        if !config.table_prefix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if !config
+            .table_prefix
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_')
+        {
             return Err(PersistenceError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(

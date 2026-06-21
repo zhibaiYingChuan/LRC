@@ -66,9 +66,7 @@ impl Neo4jConfig {
         // v0.5.4 修复：密码必须从环境变量读取，不使用硬编码默认值
         let password = match std::env::var("LRC_NEO4J_PASS") {
             Ok(p) if !p.is_empty() => p,
-            _ => return Err(
-                "LRC_NEO4J_PASS 环境变量未设置或为空，请设置 Neo4j 密码".to_string()
-            ),
+            _ => return Err("LRC_NEO4J_PASS 环境变量未设置或为空，请设置 Neo4j 密码".to_string()),
         };
         let database = std::env::var("LRC_NEO4J_DB").unwrap_or_else(|_| "neo4j".to_string());
 
@@ -404,9 +402,7 @@ impl Neo4jGraphStore {
                     }
                     if let Some(neighbor_val) = data_row.row.get(2) {
                         if let Some(props) = neighbor_val.as_object() {
-                            if !result.nodes.iter().any(|n| {
-                                n.get("id") == props.get("id")
-                            }) {
+                            if !result.nodes.iter().any(|n| n.get("id") == props.get("id")) {
                                 result.nodes.push(props.clone());
                             }
                         }

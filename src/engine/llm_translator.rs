@@ -290,7 +290,10 @@ async fn translate_openai(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        eprintln!("[LRC·LLM] OpenAI API 返回错误状态: {} (响应: {:.200})", status, body);
+        eprintln!(
+            "[LRC·LLM] OpenAI API 返回错误状态: {} (响应: {:.200})",
+            status, body
+        );
         return Err(format!("LLM API 返回错误: {}", status));
     }
 
@@ -368,7 +371,10 @@ async fn translate_ollama(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        eprintln!("[LRC·LLM] Ollama API 返回错误状态: {} (响应: {:.200})", status, body);
+        eprintln!(
+            "[LRC·LLM] Ollama API 返回错误状态: {} (响应: {:.200})",
+            status, body
+        );
         return Err(format!("Ollama API 返回错误: {}", status));
     }
 

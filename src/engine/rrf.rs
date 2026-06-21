@@ -5,8 +5,8 @@
 // 用于将多路检索结果（快速通路 + 深度通路）合并为统一排序。
 // ============================================================
 
-use crate::memory_types::Memory;
 use crate::memory_store::RecallResult;
+use crate::memory_types::Memory;
 use std::collections::HashMap;
 
 /// 默认 RRF 常数 k（控制排名对分数的敏感度，k 越大排名差异越小）

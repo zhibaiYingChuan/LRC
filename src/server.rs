@@ -618,7 +618,10 @@ async fn handle_recall_enhanced(
         .await;
         let translated: String = keywords.join(" ");
         if translated.is_empty() || translated.trim() == query {
-            eprintln!("[LRC·LLM] 增强检索翻译未产生有效结果，使用原始查询: {}", query);
+            eprintln!(
+                "[LRC·LLM] 增强检索翻译未产生有效结果，使用原始查询: {}",
+                query
+            );
             query.to_string()
         } else {
             eprintln!("[LRC·LLM] 增强检索翻译成功: {} → {}", query, translated);
@@ -663,7 +666,12 @@ async fn handle_recall_enhanced(
         });
 
     // 倒数排名融合 (RRF, Reciprocal Rank Fusion) — 使用共享 rrf_fuse
-    let fused = crate::engine::rrf::rrf_fuse(&fast_result, &deep_result, top_k, crate::engine::rrf::RRF_DEFAULT_K);
+    let fused = crate::engine::rrf::rrf_fuse(
+        &fast_result,
+        &deep_result,
+        top_k,
+        crate::engine::rrf::RRF_DEFAULT_K,
+    );
     let result_memories = fused.memories;
     let result_scores = fused.scores;
     let total = fused.total_candidates;
@@ -901,8 +909,7 @@ async fn handle_batch_remember(
             .get("memory_type")
             .and_then(|v| v.as_str())
             .unwrap_or("fact");
-        let memory_type =
-            MemoryType::try_parse(memory_type_str).unwrap_or(MemoryType::Fact);
+        let memory_type = MemoryType::try_parse(memory_type_str).unwrap_or(MemoryType::Fact);
 
         let project = item
             .get("project")
@@ -1039,8 +1046,7 @@ async fn handle_list_memories(
     let store = state.memory_store.lock().await;
     match store.list_memories(&filter) {
         Ok((memories, total)) => {
-            let mut text =
-                format!("记忆列表 (共 {} 条，本页 {} 条)\n\n", total, memories.len());
+            let mut text = format!("记忆列表 (共 {} 条，本页 {} 条)\n\n", total, memories.len());
 
             if memories.is_empty() {
                 text.push_str("暂无记忆。使用 remember 工具添加记忆。\n");
@@ -1729,12 +1735,20 @@ struct ConfigResponse {
 async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let llm = state.llm_api.read().await;
     let (configured, llm_type, llm_model, llm_base_url) = match &*llm {
-        LlmApiConfig::OpenAI { model, endpoint, .. } => {
-            (true, "openai".to_string(), Some(model.clone()), Some(endpoint.clone()))
-        }
-        LlmApiConfig::Ollama { model, host } => {
-            (true, "ollama".to_string(), Some(model.clone()), Some(host.clone()))
-        }
+        LlmApiConfig::OpenAI {
+            model, endpoint, ..
+        } => (
+            true,
+            "openai".to_string(),
+            Some(model.clone()),
+            Some(endpoint.clone()),
+        ),
+        LlmApiConfig::Ollama { model, host } => (
+            true,
+            "ollama".to_string(),
+            Some(model.clone()),
+            Some(host.clone()),
+        ),
         LlmApiConfig::None => (false, "none".to_string(), None, None),
     };
     Json(ConfigResponse {
@@ -1804,9 +1818,12 @@ async fn config_llm_handler(
                 LlmApiConfig::None => {
                     let err_msg = "内部错误：LLM 配置解析返回了未预期的 None 变体";
                     eprintln!("[LRC·错误] {}", err_msg);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                        "error": err_msg
-                    })));
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": err_msg
+                        })),
+                    );
                 }
             };
             let mut llm = state.llm_api.write().await;
@@ -1858,8 +1875,8 @@ fn save_llm_to_config(llm_api: Option<&str>) -> Result<(), String> {
 /// wizard.json 路径：%APPDATA%\LoongRecall\wizard.json
 /// API Key 使用 AES-256-GCM 加密存储（与桌面端一致）。
 fn save_llm_to_wizard_json(llm_api: &str) -> Result<(), String> {
-    let appdata = std::env::var("APPDATA")
-        .map_err(|e| format!("读取 APPDATA 环境变量失败: {}", e))?;
+    let appdata =
+        std::env::var("APPDATA").map_err(|e| format!("读取 APPDATA 环境变量失败: {}", e))?;
     let wizard_path = std::path::PathBuf::from(&appdata)
         .join("LoongRecall")
         .join("wizard.json");
@@ -1931,17 +1948,18 @@ fn save_llm_to_wizard_json(llm_api: &str) -> Result<(), String> {
 
     // 确保目录存在
     if let Some(parent) = wizard_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建 wizard.json 目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 wizard.json 目录失败: {}", e))?;
     }
 
     // 写入 wizard.json
     let json_str = serde_json::to_string_pretty(&wizard)
         .map_err(|e| format!("序列化 wizard.json 失败: {}", e))?;
-    std::fs::write(&wizard_path, json_str)
-        .map_err(|e| format!("写入 wizard.json 失败: {}", e))?;
+    std::fs::write(&wizard_path, json_str).map_err(|e| format!("写入 wizard.json 失败: {}", e))?;
 
-    eprintln!("[配置] LLM 配置已同步到 wizard.json: {}", wizard_path.display());
+    eprintln!(
+        "[配置] LLM 配置已同步到 wizard.json: {}",
+        wizard_path.display()
+    );
     Ok(())
 }
 
@@ -2195,7 +2213,10 @@ mod tests {
             tool_names.contains(&"codebase_stats"),
             "缺少 codebase_stats 工具"
         );
-        assert!(tool_names.contains(&"system_health"), "缺少 system_health 工具");
+        assert!(
+            tool_names.contains(&"system_health"),
+            "缺少 system_health 工具"
+        );
         assert!(
             tool_names.contains(&"correct_memory"),
             "缺少 correct_memory 工具"
@@ -2459,10 +2480,14 @@ mod tests {
         let text = remember_json["result"]["content"][0]["text"]
             .as_str()
             .expect("LLM 响应中 text 字段应为字符串，检查 remember 工具返回格式");
-        let id_start = text.find("ID: ")
-            .expect("LLM 响应中未找到 'ID: ' 前缀，检查 remember 工具输出格式") + 4;
-        let id_end = text[id_start..].find(')')
-            .expect("LLM 响应中未找到 ID 结束括号 ')'，检查 remember 工具输出格式") + id_start;
+        let id_start = text
+            .find("ID: ")
+            .expect("LLM 响应中未找到 'ID: ' 前缀，检查 remember 工具输出格式")
+            + 4;
+        let id_end = text[id_start..]
+            .find(')')
+            .expect("LLM 响应中未找到 ID 结束括号 ')'，检查 remember 工具输出格式")
+            + id_start;
         let memory_id = &text[id_start..id_end];
 
         // 删除该记忆
@@ -2520,10 +2545,14 @@ mod tests {
         let text = remember_json["result"]["content"][0]["text"]
             .as_str()
             .expect("LLM 响应中 text 字段应为字符串，检查 remember 工具返回格式");
-        let id_start = text.find("ID: ")
-            .expect("LLM 响应中未找到 'ID: ' 前缀，检查 remember 工具输出格式") + 4;
-        let id_end = text[id_start..].find(')')
-            .expect("LLM 响应中未找到 ID 结束括号 ')'，检查 remember 工具输出格式") + id_start;
+        let id_start = text
+            .find("ID: ")
+            .expect("LLM 响应中未找到 'ID: ' 前缀，检查 remember 工具输出格式")
+            + 4;
+        let id_end = text[id_start..]
+            .find(')')
+            .expect("LLM 响应中未找到 ID 结束括号 ')'，检查 remember 工具输出格式")
+            + id_start;
         let memory_id = &text[id_start..id_end];
 
         // 更新该记忆

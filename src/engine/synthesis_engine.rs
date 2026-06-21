@@ -577,7 +577,11 @@ mod tests {
     fn test_compute_jaccard_identical() {
         let engine = SynthesisEngine::default();
         let sim = engine.compute_jaccard("hello world", "hello world");
-        assert!((sim - 1.0).abs() < 0.001, "相同文本应返回 1.0，实际: {}", sim);
+        assert!(
+            (sim - 1.0).abs() < 0.001,
+            "相同文本应返回 1.0，实际: {}",
+            sim
+        );
     }
 
     #[test]
@@ -591,17 +595,29 @@ mod tests {
     fn test_compute_jaccard_partial_overlap() {
         let engine = SynthesisEngine::default();
         let sim = engine.compute_jaccard("hello world foo", "hello world bar");
-        assert!(sim > 0.4 && sim < 0.8, "部分重叠应在 0.4-0.8 之间，实际: {}", sim);
+        assert!(
+            sim > 0.4 && sim < 0.8,
+            "部分重叠应在 0.4-0.8 之间，实际: {}",
+            sim
+        );
     }
 
     #[test]
     fn test_compute_jaccard_cjk() {
         let engine = SynthesisEngine::default();
         let sim = engine.compute_jaccard("你好世界", "你好世界");
-        assert!((sim - 1.0).abs() < 0.001, "相同 CJK 文本应返回 1.0，实际: {}", sim);
+        assert!(
+            (sim - 1.0).abs() < 0.001,
+            "相同 CJK 文本应返回 1.0，实际: {}",
+            sim
+        );
 
         let sim_diff = engine.compute_jaccard("你好世界", "再见朋友");
-        assert!(sim_diff < 0.5, "不同 CJK 文本相似度应较低，实际: {}", sim_diff);
+        assert!(
+            sim_diff < 0.5,
+            "不同 CJK 文本相似度应较低，实际: {}",
+            sim_diff
+        );
     }
 
     #[test]
@@ -632,15 +648,22 @@ mod tests {
         assert!(summary.contains("合成知识"));
         assert!(summary.contains("3 条相关记忆"));
         // 共同主题应包含"文档"（出现 3 次）
-        assert!(summary.contains("文档"), "应包含共同主题词，实际: {}", summary);
+        assert!(
+            summary.contains("文档"),
+            "应包含共同主题词，实际: {}",
+            summary
+        );
     }
 
     #[test]
     fn test_find_synthesis_clusters_empty() {
         let engine = SynthesisEngine::default();
         let dir = TempDir::new().expect("创建临时目录失败");
-        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
-        let clusters = engine.find_synthesis_clusters(&persistence).expect("查找簇失败");
+        let persistence =
+            JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+        let clusters = engine
+            .find_synthesis_clusters(&persistence)
+            .expect("查找簇失败");
         assert!(clusters.is_empty(), "空记忆库应返回空簇");
     }
 
@@ -648,7 +671,8 @@ mod tests {
     fn test_find_synthesis_clusters_below_min_cluster() {
         let engine = SynthesisEngine::default();
         let dir = TempDir::new().expect("创建临时目录失败");
-        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+        let persistence =
+            JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
 
         // 只添加 2 条记忆，低于 min_cluster=3
         persistence
@@ -658,15 +682,22 @@ mod tests {
             .save_memory(&make_memory("记忆 B", vec!["test"]))
             .expect("保存记忆 B 失败");
 
-        let clusters = engine.find_synthesis_clusters(&persistence).expect("查找簇失败");
-        assert!(clusters.is_empty(), "低于最小簇大小时应返回空，实际: {} 簇", clusters.len());
+        let clusters = engine
+            .find_synthesis_clusters(&persistence)
+            .expect("查找簇失败");
+        assert!(
+            clusters.is_empty(),
+            "低于最小簇大小时应返回空，实际: {} 簇",
+            clusters.len()
+        );
     }
 
     #[test]
     fn test_find_synthesis_clusters_similar() {
         let engine = SynthesisEngine::default();
         let dir = TempDir::new().expect("创建临时目录失败");
-        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+        let persistence =
+            JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
 
         // 添加 3 条相似记忆
         persistence
@@ -679,7 +710,9 @@ mod tests {
             .save_memory(&make_memory("部署到生产的方法", vec!["deploy"]))
             .expect("保存失败");
 
-        let clusters = engine.find_synthesis_clusters(&persistence).expect("查找簇失败");
+        let clusters = engine
+            .find_synthesis_clusters(&persistence)
+            .expect("查找簇失败");
         // 3 条相似记忆应形成至少 1 个簇
         assert!(!clusters.is_empty(), "相似记忆应形成簇");
     }
@@ -688,7 +721,8 @@ mod tests {
     fn test_try_synthesize_empty() {
         let engine = SynthesisEngine::default();
         let dir = TempDir::new().expect("创建临时目录失败");
-        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+        let persistence =
+            JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
 
         let mut graph_store: Option<GraphMemoryStore> = None;
         let mut dao_metrics = DaoMetrics::default();
@@ -702,7 +736,8 @@ mod tests {
     fn test_try_synthesize_with_similar() {
         let engine = SynthesisEngine::default();
         let dir = TempDir::new().expect("创建临时目录失败");
-        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+        let persistence =
+            JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
 
         // 添加 3 条相似记忆
         persistence
@@ -729,14 +764,19 @@ mod tests {
             .iter()
             .filter(|m| m.memory_type == MemoryType::Synthesis)
             .count();
-        assert!(synthesis_count > 0, "应存在合成记忆，实际: {} 条", synthesis_count);
+        assert!(
+            synthesis_count > 0,
+            "应存在合成记忆，实际: {} 条",
+            synthesis_count
+        );
     }
 
     #[test]
     fn test_synthesize_is_idempotent() {
         let engine = SynthesisEngine::default();
         let dir = TempDir::new().expect("创建临时目录失败");
-        let persistence = JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
+        let persistence =
+            JsonPersistence::new(dir.path().to_str().unwrap()).expect("创建 JSON 持久化失败");
 
         // 添加 3 条相似记忆
         persistence
@@ -763,6 +803,10 @@ mod tests {
             .expect("第二次合成失败");
 
         assert!(count1 > 0, "第一次应产生合成记忆");
-        assert_eq!(count2, 0, "第二次合成应为幂等（无新簇），实际: {} 条", count2);
+        assert_eq!(
+            count2, 0,
+            "第二次合成应为幂等（无新簇），实际: {} 条",
+            count2
+        );
     }
 }

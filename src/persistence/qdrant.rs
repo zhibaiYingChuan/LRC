@@ -266,10 +266,7 @@ impl QdrantPersistence {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                eprintln!(
-                    "[LRC·Qdrant] 滚动查询返回 HTTP {}: {}",
-                    status, body
-                );
+                eprintln!("[LRC·Qdrant] 滚动查询返回 HTTP {}: {}", status, body);
                 break;
             }
 
@@ -495,10 +492,7 @@ impl Persistence for QdrantPersistence {
         // 本地兜底：从内存缓存加载
         if let Ok(guard) = self.fallback_memories.lock() {
             if !guard.is_empty() {
-                eprintln!(
-                    "[LRC·Qdrant] 从本地兜底加载 {} 条记忆",
-                    guard.len()
-                );
+                eprintln!("[LRC·Qdrant] 从本地兜底加载 {} 条记忆", guard.len());
                 return Ok(guard.clone());
             }
         }
@@ -544,7 +538,7 @@ impl Persistence for QdrantPersistence {
         // v0.5.4 修复 C06：同步清除 Qdrant 远程向量数据
         // 此前仅清除本地兜底缓存，远程 Qdrant 数据未删除，导致数据不一致
         // 用户调用"清除记忆"后期望所有数据都被删除
-        
+
         // 1. 清除本地兜底缓存
         if let Ok(mut guard) = self.fallback_memories.lock() {
             guard.clear();

@@ -142,11 +142,10 @@ impl HnswGraph {
                     candidates.push((neighbor_idx, dist));
                     results.push((neighbor_idx, dist));
                     // 保持结果集按距离升序
-                    results
-                        .sort_by(|a, b| {
-                            // v0.5.4 NaN 防护：NaN 向量已在插入时过滤，防御性保留
-                            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                        });
+                    results.sort_by(|a, b| {
+                        // v0.5.4 NaN 防护：NaN 向量已在插入时过滤，防御性保留
+                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
                     // 截断到 ef
                     if results.len() > ef {
                         results.truncate(ef);
