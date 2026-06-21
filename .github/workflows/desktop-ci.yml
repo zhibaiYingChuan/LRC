@@ -13,21 +13,11 @@ name: Desktop Gatekeeper CI
 on:
   push:
     branches: [main, develop]
-    paths:
-      - 'desktop/**'
-      - '.github/workflows/desktop-ci.yml'
     tags:
-      - 'v*'  # v0.5.4 修复：打 tag 时自动触发桌面端构建和发布
+      - 'v*'  # tag 推送时自动触发桌面端构建和发布
   pull_request:
     branches: [main]
-    paths:
-      - 'desktop/**'
-  workflow_dispatch:
-    inputs:
-      release:
-        description: '是否发布到 GitHub Release（仅 tag 推送时自动发布）'
-        type: boolean
-        default: false
+  workflow_dispatch:  # 允许手动触发
 
 permissions:
   contents: write  # v0.5.4 修复：Release 发布需要 write 权限
