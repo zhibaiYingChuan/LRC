@@ -98,7 +98,7 @@ jobs:
           echo "bin_name=${BIN_NAME}" >> $GITHUB_OUTPUT
           echo "BIN_NAME=${BIN_NAME}" >> $GITHUB_ENV
 
-          cargo build --release --features server,ml --target ${{ matrix.target }}
+          cargo build --release --features server --target ${{ matrix.target }}
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp target/${{ matrix.target }}/release/code-memory-server.exe "${BIN_NAME}"
           else
@@ -208,7 +208,7 @@ jobs:
              ```
              export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
              export RUSTFLAGS="-C link-arg=-Wl,--build-id=sha1"
-             cargo build --release --features server,ml --target <YOUR_TARGET>
+             cargo build --release --features server --target <YOUR_TARGET>
              ```
 
           3. Compare SHA256:
