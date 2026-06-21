@@ -1,6 +1,6 @@
 # Loong Recall (LRC)
 
-**AI 编程助手的记忆与检索插件 — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定。**
+**本地运行的自我演化记忆服务 — 为 AI 应用提供持久、可检索、可验证的长期记忆。**
 
 [![License](https://img.shields.io/badge/Code-Apache%202.0-blue.svg)](LICENSE_CODE)
 [![License](https://img.shields.io/badge/Engine-DaoTi%20Research%20License-red.svg)](LICENSE)
