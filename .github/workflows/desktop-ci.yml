@@ -188,6 +188,16 @@ jobs:
             python3 ../scripts/generate_icons.py || python ../scripts/generate_icons.py
           fi
 
+      # v0.5.5 修复：必须先编译 sidecar，否则 build.rs 的 sync_sidecar_binary() 找不到二进制
+      # 默认使用 Fast Match 模式（--features server），减少 CI 内存占用和编译时间
+      - name: Build sidecar binary
+        shell: bash
+        run: |
+          cd ..
+          cargo build --release --features server --target ${{ matrix.target }}
+          echo "Sidecar binary built successfully"
+          ls -lh target/${{ matrix.target }}/release/code-memory-server* 2>/dev/null || true
+
       - name: Tauri Release Build
         run: pnpm tauri build --bundles ${{ matrix.bundle_type }} --target ${{ matrix.target }}
         env:
