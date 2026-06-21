@@ -1722,8 +1722,8 @@ impl AgentDetectorRegistry {
 
         // v0.5.5 修复：为 Trae 和 Cursor 添加 frontmatter，确保规则始终生效
         let frontmatter = match tool_id {
-            "trae" | "trae-cn" => "---\nalwaysApply: true\ndescription: LRC 记忆系统规则 — 会话开始时必须 recall 检索项目记忆，完成任务后自动同步记忆库\n---\n\n",
-            "cursor" => "---\ndescription: LRC 记忆系统规则 — 会话开始时必须 recall，完成任务后自动同步记忆\nalwaysApply: true\n---\n\n",
+            "trae" | "trae-cn" => "---\nalwaysApply: true\ndescription: LRC 记忆系统规则 — 会话开始时先 recall 检索项目记忆（新用户自动降级），完成任务后自动同步记忆库\n---\n\n",
+            "cursor" => "---\ndescription: LRC 记忆系统规则 — 会话开始时先 recall，新用户自动降级，完成任务后自动同步记忆\nalwaysApply: true\n---\n\n",
             _ => "",
         };
 
@@ -1750,7 +1750,7 @@ impl AgentDetectorRegistry {
 
 ---
 
-### 规则 1：会话开始时必须 recall（最高优先级）
+### 规则 1：会话开始时先 recall 检索（新用户自动降级）
 
 **在回复用户的任何问题之前，必须先调用 recall 检索项目记忆，获取已有上下文。** 这是强制性的第一步，不可跳过。
 
@@ -1761,6 +1761,8 @@ recall(query="项目架构 模块组织 入口文件", top_k=5)
 // 第二步：根据用户任务，提取关键词检索专题记忆
 recall(query="<任务相关的关键词，如：路由 API 认证 数据库>", top_k=3)
 ```
+
+**新用户降级策略**：如果记忆库为空（首次安装），recall 会返回"无匹配结果"，此时直接进入正常工作流程，并在完成任务后通过 `remember` 开始积累记忆。后续会话中 recall 即可命中历史记忆。
 
 **只有当 recall 返回的结果不足以完成任务时，才读取源文件。** 这能减少重复读取源文件导致的上下文溢出。
 
@@ -1833,7 +1835,17 @@ recall(query="<模块名或关键词>", top_k=3)
 
 ### 示例
 
-**会话开始时**：
+**新用户首次使用（记忆库为空）**：
+```
+用户：帮我新增一个用户登录的 API
+AI：（先 recall）recall(query="认证 登录 API 路由 auth", top_k=3)
+AI：（recall 返回空）记忆库为空，直接读取源文件分析项目结构...
+AI：已完成用户登录 API，新增了 POST /api/auth/login 端点
+AI：（自动同步）remember(content="用户登录 API：POST /api/auth/login → AuthHandler::login，使用 JWT 签发 token", memory_type="code_context", tags=["auth", "api", "login"], importance=7)
+AI：已记录登录 API 到记忆库（首次记忆）
+```
+
+**后续会话（记忆库已有数据）**：
 ```
 用户：帮我新增一个用户登录的 API
 AI：（先 recall）recall(query="认证 登录 API 路由 auth", top_k=3)
