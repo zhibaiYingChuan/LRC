@@ -12,11 +12,12 @@ license = "Apache-2.0 OR LicenseRef-DaoTi-Research"
 repository = "https://github.com/zhibaiYingChuan/LRC"
 
 [features]
-default = ["server", "ml"]
-# 默认启用 ml feature：优先使用语义编码器（BGE-small-zh / all-MiniLM-L6）
-# 如果 HuggingFace 不可达或模型未安装，自动降级为统计编码器
-# 如需纯统计模式（无 ML 依赖、零外部下载），使用 --no-default-features
+# v0.5.5 内存优化：默认不启用 ml feature，减少 sidecar 基线内存占用
+# LRC Desktop 的 sidecar 默认使用 Fast Match（统计编码器），无需 ML 依赖
+# 如需 Smart Match（语义编码），使用 cargo build --features server,ml
+default = ["server"]
 # 启用 candle + CodeBERT 真实语义编码（体积大 ~200MB）
+# 仅在需要 Smart Match（离线语义搜索）时启用
 ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub", "ureq"]
 # 启用 MCP HTTP 服务（axum + tokio）
 server = ["axum", "tokio", "tower", "tower-http", "reqwest", "webbrowser"]

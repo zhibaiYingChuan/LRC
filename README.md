@@ -6,37 +6,48 @@
 [![License](https://img.shields.io/badge/Engine-DaoTi%20Research%20License-red.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
-**前置条件**：Windows / Linux / macOS | 需安装 Rust | 无需 GPU | 会基本命令行操作
+**前置条件**：Windows / Linux / macOS | 无需 GPU
+
+**两种安装方式**：
+- **方式一（推荐）**：下载 [LRC Desktop 桌面端安装包](https://github.com/zhibaiYingChuan/LRC/releases)，双击安装即可，无需安装 Rust 或命令行操作
+- **方式二**：从源码编译，需要安装 Rust 1.75+ 和基本命令行操作能力（见下方「快速开始」）
 
 ***
 
 ## 快速开始（5 分钟）
 
-### 1. 安装 Rust
+### 方式一：下载桌面端安装包（推荐）
+
+1. 前往 [Releases 页面](https://github.com/zhibaiYingChuan/LRC/releases) 下载最新版安装包
+2. 双击安装，启动 LRC Desktop
+3. 按照配置向导选择项目目录、配置 LLM（可选）、连接 AI 工具
+4. 重启 IDE，AI 自动发现 12 个 MCP 工具
+
+> LRC Desktop 会自动完成所有配置：检测 AI 工具、写入 MCP 配置、写入 AI 规则文件。用户无需手动编辑任何文件。
+
+### 方式二：从源码编译（高级用户）
 
 ```bash
-# Windows: 下载安装 https://rustup.rs/
-# macOS/Linux:
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+# 1. 安装 Rust 1.75+
+# Windows: 下载 https://rustup.rs/
+# macOS/Linux: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-### 2. 克隆并编译
-
-```bash
+# 2. 克隆并编译（默认 Fast Match 模式，零外部依赖）
 git clone https://github.com/zhibaiYingChuan/LRC.git
 cd LRC
 cargo build --release --features server
+
+# 3. 编译产物在 target/release/code-memory-server.exe（Windows）
+#    或 target/release/code-memory-server（macOS/Linux）
 ```
 
-编译产物在 `target/release/code-memory-server.exe`（Windows）或 `target/release/code-memory-server`（macOS/Linux）。
+如需 Smart Match（离线语义搜索），使用 `cargo build --release --features server,ml`（首次启动需下载模型 ~500MB）。
 
-### 3. 接入 IDE
+### 接入 IDE
 
-**推荐方式**：安装 [LRC Desktop 桌面端](#桌面端应用)，启动后会自动检测已安装的 AI 工具并写入 MCP 配置，无需手动编辑任何文件。
+**LRC Desktop 用户**：启动桌面端后自动完成，跳过此步。
 
-**手动配置方式**（仅适用于从源码编译的高级用户）：
-
-在 IDE 的 MCP 配置文件中添加（以 Trae CN 为例，`~/.trae-cn/trae-mcp.json`）：
+**源码编译用户**：在 IDE 的 MCP 配置文件中添加（以 Trae CN 为例，`~/.trae-cn/trae-mcp.json`）：
 
 ```json
 {
@@ -65,18 +76,6 @@ cargo build --release --features server
 
 > **AI 自动调用规则**：LRC Desktop 启动时会自动为检测到的 AI 工具写入规则文件（如 `.trae/rules/lrc-memory.md`），引导 AI 在会话开始时主动调用 `recall` 检索记忆，完成任务后调用 `remember` 同步记忆。用户无需手动编写任何规则。详细说明见 [用户使用说明书](docs/USER_GUIDE.md)。
 
-### 可选：桌面端应用
-
-LRC 提供基于 Tauri 2 的原生桌面应用，内置仪表盘和配置向导：
-
-```bash
-cd desktop
-pnpm install
-pnpm tauri build
-```
-
-构建产物位于 `desktop/src-tauri/target/release/bundle/`。
-
 ***
 
 ## 解决两个最痛的场景
@@ -94,7 +93,7 @@ pnpm tauri build
 | **代码定位** `search_code` | 知道函数名/变量名，AI 快速定位。配置 LLM 后可用自然语言描述 | "关键词匹配定位，无需手动翻文件" |
 | **项目记忆** `remember / recall` | 告诉 AI 一次约定，以后每次对话它都记得 | "给 AI 装个记事本，但它是活的" |
 
-配置好规则文件后，AI 会在需要时调用这些工具。你只管正常对话：
+LRC Desktop 自动写入规则文件后，AI 会在需要时调用这些工具。你只管正常对话：
 
 ```
 你：search_code("authenticate_user")      → 找到 authenticate_user()
@@ -102,9 +101,9 @@ pnpm tauri build
 你："记得：包管理器用 pnpm"                → AI 调用 remember → 下次会话可检索
 ```
 
-> **重要**：AI 助手需要规则文件引导才能自动调用记忆工具。我们提供了[配置模板](docs/USER_GUIDE.md)，3 分钟即可完成。
+> **重要**：LRC Desktop 启动时会自动为检测到的 AI 工具写入规则文件（如 `.trae/rules/lrc-memory.md`），引导 AI 主动调用记忆工具，用户无需手动编写任何规则。从源码编译的用户请参考 [用户使用说明书](docs/USER_GUIDE.md) 手动配置规则文件。
 
-LRC 是一个独立封装的 MCP 插件，零运行时依赖。
+LRC 是一个独立封装的 MCP 插件，Fast Match 模式下零外部依赖（纯 Rust 实现）。
 
 ---
 
@@ -131,10 +130,13 @@ curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
 
 ***
 
-## 两种搜索模式 + 一个可选增强
+## 搜索模式
+
+LRC 提供两种搜索模式和一个可选增强，编译时通过 Cargo feature 切换：
 
 | | Fast Match（默认） | Smart Match（`--features ml`） | LLM 增强（`--llm-api`） |
 |---|---|---|---|
+| **编码器** | FastEncoder（内联词袋编码器） | CodeBertEncoder（candle + GraphCodeBERT） | FastEncoder + LLM 查询翻译 |
 | **怎么搜** | 精确关键词匹配 | 本地语义模型 | 你的 LLM 翻译查询 → Fast Match 检索 |
 | **适合** | 你知道函数名/变量名，懒得翻文件 | 离线语义搜索 | 用自然语言描述，AI 帮你找到 |
 | **启动速度** | 即时 | 首次需下载模型（~500MB） | 即时（依赖 LLM 响应） |
@@ -142,10 +144,10 @@ curl -X POST http://127.0.0.1:3099/mcp -H "Content-Type: application/json" \
 | **依赖** | 零，纯 Rust | 自动从 hf-mirror.com 镜像下载 | 需要 LLM API（DeepSeek / 通义千问等）或本地 Ollama |
 
 ```bash
-# 默认 Fast Match（推荐日常使用）
+# 默认 Fast Match（推荐日常使用，零外部依赖）
 cargo build --features server
 
-# Smart Match（离线语义搜索）
+# Smart Match（离线语义搜索，需下载模型）
 cargo build --features server,ml
 
 # LLM 增强（用你的 LLM 做查询翻译，不下载模型）
@@ -157,6 +159,13 @@ code-memory-server --src-dir ./src --stdio --llm-api ollama:localhost:llama3
 > **LLM 增强的原理**：把你的自然语言查询发给 LLM，翻译成代码关键词，再用 Fast Match 精确检索。不配置不影响其他功能。
 >
 > 新用户建议用 HTTP 模式启动，通过仪表盘「设置」页面可视化配置 LLM，配置后即时生效。
+
+**Smart Match 模型切换**（可选）：
+
+```bash
+# 默认使用 GraphCodeBERT，可回退到 CodeBERT 基线
+$env:LRC_MODEL_ID="microsoft/codebert-base"
+```
 
 ### 成本说明
 
@@ -199,6 +208,11 @@ LLM 增强模式会调用你的 LLM API 进行查询翻译，每次消耗约 **4
 | 桌面端应用 (Tauri)   | ✅ | Windows 原生桌面应用，系统托盘 + 仪表盘内嵌 |
 | 跨 IDE 记忆同步       | ✅ | 项目指纹识别，同一项目跨 IDE 共享记忆 |
 | 记忆导出/导入        | ✅ | JSON 格式导出导入，支持项目级/全局模式 |
+| MCP 配置自动升级     | ✅ | v0.5.5 sidecar 启动时自动升级旧版本 MCP 配置 |
+| AI 规则自动写入      | ✅ | v0.5.5 自动为 AI 工具写入规则文件，引导 AI 主动调用记忆工具 |
+| 反逆向工程保护       | ✅ | v0.5.4 多层编译时与运行时保护（具体实现受 DaoTi Research License 保护） |
+| 敏感数据内存清零     | ✅ | v0.5.4 API Key 等敏感数据使用后内存清零 |
+| 基准测试框架         | ✅ | v0.5.0 内置基准测试，通过 `/v1/benchmarks/report` API 暴露 |
 
 ***
 
@@ -213,7 +227,21 @@ LRC 提供基于 Tauri 2 的原生桌面应用（Windows）：
 - **已就绪迷你面板**：显示后台服务运行状态、Agent 连接数、项目路径
 - **配置加密存储**：API Key 使用 AES-256-GCM 加密存储
 
-构建方式见上方「快速开始 → 可选：桌面端应用」。
+**获取方式**：前往 [Releases 页面](https://github.com/zhibaiYingChuan/LRC/releases) 下载安装包。
+
+**从源码构建桌面端**（高级用户）：
+
+```bash
+# 1. 先编译 sidecar（默认 Fast Match 模式）
+cargo build --release --features server
+
+# 2. 编译桌面端
+cd desktop
+pnpm install
+pnpm tauri build
+```
+
+构建产物位于 `desktop/src-tauri/target/release/bundle/`。
 
 ### 数据目录
 
@@ -325,7 +353,7 @@ LRC 提供基于 Tauri 2 的原生桌面应用（Windows）：
   --src-dir <路径>    要索引的源码目录 [默认: 当前目录]
   --host <地址>       HTTP 绑定地址 [默认: 127.0.0.1]
   --port <端口>       HTTP 绑定端口 [默认: 3099]
-  --stdio             使用 stdio 传输模式（推荐 IDE 部署）
+  --stdio             使用 stdio 传输模式（仅适用于从源码编译直接启动的场景；LRC Desktop 使用 HTTP 模式）
   --global            记忆数据存到 ~/.loong-recall/data/（跨项目共享）
   --db-path <路径>    自定义记忆数据库路径（优先级最高，覆盖 --global）
   --llm-api <配置>    配置 LLM 查询翻译（格式: openai:sk-xxx:model 或 ollama:host:model）
@@ -340,11 +368,11 @@ LRC 提供基于 Tauri 2 的原生桌面应用（Windows）：
 六种典型用法：
 
 ```bash
-# 场景 1：单项目 IDE 标准 MCP（最常用）
-code-memory-server --src-dir ./src --stdio
-
-# 场景 2：单项目 HTTP 模式调试
+# 场景 1：单项目 HTTP 模式（LRC Desktop 内部使用此模式）
 code-memory-server --src-dir ./src --port 3099
+
+# 场景 2：单项目 stdio 模式（从源码编译直接接入 IDE 时使用）
+code-memory-server --src-dir ./src --stdio
 
 # 场景 3：全局记忆，跨项目共享
 code-memory-server --global --db-path /data/my-memories --stdio
@@ -376,44 +404,6 @@ code-memory-server --src-dir ./src --stdio --llm-api openai:sk-xxx:deepseek-v4-f
 
 ***
 
-## 两种编码模式
-
-编译时通过 Cargo feature 切换：
-
-| <br />   | Fast Match（默认）            | Smart Match（`--features ml`）                  |
-| -------- | ---------------------- | ----------------------------------------- |
-| **编码器**  | FastEncoder（内联词袋编码器） | CodeBertEncoder（candle + GraphCodeBERT） |
-| **默认模型** | 无（纯词袋匹配）               | GraphCodeBERT |
-| **外部依赖** | **零**，纯 Rust 实现        | 首次启动自动下载模型（~500MB）                       |
-| **内存占用** | < 10 MB                | ~500 MB（模型加载后）                           |
-| **启动时间** | 即时                | 首次 1~5 分钟（下载模型），后续即时                     |
-| **适用场景** | 精确函数名/变量名查找            | 模糊意图描述（"处理重试逻辑的代码"）                       |
-
-### Fast Match（默认，推荐日常使用）
-
-```bash
-cargo build --features server
-```
-
-编译后零配置立即可用。
-
-### Smart Match（高精度，按需启用）
-
-```bash
-cargo build --features server,ml
-```
-
-首次启动时自动从 HuggingFace 镜像站（hf-mirror.com）下载模型（~500MB），存储在本地缓存。下载仅一次，后续启动直接加载缓存。
-
-可通过环境变量切换模型：
-
-```bash
-# 回退到 CodeBERT 基线
-$env:LRC_MODEL_ID="microsoft/codebert-base"
-```
-
-***
-
 ## 贡献指南
 
 ```bash
@@ -429,6 +419,19 @@ cargo fmt --check
 
 Loong Recall 在启动时自动执行多层运行时防护，保护核心检索引擎不被逆向工程。检测到威胁时服务静默退出。
 
+**编译时保护**（v0.5.4+）：
+- 符号信息剥离（`strip = true`）
+- 链接时优化（`lto = true`）
+- 体积优化（`opt-level = "z"` + `codegen-units = 1`）
+- Panic 时立即终止（`panic = "abort"`）
+
+**运行时保护**：
+- 多层反逆向工程检测（具体实现受 DaoTi Research License 保护，不公开）
+- 进程守护（process_guard）
+- 敏感数据使用后内存清零（SecureString 模式）
+- API Key AES-256-GCM 加密存储
+- URL 导航白名单验证（仅允许 127.0.0.1）
+
 ***
 
 ## 文档导航
@@ -436,8 +439,10 @@ Loong Recall 在启动时自动执行多层运行时防护，保护核心检索�
 | 文档                                 | 说明                                  |
 | ---------------------------------- | ----------------------------------- |
 | [用户使用说明书](docs/USER_GUIDE.md)      | AI 大模型如何主动调用 MCP 服务 |
+| [变更日志](CHANGELOG.md)      | 版本变更记录 |
 | [模型评估报告](docs/MODEL_EVALUATION.md) | CodeBERT vs GraphCodeBERT 对比与替代方案评估 |
 | [性能测试指南](docs/BENCHMARK.md)        | 如何复现性能测试 |
+| [基准测试方法论](tests/BENCHMARK_METHODOLOGY.md)        | 基准测试设计哲学与实现细节 |
 | [使用场景](docs/USE_CASES.md)          | 典型应用场景与最佳实践 |
 | [Smart Match 离线安装指南](docs/OFFLINE_MODEL_GUIDE.md) | 内网/离线环境下手动安装模型 |
 
@@ -471,12 +476,17 @@ Loong Recall 在启动时自动执行多层运行时防护，保护核心检索�
 - 统一使用完整 LLM 配置表单（多提供商选择）
 - 桌面端所有相同功能/内容统一为同一实现
 
+**内存优化**
+
+- 关闭 `ml` feature 默认启用：sidecar 基线内存占用降低（candle 等重型依赖不再编译进二进制）
+- 关闭后台结晶流水线 `run_on_start`：延迟首次合成，避免启动内存峰值
+
 ### v0.5.4 (2026-06-20) — 全项目静态审计与修复
 
 - 全项目静态代码审计，修复所有 Clippy 警告
 - 桌面端 URL 导航白名单验证（仅允许 127.0.0.1）
 - 敏感数据使用后内存清零（SecureString 模式）
-- 字符串编译时混淆（obfstr）
+- 编译时与运行时反逆向工程保护增强
 - DPAPI 密钥损坏自动恢复机制
 
 ### v0.5.1 (2026-06-18) — 用户体验统一与代码治理

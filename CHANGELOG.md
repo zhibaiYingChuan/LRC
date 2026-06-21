@@ -26,6 +26,10 @@
 - `write_ai_rules()` 清理旧路径规则文件，提取用户自定义内容并迁移
 - `commands.rs` 在 `start_sidecar` 和 `start_sidecar_for_project` 中调用 `auto_upgrade_configs`
 
+### 性能优化
+- **关闭 `ml` feature 默认启用**：`default = ["server"]`，减少 sidecar 基线内存占用（candle 等重型依赖不再编译进二进制）
+- **关闭后台结晶流水线 `run_on_start`**：延迟首次合成，避免启动内存峰值
+
 ### 安全
 - 编译产物保密性确认：`Cargo.toml` 配置 `strip = true` + `lto = true` + `opt-level = "z"` + `codegen-units = 1` + `panic = "abort"`，符号信息已剥离
 
@@ -37,7 +41,7 @@
 - 全项目静态代码审计报告
 - 桌面端 URL 导航白名单验证（仅允许 127.0.0.1）
 - 敏感数据使用后内存清零（SecureString 模式）
-- 字符串编译时混淆（obfstr）
+- 编译时与运行时反逆向工程保护增强（具体实现受 DaoTi Research License 保护）
 - DPAPI 密钥损坏自动恢复机制
 
 ### 修复
