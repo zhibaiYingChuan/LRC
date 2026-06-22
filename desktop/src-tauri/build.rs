@@ -38,17 +38,34 @@ fn compute_sha256(path: &Path) -> Option<String> {
 /// 自动同步 sidecar 二进制文件
 ///
 /// 搜索策略（按优先级）：
-/// 1. $CARGO_TARGET_DIR/release/code-memory-server.exe（自定义 target-dir）
-/// 2. 项目根 target/release/code-memory-server.exe（默认 target-dir）
-/// 3. 当前目录下已有的 code-memory-server.exe（无需更新）
+/// 1. $CARGO_TARGET_DIR/{target_triple}/release/code-memory-server[.exe]（自定义 target-dir + 交叉编译）
+/// 2. $CARGO_TARGET_DIR/release/code-memory-server[.exe]（自定义 target-dir）
+/// 3. 项目根 target/{target_triple}/release/code-memory-server[.exe]（交叉编译）
+/// 4. 项目根 target/release/code-memory-server[.exe]（默认 target-dir）
+/// 5. 当前目录下已有的 code-memory-server.exe（无需更新）
 ///
 /// v0.5.1 增强：使用 SHA-256 哈希验证，确保即使时间戳相同也能检测到内容变化
+/// v0.5.6 修复：支持 macOS/Linux 平台（二进制文件名不带 .exe 后缀）
 fn sync_sidecar_binary() {
     // 尝试使用 sha2 crate，如果不可用则回退到简单的时间戳比较
     let use_hash = true; // 优先使用哈希验证
 
     let dest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // 目标文件名统一为 lrc-sidecar.exe（与 tauri.conf.json 的 bundle.resources 一致）
     let dest_path = dest_dir.join("lrc-sidecar.exe");
+
+    // 根据目标平台确定源二进制文件名
+    // Windows: code-memory-server.exe
+    // macOS/Linux: code-memory-server
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_triple = std::env::var("TARGET").unwrap_or_default();
+    let binary_name = if target_os == "windows" {
+        "code-memory-server.exe"
+    } else {
+        "code-memory-server"
+    };
+
+    println!("cargo:info=桌面端构建目标平台: {} (triple: {})", target_os, target_triple);
 
     // 获取 workspace 根目录（桌面端在 workspace 子目录下）
     let workspace_root = find_workspace_root(&dest_dir);
@@ -57,18 +74,28 @@ fn sync_sidecar_binary() {
     let candidates: Vec<PathBuf> = {
         let mut paths = Vec::new();
 
-        // 候选 1: $CARGO_TARGET_DIR/release/（自定义 target-dir 环境变量）
+        // 候选 1: $CARGO_TARGET_DIR/{target_triple}/release/（自定义 target-dir + 交叉编译）
         if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+            if !target_triple.is_empty() {
+                let p = PathBuf::from(&target_dir)
+                    .join(&target_triple)
+                    .join("release")
+                    .join(binary_name);
+                paths.push(p);
+            }
+            // 候选 1b: $CARGO_TARGET_DIR/release/（自定义 target-dir，无交叉编译）
             let p = PathBuf::from(&target_dir)
                 .join("release")
-                .join("code-memory-server.exe");
+                .join(binary_name);
             paths.push(p);
         }
 
-        // 候选 1b: 从 ~/.cargo/config.toml 读取 target-dir（全局 cargo 配置）
+        // 候选 1c: 从 ~/.cargo/config.toml 读取 target-dir（全局 cargo 配置）
         // v0.5.1 修复：当 target-dir 通过 cargo config 而非环境变量设置时，
         // build.rs 无法通过 CARGO_TARGET_DIR 环境变量获取，需要手动解析配置
-        if let Ok(home) = std::env::var("USERPROFILE") {
+        if let Ok(home) = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+        {
             let cargo_config = PathBuf::from(&home).join(".cargo").join("config.toml");
             if let Ok(content) = std::fs::read_to_string(&cargo_config) {
                 for line in content.lines() {
@@ -77,9 +104,21 @@ fn sync_sidecar_binary() {
                         if let Some(dir) = trimmed.split('=').nth(1)
                             .or_else(|| trimmed.split_whitespace().nth(1)) {
                             let dir = dir.trim().trim_matches('"');
+                            // 交叉编译路径
+                            if !target_triple.is_empty() {
+                                let p = PathBuf::from(dir)
+                                    .join(&target_triple)
+                                    .join("release")
+                                    .join(binary_name);
+                                if p.exists() {
+                                    println!("cargo:info=从 cargo config 找到 target-dir (交叉编译): {}", dir);
+                                    paths.push(p);
+                                }
+                            }
+                            // 非交叉编译路径
                             let p = PathBuf::from(dir)
                                 .join("release")
-                                .join("code-memory-server.exe");
+                                .join(binary_name);
                             if p.exists() {
                                 println!("cargo:info=从 cargo config 找到 target-dir: {}", dir);
                                 paths.push(p);
@@ -91,13 +130,17 @@ fn sync_sidecar_binary() {
             }
         }
 
-        // 候选 2: workspace target/release/（默认 target-dir）
+        // 候选 2: workspace target/{target_triple}/release/（交叉编译）
         if let Some(ref ws) = workspace_root {
-            paths.push(ws.join("target").join("release").join("code-memory-server.exe"));
+            if !target_triple.is_empty() {
+                paths.push(ws.join("target").join(&target_triple).join("release").join(binary_name));
+            }
+            // 候选 2b: workspace target/release/（默认 target-dir）
+            paths.push(ws.join("target").join("release").join(binary_name));
         }
 
         // 候选 3: 桌面端同级目录的 target/release/
-        paths.push(dest_dir.join("target").join("release").join("code-memory-server.exe"));
+        paths.push(dest_dir.join("target").join("release").join(binary_name));
 
         paths
     };
