@@ -4,7 +4,7 @@ exclude = ["desktop/src-tauri"]
 
 [package]
 name = "code-memory"
-version = "0.5.4"
+version = "0.5.6"
 edition = "2021"
 authors = ["Open Source Contributors"]
 description = "Loong Recall (LRC) — AI 永久记忆系统，为 AI 助手提供语义代码搜索与跨会话记忆"
