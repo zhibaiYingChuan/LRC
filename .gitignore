@@ -46,6 +46,7 @@ docs/PRD_LRC_DESKTOP_V2.md
 .loong-recall/
 src/.loong-recall/
 data/
+data_*/
 
 # 本地测试/调试脚本（不交付用户）
 check_data.py
