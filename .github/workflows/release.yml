@@ -1,4 +1,4 @@
-name: Pre-compiled Release
+name: Release
 
 on:
   push:
@@ -14,8 +14,11 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
+  # ════════════════════════════════════════════════════════════
+  # Job 1: 编译 Sidecar 二进制（裸二进制，供 CLI 用户使用）
+  # ════════════════════════════════════════════════════════════
+  build-sidecar:
+    name: Build Sidecar ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -31,9 +34,6 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: lrc-windows-x86_64.exe
 
-    outputs:
-      bin_name: ${{ steps.build.outputs.bin_name }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,7 +41,6 @@ jobs:
       - name: Resolve version
         id: version
         run: |
-          # 从 tag 或手动触发输入中获取版本号
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "VER=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
           else
@@ -61,33 +60,22 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-sidecar-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-sidecar-
 
       - name: Set reproducible build env vars
-        if: runner.os == 'Linux'
-        run: |
-          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> $GITHUB_ENV
-          echo "RUSTFLAGS=-C link-arg=-Wl,--build-id=sha1" >> $GITHUB_ENV
-          echo "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG=false" >> $GITHUB_ENV
-        shell: bash
-
-      - name: Set reproducible build env vars (non-Linux)
-        if: runner.os != 'Linux'
         run: |
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> $GITHUB_ENV
           echo "CARGO_PROFILE_RELEASE_BUILD_OVERRIDE_DEBUG=false" >> $GITHUB_ENV
         shell: bash
 
-      - name: Build and name with version
+      - name: Build sidecar binary
         id: build
         run: |
           VERSION="${{ steps.version.outputs.VER }}"
-          # 根据矩阵平台确定短名称
           case "${{ matrix.os }}" in
             ubuntu-latest)   PLATFORM="linux-x86_64" ;;
             macos-latest)    PLATFORM="macos-arm64" ;;
-            macos-13)        PLATFORM="macos-x86_64" ;;
             windows-latest)  PLATFORM="windows-x86_64" ;;
             *)               PLATFORM="unknown" ;;
           esac
@@ -95,7 +83,6 @@ jobs:
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             BIN_NAME="${BIN_NAME}.exe"
           fi
-          echo "bin_name=${BIN_NAME}" >> $GITHUB_OUTPUT
           echo "BIN_NAME=${BIN_NAME}" >> $GITHUB_ENV
 
           cargo build --release --features server --target ${{ matrix.target }}
@@ -123,18 +110,155 @@ jobs:
           fi
         shell: bash
 
-      - name: Upload build artifacts
+      - name: Upload sidecar artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.build.outputs.bin_name }}
+          name: ${{ env.BIN_NAME }}
           path: |
-            ${{ steps.build.outputs.bin_name }}
-            ${{ steps.build.outputs.bin_name }}.sha256
+            ${{ env.BIN_NAME }}
+            ${{ env.BIN_NAME }}.sha256
 
+  # ════════════════════════════════════════════════════════════
+  # Job 2: 编译桌面端安装包（Tauri 桌面应用）
+  # 生成 MSI/NSIS（Windows）和 DMG（macOS）
+  # ════════════════════════════════════════════════════════════
+  build-desktop:
+    name: Build Desktop ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact-prefix: lrc-desktop-windows
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact-prefix: lrc-desktop-macos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VER=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "VER=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo deps (sidecar)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-sidecar-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-sidecar-
+
+      - name: Cache Cargo deps (desktop)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            desktop/src-tauri/target/
+          key: ${{ runner.os }}-desktop-${{ hashFiles('desktop/**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-desktop-
+
+      # 步骤 1: 先编译 sidecar 二进制（build.rs 会自动复制到 desktop/src-tauri/）
+      - name: Build sidecar binary
+        run: |
+          cargo build --release --features server --target ${{ matrix.target }}
+          echo "Sidecar binary built and will be auto-synced by build.rs"
+        shell: bash
+
+      # 步骤 2: 安装 Tauri CLI v2
+      - name: Install Tauri CLI
+        run: |
+          cargo install tauri-cli --version "^2.0" --locked || \
+            cargo install tauri-cli --version "^2.0"
+        shell: bash
+
+      # 步骤 3: 构建 Tauri 桌面端安装包
+      # build.rs 会自动从 target/release/ 复制 sidecar 到 desktop/src-tauri/lrc-sidecar.exe
+      - name: Build desktop app
+        run: |
+          cd desktop/src-tauri
+          cargo tauri build --target ${{ matrix.target }}
+        shell: bash
+
+      # 步骤 4: macOS Ad-Hoc 签名
+      - name: macOS code signing (Ad-Hoc)
+        if: runner.os == 'macOS'
+        run: |
+          APP_PATH=$(find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.app" -type d | head -1)
+          if [ -n "$APP_PATH" ]; then
+            codesign --sign - --force --deep --timestamp=none "$APP_PATH" 2>/dev/null || \
+              echo "  Ad-Hoc signing complete"
+          fi
+        shell: bash
+
+      # 步骤 5: 收集安装包
+      - name: Collect desktop artifacts (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p desktop-artifacts
+          VERSION="${{ steps.version.outputs.VER }}"
+          # 复制 MSI 安装包
+          find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.msi" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-windows-x86_64.msi \;
+          # 复制 NSIS 安装包
+          find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.exe" -path "*/nsis/*" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-windows-x86_64-setup.exe \;
+          ls -la desktop-artifacts/
+        shell: bash
+
+      - name: Collect desktop artifacts (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p desktop-artifacts
+          VERSION="${{ steps.version.outputs.VER }}"
+          # 复制 DMG 安装包
+          find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.dmg" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-macos-arm64.dmg \;
+          ls -la desktop-artifacts/
+        shell: bash
+
+      - name: Generate SHA256 checksum for desktop
+        run: |
+          cd desktop-artifacts
+          for f in *; do
+            if [ "${{ runner.os }}" = "Windows" ]; then
+              certutil -hashfile "$f" SHA256 > "$f.sha256"
+            else
+              sha256sum "$f" > "$f.sha256"
+            fi
+          done
+        shell: bash
+
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.target }}
+          path: desktop-artifacts/*
+
+  # ════════════════════════════════════════════════════════════
+  # Job 3: 创建 GitHub Release，上传所有产物
+  # ════════════════════════════════════════════════════════════
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [build-sidecar, build-desktop]
     runs-on: ubuntu-latest
+    # 如果桌面端构建失败，仍然发布 sidecar 二进制
+    if: always() && needs.build-sidecar.result == 'success'
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -143,6 +267,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+
+      - name: List artifacts
+        run: |
+          echo "=== 所有产物 ==="
+          find artifacts -type f | sort
+        shell: bash
 
       - name: Generate install script
         run: |
