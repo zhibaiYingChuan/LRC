@@ -4,6 +4,94 @@
 
 ---
 
+## [0.5.6] - 2026-06-23
+
+### 修复
+
+#### 修复一：写回性能瓶颈（O(N²) → O(N)）
+
+- **问题**：每次 `recall` 后全量重写所有记忆（`clear_memories()` + 循环 `save_memory()`），3633 条记忆时单次 recall 写回耗时 ~105s，严重阻碍大规模记忆检索
+- **修复**：
+  - 在 `Persistence` trait 增加 `update_memories` 批量更新方法（默认实现为循环 `save_memory`，推荐具体后端重写）
+  - `JsonPersistence` 重写 `update_memories` 为单次序列化 + 单次磁盘写入，仅更新被检索到的记忆（通常 ≤ top_k=10 条）
+  - `recall` 函数写回逻辑从全量重写改为增量批量更新
+- **效果**：大规模记忆场景下 recall 写回从 ~105s 降至毫秒级，3633 条记忆场景性能提升 10000 倍+
+- **涉及文件**：`src/persistence/mod.rs`、`src/persistence/json.rs`、`src/memory_store.rs`
+
+#### 修复二：TF-IDF 词边界检测
+
+- **问题**：TF-IDF 检索使用 `contains()` 子串匹配，导致 "cat" 错误匹配 "category"、"rust" 匹配 "frustrated" 等英文单词误匹配
+- **修复**：
+  - 新增 `contains_word` 和 `count_word_occurrences` 辅助函数
+  - 对长度 ≥ 3 的英文单词做词边界检测（检查匹配位置前后字符是否为非字母字符）
+  - CJK bigram 和 2 字符 ASCII bigram 保留 `contains()` 子串匹配（适配中文检索和短词匹配）
+- **效果**：英文检索精度提升，避免子串误匹配，同时保持中文检索能力
+- **涉及文件**：`src/memory_store.rs`
+
+### 新增
+
+- **公平性改革 — 基准测试从"测架构"转变为"测能力"**：
+  - 改革核心：将"验证架构"（测有没有洛书编码/LLM翻译器）转变为"验证效果"（测能不能做到知识更新/模糊查询/双关词区分）
+  - 公平原则：不利用 ground truth，所有文档 importance=5（统一），蓄水池抽样随机文档
+  - LRC 原生基准公平版：TF-IDF 模式 11/11 PASS（总评分 0.94），LLM 模式 9/11 PASS（总评分 0.79）
+  - LongMemEval 公平版 v3：Session Recall@10=85.74%（不利用 has_answer 差异化）
+
+- **6 次基准测试完整报告**：
+  - MS MARCO BEIR 测试：TF-IDF MRR@10=0.7749，LLM MRR@10=0.8895（LLM 增益 +14.8%）
+  - Natural Questions BEIR 测试：TF-IDF MRR@10=0.5389，LLM MRR@10=0.8016（LLM 增益 +48.7%）
+  - HotpotQA BEIR 测试：TF-IDF MRR@10=0.7964，LLM MRR@10=0.9383（LLM 增益 +17.8%）
+  - FiQA BEIR 测试：TF-IDF MRR@10=0.2729，LLM MRR@10=0.4453（LLM 增益 +63.2%）
+  - LRC 原生基准测试（公平版）：TF-IDF 11/11 PASS，总评分 0.94
+  - LongMemEval 基准测试（公平版 v3）：Session Recall@10=85.74%，Turn Recall@10=61.70%
+
+- **BEIR 基准测试评估脚本**：
+  - MS MARCO 评估脚本（`lrc_msmarco_eval.py`）：500 文档，100 查询，支持 TF-IDF 和 LLM 两种模式
+  - Natural Questions 评估脚本（`lrc_nq_eval.py`）：500 文档，100 查询，适配 NQ 数据集特征（title + text 文档内容）
+  - HotpotQA 评估脚本（`lrc_hotpotqa_eval.py`）：500 文档，100 查询，适配多跳推理场景
+  - FiQA 评估脚本（`lrc_fiqa_eval.py`）：500 文档，100 查询，含多字节字符处理（避免 panic）
+  - 蓄水池抽样随机文档，跳过合成记忆，BEIR 标准指标（MRR@10, Recall@10, Hit Rate@10）
+
+- **LRC 原生基准测试公平版脚本**（`lrc_native_benchmark.py`）：
+  - 11 项测试覆盖三层模型：通用检索、高级记忆能力、综合能力与信任
+  - 公平性改革：L2 和 L3 的 6 个测试函数全部重构，从"测架构"变为"测能力"
+  - 支持 TF-IDF 和 LLM 两种模式
+
+- **LongMemEval 公平版评估脚本**：
+  - v1（`lrc_real_retrieval_eval.py`）：仅会话级注入，importance=5（公平）
+  - v2（`lrc_real_retrieval_eval_v2.py`）：Turn 级注入 + has_answer=8（不公平，对比用）
+  - v3（`lrc_fair_eval_v3.py`）：Turn 级注入 + 统一 importance=5（公平，推荐）
+
+- **基准测试报告目录**（`benchmarks/reports/`）：
+  - 7 份分项报告 + 1 份汇总对比报告
+  - 完整的评估方法、结果、分析和使用建议
+
+### 性能优化
+
+- **大规模记忆检索性能释放**：v0.5.6 修复一使 LRC 能够高效处理 500+ 文档的检索场景
+  - 500 文档场景下 TF-IDF 平均检索仅 13ms（MS MARCO）/ 18ms（NQ）/ 21ms（HotpotQA）/ 19ms（FiQA）
+  - P99 检索耗时仅 27ms（MS MARCO）/ 32ms（NQ）/ 39ms（HotpotQA）/ 44ms（FiQA）
+  - LongMemEval 470 实例评估 < 60 秒，平均检索 2.6ms/查询
+
+### 变更
+
+- `Cargo.toml` 版本号 0.5.4 → 0.5.6
+- `desktop/src-tauri/Cargo.toml` 版本号 0.5.4 → 0.5.6
+- `desktop/src-tauri/tauri.conf.json` 版本号 0.5.5 → 0.5.6
+- `desktop/package.json` 版本号 0.5.4 → 0.5.6
+
+### 测试
+
+- 新增 6 个单元测试：
+  - `test_update_memories_partial_update`：验证增量批量更新
+  - `test_update_memories_empty`：验证空输入处理
+  - `test_contains_word_english_boundary`：验证英文词边界检测
+  - `test_contains_word_cjk_bigram`：验证 CJK bigram 子串匹配
+  - `test_contains_word_short_ascii_bigram`：验证短 ASCII bigram 子串匹配
+  - `test_count_word_occurrences_boundary`：验证词频统计的词边界检测
+- 全项目 406 个单元测试全部通过，clippy 无警告
+
+---
+
 ## [0.5.5] - 2026-06-21
 
 ### 新增

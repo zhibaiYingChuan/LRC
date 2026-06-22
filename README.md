@@ -441,14 +441,51 @@ Loong Recall 在启动时自动执行多层运行时防护，保护核心检索�
 | [用户使用说明书](docs/USER_GUIDE.md)      | AI 大模型如何主动调用 MCP 服务 |
 | [变更日志](CHANGELOG.md)      | 版本变更记录 |
 | [模型评估报告](docs/MODEL_EVALUATION.md) | CodeBERT vs GraphCodeBERT 对比与替代方案评估 |
-| [性能测试指南](docs/BENCHMARK.md)        | 如何复现性能测试 |
-| [基准测试方法论](tests/BENCHMARK_METHODOLOGY.md)        | 基准测试设计哲学与实现细节 |
+| [性能测试指南](docs/BENCHMARK.md)        | 如何复现性能测试 + 6 次基准测试结果概览 |
+| [基准测试方法论](tests/BENCHMARK_METHODOLOGY.md)        | 基准测试设计哲学与实现细节（公平版 v2.0） |
+| [基准测试汇总报告](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md)        | 6 次基准测试汇总对比报告 |
 | [使用场景](docs/USE_CASES.md)          | 典型应用场景与最佳实践 |
 | [Smart Match 离线安装指南](docs/OFFLINE_MODEL_GUIDE.md) | 内网/离线环境下手动安装模型 |
 
 ***
 
 ## 更新日志
+
+### v0.5.6 (2026-06-23) — 大规模记忆检索性能修复 + 公平版基准测试
+
+**修复一：写回性能瓶颈（O(N²) → O(N)）— 重要**
+
+- **问题**：每次 `recall` 后全量重写所有记忆，3633 条记忆时单次 recall 写回耗时 ~105s
+- **修复**：在 `Persistence` trait 增加 `update_memories` 批量更新方法，`JsonPersistence` 重写为单次序列化+单次磁盘写入，仅更新被检索到的记忆（通常 ≤ top_k=10 条）
+- **效果**：大规模记忆场景下 recall 写回从 ~105s 降至毫秒级，性能提升 10000 倍+
+
+**修复二：TF-IDF 词边界检测**
+
+- **问题**：TF-IDF 使用 `contains()` 子串匹配，导致 "cat" 错误匹配 "category"
+- **修复**：新增 `contains_word` 和 `count_word_occurrences` 辅助函数，对长度 ≥ 3 的英文单词做词边界检测，CJK bigram 保留子串匹配
+- **效果**：英文检索精度提升，避免子串误匹配
+
+**公平性改革 — 基准测试从"测架构"转变为"测能力"**
+
+- 改革核心：将"验证架构"（测有没有洛书编码/LLM翻译器）转变为"验证效果"（测能不能做到知识更新/模糊查询/双关词区分）
+- 公平原则：不利用 ground truth，所有文档 importance=5（统一），蓄水池抽样随机文档
+- LRC 原生基准公平版：TF-IDF 模式 11/11 PASS（总评分 0.94），LLM 模式 9/11 PASS（总评分 0.79）
+- LongMemEval 公平版 v3：Session Recall@10=85.74%（不利用 has_answer 差异化）
+
+**6 次基准测试完整报告**
+
+- MS MARCO BEIR 测试：TF-IDF MRR@10=0.7749，LLM MRR@10=0.8895（LLM 增益 +14.8%）
+- Natural Questions BEIR 测试：TF-IDF MRR@10=0.5389，LLM MRR@10=0.8016（LLM 增益 +48.7%）
+- HotpotQA BEIR 测试：TF-IDF MRR@10=0.7964，LLM MRR@10=0.9383（LLM 增益 +17.8%）
+- FiQA BEIR 测试：TF-IDF MRR@10=0.2729，LLM MRR@10=0.4453（LLM 增益 +63.2%）
+- LRC 原生基准测试（公平版）：TF-IDF 11/11 PASS，总评分 0.94
+- LongMemEval 基准测试（公平版 v3）：Session Recall@10=85.74%，Turn Recall@10=61.70%
+
+> 完整的 6 次基准测试汇总对比报告请参考 [benchmarks/reports/LRC_BENCHMARK_SUMMARY.md](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md)。
+
+**测试**
+
+- 新增 6 个单元测试，全项目 406 个单元测试全部通过，clippy 无警告
 
 ### v0.5.5 (2026-06-21) — MCP 配置自动升级 + AI 主动调用修复
 
