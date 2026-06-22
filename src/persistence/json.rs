@@ -143,6 +143,47 @@ impl Persistence for JsonPersistence {
         Ok(())
     }
 
+    /// 批量更新记忆（单次序列化 + 单次磁盘写入）
+    ///
+    /// 性能优化：相比循环调用 `save_memory`（每条触发一次全量序列化+磁盘写入），
+    /// 此方法将 N 次磁盘 I/O 降为 1 次，适用于 recall 后批量更新 `last_accessed`。
+    /// 仅更新传入的记忆，其他记忆保持不变。
+    fn update_memories(&self, updated: &[Memory]) -> Result<(), PersistenceError> {
+        if updated.is_empty() {
+            return Ok(());
+        }
+
+        // 防御性检查：确保数据目录存在
+        self.ensure_data_dir()?;
+
+        // 使用缓存优化：避免全量读取
+        self.ensure_cache_loaded()?;
+        let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
+        let memories = cache
+            .as_mut()
+            .expect("缓存已通过 ensure_cache_loaded 初始化");
+
+        // 构建待更新记忆的 ID → Memory 映射，O(M) 查找
+        let mut update_map: std::collections::HashMap<&str, &Memory> =
+            std::collections::HashMap::with_capacity(updated.len());
+        for m in updated {
+            update_map.insert(m.id.as_str(), m);
+        }
+
+        // 单次遍历：按 ID 更新匹配的记忆
+        for existing in memories.iter_mut() {
+            if let Some(new_mem) = update_map.get(existing.id.as_str()) {
+                *existing = (*new_mem).clone();
+            }
+        }
+
+        // 单次序列化 + 单次磁盘写入
+        let json = serde_json::to_string_pretty(memories)?;
+        drop(cache); // 释放写锁
+        atomic_write(&self.memories_file, &json)?;
+        Ok(())
+    }
+
     fn load_all_memories(&self) -> Result<Vec<Memory>, PersistenceError> {
         // 优先从缓存读取（O(1)），缓存失效时从磁盘加载（O(n)）
         {
@@ -462,5 +503,64 @@ mod tests {
 
         let size = p.size_bytes().expect("应获取文件大小");
         assert!(size > 0);
+    }
+
+    /// v0.5.5 修复一：验证批量更新记忆的正确性
+    /// 确保 update_memories 仅更新指定记忆，不触碰其他记忆
+    #[test]
+    fn test_update_memories_partial_update() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = JsonPersistence::new(&data_dir).expect("应成功创建");
+
+        // 准备 3 条记忆
+        p.save_memory(&make_test_memory("m1", "内容1-原始"))
+            .expect("应成功保存");
+        p.save_memory(&make_test_memory("m2", "内容2-原始"))
+            .expect("应成功保存");
+        p.save_memory(&make_test_memory("m3", "内容3-原始"))
+            .expect("应成功保存");
+
+        // 仅更新 m1 和 m3，不触碰 m2
+        let mut updated_m1 = make_test_memory("m1", "内容1-已更新");
+        updated_m1.importance = crate::memory_types::Importance::new(8);
+        let mut updated_m3 = make_test_memory("m3", "内容3-已更新");
+        updated_m3.importance = crate::memory_types::Importance::new(9);
+
+        p.update_memories(&[updated_m1, updated_m3])
+            .expect("应成功批量更新");
+
+        // 验证：m1 和 m3 已更新，m2 保持不变
+        let loaded = p.load_all_memories().expect("应成功加载");
+        assert_eq!(loaded.len(), 3, "记忆总数应保持 3 条");
+
+        let m1 = loaded.iter().find(|m| m.id == "m1").expect("应找到 m1");
+        assert_eq!(m1.content, "内容1-已更新");
+        assert_eq!(m1.importance.value(), 8);
+
+        let m2 = loaded.iter().find(|m| m.id == "m2").expect("应找到 m2");
+        assert_eq!(m2.content, "内容2-原始", "m2 应保持不变");
+
+        let m3 = loaded.iter().find(|m| m.id == "m3").expect("应找到 m3");
+        assert_eq!(m3.content, "内容3-已更新");
+        assert_eq!(m3.importance.value(), 9);
+    }
+
+    /// v0.5.5 修复一：验证空列表批量更新是 no-op
+    #[test]
+    fn test_update_memories_empty() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = JsonPersistence::new(&data_dir).expect("应成功创建");
+
+        p.save_memory(&make_test_memory("m1", "内容1"))
+            .expect("应成功保存");
+
+        // 空列表批量更新应成功且不修改任何记忆
+        p.update_memories(&[]).expect("空列表应成功");
+
+        let loaded = p.load_all_memories().expect("应成功加载");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].content, "内容1");
     }
 }

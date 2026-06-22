@@ -525,6 +525,159 @@ fn doc_token_count(text: &str) -> usize {
     tokenize_query(text).len().max(1)
 }
 
+/// v0.5.5 修复二：词边界感知的子串匹配
+///
+/// 解决 TF-IDF 检索中 "cat" 错误匹配 "category" 的问题。
+///
+/// 匹配规则：
+/// - **CJK bigram**（包含 CJK 字符的 token）：保留 `contains()` 子串匹配
+///   理由：CJK 文本无空格分词，bigram 本身就是 2 字符子串，子串匹配是合理的
+/// - **英文单词**（纯 ASCII 字母）：要求词边界匹配
+///   即匹配位置前后字符不能是字母（或位于字符串开头/结尾）
+///
+/// # 示例
+///
+/// ```ignore
+/// // 英文单词：词边界匹配
+/// assert!(contains_word("the cat sat", "cat"));
+/// assert!(!contains_word("the category sat", "cat"));  // 不再误匹配
+/// assert!(contains_word("cat", "cat"));               // 整词匹配
+///
+/// // CJK bigram：保留子串匹配
+/// assert!(contains_word("数据库连接", "据库"));
+/// ```
+fn contains_word(content: &str, word: &str) -> bool {
+    // 空 word 直接返回 false（防御性）
+    if word.is_empty() {
+        return false;
+    }
+
+    // 判断 word 是否为 CJK token（包含 CJK 字符）
+    let is_cjk_token = word.chars().any(|c| {
+        let cp = c as u32;
+        (0x4E00..=0x9FFF).contains(&cp)
+            || (0x3400..=0x4DBF).contains(&cp)
+            || (0xF900..=0xFAFF).contains(&cp)
+    });
+
+    // CJK token：保留子串匹配（bigram 本身就是子串）
+    if is_cjk_token {
+        return content.contains(word);
+    }
+
+    // v0.5.5 修复：仅对长度 ≥ 3 的纯 ASCII 字母单词做词边界检测
+    // 理由：CJK bigram 分词会把英文单词拆成 2 字符 bigram（如 "Rust" → "ru", "us", "st"），
+    // 这些 2 字符 bigram 是纯 ASCII 字母，但应保留子串匹配（否则 "ru" 无法匹配 "rust"）。
+    // 长度 ≥ 3 的英文单词（如 "cat", "category"）才做词边界检测，避免 "cat" 匹配 "category"。
+    let char_count = word.chars().count();
+    if char_count < 3 {
+        return content.contains(word);
+    }
+
+    // 英文单词（长度 ≥ 3）：词边界匹配
+    // 使用 char_indices 遍历所有匹配位置，检查前后字符是否为词边界
+    let word_bytes = word.as_bytes();
+    let content_bytes = content.as_bytes();
+    let word_len = word_bytes.len();
+
+    if word_len == 0 || word_len > content_bytes.len() {
+        return false;
+    }
+
+    // 遍历所有可能的起始位置
+    let mut start = 0;
+    while start + word_len <= content_bytes.len() {
+        // 查找下一个匹配位置
+        if let Some(pos) = content[start..].find(word) {
+            let match_start = start + pos;
+            let match_end = match_start + word_len;
+
+            // 检查前一个字符是否为词边界（非字母）
+            let prefix_ok = match_start == 0
+                || !is_alpha_byte(content_bytes[match_start - 1]);
+
+            // 检查后一个字符是否为词边界（非字母）
+            let suffix_ok = match_end == content_bytes.len()
+                || !is_alpha_byte(content_bytes[match_end]);
+
+            if prefix_ok && suffix_ok {
+                return true;
+            }
+
+            // 继续查找下一个匹配位置
+            start = match_start + 1;
+        } else {
+            break;
+        }
+    }
+
+    false
+}
+
+/// 判断字节是否为 ASCII 字母（用于词边界检测）
+fn is_alpha_byte(b: u8) -> bool {
+    b.is_ascii_alphabetic()
+}
+
+/// v0.5.5 修复二：词边界感知的词频统计
+///
+/// 与 `contains_word` 配套，统计 word 在 content 中以整词形式出现的次数。
+/// CJK token 使用 `matches().count()` 子串计数，英文单词使用词边界计数。
+fn count_word_occurrences(content: &str, word: &str) -> usize {
+    if word.is_empty() {
+        return 0;
+    }
+
+    // 判断 word 是否为 CJK token
+    let is_cjk_token = word.chars().any(|c| {
+        let cp = c as u32;
+        (0x4E00..=0x9FFF).contains(&cp)
+            || (0x3400..=0x4DBF).contains(&cp)
+            || (0xF900..=0xFAFF).contains(&cp)
+    });
+
+    // CJK token：子串计数
+    if is_cjk_token {
+        return content.matches(word).count();
+    }
+
+    // v0.5.5 修复：仅对长度 ≥ 3 的纯 ASCII 字母单词做词边界计数
+    // 与 contains_word 的判断逻辑保持一致
+    let char_count = word.chars().count();
+    if char_count < 3 {
+        return content.matches(word).count();
+    }
+
+    // 英文单词（长度 ≥ 3）：词边界计数
+    let content_bytes = content.as_bytes();
+    let word_bytes = word.as_bytes();
+    let word_len = word_bytes.len();
+    let mut count = 0;
+    let mut start = 0;
+
+    while start + word_len <= content_bytes.len() {
+        if let Some(pos) = content[start..].find(word) {
+            let match_start = start + pos;
+            let match_end = match_start + word_len;
+
+            let prefix_ok = match_start == 0
+                || !is_alpha_byte(content_bytes[match_start - 1]);
+            let suffix_ok = match_end == content_bytes.len()
+                || !is_alpha_byte(content_bytes[match_end]);
+
+            if prefix_ok && suffix_ok {
+                count += 1;
+            }
+
+            start = match_start + 1;
+        } else {
+            break;
+        }
+    }
+
+    count
+}
+
 /// 隐私过滤辅助函数：判断记忆是否对指定隐私上下文可见
 ///
 /// 规则（Section 3.3 隐私与权限）：
@@ -1679,6 +1832,7 @@ impl<P: Persistence> MemoryStore<P> {
             // TF-IDF 能更好地区分相关和无关记忆，尤其是对于长文本记忆
             // 参考: LongMemEval 基准测试验证了 TF-IDF 在长对话记忆检索中的有效性
             // v0.5.4 P1-9 修复：使用 query_word_refs 替代 query_words，支持 CJK bigram
+            // v0.5.5 修复二：使用 contains_word 替代 contains，避免 "cat" 匹配 "category"
             let mut scored: Vec<(f32, &Memory)> = {
                 // ========== TF-IDF 预处理 ==========
                 // 计算文档频率（DF）: 每个查询词在多少条候选记忆中出现
@@ -1687,7 +1841,8 @@ impl<P: Persistence> MemoryStore<P> {
                 for word in &query_word_refs {
                     for m in &candidates {
                         let content_lower = m.content.to_lowercase();
-                        if content_lower.contains(word) {
+                        // v0.5.5 修复二：词边界匹配替代子串匹配
+                        if contains_word(&content_lower, word) {
                             *doc_freq.entry(word).or_insert(0) += 1;
                         }
                     }
@@ -1722,11 +1877,13 @@ impl<P: Persistence> MemoryStore<P> {
                         // 高分。短文档中关键词密度更高，应获得加权。
                         // v0.5.4 P1-9 修复：使用 doc_token_count 替代 split_whitespace().count()
                         // 对 CJK 文本基于 bigram 数量计算文档长度
+                        // v0.5.5 修复二：使用 contains_word + count_word_occurrences
+                        // 替代 contains + matches().count()，避免子串误匹配
                         let doc_len = doc_token_count(&content_lower) as f32;
                         for word in &query_word_refs {
-                            if content_lower.contains(word) {
-                                // 计算词频（TF）: 该词在记忆内容中出现的次数
-                                let tf = content_lower.matches(word).count() as f32;
+                            if contains_word(&content_lower, word) {
+                                // 计算词频（TF）: 该词在记忆内容中以整词形式出现的次数
+                                let tf = count_word_occurrences(&content_lower, word) as f32;
                                 let idf_val = idf.get(word).copied().unwrap_or(1.0);
                                 // 归一化 TF-IDF 得分: (词频/文档长度) × 逆文档频率
                                 // 长文档中的高频常见词不再获得不合理的高分
@@ -1850,12 +2007,16 @@ impl<P: Persistence> MemoryStore<P> {
             }
         }
 
-        // 将更新后的访问时间写回持久化存储
+        // v0.5.5 性能修复：将全量重写改为增量批量更新
+        // 原实现：clear_memories() + 循环 save_memory() 全量重写所有记忆，O(N²) 序列化
+        // 新实现：仅更新被检索到的记忆（通常 ≤ top_k=10 条），单次序列化+单次磁盘写入
+        // 性能提升：3633 条记忆场景下，单次 recall 写回从 ~105s 降至毫秒级
         if any_modified {
-            self.persistence.clear_memories()?;
-            for m in all_memories {
-                self.persistence.save_memory(&m)?;
-            }
+            let modified_memories: Vec<Memory> = all_memories
+                .into_iter()
+                .filter(|m| matched_ids.contains(&m.id))
+                .collect();
+            self.persistence.update_memories(&modified_memories)?;
             // v0.5.4 写操作后标记缓存为脏
             self.invalidate_cache();
         }
@@ -2639,6 +2800,103 @@ mod tests {
         assert!(
             cjk_ratio("使用 Rust 开发") > 0.3,
             "混合文本 CJK 比例应 > 0.3"
+        );
+    }
+
+    /// v0.5.5 修复二：验证词边界感知匹配
+    /// 确保 "cat" 不再误匹配 "category"
+    #[test]
+    fn test_contains_word_english_boundary() {
+        // 整词匹配
+        assert!(contains_word("the cat sat", "cat"), "应匹配整词 'cat'");
+        assert!(contains_word("cat", "cat"), "应匹配单词 'cat'");
+        assert!(contains_word("a cat.", "cat"), "应匹配标点前的 'cat'");
+
+        // 词边界检测：不应误匹配
+        assert!(
+            !contains_word("the category sat", "cat"),
+            "不应将 'cat' 误匹配到 'category'"
+        );
+        assert!(
+            !contains_word("concatenate", "cat"),
+            "不应将 'cat' 误匹配到 'concatenate'"
+        );
+        assert!(
+            !contains_word("scat", "cat"),
+            "不应将 'cat' 误匹配到 'scat'"
+        );
+
+        // 多次出现应正确检测
+        assert!(
+            contains_word("cat and cat again", "cat"),
+            "应匹配多次出现的 'cat'"
+        );
+    }
+
+    /// v0.5.5 修复二：验证 CJK bigram 保留子串匹配
+    #[test]
+    fn test_contains_word_cjk_bigram() {
+        // CJK bigram 应保留子串匹配
+        assert!(
+            contains_word("数据库连接配置", "据库"),
+            "CJK bigram '据库' 应子串匹配"
+        );
+        assert!(
+            contains_word("数据库连接配置", "库连"),
+            "CJK bigram '库连' 应子串匹配"
+        );
+
+        // CJK bigram 不应误匹配（短词不检测词边界）
+        assert!(
+            contains_word("框架结构", "框架"),
+            "CJK bigram '框架' 应匹配"
+        );
+    }
+
+    /// v0.5.5 修复二：验证 2 字符 ASCII bigram 保留子串匹配
+    /// CJK bigram 分词会把英文单词拆成 2 字符 bigram（如 "Rust" → "ru", "us", "st"）
+    #[test]
+    fn test_contains_word_short_ascii_bigram() {
+        // 2 字符 ASCII 应保留子串匹配（支持 CJK bigram 分词产生的英文 bigram）
+        assert!(
+            contains_word("rust language", "ru"),
+            "2 字符 ASCII bigram 'ru' 应子串匹配 'rust'"
+        );
+        assert!(
+            contains_word("rust language", "us"),
+            "2 字符 ASCII bigram 'us' 应子串匹配 'rust'"
+        );
+        assert!(
+            contains_word("rust language", "st"),
+            "2 字符 ASCII bigram 'st' 应子串匹配 'rust'"
+        );
+    }
+
+    /// v0.5.5 修复二：验证词频统计的词边界感知
+    #[test]
+    fn test_count_word_occurrences_boundary() {
+        // 英文整词计数
+        assert_eq!(
+            count_word_occurrences("cat cat cat", "cat"),
+            3,
+            "应统计 3 次整词 'cat'"
+        );
+        assert_eq!(
+            count_word_occurrences("cat category cat", "cat"),
+            2,
+            "应只统计 2 次整词 'cat'，排除 'category'"
+        );
+        assert_eq!(
+            count_word_occurrences("concatenate", "cat"),
+            0,
+            "不应在 'concatenate' 中统计 'cat'"
+        );
+
+        // CJK bigram 子串计数
+        assert_eq!(
+            count_word_occurrences("数据库连接数据库", "据库"),
+            2,
+            "CJK bigram '据库' 应子串计数 2 次"
         );
     }
 

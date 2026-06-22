@@ -73,6 +73,20 @@ pub trait Persistence: Send + Sync {
     /// 保存一条记忆（新增或更新）
     fn save_memory(&self, memory: &Memory) -> Result<(), PersistenceError>;
 
+    /// 批量更新记忆（仅更新指定的记忆，不触碰其他记忆）
+    ///
+    /// 默认实现：循环调用 `save_memory`（每条都会触发一次全量序列化+磁盘写入）。
+    /// 推荐在具体后端中重写为单次序列化+单次磁盘写入，以获得 O(1) I/O 性能。
+    ///
+    /// 此方法用于 recall 后仅更新被检索到的记忆的 `last_accessed` 字段，
+    /// 避免对 N 条记忆全量重写（原 O(N²) 序列化降为 O(N) 序列化）。
+    fn update_memories(&self, memories: &[Memory]) -> Result<(), PersistenceError> {
+        for m in memories {
+            self.save_memory(m)?;
+        }
+        Ok(())
+    }
+
     /// 加载所有记忆
     fn load_all_memories(&self) -> Result<Vec<Memory>, PersistenceError>;
 
