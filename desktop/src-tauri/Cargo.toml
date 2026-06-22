@@ -59,6 +59,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Cryptography",
 ] }
 
+# ── Unix API（macOS/Linux 反调试检测 + 进程管理）──
+# integrity.rs: libc::ptrace(PT_DENY_ATTACH) macOS 反调试
+# sidecar_manager.rs: libc::kill(pid, 0) 进程存活检测
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # ── L2 保密构建配置（反逆向工程）──
 [profile.release]
 lto = true             # 链接时优化（减少二进制大小 + 增加混淆效果）
