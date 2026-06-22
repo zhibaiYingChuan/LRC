@@ -115,8 +115,8 @@ impl IntegrityChecker {
         #[cfg(target_os = "macos")]
         {
             // PT_DENY_ATTACH = 31 on macOS
-            // SAFETY: ptrace(PT_DENY_ATTACH, 0, 0, 0) 是标准反调试调用，参数均为常量，不涉及内存操作
-            let result = unsafe { libc::ptrace(31, 0, 0, 0) };
+            // SAFETY: ptrace(PT_DENY_ATTACH, 0, null, 0) 是标准反调试调用，参数均为常量，不涉及内存操作
+            let result = unsafe { libc::ptrace(31, 0, std::ptr::null_mut(), 0) };
             if result != 0 {
                 // ptrace 失败意味着可能已在调试中
                 return Err(IntegrityError::DebuggerDetected);
