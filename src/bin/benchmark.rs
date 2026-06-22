@@ -9,8 +9,8 @@
 //   code-memory-benchmark                    # 运行所有基准测试
 //   code-memory-benchmark --json             # 输出 JSON 格式（机器可读）
 //   code-memory-benchmark --layer 1          # 仅运行第一层（通用检索）
-//   code-memory-benchmark --layer 2          # 仅运行第二层（独特能力）
-//   code-memory-benchmark --layer 3          # 仅运行第三层（隐私信任）
+//   code-memory-benchmark --layer 2          # 仅运行第二层（高级记忆能力）
+//   code-memory-benchmark --layer 3          # 仅运行第三层（综合能力与信任）
 //   code-memory-benchmark --help             # 查看帮助
 //
 // 道枢映射：中宫（五）— 统摄八方，基准测试如中宫之统摄
@@ -56,8 +56,8 @@ fn main() {
         println!("  任何其他记忆系统也可以使用本工具进行对比评测。");
         println!();
         println!("  第一层：通用记忆检索基准（对标业界，证明不输于人）");
-        println!("  第二层：LRC 独有能力基准（独创，证明与众不同）");
-        println!("  第三层：隐私与信任基准（护城河，证明值得托付）");
+        println!("  第二层：高级记忆能力基准（公平版：测能力，不测架构）");
+        println!("  第三层：综合能力与信任基准（公平版：测能力，不测架构）");
         println!();
         println!("  运行中...");
         println!();
@@ -177,8 +177,8 @@ fn print_help() {
     println!("说明:");
     println!("  本工具对 Loong Recall 进行三层基准测试：");
     println!("  第一层：通用记忆检索基准（对标业界，证明不输于人）");
-    println!("  第二层：LRC 独有能力基准（独创，证明与众不同）");
-    println!("  第三层：隐私与信任基准（护城河，证明值得托付）");
+    println!("  第二层：高级记忆能力基准（公平版：测能力，不测架构）");
+    println!("  第三层：综合能力与信任基准（公平版：测能力，不测架构）");
     println!();
     println!("  任何其他记忆系统也可使用本工具进行对比评测。");
     println!("  所有测试均可由第三方在一行命令中复现。");
@@ -190,7 +190,7 @@ fn print_help() {
     println!("  # 输出 JSON 格式（供 CI/CD 或仪表盘使用）");
     println!("  code-memory-benchmark --json");
     println!();
-    println!("  # 仅测试 LRC 独有能力（第二层）");
+    println!("  # 仅测试高级记忆能力（第二层）");
     println!("  code-memory-benchmark --layer 2");
     println!();
     println!("  # 用 cargo run 直接运行");

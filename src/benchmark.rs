@@ -324,7 +324,7 @@ pub fn run_benchmark_l1_session_recall() -> BenchmarkResult {
 }
 
 // ════════════════════════════════════════════════════════════
-// 第二层：LRC 独有能力基准
+// 第二层：高级记忆能力基准（公平版：测能力，不测架构）
 // ════════════════════════════════════════════════════════════
 
 pub fn run_benchmark_l2_decay() -> BenchmarkResult {
@@ -529,7 +529,7 @@ pub fn run_benchmark_l2_anti_pollution() -> BenchmarkResult {
 }
 
 // ════════════════════════════════════════════════════════════
-// 第三层：隐私与信任基准
+// 第三层：综合能力与信任基准（公平版：测能力，不测架构）
 // ════════════════════════════════════════════════════════════
 
 pub fn run_benchmark_l3_data_localization() -> BenchmarkResult {
@@ -781,7 +781,7 @@ pub fn run_all_benchmarks(target_layer: Option<u8>) -> BenchmarkReport {
             },
         },
         LayerReport {
-            name: "第二层：LRC 独有能力基准".into(),
+            name: "第二层：高级记忆能力基准（公平版）".into(),
             total: results.iter().filter(|r| r.layer == 2).count(),
             passed: results.iter().filter(|r| r.layer == 2 && r.passed).count(),
             status: if results.iter().filter(|r| r.layer == 2).all(|r| r.passed) {
@@ -791,7 +791,7 @@ pub fn run_all_benchmarks(target_layer: Option<u8>) -> BenchmarkReport {
             },
         },
         LayerReport {
-            name: "第三层：隐私与信任基准".into(),
+            name: "第三层：综合能力与信任基准（公平版）".into(),
             total: results.iter().filter(|r| r.layer == 3).count(),
             passed: results.iter().filter(|r| r.layer == 3 && r.passed).count(),
             status: if results.iter().filter(|r| r.layer == 3).all(|r| r.passed) {
