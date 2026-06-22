@@ -1069,26 +1069,26 @@ impl AgentDetector for ClaudeDesktopDetector {
             let appdata = appdata_dir()?;
             let config = appdata.join("Claude").join("claude_desktop_config.json");
             if config.exists() || config.parent().is_some_and(|p| p.exists()) {
-                return Some(config);
+                Some(config)
+            } else {
+                None
             }
         }
 
         #[cfg(target_os = "macos")]
         {
             let home = home_dir()?;
-            return Some(
+            Some(
                 home.join("Library/Application Support/Claude")
                     .join("claude_desktop_config.json"),
-            );
+            )
         }
 
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let home = home_dir()?;
-            return Some(home.join(".config/Claude/claude_desktop_config.json"));
+            Some(home.join(".config/Claude/claude_desktop_config.json"))
         }
-
-        None
     }
 
     fn generate_config(&self, port: u16) -> serde_json::Value {
