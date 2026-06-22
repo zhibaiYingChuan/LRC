@@ -150,7 +150,6 @@ desktop/src-tauri/icons/StoreLogo.png
 desktop/src-tauri/icons/android/
 desktop/src-tauri/icons/ios/
 desktop/src-tauri/icons/icon.icns
-desktop/src-tauri/icons/icon.png
 desktop/src-tauri/icons/64x64.png
 
 # 根目录图标生成工具（开发者本地使用，不交付用户）
