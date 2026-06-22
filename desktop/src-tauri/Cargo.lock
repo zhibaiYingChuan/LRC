@@ -2126,6 +2126,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "base64 0.22.1",
+ "libc",
  "obfstr",
  "open",
  "rand 0.8.6",
