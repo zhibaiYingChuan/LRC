@@ -111,7 +111,7 @@ jobs:
         shell: bash
 
       - name: Upload sidecar artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BIN_NAME }}
           path: |
@@ -175,29 +175,42 @@ jobs:
           key: ${{ runner.os }}-desktop-${{ hashFiles('desktop/**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-desktop-
 
-      # 步骤 1: 先编译 sidecar 二进制（build.rs 会自动复制到 desktop/src-tauri/）
+      # 步骤 1: 先编译 sidecar 二进制
       - name: Build sidecar binary
         run: |
           cargo build --release --features server --target ${{ matrix.target }}
-          echo "Sidecar binary built and will be auto-synced by build.rs"
+          echo "Sidecar binary built at target/${{ matrix.target }}/release/"
         shell: bash
 
-      # 步骤 2: 安装 Tauri CLI v2
+      # 步骤 2: 手动复制 sidecar 到 desktop/src-tauri/（确保 build.rs 能找到）
+      - name: Sync sidecar to desktop
+        run: |
+          VERSION="${{ steps.version.outputs.VER }}"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp target/${{ matrix.target }}/release/code-memory-server.exe desktop/src-tauri/lrc-sidecar.exe
+          else
+            cp target/${{ matrix.target }}/release/code-memory-server desktop/src-tauri/lrc-sidecar.exe
+          fi
+          echo "Sidecar synced to desktop/src-tauri/lrc-sidecar.exe"
+          ls -la desktop/src-tauri/lrc-sidecar.exe
+        shell: bash
+
+      # 步骤 3: 安装 Tauri CLI v2
       - name: Install Tauri CLI
         run: |
           cargo install tauri-cli --version "^2.0" --locked || \
             cargo install tauri-cli --version "^2.0"
         shell: bash
 
-      # 步骤 3: 构建 Tauri 桌面端安装包
-      # build.rs 会自动从 target/release/ 复制 sidecar 到 desktop/src-tauri/lrc-sidecar.exe
+      # 步骤 4: 构建 Tauri 桌面端安装包
+      # sidecar 已手动复制，build.rs 会检测到哈希一致并跳过复制
       - name: Build desktop app
         run: |
           cd desktop/src-tauri
           cargo tauri build --target ${{ matrix.target }}
         shell: bash
 
-      # 步骤 4: macOS Ad-Hoc 签名
+      # 步骤 5: macOS Ad-Hoc 签名
       - name: macOS code signing (Ad-Hoc)
         if: runner.os == 'macOS'
         run: |
@@ -208,7 +221,7 @@ jobs:
           fi
         shell: bash
 
-      # 步骤 5: 收集安装包
+      # 步骤 6: 收集安装包
       - name: Collect desktop artifacts (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -244,7 +257,7 @@ jobs:
         shell: bash
 
       - name: Upload desktop artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: desktop-${{ matrix.target }}
           path: desktop-artifacts/*
