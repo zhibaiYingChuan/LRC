@@ -1825,7 +1825,7 @@ impl AgentDetectorRegistry {
 
         format!(
             r#"{frontmatter}{header}
-<!-- 本文件由 LRC Desktop v0.5.9 自动生成，请勿手动删除 LRC 相关规则 -->
+<!-- 本文件由 LRC Desktop v0.5.10 自动生成，请勿手动删除 LRC 相关规则 -->
 <!-- 如需自定义规则，请在本文件末尾添加 -->
 
 ## LRC 记忆系统（Loong Recall Code Memory）
@@ -2028,8 +2028,8 @@ AI：已记录登录 API 到记忆库
         if rules_path.exists() {
             let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
             if existing.contains("LRC 记忆系统") {
-                // v0.5.9 增强：检测旧版本规则并自动升级（兼容 v0.5.5、v0.5.6、v0.5.7、v0.5.8）
-                if !existing.contains("v0.5.9 自动生成") {
+                // v0.5.10 增强：检测旧版本规则并自动升级（兼容 v0.5.5、v0.5.6、v0.5.7、v0.5.8、v0.5.9）
+                if !existing.contains("v0.5.10 自动生成") {
                     // 旧版本规则，需要升级
                     if let Some(pos) = existing.find("## LRC 记忆系统") {
                         let user_content = existing[..pos].trim_end();
@@ -2042,7 +2042,7 @@ AI：已记录登录 API 到记忆库
                             format!("更新规则文件失败: {} ({})", rules_path.display(), e)
                         })?;
                         tracing::info!(
-                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.9 版本: {}",
+                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.10 版本: {}",
                             tool_id,
                             rules_path.display()
                         );
@@ -2052,13 +2052,13 @@ AI：已记录登录 API 到记忆库
                             format!("更新规则文件失败: {} ({})", rules_path.display(), e)
                         })?;
                         tracing::info!(
-                            "[AI规则] {} — 已追加 LRC v0.5.9 规则到现有文件: {}",
+                            "[AI规则] {} — 已追加 LRC v0.5.10 规则到现有文件: {}",
                             tool_id,
                             rules_path.display()
                         );
                     }
                 } else {
-                    // 已是 v0.5.9 版本，跳过
+                    // 已是 v0.5.10 版本，跳过
                     tracing::info!(
                         "[AI规则] {} — 规则文件已是最新版本，跳过: {}",
                         tool_id,
