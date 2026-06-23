@@ -45,8 +45,12 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 
 /// 基准测试报告缓存（避免每次请求都重新运行耗时的基准测试）
-static BENCHMARK_CACHE: std::sync::LazyLock<StdMutex<Option<serde_json::Value>>> =
+/// v0.5.6：添加缓存时间戳，支持 1 小时过期机制
+static BENCHMARK_CACHE: std::sync::LazyLock<StdMutex<Option<(serde_json::Value, std::time::Instant)>>> =
     std::sync::LazyLock::new(|| StdMutex::new(None));
+
+/// 基准测试缓存有效期：1 小时
+const BENCHMARK_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 // ==================== 请求/响应类型 ====================
 
@@ -1292,9 +1296,13 @@ pub fn build_v1_router(
         // 使用缓存避免每次请求都重新运行耗时的基准测试
         .route("/benchmarks/report", get({
             || async move {
-                // 优先返回缓存结果
-                if let Some(cached) = BENCHMARK_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                    return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(cached.clone()));
+                // 优先返回缓存结果（v0.5.6：检查缓存是否过期）
+                if let Some((cached, cached_at)) = BENCHMARK_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                    if cached_at.elapsed() < BENCHMARK_CACHE_TTL {
+                        return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(cached.clone()));
+                    }
+                    // 缓存已过期，清空缓存
+                    eprintln!("[基准报告] 缓存已过期（超过 {} 秒），重新运行基准测试", BENCHMARK_CACHE_TTL.as_secs());
                 }
 
                 // 在独立线程中运行基准测试，添加 90 秒超时
@@ -1366,9 +1374,9 @@ pub fn build_v1_router(
                             "note": "本报告通过实际运行基准测试生成，反映系统当前能力水平"
                         });
 
-                        // 缓存结果
+                        // 缓存结果（v0.5.6：记录缓存时间，支持 TTL 过期）
                         if let Ok(mut cache) = BENCHMARK_CACHE.lock() {
-                            *cache = Some(result.clone());
+                            *cache = Some((result.clone(), std::time::Instant::now()));
                         }
 
                         Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(result))

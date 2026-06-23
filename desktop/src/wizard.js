@@ -612,6 +612,24 @@
       }
     }
 
+    // v0.5.6 修复：重新调用 configure_agents 确保全局规则文件写入
+    // 根因：步骤 1 调用 configure_agents 时，write_ai_rules 可能未执行
+    //   （旧版依赖 project_dir，新版改为全局规则写入用户主目录）
+    // 修复：重新调用 configure_agents，确保 MCP 配置和全局规则文件都正确写入。
+    //   MCP 配置通过 write_or_merge_config 合并，不会重复或丢失。
+    if (config.selectedAgents.length > 0) {
+      try {
+        const actualPort = config.port || 3099;
+        await tauriInvoke('configure_agents', {
+          agentIds: config.selectedAgents,
+          port: actualPort,
+        });
+        console.log('[配置向导] 重新配置 Agent（确保全局 IDE 规则文件写入）');
+      } catch (e) {
+        console.warn('[配置向导] 重新配置 Agent 失败（非致命，规则文件可能未写入）:', e);
+      }
+    }
+
     // 启动 sidecar
     let sidecarStarted = false;
     const port = await startSidecarWithConfig(
@@ -728,7 +746,7 @@
           <span class="banner-icon">${allOk ? '&#x2705;' : '&#x26A0;&#xFE0F;'}</span>
           <div>
             <strong>${allOk ? '配置验证通过！' : '配置验证发现问题'}</strong>
-            <span style="font-size:12px;color:${allOk ? '#555' : '#888'};">${escapeHtml(verifyResult.suggestion || '')}</span>
+            <span style="font-size:12px;color:${allOk ? 'var(--text-secondary)' : 'var(--text-tertiary)'};">${escapeHtml(verifyResult.suggestion || '')}</span>
           </div>
         </div>
         <div class="verify-checklist">
@@ -756,14 +774,14 @@
             <span class="banner-icon">&#x2705;</span>
             <div>
               <strong>后台服务启动成功！</strong>
-              <span style="font-size:12px;color:#555;">LRC 服务运行在端口 ${safePort}</span>
+              <span style="font-size:12px;color:var(--text-secondary);">LRC 服务运行在端口 ${safePort}</span>
             </div>
           </div>`
         : `<div class="summary-banner error">
             <span class="banner-icon">&#x26A0;&#xFE0F;</span>
             <div>
               <strong>后台服务启动失败</strong>
-              <span style="font-size:12px;color:#888;">可能原因：端口被占用、磁盘空间不足、或杀毒软件拦截</span>
+              <span style="font-size:12px;color:var(--text-tertiary);">可能原因：端口被占用、磁盘空间不足、或杀毒软件拦截</span>
             </div>
           </div>`;
     }
@@ -793,10 +811,10 @@
         mcpGuideHtml += `<div class="mcp-item info">&#x2139;&#xFE0F; 需手动配置：${escapeHtml(manualItems.join('、'))}</div>`;
       }
 
-      mcpGuideHtml += `<div class="mcp-tip" style="margin-top:8px;padding:8px;background:#f0f7ff;border-radius:6px;font-size:12px;color:#555;">
+      mcpGuideHtml += `<div class="mcp-tip" style="margin-top:8px;padding:8px;background:var(--accent-alpha-08);border-radius:6px;font-size:12px;color:var(--text-secondary);">
           <strong>&#x1F4A1; 使用说明（基于 Trae 官方文档）：</strong><br>
           &#x26A0;&#xFE0F; <strong>重要</strong>：LRC 使用 HTTP 模式连接到桌面端 sidecar，<strong>请先启动桌面端应用</strong>，否则 AI 工具无法连接。<br><br>
-          <strong>配置方式</strong>（Trae 官方文档：<a href="https://docs.trae.ai/ide/model-context-protocol" style="color:#0066cc;">https://docs.trae.ai/ide/model-context-protocol</a>）：<br>
+          <strong>配置方式</strong>（Trae 官方文档：<a href="https://docs.trae.ai/ide/model-context-protocol" style="color:var(--accent);">https://docs.trae.ai/ide/model-context-protocol</a>）：<br>
           1. <strong>Trae / Trae CN</strong>：设置 → MCP → 添加 → 手动添加，粘贴以下 JSON：<br>
           &nbsp;&nbsp;&nbsp;<code>{"mcpServers":{"lrc-memory":{"url":"http://127.0.0.1:${safePort}/mcp"}}}</code><br>
           2. <strong>配置文件位置</strong>（已自动写入）：<br>
@@ -815,12 +833,12 @@
         </div>
         <div class="mcp-guide-body">
           <div class="mcp-item info">&#x2139;&#xFE0F; 未检测到已安装的 AI 工具，或配置未完成</div>
-          <div class="mcp-tip" style="margin-top:8px;padding:8px;background:#f0f7ff;border-radius:6px;font-size:12px;color:#555;">
+          <div class="mcp-tip" style="margin-top:8px;padding:8px;background:var(--accent-alpha-08);border-radius:6px;font-size:12px;color:var(--text-secondary);">
             <strong>&#x1F4A1; 手动添加 MCP 服务器（基于 Trae 官方文档）：</strong><br>
             &#x26A0;&#xFE0F; <strong>重要</strong>：LRC 使用 HTTP 模式，<strong>请先启动桌面端应用</strong>。<br><br>
             <strong>Trae / Trae CN</strong>：设置 → MCP → 添加 → 手动添加，粘贴以下 JSON：<br>
             <code>{"mcpServers":{"lrc-memory":{"url":"http://127.0.0.1:${safePort}/mcp"}}}</code><br><br>
-            官方文档：<a href="https://docs.trae.ai/ide/model-context-protocol" style="color:#0066cc;">https://docs.trae.ai/ide/model-context-protocol</a>
+            官方文档：<a href="https://docs.trae.ai/ide/model-context-protocol" style="color:var(--accent);">https://docs.trae.ai/ide/model-context-protocol</a>
           </div>
         </div>
       </div>`;
@@ -993,7 +1011,7 @@
       'color:#fff',
       'max-width:360px',
       'transition:opacity 0.3s',
-      type === 'error' ? 'background:#e74c3c' : 'background:#27ae60',
+      type === 'error' ? 'background:#B84838' : 'background:#5B7C63',
     ].join(';');
     notification.textContent = message;
 
@@ -1051,10 +1069,10 @@
       const statusText = document.querySelector('.status-text');
       if (statusDot && statusText) {
         if (status.running) {
-          statusDot.style.background = '#27ae60';
+          statusDot.style.background = '#5B7C63';
           statusText.textContent = `运行中（端口 ${status.port || '未知'}）`;
         } else {
-          statusDot.style.background = '#e74c3c';
+          statusDot.style.background = '#B84838';
           statusText.textContent = '已停止';
         }
       }
@@ -1083,9 +1101,9 @@
           // 显示警告横幅（非阻塞，用户可继续使用）
           const introBox = document.querySelector('.wizard-intro-box');
           if (introBox) {
-            introBox.style.borderColor = '#e74c3c';
+            introBox.style.borderColor = '#B84838';
             introBox.querySelector('.intro-text').innerHTML = 
-              '<strong style="color:#e74c3c;">⚠️ 配置文件已损坏</strong> 之前的配置无法读取，已使用默认配置。' +
+              '<strong style="color:#B84838;">⚠️ 配置文件已损坏</strong> 之前的配置无法读取，已使用默认配置。' +
               '请重新配置项目路径和 LLM API Key。';
           }
         }
@@ -1565,7 +1583,7 @@
     const check = step.querySelector('.qs-step-check');
     const num = step.querySelector('.qs-step-num');
     if (check) check.style.display = 'inline';
-    if (num) num.style.background = 'var(--jade, #2ecc71)';
+    if (num) num.style.background = 'var(--jade, #5B7C63)';
     step.classList.add('completed');
   }
 
@@ -1636,7 +1654,7 @@
       const badge = info.querySelector('.info-badge');
       if (badge) {
         badge.textContent = config.multiWindowEnabled ? '已启用' : '已禁用';
-        badge.style.background = config.multiWindowEnabled ? '#27ae60' : '#95a5a6';
+        badge.style.background = config.multiWindowEnabled ? '#5B7C63' : '#8A8680';
       }
       const hint = info.querySelector('.form-hint');
       if (hint) {
@@ -1662,7 +1680,7 @@
               <span class="project-path">${escapeHtml(p)}</span>
               <span class="project-status">
                 <span class="status-dot stopped"></span>
-                <span style="font-size:11px;color:#95a5a6;">未启动</span>
+                <span style="font-size:11px;color:#8A8680;">未启动</span>
               </span>
             </div>
           `).join('');
@@ -1677,10 +1695,10 @@
           <span class="project-path">${escapeHtml(p.project_dir || p.src_dir || '')}</span>
           <span class="project-status">
             <span class="status-dot ${p.running ? 'running' : 'stopped'}"></span>
-            <span style="font-size:11px;color:${p.running ? '#27ae60' : '#95a5a6'};">
+            <span style="font-size:11px;color:${p.running ? '#5B7C63' : '#8A8680'};">
               ${p.running ? '运行中' : '未启动'}
             </span>
-            ${p.port ? `<span style="font-size:11px;color:#666;">:${p.port}</span>` : ''}
+            ${p.port ? `<span style="font-size:11px;color:#6E6A63;">:${p.port}</span>` : ''}
           </span>
         </div>
       `).join('');

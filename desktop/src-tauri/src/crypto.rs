@@ -18,9 +18,34 @@ use rand::RngCore;
 use std::path::PathBuf;
 
 /// 密钥文件路径 — 与密文分离存储，但通过 DPAPI 保护
-fn key_path() -> PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-    PathBuf::from(appdata).join("LoongRecall").join(".lrc_key")
+///
+/// M-14 修复：APPDATA 未设置时使用 dirs crate 回退，而非当前目录（安全风险）。
+/// 优先级：APPDATA 环境变量 → dirs::config_dir() → dirs::data_dir() → 错误
+fn key_path() -> Result<PathBuf, String> {
+    // 优先使用 APPDATA 环境变量（保持向后兼容）
+    let base_dir = if let Ok(appdata) = std::env::var("APPDATA") {
+        if !appdata.is_empty() {
+            PathBuf::from(appdata)
+        } else {
+            // APPDATA 为空字符串，回退到 dirs crate
+            tracing::warn!("APPDATA 环境变量为空，使用 dirs::config_dir() 作为密钥文件回退目录");
+            dirs::config_dir()
+                .or_else(|| dirs::data_dir())
+                .ok_or_else(|| {
+                    "无法确定密钥目录：APPDATA 为空且 dirs::config_dir()/data_dir() 均返回 None".to_string()
+                })?
+        }
+    } else {
+        // APPDATA 未设置，回退到 dirs crate
+        tracing::warn!("APPDATA 环境变量未设置，使用 dirs::config_dir() 作为密钥文件回退目录");
+        dirs::config_dir()
+            .or_else(|| dirs::data_dir())
+            .ok_or_else(|| {
+                "无法确定密钥目录：APPDATA 未设置且 dirs::config_dir()/data_dir() 均返回 None".to_string()
+            })?
+    };
+
+    Ok(base_dir.join("LoongRecall").join(".lrc_key"))
 }
 
 /// 使用 DPAPI 加密密钥数据（Windows），非 Windows 平台直接返回原始数据
@@ -142,7 +167,7 @@ fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
 /// 后续调用从磁盘读取并通过 DPAPI 解密恢复。
 /// 密钥文件即使被复制到其他机器也无法使用。
 fn get_or_create_key() -> Result<[u8; 32], String> {
-    let path = key_path();
+    let path = key_path()?;
 
     // 尝试读取已有密钥
     if path.exists() {

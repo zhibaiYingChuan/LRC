@@ -1,53 +1,111 @@
-/* LRC Desktop 配置向导样式 */
+/* LRC Desktop 配置向导样式
+ * v0.5.7：应用 SFang 桌面客户端 UIUX 设计规范
+ * 主题：Latte（宋韵雅色）— 浅色、温润，日间明亮环境
+ * 设计理念：融合 Catppuccin 现代柔和配色与中国古典色系意境
+ */
 :root {
-    --bg-primary: #0a0a0f;
-    --bg-secondary: #12121a;
-    --bg-card: #1a1a2e;
-    --text-primary: #e0e0e0;
-    --text-secondary: #888;
-    --accent: #6c63ff;
-    --accent-hover: #7b73ff;
-    --success: #4caf50;
-    --warning: #ff9800;
-    --border: #2a2a3e;
-    --radius: 8px;
-    /* v0.5.4 修复：补充缺失的 CSS 变量，解决设置面板边框/按钮/错误提示不可见问题 */
-    --border-subtle: #2a2a3e;   /* 语义化边框色，与 --border 一致 */
-    --primary: #6c63ff;          /* 语义化主色，与 --accent 一致 */
-    --danger: #f44336;           /* 错误状态色 */
-    /* v0.5.4 修复：统一硬编码颜色值，补充语义化变量 */
-    --text-on-accent: #ffffff;   /* 在强调色/深色背景上的文字颜色 */
-    --text-tertiary: #555;       /* 三级文字颜色（最浅） */
-    --text-dark: #333;           /* 浅色背景上的深色文字 */
-    --success-dark: #2e7d32;     /* 深色成功色（文字用） */
-    --danger-dark: #c62828;      /* 深色危险色（文字用） */
-    --warning-dark: #e65100;     /* 深色警告色（文字用） */
-    --accent-alpha-10: rgba(108, 99, 255, 0.1);    /* 强调色 10% 透明 */
-    --accent-alpha-20: rgba(108, 99, 255, 0.2);    /* 强调色 20% 透明 */
-    --accent-alpha-06: rgba(108, 99, 255, 0.06);   /* 强调色 6% 透明 */
-    --success-alpha-10: rgba(76, 175, 80, 0.1);    /* 成功色 10% 透明 */
-    --success-alpha-15: rgba(76, 175, 80, 0.15);   /* 成功色 15% 透明 */
-    --success-alpha-20: rgba(76, 175, 80, 0.2);    /* 成功色 20% 透明 */
-    --success-alpha-30: rgba(76, 175, 80, 0.3);    /* 成功色 30% 透明 */
-    --success-alpha-50: rgba(76, 175, 80, 0.5);    /* 成功色 50% 透明（阴影） */
-    --danger-alpha-08: rgba(231, 76, 60, 0.08);    /* 危险色 8% 透明 */
-    --danger-alpha-10: rgba(244, 67, 54, 0.1);     /* 危险色 10% 透明 */
-    --danger-alpha-15: rgba(244, 67, 54, 0.15);    /* 危险色 15% 透明 */
-    --danger-alpha-25: rgba(231, 76, 60, 0.25);    /* 危险色 25% 透明 */
-    --danger-alpha-30: rgba(244, 67, 54, 0.3);     /* 危险色 30% 透明 */
-    --warning-alpha-08: rgba(255, 152, 0, 0.08);   /* 警告色 8% 透明 */
-    --warning-alpha-10: rgba(255, 152, 0, 0.1);    /* 警告色 10% 透明 */
-    --warning-alpha-20: rgba(255, 152, 0, 0.2);    /* 警告色 20% 透明 */
-    --warning-alpha-30: rgba(255, 152, 0, 0.3);    /* 警告色 30% 透明 */
-    --warning-alpha-40: rgba(255, 152, 0, 0.4);    /* 警告色 40% 透明（阴影） */
-    --muted-green: #27ae60;      /* 柔和绿色（状态指示器） */
-    --muted-gray: #95a5a6;       /* 柔和灰色（状态指示器） */
-    --danger-bright: #e74c3c;    /* 明亮危险色（操作按钮） */
-    --warning-bright: #e67e22;   /* 明亮警告色（高亮文字） */
-    --muted-green-alpha-10: rgba(39, 174, 96, 0.1);   /* 柔和绿色 10% 透明 */
-    --muted-green-alpha-30: rgba(39, 174, 96, 0.3);   /* 柔和绿色 30% 透明 */
-    --accent-alpha-03: rgba(108, 99, 255, 0.03);      /* 强调色 3% 透明 */
-    --accent-alpha-08: rgba(108, 99, 255, 0.08);      /* 强调色 8% 透明 */
+    /* ── 背景层级（Latte 主题） ── */
+    --bg-primary: #F5F3EF;      /* Base — 窗口主背景（宣纸底色） */
+    --bg-secondary: #E8E5DF;    /* Mantle — 次级面板、侧边栏、卡片背景 */
+    --bg-card: #FDFCFA;         /* Surface — 浮层、工具提示、卡片 */
+    --bg-crust: #DDD9D1;        /* Crust — 模态框背景、下拉菜单 */
+    --bg-tertiary: #E8E5DF;     /* 兼容旧引用，等同 Mantle */
+
+    /* ── 文字颜色 ── */
+    --text-primary: #3C3A36;    /* Text — 正文、标题（对比度 11.5:1） */
+    --text-secondary: #6E6A63;  /* Subtext0 — 辅助说明、次要信息（对比度 6.2:1） */
+    --text-tertiary: #8A8680;   /* Subtext1 — 占位符、禁用文字（对比度 4.1:1） */
+    --text-dark: #3C3A36;       /* 兼容旧引用，等同 Text */
+
+    /* ── 强调色（与功能绑定） ── */
+    --accent: #3A6B8F;           /* Primary (Blue) — 主要按钮、链接、焦点指示 */
+    --accent-hover: #2F5670;    /* Primary 加深 10% — 悬停状态 */
+    --primary: #3A6B8F;         /* 语义化主色，与 --accent 一致 */
+    --success: #5B7C63;         /* Success (Green) — 成功状态、完成、确认 */
+    --warning: #C49A6C;         /* Warning (Yellow) — 警告、注意、延迟 */
+    --danger: #B84838;          /* Error (Red) — 错误、删除、危险操作 */
+    --info: #3C6E6E;            /* Info (Cyan) — 信息提示、中性 */
+    --accent-magenta: #8F6B8A;  /* Accent (Magenta) — 选中状态、特殊标记 */
+
+    /* ── 边框与分割线 ── */
+    --border: #D1CDC5;          /* Border — 默认边框 */
+    --border-subtle: #D1CDC5;   /* 语义化边框色，与 --border 一致 */
+    --border-strong: #B8B2A8;   /* Border Strong — 强调边框（如输入框聚焦） */
+    --divider: #E0DCD4;         /* Divider — 分割线 */
+
+    /* ── 圆角规范（8px 网格） ── */
+    --radius: 6px;              /* 默认圆角（按钮、输入框） */
+    --radius-btn: 6px;          /* 按钮圆角 */
+    --radius-card: 12px;        /* 卡片圆角 */
+    --radius-modal: 16px;       /* 模态框圆角 */
+
+    /* ── 间距系统（8px 网格） ── */
+    --space-xs: 4px;            /* 图标与文字间距、紧凑元素 */
+    --space-sm: 8px;            /* 小组件内边距、列表项间距 */
+    --space-md: 16px;           /* 卡片内边距、区块间距 */
+    --space-lg: 24px;           /* 页面左右边距、模块间距 */
+    --space-xl: 32px;           /* 大区块间距、对话框内边距 */
+
+    /* ── 阴影规范 ── */
+    --shadow-low: 0 1px 2px rgba(0, 0, 0, 0.05);     /* 卡片、列表项 */
+    --shadow-medium: 0 4px 8px rgba(0, 0, 0, 0.08);   /* 模态框、下拉菜单 */
+    --shadow-high: 0 8px 16px rgba(0, 0, 0, 0.12);    /* 对话框、通知浮层 */
+
+    /* ── 字体家族 ── */
+    --font-ui: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-code: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Consolas', 'Monaco', monospace;
+    --font-cn: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+
+    /* ── 在强调色/深色背景上的文字颜色 ── */
+    --text-on-accent: #FFFFFF;  /* 白色文字（用于 Primary/Success/Error 背景上） */
+
+    /* ── 深色变体（用于浅色背景上的文字） ── */
+    --success-dark: #3D5A45;    /* 深色成功色（文字用，加深以提升对比度） */
+    --danger-dark: #8B3528;     /* 深色危险色（文字用） */
+    --warning-dark: #8B6A45;    /* 深色警告色（文字用） */
+
+    /* ── 强调色透明度变体（基于 Primary #3A6B8F） ── */
+    --accent-alpha-03: rgba(58, 107, 143, 0.03);
+    --accent-alpha-06: rgba(58, 107, 143, 0.06);
+    --accent-alpha-08: rgba(58, 107, 143, 0.08);
+    --accent-alpha-10: rgba(58, 107, 143, 0.10);
+    --accent-alpha-20: rgba(58, 107, 143, 0.20);
+
+    /* ── 成功色透明度变体（基于 #5B7C63） ── */
+    --success-alpha-10: rgba(91, 124, 99, 0.10);
+    --success-alpha-15: rgba(91, 124, 99, 0.15);
+    --success-alpha-20: rgba(91, 124, 99, 0.20);
+    --success-alpha-30: rgba(91, 124, 99, 0.30);
+    --success-alpha-50: rgba(91, 124, 99, 0.50);
+
+    /* ── 危险色透明度变体（基于 #B84838） ── */
+    --danger-alpha-08: rgba(184, 72, 56, 0.08);
+    --danger-alpha-10: rgba(184, 72, 56, 0.10);
+    --danger-alpha-15: rgba(184, 72, 56, 0.15);
+    --danger-alpha-25: rgba(184, 72, 56, 0.25);
+    --danger-alpha-30: rgba(184, 72, 56, 0.30);
+
+    /* ── 警告色透明度变体（基于 #C49A6C） ── */
+    --warning-alpha-08: rgba(196, 154, 108, 0.08);
+    --warning-alpha-10: rgba(196, 154, 108, 0.10);
+    --warning-alpha-20: rgba(196, 154, 108, 0.20);
+    --warning-alpha-30: rgba(196, 154, 108, 0.30);
+    --warning-alpha-40: rgba(196, 154, 108, 0.40);
+
+    /* ── 柔和状态色（状态指示器） ── */
+    --muted-green: #5B7C63;    /* 与 Success 一致 */
+    --muted-gray: #8A8680;     /* 与 Subtext1 一致 */
+    --danger-bright: #B84838;  /* 与 Error 一致 */
+    --warning-bright: #C49A6C; /* 与 Warning 一致 */
+
+    /* ── 柔和状态色透明度变体 ── */
+    --muted-green-alpha-10: rgba(91, 124, 99, 0.10);
+    --muted-green-alpha-30: rgba(91, 124, 99, 0.30);
+
+    /* ── 中国古典色系别名（用于特定语义场景） ── */
+    --jade: #5B7C63;            /* 青绿（成功） */
+    --gold: #C49A6C;            /* 金黄（警告） */
+    --cinnabar: #B84838;        /* 朱砂（错误） */
 }
 
 * {
@@ -57,7 +115,7 @@
 }
 
 body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    font-family: var(--font-ui), var(--font-cn);
     background: var(--bg-primary);
     color: var(--text-primary);
     min-height: 100vh;
@@ -77,8 +135,9 @@ body {
 .wizard-container {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 16px;
+    border-radius: var(--radius-modal);
     padding: 40px;
+    box-shadow: var(--shadow-medium);
 }
 
 .wizard-container h1 {
@@ -1003,9 +1062,10 @@ body {
 .settings-section {
     background: var(--bg-card);
     border: 1px solid var(--border-subtle);
-    border-radius: 12px;
+    border-radius: var(--radius-card);
     padding: 24px;
     margin-bottom: 24px;
+    box-shadow: var(--shadow-low);
 }
 
 .settings-section h2 {
@@ -1287,9 +1347,10 @@ body {
     gap: 16px;
     background: var(--bg-card);
     border: 1px solid var(--border-subtle);
-    border-radius: 12px;
+    border-radius: var(--radius-card);
     padding: 16px 20px;
     text-align: left;
+    box-shadow: var(--shadow-low);
 }
 
 .status-icon {
@@ -1463,7 +1524,7 @@ body {
 .qs-test-hint {
     margin-top: 6px;
     padding: 6px 8px;
-    background: rgba(192, 57, 43, 0.08);
+    background: var(--danger-alpha-08);
     border-radius: 4px;
     font-size: 11px;
     color: var(--text-secondary);
@@ -1485,7 +1546,7 @@ body {
 .qs-test-final {
     margin-top: 8px;
     padding: 8px 10px;
-    background: rgba(46, 204, 113, 0.08);
+    background: var(--success-alpha-10);
     border-radius: 4px;
     color: var(--jade);
     font-weight: 500;

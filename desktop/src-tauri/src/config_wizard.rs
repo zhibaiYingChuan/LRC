@@ -48,15 +48,30 @@ fn default_config_version() -> u32 {
 
 impl WizardConfig {
     /// 解析 LLM API 配置字符串并加密 API Key
-    /// 
-    /// 格式：
+    ///
+    /// 格式（推荐，使用 || 分隔符，支持 API Key 中包含冒号）：
+    ///   "openai||sk-xxx||gpt-4o||https://api.openai.com/v1"
+    ///   "ollama||llama3||http://localhost:11434"
+    ///
+    /// 向后兼容：若输入不含 ||，则按旧格式（冒号分隔）解析并记录警告日志：
     ///   "openai:sk-xxx:gpt-4o:https://api.openai.com/v1"
     ///   "ollama:llama3:http://localhost:11434"
-    /// 
+    ///
     /// API Key 使用 AES-256-GCM 加密后存储（L1-02），
     /// 原始 Key 不会以明文形式写入磁盘。
     pub fn parse_llm_config(&mut self, llm_api: &str) -> Result<(), String> {
-        let parts: Vec<&str> = llm_api.splitn(4, ':').collect();
+        // M-5 修复：优先使用 || 分隔符（支持 API Key 中包含冒号）
+        // 向后兼容：若输入不含 ||，回退到旧分隔符 : 并记录警告
+        let parts: Vec<&str> = if llm_api.contains("||") {
+            llm_api.splitn(4, "||").collect()
+        } else {
+            tracing::warn!(
+                "LLM 配置使用旧格式（冒号分隔），建议迁移到新格式（|| 分隔）。\
+                 当 API Key 包含冒号时旧格式会解析错误。输入: {}",
+                llm_api
+            );
+            llm_api.splitn(4, ':').collect()
+        };
 
         match parts.first() {
             Some(&"openai") => {
@@ -132,9 +147,9 @@ impl WizardConfig {
 
     /// 将存储的配置重建为 LLM API 字符串（用于传递给 Sidecar）
     ///
-    /// 格式与 parse_llm_config 输入格式一致：
-    ///   "openai:sk-xxx:gpt-4o:https://api.openai.com/v1"
-    ///   "ollama:llama3:http://localhost:11434"
+    /// 格式与 parse_llm_config 推荐格式一致（使用 || 分隔符）：
+    ///   "openai||sk-xxx||gpt-4o||https://api.openai.com/v1"
+    ///   "ollama||llama3||http://localhost:11434"
     ///
     /// 返回 None 表示 LLM 未配置。
     pub fn to_llm_api_string(&self) -> Option<String> {
@@ -148,13 +163,14 @@ impl WizardConfig {
                 let model = self.llm_model.as_deref().unwrap_or("gpt-4o-mini");
                 // 使用用户配置的实际 base_url，而非硬编码 OpenAI 地址
                 let base_url = self.llm_base_url.as_deref().unwrap_or("https://api.openai.com/v1");
-                Some(format!("openai:{}:{}:{}", api_key, model, base_url))
+                // M-5 修复：使用 || 分隔符，避免 API Key 中包含冒号时解析错误
+                Some(format!("openai||{}||{}||{}", api_key, model, base_url))
             }
             "ollama" => {
                 let model = self.llm_model.as_deref().unwrap_or("llama3");
                 // 使用用户配置的实际 Ollama host
                 let host = self.llm_base_url.as_deref().unwrap_or("http://localhost:11434");
-                Some(format!("ollama:{}:{}", model, host))
+                Some(format!("ollama||{}||{}", model, host))
             }
             _ => None,
         }
@@ -194,8 +210,8 @@ impl WizardState {
     ///   2. 已有有效配置（project_dir + llm_configured）但 setup_complete 为 false → 自动完成
     ///      这解决了从旧版本升级或配置已存在但向导未完成标记的问题。
     /// v0.5.4 修复：配置损坏时记录日志，设置 corrupted_on_load 标记供前端检测
-    pub fn load() -> Self {
-        let config_path = Self::config_path();
+    pub fn load() -> Result<Self, String> {
+        let config_path = Self::config_path()?;
         let mut corrupted = false;
         let mut config = if config_path.exists() {
             match std::fs::read_to_string(&config_path) {
@@ -263,11 +279,11 @@ impl WizardState {
             }
         }
 
-        Self {
+        Ok(Self {
             config,
             config_path,
             corrupted_on_load: corrupted,
-        }
+        })
     }
 
     /// 获取配置的只读引用
@@ -334,11 +350,34 @@ impl WizardState {
     }
 
     /// 配置存储路径
-    fn config_path() -> PathBuf {
-        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
-        PathBuf::from(appdata)
-            .join("LoongRecall")
-            .join("wizard.json")
+    ///
+    /// M-14 修复：APPDATA 未设置时使用 dirs crate 回退，而非当前目录（安全风险）。
+    /// 优先级：APPDATA 环境变量 → dirs::config_dir() → dirs::data_dir() → 错误
+    fn config_path() -> Result<PathBuf, String> {
+        // 优先使用 APPDATA 环境变量（保持向后兼容）
+        let base_dir = if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.is_empty() {
+                PathBuf::from(appdata)
+            } else {
+                // APPDATA 为空字符串，回退到 dirs crate
+                tracing::warn!("APPDATA 环境变量为空，使用 dirs::config_dir() 作为回退");
+                dirs::config_dir()
+                    .or_else(|| dirs::data_dir())
+                    .ok_or_else(|| {
+                        "无法确定配置目录：APPDATA 为空且 dirs::config_dir()/data_dir() 均返回 None".to_string()
+                    })?
+            }
+        } else {
+            // APPDATA 未设置，回退到 dirs crate
+            tracing::warn!("APPDATA 环境变量未设置，使用 dirs::config_dir() 作为回退");
+            dirs::config_dir()
+                .or_else(|| dirs::data_dir())
+                .ok_or_else(|| {
+                    "无法确定配置目录：APPDATA 未设置且 dirs::config_dir()/data_dir() 均返回 None".to_string()
+                })?
+        };
+
+        Ok(base_dir.join("LoongRecall").join("wizard.json"))
     }
 
     /// 持久化到磁盘
@@ -370,7 +409,7 @@ mod tests {
         assert_eq!(config.llm_type, "none");
     }
 
-    /// TDD：测试 LLM 配置解析
+    /// TDD：测试 LLM 配置解析（旧格式冒号分隔，向后兼容）
     #[test]
     fn test_llm_config_parsing_openai() {
         let mut config = WizardConfig::default();
@@ -385,6 +424,49 @@ mod tests {
         assert_eq!(decrypted, "sk-test");
     }
 
+    /// TDD：测试 LLM 配置解析（新格式 || 分隔符）
+    #[test]
+    fn test_llm_config_parsing_openai_new_format() {
+        let mut config = WizardConfig::default();
+        config.parse_llm_config("openai||sk-test||gpt-4o||https://api.openai.com/v1").expect("解析失败");
+        assert!(config.llm_configured);
+        assert_eq!(config.llm_type, "openai");
+        assert_eq!(config.llm_model, Some("gpt-4o".into()));
+        assert!(!config.encrypted_api_key.is_empty(), "API Key 应已加密");
+        let decrypted = config.get_api_key().expect("解密失败");
+        assert_eq!(decrypted, "sk-test");
+    }
+
+    /// TDD：M-5 修复验证 — API Key 中包含冒号，只有 || 格式能正确解析
+    #[test]
+    fn test_llm_config_parsing_openai_colon_in_key() {
+        let mut config = WizardConfig::default();
+        // API Key "sk-abc:def" 包含冒号，旧格式会解析错误
+        config.parse_llm_config("openai||sk-abc:def||gpt-4o||https://api.openai.com/v1").expect("解析失败");
+        assert!(config.llm_configured);
+        assert_eq!(config.llm_type, "openai");
+        assert_eq!(config.llm_model, Some("gpt-4o".into()));
+        let decrypted = config.get_api_key().expect("解密失败");
+        // 关键断言：API Key 中的冒号应被完整保留
+        assert_eq!(decrypted, "sk-abc:def");
+    }
+
+    /// TDD：测试 to_llm_api_string 使用 || 分隔符输出
+    #[test]
+    fn test_to_llm_api_string_uses_new_separator() {
+        let mut config = WizardConfig::default();
+        config.parse_llm_config("openai||sk-test123||gpt-4o||https://api.deepseek.com/v1").expect("解析失败");
+        let api_string = config.to_llm_api_string().expect("应返回 LLM API 字符串");
+        // 应使用 || 分隔符（而非冒号作为字段分隔符）
+        assert!(api_string.starts_with("openai||"), "应以 openai|| 开头");
+        // 应能被 parse_llm_config 正确解析回来（往返一致性）
+        let mut config2 = WizardConfig::default();
+        config2.parse_llm_config(&api_string).expect("往返解析失败");
+        assert_eq!(config2.llm_type, "openai");
+        assert_eq!(config2.llm_model, Some("gpt-4o".into()));
+        assert_eq!(config2.get_api_key().expect("解密失败"), "sk-test123");
+    }
+
     #[test]
     fn test_llm_config_parsing_ollama() {
         let mut config = WizardConfig::default();
@@ -393,6 +475,18 @@ mod tests {
         assert_eq!(config.llm_type, "ollama");
         assert_eq!(config.llm_model, Some("llama3".into()));
         // Ollama 不需要 API Key
+        assert!(config.encrypted_api_key.is_empty());
+        assert!(config.get_api_key().is_none());
+    }
+
+    /// TDD：测试 Ollama 新格式 || 分隔符解析
+    #[test]
+    fn test_llm_config_parsing_ollama_new_format() {
+        let mut config = WizardConfig::default();
+        config.parse_llm_config("ollama||llama3||http://localhost:11434").expect("解析失败");
+        assert!(config.llm_configured);
+        assert_eq!(config.llm_type, "ollama");
+        assert_eq!(config.llm_model, Some("llama3".into()));
         assert!(config.encrypted_api_key.is_empty());
         assert!(config.get_api_key().is_none());
     }

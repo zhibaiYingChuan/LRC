@@ -1,6 +1,6 @@
 [package]
 name = "lrc-desktop"
-version = "0.5.6"
+version = "0.5.7"
 description = "LRC Desktop — 本地优先的 AI 代码记忆桌面应用"
 authors = ["LRC Team"]
 edition = "2021"
@@ -29,12 +29,15 @@ tokio = { version = "1", features = ["full"] }
 # 日志
 tracing = "0.1"
 tracing-subscriber = "0.3"
+tracing-appender = "0.2"  # v0.5.7 修复 L-5：原子日志轮转
 # 错误处理
 anyhow = "1"
 # 打开浏览器/文件
 open = "5"
 # 文件选择对话框
 rfd = "0.15"
+# 用户目录获取（v0.5.6：全局规则文件写入）
+dirs = "5"
 # HTTP 客户端（sidecar 健康检查）
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # time crate 版本约束（兼容 0.3.x 系列，避免与 tauri-utils 冲突）

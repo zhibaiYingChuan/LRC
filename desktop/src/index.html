@@ -4,6 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LRC Desktop — AI 工具的记忆</title>
+    <!-- v0.5.7：引入 SFang UIUX 设计规范字体（Inter + JetBrains Mono + Noto Sans SC） -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -80,7 +84,7 @@
                     </div>
                     <div class="wizard-actions" style="margin-bottom:8px;margin-top:0;">
                         <button id="btn-step-1-pick-folder" class="btn btn-outline" style="font-size:12px;padding:6px 12px;">📁 选择文件夹...</button>
-                        <span id="step-1-picked-folder" class="form-hint" style="display:none;margin-left:8px;color:#27ae60;"></span>
+                        <span id="step-1-picked-folder" class="form-hint" style="display:none;margin-left:8px;color:var(--success);"></span>
                     </div>
                     <div id="project-list" class="project-list">
                         <div class="loading">正在扫描项目...</div>
@@ -275,7 +279,7 @@
                 </div>
                 <div class="settings-actions">
                     <button id="settings-btn-save-llm" class="btn btn-primary">💾 保存 LLM 配置</button>
-                    <button id="settings-btn-clear-llm" class="btn btn-outline" style="color:#c0392b;">清除 LLM 配置</button>
+                    <button id="settings-btn-clear-llm" class="btn btn-outline" style="color:var(--danger);">清除 LLM 配置</button>
                 </div>
                 <div id="settings-llm-status" class="llm-status" style="display:none"></div>
             </section>
@@ -290,7 +294,7 @@
                   <button class="btn btn-primary" id="btn-reconfigure-agents" style="font-size: 13px; padding: 6px 16px;">
                     🔄 重新检测并配置 Agent MCP
                   </button>
-                  <span id="reconfigure-status" style="margin-left: 10px; font-size: 12px; color: #888;"></span>
+                  <span id="reconfigure-status" style="margin-left: 10px; font-size: 12px; color: var(--text-secondary);"></span>
                 </div>
                 <div class="agent-config-tabs" id="agent-config-tabs">
                     <button class="agent-tab active" data-tab="agent-ide">IDE 类</button>
@@ -468,7 +472,7 @@
                         每个窗口独立启动 LRC 实例，关闭窗口时自动释放。
                     </p>
                     <div class="settings-card-info" id="settings-multi-window-info">
-                        <span class="info-badge" style="background:#27ae60;">已启用</span>
+                        <span class="info-badge" style="background:var(--success);">已启用</span>
                         <span class="form-hint">当前限制：5 个窗口。可在下方关闭此功能。</span>
                     </div>
                 </div>
@@ -495,7 +499,7 @@
             <section class="settings-section">
                 <h2>📋 关于 LRC</h2>
                 <div class="about-info">
-                    <p><strong>Loong Recall (LRC) v0.5.4</strong></p>
+                    <p><strong>Loong Recall (LRC) v0.5.7</strong></p>
                     <p>本地优先的 AI 工具记忆系统</p>
                     <p>数据存储：<code>%APPDATA%\LoongRecall\</code></p>
                     <p>服务端口：<code id="about-port">3099</code></p>
@@ -510,7 +514,7 @@
         <div class="ready-container">
             <div class="ready-header">
                 <h1>🧠 LRC Desktop 已就绪</h1>
-                <span class="ready-badge">v0.5.4</span>
+                <span class="ready-badge">v0.5.7</span>
             </div>
             <div class="ready-status-cards">
                 <div class="status-card">
@@ -591,7 +595,7 @@
                 <button id="btn-ready-wizard" class="btn btn-outline">🔄 切换项目</button>
             </div>
             <div class="ready-actions" style="margin-top:8px;">
-                <button id="btn-ready-reset" class="btn btn-outline" style="font-size:11px;color:#c0392b;border-color:#c0392b;">🔁 重置配置，重新进入向导</button>
+                <button id="btn-ready-reset" class="btn btn-outline" style="font-size:11px;color:var(--danger);border-color:var(--danger);">🔁 重置配置，重新进入向导</button>
             </div>
             <p class="ready-hint">LRC 在后台静默运行。可通过系统托盘图标右键菜单管理。</p>
         </div>
