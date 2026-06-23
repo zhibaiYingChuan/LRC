@@ -655,31 +655,36 @@
       }
     }
 
-    // v0.5.6 修复：重新调用 configure_agents 确保全局规则文件写入
-    // v0.5.7 增强：使用超时包装，添加进度提示
-    if (config.selectedAgents.length > 0) {
-      showProgress('正在配置 MCP 连接和全局规则...');
-      try {
-        const actualPort = config.port || 3099;
-        await tauriInvokeWithTimeout('configure_agents', {
-          agentIds: config.selectedAgents,
-          port: actualPort,
-        }, 30000); // configure_agents 涉及文件写入，给 30 秒
-        console.log('[配置向导] 重新配置 Agent 完成（MCP 配置 + 全局规则文件已写入）');
-      } catch (e) {
-        console.warn('[配置向导] 重新配置 Agent 失败（非致命，规则文件可能未写入）:', e);
-      }
-    }
-
-    // 启动 sidecar
+    // v0.5.7 修复：先启动 sidecar 获取实际端口，再用实际端口配置 MCP
+    // 修复前：configure_agents 在 sidecar 启动前调用，使用默认端口 3099
+    // 如果 sidecar 实际使用其他端口（如 3100+），MCP 配置会写入错误端口
     showProgress('正在启动后台服务...');
     let sidecarStarted = false;
-    const port = await startSidecarWithConfig(
+    const actualPort = await startSidecarWithConfig(
       config.selectedProjects[0] || null,
       config.port || null,
       config.multiWindowEnabled
     );
-    if (port) sidecarStarted = true;
+    if (actualPort) {
+      sidecarStarted = true;
+      config.port = actualPort; // 保存实际端口供后续使用
+    }
+
+    // v0.5.6 修复：调用 configure_agents 确保全局规则文件写入
+    // v0.5.7 修复：使用 sidecar 实际端口配置 MCP，避免端口不匹配
+    if (config.selectedAgents.length > 0) {
+      showProgress('正在配置 MCP 连接和全局规则...');
+      try {
+        const portForConfig = actualPort || config.port || 3099;
+        await tauriInvokeWithTimeout('configure_agents', {
+          agentIds: config.selectedAgents,
+          port: portForConfig,
+        }, 30000); // configure_agents 涉及文件写入，给 30 秒
+        console.log('[配置向导] 配置 Agent 完成（MCP 配置 + 全局规则文件已写入，端口:', portForConfig, '）');
+      } catch (e) {
+        console.warn('[配置向导] 配置 Agent 失败（非致命，规则文件可能未写入）:', e);
+      }
+    }
 
     // v0.5.4 P0-4 新增：调用后端验证命令，获取完整验证结果
     let verifyResult = null;

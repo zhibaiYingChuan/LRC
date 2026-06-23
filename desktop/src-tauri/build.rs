@@ -51,12 +51,10 @@ fn sync_sidecar_binary() {
     let use_hash = true; // 优先使用哈希验证
 
     let dest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // 目标文件名统一为 lrc-sidecar.exe（与 tauri.conf.json 的 bundle.resources 一致）
-    let dest_path = dest_dir.join("lrc-sidecar.exe");
 
-    // 根据目标平台确定源二进制文件名
-    // Windows: code-memory-server.exe
-    // macOS/Linux: code-memory-server
+    // 根据目标平台确定源/目标二进制文件名
+    // Windows: code-memory-server.exe / lrc-sidecar.exe
+    // macOS/Linux: code-memory-server / lrc-sidecar（无扩展名）
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_triple = std::env::var("TARGET").unwrap_or_default();
     let binary_name = if target_os == "windows" {
@@ -64,6 +62,13 @@ fn sync_sidecar_binary() {
     } else {
         "code-memory-server"
     };
+    // v0.5.7 修复：目标文件名根据平台决定（与 find_sidecar_binary 的 EXE_SUFFIX 一致）
+    let dest_name = if target_os == "windows" {
+        "lrc-sidecar.exe"
+    } else {
+        "lrc-sidecar"
+    };
+    let dest_path = dest_dir.join(dest_name);
 
     println!("cargo:info=桌面端构建目标平台: {} (triple: {})", target_os, target_triple);
 
@@ -231,7 +236,8 @@ fn sync_sidecar_binary() {
         // P1-02 修复：构建前检测文件锁定冲突
         // 尝试重命名目标文件检测是否被占用，如果锁定则给出明确提示
         // ═══════════════════════════════════════════════════════════
-        let lock_check = dest_path.with_extension("exe.lock_check");
+        // v0.5.7 修复：lock check 文件名根据平台决定
+        let lock_check = dest_dir.join(format!("{}.lock_check", dest_name));
         match std::fs::rename(&dest_path, &lock_check) {
             Ok(()) => {
                 // 重命名成功 = 文件未被占用，恢复原名并继续

@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; script-src 'self' http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; img-src 'self' data: http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434"
+      "csp": "default-src 'self' http://127.0.0.1:* http://localhost:*; script-src 'self' http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com http://127.0.0.1:* http://localhost:*; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:*; img-src 'self' data: http://127.0.0.1:* http://localhost:*"
     }
   },
   "bundle": {
@@ -39,7 +39,7 @@
       "icons/icon.png"
     ],
     "resources": {
-      "lrc-sidecar.exe": "./"
+      "lrc-sidecar*": "./"
     },
     "windows": {
       "wix": {
