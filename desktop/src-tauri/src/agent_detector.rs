@@ -264,7 +264,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
     KnownTool {
         id: "codegeex",
         name: "智谱 CodeGeeX",
-        icon: "🧠",
+        icon: "🧬",  // v0.5.7 修复 L-1：从 🧠 改为 🧬（避免与 claude-desktop 重复）
         category: "ai-assistant",
         supports_mcp: false,
         primary_marker: ".codegeex",
@@ -276,7 +276,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
     KnownTool {
         id: "tencent-ai-code",
         name: "腾讯云 AI 代码助手",
-        icon: "☁️",
+        icon: "🐧",  // v0.5.7 修复 L-1：从 ☁️ 改为 🐧（腾讯企鹅，避免与 tongyi-lingma 重复）
         category: "ai-assistant",
         supports_mcp: false,
         primary_marker: ".tencent-ai-code",
@@ -372,7 +372,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
     KnownTool {
         id: "amazon-q",
         name: "Amazon Q Developer",
-        icon: "☁️",
+        icon: "📦",  // v0.5.7 修复 L-1：从 ☁️ 改为 📦（Amazon 包裹，避免与 tongyi-lingma 重复）
         category: "ai-assistant",
         supports_mcp: false,
         primary_marker: ".aws",
@@ -420,7 +420,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
     KnownTool {
         id: "zed",
         name: "Zed",
-        icon: "⚡",
+        icon: "🚀",  // v0.5.7 修复 L-1：从 ⚡ 改为 🚀（高性能编辑器，避免与 augment 重复）
         category: "ide",
         supports_mcp: false,
         primary_marker: ".zed",
@@ -1344,6 +1344,8 @@ impl AgentDetectorRegistry {
     ///   - API Key 不写入 MCP 配置文件
     ///   - 对于不支持 MCP 的工具，仅返回提示信息
     pub fn configure(&self, agent_ids: &[String], port: u16, project_dir: Option<&std::path::Path>) -> Result<Vec<String>, String> {
+        // v0.5.6：project_dir 不再用于规则文件写入（改为全局），保留参数仅为向后兼容
+        let _ = project_dir;
         let mut configured = Vec::new();
 
         tracing::info!(
@@ -1404,24 +1406,21 @@ impl AgentDetectorRegistry {
                             tracing::info!("[MCP配置] {} — 配置写入成功: {}", info.name, path_str);
                             configured.push(format!("{} (全局配置)", info.name));
 
-                            // v0.5.4 修复：MCP 配置写入成功后，自动写入 AI 规则文件
-                            // 告知 AI 在什么情况下使用 remember/recall 工具
-                            if let Some(ref proj_dir) = project_dir {
-                                match Self::write_ai_rules(proj_dir, &info.id) {
-                                    Ok(()) => {
-                                        tracing::info!(
-                                            "[AI规则] {} — 规则文件写入成功（项目: {}）",
-                                            info.name,
-                                            proj_dir.display()
-                                        );
-                                    }
-                                    Err(e) => {
-                                        // AI 规则写入失败不影响主流程（MCP 配置已成功）
-                                        tracing::warn!(
-                                            "[AI规则] {} — 规则文件写入失败（不影响 MCP 功能）: {}",
-                                            info.name, e
-                                        );
-                                    }
+                            // v0.5.6 重构：MCP 配置写入成功后，自动写入全局 AI 规则文件
+                            // 规则文件写入用户主目录，一次配置对所有项目生效
+                            match Self::write_ai_rules(&info.id) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "[AI规则] {} — 全局规则文件写入成功",
+                                        info.name
+                                    );
+                                }
+                                Err(e) => {
+                                    // AI 规则写入失败不影响主流程（MCP 配置已成功）
+                                    tracing::warn!(
+                                        "[AI规则] {} — 全局规则文件写入失败（不影响 MCP 功能）: {}",
+                                        info.name, e
+                                    );
                                 }
                             }
                         }
@@ -1461,6 +1460,44 @@ impl AgentDetectorRegistry {
         self.configure(&installed_ids, port, project_dir)
     }
 
+    /// v0.5.6 新增：为指定 Agent 写入全局 IDE 规则文件（不修改 MCP 配置）
+    ///
+    /// 规则文件写入用户主目录，一次配置对所有项目生效。
+    /// 与 configure() 不同，此方法不修改 MCP 配置文件，只写入规则文件。
+    /// v0.5.6 重构：从项目级改为全局级，不再需要 project_dir 参数
+    pub fn write_rules_for_agents(
+        &self,
+        agent_ids: &[String],
+    ) -> Result<Vec<String>, String> {
+        let mut results = Vec::new();
+        tracing::info!(
+            "[AI规则] 开始为 {} 个 Agent 写入全局规则文件",
+            agent_ids.len()
+        );
+
+        for id in agent_ids {
+            // 查找已知工具
+            let known = KNOWN_TOOLS.iter().find(|t| t.id == *id);
+            if known.is_none() {
+                tracing::debug!("[AI规则] {} — 未知工具，跳过", id);
+                continue;
+            }
+
+            match Self::write_ai_rules(id) {
+                Ok(()) => {
+                    tracing::info!("[AI规则] {} — 全局规则文件写入成功", id);
+                    results.push(id.clone());
+                }
+                Err(e) => {
+                    tracing::warn!("[AI规则] {} — 全局规则文件写入失败: {}", id, e);
+                }
+            }
+        }
+
+        tracing::info!("[AI规则] 完成，共写入 {} 个全局规则文件", results.len());
+        Ok(results)
+    }
+
     /// v0.5.5 新增：自动检测并升级旧版本 MCP 配置
     ///
     /// 在 sidecar 启动时自动调用，无需用户重新运行配置向导。
@@ -1471,6 +1508,8 @@ impl AgentDetectorRegistry {
     ///
     /// 这样用户升级 LRC Desktop 后，无需手动操作，配置自动升级。
     pub fn auto_upgrade_configs(&self, port: u16, project_dir: Option<&std::path::Path>) -> Result<Vec<String>, String> {
+        // v0.5.6：project_dir 不再用于规则文件写入（改为全局），保留参数仅为向后兼容
+        let _ = project_dir;
         let mut upgraded = Vec::new();
 
         tracing::info!("[自动升级] 开始检测旧版本 MCP 配置（端口: {}）", port);
@@ -1515,15 +1554,13 @@ impl AgentDetectorRegistry {
                     tracing::info!("[自动升级] {} — MCP 配置升级成功: {}", info.name, config_path.display());
                     upgraded.push(format!("{} — MCP 配置已升级为 HTTP 模式", info.name));
 
-                    // 同时升级规则文件
-                    if let Some(ref proj_dir) = project_dir {
-                        match Self::write_ai_rules(proj_dir, &info.id) {
-                            Ok(()) => {
-                                tracing::info!("[自动升级] {} — 规则文件升级成功", info.name);
-                            }
-                            Err(e) => {
-                                tracing::warn!("[自动升级] {} — 规则文件升级失败（不影响 MCP）: {}", info.name, e);
-                            }
+                    // v0.5.6：同时升级全局规则文件（不再依赖 project_dir）
+                    match Self::write_ai_rules(&info.id) {
+                        Ok(()) => {
+                            tracing::info!("[自动升级] {} — 全局规则文件升级成功", info.name);
+                        }
+                        Err(e) => {
+                            tracing::warn!("[自动升级] {} — 全局规则文件升级失败（不影响 MCP）: {}", info.name, e);
                         }
                     }
                 }
@@ -1682,27 +1719,62 @@ impl AgentDetectorRegistry {
         Ok(())
     }
 
-    /// v0.5.5 修复：获取 AI 工具的规则文件模板（相对于项目根目录）
+    /// v0.5.6 重构：获取 AI 工具的全局规则文件模板（相对于用户主目录）
     ///
     /// 规则文件告知 AI 在什么情况下使用 remember/recall 工具。
     /// 不同工具使用不同的规则文件格式和位置。
     ///
-    /// v0.5.5 修复内容：
-    /// - Trae: `.trae/rules.md` → `.trae/rules/lrc-memory.md`（Trae 实际读取 `.trae/rules/` 目录下的 .md 文件）
-    /// - 添加 frontmatter（YAML 头部），设置 `alwaysApply: true`，确保规则始终生效
+    /// v0.5.6 重大变更：从项目级规则改为全局规则
+    /// - 旧版：规则文件写入项目目录（如 `.cursor/rules/lrc-memory.mdc`），每个项目都要重新配置
+    /// - 新版：规则文件写入用户主目录（如 `~/.cursor/rules/lrc-memory.mdc`），一次配置全局生效
+    ///
+    /// v0.5.7 修复内容（基于官方文档调研）：
+    /// - cline: `.cline/clinerules` → `Documents/Cline/Rules/lrc-memory.md`
+    ///   官方文档：https://docs.cline.bot/customization/cline-rules
+    ///   全局规则目录为 `~/Documents/Cline/Rules/`，非 `.cline/clinerules`
+    /// - windsurf: `.windsurf/rules/lrc-memory.md` → `.codeium/windsurf/memories/global_rules.md`
+    ///   官方文档：https://docs.windsurf.com/windsurf/cascade/memories
+    ///   全局规则为单文件 `global_rules.md`，`.windsurf/rules/` 是 workspace 级别
+    /// - roo-code: `.roo/rules.md` → `.roo/rules/lrc-memory.md`（目录而非单文件）
+    ///   官方文档：https://roocodeinc.github.io/Roo-Code/features/custom-instructions/
+    ///   全局规则目录为 `~/.roo/rules/`，规则文件放在该目录下
+    /// - zed: 移除（Zed 不支持传统全局规则文件，使用 Handlebars 模板）
+    ///
+    /// v0.5.6 修复内容：
+    /// - 所有路径改为相对于用户主目录（%USERPROFILE%）的全局路径
+    /// - 修复 ID 不匹配：`roo` → `roo-code`，`jetbrains` → `jetbrains-ai`
+    /// - 新增 gemini-cli 全局规则（`~/.gemini/GEMINI.md`）
+    /// - 新增 aider 全局规则（`~/.aider/CONVENTIONS.md`）
     fn get_rules_file_template(tool_id: &str) -> Option<&'static str> {
         match tool_id {
+            // IDE 类 — 全局规则目录
             "cursor" => Some(".cursor/rules/lrc-memory.mdc"),
-            "trae" | "trae-cn" => Some(".trae/rules/lrc-memory.md"),
+            "trae" => Some(".trae/rules/lrc-memory.md"),
+            "trae-cn" => Some(".trae-cn/rules/lrc-memory.md"),
+            // v0.5.7 修复：Windsurf 全局规则为单文件 global_rules.md（非 .windsurf/rules/）
+            // 官方文档：https://docs.windsurf.com/windsurf/cascade/memories
+            // .windsurf/rules/ 是 workspace 级别，全局规则在 ~/.codeium/windsurf/memories/global_rules.md
+            "windsurf" => Some(".codeium/windsurf/memories/global_rules.md"),
+            // v0.5.7 移除：Zed 不支持传统全局规则文件（使用 Handlebars 模板，无法通过文件注入）
+            // "zed" => Some(".zed/rules/lrc-memory.md"),
+            // AI 编码助手类 — 全局规则文件
             "codebuddy" => Some(".codebuddy/rules.md"),
-            "cline" => Some(".clinerules"),
-            "windsurf" => Some(".windsurfrules"),
-            "roo" => Some(".roo/rules.md"),
-            "vscode" => Some(".github/copilot-instructions.md"),
+            // v0.5.7 修复：Cline 全局规则目录为 ~/Documents/Cline/Rules/（非 .cline/clinerules）
+            // 官方文档：https://docs.cline.bot/customization/cline-rules
+            // .clinerules 是项目级，全局规则在 Documents/Cline/Rules/
+            "cline" => Some("Documents/Cline/Rules/lrc-memory.md"),
+            // v0.5.7 修复：Roo Code 全局规则目录为 ~/.roo/rules/（目录而非单文件 .roo/rules.md）
+            // 官方文档：https://roocodeinc.github.io/Roo-Code/features/custom-instructions/
+            // 规则文件放在 ~/.roo/rules/ 目录下，如 ~/.roo/rules/lrc-memory.md
+            "roo-code" => Some(".roo/rules/lrc-memory.md"),
             "comate" => Some(".comate/rules.md"),
-            // v0.5.5 新增：支持更多工具的规则文件
-            "zed" => Some(".zed/rules.md"),
-            "jetbrains" => Some(".github/copilot-instructions.md"),
+            // CLI 工具类 — 全局规则文件
+            "gemini-cli" => Some(".gemini/GEMINI.md"),      // v0.5.6 新增
+            "aider" => Some(".aider/CONVENTIONS.md"),        // v0.5.6 新增
+            // VS Code + Copilot — 使用全局 instructions 文件
+            "vscode" => Some(".vscode/copilot-instructions.md"),
+            // JetBrains AI — 使用全局规则文件
+            "jetbrains-ai" => Some(".jetbrains/ai-instructions.md"),  // v0.5.6 修复：ID 从 "jetbrains" 改为 "jetbrains-ai"
             _ => None, // 其他工具暂不支持规则文件自动配置
         }
     }
@@ -1733,7 +1805,7 @@ impl AgentDetectorRegistry {
             "codebuddy" => "# CodeBuddy Rules — LRC 记忆系统自动配置",
             "cline" => "# Cline Rules — LRC 记忆系统自动配置",
             "windsurf" => "# Windsurf Rules — LRC 记忆系统自动配置",
-            "roo" => "# Roo Rules — LRC 记忆系统自动配置",
+            "roo-code" => "# Roo Code Rules — LRC 记忆系统自动配置",  // v0.5.7 修复：ID 从 "roo" 改为 "roo-code"
             "vscode" => "# GitHub Copilot Instructions — LRC 记忆系统自动配置",
             "comate" => "# Comate Rules — LRC 记忆系统自动配置",
             _ => "# AI Rules — LRC 记忆系统自动配置",
@@ -1741,7 +1813,7 @@ impl AgentDetectorRegistry {
 
         format!(
             r#"{frontmatter}{header}
-<!-- 本文件由 LRC Desktop v0.5.5 自动生成，请勿手动删除 LRC 相关规则 -->
+<!-- 本文件由 LRC Desktop v0.5.7 自动生成，请勿手动删除 LRC 相关规则 -->
 <!-- 如需自定义规则，请在本文件末尾添加 -->
 
 ## LRC 记忆系统（Loong Recall Code Memory）
@@ -1862,52 +1934,42 @@ AI：已记录登录 API 到记忆库
         )
     }
 
-    /// v0.5.5 修复：写入或合并 AI 规则文件
+    /// v0.5.6 重构：写入或合并 AI 全局规则文件
     ///
-    /// 在项目根目录写入 AI 规则文件，告知 AI 何时使用记忆工具。
+    /// 在用户主目录写入 AI 规则文件，告知 AI 何时使用记忆工具。
+    /// 规则文件是全局的，一次配置对所有项目生效。
     /// 如果文件已存在，在末尾追加 LRC 规则（不覆盖用户自定义内容）。
-    /// v0.5.5 增强：检测旧版本规则并自动升级到 v0.5.5 版本（保留用户自定义内容）
-    /// v0.5.5 修复：清理旧路径规则文件（.trae/rules.md → .trae/rules/lrc-memory.md）
-    fn write_ai_rules(project_dir: &std::path::Path, tool_id: &str) -> Result<(), String> {
+    /// v0.5.5 增强：检测旧版本规则并自动升级（保留用户自定义内容）
+    /// v0.5.6 重构：从项目级改为全局级，使用用户主目录
+    fn write_ai_rules(tool_id: &str) -> Result<(), String> {
         let template = match Self::get_rules_file_template(tool_id) {
             Some(t) => t,
             None => return Ok(()), // 该工具不支持规则文件，静默跳过
         };
 
-        let rules_path = project_dir.join(template);
+        // v0.5.6：使用用户主目录作为全局规则的基础路径
+        let home_dir = dirs::home_dir().ok_or_else(|| {
+            let msg = "无法获取用户主目录（USERPROFILE 环境变量未设置）";
+            tracing::error!("[AI规则] {} — {}", tool_id, msg);
+            msg.to_string()
+        })?;
 
-        // v0.5.5 修复：清理旧路径的规则文件
-        // Trae: .trae/rules.md → .trae/rules/lrc-memory.md
-        // Cursor: .cursorrules → .cursor/rules/lrc-memory.mdc
-        let legacy_paths: Vec<&str> = match tool_id {
+        let rules_path = home_dir.join(template);
+
+        // v0.5.6：清理旧的项目级规则文件（如果存在）
+        // 旧版写入项目目录的规则文件现在不再需要，但为避免冲突，仅记录日志
+        let legacy_project_paths: Vec<&str> = match tool_id {
             "trae" | "trae-cn" => vec![".trae/rules.md"],
             "cursor" => vec![".cursorrules"],
             _ => vec![],
         };
-
-        let mut user_content_from_legacy = String::new();
-        for legacy in &legacy_paths {
-            let legacy_path = project_dir.join(legacy);
-            if legacy_path.exists() {
-                let legacy_content = std::fs::read_to_string(&legacy_path).unwrap_or_default();
-                if legacy_content.contains("LRC 记忆系统") {
-                    // 提取 LRC 规则之前的用户自定义内容
-                    if let Some(pos) = legacy_content.find("## LRC 记忆系统") {
-                        let user_part = legacy_content[..pos].trim_end();
-                        if !user_part.is_empty() && !user_content_from_legacy.contains(user_part) {
-                            user_content_from_legacy.push_str(user_part);
-                            user_content_from_legacy.push_str("\n\n");
-                        }
-                    }
-                    // 删除旧路径文件
-                    let _ = std::fs::remove_file(&legacy_path);
-                    tracing::info!(
-                        "[AI规则] {} — 已清理旧路径规则文件: {}",
-                        tool_id,
-                        legacy_path.display()
-                    );
-                }
-            }
+        // 注意：旧的项目级路径无法在此清理（不知道项目目录），仅记录日志
+        if !legacy_project_paths.is_empty() {
+            tracing::debug!(
+                "[AI规则] {} — 旧版项目级规则文件（{:?}）需要用户手动清理",
+                tool_id,
+                legacy_project_paths
+            );
         }
 
         // 确保父目录存在
@@ -1919,50 +1981,43 @@ AI：已记录登录 API 到记忆库
 
         let lrc_rules = Self::generate_ai_rules_content(tool_id);
 
-        // 如果有从旧文件迁移的用户自定义内容，追加到 LRC 规则之前
-        let final_rules = if !user_content_from_legacy.is_empty() {
-            format!("{}{}", user_content_from_legacy, lrc_rules)
-        } else {
-            lrc_rules
-        };
-
         // 如果文件已存在，检查是否已包含 LRC 规则
         if rules_path.exists() {
             let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
             if existing.contains("LRC 记忆系统") {
-                // v0.5.5 增强：检测旧版本规则并自动升级
-                if !existing.contains("v0.5.5 自动生成") {
+                // v0.5.7 增强：检测旧版本规则并自动升级（兼容 v0.5.5、v0.5.6）
+                if !existing.contains("v0.5.7 自动生成") {
                     // 旧版本规则，需要升级
                     if let Some(pos) = existing.find("## LRC 记忆系统") {
                         let user_content = existing[..pos].trim_end();
                         let merged = if user_content.is_empty() {
-                            final_rules.clone()
+                            lrc_rules.clone()
                         } else {
-                            format!("{}\n\n{}", user_content, final_rules)
+                            format!("{}\n\n{}", user_content, lrc_rules)
                         };
                         std::fs::write(&rules_path, merged).map_err(|e| {
                             format!("更新规则文件失败: {} ({})", rules_path.display(), e)
                         })?;
                         tracing::info!(
-                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.5 版本: {}",
+                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.7 版本: {}",
                             tool_id,
                             rules_path.display()
                         );
                     } else {
-                        let merged = format!("{}\n\n{}", existing.trim_end(), final_rules);
+                        let merged = format!("{}\n\n{}", existing.trim_end(), lrc_rules);
                         std::fs::write(&rules_path, merged).map_err(|e| {
                             format!("更新规则文件失败: {} ({})", rules_path.display(), e)
                         })?;
                         tracing::info!(
-                            "[AI规则] {} — 已追加 LRC v0.5.5 规则到现有文件: {}",
+                            "[AI规则] {} — 已追加 LRC v0.5.7 规则到现有文件: {}",
                             tool_id,
                             rules_path.display()
                         );
                     }
                 } else {
-                    // 已是 v0.5.5 版本，跳过
+                    // 已是 v0.5.7 版本，跳过
                     tracing::info!(
-                        "[AI规则] {} — 规则文件已是 v0.5.5 版本，跳过: {}",
+                        "[AI规则] {} — 规则文件已是最新版本，跳过: {}",
                         tool_id,
                         rules_path.display()
                     );
@@ -1970,7 +2025,7 @@ AI：已记录登录 API 到记忆库
                 return Ok(());
             }
             // 在已有内容末尾追加 LRC 规则
-            let merged = format!("{}\n\n{}", existing.trim_end(), final_rules);
+            let merged = format!("{}\n\n{}", existing.trim_end(), lrc_rules);
             std::fs::write(&rules_path, merged).map_err(|e| {
                 format!("更新规则文件失败: {} ({})", rules_path.display(), e)
             })?;
@@ -1981,11 +2036,11 @@ AI：已记录登录 API 到记忆库
             );
         } else {
             // 创建新文件
-            std::fs::write(&rules_path, &final_rules).map_err(|e| {
+            std::fs::write(&rules_path, &lrc_rules).map_err(|e| {
                 format!("创建规则文件失败: {} ({})", rules_path.display(), e)
             })?;
             tracing::info!(
-                "[AI规则] {} — 已创建规则文件: {}",
+                "[AI规则] {} — 已创建全局规则文件: {}",
                 tool_id,
                 rules_path.display()
             );
@@ -2092,11 +2147,14 @@ mod tests {
         assert!(decoded.supports_mcp);
     }
 
-    /// TDD：测试 GenericMcpAgent 始终可用
+    /// TDD：测试 GenericMcpAgent 检测行为
+    /// v0.5.6 修复：GenericMcpAgent::detect() 在 v0.5.3 中改为返回 false，
+    ///   测试需同步更新，否则 cargo test 必定失败
     #[test]
     fn test_generic_mcp_always_available() {
         let detector = GenericMcpAgent;
-        assert!(detector.detect());
+        // v0.5.3 修复：GenericMcpAgent 不自动检测为已安装，需用户手动添加
+        assert!(!detector.detect());
         assert_eq!(detector.info().category, "custom");
     }
 

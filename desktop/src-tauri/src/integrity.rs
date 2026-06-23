@@ -151,9 +151,9 @@ impl IntegrityChecker {
     /// Magic Bytes: LRCSIG\x00\xFF (0x4C 0x52 0x43 0x53 0x49 0x47 0x00 0xFF)
     ///
     /// 校验流程：
-    /// 1. 读取自身二进制文件
-    /// 2. 从文件末尾搜索 Magic Bytes
-    /// 3. 若找到签名，提取 32 字节哈希，计算文件内容（排除签名区域）的 SHA-256
+    /// 1. 流式读取自身二进制文件（8KB 缓冲区，避免大文件占满内存）
+    /// 2. 从文件中搜索 Magic Bytes（流式搜索，处理跨块边界）
+    /// 3. 若找到签名，提取 32 字节哈希，流式计算文件内容（排除签名区域）的 SHA-256
     /// 4. 对比哈希值 → 不匹配则返回 SignatureMismatch
     /// 5. 若未找到签名（开发模式），跳过校验并记录警告
     fn check_self_integrity() -> Result<(), IntegrityError> {
@@ -182,13 +182,14 @@ impl IntegrityChecker {
             return Ok(());
         }
 
-        // 读取整个二进制文件
-        let binary_data = std::fs::read(&exe_path)
+        // M-13 修复：改为流式读取，避免将整个二进制文件加载到内存
+        // 原实现 std::fs::read() 会将整个可执行文件（可能 50MB+）读入内存
+        let mut file = std::fs::File::open(&exe_path)
             .map_err(|e| IntegrityError::ReadError(e.to_string()))?;
 
-        // 从文件末尾搜索 Magic Bytes
+        // 从文件末尾搜索 Magic Bytes（流式搜索）
         let magic: [u8; 8] = *obfstr::obfbytes!(b"LRCSIG\x00\xFF");
-        let signature_offset = Self::find_magic_bytes(&binary_data, &magic);
+        let signature_offset = Self::find_magic_bytes_streaming(&mut file, &magic)?;
 
         match signature_offset {
             Some(offset) => {
@@ -197,21 +198,18 @@ impl IntegrityChecker {
                 let expected_hash_end = expected_hash_start + 32;
 
                 // 边界检查：确保签名区域在文件范围内
-                if expected_hash_end > binary_data.len() {
+                if expected_hash_end > file_size as usize {
                     return Err(IntegrityError::SignatureMismatch);
                 }
 
-                // 提取嵌入的 SHA-256 哈希
-                let embedded_hash = &binary_data[expected_hash_start..expected_hash_end];
+                // 读取嵌入的 SHA-256 哈希（签名区域中的 32 字节）
+                let embedded_hash = Self::read_embedded_hash(&mut file, offset)?;
 
-                // 计算文件内容（排除签名区域）的 SHA-256
-                let content_to_hash = &binary_data[..offset];
-                let mut hasher = Sha256::new();
-                hasher.update(content_to_hash);
-                let computed_hash = hasher.finalize();
+                // 流式计算文件内容（排除签名区域）的 SHA-256
+                let computed_hash = Self::stream_sha256(&mut file, offset)?;
 
                 // 对比哈希值（使用恒定时间比较，防止时序攻击）
-                if constant_time_eq(embedded_hash, computed_hash.as_slice()) {
+                if constant_time_eq(&embedded_hash, &computed_hash) {
                     tracing::info!(
                         "SHA-256 完整性校验通过（文件大小: {} bytes, 签名位置: {}）",
                         file_size,
@@ -235,10 +233,137 @@ impl IntegrityChecker {
         }
     }
 
+    /// 流式搜索 Magic Bytes，返回最后一次出现的位置
+    ///
+    /// 使用 8KB 缓冲区分块读取文件，保留跨块边界的重叠区域以确保
+    /// 跨块匹配的 Magic Bytes 不会被遗漏。
+    /// 返回 Magic Bytes 的最后一次出现的绝对偏移量，若未找到则返回 None。
+    fn find_magic_bytes_streaming(
+        file: &mut std::fs::File,
+        magic: &[u8],
+    ) -> Result<Option<usize>, IntegrityError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        // 重置文件指针到开头
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| IntegrityError::ReadError(e.to_string()))?;
+
+        let magic_len = magic.len();
+        let buf_size = 8192;
+        let mut buffer = vec![0u8; buf_size];
+        let mut last_match: Option<usize> = None;
+        let mut absolute_offset = 0usize;
+        // 保留上一块末尾的 magic_len-1 字节，用于跨块边界搜索
+        let mut tail: Vec<u8> = Vec::new();
+
+        loop {
+            let bytes_read = file
+                .read(&mut buffer)
+                .map_err(|e| IntegrityError::ReadError(e.to_string()))?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            // 构造搜索缓冲区：上一块尾部 + 当前块
+            let search_buf: Vec<u8> = if tail.is_empty() {
+                buffer[..bytes_read].to_vec()
+            } else {
+                let mut combined = tail.clone();
+                combined.extend_from_slice(&buffer[..bytes_read]);
+                combined
+            };
+
+            // 在搜索缓冲区中查找 Magic Bytes 的所有出现位置
+            if search_buf.len() >= magic_len {
+                for i in 0..=(search_buf.len() - magic_len) {
+                    if &search_buf[i..i + magic_len] == magic {
+                        // 计算绝对偏移量：absolute_offset 是当前块起始位置，
+                        // tail.len() 是上一块保留的尾部字节数，
+                        // search_buf[i] 对应的绝对位置 = absolute_offset - tail.len() + i
+                        last_match = Some(absolute_offset - tail.len() + i);
+                    }
+                }
+            }
+
+            // 更新绝对偏移量
+            absolute_offset += bytes_read;
+
+            // 保留当前块末尾的 magic_len-1 字节作为下一块的 tail
+            if bytes_read >= magic_len - 1 {
+                tail = buffer[bytes_read - (magic_len - 1)..bytes_read].to_vec();
+            } else {
+                // 读取量小于 magic_len-1，保留全部
+                tail = buffer[..bytes_read].to_vec();
+            }
+        }
+
+        Ok(last_match)
+    }
+
+    /// 读取嵌入的 SHA-256 哈希（签名区域中的 32 字节）
+    ///
+    /// 哈希位于 Magic Bytes 之后，即 offset+8 到 offset+40 的位置。
+    fn read_embedded_hash(
+        file: &mut std::fs::File,
+        offset: usize,
+    ) -> Result<[u8; 32], IntegrityError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        file.seek(SeekFrom::Start((offset + 8) as u64))
+            .map_err(|e| IntegrityError::ReadError(e.to_string()))?;
+
+        let mut hash = [0u8; 32];
+        file.read_exact(&mut hash)
+            .map_err(|e| IntegrityError::ReadError(e.to_string()))?;
+        Ok(hash)
+    }
+
+    /// 流式计算文件内容 [0, end_offset) 的 SHA-256 哈希
+    ///
+    /// 使用 8KB 缓冲区分块读取，每次调用 Sha256::update，
+    /// 避免将整个文件加载到内存。
+    fn stream_sha256(
+        file: &mut std::fs::File,
+        end_offset: usize,
+    ) -> Result<[u8; 32], IntegrityError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| IntegrityError::ReadError(e.to_string()))?;
+
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 8192];
+        let mut remaining = end_offset;
+
+        while remaining > 0 {
+            let to_read = remaining.min(buffer.len());
+            let bytes_read = file
+                .read(&mut buffer[..to_read])
+                .map_err(|e| IntegrityError::ReadError(e.to_string()))?;
+            if bytes_read == 0 {
+                // 文件比预期短
+                return Err(IntegrityError::ReadError(
+                    "文件读取提前结束（文件大小与签名偏移不匹配）".into(),
+                ));
+            }
+            hasher.update(&buffer[..bytes_read]);
+            remaining -= bytes_read;
+        }
+
+        let result = hasher.finalize();
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&result);
+        Ok(hash)
+    }
+
     /// 在二进制数据中从末尾搜索 Magic Bytes
     ///
     /// 从后往前搜索，找到第一个匹配的位置。
     /// 返回 Magic Bytes 的起始偏移量，若未找到则返回 None。
+    ///
+    /// 注：M-13 修复后 check_self_integrity 改用流式搜索（find_magic_bytes_streaming），
+    /// 此方法保留供单元测试使用（操作内存切片而非文件）。
+    #[allow(dead_code)]
     fn find_magic_bytes(data: &[u8], magic: &[u8]) -> Option<usize> {
         let magic_len = magic.len();
         if data.len() < magic_len {

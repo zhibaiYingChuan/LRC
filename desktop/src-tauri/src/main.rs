@@ -40,7 +40,7 @@ fn main() {
 
     // 初始化全局状态
     let app_store = AppStore {
-        wizard: Mutex::new(WizardState::load()),
+        wizard: Mutex::new(WizardState::load().expect("加载向导状态失败：无法确定配置目录")),
         sidecar: Mutex::new(SidecarManager::new(
             // sidecar 二进制路径（与桌面应用同级目录）
             std::env::current_exe()
@@ -127,6 +127,8 @@ fn main() {
                 tracing::info!("Sidecar 心跳检测协程已启动（间隔 10 秒）");
                 let mut consecutive_failures = 0u32;
                 let mut last_instance_count = 0usize;
+                // M-6 修复：cleanup 计数器，每 30 次心跳（约 5 分钟）清理一次过期限流桶
+                let mut cleanup_counter = 0u32;
 
                 loop {
                     tokio::select! {
@@ -165,21 +167,64 @@ fn main() {
                         }
                     } else {
                         // 尝试恢复死亡的实例
-                        let recovered = sidecar.recover_dead_instances(None).await;
-                        if recovered > 0 {
-                            consecutive_failures = 0;
-                            tracing::info!("Sidecar 崩溃后自动恢复 {} 个实例", recovered);
-                            let _ = monitor_handle.emit(
-                                "sidecar-recovered",
-                                serde_json::json!({
-                                    "message": "服务已自动恢复",
-                                    "recovered": recovered
-                                }),
-                            );
+                        // v0.5.7 修复 L-11：先释放 sidecar 锁，再用 tokio::task::spawn 包装
+                        // recover_dead_instances，避免死锁并处理 panic
+                        drop(sidecar);
+
+                        let recover_handle = monitor_handle.clone();
+                        let recover_result = tokio::task::spawn(async move {
+                            let state = recover_handle.state::<AppStore>();
+                            let mut sidecar = state.sidecar.lock().await;
+                            sidecar.recover_dead_instances(None).await
+                        }).await;
+
+                        match recover_result {
+                            Ok(recovered) if recovered > 0 => {
+                                consecutive_failures = 0;
+                                tracing::info!("Sidecar 崩溃后自动恢复 {} 个实例", recovered);
+                                let _ = monitor_handle.emit(
+                                    "sidecar-recovered",
+                                    serde_json::json!({
+                                        "message": "服务已自动恢复",
+                                        "recovered": recovered
+                                    }),
+                                );
+                            }
+                            Ok(_) => {
+                                // 无需恢复或无实例可恢复
+                            }
+                            Err(join_err) => {
+                                tracing::error!(
+                                    "心跳检测：recover_dead_instances 子任务 panic，已恢复并继续监控: {}",
+                                    join_err
+                                );
+                            }
                         }
+
+                        // 重新获取 sidecar 锁以更新 last_instance_count
+                        sidecar = state.sidecar.lock().await;
                     }
 
                     last_instance_count = sidecar.list_instances().len();
+                    // 显式释放 sidecar 锁，避免与 rate_limiter 锁同时持有
+                    drop(sidecar);
+
+                    // M-6 修复：每 5 分钟（30 次 × 10 秒）清理一次过期的限流桶
+                    // 防止 RateLimiter 的 buckets HashMap 因大量客户端连接而无限增长
+                    cleanup_counter += 1;
+                    if cleanup_counter >= 30 {
+                        cleanup_counter = 0;
+                        let mut rate_limiter = state.rate_limiter.lock().await;
+                        let before = rate_limiter.active_buckets();
+                        rate_limiter.cleanup(std::time::Duration::from_secs(300));
+                        let after = rate_limiter.active_buckets();
+                        if before != after {
+                            tracing::info!(
+                                "RateLimiter 清理过期桶：{} → {}（清理 {} 个）",
+                                before, after, before.saturating_sub(after)
+                            );
+                        }
+                    }
                 }
             });
 
@@ -254,39 +299,23 @@ fn init_logging() {
         return;
     }
 
-    let log_file = log_dir.join("lrc-desktop.log");
-
-    // 日志文件轮转：如果文件超过 10MB，重命名为 .old
-    if let Ok(meta) = std::fs::metadata(&log_file) {
-        if meta.len() > 10 * 1024 * 1024 {
-            let old_file = log_dir.join("lrc-desktop.old.log");
-            let _ = std::fs::remove_file(&old_file);
-            let _ = std::fs::rename(&log_file, &old_file);
-        }
-    }
-
-    // 创建文件追加器
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("[LRC] 无法打开日志文件 {}: {}", log_file.display(), e);
-            let _ = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::INFO)
-                .try_init();
-            return;
-        }
-    };
+    // v0.5.7 修复 L-5：使用 tracing_appender::rolling 替代手动轮转
+    // 原先的 remove_file + rename 非原子操作，崩溃时可能丢失日志文件。
+    // tracing_appender::rolling 提供原子轮转，按天自动轮转日志文件。
+    // 使用 non_blocking 确保日志写入不阻塞主线程。
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "lrc-desktop.log");
+    let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
+    // 注意：_guard 必须保持存活，否则日志写入会停止。
+    // 但由于 init_logging 在 main 开始时调用，guard 会随进程生命周期存活。
+    // 为避免 guard 被 drop，将其泄漏（进程退出时自动清理）
+    std::mem::forget(_guard);
 
     // 构建日志订阅器：同时输出到控制台和文件
     let console_layer = tracing_subscriber::fmt::layer()
         .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
 
     let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::sync::Mutex::new(file))
+        .with_writer(non_blocking_file)
         .with_ansi(false) // 文件中不需要 ANSI 颜色代码
         .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
 

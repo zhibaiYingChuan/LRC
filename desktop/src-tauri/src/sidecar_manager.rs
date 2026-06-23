@@ -76,7 +76,7 @@ struct SidecarHandle {
     llm_api: Option<String>,
 }
 
-/// Drop 守卫：确保所有子进程在管理器被销毁时被 kill
+/// Drop 守卫：确保所有子进程在管理器被销毁时被 kill 并回收
 impl Drop for SidecarManager {
     fn drop(&mut self) {
         for (project_dir, handle) in self.instances.drain() {
@@ -85,6 +85,39 @@ impl Drop for SidecarManager {
             // 尝试优雅终止
             let mut child = handle.child;
             let _ = child.kill();
+            // M-12 修复：kill 后必须 wait 回收子进程，否则产生僵尸进程
+            // 使用 try_wait 轮询 + 短超时（3 秒），避免 Drop 中无限阻塞
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        tracing::debug!(
+                            "子进程 PID={} 已退出，僵尸进程已回收",
+                            pid
+                        );
+                        break;
+                    }
+                    Ok(None) => {
+                        // 进程仍在运行，检查是否超时
+                        if std::time::Instant::now() >= deadline {
+                            tracing::warn!(
+                                "等待子进程 PID={} 退出超时（3秒），可能残留僵尸进程",
+                                pid
+                            );
+                            break;
+                        }
+                        // 短暂休眠后重试，避免 CPU 空转
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "等待子进程 PID={} 退出失败: {}",
+                            pid, e
+                        );
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -263,10 +296,16 @@ impl SidecarManager {
         if let Some(ref llm) = llm_api {
             if !llm.is_empty() {
                 cmd.env("LRC_LLM_API", llm);
+                // M-5 修复：兼容 || 和 : 两种分隔符，提取 LLM 类型用于日志
+                let llm_type = if llm.contains("||") {
+                    llm.split("||").next()
+                } else {
+                    llm.split(':').next()
+                }.unwrap_or("unknown");
                 tracing::info!(
                     "已通过环境变量传递 LLM 配置到 Sidecar（项目: {}, 类型: {}）",
                     project_key,
-                    llm.split(':').next().unwrap_or("unknown")
+                    llm_type
                 );
             }
         }

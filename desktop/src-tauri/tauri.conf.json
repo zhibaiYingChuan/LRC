@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicoverbruggen/wuffs/main/static/tauri-schema.json",
   "productName": "LRC Desktop",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "identifier": "com.loongcode.lrc-desktop",
   "build": {
     "frontendDist": "../src",
@@ -25,7 +25,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; script-src 'self' http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; style-src 'self' 'unsafe-inline' http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; img-src 'self' data: http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434"
+      "csp": "default-src 'self' http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; script-src 'self' http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434; img-src 'self' data: http://127.0.0.1:3099 http://127.0.0.1:3100 http://127.0.0.1:11434"
     }
   },
   "bundle": {

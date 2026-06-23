@@ -26,6 +26,58 @@ async fn get_llm_api_from_wizard(store: &State<'_, AppStore>) -> Option<String> 
     wizard.config().to_llm_api_string()
 }
 
+/// v0.5.7 新增：sidecar 启动后的公共后处理逻辑（消除 M-15 重复代码）
+/// 
+/// 统一处理 start_sidecar、start_sidecar_for_project、switch_project 三处
+/// sidecar 启动后的自动升级 MCP 配置和写入全局 IDE 规则文件逻辑。
+/// 
+/// 注意：此函数不持有 sidecar 锁，避免锁持有时间过长（M-3/M-4 修复的一部分）。
+/// project_key 用于日志标识，传入 None 表示默认项目。
+async fn post_sidecar_start(
+    store: &State<'_, AppStore>,
+    port: u16,
+    project_key: Option<&str>,
+) {
+    // v0.5.5：自动检测并升级旧版本 MCP 配置
+    // v0.5.6：规则文件改为全局级，不再依赖 project_dir
+    let (project_dir, configured_agents) = {
+        let wizard = store.wizard.lock().await;
+        (wizard.config().project_dir.clone(),
+         wizard.config().configured_agents.clone())
+    };
+    let project_path = project_dir.as_ref().map(|d| std::path::Path::new(d));
+    let registry = store.agent_registry.lock().await;
+    match registry.auto_upgrade_configs(port, project_path) {
+        Ok(upgraded) => {
+            if !upgraded.is_empty() {
+                match project_key {
+                    Some(key) => tracing::info!("[sidecar] 自动升级完成（项目 {}）: {:?}", key, upgraded),
+                    None => tracing::info!("[sidecar] 自动升级完成: {:?}", upgraded),
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("[sidecar] 自动升级失败（不影响 sidecar 运行）: {}", e);
+        }
+    }
+
+    // v0.5.6：sidecar 启动后自动写入全局 IDE 规则文件
+    // 解决升级场景：用户升级 LRC Desktop 后，规则文件可能缺失或过时
+    if !configured_agents.is_empty() {
+        match registry.write_rules_for_agents(&configured_agents) {
+            Ok(written) => {
+                if !written.is_empty() {
+                    match project_key {
+                        Some(key) => tracing::info!("[sidecar] 已为项目 {} 写入 {} 个全局 IDE 规则文件", key, written.len()),
+                        None => tracing::info!("[sidecar] 已为 {} 个 Agent 写入全局 IDE 规则文件", written.len()),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("[sidecar] 全局规则文件写入失败（不影响 sidecar）: {}", e),
+        }
+    }
+}
+
 /// 在主窗口 iframe 中显示仪表盘（统一入口，消除 2 处重复的 JS 注入逻辑）
 /// 
 /// 原先 navigate_main_to_dashboard 和 open_dashboard_window 有几乎相同的逻辑，
@@ -252,35 +304,23 @@ pub async fn start_sidecar(
     // v0.5.1 重构：统一使用 get_llm_api_from_wizard 辅助函数
     let llm_api = get_llm_api_from_wizard(&store).await;
 
-    let mut sidecar = store.sidecar.lock().await;
-    let port = sidecar.start(src_dir, port, multi_window, llm_api).await
-        .map_err(|e| user_friendly_error(&e))?;
-    // 保存端口供其他模块（托盘等）使用
-    let mut saved_port = store.sidecar_port.lock().await;
-    *saved_port = Some(port);
-    drop(saved_port);
-    drop(sidecar);
+    // v0.5.7 修复 M-3：缩小 sidecar 锁持有范围，sidecar_port 更新移到锁释放后
+    // 原先 sidecar 锁持有期间还获取 sidecar_port 锁，导致锁嵌套。
+    // 现在先释放 sidecar 锁，再获取 sidecar_port 锁，减少锁持有时间。
+    let port = {
+        let mut sidecar = store.sidecar.lock().await;
+        sidecar.start(src_dir, port, multi_window, llm_api).await
+            .map_err(|e| user_friendly_error(&e))?
+    }; // sidecar 锁在此释放
 
-    // v0.5.5 新增：sidecar 启动后自动检测并升级旧版本 MCP 配置
-    // 这样用户升级 LRC Desktop 后，无需重新运行配置向导，配置自动升级
+    // 保存端口供其他模块（托盘等）使用
     {
-        let project_dir = {
-            let wizard = store.wizard.lock().await;
-            wizard.config().project_dir.clone()
-        };
-        let project_path = project_dir.as_ref().map(|d| std::path::Path::new(d));
-        let registry = store.agent_registry.lock().await;
-        match registry.auto_upgrade_configs(port, project_path) {
-            Ok(upgraded) => {
-                if !upgraded.is_empty() {
-                    tracing::info!("[sidecar] 自动升级完成: {:?}", upgraded);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("[sidecar] 自动升级失败（不影响 sidecar 运行）: {}", e);
-            }
-        }
+        let mut saved_port = store.sidecar_port.lock().await;
+        *saved_port = Some(port);
     }
+
+    // v0.5.7 重构 M-15：使用公共后处理函数（不持有 sidecar 锁）
+    post_sidecar_start(&store, port, None).await;
 
     Ok(port)
 }
@@ -301,36 +341,23 @@ pub async fn start_sidecar_for_project(
     // v0.5.1 重构：统一使用 get_llm_api_from_wizard 辅助函数
     let llm_api = get_llm_api_from_wizard(&store).await;
 
-    let mut sidecar = store.sidecar.lock().await;
-    let port = sidecar
-        .start_for_project(&project_key, src_dir, port, multi_window, llm_api)
-        .await
-        .map_err(|e| user_friendly_error(&e))?;
-    // 保存最新端口
-    let mut saved_port = store.sidecar_port.lock().await;
-    *saved_port = Some(port);
-    drop(saved_port);
-    drop(sidecar);
+    // v0.5.7 修复 M-3：缩小 sidecar 锁持有范围，sidecar_port 更新移到锁释放后
+    let port = {
+        let mut sidecar = store.sidecar.lock().await;
+        sidecar
+            .start_for_project(&project_key, src_dir, port, multi_window, llm_api)
+            .await
+            .map_err(|e| user_friendly_error(&e))?
+    }; // sidecar 锁在此释放
 
-    // v0.5.5 新增：sidecar 启动后自动检测并升级旧版本 MCP 配置
+    // 保存最新端口
     {
-        let project_dir = {
-            let wizard = store.wizard.lock().await;
-            wizard.config().project_dir.clone()
-        };
-        let project_path = project_dir.as_ref().map(|d| std::path::Path::new(d));
-        let registry = store.agent_registry.lock().await;
-        match registry.auto_upgrade_configs(port, project_path) {
-            Ok(upgraded) => {
-                if !upgraded.is_empty() {
-                    tracing::info!("[sidecar] 自动升级完成（项目 {}）: {:?}", project_key, upgraded);
-                }
-            }
-            Err(e) => {
-                tracing::warn!("[sidecar] 自动升级失败（不影响 sidecar 运行）: {}", e);
-            }
-        }
+        let mut saved_port = store.sidecar_port.lock().await;
+        *saved_port = Some(port);
     }
+
+    // v0.5.7 重构 M-15：使用公共后处理函数（不持有 sidecar 锁）
+    post_sidecar_start(&store, port, Some(&project_key)).await;
 
     Ok(port)
 }
@@ -349,16 +376,23 @@ pub async fn stop_sidecar_for_project(
 
 /// 停止 sidecar 进程
 /// v0.5.4 P1-6 修复：错误信息人性化
+/// v0.5.7 二次审计修复：缩小 sidecar 锁持有范围，避免 L1→L2 锁嵌套
 #[tauri::command]
 pub async fn stop_sidecar(
     store: State<'_, AppStore>,
 ) -> Result<(), String> {
-    let mut sidecar = store.sidecar.lock().await;
-    sidecar.stop().await
-        .map_err(|e| user_friendly_error(&e))?;
-    // 清除端口记录
-    let mut saved_port = store.sidecar_port.lock().await;
-    *saved_port = None;
+    // v0.5.7：先持有 sidecar 锁执行 stop()，释放后再获取 sidecar_port 锁
+    {
+        let mut sidecar = store.sidecar.lock().await;
+        sidecar.stop().await
+            .map_err(|e| user_friendly_error(&e))?;
+    } // sidecar 锁在此释放
+
+    // 清除端口记录（单独获取 sidecar_port 锁，避免锁嵌套）
+    {
+        let mut saved_port = store.sidecar_port.lock().await;
+        *saved_port = None;
+    }
     Ok(())
 }
 
@@ -410,12 +444,14 @@ pub async fn save_llm_config(
         llm_type: config.llm_type.clone(),
         model: config.llm_model.clone(),
     };
+    // v0.5.7 二次审计修复：提前克隆 llm_api_str，释放 wizard 锁后再获取 sidecar_port 锁
+    let llm_api_str = config.to_llm_api_string();
+    drop(wizard); // 释放 wizard 锁，避免与 sidecar_port 锁嵌套
 
     // v0.5.4 修复：保存 LLM 配置后，同步到 Sidecar 的内存状态
     // 否则仪表盘（通过 GET /api/config）仍显示"未配置"
     let sidecar_port = store.sidecar_port.lock().await;
     if let Some(port) = *sidecar_port {
-        let llm_api_str = config.to_llm_api_string();
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
@@ -436,10 +472,14 @@ pub async fn save_llm_config(
 pub async fn clear_llm_config(
     store: State<'_, AppStore>,
 ) -> Result<LlmConfigResponse, String> {
-    let mut wizard = store.wizard.lock().await;
-    // 清除 LLM 配置（保留其他配置不变）
-    wizard.save_llm_config("")
-        .map_err(|e| user_friendly_error(&e))?;
+    // v0.5.7 二次审计修复：缩小 wizard 锁持有范围，避免与 sidecar_port 锁嵌套
+    {
+        let mut wizard = store.wizard.lock().await;
+        // 清除 LLM 配置（保留其他配置不变）
+        wizard.save_llm_config("")
+            .map_err(|e| user_friendly_error(&e))?;
+    } // wizard 锁在此释放
+
     let response = LlmConfigResponse {
         configured: false,
         llm_type: "none".to_string(),
@@ -856,24 +896,37 @@ pub async fn list_sidecar_projects(
 pub async fn get_wizard_state(
     store: State<'_, AppStore>,
 ) -> Result<WizardStateResponse, String> {
-    let wizard = store.wizard.lock().await;
-    let config = wizard.config();
-    let corrupted = wizard.corrupted_on_load;
+    // v0.5.6 修复 H-2：锁顺序改为先 sidecar（L1）后 sidecar_port（L2），避免 AB-BA 死锁
+    // 先获取 wizard 数据并释放锁
+    let (setup_complete, project_dir, llm_configured, llm_type, llm_model, configured_agents, corrupted) = {
+        let wizard = store.wizard.lock().await;
+        let config = wizard.config();
+        (
+            config.setup_complete,
+            config.project_dir.clone(),
+            config.llm_configured,
+            config.llm_type.clone(),
+            config.llm_model.clone(),
+            config.configured_agents.clone(),
+            wizard.corrupted_on_load,
+        )
+    };
 
-    // 检查 sidecar 运行状态
+    // 再按 L1 -> L2 顺序获取 sidecar 锁
     let sidecar = store.sidecar.lock().await;
     let sidecar_running = sidecar.is_running();
-    let sidecar_port = store.sidecar_port.lock().await;
+    drop(sidecar);
+    let sidecar_port = *store.sidecar_port.lock().await;
 
     Ok(WizardStateResponse {
-        setup_complete: config.setup_complete,
-        project_dir: config.project_dir.clone(),
-        llm_configured: config.llm_configured,
-        llm_type: config.llm_type.clone(),
-        llm_model: config.llm_model.clone(),
-        configured_agents: config.configured_agents.clone(),
+        setup_complete,
+        project_dir,
+        llm_configured,
+        llm_type,
+        llm_model,
+        configured_agents,
         sidecar_running,
-        sidecar_port: *sidecar_port,
+        sidecar_port,
         config_corrupted: corrupted,
     })
 }
@@ -969,24 +1022,44 @@ pub async fn switch_project(
     }
 
     // 1. 保存新项目路径并提取 LLM 配置
-    let llm_api = {
+    let (llm_api, configured_agents) = {
         let mut wizard = store.wizard.lock().await;
         wizard.set_project_dir(&project_dir)
             .map_err(|e| user_friendly_error(&e))?;
-        wizard.config().to_llm_api_string()
+        (wizard.config().to_llm_api_string(),
+         wizard.config().configured_agents.clone())
     };
-    
-    // 2. 重启 sidecar 以重新索引
-    let mut sidecar = store.sidecar.lock().await;
-    if sidecar.is_running() {
-        sidecar.stop().await
-            .map_err(|e| user_friendly_error(&e))?;
+
+    // v0.5.6 修复：切换项目后，确保全局 IDE 规则文件存在
+    // v0.5.6 重构：规则文件改为全局级（写入用户主目录），切换项目不再需要重新写入
+    //   但仍调用此方法确保规则文件存在（首次安装后可能尚未写入）
+    if !configured_agents.is_empty() {
+        let registry = store.agent_registry.lock().await;
+        match registry.write_rules_for_agents(&configured_agents) {
+            Ok(written) => tracing::info!("[切换项目] 已确保 {} 个全局 IDE 规则文件存在: {}", written.len(), project_dir),
+            Err(e) => tracing::warn!("[切换项目] 全局规则文件写入失败（不影响 sidecar）: {}", e),
+        }
     }
-    let port = sidecar.start(Some(project_dir.clone()), None, multi_window, llm_api).await
-        .map_err(|e| user_friendly_error(&e))?;
-    let mut saved_port = store.sidecar_port.lock().await;
-    *saved_port = Some(port);
-    
+
+    // 2. 重启 sidecar 以重新索引
+    // v0.5.7 修复 M-4：缩小 sidecar 锁持有范围，sidecar_port 更新移到锁释放后
+    // 原先在持有 sidecar 锁期间执行 stop + start（可能 15 秒以上），且还获取 sidecar_port 锁。
+    // 现在使用 restart_project 原子方法，并在锁释放后更新 sidecar_port。
+    let port = {
+        let mut sidecar = store.sidecar.lock().await;
+        if sidecar.is_running() {
+            sidecar.stop().await
+                .map_err(|e| user_friendly_error(&e))?;
+        }
+        sidecar.start(Some(project_dir.clone()), None, multi_window, llm_api).await
+            .map_err(|e| user_friendly_error(&e))?
+    }; // sidecar 锁在此释放
+
+    {
+        let mut saved_port = store.sidecar_port.lock().await;
+        *saved_port = Some(port);
+    }
+
     Ok(SwitchProjectResponse {
         success: true,
         port,
@@ -1076,16 +1149,22 @@ pub async fn verify_setup(
 
     // ── 1. 检查 Sidecar 状态 ──
     // v0.5.4 修复：端口从 sidecar_port 获取，而非 wizard.config().port（WizardConfig 无此字段）
-    let port = *store.sidecar_port.lock().await;
+    // v0.5.6 修复 H-1：锁顺序改为先 sidecar（L1）后 sidecar_port（L2），避免 AB-BA 死锁
     let sidecar = store.sidecar.lock().await;
     let sidecar_running = sidecar.is_running();
     drop(sidecar);
+    let port = *store.sidecar_port.lock().await;
 
     if sidecar_running {
         if let Some(port) = port {
             // 通过 /health 端点验证
+            // v0.5.6 修复 M-7：添加 3 秒超时，避免防火墙 DROP 规则导致永久阻塞
             let health_url = format!("http://127.0.0.1:{port}/health");
-            match reqwest::get(&health_url).await {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+            match client.get(&health_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     result.sidecar_running = true;
                     result.sidecar_port = Some(port);
