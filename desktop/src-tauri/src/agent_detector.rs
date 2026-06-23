@@ -1756,8 +1756,13 @@ impl AgentDetectorRegistry {
         match tool_id {
             // IDE 类 — 全局规则目录
             "cursor" => Some(".cursor/rules/lrc-memory.mdc"),
-            "trae" => Some(".trae/rules/lrc-memory.md"),
-            "trae-cn" => Some(".trae-cn/rules/lrc-memory.md"),
+            // v0.5.8 修复：Trae/Trae CN 的用户级（全局）规则在 user_rules/ 目录，不是 rules/
+            // 修复前：写入 ~/.trae/rules/lrc-memory.md（项目级规则目录，仅在打开项目时读取项目根目录）
+            // 修复后：写入 ~/.trae/user_rules/lrc-memory.md（用户级规则目录，全局生效）
+            // 参考：Trae CN 官方文档 https://docs.trae.ai/ide/rules
+            //       全局规则通过 IDE 设置面板配置，存储在 ~/.trae-cn/user_rules/ 目录
+            "trae" => Some(".trae/user_rules/lrc-memory.md"),
+            "trae-cn" => Some(".trae-cn/user_rules/lrc-memory.md"),
             // v0.5.7 修复：Windsurf 全局规则为单文件 global_rules.md（非 .windsurf/rules/）
             // 官方文档：https://docs.windsurf.com/windsurf/cascade/memories
             // .windsurf/rules/ 是 workspace 级别，全局规则在 ~/.codeium/windsurf/memories/global_rules.md
@@ -1820,7 +1825,7 @@ impl AgentDetectorRegistry {
 
         format!(
             r#"{frontmatter}{header}
-<!-- 本文件由 LRC Desktop v0.5.7 自动生成，请勿手动删除 LRC 相关规则 -->
+<!-- 本文件由 LRC Desktop v0.5.9 自动生成，请勿手动删除 LRC 相关规则 -->
 <!-- 如需自定义规则，请在本文件末尾添加 -->
 
 ## LRC 记忆系统（Loong Recall Code Memory）
@@ -1979,6 +1984,37 @@ AI：已记录登录 API 到记忆库
             );
         }
 
+        // v0.5.8 修复：清理 v0.5.7 写入的错误路径规则文件
+        // v0.5.7 错误地将 Trae/Trae CN 的全局规则写入 ~/.trae-cn/rules/ 目录
+        // 但 rules/ 是项目级规则目录，Trae CN 不会读取用户主目录下的 rules/ 目录
+        // v0.5.8 修正为 ~/.trae-cn/user_rules/ 目录（用户级全局规则目录）
+        let legacy_v057_paths: Vec<PathBuf> = match tool_id {
+            "trae" => vec![home_dir.join(".trae").join("rules").join("lrc-memory.md")],
+            "trae-cn" => vec![home_dir.join(".trae-cn").join("rules").join("lrc-memory.md")],
+            _ => vec![],
+        };
+        for legacy_path in &legacy_v057_paths {
+            if legacy_path.exists() {
+                match std::fs::remove_file(legacy_path) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "[AI规则] {} — 已清理 v0.5.7 错误路径规则文件: {}",
+                            tool_id,
+                            legacy_path.display()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "[AI规则] {} — 清理 v0.5.7 错误路径规则文件失败: {} ({})",
+                            tool_id,
+                            legacy_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         // 确保父目录存在
         if let Some(parent) = rules_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -1992,8 +2028,8 @@ AI：已记录登录 API 到记忆库
         if rules_path.exists() {
             let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
             if existing.contains("LRC 记忆系统") {
-                // v0.5.7 增强：检测旧版本规则并自动升级（兼容 v0.5.5、v0.5.6）
-                if !existing.contains("v0.5.7 自动生成") {
+                // v0.5.9 增强：检测旧版本规则并自动升级（兼容 v0.5.5、v0.5.6、v0.5.7、v0.5.8）
+                if !existing.contains("v0.5.9 自动生成") {
                     // 旧版本规则，需要升级
                     if let Some(pos) = existing.find("## LRC 记忆系统") {
                         let user_content = existing[..pos].trim_end();
@@ -2006,7 +2042,7 @@ AI：已记录登录 API 到记忆库
                             format!("更新规则文件失败: {} ({})", rules_path.display(), e)
                         })?;
                         tracing::info!(
-                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.7 版本: {}",
+                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.9 版本: {}",
                             tool_id,
                             rules_path.display()
                         );
@@ -2016,13 +2052,13 @@ AI：已记录登录 API 到记忆库
                             format!("更新规则文件失败: {} ({})", rules_path.display(), e)
                         })?;
                         tracing::info!(
-                            "[AI规则] {} — 已追加 LRC v0.5.7 规则到现有文件: {}",
+                            "[AI规则] {} — 已追加 LRC v0.5.9 规则到现有文件: {}",
                             tool_id,
                             rules_path.display()
                         );
                     }
                 } else {
-                    // 已是 v0.5.7 版本，跳过
+                    // 已是 v0.5.9 版本，跳过
                     tracing::info!(
                         "[AI规则] {} — 规则文件已是最新版本，跳过: {}",
                         tool_id,

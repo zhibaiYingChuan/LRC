@@ -11,6 +11,53 @@
 (function () {
   'use strict';
 
+  // ── v0.5.8 新增：主题切换功能 ──
+  // 支持浅色（Latte 宋韵雅色）和深色（Mocha 夜色）主题
+  // 用户偏好保存在 localStorage，页面加载时自动恢复
+  const THEME_STORAGE_KEY = 'lrc-theme';
+  const THEME_LIGHT = 'light';
+  const THEME_DARK = 'dark';
+
+  /**
+   * 初始化主题 — 页面加载时调用
+   * 从 localStorage 读取用户偏好，未设置时默认浅色
+   */
+  function initTheme() {
+    const savedTheme = localStorage.getItem(THEME_STORAGE_KEY) || THEME_LIGHT;
+    applyTheme(savedTheme);
+  }
+
+  /**
+   * 应用主题到 document 元素
+   * @param {string} theme - 'light' 或 'dark'
+   */
+  function applyTheme(theme) {
+    const toggleBtn = document.getElementById('theme-toggle');
+    if (theme === THEME_DARK) {
+      document.documentElement.setAttribute('data-theme', 'dark');
+      if (toggleBtn) toggleBtn.textContent = '🌙';
+    } else {
+      document.documentElement.removeAttribute('data-theme');
+      if (toggleBtn) toggleBtn.textContent = '☀️';
+    }
+  }
+
+  /**
+   * 切换主题（浅色 ↔ 深色）
+   */
+  function toggleTheme() {
+    const currentTheme = document.documentElement.getAttribute('data-theme') === 'dark'
+      ? THEME_DARK
+      : THEME_LIGHT;
+    const newTheme = currentTheme === THEME_DARK ? THEME_LIGHT : THEME_DARK;
+    applyTheme(newTheme);
+    localStorage.setItem(THEME_STORAGE_KEY, newTheme);
+    console.log('[LRC] 主题已切换为:', newTheme);
+  }
+
+  // 页面加载时初始化主题
+  initTheme();
+
   // ── 状态管理 ──
   let currentStep = 1;
   const config = {
@@ -1176,6 +1223,12 @@
   }
 
   async function init() {
+    // v0.5.8 新增：绑定主题切换按钮事件
+    const themeToggleBtn = document.getElementById('theme-toggle');
+    if (themeToggleBtn) {
+      themeToggleBtn.addEventListener('click', toggleTheme);
+    }
+
     // v0.5.4 P2-14 新增：监听 Sidecar 心跳检测事件
     // 崩溃恢复时显示"服务已自动恢复"，连续失败时显示"服务异常"
     setupSidecarHealthListener();
@@ -1518,7 +1571,19 @@
       const agentsIcon = $('ready-agents-icon');
       const agentsText = $('ready-agents-text');
       if (agentsIcon && agentsText) {
-        const count = (state.configured_agents || []).length;
+        // v0.5.8 修复：只计数支持 MCP 的已配置工具，与 updateStatusBar 保持一致
+        // 修复前：直接用 state.configured_agents.length，导致不支持 MCP 的工具也被计数
+        //         （如通义灵码、豆包 MarsCode 等），显示"5 个"但实际只有 2 个能配置
+        const allConfigured = state.configured_agents || [];
+        let count;
+        if (config.allAgents && config.allAgents.length > 0) {
+          count = allConfigured.filter((id) => {
+            const agent = config.allAgents.find((a) => a.id === id);
+            return agent && agent.supports_mcp;
+          }).length;
+        } else {
+          count = allConfigured.length;
+        }
         if (count > 0) {
           agentsIcon.textContent = '✅';
           agentsText.textContent = `${count} 个 AI 工具已配置`;
