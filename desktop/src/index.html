@@ -24,8 +24,8 @@
                     <strong>LRC 是什么？</strong> LRC 是一个本地代码记忆系统，它能让你的 AI 编程工具（如 Trae、Cursor）<strong>记住你的代码上下文</strong>，实现跨会话的智能代码搜索和理解。
                     <br>
                     <strong>⚡ 两条路径可选：</strong>
-                    <br>① <strong>完整配置</strong>：检测 AI 工具 → 选项目 → 配置 MCP 连接 → 启动（约 30 秒，推荐首次使用）
-                    <br>② <strong>快速上手</strong>：跳过检测 → 直接选项目文件夹 → 配置 MCP 连接 → 启动（约 10 秒，老手推荐）
+                    <br>① <strong>完整配置</strong>：检测 AI 工具 + 选项目 → 配置 LLM（可选）→ 自动配置 MCP 并启动（约 30 秒，推荐首次使用）
+                    <br>② <strong>快速上手</strong>：跳过检测 → 直接选项目文件夹 → 自动配置 MCP 并启动（约 10 秒，老手推荐）
                     <br><span class="text-highlight">💡 配置只需做一次，以后打开直接进入「已就绪」状态。只有切换项目时才需要重新配置。</span>
                     <br><span class="text-highlight">⚠️ 注意：部分 IDE（如 Cursor、VS Code）需在项目目录下手动创建 mcp.json 文件，LRC 无法自动写入项目级配置。</span>
                 </div>
@@ -65,7 +65,7 @@
                         <span class="section-icon">🔍</span>
                         <div>
                             <strong>AI 工具</strong>
-                            <span class="section-hint">已安装的工具会自动勾选</span>
+                            <span class="section-hint">已安装且支持 MCP 的工具会自动勾选</span>
                         </div>
                     </div>
                     <div id="agent-list" class="agent-list">
@@ -92,7 +92,7 @@
                 </div>
 
                 <div class="wizard-actions">
-                    <button id="btn-step-1-skip" class="btn btn-outline" style="font-size:12px;padding:6px 12px;">⚡ 跳过检测，直接选项目</button>
+                    <button id="btn-step-1-skip" class="btn btn-outline" style="font-size:12px;padding:6px 12px;">⚡ 跳过检测，快速配置</button>
                     <button id="btn-step-1-next" class="btn btn-primary" disabled>下一步：配置 LLM（可选）→</button>
                 </div>
             </div>
@@ -113,8 +113,14 @@
                         <option value="deepseek">DeepSeek — 国产性价比之王</option>
                         <option value="qwen">通义千问 — 阿里云出品</option>
                         <option value="zhipu">智谱 GLM — 清华系</option>
+                        <option value="minimax">MiniMax — 海螺AI同款</option>
+                        <option value="moonshot">Moonshot (Kimi) — 超长上下文</option>
+                        <option value="bytedance">豆包 — 字节跳动出品</option>
+                        <option value="stepfun">阶跃星辰 — 多模态强</option>
+                        <option value="baichuan">百川智能 — 金融医疗</option>
                         <option value="openai">OpenAI — GPT-4o</option>
                         <option value="ollama">Ollama 本地模型（免费）</option>
+                        <option value="custom">自定义 API 地址...</option>
                     </select>
                 </div>
 
@@ -122,7 +128,7 @@
                     <div class="form-group">
                         <label for="wizard-llm-api-key">API Key</label>
                         <input type="password" id="wizard-llm-api-key" class="form-input"
-                            placeholder="粘贴你的 API Key（sk-...）" autocomplete="off">
+                            placeholder="粘贴你的 API Key" autocomplete="off">
                         <a href="https://platform.deepseek.com/api_keys" target="_blank"
                             class="key-link" id="wizard-llm-key-link">获取 DeepSeek API Key →</a>
                     </div>
@@ -158,7 +164,7 @@
             <!-- v0.5.4 P0-3 修复：完成页面（步骤 3） -->
             <div class="wizard-panel" id="panel-step-done" data-step="3">
                 <h2>第 3 步：完成配置</h2>
-                <p class="step-desc">LRC 正在后台运行，系统托盘图标已就绪。</p>
+                <p class="step-desc">配置流程已完成，请查看下方状态了解运行情况。</p>
                 <div id="config-summary"></div>
 
                 <!-- 下一步引导：告诉用户现在该做什么 -->
@@ -167,21 +173,21 @@
                         <span class="step-icon">1</span>
                         <div>
                             <strong>打开你的 AI 工具</strong>
-                            <p>打开 Trae、Cursor 或其他已配置的 AI 工具，在 MCP 设置中确认 "lrc-memory" 已连接。</p>
+                            <p>打开 Trae、Trae CN 或其他已自动配置的 AI 工具。LRC 已通过 HTTP 模式自动配置 MCP 连接，无需手动操作。</p>
                         </div>
                     </div>
                     <div class="next-step-item">
                         <span class="step-icon">2</span>
                         <div>
-                            <strong>开始使用 LRC</strong>
-                            <p>在 AI 工具中询问代码相关问题，LRC 将根据你的问题提供项目上下文和代码记忆。</p>
+                            <strong>让 AI 记住信息</strong>
+                            <p>在 AI 工具对话中输入："帮我记住：这个项目使用 XXX 框架"，AI 会自动调用 LRC 的 <code>remember</code> 工具存储记忆。</p>
                         </div>
                     </div>
                     <div class="next-step-item">
                         <span class="step-icon">3</span>
                         <div>
-                            <strong>（可选）配置 LLM</strong>
-                            <p>在设置面板中配置 LLM API Key，可增强自然语言查询的翻译能力。</p>
+                            <strong>让 AI 回忆信息</strong>
+                            <p>在另一个对话中输入："我之前记录的项目技术栈是什么？"，AI 会调用 LRC 的 <code>recall</code> 工具检索记忆。</p>
                         </div>
                     </div>
                 </div>
@@ -197,7 +203,7 @@
                         ⚙️ 配置 LLM 和 AI 工具
                     </button>
                     <span class="form-hint" style="text-align:center;">
-                        💡 提示：LRC 在后台静默运行，无需保持此窗口打开。<br>
+                        💡 提示：LRC 设计为后台静默运行，无需保持此窗口打开。<br>
                         可通过系统托盘图标（任务栏右下角）右键菜单管理 LRC。
                     </span>
                 </div>
@@ -216,7 +222,7 @@
             <!-- LLM 配置区域 -->
             <section class="settings-section">
                 <h2>🤖 LLM 配置（可选）</h2>
-                <p class="settings-desc">配置 LLM 可增强自然语言查询的翻译能力。不配置也能使用 Fast Match 模式。</p>
+                <p class="settings-desc">配置 LLM 可增强自然语言查询的翻译能力。不配置也能正常使用基础搜索功能。</p>
                 <div class="form-row">
                     <div class="form-group form-group-sm">
                         <label for="settings-llm-provider">模型提供商</label>
@@ -246,7 +252,7 @@
                             <label for="settings-llm-api-key">API Key</label>
                             <input type="password" id="settings-llm-api-key" class="form-input"
                                 placeholder="粘贴你的 API Key" autocomplete="off">
-                            <span class="form-hint" id="settings-llm-key-hint">格式：sk-...</span>
+                            <span class="form-hint" id="settings-llm-key-hint">切换提供商查看 Key 格式</span>
                             <a href="https://platform.deepseek.com/api_keys" target="_blank"
                                 class="key-link" id="settings-llm-key-link">获取 DeepSeek API Key →</a>
                         </div>
@@ -264,12 +270,12 @@
                         </div>
                     </div>
                     <details class="advanced-details">
-                        <summary>高级选项：API 地址（已自动填写）</summary>
+                        <summary>高级选项：API 地址（选择 custom 时需手动填写）</summary>
                         <div class="form-row">
                             <div class="form-group form-group-sm">
                                 <label for="settings-llm-base-url">API 地址</label>
                                 <input type="text" id="settings-llm-base-url" class="form-input"
-                                    value="https://api.deepseek.com/v1" placeholder="自动填写">
+                                    value="https://api.deepseek.com/v1" placeholder="选择提供商后自动填写，custom 需手动输入">
                             </div>
                         </div>
                     </details>
@@ -289,9 +295,10 @@
             <!-- Agent 配置引导区域 -->
             <section class="settings-section">
                 <h2>🔌 配置 AI 工具连接 LRC</h2>
-                <p class="settings-desc">LRC 通过 MCP 协议与各种 AI 工具通信。选择你的工具查看配置方法。<br>
-                <strong>注意：</strong>只有拥有全局配置路径的 AI 工具（如 Claude Desktop、Trae）能被自动配置。<br>
-                Cursor、VS Code 等 IDE 需要你在项目目录下手动创建 mcp.json 文件。</p>
+                <p class="settings-desc">LRC 通过 MCP 协议（HTTP 模式）与各种 AI 工具通信。选择你的工具查看配置方法。<br>
+                <strong>注意：</strong>只有拥有全局配置路径的 AI 工具（如 Trae、Trae CN、Windsurf、Claude Desktop、CodeBuddy、Gemini CLI 等）能被自动配置。<br>
+                Cursor、VS Code 等 IDE 需要你在项目目录下手动创建 mcp.json 文件（使用 HTTP URL 格式）。<br>
+                <strong>前提条件：</strong>必须先启动 LRC Desktop 应用，AI 工具才能通过 HTTP 端点连接。</p>
                 <div class="settings-actions" style="margin-bottom: 12px;">
                   <button class="btn btn-primary" id="btn-reconfigure-agents" style="font-size: 13px; padding: 6px 16px;">
                     🔄 重新检测并配置 AI 工具 MCP
@@ -310,16 +317,15 @@
                         <h3>IDE 类 AI 工具配置</h3>
                         <div class="config-card">
                             <h4>🔥 Trae</h4>
-                            <p>LRC 可自动配置 Trae 的 MCP 连接。如需手动配置，在 Trae 设置 → MCP 服务器 → 添加：</p>
+                            <p>LRC 可自动配置 Trae 的 MCP 连接（HTTP 模式）。如需手动配置，在 Trae 设置 → MCP → 添加 → 手动添加：</p>
                             <pre class="config-code">{
   "mcpServers": {
     "lrc-memory": {
-      "command": "lrc-sidecar",
-      "args": ["--src-dir", ".", "--stdio"],
-      "env": {}
+      "url": "http://127.0.0.1:3099/mcp"
     }
   }
 }</pre>
+                            <p class="form-hint">⚠️ 需先启动 LRC Desktop 应用。端口号请以状态栏显示为准（默认 3099）。</p>
                         </div>
                         <div class="config-card">
                             <h4>🖥️ Cursor</h4>
@@ -327,12 +333,11 @@
                             <pre class="config-code">{
   "mcpServers": {
     "lrc-memory": {
-      "command": "lrc-sidecar",
-      "args": ["--src-dir", ".", "--stdio"],
-      "env": {}
+      "url": "http://127.0.0.1:3099/mcp"
     }
   }
 }</pre>
+                            <p class="form-hint">⚠️ 需先启动 LRC Desktop 应用。端口号请以状态栏显示为准。</p>
                         </div>
                         <div class="config-card">
                             <h4>💻 VS Code</h4>
@@ -340,25 +345,23 @@
                             <pre class="config-code">{
   "mcpServers": {
     "lrc-memory": {
-      "command": "lrc-sidecar",
-      "args": ["--src-dir", ".", "--stdio"],
-      "env": {}
+      "url": "http://127.0.0.1:3099/mcp"
     }
   }
 }</pre>
+                            <p class="form-hint">⚠️ 需先启动 LRC Desktop 应用。端口号请以状态栏显示为准。</p>
                         </div>
                         <div class="config-card">
                             <h4>🌊 Windsurf</h4>
-                            <p>LRC 可自动配置 Windsurf 的全局 MCP 连接。手动配置路径：<code>~/.codeium/windsurf/mcp_config.json</code>：</p>
+                            <p>LRC 可自动配置 Windsurf 的全局 MCP 连接（HTTP 模式）。手动配置路径：<code>~/.codeium/windsurf/mcp_config.json</code>：</p>
                             <pre class="config-code">{
   "mcpServers": {
     "lrc-memory": {
-      "command": "lrc-sidecar",
-      "args": ["--src-dir", ".", "--stdio"],
-      "env": {}
+      "url": "http://127.0.0.1:3099/mcp"
     }
   }
 }</pre>
+                            <p class="form-hint">⚠️ 需先启动 LRC Desktop 应用。端口号请以状态栏显示为准。</p>
                         </div>
                     </div>
                     <!-- 桌面应用配置 -->
@@ -366,46 +369,43 @@
                         <h3>桌面 AI 应用配置</h3>
                         <div class="config-card">
                             <h4>🤖 Claude Desktop</h4>
-                            <p>LRC 可自动配置 Claude Desktop 的 MCP 连接。手动配置路径：<code>%APPDATA%\Claude\claude_desktop_config.json</code>：</p>
+                            <p>LRC 可自动配置 Claude Desktop 的 MCP 连接（HTTP 模式）。手动配置路径：<code>%APPDATA%\Claude\claude_desktop_config.json</code>：</p>
                             <pre class="config-code">{
   "mcpServers": {
     "lrc-memory": {
-      "command": "lrc-sidecar",
-      "args": ["--src-dir", ".", "--stdio"],
-      "env": {}
+      "url": "http://127.0.0.1:3099/mcp"
     }
   }
 }</pre>
+                            <p class="form-hint">⚠️ 需先启动 LRC Desktop 应用。端口号请以状态栏显示为准。</p>
                         </div>
                         <div class="config-card">
                             <h4>🧠 ChatGPT Desktop（通过 MCP Bridge）</h4>
-                            <p>需要安装 MCP Bridge 插件，然后添加 LRC 服务器。</p>
+                            <p>需要安装 MCP Bridge 插件，然后添加 LRC 的 HTTP 端点：<code>http://127.0.0.1:3099/mcp</code></p>
                         </div>
                         <div class="config-card">
                             <h4>🤝 CodeBuddy (腾讯)</h4>
-                            <p>LRC 可自动配置 CodeBuddy 的全局 MCP 连接。手动配置路径：<code>~/.codebuddy/mcp.json</code>：</p>
+                            <p>LRC 可自动配置 CodeBuddy 的全局 MCP 连接（HTTP 模式）。手动配置路径：<code>~/.codebuddy/mcp.json</code>：</p>
                             <pre class="config-code">{
   "mcpServers": {
     "lrc-memory": {
-      "command": "lrc-sidecar",
-      "args": ["--src-dir", ".", "--stdio"],
-      "env": {}
+      "url": "http://127.0.0.1:3099/mcp"
     }
   }
 }</pre>
+                            <p class="form-hint">⚠️ 需先启动 LRC Desktop 应用。端口号请以状态栏显示为准。</p>
                         </div>
                         <div class="config-card">
                             <h4>🔮 其他 MCP 兼容桌面应用</h4>
-                            <p>通用配置格式 — 在应用的 MCP 设置中添加：</p>
+                            <p>通用配置格式（HTTP 模式）— 在应用的 MCP 设置中添加：</p>
                             <pre class="config-code">{
   "mcpServers": {
     "lrc-memory": {
-      "command": "lrc-sidecar",
-      "args": ["--src-dir", ".", "--stdio"],
-      "env": {}
+      "url": "http://127.0.0.1:3099/mcp"
     }
   }
 }</pre>
+                            <p class="form-hint">⚠️ 需先启动 LRC Desktop 应用。端口号请以状态栏显示为准。</p>
                         </div>
                     </div>
                     <!-- 命令行工具配置 -->
@@ -413,16 +413,15 @@
                         <h3>命令行 AI 工具配置</h3>
                         <div class="config-card">
                             <h4>📟 Gemini CLI</h4>
-                            <p>在 <code>~/.gemini/mcp_settings.json</code> 中添加：</p>
+                            <p>在 <code>~/.gemini/mcp_settings.json</code> 中添加（HTTP 模式）：</p>
                             <pre class="config-code">{
   "mcpServers": {
     "lrc-memory": {
-      "command": "lrc-sidecar",
-      "args": ["--src-dir", ".", "--stdio"],
-      "env": {}
+      "url": "http://127.0.0.1:3099/mcp"
     }
   }
 }</pre>
+                            <p class="form-hint">⚠️ 需先启动 LRC Desktop 应用。端口号请以状态栏显示为准。</p>
                         </div>
                         <div class="config-card">
                             <h4>💎 Codex CLI</h4>
@@ -441,15 +440,17 @@
                             <p>通过 HTTP 端点连接（需要 LRC Desktop 在后台运行）：</p>
                             <pre class="config-code">http://127.0.0.1:3099/mcp</pre>
                             <p>在浏览器插件的 MCP 设置中填入上述 URL。</p>
+                            <p class="form-hint">⚠️ 端口号请以状态栏显示为准。</p>
                         </div>
                         <div class="config-card">
                             <h4>🔧 自定义集成</h4>
                             <p>LRC 提供标准 MCP 协议接口，任何支持 MCP 的工具都可以连接：</p>
                             <ul>
-                                <li><strong>HTTP 端点</strong>: <code>http://127.0.0.1:3099/mcp</code>（需 LRC Desktop 在后台运行）</li>
-                                <li><strong>stdio 模式</strong>: <code>lrc --src-dir /path/to/project --stdio</code></li>
+                                <li><strong>HTTP 端点（推荐）</strong>: <code>http://127.0.0.1:3099/mcp</code>（需 LRC Desktop 在后台运行）</li>
                                 <li><strong>REST API</strong>: <code>http://127.0.0.1:3099/v1/*</code></li>
+                                <li><strong>仪表盘</strong>: <code>http://127.0.0.1:3099/dashboard</code></li>
                             </ul>
+                            <p class="form-hint">⚠️ 端口号请以状态栏显示为准。LRC Desktop 使用 HTTP 模式，不支持 stdio 模式。</p>
                         </div>
                     </div>
                 </div>
@@ -553,7 +554,7 @@
                         <span class="qs-step-num">1</span>
                         <div class="qs-step-content">
                             <strong>打开你的 AI 编程工具</strong>
-                            <span class="qs-step-desc">如 Cursor、Trae、Claude Code 等。LRC 已自动为它们配置好规则。</span>
+                            <span class="qs-step-desc">如 Trae、Trae CN、CodeBuddy、Gemini CLI 等。LRC 已通过 HTTP 模式自动为它们配置好 MCP 连接。<br>⚠️ Cursor、VS Code 等 IDE 需在项目目录下手动创建 mcp.json 文件（详见设置面板）。</span>
                             <span class="qs-step-check" style="display:none;">✓</span>
                         </div>
                     </li>
@@ -561,8 +562,8 @@
                         <span class="qs-step-num">2</span>
                         <div class="qs-step-content">
                             <strong>在对话中告诉 AI：</strong>
-                            <code class="qs-step-code">"帮我记住：这个项目使用 Rust + Actix-web 框架"</code>
-                            <span class="qs-step-desc">AI 会自动调用 LRC 的 remember 工具存储记忆。</span>
+                            <code class="qs-step-code">"帮我记住：这个项目使用 XXX 框架，遵循 XXX 规范"</code>
+                            <span class="qs-step-desc">可记录技术栈、项目约定、重要决策等。AI 会自动调用 LRC 的 remember 工具存储记忆。</span>
                             <span class="qs-step-check" style="display:none;">✓</span>
                         </div>
                     </li>
@@ -570,8 +571,8 @@
                         <span class="qs-step-num">3</span>
                         <div class="qs-step-content">
                             <strong>在另一个对话中问 AI：</strong>
-                            <code class="qs-step-code">"我之前记录的项目技术栈是什么？"</code>
-                            <span class="qs-step-desc">AI 会调用 LRC 的 recall 工具检索记忆。</span>
+                            <code class="qs-step-code">"我之前记录的项目信息有哪些？"</code>
+                            <span class="qs-step-desc">AI 会调用 LRC 的 recall 工具检索记忆，实现跨会话上下文延续。</span>
                             <span class="qs-step-check" style="display:none;">✓</span>
                         </div>
                     </li>

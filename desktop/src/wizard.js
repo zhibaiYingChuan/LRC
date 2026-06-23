@@ -243,16 +243,19 @@
           const safeId = escapeHtml(agent.id);
           const safeName = escapeHtml(agent.name);
           const safeIcon = escapeHtml(agent.icon || '');
+          // v0.5.7 修复：只有支持 MCP 的已安装工具才自动勾选，与 syncInitialAgentSelection 保持一致
+          const shouldCheck = installed && agent.supports_mcp;
           html += `
             <label class="agent-item ${installed ? '' : 'disabled'}">
               <input type="checkbox" value="${safeId}"
                 data-category="${escapeHtml(cat.key)}"
-                ${installed ? 'checked' : ''}
+                ${shouldCheck ? 'checked' : ''}
                 ${!installed ? 'disabled' : ''}>
               <span class="agent-icon">${safeIcon}</span>
               <div class="agent-info">
                 <span class="agent-name">${safeName}</span>
                 ${isIDE && installed ? '<span class="ide-badge">含项目列表</span>' : ''}
+                ${installed && !agent.supports_mcp ? '<span class="ide-badge" style="background:var(--text-tertiary);">不支持 MCP</span>' : ''}
               </div>
               <span class="agent-status ${installed ? 'installed' : 'not-installed'}">
                 ${installed ? '已安装' : '未安装'}
@@ -291,7 +294,7 @@
       if (hasInstalled) {
         $('btn-step-1-next').textContent = '下一步：配置 LLM（可选）→';
       } else {
-        listEl.innerHTML += '<div class="no-agents">未检测到已安装的 AI 工具。<br>请先安装 Trae、Cursor 或 VS Code 等 IDE。</div>';
+        listEl.innerHTML += '<div class="no-agents">未检测到已安装的 AI 工具。<br>请先安装 Trae、Cursor、VS Code 等 IDE，或 Claude Desktop、Gemini CLI 等 AI 工具。</div>';
       }
     } catch (e) {
       // v0.5.4 修复：异常时也取消进度监听
@@ -576,10 +579,10 @@
   function updateWizardLlmProviderUI() {
     const provider = $('wizard-llm-provider')?.value;
     const isOllama = provider === 'ollama';
-    
+
     const apiSection = $('wizard-llm-api-section');
     if (apiSection) apiSection.style.display = isOllama ? 'none' : 'block';
-    
+
     const ollamaFields = $('wizard-ollama-fields');
     if (ollamaFields) ollamaFields.style.display = isOllama ? 'block' : 'none';
 
@@ -587,8 +590,20 @@
     const providerInfo = LLM_PROVIDERS[provider];
     const keyLink = $('wizard-llm-key-link');
     if (keyLink && providerInfo) {
-      keyLink.href = providerInfo.keyUrl || '#';
-      keyLink.textContent = `获取 ${providerInfo.name} API Key →`;
+      // v0.5.7 修复：Ollama 和 custom 无需 API Key，隐藏获取链接
+      if (providerInfo.keyUrl) {
+        keyLink.href = providerInfo.keyUrl;
+        keyLink.textContent = `获取 ${providerInfo.name} API Key →`;
+        keyLink.style.display = 'inline';
+      } else {
+        keyLink.style.display = 'none';
+      }
+    }
+
+    // v0.5.7 修复：根据提供商更新模型名称 placeholder
+    const modelEl = $('wizard-llm-model');
+    if (modelEl && providerInfo) {
+      modelEl.placeholder = providerInfo.model ? `例如：${providerInfo.model}` : '输入模型名称';
     }
   }
 
@@ -620,7 +635,8 @@
       if (provider === 'ollama') {
         const ollamaModel = $('wizard-ollama-model')?.value || 'llama3';
         const ollamaUrl = $('wizard-ollama-url')?.value || 'http://localhost:11434';
-        llmString = `ollama:${ollamaModel}:${ollamaUrl}`;
+        // v0.5.7 修复：使用 || 分隔符（与后端 to_llm_api_string 保持一致）
+        llmString = `ollama||${ollamaModel}||${ollamaUrl}`;
         config.llmProvider = 'ollama';
         config.llmModel = ollamaModel;
         config.ollamaUrl = ollamaUrl;
@@ -629,7 +645,8 @@
         if (apiKey) {
           const model = $('wizard-llm-model')?.value || LLM_PROVIDERS[provider]?.model || '';
           const baseUrl = LLM_PROVIDERS[provider]?.url || '';
-          llmString = `openai:${apiKey}:${model}:${baseUrl}`;
+          // v0.5.7 修复：使用 || 分隔符（支持 API Key 中包含冒号）
+          llmString = `openai||${apiKey}||${model}||${baseUrl}`;
           config.llmApiKey = apiKey;
           config.llmModel = model;
           config.llmBaseUrl = baseUrl;
@@ -1263,9 +1280,16 @@
       if ($('settings-llm-key-hint')) {
         $('settings-llm-key-hint').textContent = providerInfo ? providerInfo.keyHint || '格式：sk-...' : '格式：sk-...';
       }
-      if ($('settings-llm-key-link')) {
-        $('settings-llm-key-link').href = providerInfo ? providerInfo.keyUrl || '#' : '#';
-        $('settings-llm-key-link').textContent = providerInfo ? `获取 ${providerInfo.name} API Key →` : '';
+      // v0.5.7 修复：Ollama 和 custom 无需 API Key，隐藏获取链接
+      const settingsKeyLink = $('settings-llm-key-link');
+      if (settingsKeyLink && providerInfo) {
+        if (providerInfo.keyUrl) {
+          settingsKeyLink.href = providerInfo.keyUrl;
+          settingsKeyLink.textContent = `获取 ${providerInfo.name} API Key →`;
+          settingsKeyLink.style.display = 'inline';
+        } else {
+          settingsKeyLink.style.display = 'none';
+        }
       }
     });
   }
@@ -1333,7 +1357,8 @@
       if (provider === 'ollama') {
         const ollamaModel = $('settings-ollama-model').value || 'llama3';
         const ollamaUrl = $('settings-ollama-url').value || 'http://localhost:11434';
-        llmString = `ollama:${ollamaModel}:${ollamaUrl}`;
+        // v0.5.7 修复：使用 || 分隔符（与后端 to_llm_api_string 保持一致）
+        llmString = `ollama||${ollamaModel}||${ollamaUrl}`;
         config.llmProvider = 'ollama';
         config.llmModel = ollamaModel;
         config.ollamaUrl = ollamaUrl;
@@ -1343,7 +1368,8 @@
         const model = $('settings-llm-model').value || LLM_PROVIDERS[provider]?.model || '';
         const baseUrl = $('settings-llm-base-url').value || LLM_PROVIDERS[provider]?.url || '';
         if (apiKey) {
-          llmString = `openai:${apiKey}:${model}:${baseUrl}`;
+          // v0.5.7 修复：使用 || 分隔符（支持 API Key 中包含冒号）
+          llmString = `openai||${apiKey}||${model}||${baseUrl}`;
           config.llmApiKey = apiKey;
           config.llmModel = model;
           config.llmBaseUrl = baseUrl;
@@ -1592,7 +1618,8 @@
 
     try {
       // 步骤 1：写入测试记忆
-      const testContent = 'LRC 测试记忆：本项目使用 Rust + Actix-web 框架开发，采用 Tauri 桌面端。';
+      // v0.5.7 修复：改为通用测试内容，避免硬编码特定技术栈
+      const testContent = 'LRC 测试记忆：这是一条示例记忆，用于验证 LRC 记忆系统是否正常工作。你可以通过 AI 工具调用 remember 工具存储任何项目信息。';
       const writeResp = await fetch(`${baseUrl}/v1/memories/consolidate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1620,7 +1647,7 @@
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          query: 'Rust 框架',
+          query: 'LRC 记忆系统 示例',
           top_k: 3
         }),
         signal: AbortSignal.timeout(10000),
