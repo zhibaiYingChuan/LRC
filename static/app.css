@@ -1191,9 +1191,9 @@
     word-break: break-all;
 }
 .copy-btn {
-    background: #1a3a2a;
+    background: rgba(46, 204, 113, 0.1);
     color: var(--jade-dark);
-    border: 1px solid #2a5a3a;
+    border: 1px solid var(--jade-dark);
     border-radius: 4px;
     padding: 6px 12px;
     cursor: pointer;
@@ -1203,7 +1203,7 @@
     transition: background 0.2s;
 }
 .copy-btn:hover {
-    background: #2a5a3a;
+    background: rgba(46, 204, 113, 0.2);
 }
 .reproducible-features {
     display: grid;
@@ -1276,7 +1276,7 @@
     font-weight: 500;
 }
 .comparison-table tbody tr:hover {
-    background: #1a1a3e;
+    background: rgba(243, 156, 18, 0.03);
 }
 .cell-pass {
     color: var(--jade-dark);
@@ -1288,7 +1288,7 @@
     background: rgba(192, 160, 96, 0.1);
 }
 .cell-fail {
-    color: #666;
+    color: var(--text-dim);
 }
 .cell-partial {
     color: var(--gold);
@@ -1347,14 +1347,14 @@
   font-size: 14px;
 }
 .form-result.success {
-  background: #e8f5e9;
-  color: #2e7d32;
-  border: 1px solid #c8e6c9;
+  background: rgba(46, 204, 113, 0.1);
+  color: var(--jade-dark);
+  border: 1px solid rgba(46, 204, 113, 0.3);
 }
 .form-result.error {
-  background: #fce4ec;
-  color: #c62828;
-  border: 1px solid #ffcdd2;
+  background: rgba(192, 57, 43, 0.1);
+  color: var(--cinnabar);
+  border: 1px solid rgba(192, 57, 43, 0.3);
 }
 .feature-header {
   display: flex;
