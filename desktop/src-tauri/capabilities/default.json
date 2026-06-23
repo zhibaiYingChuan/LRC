@@ -8,8 +8,8 @@
       "identifier": "shell:allow-open",
       "allow": [
         { "url": "https://**" },
-        { "url": "http://127.0.0.1:3099/**" },
-        { "url": "http://localhost:3099/**" }
+        { "url": "http://127.0.0.1:**" },
+        { "url": "http://localhost:**" }
       ]
     },
     {

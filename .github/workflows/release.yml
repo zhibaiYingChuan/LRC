@@ -187,16 +187,20 @@ jobs:
         shell: bash
 
       # 步骤 2: 手动复制 sidecar 到 desktop/src-tauri/（确保 build.rs 能找到）
+      # v0.5.7 修复：Linux/macOS 上文件名不带 .exe 扩展名
       - name: Sync sidecar to desktop
         run: |
           VERSION="${{ steps.version.outputs.VER }}"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp target/${{ matrix.target }}/release/code-memory-server.exe desktop/src-tauri/lrc-sidecar.exe
+            echo "Sidecar synced to desktop/src-tauri/lrc-sidecar.exe"
+            ls -la desktop/src-tauri/lrc-sidecar.exe
           else
-            cp target/${{ matrix.target }}/release/code-memory-server desktop/src-tauri/lrc-sidecar.exe
+            cp target/${{ matrix.target }}/release/code-memory-server desktop/src-tauri/lrc-sidecar
+            chmod +x desktop/src-tauri/lrc-sidecar
+            echo "Sidecar synced to desktop/src-tauri/lrc-sidecar"
+            ls -la desktop/src-tauri/lrc-sidecar
           fi
-          echo "Sidecar synced to desktop/src-tauri/lrc-sidecar.exe"
-          ls -la desktop/src-tauri/lrc-sidecar.exe
         shell: bash
 
       # 步骤 3: 安装 Tauri CLI v2
