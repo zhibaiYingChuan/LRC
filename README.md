@@ -451,6 +451,45 @@ Loong Recall 在启动时自动执行多层运行时防护，保护核心检索�
 
 ## 更新日志
 
+### v0.5.7 (2026-06-23) — UIUX 设计规范 + 全局规则路径修正 + 二次审计修复
+
+**桌面端 UIUX 设计规范完整应用**
+
+- 引入 Catppuccin Latte 浅色主题（宣纸底色 `#F5F3EF` + 中国古典色系），护眼优先
+- 8px 网格间距系统（xs=4px / sm=8px / md=16px / lg=24px / xl=32px）
+- 字体规范：Inter（UI）+ JetBrains Mono（代码）+ Noto Sans SC（中文）
+- 组件圆角规范：按钮 6px / 卡片 12px / 模态框 16px
+- 三档阴影系统（low / medium / high）
+- 引入 Google Fonts，CSP 策略同步更新
+
+**全局规则路径修正**
+
+- 根据 AI 工具官方文档规范 `get_rules_file_template` 全局规则写入路径
+- 确保各 IDE 的规则文件路径符合官方规范
+
+**审计问题修复**
+
+- 中危 M-3：`start_sidecar` / `start_sidecar_for_project` 缩小 sidecar 锁持有范围
+- 中危 M-4：`stop_sidecar` 锁顺序违反 L1→L2 约束，拆分为两个独立作用域
+- 中危 M-15：消除三处重复的 sidecar 启动后处理逻辑，提取为 `post_sidecar_start` 公共函数
+- 低危 L-1：`tracing_appender::rolling` 原子日志轮转
+- 低危 L-5：心跳协程 panic 恢复机制
+- 低危 L-11：`v1_api.rs` 缓存机制优化
+
+**二次审计修复**
+
+- `stop_sidecar` 锁顺序修复：避免 L1→L2 锁嵌套
+- `save_llm_config` / `clear_llm_config` 锁嵌套修复：释放 wizard 锁后再获取 sidecar_port 锁
+- `wizard.js` fallback 值修复：`var(--jade, #2ecc71)` → `var(--jade, #5B7C63)`（深色主题遗留色值）
+- `wizard.js` 残留硬编码颜色清理：`#555` / `#888` / `#f0f7ff` / `#0066cc` 全部替换为 CSS 变量
+
+**测试**
+
+- 主项目 406 个单元测试全部通过
+- 桌面端 44 个单元测试全部通过
+- 基准测试 11 个测试全部通过
+- Pre-commit hook 全绿（含算法泄露检测）
+
 ### v0.5.6 (2026-06-23) — 大规模记忆检索性能修复 + 公平版基准测试
 
 **修复一：写回性能瓶颈（O(N²) → O(N)）— 重要**

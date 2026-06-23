@@ -4,6 +4,53 @@
 
 ---
 
+## [0.5.7] - 2026-06-23
+
+### 新增
+
+- **桌面端 UIUX 设计规范完整应用**：
+  - 引入 Catppuccin Latte 浅色主题（宣纸底色 `#F5F3EF` + 中国古典色系），护眼优先
+  - 8px 网格间距系统（xs=4px / sm=8px / md=16px / lg=24px / xl=32px）
+  - 字体规范：Inter（UI）+ JetBrains Mono（代码）+ Noto Sans SC（中文）
+  - 组件圆角规范：按钮 6px / 卡片 12px / 模态框 16px
+  - 三档阴影系统（low / medium / high）
+  - 引入 Google Fonts（CSP 策略同步更新允许 fonts.googleapis.com 和 fonts.gstatic.com）
+
+- **二次审计修复**：
+  - `stop_sidecar` 锁顺序修复：缩小 sidecar 锁持有范围，避免 L1→L2 锁嵌套
+  - `save_llm_config` / `clear_llm_config` 锁嵌套修复：释放 wizard 锁后再获取 sidecar_port 锁
+  - `wizard.js` fallback 值修复：`var(--jade, #2ecc71)` → `var(--jade, #5B7C63)`（深色主题遗留色值）
+  - `wizard.js` 残留硬编码颜色清理：`#555` / `#888` / `#f0f7ff` / `#0066cc` 全部替换为 CSS 变量
+
+### 修复
+
+- **全局规则路径修正**：根据 AI 工具官方文档规范 `get_rules_file_template` 全局规则写入路径，确保各 IDE 的规则文件路径符合官方规范
+- **审计中危问题 M-3**：`start_sidecar` / `start_sidecar_for_project` 缩小 sidecar 锁持有范围，sidecar_port 更新移到锁释放后
+- **审计中危问题 M-4**：`stop_sidecar` 锁顺序违反 L1→L2 约束，拆分为两个独立作用域
+- **审计中危问题 M-15**：消除 `start_sidecar` / `start_sidecar_for_project` / `switch_project` 三处重复的 sidecar 启动后处理逻辑，提取为 `post_sidecar_start` 公共函数
+- **审计低危问题 L-1**：`tracing_appender::rolling` 原子日志轮转，避免日志文件轮转时丢失
+- **审计低危问题 L-5**：心跳协程 panic 恢复机制（`tokio::task::spawn` + `JoinError` 捕获）
+- **审计低危问题 L-11**：`v1_api.rs` 缓存机制优化，减少重复计算
+
+### 变更
+
+- `Cargo.toml` 版本号 0.5.6 → 0.5.7
+- `desktop/src-tauri/Cargo.toml` 版本号 0.5.6 → 0.5.7
+- `desktop/src-tauri/tauri.conf.json` 版本号 0.5.6 → 0.5.7
+- `desktop/package.json` 版本号 0.5.6 → 0.5.7
+- `desktop/src/index.html` 版本号 v0.5.4 → v0.5.7（2 处）
+- `desktop/src/styles.css` 从深色主题完全切换为 Latte 浅色主题
+- `desktop/src-tauri/tauri.conf.json` CSP 策略更新：添加 `https://fonts.googleapis.com` 和 `https://fonts.gstatic.com`
+
+### 测试
+
+- 主项目 406 个单元测试全部通过
+- 桌面端 44 个单元测试全部通过
+- 基准测试 11 个测试全部通过
+- Pre-commit hook 全绿（含算法泄露检测）
+
+---
+
 ## [0.5.6] - 2026-06-23
 
 ### 修复
