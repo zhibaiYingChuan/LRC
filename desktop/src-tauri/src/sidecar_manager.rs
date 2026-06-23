@@ -15,7 +15,7 @@ const DEFAULT_SIDECAR_PORT: u16 = 3099;
 /// 与 server.rs 中 find_available_port 的 scan_range(100) 保持一致
 const PORT_SCAN_RANGE: u16 = 100;
 use std::collections::HashMap;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 // Windows: 隐藏 sidecar 进程的 CMD 窗口
@@ -28,6 +28,23 @@ use std::os::windows::process::CommandExt;
 /// 进程在后台静默运行，不显示任何控制台窗口
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// 获取 sidecar 日志目录
+/// 与 main.rs 中 init_logging 使用相同的日志目录：$APPDATA/LoongRecall/logs/
+/// v0.5.7 新增：用于将 sidecar stderr 重定向到日志文件，便于排查启动失败原因
+fn get_sidecar_log_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA").ok()?;
+        Some(std::path::PathBuf::from(appdata).join("LoongRecall").join("logs"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // macOS/Linux: ~/.local/share/LoongRecall/logs/
+        let home = std::env::var("HOME").ok()?;
+        Some(std::path::PathBuf::from(home).join(".local/share/LoongRecall/logs"))
+    }
+}
 
 /// 单个 Sidecar 实例的运行状态（可序列化，供前端使用）
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -310,6 +327,28 @@ impl SidecarManager {
             }
         }
 
+        // v0.5.7 修复：将 sidecar stderr 重定向到日志文件，便于排查启动失败原因
+        // 之前 stderr 完全丢弃，sidecar 启动失败时（如反调试误杀、端口绑定失败、
+        // SingletonLock 冲突）无法获取错误信息，用户只看到笼统的"后台服务启动失败"
+        if let Some(log_dir) = get_sidecar_log_dir() {
+            // 确保日志目录存在
+            let _ = std::fs::create_dir_all(&log_dir);
+            let log_path = log_dir.join("lrc-sidecar.log");
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                Ok(file) => {
+                    cmd.stderr(Stdio::from(file));
+                    tracing::debug!("Sidecar stderr 重定向到: {}", log_path.display());
+                }
+                Err(e) => {
+                    tracing::warn!("无法打开 sidecar 日志文件 {}: {}", log_path.display(), e);
+                }
+            }
+        }
+
         // 启动子进程
         let mut child = cmd
             .spawn()
@@ -467,7 +506,11 @@ impl SidecarManager {
         for attempt in 1..=20 {
             // 检查进程是否还活着
             if !Self::is_process_alive(child) {
-                return Err(format!("Sidecar 进程 PID={pid} 启动后意外退出"));
+                // v0.5.7 修复：提示用户查看 sidecar 日志文件，获取真正的退出原因
+                let log_hint = get_sidecar_log_dir()
+                    .map(|d| format!("，请查看日志: {}\\lrc-sidecar.log", d.display()))
+                    .unwrap_or_default();
+                return Err(format!("Sidecar 进程 PID={pid} 启动后意外退出{log_hint}"));
             }
 
             // 端口自适应：从起始端口开始扫描（sidecar 可能已绑定到其他端口）

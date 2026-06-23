@@ -29,6 +29,8 @@
     multiWindowEnabled: true, // 同一项目多窗口同时记录（上限 5 个，默认开启）
     // Sidecar 端口
     port: 3099,
+    // v0.5.7 新增：保存 sidecar 启动失败的错误信息，用于在摘要页展示给用户
+    lastSidecarError: null,
   };
 
   // ── 工具函数 ──
@@ -297,12 +299,29 @@
         try { progressUnlisten(); } catch (ue) { /* 忽略取消监听错误 */ }
       }
       const errMsg = (e && typeof e === 'string') ? e : (e?.message || '检测失败');
-      // v0.5.4 P1-6 修复：区分后端已翻译和未翻译的错误
+      // v0.5.7 修复：超时后恢复 UI 状态 + 添加重试按钮
+      // 之前超时后按钮仍 disabled，用户无法操作，必须重启应用
+      const isTimeout = errMsg.includes('超时') || errMsg.includes('timeout');
+      const hint = isTimeout
+        ? '检测超时，可能是杀毒软件扫描或系统响应慢。可点击下方按钮重试，或重启应用。'
+        : '请确认 LRC 后端服务已启动，或重启应用后重试。';
       listEl.innerHTML = `<div class="error-message">
         <strong>AI 工具检测失败</strong><br>
         ${escapeHtml(errMsg)}<br>
-        <small style="color:var(--text-secondary);">请确认 LRC 后端服务已启动，或重启应用后重试。</small>
-      </div>`;
+        <small style="color:var(--text-secondary);">${hint}</small>
+      </div>
+      <button id="btn-retry-detect" class="btn btn-secondary" style="margin-top:12px;">重新检测</button>`;
+      // 恢复按钮状态：禁用下一步，但启用重试按钮
+      const nextBtn = $('btn-step-1-next');
+      if (nextBtn) nextBtn.disabled = true;
+      const retryBtn = $('btn-retry-detect');
+      if (retryBtn) {
+        retryBtn.addEventListener('click', () => {
+          if (retryBtn) retryBtn.disabled = true;
+          retryBtn.textContent = '正在重新检测...';
+          loadAgents();
+        });
+      }
     }
   }
 
@@ -755,14 +774,18 @@
       }, 60000);
       if (actualPort) {
         config.port = actualPort;
+        config.lastSidecarError = null;  // 清除上次错误
         console.log('[配置向导] Sidecar 已启动，端口:', actualPort);
         return actualPort;
       }
+      config.lastSidecarError = 'Sidecar 启动后未返回端口号';
       return null;
     } catch (e) {
-      // v0.5.5 P1-6 修复：显示后端已翻译的用户友好错误
+      // v0.5.7 修复：保存后端返回的错误信息，用于在摘要页展示给用户
+      // 之前只 console.warn 会导致用户看到 hardcoded 的笼统文案
       const msg = (typeof e === 'string') ? e : (e?.message || '启动失败');
       console.warn('[配置向导] Sidecar 启动失败:', msg);
+      config.lastSidecarError = msg;
       return null;
     }
   }
@@ -834,7 +857,7 @@
             <span class="banner-icon">&#x26A0;&#xFE0F;</span>
             <div>
               <strong>后台服务启动失败</strong>
-              <span style="font-size:12px;color:var(--text-tertiary);">可能原因：端口被占用、磁盘空间不足、或杀毒软件拦截</span>
+              <span style="font-size:12px;color:var(--text-tertiary);">${escapeHtml(config.lastSidecarError || '未知错误，请查看日志或重启应用')}</span>
             </div>
           </div>`;
     }
