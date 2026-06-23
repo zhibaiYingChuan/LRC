@@ -29,12 +29,21 @@ pub enum LlmApiConfig {
 impl LlmApiConfig {
     /// 从字符串解析 LLM API 配置
     ///
-    /// 支持的格式：
-    /// - `openai:sk-xxx:gpt-4o-mini` → OpenAI API
-    /// - `openai:sk-xxx:gpt-4o-mini:https://custom.api.com/v1` → 自定义 OpenAI 端点
-    /// - `ollama:localhost:llama3` → Ollama 本地模型
+    /// 支持两种分隔符格式：
+    /// - `||` 分隔符（桌面端优先使用，避免 API Key 中包含 `:` 时解析错误）：
+    ///   - `openai||sk-xxx||gpt-4o-mini||https://custom.api.com/v1`
+    ///   - `ollama||localhost||llama3`
+    /// - `:` 分隔符（向后兼容旧格式）：
+    ///   - `openai:sk-xxx:gpt-4o-mini`
+    ///   - `openai:sk-xxx:gpt-4o-mini:https://custom.api.com/v1`
+    ///   - `ollama:localhost:llama3`
     pub fn parse(input: &str) -> Result<Self, String> {
-        let parts: Vec<&str> = input.splitn(4, ':').collect();
+        // 自动检测分隔符：优先使用 || 分隔符（更安全），回退到 : 分隔符（向后兼容）
+        let parts: Vec<&str> = if input.contains("||") {
+            input.splitn(4, "||").collect()
+        } else {
+            input.splitn(4, ':').collect()
+        };
 
         match parts[0] {
             "openai" => {
@@ -453,6 +462,60 @@ mod tests {
                 assert_eq!(endpoint, "https://custom.api.com/v1");
             }
             _ => panic!("应为 OpenAI 配置"),
+        }
+    }
+
+    #[test]
+    fn test_parse_config_openai_double_pipe() {
+        // 测试 || 分隔符（桌面端 to_llm_api_string 使用此格式）
+        let config =
+            LlmApiConfig::parse("openai||sk-test123||gpt-4o-mini||https://api.openai.com/v1")
+                .unwrap();
+        match config {
+            LlmApiConfig::OpenAI {
+                api_key,
+                model,
+                endpoint,
+            } => {
+                assert_eq!(api_key, "sk-test123");
+                assert_eq!(model, "gpt-4o-mini");
+                assert_eq!(endpoint, "https://api.openai.com/v1");
+            }
+            _ => panic!("应为 OpenAI 配置"),
+        }
+    }
+
+    #[test]
+    fn test_parse_config_openai_double_pipe_custom_endpoint() {
+        // 测试 || 分隔符 + 自定义端点（通义千问等兼容 API）
+        let config = LlmApiConfig::parse(
+            "openai||sk-test||qwen-plus||https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+        .unwrap();
+        match config {
+            LlmApiConfig::OpenAI {
+                api_key,
+                model,
+                endpoint,
+            } => {
+                assert_eq!(api_key, "sk-test");
+                assert_eq!(model, "qwen-plus");
+                assert_eq!(endpoint, "https://dashscope.aliyuncs.com/compatible-mode/v1");
+            }
+            _ => panic!("应为 OpenAI 配置"),
+        }
+    }
+
+    #[test]
+    fn test_parse_config_ollama_double_pipe() {
+        // 测试 || 分隔符的 Ollama 格式
+        let config = LlmApiConfig::parse("ollama||localhost||llama3").unwrap();
+        match config {
+            LlmApiConfig::Ollama { host, model } => {
+                assert_eq!(host, "localhost");
+                assert_eq!(model, "llama3");
+            }
+            _ => panic!("应为 Ollama 配置"),
         }
     }
 
