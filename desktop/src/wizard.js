@@ -79,6 +79,31 @@
   }
 
   /**
+   * v0.5.7 新增：带超时的 tauriInvoke 包装
+   *
+   * 解决问题：某些后端命令（如 detect_agents、start_sidecar）可能因
+   * 文件 I/O 或进程启动耗时较长，导致前端无限等待。
+   *
+   * @param {string} cmd - 命令名
+   * @param {object} args - 命令参数
+   * @param {number} timeoutMs - 超时毫秒数（默认 15 秒）
+   * @returns {Promise<any>} 命令结果，超时后 reject
+   */
+  async function tauriInvokeWithTimeout(cmd, args = {}, timeoutMs = 15000) {
+    let timerId = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      timerId = setTimeout(() => reject(new Error(`命令 ${cmd} 超时（${timeoutMs}ms）`)), timeoutMs);
+    });
+    const invokePromise = tauriInvoke(cmd, args);
+    try {
+      return await Promise.race([invokePromise, timeoutPromise]);
+    } finally {
+      // 审计修复：无论成功还是超时，都清理定时器，避免悬挂的 reject 调用
+      if (timerId) clearTimeout(timerId);
+    }
+  }
+
+  /**
    * v0.5.4 新增：Tauri 事件监听辅助函数
    * 
    * 与 tauriInvoke 类似，优先使用 window.__TAURI_LISTEN__（dev 环境导入），
@@ -170,7 +195,8 @@
     listEl.innerHTML = '<div class="loading">正在扫描 AI 工具...</div>';
 
     try {
-      let agents = await tauriInvoke('detect_agents');
+      // v0.5.7 修复：使用带超时的 invoke，避免卡在"正在扫描 AI 工具..."
+      let agents = await tauriInvokeWithTimeout('detect_agents', {}, 10000);
       // v0.5.4 修复：检测完成后取消进度监听，避免内存泄漏
       if (progressUnlisten) {
         try { progressUnlisten(); } catch (e) { /* 忽略取消监听错误 */ }
@@ -186,7 +212,7 @@
 
       // 按分类分组渲染
       const categories = [
-        { key: 'ide', title: 'IDE 内嵌 Agent（可管理多个项目）', desc: '勾选后扫描项目列表' },
+        { key: 'ide', title: 'IDE 内嵌 AI 工具（可管理多个项目）', desc: '勾选后扫描项目列表' },
         { key: 'desktop', title: '独立桌面应用', desc: '勾选后直接配置 MCP 连接' },
         { key: 'ai-assistant', title: 'AI 助手类工具', desc: '勾选后配置 MCP 连接' },
         { key: 'custom', title: '自定义', desc: '提供通用连接信息' },
@@ -300,7 +326,8 @@
     // 扫描 IDE 项目
     if (ideAgents.length > 0) {
       try {
-        const projects = await tauriInvoke('scan_ide_projects', { ideIds: ideAgents });
+        // v0.5.7 修复：使用超时包装，避免 scan_ide_projects 卡住
+        const projects = await tauriInvokeWithTimeout('scan_ide_projects', { ideIds: ideAgents }, 15000);
         if (projects && projects.length > 0) {
           const grouped = {};
           for (const p of projects) {
@@ -418,9 +445,12 @@
 
   // 初始化：从 Agent 数据直接同步 selectedAgents（不依赖 DOM 状态）
   function syncInitialAgentSelection() {
-    // 已安装的 Agent 自动勾选
+    // v0.5.7 修复：只自动选中支持 MCP 的已安装工具
+    // 根因：之前所有 installed=true 的工具都被选中，包括不支持 MCP 的工具
+    // （如通义灵码、豆包 MarsCode 等），导致底部状态栏显示"Agent 5 个"
+    // 但实际只有 2 个支持 MCP 的 AI 工具能被配置
     config.allAgents.forEach((agent) => {
-      if (agent.installed && !config.selectedAgents.includes(agent.id)) {
+      if (agent.installed && agent.supports_mcp && !config.selectedAgents.includes(agent.id)) {
         config.selectedAgents.push(agent.id);
       }
     });
@@ -433,10 +463,11 @@
       btn.disabled = true;
       btn.textContent = '正在配置 MCP...';
       try {
-        const result = await tauriInvoke('configure_agents', {
+        // v0.5.7 修复：使用超时包装，避免 configure_agents 卡住
+        const result = await tauriInvokeWithTimeout('configure_agents', {
           agentIds: config.selectedAgents,
           port: config.port || 3099,
-        });
+        }, 30000);
         console.log('[配置向导] MCP 配置完成:', result);
         // v0.5.4 P2-18 修复：保存 MCP 配置结果，供 showSummary 显示
         config.mcpConfigResult = result;
@@ -464,26 +495,28 @@
     if (progressBar) progressBar.style.width = '66%';
     // 后台静默加载 Agent 列表（供后续自动配置 MCP 使用）
     try {
-      const agents = await tauriInvoke('detect_agents');
+      // v0.5.7 修复：跳过路径也使用超时包装
+      const agents = await tauriInvokeWithTimeout('detect_agents', {}, 10000);
       if (agents) {
         config.allAgents = agents;
-        // 自动勾选所有已安装的 Agent
-        agents.filter(a => a.installed).forEach(a => {
+        // v0.5.7 修复：只自动选中支持 MCP 的已安装工具（与 syncInitialAgentSelection 一致）
+        agents.filter(a => a.installed && a.supports_mcp).forEach(a => {
           if (!config.selectedAgents.includes(a.id)) {
             config.selectedAgents.push(a.id);
           }
         });
-        console.log('[配置向导] 后台检测完成，已安装 Agent:', config.selectedAgents.length, '个');
+        console.log('[配置向导] 后台检测完成，已安装且支持 MCP 的 Agent:', config.selectedAgents.length, '个');
 
         // v0.5.4 P2-18 修复：跳过检测路径也必须调用 configure_agents 写入 MCP 配置
         // 修复前：此路径不调用 configure_agents，导致 MCP 配置从未写入，用户在 AI 工具中看不到 LRC
         if (config.selectedAgents.length > 0) {
           try {
             const port = config.port || 3099;
-            const result = await tauriInvoke('configure_agents', {
+            // v0.5.7 修复：跳过路径也使用超时包装
+            const result = await tauriInvokeWithTimeout('configure_agents', {
               agentIds: config.selectedAgents,
               port: port,
-            });
+            }, 30000);
             console.log('[配置向导] MCP 配置完成（跳过检测路径）:', result);
             // 保存 MCP 配置结果，供 showSummary 显示
             config.mcpConfigResult = result;
@@ -586,51 +619,60 @@
       }
 
       if (llmString) {
-        await tauriInvoke('save_llm_config', { llmApi: llmString });
+        await tauriInvokeWithTimeout('save_llm_config', { llmApi: llmString }, 5000);
         console.log('[配置向导] LLM 配置已保存');
       }
     } catch (e) {
       console.warn('[配置向导] LLM 配置保存失败（非致命）:', e);
     }
 
-    btn.disabled = false;
-    btn.textContent = '保存并完成配置 →';
+    // v0.5.7 修复：不再提前恢复按钮状态，由 finishConfiguration() 统一管理
     await finishConfiguration();
   });
 
   // v0.5.4 P0-3 新增：统一的完成配置流程（LLM 保存后或跳过 LLM 都走这里）
+  // v0.5.7 修复：添加 loading 指示器 + 超时包装 + 全局规则写入保障
   async function finishConfiguration() {
     const btn = $('btn-step-2-next');
     const skipBtn = $('btn-step-2-skip');
-    if (btn) btn.disabled = true;
+    if (btn) { btn.disabled = true; btn.textContent = '正在配置...'; }
     if (skipBtn) skipBtn.disabled = true;
 
+    // v0.5.7 新增：显示配置进度提示
+    const progressEl = $('config-progress');
+    const showProgress = (msg) => {
+      if (progressEl) {
+        progressEl.textContent = msg;
+        progressEl.style.display = 'block';
+      }
+    };
+
     // 保存项目目录
+    showProgress('正在保存项目目录...');
     if (config.selectedProjects.length > 0) {
-      try { await tauriInvoke('set_project_dir', { projectDir: config.selectedProjects[0] }); } catch (e) {
+      try { await tauriInvokeWithTimeout('set_project_dir', { projectDir: config.selectedProjects[0] }, 5000); } catch (e) {
         console.warn('[配置向导] 项目目录设置失败:', e);
       }
     }
 
     // v0.5.6 修复：重新调用 configure_agents 确保全局规则文件写入
-    // 根因：步骤 1 调用 configure_agents 时，write_ai_rules 可能未执行
-    //   （旧版依赖 project_dir，新版改为全局规则写入用户主目录）
-    // 修复：重新调用 configure_agents，确保 MCP 配置和全局规则文件都正确写入。
-    //   MCP 配置通过 write_or_merge_config 合并，不会重复或丢失。
+    // v0.5.7 增强：使用超时包装，添加进度提示
     if (config.selectedAgents.length > 0) {
+      showProgress('正在配置 MCP 连接和全局规则...');
       try {
         const actualPort = config.port || 3099;
-        await tauriInvoke('configure_agents', {
+        await tauriInvokeWithTimeout('configure_agents', {
           agentIds: config.selectedAgents,
           port: actualPort,
-        });
-        console.log('[配置向导] 重新配置 Agent（确保全局 IDE 规则文件写入）');
+        }, 30000); // configure_agents 涉及文件写入，给 30 秒
+        console.log('[配置向导] 重新配置 Agent 完成（MCP 配置 + 全局规则文件已写入）');
       } catch (e) {
         console.warn('[配置向导] 重新配置 Agent 失败（非致命，规则文件可能未写入）:', e);
       }
     }
 
     // 启动 sidecar
+    showProgress('正在启动后台服务...');
     let sidecarStarted = false;
     const port = await startSidecarWithConfig(
       config.selectedProjects[0] || null,
@@ -643,21 +685,26 @@
     let verifyResult = null;
     try {
       // 等待 sidecar 完全就绪
+      showProgress('正在验证配置...');
       await new Promise(r => setTimeout(r, 1500));
-      verifyResult = await tauriInvoke('verify_setup');
+      verifyResult = await tauriInvokeWithTimeout('verify_setup', {}, 10000);
       console.log('[配置向导] 验证结果:', verifyResult);
     } catch (e) {
       console.warn('[配置向导] 验证调用失败（非致命）:', e);
     }
 
     // v0.5.4 P2-16 修复：标记配置完成，持久化 setup_complete=true
-    // 修复前缺失此调用，导致用户每次启动应用都需要重新配置
     try {
-      await tauriInvoke('mark_complete');
+      await tauriInvokeWithTimeout('mark_complete', {}, 5000);
       console.log('[配置向导] 已标记配置完成');
     } catch (e) {
       console.warn('[配置向导] 标记完成失败（非致命）:', e);
     }
+
+    // 隐藏进度提示
+    if (progressEl) progressEl.style.display = 'none';
+    if (btn) { btn.disabled = false; btn.textContent = '保存并完成配置 →'; }
+    if (skipBtn) skipBtn.disabled = false;
 
     showSummary(sidecarStarted, verifyResult);
     goToStep(3);
@@ -695,11 +742,12 @@
    */
   async function startSidecarWithConfig(srcDir, port, multiWindow) {
     try {
-      const actualPort = await tauriInvoke('start_sidecar', {
+      // v0.5.7 修复：使用超时包装，避免 start_sidecar 卡住（含健康检查，给 60 秒）
+      const actualPort = await tauriInvokeWithTimeout('start_sidecar', {
         srcDir: srcDir || null,
         port: port || null,
         multiWindow: multiWindow ? 5 : 1,
-      });
+      }, 60000);
       if (actualPort) {
         config.port = actualPort;
         console.log('[配置向导] Sidecar 已启动，端口:', actualPort);
@@ -863,7 +911,7 @@
     $('config-summary').innerHTML = `
       ${verifyHtml}
       ${mcpGuideHtml}
-      <div class="summary-item"><span class="check">&#x2705;</span> 已配置 Agent：${agentList || '无'}</div>
+      <div class="summary-item"><span class="check">&#x2705;</span> 已配置 AI 工具：${agentList || '无'}</div>
       <div class="summary-item"><span class="check">&#x2705;</span> 索引项目：${projectList || '无'} (${config.selectedProjects.length} 个)</div>
       <div class="summary-item"><span class="check">&#x2705;</span> LLM：${config.llmApiKey ? safeModel : '未配置'}</div>
       <div class="summary-item"><span class="check">${config.multiWindowEnabled ? '&#x1F7E2;' : '&#x26AA;'}</span> 多窗口记录：${config.multiWindowEnabled ? '已开启（上限 5 个）' : '未开启'}</div>
@@ -1123,7 +1171,8 @@
       if (progressBar) progressBar.style.width = '33%';
       // 预先加载 Agent 列表
       try {
-        const agents = await tauriInvoke('detect_agents');
+        // v0.5.7 修复：使用超时包装
+        const agents = await tauriInvokeWithTimeout('detect_agents', {}, 10000);
         if (agents) config.allAgents = agents;
       } catch (e) {
         console.warn('[配置向导] Agent 检测预加载失败:', e);
@@ -1211,12 +1260,13 @@
         const model = $('settings-llm-model').value || LLM_PROVIDERS[provider]?.model || null;
 
         // 通过 Rust 后端代理测试连接（避免 CSP 限制）
-        const result = await tauriInvoke('test_llm_connection', {
+        // v0.5.7 修复：使用超时包装（网络请求，给 30 秒）
+        const result = await tauriInvokeWithTimeout('test_llm_connection', {
           provider,
           apiKey,
           baseUrl,
           model,
-        });
+        }, 30000);
 
         if (result.success) {
           resultEl.style.display = 'block';
@@ -1274,7 +1324,8 @@
       }
 
       try {
-        await tauriInvoke('save_llm_config', { llmApi: llmString });
+        // v0.5.7 修复：使用超时包装
+        await tauriInvokeWithTimeout('save_llm_config', { llmApi: llmString }, 5000);
         statusEl.style.display = 'block';
         statusEl.className = 'llm-status success';
         statusEl.textContent = '✅ LLM 配置已保存';
@@ -1322,29 +1373,31 @@
   if (reconfigureBtn && reconfigureStatus) {
     reconfigureBtn.addEventListener('click', async () => {
       reconfigureBtn.disabled = true;
-      reconfigureStatus.textContent = '正在检测 Agent...';
+      reconfigureStatus.textContent = '正在检测 AI 工具...';
       try {
         // 获取已检测到的已安装 Agent
-        const agents = await tauriInvoke('detect_installed_agents');
-        const installedIds = agents.filter(a => a.installed).map(a => a.id);
+        // v0.5.7 修复：使用超时包装 + 只选择支持 MCP 的工具
+        const agents = await tauriInvokeWithTimeout('detect_installed_agents', {}, 10000);
+        const installedIds = agents.filter(a => a.installed && a.supports_mcp).map(a => a.id);
         if (installedIds.length === 0) {
-          reconfigureStatus.textContent = '⚠️ 未检测到已安装的 AI 工具';
+          reconfigureStatus.textContent = '⚠️ 未检测到支持 MCP 的已安装 AI 工具';
           return;
         }
         // 配置选中的 Agent
-        reconfigureStatus.textContent = `正在配置 ${installedIds.length} 个 Agent...`;
+        reconfigureStatus.textContent = `正在配置 ${installedIds.length} 个 AI 工具...`;
         const state = await tauriInvoke('get_wizard_state');
         const port = state.sidecar_port || 3099;
         if (!state.sidecar_running) {
           reconfigureStatus.textContent = '⚠️ Sidecar 未启动，仅写入配置文件（需稍后启动 Sidecar）';
         }
-        const results = await tauriInvoke('configure_agents', {
+        // v0.5.7 修复：使用超时包装，避免 configure_agents 卡住
+        const results = await tauriInvokeWithTimeout('configure_agents', {
           agentIds: installedIds,
           port
-        });
+        }, 30000);
         const successCount = results.filter(r => !r.includes(' — 配置写入失败')).length;
-        reconfigureStatus.textContent = `✅ 完成，成功配置 ${successCount}/${installedIds.length} 个 Agent`;
-        console.log('[重新配置 Agent] 结果:', results);
+        reconfigureStatus.textContent = `✅ 完成，成功配置 ${successCount}/${installedIds.length} 个 AI 工具`;
+        console.log('[重新配置 AI 工具] 结果:', results);
       } catch (e) {
         reconfigureStatus.textContent = `❌ 配置失败: ${e}`;
         console.error('[重新配置 Agent] 错误:', e);
@@ -1414,10 +1467,10 @@
         const count = (state.configured_agents || []).length;
         if (count > 0) {
           agentsIcon.textContent = '✅';
-          agentsText.textContent = `${count} 个 Agent 已配置`;
+          agentsText.textContent = `${count} 个 AI 工具已配置`;
         } else {
           agentsIcon.textContent = '⚠️';
-          agentsText.textContent = '未配置 Agent';
+          agentsText.textContent = '未配置 AI 工具';
         }
       }
 
@@ -1454,7 +1507,8 @@
       const progressBar = $('progress-bar-fill');
       if (progressBar) progressBar.style.width = '33%';
       try {
-        const agents = await tauriInvoke('detect_agents');
+        // v0.5.7 修复：使用超时包装
+        const agents = await tauriInvokeWithTimeout('detect_agents', {}, 10000);
         if (agents) config.allAgents = agents;
       } catch (e) {
         console.warn('[配置向导] Agent 检测预加载失败:', e);
@@ -1471,7 +1525,7 @@
   const btnReadyReset = $('btn-ready-reset');
   if (btnReadyReset) {
     btnReadyReset.addEventListener('click', async () => {
-      if (!confirm('确定要重置所有配置吗？\n\n这将清除项目、Agent 和 MCP 配置（LLM API Key 会保留）。\n下次打开时将重新进入配置向导。')) {
+      if (!confirm('确定要重置所有配置吗？\n\n这将清除项目、AI 工具和 MCP 配置（LLM API Key 会保留）。\n下次打开时将重新进入配置向导。')) {
         return;
       }
       btnReadyReset.disabled = true;
@@ -1971,8 +2025,13 @@
       detailPort.textContent = status && status.port ? `:${status.port}` : '—';
     }
     if (detailAgents) {
-      detailAgents.textContent = config.selectedAgents.length > 0
-        ? `${config.selectedAgents.length} 个`
+      // v0.5.7 修复：只计数支持 MCP 的已选中工具，避免显示"5 个"但实际只有 2 个能配置
+      const mcpAgentCount = config.selectedAgents.filter((id) => {
+        const agent = config.allAgents.find((a) => a.id === id);
+        return agent && agent.supports_mcp;
+      }).length;
+      detailAgents.textContent = mcpAgentCount > 0
+        ? `${mcpAgentCount} 个`
         : '0 个';
     }
 
@@ -1998,7 +2057,7 @@
         detailMcp.textContent = '已配置（等待 AI 工具连接）';
         detailMcp.style.color = '';
       } else if (status && status.running) {
-        detailMcp.textContent = '未配置 Agent';
+        detailMcp.textContent = '未配置 AI 工具';
         detailMcp.style.color = 'var(--warning)';
       } else {
         detailMcp.textContent = '服务未启动';

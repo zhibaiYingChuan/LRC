@@ -135,6 +135,10 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact-prefix: lrc-desktop-macos
+          # v0.5.7 新增：Linux 桌面端构建（AppImage + deb）
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact-prefix: lrc-desktop-linux
 
     steps:
       - name: Checkout
@@ -202,6 +206,20 @@ jobs:
             cargo install tauri-cli --version "^2.0"
         shell: bash
 
+      # v0.5.7 新增：Linux 系统依赖（Tauri v2 需要 webkit2gtk 等）
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
+        shell: bash
+
       # 步骤 4: 构建 Tauri 桌面端安装包
       # sidecar 已手动复制，build.rs 会检测到哈希一致并跳过复制
       - name: Build desktop app
@@ -241,6 +259,19 @@ jobs:
           VERSION="${{ steps.version.outputs.VER }}"
           # 复制 DMG 安装包
           find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.dmg" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-macos-arm64.dmg \;
+          ls -la desktop-artifacts/
+        shell: bash
+
+      # v0.5.7 新增：Linux artifact 收集（deb + AppImage）
+      - name: Collect desktop artifacts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p desktop-artifacts
+          VERSION="${{ steps.version.outputs.VER }}"
+          # 复制 deb 安装包
+          find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.deb" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-linux-amd64.deb \;
+          # 复制 AppImage
+          find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.AppImage" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-linux-x86_64.AppImage \;
           ls -la desktop-artifacts/
         shell: bash
 
