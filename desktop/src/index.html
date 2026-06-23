@@ -151,6 +151,8 @@
                     <button id="btn-step-2-skip" class="btn btn-outline">跳过，完成配置</button>
                     <button id="btn-step-2-next" class="btn btn-primary">保存并完成配置 →</button>
                 </div>
+                <!-- v0.5.7 新增：配置进度提示 -->
+                <div id="config-progress" class="config-progress" style="display:none; text-align:center; padding:8px; color:var(--text-secondary); font-size:13px;"></div>
             </div>
 
             <!-- v0.5.4 P0-3 修复：完成页面（步骤 3） -->
@@ -192,7 +194,7 @@
                         📊 打开仪表盘（可选）
                     </button>
                     <button id="btn-open-settings-from-done" class="btn btn-outline" style="font-size:13px;">
-                        ⚙️ 配置 LLM 和 Agent
+                        ⚙️ 配置 LLM 和 AI 工具
                     </button>
                     <span class="form-hint" style="text-align:center;">
                         💡 提示：LRC 在后台静默运行，无需保持此窗口打开。<br>
@@ -288,11 +290,11 @@
             <section class="settings-section">
                 <h2>🔌 配置 AI 工具连接 LRC</h2>
                 <p class="settings-desc">LRC 通过 MCP 协议与各种 AI 工具通信。选择你的工具查看配置方法。<br>
-                <strong>注意：</strong>只有拥有全局配置路径的 Agent（如 Claude Desktop、Trae）能被自动配置。<br>
+                <strong>注意：</strong>只有拥有全局配置路径的 AI 工具（如 Claude Desktop、Trae）能被自动配置。<br>
                 Cursor、VS Code 等 IDE 需要你在项目目录下手动创建 mcp.json 文件。</p>
                 <div class="settings-actions" style="margin-bottom: 12px;">
                   <button class="btn btn-primary" id="btn-reconfigure-agents" style="font-size: 13px; padding: 6px 16px;">
-                    🔄 重新检测并配置 Agent MCP
+                    🔄 重新检测并配置 AI 工具 MCP
                   </button>
                   <span id="reconfigure-status" style="margin-left: 10px; font-size: 12px; color: var(--text-secondary);"></span>
                 </div>
@@ -534,7 +536,7 @@
                 <div class="status-card">
                     <span class="status-icon" id="ready-agents-icon">⏳</span>
                     <div class="status-info">
-                        <strong>已配置 Agent</strong>
+                        <strong>已配置 AI 工具</strong>
                         <span id="ready-agents-text">检查中...</span>
                     </div>
                 </div>
@@ -632,7 +634,7 @@
                 <span class="status-detail-value" id="status-detail-llm">未配置</span>
             </div>
             <div class="status-detail-item">
-                <span class="status-detail-label">Agent</span>
+                <span class="status-detail-label">AI 工具</span>
                 <span class="status-detail-value" id="status-detail-agents">0 个</span>
             </div>
             <div class="status-detail-item">
