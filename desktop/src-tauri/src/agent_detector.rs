@@ -1014,27 +1014,34 @@ impl AgentDetector for ClaudeDesktopDetector {
         #[cfg(target_os = "windows")]
         {
             let local_appdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
+            // 策略 1：检查默认安装路径下的 claude.exe
             let install_exe = PathBuf::from(&local_appdata)
                 .join("AnthropicClaude")
                 .join("claude.exe");
             if install_exe.exists() {
                 return true;
             }
-
-            use std::process::Command;
-            let output = Command::new("reg")
-                .args([
-                    "query",
-                    r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall",
-                    "/f",
-                    "AnthropicClaude",
-                    "/k",
-                    "/e",
-                ])
-                .output();
-            if output.is_ok_and(|out| out.status.success() && !out.stdout.is_empty()) {
+            // 策略 2：检查 Programs 子目录（部分版本安装在此）
+            let programs_exe = PathBuf::from(&local_appdata)
+                .join("Programs")
+                .join("claude")
+                .join("claude.exe");
+            if programs_exe.exists() {
                 return true;
             }
+            // 策略 3：检查 Program Files
+            for pf in &[
+                r"C:\Program Files\Claude\claude.exe",
+                r"C:\Program Files (x86)\Claude\claude.exe",
+            ] {
+                if std::path::Path::new(pf).exists() {
+                    return true;
+                }
+            }
+            // v0.5.7 修复：移除注册表查询（reg query），速度慢且不可靠
+            // reg.exe 同步调用会阻塞 Tokio worker 线程 1-5 秒，
+            // 在持有 agent_registry 锁的情况下导致"正在扫描AI工具..."卡死。
+            // 参照 TraeDetector 的修复方式（v0.5.3），改用文件系统检查。
         }
 
         #[cfg(target_os = "macos")]

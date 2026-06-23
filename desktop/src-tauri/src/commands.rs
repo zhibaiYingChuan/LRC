@@ -130,11 +130,29 @@ fn user_friendly_error(err: &str) -> String {
     if err_lower.contains("enosys") || err_lower.contains("error 0x80004005") {
         return "LRC 服务程序无法在当前系统运行，请重新下载安装。".to_string();
     }
-    if err_lower.contains("sidecar") && err_lower.contains("not found")
-        || err_lower.contains("enoent") && err_lower.contains("sidecar")
+    // v0.5.7 修复：添加数字错误码匹配（不依赖 OS 语言）
+    // 中文 Windows 上 std::io::Error 的错误信息是中文，不包含 "not found"/"enoent"
+    if err_lower.contains("os error 2")
+        || err_lower.contains("enoent")
+        || (err_lower.contains("sidecar") && err_lower.contains("not found"))
         || err_lower.contains("lrc-sidecar") && err_lower.contains("not found")
+        || err_lower.contains("系统找不到指定的文件")
     {
         return "LRC 服务程序未找到，请重新安装或联系技术支持。".to_string();
+    }
+    // os error 5 = 拒绝访问（权限不足）
+    if err_lower.contains("os error 5")
+        || err_lower.contains("拒绝访问")
+        || (err_lower.contains("permission denied") && err_lower.contains("sidecar"))
+    {
+        return "没有权限启动 LRC 服务，请以管理员身份运行或检查杀毒软件拦截。".to_string();
+    }
+    // os error 32 = 文件被占用
+    if err_lower.contains("os error 32")
+        || err_lower.contains("文件已被另一个进程使用")
+        || err_lower.contains("being used by another process")
+    {
+        return "LRC 服务文件被占用，请关闭其他 LRC 实例后重试。".to_string();
     }
     if err_lower.contains("sidecar") && (err_lower.contains("not running") || err_lower.contains("未启动"))
     {
@@ -731,12 +749,27 @@ pub async fn test_llm_connection(
 pub async fn detect_agents(
     store: State<'_, AppStore>,
 ) -> Result<Vec<AgentInfo>, String> {
-    // v0.5.4 修复：直接同步调用 detect_all()
-    // 原实现使用 block_in_place + emit 导致事件循环死锁。
-    // emit 已移除，文件检测（Path::exists）是轻量操作，不会阻塞事件循环。
-    let registry = store.agent_registry.lock().await;
-    let result = registry.detect_all();
-    Ok(result)
+    // v0.5.7 修复：添加后端超时，避免前端超时后后端仍持锁导致死循环
+    // detect_all() 内部主要是 Path::exists（轻量），正常 < 1 秒
+    // 30 秒超时作为兜底，防止异常情况（如网络盘、杀毒软件扫描）导致卡死
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        async {
+            let registry = store.agent_registry.lock().await;
+            registry.detect_all()
+        }
+    ).await;
+
+    match result {
+        Ok(agents) => {
+            tracing::info!("detect_agents 完成，检测到 {} 个 Agent", agents.len());
+            Ok(agents)
+        }
+        Err(_) => {
+            tracing::error!("detect_agents 超时（30秒），可能存在锁竞争或文件系统慢");
+            Err("AI 工具检测超时（30秒），可能是杀毒软件扫描或网络盘响应慢，请重启应用后重试".to_string())
+        }
+    }
 }
 
 /// 仅返回已安装的 Agent（过滤掉未安装的）
@@ -760,7 +793,7 @@ pub async fn discover_all_agents(
 }
 
 /// 为选定的 Agent 配置 MCP 连接
-/// 
+///
 /// 配置完成后自动更新托盘 tooltip 显示 Agent 数量，
 /// 并持久化 configured_agents 到 wizard.json（P2-05 修复）。
 #[tauri::command]
@@ -784,11 +817,26 @@ pub async fn configure_agents(
         wizard.config().project_dir.clone()
     };
 
-    let registry = store.agent_registry.lock().await;
-    // v0.5.4 修复：传入项目目录，自动生成 AI 规则文件
+    // v0.5.7 修复：添加后端超时，避免文件写入慢导致卡死
+    // configure() 涉及多个文件读写（MCP 配置 + AI 规则），给 60 秒
     let project_path = project_dir.as_ref().map(|d| std::path::Path::new(d));
-    let result = registry.configure(&agent_ids, port, project_path)
-        .map_err(|e| user_friendly_error(&e))?;
+    let config_result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        async {
+            let registry = store.agent_registry.lock().await;
+            registry.configure(&agent_ids, port, project_path)
+        }
+    ).await;
+
+    let result = match config_result {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(user_friendly_error(&e)),
+        Err(_) => {
+            tracing::error!("configure_agents 超时（60秒）");
+            return Err("Agent 配置超时（60秒），可能是磁盘写入慢或杀毒软件拦截，请暂时关闭杀毒软件后重试".to_string());
+        }
+    };
+
     // 更新 Agent 计数
     let mut count = store.configured_agent_count.lock().await;
     *count = result.len();
@@ -802,7 +850,7 @@ pub async fn configure_agents(
 }
 
 /// 扫描已安装 IDE 的项目列表
-/// 
+///
 /// 传入已选中的 IDE agent_ids（如 ["trae", "cursor"]），
 /// 返回每个 IDE 对应的项目列表
 #[tauri::command]
@@ -810,8 +858,25 @@ pub async fn scan_ide_projects(
     store: State<'_, AppStore>,
     ide_ids: Vec<String>,
 ) -> Result<Vec<ProjectInfo>, String> {
-    let registry = store.agent_registry.lock().await;
-    Ok(registry.scan_ide_projects(&ide_ids))
+    // v0.5.7 修复：添加后端超时，避免文件系统慢导致卡死
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        async {
+            let registry = store.agent_registry.lock().await;
+            registry.scan_ide_projects(&ide_ids)
+        }
+    ).await;
+
+    match result {
+        Ok(projects) => {
+            tracing::info!("scan_ide_projects 完成，扫描到 {} 个项目", projects.len());
+            Ok(projects)
+        }
+        Err(_) => {
+            tracing::error!("scan_ide_projects 超时（30秒）");
+            Err("项目扫描超时（30秒），可能是磁盘响应慢，请减少选择的 IDE 数量后重试".to_string())
+        }
+    }
 }
 
 // ── 项目目录命令 ──
