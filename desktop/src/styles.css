@@ -108,6 +108,129 @@
     --cinnabar: #B84838;        /* 朱砂（错误） */
 }
 
+/* ============================================================
+ * v0.5.8 新增：深色主题（Mocha 夜色 — 基于 Catppuccin Mocha）
+ * 通过 [data-theme="dark"] 属性切换，覆盖浅色主题变量
+ * 配色理念：深色背景 + 柔亮强调色，保持中国古典色系语义
+ * ============================================================ */
+[data-theme="dark"] {
+    /* ── 背景层级（Mocha 主题） ── */
+    --bg-primary: #1E1E2E;      /* Base — 窗口主背景（深夜墨色） */
+    --bg-secondary: #181825;    /* Mantle — 次级面板、侧边栏、卡片背景 */
+    --bg-card: #313244;         /* Surface — 浮层、工具提示、卡片 */
+    --bg-crust: #45475A;        /* Crust — 模态框背景、下拉菜单 */
+    --bg-tertiary: #181825;     /* 兼容旧引用，等同 Mantle */
+
+    /* ── 文字颜色 ── */
+    --text-primary: #CDD6F4;    /* Text — 正文、标题（对比度 11.2:1） */
+    --text-secondary: #A6ADC8;  /* Subtext0 — 辅助说明、次要信息 */
+    --text-tertiary: #9399B2;   /* Subtext1 — 占位符、禁用文字 */
+    --text-dark: #CDD6F4;       /* 兼容旧引用，等同 Text */
+
+    /* ── 强调色（柔亮色系，适配深色背景） ── */
+    --accent: #89B4FA;           /* Primary (Blue) — 主要按钮、链接 */
+    --accent-hover: #74A0FC;     /* Primary 加深 10% — 悬停状态 */
+    --primary: #89B4FA;          /* 语义化主色 */
+    --success: #A6E3A1;          /* Success (Green) — 成功状态 */
+    --warning: #F9E2AF;          /* Warning (Yellow) — 警告 */
+    --danger: #F38BA8;           /* Error (Red) — 错误、删除 */
+    --info: #94E2D5;             /* Info (Cyan) — 信息提示 */
+    --accent-magenta: #F5C2E7;   /* Accent (Magenta) — 选中状态 */
+
+    /* ── 边框与分割线 ── */
+    --border: #45475A;           /* Border — 默认边框 */
+    --border-subtle: #45475A;    /* 语义化边框色 */
+    --border-strong: #585B70;    /* Border Strong — 强调边框 */
+    --divider: #313244;          /* Divider — 分割线 */
+
+    /* ── 阴影规范（深色主题阴影更深） ── */
+    --shadow-low: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow-medium: 0 4px 8px rgba(0, 0, 0, 0.4);
+    --shadow-high: 0 8px 16px rgba(0, 0, 0, 0.5);
+
+    /* ── 在强调色/深色背景上的文字颜色 ── */
+    --text-on-accent: #1E1E2E;   /* 深色文字（深色主题强调色更亮，用深色文字） */
+
+    /* ── 深色变体（用于浅色背景上的文字，深色主题中用亮色） ── */
+    --success-dark: #A6E3A1;
+    --danger-dark: #F38BA8;
+    --warning-dark: #F9E2AF;
+
+    /* ── 强调色透明度变体（基于 Primary #89B4FA） ── */
+    --accent-alpha-03: rgba(137, 180, 250, 0.03);
+    --accent-alpha-06: rgba(137, 180, 250, 0.06);
+    --accent-alpha-08: rgba(137, 180, 250, 0.08);
+    --accent-alpha-10: rgba(137, 180, 250, 0.10);
+    --accent-alpha-20: rgba(137, 180, 250, 0.20);
+
+    /* ── 成功色透明度变体（基于 #A6E3A1） ── */
+    --success-alpha-10: rgba(166, 227, 161, 0.10);
+    --success-alpha-15: rgba(166, 227, 161, 0.15);
+    --success-alpha-20: rgba(166, 227, 161, 0.20);
+    --success-alpha-30: rgba(166, 227, 161, 0.30);
+    --success-alpha-50: rgba(166, 227, 161, 0.50);
+
+    /* ── 危险色透明度变体（基于 #F38BA8） ── */
+    --danger-alpha-08: rgba(243, 139, 168, 0.08);
+    --danger-alpha-10: rgba(243, 139, 168, 0.10);
+    --danger-alpha-15: rgba(243, 139, 168, 0.15);
+    --danger-alpha-25: rgba(243, 139, 168, 0.25);
+    --danger-alpha-30: rgba(243, 139, 168, 0.30);
+
+    /* ── 警告色透明度变体（基于 #F9E2AF） ── */
+    --warning-alpha-08: rgba(249, 226, 175, 0.08);
+    --warning-alpha-10: rgba(249, 226, 175, 0.10);
+    --warning-alpha-20: rgba(249, 226, 175, 0.20);
+    --warning-alpha-30: rgba(249, 226, 175, 0.30);
+    --warning-alpha-40: rgba(249, 226, 175, 0.40);
+
+    /* ── 柔和状态色（状态指示器） ── */
+    --muted-green: #A6E3A1;
+    --muted-gray: #9399B2;
+    --danger-bright: #F38BA8;
+    --warning-bright: #F9E2AF;
+
+    /* ── 柔和状态色透明度变体 ── */
+    --muted-green-alpha-10: rgba(166, 227, 161, 0.10);
+    --muted-green-alpha-30: rgba(166, 227, 161, 0.30);
+
+    /* ── 中国古典色系别名（深色主题适配） ── */
+    --jade: #A6E3A1;             /* 青绿（成功） */
+    --gold: #F9E2AF;             /* 金黄（警告） */
+    --cinnabar: #F38BA8;         /* 朱砂（错误） */
+}
+
+/* v0.5.8 新增：主题切换按钮样式 */
+.theme-toggle {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    z-index: 1000;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    color: var(--text-primary);
+    cursor: pointer;
+    font-size: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s ease;
+    box-shadow: var(--shadow-low);
+}
+
+.theme-toggle:hover {
+    background: var(--bg-secondary);
+    border-color: var(--accent);
+    transform: scale(1.05);
+}
+
+.theme-toggle:active {
+    transform: scale(0.95);
+}
+
 * {
     margin: 0;
     padding: 0;

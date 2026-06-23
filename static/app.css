@@ -976,9 +976,9 @@
       font-size: 1.2em;
       font-weight: 600;
       text-align: center;
-      color: #c0a060;
+      color: var(--gold);
       padding: 16px;
-      border-bottom: 1px solid #333;
+      border-bottom: 1px solid var(--border);
       margin-bottom: 20px;
     }
     .power-cards {
@@ -987,8 +987,8 @@
       gap: 16px;
     }
     .power-card {
-      background: #1a1a2e;
-      border: 1px solid #333;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
       border-radius: 8px;
       padding: 20px;
       text-align: center;
@@ -998,20 +998,20 @@
       margin-bottom: 8px;
     }
     .power-card h3 {
-      color: #c0a060;
+      color: var(--gold);
       margin: 8px 0;
       font-size: 1.1em;
     }
     .power-card p {
-      color: #999;
+      color: var(--text-dim);
       font-size: 0.9em;
       line-height: 1.6;
       margin: 8px 0 12px;
     }
     .power-card .power-metric {
       display: inline-block;
-      background: #1a3a1a;
-      color: #4caf50;
+      background: rgba(46, 204, 113, 0.1);
+      color: var(--jade-dark);
       padding: 4px 12px;
       border-radius: 20px;
       font-size: 0.8em;
@@ -1024,7 +1024,7 @@
       flex-wrap: wrap;
       margin: 16px 0;
       padding: 12px;
-      background: #1a1a2e;
+      background: var(--card-bg);
       border-radius: 8px;
     }
     .badge {
@@ -1033,23 +1033,23 @@
       font-size: 0.85em;
       font-weight: 600;
     }
-    .badge-success { background: #1a3a1a; color: #4caf50; }
-    .badge-warning { background: #3a3a1a; color: #ff9800; }
-    .badge-info { background: #1a2a3a; color: #64b5f6; }
+    .badge-success { background: rgba(46, 204, 113, 0.1); color: var(--jade-dark); }
+    .badge-warning { background: rgba(243, 156, 18, 0.1); color: var(--gold); }
+    .badge-info { background: rgba(192, 57, 43, 0.1); color: var(--cinnabar-light); }
 
     .benchmark-layer {
-      background: #1a1a2e;
-      border: 1px solid #333;
+      background: var(--card-bg);
+      border: 1px solid var(--border);
       border-radius: 8px;
       padding: 16px;
       margin-bottom: 16px;
     }
     .benchmark-layer h3 {
-      color: #c0a060;
+      color: var(--gold);
       margin: 0 0 4px 0;
     }
     .benchmark-layer .layer-desc {
-      color: #888;
+      color: var(--text-dim);
       font-size: 0.9em;
       margin: 0 0 12px 0;
     }
@@ -1058,7 +1058,7 @@
       align-items: flex-start;
       gap: 12px;
       padding: 10px 0;
-      border-bottom: 1px solid #2a2a3e;
+      border-bottom: 1px solid var(--border);
     }
     .benchmark-test:last-child { border-bottom: none; }
     .test-status {
@@ -1072,32 +1072,32 @@
       flex-shrink: 0;
       margin-top: 2px;
     }
-    .test-status.pass { background: #1a3a1a; color: #4caf50; }
-    .test-status.fail { background: #3a1a1a; color: #f44336; }
+    .test-status.pass { background: rgba(46, 204, 113, 0.1); color: var(--jade-dark); }
+    .test-status.fail { background: rgba(192, 57, 43, 0.1); color: var(--cinnabar-light); }
     .test-info { flex: 1; }
     .test-info h4 {
       margin: 0;
       font-size: 0.95em;
-      color: #ddd;
+      color: var(--text);
     }
     .test-info .test-desc {
       font-size: 0.8em;
-      color: #888;
+      color: var(--text-dim);
       margin: 4px 0;
     }
     .test-info .test-metric {
       font-size: 0.75em;
-      color: #64b5f6;
+      color: var(--cinnabar-light);
       margin: 2px 0;
     }
     .test-story {
       font-size: 0.8em;
-      color: #c0a060;
+      color: var(--gold);
       font-style: italic;
       margin: 4px 0 0;
       padding: 6px 10px;
-      background: #111;
-      border-left: 3px solid #c0a060;
+      background: var(--bg);
+      border-left: 3px solid var(--gold);
       border-radius: 0 4px 4px 0;
     }
 
@@ -1112,21 +1112,21 @@
     }
     .chart-note {
       text-align: center;
-      color: #888;
+      color: var(--text-dim);
       font-size: 0.85em;
       margin-top: 12px;
     }
   /* 叙事导引 */
 .narrative-intro { }
 .narrative-box {
-    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-    border: 1px solid #333;
+    background: linear-gradient(135deg, var(--card-bg) 0%, var(--bg) 100%);
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 24px;
     margin: 16px 0;
 }
 .narrative-lead {
-    color: #c0a060;
+    color: var(--gold);
     font-size: 1.05em;
     margin: 0 0 16px 0;
 }
@@ -1137,54 +1137,54 @@
 }
 .narrative-gaps li {
     padding: 8px 0;
-    color: #ddd;
+    color: var(--text);
     font-size: 0.95em;
-    border-bottom: 1px solid #2a2a3e;
+    border-bottom: 1px solid var(--border);
 }
 .narrative-gaps li:last-child { border-bottom: none; }
 .narrative-gaps li strong {
-    color: #f44336;
+    color: var(--cinnabar-light);
 }
 .narrative-call {
-    color: #aaa;
+    color: var(--text-dim);
     font-size: 0.9em;
     line-height: 1.7;
     margin: 16px 0;
 }
 .narrative-open {
-    color: #64b5f6;
+    color: var(--cinnabar-light);
     font-size: 0.9em;
     text-align: center;
     margin: 12px 0 0;
     padding: 10px;
-    background: #0d1b2a;
+    background: var(--bg);
     border-radius: 6px;
 }
 
 /* 可复现区域 */
 .reproducible-box {
-    background: #1a1a2e;
-    border: 1px solid #333;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
     border-radius: 8px;
     padding: 20px;
 }
 .reproducible-intro {
-    color: #aaa;
+    color: var(--text-dim);
     font-size: 0.9em;
     margin: 0 0 16px 0;
 }
 .code-block {
     display: flex;
     align-items: center;
-    background: #0d0d1a;
-    border: 1px solid #333;
+    background: var(--bg);
+    border: 1px solid var(--border);
     border-radius: 6px;
     padding: 12px 16px;
     margin: 12px 0;
     overflow-x: auto;
 }
 .code-block code {
-    color: #4caf50;
+    color: var(--jade-dark);
     font-family: 'Consolas', 'Monaco', monospace;
     font-size: 0.85em;
     flex: 1;
@@ -1192,7 +1192,7 @@
 }
 .copy-btn {
     background: #1a3a2a;
-    color: #4caf50;
+    color: var(--jade-dark);
     border: 1px solid #2a5a3a;
     border-radius: 4px;
     padding: 6px 12px;
@@ -1215,7 +1215,7 @@
     display: flex;
     gap: 10px;
     padding: 10px;
-    background: #111;
+    background: var(--bg);
     border-radius: 6px;
 }
 .feature-icon {
@@ -1223,16 +1223,16 @@
     flex-shrink: 0;
 }
 .feature-text strong {
-    color: #ddd;
+    color: var(--text);
     font-size: 0.9em;
 }
 .feature-text p {
-    color: #888;
+    color: var(--text-dim);
     font-size: 0.8em;
     margin: 4px 0 0;
 }
 .reproducible-note {
-    color: #c0a060;
+    color: var(--gold);
     font-size: 0.85em;
     text-align: center;
     margin: 12px 0 0;
@@ -1241,7 +1241,7 @@
 
 /* 竞品对比表 */
 .comparison-note {
-    color: #888;
+    color: var(--text-dim);
     font-size: 0.85em;
     margin: 8px 0 16px;
 }
@@ -1258,11 +1258,11 @@
 .comparison-table td {
     padding: 10px 12px;
     text-align: center;
-    border: 1px solid #2a2a3e;
+    border: 1px solid var(--border);
 }
 .comparison-table th {
-    background: #1a1a2e;
-    color: #c0a060;
+    background: var(--card-bg);
+    color: var(--gold);
     font-weight: 600;
     font-size: 0.85em;
 }
@@ -1272,18 +1272,18 @@
 }
 .comparison-table td:first-child {
     text-align: left;
-    color: #ddd;
+    color: var(--text);
     font-weight: 500;
 }
 .comparison-table tbody tr:hover {
     background: #1a1a3e;
 }
 .cell-pass {
-    color: #4caf50;
+    color: var(--jade-dark);
     font-weight: 600;
 }
 .cell-unique {
-    color: #c0a060;
+    color: var(--gold);
     font-weight: 600;
     background: rgba(192, 160, 96, 0.1);
 }
@@ -1291,10 +1291,10 @@
     color: #666;
 }
 .cell-partial {
-    color: #ff9800;
+    color: var(--gold);
 }
 .comparison-disclaimer {
-    color: #888;
+    color: var(--text-dim);
     font-size: 0.8em;
     text-align: center;
     margin: 12px 0 0;
