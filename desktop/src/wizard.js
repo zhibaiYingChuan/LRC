@@ -245,7 +245,7 @@
 
     try {
       // v0.5.7 修复：使用带超时的 invoke，避免卡在"正在扫描 AI 工具..."
-      let agents = await tauriInvokeWithTimeout('detect_agents', {}, 10000);
+      let agents = await tauriInvokeWithTimeout('detect_agents', {}, 30000);
       // v0.5.4 修复：检测完成后取消进度监听，避免内存泄漏
       if (progressUnlisten) {
         try { progressUnlisten(); } catch (e) { /* 忽略取消监听错误 */ }
@@ -565,7 +565,7 @@
     // 后台静默加载 Agent 列表（供后续自动配置 MCP 使用）
     try {
       // v0.5.7 修复：跳过路径也使用超时包装
-      const agents = await tauriInvokeWithTimeout('detect_agents', {}, 10000);
+      const agents = await tauriInvokeWithTimeout('detect_agents', {}, 30000);
       if (agents) {
         config.allAgents = agents;
         // v0.5.7 修复：只自动选中支持 MCP 的已安装工具（与 syncInitialAgentSelection 一致）
@@ -1270,7 +1270,7 @@
       // 预先加载 Agent 列表
       try {
         // v0.5.7 修复：使用超时包装
-        const agents = await tauriInvokeWithTimeout('detect_agents', {}, 10000);
+        const agents = await tauriInvokeWithTimeout('detect_agents', {}, 30000);
         if (agents) config.allAgents = agents;
       } catch (e) {
         console.warn('[配置向导] Agent 检测预加载失败:', e);
@@ -1618,7 +1618,7 @@
       if (progressBar) progressBar.style.width = '33%';
       try {
         // v0.5.7 修复：使用超时包装
-        const agents = await tauriInvokeWithTimeout('detect_agents', {}, 10000);
+        const agents = await tauriInvokeWithTimeout('detect_agents', {}, 30000);
         if (agents) config.allAgents = agents;
       } catch (e) {
         console.warn('[配置向导] Agent 检测预加载失败:', e);
@@ -1987,25 +1987,42 @@
 
     // 保存状态
     if (state.project_dir) config.selectedProjects = [state.project_dir];
-    // v0.5.11 修复：过滤 configured_agents，只保留支持 MCP 的工具
-    // 根因：state.configured_agents 来自后端 wizard.json，可能包含旧版本遗留的不支持 MCP 的工具
-    // 导致底部状态栏显示"5 个"但实际只有 2 个能配置
+    // v0.5.12 修复：过滤 configured_agents，只保留已安装且支持 MCP 的 AI 工具
+    // 根因：state.configured_agents 来自后端 wizard.json，可能包含：
+    //   1. 旧版本遗留的不支持 MCP 的工具（如通义灵码、豆包 MarsCode）
+    //   2. 已移除的非 AI 工具（如 cloudbase-mcp、playwright-mcp）
+    //   3. 已卸载但未清理的工具
+    // 导致底部状态栏显示"5 个"但实际只有 2 个 AI 工具
     if (state.configured_agents) {
-      // 确保 allAgents 已填充，以便过滤 supports_mcp
+      // 确保 allAgents 已填充，以便过滤
       if (!config.allAgents || config.allAgents.length === 0) {
         try {
-          const agents = await tauriInvokeWithTimeout('detect_agents', {}, 10000);
+          const agents = await tauriInvokeWithTimeout('detect_agents', {}, 30000);
           if (agents) config.allAgents = agents;
         } catch (e) {
           console.warn('[已就绪] Agent 检测失败，将使用未过滤的列表:', e);
         }
       }
-      // 过滤：只保留支持 MCP 的工具
+      // 过滤：只保留已安装（installed=true）且支持 MCP（supports_mcp=true）的工具
       if (config.allAgents && config.allAgents.length > 0) {
         config.selectedAgents = state.configured_agents.filter((id) => {
           const agent = config.allAgents.find((a) => a.id === id);
-          return agent && agent.supports_mcp;
+          return agent && agent.installed && agent.supports_mcp;
         });
+        // v0.5.12 新增：如果过滤后数量减少，说明 configured_agents 有过期数据
+        // 清理 wizard.json 中的过期 configured_agents
+        if (config.selectedAgents.length < state.configured_agents.length) {
+          console.log(
+            `[已就绪] 清理过期 configured_agents: ${state.configured_agents.length} -> ${config.selectedAgents.length}`
+          );
+          try {
+            await tauriInvoke('save_configured_agents', {
+              agentIds: config.selectedAgents,
+            });
+          } catch (e) {
+            console.warn('[已就绪] 清理过期 configured_agents 失败:', e);
+          }
+        }
       } else {
         // 如果 allAgents 仍为空，直接使用 configured_agents（降级处理）
         config.selectedAgents = state.configured_agents;

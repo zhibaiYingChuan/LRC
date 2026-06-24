@@ -88,6 +88,7 @@ fn main() {
             commands::detect_installed_agents,
             commands::discover_all_agents,
             commands::configure_agents,
+            commands::save_configured_agents,
             commands::scan_ide_projects,
             commands::get_project_dir,
             commands::set_project_dir,

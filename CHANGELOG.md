@@ -4,6 +4,97 @@
 
 ---
 
+## [0.5.12] - 2026-06-24
+
+### 新增
+
+- **SpaceSniffer 式项目索引**：
+  - `scan_roots()` 扫描所有可用驱动器根目录（C:\, D:\, G:\ 等），不再仅扫描 C:\Users\*
+  - `scan_marker_projects()` 使用 walkdir 递归扫描，最大深度 5 层
+  - `is_scan_ignored_dir()` 跳过系统目录（Windows、Program Files）和依赖目录（node_modules、target、.git）
+  - `MAX_SCAN_ENTRIES` 从 200 增加到 5000，支持全盘扫描
+  - 新增 `walkdir = "2"` 依赖
+
+- **快捷方式扫描检测 AI 工具**（用户建议）：
+  - 新增 `scan_shortcuts()` 函数，扫描桌面和开始菜单 .lnk 文件
+  - 通过解析 .lnk 文件二进制内容匹配 exe_names（UTF-16LE + ASCII 编码）
+  - 新增 `collect_shortcut_dirs()` 收集快捷方式目录（用户桌面、公共桌面、用户开始菜单、系统开始菜单）
+  - 新增 `search_exe_in_lnk()` 和 `contains_subsequence()` 辅助函数
+  - 解决问题：用户将 AI 工具安装在非标准目录（如 D:\Trae CN\、H:\CodeBuddy CN\）时无法检测
+
+- **exe 文件扫描检测**：
+  - `KnownTool` 结构体新增 `exe_names` 字段，存储每个工具的可执行文件名列表
+  - 新增 `scan_exe_in_install_dirs()` 扫描常见安装目录中的可执行文件
+  - 新增 `collect_install_dirs()` 收集跨平台安装目录
+  - `check_known_tool()` 检测策略：binary_paths → exe_names 扫描 → 快捷方式扫描
+
+### 修复
+
+- **AI 工具数量显示错误**：`showReadyPanel` 过滤 `configured_agents`，只保留 `installed=true` 且 `supports_mcp=true` 的工具
+- **CodeBuddy CN 全局规则未配置**：检测方式从 dot 目录改为 exe 文件扫描 + 快捷方式扫描
+- **lrc-sidecar.exe 内存占用大**：`index_project()` 添加目录过滤（node_modules、target、.git）和文件大小限制（>1MB 跳过）
+- **索引失败**：项目扫描从仅扫描 C:\Users\* 改为扫描所有驱动器根目录
+
+### 变更
+
+- 移除非 AI 工具（cloudbase-mcp、playwright-mcp）的 KNOWN_TOOLS 条目
+- `Cargo.toml` 版本号 0.5.11 → 0.5.12
+- `desktop/src-tauri/Cargo.toml` 版本号 0.5.11 → 0.5.12，新增 walkdir 依赖
+- README.md 精简重写，突出基准测试评分和核心功能，使用说明书通过链接提供
+- README.md 基准测试表格增加每个测试报告的超链接
+
+### 测试
+
+- 桌面端 44 个单元测试全部通过
+- `test_print_installed_agents` 验证：检测到 2 个已安装 AI 工具（Trae CN + CodeBuddy）
+
+---
+
+## [0.5.11] - 2026-06-24
+
+### 修复
+
+- **全局规则路径修正**：`agent_detector.rs` 中规则文件写入路径从 `~/.trae-cn/rules/` 改为 `~/.trae-cn/user_rules/`
+- **AI 工具数量显示错误**：`wizard.js` 的 `updateReadyPanelStatus` 添加 `supports_mcp` 过滤
+- **仪表盘配色问题**：`app.css` 中 7 处硬编码颜色值替换为 CSS 变量或 rgba 值
+- **缺少主题切换按钮**：`index.html` 添加主题切换按钮（☀️/🌙），`wizard.js` 添加 `initTheme`/`applyTheme`/`toggleTheme` 函数，localStorage 持久化
+
+---
+
+## [0.5.10] - 2026-06-24
+
+### 变更
+
+- `app.css` 中 7 处硬编码颜色值替换为 CSS 变量（commit 25ec8b3）
+- 版本号更新至 0.5.10，触发 CI 构建
+
+---
+
+## [0.5.9] - 2026-06-24
+
+### 修复
+
+- **全局规则未安装**：路径修正 + 旧文件清理 + 手动写入正确规则
+- **AI 工具数量错误**：`wizard.js` 的 `updateReadyPanelStatus` 添加 `supports_mcp` 过滤
+- **仪表盘配色问题**：`app.css` 中硬编码颜色值替换为 CSS 变量
+- **缺少主题切换按钮**：添加 ☀️/🌙 切换按钮，localStorage 持久化
+
+---
+
+## [0.5.8] - 2026-06-24
+
+### 变更
+
+- 前端文案审计与修复：完成页面引导、快速启动示例、Agent 配置描述、端口号提示、30秒体验测试内容
+- LLM 配置字符串分隔符统一使用 `||`
+- 复选框渲染逻辑统一使用 `installed && supports_mcp`
+- Key 链接显示逻辑：ollama/custom 隐藏（`keyUrl: null`）
+- 模型占位符动态更新
+- LLM 提供商列表一致性：wizard、设置面板、常量均为 11 个提供商
+- 术语统一：使用"AI 工具"而非"Agent"
+
+---
+
 ## [0.5.7] - 2026-06-23
 
 ### 新增

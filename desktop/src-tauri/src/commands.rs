@@ -856,6 +856,22 @@ pub async fn configure_agents(
     Ok(result)
 }
 
+/// v0.5.12 新增：保存已配置的 Agent 列表（用于清理过期 configured_agents）
+///
+/// 前端在 showReadyPanel 中过滤 configured_agents 后，调用此命令
+/// 将清理后的列表持久化到 wizard.json
+#[tauri::command]
+pub async fn save_configured_agents(
+    store: State<'_, AppStore>,
+    agent_ids: Vec<String>,
+) -> Result<(), String> {
+    let mut wizard = store.wizard.lock().await;
+    wizard.save_configured_agents(agent_ids)
+        .map_err(|e| user_friendly_error(&e))?;
+    tracing::info!("[配置] 已保存 configured_agents");
+    Ok(())
+}
+
 /// 扫描已安装 IDE 的项目列表
 ///
 /// 传入已选中的 IDE agent_ids（如 ["trae", "cursor"]），

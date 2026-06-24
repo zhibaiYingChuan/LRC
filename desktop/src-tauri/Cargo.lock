@@ -2142,7 +2142,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lrc-desktop"
-version = "0.5.11"
+version = "0.5.12"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2166,6 +2166,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "walkdir",
  "windows-sys 0.59.0",
 ]
 

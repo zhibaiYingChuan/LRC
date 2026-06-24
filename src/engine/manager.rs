@@ -15,6 +15,50 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// v0.5.12 新增：判断目录是否应被忽略（不索引）
+///
+/// 排除依赖目录、构建产物、版本控制目录等，减少内存占用和索引时间。
+/// 这些目录通常包含大量自动生成的文件，对代码记忆无意义。
+fn is_ignored_dir(path: &Path) -> bool {
+    // 只检查目录名（最后一级）
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let name_lower = name.to_lowercase();
+        return matches!(
+            name_lower.as_str(),
+            // 依赖目录
+            "node_modules"
+            | ".cargo"
+            | "vendor"
+            | "bower_components"
+            // 构建产物
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".nuxt"
+            | ".output"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | "bin"
+            | "obj"
+            // 版本控制
+            | ".git"
+            | ".svn"
+            | ".hg"
+            // IDE/工具缓存
+            | ".idea"
+            | ".vscode"
+            | ".vs"
+            // 其他
+            | ".cache"
+            | "coverage"
+            | ".nyc_output"
+        );
+    }
+    false
+}
+
 /// 索引统计
 #[derive(Debug, Clone, Serialize)]
 pub struct ChunkStats {
@@ -546,11 +590,22 @@ impl<E: CodeEncoder> CoreManager<E> {
         let mut total_chunks = 0usize;
         let mut files = 0usize;
 
+        // v0.5.12 修复：排除大目录和二进制文件目录，减少内存占用
+        // 根因：旧逻辑遍历所有目录（包括 node_modules、target、.git 等），
+        //       导致大量文件被读取到内存，sidecar 内存占用过大
         for entry in walkdir::WalkDir::new(src_dir)
             .into_iter()
+            .filter_entry(|e| !is_ignored_dir(e.path()))
             .filter_map(|e| e.ok())
             .filter(|e| e.path().is_file() && is_supported_file(e.path()))
         {
+            // v0.5.12 新增：跳过过大的文件（> 1MB），避免内存浪费
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.len() > 1_048_576 {
+                    continue;
+                }
+            }
+
             let content = match std::fs::read_to_string(entry.path()) {
                 Ok(c) => c,
                 Err(_) => continue,
