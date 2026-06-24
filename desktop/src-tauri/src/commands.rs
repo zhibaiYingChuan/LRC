@@ -40,10 +40,9 @@ async fn post_sidecar_start(
 ) {
     // v0.5.5：自动检测并升级旧版本 MCP 配置
     // v0.5.6：规则文件改为全局级，不再依赖 project_dir
-    let (project_dir, configured_agents) = {
+    let project_dir = {
         let wizard = store.wizard.lock().await;
-        (wizard.config().project_dir.clone(),
-         wizard.config().configured_agents.clone())
+        wizard.config().project_dir.clone()
     };
     let project_path = project_dir.as_ref().map(|d| std::path::Path::new(d));
     let registry = store.agent_registry.lock().await;
@@ -62,14 +61,22 @@ async fn post_sidecar_start(
     }
 
     // v0.5.6：sidecar 启动后自动写入全局 IDE 规则文件
-    // 解决升级场景：用户升级 LRC Desktop 后，规则文件可能缺失或过时
-    if !configured_agents.is_empty() {
-        match registry.write_rules_for_agents(&configured_agents) {
+    // v0.5.11 修复：改为为所有已安装的 AI 工具写入规则，而不只是 configured_agents
+    //   根因：用户反馈"只有 Trae 有规则，CodeBuddy 没有"
+    //   原逻辑只为 configured_agents（用户在向导中勾选的工具）写入规则
+    //   新逻辑为所有已安装的 AI 工具写入规则（除非产品文档不支持规则文件）
+    let installed_agent_ids: Vec<String> = registry
+        .detect_installed()
+        .iter()
+        .map(|info| info.id.clone())
+        .collect();
+    if !installed_agent_ids.is_empty() {
+        match registry.write_rules_for_agents(&installed_agent_ids) {
             Ok(written) => {
                 if !written.is_empty() {
                     match project_key {
                         Some(key) => tracing::info!("[sidecar] 已为项目 {} 写入 {} 个全局 IDE 规则文件", key, written.len()),
-                        None => tracing::info!("[sidecar] 已为 {} 个 Agent 写入全局 IDE 规则文件", written.len()),
+                        None => tracing::info!("[sidecar] 已为 {} 个已安装 AI 工具写入全局 IDE 规则文件", written.len()),
                     }
                 }
             }
@@ -1087,22 +1094,27 @@ pub async fn switch_project(
     }
 
     // 1. 保存新项目路径并提取 LLM 配置
-    let (llm_api, configured_agents) = {
+    let llm_api = {
         let mut wizard = store.wizard.lock().await;
         wizard.set_project_dir(&project_dir)
             .map_err(|e| user_friendly_error(&e))?;
-        (wizard.config().to_llm_api_string(),
-         wizard.config().configured_agents.clone())
+        wizard.config().to_llm_api_string()
     };
 
     // v0.5.6 修复：切换项目后，确保全局 IDE 规则文件存在
-    // v0.5.6 重构：规则文件改为全局级（写入用户主目录），切换项目不再需要重新写入
-    //   但仍调用此方法确保规则文件存在（首次安装后可能尚未写入）
-    if !configured_agents.is_empty() {
+    // v0.5.11 修复：改为为所有已安装的 AI 工具写入规则（与 post_sidecar_start 一致）
+    {
         let registry = store.agent_registry.lock().await;
-        match registry.write_rules_for_agents(&configured_agents) {
-            Ok(written) => tracing::info!("[切换项目] 已确保 {} 个全局 IDE 规则文件存在: {}", written.len(), project_dir),
-            Err(e) => tracing::warn!("[切换项目] 全局规则文件写入失败（不影响 sidecar）: {}", e),
+        let installed_agent_ids: Vec<String> = registry
+            .detect_installed()
+            .iter()
+            .map(|info| info.id.clone())
+            .collect();
+        if !installed_agent_ids.is_empty() {
+            match registry.write_rules_for_agents(&installed_agent_ids) {
+                Ok(written) => tracing::info!("[切换项目] 已确保 {} 个全局 IDE 规则文件存在: {}", written.len(), project_dir),
+                Err(e) => tracing::warn!("[切换项目] 全局规则文件写入失败（不影响 sidecar）: {}", e),
+            }
         }
     }
 

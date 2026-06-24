@@ -1572,18 +1572,9 @@
       const agentsText = $('ready-agents-text');
       if (agentsIcon && agentsText) {
         // v0.5.8 修复：只计数支持 MCP 的已配置工具，与 updateStatusBar 保持一致
-        // 修复前：直接用 state.configured_agents.length，导致不支持 MCP 的工具也被计数
-        //         （如通义灵码、豆包 MarsCode 等），显示"5 个"但实际只有 2 个能配置
-        const allConfigured = state.configured_agents || [];
-        let count;
-        if (config.allAgents && config.allAgents.length > 0) {
-          count = allConfigured.filter((id) => {
-            const agent = config.allAgents.find((a) => a.id === id);
-            return agent && agent.supports_mcp;
-          }).length;
-        } else {
-          count = allConfigured.length;
-        }
+        // v0.5.11 修复：使用 config.selectedAgents（已在 showReadyPanel 中过滤）
+        // 而不是 state.configured_agents（可能包含旧版本遗留的不支持 MCP 的工具）
+        const count = config.selectedAgents.length;
         if (count > 0) {
           agentsIcon.textContent = '✅';
           agentsText.textContent = `${count} 个 AI 工具已配置`;
@@ -1996,7 +1987,30 @@
 
     // 保存状态
     if (state.project_dir) config.selectedProjects = [state.project_dir];
-    if (state.configured_agents) config.selectedAgents = state.configured_agents;
+    // v0.5.11 修复：过滤 configured_agents，只保留支持 MCP 的工具
+    // 根因：state.configured_agents 来自后端 wizard.json，可能包含旧版本遗留的不支持 MCP 的工具
+    // 导致底部状态栏显示"5 个"但实际只有 2 个能配置
+    if (state.configured_agents) {
+      // 确保 allAgents 已填充，以便过滤 supports_mcp
+      if (!config.allAgents || config.allAgents.length === 0) {
+        try {
+          const agents = await tauriInvokeWithTimeout('detect_agents', {}, 10000);
+          if (agents) config.allAgents = agents;
+        } catch (e) {
+          console.warn('[已就绪] Agent 检测失败，将使用未过滤的列表:', e);
+        }
+      }
+      // 过滤：只保留支持 MCP 的工具
+      if (config.allAgents && config.allAgents.length > 0) {
+        config.selectedAgents = state.configured_agents.filter((id) => {
+          const agent = config.allAgents.find((a) => a.id === id);
+          return agent && agent.supports_mcp;
+        });
+      } else {
+        // 如果 allAgents 仍为空，直接使用 configured_agents（降级处理）
+        config.selectedAgents = state.configured_agents;
+      }
+    }
     if (state.sidecar_port) config.port = state.sidecar_port;
 
     // 更新状态

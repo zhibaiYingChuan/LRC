@@ -612,7 +612,6 @@ fn scan_roots() -> Vec<PathBuf> {
             "Documents\\Projects",
             "Desktop",
             "Documents",
-            "",  // 主目录本身
         ] {
             let p = home.join(sub);
             if p.exists() {
@@ -621,10 +620,9 @@ fn scan_roots() -> Vec<PathBuf> {
         }
     }
     // v0.5.4 修复：移除驱动根目录扫描，避免扫描整个硬盘
-    // 驱动根目录扫描会导致：
-    // 1. 扫描时间过长（可能数分钟）
-    // 2. 大量系统目录误报
-    // 3. 用户体验极差
+    // v0.5.11 修复：移除主目录本身（""），避免用户主目录被当作项目目录
+    //   根因：用户主目录下有 .trae/.trae-cn 等配置目录，scan_marker_projects 会误将
+    //   主目录当作项目目录（因为 root.join(".trae").exists() 为 true）
     roots
 }
 
@@ -1825,7 +1823,7 @@ impl AgentDetectorRegistry {
 
         format!(
             r#"{frontmatter}{header}
-<!-- 本文件由 LRC Desktop v0.5.10 自动生成，请勿手动删除 LRC 相关规则 -->
+<!-- 本文件由 LRC Desktop v0.5.11 自动生成，请勿手动删除 LRC 相关规则 -->
 <!-- 如需自定义规则，请在本文件末尾添加 -->
 
 ## LRC 记忆系统（Loong Recall Code Memory）
@@ -2028,8 +2026,8 @@ AI：已记录登录 API 到记忆库
         if rules_path.exists() {
             let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
             if existing.contains("LRC 记忆系统") {
-                // v0.5.10 增强：检测旧版本规则并自动升级（兼容 v0.5.5、v0.5.6、v0.5.7、v0.5.8、v0.5.9）
-                if !existing.contains("v0.5.10 自动生成") {
+                // v0.5.11 增强：检测旧版本规则并自动升级（兼容 v0.5.5、v0.5.6、v0.5.7、v0.5.8、v0.5.9、v0.5.10）
+                if !existing.contains("v0.5.11 自动生成") {
                     // 旧版本规则，需要升级
                     if let Some(pos) = existing.find("## LRC 记忆系统") {
                         let user_content = existing[..pos].trim_end();
@@ -2042,7 +2040,7 @@ AI：已记录登录 API 到记忆库
                             format!("更新规则文件失败: {} ({})", rules_path.display(), e)
                         })?;
                         tracing::info!(
-                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.10 版本: {}",
+                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.11 版本: {}",
                             tool_id,
                             rules_path.display()
                         );
@@ -2052,13 +2050,13 @@ AI：已记录登录 API 到记忆库
                             format!("更新规则文件失败: {} ({})", rules_path.display(), e)
                         })?;
                         tracing::info!(
-                            "[AI规则] {} — 已追加 LRC v0.5.10 规则到现有文件: {}",
+                            "[AI规则] {} — 已追加 LRC v0.5.11 规则到现有文件: {}",
                             tool_id,
                             rules_path.display()
                         );
                     }
                 } else {
-                    // 已是 v0.5.10 版本，跳过
+                    // 已是 v0.5.11 版本，跳过
                     tracing::info!(
                         "[AI规则] {} — 规则文件已是最新版本，跳过: {}",
                         tool_id,
