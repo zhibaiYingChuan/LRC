@@ -16,7 +16,8 @@
 ///   - AI 浏览器/平台：Agent Browser, CloudBase MCP, Playwright MCP, OpenCode
 ///   - 其他 AI 工具：Z-Brain, Functional Hub, Tabby, PearAI, Zed, JetBrains AI
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Agent 信息（返回给前端展示）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +93,11 @@ struct KnownTool {
     /// 格式：支持环境变量 %LOCALAPPDATA%, %PROGRAMFILES%, %PROGRAMFILES(X86)%
     /// 例如：%LOCALAPPDATA%/Programs/Trae/Trae.exe
     binary_paths: &'static [&'static str],
+    /// v0.5.12 新增：可执行文件名列表（用于全盘扫描匹配，不区分大小写）
+    /// Windows: .exe 文件名（如 "CodeBuddy.exe"）
+    /// Linux/macOS: 可执行文件名（如 "codebuddy"）
+    /// 当 binary_paths 为空时，通过扫描常见安装目录匹配这些文件名来检测
+    exe_names: &'static [&'static str],
 }
 
 /// 所有已知 AI 工具的数据库
@@ -111,6 +117,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: Some(".trae/mcp.json"),
         mcp_transport: "stdio",
         binary_paths: &["%LOCALAPPDATA%/Programs/Trae/Trae.exe", "%PROGRAMFILES%/Trae/Trae.exe"],
+        exe_names: &["Trae.exe"],
     },
     KnownTool {
         id: "trae-cn",
@@ -123,6 +130,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: Some(".trae-cn/trae-mcp.json"),
         mcp_transport: "stdio",
         binary_paths: &["%LOCALAPPDATA%/Programs/Trae CN/Trae CN.exe", "%PROGRAMFILES%/Trae CN/Trae CN.exe"],
+        exe_names: &["Trae CN.exe"],
     },
     KnownTool {
         id: "cursor",
@@ -135,6 +143,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None, // 项目级 .cursor/mcp.json
         mcp_transport: "stdio",
         binary_paths: &["%LOCALAPPDATA%/Programs/Cursor/Cursor.exe", "%PROGRAMFILES%/Cursor/Cursor.exe"],
+        exe_names: &["Cursor.exe"],
     },
     KnownTool {
         id: "vscode",
@@ -147,6 +156,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None, // 项目级 .vscode/mcp.json
         mcp_transport: "stdio",
         binary_paths: &["%LOCALAPPDATA%/Programs/Microsoft VS Code/Code.exe", "%PROGRAMFILES%/Microsoft VS Code/Code.exe"],
+        exe_names: &["Code.exe"],
     },
     KnownTool {
         id: "windsurf",
@@ -159,6 +169,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: Some("%APPDATA%/Windsurf/User/globalStorage/mcp.json"),
         mcp_transport: "stdio",
         binary_paths: &["%LOCALAPPDATA%/Programs/Windsurf/Windsurf.exe", "%PROGRAMFILES%/Windsurf/Windsurf.exe"],
+        exe_names: &["Windsurf.exe"],
     },
     KnownTool {
         id: "kiro",
@@ -171,6 +182,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: Some(".kiro/settings/mcp.json"),
         mcp_transport: "stdio",
         binary_paths: &["%LOCALAPPDATA%/Programs/Kiro/Kiro.exe"],
+        exe_names: &["Kiro.exe"],
     },
 
     // ═══ 桌面应用类 ═══
@@ -185,6 +197,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: Some("%APPDATA%/Claude/claude_desktop_config.json"),
         mcp_transport: "http",
         binary_paths: &["%LOCALAPPDATA%/AnthropicClaude/claude.exe"],
+        exe_names: &["claude.exe"],
     },
     KnownTool {
         id: "gemini-cli",
@@ -197,6 +210,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: Some(".gemini/settings.json"),
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["gemini"],
     },
     KnownTool {
         id: "codex-cli",
@@ -209,6 +223,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["codex"],
     },
 
     // ═══ AI 编码助手类 ═══
@@ -223,6 +238,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: Some(".codebuddy/mcp.json"),
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["CodeBuddy.exe", "CodeBuddy CN.exe"],
     },
     KnownTool {
         id: "comate",
@@ -235,6 +251,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: Some(".comate/mcp.json"),
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["comate.exe", "Comate.exe"],
     },
     // ═══ 国产 AI 工具 ═══
     KnownTool {
@@ -248,6 +265,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["tongyi-lingma.exe", "Lingma.exe"],
     },
     KnownTool {
         id: "marscode",
@@ -260,6 +278,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["MarsCode.exe", "marscode.exe"],
     },
     KnownTool {
         id: "codegeex",
@@ -272,6 +291,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["CodeGeeX.exe", "codegeex.exe"],
     },
     KnownTool {
         id: "tencent-ai-code",
@@ -284,6 +304,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["tencent-ai-code.exe", "TencentAICode.exe"],
     },
     KnownTool {
         id: "huawei-codearts",
@@ -296,6 +317,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["CodeArts.exe", "codearts-snap.exe"],
     },
     KnownTool {
         id: "roo-code",
@@ -308,6 +330,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: Some(".roo/mcp.json"),
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &[],
     },
     KnownTool {
         id: "cline",
@@ -320,6 +343,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: Some(".cline/mcp.json"),
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &[],
     },
     KnownTool {
         id: "continue",
@@ -332,6 +356,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &[],
     },
     KnownTool {
         id: "cody",
@@ -344,6 +369,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &[],
     },
     KnownTool {
         id: "aider",
@@ -356,6 +382,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["aider"],
     },
     KnownTool {
         id: "augment",
@@ -368,6 +395,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &[],
     },
     KnownTool {
         id: "amazon-q",
@@ -380,6 +408,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["amazon-q.exe", "AmazonQ.exe"],
     },
     KnownTool {
         id: "tabby",
@@ -392,6 +421,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["tabby.exe", "Tabby.exe"],
     },
     KnownTool {
         id: "jetbrains-ai",
@@ -404,6 +434,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &["%PROGRAMFILES%/JetBrains/IntelliJ IDEA/bin/idea64.exe", "%LOCALAPPDATA%/JetBrains/Toolbox/scripts/idea.cmd"],
+        exe_names: &["idea64.exe", "pycharm64.exe", "webstorm64.exe", "clion64.exe", "goland64.exe"],
     },
     KnownTool {
         id: "pearai",
@@ -416,6 +447,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["PearAI.exe", "pearai.exe"],
     },
     KnownTool {
         id: "zed",
@@ -428,6 +460,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &["%LOCALAPPDATA%/Programs/Zed/Zed.exe"],
+        exe_names: &["Zed.exe", "zed.exe"],
     },
 
     // ═══ AI 浏览器 / 平台类 ═══
@@ -442,30 +475,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "http",
         binary_paths: &[],
-    },
-    KnownTool {
-        id: "cloudbase-mcp",
-        name: "CloudBase MCP",
-        icon: "🏗️",
-        category: "browser",
-        supports_mcp: true,
-        primary_marker: ".cloudbase-mcp",
-        secondary_markers: &[],
-        mcp_config_template: Some(".cloudbase-mcp/mcp.json"),
-        mcp_transport: "http",
-        binary_paths: &[],
-    },
-    KnownTool {
-        id: "playwright-mcp",
-        name: "Playwright MCP",
-        icon: "🎭",
-        category: "browser",
-        supports_mcp: true,
-        primary_marker: ".playwright-mcp",
-        secondary_markers: &[],
-        mcp_config_template: Some(".playwright-mcp/mcp.json"),
-        mcp_transport: "http",
-        binary_paths: &[],
+        exe_names: &["agent-browser.exe", "AgentBrowser.exe"],
     },
     KnownTool {
         id: "opencode",
@@ -478,6 +488,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
+        exe_names: &["opencode"],
     },
 
     // ═══ 其他 AI 工具 ═══
@@ -492,6 +503,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "http",
         binary_paths: &[],
+        exe_names: &["z-brain.exe", "ZBrain.exe"],
     },
     KnownTool {
         id: "functional-hub",
@@ -504,6 +516,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "http",
         binary_paths: &[],
+        exe_names: &["functional-hub.exe", "FunctionalHub.exe"],
     },
     KnownTool {
         id: "sillytavern",
@@ -516,6 +529,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "http",
         binary_paths: &[],
+        exe_names: &["SillyTavern.exe", "sillytavern.exe"],
     },
     KnownTool {
         id: "memorix",
@@ -528,6 +542,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "http",
         binary_paths: &[],
+        exe_names: &["memorix.exe", "Memorix.exe"],
     },
     // v0.5.4 P2-20 修复：移除 loong-recall 条目
     // 原因：~/.loong-recall 是 LRC 桌面端自己的数据目录，不是独立的 AI 工具。
@@ -537,10 +552,15 @@ const KNOWN_TOOLS: &[KnownTool] = &[
 
 // ── 通用扫描函数 ──
 
-/// 扫描条目数上限（防止在大目录如 Desktop 中扫描过多条目）
-const MAX_SCAN_ENTRIES: usize = 200;
+/// 扫描条目数上限（v0.5.12：从 200 增加到 5000，支持 SpaceSniffer 式全盘扫描）
+const MAX_SCAN_ENTRIES: usize = 5000;
 
-/// 扫描指定根目录下包含 marker 子目录的项目
+/// 扫描包含指定标记的项目目录
+///
+/// v0.5.12 重新设计：采用 SpaceSniffer 式递归扫描
+///   - 递归扫描所有目录（最大深度 5 层）
+///   - 跳过系统目录和依赖目录（Windows、Program Files、node_modules 等）
+///   - 检测每个目录是否包含 IDE 项目标记（如 .trae、.codebuddy）
 fn scan_marker_projects(
     roots: &[PathBuf],
     marker: &str,
@@ -549,45 +569,41 @@ fn scan_marker_projects(
 ) -> Vec<ProjectInfo> {
     let mut projects = Vec::new();
     let mut scanned = 0usize;
+
     for root in roots {
         if !root.exists() {
             continue;
         }
-        if root.join(marker).exists() {
-            projects.push(ProjectInfo {
-                name: root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| root.to_string_lossy().to_string()),
-                path: root.to_string_lossy().to_string(),
-                ide_id: ide_id.to_string(),
-                ide_name: ide_name.to_string(),
-            });
-        }
-        if let Ok(entries) = std::fs::read_dir(root) {
-            for entry in entries.flatten() {
-                // 扫描条目数上限（防止大目录扫描过慢）
-                if scanned >= MAX_SCAN_ENTRIES {
-                    tracing::debug!(
-                        "扫描根目录 {} 达到上限 {} 条，停止扫描",
-                        root.display(),
-                        MAX_SCAN_ENTRIES
-                    );
-                    break;
-                }
-                scanned += 1;
-                let path = entry.path();
-                if path.is_dir() && path.join(marker).exists() {
-                    projects.push(ProjectInfo {
-                        name: path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                        path: path.to_string_lossy().to_string(),
-                        ide_id: ide_id.to_string(),
-                        ide_name: ide_name.to_string(),
-                    });
-                }
+
+        // v0.5.12：使用 walkdir 递归扫描，类似 SpaceSniffer
+        for entry in walkdir::WalkDir::new(root)
+            .max_depth(5)
+            .into_iter()
+            .filter_entry(|e| !is_scan_ignored_dir(e.path()))
+            .filter_map(|e| e.ok())
+        {
+            // 扫描条目数上限（防止大磁盘扫描过慢）
+            if scanned >= MAX_SCAN_ENTRIES {
+                tracing::debug!(
+                    "扫描根目录 {} 达到上限 {} 条，停止扫描",
+                    root.display(),
+                    MAX_SCAN_ENTRIES
+                );
+                break;
+            }
+            scanned += 1;
+
+            let path = entry.path();
+            if path.is_dir() && path.join(marker).exists() {
+                projects.push(ProjectInfo {
+                    name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    path: path.to_string_lossy().to_string(),
+                    ide_id: ide_id.to_string(),
+                    ide_name: ide_name.to_string(),
+                });
             }
         }
     }
@@ -597,33 +613,80 @@ fn scan_marker_projects(
 }
 
 /// 获取项目扫描的根目录列表
-/// 
-/// v0.5.4 修复：移除驱动根目录扫描（C:\, D:\ 等），太慢且无意义。
-/// 只扫描用户主目录下的常见项目目录，外加 IDE 工作区配置中记录的项目。
+///
+/// v0.5.12 重新设计：SpaceSniffer 式扫描所有驱动器
+///   - 扫描所有可用驱动器根目录（C:\, D:\, G:\ 等）
+///   - 递归扫描由 scan_marker_projects 处理
+///   - 跳过系统目录由 is_scan_ignored_dir 处理
 fn scan_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        let home = PathBuf::from(&home);
-        for sub in &[
-            "source\\repos",
-            "Code",
-            "Projects",
-            "Documents\\GitHub",
-            "Documents\\Projects",
-            "Desktop",
-            "Documents",
-        ] {
-            let p = home.join(sub);
-            if p.exists() {
-                roots.push(p);
-            }
+    available_drives()
+}
+
+/// 获取所有可用的驱动器根路径（如 C:\, D:\, G:\ 等）
+fn available_drives() -> Vec<PathBuf> {
+    let mut drives = Vec::new();
+    // Windows: 检查 A-Z 所有驱动器
+    for letter in b'A'..=b'Z' {
+        let drive = format!("{}:\\", letter as char);
+        let path = PathBuf::from(&drive);
+        if path.exists() {
+            drives.push(path);
         }
     }
-    // v0.5.4 修复：移除驱动根目录扫描，避免扫描整个硬盘
-    // v0.5.11 修复：移除主目录本身（""），避免用户主目录被当作项目目录
-    //   根因：用户主目录下有 .trae/.trae-cn 等配置目录，scan_marker_projects 会误将
-    //   主目录当作项目目录（因为 root.join(".trae").exists() 为 true）
-    roots
+    drives
+}
+
+/// 判断目录是否应被扫描器忽略（递归扫描时跳过）
+///
+/// 跳过系统目录、依赖目录、构建产物等，减少扫描时间和内存占用。
+fn is_scan_ignored_dir(path: &Path) -> bool {
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let name_lower = name.to_lowercase();
+        return matches!(
+            name_lower.as_str(),
+            // 系统目录
+            "windows"
+            | "program files"
+            | "program files (x86)"
+            | "programdata"
+            | "$recycle.bin"
+            | "system volume information"
+            | "recovery"
+            | "perflogs"
+            | "msocache"
+            | "config.msi"
+            // 依赖目录
+            | "node_modules"
+            | ".cargo"
+            | "vendor"
+            | "bower_components"
+            // 构建产物
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".nuxt"
+            | ".output"
+            | "__pycache__"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | "bin"
+            | "obj"
+            // 版本控制
+            | ".git"
+            | ".svn"
+            | ".hg"
+            // IDE/工具缓存
+            | ".idea"
+            | ".vscode"
+            | ".vs"
+            // 其他
+            | ".cache"
+            | "coverage"
+            | ".nyc_output"
+        );
+    }
+    false
 }
 
 /// 获取用户主目录
@@ -690,10 +753,430 @@ fn resolve_binary_path(template: &str) -> Option<PathBuf> {
 fn binary_exists(binary_paths: &[&str]) -> bool {
     binary_paths.iter().any(|p| resolve_binary_path(p).is_some())
 }
+
+/// v0.5.12 新增：在常见安装目录中扫描可执行文件
+///
+/// 用户建议：像 SpaceSniffer 一样扫描，通过 exe 文件名确定用户实际安装了哪些 AI 工具。
+/// 此函数扫描常见安装目录（Programs、Program Files 等），匹配 exe_names 中的文件名。
+///
+/// 跨平台支持：
+///   - Windows: 扫描 %LOCALAPPDATA%/Programs/*、%PROGRAMFILES%/*、%PROGRAMFILES(X86)%/*
+///   - Linux: 扫描 /usr/local/bin、/usr/bin、/opt/*、~/.local/share/*、~/Applications
+///   - macOS: 扫描 /Applications/*、~/Applications、/usr/local/bin
+///
+/// 参数：
+///   - exe_names: 要匹配的可执行文件名列表（不区分大小写）
+///
+/// 返回：true 如果在任意安装目录中找到匹配的可执行文件
+fn scan_exe_in_install_dirs(exe_names: &[&str]) -> bool {
+    if exe_names.is_empty() {
+        return false;
+    }
+
+    // 将 exe_names 转为小写，用于不区分大小写匹配
+    let targets: Vec<String> = exe_names.iter().map(|n| n.to_lowercase()).collect();
+
+    // 收集要扫描的根目录
+    let scan_roots = collect_install_dirs();
+
+    tracing::debug!(
+        "[Agent检测] 扫描 {} 个安装目录，查找 {:?}",
+        scan_roots.len(),
+        exe_names
+    );
+
+    // 扫描每个根目录（最大深度 3 层，避免过深扫描）
+    for root in &scan_roots {
+        if !root.exists() {
+            continue;
+        }
+
+        for entry in walkdir::WalkDir::new(root)
+            .max_depth(3)
+            .into_iter()
+            .filter_entry(|e| !is_scan_ignored_dir(e.path()))
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            // 获取文件名（不区分大小写匹配）
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                let file_name_lower = file_name.to_lowercase();
+
+                // Windows: 直接匹配 .exe 文件
+                #[cfg(target_os = "windows")]
+                {
+                    if targets.iter().any(|t| *t == file_name_lower) {
+                        tracing::debug!(
+                            "[Agent检测] 匹配到可执行文件: {}",
+                            path.display()
+                        );
+                        return true;
+                    }
+                }
+
+                // Linux/macOS: 匹配可执行文件名（无扩展名）
+                #[cfg(not(target_os = "windows"))]
+                {
+                    // 移除扩展名后匹配
+                    let stem = std::path::Path::new(&file_name_lower)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&file_name_lower);
+                    if targets.iter().any(|t| {
+                        let t_stem = std::path::Path::new(t)
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(t);
+                        *t_stem == *stem
+                    }) {
+                        // 检查文件是否有执行权限
+                        if let Ok(metadata) = std::fs::metadata(path) {
+                            use std::os::unix::fs::PermissionsExt;
+                            if metadata.permissions().mode() & 0o111 != 0 {
+                                tracing::debug!(
+                                    "[Agent检测] 匹配到可执行文件: {}",
+                                    path.display()
+                                );
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// 收集常见安装目录列表（跨平台）
+fn collect_install_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: 用户级安装目录
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(&local_appdata).join("Programs"));
+        }
+        // Windows: 系统级安装目录
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            dirs.push(PathBuf::from(&program_files));
+        }
+        if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+            dirs.push(PathBuf::from(&program_files_x86));
+        }
+        // Windows: AppData（部分工具安装在此）
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            dirs.push(PathBuf::from(&appdata));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: 应用程序目录
+        dirs.push(PathBuf::from("/Applications"));
+        if let Some(home) = home_dir() {
+            dirs.push(home.join("Applications"));
+        }
+        dirs.push(PathBuf::from("/usr/local/bin"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: 系统安装目录
+        dirs.push(PathBuf::from("/usr/local/bin"));
+        dirs.push(PathBuf::from("/usr/bin"));
+        dirs.push(PathBuf::from("/opt"));
+        if let Some(home) = home_dir() {
+            dirs.push(home.join("Applications"));
+            dirs.push(home.join(".local/share"));
+        }
+    }
+
+    dirs
+}
+
 /// 检查标记路径是否存在（保留供未来扩展使用）
 #[allow(dead_code)]
 fn marker_exists(marker: &str) -> bool {
     resolve_marker(marker).is_some_and(|p| p.exists())
+}
+
+/// v0.5.12 新增：扫描桌面和开始菜单快捷方式，定位 AI 工具 exe
+///
+/// 用户建议：普通人安装程序后，桌面或开始菜单会有快捷方式（.lnk 文件）。
+/// 通过解析快捷方式指向的目标路径，可以快速定位 AI 工具的实际安装位置，
+/// 无论用户将工具安装在哪个磁盘或目录。
+///
+/// 扫描位置：
+///   - 用户桌面（%USERPROFILE%\Desktop）
+///   - 公共桌面（%PUBLIC%\Desktop）
+///   - 用户开始菜单（%APPDATA%\Microsoft\Windows\Start Menu\Programs）
+///   - 系统开始菜单（%ProgramData%\Microsoft\Windows\Start Menu\Programs）
+///
+/// 匹配方式：
+///   - 读取 .lnk 文件的二进制内容
+///   - 搜索 exe_names 中的文件名是否出现在 .lnk 文件中（UTF-16LE 和 ASCII 编码）
+///   - .lnk 文件中目标路径通常以 UTF-16LE 编码存储
+fn scan_shortcuts(exe_names: &[&str]) -> bool {
+    if exe_names.is_empty() {
+        return false;
+    }
+
+    let shortcut_dirs = collect_shortcut_dirs();
+    if shortcut_dirs.is_empty() {
+        return false;
+    }
+
+    // 将 exe_names 转为小写，用于不区分大小写匹配
+    let targets: Vec<String> = exe_names.iter().map(|n| n.to_lowercase()).collect();
+
+    for dir in &shortcut_dirs {
+        if !dir.exists() {
+            continue;
+        }
+
+        // 递归扫描快捷方式目录（最大深度 3 层）
+        for entry in walkdir::WalkDir::new(dir)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            // 只处理 .lnk 文件
+            let is_lnk = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("lnk"))
+                .unwrap_or(false);
+            if !is_lnk {
+                continue;
+            }
+
+            // 读取 .lnk 文件内容
+            let content = match std::fs::read(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // 搜索 exe_names 是否出现在 .lnk 文件中
+            if search_exe_in_lnk(&content, &targets) {
+                tracing::debug!(
+                    "[Agent检测] 通过快捷方式定位到 AI 工具: {} -> {}",
+                    path.display(),
+                    exe_names.join("/")
+                );
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// 收集快捷方式扫描目录（桌面 + 开始菜单）
+fn collect_shortcut_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        // 用户桌面
+        if let Some(home) = home_dir() {
+            dirs.push(home.join("Desktop"));
+        }
+        // 公共桌面
+        if let Ok(public) = std::env::var("PUBLIC") {
+            dirs.push(PathBuf::from(&public).join("Desktop"));
+        }
+        // 用户开始菜单
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            dirs.push(PathBuf::from(&appdata).join("Microsoft/Windows/Start Menu/Programs"));
+        }
+        // 系统开始菜单
+        if let Ok(programdata) = std::env::var("ProgramData") {
+            dirs.push(PathBuf::from(&programdata).join("Microsoft/Windows/Start Menu/Programs"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: 应用程序目录（.app 包含快捷方式信息）
+        dirs.push(PathBuf::from("/Applications"));
+        if let Some(home) = home_dir() {
+            dirs.push(home.join("Applications"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Linux: .desktop 文件目录
+        if let Some(home) = home_dir() {
+            dirs.push(home.join(".local/share/applications"));
+        }
+        dirs.push(PathBuf::from("/usr/share/applications"));
+        dirs.push(PathBuf::from("/usr/local/share/applications"));
+    }
+
+    dirs
+}
+
+/// 在 .lnk 文件二进制内容中搜索 exe 文件名
+///
+/// .lnk 文件中目标路径通常以 UTF-16LE 编码存储，
+/// 同时也检查 ASCII 编码以兼容不同格式。
+fn search_exe_in_lnk(content: &[u8], targets: &[String]) -> bool {
+    for target in targets {
+        // 检查 ASCII 编码
+        let ascii_bytes = target.as_bytes();
+        if contains_subsequence(content, ascii_bytes) {
+            return true;
+        }
+
+        // 检查 UTF-16LE 编码
+        let utf16_bytes: Vec<u8> = target
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        if contains_subsequence(content, &utf16_bytes) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 在 haystack 中搜索 needle 子序列（字节级匹配）
+fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+// ════════════════════════════════════════════════════════════════
+// v0.5.12 性能优化：全局扫描缓存
+// ════════════════════════════════════════════════════════════════
+// 根因：每个工具都重复扫描安装目录和快捷方式目录（22 个工具 × 重复扫描 = 慢）
+// 优化：一次性扫描所有目录，所有工具共享缓存，将总时间从 N×扫描 降低到 1×扫描
+
+/// 扫描缓存（一次性扫描，所有工具共享）
+struct ScanCache {
+    /// 所有安装目录中的 exe 文件名（小写）
+    exe_names: Vec<String>,
+    /// 所有 .lnk 文件内容
+    lnk_contents: Vec<Vec<u8>>,
+}
+
+/// 全局扫描缓存（首次调用时扫描，后续调用直接返回缓存）
+static SCAN_CACHE: OnceLock<ScanCache> = OnceLock::new();
+
+/// 获取扫描缓存（首次调用时扫描，后续调用直接返回缓存）
+fn get_scan_cache() -> &'static ScanCache {
+    SCAN_CACHE.get_or_init(|| {
+        let exe_names = collect_all_exe_names();
+        let lnk_contents = collect_all_lnk_contents();
+        tracing::info!(
+            "[Agent检测] 全局扫描缓存已建立: {} 个 exe 文件, {} 个 .lnk 文件",
+            exe_names.len(),
+            lnk_contents.len()
+        );
+        ScanCache {
+            exe_names,
+            lnk_contents,
+        }
+    })
+}
+
+/// 一次性扫描所有安装目录，收集所有 exe 文件名（小写）
+fn collect_all_exe_names() -> Vec<String> {
+    let mut exe_names = Vec::new();
+    let scan_roots = collect_install_dirs();
+
+    for root in &scan_roots {
+        if !root.exists() {
+            continue;
+        }
+
+        for entry in walkdir::WalkDir::new(root)
+            .max_depth(3)
+            .into_iter()
+            .filter_entry(|e| !is_scan_ignored_dir(e.path()))
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+                #[cfg(target_os = "windows")]
+                {
+                    if file_name.to_lowercase().ends_with(".exe") {
+                        exe_names.push(file_name.to_lowercase());
+                    }
+                }
+
+                #[cfg(not(target_os = "windows"))]
+                {
+                    if let Ok(metadata) = std::fs::metadata(path) {
+                        use std::os::unix::fs::PermissionsExt;
+                        if metadata.permissions().mode() & 0o111 != 0 {
+                            exe_names.push(file_name.to_lowercase());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    exe_names
+}
+
+/// 一次性扫描所有快捷方式目录，收集所有 .lnk 文件内容
+fn collect_all_lnk_contents() -> Vec<Vec<u8>> {
+    let mut lnk_contents = Vec::new();
+    let shortcut_dirs = collect_shortcut_dirs();
+
+    for dir in &shortcut_dirs {
+        if !dir.exists() {
+            continue;
+        }
+
+        for entry in walkdir::WalkDir::new(dir)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let is_lnk = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("lnk"))
+                .unwrap_or(false);
+
+            if is_lnk {
+                if let Ok(content) = std::fs::read(path) {
+                    lnk_contents.push(content);
+                }
+            }
+        }
+    }
+
+    lnk_contents
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -712,42 +1195,54 @@ impl DotDirDetector {
 
     /// 使用已知工具数据库中的信息进行检测
     ///
-    /// v0.5.5 增强：严格检测策略，避免残留目录误报
+    /// v0.5.12 重新设计：采用 exe 文件扫描检测，替代 dot 目录检测
+    ///   根因：dot 目录检测会导致误报（如 .gemini、.trae 残留目录）
+    ///         用户建议：像 SpaceSniffer 一样扫描 exe 文件确定实际安装的工具
     ///
     /// 策略（按优先级）：
-    ///   1. 有 binary_paths 的工具 → 检测二进制文件是否存在（最准确）
-    ///   2. 无 binary_paths 但有 mcp_config_template 的工具 → 检测配置文件是否存在
-    ///   3. 无 binary_paths 且无 mcp_config_template 的工具 → 不自动检测
-    ///      （避免残留 dot 目录误报，用户可在向导中手动选择）
+    ///   1. 有 binary_paths 的工具 → 检测已知路径的二进制文件是否存在（最快）
+    ///   2. 有 exe_names 的工具 → 扫描常见安装目录匹配可执行文件名（灵活）
+    ///   3. 有 exe_names 的工具 → 扫描桌面和开始菜单快捷方式定位 exe（用户建议）
+    ///   4. 以上均未匹配 → 不检测（返回 false，避免误报）
     fn check_known_tool(&self) -> bool {
-        // 策略 1：检测二进制可执行文件（最准确）
+        // 策略 1：检测已知路径的二进制文件（最快，最准确）
         if !self.tool.binary_paths.is_empty() {
-            return binary_exists(self.tool.binary_paths);
-        }
-        // 策略 2：无二进制路径但有 MCP 配置模板 → 检测配置文件是否存在
-        if let Some(config_template) = self.tool.mcp_config_template {
-            if let Some(cp) = resolve_marker(config_template) {
-                if cp.exists() {
-                    tracing::debug!(
-                        "[Agent检测] {} — 通过配置文件检测到: {}",
-                        self.tool.name,
-                        cp.display()
-                    );
-                    return true;
-                }
+            if binary_exists(self.tool.binary_paths) {
                 tracing::debug!(
-                    "[Agent检测] {} — 配置文件不存在: {}",
-                    self.tool.name,
-                    cp.display()
+                    "[Agent检测] {} — 通过 binary_paths 检测到",
+                    self.tool.name
                 );
-                return false;
+                return true;
             }
         }
-        // 策略 3：无 binary_paths 且无 mcp_config_template → 不自动检测
-        // v0.5.5 修复：避免残留 dot 目录误报（如 .gemini、.codex、.continue 等）
-        // 这些工具用户可在配置向导中手动选择
+
+        // 策略 2 & 3：使用全局缓存（避免每个工具都重复扫描安装目录和快捷方式目录）
+        // v0.5.12 性能优化：一次性扫描所有目录，所有工具共享缓存
+        if !self.tool.exe_names.is_empty() {
+            let cache = get_scan_cache();
+            let targets: Vec<String> = self.tool.exe_names.iter().map(|n| n.to_lowercase()).collect();
+
+            // 策略 2：在缓存的 exe 文件名中搜索
+            if cache.exe_names.iter().any(|exe| targets.iter().any(|t| exe == t)) {
+                tracing::debug!(
+                    "[Agent检测] {} — 通过 exe_names 扫描检测到（缓存）",
+                    self.tool.name
+                );
+                return true;
+            }
+
+            // 策略 3：在缓存的 .lnk 文件内容中搜索
+            if cache.lnk_contents.iter().any(|content| search_exe_in_lnk(content, &targets)) {
+                tracing::debug!(
+                    "[Agent检测] {} — 通过快捷方式扫描检测到（缓存）",
+                    self.tool.name
+                );
+                return true;
+            }
+        }
+
         tracing::debug!(
-            "[Agent检测] {} — 无二进制路径且无配置模板，不自动检测（避免误报）",
+            "[Agent检测] {} — 未检测到可执行文件（binary_paths、exe_names、快捷方式均未匹配）",
             self.tool.name
         );
         false
@@ -813,45 +1308,36 @@ impl AgentDetector for DotDirDetector {
 // 特殊检测器（需要复杂逻辑的工具）
 // ════════════════════════════════════════════════════════════════
 
-/// Trae 专用检测器（多策略检测，支持 Trae CN 特殊路径）
+/// Trae 专用检测器（仅检测 Trae 国际版）
+///
+/// v0.5.12 重新设计：移除 dot 目录检测，改用 exe 文件扫描
+///   根因：dot 目录检测会导致误报（.trae 残留目录存在但用户未安装 Trae 国际版）
+///   修复：仅检测 Trae.exe 可执行文件是否存在
 struct TraeDetector;
 
 impl AgentDetector for TraeDetector {
     fn detect(&self) -> bool {
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_default();
-        let home_path = PathBuf::from(&home);
-
-        // 策略 0：检查 ~/.trae-cn 和 ~/.trae
-        if home_path.join(".trae-cn").exists() || home_path.join(".trae").exists() {
+        // v0.5.12：仅通过 exe 文件检测，避免 dot 目录误报
+        // 策略 1：检测已知安装路径的 Trae.exe
+        let binary_paths = &[
+            "%LOCALAPPDATA%/Programs/Trae/Trae.exe",
+            "%PROGRAMFILES%/Trae/Trae.exe",
+        ];
+        if binary_exists(binary_paths) {
             return true;
         }
 
-        // 策略 1：检查 %APPDATA%\Trae 或 %APPDATA%\Trae CN
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        let appdata_path = PathBuf::from(&appdata);
-        if appdata_path.join("Trae").exists() || appdata_path.join("Trae CN").exists() {
-            return true;
-        }
-
-        // 策略 2：检查安装目录（二进制可执行文件）
-        let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
-        if PathBuf::from(&local).join("Programs").join("Trae").join("Trae.exe").exists()
-            || PathBuf::from(&local).join("Programs").join("Trae CN").join("Trae CN.exe").exists()
+        // 策略 2 & 3：使用全局缓存（避免重复扫描安装目录和快捷方式目录）
         {
-            return true;
-        }
-
-        // 策略 3：检查 Program Files
-        for pf in &["C:\\Program Files\\Trae\\Trae.exe", "C:\\Program Files (x86)\\Trae\\Trae.exe"] {
-            if std::path::Path::new(pf).exists() {
+            let cache = get_scan_cache();
+            let targets: Vec<String> = vec!["trae.exe".to_string()];
+            if cache.exe_names.iter().any(|exe| targets.iter().any(|t| exe == t)) {
+                return true;
+            }
+            if cache.lnk_contents.iter().any(|content| search_exe_in_lnk(content, &targets)) {
                 return true;
             }
         }
-
-        // v0.5.3 修复：移除注册表查询（reg query），速度慢且不可靠
-        // 注册表查询在 Windows 上可能需要 2-5 秒，且可能返回误报
 
         false
     }
@@ -931,13 +1417,37 @@ impl AgentDetector for TraeDetector {
 }
 
 /// Trae CN 专用检测器
+///
+/// v0.5.12 重新设计：移除 dot 目录检测，改用 exe 文件扫描
+///   根因：dot 目录检测会导致误报（.trae-cn 残留目录存在但用户未安装 Trae CN）
+///   修复：仅检测 Trae CN.exe 可执行文件是否存在
 struct TraeCNDetector;
 
 impl AgentDetector for TraeCNDetector {
     fn detect(&self) -> bool {
-        let home = home_dir().unwrap_or_default();
-        home.join(".trae-cn").exists()
-            || appdata_dir().is_some_and(|d| d.join("Trae CN").exists())
+        // v0.5.12：仅通过 exe 文件检测，避免 dot 目录误报
+        // 策略 1：检测已知安装路径的 Trae CN.exe
+        let binary_paths = &[
+            "%LOCALAPPDATA%/Programs/Trae CN/Trae CN.exe",
+            "%PROGRAMFILES%/Trae CN/Trae CN.exe",
+        ];
+        if binary_exists(binary_paths) {
+            return true;
+        }
+
+        // 策略 2 & 3：使用全局缓存（避免重复扫描安装目录和快捷方式目录）
+        {
+            let cache = get_scan_cache();
+            let targets: Vec<String> = vec!["trae cn.exe".to_string()];
+            if cache.exe_names.iter().any(|exe| targets.iter().any(|t| exe == t)) {
+                return true;
+            }
+            if cache.lnk_contents.iter().any(|content| search_exe_in_lnk(content, &targets)) {
+                return true;
+            }
+        }
+
+        false
     }
 
     fn config_path(&self) -> Option<PathBuf> {
@@ -1545,7 +2055,8 @@ impl AgentDetectorRegistry {
             };
 
             // 检查是否需要升级
-            let needs_upgrade = self.config_needs_upgrade(&existing_content);
+            // v0.5.12：传入 port 参数，用于检测端口自适应后 MCP 配置是否需要更新
+            let needs_upgrade = self.config_needs_upgrade(&existing_content, port);
             if !needs_upgrade {
                 continue;
             }
@@ -1590,7 +2101,7 @@ impl AgentDetectorRegistry {
     /// 1. 包含旧配置名称 `loong-recall`
     /// 2. `lrc-memory` 配置使用 stdio 模式（有 `command` 字段）
     /// 3. `lrc-memory` 配置使用旧的端口号
-    fn config_needs_upgrade(&self, content: &str) -> bool {
+    fn config_needs_upgrade(&self, content: &str, expected_port: u16) -> bool {
         // 解析 JSON
         let json: serde_json::Value = match serde_json::from_str(content) {
             Ok(v) => v,
@@ -1619,6 +2130,22 @@ impl AgentDetectorRegistry {
         for name in &legacy_names {
             if servers.contains_key(*name) {
                 return true;
+            }
+        }
+
+        // v0.5.12 新增：检查 lrc-memory 配置的端口号是否正确
+        // 解决问题：sidecar 端口自适应后，MCP 配置仍指向旧端口
+        // 用户反馈："如果服务启动失败，自动更换了端口。那不是白配置了"
+        if let Some(lrc_config) = servers.get("lrc-memory") {
+            if let Some(url) = lrc_config.get("url").and_then(|v| v.as_str()) {
+                let expected_port_str = format!(":{}", expected_port);
+                if !url.contains(&expected_port_str) {
+                    tracing::info!(
+                        "[自动升级] lrc-memory URL 端口不匹配: 配置={}, 期望端口={}",
+                        url, expected_port
+                    );
+                    return true; // 端口号不匹配，需要升级
+                }
             }
         }
 
@@ -1768,7 +2295,12 @@ impl AgentDetectorRegistry {
             // v0.5.7 移除：Zed 不支持传统全局规则文件（使用 Handlebars 模板，无法通过文件注入）
             // "zed" => Some(".zed/rules/lrc-memory.md"),
             // AI 编码助手类 — 全局规则文件
-            "codebuddy" => Some(".codebuddy/rules.md"),
+            // v0.5.12 修复：CodeBuddy 全局规则目录为 ~/.codebuddy/rules/，文件格式为 .mdc
+            // 修复前：写入 ~/.codebuddy/rules.md（单文件，CodeBuddy 不读取此位置）
+            // 修复后：写入 ~/.codebuddy/rules/lrc-memory.mdc（全局规则目录，CodeBuddy 会读取）
+            // 参考：用户反馈 CodeBuddy 全局规则路径为 C:\Users\<用户名>\.codebuddy\rules\
+            //       .mdc 文件需要 frontmatter（description, alwaysApply, enabled）
+            "codebuddy" => Some(".codebuddy/rules/lrc-memory.mdc"),
             // v0.5.7 修复：Cline 全局规则目录为 ~/Documents/Cline/Rules/（非 .cline/clinerules）
             // 官方文档：https://docs.cline.bot/customization/cline-rules
             // .clinerules 是项目级，全局规则在 Documents/Cline/Rules/
@@ -1803,9 +2335,11 @@ impl AgentDetectorRegistry {
         // 规则核心：会话开始必须 recall + 任务感知 recall + 完成后自动同步
 
         // v0.5.5 修复：为 Trae 和 Cursor 添加 frontmatter，确保规则始终生效
+        // v0.5.12 修复：为 CodeBuddy 添加 .mdc frontmatter（description, alwaysApply, enabled）
         let frontmatter = match tool_id {
             "trae" | "trae-cn" => "---\nalwaysApply: true\ndescription: LRC 记忆系统规则 — 会话开始时先 recall 检索项目记忆（新用户自动降级），完成任务后自动同步记忆库\n---\n\n",
             "cursor" => "---\ndescription: LRC 记忆系统规则 — 会话开始时先 recall，新用户自动降级，完成任务后自动同步记忆\nalwaysApply: true\n---\n\n",
+            "codebuddy" => "---\ndescription: LRC 记忆系统规则 — 会话开始时先 recall 检索项目记忆，完成任务后自动同步记忆库\nalwaysApply: true\nenabled: true\n---\n\n",
             _ => "",
         };
 
@@ -1823,7 +2357,7 @@ impl AgentDetectorRegistry {
 
         format!(
             r#"{frontmatter}{header}
-<!-- 本文件由 LRC Desktop v0.5.11 自动生成，请勿手动删除 LRC 相关规则 -->
+<!-- 本文件由 LRC Desktop v0.5.12 自动生成，请勿手动删除 LRC 相关规则 -->
 <!-- 如需自定义规则，请在本文件末尾添加 -->
 
 ## LRC 记忆系统（Loong Recall Code Memory）
@@ -2026,8 +2560,8 @@ AI：已记录登录 API 到记忆库
         if rules_path.exists() {
             let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
             if existing.contains("LRC 记忆系统") {
-                // v0.5.11 增强：检测旧版本规则并自动升级（兼容 v0.5.5、v0.5.6、v0.5.7、v0.5.8、v0.5.9、v0.5.10）
-                if !existing.contains("v0.5.11 自动生成") {
+                // v0.5.12 增强：检测旧版本规则并自动升级（兼容 v0.5.5 ~ v0.5.11）
+                if !existing.contains("v0.5.12 自动生成") {
                     // 旧版本规则，需要升级
                     if let Some(pos) = existing.find("## LRC 记忆系统") {
                         let user_content = existing[..pos].trim_end();
@@ -2040,7 +2574,7 @@ AI：已记录登录 API 到记忆库
                             format!("更新规则文件失败: {} ({})", rules_path.display(), e)
                         })?;
                         tracing::info!(
-                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.11 版本: {}",
+                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.12 版本: {}",
                             tool_id,
                             rules_path.display()
                         );
@@ -2050,13 +2584,13 @@ AI：已记录登录 API 到记忆库
                             format!("更新规则文件失败: {} ({})", rules_path.display(), e)
                         })?;
                         tracing::info!(
-                            "[AI规则] {} — 已追加 LRC v0.5.11 规则到现有文件: {}",
+                            "[AI规则] {} — 已追加 LRC v0.5.12 规则到现有文件: {}",
                             tool_id,
                             rules_path.display()
                         );
                     }
                 } else {
-                    // 已是 v0.5.11 版本，跳过
+                    // 已是 v0.5.12 版本，跳过
                     tracing::info!(
                         "[AI规则] {} — 规则文件已是最新版本，跳过: {}",
                         tool_id,
@@ -2166,6 +2700,27 @@ mod tests {
         assert!(ids.contains(&"kiro".to_string()));
         assert!(ids.contains(&"gemini-cli".to_string()));
         assert!(ids.contains(&"codebuddy".to_string()));
+    }
+
+    /// v0.5.12 临时测试：打印已安装的 AI 工具列表（用于本地验证 exe 文件扫描检测）
+    #[test]
+    fn test_print_installed_agents() {
+        let registry = AgentDetectorRegistry::new();
+        let installed = registry.detect_installed();
+        println!("\n=== v0.5.12 AI 工具检测结果 ===");
+        println!("已安装的工具数量: {}", installed.len());
+        for agent in &installed {
+            println!(
+                "  - {} ({}) [MCP: {}] category: {}",
+                agent.name, agent.id, agent.supports_mcp, agent.category
+            );
+        }
+        let mcp_agents: Vec<_> = installed.iter().filter(|a| a.supports_mcp).collect();
+        println!("\n支持 MCP 的已安装工具数量: {}", mcp_agents.len());
+        for agent in &mcp_agents {
+            println!("  - {} ({})", agent.name, agent.id);
+        }
+        println!("=== 检测结束 ===\n");
     }
 
     /// TDD：测试 AgentInfo 序列化 / 反序列化

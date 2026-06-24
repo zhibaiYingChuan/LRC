@@ -1,6 +1,6 @@
 [package]
 name = "lrc-desktop"
-version = "0.5.11"
+version = "0.5.12"
 description = "LRC Desktop — 本地优先的 AI 代码记忆桌面应用"
 authors = ["LRC Team"]
 edition = "2021"
@@ -42,6 +42,8 @@ dirs = "5"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # time crate 版本约束（兼容 0.3.x 系列，避免与 tauri-utils 冲突）
 time = "0.3.36"
+# v0.5.12 新增：递归扫描目录（SpaceSniffer 式项目索引）
+walkdir = "2"
 
 # ── L2 保密层依赖 ──
 obfstr = "0.4"          # 编译时字符串混淆（MVP 阶段必须）
