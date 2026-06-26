@@ -170,11 +170,17 @@ impl SidecarManager {
         let binary_name = format!("lrc-sidecar{}", std::env::consts::EXE_SUFFIX);
 
         // 搜索路径（按优先级）
-        let search_paths = [
-            exe_dir.join(&binary_name),                // 同目录
-            exe_dir.join("resources").join(&binary_name), // resources/ 子目录
+        // Windows: resources 与 exe 同目录（安装目录根）
+        // macOS: resources 在 Contents/Resources/，exe 在 Contents/MacOS/
+        // Linux AppImage: resources 在挂载点根目录
+        let search_paths: Vec<std::path::PathBuf> = [
+            exe_dir.join(&binary_name),                               // 同目录（Windows 安装目录根）
+            exe_dir.join("resources").join(&binary_name),            // resources/ 子目录
             exe_dir.parent().unwrap_or(&exe_dir).join(&binary_name), // 上级目录
-        ];
+            exe_dir.parent().unwrap_or(&exe_dir).join("Resources").join(&binary_name), // macOS: Contents/Resources/
+        ]
+        .into_iter()
+        .collect();
 
         for path in &search_paths {
             if path.exists() {

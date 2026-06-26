@@ -52,6 +52,11 @@ fn sync_sidecar_binary() {
 
     let dest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
 
+    // v0.5.13 修复：清理 lrc-sidecar.log 等非二进制文件
+    // tauri.conf.json 的 resources 使用 glob "lrc-sidecar*" 匹配，
+    // 会误匹配到运行时产生的 lrc-sidecar.log 日志文件，需在打包前清理
+    cleanup_sidecar_artifacts(&dest_dir);
+
     // 根据目标平台确定源/目标二进制文件名
     // Windows: code-memory-server.exe / lrc-sidecar.exe
     // macOS/Linux: code-memory-server / lrc-sidecar（无扩展名）
@@ -309,4 +314,30 @@ fn find_workspace_root(start: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 清理 sidecar 运行时产生的非二进制文件
+///
+/// tauri.conf.json 的 resources 使用 glob "lrc-sidecar*" 匹配文件，
+/// 会误匹配到运行时产生的 lrc-sidecar.log 等文件，需在打包前清理。
+/// 只保留 lrc-sidecar.exe（Windows）或 lrc-sidecar（Linux/macOS）二进制文件。
+fn cleanup_sidecar_artifacts(dest_dir: &Path) {
+    // 允许的 sidecar 文件名列表
+    let allowed_names = ["lrc-sidecar.exe", "lrc-sidecar"];
+
+    if let Ok(entries) = std::fs::read_dir(dest_dir) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+
+            // 匹配 lrc-sidecar 前缀但不在允许列表中的文件
+            if name_str.starts_with("lrc-sidecar") && !allowed_names.contains(&name_str.as_ref()) {
+                if let Err(e) = std::fs::remove_file(entry.path()) {
+                    println!("cargo:warning=无法删除 sidecar 残留文件 {}: {}", name_str, e);
+                } else {
+                    println!("cargo:info=已清理 sidecar 残留文件: {}", name_str);
+                }
+            }
+        }
+    }
 }
