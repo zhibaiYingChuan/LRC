@@ -230,28 +230,18 @@ fn main() {
             });
 
             // ════════════════════════════════════════════════════════════════
-            // v0.5.4 修复 C08：应用关闭时显式停止所有 sidecar 进程
-            // 防止 spawn_blocking 超时后子进程变为僵尸进程
-            // 当用户关闭窗口时，确保所有 sidecar 进程被正确终止
+            // v0.5.14 架构调整：桌面端关闭时不再停止 sidecar 进程
+            // 桌面端只是 MCP 服务的配置工具，sidecar 作为独立后台服务运行。
+            // 关闭桌面端不影响 MCP 服务可用性，用户可通过桌面端"停止服务"按钮停止。
+            // 仅停止桌面端管理的内部协程（心跳检测等）。
             // ════════════════════════════════════════════════════════════════
             if let Some(window) = app.get_webview_window("main") {
-                let app_handle = app.app_handle().clone();
                 let shutdown_tx = health_shutdown_tx.clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::Destroyed = event {
                         // v0.5.4 P2-14：通知心跳检测协程停止
                         let _ = shutdown_tx.send(true);
-                        tracing::info!("主窗口已关闭，正在清理所有 sidecar 进程...");
-                        let state = app_handle.state::<AppStore>();
-                        let rt = tokio::runtime::Handle::current();
-                        if let Err(e) = rt.block_on(async {
-                            let mut sidecar = state.sidecar.lock().await;
-                            sidecar.stop_all().await
-                        }) {
-                            tracing::error!("应用关闭时停止 sidecar 失败: {e}");
-                        } else {
-                            tracing::info!("所有 sidecar 进程已清理完毕");
-                        }
+                        tracing::info!("主窗口已关闭，sidecar 服务将继续在后台运行");
                     }
                 });
             }
