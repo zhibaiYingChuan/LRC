@@ -282,6 +282,8 @@ pub struct SidecarStatusResponse {
 /// 获取 sidecar 运行状态（返回所有运行中的实例）
 /// v0.5.1 增强：每次查询时自动检测并恢复已崩溃的 sidecar 实例
 /// v0.5.4 修复：崩溃恢复时传入最新 LLM 配置，避免使用旧值
+/// v0.5.15 修复：当桌面端 instances 为空时，探测端口上已运行的外部 sidecar，
+///              解决"先开 IDE 再开桌面端显示 LRC 未运行"的状态不真实问题
 #[tauri::command]
 pub async fn get_sidecar_status(
     store: State<'_, AppStore>,
@@ -290,14 +292,47 @@ pub async fn get_sidecar_status(
     let fresh_llm = get_llm_api_from_wizard(&store).await;
 
     let mut sidecar = store.sidecar.lock().await;
-    
+
     // v0.5.1 新增：崩溃恢复 — 检测已死实例并自动重启
     let recovered = sidecar.recover_dead_instances(fresh_llm).await;
     if recovered > 0 {
         tracing::warn!("get_sidecar_status: 已自动恢复 {} 个崩溃的 sidecar 实例", recovered);
     }
-    
+
     let instances = sidecar.list_instances();
+
+    // v0.5.15 新增：instances 为空时，探测端口上已运行的外部 sidecar
+    // 场景：用户先打开 IDE（MCP 已连接 sidecar），再打开桌面端，
+    //       桌面端的 instances HashMap 为空，但 sidecar 实际已在端口上运行。
+    if instances.is_empty() {
+        tracing::info!("get_sidecar_status: 桌面端无管理的实例，探测端口上的外部 sidecar");
+        let probed = sidecar.probe_existing_sidecar().await;
+        if !probed.is_empty() {
+            // 更新 sidecar_port 状态，供 get_wizard_state 使用
+            let mut sidecar_port = store.sidecar_port.lock().await;
+            *sidecar_port = Some(probed[0].port);
+            drop(sidecar_port);
+
+            let result: Vec<SidecarStatusResponse> = probed
+                .iter()
+                .map(|p| SidecarStatusResponse {
+                    running: true,
+                    state: format!(
+                        "Running (external, project: {}, uptime: {}s)",
+                        if p.src_dir.is_empty() { "unknown" } else { &p.src_dir },
+                        p.uptime_seconds
+                    ),
+                    port: Some(p.port),
+                    // 外部 sidecar 的 PID 无法获取，返回 None
+                    pid: None,
+                })
+                .collect();
+            return Ok(result);
+        }
+        // 探测无结果，返回空列表（前端显示"LRC 未运行"）
+        return Ok(Vec::new());
+    }
+
     Ok(instances
         .iter()
         .map(|inst| SidecarStatusResponse {
@@ -1002,7 +1037,25 @@ pub async fn get_wizard_state(
 
     // 再按 L1 -> L2 顺序获取 sidecar 锁
     let sidecar = store.sidecar.lock().await;
-    let sidecar_running = sidecar.is_running();
+    let mut sidecar_running = sidecar.is_running();
+    // v0.5.15 修复：桌面端未管理 sidecar 时，探测端口上已运行的外部 sidecar
+    // 场景：用户先打开 IDE（MCP 已连接 sidecar），再打开桌面端，
+    //       桌面端 is_running() 返回 false，但 sidecar 实际已在端口上运行。
+    if !sidecar_running {
+        tracing::info!("get_wizard_state: 桌面端无管理的实例，探测端口上的外部 sidecar");
+        let probed = sidecar.probe_existing_sidecar().await;
+        if !probed.is_empty() {
+            sidecar_running = true;
+            // 更新 sidecar_port 为探测到的端口
+            let mut sidecar_port_guard = store.sidecar_port.lock().await;
+            *sidecar_port_guard = Some(probed[0].port);
+            drop(sidecar_port_guard);
+            tracing::info!(
+                "get_wizard_state: 探测到外部 sidecar，端口 {}",
+                probed[0].port
+            );
+        }
+    }
     drop(sidecar);
     let sidecar_port = *store.sidecar_port.lock().await;
 

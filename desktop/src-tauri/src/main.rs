@@ -131,6 +131,43 @@ fn main() {
                 // M-6 修复：cleanup 计数器，每 30 次心跳（约 5 分钟）清理一次过期限流桶
                 let mut cleanup_counter = 0u32;
 
+                // ════════════════════════════════════════════════════════════════
+                // v0.5.15 新增：启动时探测端口上已运行的外部 sidecar
+                // 场景：用户先打开 IDE（MCP 已连接 sidecar），再打开桌面端，
+                //       桌面端的 instances HashMap 为空，但 sidecar 实际已在端口上运行。
+                // 此处执行一次主动探测，确保桌面端启动后立即反映真实的 sidecar 状态。
+                // ════════════════════════════════════════════════════════════════
+                {
+                    let state = monitor_handle.state::<AppStore>();
+                    let sidecar = state.sidecar.lock().await;
+                    if !sidecar.is_running() {
+                        tracing::info!("启动时探测：桌面端无管理的实例，扫描端口上的外部 sidecar");
+                        let probed = sidecar.probe_existing_sidecar().await;
+                        if !probed.is_empty() {
+                            // 更新 sidecar_port，供前端 get_wizard_state 使用
+                            let mut sidecar_port = state.sidecar_port.lock().await;
+                            *sidecar_port = Some(probed[0].port);
+                            drop(sidecar_port);
+                            tracing::info!(
+                                "启动时探测：检测到外部 sidecar，端口 {}，项目 {}",
+                                probed[0].port,
+                                if probed[0].src_dir.is_empty() { "unknown" } else { &probed[0].src_dir }
+                            );
+                            // 通知前端状态已更新（前端可据此刷新向导状态）
+                            let _ = monitor_handle.emit(
+                                "sidecar-detected",
+                                serde_json::json!({
+                                    "port": probed[0].port,
+                                    "src_dir": probed[0].src_dir,
+                                    "message": "检测到已运行的 LRC 服务"
+                                }),
+                            );
+                        } else {
+                            tracing::info!("启动时探测：未检测到外部 sidecar");
+                        }
+                    }
+                }
+
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}

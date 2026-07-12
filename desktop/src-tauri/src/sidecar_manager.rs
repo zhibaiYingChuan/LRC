@@ -74,6 +74,21 @@ pub enum SidecarState {
     Error(String),
 }
 
+/// v0.5.15 新增：探测到的外部 sidecar 实例信息
+///
+/// 应用场景：用户先打开 IDE（MCP 已连接 sidecar），再打开桌面端时，
+/// 桌面端的 instances HashMap 为空，但 sidecar 实际已在端口上运行。
+/// 此结构体表示通过端口扫描探测到的、非桌面端启动的 sidecar 实例。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProbedSidecar {
+    /// 实际绑定的端口
+    pub port: u16,
+    /// 服务源码目录（从 /health 响应中获取）
+    pub src_dir: String,
+    /// 已运行秒数
+    pub uptime_seconds: i64,
+}
+
 /// Sidecar 进程管理器（支持多项目）
 pub struct SidecarManager {
     /// 所有运行中的 sidecar 实例，按项目路径索引
@@ -227,6 +242,101 @@ impl SidecarManager {
     /// 检查指定项目的 sidecar 是否正在运行
     pub fn is_project_running(&self, project_dir: &str) -> bool {
         self.instances.contains_key(project_dir)
+    }
+
+    /// v0.5.15 新增：探测端口上已运行的 sidecar（非桌面端启动的）
+    ///
+    /// 应用场景：用户先打开 IDE（MCP 已连接 sidecar），再打开桌面端时，
+    /// 桌面端的 instances HashMap 为空，但 sidecar 实际已在端口上运行。
+    /// 此方法扫描 DEFAULT_SIDECAR_PORT..DEFAULT_SIDECAR_PORT+PORT_SCAN_RANGE
+    /// 端口范围，向每个端口的 /health 端点发送 GET 请求，
+    /// 返回所有健康检查通过且 service="loong-recall" 的 sidecar 实例信息。
+    ///
+    /// 性能考虑：
+    /// - 使用 500ms 短超时，避免长时间阻塞
+    /// - 并发扫描所有端口（而非顺序），减少总探测时间
+    /// - 仅在 instances 为空时调用，避免与桌面端管理的实例重复
+    pub async fn probe_existing_sidecar(&self) -> Vec<ProbedSidecar> {
+        // 短超时：端口未开放时应快速失败，避免 100 个端口顺序等待
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("probe_existing_sidecar: 创建 HTTP 客户端失败: {e}");
+                return Vec::new();
+            }
+        };
+
+        let start_port = DEFAULT_SIDECAR_PORT;
+        let end_port = DEFAULT_SIDECAR_PORT + PORT_SCAN_RANGE;
+
+        tracing::info!(
+            "开始探测外部 sidecar：扫描端口范围 {}-{}",
+            start_port,
+            end_port - 1
+        );
+
+        // 并发扫描所有端口
+        let mut handles = Vec::with_capacity(PORT_SCAN_RANGE as usize);
+        for port in start_port..end_port {
+            let client = client.clone();
+            handles.push(tokio::spawn(async move {
+                let url = format!("http://127.0.0.1:{port}/health");
+                match client.get(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        // 解析响应体，验证是否为 loong-recall 服务
+                        match resp.json::<serde_json::Value>().await {
+                            Ok(body) => {
+                                let service = body.get("service").and_then(|v| v.as_str()).unwrap_or("");
+                                if service == "loong-recall" {
+                                    let src_dir = body
+                                        .get("src_dir")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let uptime_seconds = body
+                                        .get("uptime_seconds")
+                                        .and_then(|v| v.as_i64())
+                                        .unwrap_or(0);
+                                    Some(ProbedSidecar {
+                                        port,
+                                        src_dir,
+                                        uptime_seconds,
+                                    })
+                                } else {
+                                    // 端口上有其他服务，跳过
+                                    None
+                                }
+                            }
+                            Err(_) => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }));
+        }
+
+        // 收集所有探测结果
+        let mut probed = Vec::new();
+        for handle in handles {
+            if let Ok(Some(result)) = handle.await {
+                probed.push(result);
+            }
+        }
+
+        if !probed.is_empty() {
+            tracing::info!(
+                "探测到 {} 个外部 sidecar 实例：{:?}",
+                probed.len(),
+                probed.iter().map(|p| (p.port, &p.src_dir)).collect::<Vec<_>>()
+            );
+        } else {
+            tracing::info!("未探测到外部 sidecar 实例");
+        }
+
+        probed
     }
 
     /// 检查进程是否存活（跨平台，静态方法）
