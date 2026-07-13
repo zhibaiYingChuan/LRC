@@ -282,66 +282,64 @@ pub struct SidecarStatusResponse {
 /// 获取 sidecar 运行状态（返回所有运行中的实例）
 /// v0.5.1 增强：每次查询时自动检测并恢复已崩溃的 sidecar 实例
 /// v0.5.4 修复：崩溃恢复时传入最新 LLM 配置，避免使用旧值
-/// v0.5.15 修复：当桌面端 instances 为空时，探测端口上已运行的外部 sidecar，
-///              解决"先开 IDE 再开桌面端显示 LRC 未运行"的状态不真实问题
+/// v0.5.16 修复：重写状态检测逻辑，避免在持有 sidecar 锁时扫描端口
+///              1. 先在 sidecar 锁内执行崩溃恢复和获取实例列表，然后释放锁
+///              2. instances 为空时，检查 sidecar_port 并执行快速健康检查
+///              3. 健康检查不持有 sidecar 锁，不会阻塞 start_sidecar 等命令
 #[tauri::command]
 pub async fn get_sidecar_status(
     store: State<'_, AppStore>,
 ) -> Result<Vec<SidecarStatusResponse>, String> {
-    // v0.5.4 修复：先获取最新 LLM 配置，再锁定 sidecar
     let fresh_llm = get_llm_api_from_wizard(&store).await;
 
-    let mut sidecar = store.sidecar.lock().await;
-
-    // v0.5.1 新增：崩溃恢复 — 检测已死实例并自动重启
-    let recovered = sidecar.recover_dead_instances(fresh_llm).await;
-    if recovered > 0 {
-        tracing::warn!("get_sidecar_status: 已自动恢复 {} 个崩溃的 sidecar 实例", recovered);
-    }
-
-    let instances = sidecar.list_instances();
-
-    // v0.5.15 新增：instances 为空时，探测端口上已运行的外部 sidecar
-    // 场景：用户先打开 IDE（MCP 已连接 sidecar），再打开桌面端，
-    //       桌面端的 instances HashMap 为空，但 sidecar 实际已在端口上运行。
-    if instances.is_empty() {
-        tracing::info!("get_sidecar_status: 桌面端无管理的实例，探测端口上的外部 sidecar");
-        let probed = sidecar.probe_existing_sidecar().await;
-        if !probed.is_empty() {
-            // 更新 sidecar_port 状态，供 get_wizard_state 使用
-            let mut sidecar_port = store.sidecar_port.lock().await;
-            *sidecar_port = Some(probed[0].port);
-            drop(sidecar_port);
-
-            let result: Vec<SidecarStatusResponse> = probed
-                .iter()
-                .map(|p| SidecarStatusResponse {
-                    running: true,
-                    state: format!(
-                        "Running (external, project: {}, uptime: {}s)",
-                        if p.src_dir.is_empty() { "unknown" } else { &p.src_dir },
-                        p.uptime_seconds
-                    ),
-                    port: Some(p.port),
-                    // 外部 sidecar 的 PID 无法获取，返回 None
-                    pid: None,
-                })
-                .collect();
-            return Ok(result);
+    // v0.5.16 修复：在 sidecar 锁内只执行崩溃恢复和获取实例列表，然后释放锁
+    let instances = {
+        let mut sidecar = store.sidecar.lock().await;
+        let recovered = sidecar.recover_dead_instances(fresh_llm).await;
+        if recovered > 0 {
+            tracing::warn!("get_sidecar_status: 已自动恢复 {} 个崩溃的 sidecar 实例", recovered);
         }
-        // 探测无结果，返回空列表（前端显示"LRC 未运行"）
-        return Ok(Vec::new());
+        sidecar.list_instances()
+    }; // sidecar 锁在此释放
+
+    // 如果桌面端管理的实例不为空，直接返回
+    if !instances.is_empty() {
+        return Ok(instances
+            .iter()
+            .map(|inst| SidecarStatusResponse {
+                running: true,
+                state: format!("Running (project: {})", inst.project_dir),
+                port: Some(inst.port),
+                pid: Some(inst.pid),
+            })
+            .collect());
     }
 
-    Ok(instances
-        .iter()
-        .map(|inst| SidecarStatusResponse {
-            running: true,
-            state: format!("Running (project: {})", inst.project_dir),
-            port: Some(inst.port),
-            pid: Some(inst.pid),
-        })
-        .collect())
+    // v0.5.16 新增：instances 为空时，检查 sidecar_port 是否指向外部 sidecar
+    // 不扫描 100 个端口（避免锁竞争），只检查 sidecar_port 指定的单个端口
+    let sidecar_port = *store.sidecar_port.lock().await;
+    if let Some(port) = sidecar_port {
+        // 快速健康检查（不持有 sidecar 锁，不会阻塞其他命令）
+        if let Some(probed) = SidecarManager::check_sidecar_health(port).await {
+            return Ok(vec![SidecarStatusResponse {
+                running: true,
+                state: format!(
+                    "Running (external, project: {}, uptime: {}s)",
+                    if probed.src_dir.is_empty() { "unknown" } else { &probed.src_dir },
+                    probed.uptime_seconds
+                ),
+                port: Some(probed.port),
+                pid: None,
+            }]);
+        } else {
+            // 健康检查失败，清除过期的 sidecar_port
+            let mut saved_port = store.sidecar_port.lock().await;
+            *saved_port = None;
+            tracing::info!("get_sidecar_status: sidecar_port {} 健康检查失败，已清除", port);
+        }
+    }
+
+    Ok(Vec::new())
 }
 
 /// 启动 sidecar 进程
@@ -1035,28 +1033,43 @@ pub async fn get_wizard_state(
         )
     };
 
-    // 再按 L1 -> L2 顺序获取 sidecar 锁
-    let sidecar = store.sidecar.lock().await;
-    let mut sidecar_running = sidecar.is_running();
-    // v0.5.15 修复：桌面端未管理 sidecar 时，探测端口上已运行的外部 sidecar
-    // 场景：用户先打开 IDE（MCP 已连接 sidecar），再打开桌面端，
-    //       桌面端 is_running() 返回 false，但 sidecar 实际已在端口上运行。
-    if !sidecar_running {
-        tracing::info!("get_wizard_state: 桌面端无管理的实例，探测端口上的外部 sidecar");
-        let probed = sidecar.probe_existing_sidecar().await;
-        if !probed.is_empty() {
-            sidecar_running = true;
-            // 更新 sidecar_port 为探测到的端口
-            let mut sidecar_port_guard = store.sidecar_port.lock().await;
-            *sidecar_port_guard = Some(probed[0].port);
-            drop(sidecar_port_guard);
-            tracing::info!(
-                "get_wizard_state: 探测到外部 sidecar，端口 {}",
-                probed[0].port
-            );
+    // v0.5.16 修复：不再在持有 sidecar 锁时扫描 100 个端口（避免 500ms 阻塞其他命令）
+    // 1. 短暂持有 sidecar 锁仅检查 is_running()，立即释放
+    // 2. 如果桌面端无管理实例，检查 sidecar_port 指向的外部 sidecar 是否健康
+    // 3. 健康检查不持有任何锁，不会阻塞 start_sidecar 等命令
+    let sidecar_running = {
+        let sidecar = store.sidecar.lock().await;
+        sidecar.is_running()
+    }; // sidecar 锁立即释放
+
+    // 如果桌面端无管理实例，检查 sidecar_port 指向的外部 sidecar
+    let sidecar_running = if sidecar_running {
+        true
+    } else {
+        let port = *store.sidecar_port.lock().await;
+        if let Some(port) = port {
+            // 快速健康检查（2 秒超时，不持有 sidecar 锁）
+            if let Some(probed) =
+                SidecarManager::check_sidecar_health(port).await
+            {
+                tracing::info!(
+                    "get_wizard_state: 外部 sidecar 运行中，端口 {}，uptime {}s",
+                    probed.port,
+                    probed.uptime_seconds
+                );
+                true
+            } else {
+                // 健康检查失败，清除过期的 sidecar_port
+                let mut saved_port = store.sidecar_port.lock().await;
+                *saved_port = None;
+                tracing::info!("get_wizard_state: sidecar_port {} 健康检查失败，已清除", port);
+                false
+            }
+        } else {
+            false
         }
-    }
-    drop(sidecar);
+    };
+
     let sidecar_port = *store.sidecar_port.lock().await;
 
     Ok(WizardStateResponse {

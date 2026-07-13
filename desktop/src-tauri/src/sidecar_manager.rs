@@ -244,7 +244,48 @@ impl SidecarManager {
         self.instances.contains_key(project_dir)
     }
 
-    /// v0.5.15 新增：探测端口上已运行的 sidecar（非桌面端启动的）
+    /// v0.5.16 新增：快速检查指定端口上的 sidecar 是否健康
+    ///
+    /// 仅检查单个端口（非扫描），适用于状态查询时的快速验证。
+    /// 不需要 SidecarManager 实例，因此可以在不持有 sidecar 锁的情况下调用。
+    ///
+    /// 返回 Some(ProbedSidecar) 如果端口上有 loong-recall 服务在运行，
+    /// 否则返回 None。
+    pub async fn check_sidecar_health(port: u16) -> Option<ProbedSidecar> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .ok()?;
+
+        let url = format!("http://127.0.0.1:{port}/health");
+        let resp = client.get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let body: serde_json::Value = resp.json().await.ok()?;
+        let service = body.get("service").and_then(|v| v.as_str()).unwrap_or("");
+        if service != "loong-recall" {
+            return None;
+        }
+
+        Some(ProbedSidecar {
+            port,
+            src_dir: body
+                .get("src_dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            uptime_seconds: body
+                .get("uptime_seconds")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+        })
+    }
+
+    /// v0.5.16 新增：探测端口上已运行的 sidecar（非桌面端启动的）
+    ///
+    /// 关联函数，不需要 &self，因此可以在不持有 sidecar 锁的情况下调用。
     ///
     /// 应用场景：用户先打开 IDE（MCP 已连接 sidecar），再打开桌面端时，
     /// 桌面端的 instances HashMap 为空，但 sidecar 实际已在端口上运行。
@@ -252,11 +293,10 @@ impl SidecarManager {
     /// 端口范围，向每个端口的 /health 端点发送 GET 请求，
     /// 返回所有健康检查通过且 service="loong-recall" 的 sidecar 实例信息。
     ///
-    /// 性能考虑：
-    /// - 使用 500ms 短超时，避免长时间阻塞
-    /// - 并发扫描所有端口（而非顺序），减少总探测时间
-    /// - 仅在 instances 为空时调用，避免与桌面端管理的实例重复
-    pub async fn probe_existing_sidecar(&self) -> Vec<ProbedSidecar> {
+    /// 重要：此函数会扫描 100 个端口，耗时约 500ms。
+    /// 不要在持有 sidecar 锁的情况下调用，否则会阻塞其他需要 sidecar 锁的操作。
+    /// 应在独立异步任务中调用。
+    pub async fn probe_existing_sidecar() -> Vec<ProbedSidecar> {
         // 短超时：端口未开放时应快速失败，避免 100 个端口顺序等待
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_millis(500))
