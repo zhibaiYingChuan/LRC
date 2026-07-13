@@ -132,22 +132,36 @@ fn main() {
                 let mut cleanup_counter = 0u32;
 
                 // ════════════════════════════════════════════════════════════════
-                // v0.5.15 新增：启动时探测端口上已运行的外部 sidecar
+                // v0.5.16 修复：启动时探测端口上已运行的外部 sidecar
                 // 场景：用户先打开 IDE（MCP 已连接 sidecar），再打开桌面端，
                 //       桌面端的 instances HashMap 为空，但 sidecar 实际已在端口上运行。
-                // 此处执行一次主动探测，确保桌面端启动后立即反映真实的 sidecar 状态。
+                //
+                // 安全设计（与 v0.5.15 的关键区别）：
+                //   1. 短暂持有 sidecar 锁仅检查 is_running()，立即释放（<1μs）
+                //   2. 用关联函数 SidecarManager::probe_existing_sidecar() 扫描端口，
+                //      不持有 sidecar 锁，不会阻塞 start_sidecar 等命令
+                //   3. 扫描完成后，短暂获取 sidecar_port 锁存储结果（<1μs）
+                //
+                // v0.5.15 的错误：在持有 sidecar 锁时调用 probe_existing_sidecar()，
+                //   导致 500ms 内所有需要 sidecar 锁的命令被阻塞，前端超时级联失败。
                 // ════════════════════════════════════════════════════════════════
                 {
                     let state = monitor_handle.state::<AppStore>();
-                    let sidecar = state.sidecar.lock().await;
-                    if !sidecar.is_running() {
+                    let sidecar_running = {
+                        let sidecar = state.sidecar.lock().await;
+                        sidecar.is_running()
+                    }; // sidecar 锁立即释放
+
+                    if !sidecar_running {
                         tracing::info!("启动时探测：桌面端无管理的实例，扫描端口上的外部 sidecar");
-                        let probed = sidecar.probe_existing_sidecar().await;
+                        // 关联函数调用，不持有 sidecar 锁，不会阻塞 start_sidecar 等命令
+                        let probed = SidecarManager::probe_existing_sidecar().await;
                         if !probed.is_empty() {
-                            // 更新 sidecar_port，供前端 get_wizard_state 使用
-                            let mut sidecar_port = state.sidecar_port.lock().await;
-                            *sidecar_port = Some(probed[0].port);
-                            drop(sidecar_port);
+                            // 短暂获取 sidecar_port 锁存储结果
+                            {
+                                let mut sidecar_port = state.sidecar_port.lock().await;
+                                *sidecar_port = Some(probed[0].port);
+                            }
                             tracing::info!(
                                 "启动时探测：检测到外部 sidecar，端口 {}，项目 {}",
                                 probed[0].port,
