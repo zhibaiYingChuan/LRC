@@ -83,6 +83,11 @@ docs/COMMUNITY_GOVERNANCE.md
 # 内部分析文档（不交付用户）
 docs/product-analysis/
 
+# 内部架构文档与测试报告（不交付用户）
+docs/ARCHITECTURE.md
+desktop/TEST_REPORT_v0.5.7.md
+desktop/TEST_REPORT_*.md
+
 # 本地测试脚本（不交付用户）
 test_server.ps1
 

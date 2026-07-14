@@ -673,14 +673,24 @@ async fn try_run() -> Result<(), String> {
             auto_synthesize: true,
             verbose: 1,
         };
-        let pipeline = ConsolidationPipeline::new(consolidation_config, memory_store.clone());
+        // v0.5.18：传入 LLM 配置，启用高维 embedding 合成
+        // LLM 未配置时自动降级到洛书合成
+        let pipeline = ConsolidationPipeline::new_with_llm(
+            consolidation_config,
+            memory_store.clone(),
+            llm_api.clone(),
+        );
         // 使用空数据源：用户通过 HTTP API / MCP 工具直接写入的记忆已在 store 中
         // 结晶流水线仅负责定期执行合成（合并重复记忆）
         let source: Arc<dyn SurfaceMemorySource> = Arc::new(InMemorySource::new("api", vec![]));
         tokio::spawn(async move {
             run_consolidation_loop(pipeline, source, consolidation_shutdown_rx).await;
         });
-        log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，自动合并相似记忆）");
+        if llm_api.is_configured() {
+            log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，LLM embedding 合成模式）");
+        } else {
+            log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，洛书合成模式，建议配置 LLM）");
+        }
     }
 
     // ── 根据运行模式选择通信协议 ──
