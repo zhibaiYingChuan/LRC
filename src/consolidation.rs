@@ -19,7 +19,9 @@
 use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
 #[cfg(feature = "ml")]
 use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
-use crate::memory_store::MemoryStore;
+// v0.5.18 新增：LLM embedding 合成所需的导入
+use crate::engine::llm_translator::{cosine_similarity, LlmApiConfig};
+use crate::memory_store::{ListFilter, MemoryStore};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::Persistence;
 use crate::persistence::PersistenceError;
@@ -200,6 +202,9 @@ pub struct ConsolidationPipeline<P: Persistence> {
     /// 洛书编码器（保留供未来直接编码使用）
     #[allow(dead_code)]
     luoshu_encoder: HybridLuoShuEncoder,
+    /// v0.5.18 新增：LLM 配置（用于结晶时的高维 embedding 合成）
+    /// 如果为 None 或 LlmApiConfig::None，则降级到洛书合成
+    llm_config: Option<LlmApiConfig>,
     /// 上次运行时间（用于增量拉取）
     last_run: DateTime<Utc>,
     /// 累积统计
@@ -213,6 +218,31 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             config,
             store,
             luoshu_encoder: HybridLuoShuEncoder::default(),
+            llm_config: None,
+            last_run: Utc::now(),
+            total_stats: CycleStats::default(),
+        }
+    }
+
+    /// v0.5.18 新增：创建带 LLM 配置的结晶流水线
+    ///
+    /// 当 LLM 配置有效时，结晶周期会优先使用 LLM embedding 进行高维语义聚类
+    /// 和信息增量计算，绕过 9 维洛书向量的局限性。
+    /// LLM 调用失败时自动降级到洛书合成。
+    pub fn new_with_llm(
+        config: ConsolidationConfig,
+        store: Arc<Mutex<MemoryStore<P>>>,
+        llm_config: LlmApiConfig,
+    ) -> Self {
+        let has_llm = llm_config.is_configured();
+        if has_llm {
+            eprintln!("[LRC·结晶] LLM embedding 合成已启用（高维语义聚类）");
+        }
+        Self {
+            config,
+            store,
+            luoshu_encoder: HybridLuoShuEncoder::default(),
+            llm_config: if has_llm { Some(llm_config) } else { None },
             last_run: Utc::now(),
             total_stats: CycleStats::default(),
         }
@@ -254,69 +284,97 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             );
         }
 
-        // 2. 逐条处理：洛书编码 → MirrorProject 分类 → 写入
-        let mut store = self.store.lock().await;
+        // 2. 逐条处理：洛书编码 → MirrorProject 分类 → 写入（Phase 1：持锁写入）
+        {
+            let mut store = self.store.lock().await;
 
-        for sm in &surface_memories {
-            let memory_type = MemoryType::try_parse(&sm.memory_type).unwrap_or(MemoryType::Fact);
-            let privacy_level = PrivacyLevel::try_parse(
-                sm.session_id.as_ref().map(|_| "session").unwrap_or("user"),
-            )
-            .unwrap_or_default();
+            for sm in &surface_memories {
+                let memory_type =
+                    MemoryType::try_parse(&sm.memory_type).unwrap_or(MemoryType::Fact);
+                let privacy_level = PrivacyLevel::try_parse(
+                    sm.session_id.as_ref().map(|_| "session").unwrap_or("user"),
+                )
+                .unwrap_or_default();
 
-            let memory = Memory::new(
-                sm.content.clone(),
-                memory_type,
-                sm.project.clone(),
-                sm.tags.clone(),
-                Importance::new(sm.importance),
-                None, // 由洛书编码器决定拓扑深度，而非 TTL
-            )
-            .with_source(format!("consolidation:{}", sm.source))
-            .with_privacy(privacy_level, sm.session_id.clone(), sm.user_id.clone());
+                let memory = Memory::new(
+                    sm.content.clone(),
+                    memory_type,
+                    sm.project.clone(),
+                    sm.tags.clone(),
+                    Importance::new(sm.importance),
+                    None, // 由洛书编码器决定拓扑深度，而非 TTL
+                )
+                .with_source(format!("consolidation:{}", sm.source))
+                .with_privacy(privacy_level, sm.session_id.clone(), sm.user_id.clone());
 
-            match store.remember(memory) {
-                Ok(_) => {
-                    stats.stored += 1;
-                    stats.encoded += 1; // remember 内部自动完成洛书编码
-                }
-                Err(e) => {
-                    stats.failed += 1;
-                    if self.config.verbose >= 1 {
-                        eprintln!("[LRC·结晶] 写入失败: {} (内容: {:.40}...)", e, sm.content);
+                match store.remember(memory) {
+                    Ok(_) => {
+                        stats.stored += 1;
+                        stats.encoded += 1; // remember 内部自动完成洛书编码
+                    }
+                    Err(e) => {
+                        stats.failed += 1;
+                        if self.config.verbose >= 1 {
+                            eprintln!("[LRC·结晶] 写入失败: {} (内容: {:.40}...)", e, sm.content);
+                        }
                     }
                 }
             }
-        }
+        } // 自动释放锁
 
-        // 3. 洛书驱动递归合成（按八卦类别分组融合）
+        // 3. 合成阶段
         if self.config.auto_synthesize {
-            // 临时提高合成阈值
-            let old_threshold = store.synthesis_min_cluster;
-            let old_similarity = store.synthesis_similarity;
-            store.synthesis_min_cluster = self.config.synthesis_threshold;
-            store.synthesis_similarity = self.config.synthesis_similarity;
+            // 3a. v0.5.18 LLM embedding 合成路径（优先）
+            // 遵循三阶段锁安全模式：Phase 1 持锁加载 → Phase 2 无锁 LLM 调用 → Phase 3 持锁写入
+            let llm_succeeded: bool = if let Some(ref llm_config) = self.llm_config {
+                match self.llm_synthesize_cycle(llm_config).await {
+                    Ok(n) => {
+                        stats.synthesized = n;
+                        if n > 0 && self.config.verbose >= 1 {
+                            eprintln!("[LRC·结晶] LLM 合成完成，生成 {} 条合成记忆", n);
+                        }
+                        n > 0
+                    }
+                    Err(e) => {
+                        if self.config.verbose >= 1 {
+                            eprintln!(
+                                "[LRC·结晶] LLM 合成失败，降级到洛书合成: {}",
+                                e
+                            );
+                        }
+                        false
+                    }
+                }
+            } else {
+                false
+            };
 
-            match store.luoshu_synthesize() {
-                Ok(n) => {
-                    stats.synthesized = n;
-                    if n > 0 && self.config.verbose >= 1 {
-                        eprintln!("[LRC·结晶] 洛书合成完成，生成 {} 条合成记忆", n);
+            // 3b. 洛书合成（降级路径：仅当 LLM 未配置或失败时执行）
+            if !llm_succeeded {
+                let mut store = self.store.lock().await;
+                let old_threshold = store.synthesis_min_cluster;
+                let old_similarity = store.synthesis_similarity;
+                store.synthesis_min_cluster = self.config.synthesis_threshold;
+                store.synthesis_similarity = self.config.synthesis_similarity;
+
+                match store.luoshu_synthesize() {
+                    Ok(n) => {
+                        stats.synthesized = n;
+                        if n > 0 && self.config.verbose >= 1 {
+                            eprintln!("[LRC·结晶] 洛书合成完成，生成 {} 条合成记忆", n);
+                        }
+                    }
+                    Err(e) => {
+                        if self.config.verbose >= 1 {
+                            eprintln!("[LRC·结晶] 合成失败: {}", e);
+                        }
                     }
                 }
-                Err(e) => {
-                    if self.config.verbose >= 1 {
-                        eprintln!("[LRC·结晶] 合成失败: {}", e);
-                    }
-                }
+
+                store.synthesis_min_cluster = old_threshold;
+                store.synthesis_similarity = old_similarity;
             }
-
-            // 恢复原始阈值
-            store.synthesis_min_cluster = old_threshold;
-            store.synthesis_similarity = old_similarity;
         }
-
-        drop(store); // 释放锁
 
         // 4. 更新统计
         stats.last_run = Some(Utc::now());
@@ -340,6 +398,274 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         }
 
         Ok(stats)
+    }
+
+    // ==================== v0.5.18 LLM embedding 合成 ====================
+
+    /// v0.5.18 新增：LLM embedding 合成周期
+    ///
+    /// 遵循三阶段锁安全模式（参考项目硬约束）：
+    /// - Phase 1：持锁加载所有非 Synthesis 记忆的 (id, content)，释放锁（<1ms）
+    /// - Phase 2：无锁，LLM embedding + 聚类 + LLM 总结（I/O 密集，可能耗时数秒）
+    /// - Phase 3：持锁写入合成记忆，释放锁（<1ms）
+    ///
+    /// 失败时返回 Err，调用方应降级到洛书合成。
+    async fn llm_synthesize_cycle(
+        &self,
+        llm_config: &LlmApiConfig,
+    ) -> Result<usize, String> {
+        // ===== Phase 1：持锁加载记忆列表 =====
+        let candidates: Vec<(String, String)> = {
+            let store = self.store.lock().await;
+            let filter = ListFilter {
+                limit: 1000, // 加载足够多的记忆用于聚类
+                ..ListFilter::new()
+            };
+            let (all, _) = store
+                .list_memories(&filter)
+                .map_err(|e| format!("加载记忆列表失败: {}", e))?;
+            all.into_iter()
+                .filter(|m| m.memory_type != MemoryType::Synthesis)
+                .map(|m| (m.id, m.content))
+                .collect::<Vec<_>>()
+        };
+
+        if candidates.len() < self.config.synthesis_threshold {
+            if self.config.verbose >= 2 {
+                eprintln!(
+                    "[LRC·结晶·LLM] 记忆数 {} 低于阈值 {}，跳过 LLM 合成",
+                    candidates.len(),
+                    self.config.synthesis_threshold
+                );
+            }
+            return Ok(0);
+        }
+
+        if self.config.verbose >= 2 {
+            eprintln!(
+                "[LRC·结晶·LLM] Phase 1 完成：加载 {} 条候选记忆",
+                candidates.len()
+            );
+        }
+
+        // ===== Phase 2：无锁，LLM embedding + 聚类 + 总结 =====
+        let texts: Vec<&str> = candidates.iter().map(|(_, c)| c.as_str()).collect();
+        let embeddings = llm_config.embed_texts(&texts).await.map_err(|e| {
+            format!("LLM embedding 调用失败: {}", e)
+        })?;
+
+        if embeddings.len() != candidates.len() {
+            return Err(format!(
+                "Embedding 数量不匹配：期望 {}，实际 {}",
+                candidates.len(),
+                embeddings.len()
+            ));
+        }
+
+        // 基于余弦相似度聚类（贪心法）
+        let clusters =
+            self.cluster_by_embedding(&embeddings, self.config.synthesis_similarity);
+
+        // 信息增量阈值：与 DaoRegulator 默认值一致（0.01）
+        const INFO_GAIN_THRESHOLD: f32 = 0.01;
+
+        let mut synthesis_results: Vec<(Vec<String>, String, f32)> = Vec::new();
+
+        for cluster_indices in &clusters {
+            if cluster_indices.len() < self.config.synthesis_threshold {
+                continue;
+            }
+
+            // 计算信息增量：1 - 平均成对余弦相似度
+            let avg_sim = self.average_pairwise_similarity(&embeddings, cluster_indices);
+            let information_gain = 1.0 - avg_sim;
+
+            if information_gain < INFO_GAIN_THRESHOLD {
+                if self.config.verbose >= 2 {
+                    eprintln!(
+                        "[LRC·结晶·LLM] 跳过簇（大小={}，信息增量 {:.4} < 阈值 {:.4}）",
+                        cluster_indices.len(),
+                        information_gain,
+                        INFO_GAIN_THRESHOLD
+                    );
+                }
+                continue;
+            }
+
+            // 收集簇内记忆内容
+            let cluster_memories: Vec<String> = cluster_indices
+                .iter()
+                .map(|&i| candidates[i].1.clone())
+                .collect();
+
+            // 调用 LLM chat API 生成合成内容
+            let summary = llm_config
+                .summarize_memories(&cluster_memories)
+                .await
+                .map_err(|e| format!("LLM 合成总结失败: {}", e))?;
+
+            // 收集源记忆 ID
+            let source_ids: Vec<String> = cluster_indices
+                .iter()
+                .map(|&i| candidates[i].0.clone())
+                .collect();
+
+            if self.config.verbose >= 2 {
+                eprintln!(
+                    "[LRC·结晶·LLM] 簇通过阈值（大小={}，信息增量 {:.4}），已生成合成内容（{} 字）",
+                    cluster_indices.len(),
+                    information_gain,
+                    summary.chars().count()
+                );
+            }
+
+            synthesis_results.push((source_ids, summary, information_gain));
+        }
+
+        if synthesis_results.is_empty() {
+            if self.config.verbose >= 1 {
+                eprintln!("[LRC·结晶·LLM] 无簇通过信息增量阈值，本次不生成合成记忆");
+            }
+            return Ok(0);
+        }
+
+        // ===== Phase 3：持锁写入合成记忆 =====
+        let written = {
+            let mut store = self.store.lock().await;
+            let mut count = 0usize;
+            for (source_ids, summary, info_gain) in synthesis_results {
+                let mut memory = Memory::new(
+                    summary,
+                    MemoryType::Synthesis,
+                    None,
+                    Vec::new(),
+                    Importance::new(7), // 合成记忆重要性 7
+                    None,
+                )
+                .with_source("llm_synthesis");
+                memory.source_ids = source_ids;
+                memory.information_gain = Some(info_gain);
+                memory.confidence = Some(0.85); // LLM 合成置信度
+                memory.resolution = "synthesized".to_string();
+
+                match store.remember(memory) {
+                    Ok(_) => count += 1,
+                    Err(e) => {
+                        if self.config.verbose >= 1 {
+                            eprintln!("[LRC·结晶·LLM] 写入合成记忆失败: {}", e);
+                        }
+                    }
+                }
+            }
+            count
+        };
+
+        if self.config.verbose >= 2 {
+            eprintln!("[LRC·结晶·LLM] Phase 3 完成：写入 {} 条合成记忆", written);
+        }
+
+        Ok(written)
+    }
+
+    /// v0.5.18 新增：基于余弦相似度的贪心聚类
+    ///
+    /// 算法：遍历每条记忆，如果与已有簇的质心相似度超过阈值，归入该簇；
+    /// 否则创建新簇。返回每个簇的候选索引列表。
+    ///
+    /// 注：质心为簇内所有向量的平均值。
+    fn cluster_by_embedding(
+        &self,
+        embeddings: &[Vec<f32>],
+        similarity_threshold: f32,
+    ) -> Vec<Vec<usize>> {
+        if embeddings.is_empty() {
+            return Vec::new();
+        }
+
+        let mut clusters: Vec<Vec<usize>> = Vec::new();
+        let mut centroids: Vec<Vec<f32>> = Vec::new();
+
+        for (i, emb) in embeddings.iter().enumerate() {
+            // 寻找最相似的簇
+            let mut best_cluster: Option<usize> = None;
+            let mut best_sim: f32 = -1.0;
+
+            for (ci, centroid) in centroids.iter().enumerate() {
+                let sim = cosine_similarity(emb, centroid);
+                if sim > best_sim {
+                    best_sim = sim;
+                    best_cluster = Some(ci);
+                }
+            }
+
+            if best_sim >= similarity_threshold {
+                if let Some(ci) = best_cluster {
+                    clusters[ci].push(i);
+                    // 更新质心
+                    self.update_centroid(&mut centroids[ci], &clusters[ci], embeddings);
+                }
+            } else {
+                // 创建新簇
+                clusters.push(vec![i]);
+                centroids.push(emb.clone());
+            }
+        }
+
+        clusters
+    }
+
+    /// 更新簇质心（所有成员向量的平均值）
+    fn update_centroid(
+        &self,
+        centroid: &mut [f32],
+        member_indices: &[usize],
+        embeddings: &[Vec<f32>],
+    ) {
+        if member_indices.is_empty() {
+            return;
+        }
+        let n = member_indices.len() as f32;
+        for (d, slot) in centroid.iter_mut().enumerate() {
+            let sum: f32 = member_indices
+                .iter()
+                .map(|&i| embeddings[i].get(d).copied().unwrap_or(0.0))
+                .sum();
+            *slot = sum / n;
+        }
+    }
+
+    /// 计算簇内平均成对余弦相似度
+    ///
+    /// 用于衡量簇内记忆的语义一致性。
+    /// 高相似度 → 信息增量低（记忆冗余）；
+    /// 低相似度 → 信息增量高（记忆多样，合成有价值）。
+    fn average_pairwise_similarity(
+        &self,
+        embeddings: &[Vec<f32>],
+        cluster_indices: &[usize],
+    ) -> f32 {
+        let n = cluster_indices.len();
+        if n < 2 {
+            return 1.0; // 单条记忆与自身完全相似
+        }
+
+        let mut total_sim = 0.0f32;
+        let mut pair_count = 0usize;
+
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let a = &embeddings[cluster_indices[i]];
+                let b = &embeddings[cluster_indices[j]];
+                total_sim += cosine_similarity(a, b);
+                pair_count += 1;
+            }
+        }
+
+        if pair_count == 0 {
+            1.0
+        } else {
+            total_sim / pair_count as f32
+        }
     }
 }
 
@@ -603,5 +929,202 @@ mod tests {
             .expect("应成功拉取");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].content, "新记忆");
+    }
+
+    // ==================== v0.5.18 LLM 合成路径测试 ====================
+
+    /// 测试：高维余弦相似度计算
+    #[test]
+    fn test_cosine_similarity_high_dim() {
+        use crate::engine::llm_translator::cosine_similarity;
+
+        // 完全相同的向量 → 相似度 1.0
+        let a = vec![1.0, 0.5, 0.3, 0.8];
+        let b = vec![1.0, 0.5, 0.3, 0.8];
+        let sim = cosine_similarity(&a, &b);
+        assert!((sim - 1.0).abs() < 1e-5, "完全相同应=1.0，实际: {}", sim);
+
+        // 正交向量 → 相似度 0.0
+        let a = vec![1.0, 0.0, 0.0, 0.0];
+        let b = vec![0.0, 1.0, 0.0, 0.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!(sim.abs() < 1e-5, "正交应≈0.0，实际: {}", sim);
+
+        // 零向量 → 相似度 0.0
+        let a = vec![0.0, 0.0, 0.0];
+        let b = vec![1.0, 2.0, 3.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!(sim.abs() < 1e-5, "零向量应=0.0，实际: {}", sim);
+    }
+
+    /// 测试：基于 embedding 的贪心聚类
+    #[test]
+    fn test_cluster_by_embedding() {
+        let (_dir, store) = make_store();
+        let store = Arc::new(Mutex::new(store));
+        let pipeline = make_pipeline(store);
+
+        // 构造两组语义相似的 embedding：
+        // 组1（数据库相关）：前 3 条相似，余弦相似度 > 0.9
+        // 组2（前端相关）：后 2 条相似
+        let embeddings: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.1, 0.05, 0.0, 0.0], // DB-1
+            vec![0.95, 0.15, 0.1, 0.0, 0.0], // DB-2
+            vec![0.9, 0.1, 0.0, 0.05, 0.0],  // DB-3
+            vec![0.0, 0.0, 0.0, 0.1, 1.0],  // FE-1
+            vec![0.0, 0.0, 0.05, 0.15, 0.95], // FE-2
+        ];
+
+        // synthesis_similarity = 0.3（来自 make_pipeline 的 config）
+        let clusters = pipeline.cluster_by_embedding(&embeddings, 0.3);
+
+        // 应形成 2 个簇：DB 组（3 条）+ FE 组（2 条）
+        assert!(
+            clusters.len() >= 2,
+            "应至少形成 2 个簇，实际: {}",
+            clusters.len()
+        );
+
+        // 最大簇应包含 3 条记忆
+        let max_cluster_size = clusters.iter().map(|c| c.len()).max().unwrap_or(0);
+        assert_eq!(
+            max_cluster_size, 3,
+            "最大簇应包含 3 条记忆，实际: {}",
+            max_cluster_size
+        );
+    }
+
+    /// 测试：信息增量计算（平均成对相似度）
+    #[test]
+    fn test_average_pairwise_similarity() {
+        let (_dir, store) = make_store();
+        let store = Arc::new(Mutex::new(store));
+        let pipeline = make_pipeline(store);
+
+        let embeddings: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![1.0, 0.0, 0.0], // 与第一条完全相同
+            vec![1.0, 0.0, 0.0], // 与第一条完全相同
+        ];
+
+        let avg_sim = pipeline.average_pairwise_similarity(&embeddings, &[0, 1, 2]);
+        assert!(
+            (avg_sim - 1.0).abs() < 1e-5,
+            "完全相同的向量平均相似度应=1.0，实际: {}",
+            avg_sim
+        );
+
+        // 信息增量 = 1 - avg_sim = 0.0（完全冗余，不应合成）
+        let info_gain = 1.0 - avg_sim;
+        assert!(
+            info_gain < 0.01,
+            "完全冗余的信息增量应 < 0.01，实际: {}",
+            info_gain
+        );
+
+        // 语义多样的记忆 → 低相似度 → 高信息增量
+        let diverse: Vec<Vec<f32>> = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let avg_sim_div = pipeline.average_pairwise_similarity(&diverse, &[0, 1, 2]);
+        let info_gain_div = 1.0 - avg_sim_div;
+        assert!(
+            info_gain_div > 0.9,
+            "正交向量的信息增量应 > 0.9，实际: {}",
+            info_gain_div
+        );
+    }
+
+    /// 测试：LLM 未配置时自动降级到洛书合成
+    #[tokio::test]
+    async fn test_llm_not_configured_fallback_to_luoshu() {
+        let (_dir, store) = make_store();
+        let store = Arc::new(Mutex::new(store));
+
+        // 使用 new（不传 LLM 配置）创建 pipeline
+        let config = ConsolidationConfig {
+            poll_interval_secs: 3600,
+            batch_size: 10,
+            synthesis_threshold: 2,
+            synthesis_similarity: 0.3,
+            run_on_start: false,
+            auto_synthesize: true,
+            verbose: 0,
+        };
+        let pipeline = ConsolidationPipeline::new(config, store.clone());
+
+        // llm_config 应为 None
+        assert!(
+            pipeline.llm_config.is_none(),
+            "未传入 LLM 配置时 llm_config 应为 None"
+        );
+
+        // 写入 3 条相似记忆，然后运行周期
+        let mut pipeline = pipeline;
+        let source = InMemorySource::new(
+            "test-fallback",
+            vec![
+                SurfaceMemory {
+                    content: "Rust 内存安全所有权机制".into(),
+                    memory_type: "fact".into(),
+                    importance: 7,
+                    project: None,
+                    tags: vec!["rust".into()],
+                    session_id: None,
+                    user_id: None,
+                    timestamp: Some(Utc::now()),
+                    source: "test".into(),
+                },
+                SurfaceMemory {
+                    content: "Rust 借用检查器工作原理".into(),
+                    memory_type: "fact".into(),
+                    importance: 7,
+                    project: None,
+                    tags: vec!["rust".into()],
+                    session_id: None,
+                    user_id: None,
+                    timestamp: Some(Utc::now()),
+                    source: "test".into(),
+                },
+                SurfaceMemory {
+                    content: "Rust 生命周期标注规则".into(),
+                    memory_type: "fact".into(),
+                    importance: 7,
+                    project: None,
+                    tags: vec!["rust".into()],
+                    session_id: None,
+                    user_id: None,
+                    timestamp: Some(Utc::now()),
+                    source: "test".into(),
+                },
+            ],
+        );
+
+        let stats = pipeline.run_cycle(&source).await.expect("周期应成功");
+        assert_eq!(stats.stored, 3);
+        // 降级路径：洛书合成应执行（无论是否生成合成记忆，都不应报错）
+        // 注：洛书合成在 9 维空间下信息增量极低，可能不生成合成记忆，
+        // 但关键是无 LLM 时不崩溃、正确降级
+    }
+
+    /// 测试：LlmApiConfig::None 时 new_with_llm 应将 llm_config 设为 None
+    #[test]
+    fn test_new_with_llm_none_config() {
+        let (_dir, store) = make_store();
+        let store = Arc::new(Mutex::new(store));
+
+        let config = ConsolidationConfig::default();
+        let pipeline = ConsolidationPipeline::new_with_llm(
+            config,
+            store,
+            crate::engine::llm_translator::LlmApiConfig::None,
+        );
+
+        assert!(
+            pipeline.llm_config.is_none(),
+            "LlmApiConfig::None 时 llm_config 应为 None"
+        );
     }
 }
