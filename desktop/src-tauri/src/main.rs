@@ -219,38 +219,84 @@ fn main() {
                         }
                     } else {
                         // 尝试恢复死亡的实例
-                        // v0.5.7 修复 L-11：先释放 sidecar 锁，再用 tokio::task::spawn 包装
-                        // recover_dead_instances，避免死锁并处理 panic
+                        // v0.5.17 三阶段锁安全模式：避免在持有 sidecar 锁时执行
+                        // spawn_and_wait（最多 40s），改为三阶段编排：
+                        //   Phase 1: collect_dead_instances（持锁，<1ms）→ 释放锁
+                        //   Phase 2: 循环 spawn_and_wait（不持锁，I/O）
+                        //   Phase 3: 循环 insert_handle（重新获取锁，<1ms）
                         drop(sidecar);
 
-                        let recover_handle = monitor_handle.clone();
-                        let recover_result = tokio::task::spawn(async move {
-                            let state = recover_handle.state::<AppStore>();
+                        // Phase 1: 收集死亡实例（持锁，无 I/O）
+                        let (dead_instances, binary_path) = {
+                            let state = monitor_handle.state::<AppStore>();
                             let mut sidecar = state.sidecar.lock().await;
-                            sidecar.recover_dead_instances(None).await
-                        }).await;
+                            let dead = sidecar.collect_dead_instances();
+                            let binary = sidecar.binary_path().to_string();
+                            (dead, binary)
+                        }; // sidecar 锁立即释放
 
-                        match recover_result {
-                            Ok(recovered) if recovered > 0 => {
-                                consecutive_failures = 0;
-                                tracing::info!("Sidecar 崩溃后自动恢复 {} 个实例", recovered);
-                                let _ = monitor_handle.emit(
-                                    "sidecar-recovered",
-                                    serde_json::json!({
-                                        "message": "服务已自动恢复",
-                                        "recovered": recovered
-                                    }),
-                                );
+                        let recovered_count = if dead_instances.is_empty() {
+                            0usize
+                        } else {
+                            // Phase 2: 逐个重启死亡实例（不持锁，I/O）
+                            let mut recovered_handles: Vec<(String, std::process::Child, u16, Option<String>, Option<u32>, Option<String>)> = Vec::new();
+
+                            for info in dead_instances {
+                                use sidecar_manager::{DeadInstanceInfo, SidecarManager};
+                                let DeadInstanceInfo {
+                                    project_key,
+                                    src_dir,
+                                    multi_window,
+                                    llm_api,
+                                } = info;
+
+                                match SidecarManager::spawn_and_wait(
+                                    &binary_path,
+                                    &project_key,
+                                    src_dir.as_deref(),
+                                    None,
+                                    multi_window,
+                                    llm_api.as_deref(),
+                                ).await {
+                                    Ok((child, port)) => {
+                                        tracing::info!(
+                                            "Sidecar 崩溃恢复成功: 项目={}, 新端口={}",
+                                            project_key, port
+                                        );
+                                        recovered_handles.push((project_key, child, port, src_dir, multi_window, llm_api));
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "Sidecar 崩溃恢复失败: 项目={}, 错误: {}",
+                                            project_key, e
+                                        );
+                                    }
+                                }
                             }
-                            Ok(_) => {
-                                // 无需恢复或无实例可恢复
+
+                            // Phase 3: 插入恢复的实例（重新获取锁，无 I/O）
+                            let recovered_count = recovered_handles.len();
+                            if recovered_count > 0 {
+                                let state = monitor_handle.state::<AppStore>();
+                                let mut sidecar = state.sidecar.lock().await;
+                                for (key, child, port, src_dir, multi_window, llm_api) in recovered_handles {
+                                    sidecar.insert_handle(&key, child, port, src_dir, multi_window, llm_api);
+                                }
                             }
-                            Err(join_err) => {
-                                tracing::error!(
-                                    "心跳检测：recover_dead_instances 子任务 panic，已恢复并继续监控: {}",
-                                    join_err
-                                );
-                            }
+
+                            recovered_count
+                        };
+
+                        if recovered_count > 0 {
+                            consecutive_failures = 0;
+                            tracing::info!("Sidecar 崩溃后自动恢复 {} 个实例", recovered_count);
+                            let _ = monitor_handle.emit(
+                                "sidecar-recovered",
+                                serde_json::json!({
+                                    "message": "服务已自动恢复",
+                                    "recovered": recovered_count
+                                }),
+                            );
                         }
 
                         // 重新获取 sidecar 锁以更新 last_instance_count
