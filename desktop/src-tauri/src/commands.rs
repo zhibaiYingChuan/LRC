@@ -286,21 +286,21 @@ pub struct SidecarStatusResponse {
 ///              1. 先在 sidecar 锁内执行崩溃恢复和获取实例列表，然后释放锁
 ///              2. instances 为空时，检查 sidecar_port 并执行快速健康检查
 ///              3. 健康检查不持有 sidecar 锁，不会阻塞 start_sidecar 等命令
+/// v0.5.17 修复：移除 get_sidecar_status 中的 recover_dead_instances 调用
+///              状态查询不应触发崩溃恢复（最多 40 秒阻塞），恢复由心跳协程负责。
+///              状态查询仅返回当前实例列表 + sidecar_port 健康检查。
 #[tauri::command]
 pub async fn get_sidecar_status(
     store: State<'_, AppStore>,
 ) -> Result<Vec<SidecarStatusResponse>, String> {
-    let fresh_llm = get_llm_api_from_wizard(&store).await;
-
-    // v0.5.16 修复：在 sidecar 锁内只执行崩溃恢复和获取实例列表，然后释放锁
+    // v0.5.17 修复：状态查询不再触发崩溃恢复
+    // 原先调用 recover_dead_instances（最多 40 秒），导致 get_sidecar_status
+    // 在持有 sidecar 锁时阻塞所有其他命令（start_sidecar 等）。
+    // 崩溃恢复由心跳协程（main.rs）负责，状态查询仅返回当前状态。
     let instances = {
-        let mut sidecar = store.sidecar.lock().await;
-        let recovered = sidecar.recover_dead_instances(fresh_llm).await;
-        if recovered > 0 {
-            tracing::warn!("get_sidecar_status: 已自动恢复 {} 个崩溃的 sidecar 实例", recovered);
-        }
+        let sidecar = store.sidecar.lock().await;
         sidecar.list_instances()
-    }; // sidecar 锁在此释放
+    }; // sidecar 锁立即释放（<1ms）
 
     // 如果桌面端管理的实例不为空，直接返回
     if !instances.is_empty() {
@@ -362,14 +362,47 @@ pub async fn start_sidecar(
     // v0.5.1 重构：统一使用 get_llm_api_from_wizard 辅助函数
     let llm_api = get_llm_api_from_wizard(&store).await;
 
-    // v0.5.7 修复 M-3：缩小 sidecar 锁持有范围，sidecar_port 更新移到锁释放后
-    // 原先 sidecar 锁持有期间还获取 sidecar_port 锁，导致锁嵌套。
-    // 现在先释放 sidecar 锁，再获取 sidecar_port 锁，减少锁持有时间。
-    let port = {
+    // v0.5.17 三阶段锁安全模式：避免在持有 sidecar 锁时执行 wait_for_health（最多 40s）
+    //   Phase 1: prepare_start（持锁，<1ms）→ 释放锁
+    //   Phase 2: spawn_and_wait（不持锁，I/O）
+    //   Phase 3: insert_handle（重新获取锁，<1ms）
+    let project_key = src_dir.clone().unwrap_or_else(|| "default".to_string());
+
+    // Phase 1: 检查是否已运行（持锁，无 I/O）
+    let prepare = {
         let mut sidecar = store.sidecar.lock().await;
-        sidecar.start(src_dir, port, multi_window, llm_api).await
-            .map_err(|e| user_friendly_error(&e))?
-    }; // sidecar 锁在此释放
+        sidecar.prepare_start(&project_key)
+    }; // sidecar 锁立即释放
+
+    let port = match prepare {
+        crate::sidecar_manager::PrepareResult::AlreadyRunning(port) => port,
+        crate::sidecar_manager::PrepareResult::NeedStart => {
+            // Phase 2: 启动子进程 + 健康检查（不持锁，I/O，最多 40s）
+            let binary_path = {
+                let sidecar = store.sidecar.lock().await;
+                sidecar.binary_path().to_string()
+            }; // 锁立即释放
+
+            let (child, port) = SidecarManager::spawn_and_wait(
+                &binary_path,
+                &project_key,
+                src_dir.as_deref(),
+                port,
+                multi_window,
+                llm_api.as_deref(),
+            )
+            .await
+            .map_err(|e| user_friendly_error(&e))?;
+
+            // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
+            {
+                let mut sidecar = store.sidecar.lock().await;
+                sidecar.insert_handle(&project_key, child, port, src_dir, multi_window, llm_api);
+            }
+
+            port
+        }
+    };
 
     // 保存端口供其他模块（托盘等）使用
     {
@@ -384,10 +417,11 @@ pub async fn start_sidecar(
 }
 
 /// 为指定项目启动 sidecar（不停止其他项目）
-/// 
+///
 /// 与 start_sidecar 不同，此命令不会停止已有的 sidecar 实例，
 /// 允许同时运行多个项目的 sidecar 服务。
 /// v0.5.4 P1-6 修复：错误信息人性化
+/// v0.5.17 修复：三阶段锁安全模式，避免在持有锁时执行 wait_for_health（最多 40s）
 #[tauri::command]
 pub async fn start_sidecar_for_project(
     store: State<'_, AppStore>,
@@ -399,14 +433,42 @@ pub async fn start_sidecar_for_project(
     // v0.5.1 重构：统一使用 get_llm_api_from_wizard 辅助函数
     let llm_api = get_llm_api_from_wizard(&store).await;
 
-    // v0.5.7 修复 M-3：缩小 sidecar 锁持有范围，sidecar_port 更新移到锁释放后
-    let port = {
+    // v0.5.17 三阶段锁安全模式
+    // Phase 1: 检查是否已运行（持锁，无 I/O，<1ms）
+    let prepare = {
         let mut sidecar = store.sidecar.lock().await;
-        sidecar
-            .start_for_project(&project_key, src_dir, port, multi_window, llm_api)
+        sidecar.prepare_start(&project_key)
+    }; // sidecar 锁立即释放
+
+    let port = match prepare {
+        crate::sidecar_manager::PrepareResult::AlreadyRunning(port) => port,
+        crate::sidecar_manager::PrepareResult::NeedStart => {
+            // Phase 2: 启动子进程 + 健康检查（不持锁，I/O，最多 40s）
+            let binary_path = {
+                let sidecar = store.sidecar.lock().await;
+                sidecar.binary_path().to_string()
+            };
+
+            let (child, port) = SidecarManager::spawn_and_wait(
+                &binary_path,
+                &project_key,
+                src_dir.as_deref(),
+                port,
+                multi_window,
+                llm_api.as_deref(),
+            )
             .await
-            .map_err(|e| user_friendly_error(&e))?
-    }; // sidecar 锁在此释放
+            .map_err(|e| user_friendly_error(&e))?;
+
+            // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
+            {
+                let mut sidecar = store.sidecar.lock().await;
+                sidecar.insert_handle(&project_key, child, port, src_dir, multi_window, llm_api);
+            }
+
+            port
+        }
+    };
 
     // 保存最新端口
     {
@@ -1201,18 +1263,59 @@ pub async fn switch_project(
     }
 
     // 2. 重启 sidecar 以重新索引
-    // v0.5.7 修复 M-4：缩小 sidecar 锁持有范围，sidecar_port 更新移到锁释放后
-    // 原先在持有 sidecar 锁期间执行 stop + start（可能 15 秒以上），且还获取 sidecar_port 锁。
-    // 现在使用 restart_project 原子方法，并在锁释放后更新 sidecar_port。
-    let port = {
+    // v0.5.17 三阶段锁安全模式：避免在持有 sidecar 锁时执行 wait_for_health（最多 40s）
+    //   Phase 1: stop + prepare_start（持锁，stop 最多 5s，无其他 I/O）→ 释放锁
+    //   Phase 2: spawn_and_wait（不持锁，I/O，最多 40s）
+    //   Phase 3: insert_handle（重新获取锁，<1ms）
+    let project_key = project_dir.clone();
+
+    // Phase 1: 停止旧实例 + 检查是否需要启动（持锁）
+    let prepare = {
         let mut sidecar = store.sidecar.lock().await;
         if sidecar.is_running() {
             sidecar.stop().await
                 .map_err(|e| user_friendly_error(&e))?;
         }
-        sidecar.start(Some(project_dir.clone()), None, multi_window, llm_api).await
-            .map_err(|e| user_friendly_error(&e))?
-    }; // sidecar 锁在此释放
+        // stop 后所有实例已清除，prepare_start 一定返回 NeedStart
+        sidecar.prepare_start(&project_key)
+    }; // sidecar 锁立即释放
+
+    let port = match prepare {
+        crate::sidecar_manager::PrepareResult::AlreadyRunning(port) => port,
+        crate::sidecar_manager::PrepareResult::NeedStart => {
+            // Phase 2: 启动子进程 + 健康检查（不持锁，I/O，最多 40s）
+            let binary_path = {
+                let sidecar = store.sidecar.lock().await;
+                sidecar.binary_path().to_string()
+            };
+
+            let (child, port) = SidecarManager::spawn_and_wait(
+                &binary_path,
+                &project_key,
+                Some(&project_dir),
+                None,
+                multi_window,
+                llm_api.as_deref(),
+            )
+            .await
+            .map_err(|e| user_friendly_error(&e))?;
+
+            // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
+            {
+                let mut sidecar = store.sidecar.lock().await;
+                sidecar.insert_handle(
+                    &project_key,
+                    child,
+                    port,
+                    Some(project_dir.clone()),
+                    multi_window,
+                    llm_api,
+                );
+            }
+
+            port
+        }
+    };
 
     {
         let mut saved_port = store.sidecar_port.lock().await;
