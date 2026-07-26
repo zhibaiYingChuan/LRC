@@ -10,6 +10,7 @@
 // 贡献者友好：修改这些模块无需理解道枢哲学。
 // 专注于实用功能：编码、检索、管理、持久化。
 // ──────────────────────────────────────────────
+pub mod embedder; // v0.6.0 统一 Embedder 抽象层
 pub mod encoder; // 编码器 trait 定义
 pub mod encoder_registry; // 编码器注册表
 pub mod hnsw; // HNSW 向量检索
@@ -22,6 +23,9 @@ pub mod rrf; // RRF 倒数排名融合（server + v1_api 共享） // 检索器 
 
 #[cfg(feature = "ml")]
 pub mod encoder_codebert; // CodeBERT 编码器实现
+
+#[cfg(feature = "ml")]
+pub mod model_downloader; // v0.6.0 模型下载器（进度回调 + 重试 + 镜像源）
 
 // ──────────────────────────────────────────────
 // L2 核心引擎层 (Core Engine Layer)
@@ -62,6 +66,16 @@ pub use dao_regulator::{
 };
 pub use encoder::{CodeEncoder, EmbeddingVector, FastEncoder};
 pub use encoder_registry::EncoderRegistry;
+pub use embedder::{EmbedError, Embedder}; // v0.6.0 统一嵌入器抽象
+#[cfg(feature = "ml")]
+pub use embedder::LocalBertEmbedder; // v0.6.0 本地 BERT 嵌入器
+#[cfg(feature = "server")]
+pub use embedder::LlmApiEmbedder; // v0.6.0 LLM API 嵌入器
+#[cfg(feature = "ml")]
+pub use model_downloader::{
+    build_download_url, manual_download_guide, ConsoleProgress, DownloadConfig, DownloadError,
+    DownloadProgress, MirrorSource, ModelDownloader,
+}; // v0.6.0 模型下载器
 pub use health_report::{
     generate_health_report, MemoryHealthStats, SystemHealthReport, SystemMode,
 };

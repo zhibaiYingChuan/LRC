@@ -25,6 +25,66 @@ use candle_core::{Device, Tensor};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+// ============================================================
+// 默认模型语言检测（v0.6.0 通用语义引擎）
+// ============================================================
+// 根据系统语言自动选择默认嵌入模型：
+//   - 中文环境 → BAAI/bge-small-zh（512 维，~100MB，中文 SOTA）
+//   - 其他语言 → sentence-transformers/all-MiniLM-L6-v2（384 维，~80MB，多语言轻量）
+//
+// 用户仍可通过环境变量覆盖：
+//   - LRC_LUOSHU_MODEL_ID（向后兼容，最高优先级）
+//   - LRC_EMBEDDER_MODEL（v0.6.0 引入，统一配置，将在 4.2.1 实现）
+//
+// 语言检测优先级（高 → 低）：
+//   1. LRC_LANG（LRC 自定义）
+//   2. LANG（Unix 标准）
+//   3. LC_ALL（Unix 标准）
+//   4. LANGUAGE（GNU 标准，可含多语言，取第一个）
+//   5. 默认 "zh_CN"（LRC 主要服务中文用户）
+
+/// 道枢映射: 坤卦·地 (☷) — 承载万物，语言检测是模型选择的基础
+/// 检测系统语言环境
+///
+/// 返回 BCP-47 风格的语言代码（如 "zh_CN"、"en_US"）。
+/// Windows 用户若未设置环境变量，默认返回 "zh_CN"。
+fn detect_system_lang() -> String {
+    // 1. 优先检查 LRC 自定义环境变量
+    for var in &["LRC_LANG", "LANG", "LC_ALL"] {
+        if let Ok(val) = std::env::var(var) {
+            // 过滤空值和 "C"/"POSIX"（ POSIX 默认值，非真实语言）
+            if !val.is_empty() && val != "C" && val != "POSIX" {
+                return val;
+            }
+        }
+    }
+    // 2. 检查 LANGUAGE（GNU 标准，可能含冒号分隔的多个语言）
+    if let Ok(val) = std::env::var("LANGUAGE") {
+        if !val.is_empty() {
+            return val
+                .split(':')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("zh_CN")
+                .to_string();
+        }
+    }
+    // 3. 默认值：LRC 主要服务中文用户
+    "zh_CN".to_string()
+}
+
+/// 根据语言代码选择默认嵌入模型 ID
+///
+/// - 中文（zh_*）→ `BAAI/bge-small-zh`（中文 SOTA）
+/// - 其他 → `sentence-transformers/all-MiniLM-L6-v2`（多语言轻量）
+fn detect_default_model_by_lang(lang: &str) -> &'static str {
+    if lang.to_lowercase().starts_with("zh") {
+        "BAAI/bge-small-zh"
+    } else {
+        "sentence-transformers/all-MiniLM-L6-v2"
+    }
+}
+
 /// 洛书编码器 ML 增强器
 ///
 /// 使用真实的 BERT 语义模型进行文本编码，提供比统计特征
@@ -64,8 +124,17 @@ impl LuoShuMlEncoder {
 
         let device = Device::Cpu;
 
-        let model_id = std::env::var("LRC_LUOSHU_MODEL_ID")
-            .unwrap_or_else(|_| "sentence-transformers/all-MiniLM-L6-v2".to_string());
+        // v0.6.0 默认模型选择：环境变量 > 语言检测默认值
+        // 优先级：LRC_LUOSHU_MODEL_ID（向后兼容）> 语言检测（中文→BGE，其他→MiniLM）
+        let model_id = std::env::var("LRC_LUOSHU_MODEL_ID").unwrap_or_else(|_| {
+            let lang = detect_system_lang();
+            let default_model = detect_default_model_by_lang(&lang);
+            eprintln!(
+                "[LRC·洛书ML] 系统语言: {} → 默认模型: {}",
+                lang, default_model
+            );
+            default_model.to_string()
+        });
 
         let local_model_name = model_id.replace('/', "--");
 
@@ -498,6 +567,14 @@ impl LuoShuMlEncoder {
             .to_vec1()
             .map_err(|e| format!("to_vec1: {}", e))
     }
+
+    /// 返回模型的隐藏层维度（v0.6.0 新增）
+    ///
+    /// 用于 Embedder trait 实现获取向量维度。
+    /// BGE-small-zh: 512, MiniLM-L6-v2: 384, BGE-base-zh: 768
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
 }
 
 /// 创建带 ML 编码器的洛书编码器组合
@@ -842,5 +919,90 @@ mod tests {
         encoder.set_recovery_threshold(0);
         let (_, threshold) = encoder.recovery_progress();
         assert_eq!(threshold, 1);
+    }
+
+    // ============================================================
+    // v0.6.0 语言检测与默认模型选择测试
+    // ============================================================
+
+    /// 测试：中文语言检测 → BGE-small-zh
+    #[test]
+    fn test_detect_default_model_chinese() {
+        // 标准中文
+        assert_eq!(detect_default_model_by_lang("zh_CN"), "BAAI/bge-small-zh");
+        assert_eq!(detect_default_model_by_lang("zh_CN.UTF-8"), "BAAI/bge-small-zh");
+        assert_eq!(detect_default_model_by_lang("zh_TW"), "BAAI/bge-small-zh");
+        assert_eq!(detect_default_model_by_lang("zh_HK"), "BAAI/bge-small-zh");
+        assert_eq!(detect_default_model_by_lang("zh_SG"), "BAAI/bge-small-zh");
+
+        // 大小写不敏感
+        assert_eq!(detect_default_model_by_lang("ZH_CN"), "BAAI/bge-small-zh");
+        assert_eq!(detect_default_model_by_lang("Zh_CN"), "BAAI/bge-small-zh");
+
+        // 纯语言代码
+        assert_eq!(detect_default_model_by_lang("zh"), "BAAI/bge-small-zh");
+    }
+
+    /// 测试：非中文语言 → MiniLM-L6-v2（多语言轻量）
+    #[test]
+    fn test_detect_default_model_english_and_others() {
+        // 英文
+        assert_eq!(
+            detect_default_model_by_lang("en_US"),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+        assert_eq!(
+            detect_default_model_by_lang("en_US.UTF-8"),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+        assert_eq!(
+            detect_default_model_by_lang("en_GB"),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+
+        // 其他语言（日/法/德/韩）→ MiniLM（多语言支持）
+        assert_eq!(
+            detect_default_model_by_lang("ja_JP"),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+        assert_eq!(
+            detect_default_model_by_lang("fr_FR"),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+        assert_eq!(
+            detect_default_model_by_lang("de_DE"),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+        assert_eq!(
+            detect_default_model_by_lang("ko_KR"),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+    }
+
+    /// 测试：空字符串和边界情况 → 默认 MiniLM（非中文）
+    #[test]
+    fn test_detect_default_model_edge_cases() {
+        // 空字符串 → 非中文 → MiniLM
+        assert_eq!(
+            detect_default_model_by_lang(""),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+        // "zh" 作为子串但非前缀 → 不应识别为中文
+        // "en_ZH_manufacturing" 经 to_lowercase 后为 "en_zh_manufacturing"，
+        // 以 "en" 开头，不以 "zh" 开头，应返回 MiniLM
+        assert_eq!(
+            detect_default_model_by_lang("en_ZH_manufacturing"),
+            "sentence-transformers/all-MiniLM-L6-v2"
+        );
+    }
+
+    /// 测试：系统语言检测（仅验证返回值非空且符合格式）
+    /// 注意：此测试不设置环境变量，依赖运行环境，仅做烟雾测试
+    #[test]
+    fn test_detect_system_lang_returns_nonempty() {
+        let lang = detect_system_lang();
+        assert!(!lang.is_empty(), "系统语言不应为空");
+        // 默认应为 "zh_CN"（LRC 主要服务中文用户）或环境变量值
+        println!("[smoke test] 当前系统语言检测: {}", lang);
     }
 }

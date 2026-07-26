@@ -21,7 +21,7 @@ use code_memory::consolidation::{
     run_consolidation_loop, ConsolidationConfig, ConsolidationPipeline, InMemorySource,
     SurfaceMemorySource,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -170,6 +170,66 @@ async fn try_run() -> Result<(), String> {
             }
             "--list-ides" => {
                 list_ides_mode = true;
+            }
+            // v0.6.0 新增：model 子命令（模型管理）
+            // 用法: code-memory-server model <list|download|use|remove> [args]
+            "model" => {
+                // 解析子命令
+                if i + 1 >= args.len() {
+                    return Err(
+                        "错误: model 子命令需要指定操作\n\
+                         用法: code-memory-server model <list|download|use|remove> [args]"
+                            .to_string(),
+                    );
+                }
+                let subcommand = args[i + 1].clone();
+                let sub_args = &args[i + 2..];
+
+                // 分发到对应的处理函数
+                match subcommand.as_str() {
+                    "list" => handle_model_list(),
+                    "download" => {
+                        if sub_args.is_empty() {
+                            return Err(
+                                "错误: model download 需要指定模型 ID\n\
+                                 用法: code-memory-server model download <model_id>\n\
+                                 示例: code-memory-server model download BAAI/bge-small-zh"
+                                    .to_string(),
+                            );
+                        }
+                        handle_model_download(&sub_args[0])?
+                    }
+                    "use" => {
+                        if sub_args.is_empty() {
+                            return Err(
+                                "错误: model use 需要指定模型 ID\n\
+                                 用法: code-memory-server model use <model_id>\n\
+                                 示例: code-memory-server model use BAAI/bge-small-zh"
+                                    .to_string(),
+                            );
+                        }
+                        handle_model_use(&sub_args[0])?
+                    }
+                    "remove" => {
+                        if sub_args.is_empty() {
+                            return Err(
+                                "错误: model remove 需要指定模型 ID\n\
+                                 用法: code-memory-server model remove <model_id>\n\
+                                 示例: code-memory-server model remove BAAI/bge-small-zh"
+                                    .to_string(),
+                            );
+                        }
+                        handle_model_remove(&sub_args[0])?
+                    }
+                    _ => {
+                        return Err(format!(
+                            "错误: 未知的 model 子命令 '{}'\n\
+                             可用子命令: list, download, use, remove",
+                            subcommand
+                        ));
+                    }
+                }
+                return Ok(());
             }
             "--help" | "-h" => {
                 print_help();
@@ -674,7 +734,7 @@ async fn try_run() -> Result<(), String> {
             verbose: 1,
         };
         // v0.5.18：传入 LLM 配置，启用高维 embedding 合成
-        // LLM 未配置时自动降级到洛书合成
+        // LLM 未配置时自动降级到本地统计合成
         let pipeline = ConsolidationPipeline::new_with_llm(
             consolidation_config,
             memory_store.clone(),
@@ -689,7 +749,7 @@ async fn try_run() -> Result<(), String> {
         if llm_api.is_configured() {
             log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，LLM embedding 合成模式）");
         } else {
-            log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，洛书合成模式，建议配置 LLM）");
+            log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，本地统计合成模式，建议配置 LLM）");
         }
     }
 
@@ -1325,6 +1385,446 @@ fn run_benchmark_mode(json_output: bool) {
     }
 }
 
+// ════════════════════════════════════════════════════════════
+// v0.6.0 模型管理子命令实现
+// ════════════════════════════════════════════════════════════
+
+/// 推荐模型列表（用于 model list 输出参考）
+const RECOMMENDED_MODELS: &[(&str, &str, &str)] = &[
+    ("BAAI/bge-small-zh", "512", "中文默认（~100MB）"),
+    ("BAAI/bge-base-zh", "768", "中文高精度（~400MB）"),
+    (
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "384",
+        "英文/多语言轻量（~80MB）",
+    ),
+    (
+        "multilingual-e5-small",
+        "384",
+        "多语言通用（~120MB）",
+    ),
+    (
+        "microsoft/graphcodebert-base",
+        "768",
+        "代码搜索（~500MB，向后兼容）",
+    ),
+];
+
+/// 获取 models/ 目录路径
+///
+/// 优先使用当前工作目录下的 models/，其次使用可执行文件同级目录的 models/
+fn get_models_dir() -> PathBuf {
+    // 优先使用当前工作目录
+    if let Ok(cwd) = std::env::current_dir() {
+        let dir = cwd.join("models");
+        if dir.exists() {
+            return dir;
+        }
+    }
+    // 其次使用可执行文件同级目录
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            return exe_dir.join("models");
+        }
+    }
+    // 默认回退到当前目录
+    PathBuf::from("models")
+}
+
+/// 处理 `model list` 子命令
+///
+/// 扫描 models/ 目录，列出已下载的模型及其大小、维度信息。
+fn handle_model_list() {
+    let models_dir = get_models_dir();
+
+    println!("═══════════════════════════════════════════");
+    println!("  LRC 已下载模型列表");
+    println!("═══════════════════════════════════════════");
+    println!();
+    println!("  模型目录: {}", models_dir.display());
+    println!();
+
+    if !models_dir.exists() {
+        println!("  （暂无已下载模型）");
+        println!();
+        println!("  推荐模型:");
+        for (id, dim, desc) in RECOMMENDED_MODELS {
+            println!("    {:<45} {:>4}维  {}", id, dim, desc);
+        }
+        println!();
+        println!("  下载模型: code-memory-server model download <model_id>");
+        return;
+    }
+
+    // 扫描 models/ 目录下的子目录
+    let entries = match std::fs::read_dir(&models_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("错误: 无法读取 models 目录: {}", e);
+            return;
+        }
+    };
+
+    let mut found_any = false;
+    let mut models: Vec<(String, u64, String)> = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+
+        // 检查是否包含必需文件（config.json + 模型权重）
+        let has_config = path.join("config.json").exists();
+        let has_weights = path.join("model.safetensors").exists()
+            || path.join("pytorch_model.bin").exists();
+
+        if !has_config || !has_weights {
+            continue;
+        }
+
+        // 计算目录总大小
+        let total_size = calculate_dir_size(&path);
+        let model_id = dir_name.replace("--", "/");
+        models.push((model_id, total_size, dir_name));
+        found_any = true;
+    }
+
+    if !found_any {
+        println!("  （暂无完整模型，仅下载了部分文件）");
+        println!();
+        println!("  推荐模型:");
+        for (id, dim, desc) in RECOMMENDED_MODELS {
+            println!("    {:<45} {:>4}维  {}", id, dim, desc);
+        }
+        println!();
+        println!("  下载模型: code-memory-server model download <model_id>");
+        return;
+    }
+
+    // 按模型 ID 排序
+    models.sort_by(|a, b| a.0.cmp(&b.0));
+
+    println!("  {:<45} {:>10}  {}", "模型 ID", "大小", "目录名");
+    println!("  {}", "─".repeat(75));
+
+    // 获取当前默认模型（从环境变量，常量定义在 engine 层避免公开层泄露）
+    let current_default = std::env::var(code_memory::engine::embedder::EMBEDDER_MODEL_ENV_VAR).ok();
+
+    for (model_id, size, dir_name) in &models {
+        let size_str = format_size(*size);
+        let marker = if Some(model_id.as_str()) == current_default.as_deref() {
+            " ← 当前默认"
+        } else {
+            ""
+        };
+        println!(
+            "  {:<45} {:>10}  {}{}",
+            model_id, size_str, dir_name, marker
+        );
+    }
+
+    println!();
+    println!("  共 {} 个已下载模型", models.len());
+    println!();
+    println!("  推荐模型（尚未下载）:");
+    let downloaded_ids: Vec<&str> = models.iter().map(|m| m.0.as_str()).collect();
+    for (id, dim, desc) in RECOMMENDED_MODELS {
+        if !downloaded_ids.contains(id) {
+            println!("    {:<45} {:>4}维  {}", id, dim, desc);
+        }
+    }
+    println!();
+    println!("  切换默认模型: code-memory-server model use <model_id>");
+    println!("  删除模型:     code-memory-server model remove <model_id>");
+}
+
+/// 处理 `model download <model_id>` 子命令
+///
+/// 使用 ModelDownloader 下载模型文件到 models/ 目录。
+/// 需要启用 ml feature（默认未启用，需用 `cargo build --features server,ml` 编译）。
+fn handle_model_download(model_id: &str) -> Result<(), String> {
+    #[cfg(not(feature = "ml"))]
+    {
+        return Err(format!(
+            "错误: 模型下载功能需要启用 ml feature\n\
+             当前编译未启用 ml feature，请使用以下命令重新编译：\n\
+             cargo build --features server,ml\n\
+             \n\
+             或手动下载模型 {}：\n\
+             1. 访问 https://hf-mirror.com/{}\n\
+             2. 下载 config.json, tokenizer.json, model.safetensors\n\
+             3. 放到 models/{}/ 目录下\n\
+             详细步骤参考: docs/OFFLINE_MODEL_GUIDE.md",
+            model_id,
+            model_id,
+            model_id.replace('/', "--")
+        ));
+    }
+
+    #[cfg(feature = "ml")]
+    {
+        use code_memory::engine::model_downloader::{
+            build_download_url, manual_download_guide, ConsoleProgress, DownloadConfig,
+            MirrorSource, ModelDownloader,
+        };
+
+        println!("═══════════════════════════════════════════");
+        println!("  LRC 模型下载");
+        println!("═══════════════════════════════════════════");
+        println!();
+        println!("  模型 ID: {}", model_id);
+        println!("  镜像源: {}", MirrorSource::from_env());
+        println!();
+
+        // 检查模型是否已下载
+        let local_dir_name = model_id.replace('/', "--");
+        let models_dir = get_models_dir();
+        let dest_dir = models_dir.join(&local_dir_name);
+
+        if dest_dir.join("config.json").exists()
+            && (dest_dir.join("model.safetensors").exists()
+                || dest_dir.join("pytorch_model.bin").exists())
+        {
+            println!("  ✓ 模型已存在: {}", dest_dir.display());
+            println!("  如需重新下载，请先删除: code-memory-server model remove {}", model_id);
+            return Ok(());
+        }
+
+        // 需要下载的文件列表
+        let files_to_download = [
+            "config.json",
+            "tokenizer.json",
+            "model.safetensors",
+        ];
+
+        let config = DownloadConfig::default();
+        let downloader = ModelDownloader::new(config);
+        let progress = ConsoleProgress::new();
+        let mirror = MirrorSource::from_env();
+
+        println!("  开始下载 {} 个文件...", files_to_download.len());
+        println!();
+
+        let mut failed_files = Vec::new();
+
+        for (idx, filename) in files_to_download.iter().enumerate() {
+            println!(
+                "[{}/{}] 下载 {} ...",
+                idx + 1,
+                files_to_download.len(),
+                filename
+            );
+
+            let url = build_download_url(model_id, filename, mirror);
+            let dest = dest_dir.join(filename);
+
+            match downloader.download_with_retry(&url, &dest, &progress) {
+                Ok(()) => {
+                    println!("  ✓ {} 下载完成", filename);
+                }
+                Err(e) => {
+                    eprintln!("  ✗ {} 下载失败: {}", filename, e);
+                    failed_files.push(*filename);
+                    // model.safetensors 下载失败时尝试 pytorch_model.bin
+                    if *filename == "model.safetensors" {
+                        eprintln!("  → 尝试下载 pytorch_model.bin 作为替代...");
+                        let alt_url = build_download_url(model_id, "pytorch_model.bin", mirror);
+                        let alt_dest = dest_dir.join("pytorch_model.bin");
+                        match downloader.download_with_retry(&alt_url, &alt_dest, &progress) {
+                            Ok(()) => {
+                                println!("  ✓ pytorch_model.bin 下载完成（替代 safetensors）");
+                            }
+                            Err(e2) => {
+                                eprintln!("  ✗ pytorch_model.bin 下载也失败: {}", e2);
+                                failed_files.push("pytorch_model.bin");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        println!();
+        if failed_files.is_empty() {
+            println!("═══════════════════════════════════════════");
+            println!("  ✓ 模型 {} 下载完成！", model_id);
+            println!("═══════════════════════════════════════════");
+            println!();
+            println!("  存储位置: {}", dest_dir.display());
+            println!();
+            println!("  下一步:");
+            println!("    设为默认模型: code-memory-server model use {}", model_id);
+            println!("    启动 LRC:     code-memory-server --src-dir ./src --stdio");
+        } else {
+            println!("═══════════════════════════════════════════");
+            println!("  ⚠ 部分文件下载失败: {:?}", failed_files);
+            println!("═══════════════════════════════════════════");
+            println!();
+            println!("{}", manual_download_guide(model_id));
+            return Err(format!(
+                "下载失败，{} 个文件未成功下载",
+                failed_files.len()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// 处理 `model use <model_id>` 子命令
+///
+/// 设置默认嵌入模型。当前通过环境变量配置（变量名见 `EMBEDDER_MODEL_ENV_VAR` 常量）。
+/// 未来版本将支持持久化到配置文件。
+fn handle_model_use(model_id: &str) -> Result<(), String> {
+    // 从 engine 层获取环境变量名（避免公开层直接出现受保护术语）
+    let env_var = code_memory::engine::embedder::EMBEDDER_MODEL_ENV_VAR;
+    println!("═══════════════════════════════════════════");
+    println!("  LRC 设置默认模型");
+    println!("═══════════════════════════════════════════");
+    println!();
+    println!("  目标模型: {}", model_id);
+
+    // 检查模型是否已下载
+    let local_dir_name = model_id.replace('/', "--");
+    let models_dir = get_models_dir();
+    let model_dir = models_dir.join(&local_dir_name);
+
+    if !model_dir.exists() {
+        println!();
+        println!("  ⚠ 该模型尚未下载");
+        println!("  请先下载: code-memory-server model download {}", model_id);
+        return Err(format!("模型 {} 未下载", model_id));
+    }
+
+    if !model_dir.join("config.json").exists() {
+        println!();
+        println!("  ⚠ 模型目录不完整（缺少 config.json）");
+        return Err(format!("模型 {} 文件不完整", model_id));
+    }
+
+    println!();
+    println!("  ✓ 模型已就绪: {}", model_dir.display());
+    println!();
+    println!("  ─────────────────────────────────────────");
+    println!("  设置方法（任选其一）：");
+    println!("  ─────────────────────────────────────────");
+    println!();
+    println!("  方法 1: 环境变量（推荐，立即生效）");
+    println!();
+    println!("    PowerShell（当前会话）:");
+    println!("      $env:{} = \"{}\"", env_var, model_id);
+    println!();
+    println!("    PowerShell（永久，当前用户）:");
+    println!("      [Environment]::SetEnvironmentVariable(");
+    println!("          \"{}\", \"{}\", \"User\")", env_var, model_id);
+    println!();
+    println!("    Bash/Zsh（Linux/macOS）:");
+    println!("      export {}={}", env_var, model_id);
+    println!("      # 永久生效请添加到 ~/.bashrc 或 ~/.zshrc");
+    println!();
+    println!("  方法 2: 启动参数");
+    println!();
+    println!("    code-memory-server --src-dir ./src --stdio");
+    println!("    （LRC 启动时会自动检测系统语言选择默认模型）");
+    println!();
+    println!("  ─────────────────────────────────────────");
+    println!("  设置后请重启 LRC 服务使配置生效。");
+    println!("  ─────────────────────────────────────────");
+
+    Ok(())
+}
+
+/// 处理 `model remove <model_id>` 子命令
+///
+/// 删除指定模型的本地文件。需要用户确认。
+fn handle_model_remove(model_id: &str) -> Result<(), String> {
+    println!("═══════════════════════════════════════════");
+    println!("  LRC 删除模型");
+    println!("═══════════════════════════════════════════");
+    println!();
+    println!("  目标模型: {}", model_id);
+
+    let local_dir_name = model_id.replace('/', "--");
+    let models_dir = get_models_dir();
+    let model_dir = models_dir.join(&local_dir_name);
+
+    if !model_dir.exists() {
+        println!();
+        println!("  ⚠ 模型目录不存在: {}", model_dir.display());
+        return Err(format!("模型 {} 未下载，无需删除", model_id));
+    }
+
+    // 计算目录大小
+    let dir_size = calculate_dir_size(&model_dir);
+    let size_str = format_size(dir_size);
+
+    println!("  目录路径: {}", model_dir.display());
+    println!("  目录大小: {}", size_str);
+    println!();
+    println!("  ⚠ 警告: 此操作将永久删除模型文件，不可恢复！");
+    println!();
+
+    // 询问用户确认
+    if !ask_user_confirmation(&format!(
+        "  确认删除模型 {} ({})？",
+        model_id, size_str
+    )) {
+        println!("  → 已取消删除");
+        return Ok(());
+    }
+
+    // 执行删除
+    match std::fs::remove_dir_all(&model_dir) {
+        Ok(()) => {
+            println!();
+            println!("  ✓ 模型已删除: {}", model_id);
+            println!("  已释放空间: {}", size_str);
+            Ok(())
+        }
+        Err(e) => Err(format!("删除失败: {}", e)),
+    }
+}
+
+/// 计算目录总大小（递归）
+fn calculate_dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                total += calculate_dir_size(&entry_path);
+            } else if entry_path.is_file() {
+                if let Ok(metadata) = entry.metadata() {
+                    total += metadata.len();
+                }
+            }
+        }
+    }
+    total
+}
+
+/// 格式化文件大小为人类可读字符串
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 fn print_help() {
     println!("Loong Recall (L-RC / 忆) — AI 编程助手的记忆与检索插件");
     println!();
@@ -1364,6 +1864,18 @@ fn print_help() {
     println!("  --export <路径>     导出记忆数据到 JSON 文件（备份）");
     println!("  --import <路径>     从 JSON 文件导入记忆数据（恢复）");
     println!("  --help, -h          显示此帮助信息");
+    println!();
+    println!("模型管理子命令（v0.6.0 新增）：");
+    println!("  model list                       列出已下载的模型");
+    println!("  model download <model_id>        下载模型（需 ml feature）");
+    println!("  model use <model_id>             设置默认模型（输出环境变量配置指引）");
+    println!("  model remove <model_id>          删除模型文件（需确认）");
+    println!();
+    println!("  示例:");
+    println!("    code-memory-server model list");
+    println!("    code-memory-server model download BAAI/bge-small-zh");
+    println!("    code-memory-server model use BAAI/bge-small-zh");
+    println!("    code-memory-server model remove BAAI/bge-small-zh");
     println!();
     println!("举个栗子:");
     println!("  # Tier 1 — 默认快速模式（零网络、零下载、秒启动）");

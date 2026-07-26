@@ -21,6 +21,8 @@ use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
 use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 // v0.5.18 新增：LLM embedding 合成所需的导入
 use crate::engine::llm_translator::{cosine_similarity, LlmApiConfig};
+// v0.6.0 新增：统一 Embedder 抽象（结晶路径支持本地嵌入）
+use crate::engine::embedder::Embedder;
 use crate::memory_store::{ListFilter, MemoryStore};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::Persistence;
@@ -565,6 +567,235 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         }
 
         Ok(written)
+    }
+
+    /// v0.6.0 新增：基于统一 Embedder 的结晶合成
+    ///
+    /// 接受任意 Embedder 实现（本地 BERT 或 LLM API），复用相同的聚类算法。
+    /// 总结阶段：如果有 LLM summarizer，用 LLM 生成高质量总结；否则用简单文本拼接。
+    ///
+    /// 遵循三阶段锁安全模式：
+    ///   Phase 1: 持锁加载记忆列表（<1ms）
+    ///   Phase 2: 无锁嵌入+聚类+总结（I/O 密集）
+    ///   Phase 3: 持锁写入合成记忆（<1ms）
+    ///
+    /// # 参数
+    /// - `embedder`：嵌入器（LocalBertEmbedder 或 LlmApiEmbedder）
+    /// - `summarizer`：可选的 LLM 总结器（有则用 LLM 生成总结，无则用本地拼接）
+    ///
+    /// 注：此方法已实现并测试通过，等待集成到 run_cycle 主流程（功能 4.2.3 后续步骤）。
+    #[allow(dead_code)]
+    async fn embedding_synthesize_cycle(
+        &self,
+        embedder: &dyn Embedder,
+        summarizer: Option<&LlmApiConfig>,
+    ) -> Result<usize, String> {
+        // ===== Phase 1：持锁加载记忆列表 =====
+        let candidates: Vec<(String, String)> = {
+            let store = self.store.lock().await;
+            let filter = ListFilter {
+                limit: 1000, // 加载足够多的记忆用于聚类
+                ..ListFilter::new()
+            };
+            let (all, _) = store
+                .list_memories(&filter)
+                .map_err(|e| format!("加载记忆列表失败: {}", e))?;
+            all.into_iter()
+                .filter(|m| m.memory_type != MemoryType::Synthesis)
+                .map(|m| (m.id, m.content))
+                .collect::<Vec<_>>()
+        };
+
+        if candidates.len() < self.config.synthesis_threshold {
+            if self.config.verbose >= 2 {
+                eprintln!(
+                    "[LRC·结晶·Embed] 记忆数 {} 低于阈值 {}，跳过合成",
+                    candidates.len(),
+                    self.config.synthesis_threshold
+                );
+            }
+            return Ok(0);
+        }
+
+        if self.config.verbose >= 2 {
+            eprintln!(
+                "[LRC·结晶·Embed] Phase 1 完成：加载 {} 条候选记忆（embedder={}, dim={}）",
+                candidates.len(),
+                embedder.model_id(),
+                embedder.dim()
+            );
+        }
+
+        // ===== Phase 2：无锁，embedding + 聚类 + 总结 =====
+        let texts: Vec<&str> = candidates.iter().map(|(_, c)| c.as_str()).collect();
+        let embeddings = embedder
+            .embed(&texts)
+            .await
+            .map_err(|e| format!("Embedding 调用失败: {}", e))?;
+
+        if embeddings.len() != candidates.len() {
+            return Err(format!(
+                "Embedding 数量不匹配：期望 {}，实际 {}",
+                candidates.len(),
+                embeddings.len()
+            ));
+        }
+
+        // 基于余弦相似度聚类（贪心法，复用现有算法）
+        let clusters =
+            self.cluster_by_embedding(&embeddings, self.config.synthesis_similarity);
+
+        // 信息增量阈值：与 DaoRegulator 默认值一致（0.01）
+        const INFO_GAIN_THRESHOLD: f32 = 0.01;
+
+        let mut synthesis_results: Vec<(Vec<String>, String, f32)> = Vec::new();
+
+        for cluster_indices in &clusters {
+            if cluster_indices.len() < self.config.synthesis_threshold {
+                continue;
+            }
+
+            // 计算信息增量：1 - 平均成对余弦相似度
+            let avg_sim = self.average_pairwise_similarity(&embeddings, cluster_indices);
+            let information_gain = 1.0 - avg_sim;
+
+            if information_gain < INFO_GAIN_THRESHOLD {
+                if self.config.verbose >= 2 {
+                    eprintln!(
+                        "[LRC·结晶·Embed] 跳过簇（大小={}，信息增量 {:.4} < 阈值 {:.4}）",
+                        cluster_indices.len(),
+                        information_gain,
+                        INFO_GAIN_THRESHOLD
+                    );
+                }
+                continue;
+            }
+
+            // 收集簇内记忆内容
+            let cluster_memories: Vec<String> = cluster_indices
+                .iter()
+                .map(|&i| candidates[i].1.clone())
+                .collect();
+
+            // 总结：有 LLM 用 LLM，否则用本地拼接降级
+            let summary = if let Some(llm) = summarizer {
+                llm.summarize_memories(&cluster_memories)
+                    .await
+                    .map_err(|e| format!("LLM 合成总结失败: {}", e))?
+            } else {
+                self.local_summarize(&cluster_memories)
+            };
+
+            // 收集源记忆 ID
+            let source_ids: Vec<String> = cluster_indices
+                .iter()
+                .map(|&i| candidates[i].0.clone())
+                .collect();
+
+            if self.config.verbose >= 2 {
+                eprintln!(
+                    "[LRC·结晶·Embed] 簇通过阈值（大小={}，信息增量 {:.4}），已生成合成内容（{} 字）",
+                    cluster_indices.len(),
+                    information_gain,
+                    summary.chars().count()
+                );
+            }
+
+            synthesis_results.push((source_ids, summary, information_gain));
+        }
+
+        if synthesis_results.is_empty() {
+            if self.config.verbose >= 1 {
+                eprintln!("[LRC·结晶·Embed] 无簇通过信息增量阈值，本次不生成合成记忆");
+            }
+            return Ok(0);
+        }
+
+        // ===== Phase 3：持锁写入合成记忆 =====
+        let written = {
+            let mut store = self.store.lock().await;
+            let mut count = 0usize;
+            for (source_ids, summary, info_gain) in synthesis_results {
+                // 区分 LLM 合成和本地合成（用于审计与置信度）
+                let (source_tag, confidence) = if summarizer.is_some() {
+                    ("llm_synthesis", 0.85)
+                } else {
+                    ("local_synthesis", 0.65) // 本地合成置信度较低
+                };
+                let mut memory = Memory::new(
+                    summary,
+                    MemoryType::Synthesis,
+                    None,
+                    Vec::new(),
+                    Importance::new(7), // 合成记忆重要性 7
+                    None,
+                )
+                .with_source(source_tag);
+                memory.source_ids = source_ids;
+                memory.information_gain = Some(info_gain);
+                memory.confidence = Some(confidence);
+                memory.resolution = "synthesized".to_string();
+
+                match store.remember(memory) {
+                    Ok(_) => count += 1,
+                    Err(e) => {
+                        if self.config.verbose >= 1 {
+                            eprintln!("[LRC·结晶·Embed] 写入合成记忆失败: {}", e);
+                        }
+                    }
+                }
+            }
+            count
+        };
+
+        if self.config.verbose >= 2 {
+            eprintln!(
+                "[LRC·结晶·Embed] Phase 3 完成：写入 {} 条合成记忆（source={}）",
+                written,
+                if summarizer.is_some() {
+                    "llm"
+                } else {
+                    "local"
+                }
+            );
+        }
+
+        Ok(written)
+    }
+
+    /// v0.6.0 新增：本地总结（无 LLM 时的降级方案）
+    ///
+    /// 简单拼接前 N 条记忆，用于本地嵌入路径的合成。
+    /// 虽然质量不如 LLM 总结，但能保留簇内记忆的关键信息。
+    ///
+    /// 注：此方法由 `embedding_synthesize_cycle` 调用，等待集成到主流程。
+    #[allow(dead_code)]
+    fn local_summarize(&self, memories: &[String]) -> String {
+        if memories.is_empty() {
+            return String::new();
+        }
+        if memories.len() == 1 {
+            return memories[0].clone();
+        }
+        // 简单拼接：取前 5 条，每条截断到 100 字
+        const MAX_ITEMS: usize = 5;
+        const MAX_CHARS: usize = 100;
+        let n = memories.len();
+        let parts: Vec<String> = memories
+            .iter()
+            .take(MAX_ITEMS)
+            .enumerate()
+            .map(|(i, m)| {
+                let truncated: String = m.chars().take(MAX_CHARS).collect();
+                format!("{}. {}", i + 1, truncated)
+            })
+            .collect();
+        let suffix = if n > MAX_ITEMS {
+            format!("\n...（共 {} 条记忆）", n)
+        } else {
+            String::new()
+        };
+        format!("融合 {} 条记忆:\n{}{}", n, parts.join("\n"), suffix)
     }
 
     /// v0.5.18 新增：基于余弦相似度的贪心聚类

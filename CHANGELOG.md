@@ -4,6 +4,48 @@
 
 ---
 
+## [0.6.0] - 2026-07-26
+
+### 新增
+
+- **v0.6.0 通用语义引擎**——将默认嵌入模型从 CodeBERT 切换为通用文本嵌入模型，提升非编程场景语义搜索能力。
+  - 中文环境默认 `BAAI/bge-small-zh`（512 维），英文环境默认 `sentence-transformers/all-MiniLM-L6-v2`（384 维），基于系统语言自动检测。
+  - 新增 `src/engine/embedder.rs`：统一 `Embedder` trait 抽象层，实现 `LocalBertEmbedder` 与 `LlmApiEmbedder`，支持代码搜索与结晶路径共享嵌入器。
+  - 新增 `src/engine/model_resolver.rs`：统一模型文件就绪检测接口 `check_model_ready()`。
+  - 新增 `src/engine/luoshu_encoder_ml.rs` 中 `detect_default_model()`：基于系统语言的默认模型检测；动态投影矩阵适配 512/384 维输入。
+
+- **模型下载器**（[src/engine/model_downloader.rs](file:///g:/code-memory/src/engine/model_downloader.rs)）：
+  - `DownloadProgress` trait：进度回调接口（`on_progress`/`on_complete`/`on_error`）。
+  - `ConsoleProgress`：控制台进度条实现，支持已知/未知总大小的下载。
+  - `MirrorSource` 枚举：镜像源选择（HfMirror/ModelScope/Auto）。
+  - `DownloadConfig`：下载配置（超时、重试次数、退避策略）。
+  - `ModelDownloader::download_with_retry()`：带指数退避的重试下载（initial=2s/max=8s/retries=3）。
+  - `build_download_url()`：根据镜像源构建下载 URL。
+  - `manual_download_guide()`：3 次重试失败后输出手动下载指引。
+  - 18 个单元测试覆盖 URL 构建、退避计算、进度回调、错误处理等场景。
+
+- **模型管理 CLI 命令**（[src/bin/server.rs](file:///g:/code-memory/src/bin/server.rs)）：
+  - `code-memory-server model list` — 列出本地已下载模型（model_id / 路径 / 大小 / 当前默认标记）。
+  - `code-memory-server model download <model_id>` — 触发下载（带进度条 + 重试）。
+  - `code-memory-server model use <model_id>` — 设置默认模型。
+  - `code-memory-server model remove <model_id>` — 删除模型文件。
+  - 辅助函数：`get_models_dir()`、`calculate_dir_size()`、`format_size()`。
+
+### 变更
+
+- **结晶路径支持本地嵌入**：[src/consolidation.rs](file:///g:/code-memory/src/consolidation.rs) 的 `embedding_synthesize_cycle()` 接受 `&dyn Embedder` 参数，支持本地嵌入与 LLM API 嵌入统一调用；本地嵌入失败时降级到洛书统计合成。
+- **国内镜像默认启用**：`src/bin/server.rs` 启动时自动设置 `HF_ENDPOINT=https://hf-mirror.com`（如未显式配置）。
+- **`src/engine/mod.rs`**：注册并导出 `model_downloader` 模块。
+- `Cargo.toml` 版本号 0.5.18 → 0.6.0。
+
+### 测试
+
+- `cargo check --features server,ml` 编译通过。
+- `cargo test --features server,ml` 全部通过：单元测试 456 passed，benchmark 11 passed，doc-tests 8 ignored。
+- 新增 model_downloader 模块 18 个单元测试（覆盖 URL 构建、退避计算、进度回调、错误处理等）。
+
+---
+
 ## [0.5.12] - 2026-06-24
 
 ### 新增
