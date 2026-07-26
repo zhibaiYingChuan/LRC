@@ -58,6 +58,45 @@ cargo build --release --features server
 
 如需离线语义搜索：`cargo build --release --features server,ml`（首次下载模型 ~500MB）。
 
+### v0.6.0 通用语义引擎（新）
+
+v0.6.0 将默认嵌入模型从 CodeBERT 切换为 **BGE-small-zh**（中文用户开箱最优）或 **MiniLM-L6-v2**（英文环境），并支持本地嵌入完成记忆结晶，无需 LLM API 即可享受记忆融合能力。
+
+**模型管理 CLI**（v0.6.0 新增）：
+
+```bash
+# 列出本地已下载模型
+code-memory-server model list
+
+# 下载模型（默认使用 hf-mirror.com 国内镜像）
+code-memory-server model download BAAI/bge-small-zh
+
+# 切换默认模型
+code-memory-server model use BAAI/bge-small-zh
+
+# 删除模型文件
+code-memory-server model remove BAAI/bge-small-zh
+```
+
+**镜像源配置**：
+
+| 镜像源 | 配置方式 | 适用场景 |
+|--------|---------|---------|
+| HF-Mirror（默认） | `HF_ENDPOINT=https://hf-mirror.com` | 国内用户首选 |
+| ModelScope | `LRC_MODEL_MIRROR=modelscope` | HF 镜像不可达时备用 |
+| 自动选择 | `LRC_MODEL_MIRROR=auto` | 优先 HF-Mirror，失败回退 ModelScope |
+
+下载失败时自动重试 3 次（2s/4s/8s 指数退避），3 次均失败后输出手动下载指引并降级到 TF-IDF 模式。
+
+**推荐模型对比**：
+
+| 模型 | 维度 | 大小 | 推荐场景 |
+|------|------|------|---------|
+| BAAI/bge-small-zh | 512 | ~100MB | 中文默认（v0.6.0 推荐） |
+| sentence-transformers/all-MiniLM-L6-v2 | 384 | ~80MB | 英文默认 |
+| BAAI/bge-base-zh | 768 | ~400MB | 中文高精度 |
+| multilingual-e5-small | 384 | ~120MB | 多语言通用 |
+
 ---
 
 ## 12 个 MCP 工具
