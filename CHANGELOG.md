@@ -6,6 +6,27 @@
 
 ## [0.6.0] - 2026-07-26
 
+### v3.0 全局动态审计与真实测试（2026-07-28）
+
+- **审计背景**：用户指出 v2.0 测试存在虚假性（lrcmcp 服务未真正打开），需重新审计并编译桌面端进行真实本地测试
+- **v3.0 审计结果**：v2.0 修复全部验证生效，代码层面无新增问题（0严重/0中等/2低等）
+- **P0 关键修复：桌面端"服务已停止"根因修复**：
+  - **根因一**：[static/app.js](file:///g:/code-memory/static/app.js) 中 `API_BASE` 使用 `window.location.origin`，在 Tauri WebView 中为 `https://tauri.localhost`，导致所有 API 请求失败
+  - **修复一**：检测 Tauri 环境（`window.__TAURI__` 或 `tauri.localhost`），使用 `http://127.0.0.1:3099` 直连 sidecar
+  - **根因二**：[src/server.rs](file:///g:/code-memory/src/server.rs) CORS 白名单缺少 `https://tauri.localhost`（Tauri 2.x Windows WebView 的源）
+  - **修复二**：CORS 白名单添加 `https://tauri.localhost`
+- **编译验证**：
+  - 主项目编译成功（cargo build --release --features server，1m04s）
+  - 桌面端编译成功（npm run build，2m23s）
+  - 生成 MSI 安装包（5.43 MB）+ NSIS 安装包（3.73 MB）
+- **真实模拟用户测试**（10/10 + 5/5 全部通过）：
+  - sidecar 服务真实运行（PID 17376，14.14 MB，端口 3099 监听）
+  - 桌面端 WebView2 到 sidecar 的 3 个 TCP 连接已建立（msedgewebview2 PID 16500 → 127.0.0.1:3099）
+  - CORS 验证：`https://tauri.localhost` 被允许，`https://evil.com` 被拒绝
+  - API 验证（模拟 Tauri Origin）：health/system/dao_metrics/memories_list/memories_recent 全部 200
+- **安全加固验证**：CORS 白名单、路径遍历防护、CSP 配置、TOML 注入防护全部通过
+- **相关文档**：审计报告、修复计划、测试报告为内部开发文档，仅本地保留，不入库
+
 ### 新增
 
 - **v0.6.0 通用语义引擎**——将默认嵌入模型从 CodeBERT 切换为通用文本嵌入模型，提升非编程场景语义搜索能力。
@@ -43,6 +64,54 @@
 - `cargo check --features server,ml` 编译通过。
 - `cargo test --features server,ml` 全部通过：单元测试 456 passed，benchmark 11 passed，doc-tests 8 ignored。
 - 新增 model_downloader 模块 18 个单元测试（覆盖 URL 构建、退避计算、进度回调、错误处理等）。
+
+### UI 重构（v0.6.0 龙忆设计系统 v1.0）
+
+- **全面应用龙忆设计系统 v1.0**——基于《LRC 全案界面重构设计文档》完成样式重构，实现"形现代，意古风"设计理念。
+  - 引入 `static/colors_and_type.css`：6 组色阶（墨韵/宣纸/金色/玉色/朱砂/水蓝，每色 10 级）、语义别名、便携别名、排版、间距、圆角、阴影、动效等完整设计 Token。
+  - 引入 `static/components.css`：按钮（5 种变体 + 3 种尺寸 + 洛书加载动画）、卡片（含记忆类型色条）、输入框、模态框、侧边栏、标签栏等全局组件库。
+  - 迁移 15 个 SVG 图标（icon-dashboard/memory/trust/crystallization/luoshu/audit/bagua/decay/search-lrc/captain-log/benchmark/health/privacy/network/integrity）到 `static/assets/icons/`。
+  - 迁移 4 个 SVG Logo（logo-primary/horizontal/vertical/text-only）到 `static/assets/logo/`。
+- **[static/index.html](file:///g:/code-memory/static/index.html) 重构**：
+  - 顶部导航栏：使用新 Logo + SVG 图标替换 emoji，应用墨韵-宣纸配色。
+  - 统计卡片：4 张卡片使用 4 种色阶（墨韵/金色/玉色/朱砂）+ 对应 SVG 图标。
+  - 信任中心：6 张卡片按记忆类型添加色条（fact→玉色/preference→金色/decision→朱砂/code_context→水蓝）。
+  - 5 分钟向导、船长日志、API 文档、设置页面：emoji 全部替换为 SVG 图标。
+- **[static/app.css](file:///g:/code-memory/static/app.css) 重构**：
+  - `:root` 别名映射：将旧变量（`--ink`/`--gold`/`--jade` 等）映射到新设计系统变量（`--lrc-墨韵-500`/`--lrc-金色-500`/`--lrc-玉色-500` 等），保持向后兼容。
+  - 新增 v0.6.0 增强样式：记忆色条、洛书九宫格加载动画、诗意空状态、暗色模式（`prefers-color-scheme: dark`）、预设场景模板选择器、结晶历史时间线、一键隐私检查按钮。
+- **[static/app.js](file:///g:/code-memory/static/app.js) 新增功能**：
+  - `selectPresetScenario()`：4 套预设场景模板选择（v0.7.0 预览）。
+  - `loadCrystallizationHistory()`：从审计日志加载结晶事件并渲染时间线（v0.8.0 预览）。
+  - `runPrivacyCheck()`：并行调用三个信任接口，100ms 内返回三色信任指示器报告（v0.9.0 预览）。
+- **复杂场景测试**：3 个场景全部通过（Playwright 自动化验证）——
+  - 场景一（仪表盘首屏）：欢迎区显示"早上好，欢迎回来"+诗意短句；道同构度仪表盘评分 85 画布渲染；侧边栏折叠/展开 240px↔60px；系统状态浮窗"统计模式"；版本号 v0.6.0；控制台 0 错误 0 警告。
+  - 场景二（记忆搜索页面）：搜索栏输入"LRC"返回 6 条记忆卡片；筛选面板正常；点击卡片打开详情面板（memory-detail-panel open）显示记忆内容与元数据。
+  - 场景三（信任中心 + 系统状态浮窗）：6 张信任卡片显示；一键隐私检查按钮点击后显示 4 个验证结果面板；系统状态浮窗展开/折叠正常（165px ↔ collapsed）。
+
+### UI 重构补丁（v0.6.0 严格遵循设计文档修复）
+
+- **三层基准测试切换标签**（设计文档 5.6）：在基准报告页面添加"通用检索/独有能力/隐私信任"三层胶囊样式切换标签，使用金色 500 选中项 + 暗色模式适配。
+- **静态资源嵌入 sidecar**：将 `colors_and_type.css`、`components.css`、2 个 Logo SVG、15 个图标 SVG 通过 `include_str!` 嵌入 sidecar 二进制，添加 `/colors_and_type.css`、`/components.css`、`/assets/logo/:filename`、`/assets/icons/:filename` 路由，解决 404 错误。
+- **safeJson 作用域修复**：将 `safeJson` 函数暴露到 `window` 对象，解决 IIFE 外部新增函数（道同构度、演化时间线、结晶历史加载）无法访问的问题。
+- **搜索 API 端点修复**：将记忆搜索端点从不存在的 `POST /recall` 改为 `POST /v1/memories/enrich`，适配 `EnrichResponse` 响应格式（`data.memories` 数组）。
+- **版本号硬编码修复**：将 `app.js` 中 `v0.5.4` 和 `index.html` 中 `v0.2.0` 统一为 `v0.6.0`。
+
+### UI 样式优化补丁（v0.6.0 前端页面样式问题修复）
+
+- **Logo 升级为 PNG 图片**：根据设计文档品牌与 Logo 设计规范，生成符合要求的 Logo 图片（主标识、横式组合、竖式组合），替换原简单 SVG 图标。
+- **侧边栏样式修复**：
+  - 修复 Logo 尺寸问题，明确设置 32px × 32px，添加 `object-fit: contain` 确保正确缩放。
+  - 修复导航图标尺寸问题，明确设置 20px × 20px，添加透明度和 hover 状态。
+  - 修复侧边栏固定高度问题，从 480px 改为 100% 自适应。
+- **顶部导航栏优化**：桌面端（≥1024px）隐藏顶部导航栏，仅保留左侧侧边栏导航，避免双重导航。
+- **道同构度主题优化**：
+  - 环形进度条颜色主题调整为金色（≥80 分金色 / 60-79 玉色 / <60 朱砂），符合品牌主色定位。
+  - 子指标文字颜色加深，标签从墨韵 400 改为墨韵 500，描述从墨韵 200 改为墨韵 300，提升可读性。
+- **欢迎区样式优化**：渐变背景从玉色调整为金色调，与整体品牌主题保持一致。
+- **快速操作区域修复**：修复标题颜色使用旧 CSS 变量的问题，改为玉色主题，替换正确的八卦图标。
+- **底部状态栏样式修复**：全面更新状态栏样式，使用宣纸 400 背景 + 墨韵 400 文字，添加顶部边框，统一使用新设计系统变量。
+- **页面验证**：验证仪表盘、记忆搜索、信任中心、船长日志、基准报告等主要页面样式均符合设计文档规范。
 
 ---
 

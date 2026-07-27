@@ -202,6 +202,17 @@ pub struct WizardState {
     pub corrupted_on_load: bool,
 }
 
+// v0.6.0 P3-1 修复：实现 Default trait，避免 load() 失败时 panic
+impl Default for WizardState {
+    fn default() -> Self {
+        Self {
+            config: WizardConfig::default(),
+            config_path: PathBuf::new(),
+            corrupted_on_load: false,
+        }
+    }
+}
+
 impl WizardState {
     /// 加载或创建向导状态
     /// 

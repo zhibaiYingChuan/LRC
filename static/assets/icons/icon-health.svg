@@ -1,0 +1,14 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 道同构度：环形仪表盘 + 中心健康评分 -->
+  <!-- 外环（仪表盘轨道） -->
+  <circle cx="12" cy="12" r="9" fill="none" stroke="#ffffff" opacity="0.3"/>
+  <!-- 内环（仪表盘进度，约 75% 弧度） -->
+  <path d="M 12 3 A 9 9 0 1 1 5.5 18.5" fill="none" stroke="#ffffff"/>
+  <!-- 中心健康评分指示（心形简化） -->
+  <path d="M 12 14.5 C 10.5 13 8.5 12 8.5 10 C 8.5 8.5 9.5 7.5 11 7.5 C 11.5 7.5 12 8 12 8.5 C 12 8 12.5 7.5 13 7.5 C 14.5 7.5 15.5 8.5 15.5 10 C 15.5 12 13.5 13 12 14.5 Z" fill="none" stroke="#ffffff"/>
+  <!-- 中心点（高亮） -->
+  <circle cx="12" cy="11" r="0.8" fill="#ffffff" stroke="none"/>
+</svg>
+
+
+

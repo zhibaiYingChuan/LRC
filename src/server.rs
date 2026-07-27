@@ -22,7 +22,9 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicBool;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 
@@ -1671,6 +1673,136 @@ async fn app_js_handler() -> axum::response::Response<String> {
         })
 }
 
+/// 龙忆设计系统 v1.0 — 色彩与排版变量（colors_and_type.css）
+///
+/// v0.6.0 UI 重构：仪表盘 HTML 引用 colors_and_type.css 作为设计系统基础变量，
+/// 包含墨韵/宣纸/玉色/朱砂/金色/水蓝色阶、字体系统（无衬线/衬线/等宽）、
+/// 8pt 间距系统、动效变量等。此端点将编译时嵌入的 CSS 内容返回。
+async fn colors_and_type_css_handler() -> axum::response::Response<String> {
+    const CSS: &str = include_str!("../static/colors_and_type.css");
+    axum::response::Response::builder()
+        .header("Content-Type", "text/css; charset=utf-8")
+        .body(CSS.to_string())
+        .unwrap_or_else(|e| {
+            eprintln!("[server] colors_and_type.css 响应构建失败: {}", e);
+            axum::response::Response::builder()
+                .body("/* colors_and_type.css 加载失败 */".to_string())
+                .unwrap_or_else(|_| {
+                    axum::response::Response::new("/* colors_and_type.css 加载失败 */".to_string())
+                })
+        })
+}
+
+/// 龙忆设计系统 v1.0 — 全局组件库（components.css）
+///
+/// v0.6.0 UI 重构：仪表盘 HTML 引用 components.css 作为全局组件库，
+/// 包含按钮、卡片、输入框、Tooltip、Skeleton 骨架屏、Toast 通知条、
+/// 洛书九宫格加载动画等组件样式。此端点将编译时嵌入的 CSS 内容返回。
+async fn components_css_handler() -> axum::response::Response<String> {
+    const CSS: &str = include_str!("../static/components.css");
+    axum::response::Response::builder()
+        .header("Content-Type", "text/css; charset=utf-8")
+        .body(CSS.to_string())
+        .unwrap_or_else(|e| {
+            eprintln!("[server] components.css 响应构建失败: {}", e);
+            axum::response::Response::builder()
+                .body("/* components.css 加载失败 */".to_string())
+                .unwrap_or_else(|_| {
+                    axum::response::Response::new("/* components.css 加载失败 */".to_string())
+                })
+        })
+}
+
+/// 龙忆设计系统 v1.0 — Logo 资源端点
+///
+/// v0.6.0 UI 重构：仪表盘引用 /assets/logo/*.svg 作为品牌 Logo，
+/// 此端点将编译时嵌入的 SVG 内容以 `image/svg+xml` MIME 类型返回。
+/// 支持的文件名：logo-primary.svg、logo-horizontal.svg
+async fn logo_asset_handler(
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> axum::response::Response<String> {
+    // 编译时嵌入所有 Logo SVG 文件
+    const LOGO_PRIMARY: &str = include_str!("../static/assets/logo/logo-primary.svg");
+    const LOGO_HORIZONTAL: &str = include_str!("../static/assets/logo/logo-horizontal.svg");
+    let content = match filename.as_str() {
+        "logo-primary.svg" => Some(LOGO_PRIMARY),
+        "logo-horizontal.svg" => Some(LOGO_HORIZONTAL),
+        _ => None,
+    };
+    match content {
+        Some(svg) => axum::response::Response::builder()
+            .header("Content-Type", "image/svg+xml; charset=utf-8")
+            .body(svg.to_string())
+            .unwrap_or_else(|e| {
+                eprintln!("[server] Logo SVG 响应构建失败: {}", e);
+                axum::response::Response::new(String::new())
+            }),
+        None => axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(format!("<!-- Logo not found: {} -->", filename))
+            .unwrap_or_else(|_| axum::response::Response::new(String::new())),
+    }
+}
+
+/// 龙忆设计系统 v1.0 — 图标资源端点
+///
+/// v0.6.0 UI 重构：仪表盘引用 /assets/icons/*.svg 作为导航和功能图标，
+/// 此端点将编译时嵌入的 SVG 内容以 `image/svg+xml` MIME 类型返回。
+/// 支持的图标：dashboard/search-lrc/captain-log/trust/benchmark/audit/
+/// baga/health/decay/luoshu/memory/crystallization/privacy/network/integrity
+async fn icon_asset_handler(
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> axum::response::Response<String> {
+    // 编译时嵌入所有图标 SVG 文件
+    const ICON_DASHBOARD: &str = include_str!("../static/assets/icons/icon-dashboard.svg");
+    const ICON_SEARCH: &str = include_str!("../static/assets/icons/icon-search-lrc.svg");
+    const ICON_CAPTAIN_LOG: &str = include_str!("../static/assets/icons/icon-captain-log.svg");
+    const ICON_TRUST: &str = include_str!("../static/assets/icons/icon-trust.svg");
+    const ICON_BENCHMARK: &str = include_str!("../static/assets/icons/icon-benchmark.svg");
+    const ICON_AUDIT: &str = include_str!("../static/assets/icons/icon-audit.svg");
+    const ICON_BAGUA: &str = include_str!("../static/assets/icons/icon-bagua.svg");
+    const ICON_HEALTH: &str = include_str!("../static/assets/icons/icon-health.svg");
+    const ICON_DECAY: &str = include_str!("../static/assets/icons/icon-decay.svg");
+    const ICON_LUOSHU: &str = include_str!("../static/assets/icons/icon-luoshu.svg");
+    const ICON_MEMORY: &str = include_str!("../static/assets/icons/icon-memory.svg");
+    const ICON_CRYSTALLIZATION: &str = include_str!("../static/assets/icons/icon-crystallization.svg");
+    const ICON_PRIVACY: &str = include_str!("../static/assets/icons/icon-privacy.svg");
+    const ICON_NETWORK: &str = include_str!("../static/assets/icons/icon-network.svg");
+    const ICON_INTEGRITY: &str = include_str!("../static/assets/icons/icon-integrity.svg");
+
+    let content = match filename.as_str() {
+        "icon-dashboard.svg" => Some(ICON_DASHBOARD),
+        "icon-search-lrc.svg" => Some(ICON_SEARCH),
+        "icon-captain-log.svg" => Some(ICON_CAPTAIN_LOG),
+        "icon-trust.svg" => Some(ICON_TRUST),
+        "icon-benchmark.svg" => Some(ICON_BENCHMARK),
+        "icon-audit.svg" => Some(ICON_AUDIT),
+        "icon-bagua.svg" => Some(ICON_BAGUA),
+        "icon-health.svg" => Some(ICON_HEALTH),
+        "icon-decay.svg" => Some(ICON_DECAY),
+        "icon-luoshu.svg" => Some(ICON_LUOSHU),
+        "icon-memory.svg" => Some(ICON_MEMORY),
+        "icon-crystallization.svg" => Some(ICON_CRYSTALLIZATION),
+        "icon-privacy.svg" => Some(ICON_PRIVACY),
+        "icon-network.svg" => Some(ICON_NETWORK),
+        "icon-integrity.svg" => Some(ICON_INTEGRITY),
+        _ => None,
+    };
+    match content {
+        Some(svg) => axum::response::Response::builder()
+            .header("Content-Type", "image/svg+xml; charset=utf-8")
+            .body(svg.to_string())
+            .unwrap_or_else(|e| {
+                eprintln!("[server] 图标 SVG 响应构建失败: {}", e);
+                axum::response::Response::new(String::new())
+            }),
+        None => axum::response::Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(format!("<!-- Icon not found: {} -->", filename))
+            .unwrap_or_else(|_| axum::response::Response::new(String::new())),
+    }
+}
+
 /// 仪表盘端点 — 返回内嵌的 Web UI 仪表盘 HTML
 ///
 /// 产品化核心入口：用户启动服务后访问 http://localhost:3099/dashboard
@@ -1963,6 +2095,553 @@ fn save_llm_to_wizard_json(llm_api: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ==================== 嵌入模型管理 API（v0.6.0+） ====================
+
+/// 全局下载任务状态标志
+///
+/// 跟踪后台下载线程的运行状态：
+/// - `false`：无下载任务或上次下载已结束
+/// - `true`：下载任务正在运行中
+static EMBEDDER_DOWNLOADING: AtomicBool = AtomicBool::new(false);
+
+/// 可用的嵌入模型白名单
+const AVAILABLE_EMBEDDER_MODELS: &[&str] = &[
+    "BAAI/bge-small-zh",
+    "sentence-transformers/all-MiniLM-L6-v2",
+    "intfloat/multilingual-e5-small",
+    "BAAI/bge-base-zh",
+];
+
+// ---------- 请求 / 响应结构体 ----------
+
+/// 嵌入模型下载请求
+#[derive(Debug, Deserialize)]
+struct EmbedderDownloadRequest {
+    model_id: String,
+    /// 镜像源："hf-mirror" 或 "modelscope"（不区分大小写，未指定时默认 hf-mirror）
+    mirror: Option<String>,
+}
+
+/// 嵌入模型应用请求
+#[derive(Debug, Deserialize)]
+struct EmbedderApplyRequest {
+    model_id: String,
+}
+
+/// 嵌入模型连通性测试请求
+#[derive(Debug, Deserialize)]
+struct EmbedderTestRequest {
+    model_id: String,
+    mirror: Option<String>,
+}
+
+/// 嵌入模型状态响应
+#[derive(Debug, Serialize)]
+struct EmbedderStatusResponse {
+    model_id: String,
+    status: String,
+    models_dir: String,
+    available_models: Vec<String>,
+}
+
+/// 嵌入模型下载响应
+#[derive(Debug, Serialize)]
+struct EmbedderDownloadResponse {
+    success: bool,
+    message: String,
+    model_id: String,
+}
+
+/// 嵌入模型应用响应
+#[derive(Debug, Serialize)]
+struct EmbedderApplyResponse {
+    success: bool,
+    message: String,
+    model_id: String,
+}
+
+/// 嵌入模型连通性测试响应
+#[derive(Debug, Serialize)]
+struct EmbedderTestResponse {
+    success: bool,
+    mirror: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_ms: Option<u64>,
+    model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// 工具检测结果项
+#[derive(Debug, Serialize)]
+struct ToolDetectItem {
+    name: String,
+    /// 工具类型："ide" 或 "extension"
+    #[serde(rename = "type")]
+    tool_type: String,
+    installed: bool,
+    version: Option<String>,
+    path: Option<String>,
+}
+
+/// 工具检测响应
+#[derive(Debug, Serialize)]
+struct ToolsDetectResponse {
+    tools: Vec<ToolDetectItem>,
+}
+
+// ---------- Handler 实现 ----------
+
+/// GET /api/embedder/status — 获取嵌入模型状态
+///
+/// 检查 models/ 目录下是否已有已下载的模型文件，返回当前状态。
+/// - `ready`：模型文件已就位
+/// - `not_downloaded`：models/ 目录存在但模型文件缺失
+/// - `unknown`：models/ 目录不存在
+async fn embedder_status_handler(
+    State(_state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // 模型目录：相对于当前工作目录
+    let models_dir = PathBuf::from("models");
+    // 默认模型 ID（与 luoshu_encoder_ml.rs 中 detect_default_model 中文分支一致）
+    let default_model_id = "BAAI/bge-small-zh".to_string();
+
+    // 检查是否已下载：本地目录名以 "--" 替换 "/"，并要求 config.json 已存在
+    let local_dir = default_model_id.replace('/', "--");
+    let model_dir = models_dir.join(&local_dir);
+    let config_path = model_dir.join("config.json");
+
+    let status = if config_path.exists() {
+        "ready"
+    } else if models_dir.exists() {
+        "not_downloaded"
+    } else {
+        "unknown"
+    };
+
+    let resp = EmbedderStatusResponse {
+        model_id: default_model_id,
+        status: status.to_string(),
+        models_dir: models_dir.to_string_lossy().to_string(),
+        available_models: AVAILABLE_EMBEDDER_MODELS.iter().map(|s| s.to_string()).collect(),
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({}))),
+    )
+}
+
+/// POST /api/embedder/download — 启动嵌入模型下载
+///
+/// 由于实际下载是耗时操作，这里立即返回任务已启动，
+/// 真正的下载在后台线程中执行，状态通过全局 AtomicBool 跟踪。
+async fn embedder_download_handler(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<EmbedderDownloadRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let model_id = body.model_id.trim().to_string();
+    if model_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "缺少 model_id 字段"
+            })),
+        );
+    }
+
+    // 校验 model_id 是否在白名单内（防止任意输入）
+    if !AVAILABLE_EMBEDDER_MODELS.contains(&model_id.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "message": format!("不支持的 model_id: {}，可选: {:?}", model_id, AVAILABLE_EMBEDDER_MODELS)
+            })),
+        );
+    }
+
+    // v0.6.0 安全加固：防御纵深——显式拒绝路径遍历字符
+    // 即使白名单已阻止，也防止未来白名单变更时引入漏洞
+    if model_id.contains("..") || model_id.contains('\\') || model_id.contains('\0') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "model_id 包含非法字符"
+            })),
+        );
+    }
+
+    // 解析镜像源（不区分大小写，默认 hf-mirror）
+    let mirror_str = body.mirror.as_deref().unwrap_or("hf-mirror").to_lowercase();
+    let mirror = match mirror_str.as_str() {
+        "modelscope" => crate::engine::model_downloader::MirrorSource::ModelScope,
+        "auto" => crate::engine::model_downloader::MirrorSource::Auto,
+        _ => crate::engine::model_downloader::MirrorSource::HfMirror,
+    };
+
+    // 抢占式设置下载标志：若已有任务在运行则拒绝
+    if EMBEDDER_DOWNLOADING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "已有下载任务在运行中，请稍后通过状态接口查看进度"
+            })),
+        );
+    }
+
+    // 后台线程执行下载
+    let model_id_clone = model_id.clone();
+    std::thread::spawn(move || {
+        use crate::engine::model_downloader::{
+            build_download_url, ConsoleProgress, ModelDownloader,
+        };
+
+        let downloader = ModelDownloader::with_defaults();
+        let progress = ConsoleProgress::new();
+
+        // 模型所需核心文件（按依赖顺序）
+        let files = ["config.json", "tokenizer.json", "model.safetensors"];
+        let local_dir = model_id_clone.replace('/', "--");
+        let base_dir = PathBuf::from("models").join(&local_dir);
+
+        for file in &files {
+            let url = build_download_url(&model_id_clone, file, mirror);
+            let dest = base_dir.join(file);
+            eprintln!("[LRC·嵌入] 下载 {}: {}", file, url);
+            if let Err(e) = downloader.download_with_retry(&url, &dest, &progress) {
+                eprintln!("[LRC·嵌入] 下载 {} 失败: {}", file, e);
+                EMBEDDER_DOWNLOADING.store(false, Ordering::SeqCst);
+                return;
+            }
+        }
+        eprintln!("[LRC·嵌入] 模型 {} 下载完成", model_id_clone);
+        EMBEDDER_DOWNLOADING.store(false, Ordering::SeqCst);
+    });
+
+    let resp = EmbedderDownloadResponse {
+        success: true,
+        message: "下载任务已启动，请通过状态接口查看进度".to_string(),
+        model_id,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({"success": true}))),
+    )
+}
+
+/// POST /api/embedder/apply — 将指定模型设为默认
+///
+/// 将模型 ID 写入 `~/.lrc/config.toml`，并提示用户也可通过环境变量
+/// `LRC_LUOSHU_MODEL_ID` 覆盖（重启后生效）。
+async fn embedder_apply_handler(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<EmbedderApplyRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let model_id = body.model_id.trim().to_string();
+    if model_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "缺少 model_id 字段"
+            })),
+        );
+    }
+
+    if !AVAILABLE_EMBEDDER_MODELS.contains(&model_id.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "message": format!("不支持的 model_id: {}", model_id)
+            })),
+        );
+    }
+
+    // 解析用户主目录（Windows 优先 USERPROFILE，Unix 用 HOME）
+    let home_dir = match std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": "无法获取用户主目录（USERPROFILE / HOME 均未设置）"
+                })),
+            );
+        }
+    };
+    let lrc_dir = home_dir.join(".lrc");
+    let config_path = lrc_dir.join("config.toml");
+
+    // 创建配置目录（如不存在）
+    if let Err(e) = std::fs::create_dir_all(&lrc_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "message": format!("创建配置目录失败: {}", e)
+            })),
+        );
+    }
+
+    // 写入 TOML 格式配置（简单键值）
+    // v0.6.0 P1-G 修复：对 model_id 进行 TOML 字符串转义
+    // 虽然 model_id 已通过白名单校验，但防御性地转义特殊字符避免配置文件注入
+    let toml_escaped_model_id = model_id
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
+    let toml_content = format!(
+        "# LRC 嵌入模型配置（由仪表盘生成）\nmodel_id = \"{}\"\n",
+        toml_escaped_model_id
+    );
+    if let Err(e) = std::fs::write(&config_path, toml_content) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "success": false,
+                "message": format!("写入配置文件失败: {}", e)
+            })),
+        );
+    }
+
+    let resp = EmbedderApplyResponse {
+        success: true,
+        message: format!(
+            "模型已设为默认，重启后生效。也可设置环境变量 {}={} 覆盖",
+            crate::engine::embedder::EMBEDDER_MODEL_ENV_VAR,
+            model_id
+        ),
+        model_id,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({"success": true}))),
+    )
+}
+
+/// POST /api/embedder/test — 测试镜像源连通性
+///
+/// 使用 ureq 发送 HEAD 请求，测量响应延迟（毫秒）。
+async fn embedder_test_handler(
+    State(_state): State<Arc<AppState>>,
+    Json(body): Json<EmbedderTestRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let model_id = body.model_id.trim().to_string();
+    if model_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "缺少 model_id 字段"
+            })),
+        );
+    }
+
+    let mirror_str = body.mirror.as_deref().unwrap_or("hf-mirror").to_lowercase();
+    let mirror = match mirror_str.as_str() {
+        "modelscope" => crate::engine::model_downloader::MirrorSource::ModelScope,
+        _ => crate::engine::model_downloader::MirrorSource::HfMirror,
+    };
+
+    // 测试 URL：取 config.json（体积小，能反映连通性）
+    let test_url =
+        crate::engine::model_downloader::build_download_url(&model_id, "config.json", mirror);
+
+    let start = std::time::Instant::now();
+    let agent = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
+
+    let resp = match agent.head(&test_url).call() {
+        Ok(_) => {
+            let latency_ms = start.elapsed().as_millis() as u64;
+            EmbedderTestResponse {
+                success: true,
+                mirror: mirror_str,
+                latency_ms: Some(latency_ms),
+                model_id,
+                message: None,
+            }
+        }
+        Err(e) => EmbedderTestResponse {
+            success: false,
+            mirror: mirror_str,
+            latency_ms: None,
+            model_id,
+            message: Some(format!("连通性测试失败: {}", e)),
+        },
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({"success": false}))),
+    )
+}
+
+/// GET /api/tools/detect — 检测系统已安装的 IDE 和 Agent 工具
+///
+/// Windows 下检测 VS Code、Cursor、Trae、Windsurf、Claude Code、Cline。
+async fn tools_detect_handler(
+    State(_state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut tools: Vec<ToolDetectItem> = Vec::new();
+
+    // 命令行可调用类工具
+    tools.push(detect_command_tool("VS Code", "code", &["--version"]));
+    tools.push(detect_command_tool("Cursor", "cursor", &["--version"]));
+    tools.push(detect_command_tool("Trae", "trae", &["--version"]));
+    tools.push(detect_command_tool("Windsurf", "windsurf", &["--version"]));
+    tools.push(detect_command_tool("Claude Code", "claude", &["--version"]));
+
+    // Cline（VS Code 扩展）
+    let cline_installed = detect_vscode_extension("saoudrizwan.claude-dev");
+    tools.push(ToolDetectItem {
+        name: "Cline".to_string(),
+        tool_type: "extension".to_string(),
+        installed: cline_installed,
+        version: None,
+        path: None,
+    });
+
+    let resp = ToolsDetectResponse { tools };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({"tools": []}))),
+    )
+}
+
+// ---------- 工具检测辅助函数 ----------
+
+/// 检测命令行工具是否安装，并解析版本号
+///
+/// 优先通过 PATH 执行命令；失败时回退到检查 Windows 常见安装路径。
+fn detect_command_tool(name: &str, cmd: &str, args: &[&str]) -> ToolDetectItem {
+    // 优先：通过 PATH 执行命令
+    if let Ok(output) = Command::new(cmd).args(args).output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // 多数 CLI 工具的版本号在第一行
+            let version = stdout
+                .lines()
+                .next()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let path = which_path(cmd);
+            return ToolDetectItem {
+                name: name.to_string(),
+                tool_type: "ide".to_string(),
+                installed: true,
+                version,
+                path,
+            };
+        }
+    }
+
+    // 回退：检查 Windows 常见安装路径
+    if let Some(path) = check_windows_install_path(name) {
+        return ToolDetectItem {
+            name: name.to_string(),
+            tool_type: "ide".to_string(),
+            installed: true,
+            version: None,
+            path: Some(path),
+        };
+    }
+
+    ToolDetectItem {
+        name: name.to_string(),
+        tool_type: "ide".to_string(),
+        installed: false,
+        version: None,
+        path: None,
+    }
+}
+
+/// 通过 `where`（Windows）/ `which`（Unix）查询可执行文件路径
+fn which_path(cmd: &str) -> Option<String> {
+    let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("where.exe", vec![cmd])
+    } else {
+        ("which", vec![cmd])
+    };
+    Command::new(program)
+        .args(&args)
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                let s = String::from_utf8_lossy(&o.stdout);
+                s.lines().next().map(|l| l.trim().to_string())
+            } else {
+                None
+            }
+        })
+}
+
+/// 检查 Windows 下的常见安装路径
+///
+/// 仅 Windows 调用，其他平台返回 None。
+fn check_windows_install_path(name: &str) -> Option<String> {
+    let local_appdata = std::env::var("LOCALAPPDATA").ok()?;
+    let candidates: Vec<PathBuf> = match name {
+        "VS Code" => vec![
+            PathBuf::from(&local_appdata)
+                .join("Programs")
+                .join("Microsoft VS Code")
+                .join("bin"),
+            PathBuf::from("C:\\Program Files")
+                .join("Microsoft VS Code")
+                .join("bin"),
+        ],
+        "Cursor" => vec![PathBuf::from(&local_appdata)
+            .join("Programs")
+            .join("cursor")],
+        "Trae" => vec![
+            PathBuf::from(&local_appdata).join("Programs").join("Trae"),
+            PathBuf::from(&local_appdata).join("Programs").join("Trae CN"),
+        ],
+        "Windsurf" => vec![PathBuf::from(&local_appdata)
+            .join("Programs")
+            .join("windsurf")],
+        _ => return None,
+    };
+
+    for dir in candidates {
+        if dir.exists() {
+            return Some(dir.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// 检测 VS Code 扩展是否已安装
+///
+/// 通过执行 `code --list-extensions` 检查指定扩展 ID 是否存在。
+fn detect_vscode_extension(extension_id: &str) -> bool {
+    let output = match Command::new("code").arg("--list-extensions").output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let list = String::from_utf8_lossy(&output.stdout);
+    list.lines()
+        .any(|line| line.trim().eq_ignore_ascii_case(extension_id))
+}
+
 // ==================== Stdio 传输层（标准 MCP） ====================
 
 /// MCP 请求分发结果
@@ -2064,6 +2743,12 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_handler))
         .route("/app.js", get(app_js_handler))
         .route("/app.css", get(app_css_handler))
+        // v0.6.0 龙忆设计系统：设计系统 CSS 资源
+        .route("/colors_and_type.css", get(colors_and_type_css_handler))
+        .route("/components.css", get(components_css_handler))
+        // v0.6.0 龙忆设计系统：Logo 与图标 SVG 资源
+        .route("/assets/logo/:filename", get(logo_asset_handler))
+        .route("/assets/icons/:filename", get(icon_asset_handler))
         .nest_service("/v1", v1_service) // 将 v1 API 嵌套在 /v1 路径下
         // 仪表盘路由：静态文件 + 重定向
         .route("/dashboard", get(dashboard_handler))
@@ -2075,7 +2760,46 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         .route("/api/config/llm", post(config_llm_handler))
         // V2: 项目信息 API
         .route("/api/project/info", get(project_info_handler))
-        .layer(tower_http::cors::CorsLayer::permissive())
+        // v0.6.0+：嵌入模型管理 API（仪表盘模型设置页用）
+        .route("/api/embedder/status", get(embedder_status_handler))
+        .route("/api/embedder/download", post(embedder_download_handler))
+        .route("/api/embedder/apply", post(embedder_apply_handler))
+        .route("/api/embedder/test", post(embedder_test_handler))
+        // v0.6.0+：IDE / Agent 工具检测
+        .route("/api/tools/detect", get(tools_detect_handler))
+        // v0.6.0 安全加固：CORS 从 permissive 收紧为显式白名单
+        // 允许本地开发服务器和桌面端访问，拒绝任意来源
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::AllowOrigin::predicate(|origin, _| {
+                    // 允许的来源：localhost 任意端口、127.0.0.1、tauri 协议
+                    // v0.6.0 P0 修复：Tauri 2.x Windows 使用 https://tauri.localhost 作为 WebView 源
+                    // v0.6.0 P1-2 修复：Tauri 2.x 默认 Windows/Android 使用 http://tauri.localhost
+                    if let Some(s) = origin.to_str().ok() {
+                        s.starts_with("http://localhost:")
+                            || s.starts_with("http://127.0.0.1:")
+                            || s.starts_with("https://localhost:")
+                            || s.starts_with("tauri://")
+                            || s.starts_with("http://0.0.0.0:")
+                            || s == "https://tauri.localhost"
+                            || s.starts_with("https://tauri.localhost")
+                            || s == "http://tauri.localhost"
+                            || s.starts_with("http://tauri.localhost")
+                    } else {
+                        false
+                    }
+                }))
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers([
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::AUTHORIZATION,
+                ])
+                .allow_credentials(false),
+        )
         .with_state(state)
 }
 

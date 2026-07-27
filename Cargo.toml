@@ -20,7 +20,8 @@ default = ["server"]
 # 仅在需要 Smart Match（离线语义搜索）时启用
 ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub", "ureq"]
 # 启用 MCP HTTP 服务（axum + tokio）
-server = ["axum", "tokio", "tower", "tower-http", "reqwest", "webbrowser"]
+# v0.6.0+：ureq 用于嵌入模型管理 API 的镜像源连通性测试 + model_downloader 模块
+server = ["axum", "tokio", "tower", "tower-http", "reqwest", "webbrowser", "ureq"]
 # PostgreSQL 持久化后端（需运行中的 PostgreSQL 服务）
 postgres = ["sqlx", "tokio"]
 # Qdrant 向量存储后端（通过 HTTP API，无需额外依赖）

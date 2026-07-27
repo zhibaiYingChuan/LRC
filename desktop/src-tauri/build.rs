@@ -170,6 +170,15 @@ fn sync_sidecar_binary() {
             "cargo:warning=未找到已编译的 code-memory-server.exe，请先构建主项目: cargo build --release -p code-memory"
         );
         println!("cargo:warning=搜索路径: {:?}", candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
+        // v0.6.0 P1-A 修复：release 构建时强制要求 sidecar 二进制存在
+        // 开发模式（debug）允许跳过，但 release 构建必须 panic 避免打包出无效的桌面端
+        let profile = std::env::var("PROFILE").unwrap_or_default();
+        if profile == "release" {
+            panic!(
+                "release 构建要求 sidecar 二进制存在，请先执行: cargo build --release --features server\n搜索路径: {:?}",
+                candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()
+            );
+        }
         return;
     };
 
@@ -255,9 +264,19 @@ fn sync_sidecar_binary() {
                     eprintln!("  ╔════════════════════════════════════════════════════╗");
                     eprintln!("  ║  P1-02 构建警告：Sidecar 文件被占用              ║");
                     eprintln!("  ╠════════════════════════════════════════════════════╣");
-                    eprintln!("  ║  code-memory-server.exe 正在被 MCP 服务使用      ║");
+                    // v0.6.0 P3-2 修复：跨平台适配错误信息
+                    let sidecar_name = if cfg!(target_os = "windows") {
+                        "code-memory-server.exe"
+                    } else {
+                        "code-memory-server"
+                    };
+                    eprintln!("  ║  {} 正在被 MCP 服务使用", sidecar_name);
                     eprintln!("  ║  请先关闭 MCP 服务后再构建:                      ║");
-                    eprintln!("  ║    taskkill /F /IM code-memory-server.exe         ║");
+                    if cfg!(target_os = "windows") {
+                        eprintln!("  ║    taskkill /F /IM {}", sidecar_name);
+                    } else {
+                        eprintln!("  ║    pkill -f {}", sidecar_name);
+                    }
                     eprintln!("  ║  当前源文件: {:?}", source);
                     eprintln!("  ║  目标文件: {:?}", dest_path);
                     eprintln!("  ╚════════════════════════════════════════════════════╝");

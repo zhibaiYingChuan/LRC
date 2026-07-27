@@ -1,0 +1,415 @@
+/* ==========================================================================
+   LRC (Loong Recall / 龙忆) Design System - Colors & Typography
+   设计系统：色阶 + 语义别名 + 便携别名 + 排版 + 间距 + 圆角 + 阴影 + 动效 + 布局
+   Source: structured-spec
+   ========================================================================== */
+
+/* ==========================================================================
+   1. Web Font Imports
+   ========================================================================== */
+
+@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* ==========================================================================
+   2. :root - Light Theme (浅色主题)
+   ========================================================================== */
+
+:root {
+  /* ------------------------------------------------------------------------
+     Layer 1: 品牌色阶 (Brand Color Scales)
+     6 个色阶组，每色 10 级 (50-900)
+     @group-priority: 金色, 玉色, 朱砂, 水蓝, 墨韵, 宣纸
+     ------------------------------------------------------------------------ */
+
+  /* 金色 */
+  --lrc-金色-50: #FFF8E8;   /* Source: structured-spec */
+  --lrc-金色-100: #FFF0D0;  /* Source: structured-spec */
+  --lrc-金色-200: #FFE0A0;  /* Source: structured-spec */
+  --lrc-金色-300: #FFD070;  /* Source: structured-spec */
+  --lrc-金色-400: #FFC040;  /* Source: structured-spec */
+  --lrc-金色-500: #D4A843;  /* @primary */ /* Source: structured-spec */
+  --lrc-金色-600: #C09838;  /* Source: structured-spec */
+  --lrc-金色-700: #A88830;  /* Source: structured-spec */
+  --lrc-金色-800: #907828;  /* Source: structured-spec */
+  --lrc-金色-900: #786820;  /* Source: structured-spec */
+
+  /* 玉色 */
+  --lrc-玉色-50: #E8F8E8;   /* Source: structured-spec */
+  --lrc-玉色-100: #D0F0D0;  /* Source: structured-spec */
+  --lrc-玉色-200: #A0E0A0;  /* Source: structured-spec */
+  --lrc-玉色-300: #70D070;  /* Source: structured-spec */
+  --lrc-玉色-400: #40C040;  /* Source: structured-spec */
+  --lrc-玉色-500: #2ECC71;  /* @primary */ /* Source: structured-spec */
+  --lrc-玉色-600: #28B864;  /* Source: structured-spec */
+  --lrc-玉色-700: #20A050;  /* Source: structured-spec */
+  --lrc-玉色-800: #188840;  /* Source: structured-spec */
+  --lrc-玉色-900: #107030;  /* Source: structured-spec */
+
+  /* 朱砂 */
+  --lrc-朱砂-50: #FDF2F2;   /* Source: structured-spec */
+  --lrc-朱砂-100: #FBE0E0;  /* Source: structured-spec */
+  --lrc-朱砂-200: #F7C0C0;  /* Source: structured-spec */
+  --lrc-朱砂-300: #F0A0A0;  /* Source: structured-spec */
+  --lrc-朱砂-400: #E08080;  /* Source: structured-spec */
+  --lrc-朱砂-500: #C0392B;  /* @primary */ /* Source: structured-spec */
+  --lrc-朱砂-600: #A83227;  /* Source: structured-spec */
+  --lrc-朱砂-700: #902B20;  /* Source: structured-spec */
+  --lrc-朱砂-800: #782418;  /* Source: structured-spec */
+  --lrc-朱砂-900: #601D10;  /* Source: structured-spec */
+
+  /* 水蓝 */
+  --lrc-水蓝-50: #E8F4FD;   /* Source: structured-spec */
+  --lrc-水蓝-100: #D0E8F8;  /* Source: structured-spec */
+  --lrc-水蓝-200: #A0D0F0;  /* Source: structured-spec */
+  --lrc-水蓝-300: #70B8E0;  /* Source: structured-spec */
+  --lrc-水蓝-400: #40A0D0;  /* Source: structured-spec */
+  --lrc-水蓝-500: #3498DB;  /* @primary */ /* Source: structured-spec */
+  --lrc-水蓝-600: #2E86C0;  /* Source: structured-spec */
+  --lrc-水蓝-700: #2674A8;  /* Source: structured-spec */
+  --lrc-水蓝-800: #1E6090;  /* Source: structured-spec */
+  --lrc-水蓝-900: #164878;  /* Source: structured-spec */
+
+  /* 墨韵 */
+  --lrc-墨韵-50: #E8E8F0;   /* Source: structured-spec */
+  --lrc-墨韵-100: #D0D0E0;  /* Source: structured-spec */
+  --lrc-墨韵-200: #A0A0C0;  /* Source: structured-spec */
+  --lrc-墨韵-300: #7070A0;  /* Source: structured-spec */
+  --lrc-墨韵-400: #505080;  /* Source: structured-spec */
+  --lrc-墨韵-500: #1A1A2E;  /* @primary */ /* Source: structured-spec */
+  --lrc-墨韵-600: #151528;  /* Source: structured-spec */
+  --lrc-墨韵-700: #101020;  /* Source: structured-spec */
+  --lrc-墨韵-800: #0A0A15;  /* Source: structured-spec */
+  --lrc-墨韵-900: #05050A;  /* Source: structured-spec */
+
+  /* 宣纸 */
+  --lrc-宣纸-50: #FEFDFA;   /* Source: structured-spec */
+  --lrc-宣纸-100: #FCFAF5;  /* Source: structured-spec */
+  --lrc-宣纸-200: #FAF5EC;  /* Source: structured-spec */
+  --lrc-宣纸-300: #F5F0E8;  /* Source: structured-spec */
+  --lrc-宣纸-400: #E8E0D0;  /* Source: structured-spec */
+  --lrc-宣纸-500: #D8CFC0;  /* @primary */ /* Source: structured-spec */
+  --lrc-宣纸-600: #C0B8A8;  /* Source: structured-spec */
+  --lrc-宣纸-700: #A8A090;  /* Source: structured-spec */
+  --lrc-宣纸-800: #908878;  /* Source: structured-spec */
+  --lrc-宣纸-900: #787060;  /* Source: structured-spec */
+
+  /* ------------------------------------------------------------------------
+     Layer 2: 语义别名 (Semantic Aliases)
+     面向设计决策的语义化颜色名称
+     ------------------------------------------------------------------------ */
+
+  /* 背景层 */
+  --lrc-bg: var(--lrc-宣纸-300);           /* Source: structured-spec */
+  --lrc-bg-elevated: var(--lrc-宣纸-400);   /* Source: structured-spec */
+  --lrc-bg-sidebar: var(--lrc-墨韵-800);     /* Source: structured-spec */
+  --lrc-bg-nav: var(--lrc-墨韵-500);         /* Source: structured-spec */
+  --lrc-bg-code: var(--lrc-墨韵-500);        /* Source: structured-spec */
+  --lrc-bg-overlay: rgba(15, 15, 26, 0.6);  /* Source: structured-spec */
+
+  /* 前景/文字 */
+  --lrc-fg: var(--lrc-墨韵-500);             /* Source: structured-spec */
+  --lrc-fg-muted: var(--lrc-墨韵-300);       /* Source: structured-spec */
+  --lrc-fg-subtle: var(--lrc-墨韵-200);      /* Source: structured-spec */
+  --lrc-fg-on-dark: var(--lrc-宣纸-300);     /* Source: structured-spec */
+  --lrc-fg-inverse: #FFFFFF;                /* Source: structured-spec */
+
+  /* 品牌主色 */
+  --lrc-primary: var(--lrc-金色-500);        /* Source: structured-spec */
+  --lrc-primary-hover: var(--lrc-金色-400);  /* Source: structured-spec */
+  --lrc-primary-active: var(--lrc-金色-600); /* Source: structured-spec */
+  --lrc-accent: var(--lrc-金色-500);         /* Source: structured-spec */
+
+  /* 状态色 */
+  --lrc-success: var(--lrc-玉色-500);        /* Source: structured-spec */
+  --lrc-success-bg: var(--lrc-玉色-50);      /* Source: structured-spec */
+  --lrc-error: var(--lrc-朱砂-500);          /* Source: structured-spec */
+  --lrc-error-bg: var(--lrc-朱砂-50);        /* Source: structured-spec */
+  --lrc-warning: var(--lrc-金色-500);        /* Source: structured-spec */
+  --lrc-warning-bg: var(--lrc-金色-50);      /* Source: structured-spec */
+  --lrc-info: var(--lrc-水蓝-500);           /* Source: structured-spec */
+  --lrc-info-bg: var(--lrc-水蓝-50);         /* Source: structured-spec */
+
+  /* 边框与分割线 */
+  --lrc-border: var(--lrc-墨韵-100);         /* Source: structured-spec */
+  --lrc-border-strong: var(--lrc-墨韵-200);  /* Source: structured-spec */
+  --lrc-border-subtle: var(--lrc-宣纸-400);  /* Source: structured-spec */
+
+  /* 交互色 */
+  --lrc-link: var(--lrc-水蓝-500);           /* Source: structured-spec */
+  --lrc-link-hover: var(--lrc-水蓝-600);     /* Source: structured-spec */
+
+  /* ------------------------------------------------------------------------
+     Layer 3: 便携别名 (Portable Aliases)
+     面向组件消费的短名 token
+     ------------------------------------------------------------------------ */
+
+  /* --color-*: 颜色便携别名 */
+  --color-bg: var(--lrc-bg);                 /* Source: structured-spec */
+  --color-bg-elevated: var(--lrc-bg-elevated); /* Source: structured-spec */
+  --color-bg-sidebar: var(--lrc-bg-sidebar); /* Source: structured-spec */
+  --color-bg-nav: var(--lrc-bg-nav);         /* Source: structured-spec */
+  --color-bg-code: var(--lrc-bg-code);       /* Source: structured-spec */
+  --color-bg-overlay: var(--lrc-bg-overlay); /* Source: structured-spec */
+  --color-fg: var(--lrc-fg);                 /* Source: structured-spec */
+  --color-fg-muted: var(--lrc-fg-muted);     /* Source: structured-spec */
+  --color-fg-subtle: var(--lrc-fg-subtle);   /* Source: structured-spec */
+  --color-fg-on-dark: var(--lrc-fg-on-dark); /* Source: structured-spec */
+  --color-fg-inverse: var(--lrc-fg-inverse); /* Source: structured-spec */
+  --color-primary: var(--lrc-primary);       /* Source: structured-spec */
+  --color-primary-hover: var(--lrc-primary-hover); /* Source: structured-spec */
+  --color-primary-active: var(--lrc-primary-active); /* Source: structured-spec */
+  --color-accent: var(--lrc-accent);         /* Source: structured-spec */
+  --color-success: var(--lrc-success);       /* Source: structured-spec */
+  --color-success-bg: var(--lrc-success-bg); /* Source: structured-spec */
+  --color-error: var(--lrc-error);           /* Source: structured-spec */
+  --color-error-bg: var(--lrc-error-bg);     /* Source: structured-spec */
+  --color-warning: var(--lrc-warning);       /* Source: structured-spec */
+  --color-warning-bg: var(--lrc-warning-bg); /* Source: structured-spec */
+  --color-info: var(--lrc-info);             /* Source: structured-spec */
+  --color-info-bg: var(--lrc-info-bg);       /* Source: structured-spec */
+  --color-border: var(--lrc-border);         /* Source: structured-spec */
+  --color-border-strong: var(--lrc-border-strong); /* Source: structured-spec */
+  --color-border-subtle: var(--lrc-border-subtle); /* Source: structured-spec */
+  --color-link: var(--lrc-link);             /* Source: structured-spec */
+  --color-link-hover: var(--lrc-link-hover); /* Source: structured-spec */
+
+  /* --radius-*: 圆角 */
+  --radius-sm: 4px;                          /* Source: structured-spec */
+  --radius-md: 6px;                          /* Source: structured-spec (按钮) */
+  --radius-lg: 12px;                         /* Source: structured-spec (卡片) */
+  --radius-xl: 16px;                         /* Source: structured-spec (模态框) */
+  --radius-full: 9999px;                     /* Source: structured-spec (胶囊/搜索框) */
+
+  /* --type-*: 排版尺寸 (px) */
+  --type-h1-size: 28px;                      /* Source: structured-spec */
+  --type-h1-line-height: 1.3;                /* Source: structured-spec */
+  --type-h1-weight: 700;                     /* Source: structured-spec */
+  --type-h2-size: 22px;                      /* Source: structured-spec */
+  --type-h2-line-height: 1.3;                /* Source: structured-spec */
+  --type-h2-weight: 600;                     /* Source: structured-spec */
+  --type-h3-size: 18px;                      /* Source: structured-spec */
+  --type-h3-line-height: 1.4;                /* Source: structured-spec */
+  --type-h3-weight: 600;                     /* Source: structured-spec */
+  --type-h4-size: 16px;                      /* Source: structured-spec */
+  --type-h4-line-height: 1.4;                /* Source: structured-spec */
+  --type-h4-weight: 500;                     /* Source: structured-spec */
+  --type-body-size: 14px;                    /* Source: structured-spec */
+  --type-body-line-height: 1.6;              /* Source: structured-spec */
+  --type-body-weight: 400;                   /* Source: structured-spec */
+  --type-body-sm-size: 12px;                 /* Source: structured-spec */
+  --type-body-sm-line-height: 1.5;           /* Source: structured-spec */
+  --type-body-sm-weight: 400;                /* Source: structured-spec */
+  --type-code-size: 13px;                    /* Source: structured-spec */
+  --type-code-line-height: 1.5;              /* Source: structured-spec */
+  --type-code-weight: 400;                   /* Source: structured-spec */
+  --type-poetic-size: 16px;                  /* Source: structured-spec */
+  --type-poetic-line-height: 1.8;            /* Source: structured-spec */
+  --type-poetic-weight: 400;                 /* Source: structured-spec */
+
+  /* --space-*: 间距 (4px 基准) */
+  --space-1: 4px;                            /* Source: structured-spec */
+  --space-2: 8px;                            /* Source: structured-spec */
+  --space-3: 12px;                           /* Source: structured-spec */
+  --space-4: 16px;                           /* Source: structured-spec */
+  --space-5: 20px;                           /* Source: structured-spec */
+  --space-6: 24px;                           /* Source: structured-spec */
+  --space-8: 32px;                           /* Source: structured-spec */
+  --space-10: 40px;                          /* Source: structured-spec */
+  --space-12: 48px;                          /* Source: structured-spec */
+  --space-16: 64px;                          /* Source: structured-spec */
+
+  /* --shadow-*: 阴影 (5 级) */
+  --shadow-sm: 0 1px 2px rgba(26, 26, 46, 0.04);    /* Source: structured-spec */
+  --shadow-card: 0 2px 8px rgba(26, 26, 46, 0.06);  /* Source: structured-spec (默认卡片) */
+  --shadow-card-hover: 0 4px 16px rgba(26, 26, 46, 0.12); /* Source: structured-spec (悬停卡片) */
+  --shadow-lg: 0 8px 24px rgba(26, 26, 46, 0.16);   /* Source: structured-spec */
+  --shadow-overlay: 0 16px 48px rgba(26, 26, 46, 0.24); /* Source: structured-spec (模态框/浮层) */
+
+  /* --font-*: 字体族 */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; /* Source: structured-spec */
+  --font-serif: "Noto Serif SC", "SimSun", "STSong", serif; /* Source: structured-spec */
+  --font-mono: "JetBrains Mono", "Consolas", "Monaco", monospace; /* Source: structured-spec */
+
+  /* --motion-*: 动效时长与缓动 */
+  --motion-duration-fade-in: 0.15s;          /* Source: structured-spec */
+  --motion-duration-fade-out: 0.1s;          /* Source: structured-spec */
+  --motion-duration-slide-up: 0.2s;          /* Source: structured-spec */
+  --motion-duration-slide-down: 0.15s;       /* Source: structured-spec */
+  --motion-duration-scale-in: 0.15s;         /* Source: structured-spec */
+  --motion-duration-pulse: 0.3s;             /* Source: structured-spec */
+  --motion-duration-shimmer: 1.5s;           /* Source: structured-spec */
+  --motion-ease-out: ease-out;               /* Source: structured-spec */
+  --motion-ease-in: ease-in;                 /* Source: structured-spec */
+  --motion-ease-in-out: ease-in-out;         /* Source: structured-spec */
+  --motion-fade-in: var(--motion-duration-fade-in) var(--motion-ease-out); /* Source: structured-spec */
+  --motion-fade-out: var(--motion-duration-fade-out) var(--motion-ease-in); /* Source: structured-spec */
+  --motion-slide-up: var(--motion-duration-slide-up) var(--motion-ease-out); /* Source: structured-spec */
+  --motion-slide-down: var(--motion-duration-slide-down) var(--motion-ease-in); /* Source: structured-spec */
+  --motion-scale-in: var(--motion-duration-scale-in) var(--motion-ease-out); /* Source: structured-spec */
+  --motion-pulse: var(--motion-duration-pulse) var(--motion-ease-in-out); /* Source: structured-spec */
+  --motion-shimmer: var(--motion-duration-shimmer) linear infinite; /* Source: structured-spec */
+
+  /* --layout-*: 布局尺寸 */
+  --layout-sidebar-collapsed: 60px;          /* Source: structured-spec */
+  --layout-sidebar-expanded: 240px;          /* Source: structured-spec */
+  --layout-nav-item-height: 48px;            /* Source: structured-spec */
+  --layout-avatar-size: 32px;                /* Source: structured-spec */
+  --layout-icon-size: 24px;                  /* Source: structured-spec */
+  --layout-button-sm: 28px;                  /* Source: structured-spec */
+  --layout-button-md: 36px;                  /* Source: structured-spec */
+  --layout-button-lg: 44px;                  /* Source: structured-spec */
+  --layout-search-radius: 20px;              /* Source: structured-spec */
+  --layout-pill-radius: 20px;                /* Source: structured-spec */
+}
+
+/* ==========================================================================
+   3. .dark - Dark Theme Overrides (暗色主题覆盖)
+   ========================================================================== */
+
+.dark {
+  /* 背景层映射 */
+  --lrc-bg: var(--lrc-墨韵-800);             /* Source: structured-spec (宣纸300→墨韵800) */
+  --lrc-bg-elevated: var(--lrc-墨韵-700);    /* Source: structured-spec (宣纸400→墨韵700) */
+  --lrc-bg-sidebar: var(--lrc-墨韵-900);     /* Source: structured-spec */
+  --lrc-bg-nav: var(--lrc-墨韵-700);         /* Source: structured-spec */
+  --lrc-bg-code: var(--lrc-墨韵-900);        /* Source: structured-spec */
+  --lrc-bg-overlay: rgba(5, 5, 10, 0.7);    /* Source: structured-spec */
+
+  /* 前景/文字映射 */
+  --lrc-fg: var(--lrc-宣纸-300);             /* Source: structured-spec (墨韵500→宣纸300) */
+  --lrc-fg-muted: var(--lrc-宣纸-500);       /* Source: structured-spec */
+  --lrc-fg-subtle: var(--lrc-宣纸-600);      /* Source: structured-spec */
+  --lrc-fg-on-dark: var(--lrc-宣纸-200);     /* Source: structured-spec */
+  --lrc-fg-inverse: var(--lrc-墨韵-900);     /* Source: structured-spec */
+
+  /* 品牌主色 - 亮度微调 */
+  --lrc-primary: var(--lrc-金色-400);        /* Source: structured-spec (亮度微调) */
+  --lrc-primary-hover: var(--lrc-金色-300);  /* Source: structured-spec */
+  --lrc-primary-active: var(--lrc-金色-500); /* Source: structured-spec */
+  --lrc-accent: var(--lrc-金色-400);         /* Source: structured-spec */
+
+  /* 状态色 - 亮度微调 */
+  --lrc-success: var(--lrc-玉色-400);        /* Source: structured-spec (亮度微调) */
+  --lrc-success-bg: rgba(46, 204, 113, 0.12); /* Source: structured-spec */
+  --lrc-error: var(--lrc-朱砂-400);          /* Source: structured-spec (亮度微调) */
+  --lrc-error-bg: rgba(192, 57, 43, 0.12);  /* Source: structured-spec */
+  --lrc-warning: var(--lrc-金色-400);        /* Source: structured-spec (亮度微调) */
+  --lrc-warning-bg: rgba(212, 168, 67, 0.12); /* Source: structured-spec */
+  --lrc-info: var(--lrc-水蓝-400);           /* Source: structured-spec (亮度微调) */
+  --lrc-info-bg: rgba(52, 152, 219, 0.12);  /* Source: structured-spec */
+
+  /* 边框与分割线 */
+  --lrc-border: var(--lrc-墨韵-600);         /* Source: structured-spec */
+  --lrc-border-strong: var(--lrc-墨韵-500);  /* Source: structured-spec */
+  --lrc-border-subtle: var(--lrc-墨韵-700);  /* Source: structured-spec */
+
+  /* 交互色 */
+  --lrc-link: var(--lrc-水蓝-400);           /* Source: structured-spec */
+  --lrc-link-hover: var(--lrc-水蓝-300);     /* Source: structured-spec */
+
+  /* 阴影 - 暗色模式加深 */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);    /* Source: structured-spec */
+  --shadow-card: 0 2px 8px rgba(0, 0, 0, 0.3);  /* Source: structured-spec */
+  --shadow-card-hover: 0 4px 16px rgba(0, 0, 0, 0.4); /* Source: structured-spec */
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);   /* Source: structured-spec */
+  --shadow-overlay: 0 16px 48px rgba(0, 0, 0, 0.6); /* Source: structured-spec */
+}
+
+/* ==========================================================================
+   4. Typography Utility Classes (排版类)
+   前缀：lrc-
+   字体大小使用 rem (基准 16px)
+   ========================================================================== */
+
+/* 标题层级 */
+.lrc-h1 {
+  font-family: var(--font-sans);
+  font-size: 1.75rem;   /* 28px */
+  font-weight: var(--type-h1-weight);
+  line-height: var(--type-h1-line-height);
+  color: var(--color-fg);
+  margin: 0;
+}
+
+.lrc-h2 {
+  font-family: var(--font-sans);
+  font-size: 1.375rem;  /* 22px */
+  font-weight: var(--type-h2-weight);
+  line-height: var(--type-h2-line-height);
+  color: var(--color-fg);
+  margin: 0;
+}
+
+.lrc-h3 {
+  font-family: var(--font-sans);
+  font-size: 1.125rem;  /* 18px */
+  font-weight: var(--type-h3-weight);
+  line-height: var(--type-h3-line-height);
+  color: var(--color-fg);
+  margin: 0;
+}
+
+.lrc-h4 {
+  font-family: var(--font-sans);
+  font-size: 1rem;      /* 16px */
+  font-weight: var(--type-h4-weight);
+  line-height: var(--type-h4-line-height);
+  color: var(--color-fg);
+  margin: 0;
+}
+
+/* 正文 */
+.lrc-body {
+  font-family: var(--font-sans);
+  font-size: 0.875rem;  /* 14px */
+  font-weight: var(--type-body-weight);
+  line-height: var(--type-body-line-height);
+  color: var(--color-fg);
+  margin: 0;
+}
+
+.lrc-body-sm {
+  font-family: var(--font-sans);
+  font-size: 0.75rem;   /* 12px */
+  font-weight: var(--type-body-sm-weight);
+  line-height: var(--type-body-sm-line-height);
+  color: var(--color-fg-muted);
+  margin: 0;
+}
+
+/* 代码 */
+.lrc-mono {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem; /* 13px */
+  font-weight: var(--type-code-weight);
+  line-height: var(--type-code-line-height);
+  color: var(--color-fg);
+}
+
+/* 诗意衬线体 */
+.lrc-poetic {
+  font-family: var(--font-serif);
+  font-size: 1rem;      /* 16px */
+  font-weight: var(--type-poetic-weight);
+  line-height: var(--type-poetic-line-height);
+  color: var(--color-fg-muted);
+  font-style: normal;
+  margin: 0;
+}
+
+/* 辅助排版类 */
+.lrc-muted {
+  color: var(--color-fg-muted);
+}
+
+.lrc-subtle {
+  color: var(--color-fg-subtle);
+}
+
+.lrc-on-dark {
+  color: var(--color-fg-on-dark);
+}
+
+.lrc-inverse {
+  color: var(--color-fg-inverse);
+}

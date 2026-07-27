@@ -1,0 +1,18 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 三片竖向竹简，左侧两条横线绑住，整体微倾斜 -->
+  <g transform="rotate(-5, 12, 12)">
+    <!-- 第一片竹简（最左） -->
+    <rect x="6" y="4" width="4" height="16" rx="1.5" fill="none" stroke="#ffffff"/>
+    <!-- 第二片竹简（中间） -->
+    <rect x="11" y="4" width="4" height="16" rx="1.5" fill="none" stroke="#ffffff"/>
+    <!-- 第三片竹简（最右） -->
+    <rect x="16" y="4" width="4" height="16" rx="1.5" fill="none" stroke="#ffffff"/>
+    <!-- 绑带（上） -->
+    <line x1="4" y1="9" x2="22" y2="9" stroke="#ffffff" stroke-width="2"/>
+    <!-- 绑带（下） -->
+    <line x1="4" y1="15" x2="22" y2="15" stroke="#ffffff" stroke-width="2"/>
+  </g>
+</svg>
+
+
+

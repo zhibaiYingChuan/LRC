@@ -3,26 +3,100 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>">
-  <title>Loong Recall · 忆 — 仪表盘</title>
+  <link rel="icon" type="image/png" href="/assets/logo/LRC桌面端Logo设计-26aa57e9-7935-4ece-badf-bd52dcccd343.png">
+  <title>龙忆 Loong Recall · 仪表盘</title>
+  <!-- 龙忆设计系统 v1.0：色阶 + 排版 + 间距 + 圆角 + 阴影 + 动效 -->
+  <link rel="stylesheet" href="/colors_and_type.css">
+  <!-- 龙忆设计系统 v1.0：全局组件库（按钮/卡片/输入框/模态框等） -->
+  <link rel="stylesheet" href="/components.css">
+  <!-- LRC 业务样式（基于设计系统变量） -->
   <link rel="stylesheet" href="/app.css">
 </head>
 <body>
 
-<!-- ==================== 顶部导航栏 ==================== -->
+<!-- ==================== Toast 通知条容器（设计文档 3.10） ==================== -->
+<div class="toast-container" id="toast-container"></div>
+
+<!-- ==================== 应用布局：侧边栏 + 主内容区（设计文档 5.1） ==================== -->
+<div class="app-layout">
+
+  <!-- ========== 侧边栏（桌面端，龙忆设计系统 v1.0） ========== -->
+  <aside class="app-sidebar sidebar" id="app-sidebar">
+    <!-- 折叠状态下显示的展开按钮（悬浮于侧边栏右边缘） -->
+    <button class="sidebar-expand-btn" onclick="toggleSidebar()" aria-label="展开侧边栏" title="展开">⟫</button>
+    <!-- 侧边栏顶部 Logo + 折叠按钮（设计文档 3.4：60/240px 切换） -->
+    <div class="sidebar-header">
+      <img class="sidebar-logo" src="/assets/logo/LRC桌面端Logo设计-26aa57e9-7935-4ece-badf-bd52dcccd343.png" alt="龙忆 Loong Recall">
+      <span class="sidebar-brand">龙忆</span>
+      <button class="sidebar-collapse-btn" onclick="toggleSidebar()" aria-label="折叠/展开侧边栏" title="折叠/展开">
+        <span class="collapse-icon">⟪</span>
+      </button>
+    </div>
+    <!-- 导航列表 -->
+    <nav class="sidebar-nav">
+      <div class="nav-section-title">主导航</div>
+      <a class="nav-item" data-tab="project-switch" data-tab-text="MCP配置">
+        <img src="/assets/icons/icon-project.svg" alt="">
+        <span class="nav-item-text">MCP配置</span>
+      </a>
+      <a class="nav-item active" data-tab="dashboard" data-tab-text="仪表盘">
+        <img src="/assets/icons/icon-dashboard.svg" alt="">
+        <span class="nav-item-text">仪表盘</span>
+      </a>
+      <a class="nav-item" data-tab="memory-search" data-tab-text="记忆搜索">
+        <img src="/assets/icons/icon-search-lrc.svg" alt="">
+        <span class="nav-item-text">记忆搜索</span>
+      </a>
+      <a class="nav-item" data-tab="captain-log" data-tab-text="船长日志">
+        <img src="/assets/icons/icon-captain-log.svg" alt="">
+        <span class="nav-item-text">船长日志</span>
+      </a>
+      <a class="nav-item" data-tab="trust-center" data-tab-text="信任中心">
+        <img src="/assets/icons/icon-trust.svg" alt="">
+        <span class="nav-item-text">信任中心</span>
+      </a>
+      <a class="nav-item" data-tab="benchmarks" data-tab-text="基准报告">
+        <img src="/assets/icons/icon-benchmark.svg" alt="">
+        <span class="nav-item-text">基准报告</span>
+      </a>
+      <div class="nav-section-title">系统</div>
+      <a class="nav-item" data-tab="api-docs" data-tab-text="用户文档">
+        <img src="/assets/icons/icon-audit.svg" alt="">
+        <span class="nav-item-text">用户文档</span>
+      </a>
+      <a class="nav-item" data-tab="settings" data-tab-text="设置">
+        <img src="/assets/icons/icon-bagua.svg" alt="">
+        <span class="nav-item-text">设置</span>
+      </a>
+    </nav>
+    <!-- 侧边栏底部 -->
+    <div class="sidebar-footer">
+      <a class="nav-item settings" data-tab="system-status" data-tab-text="系统状态">
+        <img src="/assets/icons/icon-health.svg" alt="">
+        <span class="nav-item-text">系统状态</span>
+      </a>
+    </div>
+  </aside>
+
+  <!-- ========== 主内容区 ========== -->
+  <div class="app-main">
+
+<!-- ==================== 顶部导航栏（手机端 fallback，龙忆设计系统 v1.0） ==================== -->
 <nav class="navbar">
   <a class="navbar-brand" href="#">
-    <span class="navbar-logo">Loong Recall · 忆</span>
-    <span class="navbar-tagline">你的私人记忆管家</span>
+    <img class="navbar-logo-img" src="/assets/logo/logo-horizontal.png" alt="龙忆 Loong Recall" width="140" height="32">
+    <span class="navbar-tagline">记忆有道，生生不息</span>
   </a>
   <button class="navbar-toggle" onclick="toggleNav()" aria-label="菜单">☰</button>
   <ul class="navbar-nav" id="navbarNav">
-    <li><button class="active" data-tab="dashboard">仪表盘</button></li>
-    <li><button data-tab="captain-log">船长日志</button></li>
-    <li><button data-tab="trust-center">信任中心</button></li>
-    <li><button data-tab="api-docs">API 文档</button></li>
-    <li><button data-tab="benchmarks">📊 基准报告</button></li>
-    <li><button data-tab="settings">⚙️ 设置</button></li>
+    <li><button class="active" data-tab="dashboard"><img src="/assets/icons/icon-dashboard.svg" alt="" width="14" height="14">仪表盘</button></li>
+    <li><button data-tab="memory-search"><img src="/assets/icons/icon-search-lrc.svg" alt="" width="14" height="14">记忆搜索</button></li>
+    <li><button data-tab="captain-log"><img src="/assets/icons/icon-captain-log.svg" alt="" width="14" height="14">船长日志</button></li>
+    <li><button data-tab="trust-center"><img src="/assets/icons/icon-trust.svg" alt="" width="14" height="14">信任中心</button></li>
+    <li><button data-tab="api-docs">用户文档</button></li>
+    <li><button data-tab="project-switch"><img src="/assets/icons/icon-project.svg" alt="" width="14" height="14">MCP配置</button></li>
+    <li><button data-tab="benchmarks"><img src="/assets/icons/icon-benchmark.svg" alt="" width="14" height="14">基准报告</button></li>
+    <li><button data-tab="settings">设置</button></li>
   </ul>
 </nav>
 
@@ -32,16 +106,28 @@
   <!-- ========== 仪表盘标签页 ========== -->
   <section class="tab-content active" id="tab-dashboard">
 
-    <!-- 5分钟快速体验向导 -->
+    <!-- ==================== 欢迎区（设计文档 5.2.1：仅首次使用时显示，可关闭） ==================== -->
+    <div class="welcome-banner" id="welcome-banner" hidden>
+      <div class="welcome-content">
+        <div class="welcome-greeting" id="welcome-greeting">欢迎回来</div>
+        <div class="welcome-date" id="welcome-date">--</div>
+        <div class="welcome-poem" id="welcome-poem">昨日之忆，今日之智</div>
+      </div>
+      <button class="welcome-close" onclick="dismissWelcome()" aria-label="关闭欢迎">
+        <img src="/assets/icons/icon-decay.svg" alt="" width="14" height="14">
+      </button>
+    </div>
+
+    <!-- 5分钟快速体验向导（龙忆设计系统：金色主题） -->
     <div class="wizard-card" id="quickstart-wizard">
-      <div class="wizard-title">🚀 5分钟快速体验</div>
-      <div class="wizard-subtitle">跟随以下三个步骤，快速上手 Loong Recall 记忆系统</div>
+      <div class="wizard-title"><img src="/assets/icons/icon-luoshu.svg" alt="" width="20" height="20" style="vertical-align:middle;"> 5分钟快速体验</div>
+      <div class="wizard-subtitle">跟随以下三个步骤，快速上手龙忆 Loong Recall 记忆系统</div>
       <div class="wizard-steps">
         <!-- 步骤一：搜索代码 -->
         <div class="wizard-step" id="wizard-step-1">
           <div class="wizard-step-header">
             <span class="wizard-step-num">1</span>
-            <span class="wizard-step-title">🔍 搜索代码</span>
+            <span class="wizard-step-title"><img src="/assets/icons/icon-search-lrc.svg" alt="" width="14" height="14" style="vertical-align:middle;"> 搜索代码</span>
             <span class="wizard-check">✓</span>
           </div>
           <div class="wizard-step-desc">搜索代码库中的函数、结构体或关键字</div>
@@ -54,7 +140,7 @@
         <div class="wizard-step" id="wizard-step-2">
           <div class="wizard-step-header">
             <span class="wizard-step-num">2</span>
-            <span class="wizard-step-title">✍️ 写入记忆</span>
+            <span class="wizard-step-title"><img src="/assets/icons/icon-memory.svg" alt="" width="14" height="14" style="vertical-align:middle;"> 写入记忆</span>
             <span class="wizard-check">✓</span>
           </div>
           <div class="wizard-step-desc">将示例内容写入记忆库</div>
@@ -68,7 +154,7 @@
         <div class="wizard-step" id="wizard-step-3">
           <div class="wizard-step-header">
             <span class="wizard-step-num">3</span>
-            <span class="wizard-step-title">🔎 检索记忆</span>
+            <span class="wizard-step-title"><img src="/assets/icons/icon-crystallization.svg" alt="" width="14" height="14" style="vertical-align:middle;"> 检索记忆</span>
             <span class="wizard-check">✓</span>
           </div>
           <div class="wizard-step-desc">检索刚写入的记忆，验证记忆系统</div>
@@ -80,70 +166,107 @@
       </div>
     </div>
 
-    <!-- ==================== v0.5.4 P1-7 修复：快速操作区域（用户友好） ==================== -->
-    <div class="card" style="border-left: 3px solid var(--jade);">
-      <div class="card-title" style="font-size: 18px; color: var(--jade);">
-        <span class="icon">🎯</span> 快速操作</div>
+    <!-- ==================== 快速操作区域（龙忆设计系统：玉色色条） ==================== -->
+    <div class="card" style="border-left: 3px solid var(--lrc-玉色-500);">
+      <div class="card-title" style="font-size: 18px; color: var(--lrc-玉色-600);">
+        <img src="/assets/icons/icon-bagua.svg" alt="" width="18" height="18" style="vertical-align:middle; margin-right: 6px;"> 快速操作</div>
       <p class="text-sm text-dim mb-4">
-        以下是 LRC 最常用的功能，点击即可使用。
+        以下是龙忆 LRC 最常用的功能，点击即可使用。
       </p>
       <div class="quick-actions-grid">
         <a href="#tab-captain-log" class="quick-action-item" onclick="switchToTab('captain-log')">
-          <span class="quick-action-icon">📝</span>
+          <span class="quick-action-icon"><img src="/assets/icons/icon-captain-log.svg" alt="" width="24" height="24"></span>
           <div>
             <div class="quick-action-title">生成船长日志</div>
             <div class="quick-action-desc">一键生成项目记忆健康报告</div>
           </div>
         </a>
         <a href="#tab-trust-center" class="quick-action-item" onclick="switchToTab('trust-center')">
-          <span class="quick-action-icon">🔒</span>
+          <span class="quick-action-icon"><img src="/assets/icons/icon-trust.svg" alt="" width="24" height="24"></span>
           <div>
             <div class="quick-action-title">查看信任中心</div>
             <div class="quick-action-desc">验证数据存储位置与隐私保护</div>
           </div>
         </a>
         <a href="#tab-settings" class="quick-action-item" onclick="switchToTab('settings')">
-          <span class="quick-action-icon">⚙️</span>
+          <span class="quick-action-icon"><img src="/assets/icons/icon-bagua.svg" alt="" width="24" height="24"></span>
           <div>
             <div class="quick-action-title">配置 LLM</div>
             <div class="quick-action-desc">启用自然语言搜索代码功能</div>
           </div>
         </a>
         <a href="#tab-api-docs" class="quick-action-item" onclick="switchToTab('api-docs')">
-          <span class="quick-action-icon">📖</span>
+          <span class="quick-action-icon"><img src="/assets/icons/icon-audit.svg" alt="" width="24" height="24"></span>
           <div>
-            <div class="quick-action-title">查看 API 文档</div>
-            <div class="quick-action-desc">REST API 端点说明与调用示例</div>
+            <div class="quick-action-title">查看用户文档</div>
+            <div class="quick-action-desc">快速上手、配置指南、常见问题与 API 参考</div>
           </div>
         </a>
       </div>
     </div>
 
-    <!-- 记忆统计卡片组 -->
+    <!-- ==================== 道同构度环形仪表盘（设计文档 5.2 核心区域） ==================== -->
+    <div class="dao-metrics-panel">
+      <div class="card-title" style="margin-bottom: var(--space-4);">
+        <img src="/assets/icons/icon-health.svg" alt="" width="20" height="20"> 道同构度
+        <span style="margin-left:auto;font-size:11px;color:var(--lrc-墨韵-300);font-weight:normal;">实时健康评分</span>
+      </div>
+      <div class="dao-ring-container">
+        <canvas id="dao-ring-canvas" width="200" height="200"></canvas>
+        <div class="dao-ring-center">
+          <div class="dao-ring-score" id="dao-ring-score">--</div>
+          <div class="dao-ring-label">健康评分</div>
+        </div>
+      </div>
+      <div class="dao-sub-metrics">
+        <div class="dao-sub-metric yin-yang">
+          <div class="dao-sub-metric-value" id="dao-yin-yang">--</div>
+          <div class="dao-sub-metric-label">阴阳守恒</div>
+          <div class="dao-sub-metric-desc">阴阳平衡度</div>
+        </div>
+        <div class="dao-sub-metric luoshu-deviation">
+          <div class="dao-sub-metric-value" id="dao-luoshu-deviation">--</div>
+          <div class="dao-sub-metric-label">洛书偏差</div>
+          <div class="dao-sub-metric-desc">9维坐标偏差</div>
+        </div>
+        <div class="dao-sub-metric bagua-balance">
+          <div class="dao-sub-metric-value" id="dao-bagua-balance">--</div>
+          <div class="dao-sub-metric-label">八卦均衡度</div>
+          <div class="dao-sub-metric-desc">类型分布均衡</div>
+        </div>
+        <div class="dao-sub-metric synthesis-ratio">
+          <div class="dao-sub-metric-value" id="dao-synthesis-ratio">--</div>
+          <div class="dao-sub-metric-label">合成比率</div>
+          <div class="dao-sub-metric-desc">结晶记忆占比</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 记忆统计卡片组（应用龙忆设计系统色阶） -->
     <div class="stats-grid" id="memoryStatsCards">
       <div class="stat-card">
-        <div class="stat-icon ink">📊</div>
+        <div class="stat-icon ink"><img src="/assets/icons/icon-memory.svg" alt="" width="22" height="22"></div>
         <div>
           <div class="stat-value" id="stat-total">--</div>
           <div class="stat-label">记忆总数</div>
         </div>
       </div>
       <div class="stat-card">
-        <div class="stat-icon gold">🆕</div>
+        <div class="stat-icon gold"><img src="/assets/icons/icon-crystallization.svg" alt="" width="22" height="22"></div>
         <div>
           <div class="stat-value" id="stat-today">--</div>
           <div class="stat-label">今日新增</div>
         </div>
       </div>
       <div class="stat-card">
-        <div class="stat-icon jade">⚡</div>
+        <div class="stat-icon jade"><img src="/assets/icons/icon-luoshu.svg" alt="" width="22" height="22"></div>
         <div>
           <div class="stat-value" id="stat-active">--</div>
           <div class="stat-label">活跃记忆</div>
         </div>
       </div>
       <div class="stat-card">
-        <div class="stat-icon cinnabar">💎</div>
+        <div class="stat-icon cinnabar"><img src="/assets/icons/icon-decay.svg" alt="" width="22" height="22"></div>
         <div>
           <div class="stat-value" id="stat-crystallized">--</div>
           <div class="stat-label">结晶记忆</div>
@@ -151,12 +274,58 @@
       </div>
     </div>
 
-    <!-- v0.5.4 P1-7 修复：最近记忆 + 项目分布（用户友好） -->
+    <!-- 预设场景模板 -->
+    <div class="card">
+      <div class="card-title">
+        <img src="/assets/icons/icon-bagua.svg" alt="" width="18" height="18"> 预设场景模板
+      </div>
+      <p class="text-sm text-dim mb-4">一键启用场景模板，无需手动设计记忆类型与标签体系。</p>
+      <div class="preset-scenario-grid" id="preset-scenario-grid">
+        <div class="preset-scenario-card" data-scenario="personal-notes" onclick="selectPresetScenario(this)">
+          <div class="preset-scenario-title">个人笔记</div>
+          <div class="preset-scenario-desc">灵感、日记、个人知识沉淀</div>
+        </div>
+        <div class="preset-scenario-card" data-scenario="project-management" onclick="selectPresetScenario(this)">
+          <div class="preset-scenario-title">项目管理</div>
+          <div class="preset-scenario-desc">决策、会议纪要、任务跟踪</div>
+        </div>
+        <div class="preset-scenario-card" data-scenario="learning-assistant" onclick="selectPresetScenario(this)">
+          <div class="preset-scenario-title">学习助手</div>
+          <div class="preset-scenario-desc">知识点、问答、学科分类</div>
+        </div>
+        <div class="preset-scenario-card selected" data-scenario="coding-helper" onclick="selectPresetScenario(this)">
+          <div class="preset-scenario-title">编程助手</div>
+          <div class="preset-scenario-desc">代码决策、偏好、约定（默认）</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 结晶历史时间线 -->
+    <div class="card">
+      <div class="card-title">
+        <img src="/assets/icons/icon-crystallization.svg" alt="" width="18" height="18"> 结晶历史时间线
+      </div>
+      <p class="text-sm text-dim mb-4">展示记忆库的成长轨迹——每次结晶都被持久化记录。</p>
+      <div class="crystallization-timeline" id="crystallization-timeline">
+        <div class="crystallization-event">
+          <div class="crystallization-event-title">首次结晶</div>
+          <div class="crystallization-event-time">2026-07-27 09:30</div>
+          <div class="crystallization-event-desc">将 5 条相似记忆合成为 1 条知识："项目使用 Rust + Actix-web 框架"</div>
+        </div>
+        <div class="crystallization-event">
+          <div class="crystallization-event-title">二次结晶</div>
+          <div class="crystallization-event-time">2026-07-27 14:15</div>
+          <div class="crystallization-event-desc">将 3 条决策记忆合成为方法论："错误处理优先使用 Result 而非 panic"</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 最近记忆 + 项目分布（龙忆设计系统） -->
     <div class="two-col">
       <!-- 最近记忆卡片 -->
       <div class="card">
         <div class="card-title">
-          <span class="icon">🕒</span> 最近记忆
+          <img src="/assets/icons/icon-memory.svg" alt="" width="18" height="18"> 最近记忆
           <button class="btn btn-outline btn-sm" style="margin-left:auto;padding:2px 10px;font-size:11px;" onclick="loadRecentMemories()">刷新</button>
         </div>
         <div id="recent-memories-list" class="recent-memories-container">
@@ -166,18 +335,61 @@
 
       <!-- 项目分布卡片 -->
       <div class="card">
-        <div class="card-title"><span class="icon">📂</span> 项目分布</div>
+        <div class="card-title"><img src="/assets/icons/icon-bagua.svg" alt="" width="18" height="18"> 项目分布</div>
         <div id="project-distribution" class="project-distribution-container">
           <div class="text-center text-dim" style="padding:20px;">加载中...</div>
         </div>
       </div>
     </div>
 
-    <!-- v0.5.4 P1-7 修复：系统信息 + 最近活动日志（用户友好） -->
+    <!-- ==================== 演化时间线（设计文档 5.2.4：最近 10 条演化事件） ==================== -->
+    <div class="card">
+      <div class="card-title">
+        <img src="/assets/icons/icon-crystallization.svg" alt="" width="18" height="18"> 演化时间线
+        <button class="btn btn-outline btn-sm" style="margin-left:auto;padding:2px 10px;font-size:11px;" onclick="loadEvolutionTimeline()">刷新</button>
+      </div>
+      <p class="text-sm text-dim mb-4">按时间倒序显示最近 10 条演化事件（结晶、衰减、合成、审计）。</p>
+      <ul class="evolution-timeline" id="evolution-timeline">
+        <li class="evolution-event crystallization">
+          <div class="evolution-event-dot"></div>
+          <div class="evolution-event-time">2026-07-27 14:15:32</div>
+          <span class="evolution-event-type">
+            <img src="/assets/icons/icon-crystallization.svg" alt="" width="12" height="12"> 结晶
+          </span>
+          <div class="evolution-event-desc">将 3 条决策记忆合成为方法论："错误处理优先使用 Result 而非 panic"</div>
+        </li>
+        <li class="evolution-event synthesis">
+          <div class="evolution-event-dot"></div>
+          <div class="evolution-event-time">2026-07-27 09:30:12</div>
+          <span class="evolution-event-type">
+            <img src="/assets/icons/icon-luoshu.svg" alt="" width="12" height="12"> 合成
+          </span>
+          <div class="evolution-event-desc">将 5 条相似记忆合成为 1 条知识："项目使用 Rust + Actix-web 框架"</div>
+        </li>
+        <li class="evolution-event audit">
+          <div class="evolution-event-dot"></div>
+          <div class="evolution-event-time">2026-07-27 08:00:00</div>
+          <span class="evolution-event-type">
+            <img src="/assets/icons/icon-audit.svg" alt="" width="12" height="12"> 审计
+          </span>
+          <div class="evolution-event-desc">审计日志完整性校验通过，哈希链验证成功</div>
+        </li>
+        <li class="evolution-event decay">
+          <div class="evolution-event-dot"></div>
+          <div class="evolution-event-time">2026-07-26 22:00:00</div>
+          <span class="evolution-event-type">
+            <img src="/assets/icons/icon-decay.svg" alt="" width="12" height="12"> 衰减
+          </span>
+          <div class="evolution-event-desc">2 条 30 天未访问的记忆重要性自动降级（8→6）</div>
+        </li>
+      </ul>
+    </div>
+
+    <!-- 系统信息 + 最近活动日志（龙忆设计系统） -->
     <div class="two-col">
       <!-- 系统信息卡片 -->
       <div class="card">
-        <div class="card-title"><span class="icon">⚙️</span> 系统信息</div>
+        <div class="card-title"><img src="/assets/icons/icon-benchmark.svg" alt="" width="18" height="18"> 系统信息</div>
         <div class="sys-info-grid">
           <span class="label">服务状态</span>
           <span class="value" id="sys-health-status">--</span>
@@ -196,7 +408,7 @@
 
       <!-- 最近活动日志 -->
       <div class="card">
-        <div class="card-title"><span class="icon">📋</span> 最近活动</div>
+        <div class="card-title"><img src="/assets/icons/icon-audit.svg" alt="" width="18" height="18"> 最近活动</div>
         <div class="table-wrap">
           <table>
             <thead>
@@ -222,10 +434,70 @@
 
   </section>
 
-  <!-- ========== 船长日志标签页 ========== -->
+  <!-- ========== 记忆搜索标签页（设计文档 5.3：独立搜索页面） ========== -->
+  <section class="tab-content" id="tab-memory-search">
+    <div class="memory-search-page">
+      <!-- 顶部全局搜索栏（设计文档 5.3：焦点时自动展开高级搜索提示） -->
+      <div class="memory-search-bar">
+        <img class="search-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
+        <input type="text" class="input" id="memory-search-input"
+          placeholder="搜索记忆内容、标签或关键词..." oninput="debouncedMemorySearch()">
+      </div>
+
+      <!-- 搜索布局：左侧筛选 + 右侧卡片流 -->
+      <div class="memory-search-layout">
+        <!-- 左侧高级筛选面板 -->
+        <aside class="memory-filter-panel">
+          <h4>记忆类型</h4>
+          <div class="memory-filter-group" id="filter-memory-type">
+            <span class="memory-filter-tag active" data-filter-type="all">全部</span>
+            <span class="memory-filter-tag" data-filter-type="fact">事实</span>
+            <span class="memory-filter-tag" data-filter-type="preference">偏好</span>
+            <span class="memory-filter-tag" data-filter-type="decision">决策</span>
+            <span class="memory-filter-tag" data-filter-type="code_context">代码</span>
+            <span class="memory-filter-tag" data-filter-type="conversation">对话</span>
+          </div>
+          <h4>重要性</h4>
+          <div class="memory-filter-group" id="filter-importance">
+            <span class="memory-filter-tag active" data-filter-importance="all">全部</span>
+            <span class="memory-filter-tag" data-filter-importance="high">高 (8-10)</span>
+            <span class="memory-filter-tag" data-filter-importance="medium">中 (5-7)</span>
+            <span class="memory-filter-tag" data-filter-importance="low">低 (1-4)</span>
+          </div>
+          <h4>时间范围</h4>
+          <div class="memory-filter-group" id="filter-time">
+            <span class="memory-filter-tag active" data-filter-time="all">全部</span>
+            <span class="memory-filter-tag" data-filter-time="today">今天</span>
+            <span class="memory-filter-tag" data-filter-time="week">本周</span>
+            <span class="memory-filter-tag" data-filter-time="month">本月</span>
+          </div>
+        </aside>
+
+        <!-- 右侧记忆卡片流 -->
+        <div class="memory-card-stream" id="memory-search-results">
+          <div class="memory-search-empty">
+            <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
+            <div class="empty-poem">寻而未得，或待他时</div>
+            <p class="text-sm text-dim">输入关键词开始搜索记忆</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右侧滑出详情面板（设计文档 5.3：40% 宽度） -->
+    <div class="memory-detail-panel-backdrop" id="memory-detail-backdrop" onclick="closeMemoryDetail()"></div>
+    <aside class="memory-detail-panel" id="memory-detail-panel">
+      <button class="memory-detail-close" onclick="closeMemoryDetail()">×</button>
+      <div class="memory-detail-content" id="memory-detail-content">
+        <!-- 详情内容动态填充 -->
+      </div>
+    </aside>
+  </section>
+
+  <!-- ========== 船长日志标签页（龙忆设计系统） ========== -->
   <section class="tab-content" id="tab-captain-log">
     <div class="card">
-      <div class="card-title"><span class="icon">📝</span> 船长日志生成器</div>
+      <div class="card-title"><img src="/assets/icons/icon-captain-log.svg" alt="" width="18" height="18"> 船长日志生成器</div>
       <p class="text-sm text-dim mb-4">
         船长日志将分析当前项目的代码库状态、记忆健康度和系统运行指标，
         生成一份面向开发者的综合报告。
@@ -234,11 +506,11 @@
         <input type="text" class="input" id="log-project-path"
           placeholder="例如：C:\Users\MyProject 或 .（当前目录）" value=".">
         <button class="btn btn-primary" id="btn-generate-log" onclick="generateCaptainLog()">
-          ⚡ 一键生成船长日志
+          一键生成船长日志
         </button>
       </div>
       <p class="text-sm text-dim" style="margin-top:6px;">
-        💡 输入你想分析的代码项目路径，系统会扫描该目录下的代码并生成记忆健康报告。
+        输入你想分析的代码项目路径，系统会扫描该目录下的代码并生成记忆健康报告。
       </p>
 
       <div class="loading-overlay hidden" id="log-loading">
@@ -249,16 +521,28 @@
     </div>
   </section>
 
-  <!-- ========== 信任中心标签页 ========== -->
+  <!-- ========== 信任中心标签页（龙忆设计系统：记忆类型色条） ========== -->
   <section class="tab-content" id="tab-trust-center">
+    <!-- 一键隐私检查 -->
+    <div class="card" style="margin-bottom: 16px; background: linear-gradient(135deg, var(--lrc-金色-50) 0%, var(--lrc-宣纸-400) 100%); border: 1px solid var(--lrc-金色-200);">
+      <div class="card-title">
+        <img src="/assets/icons/icon-trust.svg" alt="" width="18" height="18"> 一键隐私检查
+      </div>
+      <p class="text-sm text-dim mb-4">100ms 内获取完整的隐私报告：存储位置、大小、网络访问、加密状态。</p>
+      <button class="privacy-check-btn" onclick="runPrivacyCheck()">
+        <img src="/assets/icons/icon-trust.svg" alt="" width="16" height="16"> 立即检查隐私状态
+      </button>
+      <div id="privacy-check-result" class="verify-result" style="margin-top: 16px;"></div>
+    </div>
+
     <div class="trust-grid">
-      <!-- 数据存储位置 -->
-      <div class="trust-card">
-        <h3>📁 数据存储位置</h3>
+      <!-- 数据存储位置（fact - 玉色色条） -->
+      <div class="trust-card card-memory-fact">
+        <h3><img src="/assets/icons/icon-trust.svg" alt="" width="16" height="16" style="vertical-align:middle;"> 数据存储位置</h3>
         <p>所有数据<strong>本地优先</strong>，存储在项目目录下的 <code>.loong-recall/data/</code> 中。
           支持自定义路径（<code>--db-path</code>）和全局模式（<code>--global</code>）。</p>
         <div class="trust-actions">
-          <button class="btn btn-outline btn-sm" onclick="verifyDataLocation()">📂 查看记忆文件</button>
+          <button class="btn btn-outline btn-sm" onclick="verifyDataLocation()">查看记忆文件</button>
         </div>
         <div class="verify-result" id="data-location-result">
           <div class="loading-overlay hidden" id="data-location-loading">
@@ -267,13 +551,13 @@
         </div>
       </div>
 
-      <!-- 网络访问策略 -->
-      <div class="trust-card info">
-        <h3>🌐 网络访问策略</h3>
+      <!-- 网络访问策略（code_context - 水蓝色条） -->
+      <div class="trust-card card-memory-code">
+        <h3><img src="/assets/icons/icon-audit.svg" alt="" width="16" height="16" style="vertical-align:middle;"> 网络访问策略</h3>
         <p>核心功能<strong>完全离线</strong>可用。网络仅用于首次模型下载
           （通过 HuggingFace 镜像）。</p>
         <div class="trust-actions">
-          <button class="btn btn-outline btn-sm" onclick="verifyNetworkAudit()">🔍 查看网络活动</button>
+          <button class="btn btn-outline btn-sm" onclick="verifyNetworkAudit()">查看网络活动</button>
         </div>
         <div class="verify-result" id="network-audit-result">
           <div class="loading-overlay hidden" id="network-audit-loading">
@@ -282,9 +566,9 @@
         </div>
       </div>
 
-      <!-- 隐私保护承诺 -->
-      <div class="trust-card">
-        <h3>🔒 隐私保护承诺</h3>
+      <!-- 隐私保护承诺（preference - 金色色条） -->
+      <div class="trust-card card-memory-preference">
+        <h3><img src="/assets/icons/icon-trust.svg" alt="" width="16" height="16" style="vertical-align:middle;"> 隐私保护承诺</h3>
         <p>你的记忆<strong>不会离开你的机器</strong>。所有编码、检索、合成均在本地完成。</p>
         <ul class="feature-list mt-2">
           <li>数据不出本地</li>
@@ -294,9 +578,9 @@
         </ul>
       </div>
 
-      <!-- 开源许可 -->
-      <div class="trust-card info">
-        <h3>📜 开源许可</h3>
+      <!-- 开源许可（code_context - 水蓝色条） -->
+      <div class="trust-card card-memory-code">
+        <h3>开源许可</h3>
         <p>本项目采用双重许可：</p>
         <ul class="feature-list mt-2">
           <li><strong>Apache 2.0</strong> — 基础设施代码</li>
@@ -305,21 +589,21 @@
         </ul>
       </div>
 
-      <!-- 隐式反馈开关 -->
-      <div class="trust-card warn" id="feedback-status-card">
-        <h3>🎛️ 隐式反馈</h3>
+      <!-- 隐式反馈开关（preference - 金色色条） -->
+      <div class="trust-card card-memory-preference" id="feedback-status-card">
+        <h3>隐式反馈</h3>
         <p id="feedback-status-text">加载中...</p>
         <p class="text-sm text-dim mt-2">
           隐式反馈通过分析用户的检索行为自动优化排序，无需手动标注。
         </p>
       </div>
 
-      <!-- 审计日志完整性 -->
-      <div class="trust-card" id="audit-integrity-card">
-        <h3>📋 审计日志完整性</h3>
+      <!-- 审计日志完整性（decision - 朱砂色条） -->
+      <div class="trust-card card-memory-decision" id="audit-integrity-card">
+        <h3><img src="/assets/icons/icon-audit.svg" alt="" width="16" height="16" style="vertical-align:middle;"> 审计日志完整性</h3>
         <p id="audit-integrity-text">加载中...</p>
         <div class="trust-actions">
-          <button class="btn btn-outline btn-sm" onclick="verifyAuditIntegrity()">🔐 验证完整性</button>
+          <button class="btn btn-outline btn-sm" onclick="verifyAuditIntegrity()">验证完整性</button>
         </div>
         <div class="verify-result" id="audit-integrity-result">
           <div class="loading-overlay hidden" id="audit-integrity-loading">
@@ -337,10 +621,248 @@
     </div>
   </section>
 
-  <!-- ========== API 文档标签页 ========== -->
+  <!-- ========== 用户文档标签页（原 API 文档，v0.6.0 扩展为综合用户指南） ========== -->
   <section class="tab-content" id="tab-api-docs">
+    <!-- 页面标题 -->
     <div class="card">
-      <div class="card-title"><span class="icon">📖</span> REST v1 API 端点</div>
+      <div class="card-title"><img src="/assets/icons/icon-audit.svg" alt="" width="18" height="18"> 用户文档</div>
+      <p class="text-sm text-dim mt-4" style="margin-top:0;">
+        欢迎使用 LRC（Loong Recall）—— 本地优先的 AI 工具记忆系统。本页面整合了快速上手、配置指南、常见问题与 API 参考，帮助你快速掌握 LRC 的全部功能。
+      </p>
+    </div>
+
+    <!-- ==================== 1. 快速上手 ==================== -->
+    <div class="card">
+      <div class="card-title"><img src="/assets/icons/icon-lightning.svg" alt="" width="18" height="18"> 一、快速上手</div>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">1.1 安装与首次启动</h4>
+      <ol style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li>下载 LRC Desktop 安装包（<code>.msi</code> 或 <code>.exe</code>）并完成安装。</li>
+        <li>启动后进入配置向导，LRC 会自动扫描已安装的 AI 工具（如 Trae、Cursor、VS Code 等）。</li>
+        <li>勾选需要配置的工具，选择要索引的项目文件夹。</li>
+        <li>（可选）配置 LLM API Key 以启用自然语言搜索；不配置也能使用基础搜索功能。</li>
+        <li>点击"完成配置"，LRC 将自动启动后台服务并配置 MCP 连接。</li>
+      </ol>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">1.2 两条配置路径</h4>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 8px;">
+        <div style="background: var(--lrc-宣纸-300); padding: 12px; border-radius: var(--radius-md); border-left: 3px solid var(--lrc-金色-500);">
+          <strong>完整配置（约 30 秒）</strong>
+          <p style="margin: 6px 0 0; font-size: 13px; color: var(--text-muted);">检测 AI 工具 + 选项目 → 配置 LLM（可选）→ 自动配置 MCP 并启动。推荐首次使用。</p>
+        </div>
+        <div style="background: var(--lrc-宣纸-300); padding: 12px; border-radius: var(--radius-md); border-left: 3px solid var(--lrc-玉色-500);">
+          <strong>快速上手（约 10 秒）</strong>
+          <p style="margin: 6px 0 0; font-size: 13px; color: var(--text-muted);">跳过检测 → 直接选项目文件夹 → 自动配置 MCP 并启动。老手推荐。</p>
+        </div>
+      </div>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">1.3 让 AI 记住与回忆</h4>
+      <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li><strong>记住信息</strong>：在 AI 工具对话中输入 <code>"帮我记住：这个项目使用 React + TypeScript"</code>，AI 会自动调用 LRC 的 <code>remember</code> 工具存储记忆。</li>
+        <li><strong>回忆信息</strong>：在另一个对话中输入 <code>"我之前记录的项目技术栈是什么？"</code>，AI 会调用 LRC 的 <code>recall</code> 工具检索记忆。</li>
+        <li><strong>更新记忆</strong>：直接让 AI 记住新信息，LRC 会自动管理记忆的版本与去重。</li>
+      </ul>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">1.4 桌面端状态栏说明</h4>
+      <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li><span style="color: #2ecc71;">●</span> <strong>运行中</strong>：服务正常，AI 工具可使用记忆功能。</li>
+        <li><span style="color: #f39c12;">●</span> <strong>启动中</strong>：服务正在启动，请稍候。</li>
+        <li><span style="color: #c0392b;">●</span> <strong>已停止 / 不可达</strong>：点击状态文字（桌面端）或文字本身（仪表盘右下角）可弹出启动服务弹窗。</li>
+        <li><strong>数据目录</strong>：右下角显示的路径可点击直接打开文件夹（仅桌面端）。</li>
+      </ul>
+    </div>
+
+    <!-- ==================== 2. 配置指南 ==================== -->
+    <div class="card">
+      <div class="card-title"><img src="/assets/icons/icon-config.svg" alt="" width="18" height="18"> 二、配置指南</div>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">2.1 LLM 配置（可选）</h4>
+      <p style="line-height: 1.7; color: var(--text);">配置 LLM 可启用自然语言搜索代码功能。LRC 支持以下国产模型：</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>提供商</th><th>推荐场景</th><th>获取 Key</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>DeepSeek</td><td>代码能力极强，性价比之王</td><td><a href="https://platform.deepseek.com/api_keys" target="_blank">获取 →</a></td></tr>
+            <tr><td>通义千问</td><td>阿里云出品，中文理解出色</td><td><a href="https://dashscope.console.aliyun.com/apiKey" target="_blank">获取 →</a></td></tr>
+            <tr><td>智谱 GLM</td><td>清华系，GLM 系列模型</td><td><a href="https://open.bigmodel.cn/usercenter/apikeys" target="_blank">获取 →</a></td></tr>
+            <tr><td>MiniMax / 豆包 / 阶跃 / 百川</td><td>国产多模型可选</td><td>设置面板中查看</td></tr>
+            <tr><td>自定义 API</td><td>任何兼容 OpenAI 协议的 API 地址</td><td>—</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="text-sm text-dim mt-4" style="margin-top: 8px;">
+        <strong>安全说明</strong>：API Key 使用 AES-256-GCM 加密存储在本地，绝不上传任何服务器。
+      </p>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">2.2 本地语义模型（内置，无需配置）</h4>
+      <p style="line-height: 1.7; color: var(--text);">
+        LRC 内置本地小模型用于代码语义搜索，<strong>无需任何配置即可使用</strong>。默认根据系统语言自动选择：
+      </p>
+      <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li><strong>中文环境</strong>：<code>BAAI/bge-small-zh</code>（512 维，约 95MB，中文 SOTA）</li>
+        <li><strong>其他语言</strong>：<code>sentence-transformers/all-MiniLM-L6-v2</code>（384 维，约 80MB，多语言轻量）</li>
+      </ul>
+      <p class="text-sm text-dim mt-4" style="margin-top: 8px;">
+        模型首次启动时从国内镜像（HfMirror / ModelScope）下载，支持断点续传和指数退避重试。下载失败时自动回退到 TF-IDF 统计算法，不影响基础功能。可通过环境变量 <code>LRC_LUOSHU_MODEL_ID</code> 切换其他模型。
+      </p>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">2.3 MCP 配置</h4>
+      <p style="line-height: 1.7; color: var(--text);">
+        LRC 通过 <strong>HTTP 模式</strong>自动为 AI 工具配置 MCP 连接。配置完成后无需手动操作。
+      </p>
+      <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li><strong>支持的 IDE</strong>：Trae、Trae CN、Cursor、VS Code、CodeBuddy 等 36+ 工具。</li>
+        <li><strong>配置位置</strong>：用户级配置（<code>~/.trae/mcp.json</code> 等），对所有项目生效。</li>
+        <li><strong>部分 IDE 限制</strong>：Cursor、VS Code 需在项目目录下手动创建 <code>mcp.json</code>，LRC 无法自动写入项目级配置。</li>
+        <li><strong>规则文件</strong>：LRC 会自动为已安装的 AI 工具写入全局规则文件（如 <code>~/.trae-cn/user_rules/rules.md</code>），让 AI 知道如何使用记忆工具。</li>
+      </ul>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">2.4 数据存储位置</h4>
+      <p style="line-height: 1.7; color: var(--text);">
+        LRC 的数据完全存储在本地，路径如下：
+      </p>
+      <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li><strong>项目模式</strong>：<code>~/.loong-recall/projects/{项目指纹}/data/</code></li>
+        <li><strong>全局模式</strong>：<code>~/.loong-recall/global/data/</code></li>
+        <li><strong>旧版兼容模式</strong>：<code>&lt;项目目录&gt;/.loong-recall/data/</code></li>
+        <li><strong>Windows</strong>：<code>%USERPROFILE%\.loong-recall\</code></li>
+        <li><strong>Linux / macOS</strong>：<code>~/.loong-recall/</code></li>
+      </ul>
+      <p class="text-sm text-dim mt-4" style="margin-top: 8px;">
+        点击仪表盘右下角的"数据目录"路径可直接打开该文件夹。
+      </p>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">2.5 端口自适应</h4>
+      <p style="line-height: 1.7; color: var(--text);">
+        LRC 默认使用 <code>3099</code> 端口。若端口被占用，会自动尝试 <code>3100-3198</code> 范围内的端口，无需手动配置。
+      </p>
+    </div>
+
+    <!-- ==================== 3. 常见问题（FAQ） ==================== -->
+    <div class="card">
+      <div class="card-title"><img src="/assets/icons/icon-info.svg" alt="" width="18" height="18"> 三、常见问题（FAQ）</div>
+
+      <details style="margin: 8px 0; padding: 10px 14px; background: var(--lrc-宣纸-300); border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500);">
+        <summary style="cursor: pointer; font-weight: 600; color: var(--ink);">Q1：为什么 AI 工具提示"无法连接到 LRC 服务"？</summary>
+        <div style="margin-top: 10px; line-height: 1.7; color: var(--text);">
+          <p><strong>可能原因</strong>：</p>
+          <ol style="padding-left: 22px;">
+            <li>LRC 后台服务未启动 → 点击仪表盘左下角"已停止 / 不可达"启动服务。</li>
+            <li>端口被占用 → LRC 会自动尝试其他端口，但 MCP 配置可能仍指向旧端口，请重新配置。</li>
+            <li>防火墙拦截 → 检查防火墙是否允许 <code>127.0.0.1:3099</code> 的本地通信。</li>
+          </ol>
+        </div>
+      </details>
+
+      <details style="margin: 8px 0; padding: 10px 14px; background: var(--lrc-宣纸-300); border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500);">
+        <summary style="cursor: pointer; font-weight: 600; color: var(--ink);">Q2：API Key 是否安全？会被上传吗？</summary>
+        <div style="margin-top: 10px; line-height: 1.7; color: var(--text);">
+          <p>API Key 使用 <strong>AES-256-GCM</strong> 加密存储在本地配置文件中，<strong>绝不会</strong>上传到任何服务器。LRC 是本地优先的应用，所有数据完全存储在你的电脑上。</p>
+        </div>
+      </details>
+
+      <details style="margin: 8px 0; padding: 10px 14px; background: var(--lrc-宣纸-300); border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500);">
+        <summary style="cursor: pointer; font-weight: 600; color: var(--ink);">Q3：不配置 LLM 能用吗？</summary>
+        <div style="margin-top: 10px; line-height: 1.7; color: var(--text);">
+          <p>可以。不配置 LLM 也能使用基础的代码搜索和记忆存储功能。配置 LLM 仅用于增强<strong>自然语言查询</strong>的翻译能力（将"这个项目的认证逻辑在哪里"翻译为精确的检索向量）。</p>
+        </div>
+      </details>
+
+      <details style="margin: 8px 0; padding: 10px 14px; background: var(--lrc-宣纸-300); border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500);">
+        <summary style="cursor: pointer; font-weight: 600; color: var(--ink);">Q4：切换项目后，之前的记忆还在吗？</summary>
+        <div style="margin-top: 10px; line-height: 1.7; color: var(--text);">
+          <p>在。LRC 通过<strong>项目指纹</strong>为每个项目独立存储记忆。切换到新项目时，新项目有独立的记忆空间；切回原项目时，原项目的记忆完整保留。</p>
+        </div>
+      </details>
+
+      <details style="margin: 8px 0; padding: 10px 14px; background: var(--lrc-宣纸-300); border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500);">
+        <summary style="cursor: pointer; font-weight: 600; color: var(--ink);">Q5：LRC 支持哪些 AI 工具？</summary>
+        <div style="margin-top: 10px; line-height: 1.7; color: var(--text);">
+          <p>支持 36+ 工具，包括：</p>
+          <ul style="padding-left: 22px;">
+            <li><strong>IDE 类</strong>：Trae、Trae CN、Cursor、VS Code、JetBrains 系列、Sublime Text、Vim/Neovim、Zed</li>
+            <li><strong>CLI 类</strong>：Claude Code CLI、Qwen Code、Aider、Continue.dev、Cline</li>
+            <li><strong>Agent 类</strong>：Windsurf、Cody Sourcegraph、Tabnine、Codeium、Replit AI、DeepSeek Coder</li>
+          </ul>
+          <p>对于不支持 MCP 的工具（如 Vim），LRC 会提供手动配置指南。</p>
+        </div>
+      </details>
+
+      <details style="margin: 8px 0; padding: 10px 14px; background: var(--lrc-宣纸-300); border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500);">
+        <summary style="cursor: pointer; font-weight: 600; color: var(--ink);">Q6：如何备份/迁移记忆数据？</summary>
+        <div style="margin-top: 10px; line-height: 1.7; color: var(--text);">
+          <p>两种方式：</p>
+          <ol style="padding-left: 22px;">
+            <li><strong>UI 方式</strong>：在仪表盘"设置"标签页点击"备份记忆"按钮，会下载 JSON 备份文件。</li>
+            <li><strong>命令行</strong>：<code>code-memory-server --export backup.json</code> 和 <code>code-memory-server --import backup.json</code></li>
+          </ol>
+          <p>也可以直接复制 <code>~/.loong-recall/</code> 目录到新机器。</p>
+        </div>
+      </details>
+
+      <details style="margin: 8px 0; padding: 10px 14px; background: var(--lrc-宣纸-300); border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500);">
+        <summary style="cursor: pointer; font-weight: 600; color: var(--ink);">Q7：服务启动后 AI 工具仍然连不上怎么办？</summary>
+        <div style="margin-top: 10px; line-height: 1.7; color: var(--text);">
+          <p>排查步骤：</p>
+          <ol style="padding-left: 22px;">
+            <li>确认仪表盘左下角显示"运行中"。</li>
+            <li>在 AI 工具中检查 MCP 服务器列表是否包含 LRC。</li>
+            <li>重启 AI 工具（部分 IDE 修改 MCP 配置后需要重启）。</li>
+            <li>查看 LRC Desktop 设置面板中的"MCP 配置"是否指向正确端口。</li>
+            <li>如仍无法解决，点击"重新启动后台服务"按钮重启 sidecar。</li>
+          </ol>
+        </div>
+      </details>
+
+      <details style="margin: 8px 0; padding: 10px 14px; background: var(--lrc-宣纸-300); border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500);">
+        <summary style="cursor: pointer; font-weight: 600; color: var(--ink);">Q8：本地语义模型如何下载？是否会联网？</summary>
+        <div style="margin-top: 10px; line-height: 1.7; color: var(--text);">
+          <p>LRC 内置本地小模型（语义嵌入模型），无需用户配置。中文环境默认使用 <code>BAAI/bge-small-zh</code>（约 95MB），其他语言使用 <code>sentence-transformers/all-MiniLM-L6-v2</code>（约 80MB）。</p>
+          <p>模型首次启动时从国内镜像（HfMirror / ModelScope）下载，支持断点续传和指数退避重试（2s/4s/8s）。下载失败时自动回退到 TF-IDF 统计算法，不影响基础功能。可通过环境变量 <code>LRC_LUOSHU_MODEL_ID</code> 切换其他模型。</p>
+          <p>模型下载仅在首次使用时发生，之后完全离线运行，数据不会离开你的电脑。</p>
+        </div>
+      </details>
+    </div>
+
+    <!-- ==================== 4. 使用技巧 ==================== -->
+    <div class="card">
+      <div class="card-title"><img src="/assets/icons/icon-smile.svg" alt="" width="18" height="18"> 四、使用技巧</div>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">4.1 高效记忆的写法</h4>
+      <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li><strong>具体而非抽象</strong>：<code>"认证模块位于 src/auth/jwt.rs，核心函数是 issue_token()"</code> 优于 <code>"项目有认证功能"</code>。</li>
+        <li><strong>包含文件路径</strong>：让 AI 在后续会话中能精确定位。</li>
+        <li><strong>记录决策原因</strong>：<code>"选择 PostgreSQL 因为需要事务支持"</code> 比 <code>"使用 PostgreSQL"</code> 更有价值。</li>
+        <li><strong>分批记录</strong>：将复杂信息拆成多条小记忆，LRC 会自动关联。</li>
+      </ul>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">4.2 自然语言搜索技巧</h4>
+      <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li><strong>问"在哪里"</strong>：<code>"用户认证的逻辑在哪里？"</code></li>
+        <li><strong>问"是什么"</strong>：<code>"这个项目的数据库 schema 是什么？"</code></li>
+        <li><strong>问"为什么"</strong>：<code>"为什么用 JWT 而不是 session？"</code></li>
+        <li><strong>问"如何做"</strong>：<code>"如何添加一个新的 API 端点？"</code></li>
+      </ul>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">4.3 系统托盘管理</h4>
+      <p style="line-height: 1.7; color: var(--text);">
+        LRC 设计为后台静默运行，关闭主窗口后可通过<strong>系统托盘图标</strong>（任务栏右下角）右键菜单管理：
+      </p>
+      <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li>双击托盘图标 → 打开仪表盘</li>
+        <li>右键 → 显示主窗口 / 退出 LRC</li>
+        <li>托盘图标颜色反映服务状态（绿色=运行中，黄色=启动中，红色=未运行）</li>
+      </ul>
+    </div>
+
+    <!-- ==================== 5. REST API 参考 ==================== -->
+    <div class="card">
+      <div class="card-title"><img src="/assets/icons/icon-audit.svg" alt="" width="18" height="18"> 五、REST API 参考</div>
+      <p class="text-sm text-dim mt-4" style="margin-top:0; margin-bottom: 12px;">
+        以下端点供开发者集成与自动化测试使用。普通用户无需关注。
+      </p>
       <div class="table-wrap">
         <table>
           <thead>
@@ -368,48 +890,107 @@
         &nbsp;|&nbsp; 可通过 URL 参数 <code>?api=http://xxx:3099</code> 覆盖
       </p>
     </div>
+
+    <!-- ==================== 6. 更多资源 ==================== -->
+    <div class="card">
+      <div class="card-title"><img src="/assets/icons/icon-info.svg" alt="" width="18" height="18"> 六、更多资源</div>
+      <ul style="line-height: 1.9; padding-left: 22px; color: var(--text);">
+        <li><strong>信任中心</strong>：在左侧导航栏点击"信任中心"，验证数据存储位置与隐私保护。</li>
+        <li><strong>船长日志</strong>：一键生成项目记忆健康报告，了解 LRC 的工作状态。</li>
+        <li><strong>基准报告</strong>：查看 LRC 在标准化测试集上的性能数据。</li>
+        <li><strong>系统状态</strong>：实时查看 ML 模型、编码器、缓存状态与系统模式。</li>
+        <li><strong>反馈</strong>：在仪表盘"反馈"区域提交你的使用体验与建议。</li>
+      </ul>
+    </div>
   </section>
 
   <!-- ========== 基准报告标签页 ========== -->
   <section class="tab-content" id="tab-benchmarks">
     <!-- 叙事导引：从裁判到导游 -->
-    <div class="section narrative-intro">
-      <h2>LRC 基准报告</h2>
-      <div class="narrative-box">
-        <p class="narrative-lead">我们发现，当前所有 AI 记忆系统都存在三个根本性空白：</p>
-        <ul class="narrative-gaps">
-          <li><strong>无法演化</strong>——它们只是存储，从不"反思"记忆之间的关系</li>
-          <li><strong>污染扩散</strong>——无关噪声会混入检索结果，污染后续的推理链路</li>
-          <li><strong>隐私不透明</strong>——用户的数据去了哪里、被如何使用，无法验证</li>
-        </ul>
+    <div class="section narrative-section">
+      <div class="section-header">
+        <h2 class="section-title">LRC 基准报告</h2>
+        <p class="section-subtitle">一套开源测试标准，衡量记忆系统的真实能力</p>
+      </div>
+      <div class="narrative-card">
+        <div class="narrative-lead-wrap">
+          <span class="narrative-quote">"</span>
+          <p class="narrative-lead">我们发现，当前所有 AI 记忆系统都存在三个根本性空白：</p>
+        </div>
+        <div class="gap-cards">
+          <div class="gap-card">
+            <div class="gap-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+            </div>
+            <div class="gap-content">
+              <h4>无法演化</h4>
+              <p>它们只是存储，从不"反思"记忆之间的关系</p>
+            </div>
+          </div>
+          <div class="gap-card">
+            <div class="gap-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
+            </div>
+            <div class="gap-content">
+              <h4>污染扩散</h4>
+              <p>无关噪声会混入检索结果，污染后续的推理链路</p>
+            </div>
+          </div>
+          <div class="gap-card">
+            <div class="gap-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            </div>
+            <div class="gap-content">
+              <h4>隐私不透明</h4>
+              <p>用户的数据去了哪里、被如何使用，无法验证</p>
+            </div>
+          </div>
+        </div>
         <p class="narrative-call">为此，我们创建了一套开源测试标准，专门衡量记忆系统在这些空白领域的能力。<strong>LRC 是第一个接受这套标准挑战的系统——它不是只通过了"自己的考试"，而是尝试回答了整个行业尚未提出的问题。</strong></p>
-        <p class="narrative-open">最重要的是，我们把整套测试框架开源了。<strong>任何其他系统都可以来跑。</strong>我们欢迎对比，欢迎挑战，欢迎所有人用同一把尺子衡量所有记忆系统。</p>
+        <div class="narrative-highlight">
+          <p>最重要的是，我们把整套测试框架开源了。<strong>任何其他系统都可以来跑。</strong>我们欢迎对比，欢迎挑战，欢迎所有人用同一把尺子衡量所有记忆系统。</p>
+        </div>
       </div>
     </div>
 
     <!-- 力量宣言 -->
     <div class="section">
-      <h2>产品力量宣言</h2>
-      <div class="power-declaration">
-        <p class="tagline">这不是一个普通的记事本，而是一个拥有"灵魂"的私人记忆管家。</p>
-        <div class="power-cards">
-          <div class="power-card">
-            <div class="power-icon">🧠</div>
-            <h3>它自己会"成长"</h3>
-            <p>在基准测试中，面对 10 次相似的故障报告，它成功提炼出了标准的排查方法论，而无需你手动整理。</p>
-            <span class="power-metric">合成触发与质量：通过</span>
+      <div class="section-header">
+        <h2 class="section-title">产品力量宣言</h2>
+        <p class="section-subtitle">这不是一个普通的记事本，而是一个拥有"灵魂"的私人记忆管家</p>
+      </div>
+      <div class="power-cards">
+        <div class="power-card">
+          <div class="power-icon">
+            <img src="/assets/icons/power-growth.svg" alt="成长" width="48" height="48">
           </div>
-          <div class="power-card">
-            <div class="power-icon">⚖️</div>
-            <h3>它懂得"取舍"</h3>
-            <p>在一年跨度的重要性测试中，高优先级的记忆总能排在检索结果的前面，而无关琐事则被自然淡忘。</p>
-            <span class="power-metric">记忆衰减有效性：通过</span>
+          <h3>它自己会"成长"</h3>
+          <p class="power-desc">在基准测试中，面对 10 次相似的故障报告，它成功提炼出了标准的排查方法论，而无需你手动整理。</p>
+          <div class="power-footer">
+            <span class="power-status-icon">✓</span>
+            <span class="power-metric-text">合成触发与质量：通过</span>
           </div>
-          <div class="power-card">
-            <div class="power-icon">🛡️</div>
-            <h3>它值得你"托付"</h3>
-            <p>在严格的隐私测试中，我们证明了你的所有记忆数据 100% 存储在本地，且所有操作都有防篡改的日志为你保驾护航。</p>
-            <span class="power-metric">数据本地化 + 审计防篡改：通过</span>
+        </div>
+        <div class="power-card">
+          <div class="power-icon">
+            <img src="/assets/icons/power-balance.svg" alt="取舍" width="48" height="48">
+          </div>
+          <h3>它懂得"取舍"</h3>
+          <p class="power-desc">在一年跨度的重要性测试中，高优先级的记忆总能排在检索结果的前面，而无关琐事则被自然淡忘。</p>
+          <div class="power-footer">
+            <span class="power-status-icon">✓</span>
+            <span class="power-metric-text">记忆衰减有效性：通过</span>
+          </div>
+        </div>
+        <div class="power-card">
+          <div class="power-icon">
+            <img src="/assets/icons/power-shield.svg" alt="托付" width="48" height="48">
+          </div>
+          <h3>它值得你"托付"</h3>
+          <p class="power-desc">在严格的隐私测试中，我们证明了你的所有记忆数据 100% 存储在本地，且所有操作都有防篡改的日志为你保驾护航。</p>
+          <div class="power-footer">
+            <span class="power-status-icon">✓</span>
+            <span class="power-metric-text">数据本地化 + 审计防篡改：通过</span>
           </div>
         </div>
       </div>
@@ -417,9 +998,25 @@
 
     <!-- 三层基准详细报告 -->
     <div class="section">
-      <h2>三层基准测试报告</h2>
+      <div class="section-header">
+        <h2 class="section-title">三层基准测试报告</h2>
+        <p class="section-subtitle">从通用检索到独有能力，再到隐私信任的全面测试</p>
+      </div>
       <div class="benchmark-summary-bar" id="benchmark-summary-bar">
         <span class="badge badge-info">加载中...</span>
+      </div>
+
+      <!-- 设计文档 5.6：三层测试切换标签（通用检索/独有能力/隐私信任） -->
+      <div class="benchmark-tabs" id="benchmark-tabs" role="tablist">
+        <button class="benchmark-tab active" data-layer-idx="0" role="tab" aria-selected="true" onclick="switchBenchmarkLayer(0)">
+          <img src="/assets/icons/icon-search-lrc.svg" alt="" width="14" height="14"> 通用检索
+        </button>
+        <button class="benchmark-tab" data-layer-idx="1" role="tab" aria-selected="false" onclick="switchBenchmarkLayer(1)">
+          <img src="/assets/icons/icon-crystallization.svg" alt="" width="14" height="14"> 独有能力
+        </button>
+        <button class="benchmark-tab" data-layer-idx="2" role="tab" aria-selected="false" onclick="switchBenchmarkLayer(2)">
+          <img src="/assets/icons/icon-trust.svg" alt="" width="14" height="14"> 隐私信任
+        </button>
       </div>
 
       <div id="benchmark-layers">
@@ -429,37 +1026,47 @@
 
     <!-- 一行复现 -->
     <div class="section">
-      <h2>一行命令，亲自验证</h2>
+      <div class="section-header">
+        <h2 class="section-title">一行命令，亲自验证</h2>
+        <p class="section-subtitle">你不必相信我们的报告，所有数据都可以在你的机器上亲自验证</p>
+      </div>
       <div class="reproducible-box">
-        <p class="reproducible-intro">你不必相信我们的报告。所有数据都可以在你的机器上，用一行命令亲自验证：</p>
         <div class="code-block">
           <code id="reproCmd">git clone https://github.com/zhibaiYingChuan/LRC.git && cd LRC && cargo test --features server benchmark_</code>
           <button class="copy-btn" onclick="copyReproCmd()">📋 复制</button>
         </div>
         <div class="reproducible-features">
           <div class="feature-item">
-            <div class="feature-icon">🔒</div>
+            <div class="feature-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            </div>
             <div class="feature-text">
               <strong>确定性运行</strong>
               <p>所有记忆使用确定性 ID，每次运行输入完全一致</p>
             </div>
           </div>
           <div class="feature-item">
-            <div class="feature-icon">🧹</div>
+            <div class="feature-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+            </div>
             <div class="feature-text">
               <strong>完全隔离</strong>
               <p>每次测试使用独立的临时目录，绝不交叉污染</p>
             </div>
           </div>
           <div class="feature-item">
-            <div class="feature-icon">📐</div>
+            <div class="feature-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            </div>
             <div class="feature-text">
               <strong>数学验证</strong>
-              <p>所有断言基于数学计算（Jaccard 相似度、衰减因子、哈希链），不依赖任何外部服务</p>
+              <p>所有断言基于数学计算，不依赖任何外部服务</p>
             </div>
           </div>
           <div class="feature-item">
-            <div class="feature-icon">🚫</div>
+            <div class="feature-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+            </div>
             <div class="feature-text">
               <strong>零依赖</strong>
               <p>不需要 GPU、不需要 API Key、不需要网络连接</p>
@@ -472,8 +1079,11 @@
 
     <!-- 竞品能力对比 -->
     <div class="section">
-      <h2>能力对比：LRC vs 业界方案</h2>
-      <p class="comparison-note">以下对比基于各系统的 <strong>公开文档和已知能力</strong>。我们欢迎任何系统使用我们的开源测试框架来挑战这些结论。</p>
+      <div class="section-header">
+        <h2 class="section-title">能力对比：LRC vs 业界方案</h2>
+        <p class="section-subtitle">基于各系统公开文档和已知能力的横向对比</p>
+      </div>
+      <p class="comparison-note">我们欢迎任何系统使用我们的开源测试框架来挑战这些结论。</p>
       <div class="comparison-table-wrapper">
         <table class="comparison-table">
           <thead>
@@ -557,54 +1167,581 @@
 
     <!-- 雷达图 -->
     <div class="section">
-      <h2>能力雷达图</h2>
+      <div class="section-header">
+        <h2 class="section-title">能力雷达图</h2>
+        <p class="section-subtitle">LRC 在八个核心维度的能力评分</p>
+      </div>
       <div class="radar-container">
         <canvas id="radarChart" width="400" height="400"></canvas>
       </div>
-      <p class="chart-note">上图展示了 LRC 在八个核心维度的能力评分。与传统记忆库相比，LRC 在隐私保护、审计安全、记忆演化等维度具有独特优势。</p>
+      <p class="chart-note">与传统记忆库相比，LRC 在隐私保护、审计安全、记忆演化等维度具有独特优势。</p>
     </div>
   </section>
 
-  <!-- ==================== 设置页面 ==================== -->
-  <section class="tab-content" id="tab-settings">
+  <!-- ==================== 设置页面（龙忆设计系统） ==================== -->
+  <!-- ========== 系统状态标签页 ========== -->
+  <section class="tab-content" id="tab-system-status">
     <div class="section">
-      <h2>⚙️ 系统设置</h2>
-      <p class="section-desc">配置 Loong Recall 的各项参数，提升搜索理解力。</p>
+      <div class="section-header">
+        <h2 class="section-title">系统状态</h2>
+        <p class="section-subtitle">实时监控龙忆 LRC 系统运行状态与健康指标</p>
+      </div>
     </div>
 
-    <!-- LLM API Key 配置（桌面端嵌入时隐藏，由桌面端向导统一管理） -->
+    <!-- 服务状态概览 -->
+    <div class="section">
+      <div class="narrative-card">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px;">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <span class="status-dot unknown" id="system-status-dot" style="width: 12px; height: 12px;"></span>
+            <div>
+              <div style="font-size: 1.2em; font-weight: 600; color: var(--lrc-墨韵-700);">服务状态</div>
+              <div style="color: var(--lrc-墨韵-400); font-size: 0.9em;" id="system-status-text">检测中...</div>
+            </div>
+          </div>
+          <div class="badge badge-info" id="system-status-badge">--</div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px;">
+          <div style="background: var(--lrc-宣纸-300); padding: 16px; border-radius: var(--radius-md);">
+            <div style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-bottom: 6px;">版本号</div>
+            <div style="font-size: 1.2em; font-weight: 600; color: var(--lrc-墨韵-700);" id="sys-version">v0.6.0</div>
+          </div>
+          <div style="background: var(--lrc-宣纸-300); padding: 16px; border-radius: var(--radius-md);">
+            <div style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-bottom: 6px;">运行时长</div>
+            <div style="font-size: 1.2em; font-weight: 600; color: var(--lrc-墨韵-700);" id="sys-uptime">--</div>
+          </div>
+          <div style="background: var(--lrc-宣纸-300); padding: 16px; border-radius: var(--radius-md);">
+            <div style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-bottom: 6px;">数据目录</div>
+            <div style="font-size: 0.95em; font-weight: 600; color: var(--lrc-墨韵-700); font-family: monospace;" id="sys-data-dir-settings">--</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ML 模型状态 -->
+    <div class="section">
+      <div class="section-header" style="text-align: left;">
+        <h3 class="section-title" style="font-size: 1.1em;">模型与编码</h3>
+      </div>
+      <div class="power-cards">
+        <div class="power-card">
+          <div class="power-card-icon">
+            <img src="/assets/icons/icon-memory.svg" alt="" width="32" height="32">
+          </div>
+          <div class="power-card-title">ML 模型</div>
+          <div class="power-card-value" id="sys-ml-model">--</div>
+          <div style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-top: 4px;">自然语言搜索</div>
+        </div>
+        <div class="power-card">
+          <div class="power-card-icon">
+            <img src="/assets/icons/icon-crystallization.svg" alt="" width="32" height="32">
+          </div>
+          <div class="power-card-title">编码器</div>
+          <div class="power-card-value" id="sys-encoder">--</div>
+          <div style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-top: 4px;">向量编码类型</div>
+        </div>
+        <div class="power-card">
+          <div class="power-card-icon">
+            <img src="/assets/icons/icon-captain-log.svg" alt="" width="32" height="32">
+          </div>
+          <div class="power-card-title">缓存状态</div>
+          <div class="power-card-value" id="sys-cache">--</div>
+          <div style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-top: 4px;">内存缓存</div>
+        </div>
+        <div class="power-card">
+          <div class="power-card-icon">
+            <img src="/assets/icons/icon-health.svg" alt="" width="32" height="32">
+          </div>
+          <div class="power-card-title">编码质量</div>
+          <div class="power-card-value" id="sys-quality">--</div>
+          <div style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-top: 4px;">搜索准确率</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 系统模式 -->
+    <div class="section">
+      <div class="section-header" style="text-align: left;">
+        <h3 class="section-title" style="font-size: 1.1em;">系统模式</h3>
+      </div>
+      <div class="narrative-card">
+        <div style="display: flex; align-items: center; gap: 16px;">
+          <div style="width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, var(--lrc-金色-400), var(--lrc-金色-600)); display: flex; align-items: center; justify-content: center;">
+            <img src="/assets/icons/icon-bagua.svg" alt="" width="28" height="28" style="filter: brightness(0) invert(1);">
+          </div>
+          <div>
+            <div style="font-size: 1.1em; font-weight: 600; color: var(--lrc-墨韵-700);" id="sys-mode-name">--</div>
+            <div style="color: var(--lrc-墨韵-400); font-size: 0.9em;" id="sys-mode-desc">--</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 记忆库统计 -->
+    <div class="section">
+      <div class="section-header" style="text-align: left;">
+        <h3 class="section-title" style="font-size: 1.1em;">记忆库统计</h3>
+      </div>
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px;">
+        <div style="background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); border-radius: var(--radius-lg); padding: 20px; text-align: center;">
+          <div style="font-size: 2em; font-weight: 700; color: var(--lrc-金色-600);" id="stat-total-memories">--</div>
+          <div style="color: var(--lrc-墨韵-500); font-size: 0.9em; margin-top: 4px;">总记忆数</div>
+        </div>
+        <div style="background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); border-radius: var(--radius-lg); padding: 20px; text-align: center;">
+          <div style="font-size: 2em; font-weight: 700; color: var(--lrc-玉色-600);" id="stat-crystallizations">--</div>
+          <div style="color: var(--lrc-墨韵-500); font-size: 0.9em; margin-top: 4px;">结晶次数</div>
+        </div>
+        <div style="background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); border-radius: var(--radius-lg); padding: 20px; text-align: center;">
+          <div style="font-size: 2em; font-weight: 700; color: var(--lrc-朱砂-600);" id="stat-decays">--</div>
+          <div style="color: var(--lrc-墨韵-500); font-size: 0.9em; margin-top: 4px;">衰减次数</div>
+        </div>
+        <div style="background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); border-radius: var(--radius-lg); padding: 20px; text-align: center;">
+          <div style="font-size: 2em; font-weight: 700; color: var(--lrc-水蓝-600);" id="stat-syntheses">--</div>
+          <div style="color: var(--lrc-墨韵-500); font-size: 0.9em; margin-top: 4px;">合成次数</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== MCP配置标签页 ========== -->
+  <section class="tab-content" id="tab-project-switch">
+    <div class="section">
+      <div class="section-header" style="text-align: left;">
+        <h2 class="section-title"><img src="/assets/icons/icon-project.svg" alt="" width="24" height="24" style="vertical-align:middle; margin-right: 10px;"> MCP配置</h2>
+        <p class="section-subtitle">配置 IDE & Agent 工具的 MCP 连接，选择项目并自动启动服务</p>
+      </div>
+    </div>
+
+    <!-- 两条路径选择 -->
+    <div class="section">
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 32px;">
+        <!-- 路径 1：完整配置 -->
+        <div class="narrative-card" style="cursor: pointer; border: 2px solid var(--lrc-宣纸-500); transition: all 0.3s ease;" onmouseover="this.style.borderColor='var(--lrc-金色-400)'" onmouseout="this.style.borderColor='var(--lrc-宣纸-500)'" onclick="startFullSetup()">
+          <div style="text-align: center; padding: 24px;">
+            <div style="display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, var(--lrc-金色-400), var(--lrc-金色-600)); color: white; font-weight: 700; font-size: 1.2em; margin-bottom: 16px;">
+              <img src="/assets/icons/icon-settings.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <h4 style="margin: 0 0 8px 0; color: var(--lrc-墨韵-700); font-size: 1.1em;">完整配置</h4>
+            <p style="margin: 0 0 16px 0; color: var(--lrc-墨韵-500); font-size: 0.9em; line-height: 1.6;">
+              检测 IDE & Agent 工具 + 选项目 → 配置 LLM（可选）→ 自动配置 <span class="term-tooltip">MCP<span class="tooltip-content">模型上下文协议（Model Context Protocol），一种让 AI 工具安全访问本地资源的开放协议。龙忆（LRC）通过 MCP 为 IDE 和 Agent 提供代码记忆检索能力。</span></span> 并启动
+            </p>
+            <p style="margin: 0; color: var(--lrc-金色-600); font-size: 0.85em; font-weight: 600;">
+              约 30 秒，推荐首次使用
+            </p>
+          </div>
+        </div>
+
+        <!-- 路径 2：快速上手 -->
+        <div class="narrative-card" style="cursor: pointer; border: 2px solid var(--lrc-宣纸-500); transition: all 0.3s ease;" onmouseover="this.style.borderColor='var(--lrc-玉色-400)'" onmouseout="this.style.borderColor='var(--lrc-宣纸-500)'" onclick="startQuickSetup()">
+          <div style="text-align: center; padding: 24px;">
+            <div style="display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, var(--lrc-玉色-400), var(--lrc-玉色-600)); color: white; font-weight: 700; font-size: 1.2em; margin-bottom: 16px;">
+              <img src="/assets/icons/icon-lightning.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <h4 style="margin: 0 0 8px 0; color: var(--lrc-墨韵-700); font-size: 1.1em;">快速上手</h4>
+            <p style="margin: 0 0 16px 0; color: var(--lrc-墨韵-500); font-size: 0.9em; line-height: 1.6;">
+              跳过检测 → 直接选项目文件夹 → 自动配置 <span class="term-tooltip">MCP<span class="tooltip-content">模型上下文协议（Model Context Protocol），一种让 AI 工具安全访问本地资源的开放协议。龙忆（LRC）通过 MCP 为 IDE 和 Agent 提供代码记忆检索能力。</span></span> 并启动
+            </p>
+            <p style="margin: 0; color: var(--lrc-玉色-600); font-size: 0.85em; font-weight: 600;">
+              约 10 秒，老手推荐
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <p style="text-align: center; color: var(--lrc-墨韵-400); font-size: 0.85em; margin-bottom: 32px;">
+        <img src="/assets/icons/icon-info.svg" alt="" width="14" height="14" style="vertical-align: middle; margin-right: 4px; opacity: 0.7;"> 配置只需做一次，以后打开直接进入「已就绪」状态。只有切换项目时才需要重新配置。
+      </p>
+    </div>
+
+    <!-- 配置步骤指示器 -->
+    <div class="section" id="setup-steps-section" style="display: none;">
+      <div class="narrative-card">
+        <div style="display: flex; align-items: center; justify-content: center; gap: 16px; margin-bottom: 32px;">
+          <div class="step-indicator active" id="step-1">
+            <div class="step-number">1</div>
+            <div class="step-label">检测 IDE & Agent</div>
+          </div>
+          <div style="flex: 1; height: 2px; background: var(--lrc-宣纸-500); max-width: 80px;" id="step-line-1"></div>
+          <div class="step-indicator" id="step-2">
+            <div class="step-number">2</div>
+            <div class="step-label">配置 LLM</div>
+          </div>
+          <div style="flex: 1; height: 2px; background: var(--lrc-宣纸-500); max-width: 80px;" id="step-line-2"></div>
+          <div class="step-indicator" id="step-3">
+            <div class="step-number">✓</div>
+            <div class="step-label">完成配置</div>
+          </div>
+        </div>
+
+        <!-- 步骤 1：检测 IDE & Agent 工具并选择项目 -->
+        <div id="setup-step-1">
+          <h3 style="margin: 0 0 24px 0; text-align: center; color: var(--lrc-墨韵-700); font-family: var(--font-serif);">
+            第 1 步：检测 IDE & Agent 工具并选择项目
+          </h3>
+          <p style="text-align: center; color: var(--lrc-墨韵-500); margin-bottom: 32px;">
+            龙忆（LRC）将扫描你电脑上的 IDE 和 Agent 工具，并自动检测对应项目。勾选你需要的工具和项目即可。
+          </p>
+
+          <!-- IDE & Agent 工具检测 -->
+          <div style="margin-bottom: 32px;">
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px;">
+              <img src="/assets/icons/icon-search.svg" alt="" width="20" height="20" style="opacity: 0.7;">
+              <h4 style="margin: 0; color: var(--lrc-墨韵-700); font-size: 1em;">IDE & Agent 工具</h4>
+              <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">已安装且支持 <span class="term-tooltip">MCP<span class="tooltip-content">模型上下文协议（Model Context Protocol），一种让 AI 工具安全访问本地资源的开放协议。龙忆（LRC）通过 MCP 为 IDE 和 Agent 提供代码记忆检索能力。</span></span> 的工具会自动勾选</span>
+            </div>
+            <div id="ai-tools-list" style="background: var(--lrc-宣纸-300); border-radius: var(--radius-md); padding: 20px; text-align: center;">
+              <p style="color: var(--lrc-墨韵-400); margin: 0;">正在扫描工具...</p>
+            </div>
+          </div>
+
+          <!-- 索引项目 -->
+          <div style="margin-bottom: 32px;">
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px;">
+              <img src="/assets/icons/icon-folder.svg" alt="" width="20" height="20" style="opacity: 0.7;">
+              <h4 style="margin: 0; color: var(--lrc-墨韵-700); font-size: 1em;">索引项目</h4>
+              <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">选择要让龙忆（LRC）记住代码的项目</span>
+            </div>
+
+            <!-- 选择文件夹按钮 -->
+            <div style="margin-bottom: 16px;">
+              <button class="btn btn-outline" onclick="selectProjectFolder()">
+                <img src="/assets/icons/icon-folder.svg" alt="" width="16" height="16" style="vertical-align: middle; margin-right: 6px; opacity: 0.8;"> 选择文件夹...
+              </button>
+            </div>
+
+            <!-- 已选项目列表 -->
+            <div id="selected-projects" style="background: var(--lrc-宣纸-300); border-radius: var(--radius-md); padding: 16px;">
+              <p style="color: var(--lrc-墨韵-400); margin: 0; text-align: center;">暂未选择项目</p>
+            </div>
+          </div>
+
+          <!-- 下一步按钮 -->
+          <div style="text-align: center;">
+            <button class="btn btn-primary" onclick="goToStep(2)" id="step-1-next-btn" disabled style="opacity: 0.5; cursor: not-allowed;">
+              下一步
+            </button>
+          </div>
+        </div>
+
+        <!-- 步骤 2：配置 LLM -->
+        <div id="setup-step-2" style="display: none;">
+          <h3 style="margin: 0 0 24px 0; text-align: center; color: var(--lrc-墨韵-700); font-family: var(--font-serif);">
+            第 2 步：配置 LLM（可选）
+          </h3>
+          <p style="text-align: center; color: var(--lrc-墨韵-500); margin-bottom: 32px;">
+            配置 LLM 以启用自然语言搜索代码。不配置也可以使用基础功能。
+          </p>
+
+          <div style="max-width: 500px; margin: 0 auto 32px auto;">
+            <div class="form-group">
+              <label for="setup-llm-provider">选择提供商</label>
+              <select id="setup-llm-provider" class="form-select" onchange="updateSetupLlmFields()">
+                <option value="none">暂不配置</option>
+                <option value="deepseek">DeepSeek（推荐）</option>
+                <option value="qwen">通义千问</option>
+                <option value="zhipu">智谱 GLM</option>
+                <option value="hunyuan">腾讯混元</option>
+              </select>
+            </div>
+            <div id="setup-llm-api-key-group" style="display: none;">
+              <div class="form-group">
+                <label for="setup-llm-api-key">API Key</label>
+                <input type="password" id="setup-llm-api-key" class="form-input" placeholder="sk-...">
+              </div>
+            </div>
+          </div>
+
+          <div style="text-align: center; display: flex; gap: 12px; justify-content: center;">
+            <button class="btn btn-outline" onclick="goToStep(1)">上一步</button>
+            <button class="btn btn-primary" onclick="finishSetup()">完成配置</button>
+          </div>
+        </div>
+
+        <!-- 步骤 3：完成 -->
+        <div id="setup-step-3" style="display: none; text-align: center;">
+          <div style="margin-bottom: 24px;">
+            <img src="/assets/icons/icon-smile.svg" alt="" width="64" height="64" style="filter: brightness(0) saturate(100%) invert(72%) sepia(52%) saturate(500%) hue-rotate(5deg) brightness(90%) contrast(85%);">
+          </div>
+          <h3 style="margin: 0 0 16px 0; color: var(--lrc-墨韵-700); font-family: var(--font-serif); font-size: 1.5em;">
+            配置完成！
+          </h3>
+          <p style="color: var(--lrc-墨韵-500); margin-bottom: 32px; line-height: 1.8;">
+            龙忆（LRC）正在索引你的代码，完成后即可使用。<br>
+            你可以随时在设置中修改配置。
+          </p>
+          <button class="btn btn-primary" onclick="switchToTab('dashboard')">
+            进入仪表盘
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 注意事项 -->
+    <div class="section">
+      <div class="narrative-card" style="background: rgba(212, 168, 67, 0.05); border: 1px solid var(--lrc-金色-300);">
+        <div style="display: flex; align-items: flex-start; gap: 12px;">
+          <img src="/assets/icons/icon-warning.svg" alt="" width="28" height="28" style="flex-shrink: 0; margin-top: 2px; filter: brightness(0) saturate(100%) invert(72%) sepia(52%) saturate(500%) hue-rotate(5deg) brightness(90%) contrast(85%);">
+          <div>
+            <h4 style="margin: 0 0 8px 0; color: var(--lrc-墨韵-700);">注意事项</h4>
+            <p style="margin: 0; color: var(--lrc-墨韵-500); font-size: 0.9em; line-height: 1.8;">
+              部分 IDE（如 Cursor、VS Code）需在项目目录下手动创建 mcp.json 文件，龙忆（LRC）无法自动写入项目级配置。
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== 设置标签页 ========== -->
+  <section class="tab-content" id="tab-settings">
+    <div class="section">
+      <div class="section-header" style="text-align: left;">
+        <h2 class="section-title"><img src="/assets/icons/icon-bagua.svg" alt="" width="24" height="24" style="vertical-align:middle; margin-right: 10px;"> 系统设置</h2>
+        <p class="section-subtitle">配置龙忆 Loong Recall 的各项参数，提升搜索理解力</p>
+      </div>
+    </div>
+
+    <!-- 语义编码模型（核心配置） -->
+    <div class="section" id="embedder-section">
+      <div class="narrative-card">
+        <div class="settings-section-header">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="settings-icon-badge" style="background: linear-gradient(135deg, var(--lrc-水蓝-400), var(--lrc-水蓝-600));">
+              <img src="/assets/icons/icon-embed.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <div>
+              <h3 class="settings-section-title">
+                <span class="term-tooltip">语义编码模型
+                  <span class="tooltip-content">将文本转换为向量的AI模型，用于语义理解和相似度检索。龙忆（LRC）使用它将代码和记忆编码为向量，实现智能搜索。</span>
+                </span>
+              </h3>
+              <p class="settings-section-desc">本地小模型，用于代码语义翻译与向量编码，决定记忆检索精度</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 模型状态卡片 -->
+        <div class="ollama-status-card">
+          <div class="ollama-status-header">
+            <div style="display: flex; align-items: center; gap: 12px;">
+              <span class="ollama-status-dot" id="embedder-status-dot"></span>
+              <div>
+                <div class="ollama-status-title">当前模型</div>
+                <div class="ollama-status-text" id="embedder-status-text">检测中...</div>
+              </div>
+            </div>
+            <button class="btn btn-outline btn-sm" onclick="checkEmbedderStatus()">
+              检测状态
+            </button>
+          </div>
+        </div>
+
+        <!-- 选择模型 -->
+        <div style="margin-bottom: 20px;">
+          <div style="font-weight: 600; color: var(--lrc-墨韵-700); margin-bottom: 12px; font-size: 0.95em;">
+            选择模型
+          </div>
+          <div class="provider-grid">
+            <div class="provider-card active" data-embedder="bge-small-zh" onclick="selectEmbedderModel('BAAI/bge-small-zh')">
+              <div class="provider-card-header">
+                <span class="provider-name">BGE-small-zh</span>
+                <span class="provider-recommended">中文首选</span>
+              </div>
+              <p class="provider-card-desc">中文通用，512维，~100MB，精度高速度快</p>
+            </div>
+            <div class="provider-card" data-embedder="minilm-l6" onclick="selectEmbedderModel('sentence-transformers/all-MiniLM-L6-v2')">
+              <div class="provider-card-header">
+                <span class="provider-name">MiniLM-L6-v2</span>
+              </div>
+              <p class="provider-card-desc">英文通用，384维，~80MB，轻量快速</p>
+            </div>
+            <div class="provider-card" data-embedder="multilingual-e5" onclick="selectEmbedderModel('intfloat/multilingual-e5-small')">
+              <div class="provider-card-header">
+                <span class="provider-name">multilingual-e5</span>
+              </div>
+              <p class="provider-card-desc">多语言，384维，~120MB，支持100+语言</p>
+            </div>
+            <div class="provider-card" data-embedder="bge-base-zh" onclick="selectEmbedderModel('BAAI/bge-base-zh')">
+              <div class="provider-card-header">
+                <span class="provider-name">BGE-base-zh</span>
+                <span style="font-size: 0.75em; padding: 2px 8px; background: var(--lrc-宣纸-500); border-radius: 12px; color: var(--lrc-墨韵-500);">高精度</span>
+              </div>
+              <p class="provider-card-desc">中文高精度，768维，~400MB，效果最佳</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- 操作说明 -->
+        <div style="background: var(--lrc-宣纸-300); border-radius: var(--radius-md); padding: 16px 20px; margin-bottom: 20px; border-left: 4px solid var(--lrc-水蓝-400);">
+          <div style="display: flex; align-items: flex-start; gap: 10px;">
+            <img src="/assets/icons/icon-info.svg" alt="" width="22" height="22" style="flex-shrink: 0; margin-top: 2px; color: var(--lrc-水蓝-500);">
+            <div>
+              <div style="font-weight: 600; color: var(--lrc-墨韵-700); margin-bottom: 6px;">操作说明</div>
+              <ol style="margin: 0; padding-left: 20px; color: var(--lrc-墨韵-600); font-size: 0.9em; line-height: 1.8;">
+                <li>选择一个模型（推荐 BGE-small-zh）</li>
+                <li>点击「下载并安装」，模型将从国内镜像下载到本地</li>
+                <li>安装完成后自动生效，所有记忆将使用新模型重新编码</li>
+              </ol>
+            </div>
+          </div>
+        </div>
+
+        <!-- 下载源选择 -->
+        <div class="settings-form">
+          <div class="form-group">
+            <label for="embedder-mirror">下载源</label>
+            <select id="embedder-mirror" class="form-select" onchange="changeEmbedderMirror()">
+              <option value="hf-mirror">HF-Mirror（国内推荐，速度快）</option>
+              <option value="modelscope">ModelScope（魔搭社区）</option>
+            </select>
+            <span class="form-hint">均为国内镜像源，下载速度快</span>
+          </div>
+          <div class="form-actions">
+            <button class="btn btn-primary" onclick="downloadEmbedderModel()">
+              <img src="/assets/icons/icon-download.svg" alt="" width="16" height="16" style="vertical-align: middle; margin-right: 6px; filter: brightness(0) invert(1);"> 下载并安装
+            </button>
+            <button class="btn btn-outline" onclick="applyEmbedderModel()">
+              应用已下载的模型
+            </button>
+            <button class="btn btn-outline" onclick="testEmbedderConnection()">
+              测试链接
+            </button>
+          </div>
+        </div>
+
+        <!-- 下载进度 -->
+        <div id="embedder-download-progress" style="display:none; margin-top: 16px;">
+          <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+            <span style="font-size: 0.9em; color: var(--lrc-墨韵-600);">下载中...</span>
+            <span id="embedder-download-percent" style="font-size: 0.9em; color: var(--lrc-金色-600); font-weight: 600;">0%</span>
+          </div>
+          <div style="width: 100%; height: 8px; background: var(--lrc-宣纸-400); border-radius: 4px; overflow: hidden;">
+            <div id="embedder-download-bar" style="height: 100%; width: 0%; background: linear-gradient(90deg, var(--lrc-金色-400), var(--lrc-金色-600)); border-radius: 4px; transition: width 0.3s ease;"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- LLM 查询翻译（可选） -->
     <div class="section" id="llm-setup-section">
-      <div class="feature-card">
-        <div class="feature-header">
-          <h3>🤖 LLM 查询翻译</h3>
+      <div class="narrative-card">
+        <div class="settings-section-header">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="settings-icon-badge">
+              <img src="/assets/icons/icon-llm.svg" alt="" width="24" height="24">
+            </div>
+            <div>
+              <h3 class="settings-section-title">
+                <span class="term-tooltip">LLM
+                  <span class="tooltip-content">大语言模型（Large Language Model），如 DeepSeek、通义千问等。龙忆（LRC）可选配置，用于将自然语言查询翻译为代码检索关键词，提升搜索体验。</span>
+                </span>
+                 查询翻译（可选）
+              </h3>
+              <p class="settings-section-desc">配置 LLM API 后，可以用自然语言搜索代码</p>
+            </div>
+          </div>
           <span id="llm-status-badge" class="badge badge-info">未配置</span>
         </div>
-        <p class="feature-desc">
-          配置 LLM API 后，可以用自然语言搜索代码（如"帮我查上次登录相关的逻辑"）。
-          支持所有 OpenAI 兼容 API（OpenAI、DeepSeek、通义千问等）和 Ollama 本地模型。
-        </p>
 
-        <div class="form-group">
-          <label for="llm-provider">模型提供商</label>
-          <select id="llm-provider" class="form-select" onchange="switchLlmProvider()">
-            <option value="deepseek">DeepSeek（推荐，国产性价比之王）</option>
-            <option value="qwen">通义千问（阿里云）</option>
-            <option value="zhipu">智谱 GLM（清华系）</option>
-            <option value="minimax">MiniMax（海螺AI同款）</option>
-            <option value="moonshot">Moonshot / Kimi（超长上下文）</option>
-            <option value="openai">OpenAI（GPT-4o）</option>
-            <option value="ollama">Ollama 本地模型（免费，数据不出电脑）</option>
-            <option value="custom">自定义 API（兼容 OpenAI 格式）</option>
-          </select>
-          <span class="form-hint" id="provider-desc">国产性价比之王，代码能力极强</span>
+        <!-- 提供商分类标签 -->
+        <div class="provider-tabs">
+          <button class="provider-tab active" data-category="cloud" onclick="switchProviderCategory('cloud')">
+            <img src="/assets/icons/icon-cloud.svg" alt="" width="16" height="16" style="vertical-align: middle; margin-right: 6px; opacity: 0.8;"> 云端 API
+          </button>
+          <button class="provider-tab" data-category="custom" onclick="switchProviderCategory('custom')">
+            <img src="/assets/icons/icon-settings.svg" alt="" width="16" height="16" style="vertical-align: middle; margin-right: 6px; opacity: 0.8;"> 自定义
+          </button>
         </div>
 
-        <div id="openai-fields">
+        <!-- 提供商卡片网格 -->
+        <div class="provider-grid" id="provider-grid-cloud">
+          <div class="provider-card active" data-provider="deepseek" onclick="selectProvider('deepseek')">
+            <div class="provider-card-header">
+              <span class="provider-name">DeepSeek</span>
+              <span class="provider-recommended">推荐</span>
+            </div>
+            <p class="provider-card-desc">国产性价比之王，代码能力极强</p>
+          </div>
+          <div class="provider-card" data-provider="qwen" onclick="selectProvider('qwen')">
+            <div class="provider-card-header">
+              <span class="provider-name">通义千问</span>
+            </div>
+            <p class="provider-card-desc">阿里云出品，中文理解出色</p>
+          </div>
+          <div class="provider-card" data-provider="zhipu" onclick="selectProvider('zhipu')">
+            <div class="provider-card-header">
+              <span class="provider-name">智谱 GLM</span>
+            </div>
+            <p class="provider-card-desc">清华系，GLM 系列模型</p>
+          </div>
+          <div class="provider-card" data-provider="minimax" onclick="selectProvider('minimax')">
+            <div class="provider-card-header">
+              <span class="provider-name">MiniMax 海螺</span>
+            </div>
+            <p class="provider-card-desc">长文本支持好，性价比高</p>
+          </div>
+          <div class="provider-card" data-provider="moonshot" onclick="selectProvider('moonshot')">
+            <div class="provider-card-header">
+              <span class="provider-name">Kimi 月之暗面</span>
+            </div>
+            <p class="provider-card-desc">超长上下文，阅读能力强</p>
+          </div>
+          <div class="provider-card" data-provider="stepfun" onclick="selectProvider('stepfun')">
+            <div class="provider-card-header">
+              <span class="provider-name">阶跃星辰</span>
+            </div>
+            <p class="provider-card-desc">多模态能力强，图像理解出色</p>
+          </div>
+          <div class="provider-card" data-provider="baichuan" onclick="selectProvider('baichuan')">
+            <div class="provider-card-header">
+              <span class="provider-name">百川智能</span>
+            </div>
+            <p class="provider-card-desc">垂直领域优化，性价比高</p>
+          </div>
+          <div class="provider-card" data-provider="xunfei" onclick="selectProvider('xunfei')">
+            <div class="provider-card-header">
+              <span class="provider-name">讯飞星火</span>
+            </div>
+            <p class="provider-card-desc">科大讯飞出品，语音能力强</p>
+          </div>
+          <div class="provider-card" data-provider="hunyuan" onclick="selectProvider('hunyuan')">
+            <div class="provider-card-header">
+              <span class="provider-name">腾讯混元</span>
+            </div>
+            <p class="provider-card-desc">腾讯出品，腾讯生态深度集成</p>
+          </div>
+        </div>
+
+        <div class="provider-grid" id="provider-grid-custom" style="display:none;">
+          <div class="provider-card" data-provider="custom" onclick="selectProvider('custom')">
+            <div class="provider-card-header">
+              <span class="provider-name">自定义 API</span>
+            </div>
+            <p class="provider-card-desc">手动填写任何兼容 OpenAI 的 API 地址</p>
+          </div>
+        </div>
+
+        <!-- 隐藏的 select 用于兼容原有逻辑 -->
+        <select id="llm-provider" style="display:none;" onchange="switchLlmProvider()">
+          <option value="deepseek">DeepSeek</option>
+          <option value="qwen">通义千问</option>
+          <option value="zhipu">智谱 GLM</option>
+          <option value="minimax">MiniMax 海螺</option>
+          <option value="moonshot">Kimi 月之暗面</option>
+          <option value="stepfun">阶跃星辰</option>
+          <option value="baichuan">百川智能</option>
+          <option value="xunfei">讯飞星火</option>
+          <option value="hunyuan">腾讯混元</option>
+          <option value="custom">自定义 API</option>
+        </select>
+
+        <!-- 云端 API 配置表单 -->
+        <div id="openai-fields" class="settings-form">
           <div class="form-group">
             <label for="llm-api-key">API Key</label>
             <input type="password" id="llm-api-key" class="form-input"
               placeholder="sk-..." autocomplete="off">
-            <span class="form-hint">你的 API Key 仅存储在本地，绝不上传。</span>
+            <span class="form-hint">🔒 你的 API Key 仅存储在本地，绝不上传</span>
           </div>
           <div class="form-group">
             <label for="llm-model">模型名称</label>
@@ -616,79 +1753,95 @@
             <label for="llm-endpoint">API 端点</label>
             <input type="text" id="llm-endpoint" class="form-input"
               placeholder="https://api.deepseek.com/v1" value="https://api.deepseek.com/v1">
-            <span class="form-hint">已自动填充默认端点，如使用代理可修改。</span>
+            <span class="form-hint">已自动填充默认端点，如使用代理可修改</span>
           </div>
         </div>
 
-        <div id="ollama-fields" style="display:none">
-          <div class="form-group">
-            <label for="llm-ollama-host">Ollama 服务地址</label>
-            <input type="text" id="llm-ollama-host" class="form-input"
-              placeholder="localhost" value="localhost">
-            <span class="form-hint">Ollama 默认运行在 localhost:11434</span>
-          </div>
-          <div class="form-group">
-            <label for="llm-ollama-model">模型名称</label>
-            <input type="text" id="llm-ollama-model" class="form-input"
-              placeholder="llama3" value="llama3">
-            <span class="form-hint">常用: llama3, qwen2.5, deepseek-r1, mistral</span>
-          </div>
-        </div>
-
-        <div id="llm-config-actions" class="form-actions">
-          <button id="btn-save-llm" class="btn btn-primary" onclick="saveLlmConfig()">💾 保存配置</button>
-          <button id="btn-clear-llm" class="btn btn-secondary" onclick="clearLlmConfig()">🗑️ 清除配置</button>
+        <!-- 操作按钮 -->
+        <div class="settings-actions">
+          <button id="btn-save-llm" class="btn btn-primary" onclick="saveLlmConfig()">
+            <img src="/assets/icons/icon-save.svg" alt="" width="16" height="16" style="vertical-align:middle; margin-right: 6px;">
+            保存配置
+          </button>
+          <button id="btn-test-llm" class="btn btn-outline" onclick="testLlmConfig()">
+            <img src="/assets/icons/icon-search.svg" alt="" width="16" height="16" style="vertical-align:middle; margin-right: 6px; opacity: 0.8;">
+            测试连接
+          </button>
+          <button id="btn-clear-llm" class="btn btn-ghost" onclick="clearLlmConfig()">
+            <img src="/assets/icons/icon-delete.svg" alt="" width="16" height="16" style="vertical-align:middle; margin-right: 6px;">
+            清除配置
+          </button>
         </div>
 
         <div id="llm-config-result" class="form-result" style="display:none"></div>
       </div>
     </div>
 
-    <!-- 当前配置状态（桌面端嵌入时隐藏） -->
-    <div class="section" id="current-config-section" style="display:none">
-      <div class="feature-card">
-        <h3>📋 当前配置</h3>
-        <div id="current-config-content">
-          <p>加载中...</p>
-        </div>
-      </div>
-    </div>
-
-    <!-- V2: 项目信息（跨IDE项目识别） -->
+    <!-- 项目信息 -->
     <div class="section" id="project-info-section">
-      <div class="feature-card">
-        <h3>📊 项目信息</h3>
-        <p class="feature-desc">
-          项目指纹用于跨 IDE 识别同一项目，确保记忆数据在多 IDE 间共享。
-        </p>
-        <div class="form-group">
-          <label>项目指纹</label>
-          <div id="project-fingerprint" style="font-family: monospace; font-size: 16px; color: var(--gold); padding: 8px 0;">--</div>
-          <span class="form-hint">基于项目路径的 SHA256 哈希前 16 位，用于跨 IDE 识别同一项目</span>
+      <div class="narrative-card">
+        <div class="settings-section-header">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="settings-icon-badge" style="background: linear-gradient(135deg, var(--lrc-玉色-400), var(--lrc-玉色-600));">
+              <img src="/assets/icons/icon-chart.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <div>
+              <h3 class="settings-section-title">项目信息</h3>
+              <p class="settings-section-desc">项目指纹用于跨 IDE 识别同一项目</p>
+            </div>
+          </div>
         </div>
-        <div class="form-group">
-          <label>规范化路径</label>
-          <div id="project-canonical-path" style="font-size: 13px; color: var(--text-dim); padding: 4px 0; word-break: break-all;">--</div>
-          <span class="form-hint">跨平台一致的项目绝对路径</span>
+        <div class="info-grid">
+          <div class="info-item">
+            <div class="info-label">项目指纹</div>
+            <div class="info-value" id="project-fingerprint">--</div>
+            <div class="info-hint">基于项目路径的 SHA256 哈希前 16 位</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">规范化路径</div>
+            <div class="info-value" id="project-canonical-path" style="font-size: 0.9em;">--</div>
+            <div class="info-hint">跨平台一致的项目绝对路径</div>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- V2: 记忆备份与恢复 -->
+    <!-- 记忆备份与恢复 -->
     <div class="section" id="backup-section">
-      <div class="feature-card">
-        <h3>💾 记忆备份与恢复</h3>
-        <p class="feature-desc">
-          导出记忆数据到 JSON 文件进行备份，或从备份文件导入恢复。所有操作仅在本地执行，数据不会上传。
-        </p>
-        <div class="form-actions">
-          <button id="btn-backup-memories" class="btn btn-primary" onclick="backupMemories()">📤 导出记忆</button>
-          <input type="file" id="import-file" style="display:none" accept=".json" onchange="importMemories(event)">
-          <button id="btn-import-memories" class="btn btn-outline" onclick="document.getElementById('import-file').click()">📥 导入记忆</button>
+      <div class="narrative-card">
+        <div class="settings-section-header">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="settings-icon-badge" style="background: linear-gradient(135deg, var(--lrc-朱砂-400), var(--lrc-朱砂-600));">
+              <img src="/assets/icons/icon-save.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <div>
+              <h3 class="settings-section-title">记忆备份与恢复</h3>
+              <p class="settings-section-desc">导出或导入记忆数据，所有操作仅在本地执行</p>
+            </div>
+          </div>
+        </div>
+        <div class="backup-actions-grid">
+          <button class="backup-action-card" onclick="backupMemories()">
+            <div class="backup-icon" style="background: rgba(212, 168, 67, 0.1);">
+              <img src="/assets/icons/icon-export.svg" alt="" width="32" height="32">
+            </div>
+            <div class="backup-title">导出记忆</div>
+            <div class="backup-desc">将所有记忆数据导出为 JSON 备份文件</div>
+          </button>
+          <div style="display: none;">
+            <input type="file" id="import-file" style="display:none" accept=".json" onchange="importMemories(event)">
+          </div>
+          <button class="backup-action-card" onclick="document.getElementById('import-file').click()">
+            <div class="backup-icon" style="background: rgba(76, 164, 156, 0.1);">
+              <img src="/assets/icons/icon-import.svg" alt="" width="32" height="32" style="filter: brightness(0) saturate(100%) invert(60%) sepia(48%) saturate(400%) hue-rotate(130deg) brightness(90%) contrast(85%);">
+            </div>
+            <div class="backup-title">导入记忆</div>
+            <div class="backup-desc">从备份文件中恢复记忆数据</div>
+          </button>
         </div>
         <div id="backup-result" class="form-result" style="display:none"></div>
-        <p class="form-hint mt-4" style="font-size: 12px;">
-          提示：也可以通过命令行操作：<code>code-memory-server --export backup.json</code> 和 <code>code-memory-server --import backup.json</code>
+        <p class="form-hint" style="text-align: center; margin-top: 16px; font-size: 12px;">
+          <img src="/assets/icons/icon-info.svg" alt="" width="12" height="12" style="vertical-align: middle; margin-right: 4px; opacity: 0.6;"> 也可以通过命令行操作：<code>code-memory-server --export backup.json</code> 和 <code>code-memory-server --import backup.json</code>
         </p>
       </div>
     </div>
@@ -699,14 +1852,101 @@
 <!-- ==================== 底部状态栏 ==================== -->
 <footer class="status-bar">
   <div class="status-bar-left">
-    <span><span class="status-dot unknown" id="status-dot"></span><span id="status-text">检测中...</span></span>
-    <span>版本 <strong id="status-version">v0.2.0</strong></span>
+    <span><span class="status-dot unknown" id="status-dot"></span><span id="status-text" class="status-clickable" title="点击启动 LRC 服务">检测中...</span></span>
+    <span>版本 <strong id="status-version">v0.6.0</strong></span>
   </div>
   <div class="status-bar-right">
-    <span>数据目录：<code id="status-data-dir">--</code></span>
+    <span>数据目录：<code id="status-data-dir" class="status-clickable" title="点击打开数据目录">--</code></span>
     <span>运行时长：<span id="status-uptime">--</span></span>
   </div>
 </footer>
+
+<!-- ==================== 启动服务弹窗（v0.6.0：状态栏点击触发） ==================== -->
+<div class="modal-overlay" id="start-service-modal" hidden>
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3>启动 LRC 服务</h3>
+      <button class="modal-close" onclick="closeStartServiceModal()" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-body">
+      <p>LRC 后台服务未运行，AI 工具将无法使用记忆功能。</p>
+      <p class="modal-desc">点击下方按钮启动服务。启动后请稍候片刻，仪表盘会自动刷新。</p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" onclick="closeStartServiceModal()">取消</button>
+      <button class="btn btn-primary" id="modal-btn-start-service">启动服务</button>
+    </div>
+  </div>
+</div>
+
+  <!-- ========== 关闭主内容区 ========== -->
+  </div><!-- /.app-main -->
+
+<!-- ========== 关闭应用布局 ========== -->
+</div><!-- /.app-layout -->
+
+<!-- ==================== 系统状态浮窗（设计文档 5.2.5：右下角固定） ==================== -->
+<!-- 显示 ML 模型状态、编码器类型、缓存状态、系统模式、编码质量评分 -->
+<aside class="sys-status-float" id="sys-status-float" aria-label="系统状态">
+  <div class="sys-status-header">
+    <div class="sys-status-title">
+      <img src="/assets/icons/icon-health.svg" alt="" width="14" height="14">
+      <span>系统状态</span>
+    </div>
+    <button class="sys-status-toggle" onclick="toggleSysStatusFloat()" aria-label="折叠/展开">
+      <span id="sys-status-toggle-icon">─</span>
+    </button>
+  </div>
+  <div class="sys-status-body" id="sys-status-body">
+    <div class="sys-status-row">
+      <span class="sys-status-label">ML 模型</span>
+      <span class="sys-status-value" id="float-ml-model">--</span>
+    </div>
+    <div class="sys-status-row">
+      <span class="sys-status-label">编码器</span>
+      <span class="sys-status-value" id="float-encoder-type">--</span>
+    </div>
+    <div class="sys-status-row">
+      <span class="sys-status-label">缓存状态</span>
+      <span class="sys-status-value" id="float-cache-status">--</span>
+    </div>
+    <div class="sys-status-row">
+      <span class="sys-status-label">系统模式</span>
+      <span class="sys-status-value" id="float-sys-mode">--</span>
+    </div>
+    <div class="sys-status-row">
+      <span class="sys-status-label">编码质量</span>
+      <span class="sys-status-value" id="float-quality-score">--</span>
+      <div class="sys-status-quality-bar">
+        <div class="sys-status-quality-fill" id="float-quality-fill"></div>
+      </div>
+    </div>
+  </div>
+</aside>
+
+<!-- ==================== 手机端底部固定标签栏（设计文档 6.2：4 个主要功能 + 1 个"更多"） ==================== -->
+<nav class="mobile-tabbar">
+  <button class="tab-item active" data-tab="dashboard">
+    <img src="/assets/icons/icon-dashboard.svg" alt="">
+    <span>仪表盘</span>
+  </button>
+  <button class="tab-item" data-tab="memory-search">
+    <img src="/assets/icons/icon-search-lrc.svg" alt="">
+    <span>搜索</span>
+  </button>
+  <button class="tab-item" data-tab="trust-center">
+    <img src="/assets/icons/icon-trust.svg" alt="">
+    <span>信任</span>
+  </button>
+  <button class="tab-item" data-tab="captain-log">
+    <img src="/assets/icons/icon-captain-log.svg" alt="">
+    <span>日志</span>
+  </button>
+  <button class="tab-item" onclick="toggleNav()">
+    <img src="/assets/icons/icon-bagua.svg" alt="">
+    <span>更多</span>
+  </button>
+</nav>
 
 <!-- ==================== JavaScript ==================== -->
 <script src="app.js"></script>

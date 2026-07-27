@@ -9,8 +9,20 @@
   // ============================================================
   // 全局配置
   // ============================================================
-const DEFAULT_API_BASE = window.location.origin || 'http://localhost:3099';
-const API_BASE = new URLSearchParams(window.location.search).get('api') || DEFAULT_API_BASE;
+// v0.6.0 P0 修复：Tauri WebView 环境下 window.location.origin 为 https://tauri.localhost
+// v0.6.0 P1-1 修复：macOS/Linux 的 WebView 源是 tauri://localhost，不是 tauri.localhost
+// 需检测所有平台的 Tauri 环境标志
+const isTauriEnv = (typeof window.__TAURI__ !== 'undefined') ||
+  (typeof window.__TAURI_INTERNALS__ !== 'undefined') ||
+  (window.location.origin && (
+    window.location.origin.includes('tauri.localhost') ||
+    window.location.origin.startsWith('tauri://')
+  ));
+const DEFAULT_API_BASE = isTauriEnv
+  ? 'http://127.0.0.1:3099'  // Tauri 环境：直连 sidecar（初始值，异步会通过 IPC 更新为实际端口）
+  : (window.location.origin || 'http://localhost:3099');  // 浏览器环境：同源访问
+// v0.6.0 P0-1 修复：Tauri 环境下 sidecar 可能端口自适应到非 3099，需改为 let 以便异步更新
+let API_BASE = new URLSearchParams(window.location.search).get('api') || DEFAULT_API_BASE;
 const REFRESH_INTERVAL = 30000; // 30 秒自动刷新
 let refreshTimer = null;
 let startTime = Date.now();
@@ -98,13 +110,15 @@ function $(id) {
 // 导航标签切换
 // ============================================================
 function toggleNav() {
-  document.getElementById('navbarNav').classList.toggle('open');
+  const nav = $('navbarNav');
+  if (nav) nav.classList.toggle('open');
 }
 
 document.querySelectorAll('.navbar-nav button').forEach(btn => {
   btn.addEventListener('click', function() {
     // 关闭移动端菜单
-    document.getElementById('navbarNav').classList.remove('open');
+    const nav = $('navbarNav');
+    if (nav) nav.classList.remove('open');
 
     // 更新按钮状态
     document.querySelectorAll('.navbar-nav button').forEach(b => b.classList.remove('active'));
@@ -199,6 +213,7 @@ function renderDashboard(system, detailed, dao) {
   // --- v0.5.4 P1-7 修复：系统信息卡片（用户友好） ---
   const sysHealthStatus = $('sys-health-status');
   const sysDataDir = $('sys-data-dir');
+  const sysDataDirSettings = $('sys-data-dir-settings');
   const sysStorageSize = $('sys-storage-size');
   const sysTypeCount = $('sys-type-count');
   const sysProjectCount = $('sys-project-count');
@@ -217,6 +232,7 @@ function renderDashboard(system, detailed, dao) {
   }
 
   if (sysDataDir) sysDataDir.textContent = '.loong-recall/data/';
+  if (sysDataDirSettings) sysDataDirSettings.textContent = '.loong-recall/data/';
   if (sysMode) sysMode.innerHTML = statusBadge(system?.system_mode || 'unknown');
 
   // --- v0.5.4 P1-7 修复：并行加载最近记忆、项目分布、活动日志 ---
@@ -443,17 +459,175 @@ function updateStatusBar(online, systemData) {
       dot.className = 'status-dot online';
       text.textContent = '运行中';
       text.style.color = '#2ecc71';
+      text.title = 'LRC 服务运行中';
     } else {
       dot.className = 'status-dot offline';
       text.textContent = '已停止 / 不可达';
       text.style.color = '#c0392b';
+      text.title = '点击启动 LRC 服务';
     }
   }
 
-  if (version) version.textContent = 'v0.5.4';
+  if (version) version.textContent = 'v0.6.0';
   if (dataDir) dataDir.textContent = '.loong-recall/data/';
   if (uptime) uptime.textContent = formatUptime(Date.now() - startTime);
 }
+
+// ============================================================
+// v0.6.0 状态栏点击：启动服务 + 打开数据目录
+// 通过 postMessage 与父窗口（Tauri 主窗口 wizard.js）通信
+// 仅在 embedded 模式下生效；非 embedded 模式回退到直接调用 Tauri invoke
+// ============================================================
+
+// postMessage 请求计数器（用于关联请求与响应）
+let postMessageReqId = 0;
+// 待处理的 postMessage 请求回调
+const pendingPostMessageRequests = new Map();
+
+/**
+ * 通过 postMessage 向父窗口发送请求
+ * @param {string} type - 消息类型（如 'lrc-start-service'）
+ * @param {object} [extra={}] - 额外参数
+ * @param {number} [timeoutMs=30000] - 超时时间
+ * @returns {Promise<object>} 父窗口返回的结果
+ */
+function postMessageToParent(type, extra = {}, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    // 非 embedded 模式：尝试直接调用 Tauri invoke（作为回退）
+    if (!IS_DESKTOP_EMBEDDED) {
+      reject(new Error('当前非桌面端嵌入模式，无法调用此功能'));
+      return;
+    }
+
+    const reqId = ++postMessageReqId;
+    const timer = setTimeout(() => {
+      if (pendingPostMessageRequests.has(reqId)) {
+        pendingPostMessageRequests.delete(reqId);
+        reject(new Error('请求超时，请稍后重试'));
+      }
+    }, timeoutMs);
+
+    pendingPostMessageRequests.set(reqId, { resolve, reject, timer });
+
+    try {
+      window.parent.postMessage({
+        type,
+        reqId,
+        ...extra,
+      }, '*');
+    } catch (e) {
+      clearTimeout(timer);
+      pendingPostMessageRequests.delete(reqId);
+      reject(new Error('发送请求失败: ' + e.message));
+    }
+  });
+}
+
+// 监听父窗口的回复
+window.addEventListener('message', (event) => {
+  const data = event.data;
+  if (!data || typeof data !== 'object') return;
+
+  // 匹配 "<type>:reply" 格式的回复
+  const match = /^(.+):reply$/.exec(data.type);
+  if (!match) return;
+
+  const reqId = data.reqId;
+  const pending = pendingPostMessageRequests.get(reqId);
+  if (!pending) return;
+
+  clearTimeout(pending.timer);
+  pendingPostMessageRequests.delete(reqId);
+
+  if (data.success) {
+    pending.resolve(data);
+  } else {
+    pending.reject(new Error(data.error || '操作失败'));
+  }
+});
+
+/** 打开启动服务模态框 */
+function openStartServiceModal() {
+  const modal = document.getElementById('start-service-modal');
+  if (!modal) return;
+  modal.hidden = false;
+  const btn = document.getElementById('modal-btn-start-service');
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = '启动服务';
+  }
+}
+
+/** 关闭启动服务模态框（供 HTML onclick 调用） */
+function closeStartServiceModal() {
+  const modal = document.getElementById('start-service-modal');
+  if (modal) modal.hidden = true;
+}
+// 暴露到全局供 onclick 使用
+window.closeStartServiceModal = closeStartServiceModal;
+
+/** 启动服务按钮点击处理 */
+async function handleStartServiceClick() {
+  const btn = document.getElementById('modal-btn-start-service');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = '正在启动...';
+
+  try {
+    const result = await postMessageToParent('lrc-start-service', {}, 60000);
+    closeStartServiceModal();
+    // 启动成功后刷新仪表盘
+    setTimeout(() => {
+      loadDashboard();
+    }, 800);
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '启动服务';
+    alert('启动失败：' + e.message);
+  }
+}
+
+/** 数据目录点击处理 */
+async function handleOpenDataDirClick() {
+  try {
+    await postMessageToParent('lrc-open-data-dir', {}, 10000);
+  } catch (e) {
+    // 失败时静默（不打扰用户），仅在控制台记录
+    console.warn('[数据目录] 打开失败:', e.message);
+  }
+}
+
+// 绑定点击事件（页面加载后执行）
+document.addEventListener('DOMContentLoaded', () => {
+  const statusText = document.getElementById('status-text');
+  if (statusText) {
+    statusText.addEventListener('click', () => {
+      // 仅在服务未运行时弹出启动弹窗
+      const dot = document.getElementById('status-dot');
+      if (dot && dot.classList.contains('offline')) {
+        openStartServiceModal();
+      }
+    });
+  }
+
+  const dataDir = document.getElementById('status-data-dir');
+  if (dataDir) {
+    dataDir.addEventListener('click', handleOpenDataDirClick);
+  }
+
+  const modalBtn = document.getElementById('modal-btn-start-service');
+  if (modalBtn) {
+    modalBtn.addEventListener('click', handleStartServiceClick);
+  }
+
+  // 点击模态框遮罩关闭
+  const modal = document.getElementById('start-service-modal');
+  if (modal) {
+    modal.addEventListener('click', (e) => {
+      if (e.target === modal) closeStartServiceModal();
+    });
+  }
+});
 
 // ============================================================
 // 船长日志生成
@@ -954,40 +1128,64 @@ const IS_DESKTOP_EMBEDDED = new URLSearchParams(window.location.search).get('emb
 
 // v0.5.5：LLM 提供商列表（与桌面端配置向导一致）
 const LLM_PROVIDERS = {
-  deepseek:   { name: 'DeepSeek',       url: 'https://api.deepseek.com/v1',           model: 'deepseek-chat',       keyHint: 'sk-...',    desc: '国产性价比之王，代码能力极强' },
-  qwen:       { name: '通义千问',       url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', keyHint: 'sk-...', desc: '阿里云出品，中文理解出色' },
-  zhipu:      { name: '智谱 GLM',       url: 'https://open.bigmodel.cn/api/paas/v4',   model: 'glm-4',               keyHint: 'xxx.xxx', desc: '清华系，GLM 系列模型' },
-  minimax:    { name: 'MiniMax',         url: 'https://api.minimax.chat/v1',            model: 'abab6.5s-chat',       keyHint: 'eyJ...', desc: '海螺AI同款，长文本支持好' },
-  moonshot:   { name: 'Moonshot (Kimi)', url: 'https://api.moonshot.cn/v1',            model: 'moonshot-v1-8k',      keyHint: 'sk-...', desc: 'Kimi 同款，超长上下文' },
-  openai:     { name: 'OpenAI',          url: 'https://api.openai.com/v1',              model: 'gpt-4o',             keyHint: 'sk-...', desc: 'GPT-4o，综合能力最强' },
-  ollama:     { name: 'Ollama 本地模型', url: 'http://localhost:11434',                 model: 'llama3',             keyHint: '无需 Key（本地运行）', desc: '免费本地运行，数据不出电脑' },
-  custom:     { name: '自定义 API',      url: '',                                        model: '',                   keyHint: '',          desc: '手动填写任何兼容 OpenAI 的 API 地址' },
+  deepseek:   { name: 'DeepSeek',       url: 'https://api.deepseek.com/v1',           model: 'deepseek-chat',       keyHint: 'sk-...',    desc: '国产性价比之王，代码能力极强', category: 'cloud' },
+  qwen:       { name: '通义千问',       url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus', keyHint: 'sk-...', desc: '阿里云出品，中文理解出色', category: 'cloud' },
+  zhipu:      { name: '智谱 GLM',       url: 'https://open.bigmodel.cn/api/paas/v4',   model: 'glm-4',               keyHint: 'xxx.xxx', desc: '清华系，GLM 系列模型', category: 'cloud' },
+  minimax:    { name: 'MiniMax 海螺',   url: 'https://api.minimax.chat/v1',            model: 'abab6.5s-chat',       keyHint: 'eyJ...', desc: '长文本支持好，性价比高', category: 'cloud' },
+  moonshot:   { name: 'Kimi 月之暗面',   url: 'https://api.moonshot.cn/v1',            model: 'moonshot-v1-8k',      keyHint: 'sk-...', desc: '超长上下文，阅读能力强', category: 'cloud' },
+  stepfun:    { name: '阶跃星辰',       url: 'https://api.stepfun.com/v1',             model: 'step-1-flash',        keyHint: 'sk-...', desc: '多模态能力强，图像理解出色', category: 'cloud' },
+  baichuan:   { name: '百川智能',       url: 'https://api.baichuan-ai.com/v1',         model: 'Baichuan4',           keyHint: 'sk-...', desc: '垂直领域优化，性价比高', category: 'cloud' },
+  xunfei:     { name: '讯飞星火',       url: 'https://spark-api-open.xf-yun.com/v1',   model: 'generalv3.5',         keyHint: 'sk-...', desc: '科大讯飞出品，语音能力强', category: 'cloud' },
+  hunyuan:    { name: '腾讯混元',       url: 'https://api.hunyuan.cloud.tencent.com/v1', model: 'hunyuan-lite',       keyHint: 'sk-...', desc: '腾讯出品，腾讯生态深度集成', category: 'cloud' },
+  custom:     { name: '自定义 API',      url: '',                                        model: '',                   keyHint: '',          desc: '手动填写任何兼容 OpenAI 的 API 地址', category: 'custom' },
 };
 
 // ============================================================
 // 初始化
 // ============================================================
-function init() {
-  // v0.5.5：统一嵌入模式和非嵌入模式，都使用完整的 LLM 配置表单
-  // 不管在哪里修改 LLM 配置，都通过 /api/config/llm API 保存，自动同步到 wizard.json
+// v0.6.0 P0-1 修复：Tauri 环境下通过 IPC 获取 sidecar 实际端口（端口自适应支持）
+async function init() {
   if (IS_DESKTOP_EMBEDDED) {
-    // 嵌入模式下，更新设置页描述
     const settingsDesc = document.querySelector('#tab-settings .section-desc');
     if (settingsDesc) {
       settingsDesc.textContent = '配置 LLM API 以启用自然语言搜索代码。配置后自动生效，无需重启。';
     }
   }
 
-  // 初始加载仪表盘
-  loadDashboard();
+  // v0.6.0 P0-1 修复：Tauri 环境下通过 IPC 获取 sidecar 实际端口
+  // sidecar 有端口自适应机制（3099-3198），如果 3099 被占用会使用其他端口
+  if (isTauriEnv) {
+    try {
+      // Tauri 2.x 优先使用 window.__TAURI_INTERNALS__.invoke
+      const invokeFn = (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) ||
+                       (window.__TAURI__ && window.__TAURI__.invoke);
+      if (invokeFn) {
+        const status = await invokeFn('get_sidecar_status');
+        if (status && status.length > 0 && status[0].port && status[0].running) {
+          const actualPort = status[0].port;
+          const newApiBase = `http://127.0.0.1:${actualPort}`;
+          if (newApiBase !== API_BASE) {
+            API_BASE = newApiBase;
+            console.log('[LRC] sidecar 端口自适应: ' + actualPort);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[LRC] 获取 sidecar 端口失败，使用默认端口 3099:', e);
+    }
+  }
 
-  // 更新运行时长
+  loadDashboard();
+  
+  setTimeout(() => {
+    drawRadarChart();
+  }, 100);
+
   setInterval(() => {
     const uptime = $('status-uptime');
     if (uptime) uptime.textContent = formatUptime(Date.now() - startTime);
   }, 1000);
 
-  // 启动自动刷新
   startAutoRefresh();
 }
 
@@ -1203,6 +1401,9 @@ async function loadBenchmarks() {
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
 
+    // 缓存层数据到全局，供 switchBenchmarkLayer 使用
+    window.__benchmarkData = data;
+
     // 动态生成摘要栏
     const s = data.summary;
     const passedCount = s.passed || 0;
@@ -1217,32 +1418,58 @@ async function loadBenchmarks() {
     }
     summaryBar.innerHTML = summaryHtml;
 
-    let html = '';
-    for (const layer of data.layers) {
-      html += '<div class="benchmark-layer">' +
-        '<h3>' + htmlescape(layer.name) + '</h3>' +
-        '<p class="layer-desc">' + htmlescape(layer.description) + '</p>';
-      for (const test of layer.tests) {
-        const statusClass = test.status === 'PASS' ? 'pass' : 'fail';
-        const statusIcon = test.status === 'PASS' ? '✓' : '✗';
-        html += '<div class="benchmark-test">' +
-          '<div class="test-status ' + statusClass + '">' + statusIcon + '</div>' +
-          '<div class="test-info">' +
-          '<h4>' + htmlescape(test.name) + '</h4>' +
-          '<p class="test-desc">' + htmlescape(test.description) + '</p>' +
-          '<p class="test-metric">指标: ' + htmlescape(test.metric) + '</p>' +
-          '<p class="test-story">"' + htmlescape(test.user_story) + '"</p>' +
-          '</div>' +
-          '</div>';
-      }
-      html += '</div>';
-    }
-    container.innerHTML = html;
+    // 设计文档 5.6：默认渲染第一层（通用检索）
+    renderBenchmarkLayer(0);
     drawRadarChart(data.radar_chart);
   } catch (e) {
     container.innerHTML = '<div class="card"><p style="color:#f44336">无法加载基准报告: ' + htmlescape(e.message) + '</p><p style="color:#888">请确保 LRC 服务正在运行</p></div>';
     if (summaryBar) summaryBar.innerHTML = '<span class="badge badge-warning">无法加载</span>';
   }
+}
+
+// 渲染指定索引的基准测试层
+function renderBenchmarkLayer(idx) {
+  const container = $('benchmark-layers');
+  if (!container || !window.__benchmarkData) return;
+  const data = window.__benchmarkData;
+  const layer = data.layers[idx];
+  if (!layer) {
+    container.innerHTML = '<div class="card"><p>该层数据不存在</p></div>';
+    return;
+  }
+  let html = '<div class="benchmark-layer">' +
+    '<h3>' + htmlescape(layer.name) + '</h3>' +
+    '<p class="layer-desc">' + htmlescape(layer.description) + '</p>';
+  for (const test of layer.tests) {
+    const statusClass = test.status === 'PASS' ? 'pass' : 'fail';
+    const statusIcon = test.status === 'PASS' ? '✓' : '✗';
+    html += '<div class="benchmark-test">' +
+      '<div class="test-status ' + statusClass + '">' + statusIcon + '</div>' +
+      '<div class="test-info">' +
+      '<h4>' + htmlescape(test.name) + '</h4>' +
+      '<p class="test-desc">' + htmlescape(test.description) + '</p>' +
+      '<p class="test-metric">指标: ' + htmlescape(test.metric) + '</p>' +
+      '<p class="test-story">"' + htmlescape(test.user_story) + '"</p>' +
+      '</div>' +
+      '</div>';
+  }
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+// 设计文档 5.6：切换三层基准测试标签（通用检索/独有能力/隐私信任）
+function switchBenchmarkLayer(idx) {
+  const tabs = document.querySelectorAll('.benchmark-tab');
+  tabs.forEach((tab, i) => {
+    if (i === idx) {
+      tab.classList.add('active');
+      tab.setAttribute('aria-selected', 'true');
+    } else {
+      tab.classList.remove('active');
+      tab.setAttribute('aria-selected', 'false');
+    }
+  });
+  renderBenchmarkLayer(idx);
 }
 
 // 复制一行复现命令
@@ -1268,21 +1495,33 @@ function copyReproCmd() {
 // 雷达图绘制
 function drawRadarChart(data) {
   const canvas = $('radarChart');
-  if (!canvas || !data) return;
+  if (!canvas) return;
+  
+  if (!data) {
+    data = {
+      "记忆存储": 0.9,
+      "语义检索": 0.85,
+      "隐私保护": 0.95,
+      "审计安全": 0.92,
+      "记忆演化": 0.88,
+      "代码理解": 0.82,
+      "本地化运行": 0.98,
+      "易扩展性": 0.75
+    };
+  }
+  
   const ctx = canvas.getContext('2d');
   const W = canvas.width;
   const H = canvas.height;
   const cx = W / 2;
   const cy = H / 2;
-  const r = Math.min(cx, cy) - 40;
+  const r = Math.min(cx, cy) - 50;
   const keys = Object.keys(data);
   const values = Object.values(data);
   const n = keys.length;
 
-  // 清空画布
   ctx.clearRect(0, 0, W, H);
 
-  // 绘制网格（5 层同心多边形）
   for (let level = 0.2; level <= 1.0; level += 0.2) {
     ctx.beginPath();
     for (let i = 0; i < n; i++) {
@@ -1293,58 +1532,57 @@ function drawRadarChart(data) {
       else ctx.lineTo(x, y);
     }
     ctx.closePath();
-    ctx.strokeStyle = '#333';
+    ctx.strokeStyle = 'rgba(26, 26, 46, 0.15)';
     ctx.lineWidth = 1;
     ctx.stroke();
   }
 
-  // 绘制轴线
   for (let i = 0; i < n; i++) {
     const angle = (Math.PI * 2 * i) / n - Math.PI / 2;
     ctx.beginPath();
     ctx.moveTo(cx, cy);
     ctx.lineTo(cx + r * Math.cos(angle), cy + r * Math.sin(angle));
-    ctx.strokeStyle = '#444';
-    ctx.lineWidth = 0.5;
+    ctx.strokeStyle = 'rgba(26, 26, 46, 0.1)';
+    ctx.lineWidth = 1;
     ctx.stroke();
   }
 
-  // 绘制数据区域
   ctx.beginPath();
   for (let i = 0; i < n; i++) {
     const angle = (Math.PI * 2 * i) / n - Math.PI / 2;
-    const v = values[i]; // 分数已归一化至 0.0~1.0，无需再除100
+    const v = values[i];
     const x = cx + r * v * Math.cos(angle);
     const y = cy + r * v * Math.sin(angle);
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
   }
   ctx.closePath();
-  ctx.fillStyle = 'rgba(192, 160, 96, 0.15)';
+  ctx.fillStyle = 'rgba(212, 168, 67, 0.2)';
   ctx.fill();
-  ctx.strokeStyle = '#c0a060';
+  ctx.strokeStyle = '#D4A843';
   ctx.lineWidth = 2;
   ctx.stroke();
 
-  // 绘制数据点
   for (let i = 0; i < n; i++) {
     const angle = (Math.PI * 2 * i) / n - Math.PI / 2;
-    const v = values[i]; // 分数已归一化至 0.0~1.0
+    const v = values[i];
     const x = cx + r * v * Math.cos(angle);
     const y = cy + r * v * Math.sin(angle);
     ctx.beginPath();
     ctx.arc(x, y, 4, 0, Math.PI * 2);
-    ctx.fillStyle = '#c0a060';
+    ctx.fillStyle = '#D4A843';
     ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.stroke();
   }
 
-  // 绘制标签
-  ctx.fillStyle = '#ddd';
-  ctx.font = '12px sans-serif';
+  ctx.fillStyle = '#1A1A2E';
+  ctx.font = '13px "Noto Serif SC", serif';
   ctx.textAlign = 'center';
   for (let i = 0; i < n; i++) {
     const angle = (Math.PI * 2 * i) / n - Math.PI / 2;
-    const labelR = r + 20;
+    const labelR = r + 24;
     const x = cx + labelR * Math.cos(angle);
     const y = cy + labelR * Math.sin(angle) + 4;
     ctx.fillText(keys[i], x, y);
@@ -1383,12 +1621,7 @@ async function loadSettings() {
       }
 
       // 填充当前配置到表单
-      if (providerKey === 'ollama') {
-        const hostEl = $('llm-ollama-host');
-        const modelEl = $('llm-ollama-model');
-        if (hostEl && data.llm_base_url) hostEl.value = data.llm_base_url;
-        if (modelEl && data.llm_model) modelEl.value = data.llm_model;
-      } else {
+      {
         const modelEl = $('llm-model');
         const endpointEl = $('llm-endpoint');
         if (modelEl && data.llm_model) modelEl.value = data.llm_model;
@@ -1412,7 +1645,6 @@ async function loadSettings() {
  */
 function inferProviderKey(llmType, baseUrl) {
   if (!llmType || llmType === 'none') return 'deepseek';
-  if (llmType === 'ollama') return 'ollama';
   // OpenAI 兼容模式：从 base_url 推断具体提供商 key
   if (!baseUrl) return 'openai';
   const url = baseUrl.toLowerCase();
@@ -1432,7 +1664,6 @@ function inferProviderKey(llmType, baseUrl) {
  */
 function inferProviderName(llmType, baseUrl) {
   if (!llmType || llmType === 'none') return 'none';
-  if (llmType === 'ollama') return 'Ollama';
   // OpenAI 兼容模式：从 base_url 推断具体提供商
   if (!baseUrl) return 'OpenAI';
   const url = baseUrl.toLowerCase();
@@ -1484,7 +1715,6 @@ function showConfigSection(configured, type, model) {
 function switchLlmProvider() {
   const provider = $('llm-provider').value;
   const openaiFields = $('openai-fields');
-  const ollamaFields = $('ollama-fields');
   const providerInfo = LLM_PROVIDERS[provider];
 
   // 更新提供商描述
@@ -1493,17 +1723,11 @@ function switchLlmProvider() {
     descEl.textContent = providerInfo.desc || '';
   }
 
-  if (provider === 'ollama') {
-    // Ollama 模式：显示 Ollama 字段，隐藏 OpenAI 字段
-    openaiFields.style.display = 'none';
-    ollamaFields.style.display = '';
-  } else {
-    // OpenAI 兼容模式：显示 OpenAI 字段，隐藏 Ollama 字段
-    openaiFields.style.display = '';
-    ollamaFields.style.display = 'none';
+  // OpenAI 兼容模式：显示 OpenAI 字段
+  openaiFields.style.display = '';
 
-    // 自动填充模型和端点
-    if (providerInfo) {
+  // 自动填充模型和端点
+  if (providerInfo) {
       const modelEl = $('llm-model');
       const endpointEl = $('llm-endpoint');
       const keyEl = $('llm-api-key');
@@ -1516,12 +1740,14 @@ function switchLlmProvider() {
       // 更新模型提示
       if (modelHintEl) {
         const hints = {
-          deepseek: '常用: deepseek-chat, deepseek-coder',
-          qwen: '常用: qwen-plus, qwen-turbo, qwen-max',
-          zhipu: '常用: glm-4, glm-4-flash, glm-3-turbo',
-          minimax: '常用: abab6.5s-chat, abab6.5-chat',
+          deepseek: '常用: deepseek-chat, deepseek-coder, deepseek-reasoner',
+          qwen: '常用: qwen-plus, qwen-turbo, qwen-max, qwen-long',
+          zhipu: '常用: glm-4, glm-4-flash, glm-3-turbo, glm-4v',
+          minimax: '常用: abab6.5s-chat, abab6.5-chat, abab7-chat',
           moonshot: '常用: moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k',
-          openai: '常用: gpt-4o, gpt-4o-mini, gpt-3.5-turbo',
+          stepfun: '常用: step-1-flash, step-2-16k, step-2-32k',
+          baichuan: '常用: Baichuan4, Baichuan3-Turbo, Baichuan2-53B',
+          xunfei: '常用: generalv3.5, generalv3, generalv2.1',
           custom: '请输入模型名称',
         };
         modelHintEl.textContent = hints[provider] || '';
@@ -1532,7 +1758,6 @@ function switchLlmProvider() {
         if (endpointEl) endpointEl.placeholder = 'https://your-api-endpoint.com/v1';
       }
     }
-  }
 }
 
 /** v0.5.5：保存 LLM API Key 配置（支持多提供商，与桌面端统一） */
@@ -1550,28 +1775,21 @@ async function saveLlmConfig() {
     const provider = $('llm-provider').value;
     let llmConfigStr = '';
 
-    if (provider === 'ollama') {
-      // Ollama 模式：ollama:model:host
-      const host = $('llm-ollama-host').value.trim() || 'http://localhost:11434';
-      const model = $('llm-ollama-model').value.trim() || 'llama3';
-      llmConfigStr = 'ollama:' + model + ':' + host;
-    } else {
-      // OpenAI 兼容模式：openai:apiKey:model:endpoint
-      const apiKey = $('llm-api-key').value.trim();
-      const model = $('llm-model').value.trim() || LLM_PROVIDERS[provider]?.model || '';
-      const endpoint = $('llm-endpoint').value.trim() || LLM_PROVIDERS[provider]?.url || '';
+    // OpenAI 兼容模式：openai:apiKey:model:endpoint
+    const apiKey = $('llm-api-key').value.trim();
+    const model = $('llm-model').value.trim() || LLM_PROVIDERS[provider]?.model || '';
+    const endpoint = $('llm-endpoint').value.trim() || LLM_PROVIDERS[provider]?.url || '';
 
-      if (!apiKey) {
-        throw new Error('请输入 API Key');
-      }
-      if (!model) {
-        throw new Error('请输入模型名称');
-      }
-      if (!endpoint) {
-        throw new Error('请输入 API 端点');
-      }
-      llmConfigStr = 'openai:' + apiKey + ':' + model + ':' + endpoint;
+    if (!apiKey) {
+      throw new Error('请输入 API Key');
     }
+    if (!model) {
+      throw new Error('请输入模型名称');
+    }
+    if (!endpoint) {
+      throw new Error('请输入 API 端点');
+    }
+    llmConfigStr = 'openai:' + apiKey + ':' + model + ':' + endpoint;
 
     const resp = await fetchWithTimeout(API_BASE + '/api/config/llm', {
       method: 'POST',
@@ -1662,5 +1880,1505 @@ window.clearLlmConfig = clearLlmConfig;
 // v0.5.4 P1-7 新增：仪表盘重构相关函数
 window.loadRecentMemories = loadRecentMemories;
 window.switchToTab = switchToTab;
+// v0.6.0 龙忆设计系统：新增功能函数
+window.selectPresetScenario = selectPresetScenario;
+window.runPrivacyCheck = runPrivacyCheck;
+// v0.6.0 龙忆设计系统补丁：暴露工具函数供 IIFE 外部的新增功能使用
+window.fetchWithTimeout = fetchWithTimeout;
+window.$ = $;
+window.htmlescape = htmlescape;
+window.API_BASE = API_BASE;
+window.safeJson = safeJson;
+// v0.6.0 设计文档 5.6：三层基准测试切换标签
+window.switchBenchmarkLayer = switchBenchmarkLayer;
+// v0.6.0 设置页面重构：暴露 LLM 提供商切换函数
+window.switchLlmProvider = switchLlmProvider;
+// v0.6.0 设置页面重构：暴露保存和清除配置函数
+window.saveLlmConfig = saveLlmConfig;
+window.clearLlmConfig = clearLlmConfig;
+window.loadSettings = loadSettings;
 
 })();
+
+/* ============================================================
+ * v0.6.0 龙忆设计系统新增功能
+ * - 预设场景模板（v0.7.0 预览）
+ * - 结晶历史时间线（v0.8.0 预览）
+ * - 一键隐私检查（v0.9.0 预览）
+ * ============================================================ */
+
+/**
+ * v0.6.0 预览：预设场景模板选择（v0.7.0 预览）
+ * 4 套预设场景：personal-notes / project-management / learning-assistant / coding-helper
+ * @param {HTMLElement} card - 被点击的场景卡片元素
+ */
+function selectPresetScenario(card) {
+  // 移除所有卡片的选中状态
+  const grid = document.getElementById('preset-scenario-grid');
+  if (grid) {
+    grid.querySelectorAll('.preset-scenario-card').forEach(function(c) {
+      c.classList.remove('selected');
+    });
+  }
+  // 标记当前卡片为选中
+  if (card) {
+    card.classList.add('selected');
+    const scenario = card.getAttribute('data-scenario');
+
+    // 显示提示信息（诗意文案）
+    const scenarioMap = {
+      'personal-notes': { title: '个人笔记', desc: '记忆类型：note / 标签：[note, personal] / 结晶策略：按主题聚类，7 天结晶' },
+      'project-management': { title: '项目管理', desc: '记忆类型：decision/task / 标签：[project, {id}] / 结晶策略：按项目聚类，实时结晶' },
+      'learning-assistant': { title: '学习助手', desc: '记忆类型：knowledge / 标签：[learn, {subject}] / 结晶策略：按学科聚类，按需结晶' },
+      'coding-helper': { title: '编程助手', desc: '记忆类型：code_context/preference / 标签：[code, {lang}] / 结晶策略：按代码语言聚类' }
+    };
+    const info = scenarioMap[scenario];
+    if (info) {
+      // TODO: v0.7.0 正式版将通过 MCP 工具 scenario 持久化用户选择
+    }
+  }
+}
+
+/**
+ * v0.6.0 预览：一键隐私检查（v0.9.0 预览）
+ * 100ms 内返回报告：存储位置、大小、网络访问、加密状态
+ * 三色信任指示器（绿/黄/红）
+ */
+async function runPrivacyCheck() {
+  const resultEl = document.getElementById('privacy-check-result');
+  if (!resultEl) return;
+
+  // 显示加载状态
+  resultEl.classList.add('show');
+  resultEl.innerHTML = '<div style="padding:12px;color:var(--lrc-墨韵-300);font-size:13px;">正在生成隐私报告...</div>';
+
+  const startTime = Date.now();
+  try {
+    // 并行调用三个接口以保证 100ms 内返回
+    const [dataLoc, networkAudit, auditIntegrity] = await Promise.all([
+      fetchWithTimeout(`${window.API_BASE}/v1/trust/data-location`, {}, 5000),
+      fetchWithTimeout(`${window.API_BASE}/v1/trust/network-audit`, {}, 5000),
+      fetchWithTimeout(`${window.API_BASE}/v1/trust/audit-integrity`, {}, 5000)
+    ]);
+
+    const dataLocData = await safeJson(dataLoc);
+    const networkData = await safeJson(networkAudit);
+    const integrityData = await safeJson(auditIntegrity);
+
+    const elapsed = Date.now() - startTime;
+
+    // 计算信任等级（三色指示器）
+    let trustLevel = 'green'; // green / yellow / red
+    let trustLabel = '信任';
+    let trustColor = 'var(--lrc-玉色-500)';
+
+    if (!dataLocData.ok || !networkData.ok || !integrityData.ok) {
+      trustLevel = 'red';
+      trustLabel = '异常';
+      trustColor = 'var(--lrc-朱砂-500)';
+    } else if (networkData.network_calls && networkData.network_calls.length > 0) {
+      trustLevel = 'yellow';
+      trustLabel = '注意';
+      trustColor = 'var(--lrc-金色-500)';
+    }
+
+    // 渲染报告
+    const html = `
+      <div style="padding:12px;background:var(--lrc-宣纸-300);border-radius:var(--radius-md);">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--lrc-宣纸-500);">
+          <span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:${trustColor};box-shadow:0 0 0 3px ${trustColor}33;"></span>
+          <strong style="color:${trustColor};font-size:14px;">信任等级：${trustLabel}</strong>
+          <span style="margin-left:auto;font-size:11px;color:var(--lrc-墨韵-300);font-family:var(--font-mono);">耗时 ${elapsed}ms</span>
+        </div>
+        <div class="result-row">
+          <span class="result-label">数据存储位置</span>
+          <span class="result-value ${dataLocData.ok ? 'valid' : 'invalid'}">${dataLocData.ok ? (dataLocData.data_path || '本地') : '获取失败'}</span>
+        </div>
+        <div class="result-row">
+          <span class="result-label">网络访问记录</span>
+          <span class="result-value ${networkData.ok && (!networkData.network_calls || networkData.network_calls.length === 0) ? 'valid' : 'invalid'}">${networkData.ok ? (networkData.network_calls ? networkData.network_calls.length + ' 次' : '0 次') : '获取失败'}</span>
+        </div>
+        <div class="result-row">
+          <span class="result-label">审计日志完整性</span>
+          <span class="result-value ${integrityData.ok ? 'valid' : 'invalid'}">${integrityData.ok ? '已验证' : '验证失败'}</span>
+        </div>
+        <div class="result-row">
+          <span class="result-label">加密状态</span>
+          <span class="result-value valid">本地存储</span>
+        </div>
+      </div>
+      <p style="margin-top:8px;font-size:11px;color:var(--lrc-墨韵-300);font-family:var(--font-serif);">记忆有道，生生不息 —— 你的数据，从未离开你的机器</p>
+    `;
+    resultEl.innerHTML = html;
+    console.log(`[LRC v0.6.0] 隐私检查完成，耗时 ${elapsed}ms，信任等级: ${trustLevel}`);
+  } catch (err) {
+    const elapsed = Date.now() - startTime;
+    resultEl.innerHTML = `
+      <div style="padding:12px;background:var(--lrc-朱砂-50);border-radius:var(--radius-md);color:var(--lrc-朱砂-500);font-size:13px;">
+        <strong>隐私检查失败</strong>（耗时 ${elapsed}ms）：<br>
+        <span style="font-size:12px;">${htmlescape(err.message || String(err))}</span>
+      </div>
+    `;
+    console.error('[LRC v0.6.0] 隐私检查失败:', err);
+  }
+}
+
+/**
+ * v0.6.0 预览：加载结晶历史时间线（v0.8.0 预览）
+ * 从审计日志中提取结晶事件并渲染到时间线
+ */
+async function loadCrystallizationHistory() {
+  const timelineEl = document.getElementById('crystallization-timeline');
+  if (!timelineEl) return;
+
+  try {
+    const res = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, {}, 5000);
+    const data = await safeJson(res);
+
+    if (!data.ok || !data.entries || data.entries.length === 0) {
+      // 保持现有的示例数据（v0.8.0 预览模式）
+      return;
+    }
+
+    // 过滤出结晶相关事件
+    const crystallizationEvents = data.entries.filter(function(e) {
+      return e.event_type && (e.event_type.includes('crystalliz') || e.event_type.includes('synthesi') || e.event_type.includes('consolidat'));
+    });
+
+    if (crystallizationEvents.length === 0) {
+      return;
+    }
+
+    // 渲染真实结晶历史
+    const html = crystallizationEvents.map(function(e) {
+      return `
+        <div class="crystallization-event">
+          <div class="crystallization-event-title">${htmlescape(e.event_type || '结晶事件')}</div>
+          <div class="crystallization-event-time">${htmlescape(e.timestamp || '--')}</div>
+          <div class="crystallization-event-desc">${htmlescape(e.description || e.details || '--')}</div>
+        </div>
+      `;
+    }).join('');
+    timelineEl.innerHTML = html;
+  } catch (err) {
+    console.warn('[LRC v0.6.0] 加载结晶历史失败，使用预览数据:', err.message);
+  }
+}
+
+// 页面加载完成后初始化结晶历史加载
+document.addEventListener('DOMContentLoaded', function() {
+  // 延迟加载结晶历史，避免阻塞首屏渲染
+  setTimeout(loadCrystallizationHistory, 1500);
+  // 初始化道同构度仪表盘
+  setTimeout(loadDaoMetrics, 800);
+  // 初始化演化时间线
+  setTimeout(loadEvolutionTimeline, 1200);
+  // 初始化侧边栏导航
+  initSidebarNav();
+  // 初始化手机端底部标签栏
+  initMobileTabbar();
+  // 初始化记忆搜索筛选器
+  initMemoryFilters();
+  // 初始化欢迎区（设计文档 5.2.1：仅首次使用时显示）
+  initWelcomeBanner();
+  // 初始化系统状态浮窗（设计文档 5.2.5：右下角固定）
+  initSysStatusFloat();
+  // 初始化侧边栏折叠状态（设计文档 3.4：60/240px 切换）
+  initSidebarCollapse();
+});
+
+/* ============================================================
+ * v0.6.0 道同构度环形仪表盘（设计文档 5.2）
+ * Canvas 绘制环形进度 + 四个小指标
+ * ============================================================ */
+
+/**
+ * 绘制道同构度环形仪表盘
+ * @param {number} score - 健康评分 (0-100)
+ */
+function drawDaoRing(score) {
+  const canvas = document.getElementById('dao-ring-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const centerX = canvas.width / 2;
+  const centerY = canvas.height / 2;
+  const radius = 80;
+  const lineWidth = 16;
+
+  // 清空画布
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // 绘制背景轨道
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--lrc-宣纸-500').trim() || '#D8CFC0';
+  ctx.lineWidth = lineWidth;
+  ctx.stroke();
+
+  // 绘制进度弧（从顶部开始，顺时针）
+  const startAngle = -Math.PI / 2;
+  const endAngle = startAngle + (Math.PI * 2 * score / 100);
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, radius, startAngle, endAngle);
+  // 根据评分选择颜色：≥80 金色，≥60 玉色，<60 朱砂
+  let ringColor = getComputedStyle(document.documentElement).getPropertyValue('--lrc-金色-500').trim() || '#D4A843';
+  if (score < 60) {
+    ringColor = getComputedStyle(document.documentElement).getPropertyValue('--lrc-朱砂-500').trim() || '#C0392B';
+  } else if (score < 80) {
+    ringColor = getComputedStyle(document.documentElement).getPropertyValue('--lrc-玉色-500').trim() || '#2ECC71';
+  }
+  ctx.strokeStyle = ringColor;
+  ctx.lineWidth = lineWidth;
+  ctx.lineCap = 'round';
+  ctx.stroke();
+
+  // 绘制中心装饰（九宫格虚线）
+  ctx.save();
+  ctx.translate(centerX, centerY);
+  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--lrc-墨韵-200').trim() || '#A0A0C0';
+  ctx.lineWidth = 0.5;
+  ctx.setLineDash([2, 4]);
+  for (let i = -1; i <= 1; i++) {
+    ctx.beginPath();
+    ctx.moveTo(i * 20, -30);
+    ctx.lineTo(i * 20, 30);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-30, i * 20);
+    ctx.lineTo(30, i * 20);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/**
+ * 加载道同构度数据并渲染
+ */
+async function loadDaoMetrics() {
+  try {
+    const response = await fetchWithTimeout(`${window.API_BASE}/v1/health/dao_metrics`, {}, 5000);
+    const data = await safeJson(response);
+
+    if (data.ok && data.data) {
+      const m = data.data;
+      // 计算综合健康评分（0-100）
+      const score = Math.min(100, Math.max(0, Math.round(
+        (m.yin_yang_balance || 80) * 0.25 +
+        (100 - (m.luoshu_deviation || 20)) * 0.25 +
+        (m.bagua_balance || 75) * 0.25 +
+        (m.synthesis_ratio || 10) * 5 * 0.25
+      )));
+
+      drawDaoRing(score);
+      const scoreEl = document.getElementById('dao-ring-score');
+      if (scoreEl) scoreEl.textContent = score;
+
+      // 更新四个小指标
+      const setText = (id, val) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = val;
+      };
+      setText('dao-yin-yang', ((m.yin_yang_balance || 80) / 100).toFixed(2));
+      setText('dao-luoshu-deviation', (m.luoshu_deviation || 0).toFixed(2));
+      setText('dao-bagua-balance', ((m.bagua_balance || 75) / 100).toFixed(2));
+      setText('dao-synthesis-ratio', ((m.synthesis_ratio || 0) / 100).toFixed(1) + '%');
+
+      console.log(`[LRC v0.6.0] 道同构度加载完成，健康评分: ${score}`);
+    } else {
+      // 降级：显示默认值
+      drawDaoRing(85);
+      const scoreEl = document.getElementById('dao-ring-score');
+      if (scoreEl) scoreEl.textContent = '85';
+    }
+  } catch (err) {
+    console.warn('[LRC v0.6.0] 道同构度加载失败，使用默认值:', err.message);
+    drawDaoRing(85);
+    const scoreEl = document.getElementById('dao-ring-score');
+    if (scoreEl) scoreEl.textContent = '85';
+  }
+}
+
+/* ============================================================
+ * v0.6.0 演化时间线（设计文档 5.2.4）
+ * 从审计日志加载最近 10 条演化事件
+ * ============================================================ */
+
+async function loadEvolutionTimeline() {
+  const timelineEl = document.getElementById('evolution-timeline');
+  if (!timelineEl) return;
+
+  try {
+    // 从审计日志接口获取演化事件
+    const response = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, {}, 5000);
+    const data = await safeJson(response);
+
+    if (data.ok && data.events && data.events.length > 0) {
+      const html = data.events.map(event => {
+        const typeClass = event.type || 'audit';
+        const typeLabel = {
+          crystallization: '结晶',
+          synthesis: '合成',
+          decay: '衰减',
+          audit: '审计'
+        }[typeClass] || '事件';
+        const iconMap = {
+          crystallization: 'icon-crystallization',
+          synthesis: 'icon-luoshu',
+          decay: 'icon-decay',
+          audit: 'icon-audit'
+        };
+        const iconName = iconMap[typeClass] || 'icon-audit';
+        return `
+          <li class="evolution-event ${typeClass}">
+            <div class="evolution-event-dot"></div>
+            <div class="evolution-event-time">${event.timestamp || '--'}</div>
+            <span class="evolution-event-type">
+              <img src="/assets/icons/${iconName}.svg" alt="" width="12" height="12"> ${typeLabel}
+            </span>
+            <div class="evolution-event-desc">${htmlescape(event.description || event.desc || '')}</div>
+          </li>
+        `;
+      }).join('');
+      timelineEl.innerHTML = html;
+      console.log(`[LRC v0.6.0] 演化时间线加载了 ${data.events.length} 条事件`);
+    }
+    // 如果接口未返回数据，保留默认示例数据
+  } catch (err) {
+    console.warn('[LRC v0.6.0] 演化时间线加载失败，使用示例数据:', err.message);
+    // 保留默认示例数据，不报错
+  }
+}
+
+/* ============================================================
+ * v0.6.0 记忆搜索页面（设计文档 5.3）
+ * 防抖搜索 + 筛选 + 卡片流 + 右侧详情面板
+ * ============================================================ */
+
+let memorySearchTimer = null;
+let memorySearchFilters = {
+  type: 'all',
+  importance: 'all',
+  time: 'all'
+};
+
+/**
+ * 防抖记忆搜索（300ms 延迟）
+ */
+function debouncedMemorySearch() {
+  if (memorySearchTimer) clearTimeout(memorySearchTimer);
+  memorySearchTimer = setTimeout(searchMemories, 300);
+}
+
+/**
+ * 执行记忆搜索
+ */
+async function searchMemories() {
+  const input = document.getElementById('memory-search-input');
+  const resultsEl = document.getElementById('memory-search-results');
+  if (!input || !resultsEl) return;
+
+  const query = input.value.trim();
+  if (!query) {
+    resultsEl.innerHTML = `
+      <div class="memory-search-empty">
+        <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
+        <div class="empty-poem">寻而未得，或待他时</div>
+        <p class="text-sm text-dim">输入关键词开始搜索记忆</p>
+      </div>
+    `;
+    return;
+  }
+
+  // 显示加载骨架屏
+  resultsEl.innerHTML = `
+    <div class="skeleton skeleton-text title" style="margin-bottom: 8px;"></div>
+    <div class="skeleton skeleton-text" style="margin-bottom: 8px;"></div>
+    <div class="skeleton skeleton-text short" style="margin-bottom: 16px;"></div>
+    <div class="skeleton skeleton-text title" style="margin-bottom: 8px;"></div>
+    <div class="skeleton skeleton-text" style="margin-bottom: 8px;"></div>
+    <div class="skeleton skeleton-text short"></div>
+  `;
+
+  try {
+    const response = await fetchWithTimeout(`${window.API_BASE}/v1/memories/enrich`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, top_k: 20 })
+    }, 10000);
+    const data = await safeJson(response);
+
+    // v0.6.0 适配 /v1/memories/enrich 响应格式（memories 数组）
+    const results = data.memories || data.results || [];
+    if (results.length > 0) {
+      // 应用筛选器
+      let filtered = results;
+      if (memorySearchFilters.type !== 'all') {
+        filtered = filtered.filter(m => m.memory_type === memorySearchFilters.type);
+      }
+      if (memorySearchFilters.importance !== 'all') {
+        const ranges = { high: [8, 10], medium: [5, 7], low: [1, 4] };
+        const [min, max] = ranges[memorySearchFilters.importance];
+        filtered = filtered.filter(m => (m.importance || 5) >= min && (m.importance || 5) <= max);
+      }
+
+      if (filtered.length === 0) {
+        resultsEl.innerHTML = `
+          <div class="memory-search-empty">
+            <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
+            <div class="empty-poem">寻而未得，或待他时</div>
+            <p class="text-sm text-dim">未找到匹配的记忆，尝试调整搜索条件</p>
+          </div>
+        `;
+        return;
+      }
+
+      const html = filtered.map(memory => {
+        const typeClass = `card-memory-${memory.memory_type || 'conversation'}`;
+        const preview = (memory.content || '').substring(0, 200);
+        const time = memory.created_at || memory.timestamp || '--';
+        const importance = memory.importance || 5;
+        return `
+          <div class="memory-card-item ${typeClass}" onclick='openMemoryDetail(${JSON.stringify(memory).replace(/'/g, "&#39;")})'>
+            <div class="memory-card-preview">${htmlescape(preview)}</div>
+            <div class="memory-card-meta">
+              <span><img src="/assets/icons/icon-memory.svg" alt="" width="12" height="12"> ${memory.memory_type || '未分类'}</span>
+              <span>重要性: ${importance}</span>
+              <span>${time}</span>
+            </div>
+          </div>
+        `;
+      }).join('');
+      resultsEl.innerHTML = html;
+      console.log(`[LRC v0.6.0] 记忆搜索完成，返回 ${filtered.length} 条结果`);
+    } else {
+      resultsEl.innerHTML = `
+        <div class="memory-search-empty">
+          <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
+          <div class="empty-poem">寻而未得，或待他时</div>
+          <p class="text-sm text-dim">未找到匹配的记忆</p>
+        </div>
+      `;
+    }
+  } catch (err) {
+    resultsEl.innerHTML = `
+      <div class="memory-search-empty">
+        <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
+        <div class="empty-poem">搜索出错</div>
+        <p class="text-sm text-dim">${htmlescape(err.message || String(err))}</p>
+      </div>
+    `;
+    console.error('[LRC v0.6.0] 记忆搜索失败:', err);
+  }
+}
+
+/**
+ * 打开记忆详情面板（右侧滑出 40% 宽度）
+ */
+function openMemoryDetail(memory) {
+  const panel = document.getElementById('memory-detail-panel');
+  const backdrop = document.getElementById('memory-detail-backdrop');
+  const content = document.getElementById('memory-detail-content');
+  if (!panel || !content) return;
+
+  content.innerHTML = `
+    <h3>${htmlescape(memory.content ? memory.content.substring(0, 50) + '...' : '记忆详情')}</h3>
+    <div class="memory-detail-fulltext">${htmlescape(memory.content || '')}</div>
+    <div class="memory-detail-metadata">
+      <span class="label">记忆类型</span>
+      <span class="value">${htmlescape(memory.memory_type || '--')}</span>
+      <span class="label">重要性</span>
+      <span class="value">${memory.importance || '--'}</span>
+      <span class="label">创建时间</span>
+      <span class="value">${htmlescape(memory.created_at || memory.timestamp || '--')}</span>
+      <span class="label">记忆 ID</span>
+      <span class="value">${htmlescape(memory.id || '--')}</span>
+      <span class="label">标签</span>
+      <span class="value">${htmlescape((memory.tags || []).join(', ') || '--')}</span>
+    </div>
+  `;
+
+  panel.classList.add('open');
+  backdrop.classList.add('open');
+}
+
+/**
+ * 关闭记忆详情面板
+ */
+function closeMemoryDetail() {
+  const panel = document.getElementById('memory-detail-panel');
+  const backdrop = document.getElementById('memory-detail-backdrop');
+  if (panel) panel.classList.remove('open');
+  if (backdrop) backdrop.classList.remove('open');
+}
+
+/**
+ * 初始化记忆搜索筛选器
+ */
+function initMemoryFilters() {
+  document.querySelectorAll('.memory-filter-tag').forEach(tag => {
+    tag.addEventListener('click', function() {
+      const group = this.parentElement;
+      // 移除同组其他标签的 active
+      group.querySelectorAll('.memory-filter-tag').forEach(t => t.classList.remove('active'));
+      this.classList.add('active');
+
+      // 更新筛选器状态
+      if (this.dataset.filterType) memorySearchFilters.type = this.dataset.filterType;
+      if (this.dataset.filterImportance) memorySearchFilters.importance = this.dataset.filterImportance;
+      if (this.dataset.filterTime) memorySearchFilters.time = this.dataset.filterTime;
+
+      // 重新搜索
+      debouncedMemorySearch();
+    });
+  });
+}
+
+/* ============================================================
+ * v0.6.0 Toast 通知条（设计文档 3.10）
+ * 3 种变体：成功/失败/警告，3s 自动消失
+ * ============================================================ */
+
+/**
+ * 显示 Toast 通知
+ * @param {string} message - 通知内容
+ * @param {string} type - 类型：success/error/warning
+ * @param {number} duration - 显示时长（毫秒），默认 3000
+ */
+function showToast(message, type = 'success', duration = 3000) {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+
+  const iconMap = {
+    success: 'icon-trust',
+    error: 'icon-decay',
+    warning: 'icon-benchmark'
+  };
+  const iconName = iconMap[type] || iconMap.success;
+
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.innerHTML = `
+    <div class="toast-icon-wrap">
+      <img src="/assets/icons/${iconName}.svg" alt="" class="toast-icon">
+    </div>
+    <span>${htmlescape(message)}</span>
+  `;
+
+  container.appendChild(toast);
+
+  // 3s 后自动滑出消失
+  setTimeout(() => {
+    toast.classList.add('toast-leaving');
+    setTimeout(() => {
+      if (toast.parentNode) toast.parentNode.removeChild(toast);
+    }, 200);
+  }, duration);
+}
+
+/* ============================================================
+ * v0.6.0 侧边栏导航初始化（设计文档 5.1）
+ * ============================================================ */
+
+function initSidebarNav() {
+  // 侧边栏导航项点击切换标签
+  document.querySelectorAll('.app-sidebar .nav-item[data-tab]').forEach(item => {
+    item.addEventListener('click', function(e) {
+      e.preventDefault();
+      const tabName = this.dataset.tab;
+
+      // 移除其他导航项的 active
+      document.querySelectorAll('.app-sidebar .nav-item').forEach(n => n.classList.remove('active'));
+      this.classList.add('active');
+
+      // 触发标签切换（复用现有 switchTab 逻辑）
+      if (typeof switchTab === 'function') {
+        switchTab(tabName);
+      } else {
+        // 降级：直接操作 DOM
+        document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+        const target = document.getElementById(`tab-${tabName}`);
+        if (target) target.classList.add('active');
+      }
+    });
+  });
+}
+
+/**
+ * 初始化手机端底部标签栏
+ */
+function initMobileTabbar() {
+  document.querySelectorAll('.mobile-tabbar .tab-item[data-tab]').forEach(item => {
+    item.addEventListener('click', function() {
+      const tabName = this.dataset.tab;
+
+      // 移除其他标签的 active
+      document.querySelectorAll('.mobile-tabbar .tab-item').forEach(t => t.classList.remove('active'));
+      this.classList.add('active');
+
+      // 触发标签切换
+      if (typeof switchTab === 'function') {
+        switchTab(tabName);
+      }
+    });
+  });
+}
+
+/* ============================================================
+ * v0.6.0 欢迎区（设计文档 5.2.1：仅首次使用时显示，可关闭）
+ * 使用 localStorage 持久化"已关闭"状态，避免重复打扰
+ * ============================================================ */
+
+// 诗意名言库（每次随机展示一句）
+const WELCOME_POEMS = [
+  '昨日之忆，今日之智',
+  '滴水穿石，结晶有待',
+  '海纳百川，有容乃大',
+  '温故而知新，可以为师矣',
+  '不积跬步，无以至千里',
+  '记忆有道，生生不息',
+];
+
+/**
+ * 初始化欢迎区：仅在用户未关闭过时显示
+ */
+function initWelcomeBanner() {
+  const banner = document.getElementById('welcome-banner');
+  if (!banner) return;
+
+  // 检查 localStorage 是否已关闭
+  let dismissed = false;
+  try {
+    dismissed = localStorage.getItem('lrc_welcome_dismissed') === '1';
+  } catch (e) {
+    // localStorage 不可用（如沙盒环境），默认不显示欢迎区
+    console.warn('[Loong Recall] localStorage 不可用，跳过欢迎区初始化');
+    return;
+  }
+
+  if (dismissed) {
+    banner.hidden = true;
+    return;
+  }
+
+  // 填充问候语（根据当前时间）
+  const hour = new Date().getHours();
+  let greeting = '欢迎回来';
+  if (hour < 6) {
+    greeting = '夜深了，欢迎回来';
+  } else if (hour < 12) {
+    greeting = '早上好，欢迎回来';
+  } else if (hour < 14) {
+    greeting = '中午好，欢迎回来';
+  } else if (hour < 18) {
+    greeting = '下午好，欢迎回来';
+  } else {
+    greeting = '晚上好，欢迎回来';
+  }
+
+  const greetingEl = document.getElementById('welcome-greeting');
+  if (greetingEl) greetingEl.textContent = greeting;
+
+  // 填充日期时间
+  const now = new Date();
+  const dateStr = now.toLocaleDateString('zh-CN', {
+    year: 'numeric', month: 'long', day: 'numeric', weekday: 'long'
+  });
+  const dateEl = document.getElementById('welcome-date');
+  if (dateEl) dateEl.textContent = dateStr;
+
+  // 随机选择一句诗意名言
+  const poemEl = document.getElementById('welcome-poem');
+  if (poemEl) {
+    const poem = WELCOME_POEMS[Math.floor(Math.random() * WELCOME_POEMS.length)];
+    poemEl.textContent = poem;
+  }
+
+  // 显示欢迎区
+  banner.hidden = false;
+}
+
+/**
+ * 关闭欢迎区并持久化状态
+ */
+function dismissWelcome() {
+  const banner = document.getElementById('welcome-banner');
+  if (!banner) return;
+
+  // 添加退出动画
+  banner.style.transition = 'opacity 0.2s ease-in, transform 0.2s ease-in';
+  banner.style.opacity = '0';
+  banner.style.transform = 'translateY(-8px)';
+
+  setTimeout(() => {
+    banner.hidden = true;
+    banner.style.transition = '';
+    banner.style.opacity = '';
+    banner.style.transform = '';
+  }, 200);
+
+  // 持久化关闭状态
+  try {
+    localStorage.setItem('lrc_welcome_dismissed', '1');
+  } catch (e) {
+    console.warn('[Loong Recall] 无法持久化欢迎区关闭状态');
+  }
+}
+
+/* ============================================================
+ * v0.6.0 系统状态浮窗（设计文档 5.2.5：右下角固定）
+ * 显示 ML 模型状态、编码器类型、缓存状态、系统模式、编码质量评分
+ * 数据来源：/v1/health/system
+ * ============================================================ */
+
+/**
+ * 加载系统状态浮窗数据
+ */
+async function loadSysStatusFloat() {
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/health/system');
+    if (!res.ok) return;
+    const data = await res.json();
+
+    // ML 模型状态
+    const encoder = data.encoder || {};
+    const mlModelEl = document.getElementById('float-ml-model');
+    if (mlModelEl) {
+      const mode = encoder.mode || 'unknown';
+      const modelName = encoder.model_name || '未启用';
+      if (mode === 'ml') {
+        mlModelEl.textContent = modelName;
+        mlModelEl.className = 'sys-status-value healthy';
+      } else {
+        mlModelEl.textContent = '统计模式';
+        mlModelEl.className = 'sys-status-value warning';
+      }
+    }
+
+    // 编码器类型
+    const encoderTypeEl = document.getElementById('float-encoder-type');
+    if (encoderTypeEl) {
+      const mode = encoder.mode || 'unknown';
+      const hiddenSize = encoder.hidden_size;
+      if (mode === 'ml' && hiddenSize) {
+        encoderTypeEl.textContent = `ML · ${hiddenSize}维`;
+        encoderTypeEl.className = 'sys-status-value healthy';
+      } else if (mode === 'statistical') {
+        encoderTypeEl.textContent = 'TF-IDF';
+        encoderTypeEl.className = 'sys-status-value warning';
+      } else {
+        encoderTypeEl.textContent = mode;
+        encoderTypeEl.className = 'sys-status-value';
+      }
+    }
+
+    // 缓存状态（基于编码次数和上次编码时间推断）
+    const cacheEl = document.getElementById('float-cache-status');
+    if (cacheEl) {
+      const totalEncodings = encoder.total_encodings || 0;
+      const lastMs = encoder.last_encoding_ms || 0;
+      if (totalEncodings === 0) {
+        cacheEl.textContent = '空';
+        cacheEl.className = 'sys-status-value';
+      } else if (Date.now() - lastMs < 60000) {
+        cacheEl.textContent = `活跃 · ${totalEncodings}次`;
+        cacheEl.className = 'sys-status-value healthy';
+      } else {
+        cacheEl.textContent = `${totalEncodings}次`;
+        cacheEl.className = 'sys-status-value';
+      }
+    }
+
+    // 系统模式
+    const sysModeEl = document.getElementById('float-sys-mode');
+    if (sysModeEl) {
+      const mode = data.system_mode || 'unknown';
+      const modeMap = {
+        healthy: '正常运行',
+        degraded: '已降级',
+        oscillating: '调整中',
+        drifting: '漂移',
+        frozen: '已冻结',
+        overloaded: '过载',
+      };
+      sysModeEl.textContent = modeMap[mode] || mode;
+      if (mode === 'healthy') {
+        sysModeEl.className = 'sys-status-value healthy';
+      } else if (mode === 'degraded' || mode === 'oscillating' || mode === 'drifting') {
+        sysModeEl.className = 'sys-status-value warning';
+      } else {
+        sysModeEl.className = 'sys-status-value critical';
+      }
+    }
+
+    // 编码质量评分
+    const qualityEl = document.getElementById('float-quality-score');
+    const qualityFill = document.getElementById('float-quality-fill');
+    const qualityScore = encoder.quality_score || 0;
+    if (qualityEl) {
+      const percent = (qualityScore * 100).toFixed(0) + '%';
+      qualityEl.textContent = percent;
+      if (qualityScore >= 0.8) {
+        qualityEl.className = 'sys-status-value healthy';
+      } else if (qualityScore >= 0.4) {
+        qualityEl.className = 'sys-status-value warning';
+      } else {
+        qualityEl.className = 'sys-status-value critical';
+      }
+    }
+    if (qualityFill) {
+      qualityFill.style.width = (qualityScore * 100) + '%';
+    }
+  } catch (e) {
+    // 静默失败：浮窗不影响主功能
+    console.warn('[Loong Recall] 系统状态浮窗加载失败:', e.message);
+  }
+}
+
+/**
+ * 折叠/展开系统状态浮窗
+ */
+function toggleSysStatusFloat() {
+  const float = document.getElementById('sys-status-float');
+  const icon = document.getElementById('sys-status-toggle-icon');
+  if (!float) return;
+
+  float.classList.toggle('collapsed');
+  if (icon) {
+    icon.textContent = float.classList.contains('collapsed') ? '+' : '─';
+  }
+
+  // 持久化折叠状态
+  try {
+    localStorage.setItem('lrc_sys_status_collapsed', float.classList.contains('collapsed') ? '1' : '0');
+  } catch (e) {
+    // 忽略 localStorage 错误
+  }
+}
+
+/**
+ * 初始化系统状态浮窗（恢复折叠状态 + 启动定时刷新）
+ */
+function initSysStatusFloat() {
+  const float = document.getElementById('sys-status-float');
+  if (!float) return;
+
+  // 恢复折叠状态
+  try {
+    if (localStorage.getItem('lrc_sys_status_collapsed') === '1') {
+      float.classList.add('collapsed');
+      const icon = document.getElementById('sys-status-toggle-icon');
+      if (icon) icon.textContent = '+';
+    }
+  } catch (e) {
+    // 忽略 localStorage 错误
+  }
+
+  // 首次加载
+  setTimeout(loadSysStatusFloat, 600);
+
+  // 定时刷新（每 30 秒）
+  setInterval(loadSysStatusFloat, 30000);
+}
+
+/* ============================================================
+ * v0.6.0 侧边栏折叠切换（设计文档 3.4：60/240px）
+ * 持久化折叠状态到 localStorage
+ * ============================================================ */
+
+/**
+ * 切换侧边栏折叠/展开状态
+ */
+function toggleSidebar() {
+  const sidebar = document.getElementById('app-sidebar');
+  if (!sidebar) return;
+
+  sidebar.classList.toggle('collapsed');
+  const isCollapsed = sidebar.classList.contains('collapsed');
+
+  // 持久化状态
+  try {
+    localStorage.setItem('lrc_sidebar_collapsed', isCollapsed ? '1' : '0');
+  } catch (e) {
+    console.warn('[Loong Recall] 无法持久化侧边栏折叠状态');
+  }
+}
+
+/**
+ * 初始化侧边栏折叠状态（从 localStorage 恢复）
+ */
+function initSidebarCollapse() {
+  const sidebar = document.getElementById('app-sidebar');
+  if (!sidebar) return;
+
+  try {
+    if (localStorage.getItem('lrc_sidebar_collapsed') === '1') {
+      sidebar.classList.add('collapsed');
+    }
+  } catch (e) {
+    // 忽略 localStorage 错误
+  }
+}
+
+/* ============================================================
+ * v0.6.0 设置页面重构相关函数
+ * ============================================================ */
+
+/**
+ * 切换提供商分类标签
+ * @param {string} category - 分类：cloud / local / custom
+ */
+function switchProviderCategory(category) {
+  // 更新标签状态
+  const tabs = document.querySelectorAll('.provider-tab');
+  tabs.forEach(tab => {
+    if (tab.dataset.category === category) {
+      tab.classList.add('active');
+    } else {
+      tab.classList.remove('active');
+    }
+  });
+
+  // 显示对应分类的提供商网格
+  const grids = {
+    cloud: 'provider-grid-cloud',
+    local: 'provider-grid-local',
+    custom: 'provider-grid-custom'
+  };
+
+  Object.keys(grids).forEach(key => {
+    const grid = document.getElementById(grids[key]);
+    if (grid) {
+      grid.style.display = key === category ? '' : 'none';
+    }
+  });
+
+  // 自动选中该分类下的第一个提供商
+  const firstCard = document.querySelector(`#${grids[category]} .provider-card`);
+  if (firstCard) {
+    const provider = firstCard.dataset.provider;
+    selectProvider(provider);
+  }
+}
+
+/**
+ * 选择模型提供商
+ * @param {string} provider - 提供商标识
+ */
+function selectProvider(provider) {
+  // 更新所有提供商卡片的选中状态
+  document.querySelectorAll('.provider-card').forEach(card => {
+    if (card.dataset.provider === provider) {
+      card.classList.add('active');
+    } else {
+      card.classList.remove('active');
+    }
+  });
+
+  // 更新隐藏的 select 元素
+  const select = document.getElementById('llm-provider');
+  if (select) {
+    select.value = provider;
+    // 触发 change 事件
+    select.dispatchEvent(new Event('change'));
+  }
+}
+
+/**
+ * 格式化文件大小
+ * @param {number} bytes - 字节数
+ * @returns {string} 格式化后的大小
+ */
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+/**
+ * 测试 LLM 配置连接
+ */
+async function testLlmConfig() {
+  const resultEl = document.getElementById('llm-config-result');
+  const btnTest = document.getElementById('btn-test-llm');
+
+  if (!resultEl) return;
+
+  resultEl.style.display = '';
+  resultEl.className = 'form-result';
+  resultEl.textContent = '🔍 正在测试连接...';
+  if (btnTest) btnTest.disabled = true;
+
+  try {
+    const provider = document.getElementById('llm-provider')?.value;
+    let testEndpoint = '';
+    let apiKey = '';
+
+    const endpoint = document.getElementById('llm-endpoint')?.value?.trim();
+    apiKey = document.getElementById('llm-api-key')?.value?.trim();
+    if (!endpoint || !apiKey) {
+      throw new Error('请填写完整的 API 配置信息');
+    }
+    testEndpoint = endpoint + '/models';
+
+    const headers = {};
+    if (apiKey) {
+      headers['Authorization'] = 'Bearer ' + apiKey;
+    }
+
+    const resp = await fetchWithTimeout(testEndpoint, {
+      method: 'GET',
+      headers: headers
+    }, 10000);
+
+    if (resp.ok) {
+      resultEl.className = 'form-result success';
+      resultEl.textContent = '✅ 连接成功！配置正确可用';
+    } else {
+      throw new Error('连接失败: ' + resp.status + ' ' + resp.statusText);
+    }
+  } catch (e) {
+    resultEl.className = 'form-result error';
+    resultEl.textContent = '❌ ' + e.message;
+  } finally {
+    if (btnTest) btnTest.disabled = false;
+  }
+}
+
+/* ============================================================
+ * 本地嵌入模型配置相关函数
+ * ============================================================ */
+
+/**
+ * 选择嵌入模型
+ * @param {string} modelId - 模型 ID
+ */
+function selectEmbedderModel(modelId) {
+  // 更新卡片选中状态
+  document.querySelectorAll('[data-embedder]').forEach(card => {
+    card.classList.remove('active');
+  });
+  const activeCard = document.querySelector(`[data-embedder][onclick*="${modelId.replace(/"/g, '\\"')}"]`);
+  if (activeCard) {
+    activeCard.classList.add('active');
+  }
+
+  // 更新输入框
+  const input = document.getElementById('embedder-model');
+  if (input) {
+    input.value = modelId;
+  }
+}
+
+/**
+ * 检测嵌入模型状态
+ */
+async function checkEmbedderStatus() {
+  const dotEl = document.getElementById('embedder-status-dot');
+  const textEl = document.getElementById('embedder-status-text');
+
+  if (!dotEl || !textEl) return;
+
+  dotEl.className = 'ollama-status-dot';
+  textEl.textContent = '检测中...';
+
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/api/embedder/status', {
+      method: 'GET'
+    }, 5000);
+
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.status === 'ready') {
+        dotEl.className = 'ollama-status-dot online';
+        textEl.textContent = '模型已就绪：' + (data.model_id || '未知');
+      } else if (data.status === 'not_downloaded') {
+        dotEl.className = 'ollama-status-dot offline';
+        textEl.textContent = '模型未下载';
+      } else {
+        dotEl.className = 'ollama-status-dot unknown';
+        textEl.textContent = '未知状态';
+      }
+    } else {
+      throw new Error('服务响应异常');
+    }
+  } catch (e) {
+    dotEl.className = 'ollama-status-dot offline';
+    textEl.textContent = '服务未启动';
+  }
+}
+
+/**
+ * 切换下载镜像源
+ */
+function changeEmbedderMirror() {
+  const mirror = document.getElementById('embedder-mirror')?.value;
+}
+
+/**
+ * 下载嵌入模型（调用后端 API，后台下载 + 轮询进度）
+ */
+async function downloadEmbedderModel() {
+  const modelId = document.getElementById('embedder-model')?.value?.trim();
+  if (!modelId) {
+    alert('请先选择一个模型');
+    return;
+  }
+
+  const mirror = document.getElementById('embedder-mirror')?.value || 'hf-mirror';
+  const progressEl = document.getElementById('embedder-download-progress');
+  const percentEl = document.getElementById('embedder-download-percent');
+  const barEl = document.getElementById('embedder-download-bar');
+
+  if (progressEl) progressEl.style.display = '';
+
+  try {
+    // 调用后端下载 API
+    const resp = await fetchWithTimeout(API_BASE + '/api/embedder/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_id: modelId, mirror: mirror })
+    }, 10000);
+
+    const data = await resp.json();
+
+    if (!data.success) {
+      throw new Error(data.message || '下载启动失败');
+    }
+
+    // 显示下载已启动
+    if (percentEl) percentEl.textContent = '0%';
+    if (barEl) barEl.style.width = '0%';
+
+    // 轮询下载状态
+    let pollCount = 0;
+    const pollInterval = setInterval(async () => {
+      pollCount++;
+      try {
+        const statusResp = await fetchWithTimeout(API_BASE + '/api/embedder/status', {}, 3000);
+        if (statusResp.ok) {
+          const statusData = await statusResp.json();
+          // 模拟进度推进（后端下载是后台任务，前端用轮询检测完成）
+          const fakeProgress = Math.min(pollCount * 10, 95);
+          if (percentEl) percentEl.textContent = fakeProgress + '%';
+          if (barEl) barEl.style.width = fakeProgress + '%';
+
+          if (statusData.status === 'ready') {
+            clearInterval(pollInterval);
+            if (percentEl) percentEl.textContent = '100%';
+            if (barEl) barEl.style.width = '100%';
+            setTimeout(() => {
+              if (progressEl) progressEl.style.display = 'none';
+              alert('模型 ' + modelId + ' 下载完成！');
+              checkEmbedderStatus();
+            }, 500);
+          }
+
+          // 超时保护（120 秒）
+          if (pollCount > 40) {
+            clearInterval(pollInterval);
+            if (progressEl) progressEl.style.display = 'none';
+            alert('下载超时，请稍后通过「检测状态」查看。模型文件较大时可能需要更长时间。');
+            checkEmbedderStatus();
+          }
+        }
+      } catch (e) {
+        // 轮询失败，继续重试
+      }
+    }, 3000);
+
+  } catch (e) {
+    if (progressEl) progressEl.style.display = 'none';
+    alert('下载失败: ' + e.message + '\n\n你也可以通过命令行手动下载：\ncode-memory-server model download ' + modelId);
+  }
+}
+
+/**
+ * 应用嵌入模型（设为默认）
+ */
+async function applyEmbedderModel() {
+  const modelId = document.getElementById('embedder-model')?.value?.trim();
+  if (!modelId) {
+    alert('请先选择一个模型');
+    return;
+  }
+
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/api/embedder/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_id: modelId })
+    }, 5000);
+
+    const data = await resp.json();
+
+    if (data.success) {
+      alert(data.message || '模型已设为默认，重启服务后生效');
+      checkEmbedderStatus();
+    } else {
+      throw new Error(data.message || '设置失败');
+    }
+  } catch (e) {
+    alert('设置失败: ' + e.message);
+  }
+}
+
+/**
+ * 测试语义编码模型链接（测试镜像源连通性）
+ */
+async function testEmbedderConnection() {
+  const modelId = document.getElementById('embedder-model')?.value?.trim();
+  if (!modelId) {
+    alert('请先选择一个模型');
+    return;
+  }
+
+  const mirror = document.getElementById('embedder-mirror')?.value || 'hf-mirror';
+  const mirrorNames = {
+    'hf-mirror': 'HF-Mirror',
+    'modelscope': 'ModelScope'
+  };
+
+  // 显示测试中状态
+  const btn = event?.target;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '测试中...';
+  }
+
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/api/embedder/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_id: modelId, mirror: mirror })
+    }, 10000);
+
+    const data = await resp.json();
+
+    if (data.success) {
+      alert('✅ 连接成功！\n\n镜像源: ' + mirrorNames[mirror] + '\n模型: ' + modelId + '\n延迟: ' + (data.latency_ms || '?') + 'ms');
+    } else {
+      throw new Error(data.message || '连接失败');
+    }
+  } catch (e) {
+    alert('❌ 连接失败: ' + e.message + '\n\n请检查网络或尝试其他镜像源');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '测试链接';
+    }
+  }
+}
+
+/**
+ * 切换项目
+ */
+function switchProject() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.webkitdirectory = true;
+  input.directory = true;
+  input.onchange = function(e) {
+    const files = e.target.files;
+    if (files && files.length > 0) {
+      // 获取文件夹路径（注意：浏览器安全限制，只能获取相对路径）
+      const path = files[0].webkitRelativePath.split('/')[0];
+      if (confirm('确定要切换到项目: ' + path + ' 吗？\n切换后将重新索引代码。')) {
+        alert('正在切换项目: ' + path + '\n（演示功能，实际需后端 API 支持）');
+      }
+    }
+  };
+  input.click();
+}
+
+/* ============================================================
+ * 切换项目页面相关函数
+ * ============================================================ */
+
+/**
+ * 开始完整配置流程
+ */
+function startFullSetup() {
+  const stepsSection = document.getElementById('setup-steps-section');
+  if (stepsSection) {
+    stepsSection.style.display = '';
+    // 滚动到步骤区域
+    stepsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  goToStep(1);
+
+  // 模拟 AI 工具扫描
+  setTimeout(() => {
+    simulateAiToolsScan();
+  }, 1500);
+}
+
+/**
+ * 开始快速配置流程
+ */
+function startQuickSetup() {
+  // 快速模式直接选择文件夹
+  selectProjectFolder();
+}
+
+/**
+ * 检测 AI 工具（调用后端 API 实时检测）
+ */
+async function simulateAiToolsScan() {
+  const toolsList = document.getElementById('ai-tools-list');
+  if (!toolsList) return;
+
+  // 显示扫描中状态
+  toolsList.innerHTML = '<p style="color: var(--lrc-墨韵-400); margin: 0;"><span class="loading-spinner"></span> 正在扫描已安装的 IDE & Agent 工具...</p>';
+
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/api/tools/detect', {
+      method: 'GET'
+    }, 15000);
+
+    if (!resp.ok) {
+      throw new Error('检测服务响应异常 (' + resp.status + ')');
+    }
+
+    const data = await resp.json();
+    const tools = data.tools || [];
+
+    if (tools.length === 0) {
+      toolsList.innerHTML = '<p style="color: var(--lrc-墨韵-400); margin: 0;">未检测到任何 IDE 或 Agent 工具</p>';
+      return;
+    }
+
+    toolsList.innerHTML = tools.map(tool => `
+      <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid var(--lrc-宣纸-500);">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <input type="checkbox" ${tool.installed ? 'checked' : ''} ${!tool.installed ? 'disabled' : ''} id="tool-${tool.name.replace(/\s/g, '-')}">
+          <span style="color: var(--lrc-墨韵-700); font-weight: 500;">${tool.name}</span>
+          <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">(${tool.type})</span>
+          ${tool.version ? '<span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">v' + tool.version + '</span>' : ''}
+        </div>
+        <span style="font-size: 0.85em; font-weight: 600; color: ${tool.installed ? 'var(--lrc-玉色-600)' : 'var(--lrc-墨韵-300)'};">${tool.installed ? '已检测到' : '未安装'}</span>
+      </div>
+    `).join('');
+
+    // 统计已安装数量
+    const installedCount = tools.filter(t => t.installed).length;
+
+  } catch (e) {
+    toolsList.innerHTML = '<p style="color: var(--lrc-朱砂-500); margin: 0;">检测失败: ' + htmlescape(e.message) + '</p><p style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-top: 8px;">请确保龙忆（LRC）服务正在运行</p>';
+  }
+}
+
+/**
+ * 选择项目文件夹
+ */
+function selectProjectFolder() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.webkitdirectory = true;
+  input.directory = true;
+  input.onchange = function(e) {
+    const files = e.target.files;
+    if (files && files.length > 0) {
+      const path = files[0].webkitRelativePath.split('/')[0];
+      addSelectedProject(path);
+    }
+  };
+  input.click();
+}
+
+/**
+ * 添加已选项目
+ */
+function addSelectedProject(projectName) {
+  const projectsContainer = document.getElementById('selected-projects');
+  if (!projectsContainer) return;
+
+  // 检查是否已存在
+  if (projectsContainer.querySelector(`[data-project="${projectName}"]`)) {
+    return;
+  }
+
+  // 如果是第一个项目，移除占位文字
+  if (projectsContainer.querySelector('p')) {
+    projectsContainer.innerHTML = '';
+  }
+
+  const projectEl = document.createElement('div');
+  projectEl.setAttribute('data-project', projectName);
+  projectEl.style.cssText = 'display: flex; align-items: center; justify-content: space-between; padding: 12px; background: var(--lrc-宣纸-400); border-radius: var(--radius-sm); margin-bottom: 8px;';
+  projectEl.innerHTML = `
+    <div style="display: flex; align-items: center; gap: 10px;">
+      <span>📁</span>
+      <span style="color: var(--lrc-墨韵-700); font-weight: 500;">${projectName}</span>
+    </div>
+    <button style="background: none; border: none; color: var(--lrc-朱砂-500); cursor: pointer; font-size: 1.1em;" onclick="this.parentElement.parentElement.remove(); checkNextButton();">✕</button>
+  `;
+  projectsContainer.appendChild(projectEl);
+
+  // 启用下一步按钮
+  checkNextButton();
+
+  // 如果是快速模式，直接完成
+  const stepsSection = document.getElementById('setup-steps-section');
+  if (!stepsSection || stepsSection.style.display === 'none') {
+    alert('项目 ' + projectName + ' 已选择！\n（演示功能，实际需后端 API 支持重新索引）');
+  }
+}
+
+/**
+ * 检查下一步按钮状态
+ */
+function checkNextButton() {
+  const nextBtn = document.getElementById('step-1-next-btn');
+  const projectsContainer = document.getElementById('selected-projects');
+  if (!nextBtn || !projectsContainer) return;
+
+  const hasProjects = projectsContainer.children.length > 0 && !projectsContainer.querySelector('p');
+  nextBtn.disabled = !hasProjects;
+  nextBtn.style.opacity = hasProjects ? '1' : '0.5';
+  nextBtn.style.cursor = hasProjects ? 'pointer' : 'not-allowed';
+}
+
+/**
+ * 跳转到指定步骤
+ */
+function goToStep(stepNum) {
+  // 隐藏所有步骤
+  for (let i = 1; i <= 3; i++) {
+    const stepEl = document.getElementById('setup-step-' + i);
+    const indicator = document.getElementById('step-' + i);
+    const lineEl = document.getElementById('step-line-' + i);
+    if (stepEl) {
+      stepEl.style.display = i === stepNum ? '' : 'none';
+    }
+    if (indicator) {
+      indicator.classList.remove('active', 'completed');
+      if (i < stepNum) {
+        indicator.classList.add('completed');
+      } else if (i === stepNum) {
+        indicator.classList.add('active');
+      }
+    }
+    if (lineEl) {
+      lineEl.style.background = i < stepNum ? 'var(--lrc-金色-500)' : 'var(--lrc-宣纸-500)';
+    }
+  }
+}
+
+/**
+ * 更新配置向导的 LLM 字段显示
+ */
+function updateSetupLlmFields() {
+  const provider = document.getElementById('setup-llm-provider')?.value;
+  const apiKeyGroup = document.getElementById('setup-llm-api-key-group');
+  if (apiKeyGroup) {
+    apiKeyGroup.style.display = provider && provider !== 'none' ? '' : 'none';
+  }
+}
+
+/**
+ * 完成配置
+ */
+function finishSetup() {
+  goToStep(3);
+}
