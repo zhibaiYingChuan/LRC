@@ -1,0 +1,8 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 信任中心：盾牌 + 勾选 -->
+  <path d="M 12 3 L 19 6 V 12 C 19 16 16 19 12 21 C 8 19 5 16 5 12 V 6 Z" fill="none"/>
+  <path d="M 8 12 L 11 15 L 16 9" fill="none"/>
+</svg>
+
+
+

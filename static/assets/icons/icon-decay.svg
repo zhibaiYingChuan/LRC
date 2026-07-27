@@ -1,0 +1,22 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 圆形被 S 形曲线分成两半 -->
+  <!-- 外圆轮廓 -->
+  <circle cx="12" cy="12" r="10" fill="none" stroke="#ffffff"/>
+  
+  <!-- S 形分割线（阴阳鱼简化） -->
+  <!-- 上半部分曲线（从左到右向下凸） -->
+  <path d="M 12 2 A 5 5 0 0 1 12 12 A 5 5 0 0 0 12 22" 
+        fill="none" stroke="#ffffff"/>
+  
+  <!-- 阳眼（上半实心点） -->
+  <circle cx="12" cy="7" r="1.5" fill="#ffffff" stroke="none"/>
+  
+  <!-- 阴眼（下半空心点） -->
+  <circle cx="12" cy="17" r="1.5" fill="none" stroke="#ffffff"/>
+  
+  <!-- 旋转动势提示（右上小箭头） -->
+  <path d="M 20 8 L 21.5 9.5 L 20 11" fill="none" stroke="#ffffff" opacity="0.5"/>
+</svg>
+
+
+

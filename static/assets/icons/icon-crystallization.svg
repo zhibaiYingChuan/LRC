@@ -1,0 +1,15 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 中心六边形晶体 -->
+  <polygon points="12,6 16.5,9 16.5,15 12,18 7.5,15 7.5,9" fill="none" stroke="#ffffff"/>
+  <!-- 内圈六边形（波纹第一圈） -->
+  <polygon points="12,3.5 18,7 18,17 12,20.5 6,17 6,7" fill="none" stroke="#ffffff"/>
+  <!-- 外圈虚线六边形（波纹第二圈） -->
+  <g stroke-dasharray="2,2">
+    <polygon points="12,1.5 19.5,5.5 19.5,18.5 12,22.5 4.5,18.5 4.5,5.5" fill="none"/>
+  </g>
+  <!-- 中心闪光点 -->
+  <circle cx="12" cy="12" r="1.5" fill="#ffffff" stroke="none"/>
+</svg>
+
+
+

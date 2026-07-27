@@ -70,8 +70,6 @@
     llmApiKey: null,
     llmModel: 'deepseek-chat',
     llmBaseUrl: 'https://api.deepseek.com/v1',
-    ollamaModel: 'llama3',
-    ollamaUrl: 'http://localhost:11434',
     // 多窗口 LRC 记录
     multiWindowEnabled: true, // 同一项目多窗口同时记录（上限 5 个，默认开启）
     // Sidecar 端口
@@ -625,19 +623,15 @@
   // 提供商切换时更新 UI
   function updateWizardLlmProviderUI() {
     const provider = $('wizard-llm-provider')?.value;
-    const isOllama = provider === 'ollama';
 
     const apiSection = $('wizard-llm-api-section');
-    if (apiSection) apiSection.style.display = isOllama ? 'none' : 'block';
-
-    const ollamaFields = $('wizard-ollama-fields');
-    if (ollamaFields) ollamaFields.style.display = isOllama ? 'block' : 'none';
+    if (apiSection) apiSection.style.display = 'block';
 
     // 更新 Key 链接
     const providerInfo = LLM_PROVIDERS[provider];
     const keyLink = $('wizard-llm-key-link');
     if (keyLink && providerInfo) {
-      // v0.5.7 修复：Ollama 和 custom 无需 API Key，隐藏获取链接
+      // v0.5.7 修复：custom 无需 API Key，隐藏获取链接
       if (providerInfo.keyUrl) {
         keyLink.href = providerInfo.keyUrl;
         keyLink.textContent = `获取 ${providerInfo.name} API Key →`;
@@ -679,15 +673,7 @@
     const provider = $('wizard-llm-provider')?.value || 'deepseek';
     try {
       let llmString = '';
-      if (provider === 'ollama') {
-        const ollamaModel = $('wizard-ollama-model')?.value || 'llama3';
-        const ollamaUrl = $('wizard-ollama-url')?.value || 'http://localhost:11434';
-        // v0.5.7 修复：使用 || 分隔符（与后端 to_llm_api_string 保持一致）
-        llmString = `ollama||${ollamaModel}||${ollamaUrl}`;
-        config.llmProvider = 'ollama';
-        config.llmModel = ollamaModel;
-        config.ollamaUrl = ollamaUrl;
-      } else {
+      {
         const apiKey = ($('wizard-llm-api-key')?.value || '').trim();
         if (apiKey) {
           const model = $('wizard-llm-model')?.value || LLM_PROVIDERS[provider]?.model || '';
@@ -813,10 +799,7 @@
     bytedance:  { name: '豆包 (ByteDance)',url: 'https://ark.cn-beijing.volces.com/api/v3', model: 'doubao-pro-32k', keyUrl: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey', keyHint: '...', desc: '字节跳动出品，性价比高' },
     stepfun:    { name: '阶跃星辰',       url: 'https://api.stepfun.com/v1',              model: 'step-1-8k',          keyUrl: 'https://platform.stepfun.com/',                keyHint: 'sk-...',    desc: 'Step 系列，多模态能力强' },
     baichuan:   { name: '百川智能',       url: 'https://api.baichuan-ai.com/v1',          model: 'Baichuan4',          keyUrl: 'https://platform.baichuan-ai.com/',             keyHint: 'sk-...',    desc: '百川大模型，金融医疗领域强' },
-    // ── 国际厂商 ──
-    openai:     { name: 'OpenAI',          url: 'https://api.openai.com/v1',              model: 'gpt-4o',             keyUrl: 'https://platform.openai.com/api-keys',         keyHint: 'sk-...',    desc: 'GPT-4o，综合能力最强' },
-    // ── 本地/自定义 ──
-    ollama:     { name: 'Ollama 本地模型', url: 'http://localhost:11434',                 model: 'llama3',             keyUrl: null,         keyHint: '无需 Key（本地运行）', desc: '免费本地运行，数据不出电脑' },
+    // ── 自定义 ──
     custom:     { name: '自定义 API',      url: '',                                        model: '',                   keyUrl: null,         keyHint: '',          desc: '手动填写任何兼容 OpenAI 的 API 地址' },
   };
 
@@ -1307,18 +1290,11 @@
   if (settingsProviderEl) {
     settingsProviderEl.addEventListener('change', function () {
       const provider = this.value;
-      const isOllama = provider === 'ollama';
       const isCustom = provider === 'custom';
-
-      // 切换 Ollama 字段
-      const ollamaFields = $('settings-ollama-fields');
-      if (ollamaFields) ollamaFields.style.display = isOllama ? 'block' : 'none';
-      const ollamaModelField = $('settings-ollama-model-field');
-      if (ollamaModelField) ollamaModelField.style.display = isOllama ? 'block' : 'none';
 
       // 切换 API Key 区域
       const apiSection = $('settings-llm-api-section');
-      if (apiSection) apiSection.style.display = isOllama ? 'none' : 'block';
+      if (apiSection) apiSection.style.display = 'block';
 
       // 更新默认 URL 和模型
       const providerInfo = LLM_PROVIDERS[provider];
@@ -1333,7 +1309,7 @@
       if ($('settings-llm-key-hint')) {
         $('settings-llm-key-hint').textContent = providerInfo ? providerInfo.keyHint || '格式：sk-...' : '格式：sk-...';
       }
-      // v0.5.7 修复：Ollama 和 custom 无需 API Key，隐藏获取链接
+      // v0.5.7 修复：custom 无需 API Key，隐藏获取链接
       const settingsKeyLink = $('settings-llm-key-link');
       if (settingsKeyLink && providerInfo) {
         if (providerInfo.keyUrl) {
@@ -1407,15 +1383,7 @@
       const provider = $('settings-llm-provider').value;
       let llmString = '';
 
-      if (provider === 'ollama') {
-        const ollamaModel = $('settings-ollama-model').value || 'llama3';
-        const ollamaUrl = $('settings-ollama-url').value || 'http://localhost:11434';
-        // v0.5.7 修复：使用 || 分隔符（与后端 to_llm_api_string 保持一致）
-        llmString = `ollama||${ollamaModel}||${ollamaUrl}`;
-        config.llmProvider = 'ollama';
-        config.llmModel = ollamaModel;
-        config.ollamaUrl = ollamaUrl;
-      } else {
+      {
         // v0.5.4 修复：API Key 输入清洗，trim 去除复制粘贴带入的空白
         const apiKey = ($('settings-llm-api-key').value || '').trim();
         const model = $('settings-llm-model').value || LLM_PROVIDERS[provider]?.model || '';
@@ -2246,6 +2214,64 @@
   if (statusBarMain) {
     statusBarMain.addEventListener('click', toggleStatusBarDetails);
   }
+
+  // ══════════════════════════════════════════════════════════════
+  // v0.6.0 新增：仪表盘 iframe ↔ 父窗口 postMessage 通信
+  // 仪表盘通过 HTTP iframe 嵌入，跨域无法直接调用 Tauri invoke。
+  // 通过 postMessage 桥接：iframe 发送请求 → 父窗口调用 Tauri 命令 → 返回结果
+  // ══════════════════════════════════════════════════════════════
+  window.addEventListener('message', async (event) => {
+    // 安全：仅处理已知消息类型，不限制 origin（仪表盘来自 127.0.0.1）
+    const data = event.data;
+    if (!data || typeof data !== 'object') return;
+
+    // 请求来源 iframe（用于回传结果）
+    const reply = (payload) => {
+      try {
+        event.source?.postMessage({
+          type: data.type + ':reply',
+          reqId: data.reqId,
+          ...payload,
+        }, event.origin);
+      } catch (e) {
+        console.warn('[postMessage] 回复失败:', e);
+      }
+    };
+
+    switch (data.type) {
+      case 'lrc-start-service': {
+        // 仪表盘请求启动 sidecar 服务
+        try {
+          const srcDir = config.selectedProjects[0] || null;
+          const port = await startSidecarWithConfig(srcDir, null, false);
+          if (port) {
+            reply({ success: true, port });
+          } else {
+            reply({
+              success: false,
+              error: config.lastSidecarError || '启动失败，请检查配置',
+            });
+          }
+        } catch (e) {
+          reply({ success: false, error: String(e?.message || e) });
+        }
+        break;
+      }
+      case 'lrc-open-data-dir': {
+        // 仪表盘请求打开数据目录文件夹
+        try {
+          const path = await tauriInvokeWithTimeout('open_data_dir', {}, 10000);
+          reply({ success: true, path });
+        } catch (e) {
+          reply({ success: false, error: String(e?.message || e) });
+        }
+        break;
+      }
+      default:
+        // 未知消息类型，忽略
+        break;
+    }
+  });
 
   /** v0.5.4 新增：即时健康检查
    * 配置完成后立即验证 sidecar 是否正常响应，用户无需等待轮询间隔。

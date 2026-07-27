@@ -883,6 +883,19 @@ pub async fn detect_installed_agents(
     Ok(registry.detect_installed())
 }
 
+/// v0.6.0 新增：获取工具的手动配置指引
+///
+/// 对于不支持 MCP 自动配置的工具，返回手动配置文档。
+/// 前端可据此展示"如何手动配置"面板，包含配置路径、模板和官方文档链接。
+#[tauri::command]
+pub async fn get_agent_config_guide(
+    agent_id: String,
+) -> Result<Option<String>, String> {
+    // 调用 agent_detector 模块的公开函数获取配置指引
+    let guide = crate::agent_detector::get_manual_config_guide(&agent_id);
+    Ok(guide.map(|s| s.to_string()))
+}
+
 /// 全面发现：已知工具 + 未知 dot 目录中的潜在 AI 工具
 ///
 /// 返回 (已知工具列表, 未知工具列表)
@@ -1524,6 +1537,74 @@ pub async fn verify_setup(
     );
 
     Ok(result)
+}
+
+/// 打开数据目录（用户友好功能：右下角"数据目录"点击后调用）
+///
+/// 路径策略：
+///   1. 优先使用 sidecar 实际运行的数据目录（通过 sidecar_port 健康检查获取）
+///   2. 回退到 ~/.loong-recall/ 根目录（跨平台）
+///
+/// 失败时返回用户可理解的错误消息（v0.5.4 P1-6 规范）。
+#[tauri::command]
+pub async fn open_data_dir(store: State<'_, AppStore>) -> Result<String, String> {
+    // 阶段 1：尝试通过 sidecar HTTP API 获取实际数据目录路径
+    // 这样能精确定位到当前项目的数据目录（~/.loong-recall/projects/{fp}/data/）
+    let sidecar_port = {
+        let port = store.sidecar_port.lock().await;
+        *port
+    };
+
+    if let Some(port) = sidecar_port {
+        let url = format!("http://127.0.0.1:{port}/v1/trust/data-location");
+        match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?
+            .get(&url)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    // API 字段为 data_directory（见 server.rs /v1/trust/data-location）
+                    if let Some(path) = json.get("data_directory").and_then(|v| v.as_str()) {
+                        if !path.is_empty() {
+                            // 确保目录存在后打开
+                            let _ = std::fs::create_dir_all(path);
+                            open::that(path).map_err(|e| {
+                                user_friendly_error(&format!("打开数据目录失败: {e}"))
+                            })?;
+                            tracing::info!("[数据目录] 已通过 sidecar API 打开: {}", path);
+                            return Ok(path.to_string());
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::debug!("[数据目录] sidecar API 不可用，回退到根目录");
+            }
+        }
+    }
+
+    // 阶段 2：回退到 ~/.loong-recall/ 根目录
+    let home = dirs::home_dir().ok_or_else(|| {
+        user_friendly_error("无法获取用户主目录，请检查系统环境变量。")
+    })?;
+    let root = home.join(".loong-recall");
+
+    // 目录不存在时创建（首次使用场景）
+    std::fs::create_dir_all(&root).map_err(|e| {
+        user_friendly_error(&format!("创建数据目录失败: {e}"))
+    })?;
+
+    let path_str = root.display().to_string();
+    open::that(&root).map_err(|e| {
+        user_friendly_error(&format!("打开数据目录失败: {e}"))
+    })?;
+
+    tracing::info!("[数据目录] 已打开根目录: {}", path_str);
+    Ok(path_str)
 }
 
 #[cfg(test)]

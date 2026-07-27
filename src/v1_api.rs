@@ -29,6 +29,7 @@ use crate::engine::user_feedback::{FeedbackTarget, FeedbackType};
 use crate::memory_store::{ListFilter, MemoryStore, RecallFilter};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::json::JsonPersistence;
+use crate::persistence::Persistence;
 use crate::server::IndexedCodebase;
 use crate::RecallResult;
 use axum::{
@@ -40,6 +41,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
@@ -235,6 +237,28 @@ pub type SharedStore = Arc<Mutex<MemoryStore<JsonPersistence>>>;
 pub struct RecentMemoriesParams {
     /// 返回的记忆数量（默认 5，最大 20）
     pub limit: Option<usize>,
+}
+
+/// v0.6.0 新增：/v1/memories/list 请求体
+///
+/// 用于备份导出时获取全量记忆列表。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryListRequest {
+    /// 返回的记忆数量（默认 10000，最大 50000）
+    pub limit: Option<usize>,
+}
+
+/// v0.6.0 新增：/v1/memories/remember 请求体
+///
+/// 用于导入备份时逐条写入记忆。字段与前端 app.js 调用对齐。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryRememberRequest {
+    /// 记忆内容（必填）
+    pub content: String,
+    /// 记忆类型（如 fact, decision, preference 等）
+    pub memory_type: String,
+    /// 重要性 1-10（默认 5）
+    pub importance: Option<u8>,
 }
 
 // ==================== 路由构建 ====================
@@ -952,6 +976,166 @@ pub fn build_v1_router(
                             Json(serde_json::json!({
                                 "error": "recent_memories_failed",
                                 "message": format!("最近记忆获取失败: {}", e)
+                            })),
+                        )),
+                    }
+                }
+            }
+        }))
+        // ============================================================
+        // 记忆备份与恢复 API（审计 P0-1 修复）
+        // ============================================================
+        //
+        // v0.6.0 新增：POST /v1/memories/list — 获取记忆列表（备份导出用）
+        //
+        // 返回全量记忆列表（不截断内容），供前端 backupMemories 导出 JSON 备份。
+        // 与 /memories/recent 的区别：recent 返回摘要且限制 20 条，list 返回完整内容。
+        .route("/memories/list", post({
+            let store = metrics_store.clone();
+            move |Json(params): Json<MemoryListRequest>| {
+                let store = store.clone();
+                async move {
+                    // 限制最大返回数量，防止内存溢出
+                    let limit = params.limit.unwrap_or(10000).clamp(1, 50000);
+                    let store = store.lock().await;
+
+                    let filter = crate::memory_store::ListFilter {
+                        limit,
+                        offset: 0,
+                        sort_by: crate::memory_store::SortBy::CreatedAt,
+                        order: crate::memory_store::SortOrder::Desc,
+                        ..Default::default()
+                    };
+
+                    match store.list_memories(&filter) {
+                        Ok((memories, total)) => {
+                            let memories_json: Vec<serde_json::Value> = memories
+                                .iter()
+                                .map(|m| {
+                                    serde_json::json!({
+                                        "id": m.id,
+                                        "content": m.content,
+                                        "memory_type": m.memory_type.as_str(),
+                                        "project": m.project,
+                                        "created_at_ms": m.created_at.timestamp_millis(),
+                                        "importance": m.importance.value(),
+                                        "tags": m.tags,
+                                    })
+                                })
+                                .collect();
+
+                            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "memories": memories_json,
+                                "total": total,
+                            })))
+                        }
+                        Err(e) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "list_memories_failed",
+                                "message": format!("记忆列表获取失败: {}", e)
+                            })),
+                        )),
+                    }
+                }
+            }
+        }))
+        //
+        // v0.6.0 新增：POST /v1/memories/archive — 获取归档记忆列表（备份导出用）
+        //
+        // 返回已归档的记忆列表，供前端 backupMemories 导出完整备份。
+        .route("/memories/archive", post({
+            let store = metrics_store.clone();
+            move |_body: Json<serde_json::Value>| {
+                let store = store.clone();
+                async move {
+                    let store = store.lock().await;
+
+                    // 通过持久层加载归档记忆
+                    match store.persistence().load_archived_memories() {
+                        Ok(archived_memories) => {
+                            let archived: Vec<serde_json::Value> = archived_memories
+                                .iter()
+                                .map(|m| {
+                                    serde_json::json!({
+                                        "id": m.id,
+                                        "content": m.content,
+                                        "memory_type": m.memory_type.as_str(),
+                                        "project": m.project,
+                                        "created_at_ms": m.created_at.timestamp_millis(),
+                                        "importance": m.importance.value(),
+                                        "tags": m.tags,
+                                    })
+                                })
+                                .collect();
+
+                            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "archive": archived,
+                                "total": archived.len(),
+                            })))
+                        }
+                        Err(e) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "archive_list_failed",
+                                "message": format!("归档记忆获取失败: {}", e)
+                            })),
+                        )),
+                    }
+                }
+            }
+        }))
+        //
+        // v0.6.0 新增：POST /v1/memories/remember — 写入单条记忆（导入恢复用）
+        //
+        // 接收前端导入备份时逐条写入的记忆数据，字段与前端 JSON.stringify 对齐。
+        .route("/memories/remember", post({
+            let store = metrics_store.clone();
+            move |Json(params): Json<MemoryRememberRequest>| {
+                let store = store.clone();
+                async move {
+                    // 输入校验：content 不能为空
+                    if params.content.trim().is_empty() {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "invalid_input",
+                                "message": "content 字段不能为空"
+                            })),
+                        ));
+                    }
+
+                    // 解析记忆类型，无效时回退到 Fact
+                    let memory_type = MemoryType::from_str(&params.memory_type)
+                        .unwrap_or(MemoryType::Fact);
+
+                    // 解析重要性，限制 1-10
+                    let importance = Importance::new(params.importance.unwrap_or(5));
+
+                    let mut store = store.lock().await;
+
+                    // 构造新记忆（project 和 tags 暂为空，ttl 永久）
+                    let memory = Memory::new(
+                        params.content,
+                        memory_type,
+                        None,
+                        Vec::new(),
+                        importance,
+                        None,
+                    );
+
+                    match store.remember(memory) {
+                        Ok(id) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+                            Json(serde_json::json!({
+                                "success": true,
+                                "memory_id": id,
+                            }))
+                        ),
+                        Err(e) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "remember_failed",
+                                "message": format!("记忆写入失败: {}", e)
                             })),
                         )),
                     }

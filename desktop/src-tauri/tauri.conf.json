@@ -1,10 +1,10 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicoverbruggen/wuffs/main/static/tauri-schema.json",
   "productName": "LRC Desktop",
-  "version": "0.5.18",
+  "version": "0.6.0",
   "identifier": "com.loongcode.lrc-desktop",
   "build": {
-    "frontendDist": "../src",
+    "frontendDist": "../../static",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "",
     "beforeBuildCommand": ""
@@ -16,16 +16,18 @@
         "title": "LRC Desktop — AI 工具的记忆",
         "url": "index.html",
         "useHttpsScheme": true,
-        "width": 600,
-        "height": 700,
-        "resizable": false,
+        "width": 1280,
+        "height": 800,
+        "minWidth": 1024,
+        "minHeight": 700,
+        "resizable": true,
         "fullscreen": false,
         "center": true,
         "visible": true
       }
     ],
     "security": {
-      "csp": "default-src 'self' http://127.0.0.1:* http://localhost:*; script-src 'self' http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com http://127.0.0.1:* http://localhost:*; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:*; img-src 'self' data: http://127.0.0.1:* http://localhost:*"
+      "csp": "default-src 'self' http://127.0.0.1:* http://localhost:* tauri://*; script-src 'self' http://127.0.0.1:* http://localhost:*; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* http://localhost:* tauri://*; img-src 'self' data: http://127.0.0.1:* http://localhost:*"
     }
   },
   "bundle": {

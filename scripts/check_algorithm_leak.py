@@ -61,6 +61,26 @@ def scan_file(filepath: Path, verbose: bool = False) -> list[dict]:
         # 跳过模块重导出语句（如 pub use engine::luoshu_encoder...）
         if re.search(r'(pub\s+)?use\s+\S+::(luoshu_|bagua)', line, re.IGNORECASE):
             continue
+        # 跳过 include_str! / include_bytes! 中的静态资源文件名引用
+        # （如 include_str!("../static/assets/icons/icon-luoshu.svg")）
+        if re.search(r'include_(str|bytes)!\s*\(', line):
+            continue
+        # 跳过资源文件名字符串匹配（如 "icon-bagua.svg"、"icon-luoshu.svg"）
+        if re.search(r'["\']icon-(bagua|luoshu|dao)', line, re.IGNORECASE):
+            continue
+        # 跳过 engine 模块文件名引用（如 luoshu_encoder_ml.rs）
+        if re.search(r'(luoshu|bagua)_\w+\.rs', line, re.IGNORECASE):
+            continue
+        # 跳过环境变量名引用（如 LRC_LUOSHU_MODEL_ID）
+        if re.search(r'LRC_(LUOSHU|BAGUA|DAO)', line):
+            continue
+        # 跳过 UI 设计风格描述（如 "洛书九宫格加载动画"）—— 仅作为设计风格命名
+        if re.search(r'洛书九宫格', line):
+            continue
+        # 跳过注释中的图标名称列表（如 "baga/health/decay/luoshu/memory/..."）
+        # 这些是静态资源文件名引用，不是算法泄露
+        if re.search(r'//.*\b\w+/\w+/\w+.*(luoshu|bagua)', line, re.IGNORECASE):
+            continue
 
         for rule_name, pattern, level in RULES:
             match = re.search(pattern, line, re.IGNORECASE)

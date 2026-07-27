@@ -24,7 +24,9 @@ pub mod rrf; // RRF 倒数排名融合（server + v1_api 共享） // 检索器 
 #[cfg(feature = "ml")]
 pub mod encoder_codebert; // CodeBERT 编码器实现
 
-#[cfg(feature = "ml")]
+// v0.6.0+：model_downloader 仅依赖 ureq + std，无需 ml 重依赖。
+// 在 server feature 下也可用，供仪表盘嵌入模型管理 API 调用。
+#[cfg(any(feature = "ml", feature = "server"))]
 pub mod model_downloader; // v0.6.0 模型下载器（进度回调 + 重试 + 镜像源）
 
 // ──────────────────────────────────────────────
@@ -71,7 +73,8 @@ pub use embedder::{EmbedError, Embedder}; // v0.6.0 统一嵌入器抽象
 pub use embedder::LocalBertEmbedder; // v0.6.0 本地 BERT 嵌入器
 #[cfg(feature = "server")]
 pub use embedder::LlmApiEmbedder; // v0.6.0 LLM API 嵌入器
-#[cfg(feature = "ml")]
+// v0.6.0+：model_downloader 在 server 或 ml feature 下均导出
+#[cfg(any(feature = "ml", feature = "server"))]
 pub use model_downloader::{
     build_download_url, manual_download_guide, ConsoleProgress, DownloadConfig, DownloadError,
     DownloadProgress, MirrorSource, ModelDownloader,

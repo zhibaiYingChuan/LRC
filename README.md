@@ -97,6 +97,39 @@ code-memory-server model remove BAAI/bge-small-zh
 | BAAI/bge-base-zh | 768 | ~400MB | 中文高精度 |
 | multilingual-e5-small | 384 | ~120MB | 多语言通用 |
 
+### v0.6.0 龙忆设计系统 v1.0（UI 重构）
+
+v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计理念，构建完整的龙忆设计系统 v1.0。
+
+**核心设计资源**（位于 `static/` 目录）：
+
+| 资源 | 文件 | 说明 |
+|------|------|------|
+| 色阶与排版 Token | [colors_and_type.css](file:///g:/code-memory/static/colors_and_type.css) | 6 组色阶（墨韵/宣纸/金色/玉色/朱砂/水蓝，每色 10 级）+ 语义别名 + 排版/间距/圆角/阴影/动效 |
+| 全局组件库 | [components.css](file:///g:/code-memory/static/components.css) | 按钮（5 种变体 + 3 种尺寸 + 洛书加载动画）、卡片（含记忆类型色条）、输入框、模态框、侧边栏 |
+| SVG 图标集 | [static/assets/icons/](file:///g:/code-memory/static/assets/icons) | 15 个极简线性图标（24x24px 栅格） |
+| SVG Logo 集 | [static/assets/logo/](file:///g:/code-memory/static/assets/logo) | 4 种 Logo 形态（主标/横版/纵版/纯文字） |
+
+**记忆类型色条系统**：信任中心 6 张卡片按记忆类型添加左侧色条，实现"一眼可辨"的视觉分组。
+
+| 记忆类型 | 色条颜色 | CSS 类 |
+|---------|---------|--------|
+| fact（事实） | 玉色 | `card-memory-fact` |
+| preference（偏好） | 金色 | `card-memory-preference` |
+| decision（决策） | 朱砂 | `card-memory-decision` |
+| code_context（代码上下文） | 水蓝 | `card-memory-code` |
+| conversation（对话） | 墨韵 | `card-memory-conversation` |
+
+**v0.7.0/v0.8.0/v0.9.0 预览功能**（v0.6.0 已内置 UI，后续版本将完善后端能力）：
+
+- **预设场景模板**（v0.7.0 预览）：4 套场景模板选择器（个人笔记/项目管理/学习助手/编程助手），位于仪表盘顶部。
+- **结晶历史时间线**（v0.8.0 预览）：从审计日志加载结晶事件并渲染为成长轨迹时间线。
+- **一键隐私检查**（v0.9.0 预览）：100ms 内返回三色信任指示器报告（存储位置/网络访问/加密状态），并行调用三个信任接口。
+
+**暗色模式**：通过 `prefers-color-scheme: dark` 自动适配系统暗色主题，所有色值使用 CSS 变量，无硬编码颜色。
+
+> 设计文档详见 [LRC 全案界面重构设计文档](docs/LRC%20(Loong%20Recall)%20全案界面重构设计文档.md)。
+
 ---
 
 ## 12 个 MCP 工具

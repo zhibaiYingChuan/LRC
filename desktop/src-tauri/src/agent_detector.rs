@@ -544,11 +544,348 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         binary_paths: &[],
         exe_names: &["memorix.exe", "Memorix.exe"],
     },
+    // ═══ v0.6.0 新增：补充遗漏的主流 AI 工具 ═══
+    // Claude Code CLI — Anthropic 官方命令行工具（不同于 Claude Desktop）
+    // 通过 npm install -g @anthropic-ai/claude-code 安装，命令为 claude
+    KnownTool {
+        id: "claude-code",
+        name: "Claude Code CLI",
+        icon: "💻",
+        category: "cli",
+        supports_mcp: true,
+        primary_marker: ".claude",
+        secondary_markers: &[".claude.json"],
+        mcp_config_template: Some(".claude.json"),
+        mcp_transport: "stdio",
+        binary_paths: &[],
+        exe_names: &["claude", "claude.exe"],
+    },
+    // Sublime Text — 老牌代码编辑器，通过插件支持 AI 功能
+    KnownTool {
+        id: "sublime-text",
+        name: "Sublime Text",
+        icon: "📝",
+        category: "ide",
+        supports_mcp: false,
+        primary_marker: "AppData/Roaming/Sublime Text",
+        secondary_markers: &["%APPDATA%/Sublime Text"],
+        mcp_config_template: None,
+        mcp_transport: "stdio",
+        binary_paths: &[
+            "%PROGRAMFILES%/Sublime Text/sublime_text.exe",
+            "%LOCALAPPDATA%/Programs/Sublime Text/sublime_text.exe",
+        ],
+        exe_names: &["sublime_text.exe", "subl.exe"],
+    },
+    // Tabnine — 独立 AI 编码助手，有 VSCode 插件也有独立应用
+    KnownTool {
+        id: "tabnine",
+        name: "Tabnine",
+        icon: "🔢",
+        category: "ai-assistant",
+        supports_mcp: false,
+        primary_marker: ".tabnine",
+        secondary_markers: &["%APPDATA%/Tabnine"],
+        mcp_config_template: None,
+        mcp_transport: "stdio",
+        binary_paths: &["%LOCALAPPDATA%/Programs/Tabnine/Tabnine.exe"],
+        exe_names: &["Tabnine.exe", "tabnine.exe"],
+    },
+    // Qwen Code — 阿里通义千问 CLI 工具（与通义灵码不同）
+    // 通过 npm install -g @qwen-code/qwen-code 安装，命令为 qwen
+    KnownTool {
+        id: "qwen-code",
+        name: "Qwen Code (通义千问 CLI)",
+        icon: "🌐",
+        category: "cli",
+        supports_mcp: true,
+        primary_marker: ".qwen",
+        secondary_markers: &[],
+        mcp_config_template: Some(".qwen/settings.json"),
+        mcp_transport: "stdio",
+        binary_paths: &[],
+        exe_names: &["qwen", "qwen-code", "qwen.exe"],
+    },
+    // Replit — 在线 IDE 的桌面端应用
+    KnownTool {
+        id: "replit",
+        name: "Replit",
+        icon: "🔄",
+        category: "ide",
+        supports_mcp: false,
+        primary_marker: ".replit",
+        secondary_markers: &["%APPDATA%/Replit"],
+        mcp_config_template: None,
+        mcp_transport: "stdio",
+        binary_paths: &["%LOCALAPPDATA%/Programs/Replit/Replit.exe"],
+        exe_names: &["Replit.exe", "replit.exe"],
+    },
+    // DeepSeek Coder — DeepSeek 的命令行编码助手
+    KnownTool {
+        id: "deepseek-coder",
+        name: "DeepSeek Coder",
+        icon: "🦈",
+        category: "cli",
+        supports_mcp: false,
+        primary_marker: ".deepseek",
+        secondary_markers: &[],
+        mcp_config_template: None,
+        mcp_transport: "stdio",
+        binary_paths: &[],
+        exe_names: &["deepseek", "deepseek-coder", "deepseek.exe"],
+    },
     // v0.5.4 P2-20 修复：移除 loong-recall 条目
     // 原因：~/.loong-recall 是 LRC 桌面端自己的数据目录，不是独立的 AI 工具。
     //       将其作为独立工具检测会导致所有安装了 LRC 的用户都看到"Loong Recall 已安装"，
     //       这是误导性的。LRC 桌面端应用本身就是 LRC 的入口。
 ];
+
+/// v0.6.0 新增：使用特殊检测器的工具 ID 列表
+///
+/// 这些工具有专用的检测器实现（如 TraeDetector、TraeCnDetector、
+/// ClaudeDesktopDetector、GenericMcpAgent），不使用通用的 DotDirDetector。
+///
+/// 新增特殊检测器时，需在此列表中添加对应 ID，否则会导致同一工具被检测两次。
+const SPECIAL_DETECTOR_IDS: &[&str] = &["trae", "trae-cn", "claude-desktop", "generic-mcp"];
+
+// ════════════════════════════════════════════════════════════════
+// v0.6.0 新增：supports_mcp=false 工具的手动配置指引
+// ════════════════════════════════════════════════════════════════
+
+/// 获取不支持 MCP 自动配置的工具的手动配置指引
+///
+/// 返回 None 表示该工具支持自动配置或无指引可用。
+/// 返回 Some 包含配置文档（Markdown 格式），前端可展示给用户。
+///
+/// 指引内容规范：
+///   - 配置文件路径
+///   - 配置 JSON 模板（可直接复制）
+///   - 官方文档链接
+///   - 替代方案说明（如 REST API）
+pub fn get_manual_config_guide(tool_id: &str) -> Option<&'static str> {
+    match tool_id {
+        // ── 国产 AI 编码助手 ──
+        "tongyi-lingma" => Some(
+            "通义灵码暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用通义灵码的 IDE 插件形式（VS Code / JetBrains 插件）\n\
+             2. 在 IDE 中安装通义灵码插件后，可通过 IDE 的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://tongyi.aliyun.com/lingma\n\n\
+             **配置示例**（如果你在 VS Code 中使用通义灵码插件）：\n\
+             在项目根目录创建 `.vscode/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+        "marscode" => Some(
+            "豆包 MarsCode 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用 MarsCode 的 IDE 插件形式（VS Code 插件）\n\
+             2. 在 VS Code 中安装 MarsCode 插件后，可通过 VS Code 的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://www.marscode.com\n\n\
+             **配置示例**（如果你在 VS Code 中使用 MarsCode 插件）：\n\
+             在项目根目录创建 `.vscode/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+        "codegeex" => Some(
+            "智谱 CodeGeeX 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用 CodeGeeX 的 IDE 插件形式（VS Code / JetBrains 插件）\n\
+             2. 在 IDE 中安装 CodeGeeX 插件后，可通过 IDE 的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://codegeex.cn\n\n\
+             **配置示例**（如果你在 VS Code 中使用 CodeGeeX 插件）：\n\
+             在项目根目录创建 `.vscode/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+        "tencent-ai-code" => Some(
+            "腾讯云 AI 代码助手暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用腾讯云 AI 代码助手的 IDE 插件形式（VS Code 插件）\n\
+             2. 在 VS Code 中安装插件后，可通过 VS Code 的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://cloud.tencent.com/product/aco\n\n\
+             **配置示例**（如果你在 VS Code 中使用腾讯云 AI 插件）：\n\
+             在项目根目录创建 `.vscode/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+        "huawei-codearts" => Some(
+            "华为 CodeArts Snap 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用 CodeArts Snap 的 IDE 插件形式（VS Code / JetBrains 插件）\n\
+             2. 在 IDE 中安装插件后，可通过 IDE 的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://www.huaweicloud.com/product/codeartside.html\n\n\
+             **配置示例**（如果你在 VS Code 中使用 CodeArts Snap 插件）：\n\
+             在项目根目录创建 `.vscode/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+
+        // ── 国际 AI 编码助手 ──
+        "continue" => Some(
+            "Continue.dev 支持通过 config.json 配置 MCP 服务器。\n\n\
+             **配置文件路径**：`~/.continue/config.json`\n\n\
+             **配置模板**（将以下内容添加到 config.json 的 `mcpServers` 数组中）：\n\
+             ```json\n\
+             {\n\
+               \"name\": \"lrc-memory\",\n\
+               \"transport\": {\n\
+                 \"type\": \"streamingHttp\",\n\
+                 \"url\": \"http://127.0.0.1:3099/mcp\"\n\
+               }\n\
+             }\n\
+             ```\n\n\
+             **官方文档**：https://docs.continue.dev/reference/Model%20Context%20Protocol"
+        ),
+        "cody" => Some(
+            "Cody (Sourcegraph) 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用 Cody 的 IDE 插件形式（VS Code / JetBrains 插件）\n\
+             2. 在 IDE 中安装 Cody 插件后，可通过 IDE 的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://docs.sourcegraph.com/cody\n\n\
+             **配置示例**（如果你在 VS Code 中使用 Cody 插件）：\n\
+             在项目根目录创建 `.vscode/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+        "aider" => Some(
+            "Aider 暂不原生支持 MCP 协议。\n\n\
+             **替代方案**：\n\
+             1. Aider 支持通过 `--read` 参数读取文件，可将 LRC 的记忆导出为文件供 Aider 读取\n\
+             2. 使用 LRC 的 REST API（http://127.0.0.1:3099）手动集成\n\
+             3. 官方文档：https://aider.chat\n\n\
+             **配置示例**：\n\
+             在终端运行 Aider 时，添加 LRC 导出的记忆文件：\n\
+             `aider --read lrc-memory.md`"
+        ),
+        "augment" => Some(
+            "Augment Code 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用 Augment 的 IDE 插件形式（VS Code / JetBrains 插件）\n\
+             2. 在 IDE 中安装 Augment 插件后，可通过 IDE 的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://www.augmentcode.com\n\n\
+             **配置示例**（如果你在 VS Code 中使用 Augment 插件）：\n\
+             在项目根目录创建 `.vscode/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+        "amazon-q" => Some(
+            "Amazon Q Developer 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用 Amazon Q 的 IDE 插件形式（VS Code / JetBrains 插件）\n\
+             2. 在 IDE 中安装 Amazon Q 插件后，可通过 IDE 的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://aws.amazon.com/codewhisperer\n\n\
+             **配置示例**（如果你在 VS Code 中使用 Amazon Q 插件）：\n\
+             在项目根目录创建 `.vscode/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+        "tabnine" => Some(
+            "Tabnine 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用 Tabnine 的 IDE 插件形式（VS Code / JetBrains 插件）\n\
+             2. 在 IDE 中安装 Tabnine 插件后，可通过 IDE 的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://www.tabnine.com\n\n\
+             **配置示例**（如果你在 VS Code 中使用 Tabnine 插件）：\n\
+             在项目根目录创建 `.vscode/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+
+        // ── CLI 工具 ──
+        "codex-cli" => Some(
+            "OpenAI Codex CLI 暂不支持 MCP 协议。\n\n\
+             **替代方案**：\n\
+             1. 使用 LRC 的 REST API（http://127.0.0.1:3099）手动集成\n\
+             2. 通过 `codex --config` 参数传递配置\n\
+             3. 官方文档：https://github.com/openai/codex\n\n\
+             **配置示例**：\n\
+             在终端运行 Codex CLI 时，可通过环境变量传递 LRC 端点：\n\
+             `LRC_ENDPOINT=http://127.0.0.1:3099 codex`"
+        ),
+        "deepseek-coder" => Some(
+            "DeepSeek Coder 暂不支持 MCP 协议。\n\n\
+             **替代方案**：\n\
+             1. 使用 DeepSeek API 直接集成（需配置 API Key）\n\
+             2. 使用 LRC 的 REST API（http://127.0.0.1:3099）手动集成\n\
+             3. 官方文档：https://www.deepseek.com\n\n\
+             **配置示例**：\n\
+             在终端运行 DeepSeek Coder 时，可通过环境变量传递 LRC 端点：\n\
+             `LRC_ENDPOINT=http://127.0.0.1:3099 deepseek`"
+        ),
+
+        // ── IDE 类 ──
+        "sublime-text" => Some(
+            "Sublime Text 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 安装 Sublime Text 的 AI 插件（如 Continue 或 Tabnine 插件）\n\
+             2. 通过 AI 插件的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://www.sublimetext.com\n\n\
+             **配置示例**：\n\
+             如果你安装了 Continue 插件，参考 Continue 的配置指引。"
+        ),
+        "replit" => Some(
+            "Replit 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. Replit 是在线 IDE，建议在本地使用 VS Code + Replit 插件\n\
+             2. 在 VS Code 中安装 Replit 插件后，可通过 VS Code 的 MCP 配置间接使用 LRC\n\
+             3. 官方文档：https://docs.replit.com\n\n\
+             **配置示例**（如果你在 VS Code 中使用 Replit 插件）：\n\
+             在项目根目录创建 `.vscode/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+
+        // ── 其他工具 ──
+        "jetbrains-ai" => Some(
+            "JetBrains AI Assistant 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. JetBrains IDE（IntelliJ IDEA / PyCharm / WebStorm 等）可通过插件支持 MCP\n\
+             2. 安装 'MCP Server' 插件后，可在 IDE 设置中配置 MCP 服务器\n\
+             3. 官方文档：https://www.jetbrains.com/ai\n\n\
+             **配置示例**：\n\
+             在 JetBrains IDE 中安装 MCP 插件后，添加 LRC 服务器：\n\
+             URL: http://127.0.0.1:3099/mcp"
+        ),
+        "zed" => Some(
+            "Zed 编辑器暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. Zed 计划在未来版本支持 MCP，请关注官方更新\n\
+             2. 目前可通过 Zed 的扩展插件系统手动集成 LRC\n\
+             3. 官方文档：https://zed.dev\n\n\
+             **配置示例**：\n\
+             等待 Zed 官方 MCP 支持后，将在 LRC 中添加自动配置。"
+        ),
+        "pearai" => Some(
+            "PearAI 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. PearAI 基于 VS Code，可参考 VS Code 的项目级 MCP 配置\n\
+             2. 在项目根目录创建 `.pearai/mcp.json`（或 `.vscode/mcp.json`）\n\
+             3. 官方文档：https://trypear.ai\n\n\
+             **配置示例**：\n\
+             在项目根目录创建 `.pearai/mcp.json`，内容参考 VS Code 的 MCP 配置模板。"
+        ),
+        "opencode" => Some(
+            "OpenCode 暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用 LRC 的 REST API（http://127.0.0.1:3099）手动集成\n\
+             2. 官方文档：https://github.com/opencode-ai/opencode\n\n\
+             **配置示例**：\n\
+             在 OpenCode 配置文件中添加 LRC 端点：\n\
+             `LRC_ENDPOINT=http://127.0.0.1:3099`"
+        ),
+        "z-brain" | "functional-hub" | "sillytavern" | "memorix" => Some(
+            "该工具暂不支持 MCP 协议自动配置。\n\n\
+             **替代方案**：\n\
+             1. 使用 LRC 的 REST API（http://127.0.0.1:3099）手动集成\n\
+             2. 参考 LRC 官方文档了解 REST API 接口"
+        ),
+
+        // ── 支持 MCP 的工具返回 None ──
+        _ => None,
+    }
+}
+
+/// v0.6.0 新增：获取工具类别的扫描优先级（数值越小优先级越高）
+///
+/// 优先级规则：
+///   1 (最高): ide — IDE 类工具（Trae/Cursor/VSCode/Windsurf/Kiro/JetBrains等）
+///   2:        desktop — 桌面应用类（Claude Desktop/Gemini CLI等）
+///   3:        cli — CLI 工具类（Codex CLI/Aider/Claude Code CLI等）
+///   4:        ai-assistant — AI 编码助手类（CodeBuddy/Comate/Continue等）
+///   5:        browser — 浏览器类（Agent Browser等）
+///   6 (最低): custom — 自定义/未知工具
+fn category_scan_priority(category: &str) -> u8 {
+    match category {
+        "ide" => 1,
+        "desktop" => 2,
+        "cli" => 3,
+        "ai-assistant" => 4,
+        "browser" => 5,
+        "custom" => 6,
+        _ => 7,
+    }
+}
 
 // ── 通用扫描函数 ──
 
@@ -698,13 +1035,42 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 /// 获取 AppData 目录
+///
+/// v0.6.0 跨平台支持：
+///   - Windows: %APPDATA% (如 C:\Users\<user>\AppData\Roaming)
+///   - macOS: ~/Library/Application Support
+///   - Linux: ~/.config
 fn appdata_dir() -> Option<PathBuf> {
-    std::env::var("APPDATA").ok().map(PathBuf::from)
+    // Windows 优先使用 APPDATA 环境变量
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return Some(PathBuf::from(appdata));
+        }
+    }
+    // v0.6.0：macOS/Linux 跨平台支持
+    // 使用 dirs crate 获取平台标准的配置目录
+    dirs::config_dir().or_else(|| home_dir().map(|h| h.join(".config")))
 }
 
 /// 获取 LocalAppData 目录
+///
+/// v0.6.0 跨平台支持：
+///   - Windows: %LOCALAPPDATA% (如 C:\Users\<user>\AppData\Local)
+///   - macOS: ~/Library/Application Support（macOS 不区分 Roaming/Local）
+///   - Linux: ~/.local/share
 fn local_appdata_dir() -> Option<PathBuf> {
-    std::env::var("LOCALAPPDATA").ok().map(PathBuf::from)
+    // Windows 优先使用 LOCALAPPDATA 环境变量
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+            return Some(PathBuf::from(local_appdata));
+        }
+    }
+    // v0.6.0：macOS/Linux 跨平台支持
+    // macOS 的 data_dir 和 config_dir 都指向 ~/Library/Application Support
+    // Linux 的 data_dir 指向 ~/.local/share
+    dirs::data_dir().or_else(|| home_dir().map(|h| h.join(".local/share")))
 }
 
 /// 解析标记路径中的变量
@@ -1707,9 +2073,9 @@ impl AgentDetectorRegistry {
 
         // 数据驱动的通用检测器（基于 KNOWN_TOOLS 数据库）
         // 排除已用特殊检测器覆盖的工具
-        let special_ids = ["trae", "trae-cn", "claude-desktop", "generic-mcp"];
+        // v0.6.0：使用模块级常量 SPECIAL_DETECTOR_IDS 替代局部变量
         for tool in KNOWN_TOOLS {
-            if !special_ids.contains(&tool.id) {
+            if !SPECIAL_DETECTOR_IDS.contains(&tool.id) {
                 detectors.push(Box::new(DotDirDetector::new(tool)));
             }
         }
@@ -1731,22 +2097,41 @@ impl AgentDetectorRegistry {
 
     /// 检测所有已安装的 Agent，返回信息列表
     pub fn detect_all(&self) -> Vec<AgentInfo> {
-        self.detectors.iter().map(|d| d.info()).collect()
+        // v0.6.0 优化：按 category 优先级排序，IDE 和 Agent 工具优先返回
+        // 优先级：ide(1) > desktop(2) > cli(3) > ai-assistant(4) > browser(5) > custom(6)
+        let mut agents: Vec<AgentInfo> = self.detectors.iter().map(|d| d.info()).collect();
+        agents.sort_by_key(|a| category_scan_priority(&a.category));
+        agents
     }
 
     /// v0.5.4 新增：带进度回调的 Agent 检测
-    /// 
+    ///
     /// 每检测完一个 Agent 就调用 on_progress 回调，
     /// 前端可据此显示"正在检测 Trae... (3/22)"的进度反馈。
+    ///
+    /// v0.6.0 优化：按 category 优先级排序检测，IDE 和 Agent 工具优先。
+    /// 这样前端进度条会先显示"正在检测 Trae/Cursor/VSCode..."等高频工具，
+    /// 再显示 AI 编码助手类工具，提升用户感知速度。
     pub fn detect_all_with_progress<F>(&self, on_progress: F) -> Vec<AgentInfo>
     where
         F: Fn(usize, usize, &AgentInfo),
     {
         let total = self.detectors.len();
-        self.detectors
+        // v0.6.0：先收集所有 (detector, category_priority) 对，按优先级排序
+        let mut indexed_detectors: Vec<(u8, &Box<dyn AgentDetector + Send + Sync>)> = self
+            .detectors
+            .iter()
+            .map(|d| {
+                let info = d.info();
+                (category_scan_priority(&info.category), d)
+            })
+            .collect();
+        indexed_detectors.sort_by_key(|(priority, _)| *priority);
+
+        indexed_detectors
             .iter()
             .enumerate()
-            .map(|(i, d)| {
+            .map(|(i, (_, d))| {
                 let info = d.info();
                 on_progress(i + 1, total, &info);
                 info
@@ -1881,9 +2266,12 @@ impl AgentDetectorRegistry {
 
                 if !info.supports_mcp {
                     tracing::info!("[MCP配置] {} — 不支持 MCP 协议，跳过", info.name);
+                    // v0.6.0 优化：为不支持 MCP 的工具提供手动配置指引
+                    let guide = get_manual_config_guide(&info.id)
+                        .unwrap_or("该工具暂不支持 MCP 协议，无配置指引可用。");
                     configured.push(format!(
-                        "{} — 不支持 MCP 协议，无法自动配置",
-                        info.name
+                        "{} — 不支持 MCP 自动配置。手动配置指引：\n{}",
+                        info.name, guide
                     ));
                     continue;
                 }
@@ -2776,5 +3164,109 @@ mod tests {
         assert!(!is_system_dir(".trae"));
         assert!(!is_system_dir(".cursor"));
         assert!(!is_system_dir(".kiro"));
+    }
+
+    // ════════════════════════════════════════════════════════════════
+    // v0.6.0 新增测试：验证 AI 工具扫描优化功能
+    // ════════════════════════════════════════════════════════════════
+
+    /// v0.6.0 测试：验证新增的 AI 工具已添加到 KNOWN_TOOLS
+    #[test]
+    fn test_v6_new_tools_added() {
+        let ids: Vec<_> = KNOWN_TOOLS.iter().map(|t| t.id).collect();
+        // v0.6.0 新增的 6 个工具
+        assert!(ids.contains(&"claude-code"), "缺少 claude-code 工具");
+        assert!(ids.contains(&"sublime-text"), "缺少 sublime-text 工具");
+        assert!(ids.contains(&"tabnine"), "缺少 tabnine 工具");
+        assert!(ids.contains(&"qwen-code"), "缺少 qwen-code 工具");
+        assert!(ids.contains(&"replit"), "缺少 replit 工具");
+        assert!(ids.contains(&"deepseek-coder"), "缺少 deepseek-coder 工具");
+        // 工具总数应至少 36 个（原 30 + 新增 6）
+        assert!(
+            KNOWN_TOOLS.len() >= 36,
+            "工具总数 {} 少于预期 36",
+            KNOWN_TOOLS.len()
+        );
+    }
+
+    /// v0.6.0 测试：验证 get_manual_config_guide 为不支持 MCP 的工具返回指引
+    #[test]
+    fn test_manual_config_guide_for_non_mcp_tools() {
+        // 不支持 MCP 的工具应返回配置指引
+        assert!(get_manual_config_guide("tongyi-lingma").is_some());
+        assert!(get_manual_config_guide("marscode").is_some());
+        assert!(get_manual_config_guide("codegeex").is_some());
+        assert!(get_manual_config_guide("continue").is_some());
+        assert!(get_manual_config_guide("aider").is_some());
+        assert!(get_manual_config_guide("sublime-text").is_some());
+        assert!(get_manual_config_guide("tabnine").is_some());
+        assert!(get_manual_config_guide("deepseek-coder").is_some());
+
+        // 指引内容应包含关键信息
+        let guide = get_manual_config_guide("continue").unwrap();
+        assert!(guide.contains("config.json"), "Continue 指引应包含配置文件路径");
+        assert!(guide.contains("127.0.0.1:3099"), "指引应包含 LRC 端点");
+    }
+
+    /// v0.6.0 测试：验证 get_manual_config_guide 对支持 MCP 的工具返回 None
+    #[test]
+    fn test_manual_config_guide_for_mcp_tools() {
+        // 支持 MCP 的工具应返回 None
+        assert!(get_manual_config_guide("trae").is_none());
+        assert!(get_manual_config_guide("cursor").is_none());
+        assert!(get_manual_config_guide("claude-desktop").is_none());
+        assert!(get_manual_config_guide("windsurf").is_none());
+    }
+
+    /// v0.6.0 测试：验证 category_scan_priority 优先级正确
+    #[test]
+    fn test_category_scan_priority() {
+        // IDE 类优先级最高
+        assert_eq!(category_scan_priority("ide"), 1);
+        // 桌面应用类
+        assert_eq!(category_scan_priority("desktop"), 2);
+        // CLI 工具类
+        assert_eq!(category_scan_priority("cli"), 3);
+        // AI 编码助手类
+        assert_eq!(category_scan_priority("ai-assistant"), 4);
+        // 浏览器类
+        assert_eq!(category_scan_priority("browser"), 5);
+        // 自定义类
+        assert_eq!(category_scan_priority("custom"), 6);
+        // 未知类别
+        assert_eq!(category_scan_priority("unknown"), 7);
+        // 验证优先级顺序
+        assert!(category_scan_priority("ide") < category_scan_priority("ai-assistant"));
+    }
+
+    /// v0.6.0 测试：验证 detect_all 按 category 优先级排序
+    #[test]
+    fn test_detect_all_sorted_by_priority() {
+        let registry = AgentDetectorRegistry::new();
+        let agents = registry.detect_all();
+        assert!(!agents.is_empty(), "检测结果不应为空");
+
+        // 找到第一个 ide 类工具的位置
+        let first_ide_pos = agents.iter().position(|a| a.category == "ide");
+        let first_ai_assistant_pos = agents.iter().position(|a| a.category == "ai-assistant");
+
+        // 如果同时存在 ide 和 ai-assistant 类工具，ide 应该排在前面
+        if let (Some(ide_pos), Some(ai_pos)) = (first_ide_pos, first_ai_assistant_pos) {
+            assert!(
+                ide_pos < ai_pos,
+                "IDE 类工具应排在 AI 助手类前面（ide位置: {}, ai-assistant位置: {}）",
+                ide_pos,
+                ai_pos
+            );
+        }
+    }
+
+    /// v0.6.0 测试：验证 SPECIAL_DETECTOR_IDS 常量正确
+    #[test]
+    fn test_special_detector_ids() {
+        assert!(SPECIAL_DETECTOR_IDS.contains(&"trae"));
+        assert!(SPECIAL_DETECTOR_IDS.contains(&"trae-cn"));
+        assert!(SPECIAL_DETECTOR_IDS.contains(&"claude-desktop"));
+        assert!(SPECIAL_DETECTOR_IDS.contains(&"generic-mcp"));
     }
 }

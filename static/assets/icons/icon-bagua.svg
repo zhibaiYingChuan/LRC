@@ -1,0 +1,30 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 外八边形 -->
+  <polygon points="12,2 18,5 21,11 19,18 12,21 5,18 3,11 6,5" fill="none" stroke="#ffffff"/>
+  
+  <!-- 中心太极阴阳鱼简化图 -->
+  <circle cx="12" cy="12" r="5" fill="none" stroke="#ffffff"/>
+  <path d="M 12 7 A 2.5 2.5 0 0 1 12 12 A 2.5 2.5 0 0 0 12 17" 
+        fill="none" stroke="#ffffff"/>
+  <circle cx="12" cy="9.5" r="0.8" fill="#ffffff" stroke="none"/>
+  <circle cx="12" cy="14.5" r="0.8" fill="none" stroke="#ffffff"/>
+  
+  <!-- 八卦边的短横（每边一个，模拟三爻） -->
+  <!-- 上边（乾三连示意） -->
+  <line x1="10" y1="3.5" x2="11" y2="3.5"/>
+  <line x1="12" y1="3.5" x2="13" y2="3.5"/>
+  <line x1="14" y1="3.5" x2="15" y2="3.5"/>
+  <!-- 右边 -->
+  <line x1="19" y1="9" x2="19" y2="10"/>
+  <line x1="19" y1="11" x2="19" y2="12"/>
+  <line x1="19" y1="13" x2="19" y2="14"/>
+  <!-- 下边 -->
+  <line x1="10" y1="20" x2="11" y2="20"/>
+  <line x1="13" y1="20" x2="14" y2="20"/>
+  <!-- 左边 -->
+  <line x1="5" y1="9" x2="5" y2="10"/>
+  <line x1="5" y1="13" x2="5" y2="14"/>
+</svg>
+
+
+

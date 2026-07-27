@@ -121,8 +121,6 @@
                         <option value="bytedance">豆包 — 字节跳动出品</option>
                         <option value="stepfun">阶跃星辰 — 多模态强</option>
                         <option value="baichuan">百川智能 — 金融医疗</option>
-                        <option value="openai">OpenAI — GPT-4o</option>
-                        <option value="ollama">Ollama 本地模型（免费）</option>
                         <option value="custom">自定义 API 地址...</option>
                     </select>
                 </div>
@@ -139,19 +137,6 @@
                         <label for="wizard-llm-model">模型名称（可选，留空使用默认）</label>
                         <input type="text" id="wizard-llm-model" class="form-input"
                             placeholder="例如：deepseek-chat" autocomplete="off">
-                    </div>
-                </div>
-
-                <div id="wizard-ollama-fields" style="display:none;">
-                    <div class="form-group">
-                        <label for="wizard-ollama-url">Ollama 地址</label>
-                        <input type="text" id="wizard-ollama-url" class="form-input"
-                            value="http://localhost:11434" placeholder="http://localhost:11434">
-                    </div>
-                    <div class="form-group">
-                        <label for="wizard-ollama-model">模型名称</label>
-                        <input type="text" id="wizard-ollama-model" class="form-input"
-                            value="llama3" placeholder="llama3">
                     </div>
                 </div>
 
@@ -238,15 +223,8 @@
                             <option value="bytedance">豆包 — 字节跳动出品</option>
                             <option value="stepfun">阶跃星辰 — 多模态强</option>
                             <option value="baichuan">百川智能 — 金融医疗</option>
-                            <option value="openai">OpenAI — GPT-4o</option>
-                            <option value="ollama">Ollama 本地模型（免费）</option>
                             <option value="custom">自定义 API 地址...</option>
                         </select>
-                    </div>
-                    <div class="form-group form-group-sm" id="settings-ollama-fields" style="display:none">
-                        <label for="settings-ollama-url">Ollama 地址</label>
-                        <input type="text" id="settings-ollama-url" class="form-input"
-                            value="http://localhost:11434" placeholder="http://localhost:11434">
                     </div>
                 </div>
                 <div id="settings-llm-api-section">
@@ -282,11 +260,6 @@
                             </div>
                         </div>
                     </details>
-                    <div class="form-group" id="settings-ollama-model-field" style="display:none">
-                        <label for="settings-ollama-model">模型名称</label>
-                        <input type="text" id="settings-ollama-model" class="form-input"
-                            value="llama3" placeholder="llama3">
-                    </div>
                 </div>
                 <div class="settings-actions">
                     <button id="settings-btn-save-llm" class="btn btn-primary">💾 保存 LLM 配置</button>

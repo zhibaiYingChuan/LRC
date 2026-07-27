@@ -1,0 +1,14 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 仪表盘：环形表盘 + 指针 -->
+  <path d="M 4 16 A 8 8 0 0 1 20 16" fill="none"/>
+  <line x1="12" y1="16" x2="12" y2="8"/>
+  <circle cx="12" cy="16" r="1.5" fill="#ffffff" stroke="none"/>
+  <!-- 刻度 -->
+  <line x1="5.5" y1="13" x2="6.5" y2="12"/>
+  <line x1="17.5" y1="12" x2="18.5" y2="13"/>
+  <line x1="9" y1="6" x2="9.5" y2="7"/>
+  <line x1="15" y1="7" x2="15.5" y2="6"/>
+</svg>
+
+
+

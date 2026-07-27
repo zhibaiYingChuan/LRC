@@ -1,0 +1,28 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 放大镜镜片：九宫格虚线网格 -->
+  <circle cx="10" cy="10" r="7" fill="none" stroke="#ffffff"/>
+  
+  <!-- 九宫格虚线（镜片内） -->
+  <g stroke-dasharray="1,1.5" opacity="0.5">
+    <line x1="6" y1="6" x2="6" y2="14"/>
+    <line x1="10" y1="4" x2="10" y2="16"/>
+    <line x1="14" y1="6" x2="14" y2="14"/>
+    <line x1="4" y1="10" x2="16" y2="10"/>
+    <line x1="6" y1="14" x2="14" y2="14"/>
+    <line x1="6" y1="6" x2="14" y2="6"/>
+  </g>
+  
+  <!-- 中心光点 -->
+  <circle cx="10" cy="10" r="1" fill="#ffffff" stroke="none"/>
+  
+  <!-- 手柄：龙尾弧线（从镜片右下延伸） -->
+  <path d="M 15 15 Q 18 18 21 20" 
+        fill="none" stroke="#ffffff" stroke-width="2"/>
+  
+  <!-- 龙尾尖 -->
+  <path d="M 20 19.5 L 21 21 L 19.5 20.5" 
+        fill="none" stroke="#ffffff" stroke-width="1.5"/>
+</svg>
+
+
+

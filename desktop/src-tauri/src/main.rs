@@ -39,18 +39,37 @@ fn main() {
     }
 
     // 初始化全局状态
+    let sidecar_binary_path = std::env::current_exe()
+        .unwrap_or_default()
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("lrc-sidecar")
+        .with_extension(std::env::consts::EXE_EXTENSION);
+
+    // v0.6.0 P0-D 修复：启动时检查 sidecar 二进制是否存在
+    // 若不存在，打印明确的错误日志（不阻断启动，让用户能看到提示）
+    if !sidecar_binary_path.exists() {
+        tracing::error!(
+            "═══════════════════════════════════════════════════════"
+        );
+        tracing::error!("LRC Sidecar 二进制文件不存在: {}", sidecar_binary_path.display());
+        tracing::error!("请先编译主项目: cargo build --release --features server");
+        tracing::error!("或重新安装 LRC Desktop 以获取完整的 sidecar 二进制");
+        tracing::error!(
+            "═══════════════════════════════════════════════════════"
+        );
+    } else {
+        tracing::info!("LRC Sidecar 二进制: {}", sidecar_binary_path.display());
+    }
+
     let app_store = AppStore {
-        wizard: Mutex::new(WizardState::load().expect("加载向导状态失败：无法确定配置目录")),
+        // v0.6.0 P3-1 修复：expect 改为 unwrap_or_else 优雅降级，避免配置目录异常时 panic
+        wizard: Mutex::new(WizardState::load().unwrap_or_else(|e| {
+            tracing::warn!("加载向导状态失败，使用默认状态: {}", e);
+            WizardState::default()
+        })),
         sidecar: Mutex::new(SidecarManager::new(
-            // sidecar 二进制路径（与桌面应用同级目录）
-            std::env::current_exe()
-                .unwrap_or_default()
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join("lrc-sidecar")
-                .with_extension(std::env::consts::EXE_EXTENSION)
-                .display()
-                .to_string(),
+            sidecar_binary_path.display().to_string(),
         )),
         agent_registry: {
             let mut registry = AgentDetectorRegistry::new();
@@ -86,6 +105,7 @@ fn main() {
             commands::test_llm_connection,
             commands::detect_agents,
             commands::detect_installed_agents,
+            commands::get_agent_config_guide,
             commands::discover_all_agents,
             commands::configure_agents,
             commands::save_configured_agents,
@@ -102,6 +122,7 @@ fn main() {
             commands::reset_wizard,
             commands::mark_complete,
             commands::verify_setup,
+            commands::open_data_dir, // v0.6.0：右下角"数据目录"点击打开文件夹
         ])
         .manage(app_store)
         // v0.5.4 P2-16 调试：页面加载事件追踪

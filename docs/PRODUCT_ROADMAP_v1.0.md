@@ -1,11 +1,11 @@
 # LRC 产品迭代计划文档
 
-**文档版本**：v1.1
+**文档版本**：v1.2
 **适用产品版本**：v0.6.0 ~ v0.9.0
-**当前基线版本**：v0.6.0（通用语义引擎已交付）
-**文档状态**：v0.6.0 已实现，待评审后续版本
+**当前基线版本**：v0.6.0（通用语义引擎 + 龙忆设计系统 v1.0 已交付）
+**文档状态**：v0.6.0 已实现（含 UI 重构 + v0.7/v0.8/v0.9 预览），待评审后续版本
 **产品负责人**：创世者设计
-**最后更新**：2026-07-26
+**最后更新**：2026-07-27
 
 ---
 
@@ -18,7 +18,7 @@
 | 一句话 | 给 AI 编程助手装上记忆插件 | 通用个人记忆管家 |
 | 核心场景 | IDE 内代码搜索 + 跨会话决策记忆 | 编程 / 笔记 / 项目管理 / 学习助手 全场景记忆 |
 | 语义模型 | CodeBERT 强代码弱通用文本 | 通用文本嵌入（BGE/MiniLM）+ 可切换代码模型 |
-| 结晶路径 | 强依赖 LLM API（OpenAI/Ollama） | 本地嵌入优先，LLM API 可选增强 |
+| 结晶路径 | 强依赖 LLM API（OpenAI） | 本地嵌入优先，LLM API 可选增强 |
 | 用户感知 | 黑盒记忆库 | 可视化演化轨迹 + 隐私审计 |
 
 ### 1.2 北极星目标
@@ -102,18 +102,19 @@ v0.9.0 (4 周) ── 隐私与信任感知
 
 | 版本 | 发布日期（目标） | 核心主题 | 关键交付物 |
 |------|----------------|---------|-----------|
-| v0.6.0 | T+4 周 | 通用语义引擎 | Embedder trait + 模型管理器 + BGE 默认 + 本地结晶 |
-| v0.7.0 | T+8 周 | 场景化记忆 | 4 套场景模板 + 场景感知 API |
-| v0.8.0 | T+12 周 | 演化可视化 | 结晶历史持久化 + 仪表盘增强 |
-| v0.9.0 | T+16 周 | 隐私信任 | 审计日志查询 + 隐私仪表盘 |
+| v0.6.0 | T+4 周 | 通用语义引擎 + 龙忆设计系统 v1.0 | Embedder trait + 模型管理器 + BGE 默认 + 本地结晶 + UI 全面重构 + v0.7/v0.8/v0.9 预览 |
+| v0.7.0 | T+8 周 | 场景化记忆 | 4 套场景模板 + 场景感知 API（v0.6.0 已预览 UI） |
+| v0.8.0 | T+12 周 | 演化可视化 | 结晶历史持久化 + 仪表盘增强（v0.6.0 已预览时间线 UI） |
+| v0.9.0 | T+16 周 | 隐私信任 | 审计日志查询 + 隐私仪表盘（v0.6.0 已预览一键检查 UI） |
 
 ---
 
-## 4. v0.6.0 — 通用语义引擎 ✅ 已交付
+## 4. v0.6.0 — 通用语义引擎 + 龙忆设计系统 v1.0 ✅ 已交付
 
-> **交付状态**：已完成全部 5 项核心功能，cargo test 456 passed（含 model_downloader 18 项），cargo check 编译通过。
-> **交付日期**：2026-07-26
-> **代码变更**：新增 `src/engine/model_downloader.rs`（~600 行）、`src/engine/embedder.rs`、`src/engine/model_resolver.rs`、`src/engine/luoshu_encoder_ml.rs`，修改 `src/consolidation.rs`、`src/bin/server.rs`、`src/engine/mod.rs`。
+> **交付状态**：已完成全部 5 项核心功能 + UI 全面重构 + v0.7/v0.8/v0.9 预览功能。cargo test 456 passed，3 个复杂场景测试全部通过（Playwright 自动化验证）。
+> **交付日期**：2026-07-27（UI 重构 + 补丁修复）/ 2026-07-26（通用语义引擎）
+> **代码变更**：新增 `src/engine/model_downloader.rs`（~600 行）、`src/engine/embedder.rs`、`src/engine/model_resolver.rs`、`src/engine/luoshu_encoder_ml.rs`，修改 `src/consolidation.rs`、`src/bin/server.rs`、`src/engine/mod.rs`；UI 重构涉及 `static/index.html`、`static/app.css`、`static/app.js`、`static/colors_and_type.css`、`static/components.css`、`static/assets/icons/`（15 个图标）、`static/assets/logo/`；`src/server.rs` 新增静态资源嵌入路由（colors_and_type.css/components.css/15 SVG）。
+> **补丁修复**（2026-07-27）：三层基准测试切换标签（设计文档 5.6）、静态资源 404 修复（嵌入 sidecar）、safeJson 作用域修复、搜索 API 端点修复（/recall → /v1/memories/enrich）、版本号硬编码统一为 v0.6.0。
 
 ### 4.1 版本目标
 

@@ -88,6 +88,27 @@ docs/ARCHITECTURE.md
 desktop/TEST_REPORT_v0.5.7.md
 desktop/TEST_REPORT_*.md
 
+# v0.6.0 迭代产生的本地审计/测试/修复报告（不交付用户）
+docs/AUDIT_REPORT_*.md
+docs/TEST_REPORT_*.md
+docs/FIX_PLAN_*.md
+docs/CROSS_PLATFORM_AUDIT_*.md
+
+# v0.6.0 本地设计文档与UI Kit（不交付用户）
+# 注：static/colors_and_type.css 和 static/components.css 是生产必需资源，由 server.rs include_str! 内嵌，必须推送
+docs/LRC*全案*.md
+loong-recall/
+static/logo-preview.html
+
+# v0.6.0 本地测试脚本（不交付用户）
+desktop/test-full.mjs
+desktop/test-*.mjs
+test-cdp.ps1
+
+# 桌面端二进制目录（构建产物，不入库）
+desktop/src-tauri/binaries/
+desktop/.github/
+
 # 本地测试脚本（不交付用户）
 test_server.ps1
 

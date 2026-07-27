@@ -1,0 +1,16 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+  <!-- 网络审计：中心节点 + 三个外围节点 + 连线，象征网络访问监控 -->
+  <!-- 连线（先画，置于节点下方） -->
+  <line x1="12" y1="12" x2="5" y2="6" stroke="#ffffff" opacity="0.6"/>
+  <line x1="12" y1="12" x2="19" y2="6" stroke="#ffffff" opacity="0.6"/>
+  <line x1="12" y1="12" x2="12" y2="20" stroke="#ffffff" opacity="0.6"/>
+  <!-- 中心节点（实心，强调） -->
+  <circle cx="12" cy="12" r="3" fill="#ffffff" stroke="none"/>
+  <!-- 外围节点（空心） -->
+  <circle cx="5" cy="6" r="2" fill="none" stroke="#ffffff"/>
+  <circle cx="19" cy="6" r="2" fill="none" stroke="#ffffff"/>
+  <circle cx="12" cy="20" r="2" fill="none" stroke="#ffffff"/>
+</svg>
+
+
+
