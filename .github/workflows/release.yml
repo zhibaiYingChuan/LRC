@@ -249,9 +249,7 @@ jobs:
         run: |
           mkdir -p desktop-artifacts
           VERSION="${{ steps.version.outputs.VER }}"
-          # 复制 MSI 安装包
-          find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.msi" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-windows-x86_64.msi \;
-          # 复制 NSIS 安装包
+          # 复制 NSIS 安装包（v0.6.0 起：不再使用 MSI/WiX，避免 GitHub 下载 WiX 超时）
           find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.exe" -path "*/nsis/*" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-windows-x86_64-setup.exe \;
           ls -la desktop-artifacts/
         shell: bash
