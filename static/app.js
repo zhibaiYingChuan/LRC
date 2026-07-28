@@ -1364,9 +1364,25 @@ async function importMemories(event) {
       throw new Error('无效的 JSON 文件格式: ' + e.message);
     }
 
-    // 验证导出格式版本
-    if (!exportData.version || exportData.version !== '2.0') {
-      throw new Error('不支持的导出格式版本: ' + (exportData.version || '未知'));
+    // 兼容老版本格式：老版本 memories.json 是数组格式 [{...}, ...]
+    // 新版本格式是对象 { version: '2.0', memories: [...], ... }
+    if (Array.isArray(exportData)) {
+      // 老版本数组格式,转换为新版本结构
+      exportData = {
+        version: '1.0-legacy',
+        memories: exportData,
+        chunks: [],
+        source: 'legacy_array',
+        fingerprint: null,
+      };
+    }
+
+    // 验证导出格式版本(兼容 1.0-legacy 和 2.0)
+    if (!exportData.version) {
+      throw new Error('不支持的导出格式: 缺少 version 字段');
+    }
+    if (exportData.version !== '2.0' && exportData.version !== '1.0-legacy') {
+      throw new Error('不支持的导出格式版本: ' + exportData.version);
     }
 
     const memoryCount = Array.isArray(exportData.memories) ? exportData.memories.length : 0;
@@ -1377,6 +1393,7 @@ async function importMemories(event) {
       '  记忆：' + memoryCount + ' 条\n' +
       '  代码片段：' + chunkCount + ' 个\n' +
       '  来源：' + (exportData.source || '未知') + '\n' +
+      '  格式版本：' + exportData.version + '\n' +
       '  指纹：' + (exportData.fingerprint || '无') + '\n\n' +
       '导入将追加到现有数据，不会覆盖已有记忆。确认继续？'
     )) {
