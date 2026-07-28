@@ -1254,23 +1254,19 @@ async function backupMemories() {
   }
 
   try {
-    // 从 API 获取记忆数据
+    // 从 API 获取记忆数据(大量数据时需要更长超时)
     const [memoriesRes, chunksRes, archiveRes, projectRes] = await Promise.allSettled([
       fetchWithTimeout(API_BASE + '/v1/memories/list', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ limit: 10000 })
-      }),
-      fetchWithTimeout(API_BASE + '/v1/code/search', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: '', limit: 10000 })
-      }),
+      }, 60000),
+      fetchWithTimeout(API_BASE + '/v1/code/search?query=&top_k=10000', {}, 60000),
       fetchWithTimeout(API_BASE + '/v1/memories/archive', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({})
-      }),
+      }, 60000),
       fetchWithTimeout(API_BASE + '/api/project/info'),
     ]);
 
@@ -1406,23 +1402,36 @@ async function importMemories(event) {
 
     // 调用后端 API 写入数据
     if (memoryCount > 0) {
+      let imported = 0;
+      let failed = 0;
       for (const mem of exportData.memories) {
-        await fetchWithTimeout(API_BASE + '/v1/memories/remember', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            content: mem.content || JSON.stringify(mem),
-            memory_type: mem.memory_type || 'general',
-            importance: mem.importance || 5,
-            metadata: mem
-          }),
-        });
+        try {
+          await fetchWithTimeout(API_BASE + '/v1/memories/remember', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              content: mem.content || JSON.stringify(mem),
+              memory_type: mem.memory_type || 'general',
+              importance: mem.importance || 5,
+              metadata: mem
+            }),
+          }, 30000);
+          imported++;
+          // 每 50 条更新一次进度
+          if (imported % 50 === 0 && result) {
+            result.textContent = '⏳ 导入中... ' + imported + '/' + memoryCount + ' 条';
+          }
+        } catch (e) {
+          failed++;
+          console.warn('记忆导入失败 #' + imported + failed + ':', e.message);
+        }
       }
-    }
-
-    if (result) {
-      result.textContent = '✅ 导入完成！共导入 ' + memoryCount + ' 条记忆';
-      result.className = 'form-result form-result-success';
+      if (result) {
+        const msg = '✅ 导入完成！成功 ' + imported + ' 条' +
+                    (failed > 0 ? '，失败 ' + failed + ' 条' : '');
+        result.textContent = msg;
+        result.className = 'form-result form-result-success';
+      }
     }
   } catch (e) {
     if (result) {
