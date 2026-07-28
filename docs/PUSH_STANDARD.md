@@ -12,13 +12,15 @@
 | 类别 | 路径示例 | 说明 |
 |------|---------|------|
 | Rust 源码 | `src/**/*.rs`、`build.rs`、`Cargo.toml`、`Cargo.lock` | 后端核心 |
-| 桌面端源码 | `desktop/src-tauri/src/**/*.rs`、`desktop/src/**/*` | Tauri 桌面应用 |
-| 静态资源 | `static/index.html`、`static/app.js`、`static/app.css`、`static/colors_and_type.css`、`static/components.css`、`static/assets/**` | 仪表盘前端，被 sidecar `include_str!` 内嵌 |
+| 桌面端源码 | `desktop/src-tauri/src/**/*.rs` | Tauri 桌面应用后端（Rust） |
+| 静态资源 | `static/index.html`、`static/app.js`、`static/app.css`、`static/colors_and_type.css`、`static/components.css`、`static/assets/**` | 仪表盘前端，被 sidecar `include_str!` 内嵌；`tauri.conf.json` 的 `frontendDist` 指向 `../../static` |
 | 构建配置 | `desktop/src-tauri/tauri.conf.json`、`desktop/src-tauri/Cargo.toml`、`desktop/package.json` | 构建系统配置 |
 | CI/CD | `.github/workflows/*.yml` | GitHub Actions 工作流 |
 | 用户文档 | `README.md`、`CHANGELOG.md`、`docs/USER_GUIDE.md`、`docs/PRODUCT_ROADMAP_v1.0.md`、`LICENSE`、`LICENSE_CODE` | 面向用户的文档 |
 | 基准测试 | `benchmarks/**` | 基准测试报告与脚本 |
 | 预设模板 | `templates/**` | 用户可用的预设模板 |
+
+> **注意**：`desktop/src/` 下的旧前端文件（index.html、styles.css、wizard.js）已于 v0.6.0 删除，被 `static/` 下的新仪表盘完全取代。**禁止**重新引入 `desktop/src/` 目录作为前端，所有前端资源统一放在 `static/`。
 
 ### 1.2 禁止推送（本地开发产物）
 
@@ -174,8 +176,7 @@ MAJOR.MINOR.PATCH
 3. `desktop/src-tauri/tauri.conf.json` → `version` 字段
 4. `desktop/package.json` → `version` 字段
 5. `CHANGELOG.md` → 最新版本标题
-6. `static/app.js` → 显示给用户的版本号（如有硬编码）
-7. `desktop/src/index.html` → 显示给用户的版本号（如有硬编码）
+6. `static/index.html` → 显示给用户的版本号（`id="sys-version"` 和 `id="status-version"`）
 
 ### 4.2 当前版本
 
@@ -461,6 +462,7 @@ python scripts/check_algorithm_leak.py --verbose
 - **禁止** `git add .` 或 `git add -A`（可能添加敏感文件）
 - **禁止**提交 `.env`、密钥、证书文件
 - **禁止**在提交信息中暴露敏感信息
+- **禁止**在 `feat` 提交上打版本 tag（tag 必须指向 `chore(release)` 提交，详见第十章）
 
 ### 9.2 推荐操作
 
@@ -471,9 +473,129 @@ python scripts/check_algorithm_leak.py --verbose
 
 ---
 
-## 十、附录
+## 十、旧版本清理规范
 
-### 10.1 当前仓库状态（v0.6.0）
+> **强制要求**：每次版本发布前，必须执行旧版本清理，防止旧文件残留导致版本混淆（v0.6.0 曾因旧前端残留导致编译出 0.5.12 版本）。
+
+### 10.1 清理范围
+
+| 类别 | 清理对象 | 判定标准 |
+|------|---------|---------|
+| 旧前端文件 | `desktop/src/` 目录 | 已被 `static/` 取代的配置向导、旧样式表、旧脚本 |
+| 旧构建脚本 | `build_release.ps1`、`sign-binary.ps1` | 含过期 token、硬编码旧版本号的脚本 |
+| 旧测试报告 | `desktop/TEST_REPORT_v*.md` | 历史版本测试报告，不影响当前版本 |
+| 旧安装包 | `*.msi`、`*setup*.exe`、`*.dmg`、`MicrosoftEdgeWebview2Setup.exe` | 旧版本安装包，CI/CD 会重新构建 |
+| 空残留文件 | `build-log.txt`（0 字节）| 空文件残留 |
+| 旧编译缓存 | `target/`、`desktop/src-tauri/target/` | 本地编译缓存（.gitignore 已忽略） |
+
+### 10.2 清理流程
+
+```powershell
+# 1. 检查旧版本残留文件
+Get-ChildItem -Path . -Filter "TEST_REPORT_v*" -Recurse
+Get-ChildItem -Path . -Filter "build_release.ps1" -Recurse
+Get-ChildItem -Path . -Filter "*.msi" -Recurse
+
+# 2. 删除旧前端（已被 static/ 取代）
+git rm desktop/src/index.html desktop/src/styles.css desktop/src/wizard.js 2>$null
+
+# 3. 删除旧脚本（含过期 token）
+Remove-Item build_release.ps1 -Force -ErrorAction SilentlyContinue
+
+# 4. 删除旧测试报告
+Remove-Item desktop/TEST_REPORT_v*.md -Force -ErrorAction SilentlyContinue
+
+# 5. 删除旧安装包
+Remove-Item MicrosoftEdgeWebview2Setup.exe -Force -ErrorAction SilentlyContinue
+
+# 6. 提交清理
+git commit -m "chore: 清理旧版本残留文件"
+```
+
+### 10.3 清理验证
+
+清理完成后，验证以下事项：
+
+1. `desktop/src/` 目录不存在或为空（前端统一在 `static/`）
+2. `tauri.conf.json` 的 `frontendDist` 指向 `../../static`
+3. 无含过期 token 的脚本文件
+4. 无旧版本测试报告
+5. `git status` 干净，无非预期的旧文件
+
+---
+
+## 十一、Tag 构建规范
+
+> **强制要求**：版本 tag 必须指向最新的 `chore(release)` 提交，不能指向 `feat` 或 `fix` 提交。
+
+### 11.1 Tag 指向规则
+
+| 提交类型 | 是否可以打 tag | 原因 |
+|---------|--------------|------|
+| `chore(release): 发布 vX.Y.Z` | ✅ **必须** | 包含所有前端+后端+配置的完整更新 |
+| `feat: 新功能` | ❌ **禁止** | 可能不包含前端更新或配置修复 |
+| `fix: Bug 修复` | ❌ **禁止** | 可能不包含完整的版本发布内容 |
+
+### 11.2 Tag 创建流程
+
+```powershell
+# 1. 确认所有修改已提交（包括前端、后端、配置、文档）
+git status
+# 期望：nothing to commit, working tree clean
+
+# 2. 确认 HEAD 是 chore(release) 提交
+git log --oneline -1
+# 期望：chore(release): 发布 vX.Y.Z
+
+# 3. 确认版本号一致性（见 4.1 节）
+
+# 4. 确认旧版本已清理（见第十章）
+
+# 5. 创建 tag（在 chore(release) 提交上）
+git tag -a vX.Y.Z -m "vX.Y.Z: 版本说明"
+
+# 6. 验证 tag 指向
+git rev-list -n 1 vX.Y.Z
+# 必须等于 git rev-parse HEAD
+
+# 7. 推送 tag（触发 CI/CD）
+git push origin vX.Y.Z
+```
+
+### 11.3 Tag 修复流程（当 tag 指向错误提交时）
+
+```powershell
+# 1. 删除本地旧 tag
+git tag -d vX.Y.Z
+
+# 2. 在正确的提交上创建新 tag
+git tag -a vX.Y.Z -m "vX.Y.Z: 版本说明"
+
+# 3. 强制推送 tag（覆盖远程旧 tag）
+git push origin vX.Y.Z --force
+
+# 4. 验证远程 tag 指向
+git ls-remote --tags origin vX.Y.Z
+```
+
+> **注意**：强制推送 tag 后，需要手动删除旧的 GitHub Release（如果已创建），或让 CI/CD 自动更新 Release（`softprops/action-gh-release` 会更新已存在的 Release）。
+
+### 11.4 二进制编译包处理
+
+| 场景 | 处理方式 | 说明 |
+|------|---------|------|
+| 仓库代码 | **禁止**推送二进制 | `.gitignore` 已忽略 `*.exe`、`*.msi`、`*.dmg`、`target/` |
+| CI/CD 构建 | 自动编译 | `release.yml` 步骤 1 编译 sidecar，步骤 2 复制到 `desktop/src-tauri/`，步骤 4 构建桌面端 |
+| GitHub Release | 自动上传 | CI/CD 编译后自动上传到 GitHub Release，用户从 Release 下载 |
+| 本地构建 | 手动编译 | `cargo build --release --features server` 编译 sidecar，复制到 `desktop/src-tauri/lrc-sidecar.exe` |
+
+> **重要**：仓库中**不需要**也不**应该**包含预编译的二进制文件。CI/CD 会从源码编译所有产物。`build.rs` 会检测 `desktop/src-tauri/lrc-sidecar.exe` 是否存在，本地构建时需手动编译并复制。
+
+---
+
+## 十二、附录
+
+### 12.1 当前仓库状态（v0.6.0）
 
 - **仓库地址**：https://github.com/zhibaiYingChuan/LRC
 - **主分支**：main
@@ -481,7 +603,7 @@ python scripts/check_algorithm_leak.py --verbose
 - **构建工作流**：`.github/workflows/release.yml`
 - **覆盖平台**：Windows、macOS、Linux
 
-### 10.2 相关文档
+### 12.2 相关文档
 
 - [CHANGELOG.md](../CHANGELOG.md) — 变更记录
 - [README.md](../README.md) — 项目说明
@@ -489,8 +611,9 @@ python scripts/check_algorithm_leak.py --verbose
 - [.github/workflows/release.yml](../.github/workflows/release.yml) — 构建工作流
 - [.gitignore](../.gitignore) — Git 忽略规则
 
-### 10.3 修订记录
+### 12.3 修订记录
 
 | 日期 | 版本 | 修订内容 |
 |------|------|---------|
 | 2026-07-28 | v1.0 | 初始版本，基于 v0.6.0 迭代经验形成 |
+| 2026-07-28 | v1.1 | 新增第十章旧版本清理规范、第十一章 Tag 构建规范；删除 desktop/src/ 相关要求；明确二进制编译包处理方式 |
