@@ -384,6 +384,10 @@ impl SidecarManager {
 
         if let Some(dir) = src_dir {
             cmd.args(["--src-dir", dir]);
+        } else {
+            // v0.6.0 修复:桌面端无 src_dir 时使用全局模式,避免基于 cwd 生成指纹目录
+            // 桌面端场景无明确项目概念,全局模式更符合用户直觉
+            cmd.arg("--global");
         }
 
         // 多窗口模式
