@@ -508,7 +508,8 @@ function postMessageToParent(type, extra = {}, timeoutMs = 30000) {
       const cmdName = POST_MESSAGE_TO_INVOKE[type];
       if (invokeFn && cmdName) {
         try {
-          const result = await invokeFn(cmdName);
+          // v0.6.0 修复:传递 extra 参数,否则 start_sidecar 等命令无法接收 src_dir 等配置
+          const result = await invokeFn(cmdName, extra);
           resolve(result);
         } catch (e) {
           reject(new Error(typeof e === 'string' ? e : (e.message || String(e))));
