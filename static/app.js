@@ -475,8 +475,9 @@ function updateStatusBar(online, systemData) {
 
 // ============================================================
 // v0.6.0 状态栏点击：启动服务 + 打开数据目录
-// 通过 postMessage 与父窗口（Tauri 主窗口 wizard.js）通信
-// 仅在 embedded 模式下生效；非 embedded 模式回退到直接调用 Tauri invoke
+// v0.6.0 修复：wizard.js 已删除，Tauri 主窗口直接加载 static/index.html
+// 在 Tauri 环境中直接调用 invoke，不再通过 postMessage 与父窗口通信
+// 仅在 iframe 嵌入模式（?embedded=tauri）下回退到 postMessage
 // ============================================================
 
 // postMessage 请求计数器（用于关联请求与响应）
@@ -484,16 +485,41 @@ let postMessageReqId = 0;
 // 待处理的 postMessage 请求回调
 const pendingPostMessageRequests = new Map();
 
+// 消息类型 → Tauri 命令名映射
+const POST_MESSAGE_TO_INVOKE = {
+  'lrc-start-service': 'start_sidecar',
+  'lrc-open-data-dir': 'open_data_dir',
+};
+
 /**
- * 通过 postMessage 向父窗口发送请求
+ * 向桌面端发送请求（启动服务/打开数据目录等）
+ * v0.6.0 修复：Tauri 环境直接调用 invoke，iframe 嵌入模式回退到 postMessage
  * @param {string} type - 消息类型（如 'lrc-start-service'）
  * @param {object} [extra={}] - 额外参数
  * @param {number} [timeoutMs=30000] - 超时时间
- * @returns {Promise<object>} 父窗口返回的结果
+ * @returns {Promise<object>} 桌面端返回的结果
  */
 function postMessageToParent(type, extra = {}, timeoutMs = 30000) {
-  return new Promise((resolve, reject) => {
-    // 非 embedded 模式：尝试直接调用 Tauri invoke（作为回退）
+  return new Promise(async (resolve, reject) => {
+    // 优先：Tauri 环境（主窗口直接加载仪表盘）直接调用 invoke
+    if (isTauriEnv) {
+      const invokeFn = (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) ||
+                       (window.__TAURI__ && window.__TAURI__.invoke);
+      const cmdName = POST_MESSAGE_TO_INVOKE[type];
+      if (invokeFn && cmdName) {
+        try {
+          const result = await invokeFn(cmdName);
+          resolve(result);
+        } catch (e) {
+          reject(new Error(typeof e === 'string' ? e : (e.message || String(e))));
+        }
+        return;
+      }
+      reject(new Error('Tauri 环境但无法调用 invoke: ' + type));
+      return;
+    }
+
+    // 回退：iframe 嵌入模式（?embedded=tauri）通过 postMessage 与父窗口通信
     if (!IS_DESKTOP_EMBEDDED) {
       reject(new Error('当前非桌面端嵌入模式，无法调用此功能'));
       return;
@@ -1124,7 +1150,10 @@ function startAutoRefresh() {
 // 当仪表盘被嵌入 Tauri 桌面端时，URL 会带 ?embedded=tauri 参数
 // v0.5.5：嵌入模式和非嵌入模式统一使用完整的 LLM 配置表单
 // 不管在哪里修改 LLM 配置，都通过 /api/config/llm API 保存，自动同步到 wizard.json
-const IS_DESKTOP_EMBEDDED = new URLSearchParams(window.location.search).get('embedded') === 'tauri';
+// v0.6.0 修复：Tauri 主窗口直接加载 static/index.html（非 iframe），URL 无 ?embedded=tauri
+// 需同时检查 isTauriEnv（window.__TAURI_INTERNALS__ 存在）判断是否在桌面端
+const IS_DESKTOP_EMBEDDED = isTauriEnv ||
+  (new URLSearchParams(window.location.search).get('embedded') === 'tauri');
 
 // v0.5.5：LLM 提供商列表（与桌面端配置向导一致）
 const LLM_PROVIDERS = {
