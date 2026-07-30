@@ -32,6 +32,12 @@ pub mod data_dir;
 /// 数据迁移模块：旧版 V1 数据自动迁移到 V2 结构
 pub mod migration;
 
+/// v0.8.0 "归一"：记忆数据备份模块
+pub mod backup;
+
+/// v0.8.0 "归一"：数据操作日志模块
+pub mod data_log;
+
 /// 数据导出/导入模块：记忆备份与恢复
 pub mod export;
 

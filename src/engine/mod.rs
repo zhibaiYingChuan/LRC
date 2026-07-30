@@ -29,6 +29,11 @@ pub mod encoder_codebert; // CodeBERT 编码器实现
 #[cfg(any(feature = "ml", feature = "server"))]
 pub mod model_downloader; // v0.6.0 模型下载器（进度回调 + 重试 + 镜像源）
 
+// v0.6.0+ 参赛扩展：结构化探索日志模块
+// 为"开放探索赛题"提供科学探索过程的结构化日志记录（JSON Lines 格式）
+// 位置在 L1 应用层，因为它只是日志记录工具，不涉及核心算法
+pub mod exploration_log;
+
 // ──────────────────────────────────────────────
 // L2 核心引擎层 (Core Engine Layer)
 // ──────────────────────────────────────────────
@@ -84,7 +89,7 @@ pub use health_report::{
 };
 pub use hnsw::HnswRetriever;
 pub use llm_translator::LlmApiConfig;
-pub use luoshu_encoder::{EncoderStatus, LuoShuEncoder, LuoShuVector};
+pub use luoshu_encoder::{EncoderStatus, LuoShuEncoder, LuoShuVector, LUOSHU_WEIGHTS};
 pub use manager::{ChunkStats, CoreManager};
 pub use memory_gc::{
     GcCandidate, GcConfig, GcStats, MemoryGarbageCollector, MemoryInfoQuery, MemorySnapshot,
@@ -103,6 +108,12 @@ pub use user_feedback::{
 };
 
 pub use pooling::PoolingStrategy;
+
+// v0.6.0+ 参赛扩展：探索日志公开导出
+pub use exploration_log::{
+    BaguaDistribution, DepthDistribution, ExplorationEventType, ExplorationLogEntry,
+    ExplorationLogger, Metrics, SnapshotPayload,
+};
 
 #[cfg(feature = "ml")]
 pub use encoder_codebert::CodeBertEncoder;

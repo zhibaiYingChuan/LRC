@@ -175,13 +175,14 @@ MAJOR.MINOR.PATCH
 2. `desktop/src-tauri/Cargo.toml` → `version` 字段
 3. `desktop/src-tauri/tauri.conf.json` → `version` 字段
 4. `desktop/package.json` → `version` 字段
-5. `CHANGELOG.md` → 最新版本标题
-6. `static/index.html` → 显示给用户的版本号（`id="sys-version"` 和 `id="status-version"`）
+5. `static/app.js` → `APP_VERSION` 常量（前端版本号唯一来源，status-version 和日志前缀均引用）
+6. `static/index.html` → 显示给用户的版本号（`id="sys-version"` 和 `id="status-version"` 初始值 + `<meta name="version">`）
+7. `CHANGELOG.md` → 最新版本标题
 
 ### 4.2 当前版本
 
-- **当前版本**：0.6.0
-- **下一版本**：0.6.1（Bug 修复）或 0.7.0（功能新增）
+- **当前版本**：0.8.7
+- **下一版本**：0.8.8（Bug 修复）或 0.9.0（功能新增）
 
 ---
 
@@ -487,6 +488,9 @@ python scripts/check_algorithm_leak.py --verbose
 | 旧安装包 | `*.msi`、`*setup*.exe`、`*.dmg`、`MicrosoftEdgeWebview2Setup.exe` | 旧版本安装包，CI/CD 会重新构建 |
 | 空残留文件 | `build-log.txt`（0 字节）| 空文件残留 |
 | 旧编译缓存 | `target/`、`desktop/src-tauri/target/` | 本地编译缓存（.gitignore 已忽略） |
+| 旧版本 sidecar | `desktop/src-tauri/lrc-sidecar.exe`、`G:\rust-target\release\lrc-sidecar.exe` | 旧版本 sidecar 二进制（v0.7.x debug 构建约 17MB，release 约 4MB） |
+| 旧版本桌面端 | `G:\rust-target\release\lrc-desktop.exe` | 旧版本桌面端二进制 |
+| 旧版本清理脚本 | `scripts/cleanup_old_builds_v*.ps1` | 历史版本清理脚本（保留最新版本） |
 
 ### 10.2 清理流程
 
@@ -595,11 +599,11 @@ git ls-remote --tags origin vX.Y.Z
 
 ## 十二、附录
 
-### 12.1 当前仓库状态（v0.6.0）
+### 12.1 当前仓库状态（v0.8.7）
 
 - **仓库地址**：https://github.com/zhibaiYingChuan/LRC
 - **主分支**：main
-- **当前版本**：0.6.0
+- **当前版本**：0.8.7
 - **构建工作流**：`.github/workflows/release.yml`
 - **覆盖平台**：Windows、macOS、Linux
 
@@ -617,3 +621,4 @@ git ls-remote --tags origin vX.Y.Z
 |------|------|---------|
 | 2026-07-28 | v1.0 | 初始版本，基于 v0.6.0 迭代经验形成 |
 | 2026-07-28 | v1.1 | 新增第十章旧版本清理规范、第十一章 Tag 构建规范；删除 desktop/src/ 相关要求；明确二进制编译包处理方式 |
+| 2026-07-30 | v1.2 | HCSE 安全评估 + 发布规范专家评审后更新：第 4.1 节版本号同步清单 6→7 处（新增 static/app.js APP_VERSION）；第 4.2 节当前版本 0.6.0→0.8.7；第 10.1 节清理范围补充 v0.8.x 编译产物；第 12.1 节仓库状态更新到 v0.8.7 |

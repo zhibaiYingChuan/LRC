@@ -283,7 +283,7 @@ impl Embedder for LlmApiEmbedder {
         self.config
             .embed_texts(texts)
             .await
-            .map_err(|e| EmbedError::Network(e))
+            .map_err(EmbedError::Network)
     }
 
     fn dim(&self) -> usize {

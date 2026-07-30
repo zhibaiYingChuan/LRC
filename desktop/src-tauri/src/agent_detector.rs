@@ -63,6 +63,26 @@ pub struct ProjectInfo {
     pub ide_name: String,
 }
 
+/// v0.8.0 "归一"：规则文件状态信息
+///
+/// 用于信任中心展示各 AI 工具的 LRC 规则写入状态，
+/// 让用户能确认规则是否已正确写入。
+#[derive(Debug, Clone, Serialize)]
+pub struct RulesStatus {
+    /// 工具 ID（如 "trae", "cursor"）
+    pub tool_id: String,
+    /// 规则文件绝对路径
+    pub rules_path: String,
+    /// 文件是否存在
+    pub exists: bool,
+    /// 文件中解析到的规则版本号（如 "0.8.0"）
+    pub version: Option<String>,
+    /// 是否需要更新（版本低于当前或文件不存在）
+    pub needs_update: bool,
+    /// 最后修改时间（UNIX 时间戳字符串）
+    pub last_modified: Option<String>,
+}
+
 // ════════════════════════════════════════════════════════════════
 // 已知 AI 工具定义（数据驱动的工具数据库）
 // ════════════════════════════════════════════════════════════════
@@ -639,6 +659,81 @@ const KNOWN_TOOLS: &[KnownTool] = &[
     //       将其作为独立工具检测会导致所有安装了 LRC 的用户都看到"Loong Recall 已安装"，
     //       这是误导性的。LRC 桌面端应用本身就是 LRC 的入口。
 ];
+
+/// v0.8.0 "归一"：LRC 规则文件版本号
+///
+/// 用于规则文件的版本化管理和自动升级。
+/// 当此版本号高于规则文件中的版本号时，自动升级规则内容。
+/// 版本号遵循语义化版本规范（major.minor.patch）。
+const LRC_RULES_VERSION: &str = "0.8.0";
+
+/// v0.8.0 "归一"：从规则文件内容中解析版本号
+///
+/// 查找 `<!-- LRC_RULES_VERSION: x.y.z -->` 标记并提取版本号。
+/// 兼容旧版本规则文件（无结构化标记时返回 None）。
+fn parse_rules_version(content: &str) -> Option<String> {
+    // 查找结构化版本标记
+    let marker = "<!-- LRC_RULES_VERSION:";
+    if let Some(pos) = content.find(marker) {
+        let start = pos + marker.len();
+        let rest = &content[start..];
+        // 提取到 "-->" 为止的版本号
+        if let Some(end) = rest.find("-->") {
+            let version = rest[..end].trim();
+            if !version.is_empty() {
+                return Some(version.to_string());
+            }
+        }
+    }
+
+    // v0.8.0 兼容：旧版本规则文件（v0.5.12 格式）
+    // 旧格式：<!-- 本文件由 LRC Desktop v0.5.12 自动生成 -->
+    let legacy_marker = "LRC Desktop v";
+    if let Some(pos) = content.find(legacy_marker) {
+        let start = pos + legacy_marker.len();
+        let rest = &content[start..];
+        // 提取版本号（数字和点组成的字符串）
+        let version: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        if !version.is_empty() {
+            return Some(version);
+        }
+    }
+
+    None
+}
+
+/// v0.8.0 "归一"：语义化版本比较
+///
+/// 将 "0.8.0" 和 "0.5.12" 这样的版本号比较大小。
+/// 返回 std::cmp::Ordering::Less/Equal/Greater。
+///
+/// 比较规则：按 major.minor.patch 逐段比较数字大小。
+/// 缺失的段视为 0（如 "0.8" 等于 "0.8.0"）。
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse_ver = |s: &str| -> Vec<u32> {
+        s.split('.')
+            .filter_map(|part| part.parse::<u32>().ok())
+            .collect()
+    };
+
+    let va = parse_ver(a);
+    let vb = parse_ver(b);
+    let len = va.len().max(vb.len());
+
+    for i in 0..len {
+        let na = va.get(i).copied().unwrap_or(0);
+        let nb = vb.get(i).copied().unwrap_or(0);
+        match na.cmp(&nb) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+
+    std::cmp::Ordering::Equal
+}
 
 /// v0.6.0 新增：使用特殊检测器的工具 ID 列表
 ///
@@ -2363,6 +2458,87 @@ impl AgentDetectorRegistry {
         self.configure(&installed_ids, port, project_dir)
     }
 
+    /// v0.8.0 "归一" 新增：获取所有支持规则文件的工具 ID 列表
+    ///
+    /// 用于桌面端 setup() 时自动写入规则，无需依赖 sidecar 启动。
+    /// 返回 KNOWN_TOOLS 中所有定义了 rules_file_template 的工具 ID。
+    pub fn get_all_rules_capable_tool_ids() -> Vec<String> {
+        KNOWN_TOOLS
+            .iter()
+            .filter_map(|t| {
+                if Self::get_rules_file_template(t.id).is_some() {
+                    Some(t.id.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// v0.8.0 "归一" 新增：获取所有工具的规则文件状态
+    ///
+    /// 用于信任中心展示各 AI 工具的 LRC 规则写入状态。
+    /// 检查每个工具的规则文件是否存在、版本是否最新。
+    pub fn get_rules_status() -> Vec<RulesStatus> {
+        let home_dir = match dirs::home_dir() {
+            Some(h) => h,
+            None => {
+                tracing::warn!("[AI规则] 无法获取用户主目录，返回空状态列表");
+                return Vec::new();
+            }
+        };
+
+        KNOWN_TOOLS
+            .iter()
+            .filter_map(|t| {
+                let template = Self::get_rules_file_template(t.id)?;
+                let rules_path = home_dir.join(template);
+                let exists = rules_path.exists();
+
+                let (version, needs_update) = if exists {
+                    let content = std::fs::read_to_string(&rules_path).unwrap_or_default();
+                    let ver = parse_rules_version(&content);
+                    let needs = match &ver {
+                        Some(v) => {
+                            compare_versions(v, LRC_RULES_VERSION) == std::cmp::Ordering::Less
+                        }
+                        None => true, // 无法解析版本，需要更新
+                    };
+                    (ver, needs)
+                } else {
+                    (None, true) // 文件不存在，需要创建
+                };
+
+                let last_modified = if exists {
+                    std::fs::metadata(&rules_path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs().to_string())
+                } else {
+                    None
+                };
+
+                tracing::debug!(
+                    "[AI规则] {} — exists={}, version={:?}, needs_update={}",
+                    t.id,
+                    exists,
+                    version,
+                    needs_update
+                );
+
+                Some(RulesStatus {
+                    tool_id: t.id.to_string(),
+                    rules_path: rules_path.display().to_string(),
+                    exists,
+                    version,
+                    needs_update,
+                    last_modified,
+                })
+            })
+            .collect()
+    }
+
     /// v0.5.6 新增：为指定 Agent 写入全局 IDE 规则文件（不修改 MCP 配置）
     ///
     /// 规则文件写入用户主目录，一次配置对所有项目生效。
@@ -2745,12 +2921,28 @@ impl AgentDetectorRegistry {
 
         format!(
             r#"{frontmatter}{header}
-<!-- 本文件由 LRC Desktop v0.5.12 自动生成，请勿手动删除 LRC 相关规则 -->
+<!-- LRC_RULES_VERSION: 0.8.0 -->
+<!-- LRC_RULES_GENERATED: 2026-07-29 -->
+<!-- 本文件由 LRC Desktop v0.8.0 "归一" 自动生成，请勿手动删除 LRC 相关规则 -->
 <!-- 如需自定义规则，请在本文件末尾添加 -->
 
 ## LRC 记忆系统（Loong Recall Code Memory）
 
 你已连接 LRC 记忆系统——一个本地代码记忆库。**请严格遵循以下规则，主动使用记忆工具。** 这不是可选项，而是你工作流程的一部分。
+
+---
+
+### 数据安全承诺（v0.8.0 "归一"）
+
+**数据统一存储位置**：`~/.loong-recall/global/data/`（桌面端默认全局模式）
+
+- 桌面端使用全局模式（无项目指纹隔离），所有项目共享记忆库
+- IDE 插件使用项目指纹模式，每个项目独立记忆库
+- 数据操作（迁移/备份/恢复/导出/导入）自动记录到 `~/.loong-recall/data_operations.log`
+- 备份文件存储在 `~/.loong-recall/backups/`，最多保留 4 个（自动清理最旧）
+- 用户可通过信任中心查看数据位置、记忆数量、文件大小、最后备份时间
+
+当用户询问数据存储位置时，请告知上述路径。当用户需要数据管理操作时，可建议使用信任中心的相关功能。
 
 ---
 
@@ -2804,6 +2996,30 @@ recall(query="<模块名或关键词>", top_k=3)
 | 纯 bug 修复（不改变结构） | 无需同步 |
 
 3. 向用户报告同步结果（一句话即可，如"已记录限流模块到记忆库"或"本次无需同步记忆"）
+
+---
+
+### v0.6.0~v0.8.0 新功能说明
+
+**v0.6.0 合成引擎与道同构度**：
+- 合成引擎（synthesize）：自动将碎片化记忆合成为高层抽象记忆，提升检索质量
+- 道同构度调节器（dao-regulator）：评估记忆一致性，自动调节合成策略
+- 探索日志（exploration_log）：记录关键方法的执行轨迹，便于调试和优化
+- 本地语义模型：默认 `BAAI/bge-small-zh`，通过 `--embedding-model` 配置
+
+**v0.7.0 洛书向量编码**：
+- 洛书向量编码器（/v1/encode）：将代码转换为语义向量，支持相似度计算
+- 船长日志（/v1/captains-log）：记录系统运行状态和关键决策
+- 版本检查（/v1/version/check）：检查 LRC 是否有新版本
+
+**v0.8.0 数据治理**：
+- 数据迁移（POST /v1/migrate）：合并旧版本数据到统一存储位置
+- 手动备份（POST /v1/backup）：创建数据快照
+- 列出备份（GET /v1/backups）：查看可用备份列表
+- 操作日志（GET /v1/data-logs）：查看数据操作历史
+- 全局模式默认：桌面端默认使用全局模式，所有项目共享记忆库
+
+当用户询问这些功能时，请主动调用对应的 MCP 工具或建议用户通过信任中心使用。
 
 ---
 
@@ -2944,68 +3160,132 @@ AI：已记录登录 API 到记忆库
 
         let lrc_rules = Self::generate_ai_rules_content(tool_id);
 
-        // 如果文件已存在，检查是否已包含 LRC 规则
+        // v0.8.0 "归一"：基于版本号的规则升级逻辑
+        // 替代旧的字符串匹配（"v0.5.12 自动生成"），实现语义化版本比较
         if rules_path.exists() {
             let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
-            if existing.contains("LRC 记忆系统") {
-                // v0.5.12 增强：检测旧版本规则并自动升级（兼容 v0.5.5 ~ v0.5.11）
-                if !existing.contains("v0.5.12 自动生成") {
-                    // 旧版本规则，需要升级
-                    if let Some(pos) = existing.find("## LRC 记忆系统") {
-                        let user_content = existing[..pos].trim_end();
-                        let merged = if user_content.is_empty() {
-                            lrc_rules.clone()
-                        } else {
-                            format!("{}\n\n{}", user_content, lrc_rules)
-                        };
-                        std::fs::write(&rules_path, merged).map_err(|e| {
-                            format!("更新规则文件失败: {} ({})", rules_path.display(), e)
-                        })?;
+
+            // 解析现有规则文件的版本号
+            let file_version = parse_rules_version(&existing);
+
+            match file_version {
+                Some(ref ver) => {
+                    // 版本比较：当前版本 >= LRC_RULES_VERSION → 跳过（幂等）
+                    if compare_versions(ver, LRC_RULES_VERSION) != std::cmp::Ordering::Less {
                         tracing::info!(
-                            "[AI规则] {} — 已升级 LRC 规则到 v0.5.12 版本: {}",
-                            tool_id,
-                            rules_path.display()
+                            "[AI规则] {} — 规则文件版本 {} 已是最新（{}），跳过: {}",
+                            tool_id, ver, LRC_RULES_VERSION, rules_path.display()
                         );
-                    } else {
-                        let merged = format!("{}\n\n{}", existing.trim_end(), lrc_rules);
-                        std::fs::write(&rules_path, merged).map_err(|e| {
-                            format!("更新规则文件失败: {} ({})", rules_path.display(), e)
-                        })?;
-                        tracing::info!(
-                            "[AI规则] {} — 已追加 LRC v0.5.12 规则到现有文件: {}",
-                            tool_id,
-                            rules_path.display()
-                        );
+                        return Ok(());
                     }
-                } else {
-                    // 已是 v0.5.12 版本，跳过
+
+                    // 版本较低 → 需要升级
                     tracing::info!(
-                        "[AI规则] {} — 规则文件已是最新版本，跳过: {}",
-                        tool_id,
-                        rules_path.display()
+                        "[AI规则] {} — 规则文件版本 {} 低于当前版本 {}，开始升级: {}",
+                        tool_id, ver, LRC_RULES_VERSION, rules_path.display()
+                    );
+
+                    // v0.8.0 安全措施：升级前备份旧文件到 .bak
+                    let bak_path = rules_path.with_extension("md.bak");
+                    if bak_path.extension().is_none() {
+                        // 非 .md 文件（如 .mdc）的备份路径处理
+                        let bak_path = format!("{}.bak", rules_path.display());
+                        let _ = std::fs::copy(&rules_path, &bak_path);
+                    } else {
+                        let _ = std::fs::copy(&rules_path, &bak_path);
+                    }
+
+                    // 保留用户自定义内容（LRC 规则之外的部分）
+                    let merged = if existing.contains("## LRC 记忆系统") {
+                        // 提取 LRC 规则之前的用户内容
+                        if let Some(pos) = existing.find("## LRC 记忆系统") {
+                            // 往前找 frontmatter 或 LRC 头部注释
+                            let user_end = pos;
+                            // 查找 LRC 规则的起始位置（包括前面的注释和 frontmatter）
+                            let lrc_start = existing
+                                .find("# AI Rules — LRC")
+                                .or_else(|| existing.find("# Trae AI Rules"))
+                                .or_else(|| existing.find("# Cursor AI Rules"))
+                                .or_else(|| existing.find("# CodeBuddy Rules"))
+                                .or_else(|| existing.find("# Cline Rules"))
+                                .or_else(|| existing.find("# Windsurf Rules"))
+                                .or_else(|| existing.find("# Roo Code Rules"))
+                                .or_else(|| existing.find("# GitHub Copilot"))
+                                .or_else(|| existing.find("# Comate Rules"))
+                                .unwrap_or(0);
+
+                            // 也查找 frontmatter 起始
+                            let frontmatter_start = if existing.starts_with("---\n") {
+                                existing.find("\n---\n").map(|p| p + 5).unwrap_or(0)
+                            } else {
+                                lrc_start
+                            };
+
+                            let user_content = existing[..frontmatter_start].trim_end();
+                            if user_content.is_empty() {
+                                lrc_rules.clone()
+                            } else {
+                                format!("{}\n\n{}", user_content, lrc_rules)
+                            }
+                        } else {
+                            // 有 "## LRC 记忆系统" 但找不到标题，全覆盖
+                            lrc_rules.clone()
+                        }
+                    } else {
+                        // 不包含 LRC 规则标记，可能是纯用户文件，追加 LRC 规则
+                        format!("{}\n\n{}", existing.trim_end(), lrc_rules)
+                    };
+
+                    std::fs::write(&rules_path, &merged).map_err(|e| {
+                        format!("升级规则文件失败: {} ({})", rules_path.display(), e)
+                    })?;
+                    tracing::info!(
+                        "[AI规则] {} — 已升级规则文件到 v{}: {}",
+                        tool_id, LRC_RULES_VERSION, rules_path.display()
                     );
                 }
-                return Ok(());
+                None => {
+                    // 版本号解析失败 → 降级为全覆盖（备份后写入）
+                    tracing::warn!(
+                        "[AI规则] {} — 无法解析规则文件版本，降级为全覆盖策略: {}",
+                        tool_id, rules_path.display()
+                    );
+
+                    // 备份旧文件
+                    let bak_path = format!("{}.bak", rules_path.display());
+                    let _ = std::fs::copy(&rules_path, &bak_path);
+
+                    // 检查是否包含 LRC 规则标记
+                    if existing.contains("LRC 记忆系统") {
+                        // 包含 LRC 标记但无法解析版本，全覆盖
+                        std::fs::write(&rules_path, &lrc_rules).map_err(|e| {
+                            format!("覆盖规则文件失败: {} ({})", rules_path.display(), e)
+                        })?;
+                        tracing::info!(
+                            "[AI规则] {} — 已全覆盖写入规则文件: {}",
+                            tool_id, rules_path.display()
+                        );
+                    } else {
+                        // 不包含 LRC 标记，追加
+                        let merged = format!("{}\n\n{}", existing.trim_end(), lrc_rules);
+                        std::fs::write(&rules_path, &merged).map_err(|e| {
+                            format!("追加规则文件失败: {} ({})", rules_path.display(), e)
+                        })?;
+                        tracing::info!(
+                            "[AI规则] {} — 已追加 LRC 规则到现有文件: {}",
+                            tool_id, rules_path.display()
+                        );
+                    }
+                }
             }
-            // 在已有内容末尾追加 LRC 规则
-            let merged = format!("{}\n\n{}", existing.trim_end(), lrc_rules);
-            std::fs::write(&rules_path, merged).map_err(|e| {
-                format!("更新规则文件失败: {} ({})", rules_path.display(), e)
-            })?;
-            tracing::info!(
-                "[AI规则] {} — 已追加 LRC 规则到现有文件: {}",
-                tool_id,
-                rules_path.display()
-            );
         } else {
             // 创建新文件
             std::fs::write(&rules_path, &lrc_rules).map_err(|e| {
                 format!("创建规则文件失败: {} ({})", rules_path.display(), e)
             })?;
             tracing::info!(
-                "[AI规则] {} — 已创建全局规则文件: {}",
-                tool_id,
-                rules_path.display()
+                "[AI规则] {} — 已创建全局规则文件 v{}: {}",
+                tool_id, LRC_RULES_VERSION, rules_path.display()
             );
         }
 
@@ -3063,6 +3343,62 @@ fn is_system_dir(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ════════════════════════════════════════════════════════════
+    // v0.8.0 "归一"：规则版本管理单元测试
+    // ════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_parse_rules_version_structured() {
+        let content = "<!-- LRC_RULES_VERSION: 0.8.0 -->\n# Rules";
+        assert_eq!(parse_rules_version(content), Some("0.8.0".to_string()));
+    }
+
+    #[test]
+    fn test_parse_rules_version_legacy_v0512() {
+        let content = "<!-- 本文件由 LRC Desktop v0.5.12 自动生成 -->\n# Rules";
+        assert_eq!(parse_rules_version(content), Some("0.5.12".to_string()));
+    }
+
+    #[test]
+    fn test_parse_rules_version_no_version() {
+        let content = "# My Custom Rules\nNo version info here";
+        assert_eq!(parse_rules_version(content), None);
+    }
+
+    #[test]
+    fn test_parse_rules_version_empty() {
+        assert_eq!(parse_rules_version(""), None);
+    }
+
+    #[test]
+    fn test_parse_rules_version_structured_with_spaces() {
+        let content = "<!-- LRC_RULES_VERSION:   1.2.3  -->\n# Rules";
+        assert_eq!(parse_rules_version(content), Some("1.2.3".to_string()));
+    }
+
+    #[test]
+    fn test_compare_versions_equal() {
+        assert_eq!(compare_versions("0.8.0", "0.8.0"), std::cmp::Ordering::Equal);
+        assert_eq!(compare_versions("0.8", "0.8.0"), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_versions_less() {
+        assert_eq!(compare_versions("0.5.12", "0.8.0"), std::cmp::Ordering::Less);
+        assert_eq!(compare_versions("0.7.99", "0.8.0"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn test_compare_versions_greater() {
+        assert_eq!(compare_versions("0.8.0", "0.5.12"), std::cmp::Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0", "0.8.0"), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_lrc_rules_version_constant() {
+        assert_eq!(LRC_RULES_VERSION, "0.8.0");
+    }
 
     /// TDD：测试 detect_all 返回所有注册的检测器信息
     #[test]

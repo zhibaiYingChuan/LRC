@@ -1,0 +1,198 @@
+name: CI
+
+# v0.7.1 P4-2：E2E 自动化测试接入 CI
+# 触发条件：push 到 main/develop 分支、所有 PR
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  # Job 1: 代码格式检查（cargo fmt）
+  # ════════════════════════════════════════════════════════════
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # ════════════════════════════════════════════════════════════
+  # Job 2: Clippy 静态检查（拒绝 warnings）
+  # ════════════════════════════════════════════════════════════
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache Cargo deps
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-clippy-
+      - name: Run clippy (server feature)
+        run: cargo clippy --features server -- -D warnings
+      - name: Run clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+  # ════════════════════════════════════════════════════════════
+  # Job 3: 单元测试 + 集成测试
+  # 包含 v1_api.rs 的 22 个 API 契约测试 + server.rs 路径遍历测试
+  # ════════════════════════════════════════════════════════════
+  test:
+    name: Unit & Integration Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo deps
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-test-
+      - name: Run tests (server feature)
+        run: cargo test --features server --verbose
+      - name: Run tests (default features)
+        run: cargo test --verbose
+
+  # ════════════════════════════════════════════════════════════
+  # Job 4: E2E Smoke Test
+  # 启动 sidecar 二进制，curl 关键端点验证 HTTP 200
+  # 验证链路：二进制启动 → HTTP 服务监听 → API 响应正确
+  # ════════════════════════════════════════════════════════════
+  e2e-smoke:
+    name: E2E Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo deps
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-e2e-
+
+      - name: Build sidecar binary
+        run: cargo build --release --features server
+
+      - name: Start sidecar in background
+        # 启动 sidecar，端口 3099，源码目录为当前仓库
+        # 使用 nohup + & 后台运行，等待 3 秒让服务就绪
+        run: |
+          nohup ./target/release/code-memory-server --src-dir . --port 3099 > sidecar.log 2>&1 &
+          echo "Sidecar PID: $!"
+          sleep 3
+          # 验证进程存活
+          if ! pgrep -f "code-memory-server"; then
+            echo "ERROR: sidecar 启动失败"
+            cat sidecar.log
+            exit 1
+          fi
+
+      - name: Smoke test - /v1/health/system
+        # 验证系统健康端点返回 200
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3099/v1/health/system)
+          echo "GET /v1/health/system → HTTP $RESPONSE"
+          if [ "$RESPONSE" != "200" ]; then
+            echo "FAIL: 期望 200，实际 $RESPONSE"
+            cat sidecar.log
+            exit 1
+          fi
+
+      - name: Smoke test - /v1/memories/stats
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3099/v1/memories/stats)
+          echo "GET /v1/memories/stats → HTTP $RESPONSE"
+          if [ "$RESPONSE" != "200" ]; then
+            echo "FAIL: 期望 200，实际 $RESPONSE"
+            cat sidecar.log
+            exit 1
+          fi
+
+      - name: Smoke test - /v1/encode (POST)
+        # 验证编码端点能正确处理请求
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST http://127.0.0.1:3099/v1/encode \
+            -H "Content-Type: application/json" \
+            -d '{"text":"Rust 开发"}')
+          echo "POST /v1/encode → HTTP $RESPONSE"
+          if [ "$RESPONSE" != "200" ]; then
+            echo "FAIL: 期望 200，实际 $RESPONSE"
+            cat sidecar.log
+            exit 1
+          fi
+
+      - name: Smoke test - / (dashboard)
+        # 验证静态资源服务正常
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3099/)
+          echo "GET / → HTTP $RESPONSE"
+          if [ "$RESPONSE" != "200" ]; then
+            echo "FAIL: 期望 200，实际 $RESPONSE"
+            cat sidecar.log
+            exit 1
+          fi
+
+      - name: Dump sidecar log on failure
+        if: failure()
+        run: |
+          echo "=== sidecar.log ==="
+          cat sidecar.log || true
+
+      - name: Stop sidecar
+        if: always()
+        run: |
+          pkill -f "code-memory-server" || true
+
+  # ════════════════════════════════════════════════════════════
+  # Job 5: 跨平台编译验证（确保 Windows/macOS 可编译）
+  # ════════════════════════════════════════════════════════════
+  build-matrix:
+    name: Build Check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo deps
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-build-
+      - name: cargo check (server feature)
+        run: cargo check --features server

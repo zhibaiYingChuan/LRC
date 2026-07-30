@@ -1,0 +1,66 @@
+name: Security Audit
+
+# v0.7.1 P4-3：cargo-audit 安全漏洞扫描
+# 触发条件：
+#   1. PR（检查新引入的依赖是否有漏洞）
+#   2. 定时扫描（每周一 09:00 UTC，发现新披露的漏洞）
+#   3. 手动触发
+on:
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+  schedule:
+    # 每周一 09:00 UTC（北京时间 17:00）定期扫描
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ════════════════════════════════════════════════════════════
+  # Job 1: cargo-audit 漏洞扫描
+  # 对照 RustSec Advisory Database 检查 Cargo.lock
+  # ════════════════════════════════════════════════════════════
+  cargo-audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    # 定时触发的扫描即使发现漏洞也不阻塞（仅报告），PR 触发的阻塞
+    continue-on-error: ${{ github.event_name == 'schedule' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install cargo-audit
+        # 使用 rustsec 官方维护的 action，自动安装 cargo-audit
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          # 扫描整个工作空间（含 desktop/src-tauri）
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ════════════════════════════════════════════════════════════
+  # Job 2: 依赖许可证检查（可选，确保无 GPL 等传染性许可证）
+  # ════════════════════════════════════════════════════════════
+  license-check:
+    name: License Check
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-license
+        run: cargo install cargo-license --locked || cargo install cargo-license
+
+      - name: Check dependency licenses
+        # 列出所有依赖的许可证，标记非宽松许可证
+        run: |
+          echo "=== 依赖许可证清单 ==="
+          cargo license --avoid-dev --avoid-build-scripts 2>&1 | tee licenses.txt
+          # 检查是否有传染性许可证（GPL, AGPL, LGPL）
+          if grep -iE 'GPL|AGPL|LGPL' licenses.txt; then
+            echo "WARNING: 检测到传染性许可证依赖，请人工审核"
+          else
+            echo "OK: 未检测到传染性许可证"
+          fi

@@ -378,6 +378,33 @@
       box-shadow: 0 0 0 3px rgba(243,156,18,0.1);
     }
 
+    /* v0.8.3 Step 12 / G015：输入框校验失败样式 */
+    .input.input-error,
+    .form-input.input-error {
+      border-color: var(--cinnabar);
+      box-shadow: 0 0 0 3px rgba(192,57,43,0.12);
+    }
+
+    .input.input-error:focus,
+    .form-input.input-error:focus {
+      border-color: var(--cinnabar);
+      box-shadow: 0 0 0 3px rgba(192,57,43,0.18);
+    }
+
+    /* 离线模式样式（G010：网络断开时降低非关键元素不透明度） */
+    body.offline-mode .stat-card,
+    body.offline-mode .trust-card {
+      opacity: 0.7;
+    }
+
+    body.offline-mode .navbar::after {
+      content: '⚠ 离线';
+      color: var(--cinnabar);
+      font-size: 12px;
+      margin-left: var(--space-3);
+      font-weight: 600;
+    }
+
     .input-group {
       display: flex;
       gap: 10px;
@@ -3359,7 +3386,9 @@ code, pre, .code-block {
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 9999;
+  /* v0.8.3 Step 2：Z-index 层级规范（modal:10020，低于 toast:10030，高于 banner:10010） */
+  /* 此前为 9999，会被 sidecar-down-banner(10000) 遮挡标题栏；同时遮挡 toast(1000) */
+  z-index: 10020;
   animation: modal-fade-in 0.2s ease-out;
 }
 
@@ -3477,6 +3506,27 @@ code, pre, .code-block {
 .modal-card .btn-secondary:hover {
   border-color: var(--lrc-墨韵-500, #1A1A2E);
   background: var(--lrc-宣纸-300, #F0E8D8);
+}
+
+/* v0.8.1：危险操作按钮样式（确认对话框用） */
+.modal-card .btn-danger {
+  background: var(--lrc-朱砂-500, #C0392B);
+  color: #fff;
+  border: 1px solid var(--lrc-朱砂-600, #A93226);
+}
+
+.modal-card .btn-danger:hover {
+  background: var(--lrc-朱砂-600, #A93226);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(192, 57, 43, 0.3);
+}
+
+/* v0.8.1：确认对话框文案样式 */
+.confirm-message {
+  margin: 12px 0 20px;
+  line-height: 1.6;
+  color: var(--lrc-墨色-700, #333);
+  font-size: 14px;
 }
 
 @keyframes modal-fade-in {
@@ -3860,4 +3910,55 @@ code, pre, .code-block {
 .step-indicator.active .step-label {
   color: var(--lrc-金色-600);
   font-weight: 600;
+}
+
+/* ============================================================
+   v0.8.2：Sidecar 未运行横幅样式（对应审计 G005）
+   ============================================================ */
+.sidecar-down-banner {
+  position: sticky;
+  top: 0;
+  /* v0.8.3 Step 2：Z-index 层级规范（banner:10010，低于 modal:10020 和 toast:10030） */
+  /* 此前为 10000，会遮挡 modal-overlay(9999) 的标题栏 */
+  z-index: 10010;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 10px 20px;
+  background: linear-gradient(90deg, var(--lrc-朱砂-500, #d9534f), var(--lrc-朱砂-600, #c9302c));
+  color: #fff;
+  font-size: 14px;
+  animation: banner-slide-in 0.3s ease-out;
+}
+.sidecar-down-banner[hidden] {
+  display: none !important;
+}
+.sidecar-down-banner .banner-icon {
+  font-size: 18px;
+}
+.sidecar-down-banner .banner-btn {
+  padding: 4px 14px;
+  background: rgba(255, 255, 255, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 4px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 13px;
+}
+.sidecar-down-banner .banner-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+@keyframes banner-slide-in {
+  from { transform: translateY(-100%); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+/* v0.8.2：API 按钮禁用样式（sidecar 不可达时） */
+/* v0.8.3 Step 8：移除 pointer-events:none，保留 hover 能力以显示 tooltip（修复 N04） */
+/* 此前 pointer-events:none 导致禁用按钮无法 hover，用户不知道为什么按钮是灰的 */
+.btn-disabled-api {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: grayscale(0.5);
 }

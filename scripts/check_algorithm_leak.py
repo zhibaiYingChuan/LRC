@@ -77,6 +77,11 @@ def scan_file(filepath: Path, verbose: bool = False) -> list[dict]:
         # 跳过 UI 设计风格描述（如 "洛书九宫格加载动画"）—— 仅作为设计风格命名
         if re.search(r'洛书九宫格', line):
             continue
+        # 跳过道同构度 UI 指标名称引用（如 "道同构度调节器"、"道同构度评分"）
+        # "道同构度" 是面向用户的 UI 指标名，不是受保护的算法术语
+        # 受保护的是 "道同构"（无"度"字），实际算法在 src/engine/ 受保护文件中
+        if re.search(r'道同构度', line):
+            continue
         # 跳过注释中的图标名称列表（如 "baga/health/decay/luoshu/memory/..."）
         # 这些是静态资源文件名引用，不是算法泄露
         if re.search(r'//.*\b\w+/\w+/\w+.*(luoshu|bagua)', line, re.IGNORECASE):

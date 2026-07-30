@@ -19,7 +19,7 @@
 //   -[:SYNTHESIZES_FROM]-> (:Memory)
 //   -[:RELATED_TO]-> (:Memory)
 
-use crate::graph_store::{EdgeType, GraphMemoryStore, GraphQueryResult, MemoryEdge};
+use crate::graph_store::{EdgeType, GraphMemoryStore, GraphQueryResult};
 use crate::persistence::PersistenceError;
 use serde::{Deserialize, Serialize};
 
@@ -384,30 +384,57 @@ impl Neo4jGraphStore {
         match self.execute_cypher(&cypher, params).await {
             Ok(response) => {
                 let mut result = GraphQueryResult::default();
-                for data_row in &response.results.first().map(|r| &r.data).unwrap_or(&vec![]) {
-                    // 提取节点和边信息
-                    if let Some(node_val) = data_row.row.get(0) {
-                        if let Some(props) = node_val.as_object() {
-                            result.nodes.push(props.clone());
-                        }
-                    }
-                    if let Some(edges_val) = data_row.row.get(1) {
-                        if let Some(edges_arr) = edges_val.as_array() {
-                            for edge in edges_arr {
-                                if let Some(edge_obj) = edge.as_object() {
-                                    result.edges.push(edge_obj.clone());
+                let empty_data: Vec<Neo4jDataRow> = vec![];
+                let data_rows: &Vec<Neo4jDataRow> = response.results.first()
+                    .map(|r| &r.data)
+                    .unwrap_or(&empty_data);
+                for data_row in data_rows {
+                    // 提取邻居节点 ID，填入 related_ids
+                    if let Some(neighbor_val) = data_row.row.get(2) {
+                        if let Some(props) = neighbor_val.as_object() {
+                            let id_val: Option<&str> = props.get("id").and_then(|v: &serde_json::Value| v.as_str());
+                            if let Some(id_str) = id_val {
+                                if !result.related_ids.contains(&id_str.to_string()) {
+                                    result.related_ids.push(id_str.to_string());
                                 }
                             }
                         }
                     }
-                    if let Some(neighbor_val) = data_row.row.get(2) {
-                        if let Some(props) = neighbor_val.as_object() {
-                            if !result.nodes.iter().any(|n| n.get("id") == props.get("id")) {
-                                result.nodes.push(props.clone());
+                    // 提取边信息，根据类型填入 evolution_chain 或 synthesis_sources
+                    if let Some(edges_val) = data_row.row.get(1) {
+                        if let Some(edges_arr) = edges_val.as_array() {
+                            for edge in edges_arr {
+                                if let Some(edge_obj) = edge.as_object() {
+                                    let edge_type: &str = edge_obj.get("type")
+                                        .and_then(|v: &serde_json::Value| v.as_str())
+                                        .unwrap_or("");
+                                    // 尝试从 endNode/end_node/target 字段提取目标节点 ID
+                                    let end_node_id: Option<&str> = edge_obj.get("endNode")
+                                        .and_then(|v: &serde_json::Value| v.as_str())
+                                        .or_else(|| edge_obj.get("end_node").and_then(|v: &serde_json::Value| v.as_str()))
+                                        .or_else(|| edge_obj.get("target").and_then(|v: &serde_json::Value| v.as_str()));
+                                    if let Some(node_id) = end_node_id {
+                                        match edge_type {
+                                            "Evolves" => {
+                                                if !result.evolution_chain.contains(&node_id.to_string()) {
+                                                    result.evolution_chain.push(node_id.to_string());
+                                                }
+                                            }
+                                            "SynthesizesFrom" => {
+                                                if !result.synthesis_sources.contains(&node_id.to_string()) {
+                                                    result.synthesis_sources.push(node_id.to_string());
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                // subgraph_size = related_ids 数量 + 1（包含起始节点）
+                result.subgraph_size = result.related_ids.len() + 1;
                 Ok(result)
             }
             Err(e) => {

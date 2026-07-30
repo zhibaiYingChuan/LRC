@@ -9,7 +9,7 @@
 /// 按文件扩展名自动选择多语言切分策略。
 use crate::chunker::{chunk_by_language, is_supported_file, CodeChunk};
 use crate::engine::encoder::{CodeEncoder, EmbeddingVector, FastEncoder};
-use crate::engine::retriever::{CodeRetriever, LocalRetriever, RetrievalResult};
+use crate::engine::retriever::{CodeRetriever, LocalRetriever, RetrievalResult, ScoredChunk};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -703,6 +703,38 @@ impl<E: CodeEncoder> CoreManager<E> {
 
     pub fn indexed_count(&self) -> usize {
         self.retriever.indexed_count()
+    }
+
+    /// v0.6.1 P0-2 修复: 获取最近索引的 N 条代码片段
+    ///
+    /// 用于 /v1/code/search 的 query 为空时的回退逻辑,
+    /// 避免导出功能在无查询参数时返回空结果导致功能失效。
+    ///
+    /// 返回最近索引的 top_k 条 chunks(按索引顺序逆序),score=1.0 表示"推荐"而非相似度。
+    pub fn recent_chunks(&self, top_k: usize) -> RetrievalResult {
+        let all = self.retriever.all_chunks();
+        let total_indexed = all.len();
+
+        // 取最后 top_k 条(最近索引的),并逆序使最新的在前
+        let start = total_indexed.saturating_sub(top_k);
+        let recent: Vec<ScoredChunk> = all[start..]
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, chunk)| ScoredChunk {
+                chunk: chunk.clone(),
+                score: 1.0, // 回退结果无相似度评分,用 1.0 标记为"推荐"
+                rank: i + 1,
+            })
+            .collect();
+
+        let returned = recent.len();
+        RetrievalResult {
+            query: String::new(), // 空查询,与调用方一致
+            returned,
+            total_indexed,
+            results: recent,
+        }
     }
 
     /// 索引单个文件，自动按扩展名选择切分策略

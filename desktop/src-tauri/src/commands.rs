@@ -9,7 +9,7 @@ use tauri::Emitter; // v0.5.5 P1-2：Emitter trait 提供 emit 方法（open_set
 // v0.5.4 修复：移除未使用的 Emitter import（emit 已从 detect_agents 中移除）
 use tokio::sync::Mutex; // 使用 tokio::sync::Mutex 以支持跨 await 持有
 
-use crate::agent_detector::{AgentDetectorRegistry, AgentInfo, ProjectInfo};
+use crate::agent_detector::{AgentDetectorRegistry, AgentInfo, ProjectInfo, RulesStatus};
 use crate::config_wizard::WizardState;
 use crate::rate_limiter::RateLimiter;
 use crate::sidecar_manager::SidecarManager;
@@ -18,7 +18,7 @@ use crate::tray; // 托盘模块的 open_dashboard 函数
 // ── v0.5.1 辅助函数：消除重复代码 ──
 
 /// 从向导配置中获取 LLM API 字符串（消除 3 处重复调用）
-/// 
+///
 /// 此函数统一了 start_sidecar、start_sidecar_for_project、switch_project
 /// 三处获取 LLM 配置的逻辑，避免未来修改时遗漏同步。
 async fn get_llm_api_from_wizard(store: &State<'_, AppStore>) -> Option<String> {
@@ -362,11 +362,19 @@ pub async fn start_sidecar(
     // v0.5.1 重构：统一使用 get_llm_api_from_wizard 辅助函数
     let llm_api = get_llm_api_from_wizard(&store).await;
 
+    // v0.8.0 "归一"修复: 桌面端始终使用全局模式，不再回退到 wizard.project_dir
+    //   v0.6.1 P1-1 曾添加 wizard.project_dir 回退以修复空指纹目录问题
+    //   但这导致 wizard.project_dir 有值时走项目指纹模式，违反 project_memory.md 约束:
+    //     "Desktop client must use global mode by default"
+    //   v0.8.0 决策: wizard.project_dir 仅用于 MCP 配置，不决定数据存储位置
+    //   显式 src_dir（如 switch_project 调用）仍可走项目指纹模式
+    let effective_src_dir = src_dir.clone();
+
     // v0.5.17 三阶段锁安全模式：避免在持有 sidecar 锁时执行 wait_for_health（最多 40s）
     //   Phase 1: prepare_start（持锁，<1ms）→ 释放锁
     //   Phase 2: spawn_and_wait（不持锁，I/O）
     //   Phase 3: insert_handle（重新获取锁，<1ms）
-    let project_key = src_dir.clone().unwrap_or_else(|| "default".to_string());
+    let project_key = effective_src_dir.clone().unwrap_or_else(|| "default".to_string());
 
     // Phase 1: 检查是否已运行（持锁，无 I/O）
     let prepare = {
@@ -386,7 +394,7 @@ pub async fn start_sidecar(
             let (child, port) = SidecarManager::spawn_and_wait(
                 &binary_path,
                 &project_key,
-                src_dir.as_deref(),
+                effective_src_dir.as_deref(),
                 port,
                 multi_window,
                 llm_api.as_deref(),
@@ -397,7 +405,7 @@ pub async fn start_sidecar(
             // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
             {
                 let mut sidecar = store.sidecar.lock().await;
-                sidecar.insert_handle(&project_key, child, port, src_dir, multi_window, llm_api);
+                sidecar.insert_handle(&project_key, child, port, effective_src_dir, multi_window, llm_api);
             }
 
             port
@@ -1605,6 +1613,22 @@ pub async fn open_data_dir(store: State<'_, AppStore>) -> Result<String, String>
 
     tracing::info!("[数据目录] 已打开根目录: {}", path_str);
     Ok(path_str)
+}
+
+/// v0.8.0 "归一" 新增：获取所有 AI 工具的规则文件状态
+///
+/// 用于信任中心展示各工具的 LRC 规则写入状态。
+/// 返回 [{ tool_id, rules_path, exists, version, needs_update, last_modified }]
+///
+/// 此命令不依赖 sidecar，直接读取文件系统，可在 sidecar 未启动时调用。
+#[tauri::command]
+pub async fn get_rules_status() -> Result<Vec<RulesStatus>, String> {
+    let status = AgentDetectorRegistry::get_rules_status();
+    tracing::info!(
+        "[v0.8.0] 规则状态查询完成，共 {} 个工具",
+        status.len()
+    );
+    Ok(status)
 }
 
 #[cfg(test)]

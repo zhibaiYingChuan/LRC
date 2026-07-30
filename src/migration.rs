@@ -1,393 +1,419 @@
 // ============================================================
 // 许可证: Apache 2.0
-// 本文件实现旧数据迁移，属于公开层 (Layer 1)。
+// 本文件实现记忆数据迁移与合并工具，属于公开层 (Layer 1)。
 // ============================================================
 //
-// 数据迁移模块 — 将旧版 V1 数据目录迁移到 V2 统一数据目录
+// v0.8.0 "归一" 专项：记忆数据迁移工具
 //
-// 迁移策略：
-//   1. 启动时检查旧版 {src_dir}/.loong-recall/data/ 是否存在
-//   2. 若存在且新版 ~/.loong-recall/projects/{fp}/data/ 为空 → 自动迁移
-//   3. 迁移完成后在旧目录创建 .migrated_to_v2 标记文件
-//   4. 若迁移失败，保留旧数据不动，报告错误
+// 功能：
+//   1. 扫描已知老路径（项目指纹目录、老版本路径）
+//   2. 按 memory.id 去重合并到 global 目录
+//   3. 原文件重命名 .bak，不删除
+//   4. 生成迁移报告
 //
-// 迁移文件：
-//   - memories.json
-//   - chunks.json
-//   - archive.json
-//   - 其他 .json 文件
-//
-// 安全原则：
-//   - 迁移采用复制（copy）而非移动（move），旧数据不丢失
-//   - 迁移前检查新版目录是否为空，非空则跳过避免覆盖
-//   - 每个文件独立迁移，失败不影响其他文件
+// 设计原则：
+//   - 按 JSON 层面操作，兼容老版本格式差异
+//   - 按 id 去重，保留最新 updated_at 的版本
+//   - 原文件保留 .bak 备份，确保数据安全
+//   - 龙老版本（G:\loong\data\memory\）格式不兼容，跳过
 
-use std::path::Path;
-use std::{fs, io};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-/// 迁移结果统计
-#[derive(Debug, Clone, Default)]
-pub struct MigrationResult {
-    /// 已迁移的文件数
-    pub migrated_files: usize,
-    /// 跳过的文件数（新版目录已有）
-    pub skipped_files: usize,
-    /// 失败的文件数
-    pub failed_files: usize,
-    /// 操作详情（用于日志和调试）
-    pub details: Vec<String>,
+/// 迁移源描述
+#[derive(Debug, Clone)]
+pub struct MigrationSource {
+    /// 数据源路径（memories.json 所在目录）
+    pub data_dir: PathBuf,
+    /// 源类型描述
+    pub source_type: String,
+    /// 是否为 global 目录（global 不迁移，仅作为合并目标）
+    pub is_global: bool,
 }
 
-impl MigrationResult {
-    /// 是否完全成功（无失败文件）
-    pub fn is_success(&self) -> bool {
-        self.failed_files == 0
-    }
-
-    /// 是否有文件被迁移
-    pub fn has_migrations(&self) -> bool {
-        self.migrated_files > 0
-    }
+/// 迁移结果报告
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MigrationReport {
+    /// 扫描到的数据源数量
+    pub sources_scanned: usize,
+    /// 各源详情
+    pub sources: Vec<SourceReport>,
+    /// 合并前 global 记忆数
+    pub global_before: usize,
+    /// 合并后 global 记忆数
+    pub global_after: usize,
+    /// 新增记忆数（去重后）
+    pub memories_added: usize,
+    /// 跳过的重复记忆数
+    pub duplicates_skipped: usize,
+    /// 备份的文件数
+    pub files_backed_up: usize,
+    /// 是否成功
+    pub success: bool,
+    /// 错误信息（如有）
+    pub error: Option<String>,
 }
 
-/// 将旧版数据从 src_dir 迁移到新版数据目录
+/// 单个数据源的迁移报告
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SourceReport {
+    /// 数据目录路径
+    pub data_dir: String,
+    /// 源类型
+    pub source_type: String,
+    /// 该源的記憶数
+    pub memory_count: usize,
+    /// 该源新增的记忆数（去重后）
+    pub added: usize,
+    /// 该源重复的记忆数
+    pub duplicates: usize,
+    /// 是否已备份
+    pub backed_up: bool,
+    /// 处理状态
+    pub status: String,
+}
+
+/// 扫描已知老路径，返回所有可能含记忆数据的目录
 ///
-/// # 参数
-/// - `src_dir`: 项目源码目录（旧版数据位于 src_dir/.loong-recall/data/）
-/// - `new_data_dir`: 新版数据目录（~/.loong-recall/projects/{fp}/data/）
-/// - `dry_run`: 如果为 true，仅报告将迁移什么，不实际执行
-///
-/// # 返回
-/// - `Ok(MigrationResult)`: 迁移结果统计
-/// - `Err(io::Error)`: 严重错误（如无法读取旧版目录）
-pub fn migrate_legacy_to_v2(
-    src_dir: &Path,
-    new_data_dir: &Path,
-    dry_run: bool,
-) -> io::Result<MigrationResult> {
-    let legacy_data_dir = crate::data_dir::DataDir::legacy_data_path(src_dir);
-    let mut result = MigrationResult::default();
+/// 扫描路径：
+/// 1. ~/.loong-recall/projects/*/data/（项目指纹目录）
+/// 2. G:\data\code-memory\（老版本路径）
+/// 3. ~/.loong-recall/global/data/（global 目录，仅作为合并目标）
+pub fn scan_legacy_sources() -> Vec<MigrationSource> {
+    let mut sources = Vec::new();
+    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
-    // 检查迁移标记：如果已迁移过，直接跳过
-    if crate::data_dir::DataDir::is_migrated(src_dir) {
-        result
-            .details
-            .push("已迁移过（检测到 .migrated_to_v2 标记），跳过".to_string());
-        return Ok(result);
-    }
-
-    // 检查旧版数据目录是否存在
-    if !legacy_data_dir.exists() {
-        result
-            .details
-            .push("旧版数据目录不存在，无需迁移".to_string());
-        return Ok(result);
-    }
-
-    result
-        .details
-        .push(format!("检测到旧版数据: {}", legacy_data_dir.display()));
-
-    // 确保新版数据目录存在
-    if !dry_run {
-        fs::create_dir_all(new_data_dir)?;
-    }
-
-    // 列出旧版数据目录中的所有 JSON 文件
-    let entries = match fs::read_dir(&legacy_data_dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            result.details.push(format!("无法读取旧版数据目录: {}", e));
-            return Err(e);
+    // 1. 扫描项目指纹目录
+    let projects_dir = home.join(".loong-recall").join("projects");
+    if projects_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+            for entry in entries.flatten() {
+                let fingerprint_dir = entry.path();
+                let data_dir = fingerprint_dir.join("data");
+                let memory_file = data_dir.join("memories.json");
+                if memory_file.exists() {
+                    sources.push(MigrationSource {
+                        data_dir: data_dir.clone(),
+                        source_type: format!("项目指纹({})", fingerprint_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+                        is_global: false,
+                    });
+                }
+            }
         }
+    }
+
+    // 2. 扫描老版本路径 G:\data\code-memory\
+    let legacy_path = PathBuf::from(r"G:\data\code-memory");
+    if legacy_path.join("memories.json").exists() {
+        sources.push(MigrationSource {
+            data_dir: legacy_path,
+            source_type: "老版本路径(G:\\data\\code-memory)".to_string(),
+            is_global: false,
+        });
+    }
+
+    // 3. global 目录（仅作为合并目标，不迁移）
+    let global_dir = home.join(".loong-recall").join("global").join("data");
+    if global_dir.join("memories.json").exists() {
+        sources.push(MigrationSource {
+            data_dir: global_dir,
+            source_type: "全局目录(global)".to_string(),
+            is_global: true,
+        });
+    }
+
+    sources
+}
+
+/// 从 memories.json 文件读取记忆列表（JSON 层面，兼容老版本格式）
+fn read_memories(data_dir: &Path) -> Result<Vec<serde_json::Value>, String> {
+    let memory_file = data_dir.join("memories.json");
+    if !memory_file.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(&memory_file)
+        .map_err(|e| format!("读取 {} 失败: {}", memory_file.display(), e))?;
+    // 兼容两种格式：Vec<Memory> 或单个 Memory 对象
+    let memories: Vec<serde_json::Value> = if content.trim_start().starts_with('[') {
+        serde_json::from_str(&content)
+            .map_err(|e| format!("解析 {} 失败: {}", memory_file.display(), e))?
+    } else {
+        // 单对象格式，包装为数组
+        let single: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("解析 {} 失败: {}", memory_file.display(), e))?;
+        vec![single]
+    };
+    Ok(memories)
+}
+
+/// 获取记忆的 id 和 updated_at（用于去重）
+fn get_id_and_updated(mem: &serde_json::Value) -> (String, String) {
+    let id = mem.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let updated = mem.get("updated_at")
+        .and_then(|v| v.as_str())
+        .or_else(|| mem.get("created_at").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    (id, updated)
+}
+
+/// 执行迁移与合并
+///
+/// 流程：
+/// 1. 扫描所有数据源
+/// 2. 读取 global 目录现有记忆作为基准
+/// 3. 逐个读取其他源，按 id 去重合并
+/// 4. 写入 global 目录
+/// 5. 非 global 源文件重命名 .bak
+pub fn execute_migration() -> MigrationReport {
+    let mut report = MigrationReport {
+        sources_scanned: 0,
+        sources: Vec::new(),
+        global_before: 0,
+        global_after: 0,
+        memories_added: 0,
+        duplicates_skipped: 0,
+        files_backed_up: 0,
+        success: false,
+        error: None,
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    let sources = scan_legacy_sources();
+    report.sources_scanned = sources.len();
 
-        // 只迁移数据文件（.json），跳过锁文件和标记文件
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if !file_name.ends_with(".json") {
-            result.details.push(format!("跳过非数据文件: {file_name}"));
-            continue;
-        }
+    // 按 id 去重的记忆池：id -> (记忆, 来源, updated_at)
+    let mut memory_pool: HashMap<String, (serde_json::Value, String, String)> = HashMap::new();
 
-        let dest = new_data_dir.join(file_name);
+    // 逐个处理数据源
+    for source in &sources {
+        match read_memories(&source.data_dir) {
+            Ok(memories) => {
+                let count = memories.len();
+                let mut added = 0usize;
+                let mut duplicates = 0usize;
 
-        // 如果新版目录已有同名文件，跳过（避免覆盖已有数据）
-        if dest.exists() {
-            result
-                .details
-                .push(format!("跳过已存在文件: {file_name}（新版目录已有）"));
-            result.skipped_files += 1;
-            continue;
-        }
-
-        if dry_run {
-            result.details.push(format!(
-                "[DRY RUN] 将迁移: {file_name} → {}",
-                new_data_dir.display()
-            ));
-            result.migrated_files += 1;
-        } else {
-            // 复制文件（保留旧数据不丢失）
-            match fs::copy(&path, &dest) {
-                Ok(bytes) => {
-                    result
-                        .details
-                        .push(format!("已迁移: {file_name} ({} bytes)", bytes));
-                    result.migrated_files += 1;
+                for mem in &memories {
+                    let (id, updated) = get_id_and_updated(mem);
+                    if id.is_empty() {
+                        // 无 id 的记忆直接保留
+                        let fake_id = format!("no-id-{}", uuid::Uuid::new_v4());
+                        memory_pool.insert(fake_id, (mem.clone(), source.source_type.clone(), updated.clone()));
+                        added += 1;
+                        continue;
+                    }
+                    match memory_pool.get(&id) {
+                        Some(existing) => {
+                            // 比较 updated_at，保留最新的
+                            if updated > existing.2 {
+                                memory_pool.insert(id, (mem.clone(), source.source_type.clone(), updated));
+                            }
+                            duplicates += 1;
+                        }
+                        None => {
+                            memory_pool.insert(id, (mem.clone(), source.source_type.clone(), updated));
+                            added += 1;
+                        }
+                    }
                 }
-                Err(e) => {
-                    result
-                        .details
-                        .push(format!("迁移失败: {file_name} — {}", e));
-                    result.failed_files += 1;
-                }
-            }
-        }
-    }
 
-    // 迁移完成后写入标记文件
-    if !dry_run && result.is_success() {
-        let marker = crate::data_dir::DataDir::migration_marker_path(src_dir);
-        if let Some(parent) = marker.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        match fs::write(
-            &marker,
-            format!(
-                "v2\nmigrated_at: {}\nnew_path: {}",
-                {
-                    // 使用简单的 Unix 时间戳，避免依赖 chrono
-                    use std::time::SystemTime;
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_secs().to_string())
-                        .unwrap_or_else(|_| "unknown".to_string())
-                },
-                new_data_dir.display()
-            ),
-        ) {
-            Ok(()) => {
-                result
-                    .details
-                    .push("迁移标记已写入 .migrated_to_v2".to_string());
+                if source.is_global {
+                    report.global_before = count;
+                }
+
+                report.sources.push(SourceReport {
+                    data_dir: source.data_dir.to_string_lossy().to_string(),
+                    source_type: source.source_type.clone(),
+                    memory_count: count,
+                    added,
+                    duplicates,
+                    backed_up: false,
+                    status: "已读取".to_string(),
+                });
             }
             Err(e) => {
-                result.details.push(format!("写入迁移标记失败: {}", e));
+                report.sources.push(SourceReport {
+                    data_dir: source.data_dir.to_string_lossy().to_string(),
+                    source_type: source.source_type.clone(),
+                    memory_count: 0,
+                    added: 0,
+                    duplicates: 0,
+                    backed_up: false,
+                    status: format!("读取失败: {}", e),
+                });
             }
         }
     }
 
-    if result.migrated_files == 0 && result.skipped_files == 0 {
-        result
-            .details
-            .push("旧版数据目录为空，无需迁移".to_string());
+    // 合并后的记忆列表（按 created_at 排序）
+    let mut merged: Vec<serde_json::Value> = memory_pool.into_values().map(|(m, _, _)| m).collect();
+    merged.sort_by(|a, b| {
+        let a_time = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        let b_time = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
+        a_time.cmp(&b_time)
+    });
+
+    report.global_after = merged.len();
+    report.memories_added = report.global_after.saturating_sub(report.global_before);
+
+    // 写入 global 目录
+    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let global_dir = home.join(".loong-recall").join("global").join("data");
+    if let Err(e) = std::fs::create_dir_all(&global_dir) {
+        report.error = Some(format!("创建 global 目录失败: {}", e));
+        return report;
     }
 
-    Ok(result)
-}
+    let global_file = global_dir.join("memories.json");
+    let merged_json = match serde_json::to_string_pretty(&merged) {
+        Ok(s) => s,
+        Err(e) => {
+            report.error = Some(format!("序列化合并记忆失败: {}", e));
+            return report;
+        }
+    };
+    if let Err(e) = std::fs::write(&global_file, merged_json) {
+        report.error = Some(format!("写入 global memories.json 失败: {}", e));
+        return report;
+    }
 
-/// 检查是否需要进行迁移
-///
-/// 返回 true 表示需要迁移：
-/// - 旧版数据目录存在
-/// - 尚未迁移（无 .migrated_to_v2 标记）
-pub fn needs_migration(src_dir: &Path) -> bool {
-    crate::data_dir::DataDir::has_legacy_data(src_dir)
-        && !crate::data_dir::DataDir::is_migrated(src_dir)
-}
-
-/// 生成迁移报告字符串（用于日志输出）
-pub fn format_migration_report(result: &MigrationResult) -> String {
-    let mut report = String::new();
-    report.push_str(&format!(
-        "迁移完成: {} 个文件已迁移, {} 跳过, {} 失败",
-        result.migrated_files, result.skipped_files, result.failed_files
-    ));
-    if !result.details.is_empty() {
-        report.push('\n');
-        for detail in &result.details {
-            report.push_str(&format!("  - {detail}\n"));
+    // 非 global 源文件重命名 .bak
+    for source in &sources {
+        if source.is_global {
+            continue;
+        }
+        let memory_file = source.data_dir.join("memories.json");
+        if !memory_file.exists() {
+            continue;
+        }
+        let bak_file = memory_file.with_extension("json.bak");
+        match std::fs::rename(&memory_file, &bak_file) {
+            Ok(()) => {
+                report.files_backed_up += 1;
+                // 更新对应 source 的 backed_up 状态
+                for s in &mut report.sources {
+                    if s.data_dir == source.data_dir.to_string_lossy().to_string() {
+                        s.backed_up = true;
+                        s.status = "已备份(.bak)".to_string();
+                    }
+                }
+            }
+            Err(e) => {
+                for s in &mut report.sources {
+                    if s.data_dir == source.data_dir.to_string_lossy().to_string() {
+                        s.status = format!("备份失败: {}", e);
+                    }
+                }
+            }
         }
     }
+
+    // 清理空项目目录（只有 .lrc.lock，无 memories.json）
+    let projects_dir = home.join(".loong-recall").join("projects");
+    if projects_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&projects_dir) {
+            for entry in entries.flatten() {
+                let fp_dir = entry.path();
+                let data_dir = fp_dir.join("data");
+                let mem_file = data_dir.join("memories.json");
+                let bak_file = data_dir.join("memories.json.bak");
+                // 既无 memories.json 也无 .bak，且只有 .lrc.lock → 空目录
+                if !mem_file.exists() && !bak_file.exists() {
+                    let lock_file = data_dir.join(".lrc.lock");
+                    if lock_file.exists() {
+                        let _ = std::fs::remove_dir_all(&fp_dir);
+                    }
+                }
+            }
+        }
+    }
+
+    report.success = report.error.is_none();
+
+    // v0.8.0 "归一"：记录数据操作日志
+    if report.success {
+        let details = format!(
+            "扫描 {} 处源，合并 {} 条记忆至 global（新增 {}，备份 {} 文件）",
+            report.sources_scanned,
+            report.global_after,
+            report.memories_added,
+            report.files_backed_up
+        );
+        crate::data_log::log_operation(
+            crate::data_log::OperationType::Migrate,
+            &details,
+        );
+    }
+
     report
 }
-
-// ==================== 单元测试 ====================
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_dir::DataDir;
 
-    /// 测试: 旧版数据不存在时跳过迁移
     #[test]
-    fn test_no_legacy_data_skips() {
-        let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
-        let src = tmp.path().join("empty_project");
-        let new_data = tmp.path().join("new_data");
-
-        // 创建空的新版目录
-        fs::create_dir_all(&new_data).unwrap();
-
-        let result = migrate_legacy_to_v2(&src, &new_data, false).expect("迁移不应报错");
-        assert_eq!(result.migrated_files, 0);
-        assert_eq!(result.failed_files, 0);
-        assert!(result.is_success());
+    fn test_get_id_and_updated() {
+        let mem = serde_json::json!({
+            "id": "test-001",
+            "updated_at": "2026-07-29T10:00:00Z",
+            "content": "测试"
+        });
+        let (id, updated) = get_id_and_updated(&mem);
+        assert_eq!(id, "test-001");
+        assert_eq!(updated, "2026-07-29T10:00:00Z");
     }
 
-    /// 测试: 已迁移过则跳过
     #[test]
-    fn test_already_migrated_skips() {
-        let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
-        let src = tmp.path().join("migrated_project");
-        let new_data = tmp.path().join("new_data");
-
-        // 创建迁移标记
-        let marker = DataDir::migration_marker_path(&src);
-        fs::create_dir_all(marker.parent().unwrap()).unwrap();
-        fs::write(&marker, "v2").unwrap();
-
-        // 也创建旧版数据目录（但应被跳过）
-        let legacy = DataDir::legacy_data_path(&src);
-        fs::create_dir_all(&legacy).unwrap();
-
-        let result = migrate_legacy_to_v2(&src, &new_data, false).expect("迁移不应报错");
-        assert_eq!(result.migrated_files, 0);
-        assert!(result.details.iter().any(|d| d.contains("已迁移过")));
+    fn test_get_id_fallback_to_created_at() {
+        // 无 updated_at 时回退到 created_at
+        let mem = serde_json::json!({
+            "id": "test-002",
+            "created_at": "2026-07-28T00:00:00Z"
+        });
+        let (id, updated) = get_id_and_updated(&mem);
+        assert_eq!(id, "test-002");
+        assert_eq!(updated, "2026-07-28T00:00:00Z");
     }
 
-    /// 测试: 正常迁移流程
     #[test]
-    fn test_successful_migration() {
-        let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
-        let src = tmp.path().join("project");
-        let new_data = tmp.path().join("new_data");
-
-        // 创建旧版数据目录和文件
-        let legacy = DataDir::legacy_data_path(&src);
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("memories.json"), r#"{"test": "memory"}"#).unwrap();
-        fs::write(legacy.join("chunks.json"), r#"{"test": "chunk"}"#).unwrap();
-        // 创建非 JSON 文件（应被跳过）
-        fs::write(legacy.join(".lrc.lock"), "12345").unwrap();
-
-        let result = migrate_legacy_to_v2(&src, &new_data, false).expect("迁移不应报错");
-
-        assert_eq!(result.migrated_files, 2, "应迁移 2 个 JSON 文件");
-        assert_eq!(result.failed_files, 0, "不应有失败文件");
-        assert!(result.is_success());
-
-        // 验证文件已复制到新版目录
-        assert!(new_data.join("memories.json").exists());
-        assert!(new_data.join("chunks.json").exists());
-        // 锁文件不应被迁移
-        assert!(!new_data.join(".lrc.lock").exists());
-
-        // 验证迁移标记
-        assert!(DataDir::is_migrated(&src));
-
-        // 验证旧数据仍然存在（复制非移动）
-        assert!(legacy.join("memories.json").exists());
+    fn test_get_id_empty() {
+        let mem = serde_json::json!({"content": "无 id"});
+        let (id, _) = get_id_and_updated(&mem);
+        assert_eq!(id, "");
     }
 
-    /// 测试: 新版目录已有文件时跳过
     #[test]
-    fn test_skip_existing_files() {
-        let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
-        let src = tmp.path().join("project");
-        let new_data = tmp.path().join("new_data");
-
-        // 创建旧版数据
-        let legacy = DataDir::legacy_data_path(&src);
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("memories.json"), "old data").unwrap();
-
-        // 新版目录已有同名文件
-        fs::create_dir_all(&new_data).unwrap();
-        fs::write(new_data.join("memories.json"), "new data").unwrap();
-
-        let result = migrate_legacy_to_v2(&src, &new_data, false).expect("迁移不应报错");
-
-        assert_eq!(result.migrated_files, 0);
-        assert_eq!(result.skipped_files, 1, "已有文件应被跳过");
-        // 新数据不应被覆盖
-        let content = fs::read_to_string(new_data.join("memories.json")).unwrap();
-        assert_eq!(content, "new data", "新版数据不应被覆盖");
+    fn test_read_memories_array_format() {
+        // 标准数组格式
+        let dir = std::env::temp_dir().join("lrc_migration_test_array");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("memories.json"),
+            r#"[{"id":"a","content":"A"},{"id":"b","content":"B"}]"#,
+        ).unwrap();
+        let memories = read_memories(&dir).unwrap();
+        assert_eq!(memories.len(), 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 测试: dry_run 模式不实际执行
     #[test]
-    fn test_dry_run() {
-        let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
-        let src = tmp.path().join("project");
-        let new_data = tmp.path().join("new_data");
-
-        // 创建旧版数据
-        let legacy = DataDir::legacy_data_path(&src);
-        fs::create_dir_all(&legacy).unwrap();
-        fs::write(legacy.join("memories.json"), "test").unwrap();
-
-        let result = migrate_legacy_to_v2(&src, &new_data, true).expect("dry_run 不应报错");
-
-        assert!(result.details.iter().any(|d| d.contains("DRY RUN")));
-        // 实际文件不应被创建
-        assert!(!new_data.join("memories.json").exists());
-        // 迁移标记不应被写入
-        assert!(!DataDir::is_migrated(&src));
+    fn test_read_memories_single_object_format() {
+        // 龙老版本单对象格式
+        let dir = std::env::temp_dir().join("lrc_migration_test_single");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("memories.json"),
+            r#"{"id":"a","content":"A","long_term":true}"#,
+        ).unwrap();
+        let memories = read_memories(&dir).unwrap();
+        assert_eq!(memories.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// 测试: needs_migration 检测
     #[test]
-    fn test_needs_migration() {
-        let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
-
-        // 空目录不需要迁移
-        let empty = tmp.path().join("empty");
-        assert!(!needs_migration(&empty));
-
-        // 有旧数据但无迁移标记 → 需要迁移
-        let unmirated = tmp.path().join("unmirated");
-        let legacy = DataDir::legacy_data_path(&unmirated);
-        fs::create_dir_all(&legacy).unwrap();
-        assert!(needs_migration(&unmirated));
-
-        // 写入迁移标记 → 不再需要迁移
-        let marker = DataDir::migration_marker_path(&unmirated);
-        fs::write(&marker, "v2").unwrap();
-        assert!(!needs_migration(&unmirated));
-    }
-
-    /// 测试: 空旧版目录不迁移
-    #[test]
-    fn test_empty_legacy_dir() {
-        let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
-        let src = tmp.path().join("empty_legacy");
-        let new_data = tmp.path().join("new_data");
-
-        // 创建空的旧版数据目录
-        let legacy = DataDir::legacy_data_path(&src);
-        fs::create_dir_all(&legacy).unwrap();
-
-        let result = migrate_legacy_to_v2(&src, &new_data, false).expect("迁移不应报错");
-        assert_eq!(result.migrated_files, 0);
-        assert!(result.details.iter().any(|d| d.contains("为空")));
-    }
-
-    /// 测试: format_migration_report 生成报告
-    #[test]
-    fn test_format_migration_report() {
-        let result = MigrationResult {
-            migrated_files: 3,
-            skipped_files: 1,
-            failed_files: 0,
-            details: vec!["已迁移: memories.json (100 bytes)".to_string()],
-        };
-        let report = format_migration_report(&result);
-        assert!(report.contains("3"));
-        assert!(report.contains("1"));
-        assert!(report.contains("memories.json"));
+    fn test_read_memories_nonexistent() {
+        let dir = std::env::temp_dir().join("lrc_migration_test_nonexist");
+        let memories = read_memories(&dir).unwrap();
+        assert_eq!(memories.len(), 0);
     }
 }
