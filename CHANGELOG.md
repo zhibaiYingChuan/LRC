@@ -4,6 +4,37 @@
 
 ---
 
+## [0.8.10] - 2026-07-30
+
+### 修复
+
+- **P0 L3-01**: `startSidecarForProject` 超时 60s → 120s（app.js:3727）
+  — 与 `handleStartServiceClick` 对齐，覆盖 `spawn_and_wait`(40s) + 索引期间 HTTP 慢响应
+- **P0 L4-01**: `switchProject` 超时 60s → 120s（app.js:6182）
+  — 覆盖 stop(5s) + `spawn_and_wait`(40s) + 索引开销
+- **P0 L3-03/L4-04**: `startSidecarForProject`/`switchProject` 成功后主动触发 `SidecarHealthMonitor.check()`（app.js:3731, 6190）
+  — 加速状态栏更新，避免等待 10s 轮询周期
+- **P0 L4-02**: 新增 `_broadcastSidecarStateChange(online)` 方法（app.js:364-382）
+  — `_setReachable` 可达/不可达均广播全局状态变更
+  — 刷新当前 active tab（dashboard/settings/trust-center）+ 发出 `lrc:sidecar-state-change` 自定义事件
+  — 修复设置页/信任中心页状态不同步问题（用户报告"左下角显示运行，其他页面仍显示重启"）
+- **P0 L5-01**: 新增 3 个 Tauri 事件监听器（app.js:2140-2174）
+  — `sidecar-detected`: 检测到外部 sidecar（用户手动启动场景）时 toast + 触发健康检查
+  — `sidecar-recovered`: 心跳协程自动恢复成功时 toast + 触发健康检查
+  — `sidecar-crash`: 连续 3 次恢复失败时 error toast + 更新状态栏 + 显示横幅
+  — 之前前端未监听这 3 个事件，导致手动启动/自动恢复/崩溃场景下 UI 不同步
+- **P1 L5-03**: `sidecar_manager.rs` 健康检查失败路径 `child.kill()` 错误不再静默吞掉（sidecar_manager.rs:635-641）
+  — 新增 `tracing::error!`/`tracing::warn!` 日志，便于排查孤儿进程清理失败
+
+### 测试
+
+- cargo fmt --all -- --check: 通过
+- cargo clippy --all-targets --features server -- -D warnings: 通过
+- desktop clippy: 通过
+- cargo test --features server: 505 passed, 0 failed, 7 ignored
+
+---
+
 ## [0.8.9] - 2026-07-30
 
 ### 修复

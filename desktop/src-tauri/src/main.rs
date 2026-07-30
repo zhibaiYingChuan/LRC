@@ -2,6 +2,9 @@
 // 普通用户看到 CMD 窗口会困惑，且关闭可能导致后端进程异常
 #![windows_subsystem = "windows"]
 
+use agent_detector::AgentDetectorRegistry;
+use commands::AppStore;
+use config_wizard::WizardState;
 /// LRC Desktop — Tauri 壳层主入口
 ///
 /// 职责：
@@ -12,18 +15,17 @@
 /// 5. Agent 自动检测与配置
 ///
 /// 契约：所有 IPC 通信通过 Tauri Commands 进行，前端不直接调用 sidecar。
-use lrc_desktop_lib::{agent_detector, commands, config_wizard, integrity, rate_limiter, sidecar_manager, tray};
-use commands::AppStore;
-use agent_detector::AgentDetectorRegistry;
-use config_wizard::WizardState;
+use lrc_desktop_lib::{
+    agent_detector, commands, config_wizard, integrity, rate_limiter, sidecar_manager, tray,
+};
 use rate_limiter::RateLimiter;
 use sidecar_manager::SidecarManager;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use tauri::Manager; // Manager trait 提供 app_handle() 等方法
+use std::sync::Arc;
 use tauri::Emitter; // v0.5.4 P2-14: Emitter trait 提供 emit() 方法，用于心跳协程通知前端
-use tokio::sync::Mutex; // Tauri 2 异步命令需要 tokio::sync::Mutex (支持 Send)
-use tauri::WindowEvent; // v0.5.4: 窗口事件监听，用于应用关闭时清理 sidecar
+use tauri::Manager; // Manager trait 提供 app_handle() 等方法
+use tauri::WindowEvent;
+use tokio::sync::Mutex; // Tauri 2 异步命令需要 tokio::sync::Mutex (支持 Send) // v0.5.4: 窗口事件监听，用于应用关闭时清理 sidecar
 
 fn main() {
     // ════════════════════════════════════════════════════════════════
@@ -51,15 +53,14 @@ fn main() {
     // v0.6.0 P0-D 修复：启动时检查 sidecar 二进制是否存在
     // 若不存在，打印明确的错误日志（不阻断启动，让用户能看到提示）
     if !sidecar_binary_path.exists() {
+        tracing::error!("═══════════════════════════════════════════════════════");
         tracing::error!(
-            "═══════════════════════════════════════════════════════"
+            "LRC Sidecar 二进制文件不存在: {}",
+            sidecar_binary_path.display()
         );
-        tracing::error!("LRC Sidecar 二进制文件不存在: {}", sidecar_binary_path.display());
         tracing::error!("请先编译主项目: cargo build --release --features server");
         tracing::error!("或重新安装 LRC Desktop 以获取完整的 sidecar 二进制");
-        tracing::error!(
-            "═══════════════════════════════════════════════════════"
-        );
+        tracing::error!("═══════════════════════════════════════════════════════");
     } else {
         tracing::info!("LRC Sidecar 二进制: {}", sidecar_binary_path.display());
     }
@@ -132,7 +133,11 @@ fn main() {
         .manage(app_store)
         // v0.5.4 P2-16 调试：页面加载事件追踪
         .on_page_load(|_webview, payload| {
-            tracing::info!("页面加载事件: {:?} - URL: {}", payload.event(), payload.url());
+            tracing::info!(
+                "页面加载事件: {:?} - URL: {}",
+                payload.event(),
+                payload.url()
+            );
         })
         .setup(|app| {
             // 构建系统托盘（右键菜单 + 双击打开仪表盘）
@@ -190,8 +195,7 @@ fn main() {
             // 连续 3 次恢复失败后，通过 Tauri 事件通知前端"服务异常"。
             // ════════════════════════════════════════════════════════════════
             let monitor_handle = app.app_handle().clone();
-            let (health_shutdown_tx, mut health_shutdown_rx) =
-                tokio::sync::watch::channel(false);
+            let (health_shutdown_tx, mut health_shutdown_rx) = tokio::sync::watch::channel(false);
 
             // v0.5.4 P2-14 修复：使用 tauri::async_runtime::spawn 而非 tokio::spawn
             // 原因：setup 回调不在 Tokio 运行时上下文中，直接调用 tokio::spawn 会 panic
@@ -237,7 +241,11 @@ fn main() {
                             tracing::info!(
                                 "启动时探测：检测到外部 sidecar，端口 {}，项目 {}",
                                 probed[0].port,
-                                if probed[0].src_dir.is_empty() { "unknown" } else { &probed[0].src_dir }
+                                if probed[0].src_dir.is_empty() {
+                                    "unknown"
+                                } else {
+                                    &probed[0].src_dir
+                                }
                             );
                             // 通知前端状态已更新（前端可据此刷新向导状态）
                             let _ = monitor_handle.emit(
@@ -272,7 +280,8 @@ fn main() {
                         consecutive_failures += 1;
                         tracing::error!(
                             "Sidecar 崩溃检测：实例数 {} → 0，连续失败 {} 次",
-                            last_instance_count, consecutive_failures
+                            last_instance_count,
+                            consecutive_failures
                         );
 
                         if consecutive_failures >= 3 {
@@ -312,7 +321,14 @@ fn main() {
                         } else {
                             // Phase 2: 逐个重启死亡实例（不持锁，I/O）
                             // type alias 简化复杂类型（clippy::type_complexity）
-                            type RecoveredHandle = (String, std::process::Child, u16, Option<String>, Option<u32>, Option<String>);
+                            type RecoveredHandle = (
+                                String,
+                                std::process::Child,
+                                u16,
+                                Option<String>,
+                                Option<u32>,
+                                Option<String>,
+                            );
                             let mut recovered_handles: Vec<RecoveredHandle> = Vec::new();
                             // v0.8.9 G-001：心跳恢复使用独立的 cancel_flag，不与用户启动取消共享
                             // 心跳恢复是后台自动行为，不应被用户的 cancel_start_sidecar 干扰
@@ -320,7 +336,9 @@ fn main() {
                             let heartbeat_cancel = std::sync::atomic::AtomicBool::new(false);
 
                             for info in dead_instances {
-                                use sidecar_manager::{DeadInstanceInfo, SidecarManager, StartOptions};
+                                use sidecar_manager::{
+                                    DeadInstanceInfo, SidecarManager, StartOptions,
+                                };
                                 let DeadInstanceInfo {
                                     project_key,
                                     src_dir,
@@ -340,18 +358,29 @@ fn main() {
                                     &binary_path,
                                     &project_key,
                                     &start_opts,
-                                ).await {
+                                )
+                                .await
+                                {
                                     Ok((child, port)) => {
                                         tracing::info!(
                                             "Sidecar 崩溃恢复成功: 项目={}, 新端口={}",
-                                            project_key, port
+                                            project_key,
+                                            port
                                         );
-                                        recovered_handles.push((project_key, child, port, src_dir, multi_window, llm_api));
+                                        recovered_handles.push((
+                                            project_key,
+                                            child,
+                                            port,
+                                            src_dir,
+                                            multi_window,
+                                            llm_api,
+                                        ));
                                     }
                                     Err(e) => {
                                         tracing::error!(
                                             "Sidecar 崩溃恢复失败: 项目={}, 错误: {}",
-                                            project_key, e
+                                            project_key,
+                                            e
                                         );
                                     }
                                 }
@@ -362,8 +391,17 @@ fn main() {
                             if recovered_count > 0 {
                                 let state = monitor_handle.state::<AppStore>();
                                 let mut sidecar = state.sidecar.lock().await;
-                                for (key, child, port, src_dir, multi_window, llm_api) in recovered_handles {
-                                    sidecar.insert_handle(&key, child, port, src_dir, multi_window, llm_api);
+                                for (key, child, port, src_dir, multi_window, llm_api) in
+                                    recovered_handles
+                                {
+                                    sidecar.insert_handle(
+                                        &key,
+                                        child,
+                                        port,
+                                        src_dir,
+                                        multi_window,
+                                        llm_api,
+                                    );
                                 }
                             }
 
@@ -402,7 +440,9 @@ fn main() {
                         if before != after {
                             tracing::info!(
                                 "RateLimiter 清理过期桶：{} → {}（清理 {} 个）",
-                                before, after, before.saturating_sub(after)
+                                before,
+                                after,
+                                before.saturating_sub(after)
                             );
                         }
                     }
@@ -494,8 +534,8 @@ fn init_logging() {
     std::mem::forget(_guard);
 
     // 构建日志订阅器：同时输出到控制台和文件
-    let console_layer = tracing_subscriber::fmt::layer()
-        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
+    let console_layer =
+        tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::filter::LevelFilter::INFO);
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking_file)

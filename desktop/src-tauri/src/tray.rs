@@ -53,7 +53,7 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let mut tray_builder = TrayIconBuilder::with_id(TRAY_ICON_ID)
         .menu(&menu)
         .tooltip("LRC Desktop — AI 工具的记忆");
-    
+
     // 显式设置图标（如果可用）
     if let Some(icon) = tray_icon {
         tray_builder = tray_builder.icon(icon);
@@ -84,7 +84,7 @@ pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 }
 
 /// 更新托盘悬浮提示
-/// 
+///
 /// 根据已配置的 Agent 数量和运行中的项目动态更新 tooltip 文本。
 /// 契约：在 configure_agents 或 sidecar 状态变更后调用。
 pub fn update_tooltip<R: Runtime>(app: &AppHandle<R>, agent_count: usize) {
@@ -124,15 +124,9 @@ pub fn update_tooltip<R: Runtime>(app: &AppHandle<R>, agent_count: usize) {
             project_list.join("\n")
         )
     } else if sidecar_running {
-        format!(
-            "LRC Desktop — {} 个 Agent 已连接 | 服务运行中",
-            agent_count
-        )
+        format!("LRC Desktop — {} 个 Agent 已连接 | 服务运行中", agent_count)
     } else {
-        format!(
-            "LRC Desktop — {} 个 Agent 已连接",
-            agent_count
-        )
+        format!("LRC Desktop — {} 个 Agent 已连接", agent_count)
     };
 
     if let Some(tray) = app.tray_by_id(TRAY_ICON_ID) {
@@ -208,9 +202,7 @@ pub fn open_dashboard<R: Runtime>(app: &AppHandle<R>) {
     // 获取 sidecar 实际端口
     let port = app
         .try_state::<AppStore>()
-        .and_then(|store| {
-            store.sidecar_port.try_lock().ok().and_then(|guard| *guard)
-        })
+        .and_then(|store| store.sidecar_port.try_lock().ok().and_then(|guard| *guard))
         .unwrap_or(3099);
 
     // 在主窗口 iframe 中显示仪表盘（统一入口）

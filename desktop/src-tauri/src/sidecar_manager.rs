@@ -37,7 +37,11 @@ fn get_sidecar_log_dir() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
         let appdata = std::env::var("APPDATA").ok()?;
-        Some(std::path::PathBuf::from(appdata).join("LoongRecall").join("logs"))
+        Some(
+            std::path::PathBuf::from(appdata)
+                .join("LoongRecall")
+                .join("logs"),
+        )
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -270,7 +274,11 @@ impl Drop for SidecarManager {
     fn drop(&mut self) {
         for (project_dir, handle) in self.instances.drain() {
             let pid = handle.child.id();
-            tracing::info!("SidecarManager 释放，kill 子进程 project={}, PID={}", project_dir, pid);
+            tracing::info!(
+                "SidecarManager 释放，kill 子进程 project={}, PID={}",
+                project_dir,
+                pid
+            );
             // 尝试优雅终止
             let mut child = handle.child;
             let _ = child.kill();
@@ -280,10 +288,7 @@ impl Drop for SidecarManager {
             loop {
                 match child.try_wait() {
                     Ok(Some(_status)) => {
-                        tracing::debug!(
-                            "子进程 PID={} 已退出，僵尸进程已回收",
-                            pid
-                        );
+                        tracing::debug!("子进程 PID={} 已退出，僵尸进程已回收", pid);
                         break;
                     }
                     Ok(None) => {
@@ -299,10 +304,7 @@ impl Drop for SidecarManager {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "等待子进程 PID={} 退出失败: {}",
-                            pid, e
-                        );
+                        tracing::warn!("等待子进程 PID={} 退出失败: {}", pid, e);
                         break;
                     }
                 }
@@ -358,10 +360,14 @@ impl SidecarManager {
         // macOS: resources 在 Contents/Resources/，exe 在 Contents/MacOS/
         // Linux AppImage: resources 在挂载点根目录
         let search_paths: Vec<std::path::PathBuf> = [
-            exe_dir.join(&binary_name),                               // 同目录（Windows 安装目录根）
-            exe_dir.join("resources").join(&binary_name),            // resources/ 子目录
+            exe_dir.join(&binary_name), // 同目录（Windows 安装目录根）
+            exe_dir.join("resources").join(&binary_name), // resources/ 子目录
             exe_dir.parent().unwrap_or(&exe_dir).join(&binary_name), // 上级目录
-            exe_dir.parent().unwrap_or(&exe_dir).join("Resources").join(&binary_name), // macOS: Contents/Resources/
+            exe_dir
+                .parent()
+                .unwrap_or(&exe_dir)
+                .join("Resources")
+                .join(&binary_name), // macOS: Contents/Resources/
         ]
         .into_iter()
         .collect();
@@ -394,13 +400,15 @@ impl SidecarManager {
 
     /// 获取指定项目的实例信息
     pub fn get_instance(&self, project_dir: &str) -> Option<SidecarInstance> {
-        self.instances.get(project_dir).map(|handle| SidecarInstance {
-            project_dir: handle.project_dir.clone(),
-            state: SidecarState::Running,
-            running: true,
-            port: handle.port,
-            pid: handle.child.id(),
-        })
+        self.instances
+            .get(project_dir)
+            .map(|handle| SidecarInstance {
+                project_dir: handle.project_dir.clone(),
+                state: SidecarState::Running,
+                running: true,
+                port: handle.port,
+                pid: handle.child.id(),
+            })
     }
 
     /// 检查是否有 sidecar 正在运行
@@ -449,7 +457,9 @@ impl SidecarManager {
             if Self::is_process_alive(&mut handle.child) {
                 tracing::info!(
                     "项目 {} 的 sidecar 已在运行 (PID={}, port={})",
-                    project_key, handle.child.id(), handle.port
+                    project_key,
+                    handle.child.id(),
+                    handle.port
                 );
                 return PrepareResult::AlreadyRunning(handle.port);
             }
@@ -477,10 +487,7 @@ impl SidecarManager {
         let mut dead_instances = Vec::new();
         for key in dead_keys {
             if let Some(handle) = self.instances.remove(&key) {
-                tracing::warn!(
-                    "检测到 sidecar 已死亡: 项目={}, 端口={}",
-                    key, handle.port
-                );
+                tracing::warn!("检测到 sidecar 已死亡: 项目={}, 端口={}", key, handle.port);
                 dead_instances.push(DeadInstanceInfo {
                     project_key: key,
                     src_dir: handle.src_dir,
@@ -551,10 +558,12 @@ impl SidecarManager {
                     llm.split("||").next()
                 } else {
                     llm.split(':').next()
-                }.unwrap_or("unknown");
+                }
+                .unwrap_or("unknown");
                 tracing::info!(
                     "已通过环境变量传递 LLM 配置到 Sidecar（项目: {}, 类型: {}）",
-                    project_key, llm_type
+                    project_key,
+                    llm_type
                 );
             }
         }
@@ -588,11 +597,14 @@ impl SidecarManager {
         let port_check = tokio::time::timeout(
             Duration::from_millis(200),
             Self::check_sidecar_health(actual_port),
-        ).await;
+        )
+        .await;
         if let Ok(Some(probed)) = port_check {
             tracing::warn!(
                 "G-002：端口 {} 已有健康 sidecar 运行（src_dir: {}, uptime: {}s），spawn 被阻止",
-                actual_port, probed.src_dir, probed.uptime_seconds
+                actual_port,
+                probed.src_dir,
+                probed.uptime_seconds
             );
             return Err(SidecarStartError::PortConflict {
                 port: actual_port,
@@ -606,9 +618,9 @@ impl SidecarManager {
         }
 
         // 启动子进程
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| SidecarStartError::SpawnFailed { reason: e.to_string() })?;
+        let mut child = cmd.spawn().map_err(|e| SidecarStartError::SpawnFailed {
+            reason: e.to_string(),
+        })?;
 
         let pid = child.id();
 
@@ -624,19 +636,27 @@ impl SidecarManager {
         // 等待健康检查通过
         // v0.8.9 修复 G-010：健康检查失败时显式 kill 子进程，防止孤儿进程
         // std::process::Child 的 Drop 不会 kill 子进程，必须显式 kill + wait
-        let port = match Self::wait_for_health_static(&mut child, actual_port, cancel_flag, progress_tx).await {
-            Ok(port) => port,
-            Err(e) => {
-                tracing::warn!(
-                    "健康检查失败，正在清理子进程 (pid: {:?}): {}",
-                    pid,
-                    e
-                );
-                let _ = child.kill();
-                let _ = child.wait(); // 等待子进程退出，避免僵尸进程
-                return Err(e);
-            }
-        };
+        let port =
+            match Self::wait_for_health_static(&mut child, actual_port, cancel_flag, progress_tx)
+                .await
+            {
+                Ok(port) => port,
+                Err(e) => {
+                    tracing::warn!("健康检查失败，正在清理子进程 (pid: {:?}): {}", pid, e);
+                    // v0.8.10 L5-03：kill/wait 错误不再静默吞掉，记录日志便于排查
+                    if let Err(kill_err) = child.kill() {
+                        tracing::error!(
+                            "清理子进程失败 (pid: {:?}): kill 返回错误: {}",
+                            pid,
+                            kill_err
+                        );
+                    }
+                    if let Err(wait_err) = child.wait() {
+                        tracing::warn!("等待子进程退出失败 (pid: {:?}): {}", pid, wait_err);
+                    }
+                    return Err(e);
+                }
+            };
 
         // G-003：发送"服务已就绪"进度
         if let Some(tx) = progress_tx {
@@ -649,7 +669,9 @@ impl SidecarManager {
 
         tracing::info!(
             "Sidecar 已启动: 项目={}, PID={}, port={}",
-            project_key, pid, port
+            project_key,
+            pid,
+            port
         );
         Ok((child, port))
     }
@@ -698,7 +720,9 @@ impl SidecarManager {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
-            .map_err(|e| SidecarStartError::HttpClientError { reason: e.to_string() })?;
+            .map_err(|e| SidecarStartError::HttpClientError {
+                reason: e.to_string(),
+            })?;
 
         for attempt in 1..=20 {
             // v0.8.9 G-001：检查取消标志，前端 abort 时终止等待
@@ -733,7 +757,8 @@ impl SidecarManager {
                         if offset > 0 {
                             tracing::info!(
                                 "Sidecar 端口自适应: {} → {} (第{attempt}次尝试)",
-                                start_port, port
+                                start_port,
+                                port
                             );
                         }
                         return Ok(port);
@@ -850,7 +875,8 @@ impl SidecarManager {
                         // 解析响应体，验证是否为 loong-recall 服务
                         match resp.json::<serde_json::Value>().await {
                             Ok(body) => {
-                                let service = body.get("service").and_then(|v| v.as_str()).unwrap_or("");
+                                let service =
+                                    body.get("service").and_then(|v| v.as_str()).unwrap_or("");
                                 if service == "loong-recall" {
                                     let src_dir = body
                                         .get("src_dir")
@@ -891,7 +917,10 @@ impl SidecarManager {
             tracing::info!(
                 "探测到 {} 个外部 sidecar 实例：{:?}",
                 probed.len(),
-                probed.iter().map(|p| (p.port, &p.src_dir)).collect::<Vec<_>>()
+                probed
+                    .iter()
+                    .map(|p| (p.port, &p.src_dir))
+                    .collect::<Vec<_>>()
             );
         } else {
             tracing::info!("未探测到外部 sidecar 实例");
@@ -908,9 +937,9 @@ impl SidecarManager {
         #[cfg(target_os = "windows")]
         {
             match child.try_wait() {
-                Ok(None) => true,      // 进程仍在运行
-                Ok(Some(_)) => false,  // 进程已退出
-                Err(_) => true,        // try_wait 失败时保守假设仍在运行
+                Ok(None) => true,     // 进程仍在运行
+                Ok(Some(_)) => false, // 进程已退出
+                Err(_) => true,       // try_wait 失败时保守假设仍在运行
             }
         }
 
@@ -1017,7 +1046,9 @@ impl SidecarManager {
 
             tracing::info!(
                 "Sidecar 已停止: 项目={}, PID={}: {:?}",
-                project_key, pid, wait_result
+                project_key,
+                pid,
+                wait_result
             );
         }
         Ok(())
@@ -1104,14 +1135,12 @@ impl SidecarManager {
                     recovered += 1;
                     tracing::info!(
                         "Sidecar 崩溃恢复成功: 项目={}, 新端口={}",
-                        project_key, port
+                        project_key,
+                        port
                     );
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "Sidecar 崩溃恢复失败: 项目={}, 错误: {}",
-                        project_key, e
-                    );
+                    tracing::error!("Sidecar 崩溃恢复失败: 项目={}, 错误: {}", project_key, e);
                 }
             }
         }
@@ -1185,7 +1214,10 @@ mod tests {
         let mut manager = SidecarManager::for_testing("nonexistent.exe".into());
         // 启动一个真实子进程（会立即退出）用于测试
         #[cfg(target_os = "windows")]
-        let child = Command::new("cmd").args(["/c", "timeout", "10"]).spawn().unwrap();
+        let child = Command::new("cmd")
+            .args(["/c", "timeout", "10"])
+            .spawn()
+            .unwrap();
         #[cfg(not(target_os = "windows"))]
         let child = Command::new("sleep").arg("10").spawn().unwrap();
 
@@ -1220,9 +1252,9 @@ mod tests {
     /// 验证 Phase 1 不执行 I/O，锁持有时间极短。
     #[tokio::test]
     async fn test_concurrent_prepare_start_no_blocking() {
-        let manager = Arc::new(tokio::sync::Mutex::new(
-            SidecarManager::for_testing("nonexistent.exe".into())
-        ));
+        let manager = Arc::new(tokio::sync::Mutex::new(SidecarManager::for_testing(
+            "nonexistent.exe".into(),
+        )));
 
         let start = Instant::now();
         let mut handles = Vec::new();
@@ -1251,9 +1283,9 @@ mod tests {
     /// 并发压力测试：10 个 collect_dead_instances 调用应在 < 100ms 内完成
     #[tokio::test]
     async fn test_concurrent_collect_dead_instances_no_blocking() {
-        let manager = Arc::new(tokio::sync::Mutex::new(
-            SidecarManager::for_testing("nonexistent.exe".into())
-        ));
+        let manager = Arc::new(tokio::sync::Mutex::new(SidecarManager::for_testing(
+            "nonexistent.exe".into(),
+        )));
 
         let start = Instant::now();
         let mut handles = Vec::new();
@@ -1288,9 +1320,9 @@ mod tests {
     /// 在 Phase 2 期间，另一个任务应该能立即获取 sidecar 锁。
     #[tokio::test]
     async fn test_three_phase_lock_safety_phase2_releases_lock() {
-        let manager = Arc::new(tokio::sync::Mutex::new(
-            SidecarManager::for_testing("nonexistent.exe".into())
-        ));
+        let manager = Arc::new(tokio::sync::Mutex::new(SidecarManager::for_testing(
+            "nonexistent.exe".into(),
+        )));
 
         // Phase 1: prepare_start（持锁，< 1ms）
         let prepare = {
@@ -1332,9 +1364,9 @@ mod tests {
     /// 用于验证测试框架能检测到锁竞争问题。
     #[tokio::test]
     async fn test_old_pattern_holding_lock_during_io_is_detectable() {
-        let manager = Arc::new(tokio::sync::Mutex::new(
-            SidecarManager::for_testing("nonexistent.exe".into())
-        ));
+        let manager = Arc::new(tokio::sync::Mutex::new(SidecarManager::for_testing(
+            "nonexistent.exe".into(),
+        )));
 
         // 启动监控任务：在主任务持有锁期间尝试获取锁
         let mgr_clone = manager.clone();
@@ -1379,12 +1411,9 @@ mod tests {
             cancel_flag: &cancel_flag,
             progress_tx: None, // G-003：测试不需要进度反馈
         };
-        let result = SidecarManager::spawn_and_wait(
-            "nonexistent-binary-xyz.exe",
-            "test_project",
-            &opts,
-        )
-        .await;
+        let result =
+            SidecarManager::spawn_and_wait("nonexistent-binary-xyz.exe", "test_project", &opts)
+                .await;
 
         let elapsed = start.elapsed();
 
@@ -1407,9 +1436,9 @@ mod tests {
     /// 所有命令应在 < 500ms 内完成（因为 Phase 2 不持锁）。
     #[tokio::test]
     async fn test_concurrent_status_start_wizard_no_blocking() {
-        let manager = Arc::new(tokio::sync::Mutex::new(
-            SidecarManager::for_testing("nonexistent.exe".into())
-        ));
+        let manager = Arc::new(tokio::sync::Mutex::new(SidecarManager::for_testing(
+            "nonexistent.exe".into(),
+        )));
         let sidecar_port = Arc::new(tokio::sync::Mutex::new(None::<u16>));
 
         let start = Instant::now();
@@ -1453,11 +1482,8 @@ mod tests {
                     cancel_flag: &cancel_flag,
                     progress_tx: None, // G-003：测试不需要进度反馈
                 };
-                let _ = SidecarManager::spawn_and_wait(
-                    "nonexistent.exe",
-                    &project_key,
-                    &opts,
-                ).await;
+                let _ =
+                    SidecarManager::spawn_and_wait("nonexistent.exe", &project_key, &opts).await;
                 // 不执行 Phase 3（因为 Phase 2 失败了）
             }));
         }
@@ -1516,7 +1542,10 @@ mod tests {
         let mut manager = SidecarManager::for_testing("nonexistent.exe".into());
 
         #[cfg(target_os = "windows")]
-        let child = Command::new("cmd").args(["/c", "timeout", "10"]).spawn().unwrap();
+        let child = Command::new("cmd")
+            .args(["/c", "timeout", "10"])
+            .spawn()
+            .unwrap();
         #[cfg(not(target_os = "windows"))]
         let child = Command::new("sleep").arg("10").spawn().unwrap();
 
@@ -1567,9 +1596,9 @@ mod tests {
     /// 4. 在整个过程中，其他任务可以获取 sidecar 锁
     #[tokio::test]
     async fn test_startup_sequence_no_lock_blocking() {
-        let manager = Arc::new(tokio::sync::Mutex::new(
-            SidecarManager::for_testing("nonexistent.exe".into())
-        ));
+        let manager = Arc::new(tokio::sync::Mutex::new(SidecarManager::for_testing(
+            "nonexistent.exe".into(),
+        )));
         let sidecar_port = Arc::new(tokio::sync::Mutex::new(None::<u16>));
 
         // 启动监控任务：在启动序列期间持续尝试获取锁
@@ -1627,9 +1656,9 @@ mod tests {
     /// 5. 整个恢复过程中，其他任务可以获取 sidecar 锁
     #[tokio::test]
     async fn test_heartbeat_recovery_sequence_no_lock_blocking() {
-        let manager = Arc::new(tokio::sync::Mutex::new(
-            SidecarManager::for_testing("nonexistent.exe".into())
-        ));
+        let manager = Arc::new(tokio::sync::Mutex::new(SidecarManager::for_testing(
+            "nonexistent.exe".into(),
+        )));
 
         // 启动监控任务：在恢复序列期间持续尝试获取锁
         let mgr_monitor = manager.clone();
@@ -1673,11 +1702,7 @@ mod tests {
                 cancel_flag: &heartbeat_cancel,
                 progress_tx: None, // G-003：测试不需要进度反馈
             };
-            let _ = SidecarManager::spawn_and_wait(
-                &binary_path,
-                &info.project_key,
-                &opts,
-            ).await;
+            let _ = SidecarManager::spawn_and_wait(&binary_path, &info.project_key, &opts).await;
             // spawn_and_wait 会快速失败（binary 不存在）
         }
 
@@ -1704,9 +1729,9 @@ mod tests {
     /// 4. 整个过程中，其他任务可以获取 sidecar 锁
     #[tokio::test]
     async fn test_start_sidecar_three_phase_no_lock_blocking() {
-        let manager = Arc::new(tokio::sync::Mutex::new(
-            SidecarManager::for_testing("nonexistent.exe".into())
-        ));
+        let manager = Arc::new(tokio::sync::Mutex::new(SidecarManager::for_testing(
+            "nonexistent.exe".into(),
+        )));
 
         // 启动监控任务
         let mgr_monitor = manager.clone();
@@ -1745,11 +1770,7 @@ mod tests {
             cancel_flag: &cancel_flag,
             progress_tx: None, // G-003：测试不需要进度反馈
         };
-        let _ = SidecarManager::spawn_and_wait(
-            &binary_path,
-            "test_project",
-            &opts,
-        ).await;
+        let _ = SidecarManager::spawn_and_wait(&binary_path, "test_project", &opts).await;
 
         // Phase 3: 不执行（Phase 2 失败了）
 

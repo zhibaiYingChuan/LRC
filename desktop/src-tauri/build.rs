@@ -75,7 +75,10 @@ fn sync_sidecar_binary() {
     };
     let dest_path = dest_dir.join(dest_name);
 
-    println!("cargo:info=桌面端构建目标平台: {} (triple: {})", target_os, target_triple);
+    println!(
+        "cargo:info=桌面端构建目标平台: {} (triple: {})",
+        target_os, target_triple
+    );
 
     // 获取 workspace 根目录（桌面端在 workspace 子目录下）
     let workspace_root = find_workspace_root(&dest_dir);
@@ -94,25 +97,24 @@ fn sync_sidecar_binary() {
                 paths.push(p);
             }
             // 候选 1b: $CARGO_TARGET_DIR/release/（自定义 target-dir，无交叉编译）
-            let p = PathBuf::from(&target_dir)
-                .join("release")
-                .join(binary_name);
+            let p = PathBuf::from(&target_dir).join("release").join(binary_name);
             paths.push(p);
         }
 
         // 候选 1c: 从 ~/.cargo/config.toml 读取 target-dir（全局 cargo 配置）
         // v0.5.1 修复：当 target-dir 通过 cargo config 而非环境变量设置时，
         // build.rs 无法通过 CARGO_TARGET_DIR 环境变量获取，需要手动解析配置
-        if let Ok(home) = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-        {
+        if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
             let cargo_config = PathBuf::from(&home).join(".cargo").join("config.toml");
             if let Ok(content) = std::fs::read_to_string(&cargo_config) {
                 for line in content.lines() {
                     let trimmed = line.trim();
                     if trimmed.starts_with("target-dir") {
-                        if let Some(dir) = trimmed.split('=').nth(1)
-                            .or_else(|| trimmed.split_whitespace().nth(1)) {
+                        if let Some(dir) = trimmed
+                            .split('=')
+                            .nth(1)
+                            .or_else(|| trimmed.split_whitespace().nth(1))
+                        {
                             let dir = dir.trim().trim_matches('"');
                             // 交叉编译路径
                             if !target_triple.is_empty() {
@@ -121,14 +123,15 @@ fn sync_sidecar_binary() {
                                     .join("release")
                                     .join(binary_name);
                                 if p.exists() {
-                                    println!("cargo:info=从 cargo config 找到 target-dir (交叉编译): {}", dir);
+                                    println!(
+                                        "cargo:info=从 cargo config 找到 target-dir (交叉编译): {}",
+                                        dir
+                                    );
                                     paths.push(p);
                                 }
                             }
                             // 非交叉编译路径
-                            let p = PathBuf::from(dir)
-                                .join("release")
-                                .join(binary_name);
+                            let p = PathBuf::from(dir).join("release").join(binary_name);
                             if p.exists() {
                                 println!("cargo:info=从 cargo config 找到 target-dir: {}", dir);
                                 paths.push(p);
@@ -143,7 +146,12 @@ fn sync_sidecar_binary() {
         // 候选 2: workspace target/{target_triple}/release/（交叉编译）
         if let Some(ref ws) = workspace_root {
             if !target_triple.is_empty() {
-                paths.push(ws.join("target").join(&target_triple).join("release").join(binary_name));
+                paths.push(
+                    ws.join("target")
+                        .join(&target_triple)
+                        .join("release")
+                        .join(binary_name),
+                );
             }
             // 候选 2b: workspace target/release/（默认 target-dir）
             paths.push(ws.join("target").join("release").join(binary_name));
@@ -156,20 +164,23 @@ fn sync_sidecar_binary() {
     };
 
     // 查找最新的候选源文件
-    let best_source = candidates
-        .iter()
-        .filter(|p| p.exists())
-        .max_by_key(|p| {
-            std::fs::metadata(p)
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        });
+    let best_source = candidates.iter().filter(|p| p.exists()).max_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
 
     let Some(source) = best_source else {
         println!(
             "cargo:warning=未找到已编译的 code-memory-server.exe，请先构建主项目: cargo build --release -p code-memory"
         );
-        println!("cargo:warning=搜索路径: {:?}", candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
+        println!(
+            "cargo:warning=搜索路径: {:?}",
+            candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+        );
         // v0.6.0 P1-A 修复：release 构建时强制要求 sidecar 二进制存在
         // 开发模式（debug）允许跳过，但 release 构建必须 panic 避免打包出无效的桌面端
         let profile = std::env::var("PROFILE").unwrap_or_default();
@@ -182,15 +193,11 @@ fn sync_sidecar_binary() {
         return;
     };
 
-    let src_size = std::fs::metadata(source)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let src_size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
 
     // 检查目标文件是否需要更新
     if dest_path.exists() {
-        let dest_size = std::fs::metadata(&dest_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let dest_size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
 
         // v0.5.1 增强：使用 SHA-256 哈希验证（比时间戳更可靠）
         if use_hash {
@@ -206,7 +213,8 @@ fn sync_sidecar_binary() {
                     }
                     println!(
                         "cargo:info=Sidecar 二进制哈希不匹配，需要更新 (目标: {}..., 源: {}...)",
-                        &dest_hash[..16], &src_hash[..16]
+                        &dest_hash[..16],
+                        &src_hash[..16]
                     );
                 }
                 _ => {
@@ -352,7 +360,10 @@ fn cleanup_sidecar_artifacts(dest_dir: &Path) {
             // 匹配 lrc-sidecar 前缀但不在允许列表中的文件
             if name_str.starts_with("lrc-sidecar") && !allowed_names.contains(&name_str.as_ref()) {
                 if let Err(e) = std::fs::remove_file(entry.path()) {
-                    println!("cargo:warning=无法删除 sidecar 残留文件 {}: {}", name_str, e);
+                    println!(
+                        "cargo:warning=无法删除 sidecar 残留文件 {}: {}",
+                        name_str, e
+                    );
                 } else {
                     println!("cargo:info=已清理 sidecar 残留文件: {}", name_str);
                 }

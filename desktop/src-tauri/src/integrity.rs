@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 /// 敏感字符串（编译时混淆，运行时解密）
 /// 二进制中搜索不到以下明文。
-/// 
+///
 /// 注：obfstr! 宏返回对内部临时值的引用，不能从函数返回 &'static str。
 /// 因此直接在调用点使用 obfstr!() 宏，编译时加密、运行时栈上解密。
 ///
@@ -80,9 +80,8 @@ impl IntegrityChecker {
     fn check_windows_debugger() -> Result<(), IntegrityError> {
         // L2-AD-1: IsDebuggerPresent（最基础的检测）
         // SAFETY: IsDebuggerPresent 是 Windows 标准 API，无参数，无内存操作，调用始终安全
-        let is_debugger_present = unsafe {
-            windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent()
-        };
+        let is_debugger_present =
+            unsafe { windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent() };
         if is_debugger_present != 0 {
             // 静默退出，不弹出警告
             return Err(IntegrityError::DebuggerDetected);
@@ -91,9 +90,7 @@ impl IntegrityChecker {
         // L2-AD-2: CheckRemoteDebuggerPresent（检测远程调试）
         let mut remote_debugger_present: i32 = 0;
         // SAFETY: GetCurrentProcess 返回当前进程的伪句柄，无内存分配，调用始终安全
-        let current_process = unsafe {
-            windows_sys::Win32::System::Threading::GetCurrentProcess()
-        };
+        let current_process = unsafe { windows_sys::Win32::System::Threading::GetCurrentProcess() };
         // SAFETY: CheckRemoteDebuggerPresent 接收有效进程句柄和布尔指针，remote_debugger_present 是栈上变量
         let check_result = unsafe {
             windows_sys::Win32::System::Diagnostics::Debug::CheckRemoteDebuggerPresent(
@@ -158,12 +155,11 @@ impl IntegrityChecker {
     /// 5. 若未找到签名（开发模式），跳过校验并记录警告
     fn check_self_integrity() -> Result<(), IntegrityError> {
         // 获取自身二进制路径
-        let exe_path = std::env::current_exe()
-            .map_err(|_| IntegrityError::BinaryNotFound)?;
+        let exe_path = std::env::current_exe().map_err(|_| IntegrityError::BinaryNotFound)?;
 
         // 验证文件存在且可读
-        let metadata = std::fs::metadata(&exe_path)
-            .map_err(|e| IntegrityError::ReadError(e.to_string()))?;
+        let metadata =
+            std::fs::metadata(&exe_path).map_err(|e| IntegrityError::ReadError(e.to_string()))?;
 
         // 验证文件大小合理（非空文件）
         if metadata.len() == 0 {
@@ -184,8 +180,8 @@ impl IntegrityChecker {
 
         // M-13 修复：改为流式读取，避免将整个二进制文件加载到内存
         // 原实现 std::fs::read() 会将整个可执行文件（可能 50MB+）读入内存
-        let mut file = std::fs::File::open(&exe_path)
-            .map_err(|e| IntegrityError::ReadError(e.to_string()))?;
+        let mut file =
+            std::fs::File::open(&exe_path).map_err(|e| IntegrityError::ReadError(e.to_string()))?;
 
         // 从文件末尾搜索 Magic Bytes（流式搜索）
         let magic: [u8; 8] = *obfstr::obfbytes!(b"LRCSIG\x00\xFF");
