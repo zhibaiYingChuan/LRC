@@ -381,6 +381,7 @@ impl PythonChunker {
 
         // 处理 async def
         let after_async = trimmed.strip_prefix("async def ").map(|r| ("def", r));
+        #[allow(clippy::question_mark)]
         let (keyword, rest) = if let Some((kw, r)) = after_async {
             (kw, r.to_string())
         } else if let Some(r) = trimmed.strip_prefix("def ") {

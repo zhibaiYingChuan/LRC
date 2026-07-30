@@ -171,7 +171,7 @@ fn cleanup_old_backups(backups_dir: &Path) -> usize {
     }
 
     // 按修改时间降序排列（最新的在前）
-    backups.sort_by(|a, b| b.1.cmp(&a.1));
+    backups.sort_by_key(|(_, t)| std::cmp::Reverse(*t));
 
     // 删除超出部分
     let mut removed = 0;
@@ -253,7 +253,7 @@ pub fn list_backups() -> Vec<BackupInfo> {
     }
 
     // 按修改时间降序排列（最新的在前）
-    backups.sort_by(|a, b| b.modified_timestamp.cmp(&a.modified_timestamp));
+    backups.sort_by_key(|b| std::cmp::Reverse(b.modified_timestamp));
     backups
 }
 

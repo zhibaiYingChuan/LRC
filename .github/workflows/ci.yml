@@ -150,11 +150,12 @@ jobs:
             exit 1
           fi
 
-      - name: Smoke test - / (dashboard)
-        # 验证静态资源服务正常
+      - name: Smoke test - /dashboard
+        # 验证仪表盘静态资源服务正常
+        # 注意：根路径 / 会 302 重定向到 /dashboard，因此直接测试 /dashboard
         run: |
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3099/)
-          echo "GET / → HTTP $RESPONSE"
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3099/dashboard)
+          echo "GET /dashboard → HTTP $RESPONSE"
           if [ "$RESPONSE" != "200" ]; then
             echo "FAIL: 期望 200，实际 $RESPONSE"
             cat sidecar.log
