@@ -945,26 +945,36 @@ function postMessageToParent(type, extra = {}, timeoutMs = 30000, externalSignal
                        (window.__TAURI__ && window.__TAURI__.invoke);
       const cmdName = POST_MESSAGE_TO_INVOKE[type];
       if (invokeFn && cmdName) {
+        let timeoutId = null;
         try {
-          // v0.8.6 Step 2 / N003 G058：使用 Promise.race 实现 abort 语义
-          // Tauri invoke 本身不支持真正中断，但前端可通过 race 拒绝 Promise
+          // v0.8.9 修复：Tauri 分支加 setTimeout 硬超时
+          // 之前 timeoutMs 参数在 Tauri 分支被完全忽略（只有 iframe 模式有超时）
+          // 导致 invoke 永不返回时 UI 永久卡死（启动服务 10 分钟无响应 bug）
           const invokePromise = invokeFn(cmdName, extra);
 
+          // 超时 Promise：timeoutMs 后 reject，防止 invoke 永不返回
+          const timeoutPromise = new Promise((_, rejectTimeout) => {
+            timeoutId = setTimeout(() => {
+              rejectTimeout(new Error('请求超时（' + timeoutMs + 'ms），请稍后重试'));
+            }, timeoutMs);
+          });
+
+          // 构建竞争 Promise 列表：invoke + 超时 + abort（如有）
+          const racers = [invokePromise, timeoutPromise];
           if (externalSignal) {
-            // 创建 abort Promise，监听外部信号
+            // v0.8.6：abort Promise，监听外部取消信号
             const abortPromise = new Promise((_, rejectAbort) => {
               externalSignal.addEventListener('abort', () => {
                 rejectAbort(new DOMException('Aborted', 'AbortError'));
-            }, { once: true });
+              }, { once: true });
             });
-            const result = await Promise.race([invokePromise, abortPromise]);
-            resolve(result);
-          } else {
-            // 无外部信号，保持原有行为
-            const result = await invokePromise;
-            resolve(result);
+            racers.push(abortPromise);
           }
+          const result = await Promise.race(racers);
+          clearTimeout(timeoutId);
+          resolve(result);
         } catch (e) {
+          clearTimeout(timeoutId);
           if (e && e.name === 'AbortError') {
             reject(new DOMException('用户取消操作', 'AbortError'));
           } else {
