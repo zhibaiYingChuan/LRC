@@ -221,3 +221,54 @@ do_git.bat
 do_git.ps1
 run_check.ps1
 build_release.ps1
+
+# ============================================================
+# v0.8.7 HCSE 发布合规评估后新增规则（2026-07-30）
+# 依据: docs/PUSH_STANDARD.md + HCSE 发布合规专家评审
+# ============================================================
+
+# P0: 根目录 node_modules（之前仅忽略 desktop/node_modules/，遗漏根目录）
+/node_modules/
+
+# P1: 参赛材料（非产品交付，含 270MB 数据集超 GitHub 限制，通过 Release 单独发布）
+competition/
+
+# P1: 本地测试截图（非交付内容）
+docs/desktop_test_screenshots/
+
+# P1: 本地测试/验证脚本（仅开发期使用，非交付内容）
+scripts/verify_*.ps1
+scripts/test_*.py
+scripts/test_*.js
+scripts/test[0-9]*.py
+scripts/test[0-9]*.js
+scripts/cdp_*.py
+scripts/probe_*.py
+scripts/check_*_v0*.ps1
+scripts/cleanup_old_builds_v0*.ps1
+scripts/copy_sidecar_to_desktop_v0*.ps1
+scripts/stop_processes_before_build.ps1
+scripts/convert_onclick_to_data_action.ps1
+scripts/audit_*.py
+scripts/emergency_unblock.py
+scripts/force_reload.py
+scripts/commit_msg_*.txt
+scripts/audit_report.json
+
+# P1: 本地报告文档（内部审计/测试/评审报告，非用户文档）
+docs/CDP_TEST_REPORT_*.md
+docs/HCSE_VERIFICATION_REPORT_*.md
+docs/INTERACTION_AUDIT_REPORT_*.md
+docs/PRODUCT_ASSESSMENT_*.md
+docs/PRODUCT_REVIEW_*.md
+docs/PUSH_STANDARD_*_REVIEW.md
+docs/DESKTOP_*_REPORT_*.md
+docs/DESKTOP_*_PLAN_*.md
+docs/RULES_AUDIT_*.md
+docs/ONBOARDING_AUDIT_REPORT.md
+docs/MEMORY_STORAGE_ASSESSMENT_*.md
+docs/cdp_regression_*.js
+
+# P1: 备份文件（不应入库）
+*.bak
+static/index.html.bak
