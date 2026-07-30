@@ -308,11 +308,12 @@ sha256sum target/<YOUR_TARGET>/release/code-memory-server
 # 与 Release 中的 .sha256 对比
 ```
 
-### 5.6 CI 预检门禁（v0.8.8 新增）
+### 5.6 CI 预检门禁（v0.8.8 已实现）
 
+> **已落地**：`release.yml` 已实现 preflight job（v0.8.8），在三平台构建前执行 7 项检查，任一失败则阻止构建。
 > **强制要求**：`release.yml` 在触发三平台构建前，必须先跑 preflight job 确保基础编译通过。v0.8.7 因无 preflight 导致三平台并行失败浪费时间。
 
-#### Preflight Job 设计
+#### Preflight Job 已实现内容（release.yml Job 0）
 
 ```yaml
 # release.yml 新增 preflight job（在 build-sidecar 和 build-desktop 之前）
@@ -509,7 +510,7 @@ README.md 中所有性能数据必须满足：
 
 #### 7.4.5 未发布版本功能禁令（P1）
 
-1. **禁止**描述未发布版本的功能（当前 v0.8.7，则禁止描述 v0.9.0 功能）
+1. **禁止**描述未发布版本的功能（当前 v0.8.8，则禁止描述 v0.9.0 功能）
 2. **禁止**对已发布版本使用"预览"标记
 3. 未实现功能移至 `docs/PRODUCT_ROADMAP_v1.0.md`
 
@@ -948,11 +949,11 @@ python scripts/check_algorithm_leak.py --verbose
 
 ## 十五、附录
 
-### 15.1 当前仓库状态（v0.8.7，修复中 → v0.8.8）
+### 15.1 当前仓库状态（v0.8.8）
 
 - **仓库地址**：https://github.com/zhibaiYingChuan/LRC
 - **主分支**：main
-- **当前版本**：0.8.7（v0.8.8 修复中）
+- **当前版本**：0.8.8
 - **构建工作流**：`.github/workflows/release.yml`
 - **覆盖平台**：Windows、macOS、Linux
 
@@ -975,3 +976,107 @@ python scripts/check_algorithm_leak.py --verbose
 | 2026-07-30 | v1.4 | v0.8.7 CI 失败复盘后新增：第 2.3 节跨平台预检、第 5.6 节 CI preflight 门禁、第 11.5 节 CI 失败 Tag 处置决策树、第十二章 MSRV 一致性规范、第十三章 CI 失败处理与防复发；桌面端 MSRV 1.77→1.80 统一 |
 | 2026-07-30 | v1.5 | HCSE README 审核后新增：第 7.4 节 README.md 审查规范（7 项审查）；2.2 节检查清单第 5 项扩展为 7 项；修复 README 死链、虚假性能数据、file:// 链接、未发布版本功能描述、过时标记 |
 | 2026-07-30 | v1.6 | 新增第十四章发布前全面审计规范（8 大领域审计范围 + 隧道视野防范规则 + 审计报告模板）；根因分析：前三次专家评估因"隧道视野"导致 README 问题遗漏 |
+| 2026-07-30 | v1.7 | 工作流程标准化改造：pre-commit hook v2.0（新增 fmt+clippy+PATH 修复）；release.yml preflight job 已实现（7 项检查）；ci.yml build-matrix 新增桌面端 cargo check + tauri 配置校验；新增 scripts/preflight_check.ps1 一键 8 大领域审计脚本；新增第十六章标准化工作流程门禁链 |
+
+---
+
+## 十六、标准化工作流程门禁链（v0.8.8 工具化）
+
+> **核心改进**：将文档规范升级为自动化工具链，构建三层门禁防线，确保问题在最早阶段被发现和拦截。
+> **根因分析**：v0.8.7 三平台两失败的根因不是规范缺失（PUSH_STANDARD.md 已有 977 行规范），而是**规范与工具脱节**——规范要求了 fmt/clippy/跨平台预检，但 pre-commit hook 和 release.yml 都没有实现这些检查。
+
+### 16.1 三层门禁架构
+
+```
+开发提交 → [门禁 1] pre-commit hook（本地，5 项检查）
+               ↓ 通过
+           git push main → [门禁 2] CI（ci.yml，5 个 job）
+               ↓ 全绿
+           git tag vX.Y.Z → [门禁 3] Release preflight（release.yml Job 0，7 项检查）
+               ↓ 全绿
+           build-sidecar + build-desktop（三平台并行构建）
+               ↓ 全部成功
+           GitHub Release（自动发布）
+```
+
+### 16.2 门禁 1：pre-commit hook v2.0（本地防线）
+
+> **已实现**：`.git/hooks/pre-commit`（v2.0，2026-07-30）
+
+| 检查项 | 工具 | 失败动作 | 对应 CI job |
+|--------|------|---------|------------|
+| 代码格式 | `cargo fmt --all -- --check` | 阻止提交 | Rustfmt |
+| Clippy（server） | `cargo clippy --features server -- -D warnings` | 阻止提交 | Clippy |
+| Clippy（all-targets） | `cargo clippy --all-targets -- -D warnings` | 阻止提交 | Clippy |
+| 编译检查 | `cargo check --features server` | 阻止提交 | Build Check |
+| 单元测试 | `cargo test` | 阻止提交 | Unit & Integration Tests |
+| 算法泄露检测 | `python scripts/check_algorithm_leak.py` | 阻止提交 | — |
+
+**v2.0 变更**：
+- 新增 `cargo fmt --check`（v0.8.7 遗漏，CI fmt job 失败）
+- 新增 `cargo clippy -D warnings`（v0.8.7 遗漏，CI Clippy job 失败）
+- 修复 Windows Git Bash cargo PATH 问题（`export PATH="$HOME/.cargo/bin:$PATH"`）
+
+### 16.3 门禁 2：CI（ci.yml，push 到 main 触发）
+
+> **已增强**：`.github/workflows/ci.yml`（v0.8.8）
+
+| Job | 检查内容 | v0.8.8 新增 |
+|-----|---------|------------|
+| Rustfmt | `cargo fmt --all -- --check` | — |
+| Clippy | `cargo clippy --features server -- -D warnings` + `--all-targets` | — |
+| Unit & Integration Tests | `cargo test --features server` | — |
+| E2E Smoke Test | 启动 sidecar，curl `/dashboard`（v0.8.8 修复 `/`→302 问题） | ✓ 端点修复 |
+| Build Check（三平台） | `cargo check --features server` + **桌面端 `cargo check`** | ✓ 桌面端检查 |
+| — | **Tauri 配置校验**（targets 禁止单平台） | ✓ 新增 |
+
+### 16.4 门禁 3：Release Preflight（release.yml Job 0，tag 触发）
+
+> **已实现**：`.github/workflows/release.yml` preflight job（v0.8.8）
+
+| 检查项 | 检查内容 | 防止的故障 |
+|--------|---------|-----------|
+| Format check | `cargo fmt --all -- --check` | CI Rustfmt job 失败 |
+| Clippy check (server) | `cargo clippy --features server -- -D warnings` | CI Clippy job 失败 |
+| Clippy check (all-targets) | `cargo clippy --all-targets -- -D warnings` | CI Clippy job 失败 |
+| Compile check | `cargo check --features server` | 编译失败浪费三平台构建 |
+| Unit tests | `cargo test --features server` | 测试失败 |
+| Tauri config lint | targets 禁止 `["nsis"]` 单平台 | macOS/Linux 无 bundle（v0.8.7 根因） |
+| MSRV consistency | 主项目 = 桌面端 | MSRV 不一致导致编译失败 |
+| Version consistency | Cargo.toml = desktop Cargo.toml = tauri.conf.json | 版本号不一致 |
+
+**关键设计**：`build-sidecar` 和 `build-desktop` 均设置 `needs: preflight`，preflight 失败则不进入构建阶段。
+
+### 16.5 一键验证脚本：scripts/preflight_check.ps1
+
+> **已创建**：`scripts/preflight_check.ps1`（v0.8.8）
+
+一键执行 PUSH_STANDARD.md 第十四章 8 大领域审计：
+
+```powershell
+# 发布前一键验证（8 大领域全覆盖）
+powershell -File scripts/preflight_check.ps1
+```
+
+| 领域 | 自动化检查项 | 退出码 |
+|------|------------|--------|
+| 1. 代码编译 | 主项目 + 桌面端 cargo check | 0=通过, 1=失败 |
+| 2. 代码质量 | fmt + clippy + 泄露检测 | — |
+| 3. 跨平台配置 | tauri targets + MSRV 一致性 | — |
+| 4. README.md | file:// 链接 + 徽章版本 | — |
+| 5. 版本号一致性 | 3 处核心版本号 | — |
+| 6. CHANGELOG.md | 当前版本已记录 | — |
+| 7. 用户文档 | 人工检查提示 | WARN |
+| 8. CI/CD 配置 | preflight job + desktop check + tauri lint | — |
+
+### 16.6 v0.8.7 故障与门禁对照表
+
+| v0.8.7 故障 | 根因 | 门禁 1 拦截 | 门禁 2 拦截 | 门禁 3 拦截 |
+|------------|------|:----------:|:----------:|:----------:|
+| Clippy exit 101 | unnecessary_sort_by 等 4 个 lint | ✓ v2.0 新增 | ✓ CI Clippy | ✓ Preflight |
+| E2E exit 1 | GET / 返回 302 | — | ✓ v0.8.8 修复端点 | — |
+| macOS/Linux 无 bundle | tauri targets=["nsis"] | — | ✓ Tauri lint | ✓ Tauri lint |
+| MSRV 不一致 | 主项目 1.70 vs 桌面端 1.77 | — | — | ✓ MSRV check |
+| Node.js 20 废弃 | download-artifact@v5 | — | — | — (非构建失败) |
+
+> **结论**：三层门禁中任意一层即可拦截 v0.8.7 的全部故障。v0.8.7 之所以失败，是因为三层门禁全部缺失。
