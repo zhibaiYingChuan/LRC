@@ -4,6 +4,71 @@
 
 ---
 
+## [0.8.14] - 2026-07-31
+
+### 全局交互韧性修复（基于双智能体并行审计 + CI 门禁强化）
+
+> 本版本由 interaction-resilience-auditor（五层交互韧性审计）和
+> hcse-resilience-validator（HCSE 韧性验证回归测试）两个智能体全局审计，
+> 发现 9 P0 + 11 P1 + 6 P2 = 26 个盲点，本次修复 7 P0 + 1 P1。
+
+#### CI 门禁强化（v0.8.12 CI 失败根因修复）
+- **Cargo.lock 版本号检查**：preflight_check.ps1 和 release.yml 新增 Cargo.lock 版本号一致性检查
+  — v0.8.12 CI 失败根因：Cargo.toml=0.8.12 但 Cargo.lock=0.8.11，preflight 脚本漏检 Cargo.lock
+  — 修复后检查 8 处版本号同步（原 7 处 + Cargo.lock）
+- **PS 5.1 兼容性**：preflight_check.ps1 修复 Join-String 不可用问题（改用 -join 运算符）
+- **正则匹配修复**：统一使用 Select-String 提取版本号，避免 Get-Content -Raw + BOM 导致正则失配
+
+#### P0 致命问题修复（7处）
+
+- **P0-1(FM-11) 阻断性 bug**: `switch_project` 未重置 `start_cancel_flag`（commands.rs:1434）
+  — 根因：switch_project 复用 start_cancel_flag 但未在入口重置，用户取消启动后 flag 残留 true
+  — 影响：用户取消 start_sidecar 后 switch_project 永久失效直到应用重启（RPN=288，最高风险）
+  — 修复：在 switch_project 入口添加 `store.start_cancel_flag.store(false, Ordering::SeqCst)`
+
+- **P0-2**: `loadDaoMetrics` 不在 TAB_LOADERS，切换标签页后道同构度永不刷新（app.js:5793）
+  — 修复：TAB_LOADERS.dashboard 加入 loadDaoMetrics() 调用
+
+- **P0-4**: 遮罩快速点击 6 次产生 5 个僵尸确认框（app.js:1680）
+  — 根因：D2 showConfirm 入队上限 5，快速点击产生多个确认框
+  — 修复：添加 `_pendingOverlayConfirm` 去重标志
+
+- **P0-5**: loadDashboard 失败但 sidecarKnownReachable 时矛盾显示（app.js:767）
+  — 根因：索引期 error 显示"⚠️ 无法连接"与状态栏"运行中"矛盾
+  — 修复：sidecarKnownReachable 时显示"⏳ 索引中..."提示
+
+- **P0-6**: switchProject 120s 等待无进度反馈（app.js:6660）
+  — 修复：显示进度 Toast + 监听 sidecar-start-progress 事件更新提示
+
+- **P0-7(FM-16)**: `_trustRetryTimer` 未在 `_abortActiveTabRequests` 清除（app.js:5895）
+  — 根因：F3 新增 loadTrustCenter 重试时遗漏 B1/B2 建立的保护模式
+  — 修复：_abortActiveTabRequests 增加 _trustRetryTimer 清理
+
+- **P0-1(审计)**: sidecar-detected/recovered 直接修改 `_isReachable` 绕过状态机（app.js:2409,2420）
+  — 根因：直接修改 _isReachable 不触发 _setReachable 广播，UI 与状态不一致
+  — 修复：改用重置 _failCount + _backoffStep + check() 走正规状态机
+
+#### P1 严重问题修复（1处）
+- **P1-2**: sidecar-crash 后 `_backoffStep` 未重置，恢复检测最慢 60s（app.js:2440）
+  — 修复：sidecar-crash 事件处理中重置 `_backoffStep = 0`
+
+#### 未修复的已知问题（后续版本处理）
+- P0-3: showPrompt 绕过 processConfirmQueue（需较大重构，风险较高）
+- P0-8: 启动取消后误标不可达（边缘场景）
+- P0-9: start-service-modal ESC 与 confirm-modal ESC 冲突（边缘场景）
+- P1-1: 首屏需 20s 才显示"已停止"（体验优化）
+- P1-5: beforeunload 误判后台请求（体验优化）
+
+### 测试
+
+- node -c app.js: 通过（语法检查）
+- cargo check --features server: 通过
+- preflight_check.ps1: 15 passed, 0 failed
+- interaction-resilience-auditor: 五层交互韧性全局审计完成
+- hcse-resilience-validator: HCSE 韧性验证回归测试完成
+
+---
+
 ## [0.8.13] - 2026-07-31
 
 ### 综合交互韧性修复（22处，基于五层交互审计 + HCSE 韧性验证）
