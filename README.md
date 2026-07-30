@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/Code-Apache%202.0-blue.svg)](LICENSE_CODE)
 [![License](https://img.shields.io/badge/Engine-DaoTi%20Research%20License-red.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
 ---
 
@@ -33,6 +33,8 @@
 | [LongMemEval](benchmarks/reports/LRC_LONGMEMEVAL_REPORT.md) | 长时记忆 | Session Recall@10 = **85.74%** | Turn Recall@10 = **61.70%** | — |
 
 > 完整报告见 [基准测试汇总](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md)。
+>
+> **数据版本说明**：上述数据基于 v0.5.6 基准测试（2026-06-23），当前 v0.8.7 版本的检索引擎已有演进，最新数据以重新测试为准。
 
 ---
 
@@ -58,11 +60,11 @@ cargo build --release --features server
 
 如需离线语义搜索：`cargo build --release --features server,ml`（首次下载模型 ~500MB）。
 
-### v0.6.0 通用语义引擎（新）
+### 通用语义引擎
 
 v0.6.0 将默认嵌入模型从 CodeBERT 切换为 **BGE-small-zh**（中文用户开箱最优）或 **MiniLM-L6-v2**（英文环境），并支持本地嵌入完成记忆结晶，无需 LLM API 即可享受记忆融合能力。
 
-**模型管理 CLI**（v0.6.0 新增）：
+**模型管理 CLI**：
 
 ```bash
 # 列出本地已下载模型
@@ -92,7 +94,7 @@ code-memory-server model remove BAAI/bge-small-zh
 
 | 模型 | 维度 | 大小 | 推荐场景 |
 |------|------|------|---------|
-| BAAI/bge-small-zh | 512 | ~100MB | 中文默认（v0.6.0 推荐） |
+| BAAI/bge-small-zh | 512 | ~100MB | 中文默认推荐 |
 | sentence-transformers/all-MiniLM-L6-v2 | 384 | ~80MB | 英文默认 |
 | BAAI/bge-base-zh | 768 | ~400MB | 中文高精度 |
 | multilingual-e5-small | 384 | ~120MB | 多语言通用 |
@@ -105,10 +107,10 @@ v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计
 
 | 资源 | 文件 | 说明 |
 |------|------|------|
-| 色阶与排版 Token | [colors_and_type.css](file:///g:/code-memory/static/colors_and_type.css) | 6 组色阶（墨韵/宣纸/金色/玉色/朱砂/水蓝，每色 10 级）+ 语义别名 + 排版/间距/圆角/阴影/动效 |
-| 全局组件库 | [components.css](file:///g:/code-memory/static/components.css) | 按钮（5 种变体 + 3 种尺寸 + 洛书加载动画）、卡片（含记忆类型色条）、输入框、模态框、侧边栏 |
-| SVG 图标集 | [static/assets/icons/](file:///g:/code-memory/static/assets/icons) | 15 个极简线性图标（24x24px 栅格） |
-| SVG Logo 集 | [static/assets/logo/](file:///g:/code-memory/static/assets/logo) | 4 种 Logo 形态（主标/横版/纵版/纯文字） |
+| 色阶与排版 Token | [colors_and_type.css](static/colors_and_type.css) | 6 组色阶（墨韵/宣纸/金色/玉色/朱砂/水蓝，每色 10 级）+ 语义别名 + 排版/间距/圆角/阴影/动效 |
+| 全局组件库 | [components.css](static/components.css) | 按钮（5 种变体 + 3 种尺寸 + 洛书加载动画）、卡片（含记忆类型色条）、输入框、模态框、侧边栏 |
+| SVG 图标集 | [static/assets/icons/](static/assets/icons) | 15 个极简线性图标（24x24px 栅格） |
+| SVG Logo 集 | [static/assets/logo/](static/assets/logo) | 4 种 Logo 形态（主标/横版/纵版/纯文字） |
 
 **记忆类型色条系统**：信任中心 6 张卡片按记忆类型添加左侧色条，实现"一眼可辨"的视觉分组。
 
@@ -120,15 +122,16 @@ v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计
 | code_context（代码上下文） | 水蓝 | `card-memory-code` |
 | conversation（对话） | 墨韵 | `card-memory-conversation` |
 
-**v0.7.0/v0.8.0/v0.9.0 预览功能**（v0.6.0 已内置 UI，后续版本将完善后端能力）：
+**已实现功能**：
 
-- **预设场景模板**（v0.7.0 预览）：4 套场景模板选择器（个人笔记/项目管理/学习助手/编程助手），位于仪表盘顶部。
-- **结晶历史时间线**（v0.8.0 预览）：从审计日志加载结晶事件并渲染为成长轨迹时间线。
-- **一键隐私检查**（v0.9.0 预览）：100ms 内返回三色信任指示器报告（存储位置/网络访问/加密状态），并行调用三个信任接口。
+- **预设场景模板**：4 套场景模板选择器（个人笔记/项目管理/学习助手/编程助手），位于仪表盘顶部。
+- **结晶历史时间线**：从审计日志加载结晶事件并渲染为成长轨迹时间线。
+
+> 更多功能规划详见 [产品路线图](docs/PRODUCT_ROADMAP_v1.0.md)。
 
 **暗色模式**：通过 `prefers-color-scheme: dark` 自动适配系统暗色主题，所有色值使用 CSS 变量，无硬编码颜色。
 
-> 设计文档详见 [LRC 全案界面重构设计文档](docs/LRC%20(Loong%20Recall)%20全案界面重构设计文档.md)。
+> 设计资源位于 `static/` 目录，详见上方表格中的文件引用。
 
 ---
 
@@ -143,13 +146,9 @@ v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计
 
 ## 性能
 
-| 规模 | 检索延迟 | 内存占用 |
-|------|---------|---------|
-| 万条记忆 | < 5ms | < 10 MB |
-| 十万条记忆 | < 15ms | < 10 MB |
-| 百万条记忆 | < 30ms | < 10 MB |
+基于 BEIR 标准基准测试（500 文档 / 100 查询），TF-IDF 模式平均检索延迟 13-21ms，LLM 增强模式平均 1.0-1.3s（含 LLM API 调用）。LongMemEval（470 实例）Session Recall@10 = 85.74%。
 
-> 基于 Fast Match 模式（纯 Rust，零外部依赖），消费级 CPU，未使用 GPU。
+> 上述数据来自 v0.5.6 基准测试（2026-06-23），基于 Fast Match 模式（纯 Rust，零外部依赖），消费级 CPU，未使用 GPU。详见 [基准测试汇总](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md)。
 
 ---
 

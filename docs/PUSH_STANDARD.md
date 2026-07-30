@@ -106,7 +106,14 @@ cd desktop/src-tauri; cargo test; cd ../..
 # - CHANGELOG.md (最新版本标题)
 
 # 4. CHANGELOG.md 已更新
-# 5. README.md 内容实事求是（无虚假数据）
+# 5. README.md 审查（7 项，见 7.4 节，0 错误才允许推送）
+#    - 链接有效性：无死链、无 file:// 链接
+#    - 徽章准确性：Rust 版本徽章 = Cargo.toml rust-version
+#    - 性能数据出处：所有性能数据有测试报告支撑
+#    - 版本一致性：徽章/数据版本/功能标记与当前版本一致
+#    - 未发布版本禁令：无未发布版本功能描述
+#    - 实事求是：无虚假数据、无未实现功能描述
+#    - 过时内容清理：无"（新）"等过时标记、无版本号小节标题
 # 6. 用户文档已同步更新
 ```
 
@@ -431,6 +438,94 @@ git push origin <branch>
 
 ### 测试
 - 测试结果
+```
+
+### 7.4 README.md 审查规范（v0.8.8 新增）
+
+> **强制要求**：每次版本发布前必须对 README.md 执行以下 7 项审查，0 错误才允许推送。
+> 基于 v0.8.8 HCSE 评估新增，防止死链、虚假数据、过时内容流入用户文档。
+
+#### 7.4.1 链接有效性验证（P0）
+
+README.md 中所有文档链接必须满足：
+
+1. 相对路径链接指向的文件必须已被 git 跟踪（`git ls-files <path>` 返回非空）
+2. **禁止**链接到 `.gitignore` 忽略的文件（如 `docs/LRC*全案*.md`、`docs/PRD_*.md`）
+3. **禁止**使用 `file:///` 本地绝对路径，必须使用相对路径
+4. 外部 URL 链接必须可访问
+
+```powershell
+# 检测 file:// 本地路径链接（必须为空）
+Select-String -Path README.md -Pattern 'file:///'
+# 期望结果：无匹配
+
+# 验证相对路径链接的文件已被 git 跟踪
+Select-String -Path README.md -Pattern '\]\(([^h)][^)]+)\)' -AllMatches |
+  ForEach-Object { $_.Matches.Groups[1].Value } |
+  Where-Object { $_ -notmatch '^http' } |
+  ForEach-Object {
+    $f = ($_ -replace '#.*$','' -replace '%20',' ')
+    if (-not (git ls-files --error-unmatch $f 2>$null)) {
+      Write-Host "死链: $f" -ForegroundColor Red
+    }
+  }
+# 期望结果：无输出
+```
+
+#### 7.4.2 徽章准确性验证（P1）
+
+README.md 中所有徽章必须与项目实际配置一致：
+
+| 徽章 | 验证来源 | 规则 |
+|------|---------|------|
+| Rust 版本 | `Cargo.toml` 的 `rust-version` | 徽章版本号 = Cargo.toml rust-version |
+| License | `LICENSE_CODE` / `LICENSE` 文件 | 文件必须存在 |
+
+```powershell
+# 验证 Rust 徽章版本与 Cargo.toml 一致
+$badgeVersion = (Select-String -Path README.md -Pattern 'Rust-(\d+\.\d+)').Matches.Groups[1].Value
+$cargoMsrv = (Select-String -Path Cargo.toml -Pattern '^rust-version.*"(\d+\.\d+)"').Matches.Groups[1].Value
+if ($badgeVersion -ne $cargoMsrv) {
+  Write-Host "徽章版本($badgeVersion) != MSRV($cargoMsrv)" -ForegroundColor Red
+}
+# 期望结果：无输出
+```
+
+#### 7.4.3 性能数据出处验证（P0）
+
+README.md 中所有性能数据必须满足：
+
+1. **必须有测试报告**：`benchmarks/reports/` 目录下存在对应报告
+2. **数据规模必须匹配**：README 声称的规模必须在测试报告中实际测试过
+3. **禁止逻辑矛盾**：大规模延迟不得反常低于小规模
+4. **禁止无测试支撑的规模声明**（如"百万条"必须有百万级测试报告）
+
+#### 7.4.4 版本一致性验证（P1）
+
+1. **徽章版本号**：与 `Cargo.toml` 的 `rust-version` 一致
+2. **基准测试数据版本**：引用 `benchmarks/reports/` 数据时必须标注来源版本
+3. **禁止时效性标记**：已发布多个版本的功能不应标"（新）"
+4. **禁止版本号小节标题**：如"### v0.6.0 xxx"应改为"### xxx"，版本信息移至 CHANGELOG
+
+#### 7.4.5 未发布版本功能禁令（P1）
+
+1. **禁止**描述未发布版本的功能（当前 v0.8.7，则禁止描述 v0.9.0 功能）
+2. **禁止**对已发布版本使用"预览"标记
+3. 未实现功能移至 `docs/PRODUCT_ROADMAP_v1.0.md`
+
+#### 7.4.6 README 审查检查清单（并入 2.2 节第 5 项）
+
+发布前检查清单第 5 项扩展为：
+
+```powershell
+# 5. README.md 审查（7 项，0 错误才允许推送）
+#   5.1 链接有效性：无死链、无 file:// 链接（见 7.4.1）
+#   5.2 徽章准确性：Rust 版本徽章 = Cargo.toml rust-version（见 7.4.2）
+#   5.3 性能数据出处：所有性能数据有测试报告支撑（见 7.4.3）
+#   5.4 版本一致性：徽章/数据版本/功能标记与当前版本一致（见 7.4.4）
+#   5.5 未发布版本禁令：无未发布版本功能描述（见 7.4.5）
+#   5.6 实事求是：无虚假数据、无未实现功能描述（见 7.1）
+#   5.7 过时内容清理：无"（新）"等过时标记、无版本号小节标题（见 7.4.4）
 ```
 
 ---
@@ -804,3 +899,4 @@ git push origin vX.Y.Z
 | 2026-07-30 | v1.2 | HCSE 安全评估 + 发布规范专家评审后更新：第 4.1 节版本号同步清单 6→7 处（新增 static/app.js APP_VERSION）；第 4.2 节当前版本 0.6.0→0.8.7；第 10.1 节清理范围补充 v0.8.x 编译产物；第 12.1 节仓库状态更新到 v0.8.7 |
 | 2026-07-30 | v1.3 | 新增第 2.1 节 cargo fmt + clippy 预检规则（与 CI 对齐） |
 | 2026-07-30 | v1.4 | v0.8.7 CI 失败复盘后新增：第 2.3 节跨平台预检、第 5.6 节 CI preflight 门禁、第 11.5 节 CI 失败 Tag 处置决策树、第十二章 MSRV 一致性规范、第十三章 CI 失败处理与防复发；桌面端 MSRV 1.77→1.80 统一 |
+| 2026-07-30 | v1.5 | HCSE README 审核后新增：第 7.4 节 README.md 审查规范（7 项审查）；2.2 节检查清单第 5 项扩展为 7 项；修复 README 死链、虚假性能数据、file:// 链接、未发布版本功能描述、过时标记 |
