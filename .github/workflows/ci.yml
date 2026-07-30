@@ -211,6 +211,20 @@ jobs:
             patchelf \
             libssl-dev
 
+      # v0.8.9 修复：创建占位 sidecar 文件
+      # tauri.conf.json 的 resources: ["lrc-sidecar*"] 要求 sidecar 文件存在
+      # tauri_build::build() 在编译时检查 resources glob，找不到文件会 panic
+      # cargo check 只做编译检查，不需要真正的 sidecar 二进制，占位文件即可
+      - name: Create placeholder sidecar
+        shell: bash
+        run: |
+          cd desktop/src-tauri
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            touch lrc-sidecar.exe
+          else
+            touch lrc-sidecar
+          fi
+
       - name: cargo check (desktop)
         run: cd desktop/src-tauri && cargo check
 
