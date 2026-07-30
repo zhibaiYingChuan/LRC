@@ -3,6 +3,8 @@
 /// 契约优先：所有命令的输入/输出结构体在此定义，
 /// 前端通过 `invoke('command_name', { ... })` 调用。
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tauri::State;
 use tauri::Manager; // Manager trait 提供 get_webview_window 等方法
 use tauri::Emitter; // v0.5.5 P1-2：Emitter trait 提供 emit 方法（open_settings 命令使用）
@@ -12,7 +14,7 @@ use tokio::sync::Mutex; // 使用 tokio::sync::Mutex 以支持跨 await 持有
 use crate::agent_detector::{AgentDetectorRegistry, AgentInfo, ProjectInfo, RulesStatus};
 use crate::config_wizard::WizardState;
 use crate::rate_limiter::RateLimiter;
-use crate::sidecar_manager::SidecarManager;
+use crate::sidecar_manager::{SidecarManager, SidecarStartError, StartOptions, StartProgress};
 use crate::tray; // 托盘模块的 open_dashboard 函数
 
 // ── v0.5.1 辅助函数：消除重复代码 ──
@@ -44,7 +46,7 @@ async fn post_sidecar_start(
         let wizard = store.wizard.lock().await;
         wizard.config().project_dir.clone()
     };
-    let project_path = project_dir.as_ref().map(|d| std::path::Path::new(d));
+    let project_path = project_dir.as_ref().map(std::path::Path::new);
     let registry = store.agent_registry.lock().await;
     match registry.auto_upgrade_configs(port, project_path) {
         Ok(upgraded) => {
@@ -126,12 +128,50 @@ fn show_dashboard_in_main_window(
     Ok(())
 }
 
+/// v0.8.9 G-004：结构化错误 → 用户友好消息（类型安全，无需字符串匹配）
+///
+/// 与 `user_friendly_error` 的字符串匹配不同，此函数直接匹配枚举变体，
+/// 不会因错误信息措辞变化而漏匹配。前端可据此做差异化处理。
+fn sidecar_error_to_user_message(e: &SidecarStartError) -> String {
+    match e {
+        SidecarStartError::UserCancelled => "启动已取消。".to_string(),
+        SidecarStartError::PortConflict { port, .. } => {
+            format!("端口 {} 已被其他 LRC 服务占用，请先停止现有服务再启动。", port)
+        }
+        SidecarStartError::BinaryNotFound { .. } => {
+            "LRC 服务程序未找到，请重新安装或联系技术支持。".to_string()
+        }
+        SidecarStartError::SpawnFailed { reason } => {
+            format!("启动 LRC 服务失败：{reason}")
+        }
+        SidecarStartError::HealthCheckTimeout { port, .. } => {
+            format!("LRC 服务健康检查超时（端口 {}），请检查系统资源或重启应用。", port)
+        }
+        SidecarStartError::ProcessDied { pid, log_hint } => {
+            format!("LRC 服务进程（PID={pid}）启动后意外退出{log_hint}。")
+        }
+        SidecarStartError::HttpClientError { reason } => {
+            format!("内部错误：{reason}")
+        }
+    }
+}
+
 /// v0.5.4 P1-6 新增：用户友好的错误消息映射
 /// 
 /// 将技术错误信息翻译为用户可理解的提示，并附带修复建议。
 /// 覆盖常见的错误模式：ENOENT、Connection refused、RwLock 毒化等。
 fn user_friendly_error(err: &str) -> String {
     let err_lower = err.to_lowercase();
+
+    // ── v0.8.9 G-001：用户取消启动（最优先匹配，避免被其他规则误捕获） ──
+    if err.contains("用户取消启动") || err_lower.contains("cancel") && err_lower.contains("start") {
+        return "启动已取消。".to_string();
+    }
+
+    // ── v0.8.9 G-002：端口被外部 sidecar 占用 ──
+    if err.contains("已有 sidecar 运行") {
+        return "端口已被其他 LRC 服务占用，请先停止现有服务再启动。".to_string();
+    }
 
     // ── Sidecar 相关错误 ──
     if err_lower.contains("enosys") || err_lower.contains("error 0x80004005") {
@@ -262,6 +302,8 @@ pub struct AppStore {
     pub sidecar_port: Mutex<Option<u16>>,
     /// 已配置的 Agent 数量（供托盘 tooltip 使用）
     pub configured_agent_count: Mutex<usize>,
+    /// 启动取消标志（v0.8.9 G-001：前端 abort 时通知后端终止启动）
+    pub start_cancel_flag: Arc<AtomicBool>,
 }
 
 // ── Sidecar 管理命令 ──
@@ -344,9 +386,12 @@ pub async fn get_sidecar_status(
 
 /// 启动 sidecar 进程
 /// v0.5.4 P1-6 修复：错误信息人性化
+/// v0.8.9 G-003：通过 Tauri event 向前端推送启动进度
+/// v0.8.9 G-004：使用结构化错误 SidecarStartError
 #[tauri::command]
 pub async fn start_sidecar(
     store: State<'_, AppStore>,
+    app: tauri::AppHandle,
     src_dir: Option<String>,
     port: Option<u16>,
     multi_window: Option<u32>,
@@ -358,6 +403,19 @@ pub async fn start_sidecar(
             return Err(user_friendly_error("请求过于频繁"));
         }
     }
+
+    // v0.8.9 G-001：重置取消标志，允许新的启动请求
+    store.start_cancel_flag.store(false, Ordering::SeqCst);
+
+    // v0.8.9 G-003：创建进度通道，spawn 转发任务将进度事件推送到前端
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::channel::<StartProgress>(32);
+    let app_for_progress = app.clone();
+    tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            let _ = app_for_progress.emit("sidecar-start-progress", progress);
+        }
+    });
 
     // v0.5.1 重构：统一使用 get_llm_api_from_wizard 辅助函数
     let llm_api = get_llm_api_from_wizard(&store).await;
@@ -385,30 +443,48 @@ pub async fn start_sidecar(
     let port = match prepare {
         crate::sidecar_manager::PrepareResult::AlreadyRunning(port) => port,
         crate::sidecar_manager::PrepareResult::NeedStart => {
-            // Phase 2: 启动子进程 + 健康检查（不持锁，I/O，最多 40s）
-            let binary_path = {
-                let sidecar = store.sidecar.lock().await;
-                sidecar.binary_path().to_string()
-            }; // 锁立即释放
+            // v0.8.9 G-002：Phase 1.5 — 检测端口是否被外部 sidecar 占用
+            // 场景：桌面端崩溃后重启，旧 sidecar 仍在端口上运行。
+            // 复用现有 sidecar，避免 spawn 重复进程（孤儿进程问题）。
+            let target_port = port.unwrap_or(crate::sidecar_manager::DEFAULT_SIDECAR_PORT);
+            if let Some(probed) = SidecarManager::check_sidecar_health(target_port).await {
+                tracing::info!(
+                    "G-002：端口 {} 已有健康 sidecar（src_dir: {}, uptime: {}s），复用现有实例",
+                    target_port, probed.src_dir, probed.uptime_seconds
+                );
+                // 复用现有 sidecar，不执行 Phase 2/3
+                target_port
+            } else {
+                // Phase 2: 启动子进程 + 健康检查（不持锁，I/O，最多 40s）
+                let binary_path = {
+                    let sidecar = store.sidecar.lock().await;
+                    sidecar.binary_path().to_string()
+                }; // 锁立即释放
 
-            let (child, port) = SidecarManager::spawn_and_wait(
-                &binary_path,
-                &project_key,
-                effective_src_dir.as_deref(),
-                port,
-                multi_window,
-                llm_api.as_deref(),
-            )
-            .await
-            .map_err(|e| user_friendly_error(&e))?;
+                let start_opts = StartOptions {
+                    src_dir: effective_src_dir.as_deref(),
+                    port,
+                    multi_window,
+                    llm_api: llm_api.as_deref(),
+                    cancel_flag: &store.start_cancel_flag,
+                    progress_tx: Some(&progress_tx),
+                };
+                let (child, port) = SidecarManager::spawn_and_wait(
+                    &binary_path,
+                    &project_key,
+                    &start_opts,
+                )
+                .await
+                .map_err(|e| sidecar_error_to_user_message(&e))?;
 
-            // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
-            {
-                let mut sidecar = store.sidecar.lock().await;
-                sidecar.insert_handle(&project_key, child, port, effective_src_dir, multi_window, llm_api);
+                // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
+                {
+                    let mut sidecar = store.sidecar.lock().await;
+                    sidecar.insert_handle(&project_key, child, port, effective_src_dir, multi_window, llm_api);
+                }
+
+                port
             }
-
-            port
         }
     };
 
@@ -433,11 +509,25 @@ pub async fn start_sidecar(
 #[tauri::command]
 pub async fn start_sidecar_for_project(
     store: State<'_, AppStore>,
+    app: tauri::AppHandle,
     project_key: String,
     src_dir: Option<String>,
     port: Option<u16>,
     multi_window: Option<u32>,
 ) -> Result<u16, String> {
+    // v0.8.9 G-001：重置取消标志，允许新的启动请求
+    store.start_cancel_flag.store(false, Ordering::SeqCst);
+
+    // v0.8.9 G-003：创建进度通道
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::channel::<StartProgress>(32);
+    let app_for_progress = app.clone();
+    tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            let _ = app_for_progress.emit("sidecar-start-progress", progress);
+        }
+    });
+
     // v0.5.1 重构：统一使用 get_llm_api_from_wizard 辅助函数
     let llm_api = get_llm_api_from_wizard(&store).await;
 
@@ -451,30 +541,45 @@ pub async fn start_sidecar_for_project(
     let port = match prepare {
         crate::sidecar_manager::PrepareResult::AlreadyRunning(port) => port,
         crate::sidecar_manager::PrepareResult::NeedStart => {
-            // Phase 2: 启动子进程 + 健康检查（不持锁，I/O，最多 40s）
-            let binary_path = {
-                let sidecar = store.sidecar.lock().await;
-                sidecar.binary_path().to_string()
-            };
+            // v0.8.9 G-002：Phase 1.5 — 检测端口是否被外部 sidecar 占用
+            let target_port = port.unwrap_or(crate::sidecar_manager::DEFAULT_SIDECAR_PORT);
+            if let Some(probed) = SidecarManager::check_sidecar_health(target_port).await {
+                tracing::info!(
+                    "G-002：端口 {} 已有健康 sidecar（src_dir: {}），复用现有实例（项目: {}）",
+                    target_port, probed.src_dir, project_key
+                );
+                target_port
+            } else {
+                // Phase 2: 启动子进程 + 健康检查（不持锁，I/O，最多 40s）
+                let binary_path = {
+                    let sidecar = store.sidecar.lock().await;
+                    sidecar.binary_path().to_string()
+                };
 
-            let (child, port) = SidecarManager::spawn_and_wait(
-                &binary_path,
-                &project_key,
-                src_dir.as_deref(),
-                port,
-                multi_window,
-                llm_api.as_deref(),
-            )
-            .await
-            .map_err(|e| user_friendly_error(&e))?;
+                let start_opts = StartOptions {
+                    src_dir: src_dir.as_deref(),
+                    port,
+                    multi_window,
+                    llm_api: llm_api.as_deref(),
+                    cancel_flag: &store.start_cancel_flag,
+                    progress_tx: Some(&progress_tx),
+                };
+                let (child, port) = SidecarManager::spawn_and_wait(
+                    &binary_path,
+                    &project_key,
+                    &start_opts,
+                )
+                .await
+                .map_err(|e| sidecar_error_to_user_message(&e))?;
 
-            // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
-            {
-                let mut sidecar = store.sidecar.lock().await;
-                sidecar.insert_handle(&project_key, child, port, src_dir, multi_window, llm_api);
+                // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
+                {
+                    let mut sidecar = store.sidecar.lock().await;
+                    sidecar.insert_handle(&project_key, child, port, src_dir, multi_window, llm_api);
+                }
+
+                port
             }
-
-            port
         }
     };
 
@@ -488,6 +593,20 @@ pub async fn start_sidecar_for_project(
     post_sidecar_start(&store, port, Some(&project_key)).await;
 
     Ok(port)
+}
+
+/// 取消正在进行的 sidecar 启动（v0.8.9 G-001）
+///
+/// 前端 abort 启动请求时调用此命令，设置取消标志，
+/// 后端 `spawn_and_wait` 中的健康检查循环会检测此标志并立即终止。
+///
+/// **注意**：此命令仅设置标志，不会中断已 spawn 的子进程。
+/// 子进程清理由 `spawn_and_wait` 的错误处理路径完成（kill + wait）。
+#[tauri::command]
+pub async fn cancel_start_sidecar(store: State<'_, AppStore>) -> Result<(), String> {
+    store.start_cancel_flag.store(true, Ordering::SeqCst);
+    tracing::info!("收到取消 sidecar 启动请求，标志已设置");
+    Ok(())
 }
 
 /// 停止指定项目的 sidecar 进程
@@ -942,7 +1061,7 @@ pub async fn configure_agents(
 
     // v0.5.7 修复：添加后端超时，避免文件写入慢导致卡死
     // configure() 涉及多个文件读写（MCP 配置 + AI 规则），给 60 秒
-    let project_path = project_dir.as_ref().map(|d| std::path::Path::new(d));
+    let project_path = project_dir.as_ref().map(std::path::Path::new);
     let config_result = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         async {
@@ -1238,6 +1357,7 @@ pub struct SwitchProjectResponse {
 #[tauri::command]
 pub async fn switch_project(
     store: State<'_, AppStore>,
+    app: tauri::AppHandle,
     project_dir: String,
     multi_window: Option<u32>,
 ) -> Result<SwitchProjectResponse, String> {
@@ -1248,6 +1368,16 @@ pub async fn switch_project(
             return Err(user_friendly_error("请求过于频繁"));
         }
     }
+
+    // v0.8.9 G-003：创建进度通道
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::channel::<StartProgress>(32);
+    let app_for_progress = app.clone();
+    tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            let _ = app_for_progress.emit("sidecar-start-progress", progress);
+        }
+    });
 
     // v0.5.4 修复：切换项目前验证路径存在
     let path = std::path::Path::new(&project_dir);
@@ -1310,16 +1440,21 @@ pub async fn switch_project(
                 sidecar.binary_path().to_string()
             };
 
+            let start_opts = StartOptions {
+                src_dir: Some(&project_dir),
+                port: None,
+                multi_window,
+                llm_api: llm_api.as_deref(),
+                cancel_flag: &store.start_cancel_flag,
+                progress_tx: Some(&progress_tx),
+            };
             let (child, port) = SidecarManager::spawn_and_wait(
                 &binary_path,
                 &project_key,
-                Some(&project_dir),
-                None,
-                multi_window,
-                llm_api.as_deref(),
+                &start_opts,
             )
             .await
-            .map_err(|e| user_friendly_error(&e))?;
+            .map_err(|e| sidecar_error_to_user_message(&e))?;
 
             // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
             {

@@ -108,6 +108,7 @@ struct KnownTool {
     /// MCP 配置路径模板（相对于 %USERPROFILE%，None 表示项目级配置或无 MCP）
     mcp_config_template: Option<&'static str>,
     /// MCP 传输类型："stdio" 或 "http"
+    #[allow(dead_code)]
     mcp_transport: &'static str,
     /// 二进制可执行文件路径（多路径，按优先级，相对于 %LOCALAPPDATA% 或 %PROGRAMFILES%）
     /// 格式：支持环境变量 %LOCALAPPDATA%, %PROGRAMFILES%, %PROGRAMFILES(X86)%
@@ -1229,6 +1230,7 @@ fn binary_exists(binary_paths: &[&str]) -> bool {
 ///   - exe_names: 要匹配的可执行文件名列表（不区分大小写）
 ///
 /// 返回：true 如果在任意安装目录中找到匹配的可执行文件
+#[allow(dead_code)]
 fn scan_exe_in_install_dirs(exe_names: &[&str]) -> bool {
     if exe_names.is_empty() {
         return false;
@@ -1270,7 +1272,7 @@ fn scan_exe_in_install_dirs(exe_names: &[&str]) -> bool {
                 // Windows: 直接匹配 .exe 文件
                 #[cfg(target_os = "windows")]
                 {
-                    if targets.iter().any(|t| *t == file_name_lower) {
+                    if targets.contains(&file_name_lower) {
                         tracing::debug!(
                             "[Agent检测] 匹配到可执行文件: {}",
                             path.display()
@@ -1384,6 +1386,7 @@ fn marker_exists(marker: &str) -> bool {
 ///   - 读取 .lnk 文件的二进制内容
 ///   - 搜索 exe_names 中的文件名是否出现在 .lnk 文件中（UTF-16LE 和 ASCII 编码）
 ///   - .lnk 文件中目标路径通常以 UTF-16LE 编码存储
+#[allow(dead_code)]
 fn scan_shortcuts(exe_names: &[&str]) -> bool {
     if exe_names.is_empty() {
         return false;
@@ -1667,14 +1670,12 @@ impl DotDirDetector {
     ///   4. 以上均未匹配 → 不检测（返回 false，避免误报）
     fn check_known_tool(&self) -> bool {
         // 策略 1：检测已知路径的二进制文件（最快，最准确）
-        if !self.tool.binary_paths.is_empty() {
-            if binary_exists(self.tool.binary_paths) {
-                tracing::debug!(
-                    "[Agent检测] {} — 通过 binary_paths 检测到",
-                    self.tool.name
-                );
-                return true;
-            }
+        if !self.tool.binary_paths.is_empty() && binary_exists(self.tool.binary_paths) {
+            tracing::debug!(
+                "[Agent检测] {} — 通过 binary_paths 检测到",
+                self.tool.name
+            );
+            return true;
         }
 
         // 策略 2 & 3：使用全局缓存（避免每个工具都重复扫描安装目录和快捷方式目录）
@@ -3198,9 +3199,7 @@ AI：已记录登录 API 到记忆库
                     // 保留用户自定义内容（LRC 规则之外的部分）
                     let merged = if existing.contains("## LRC 记忆系统") {
                         // 提取 LRC 规则之前的用户内容
-                        if let Some(pos) = existing.find("## LRC 记忆系统") {
-                            // 往前找 frontmatter 或 LRC 头部注释
-                            let user_end = pos;
+                        if let Some(_pos) = existing.find("## LRC 记忆系统") {
                             // 查找 LRC 规则的起始位置（包括前面的注释和 frontmatter）
                             let lrc_start = existing
                                 .find("# AI Rules — LRC")

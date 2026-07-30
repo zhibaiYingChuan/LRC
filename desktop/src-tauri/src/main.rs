@@ -18,6 +18,8 @@ use agent_detector::AgentDetectorRegistry;
 use config_wizard::WizardState;
 use rate_limiter::RateLimiter;
 use sidecar_manager::SidecarManager;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tauri::Manager; // Manager trait 提供 app_handle() 等方法
 use tauri::Emitter; // v0.5.4 P2-14: Emitter trait 提供 emit() 方法，用于心跳协程通知前端
 use tokio::sync::Mutex; // Tauri 2 异步命令需要 tokio::sync::Mutex (支持 Send)
@@ -87,6 +89,7 @@ fn main() {
         rate_limiter: Mutex::new(RateLimiter::default()),
         sidecar_port: Mutex::new(None),
         configured_agent_count: Mutex::new(0),
+        start_cancel_flag: Arc::new(AtomicBool::new(false)),
     };
 
     tauri::Builder::default()
@@ -96,6 +99,7 @@ fn main() {
             commands::get_sidecar_status,
             commands::start_sidecar,
             commands::start_sidecar_for_project,
+            commands::cancel_start_sidecar,
             commands::stop_sidecar,
             commands::stop_sidecar_for_project,
             commands::list_sidecar_projects,
@@ -127,7 +131,7 @@ fn main() {
         ])
         .manage(app_store)
         // v0.5.4 P2-16 调试：页面加载事件追踪
-        .on_page_load(|webview, payload| {
+        .on_page_load(|_webview, payload| {
             tracing::info!("页面加载事件: {:?} - URL: {}", payload.event(), payload.url());
         })
         .setup(|app| {
@@ -307,10 +311,16 @@ fn main() {
                             0usize
                         } else {
                             // Phase 2: 逐个重启死亡实例（不持锁，I/O）
-                            let mut recovered_handles: Vec<(String, std::process::Child, u16, Option<String>, Option<u32>, Option<String>)> = Vec::new();
+                            // type alias 简化复杂类型（clippy::type_complexity）
+                            type RecoveredHandle = (String, std::process::Child, u16, Option<String>, Option<u32>, Option<String>);
+                            let mut recovered_handles: Vec<RecoveredHandle> = Vec::new();
+                            // v0.8.9 G-001：心跳恢复使用独立的 cancel_flag，不与用户启动取消共享
+                            // 心跳恢复是后台自动行为，不应被用户的 cancel_start_sidecar 干扰
+                            // 心跳自身的关闭通过 health_shutdown_rx 控制
+                            let heartbeat_cancel = std::sync::atomic::AtomicBool::new(false);
 
                             for info in dead_instances {
-                                use sidecar_manager::{DeadInstanceInfo, SidecarManager};
+                                use sidecar_manager::{DeadInstanceInfo, SidecarManager, StartOptions};
                                 let DeadInstanceInfo {
                                     project_key,
                                     src_dir,
@@ -318,13 +328,18 @@ fn main() {
                                     llm_api,
                                 } = info;
 
+                                let start_opts = StartOptions {
+                                    src_dir: src_dir.as_deref(),
+                                    port: None,
+                                    multi_window,
+                                    llm_api: llm_api.as_deref(),
+                                    cancel_flag: &heartbeat_cancel,
+                                    progress_tx: None, // G-003：心跳恢复不需要进度反馈
+                                };
                                 match SidecarManager::spawn_and_wait(
                                     &binary_path,
                                     &project_key,
-                                    src_dir.as_deref(),
-                                    None,
-                                    multi_window,
-                                    llm_api.as_deref(),
+                                    &start_opts,
                                 ).await {
                                     Ok((child, port)) => {
                                         tracing::info!(
