@@ -4,7 +4,7 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.13';
+const APP_VERSION = '0.8.14';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -764,7 +764,13 @@ async function loadDashboard() {
     // 非索引期或重试耗尽，显示错误
     _dashboardRetryCount = 0;
     if (error) {
-      error.textContent = '⚠️ ' + htmlescape(e.message);
+      // v0.8.14 P0-5 修复：sidecar 已知可达时（索引期），显示"索引中"提示而非"无法连接"
+      // 避免与状态栏"运行中"矛盾
+      if (sidecarKnownReachable) {
+        error.textContent = '⏳ LRC 服务正在索引代码库，数据稍后自动加载...';
+      } else {
+        error.textContent = '⚠️ ' + htmlescape(e.message);
+      }
       error.classList.add('show');
     }
     // v0.8.12：仅在 sidecar 确实不可达时才更新状态栏为"已停止"
@@ -1670,14 +1676,20 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // 点击模态框遮罩关闭
   const modal = document.getElementById('start-service-modal');
+  // v0.8.14 P0-4 修复：去重标志，避免快速点击遮罩产生多个僵尸确认框
+  let _pendingOverlayConfirm = false;
   if (modal) {
     modal.addEventListener('click', (e) => {
       if (e.target !== modal) return;
       // v0.8.13 D2: 启动进行中点击遮罩需二次确认，避免误取消
       // showConfirm 返回 Promise<boolean>，确认后调用 closeStartServiceModal
       if (startServiceAbortController && !startServiceAbortController.signal.aborted) {
+        // v0.8.14 P0-4: 已有确认框弹出时，忽略后续点击
+        if (_pendingOverlayConfirm) return;
         if (typeof showConfirm === 'function') {
+          _pendingOverlayConfirm = true;
           showConfirm('启动正在进行中，确定要取消吗？').then((confirmed) => {
+            _pendingOverlayConfirm = false;
             if (confirmed) closeStartServiceModal();
           });
           return;
@@ -2405,9 +2417,11 @@ async function init() {
           const payload = (event && event.payload) || {};
           console.log('[LRC] 检测到外部 sidecar:', payload);
           showToast('检测到已运行的 LRC 服务（端口 ' + (payload.port || '未知') + '）', 'success', 4000);
-          // 主动触发健康监测器，避免等待 10s 轮询
+          // v0.8.14 P0-1 修复：不再直接修改 _isReachable，改用正规状态机
+          // 重置容错计数和退避步数，让 check() 从干净状态开始
           if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
-            SidecarHealthMonitor._isReachable = false; // 强制触发状态变更
+            SidecarHealthMonitor._failCount = 0;
+            SidecarHealthMonitor._backoffStep = 0;
             SidecarHealthMonitor.check();
           }
         });
@@ -2417,8 +2431,10 @@ async function init() {
           const payload = (event && event.payload) || {};
           console.log('[LRC] Sidecar 自动恢复:', payload);
           showToast('LRC 服务已自动恢复', 'success', 4000);
+          // v0.8.14 P0-1 修复：不再直接修改 _isReachable，改用正规状态机
           if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
-            SidecarHealthMonitor._isReachable = false;
+            SidecarHealthMonitor._failCount = 0;
+            SidecarHealthMonitor._backoffStep = 0;
             SidecarHealthMonitor.check();
           }
         });
@@ -2432,6 +2448,8 @@ async function init() {
           // 直接将 _failCount 拉到阈值，触发 _setReachable(false) 立即生效
           if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
             SidecarHealthMonitor._failCount = SidecarHealthMonitor._FAIL_THRESHOLD;
+            // v0.8.14 P1-2 修复：重置 _backoffStep，避免恢复检测退避到 60s
+            SidecarHealthMonitor._backoffStep = 0;
             SidecarHealthMonitor._setReachable(false);
           }
           // 立即更新状态栏，不等下次轮询
@@ -5783,7 +5801,10 @@ function showToast(message, type = 'success', duration = 3000) {
 //   4. 暴露到 window 便于 CDP 测试与外部调用
 // 注意：未在 TAB_LOADERS 中列出的标签页仅切换 DOM 不报错
 const TAB_LOADERS = {
-  'dashboard': () => loadDashboard(),
+  // v0.8.14 P0-2 修复：dashboard 加载后同时刷新道同构度，避免切换标签页后数据陈旧
+  'dashboard': () => loadDashboard().then(() => {
+    if (typeof loadDaoMetrics === 'function') return loadDaoMetrics();
+  }),
   'trust-center': () => loadTrustCenter(),
   'benchmarks': () => loadBenchmarks(),
   'settings': () => { loadSettings(); loadProjectInfo(); },
@@ -5885,6 +5906,11 @@ function _abortActiveTabRequests(excludeTab) {
   if (_daoRetryTimer) {
     clearTimeout(_daoRetryTimer);
     _daoRetryTimer = null;
+  }
+  // v0.8.14 P0-7/FM-16 修复：清除信任中心重试 timer，避免切换标签页后 timer 泄漏
+  if (typeof _trustRetryTimer !== 'undefined' && _trustRetryTimer) {
+    clearTimeout(_trustRetryTimer);
+    _trustRetryTimer = null;
   }
 }
 window._abortActiveTabRequests = _abortActiveTabRequests;
@@ -6631,11 +6657,35 @@ async function switchProject() {
   }
 
   // 调用桌面端 switch_project 命令
+  // v0.8.14 P0-6 修复：switchProject 120s 等待期间显示进度反馈
+  // 避免用户以为卡死
+  showToast('正在切换项目并重新索引，请稍候...', 'info', 120000);
+  // 监听后端 progress 事件更新提示（声明在 try 外，确保 catch 也能清理）
+  let progressUnlisten = null;
+  if (typeof tauriEvent !== 'undefined' && tauriEvent && tauriEvent.listen) {
+    try {
+      progressUnlisten = await tauriEvent.listen('sidecar-start-progress', (event) => {
+        const payload = (event && event.payload) || {};
+        if (payload.message) {
+          showToast('切换项目中: ' + payload.message, 'info', 5000);
+        }
+      });
+    } catch (listenErr) {
+      console.warn('[LRC] switchProject progress 监听注册失败:', listenErr);
+    }
+  }
+
   try {
     // v0.8.10 L4-01：超时从 60s 延长到 120s，覆盖 stop(5s) + spawn_and_wait(40s) + 索引开销
     const result = await postMessageToParent('lrc-switch-project', {
       projectDir: trimmedDir,  // Tauri 命令参数: project_dir → projectDir (camelCase)
     }, 120000);
+
+    // 清理 progress 事件监听器
+    if (progressUnlisten) {
+      try { progressUnlisten(); } catch (e) { /* 忽略 */ }
+      progressUnlisten = null;
+    }
 
     if (result && result.success) {
       // v0.8.2：用 showInfoModal 替代多行 alert
@@ -6657,6 +6707,11 @@ async function switchProject() {
       showToast('项目切换失败: ' + (result?.message || '未知错误'), 'error');
     }
   } catch (e) {
+    // v0.8.14 P0-6: catch 块也清理 progress 监听器
+    if (progressUnlisten) {
+      try { progressUnlisten(); } catch (cleanupErr) { /* 忽略 */ }
+      progressUnlisten = null;
+    }
     // 浏览器环境或非桌面端嵌入模式会走到这里
     const errMsg = e.message || String(e);
     if (errMsg.includes('非桌面端嵌入模式') || errMsg.includes('无法调用此功能')) {

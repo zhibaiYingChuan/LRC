@@ -1431,6 +1431,10 @@ pub async fn switch_project(
         }
     }
 
+    // v0.8.14 FM-11 修复：重置取消标志，避免 start_sidecar 取消后 switch_project 永久失效
+    // 根因：switch_project 复用 start_cancel_flag 但未在入口重置，用户取消启动后 flag 残留 true
+    store.start_cancel_flag.store(false, Ordering::SeqCst);
+
     // v0.8.9 G-003：创建进度通道
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<StartProgress>(32);
     let app_for_progress = app.clone();

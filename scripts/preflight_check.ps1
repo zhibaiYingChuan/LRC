@@ -167,27 +167,43 @@ if ($badgeMatch.Success -and $cargoMsrvMatch.Success) {
 # ============================================================
 Write-Host "`n[Domain 5] Version Consistency" -ForegroundColor Cyan
 
-$cargoVer = [regex]::Match((Get-Content Cargo.toml -Raw), '^version\s*=\s*"(.*)"').Groups[1].Value
-$desktopCargoVer = [regex]::Match((Get-Content desktop/src-tauri/Cargo.toml -Raw), '^version\s*=\s*"(.*)"').Groups[1].Value
-$tauriVer = [regex]::Match((Get-Content desktop/src-tauri/tauri.conf.json -Raw), '"version"\s*:\s*"(.*)"').Groups[1].Value
+# v0.8.13 修复：统一使用 Select-String 提取版本号，避免 Get-Content -Raw + BOM 导致正则失配
+$cargoLine = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+$desktopLine = (Select-String -Path desktop/src-tauri/Cargo.toml -Pattern '^version\s*=\s*"(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+$tauriLine = (Select-String -Path desktop/src-tauri/tauri.conf.json -Pattern '"version"\s*:\s*"(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+# v0.8.13 修复：必须检查 Cargo.lock 中 code-memory 包的版本号
+# v0.8.12 CI 失败根因：Cargo.toml=0.8.12 但 Cargo.lock=0.8.11，导致 cargo 重新编译触发问题
+$cargoLockMatch = Select-String -Path Cargo.lock -Pattern 'name = "code-memory"' -Context 0,1 | Select-Object -First 1
+$cargoLockVer = ""
+if ($cargoLockMatch) {
+    $lockVerMatch = [regex]::Match($cargoLockMatch.Context.PostContext, 'version\s*=\s*"(.*)"')
+    if ($lockVerMatch.Success) { $cargoLockVer = $lockVerMatch.Groups[1].Value }
+}
 
 $versions = @{
-    "Cargo.toml"         = $cargoVer
-    "desktop Cargo.toml" = $desktopCargoVer
-    "tauri.conf.json"    = $tauriVer
+    "Cargo.toml"         = $cargoLine
+    "desktop Cargo.toml" = $desktopLine
+    "tauri.conf.json"    = $tauriLine
+    "Cargo.lock"         = $cargoLockVer
 }
 
 $allSame = $true
-$firstVer = $cargoVer
+$firstVer = $cargoLine
 foreach ($kv in $versions.GetEnumerator()) {
     if ($kv.Value -ne $firstVer) { $allSame = $false }
 }
 
-if ($allSame -and $cargoVer) {
-    Write-Check "5. Version" "Version consistency (all = $cargoVer)" "PASS" ""
+if ($allSame -and $cargoLine) {
+    Write-Check "5. Version" "Version consistency (all = $cargoLine)" "PASS" ""
 } else {
-    $detail = $versions.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" } | Join-String -sep ", "
+    # v0.8.13 修复：Join-String 在 PS 5.1 不可用，改用 -join 运算符
+    $detailParts = $versions.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
+    $detail = $detailParts -join ", "
     Write-Check "5. Version" "Version consistency" "FAIL" $detail
+    # v0.8.13 修复：如果 Cargo.lock 版本号不一致，提供自动修复提示
+    if ($cargoLockVer -and $cargoLockVer -ne $cargoVer) {
+        Write-Check "5. Version" "Cargo.lock sync" "FAIL" "Run 'cargo check --features server' to update Cargo.lock, then commit"
+    }
 }
 
 # ============================================================
@@ -196,10 +212,10 @@ if ($allSame -and $cargoVer) {
 Write-Host "`n[Domain 6] CHANGELOG.md" -ForegroundColor Cyan
 
 $changelogContent = Get-Content CHANGELOG.md -Raw -ErrorAction SilentlyContinue
-if ($changelogContent -and $changelogContent -match "##\s*\[$cargoVer\]") {
-    Write-Check "6. CHANGELOG" "CHANGELOG has entry for v$cargoVer" "PASS" ""
+if ($changelogContent -and $changelogContent -match "##\s*\[$cargoLine\]") {
+    Write-Check "6. CHANGELOG" "CHANGELOG has entry for v$cargoLine" "PASS" ""
 } else {
-    Write-Check "6. CHANGELOG" "CHANGELOG entry for v$cargoVer" "FAIL" "Add '## [$cargoVer] - <date>' section to CHANGELOG.md"
+    Write-Check "6. CHANGELOG" "CHANGELOG entry for v$cargoLine" "FAIL" "Add '## [$cargoLine] - <date>' section to CHANGELOG.md"
 }
 
 # ============================================================
