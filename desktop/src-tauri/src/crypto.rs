@@ -30,7 +30,7 @@ fn key_path() -> Result<PathBuf, String> {
             // APPDATA 为空字符串，回退到 dirs crate
             tracing::warn!("APPDATA 环境变量为空，使用 dirs::config_dir() 作为密钥文件回退目录");
             dirs::config_dir()
-                .or_else(|| dirs::data_dir())
+                .or_else(dirs::data_dir)
                 .ok_or_else(|| {
                     "无法确定密钥目录：APPDATA 为空且 dirs::config_dir()/data_dir() 均返回 None".to_string()
                 })?
@@ -39,7 +39,7 @@ fn key_path() -> Result<PathBuf, String> {
         // APPDATA 未设置，回退到 dirs crate
         tracing::warn!("APPDATA 环境变量未设置，使用 dirs::config_dir() 作为密钥文件回退目录");
         dirs::config_dir()
-            .or_else(|| dirs::data_dir())
+            .or_else(dirs::data_dir)
             .ok_or_else(|| {
                 "无法确定密钥目录：APPDATA 未设置且 dirs::config_dir()/data_dir() 均返回 None".to_string()
             })?

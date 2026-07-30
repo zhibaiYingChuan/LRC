@@ -220,6 +220,7 @@ impl WizardState {
     ///   1. 版本不匹配 → 重置配置，重新引导用户完成向导
     ///   2. 已有有效配置（project_dir + llm_configured）但 setup_complete 为 false → 自动完成
     ///      这解决了从旧版本升级或配置已存在但向导未完成标记的问题。
+    ///
     /// v0.5.4 修复：配置损坏时记录日志，设置 corrupted_on_load 标记供前端检测
     pub fn load() -> Result<Self, String> {
         let config_path = Self::config_path()?;
@@ -373,7 +374,7 @@ impl WizardState {
                 // APPDATA 为空字符串，回退到 dirs crate
                 tracing::warn!("APPDATA 环境变量为空，使用 dirs::config_dir() 作为回退");
                 dirs::config_dir()
-                    .or_else(|| dirs::data_dir())
+                    .or_else(dirs::data_dir)
                     .ok_or_else(|| {
                         "无法确定配置目录：APPDATA 为空且 dirs::config_dir()/data_dir() 均返回 None".to_string()
                     })?
@@ -382,7 +383,7 @@ impl WizardState {
             // APPDATA 未设置，回退到 dirs crate
             tracing::warn!("APPDATA 环境变量未设置，使用 dirs::config_dir() 作为回退");
             dirs::config_dir()
-                .or_else(|| dirs::data_dir())
+                .or_else(dirs::data_dir)
                 .ok_or_else(|| {
                     "无法确定配置目录：APPDATA 未设置且 dirs::config_dir()/data_dir() 均返回 None".to_string()
                 })?

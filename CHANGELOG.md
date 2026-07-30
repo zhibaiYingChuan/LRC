@@ -4,6 +4,54 @@
 
 ---
 
+## [0.8.9] - 2026-07-30
+
+### 修复
+
+- **P0 G-001**: 修复"假取消"架构缺陷 — 前端 AbortController 仅中断前端 Promise，后端 `spawn_and_wait` 健康检查循环无取消机制
+  - 新增 `cancel_start_sidecar` IPC 命令（`commands.rs`），设置 `AtomicBool` 取消标志
+  - `AppStore` 新增 `start_cancel_flag: Arc<AtomicBool>` 字段
+  - `spawn_and_wait` 新增 `cancel_flag: &AtomicBool` 参数，健康检查循环每次迭代检测取消标志
+  - `wait_for_health_static` 检测到取消时返回 `"用户取消启动"` 错误
+  - 取消时显式 `child.kill()` + `child.wait()`，防止孤儿进程
+  - 所有 8 处 `spawn_and_wait` 调用点已同步更新（含生产代码 + 测试代码）
+- **P0 G-002/G-009**: 修复孤儿进程问题 — 桌面端崩溃后重启导致重复 sidecar
+  - `spawn_and_wait` 中添加 200ms 超时的端口预检（`tokio::time::timeout` 包裹 `check_sidecar_health`）
+  - `start_sidecar` 和 `start_sidecar_for_project` 中添加 Phase 1.5 端口冲突检测
+  - 检测到已有健康 sidecar 时复用现有实例，跳过 spawn
+  - `DEFAULT_SIDECAR_PORT` 改为 `pub` 供 commands.rs 引用
+- **P0**: 修复健康检查失败时的孤儿进程 — `spawn_and_wait` 健康检查失败时显式 `child.kill()` + `child.wait()`
+- **P1 D2**: 取消错误消息友好化 — `user_friendly_error` 新增 cancel 和端口冲突的专用匹配规则
+- **P1**: 修复 `model_downloader.rs` 测试环境变量竞争 — 并行测试共享 `LRC_MODEL_MIRROR` 环境变量导致断言失败，添加 `static Mutex` 强制串行
+- **P1**: 修复 `commands.rs` 和 `main.rs` 中 `Arc` 导入位置错误 — `Arc` 应从 `std::sync` 导入而非 `std::sync::atomic`
+- **P1 G-003**: 启动进度事件通知前端 — sidecar 启动期间前端无可见性
+  - 新增 `StartProgress` 结构体（`stage`/`progress`/`message`），通过 Tauri event `sidecar-start-progress` 推送
+  - `spawn_and_wait` 在 4 个关键阶段发送进度：port_check(5%) → spawn(10%) → health_check(15%-95%) → ready(100%)
+  - `start_sidecar`/`start_sidecar_for_project`/`switch_project` 创建 `mpsc` 通道 + `tokio::spawn` 转发任务
+  - 前端可通过 `listen('sidecar-start-progress', cb)` 接收实时进度
+- **P1 G-004**: 结构化错误体系 — 原先 `spawn_and_wait` 返回 `String` 错误，依赖 `user_friendly_error` 字符串匹配
+  - 新增 `SidecarStartError` 枚举（7 个变体）：BinaryNotFound(E001) / SpawnFailed(E002) / HealthCheckTimeout(E003) / ProcessDied(E004) / UserCancelled(E005) / PortConflict(E006) / HttpClientError(E007)
+  - 实现 `Display` + `From<SidecarStartError> for String`（支持 `?` 运算符自动转换）
+  - 新增 `sidecar_error_to_user_message` 类型安全匹配函数，替代字符串 pattern matching
+  - `spawn_and_wait` 返回类型从 `Result<_, String>` 改为 `Result<_, SidecarStartError>`
+
+### 变更
+
+- `SidecarManager::spawn_and_wait` 签名变更：新增 `cancel_flag: &AtomicBool` + `progress_tx: Option<&Sender<StartProgress>>` 参数；返回类型改为 `Result<_, SidecarStartError>`
+- `SidecarManager::start_for_project` 签名变更：新增 `cancel_flag` + `progress_tx` 参数
+- `SidecarManager::start` 签名变更：新增 `cancel_flag` + `progress_tx` 参数
+- `SidecarManager::restart_project` 签名变更：新增 `cancel_flag` + `progress_tx` 参数
+- `SidecarManager::recover_dead_instances` 签名变更：新增 `cancel_flag` 参数
+- 心跳协程（`main.rs`）使用独立 `AtomicBool` 标志，不与用户启动取消共享
+- `start_sidecar`/`start_sidecar_for_project`/`switch_project` 命令新增 `app: tauri::AppHandle` 参数（Tauri 自动注入）
+
+### 测试
+
+- 74 单元测试通过（2 个测试期望值因 G-002 预检 200ms 超时而调整）
+- 编译验证通过（`cargo check` + `cargo test --lib`）
+
+---
+
 ## [0.8.8] - 2026-07-30
 
 ### 修复
