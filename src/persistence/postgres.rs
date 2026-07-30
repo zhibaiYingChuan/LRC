@@ -102,7 +102,8 @@ impl PostgresPersistence {
     /// 创建新的 PostgreSQL 持久化后端
     pub async fn new(config: PostgresConfig) -> Result<Self, PersistenceError> {
         // v0.5.4 修复：table_prefix 白名单校验，防止 SQL 注入
-        // 仅允许字母、数字和下划线，长度 1-30 字符
+        // 仅允许 ASCII 字母、数字和下划线，长度 1-30 字符
+        // v0.7.1 P3-1 加固：is_alphanumeric() → is_ascii_alphanumeric()，拒绝 Unicode 字母
         if config.table_prefix.is_empty() || config.table_prefix.len() > 30 {
             return Err(PersistenceError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -115,7 +116,7 @@ impl PostgresPersistence {
         if !config
             .table_prefix
             .chars()
-            .all(|c| c.is_alphanumeric() || c == '_')
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             return Err(PersistenceError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

@@ -4,8 +4,11 @@ exclude = ["desktop/src-tauri"]
 
 [package]
 name = "code-memory"
-version = "0.6.0"
+version = "0.8.7"
 edition = "2021"
+# v0.7.1 P2-5：声明最低支持 Rust 版本（MSRV）
+# 基于依赖矩阵：axum 0.7 (1.66+)、tokio 1.x (1.63+)、reqwest (1.64+)
+rust-version = "1.70"
 authors = ["Open Source Contributors"]
 description = "Loong Recall (LRC) — AI 永久记忆系统，为 AI 助手提供语义代码搜索与跨会话记忆"
 license = "Apache-2.0 OR LicenseRef-DaoTi-Research"
@@ -21,7 +24,7 @@ default = ["server"]
 ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub", "ureq"]
 # 启用 MCP HTTP 服务（axum + tokio）
 # v0.6.0+：ureq 用于嵌入模型管理 API 的镜像源连通性测试 + model_downloader 模块
-server = ["axum", "tokio", "tower", "tower-http", "reqwest", "webbrowser", "ureq"]
+server = ["axum", "tokio", "tower", "tower-http", "reqwest", "webbrowser", "ureq", "socket2"]
 # PostgreSQL 持久化后端（需运行中的 PostgreSQL 服务）
 postgres = ["sqlx", "tokio"]
 # Qdrant 向量存储后端（通过 HTTP API，无需额外依赖）
@@ -63,11 +66,14 @@ hf-hub = { version = "0.4", optional = true }
 ureq = { version = "2", optional = true }
 
 # MCP HTTP 服务依赖（optional，server feature 启用）
-axum = { version = "0.7", optional = true }
+# v0.7.1 P2-4：axum 0.7 → 0.8 升级，tower-http 0.5 → 0.6
+axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "io-std", "signal"], optional = true }
 tower = { version = "0.5", optional = true }
-tower-http = { version = "0.5", features = ["cors"], optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
+# v0.8.1：TCP keepalive 配置（防止 sidecar 连接池泄漏）
+socket2 = { version = "0.6", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

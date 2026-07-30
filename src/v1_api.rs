@@ -31,7 +31,7 @@ use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::json::JsonPersistence;
 use crate::persistence::Persistence;
 use crate::server::IndexedCodebase;
-use crate::RecallResult;
+use crate::{LlmApiConfig, RecallResult};
 use axum::{
     extract::Query,
     http::StatusCode,
@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 /// 基准测试报告缓存（避免每次请求都重新运行耗时的基准测试）
 /// v0.5.6：添加缓存时间戳，支持 1 小时过期机制
@@ -180,20 +180,41 @@ pub struct CorrectResponse {
     pub history_versions: usize,
 }
 
-/// /v1/health/dao_metrics 响应体
+/// /v1/health/dao_metrics 响应体（v0.8.1：契约对齐，包装为 {ok, data, raw} 结构）
+///
+/// 字段说明：
+///   - yin_yang_balance: 阴阳守恒度（0-100），派生自 dao_isomorphism_score * 100
+///   - luoshu_deviation: 洛书偏差（0-100），派生自 (1 - dao_isomorphism_score) * 100
+///   - bagua_balance: 八卦均衡度（0-100），派生自 (1 - bagua_entropy) * 100
+///   - synthesis_ratio: 合成比率（0-100 百分比），原始值 * 100
 #[derive(Debug, Serialize)]
-pub struct DaoMetricsResponse {
-    pub dao_isomorphism_score: f32,
-    pub bagua_entropy: f32,
+pub struct DaoMetricsData {
+    pub yin_yang_balance: f32,
+    pub luoshu_deviation: f32,
+    pub bagua_balance: f32,
     pub synthesis_ratio: f32,
+    // 保留原始诊断字段（前端展示用）
+    pub dao_isomorphism_score: f32,
     pub active_memories: usize,
     pub crystallized_memories: usize,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DaoMetricsRaw {
+    pub bagua_entropy: f32,
     pub archived_memories: usize,
     pub encodings_total: u64,
     pub compositions_total: u64,
     pub recalls_total: u64,
     pub corrections_total: u64,
-    pub status: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DaoMetricsResponse {
+    pub ok: bool,
+    pub data: DaoMetricsData,
+    pub raw: DaoMetricsRaw,
 }
 
 /// /v1/memories/unfold 请求体（Section 3.2 RecursiveUnfold）
@@ -261,6 +282,30 @@ pub struct MemoryRememberRequest {
     pub importance: Option<u8>,
 }
 
+/// v0.8.1 新增：/v1/config/llm/test 请求体
+///
+/// 前端 testLlmConfig 通过 sidecar 转发 LLM 测试请求，
+/// 绕过浏览器 CSP connect-src 限制。
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmTestRequest {
+    /// LLM API 端点（如 https://api.deepseek.com）
+    pub endpoint: String,
+    /// API Key
+    pub api_key: String,
+    /// 供应商名称（可选，用于日志）
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+/// v0.8.1 新增：/v1/config/llm/test 响应体
+#[derive(Debug, Serialize)]
+pub struct LlmTestResponse {
+    pub ok: bool,
+    pub status: u16,
+    pub message: String,
+    pub latency_ms: u64,
+}
+
 // ==================== 路由构建 ====================
 
 /// 创建 v1 REST API 路由（状态类型为 ()，以便与主路由合并）
@@ -269,6 +314,7 @@ pub struct MemoryRememberRequest {
 pub fn build_v1_router(
     store: SharedStore,
     codebase_manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
+    llm_api: Arc<RwLock<LlmApiConfig>>,
 ) -> Router {
     let consolidate_store = store.clone();
     let enrich_store = store.clone();
@@ -285,7 +331,22 @@ pub fn build_v1_router(
             let encoder = encode_encoder.clone();
             move |Json(req): Json<EncodeRequest>| {
                 async move {
-                    let luoshu_vec = encoder.encode_text(&req.text);
+                    // v0.7.1 P1-2 修复：用 spawn_blocking 包裹同步编码调用，
+                    // 避免 ML feature 下阻塞 Tokio worker 线程
+                    let text = req.text;
+                    let luoshu_vec = tokio::task::spawn_blocking(move || {
+                        encoder.encode_text(&text)
+                    })
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": format!("编码任务执行失败: {}", e)
+                            })),
+                        )
+                    })?;
+
                 let proj = mirror_project(&luoshu_vec);
                 let center_val = luoshu_vec.center_value();
                 let topological_depth: f32 = (1.0 - center_val).clamp(0.0, 1.0);
@@ -533,18 +594,32 @@ pub fn build_v1_router(
                             } else {
                                 "healthy"
                             };
+                            // v0.8.1：派生前端友好字段（0-100 区间）
+                            let yin_yang_balance = snapshot.dao_isomorphism_score * 100.0;
+                            let luoshu_deviation = (1.0 - snapshot.dao_isomorphism_score) * 100.0;
+                            let bagua_balance = (1.0 - snapshot.bagua_entropy) * 100.0;
+                            let synthesis_ratio_pct = snapshot.synthesis_ratio * 100.0;
+
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(DaoMetricsResponse {
-                                dao_isomorphism_score: snapshot.dao_isomorphism_score,
-                                bagua_entropy: snapshot.bagua_entropy,
-                                synthesis_ratio: snapshot.synthesis_ratio,
-                                active_memories: snapshot.active_memories,
-                                crystallized_memories: snapshot.crystallized_memories,
-                                archived_memories: snapshot.archived_memories,
-                                encodings_total: snapshot.encodings_total,
-                                compositions_total: snapshot.compositions_total,
-                                recalls_total: snapshot.recalls_total,
-                                corrections_total: snapshot.corrections_total,
-                                status: status.to_string(),
+                                ok: true,
+                                data: DaoMetricsData {
+                                    yin_yang_balance,
+                                    luoshu_deviation,
+                                    bagua_balance,
+                                    synthesis_ratio: synthesis_ratio_pct,
+                                    dao_isomorphism_score: snapshot.dao_isomorphism_score,
+                                    active_memories: snapshot.active_memories,
+                                    crystallized_memories: snapshot.crystallized_memories,
+                                    status: status.to_string(),
+                                },
+                                raw: DaoMetricsRaw {
+                                    bagua_entropy: snapshot.bagua_entropy,
+                                    archived_memories: snapshot.archived_memories,
+                                    encodings_total: snapshot.encodings_total,
+                                    compositions_total: snapshot.compositions_total,
+                                    recalls_total: snapshot.recalls_total,
+                                    corrections_total: snapshot.corrections_total,
+                                },
                             }))
                         }
                         Err(e) => Err((
@@ -1156,15 +1231,72 @@ pub fn build_v1_router(
                     // 获取记忆文件实际路径
                     let data_dir = store.persistence().data_dir().to_path_buf();
                     let memory_file = data_dir.join("memories.json");
-                    let file_exists = memory_file.exists();
-                    let file_size = if file_exists {
-                        std::fs::metadata(&memory_file).map(|m| m.len()).unwrap_or_else(|e| {
-                            eprintln!("[v1/trust] 读取文件大小失败: {}", e);
+                    // v0.7.1 P2-1 修复：用 spawn_blocking 包裹同步文件 I/O
+                    let memory_file_clone = memory_file.clone();
+                    let data_dir_clone = data_dir.clone();
+                    let (file_exists, file_size, memory_count, last_backup_time) = tokio::task::spawn_blocking(move || {
+                        let exists = memory_file_clone.exists();
+                        let size = if exists {
+                            std::fs::metadata(&memory_file_clone).map(|m| m.len()).unwrap_or_else(|e| {
+                                eprintln!("[v1/trust] 读取文件大小失败: {}", e);
+                                0
+                            })
+                        } else {
                             0
-                        })
-                    } else {
-                        0
-                    };
+                        };
+
+                        // v0.8.0 "归一"：读取记忆数量（直接解析 JSON 文件，避免在 spawn_blocking 中获取锁）
+                        let count = if exists {
+                            std::fs::read_to_string(&memory_file_clone)
+                                .ok()
+                                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+                                .and_then(|v| {
+                                    if v.is_array() {
+                                        Some(v.as_array().unwrap().len())
+                                    } else if v.is_object() {
+                                        v.get("memories")
+                                            .and_then(|m| m.as_array())
+                                            .map(|a| a.len())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        };
+
+                        // v0.8.0 "归一"：检查 backups 目录获取最后备份时间
+                        let backups_dir = data_dir_clone
+                            .parent() // data/ 的父目录
+                            .map(|p| p.join("backups"))
+                            .unwrap_or_else(|| std::path::PathBuf::from(".loong-recall/backups"));
+                        let last_backup = if backups_dir.exists() {
+                            std::fs::read_dir(&backups_dir)
+                                .ok()
+                                .and_then(|entries| {
+                                    entries
+                                        .filter_map(|e| e.ok())
+                                        .filter_map(|e| {
+                                            e.metadata()
+                                                .ok()
+                                                .and_then(|m| m.modified().ok())
+                                        })
+                                        .max()
+                                })
+                                .and_then(|t| {
+                                    t.duration_since(std::time::UNIX_EPOCH)
+                                        .ok()
+                                        .map(|d| d.as_secs())
+                                })
+                        } else {
+                            None
+                        };
+
+                        (exists, size, count, last_backup)
+                    })
+                    .await
+                    .unwrap_or((false, 0, 0, None));
 
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "data_directory": data_dir.to_string_lossy(),
@@ -1178,6 +1310,8 @@ pub fn build_v1_router(
                         } else {
                             format!("{} B", file_size)
                         },
+                        "memory_count": memory_count,
+                        "last_backup_time": last_backup_time,
                         "storage_backend": "JSON 文件（本地存储）",
                         "is_local": true,
                         "network_required": false,
@@ -1380,13 +1514,10 @@ pub fn build_v1_router(
                     } else if !query.is_empty() {
                         manager.search(&query, top_k)
                     } else {
-                        // 没有查询参数时返回空结果
-                        crate::engine::retriever::RetrievalResult {
-                            query: String::new(),
-                            returned: 0,
-                            total_indexed: manager.get_stats().total_chunks,
-                            results: vec![],
-                        }
+                        // v0.6.1 P0-2 修复: query 和 keywords 均为空时,回退返回最近 top_k 条
+                        // 修复前: 返回空结果,导致导出代码片段功能在无查询参数时失效
+                        // 修复后: 返回最近索引的 top_k 条代码片段,确保导出功能可用
+                        manager.recent_chunks(top_k)
                     };
 
                     let stats = manager.get_stats();
@@ -1588,6 +1719,222 @@ pub fn build_v1_router(
                 }
             }
         }))
+        // POST /v1/migrate — v0.8.0 "归一"：数据迁移与合并
+        // 扫描所有已知老路径，按 memory.id 去重合并到 global 目录
+        .route("/migrate", post(|| async move {
+            // v0.8.0：迁移是同步文件 I/O 操作，用 spawn_blocking 避免阻塞 Tokio
+            let report = tokio::task::spawn_blocking(|| {
+                crate::migration::execute_migration()
+            })
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("迁移任务执行失败: {}", e)
+                    })),
+                )
+            })?;
+            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::to_value(&report).unwrap_or_else(|_| {
+                serde_json::json!({"success": false, "error": "序列化迁移报告失败"})
+            })))
+        }))
+        // POST /v1/backup — v0.8.0 "归一"：手动创建记忆备份
+        // 将 global/data/memories.json 复制到 ~/.loong-recall/backups/
+        .route("/backup", post(|| async move {
+            let report = tokio::task::spawn_blocking(|| {
+                crate::backup::create_backup()
+            })
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("备份任务执行失败: {}", e)
+                    })),
+                )
+            })?;
+            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::to_value(&report).unwrap_or_else(|_| {
+                serde_json::json!({"success": false, "error": "序列化备份报告失败"})
+            })))
+        }))
+        // GET /v1/backups — v0.8.0 "归一"：列出所有备份文件
+        .route("/backups", get(|| async move {
+            let backups = tokio::task::spawn_blocking(|| {
+                crate::backup::list_backups()
+            })
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("列出备份失败: {}", e)
+                    })),
+                )
+            })?;
+            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                "success": true,
+                "total": backups.len(),
+                "backups": backups,
+            })))
+        }))
+        // GET /v1/data-logs — v0.8.0 "归一"：数据操作日志
+        // 返回最近 10 条数据操作记录（迁移、备份、导入等）
+        .route("/data-logs", get(|| async move {
+            let entries = tokio::task::spawn_blocking(|| {
+                crate::data_log::read_recent_operations(10)
+            })
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("读取操作日志失败: {}", e)
+                    })),
+                )
+            })?;
+            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                "success": true,
+                "total": entries.len(),
+                "entries": entries,
+            })))
+        }))
+        // v0.8.1 新增：POST /v1/config/llm/test — LLM 连接测试转发
+        //
+        // 由 sidecar 服务端发起对外部 LLM API 的测试请求，
+        // 绕过浏览器 CSP connect-src 限制。
+        // 安全说明：API Key 仅在 sidecar 进程内传输，不经过浏览器网络层。
+        .route("/config/llm/test", post({
+            move |Json(req): Json<LlmTestRequest>| {
+                async move {
+                    // 输入校验
+                    if req.endpoint.trim().is_empty() || req.api_key.trim().is_empty() {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "status": 0,
+                                "message": "endpoint 和 api_key 不能为空",
+                                "latency_ms": 0
+                            })),
+                        ));
+                    }
+
+                    // 校验 endpoint 是合法 HTTP/HTTPS URL，并拼接 /models 路径（OpenAI 兼容）
+                    let test_url = format!("{}/models", req.endpoint.trim_end_matches('/'));
+                    if !test_url.starts_with("https://") && !test_url.starts_with("http://") {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "status": 0,
+                                "message": "endpoint 必须以 http:// 或 https:// 开头",
+                                "latency_ms": 0
+                            })),
+                        ));
+                    }
+
+                    let start = std::time::Instant::now();
+
+                    // 构造 HTTP 客户端（带 10 秒超时）
+                    let client = match reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .user_agent("loong-recall-llm-test")
+                        .build()
+                    {
+                        Ok(c) => c,
+                        Err(e) => {
+                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "status": 0,
+                                    "message": format!("HTTP 客户端创建失败: {}", e),
+                                    "latency_ms": start.elapsed().as_millis() as u64
+                                }))
+                            );
+                        }
+                    };
+
+                    // 发起测试请求（GET /models，OpenAI 兼容端点）
+                    let resp_result = client
+                        .get(&test_url)
+                        .header("Authorization", format!("Bearer {}", req.api_key))
+                        .send()
+                        .await;
+
+                    let latency_ms = start.elapsed().as_millis() as u64;
+
+                    match resp_result {
+                        Ok(resp) => {
+                            let status = resp.status().as_u16();
+                            if resp.status().is_success() {
+                                Ok(Json(serde_json::json!({
+                                    "ok": true,
+                                    "status": status,
+                                    "message": "连接成功，API Key 有效",
+                                    "latency_ms": latency_ms
+                                })))
+                            } else {
+                                let err_msg = match status {
+                                    401 => "API Key 无效或已过期",
+                                    403 => "无访问权限",
+                                    404 => "端点不存在，请检查 endpoint 配置",
+                                    429 => "请求频率超限",
+                                    _ => "连接失败",
+                                };
+                                Ok(Json(serde_json::json!({
+                                    "ok": false,
+                                    "status": status,
+                                    "message": err_msg,
+                                    "latency_ms": latency_ms
+                                })))
+                            }
+                        }
+                        Err(e) => {
+                            let err_msg = if e.is_timeout() {
+                                "连接超时（10秒），请检查网络或 endpoint 可达性"
+                            } else if e.is_connect() {
+                                "无法连接到 endpoint，请检查 URL 是否正确"
+                            } else {
+                                "网络请求失败"
+                            };
+                            Ok(Json(serde_json::json!({
+                                "ok": false,
+                                "status": 0,
+                                "message": format!("{}: {}", err_msg, e),
+                                "latency_ms": latency_ms
+                            })))
+                        }
+                    }
+                }
+            }
+        }))
+        // v0.8.1 新增：GET /v1/config — 获取当前 LLM 配置状态（统一前缀，与 /api/config 兼容）
+        .route("/config", get({
+            let llm_api = llm_api.clone();
+            move || {
+                let llm_api = llm_api.clone();
+                async move {
+                    Json(crate::server::get_llm_config_state(&llm_api).await)
+                }
+            }
+        }))
+        // v0.8.1 新增：POST /v1/config/llm — 更新 LLM API Key 配置（统一前缀，与 /api/config/llm 兼容）
+        .route("/config/llm", post({
+            let memory_store = store.clone();
+            let llm_api = llm_api.clone();
+            move |Json(body): Json<serde_json::Value>| {
+                let memory_store = memory_store.clone();
+                let llm_api = llm_api.clone();
+                async move {
+                    crate::server::update_llm_config(&memory_store, &llm_api, body).await
+                }
+            }
+        }))
 }
 
 /// 比较版本号：latest > current 返回 true
@@ -1630,5 +1977,310 @@ mod version_tests {
         assert!(compare_versions("1.0.0", "0.9.9"));
         assert!(!compare_versions("0.1.0", "1.0.0"));
         assert!(compare_versions("0.2.1", "0.2.0"));
+    }
+
+    // v0.7.1 P4-1 补充：compare_versions 边界场景
+    #[test]
+    fn test_compare_versions_edge_cases() {
+        // 空字符串应安全降级为 false（不升级）
+        assert!(!compare_versions("", "0.1.0"));
+        assert!(!compare_versions("0.1.0", ""));
+        // 非法格式（含非数字段）应过滤后返回 false
+        assert!(!compare_versions("x.y.z", "0.1.0"));
+        // 多段版本号：补 0 对齐比较
+        assert!(compare_versions("0.2.0.1", "0.2.0"));
+        assert!(!compare_versions("0.2.0", "0.2.0.1"));
+        // 大版本号跨越
+        assert!(compare_versions("2.0.0", "1.9.9.9"));
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// v0.7.1 P4-1：v1_api.rs 核心端点单元测试
+// ──────────────────────────────────────────────────────────────
+// 说明：22 个端点均以闭包形式注册到 Router，handler 未暴露为命名函数，
+//       因此无法直接调用 handler 做纯单元测试。此处采用三层测试策略：
+//   1. 纯函数测试（default_* 系列）
+//   2. 请求体 serde 默认值测试（验证 API 契约的向后兼容性）
+//   3. 响应体序列化字段名测试（确保前端可正确解析 JSON）
+// 完整端点级集成测试由 server.rs 中的 axum integration tests 覆盖。
+#[cfg(test)]
+mod api_contracts_tests {
+    use super::*;
+
+    // ===== 1. 纯函数测试：default_* 系列确保默认值稳定 =====
+
+    #[test]
+    fn test_default_synthesis_similarity() {
+        assert_eq!(default_synthesis_similarity(), 0.4);
+    }
+
+    #[test]
+    fn test_default_min_cluster() {
+        assert_eq!(default_min_cluster(), 3);
+    }
+
+    #[test]
+    fn test_default_memory_type() {
+        assert_eq!(default_memory_type(), "fact");
+    }
+
+    #[test]
+    fn test_default_importance() {
+        assert_eq!(default_importance(), 5);
+    }
+
+    #[test]
+    fn test_default_privacy() {
+        assert_eq!(default_privacy(), "user");
+    }
+
+    #[test]
+    fn test_default_top_k() {
+        assert_eq!(default_top_k(), 5);
+    }
+
+    #[test]
+    fn test_default_min_activation() {
+        assert_eq!(default_min_activation(), 0.1);
+    }
+
+    // ===== 2. 请求体 serde 默认值测试（API 契约向后兼容性） =====
+
+    #[test]
+    fn test_consolidate_request_serde_defaults() {
+        // 最小请求体：仅提供 memories 字段，其余字段应使用 serde default
+        let json = r#"{"memories":[{"content":"测试记忆"}]}"#;
+        let req: ConsolidateRequest = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(req.memories.len(), 1);
+        assert_eq!(req.synthesis_similarity, 0.4, "synthesis_similarity 默认值应为 0.4");
+        assert_eq!(req.min_cluster, 3, "min_cluster 默认值应为 3");
+        // ConsolidateMemory 的默认值
+        assert_eq!(req.memories[0].memory_type, "fact");
+        assert_eq!(req.memories[0].importance, 5);
+        assert_eq!(req.memories[0].privacy_level, "user");
+        assert!(req.memories[0].tags.is_empty());
+        assert!(req.memories[0].project.is_none());
+        assert!(req.memories[0].session_id.is_none());
+        assert!(req.memories[0].user_id.is_none());
+    }
+
+    #[test]
+    fn test_consolidate_request_explicit_values() {
+        // 显式提供所有字段，确保不被默认值覆盖
+        let json = r#"{
+            "memories":[{"content":"显式","memory_type":"decision","importance":9,"privacy_level":"team"}],
+            "synthesis_similarity":0.6,
+            "min_cluster":5
+        }"#;
+        let req: ConsolidateRequest = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(req.synthesis_similarity, 0.6);
+        assert_eq!(req.min_cluster, 5);
+        assert_eq!(req.memories[0].memory_type, "decision");
+        assert_eq!(req.memories[0].importance, 9);
+        assert_eq!(req.memories[0].privacy_level, "team");
+    }
+
+    #[test]
+    fn test_enrich_request_serde_defaults() {
+        let json = r#"{"query":"Rust 开发"}"#;
+        let req: EnrichRequest = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(req.query, "Rust 开发");
+        assert_eq!(req.top_k, 5, "top_k 默认值应为 5");
+        assert!(req.session_id.is_none());
+        assert!(req.user_id.is_none());
+    }
+
+    #[test]
+    fn test_unfold_request_serde_defaults() {
+        let json = r#"{"memory_id":"mem-001"}"#;
+        let req: UnfoldRequest = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(req.memory_id, "mem-001");
+        assert_eq!(req.min_activation, 0.1, "min_activation 默认值应为 0.1");
+    }
+
+    #[test]
+    fn test_correct_request_serde_defaults() {
+        // reason 字段 #[serde(default)]，缺失时应为 None
+        let json = r#"{"memory_id":"mem-001","content":"修正内容"}"#;
+        let req: CorrectRequest = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(req.memory_id, "mem-001");
+        assert_eq!(req.content, "修正内容");
+        assert!(req.reason.is_none(), "reason 默认应为 None");
+    }
+
+    #[test]
+    fn test_correct_request_with_reason() {
+        let json = r#"{"memory_id":"mem-001","content":"修正","reason":"用户指出错误"}"#;
+        let req: CorrectRequest = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(req.reason, Some("用户指出错误".to_string()));
+    }
+
+    #[test]
+    fn test_encode_request_required_fields() {
+        // text 是必填字段，缺失应反序列化失败
+        let json = r#"{}"#;
+        let result: Result<EncodeRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "缺失 text 字段应反序列化失败");
+    }
+
+    // ===== 3. 响应体序列化字段名测试（前端契约稳定性） =====
+
+    #[test]
+    fn test_encode_response_field_names() {
+        let resp = EncodeResponse {
+            luoshu_vector: [0.5; 9],
+            bagua_index: 3,
+            bagua_category: "震".to_string(),
+            center_value: 0.5,
+            topological_depth: 0.5,
+        };
+        let json = serde_json::to_value(&resp).expect("序列化失败");
+        // 验证字段名与前端预期一致（snake_case）
+        assert!(json.get("luoshu_vector").is_some(), "字段名应为 luoshu_vector");
+        assert!(json.get("bagua_index").is_some());
+        assert!(json.get("bagua_category").is_some());
+        assert!(json.get("center_value").is_some());
+        assert!(json.get("topological_depth").is_some());
+        // 验证数组长度为 9
+        assert_eq!(json["luoshu_vector"].as_array().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn test_consolidate_response_field_names() {
+        let resp = ConsolidateResponse {
+            stored: 3,
+            synthesized: 1,
+            total_memories: 4,
+            synthesis_summaries: vec!["合成摘要".to_string()],
+        };
+        let json = serde_json::to_value(&resp).expect("序列化失败");
+        assert_eq!(json["stored"], 3);
+        assert_eq!(json["synthesized"], 1);
+        assert_eq!(json["total_memories"], 4);
+        assert!(json["synthesis_summaries"].is_array());
+    }
+
+    #[test]
+    fn test_dao_metrics_response_field_names() {
+        // v0.8.1：契约对齐后，响应包装为 {ok, data, raw} 嵌套结构
+        let resp = DaoMetricsResponse {
+            ok: true,
+            data: DaoMetricsData {
+                yin_yang_balance: 85.5,
+                luoshu_deviation: 14.5,
+                bagua_balance: 97.9,
+                synthesis_ratio: 30.0,
+                dao_isomorphism_score: 0.855,
+                active_memories: 100,
+                crystallized_memories: 30,
+                status: "healthy".to_string(),
+            },
+            raw: DaoMetricsRaw {
+                bagua_entropy: 2.1,
+                archived_memories: 5,
+                encodings_total: 1000,
+                compositions_total: 50,
+                recalls_total: 200,
+                corrections_total: 10,
+            },
+        };
+        let json = serde_json::to_value(&resp).expect("序列化失败");
+        // 验证顶层嵌套结构（前端 loadDaoMetrics 依赖 ok/data）
+        assert_eq!(json["ok"], true);
+        // f32 → JSON 存在精度损失，浮点字段用容差比较
+        let approx_eq = |a: f64, b: f64| (a - b).abs() < 1e-3;
+        // 验证 data 字段（前端 dashboard 依赖这些名称）
+        let data = &json["data"];
+        assert!(approx_eq(
+            data["yin_yang_balance"].as_f64().unwrap(),
+            85.5
+        ));
+        assert!(approx_eq(
+            data["luoshu_deviation"].as_f64().unwrap(),
+            14.5
+        ));
+        assert!(approx_eq(data["bagua_balance"].as_f64().unwrap(), 97.9));
+        assert!(approx_eq(
+            data["synthesis_ratio"].as_f64().unwrap(),
+            30.0
+        ));
+        assert!(approx_eq(
+            data["dao_isomorphism_score"].as_f64().unwrap(),
+            0.855
+        ));
+        assert_eq!(data["active_memories"], 100);
+        assert_eq!(data["crystallized_memories"], 30);
+        assert_eq!(data["status"], "healthy");
+        // 验证 raw 字段（保留原始诊断信息）
+        let raw = &json["raw"];
+        assert!(approx_eq(raw["bagua_entropy"].as_f64().unwrap(), 2.1));
+        assert_eq!(raw["archived_memories"], 5);
+        assert_eq!(raw["encodings_total"], 1000);
+        assert_eq!(raw["compositions_total"], 50);
+        assert_eq!(raw["recalls_total"], 200);
+        assert_eq!(raw["corrections_total"], 10);
+    }
+
+    #[test]
+    fn test_unfold_response_field_names() {
+        let resp = UnfoldResponse {
+            success: true,
+            source_memory_id: "mem-001".to_string(),
+            sub_vectors_count: 3,
+            fidelity: 0.95,
+            sub_memories: vec![],
+        };
+        let json = serde_json::to_value(&resp).expect("序列化失败");
+        assert_eq!(json["success"], true);
+        assert_eq!(json["source_memory_id"], "mem-001");
+        assert_eq!(json["sub_vectors_count"], 3);
+        // f32 → JSON 精度损失，用容差比较
+        assert!(
+            (json["fidelity"].as_f64().unwrap() - 0.95).abs() < 1e-5,
+            "fidelity 字段值异常"
+        );
+        assert!(json["sub_memories"].is_array());
+    }
+
+    #[test]
+    fn test_correct_response_field_names() {
+        let resp = CorrectResponse {
+            success: true,
+            memory_id: "mem-001".to_string(),
+            new_version: 2,
+            history_versions: 1,
+        };
+        let json = serde_json::to_value(&resp).expect("序列化失败");
+        assert_eq!(json["success"], true);
+        assert_eq!(json["memory_id"], "mem-001");
+        assert_eq!(json["new_version"], 2);
+        assert_eq!(json["history_versions"], 1);
+    }
+
+    #[test]
+    fn test_enriched_memory_field_names() {
+        let mem = EnrichedMemory {
+            id: "mem-001".to_string(),
+            content: "内容".to_string(),
+            memory_type: "fact".to_string(),
+            score: 0.85,
+            bagua_category: Some("震".to_string()),
+            importance: 7,
+            topological_depth: 0.5,
+            version: 1,
+            created_at: "2026-07-29T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_value(&mem).expect("序列化失败");
+        assert_eq!(json["id"], "mem-001");
+        assert_eq!(json["memory_type"], "fact");
+        // f32 → JSON 精度损失，用容差比较
+        assert!(
+            (json["score"].as_f64().unwrap() - 0.85).abs() < 1e-5,
+            "score 字段值异常"
+        );
+        assert_eq!(json["bagua_category"], "震");
+        assert_eq!(json["importance"], 7);
+        assert_eq!(json["version"], 1);
     }
 }

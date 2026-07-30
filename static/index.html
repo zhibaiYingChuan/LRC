@@ -2,7 +2,11 @@
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
+  <!-- v0.8.6 Step 1 / N002 G076 修复：Content-Security-Policy 纵深防御层 -->
+  <!-- 之前完全未配置 CSP，XSS/数据注入防御缺失，HCSE 安全不变量 INV-01 违规 -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.openai.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="version" content="0.8.7">
   <link rel="icon" type="image/png" href="/assets/logo/LRC桌面端Logo设计-26aa57e9-7935-4ece-badf-bd52dcccd343.png">
   <title>龙忆 Loong Recall · 仪表盘</title>
   <!-- 龙忆设计系统 v1.0：色阶 + 排版 + 间距 + 圆角 + 阴影 + 动效 -->
@@ -17,18 +21,25 @@
 <!-- ==================== Toast 通知条容器（设计文档 3.10） ==================== -->
 <div class="toast-container" id="toast-container"></div>
 
+<!-- v0.8.2：Sidecar 未运行横幅（对应审计 G005） -->
+<div id="sidecar-down-banner" class="sidecar-down-banner" hidden>
+  <span class="banner-icon">⚠️</span>
+  <span class="banner-text">LRC 服务未运行，部分功能不可用</span>
+  <button class="banner-btn" data-action="openStartServiceModal">启动服务</button>
+</div>
+
 <!-- ==================== 应用布局：侧边栏 + 主内容区（设计文档 5.1） ==================== -->
 <div class="app-layout">
 
   <!-- ========== 侧边栏（桌面端，龙忆设计系统 v1.0） ========== -->
   <aside class="app-sidebar sidebar" id="app-sidebar">
     <!-- 折叠状态下显示的展开按钮（悬浮于侧边栏右边缘） -->
-    <button class="sidebar-expand-btn" onclick="toggleSidebar()" aria-label="展开侧边栏" title="展开">⟫</button>
+    <button class="sidebar-expand-btn" data-action="toggleSidebar" aria-label="展开侧边栏" title="展开">⟫</button>
     <!-- 侧边栏顶部 Logo + 折叠按钮（设计文档 3.4：60/240px 切换） -->
     <div class="sidebar-header">
       <img class="sidebar-logo" src="/assets/logo/LRC桌面端Logo设计-26aa57e9-7935-4ece-badf-bd52dcccd343.png" alt="龙忆 Loong Recall">
       <span class="sidebar-brand">龙忆</span>
-      <button class="sidebar-collapse-btn" onclick="toggleSidebar()" aria-label="折叠/展开侧边栏" title="折叠/展开">
+      <button class="sidebar-collapse-btn" data-action="toggleSidebar" aria-label="折叠/展开侧边栏" title="折叠/展开">
         <span class="collapse-icon">⟪</span>
       </button>
     </div>
@@ -84,10 +95,10 @@
 <!-- ==================== 顶部导航栏（手机端 fallback，龙忆设计系统 v1.0） ==================== -->
 <nav class="navbar">
   <a class="navbar-brand" href="#">
-    <img class="navbar-logo-img" src="/assets/logo/logo-horizontal.png" alt="龙忆 Loong Recall" width="140" height="32">
+    <img class="navbar-logo-img" src="/assets/logo/logo-horizontal.svg" alt="龙忆 Loong Recall" width="140" height="32">
     <span class="navbar-tagline">记忆有道，生生不息</span>
   </a>
-  <button class="navbar-toggle" onclick="toggleNav()" aria-label="菜单">☰</button>
+  <button class="navbar-toggle" data-action="toggleNav" aria-label="菜单">☰</button>
   <ul class="navbar-nav" id="navbarNav">
     <li><button class="active" data-tab="dashboard"><img src="/assets/icons/icon-dashboard.svg" alt="" width="14" height="14">仪表盘</button></li>
     <li><button data-tab="memory-search"><img src="/assets/icons/icon-search-lrc.svg" alt="" width="14" height="14">记忆搜索</button></li>
@@ -113,7 +124,7 @@
         <div class="welcome-date" id="welcome-date">--</div>
         <div class="welcome-poem" id="welcome-poem">昨日之忆，今日之智</div>
       </div>
-      <button class="welcome-close" onclick="dismissWelcome()" aria-label="关闭欢迎">
+      <button class="welcome-close" data-action="dismissWelcome" aria-label="关闭欢迎">
         <img src="/assets/icons/icon-decay.svg" alt="" width="14" height="14">
       </button>
     </div>
@@ -131,8 +142,8 @@
             <span class="wizard-check">✓</span>
           </div>
           <div class="wizard-step-desc">搜索代码库中的函数、结构体或关键字</div>
-          <input type="text" class="input" id="wizard-search-path" placeholder="搜索代码关键词（如：struct、fn、MemoryStore）" value="struct">
-          <button class="btn btn-accent" onclick="wizardStep1Search()">搜索代码</button>
+          <input type="text" class="input" id="wizard-search-path" placeholder="搜索代码关键词（如：struct、fn、MemoryStore）" value="struct" required maxlength="200">
+          <button class="btn btn-accent" data-action="wizardStep1Search">搜索代码</button>
           <div class="wizard-result" id="wizard-step1-result"></div>
         </div>
 
@@ -145,8 +156,8 @@
           </div>
           <div class="wizard-step-desc">将示例内容写入记忆库</div>
           <input type="text" class="input" id="wizard-memory-content"
-            value="项目使用 Rust 语言开发，采用 Actix-web 框架" placeholder="记忆内容...">
-          <button class="btn btn-accent" onclick="wizardStep2Write()">写入记忆</button>
+            value="项目使用 Rust 语言开发，采用 Actix-web 框架" placeholder="记忆内容..." required maxlength="2000">
+          <button class="btn btn-accent" data-action="wizardStep2Write">写入记忆</button>
           <div class="wizard-result" id="wizard-step2-result"></div>
         </div>
 
@@ -159,8 +170,8 @@
           </div>
           <div class="wizard-step-desc">检索刚写入的记忆，验证记忆系统</div>
           <input type="text" class="input" id="wizard-search-query"
-            value="Rust 开发" placeholder="搜索关键词...">
-          <button class="btn btn-accent" onclick="wizardStep3Search()">检索记忆</button>
+            value="Rust 开发" placeholder="搜索关键词..." required maxlength="200">
+          <button class="btn btn-accent" data-action="wizardStep3Search">检索记忆</button>
           <div class="wizard-result" id="wizard-step3-result"></div>
         </div>
       </div>
@@ -174,28 +185,28 @@
         以下是龙忆 LRC 最常用的功能，点击即可使用。
       </p>
       <div class="quick-actions-grid">
-        <a href="#tab-captain-log" class="quick-action-item" onclick="switchToTab('captain-log')">
+        <a href="#tab-captain-log" class="quick-action-item" data-action="switchToTab" data-arg="captain-log">
           <span class="quick-action-icon"><img src="/assets/icons/icon-captain-log.svg" alt="" width="24" height="24"></span>
           <div>
             <div class="quick-action-title">生成船长日志</div>
             <div class="quick-action-desc">一键生成项目记忆健康报告</div>
           </div>
         </a>
-        <a href="#tab-trust-center" class="quick-action-item" onclick="switchToTab('trust-center')">
+        <a href="#tab-trust-center" class="quick-action-item" data-action="switchToTab" data-arg="trust-center">
           <span class="quick-action-icon"><img src="/assets/icons/icon-trust.svg" alt="" width="24" height="24"></span>
           <div>
             <div class="quick-action-title">查看信任中心</div>
             <div class="quick-action-desc">验证数据存储位置与隐私保护</div>
           </div>
         </a>
-        <a href="#tab-settings" class="quick-action-item" onclick="switchToTab('settings')">
+        <a href="#tab-settings" class="quick-action-item" data-action="switchToTab" data-arg="settings">
           <span class="quick-action-icon"><img src="/assets/icons/icon-bagua.svg" alt="" width="24" height="24"></span>
           <div>
             <div class="quick-action-title">配置 LLM</div>
             <div class="quick-action-desc">启用自然语言搜索代码功能</div>
           </div>
         </a>
-        <a href="#tab-api-docs" class="quick-action-item" onclick="switchToTab('api-docs')">
+        <a href="#tab-api-docs" class="quick-action-item" data-action="switchToTab" data-arg="api-docs">
           <span class="quick-action-icon"><img src="/assets/icons/icon-audit.svg" alt="" width="24" height="24"></span>
           <div>
             <div class="quick-action-title">查看用户文档</div>
@@ -281,19 +292,19 @@
       </div>
       <p class="text-sm text-dim mb-4">一键启用场景模板，无需手动设计记忆类型与标签体系。</p>
       <div class="preset-scenario-grid" id="preset-scenario-grid">
-        <div class="preset-scenario-card" data-scenario="personal-notes" onclick="selectPresetScenario(this)">
+        <div class="preset-scenario-card" data-scenario="personal-notes" data-action="selectPresetScenario" data-arg-mode="this">
           <div class="preset-scenario-title">个人笔记</div>
           <div class="preset-scenario-desc">灵感、日记、个人知识沉淀</div>
         </div>
-        <div class="preset-scenario-card" data-scenario="project-management" onclick="selectPresetScenario(this)">
+        <div class="preset-scenario-card" data-scenario="project-management" data-action="selectPresetScenario" data-arg-mode="this">
           <div class="preset-scenario-title">项目管理</div>
           <div class="preset-scenario-desc">决策、会议纪要、任务跟踪</div>
         </div>
-        <div class="preset-scenario-card" data-scenario="learning-assistant" onclick="selectPresetScenario(this)">
+        <div class="preset-scenario-card" data-scenario="learning-assistant" data-action="selectPresetScenario" data-arg-mode="this">
           <div class="preset-scenario-title">学习助手</div>
           <div class="preset-scenario-desc">知识点、问答、学科分类</div>
         </div>
-        <div class="preset-scenario-card selected" data-scenario="coding-helper" onclick="selectPresetScenario(this)">
+        <div class="preset-scenario-card selected" data-scenario="coding-helper" data-action="selectPresetScenario" data-arg-mode="this">
           <div class="preset-scenario-title">编程助手</div>
           <div class="preset-scenario-desc">代码决策、偏好、约定（默认）</div>
         </div>
@@ -326,7 +337,7 @@
       <div class="card">
         <div class="card-title">
           <img src="/assets/icons/icon-memory.svg" alt="" width="18" height="18"> 最近记忆
-          <button class="btn btn-outline btn-sm" style="margin-left:auto;padding:2px 10px;font-size:11px;" onclick="loadRecentMemories()">刷新</button>
+          <button class="btn btn-outline btn-sm" style="margin-left:auto;padding:2px 10px;font-size:11px;" data-action="loadRecentMemories">刷新</button>
         </div>
         <div id="recent-memories-list" class="recent-memories-container">
           <div class="text-center text-dim" style="padding:20px;">加载中...</div>
@@ -342,11 +353,37 @@
       </div>
     </div>
 
+    <!-- ==================== 洛书向量编码器（v0.7.0 孤儿路由修复 Step 3-D） ==================== -->
+    <div class="card">
+      <div class="card-title">
+        <img src="/assets/icons/icon-luoshu.svg" alt="" width="18" height="18"> 洛书向量编码器
+        <span style="margin-left:auto;font-size:11px;color:var(--lrc-墨韵-300);font-weight:normal;">POST /v1/encode</span>
+      </div>
+      <p class="text-sm text-dim mb-4">输入任意文本，实时查看其洛书 9 维向量表示、八卦归属与拓扑深度。</p>
+      <div class="luoshu-encoder-input" style="display:flex;gap:8px;margin-bottom:12px;">
+        <input type="text" class="input" id="luoshu-encode-input"
+          placeholder="请输入要编码的文本（例如：用户认证逻辑）" style="flex:1;" maxlength="500">
+        <button class="btn btn-primary" id="btn-luoshu-encode" data-action="encodeTextToLuoshu">编码</button>
+      </div>
+      <div class="luoshu-encode-error" id="luoshu-encode-error" style="display:none;color:var(--lrc-朱砂-400,#c04851);font-size:12px;margin-bottom:8px;"></div>
+      <div class="luoshu-encode-result" id="luoshu-encode-result" style="display:none;">
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:12px;" id="luoshu-vector-grid">
+          <!-- 9 个向量分量将通过 JS 动态填充 -->
+        </div>
+        <div class="luoshu-encode-meta" style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;font-size:13px;">
+          <div><span class="text-dim">八卦索引：</span><span id="luoshu-bagua-index" style="font-weight:600;">--</span></div>
+          <div><span class="text-dim">八卦类别：</span><span id="luoshu-bagua-category" style="font-weight:600;">--</span></div>
+          <div><span class="text-dim">中心值：</span><span id="luoshu-center-value" style="font-weight:600;">--</span></div>
+          <div><span class="text-dim">拓扑深度：</span><span id="luoshu-topological-depth" style="font-weight:600;">--</span></div>
+        </div>
+      </div>
+    </div>
+
     <!-- ==================== 演化时间线（设计文档 5.2.4：最近 10 条演化事件） ==================== -->
     <div class="card">
       <div class="card-title">
         <img src="/assets/icons/icon-crystallization.svg" alt="" width="18" height="18"> 演化时间线
-        <button class="btn btn-outline btn-sm" style="margin-left:auto;padding:2px 10px;font-size:11px;" onclick="loadEvolutionTimeline()">刷新</button>
+        <button class="btn btn-outline btn-sm" style="margin-left:auto;padding:2px 10px;font-size:11px;" data-action="loadEvolutionTimeline">刷新</button>
       </div>
       <p class="text-sm text-dim mb-4">按时间倒序显示最近 10 条演化事件（结晶、衰减、合成、审计）。</p>
       <ul class="evolution-timeline" id="evolution-timeline">
@@ -441,7 +478,7 @@
       <div class="memory-search-bar">
         <img class="search-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
         <input type="text" class="input" id="memory-search-input"
-          placeholder="搜索记忆内容、标签或关键词..." oninput="debouncedMemorySearch()">
+          placeholder="搜索记忆内容、标签或关键词..." data-input-action="debouncedMemorySearch" data-input-event="input" maxlength="200">
       </div>
 
       <!-- 搜索布局：左侧筛选 + 右侧卡片流 -->
@@ -485,9 +522,9 @@
     </div>
 
     <!-- 右侧滑出详情面板（设计文档 5.3：40% 宽度） -->
-    <div class="memory-detail-panel-backdrop" id="memory-detail-backdrop" onclick="closeMemoryDetail()"></div>
+    <div class="memory-detail-panel-backdrop" id="memory-detail-backdrop" data-action="closeMemoryDetail"></div>
     <aside class="memory-detail-panel" id="memory-detail-panel">
-      <button class="memory-detail-close" onclick="closeMemoryDetail()">×</button>
+      <button class="memory-detail-close" data-action="closeMemoryDetail">×</button>
       <div class="memory-detail-content" id="memory-detail-content">
         <!-- 详情内容动态填充 -->
       </div>
@@ -504,8 +541,8 @@
       </p>
       <div class="input-group">
         <input type="text" class="input" id="log-project-path"
-          placeholder="例如：C:\Users\MyProject 或 .（当前目录）" value=".">
-        <button class="btn btn-primary" id="btn-generate-log" onclick="generateCaptainLog()">
+          placeholder="例如：C:\Users\MyProject 或 .（当前目录）" value="." maxlength="500">
+        <button class="btn btn-primary" id="btn-generate-log" data-action="generateCaptainLog">
           一键生成船长日志
         </button>
       </div>
@@ -529,7 +566,7 @@
         <img src="/assets/icons/icon-trust.svg" alt="" width="18" height="18"> 一键隐私检查
       </div>
       <p class="text-sm text-dim mb-4">100ms 内获取完整的隐私报告：存储位置、大小、网络访问、加密状态。</p>
-      <button class="privacy-check-btn" onclick="runPrivacyCheck()">
+      <button class="privacy-check-btn" data-action="runPrivacyCheck">
         <img src="/assets/icons/icon-trust.svg" alt="" width="16" height="16"> 立即检查隐私状态
       </button>
       <div id="privacy-check-result" class="verify-result" style="margin-top: 16px;"></div>
@@ -539,10 +576,10 @@
       <!-- 数据存储位置（fact - 玉色色条） -->
       <div class="trust-card card-memory-fact">
         <h3><img src="/assets/icons/icon-trust.svg" alt="" width="16" height="16" style="vertical-align:middle;"> 数据存储位置</h3>
-        <p>所有数据<strong>本地优先</strong>，存储在项目目录下的 <code>.loong-recall/data/</code> 中。
-          支持自定义路径（<code>--db-path</code>）和全局模式（<code>--global</code>）。</p>
+        <p>所有数据<strong>本地优先</strong>，桌面端默认存储在 <code>~/.loong-recall/global/data/</code> 中（全局模式）。
+          点击下方按钮查看完整存储详情，包括记忆总数、文件大小和最后备份时间。</p>
         <div class="trust-actions">
-          <button class="btn btn-outline btn-sm" onclick="verifyDataLocation()">查看记忆文件</button>
+          <button class="btn btn-outline btn-sm" data-action="verifyDataLocation">查看记忆文件</button>
         </div>
         <div class="verify-result" id="data-location-result">
           <div class="loading-overlay hidden" id="data-location-loading">
@@ -557,7 +594,7 @@
         <p>核心功能<strong>完全离线</strong>可用。网络仅用于首次模型下载
           （通过 HuggingFace 镜像）。</p>
         <div class="trust-actions">
-          <button class="btn btn-outline btn-sm" onclick="verifyNetworkAudit()">查看网络活动</button>
+          <button class="btn btn-outline btn-sm" data-action="verifyNetworkAudit">查看网络活动</button>
         </div>
         <div class="verify-result" id="network-audit-result">
           <div class="loading-overlay hidden" id="network-audit-loading">
@@ -603,7 +640,7 @@
         <h3><img src="/assets/icons/icon-audit.svg" alt="" width="16" height="16" style="vertical-align:middle;"> 审计日志完整性</h3>
         <p id="audit-integrity-text">加载中...</p>
         <div class="trust-actions">
-          <button class="btn btn-outline btn-sm" onclick="verifyAuditIntegrity()">验证完整性</button>
+          <button class="btn btn-outline btn-sm" data-action="verifyAuditIntegrity">验证完整性</button>
         </div>
         <div class="verify-result" id="audit-integrity-result">
           <div class="loading-overlay hidden" id="audit-integrity-loading">
@@ -612,6 +649,76 @@
         </div>
         <p class="text-sm text-dim mt-2">
           所有系统自主行为（合成、删除、调节等）均被记录在不可篡改的哈希链中。
+        </p>
+      </div>
+
+      <!-- v0.8.0 "归一"：数据备份与恢复（preference - 金色色条） -->
+      <div class="trust-card card-memory-preference" id="data-backup-card">
+        <h3><img src="/assets/icons/icon-save.svg" alt="" width="16" height="16" style="vertical-align:middle;"> 数据备份与恢复</h3>
+        <p>将记忆数据导出为 JSON 文件，或从备份文件恢复。<strong>所有操作仅在本地执行</strong>，数据不会离开你的机器。</p>
+        <div class="trust-actions">
+          <button class="btn btn-outline btn-sm" data-action="createBackup">
+            <img src="/assets/icons/icon-save.svg" alt="" width="14" height="14"> 立即备份
+          </button>
+          <button class="btn btn-outline btn-sm" data-action="backupMemories">
+            <img src="/assets/icons/icon-export.svg" alt="" width="14" height="14"> 导出记忆
+          </button>
+          <button class="btn btn-outline btn-sm" data-action="triggerFileInput" data-target="trust-import-file">
+            <img src="/assets/icons/icon-import.svg" alt="" width="14" height="14"> 导入记忆
+          </button>
+          <input type="file" id="trust-import-file" style="display:none" accept=".json" data-input-action="importMemories" data-input-event="change" data-pass-event="1">
+        </div>
+        <div class="verify-result" id="trust-backup-result"></div>
+        <div class="verify-result" id="backup-result-trust"></div>
+        <p class="text-sm text-dim mt-2">
+          「立即备份」在本地创建快照（保留最近 4 份）；「导出」下载 JSON 文件到本地；「导入」从 JSON 文件恢复。
+        </p>
+      </div>
+
+      <!-- v0.8.0 "归一"：数据迁移与合并（decision - 朱砂色条） -->
+      <div class="trust-card card-memory-decision" id="data-migration-card">
+        <h3><img src="/assets/icons/icon-bagua.svg" alt="" width="16" height="16" style="vertical-align:middle;"> 数据迁移与合并</h3>
+        <p>扫描历史版本遗留的分散数据，按记忆 ID 去重合并到统一的全局目录。<strong>原文件将保留 .bak 备份</strong>，确保数据安全。</p>
+        <div class="trust-actions">
+          <button class="btn btn-outline btn-sm" data-action="migrateData">
+            <img src="/assets/icons/icon-bagua.svg" alt="" width="14" height="14"> 执行迁移
+          </button>
+        </div>
+        <div class="verify-result" id="migration-result"></div>
+        <p class="text-sm text-dim mt-2">
+          适用于从旧版本升级或数据分散在多个项目目录的场景。
+        </p>
+      </div>
+
+      <!-- v0.8.0 "归一"：数据操作日志（code_context - 水蓝色条） -->
+      <div class="trust-card card-memory-code" id="data-log-card">
+        <h3><img src="/assets/icons/icon-audit.svg" alt="" width="16" height="16" style="vertical-align:middle;"> 数据操作历史</h3>
+        <p>所有数据操作（迁移、备份、导入等）均被记录，让一切有迹可循。</p>
+        <div class="trust-actions">
+          <button class="btn btn-outline btn-sm" data-action="loadDataLogs">查看操作日志</button>
+        </div>
+        <div class="verify-result" id="data-logs-result">
+          <div class="loading-overlay hidden" id="data-logs-loading">
+            <span class="loading-spinner"></span> 正在获取...
+          </div>
+        </div>
+      </div>
+
+      <!-- v0.8.0 "归一"：AI 规则文件状态（decision - 朱砂色条） -->
+      <div class="trust-card card-memory-decision" id="rules-status-card">
+        <h3><img src="/assets/icons/icon-trust.svg" alt="" width="16" height="16" style="vertical-align:middle;"> AI 规则文件状态</h3>
+        <p>查看各 AI 工具（Trae、Cursor、CodeBuddy 等）的 LRC 规则写入状态。规则是 AI 主动调用记忆工具的前提。</p>
+        <div class="trust-actions">
+          <button class="btn btn-outline btn-sm" data-action="loadRulesStatus">查看规则状态</button>
+          <button class="btn btn-outline btn-sm" data-action="retryWriteRules">重新写入规则</button>
+        </div>
+        <div class="verify-result" id="rules-status-result">
+          <div class="loading-overlay hidden" id="rules-status-loading">
+            <span class="loading-spinner"></span> 正在获取...
+          </div>
+        </div>
+        <p class="text-sm text-dim mt-2">
+          规则文件版本 <code>v0.8.0</code>。全新安装后首次启动自动写入，无需手动操作。
         </p>
       </div>
     </div>
@@ -1008,13 +1115,13 @@
 
       <!-- 设计文档 5.6：三层测试切换标签（通用检索/独有能力/隐私信任） -->
       <div class="benchmark-tabs" id="benchmark-tabs" role="tablist">
-        <button class="benchmark-tab active" data-layer-idx="0" role="tab" aria-selected="true" onclick="switchBenchmarkLayer(0)">
+        <button class="benchmark-tab active" data-layer-idx="0" role="tab" aria-selected="true" data-action="switchBenchmarkLayer" data-arg="0">
           <img src="/assets/icons/icon-search-lrc.svg" alt="" width="14" height="14"> 通用检索
         </button>
-        <button class="benchmark-tab" data-layer-idx="1" role="tab" aria-selected="false" onclick="switchBenchmarkLayer(1)">
+        <button class="benchmark-tab" data-layer-idx="1" role="tab" aria-selected="false" data-action="switchBenchmarkLayer" data-arg="1">
           <img src="/assets/icons/icon-crystallization.svg" alt="" width="14" height="14"> 独有能力
         </button>
-        <button class="benchmark-tab" data-layer-idx="2" role="tab" aria-selected="false" onclick="switchBenchmarkLayer(2)">
+        <button class="benchmark-tab" data-layer-idx="2" role="tab" aria-selected="false" data-action="switchBenchmarkLayer" data-arg="2">
           <img src="/assets/icons/icon-trust.svg" alt="" width="14" height="14"> 隐私信任
         </button>
       </div>
@@ -1033,7 +1140,7 @@
       <div class="reproducible-box">
         <div class="code-block">
           <code id="reproCmd">git clone https://github.com/zhibaiYingChuan/LRC.git && cd LRC && cargo test --features server benchmark_</code>
-          <button class="copy-btn" onclick="copyReproCmd()">📋 复制</button>
+          <button class="copy-btn" data-action="copyReproCmd">📋 复制</button>
         </div>
         <div class="reproducible-features">
           <div class="feature-item">
@@ -1204,7 +1311,7 @@
         <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px;">
           <div style="background: var(--lrc-宣纸-300); padding: 16px; border-radius: var(--radius-md);">
             <div style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-bottom: 6px;">版本号</div>
-            <div style="font-size: 1.2em; font-weight: 600; color: var(--lrc-墨韵-700);" id="sys-version">v0.6.0</div>
+            <div style="font-size: 1.2em; font-weight: 600; color: var(--lrc-墨韵-700);" id="sys-version">v0.8.7</div>
           </div>
           <div style="background: var(--lrc-宣纸-300); padding: 16px; border-radius: var(--radius-md);">
             <div style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-bottom: 6px;">运行时长</div>
@@ -1316,7 +1423,7 @@
     <div class="section">
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 32px;">
         <!-- 路径 1：完整配置 -->
-        <div class="narrative-card" style="cursor: pointer; border: 2px solid var(--lrc-宣纸-500); transition: all 0.3s ease;" onmouseover="this.style.borderColor='var(--lrc-金色-400)'" onmouseout="this.style.borderColor='var(--lrc-宣纸-500)'" onclick="startFullSetup()">
+        <div class="narrative-card" style="cursor: pointer; border: 2px solid var(--lrc-宣纸-500); transition: all 0.3s ease;" data-action="startFullSetup" data-hover-border="var(--lrc-金色-400)" data-default-border="var(--lrc-宣纸-500)">
           <div style="text-align: center; padding: 24px;">
             <div style="display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, var(--lrc-金色-400), var(--lrc-金色-600)); color: white; font-weight: 700; font-size: 1.2em; margin-bottom: 16px;">
               <img src="/assets/icons/icon-settings.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
@@ -1332,7 +1439,7 @@
         </div>
 
         <!-- 路径 2：快速上手 -->
-        <div class="narrative-card" style="cursor: pointer; border: 2px solid var(--lrc-宣纸-500); transition: all 0.3s ease;" onmouseover="this.style.borderColor='var(--lrc-玉色-400)'" onmouseout="this.style.borderColor='var(--lrc-宣纸-500)'" onclick="startQuickSetup()">
+        <div class="narrative-card" style="cursor: pointer; border: 2px solid var(--lrc-宣纸-500); transition: all 0.3s ease;" data-action="startQuickSetup" data-hover-border="var(--lrc-玉色-400)" data-default-border="var(--lrc-宣纸-500)">
           <div style="text-align: center; padding: 24px;">
             <div style="display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, var(--lrc-玉色-400), var(--lrc-玉色-600)); color: white; font-weight: 700; font-size: 1.2em; margin-bottom: 16px;">
               <img src="/assets/icons/icon-lightning.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
@@ -1404,7 +1511,7 @@
 
             <!-- 选择文件夹按钮 -->
             <div style="margin-bottom: 16px;">
-              <button class="btn btn-outline" onclick="selectProjectFolder()">
+              <button class="btn btn-outline" data-action="selectProjectFolder">
                 <img src="/assets/icons/icon-folder.svg" alt="" width="16" height="16" style="vertical-align: middle; margin-right: 6px; opacity: 0.8;"> 选择文件夹...
               </button>
             </div>
@@ -1417,7 +1524,7 @@
 
           <!-- 下一步按钮 -->
           <div style="text-align: center;">
-            <button class="btn btn-primary" onclick="goToStep(2)" id="step-1-next-btn" disabled style="opacity: 0.5; cursor: not-allowed;">
+            <button class="btn btn-primary" data-action="goToStep" data-arg="2" id="step-1-next-btn" disabled style="opacity: 0.5; cursor: not-allowed;">
               下一步
             </button>
           </div>
@@ -1435,7 +1542,7 @@
           <div style="max-width: 500px; margin: 0 auto 32px auto;">
             <div class="form-group">
               <label for="setup-llm-provider">选择提供商</label>
-              <select id="setup-llm-provider" class="form-select" onchange="updateSetupLlmFields()">
+              <select id="setup-llm-provider" class="form-select" data-input-action="updateSetupLlmFields" data-input-event="change">
                 <option value="none">暂不配置</option>
                 <option value="deepseek">DeepSeek（推荐）</option>
                 <option value="qwen">通义千问</option>
@@ -1446,14 +1553,14 @@
             <div id="setup-llm-api-key-group" style="display: none;">
               <div class="form-group">
                 <label for="setup-llm-api-key">API Key</label>
-                <input type="password" id="setup-llm-api-key" class="form-input" placeholder="sk-...">
+                <input type="password" id="setup-llm-api-key" class="form-input" placeholder="sk-..." maxlength="500">
               </div>
             </div>
           </div>
 
           <div style="text-align: center; display: flex; gap: 12px; justify-content: center;">
-            <button class="btn btn-outline" onclick="goToStep(1)">上一步</button>
-            <button class="btn btn-primary" onclick="finishSetup()">完成配置</button>
+            <button class="btn btn-outline" data-action="goToStep" data-arg="1">上一步</button>
+            <button class="btn btn-primary" data-action="finishSetup">完成配置</button>
           </div>
         </div>
 
@@ -1469,7 +1576,7 @@
             龙忆（LRC）正在索引你的代码，完成后即可使用。<br>
             你可以随时在设置中修改配置。
           </p>
-          <button class="btn btn-primary" onclick="switchToTab('dashboard')">
+          <button class="btn btn-primary" data-action="switchToTab" data-arg="dashboard">
             进入仪表盘
           </button>
         </div>
@@ -1498,6 +1605,121 @@
       <div class="section-header" style="text-align: left;">
         <h2 class="section-title"><img src="/assets/icons/icon-bagua.svg" alt="" width="24" height="24" style="vertical-align:middle; margin-right: 10px;"> 系统设置</h2>
         <p class="section-subtitle">配置龙忆 Loong Recall 的各项参数，提升搜索理解力</p>
+      </div>
+    </div>
+
+    <!-- v0.6.1 P1-3 修复: 项目切换入口（仅在桌面端可用） -->
+    <div class="section" id="project-switch-section">
+      <div class="narrative-card">
+        <div class="settings-section-header">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="settings-icon-badge" style="background: linear-gradient(135deg, var(--lrc-青玉-400), var(--lrc-青玉-600));">
+              <img src="/assets/icons/icon-project.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <div>
+              <h3 class="settings-section-title">项目切换</h3>
+              <p class="settings-section-desc">切换当前索引的项目目录，切换后 sidecar 将重启并重新索引代码</p>
+            </div>
+          </div>
+        </div>
+        <div style="padding: 16px 0;">
+          <button class="btn btn-primary" data-action="switchProject">
+            切换项目目录
+          </button>
+          <span style="margin-left: 12px; color: var(--lrc-墨韵-500); font-size: 0.85em;">
+            ⚠ 仅在桌面端可用
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- v0.6.1 P0-3 修复: 桌面端服务管理（第一批核心命令调用入口） -->
+    <div class="section" id="desktop-service-section">
+      <div class="narrative-card">
+        <div class="settings-section-header">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="settings-icon-badge" style="background: linear-gradient(135deg, var(--lrc-朱砂-400), var(--lrc-朱砂-600));">
+              <img src="/assets/icons/icon-memory.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <div>
+              <h3 class="settings-section-title">桌面端服务管理</h3>
+              <p class="settings-section-desc">启动/停止 sidecar 服务、重置向导、选择项目目录等桌面端专属操作</p>
+            </div>
+          </div>
+        </div>
+        <div style="padding: 16px 0; display: flex; flex-wrap: wrap; gap: 12px;">
+          <button class="btn btn-primary" data-action="stopSidecarService">
+            停止服务
+          </button>
+          <button class="btn btn-outline" data-action="listSidecarProjects">
+            刷新项目列表
+          </button>
+          <button class="btn btn-outline" data-action="pickProjectDirectory">
+            选择项目目录
+          </button>
+          <button class="btn btn-outline" data-action="getWizardState">
+            向导状态
+          </button>
+          <button class="btn btn-outline" style="color: var(--lrc-朱砂-600); border-color: var(--lrc-朱砂-400);" data-action="resetWizardState">
+            重置向导
+          </button>
+          <span style="width: 100%; color: var(--lrc-墨韵-500); font-size: 0.85em; margin-top: 8px;">
+            ⚠ 这些按钮仅在桌面端可用,浏览器环境会提示错误
+          </span>
+        </div>
+      </div>
+    </div>
+
+    <!-- v0.6.1 P0-3 修复: 高级管理（第二批/第三批命令调用入口，默认折叠） -->
+    <div class="section" id="advanced-management-section">
+      <div class="narrative-card">
+        <div class="settings-section-header">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="settings-icon-badge" style="background: linear-gradient(135deg, var(--lrc-水蓝-400), var(--lrc-水蓝-600));">
+              <img src="/assets/icons/icon-bagua.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <div>
+              <h3 class="settings-section-title">高级管理</h3>
+              <p class="settings-section-desc">LLM 配置查询、Agent 检测/配置、多实例管理、IDE 项目扫描等高级操作</p>
+            </div>
+            <button class="btn btn-outline" style="margin-left: auto; padding: 4px 12px; font-size: 0.85em;" data-action="toggleAdvancedManagement">
+              <span id="advanced-toggle-text">展开</span>
+            </button>
+          </div>
+        </div>
+        <div id="advanced-management-body" hidden style="padding: 16px 0;">
+          <!-- 第二批: 用户功能命令 -->
+          <div style="margin-bottom: 16px;">
+            <div style="color: var(--lrc-墨韵-700); font-size: 0.9em; margin-bottom: 8px; font-weight: 600;">用户功能</div>
+            <div style="display: flex; flex-wrap: wrap; gap: 12px;">
+              <button class="btn btn-outline" data-action="getLlmConfig">查询 LLM 配置</button>
+              <button class="btn btn-outline" data-action="testLlmConnection">测试 LLM 连接</button>
+              <button class="btn btn-outline" data-action="detectAgents">检测所有 Agent</button>
+              <button class="btn btn-outline" data-action="detectInstalledAgents">已安装 Agent</button>
+              <button class="btn btn-outline" data-action="setProjectDir">设置项目目录</button>
+              <button class="btn btn-outline" data-action="getProjectDir">查询项目目录</button>
+            </div>
+          </div>
+          <!-- 第三批: 低频管理命令 -->
+          <div>
+            <div style="color: var(--lrc-墨韵-700); font-size: 0.9em; margin-bottom: 8px; font-weight: 600;">低频管理</div>
+            <div style="display: flex; flex-wrap: wrap; gap: 12px;">
+              <button class="btn btn-outline" data-action="startSidecarForProject">为项目启动 sidecar</button>
+              <button class="btn btn-outline" data-action="stopSidecarForProject">停止项目 sidecar</button>
+              <button class="btn btn-outline" data-action="getAgentConfigGuide">Agent 配置指南</button>
+              <button class="btn btn-outline" data-action="discoverAllAgents">发现所有 Agent</button>
+              <button class="btn btn-outline" data-action="configureAgents">自动配置 Agent</button>
+              <button class="btn btn-outline" data-action="saveConfiguredAgents">保存 Agent 配置</button>
+              <button class="btn btn-outline" data-action="scanIdeProjects">扫描 IDE 项目</button>
+              <button class="btn btn-outline" data-action="openSettings">打开桌面端设置</button>
+              <button class="btn btn-outline" data-action="markComplete">标记向导完成</button>
+              <button class="btn btn-outline" style="color: var(--lrc-玉色-600); border-color: var(--lrc-玉色-400);" data-action="verifySetup">验证安装</button>
+            </div>
+          </div>
+          <span style="display: block; width: 100%; color: var(--lrc-墨韵-500); font-size: 0.85em; margin-top: 12px;">
+            ⚠ 这些按钮仅在桌面端可用,浏览器环境会提示错误
+          </span>
+        </div>
       </div>
     </div>
 
@@ -1530,7 +1752,7 @@
                 <div class="ollama-status-text" id="embedder-status-text">检测中...</div>
               </div>
             </div>
-            <button class="btn btn-outline btn-sm" onclick="checkEmbedderStatus()">
+            <button class="btn btn-outline btn-sm" data-action="checkEmbedderStatus">
               检测状态
             </button>
           </div>
@@ -1542,26 +1764,26 @@
             选择模型
           </div>
           <div class="provider-grid">
-            <div class="provider-card active" data-embedder="bge-small-zh" onclick="selectEmbedderModel('BAAI/bge-small-zh')">
+            <div class="provider-card active" data-embedder="bge-small-zh" data-action="selectEmbedderModel" data-arg="BAAI/bge-small-zh">
               <div class="provider-card-header">
                 <span class="provider-name">BGE-small-zh</span>
                 <span class="provider-recommended">中文首选</span>
               </div>
               <p class="provider-card-desc">中文通用，512维，~100MB，精度高速度快</p>
             </div>
-            <div class="provider-card" data-embedder="minilm-l6" onclick="selectEmbedderModel('sentence-transformers/all-MiniLM-L6-v2')">
+            <div class="provider-card" data-embedder="minilm-l6" data-action="selectEmbedderModel" data-arg="sentence-transformers/all-MiniLM-L6-v2">
               <div class="provider-card-header">
                 <span class="provider-name">MiniLM-L6-v2</span>
               </div>
               <p class="provider-card-desc">英文通用，384维，~80MB，轻量快速</p>
             </div>
-            <div class="provider-card" data-embedder="multilingual-e5" onclick="selectEmbedderModel('intfloat/multilingual-e5-small')">
+            <div class="provider-card" data-embedder="multilingual-e5" data-action="selectEmbedderModel" data-arg="intfloat/multilingual-e5-small">
               <div class="provider-card-header">
                 <span class="provider-name">multilingual-e5</span>
               </div>
               <p class="provider-card-desc">多语言，384维，~120MB，支持100+语言</p>
             </div>
-            <div class="provider-card" data-embedder="bge-base-zh" onclick="selectEmbedderModel('BAAI/bge-base-zh')">
+            <div class="provider-card" data-embedder="bge-base-zh" data-action="selectEmbedderModel" data-arg="BAAI/bge-base-zh">
               <div class="provider-card-header">
                 <span class="provider-name">BGE-base-zh</span>
                 <span style="font-size: 0.75em; padding: 2px 8px; background: var(--lrc-宣纸-500); border-radius: 12px; color: var(--lrc-墨韵-500);">高精度</span>
@@ -1590,20 +1812,20 @@
         <div class="settings-form">
           <div class="form-group">
             <label for="embedder-mirror">下载源</label>
-            <select id="embedder-mirror" class="form-select" onchange="changeEmbedderMirror()">
+            <select id="embedder-mirror" class="form-select" data-input-action="changeEmbedderMirror" data-input-event="change">
               <option value="hf-mirror">HF-Mirror（国内推荐，速度快）</option>
               <option value="modelscope">ModelScope（魔搭社区）</option>
             </select>
             <span class="form-hint">均为国内镜像源，下载速度快</span>
           </div>
           <div class="form-actions">
-            <button class="btn btn-primary" onclick="downloadEmbedderModel()">
+            <button class="btn btn-primary" data-action="downloadEmbedderModel">
               <img src="/assets/icons/icon-download.svg" alt="" width="16" height="16" style="vertical-align: middle; margin-right: 6px; filter: brightness(0) invert(1);"> 下载并安装
             </button>
-            <button class="btn btn-outline" onclick="applyEmbedderModel()">
+            <button class="btn btn-outline" data-action="applyEmbedderModel">
               应用已下载的模型
             </button>
-            <button class="btn btn-outline" onclick="testEmbedderConnection()">
+            <button class="btn btn-outline" data-action="testEmbedderConnection">
               测试链接
             </button>
           </div>
@@ -1645,66 +1867,66 @@
 
         <!-- 提供商分类标签 -->
         <div class="provider-tabs">
-          <button class="provider-tab active" data-category="cloud" onclick="switchProviderCategory('cloud')">
+          <button class="provider-tab active" data-category="cloud" data-action="switchProviderCategory" data-arg="cloud">
             <img src="/assets/icons/icon-cloud.svg" alt="" width="16" height="16" style="vertical-align: middle; margin-right: 6px; opacity: 0.8;"> 云端 API
           </button>
-          <button class="provider-tab" data-category="custom" onclick="switchProviderCategory('custom')">
+          <button class="provider-tab" data-category="custom" data-action="switchProviderCategory" data-arg="custom">
             <img src="/assets/icons/icon-settings.svg" alt="" width="16" height="16" style="vertical-align: middle; margin-right: 6px; opacity: 0.8;"> 自定义
           </button>
         </div>
 
         <!-- 提供商卡片网格 -->
         <div class="provider-grid" id="provider-grid-cloud">
-          <div class="provider-card active" data-provider="deepseek" onclick="selectProvider('deepseek')">
+          <div class="provider-card active" data-provider="deepseek" data-action="selectProvider" data-arg="deepseek">
             <div class="provider-card-header">
               <span class="provider-name">DeepSeek</span>
               <span class="provider-recommended">推荐</span>
             </div>
             <p class="provider-card-desc">国产性价比之王，代码能力极强</p>
           </div>
-          <div class="provider-card" data-provider="qwen" onclick="selectProvider('qwen')">
+          <div class="provider-card" data-provider="qwen" data-action="selectProvider" data-arg="qwen">
             <div class="provider-card-header">
               <span class="provider-name">通义千问</span>
             </div>
             <p class="provider-card-desc">阿里云出品，中文理解出色</p>
           </div>
-          <div class="provider-card" data-provider="zhipu" onclick="selectProvider('zhipu')">
+          <div class="provider-card" data-provider="zhipu" data-action="selectProvider" data-arg="zhipu">
             <div class="provider-card-header">
               <span class="provider-name">智谱 GLM</span>
             </div>
             <p class="provider-card-desc">清华系，GLM 系列模型</p>
           </div>
-          <div class="provider-card" data-provider="minimax" onclick="selectProvider('minimax')">
+          <div class="provider-card" data-provider="minimax" data-action="selectProvider" data-arg="minimax">
             <div class="provider-card-header">
               <span class="provider-name">MiniMax 海螺</span>
             </div>
             <p class="provider-card-desc">长文本支持好，性价比高</p>
           </div>
-          <div class="provider-card" data-provider="moonshot" onclick="selectProvider('moonshot')">
+          <div class="provider-card" data-provider="moonshot" data-action="selectProvider" data-arg="moonshot">
             <div class="provider-card-header">
               <span class="provider-name">Kimi 月之暗面</span>
             </div>
             <p class="provider-card-desc">超长上下文，阅读能力强</p>
           </div>
-          <div class="provider-card" data-provider="stepfun" onclick="selectProvider('stepfun')">
+          <div class="provider-card" data-provider="stepfun" data-action="selectProvider" data-arg="stepfun">
             <div class="provider-card-header">
               <span class="provider-name">阶跃星辰</span>
             </div>
             <p class="provider-card-desc">多模态能力强，图像理解出色</p>
           </div>
-          <div class="provider-card" data-provider="baichuan" onclick="selectProvider('baichuan')">
+          <div class="provider-card" data-provider="baichuan" data-action="selectProvider" data-arg="baichuan">
             <div class="provider-card-header">
               <span class="provider-name">百川智能</span>
             </div>
             <p class="provider-card-desc">垂直领域优化，性价比高</p>
           </div>
-          <div class="provider-card" data-provider="xunfei" onclick="selectProvider('xunfei')">
+          <div class="provider-card" data-provider="xunfei" data-action="selectProvider" data-arg="xunfei">
             <div class="provider-card-header">
               <span class="provider-name">讯飞星火</span>
             </div>
             <p class="provider-card-desc">科大讯飞出品，语音能力强</p>
           </div>
-          <div class="provider-card" data-provider="hunyuan" onclick="selectProvider('hunyuan')">
+          <div class="provider-card" data-provider="hunyuan" data-action="selectProvider" data-arg="hunyuan">
             <div class="provider-card-header">
               <span class="provider-name">腾讯混元</span>
             </div>
@@ -1713,7 +1935,7 @@
         </div>
 
         <div class="provider-grid" id="provider-grid-custom" style="display:none;">
-          <div class="provider-card" data-provider="custom" onclick="selectProvider('custom')">
+          <div class="provider-card" data-provider="custom" data-action="selectProvider" data-arg="custom">
             <div class="provider-card-header">
               <span class="provider-name">自定义 API</span>
             </div>
@@ -1722,7 +1944,7 @@
         </div>
 
         <!-- 隐藏的 select 用于兼容原有逻辑 -->
-        <select id="llm-provider" style="display:none;" onchange="switchLlmProvider()">
+        <select id="llm-provider" style="display:none;" data-input-action="switchLlmProvider" data-input-event="change">
           <option value="deepseek">DeepSeek</option>
           <option value="qwen">通义千问</option>
           <option value="zhipu">智谱 GLM</option>
@@ -1740,34 +1962,34 @@
           <div class="form-group">
             <label for="llm-api-key">API Key</label>
             <input type="password" id="llm-api-key" class="form-input"
-              placeholder="sk-..." autocomplete="off">
+              placeholder="sk-..." autocomplete="off" maxlength="500">
             <span class="form-hint">🔒 你的 API Key 仅存储在本地，绝不上传</span>
           </div>
           <div class="form-group">
             <label for="llm-model">模型名称</label>
             <input type="text" id="llm-model" class="form-input"
-              placeholder="deepseek-chat" value="deepseek-chat">
+              placeholder="deepseek-chat" value="deepseek-chat" maxlength="100">
             <span class="form-hint" id="model-hint">常用: deepseek-chat, deepseek-coder</span>
           </div>
           <div class="form-group" id="endpoint-group">
             <label for="llm-endpoint">API 端点</label>
             <input type="text" id="llm-endpoint" class="form-input"
-              placeholder="https://api.deepseek.com/v1" value="https://api.deepseek.com/v1">
+              placeholder="https://api.deepseek.com/v1" value="https://api.deepseek.com/v1" maxlength="500">
             <span class="form-hint">已自动填充默认端点，如使用代理可修改</span>
           </div>
         </div>
 
         <!-- 操作按钮 -->
         <div class="settings-actions">
-          <button id="btn-save-llm" class="btn btn-primary" onclick="saveLlmConfig()">
+          <button id="btn-save-llm" class="btn btn-primary" data-action="saveLlmConfig">
             <img src="/assets/icons/icon-save.svg" alt="" width="16" height="16" style="vertical-align:middle; margin-right: 6px;">
             保存配置
           </button>
-          <button id="btn-test-llm" class="btn btn-outline" onclick="testLlmConfig()">
+          <button id="btn-test-llm" class="btn btn-outline" data-action="testLlmConfig">
             <img src="/assets/icons/icon-search.svg" alt="" width="16" height="16" style="vertical-align:middle; margin-right: 6px; opacity: 0.8;">
             测试连接
           </button>
-          <button id="btn-clear-llm" class="btn btn-ghost" onclick="clearLlmConfig()">
+          <button id="btn-clear-llm" class="btn btn-ghost" data-action="clearLlmConfig">
             <img src="/assets/icons/icon-delete.svg" alt="" width="16" height="16" style="vertical-align:middle; margin-right: 6px;">
             清除配置
           </button>
@@ -1821,7 +2043,7 @@
           </div>
         </div>
         <div class="backup-actions-grid">
-          <button class="backup-action-card" onclick="backupMemories()">
+          <button class="backup-action-card" data-action="backupMemories">
             <div class="backup-icon" style="background: rgba(212, 168, 67, 0.1);">
               <img src="/assets/icons/icon-export.svg" alt="" width="32" height="32">
             </div>
@@ -1829,9 +2051,9 @@
             <div class="backup-desc">将所有记忆数据导出为 JSON 备份文件</div>
           </button>
           <div style="display: none;">
-            <input type="file" id="import-file" style="display:none" accept=".json" onchange="importMemories(event)">
+            <input type="file" id="import-file" style="display:none" accept=".json" data-input-action="importMemories" data-input-event="change" data-pass-event="1">
           </div>
-          <button class="backup-action-card" onclick="document.getElementById('import-file').click()">
+          <button class="backup-action-card" data-action="triggerFileInput" data-target="import-file">
             <div class="backup-icon" style="background: rgba(76, 164, 156, 0.1);">
               <img src="/assets/icons/icon-import.svg" alt="" width="32" height="32" style="filter: brightness(0) saturate(100%) invert(60%) sepia(48%) saturate(400%) hue-rotate(130deg) brightness(90%) contrast(85%);">
             </div>
@@ -1845,6 +2067,31 @@
         </p>
       </div>
     </div>
+
+    <!-- v0.7.0 孤儿路由修复 Step 3-F：关于与更新检查 -->
+    <div class="section" id="about-update-section">
+      <div class="narrative-card">
+        <div class="settings-section-header">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="settings-icon-badge" style="background: linear-gradient(135deg, var(--lrc-墨韵-500), var(--lrc-墨韵-700));">
+              <img src="/assets/icons/icon-bagua.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <div>
+              <h3 class="settings-section-title">关于与更新</h3>
+              <p class="settings-section-desc">检查 LRC 最新版本，获取更新信息（仅在点击时发起请求，不会自动上报）</p>
+            </div>
+          </div>
+        </div>
+        <div style="padding: 16px 0;">
+          <button class="btn btn-primary" id="btn-check-update" data-action="checkVersionUpdate">
+            检查更新
+          </button>
+          <div id="version-check-result" style="margin-top: 16px; display: none;">
+            <!-- 检查结果将通过 JS 动态填充 -->
+          </div>
+        </div>
+      </div>
+    </div>
   </section>
 
 </main>
@@ -1853,7 +2100,7 @@
 <footer class="status-bar">
   <div class="status-bar-left">
     <span><span class="status-dot unknown" id="status-dot"></span><span id="status-text" class="status-clickable" title="点击启动 LRC 服务">检测中...</span></span>
-    <span>版本 <strong id="status-version">v0.6.0</strong></span>
+    <span>版本 <strong id="status-version">v0.8.7</strong></span>
   </div>
   <div class="status-bar-right">
     <span>数据目录：<code id="status-data-dir" class="status-clickable" title="点击打开数据目录">--</code></span>
@@ -1866,15 +2113,31 @@
   <div class="modal-card">
     <div class="modal-header">
       <h3>启动 LRC 服务</h3>
-      <button class="modal-close" onclick="closeStartServiceModal()" aria-label="关闭">×</button>
+      <button class="modal-close" data-action="closeStartServiceModal" aria-label="关闭">×</button>
     </div>
     <div class="modal-body">
       <p>LRC 后台服务未运行，AI 工具将无法使用记忆功能。</p>
       <p class="modal-desc">点击下方按钮启动服务。启动后请稍候片刻，仪表盘会自动刷新。</p>
     </div>
     <div class="modal-footer">
-      <button class="btn btn-secondary" onclick="closeStartServiceModal()">取消</button>
+      <button class="btn btn-secondary" data-action="closeStartServiceModal">取消</button>
       <button class="btn btn-primary" id="modal-btn-start-service">启动服务</button>
+    </div>
+  </div>
+</div>
+
+<!-- v0.8.1：通用确认对话框（替代同步 confirm()，避免阻塞 JS 线程） -->
+<div class="modal-overlay" id="confirm-modal" hidden>
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3 id="confirm-modal-title">确认操作</h3>
+    </div>
+    <div class="modal-body">
+      <p id="confirm-modal-message" class="confirm-message">确定要执行此操作吗？</p>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-secondary" id="confirm-modal-cancel" data-autotest="confirm-cancel">取消</button>
+      <button class="btn btn-danger" id="confirm-modal-ok" data-autotest="confirm-ok">确认</button>
     </div>
   </div>
 </div>
@@ -1893,7 +2156,7 @@
       <img src="/assets/icons/icon-health.svg" alt="" width="14" height="14">
       <span>系统状态</span>
     </div>
-    <button class="sys-status-toggle" onclick="toggleSysStatusFloat()" aria-label="折叠/展开">
+    <button class="sys-status-toggle" data-action="toggleSysStatusFloat" aria-label="折叠/展开">
       <span id="sys-status-toggle-icon">─</span>
     </button>
   </div>
@@ -1942,7 +2205,7 @@
     <img src="/assets/icons/icon-captain-log.svg" alt="">
     <span>日志</span>
   </button>
-  <button class="tab-item" onclick="toggleNav()">
+  <button class="tab-item" data-action="toggleNav">
     <img src="/assets/icons/icon-bagua.svg" alt="">
     <span>更多</span>
   </button>

@@ -1,13 +1,15 @@
 {
   "identifier": "default",
-  "description": "LRC Desktop 默认权限配置（v0.5.4 收紧：添加 scope 白名单）",
+  "description": "LRC Desktop 默认权限配置（v0.7.1 P3-2 收紧：shell:allow-open 从 https://** 收敛为 GitHub 白名单）",
   "windows": ["main"],
   "permissions": [
     "core:default",
     {
       "identifier": "shell:allow-open",
       "allow": [
-        { "url": "https://**" },
+        { "url": "https://github.com/zhibaiYingChuan/LRC/*" },
+        { "url": "https://github.com/zhibaiYingChuan/LRC/releases/*" },
+        { "url": "https://api.github.com/repos/zhibaiYingChuan/LRC/*" },
         { "url": "http://127.0.0.1:**" },
         { "url": "http://localhost:**" }
       ]

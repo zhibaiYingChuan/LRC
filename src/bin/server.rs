@@ -29,9 +29,9 @@ use tokio::sync::Mutex;
 use code_memory::process_guard::{self, SingletonLock};
 // 配置持久化：桌面端agent配置保存与加载
 use code_memory::config::{LrcConfig, DEFAULT_PORT};
-// V2 模块：项目指纹、统一数据目录、数据迁移
+// V2 模块：项目指纹、统一数据目录
+// v0.8.0：migration 模块改为通过 API（POST /v1/migrate）调用，不在启动时自动执行
 use code_memory::data_dir::DataDir;
-use code_memory::migration;
 
 #[tokio::main]
 async fn main() {
@@ -87,6 +87,13 @@ async fn try_run() -> Result<(), String> {
     let mut tray_mode = false; // --tray：启用系统托盘图标
     let mut export_path: Option<String> = None; // V2: --export 导出记忆
     let mut import_path: Option<String> = None; // V2: --import 导入记忆
+
+    // v0.6.0+ 参赛扩展：参照系实验 CLI 参数
+    // 设计原则：默认启用所有功能（避免"无声失败"），由用户通过 flag 显式禁用
+    let mut disable_synthesis = false; // --disable-synthesis：禁用合成引擎（基线 B）
+    let mut disable_dao_regulator = false; // --disable-dao-regulator：禁用道同构度调节器（基线 B）
+    let mut disable_memory = false; // --disable-memory：禁用记忆系统（基线 A）
+    let mut exploration_log_path: Option<String> = None; // --exploration-log <path>：启用探索日志
 
     // 加载已保存的全局配置（仅在非 daemon 模式下加载）
     // daemon 模式下由桌面端统一管理配置，所有配置通过 CLI 参数传递
@@ -300,6 +307,26 @@ async fn try_run() -> Result<(), String> {
                 } else {
                     return Err("错误: --import 需要指定导入文件路径\n\
                          用法: code-memory-server --import ~/backup/lrc-export.json"
+                        .to_string());
+                }
+            }
+            // v0.6.0+ 参赛扩展：参照系实验参数
+            "--disable-synthesis" => {
+                disable_synthesis = true;
+            }
+            "--disable-dao-regulator" => {
+                disable_dao_regulator = true;
+            }
+            "--disable-memory" => {
+                disable_memory = true;
+            }
+            "--exploration-log" => {
+                i += 1;
+                if i < args.len() {
+                    exploration_log_path = Some(args[i].clone());
+                } else {
+                    return Err("错误: --exploration-log 需要指定日志文件路径\n\
+                         用法: code-memory-server --exploration-log ./exploration.jsonl"
                         .to_string());
                 }
             }
@@ -521,7 +548,7 @@ async fn try_run() -> Result<(), String> {
 
     // 确定记忆数据目录 — V2 统一数据目录结构
     // 优先级: --db-path > --data-dir > --global > 项目指纹模式
-    let (data_dir, data_dir_manager) = if let Some(ref custom_path) = db_path {
+    let (data_dir, _data_dir_manager) = if let Some(ref custom_path) = db_path {
         // --db-path: 完全自定义路径（向后兼容）
         (custom_path.clone(), DataDir::for_custom(custom_path))
     } else if let Some(ref custom_root) = data_dir {
@@ -546,27 +573,10 @@ async fn try_run() -> Result<(), String> {
     log(&format!("   记忆数据目录: {data_dir}"));
 
     // ════════════════════════════════════════════════════════════
-    // V2: 自动迁移旧版数据（如果存在）
+    // v0.8.0 "归一"：数据迁移改为 API 触发（POST /v1/migrate）
+    // 旧版启动时自动迁移已移除，避免 sidecar 启动延迟和意外数据修改
+    // 用户可通过桌面端"数据迁移向导"或直接调用 API 触发迁移
     // ════════════════════════════════════════════════════════════
-    let src_path = std::path::Path::new(&src_dir);
-    if migration::needs_migration(src_path) {
-        log("  检测到旧版数据，开始自动迁移...");
-        match migration::migrate_legacy_to_v2(
-            src_path,
-            data_dir_manager.data_path(),
-            false, // 实际执行迁移
-        ) {
-            Ok(result) => {
-                log(&migration::format_migration_report(&result));
-                if !result.is_success() {
-                    log("  ⚠ 部分文件迁移失败，旧数据已保留，可稍后重试");
-                }
-            }
-            Err(e) => {
-                log(&format!("  ⚠ 迁移过程中出现错误: {e}，跳过迁移"));
-            }
-        }
-    }
 
     // ========== 进程守护：单例锁（Drop 时自动清理 ==========
     let _singleton_lock = SingletonLock::acquire(std::path::Path::new(&data_dir), multi_window)
@@ -595,6 +605,60 @@ async fn try_run() -> Result<(), String> {
         )
     })?;
     let memory_store = Arc::new(Mutex::new(MemoryStore::new(persistence)));
+
+    // ╔═══════════════════════════════════════════════════════════════╗
+    // ║ v0.6.0+ 参赛扩展：应用参照系实验 CLI 参数                   ║
+    // ║ 设计原则：默认启用所有功能，由 flag 显式禁用                ║
+    // ╚═══════════════════════════════════════════════════════════════╝
+    {
+        let mut store = memory_store.lock().await;
+
+        // --exploration-log <path>：注入探索日志记录器
+        if let Some(ref log_path) = exploration_log_path {
+            let logger = code_memory::engine::exploration_log::ExplorationLogger::new(
+                std::path::PathBuf::from(log_path),
+                format!("exp_{}", std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()),
+            );
+            // 先记录实验配置事件
+            logger.log_experiment_config(serde_json::json!({
+                "disable_synthesis": disable_synthesis,
+                "disable_dao_regulator": disable_dao_regulator,
+                "disable_memory": disable_memory,
+                "src_dir": src_dir,
+                "data_dir": data_dir,
+                "port": port,
+                "stdio_mode": stdio_mode,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+            }));
+            // 记录 sidecar 启动事件
+            logger.log_sidecar_started(0, &args.join(" "));
+            store.set_exploration_logger(logger);
+            log(&format!("   探索日志: 已启用 → {log_path}"));
+        }
+
+        // --disable-synthesis：禁用合成引擎（基线 B）
+        // 通过设置 synthesis_min_cluster 为 usize::MAX，使合成永远不会触发
+        if disable_synthesis {
+            store.synthesis_min_cluster = usize::MAX;
+            log("   ⚠ 合成引擎: 已禁用（基线 B：no_evolution）");
+        }
+
+        // --disable-dao-regulator：禁用道同构度调节器（基线 B）
+        if disable_dao_regulator {
+            store.dao_regulator.auto_regulate = false;
+            log("   ⚠ 道同构度调节器: 已禁用（基线 B：no_evolution）");
+        }
+
+        // --disable-memory：禁用记忆系统（基线 A）
+        // 通过环境变量标记，remember 请求将返回成功但不实际存储
+        if disable_memory {
+            std::env::set_var("LRC_DISABLE_MEMORY", "1");
+            log("   ⚠ 记忆系统: 已禁用（基线 A：zero_memory）");
+        }
+    }
 
     // ╔═══════════════════════════════════════════════════════════════╗
     // ║  第2位 — Tier 2: 配置 LLM API Key（优先引导）               ║

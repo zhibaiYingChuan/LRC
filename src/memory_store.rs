@@ -252,6 +252,9 @@ pub struct MemoryStore<P: Persistence> {
     /// LLM 配置后替代本地 ML 模型提供语义理解能力，编码器不再视为"降级"
     /// 通过 set_llm_configured() 在 sidecar 启动后设置
     llm_configured: std::sync::atomic::AtomicBool,
+    /// v0.6.0+ 参赛扩展：探索日志记录器（默认禁用，由 sidecar 启动时注入）
+    /// 用于记录科学探索过程的结构化日志（JSON Lines 格式）
+    exploration_logger: crate::engine::exploration_log::ExplorationLogger,
 }
 
 // ============================================================
@@ -755,6 +758,8 @@ impl<P: Persistence> MemoryStore<P> {
             cache_dirty: std::cell::Cell::new(true), // 初始为脏，首次读取时加载
             // v0.5.5 P1-1：LLM 默认未配置，由 sidecar 启动后通过 set_llm_configured() 设置
             llm_configured: std::sync::atomic::AtomicBool::new(false),
+            // v0.6.0+ 参赛扩展：探索日志默认禁用
+            exploration_logger: crate::engine::exploration_log::ExplorationLogger::disabled(),
         }
     }
 
@@ -794,7 +799,16 @@ impl<P: Persistence> MemoryStore<P> {
             cache_dirty: std::cell::Cell::new(true), // 初始为脏，首次读取时加载
             // v0.5.5 P1-1：LLM 默认未配置
             llm_configured: std::sync::atomic::AtomicBool::new(false),
+            // v0.6.0+ 参赛扩展：探索日志默认禁用
+            exploration_logger: crate::engine::exploration_log::ExplorationLogger::disabled(),
         }
+    }
+
+    /// v0.6.0+ 参赛扩展：设置探索日志记录器
+    /// 由 sidecar 启动时根据 `--exploration-log <path>` 参数注入
+    /// 未调用此方法时，所有日志调用为空操作（disabled 模式）
+    pub fn set_exploration_logger(&mut self, logger: crate::engine::exploration_log::ExplorationLogger) {
+        self.exploration_logger = logger;
     }
 
     /// v0.5.5 P1-1：设置 LLM 配置状态
@@ -921,11 +935,32 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 返回本次新生成的合成记忆数量。
     pub fn try_synthesize(&mut self) -> Result<usize, PersistenceError> {
-        self.synthesis_engine.try_synthesize(
+        // v0.6.0+ 参赛扩展：探索日志埋点（synthesize 事件）
+        let synthesize_start = std::time::Instant::now();
+
+        let result = self.synthesis_engine.try_synthesize(
             &self.persistence,
             &mut self.graph_store,
             &mut self.dao_metrics,
-        )
+        );
+
+        // v0.6.0+ 参赛扩展：探索日志记录（synthesize 事件）
+        if let Ok(synthesized_count) = &result {
+            self.exploration_logger.log(
+                crate::engine::exploration_log::ExplorationEventType::Synthesize,
+                serde_json::json!({
+                    "engine": "jaccard",
+                    "synthesized_count": synthesized_count,
+                }),
+                Some(crate::engine::exploration_log::Metrics {
+                    latency_ms: Some(synthesize_start.elapsed().as_millis() as u64),
+                    result_count: Some(*synthesized_count),
+                    ..Default::default()
+                }),
+            );
+        }
+
+        result
     }
 
     /// 洛书驱动递归合成（M.T.R. RecursiveCompose 增强版）
@@ -937,6 +972,9 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 返回新生成的合成记忆数量。
     pub fn luoshu_synthesize(&mut self) -> Result<usize, PersistenceError> {
+        // v0.6.0+ 参赛扩展：探索日志埋点（synthesize 事件 - 洛书模式）
+        let synthesize_start = std::time::Instant::now();
+
         // 同步引擎配置与存储层设置（确保 consolidation 等外部调用者设置的阈值生效）
         self.synthesis_engine = SynthesisEngine::new(SynthesisConfig {
             min_cluster: self.synthesis_min_cluster,
@@ -953,6 +991,19 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 洛书合成成功，直接返回
         if luoshu_result > 0 {
+            // v0.6.0+ 参赛扩展：探索日志记录（synthesize 事件 - 洛书模式）
+            self.exploration_logger.log(
+                crate::engine::exploration_log::ExplorationEventType::Synthesize,
+                serde_json::json!({
+                    "engine": "luoshu",
+                    "synthesized_count": luoshu_result,
+                }),
+                Some(crate::engine::exploration_log::Metrics {
+                    latency_ms: Some(synthesize_start.elapsed().as_millis() as u64),
+                    result_count: Some(luoshu_result),
+                    ..Default::default()
+                }),
+            );
             return Ok(luoshu_result);
         }
 
@@ -970,6 +1021,21 @@ impl<P: Persistence> MemoryStore<P> {
                 jaccard_result
             );
         }
+
+        // v0.6.0+ 参赛扩展：探索日志记录（synthesize 事件 - Jaccard 降级模式）
+        self.exploration_logger.log(
+            crate::engine::exploration_log::ExplorationEventType::Synthesize,
+            serde_json::json!({
+                "engine": "jaccard_fallback",
+                "luoshu_result": luoshu_result,
+                "jaccard_result": jaccard_result,
+            }),
+            Some(crate::engine::exploration_log::Metrics {
+                latency_ms: Some(synthesize_start.elapsed().as_millis() as u64),
+                result_count: Some(jaccard_result),
+                ..Default::default()
+            }),
+        );
 
         Ok(jaccard_result)
     }
@@ -1034,6 +1100,9 @@ impl<P: Persistence> MemoryStore<P> {
                 .snapshot(total, crystallized, archived, avg_deviation, &bagua_counts);
         let journal_snapshot = self.synthesis_journal.snapshot();
 
+        // v0.6.0+ 参赛扩展：探索日志埋点（regulate 事件）
+        let regulate_start = std::time::Instant::now();
+
         let action = self.dao_regulator.regulate(
             snapshot.dao_isomorphism_score,
             snapshot.bagua_entropy,
@@ -1042,6 +1111,29 @@ impl<P: Persistence> MemoryStore<P> {
             journal_snapshot.synthesis_rate_per_minute,
             self.decay_config.decay_rate,
             self.synthesis_min_cluster,
+        );
+
+        // v0.6.0+ 参赛扩展：探索日志记录（regulate 事件）
+        let action_str = match &action {
+            RegulationAction::NoAction => "no_action",
+            RegulationAction::AdjustDecayRate { .. } => "adjust_decay_rate",
+            RegulationAction::AdjustSynthesisThreshold { .. } => "adjust_synthesis_threshold",
+            RegulationAction::SuggestReencoding { .. } => "suggest_reencoding",
+            RegulationAction::AdjustRetrievalWeights { .. } => "adjust_retrieval_weights",
+            RegulationAction::AdjustInformationGainThreshold { .. } => {
+                "adjust_information_gain_threshold"
+            }
+            RegulationAction::SuggestComprehensiveRebalance { .. } => {
+                "suggest_comprehensive_rebalance"
+            }
+        };
+        self.exploration_logger.log_regulate(
+            snapshot.dao_isomorphism_score,
+            snapshot.bagua_entropy,
+            snapshot.synthesis_ratio,
+            avg_deviation,
+            action_str,
+            regulate_start.elapsed().as_millis() as u64,
         );
 
         // 执行调节动作
@@ -1467,6 +1559,28 @@ impl<P: Persistence> MemoryStore<P> {
     /// 2. MirrorProject 分类：自动判定记忆的先天八卦类别
     /// 3. 递归合成：若记忆库中相似记忆数 ≥ 3 条，则自动生成合成记忆
     pub fn remember(&mut self, memory: Memory) -> Result<Memory, PersistenceError> {
+        // v0.6.0+ 参赛扩展：探索日志埋点（remember 事件）
+        let remember_start = std::time::Instant::now();
+        let mem_type_str = memory.memory_type.as_str().to_string();
+        let mem_importance = memory.importance.value();
+        let mem_tags = memory.tags.clone();
+
+        // v0.6.0+ 参赛扩展：基线 A（zero_memory）支持
+        // 当 --disable-memory 启用时，remember 直接返回原始记忆但不持久化
+        // 用于对照实验：验证"记忆系统"本身的价值
+        if std::env::var("LRC_DISABLE_MEMORY").is_ok() {
+            let mut no_op_memory = memory.clone();
+            no_op_memory.id = format!("zero_memory_{}", chrono::Utc::now().timestamp_millis());
+            // 记录探索日志但不实际存储
+            self.exploration_logger.log_remember(
+                &mem_type_str,
+                mem_importance,
+                &mem_tags,
+                remember_start.elapsed().as_millis() as u64,
+            );
+            return Ok(no_op_memory);
+        }
+
         // 检查是否有相似记忆
         let mut result = if let Some(existing) = self.find_similar(&memory.content)? {
             // 合并标签（去重）
@@ -1544,6 +1658,14 @@ impl<P: Persistence> MemoryStore<P> {
 
         // v0.5.4 写操作后标记缓存为脏
         self.invalidate_cache();
+
+        // v0.6.0+ 参赛扩展：探索日志记录（remember 事件）
+        self.exploration_logger.log_remember(
+            &mem_type_str,
+            mem_importance,
+            &mem_tags,
+            remember_start.elapsed().as_millis() as u64,
+        );
 
         Ok(result)
     }
@@ -1779,6 +1901,10 @@ impl<P: Persistence> MemoryStore<P> {
         query: &str,
         filter: &RecallFilter,
     ) -> Result<RecallResult, PersistenceError> {
+        // v0.6.0+ 参赛扩展：探索日志埋点（recall 事件）
+        let recall_start = std::time::Instant::now();
+        let recall_top_k = filter.top_k;
+
         let mut all_memories = self.load_cached()?;
         let total_count = all_memories.iter().filter(|m| !m.is_expired()).count();
 
@@ -2023,6 +2149,15 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 记录指标：检索 + 1
         self.dao_metrics.record_recall();
+
+        // v0.6.0+ 参赛扩展：探索日志记录（recall 事件）
+        let recall_result_count = memories.len();
+        self.exploration_logger.log_recall(
+            query,
+            recall_top_k,
+            recall_result_count,
+            recall_start.elapsed().as_millis() as u64,
+        );
 
         Ok(RecallResult {
             memories,

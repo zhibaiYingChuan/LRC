@@ -19,6 +19,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
+    serve::ListenerExt,
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,44 @@ struct JsonRpcResponse {
 struct JsonRpcError {
     code: i32,
     message: String,
+}
+
+// ==================== 统一 API 错误类型（v0.7.1 P2-3） ====================
+
+/// HTTP API 统一错误类型
+///
+/// 提供 HTTP API 的错误响应标准格式，确保所有错误响应具有一致的结构。
+/// 后续新增 handler 应优先使用此类型返回 `Result<T, ApiError>`，
+/// 现有 handler 可逐步迁移至此类型。
+#[derive(Debug)]
+pub enum ApiError {
+    /// 请求参数错误（400）
+    BadRequest(String),
+    /// 资源未找到（404）
+    NotFound(String),
+    /// 内部服务器错误（500）
+    Internal(String),
+    /// 服务不可用（503）
+    ServiceUnavailable(String),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, message) = match self {
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+        };
+        (
+            status,
+            Json(serde_json::json!({
+                "success": false,
+                "error": message,
+            })),
+        )
+            .into_response()
+    }
 }
 
 // ==================== MCP 协议类型 ====================
@@ -122,6 +161,8 @@ pub trait IndexedCodebase: Send {
     fn search(&self, query: &str, top_k: usize) -> RetrievalResult;
     fn multi_keyword_search(&self, keywords: &[String], top_k: usize) -> RetrievalResult;
     fn get_stats(&self) -> ChunkStats;
+    /// v0.6.1 P0-2 修复: 获取最近索引的 N 条代码片段(用于空查询回退)
+    fn recent_chunks(&self, top_k: usize) -> RetrievalResult;
 }
 
 // 为泛型 CodeMemoryManager<E> 自动实现 IndexedCodebase
@@ -134,6 +175,9 @@ impl<E: crate::engine::encoder::CodeEncoder> IndexedCodebase for CodeMemoryManag
     }
     fn get_stats(&self) -> ChunkStats {
         CodeMemoryManager::get_stats(self)
+    }
+    fn recent_chunks(&self, top_k: usize) -> RetrievalResult {
+        CodeMemoryManager::recent_chunks(self, top_k)
     }
 }
 
@@ -1769,6 +1813,32 @@ async fn icon_asset_handler(
     const ICON_PRIVACY: &str = include_str!("../static/assets/icons/icon-privacy.svg");
     const ICON_NETWORK: &str = include_str!("../static/assets/icons/icon-network.svg");
     const ICON_INTEGRITY: &str = include_str!("../static/assets/icons/icon-integrity.svg");
+    // v0.8.7 Step 1：补全 21 个缺失的 icon-*.svg 嵌入（HCSE-P1 修复）
+    const ICON_PROJECT: &str = include_str!("../static/assets/icons/icon-project.svg");
+    const ICON_SAVE: &str = include_str!("../static/assets/icons/icon-save.svg");
+    const ICON_EXPORT: &str = include_str!("../static/assets/icons/icon-export.svg");
+    const ICON_IMPORT: &str = include_str!("../static/assets/icons/icon-import.svg");
+    const ICON_LIGHTNING: &str = include_str!("../static/assets/icons/icon-lightning.svg");
+    const ICON_CONFIG: &str = include_str!("../static/assets/icons/icon-config.svg");
+    const ICON_INFO: &str = include_str!("../static/assets/icons/icon-info.svg");
+    const ICON_SMILE: &str = include_str!("../static/assets/icons/icon-smile.svg");
+    const ICON_CHART: &str = include_str!("../static/assets/icons/icon-chart.svg");
+    const ICON_CHECK: &str = include_str!("../static/assets/icons/icon-check.svg");
+    const ICON_CLOUD: &str = include_str!("../static/assets/icons/icon-cloud.svg");
+    const ICON_DELETE: &str = include_str!("../static/assets/icons/icon-delete.svg");
+    const ICON_DOWNLOAD: &str = include_str!("../static/assets/icons/icon-download.svg");
+    const ICON_EMBED: &str = include_str!("../static/assets/icons/icon-embed.svg");
+    const ICON_FOLDER: &str = include_str!("../static/assets/icons/icon-folder.svg");
+    const ICON_LLM: &str = include_str!("../static/assets/icons/icon-llm.svg");
+    const ICON_SEARCH_GENERIC: &str = include_str!("../static/assets/icons/icon-search.svg");
+    const ICON_SETTINGS: &str = include_str!("../static/assets/icons/icon-settings.svg");
+    const ICON_USER: &str = include_str!("../static/assets/icons/icon-user.svg");
+    const ICON_USERS: &str = include_str!("../static/assets/icons/icon-users.svg");
+    const ICON_WARNING: &str = include_str!("../static/assets/icons/icon-warning.svg");
+    // v0.8.7 Step 2：补全 3 个 power-*.svg 嵌入（HCSE-P1 修复）
+    const POWER_BALANCE: &str = include_str!("../static/assets/icons/power-balance.svg");
+    const POWER_GROWTH: &str = include_str!("../static/assets/icons/power-growth.svg");
+    const POWER_SHIELD: &str = include_str!("../static/assets/icons/power-shield.svg");
 
     let content = match filename.as_str() {
         "icon-dashboard.svg" => Some(ICON_DASHBOARD),
@@ -1786,6 +1856,32 @@ async fn icon_asset_handler(
         "icon-privacy.svg" => Some(ICON_PRIVACY),
         "icon-network.svg" => Some(ICON_NETWORK),
         "icon-integrity.svg" => Some(ICON_INTEGRITY),
+        // v0.8.7 Step 1：补全 21 个缺失的 icon-*.svg 路由匹配
+        "icon-project.svg" => Some(ICON_PROJECT),
+        "icon-save.svg" => Some(ICON_SAVE),
+        "icon-export.svg" => Some(ICON_EXPORT),
+        "icon-import.svg" => Some(ICON_IMPORT),
+        "icon-lightning.svg" => Some(ICON_LIGHTNING),
+        "icon-config.svg" => Some(ICON_CONFIG),
+        "icon-info.svg" => Some(ICON_INFO),
+        "icon-smile.svg" => Some(ICON_SMILE),
+        "icon-chart.svg" => Some(ICON_CHART),
+        "icon-check.svg" => Some(ICON_CHECK),
+        "icon-cloud.svg" => Some(ICON_CLOUD),
+        "icon-delete.svg" => Some(ICON_DELETE),
+        "icon-download.svg" => Some(ICON_DOWNLOAD),
+        "icon-embed.svg" => Some(ICON_EMBED),
+        "icon-folder.svg" => Some(ICON_FOLDER),
+        "icon-llm.svg" => Some(ICON_LLM),
+        "icon-search.svg" => Some(ICON_SEARCH_GENERIC),
+        "icon-settings.svg" => Some(ICON_SETTINGS),
+        "icon-user.svg" => Some(ICON_USER),
+        "icon-users.svg" => Some(ICON_USERS),
+        "icon-warning.svg" => Some(ICON_WARNING),
+        // v0.8.7 Step 2：补全 3 个 power-*.svg 路由匹配
+        "power-balance.svg" => Some(POWER_BALANCE),
+        "power-growth.svg" => Some(POWER_GROWTH),
+        "power-shield.svg" => Some(POWER_SHIELD),
         _ => None,
     };
     match content {
@@ -1851,21 +1947,11 @@ async fn project_info_handler(State(state): State<Arc<AppState>>) -> impl IntoRe
     })
 }
 
-/// 配置响应结构体
-#[derive(Debug, Serialize)]
-struct ConfigResponse {
-    llm_configured: bool,
-    llm_type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    llm_model: Option<String>,
-    /// v0.5.5 P1-3：LLM API 端点（用于仪表盘显示具体提供商）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    llm_base_url: Option<String>,
-}
-
-/// GET /api/config — 获取当前 LLM 配置状态
-async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let llm = state.llm_api.read().await;
+/// v0.8.1 抽取：获取 LLM 配置状态（供 /api/config 和 /v1/config 共用）
+///
+/// 返回 JSON 包含：llm_configured, llm_type, llm_model, llm_base_url
+pub async fn get_llm_config_state(llm_api: &Arc<RwLock<LlmApiConfig>>) -> serde_json::Value {
+    let llm = llm_api.read().await;
     let (configured, llm_type, llm_model, llm_base_url) = match &*llm {
         LlmApiConfig::OpenAI {
             model, endpoint, ..
@@ -1883,22 +1969,28 @@ async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         ),
         LlmApiConfig::None => (false, "none".to_string(), None, None),
     };
-    Json(ConfigResponse {
-        llm_configured: configured,
-        llm_type,
-        llm_model,
-        llm_base_url,
+    serde_json::json!({
+        "llm_configured": configured,
+        "llm_type": llm_type,
+        "llm_model": llm_model,
+        "llm_base_url": llm_base_url,
     })
 }
 
-/// POST /api/config/llm — 更新 LLM API Key 配置
+/// GET /api/config — 获取当前 LLM 配置状态
+async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(get_llm_config_state(&state.llm_api).await)
+}
+
+/// v0.8.1 抽取：更新 LLM API Key 配置（供 /api/config/llm 和 /v1/config/llm 共用）
 ///
 /// 请求体: `{ "llm_api": "openai:sk-xxx:gpt-4o-mini" }`
 /// 保存到全局配置文件，并立即生效用于后续查询翻译。
-async fn config_llm_handler(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
+pub async fn update_llm_config(
+    memory_store: &Arc<Mutex<MemoryStore<JsonPersistence>>>,
+    llm_api: &Arc<RwLock<LlmApiConfig>>,
+    body: serde_json::Value,
+) -> (StatusCode, Json<serde_json::Value>) {
     let llm_str = match body.get("llm_api").and_then(|v| v.as_str()) {
         Some(s) => s.trim().to_string(),
         None => {
@@ -1914,19 +2006,27 @@ async fn config_llm_handler(
 
     // 空字符串表示清除配置
     if llm_str.is_empty() {
-        let mut llm = state.llm_api.write().await;
-        *llm = LlmApiConfig::None;
-        // 保存到全局配置文件
-        if let Err(e) = save_llm_to_config(None) {
-            eprintln!("[配置] 清除 LLM API 配置失败: {e}");
+        // v0.7.1 P2-1 修复：先更新内存状态（持锁时间最短），再用 spawn_blocking 执行文件 I/O
+        {
+            let mut llm = llm_api.write().await;
+            *llm = LlmApiConfig::None;
         }
-        // v0.5.5：同步清除 wizard.json 中的 LLM 配置
-        if let Err(e) = save_llm_to_wizard_json("") {
-            eprintln!("[配置] 同步清除 wizard.json LLM 配置失败: {e}");
+        // v0.7.1 P2-1 修复：用 spawn_blocking 包裹同步文件 I/O，避免阻塞 Tokio worker 线程
+        let save_result = tokio::task::spawn_blocking(|| {
+            if let Err(e) = save_llm_to_config(None) {
+                return Err(e);
+            }
+            save_llm_to_wizard_json("")
+        })
+        .await;
+        match save_result {
+            Ok(Err(e)) => eprintln!("[配置] 清除 LLM API 配置失败: {e}"),
+            Err(e) => eprintln!("[配置] 异步保存任务失败: {e}"),
+            Ok(Ok(_)) => {}
         }
         // v0.5.5：更新 MemoryStore 的 LLM 配置状态
         {
-            let store = state.memory_store.lock().await;
+            let store = memory_store.lock().await;
             store.set_llm_configured(false);
         }
         return (
@@ -1958,19 +2058,28 @@ async fn config_llm_handler(
                     );
                 }
             };
-            let mut llm = state.llm_api.write().await;
-            *llm = config;
-            // 保存到全局配置文件
-            if let Err(e) = save_llm_to_config(Some(&llm_str)) {
-                eprintln!("[配置] 保存 LLM API 配置失败: {e}");
+            // v0.7.1 P2-1 修复：先更新内存状态（持锁时间最短），再用 spawn_blocking 执行文件 I/O
+            {
+                let mut llm = llm_api.write().await;
+                *llm = config;
             }
-            // v0.5.5：同步保存到 wizard.json，确保桌面端和仪表盘配置一致
-            if let Err(e) = save_llm_to_wizard_json(&llm_str) {
-                eprintln!("[配置] 同步保存 wizard.json LLM 配置失败: {e}");
+            // v0.7.1 P2-1 修复：用 spawn_blocking 包裹同步文件 I/O，避免阻塞 Tokio worker 线程
+            let llm_str_for_save = llm_str.clone();
+            let save_result = tokio::task::spawn_blocking(move || {
+                if let Err(e) = save_llm_to_config(Some(&llm_str_for_save)) {
+                    return Err(e);
+                }
+                save_llm_to_wizard_json(&llm_str_for_save)
+            })
+            .await;
+            match save_result {
+                Ok(Err(e)) => eprintln!("[配置] 保存 LLM API 配置失败: {e}"),
+                Err(e) => eprintln!("[配置] 异步保存任务失败: {e}"),
+                Ok(Ok(_)) => {}
             }
             // v0.5.5：更新 MemoryStore 的 LLM 配置状态
             {
-                let store = state.memory_store.lock().await;
+                let store = memory_store.lock().await;
                 store.set_llm_configured(true);
             }
             (
@@ -1992,6 +2101,17 @@ async fn config_llm_handler(
             })),
         ),
     }
+}
+
+/// POST /api/config/llm — 更新 LLM API Key 配置
+///
+/// 请求体: `{ "llm_api": "openai:sk-xxx:gpt-4o-mini" }`
+/// 保存到全局配置文件，并立即生效用于后续查询翻译。
+async fn config_llm_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    update_llm_config(&state.memory_store, &state.llm_api, body).await
 }
 
 /// 保存 LLM API 配置到全局配置文件
@@ -2382,17 +2502,6 @@ async fn embedder_apply_handler(
     let lrc_dir = home_dir.join(".lrc");
     let config_path = lrc_dir.join("config.toml");
 
-    // 创建配置目录（如不存在）
-    if let Err(e) = std::fs::create_dir_all(&lrc_dir) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "message": format!("创建配置目录失败: {}", e)
-            })),
-        );
-    }
-
     // 写入 TOML 格式配置（简单键值）
     // v0.6.0 P1-G 修复：对 model_id 进行 TOML 字符串转义
     // 虽然 model_id 已通过白名单校验，但防御性地转义特殊字符避免配置文件注入
@@ -2405,14 +2514,40 @@ async fn embedder_apply_handler(
         "# LRC 嵌入模型配置（由仪表盘生成）\nmodel_id = \"{}\"\n",
         toml_escaped_model_id
     );
-    if let Err(e) = std::fs::write(&config_path, toml_content) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "success": false,
-                "message": format!("写入配置文件失败: {}", e)
-            })),
-        );
+
+    // v0.7.1 P2-1 修复：用 spawn_blocking 包裹同步文件 I/O，避免阻塞 Tokio worker 线程
+    let write_result = tokio::task::spawn_blocking(move || {
+        // 创建配置目录（如不存在）
+        if let Err(e) = std::fs::create_dir_all(&lrc_dir) {
+            return Err(format!("创建配置目录失败: {}", e));
+        }
+        if let Err(e) = std::fs::write(&config_path, toml_content) {
+            return Err(format!("写入配置文件失败: {}", e));
+        }
+        Ok(())
+    })
+    .await;
+
+    match write_result {
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": e
+                })),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": format!("异步写入任务失败: {}", e)
+                })),
+            );
+        }
+        Ok(Ok(_)) => {}
     }
 
     let resp = EmbedderApplyResponse {
@@ -2496,24 +2631,24 @@ async fn embedder_test_handler(
 async fn tools_detect_handler(
     State(_state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut tools: Vec<ToolDetectItem> = Vec::new();
-
-    // 命令行可调用类工具
-    tools.push(detect_command_tool("VS Code", "code", &["--version"]));
-    tools.push(detect_command_tool("Cursor", "cursor", &["--version"]));
-    tools.push(detect_command_tool("Trae", "trae", &["--version"]));
-    tools.push(detect_command_tool("Windsurf", "windsurf", &["--version"]));
-    tools.push(detect_command_tool("Claude Code", "claude", &["--version"]));
-
-    // Cline（VS Code 扩展）
+    // Cline（VS Code 扩展）— 需在 vec! 初始化前调用
     let cline_installed = detect_vscode_extension("saoudrizwan.claude-dev");
-    tools.push(ToolDetectItem {
-        name: "Cline".to_string(),
-        tool_type: "extension".to_string(),
-        installed: cline_installed,
-        version: None,
-        path: None,
-    });
+
+    // 命令行可调用类工具 + Cline 扩展
+    let tools: Vec<ToolDetectItem> = vec![
+        detect_command_tool("VS Code", "code", &["--version"]),
+        detect_command_tool("Cursor", "cursor", &["--version"]),
+        detect_command_tool("Trae", "trae", &["--version"]),
+        detect_command_tool("Windsurf", "windsurf", &["--version"]),
+        detect_command_tool("Claude Code", "claude", &["--version"]),
+        ToolDetectItem {
+            name: "Cline".to_string(),
+            tool_type: "extension".to_string(),
+            installed: cline_installed,
+            version: None,
+            path: None,
+        },
+    ];
 
     let resp = ToolsDetectResponse { tools };
     (
@@ -2735,7 +2870,7 @@ pub async fn run_stdio(state: Arc<AppState>) {
 pub fn build_mcp_router(state: Arc<AppState>) -> Router {
     // 创建 v1 API 路由（通过闭包捕获共享状态，状态类型为 ()）
     let v1_service =
-        crate::v1_api::build_v1_router(state.memory_store.clone(), state.manager.clone())
+        crate::v1_api::build_v1_router(state.memory_store.clone(), state.manager.clone(), state.llm_api.clone())
             .into_service();
 
     Router::new()
@@ -2747,8 +2882,8 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         .route("/colors_and_type.css", get(colors_and_type_css_handler))
         .route("/components.css", get(components_css_handler))
         // v0.6.0 龙忆设计系统：Logo 与图标 SVG 资源
-        .route("/assets/logo/:filename", get(logo_asset_handler))
-        .route("/assets/icons/:filename", get(icon_asset_handler))
+        .route("/assets/logo/{filename}", get(logo_asset_handler))
+        .route("/assets/icons/{filename}", get(icon_asset_handler))
         .nest_service("/v1", v1_service) // 将 v1 API 嵌套在 /v1 路径下
         // 仪表盘路由：静态文件 + 重定向
         .route("/dashboard", get(dashboard_handler))
@@ -2756,8 +2891,9 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         // 根路径重定向到仪表盘（方便桌面端直接加载）
         .route("/", get(root_redirect_handler))
         // 配置 API：仪表盘设置页面用
-        .route("/api/config", get(config_handler))
-        .route("/api/config/llm", post(config_llm_handler))
+        // v0.8.1：以下路由保留向后兼容，新代码应使用 /v1/config 和 /v1/config/llm
+        .route("/api/config", get(config_handler)) // deprecated, use /v1/config
+        .route("/api/config/llm", post(config_llm_handler)) // deprecated, use /v1/config/llm
         // V2: 项目信息 API
         .route("/api/project/info", get(project_info_handler))
         // v0.6.0+：嵌入模型管理 API（仪表盘模型设置页用）
@@ -2775,12 +2911,14 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
                     // 允许的来源：localhost 任意端口、127.0.0.1、tauri 协议
                     // v0.6.0 P0 修复：Tauri 2.x Windows 使用 https://tauri.localhost 作为 WebView 源
                     // v0.6.0 P1-2 修复：Tauri 2.x 默认 Windows/Android 使用 http://tauri.localhost
-                    if let Some(s) = origin.to_str().ok() {
+                    if let Ok(s) = origin.to_str() {
+                        // v0.7.1 P2-2 修复：移除 http://0.0.0.0: 白名单
+                        // 0.0.0.0 不是真实客户端地址，允许其作为 Origin 存在安全风险
+                        // 仅允许 localhost、127.0.0.1 和 tauri 协议
                         s.starts_with("http://localhost:")
                             || s.starts_with("http://127.0.0.1:")
                             || s.starts_with("https://localhost:")
                             || s.starts_with("tauri://")
-                            || s.starts_with("http://0.0.0.0:")
                             || s == "https://tauri.localhost"
                             || s.starts_with("https://tauri.localhost")
                             || s == "http://tauri.localhost"
@@ -2829,6 +2967,24 @@ pub async fn serve_on_listener(
     println!("   船长日志: GET  http://{}/v1/captains-log", addr);
     println!("   MCP 协议: POST http://{}/mcp", addr);
     println!("   状态检查: GET  http://{}/health", addr);
+
+    // v0.8.1：连接池与超时优化（修复 Bug #7：sidecar API 间歇性超时）
+    //
+    // axum 0.8 的 Serve 移除了 tcp_nodelay/tcp_keepalive/http2_keep_alive 方法（axum 0.7 API），
+    // 改用 ListenerExt::tap_io 对每个接入连接设置 TCP 选项：
+    // 1. TCP_NODELAY：禁用 Nagle 算法，降低小请求延迟
+    // 2. SO_KEEPALIVE：60 秒无数据后发送保活探测，自动回收泄漏连接
+    let listener = listener.tap_io(|stream| {
+        if let Err(e) = stream.set_nodelay(true) {
+            eprintln!("[sidecar] 设置 TCP_NODELAY 失败: {e}");
+        }
+        let socket = socket2::SockRef::from(&*stream);
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(60));
+        if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
+            eprintln!("[sidecar] 设置 TCP keepalive 失败: {e}");
+        }
+    });
 
     axum::serve(listener, app).await
 }
@@ -3481,5 +3637,42 @@ mod tests {
             "应显示归档数量: {}",
             archive_text
         );
+    }
+
+    // ---- v0.7.1 P3-4: 静态资源路径遍历防护测试 ----
+
+    #[tokio::test]
+    async fn test_logo_asset_valid_filename() {
+        // 有效文件名应返回 200 和 SVG 内容
+        let resp = logo_asset_handler(axum::extract::Path("logo-primary.svg".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_logo_asset_path_traversal() {
+        // 路径遍历注入应返回 404，不应泄露文件系统内容
+        let resp = logo_asset_handler(axum::extract::Path("../../../etc/passwd".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_logo_asset_traversal_encoded() {
+        // URL 编码的路径遍历也应返回 404
+        let resp = logo_asset_handler(axum::extract::Path("..%2F..%2Fetc%2Fpasswd".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_icon_asset_path_traversal() {
+        // 图标路径遍历注入应返回 404
+        let resp = icon_asset_handler(axum::extract::Path("../../../etc/shadow".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_icon_asset_valid_filename() {
+        // 有效图标文件名应返回 200
+        let resp = icon_asset_handler(axum::extract::Path("icon-dashboard.svg".to_string())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

@@ -123,6 +123,7 @@ fn main() {
             commands::mark_complete,
             commands::verify_setup,
             commands::open_data_dir, // v0.6.0：右下角"数据目录"点击打开文件夹
+            commands::get_rules_status, // v0.8.0：信任中心规则状态查询
         ])
         .manage(app_store)
         // v0.5.4 P2-16 调试：页面加载事件追踪
@@ -132,6 +133,52 @@ fn main() {
         .setup(|app| {
             // 构建系统托盘（右键菜单 + 双击打开仪表盘）
             tray::build_tray(app.app_handle())?;
+
+            // ════════════════════════════════════════════════════════════════
+            // v0.8.0 "归一" 新增：启动时自动写入 AI 规则文件
+            // 不依赖 sidecar 启动，确保全新安装后首次启动即写入规则
+            // 使用异步任务执行，不阻塞 setup() 回调
+            // 规则写入失败时通过 Tauri 事件通知前端显示提示
+            // ════════════════════════════════════════════════════════════════
+            let rules_handle = app.app_handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tracing::info!("[v0.8.0] 启动时自动写入 AI 规则文件（不依赖 sidecar）");
+                let registry = AgentDetectorRegistry::new();
+                let tool_ids = AgentDetectorRegistry::get_all_rules_capable_tool_ids();
+                tracing::info!("[v0.8.0] 待写入规则的工具数: {}", tool_ids.len());
+
+                match registry.write_rules_for_agents(&tool_ids) {
+                    Ok(written) => {
+                        tracing::info!(
+                            "[v0.8.0] 启动时规则写入完成，成功 {} 个工具: {:?}",
+                            written.len(),
+                            written
+                        );
+                        // 通知前端规则写入成功
+                        let _ = rules_handle.emit(
+                            "rules-write-completed",
+                            serde_json::json!({
+                                "success": true,
+                                "written_count": written.len(),
+                                "total_count": tool_ids.len(),
+                                "tools": written,
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("[v0.8.0] 启动时规则写入失败: {}", e);
+                        // 通知前端规则写入失败
+                        let _ = rules_handle.emit(
+                            "rules-write-failed",
+                            serde_json::json!({
+                                "success": false,
+                                "error": e,
+                                "message": "规则文件写入失败，AI 助手可能无法自动调用记忆工具",
+                            }),
+                        );
+                    }
+                }
+            });
 
             // ════════════════════════════════════════════════════════════════
             // v0.5.4 P2-14 新增：Sidecar 心跳检测协程
@@ -414,9 +461,21 @@ fn init_logging() {
     // 使用 non_blocking 确保日志写入不阻塞主线程。
     let file_appender = tracing_appender::rolling::daily(&log_dir, "lrc-desktop.log");
     let (non_blocking_file, _guard) = tracing_appender::non_blocking(file_appender);
-    // 注意：_guard 必须保持存活，否则日志写入会停止。
-    // 但由于 init_logging 在 main 开始时调用，guard 会随进程生命周期存活。
-    // 为避免 guard 被 drop，将其泄漏（进程退出时自动清理）
+    // ──────────────────────────────────────────────────────────────
+    // v0.7.1 P3-5 说明：关于 std::mem::forget(_guard) 的安全性
+    // ──────────────────────────────────────────────────────────────
+    // 1. WorkerGuard 必须保持存活到进程结束，否则 non_blocking 缓冲区中
+    //    未刷新的日志事件会丢失（drop 时 guard 会 flush 并关闭通道）。
+    // 2. 此处使用 std::mem::forget 是 tracing-appender 官方推荐模式之一，
+    //    参考：https://docs.rs/tracing-appender/latest/tracing_appender/non_blocking/index.html
+    //    官方文档明确指出："The guard returned by non_blocking should be kept
+    //    alive for the entire duration you wish for logs to be written."
+    // 3. 替代方案为将 guard 存入 Tauri State，但 WorkerGuard 不是 Send，
+    //    无法跨线程传递（Tauri State 要求 Send + Sync），因此不适用。
+    // 4. 这不是"内存泄漏"——guard 内部仅持有通道句柄，无外部资源（文件句柄
+    //    由 file_appender 持有并通过 Drop 关闭）；进程退出时由 OS 自动回收。
+    // 5. 可选改进：将 guard 封装到 fn main() 作用域变量中，让其在 main
+    //    返回时 drop（当前 init_logging 是独立函数，需调整签名）。
     std::mem::forget(_guard);
 
     // 构建日志订阅器：同时输出到控制台和文件
