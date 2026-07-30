@@ -4,6 +4,54 @@
 
 ---
 
+## [0.8.11] - 2026-07-31
+
+### 修复
+
+- **P0 L6-01**: `SidecarHealthMonitor.check()` 超时从 3s 延长到 8s + 失败容错计数（app.js:354）
+  — sidecar 索引期间 `/v1/health/system` 响应可能 >3s，3s 超时导致误判 sidecar 不可达
+  — 新增 `_handleCheckFailure()` 方法，连续 2 次失败才判定不可达，避免单次慢响应触发状态栏闪红
+- **P0 L6-02**: `SidecarHealthMonitor.check()` 解析后端 `status` 字段，区分 starting/indexing/running（app.js:356-367）
+  — 之前只检查 `res.ok`，导致 indexing 期间健康检查显示"运行中"但 `dao_metrics` 超时
+  — **关键 bug 修复**：健康检查接口从 `/v1/health/system`（返回详细报告，不含 status 字段）改为 `/health`（返回 HealthResponse，含 status 字段）
+  — 此 bug 通过 Playwright 交互测试发现：`/v1/health/system` 返回 `health_report()` 不含 status 字段，导致 P0-2 修复无效
+  — 新增 `_sidecarStatus` 字段 + `getSidecarStatus()` / `isIndexing()` 方法
+  — `_broadcastSidecarStateChange` 广播时携带 `sidecarStatus` 和 `indexing` 标志
+- **P0 L6-03**: `loadDaoMetrics` 在 sidecar 索引期间显示"索引中"提示而非"加载失败"（app.js:4595-4628）
+  — 新增 `_applyDaoMetricsIndexingHint()` 函数，显示蓝色"索引中"提示横幅（含加载动画）
+  — 区别于 `_applyDaoMetricsFallback`（红色降级横幅），索引中提示不重置 4 个小指标
+  — 重试耗尽时根据 sidecar 状态区分提示："LRC 服务未启动" vs "索引耗时较长，请稍后手动刷新" vs 实际错误
+  — 数据加载成功/降级时自动清除"索引中"提示横幅
+- **P1**: `loadDaoMetrics` 超时从 5s 延长到 10s + 指数退避重试（2s/4s/8s，最多 3 次）（app.js:4553）
+- **P1**: 信任中心 3 个接口（data-location/network-audit/audit-integrity）超时从 5s 延长到 10s
+- **P1**: 审计日志接口 audit-trail 超时从 5s 延长到 10s
+
+### 根因分析
+
+v0.8.10 用户测试报告："运行中 版本 v0.8.10" 与 "⚠ 道同构度数据加载失败：请求超时" 同时出现。
+
+HCSE 五层交互韧性审计（L1-L5）虽然覆盖了状态栏/模态框/卡片/嵌套操作，但未充分覆盖**组件级数据加载韧性**（L6）。本次审计新增 L6 章节，识别出核心问题：
+
+1. **状态感知缺失**：前端健康检查只判断 HTTP 200，未读取后端 `status` 字段，无法区分"可达但索引中"和"完全就绪"
+2. **健康检查超时过短**：3s 超时在索引期会误判 sidecar 不可达
+3. **组件级数据加载缺乏索引期感知**：`loadDaoMetrics` 在索引期超时后直接显示"加载失败"，而非"索引中"
+
+### HCSE 验证结果
+
+- 组件级数据加载韧性审计（L6 新增章节）：识别 5 P0 + 8 P1 + 4 P2
+- P0 修复完成：3 项（L6-01/02/03）
+- P1 修复完成：3 项（超时延长 + 重试机制）
+
+### 测试
+
+- cargo fmt --all -- --check: 通过
+- cargo clippy --all-targets --features server -- -D warnings: 通过
+- desktop clippy: 通过
+- cargo test --features server: 505 passed, 0 failed, 7 ignored
+- 算法泄露检测: 通过（0 泄露）
+
+---
+
 ## [0.8.10] - 2026-07-30
 
 ### 修复
