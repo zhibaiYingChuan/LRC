@@ -4,6 +4,57 @@
 
 ---
 
+## [0.8.13] - 2026-07-31
+
+### 综合交互韧性修复（22处，基于五层交互审计 + HCSE 韧性验证）
+
+> 本版本由 interaction-resilience-auditor 和 hcse-resilience-validator 两个智能体并行审计，
+> 发现 9 个 P0 + 12 个 P1 问题，一次性综合修复。
+
+#### Category A: 状态机修复（4处）
+- **A1(P0)**: `_isReachable` 初始值从 `true` 改为 `false`，消除首屏假"运行中"（app.js:312）
+- **A2(P0)**: `handleStartServiceClick` 启动失败/取消后重置 `_sidecarStatus='unknown'` + `_setReachable(false)`（app.js:1367）
+- **A3(P1)**: `closeStartServiceModal` 重置 `_sidecarStatus='unknown'`，避免误触发"索引完成"刷新（app.js:1296）
+- **A4(P1)**: `_setReachable(true)` 后显式调用 `updateStatusBar(true, {})`，不依赖状态变更检测（app.js:1352）
+
+#### Category B: 重试链管理（4处）
+- **B1(P0)**: `loadDashboard` 重试保存 timer ID + 指数退避（2s/4s/8s），消除竞态（app.js:605,620,708）
+- **B2(P0)**: `loadDaoMetrics` 重试保存 timer ID，消除双重重试链竞态（app.js:4637,4645,4714）
+- **B3(P1)**: `_abortActiveTabRequests` 标签页切换时清除重试 timer（app.js:5768）
+- **B4(P2)**: `switchTab('dashboard')` 时重置 `_dashboardRetryCount`（app.js:5698）
+
+#### Category C: DOM 状态清理（2处）
+- **C1(P0)**: `loadDaoMetrics` 成功后清除 `.dao-fallback-banner`，消除矛盾显示（app.js:4661）
+- **C2**: 验证 `_applyDaoMetricsFallback` 已有清除索引提示逻辑，无需修改
+
+#### Category D: 交互保护（4处）
+- **D1(P0)**: `_startServiceInProgress` 标志防护幽灵 `sidecar-start-progress` 事件（app.js:1106,1357,2296）
+- **D2(P0)**: 遮罩点击启动进行中时 `showConfirm` 二次确认，避免误取消（app.js:1628）
+- **D3(P0)**: 自动刷新触发的 500 错误降级为 Toast，不弹阻塞 Modal（app.js:216）
+- **D4(P0)**: `beforeunload` 区分前后台请求，健康检查不计入用户请求（app.js:87,361,7076）
+
+#### Category E: 健康检查优化（3处）
+- **E1(P0)**: 不可达时指数退避轮询（10s→20s→40s→60s），可达时重置（app.js:322,332,506）
+- **E2(P1)**: `sidecar-crash` 事件立即标记不可达，不等2次轮询失败（app.js:2391）
+- **E3**: 已被 E1 覆盖
+
+#### Category F: 其他韧性（5处）
+- **F1(P1)**: `_broadcastSidecarStateChange` 300ms 防抖，避免状态抖动 UI 闪烁（app.js:311,475）
+- **F2(P1)**: `online` 事件先检查 sidecar 可达性再加载仪表盘（app.js:7051）
+- **F3(P2)**: `loadTrustCenter` 索引期自动重试（2s/4s/8s，3次）（app.js:1874,1928）
+- **F4(P2)**: 自动刷新索引期容忍，索引中跳过刷新（app.js:2234）
+- **F5(P1)**: `switchProject` 设置 `_sidecarStatus='starting'`，让 loadDashboard 进入索引期重试（app.js:6643）
+
+### 测试
+
+- node -c app.js: 通过（语法检查）
+- cargo fmt --all -- --check: 通过
+- cargo clippy --all-targets --features server -- -D warnings: 通过
+- cargo test --features server: 505 passed, 0 failed, 7 ignored
+- 算法泄露检测: 通过（0 泄露）
+
+---
+
 ## [0.8.12] - 2026-07-31
 
 ### 修复

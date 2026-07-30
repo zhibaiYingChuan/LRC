@@ -4,7 +4,7 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.12';
+const APP_VERSION = '0.8.13';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -84,6 +84,7 @@ function safeJson(res) {
 // v0.8.3 Step 5：暴露只读接口到 window，便于 CDP 测试与外部检测（修复 G006）
 // 使用 Object.defineProperty 的 getter（无 setter）确保只读，避免外部恶意修改
 let pendingRequestCount = 0;
+let _pendingBackgroundCount = 0; // v0.8.13 D4: 后台请求计数（健康检查等），beforeunload 时排除
 window.__getPendingRequestCount = () => pendingRequestCount;
 Object.defineProperty(window, 'pendingRequestCount', {
   get: () => pendingRequestCount,
@@ -214,6 +215,15 @@ async function handleHttpError(response, context = '操作', retryContext = null
   console.error(`[handleHttpError] ${context} 失败 [${status}]:`, errorDetail);
 
   if (status === 500) {
+    // v0.8.13 D3: 自动刷新触发的 500 错误降级为 Toast，不弹阻塞 Modal
+    // 自动刷新失败属于预期内的偶发错误，弹 Modal 会打断用户操作
+    const isAutoRefresh = context && (context.includes('auto-refresh') || context.includes('autoRefresh'));
+    if (isAutoRefresh) {
+      if (typeof showToast === 'function') {
+        showToast('数据自动刷新失败，将在下次刷新时重试', 'warning');
+      }
+      return { action: 'cancel', status, errorDetail };
+    }
     // v0.8.4 Step 10 / G029：重试次数上限检查
     const retryKey = retryContext ? `${retryContext.method || 'GET'}:${retryContext.url || ''}` : `default:${context}`;
     const retryCount = _retryCounters.get(retryKey) || 0;
@@ -298,8 +308,9 @@ window.resetRetryCounter = resetRetryCounter;
 // v0.8.2 新增：Sidecar 健康监测器（对应审计 G005）
 // 每 10 秒轮询 sidecar 可达性，不可达时禁用所有 API 按钮并显示横幅
 // ============================================================
+let _broadcastDebounceTimer = null; // v0.8.13 F1: 广播防抖，避免状态抖动导致 UI 闪烁
 const SidecarHealthMonitor = {
-  _isReachable: true,
+  _isReachable: false,
   _pollTimer: null,
   _pollInterval: 10000,  // 10 秒轮询
   _inFlight: false,
@@ -309,6 +320,8 @@ const SidecarHealthMonitor = {
   // v0.8.11 P0-1：健康检查失败容错计数（索引期响应慢，连续 2 次失败才判定不可达）
   _failCount: 0,
   _FAIL_THRESHOLD: 2,
+  _backoffStep: 0,  // v0.8.13 E1: 退避步数（不可达时指数退避）
+  _MAX_BACKOFF: 60000,  // v0.8.13 E1: 最大退避 60s
 
   /**
    * 启动健康监测
@@ -317,9 +330,23 @@ const SidecarHealthMonitor = {
     if (this._pollTimer) return;
     // 立即检测一次
     this.check();
-    // 定时轮询
-    this._pollTimer = setInterval(() => this.check(), this._pollInterval);
+    // v0.8.13 E1: 使用 setTimeout 链式调用，支持指数退避（不可达时拉长间隔）
+    this._scheduleNextCheck();
     console.log('[LRC v' + APP_VERSION + ']Sidecar 健康监测器已启动，轮询间隔:', this._pollInterval + 'ms');
+  },
+
+  /**
+   * v0.8.13 E1: 调度下一次健康检查
+   * 可达时使用固定 _pollInterval，不可达时按 _backoffStep 指数退避（上限 _MAX_BACKOFF）
+   */
+  _scheduleNextCheck() {
+    const interval = this._isReachable
+      ? this._pollInterval
+      : Math.min(this._pollInterval * Math.pow(2, this._backoffStep), this._MAX_BACKOFF);
+    this._pollTimer = setTimeout(() => {
+      this.check();
+      this._scheduleNextCheck();
+    }, interval);
   },
 
   /**
@@ -327,7 +354,7 @@ const SidecarHealthMonitor = {
    */
   stop() {
     if (this._pollTimer) {
-      clearInterval(this._pollTimer);
+      clearTimeout(this._pollTimer); // v0.8.13 E1: setInterval → setTimeout，需用 clearTimeout
       this._pollTimer = null;
     }
   },
@@ -348,6 +375,8 @@ const SidecarHealthMonitor = {
   async check() {
     if (this._inFlight) return this._isReachable;
     this._inFlight = true;
+    // v0.8.13 D4: 健康检查属于后台请求，beforeunload 时不应阻塞用户关闭
+    _pendingBackgroundCount++;
     try {
       // v0.8.11 P0-1：健康检查超时从 3s 延长到 8s
       // sidecar 索引期间 /health 需要获取 memory_store 锁，3s 不够
@@ -391,6 +420,8 @@ const SidecarHealthMonitor = {
       return this._handleCheckFailure();
     } finally {
       this._inFlight = false;
+      // v0.8.13 D4: 健康检查结束，减少后台请求计数
+      _pendingBackgroundCount--;
     }
   },
 
@@ -404,6 +435,8 @@ const SidecarHealthMonitor = {
     if (this._failCount >= this._FAIL_THRESHOLD) {
       // 超过阈值，判定不可达
       this._sidecarStatus = 'unknown';
+      // v0.8.13 E1: 不可达时递增退避步数（上限 5，配合 _MAX_BACKOFF 限制最大间隔）
+      this._backoffStep = Math.min(this._backoffStep + 1, 5);
       this._setReachable(false);
       return false;
     }
@@ -440,30 +473,38 @@ const SidecarHealthMonitor = {
    * @param {boolean} online - sidecar 是否可达
    */
   _broadcastSidecarStateChange(online) {
-    // 1. 状态栏立即更新（不依赖 loadDashboard）
-    if (typeof updateStatusBar === 'function') {
-      updateStatusBar(online, online ? {} : null);
+    // v0.8.13 F1: 300ms 防抖，避免状态抖动导致 UI 闪烁
+    // 健康检查在可达/不可达边界可能产生连续多次状态变更，防抖合并为一次 UI 更新
+    if (_broadcastDebounceTimer) {
+      clearTimeout(_broadcastDebounceTimer);
     }
-    // 2. 根据当前 active tab 刷新对应页面
-    const activeTab = document.querySelector('.navbar-nav button.active, .nav-item.active, [data-tab].active');
-    const tabName = activeTab?.getAttribute('data-tab') || 'dashboard';
-    if (tabName === 'dashboard' && typeof loadDashboard === 'function') {
-      setTimeout(() => loadDashboard(), 500);
-    } else if (tabName === 'settings' && typeof loadSettings === 'function') {
-      setTimeout(() => loadSettings(), 500);
-    } else if (tabName === 'trust-center' && typeof loadTrustCenter === 'function') {
-      setTimeout(() => loadTrustCenter(), 500);
-    }
-    // 3. 发出自定义事件，供其他模块解耦响应
-    // v0.8.11 P0-2：事件携带 sidecarStatus，供 loadDaoMetrics 等组件感知索引期
-    window.dispatchEvent(new CustomEvent('lrc:sidecar-state-change', {
-      detail: {
-        online,
-        sidecarStatus: this._sidecarStatus,
-        indexing: this.isIndexing(),
-        timestamp: Date.now()
+    _broadcastDebounceTimer = setTimeout(() => {
+      _broadcastDebounceTimer = null;
+      // 1. 状态栏立即更新（不依赖 loadDashboard）
+      if (typeof updateStatusBar === 'function') {
+        updateStatusBar(online, online ? {} : null);
       }
-    }));
+      // 2. 根据当前 active tab 刷新对应页面
+      const activeTab = document.querySelector('.navbar-nav button.active, .nav-item.active, [data-tab].active');
+      const tabName = activeTab?.getAttribute('data-tab') || 'dashboard';
+      if (tabName === 'dashboard' && typeof loadDashboard === 'function') {
+        setTimeout(() => loadDashboard(), 500);
+      } else if (tabName === 'settings' && typeof loadSettings === 'function') {
+        setTimeout(() => loadSettings(), 500);
+      } else if (tabName === 'trust-center' && typeof loadTrustCenter === 'function') {
+        setTimeout(() => loadTrustCenter(), 500);
+      }
+      // 3. 发出自定义事件，供其他模块解耦响应
+      // v0.8.11 P0-2：事件携带 sidecarStatus，供 loadDaoMetrics 等组件感知索引期
+      window.dispatchEvent(new CustomEvent('lrc:sidecar-state-change', {
+        detail: {
+          online,
+          sidecarStatus: this._sidecarStatus,
+          indexing: this.isIndexing(),
+          timestamp: Date.now()
+        }
+      }));
+    }, 300);
   },
 
   /**
@@ -472,6 +513,11 @@ const SidecarHealthMonitor = {
   _setReachable(reachable) {
     const wasReachable = this._isReachable;
     this._isReachable = reachable;
+
+    // v0.8.13 E1: 可达时重置退避步数，不可达时由 _handleCheckFailure 递增
+    if (reachable) {
+      this._backoffStep = 0;
+    }
 
     if (reachable === wasReachable) return;  // 状态未变
 
@@ -602,6 +648,7 @@ document.querySelectorAll('.navbar-nav button').forEach(btn => {
 let dashboardAbortController = null;
 // v0.8.12：仪表盘索引期自动重试计数器
 let _dashboardRetryCount = 0;
+let _dashboardRetryTimer = null; // v0.8.13 B1: 索引期重试 timer，支持取消与竞态防护
 const _DASHBOARD_MAX_RETRIES = 3;
 
 async function loadDashboard() {
@@ -615,6 +662,12 @@ async function loadDashboard() {
   }
   dashboardAbortController = new AbortController();
   const currentSignal = dashboardAbortController.signal;
+
+  // v0.8.13 B1: 清除已有的索引期重试 timer，避免竞态
+  if (_dashboardRetryTimer) {
+    clearTimeout(_dashboardRetryTimer);
+    _dashboardRetryTimer = null;
+  }
 
   loading.classList.remove('hidden');
   if (error) {
@@ -698,8 +751,13 @@ async function loadDashboard() {
         error.classList.add('show');
       }
       // 不覆盖状态栏（保持"索引中..."显示）
-      console.log('[loadDashboard] 索引期加载失败，3s 后自动重试 (' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')');
-      setTimeout(() => loadDashboard(), 3000);
+      // v0.8.13 B1: 固定 3s 改为指数退避（2s/4s/8s），并保存 timer ID 支持取消
+      const retryDelay = 2000 * Math.pow(2, _dashboardRetryCount - 1); // 2s/4s/8s
+      console.log('[loadDashboard] 索引期加载失败，' + retryDelay + 'ms 后自动重试 (' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')');
+      _dashboardRetryTimer = setTimeout(() => {
+        _dashboardRetryTimer = null;
+        loadDashboard();
+      }, retryDelay);
       return;
     }
 
@@ -1091,6 +1149,7 @@ const POST_MESSAGE_TO_INVOKE = {
 // v0.8.6 Step 2 / N003 G058 修复：启动服务的 AbortController
 // 之前取消按钮仅关闭模态框，60s 内的 Tauri invoke 请求无法中断
 let startServiceAbortController = null;
+let _startServiceInProgress = false; // v0.8.13 D1: 防护幽灵 progress 事件
 
 function postMessageToParent(type, extra = {}, timeoutMs = 30000, externalSignal) {
   return new Promise(async (resolve, reject) => {
@@ -1293,6 +1352,10 @@ function closeStartServiceModal() {
   if (startServiceAbortController) {
     startServiceAbortController.abort();
     startServiceAbortController = null;
+    // v0.8.13 A3: 取消/关闭时重置 sidecar 状态，避免误触发"索引完成"刷新
+    if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+      SidecarHealthMonitor._sidecarStatus = 'unknown';
+    }
   }
   // v0.8.3 Step 6：同时设置 hidden 属性和 display:none 确保隐藏
   modal.style.display = 'none';
@@ -1337,6 +1400,8 @@ async function handleStartServiceClick() {
   startServiceAbortController = new AbortController();
 
   try {
+    // v0.8.13 D1: 标记启动进行中，允许 progress 事件更新按钮文字
+    _startServiceInProgress = true;
     // v0.8.9：超时从 60s 延长到 120s，配合 G-003 进度事件反馈
     // sidecar 首次启动需要索引项目代码，可能超过 60s
     // 进度事件 sidecar-start-progress 会实时更新按钮文字，用户不会以为卡住
@@ -1349,6 +1414,11 @@ async function handleStartServiceClick() {
       SidecarHealthMonitor._sidecarStatus = 'starting';
       // 立即更新状态栏为可达（触发 _broadcastSidecarStateChange → updateStatusBar + loadDashboard）
       SidecarHealthMonitor._setReachable(true);
+      // v0.8.13 A4: 显式刷新状态栏，不依赖 _setReachable 的状态变更检测
+      // 当 sidecar 之前已可达（如重启 sidecar 场景），_setReachable(true) 不触发广播，状态栏不刷新
+      if (typeof updateStatusBar === 'function') {
+        updateStatusBar(true, {});
+      }
       // 后台运行健康检查，获取实际状态（starting/indexing/running）并更新
       SidecarHealthMonitor.check();
     } else {
@@ -1359,6 +1429,13 @@ async function handleStartServiceClick() {
   } catch (e) {
     btn.disabled = false;
     btn.textContent = '启动服务';
+    // v0.8.13 A2: 启动失败/取消后重置状态，避免状态栏残留"索引中"
+    if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+      SidecarHealthMonitor._sidecarStatus = 'unknown';
+      if (SidecarHealthMonitor._isReachable) {
+        SidecarHealthMonitor._setReachable(false);
+      }
+    }
     // v0.8.6 Step 2 / N003 G058：abort 时显示"已取消"提示，不显示错误
     if (e && e.name === 'AbortError') {
       console.log('[handleStartServiceClick] 用户取消启动服务');
@@ -1372,6 +1449,8 @@ async function handleStartServiceClick() {
   } finally {
     // v0.8.6 Step 2 / N003 G058：确保 controller 被清理，避免内存泄漏
     startServiceAbortController = null;
+    // v0.8.13 D1: 启动结束（成功/失败/取消），允许 progress 事件再次更新（下次启动）
+    _startServiceInProgress = false;
   }
 }
 
@@ -1593,7 +1672,18 @@ document.addEventListener('DOMContentLoaded', () => {
   const modal = document.getElementById('start-service-modal');
   if (modal) {
     modal.addEventListener('click', (e) => {
-      if (e.target === modal) closeStartServiceModal();
+      if (e.target !== modal) return;
+      // v0.8.13 D2: 启动进行中点击遮罩需二次确认，避免误取消
+      // showConfirm 返回 Promise<boolean>，确认后调用 closeStartServiceModal
+      if (startServiceAbortController && !startServiceAbortController.signal.aborted) {
+        if (typeof showConfirm === 'function') {
+          showConfirm('启动正在进行中，确定要取消吗？').then((confirmed) => {
+            if (confirmed) closeStartServiceModal();
+          });
+          return;
+        }
+      }
+      closeStartServiceModal();
     });
   }
 });
@@ -1781,6 +1871,10 @@ async function generateCaptainLog() {
 // ============================================================
 // 信任中心数据加载
 // ============================================================
+// v0.8.13 F3: 信任中心索引期重试计数器与 timer
+let _trustRetryCount = 0;
+let _trustRetryTimer = null;
+
 async function loadTrustCenter() {
   const loading = $('trust-loading');
   if (!loading) return;
@@ -1832,12 +1926,29 @@ async function loadTrustCenter() {
     }
 
   } catch (e) {
+    // v0.8.13 F3: 索引期自动重试，避免 sidecar 索引中时显示"无法获取数据"
+    const isIndexing = typeof SidecarHealthMonitor !== 'undefined'
+      && SidecarHealthMonitor
+      && typeof SidecarHealthMonitor.isIndexing === 'function'
+      && SidecarHealthMonitor.isIndexing();
+    if (isIndexing && _trustRetryCount < 3) {
+      _trustRetryCount++;
+      const retryDelay = 2000 * Math.pow(2, _trustRetryCount - 1); // 2s/4s/8s
+      console.log('[loadTrustCenter] 索引期加载失败，' + retryDelay + 'ms 后自动重试 (' + _trustRetryCount + '/3)');
+      _trustRetryTimer = setTimeout(() => {
+        _trustRetryTimer = null;
+        loadTrustCenter();
+      }, retryDelay);
+      return; // 不显示错误文本，等待重试
+    }
+    _trustRetryCount = 0;
     const fbText = $('feedback-status-text');
     const auditText = $('audit-integrity-text');
     if (fbText) fbText.textContent = '无法获取数据：' + htmlescape(e.message);
     if (auditText) auditText.textContent = '无法获取数据：' + htmlescape(e.message);
   } finally {
-    if (loading) loading.classList.add('hidden');
+    // v0.8.13 F3: 重试期间保持 loading 可见（_trustRetryTimer 非空表示有重试待执行）
+    if (loading && !_trustRetryTimer) loading.classList.add('hidden');
   }
 }
 
@@ -2120,18 +2231,28 @@ async function wizardStep3Search() {
 function startAutoRefresh() {
   if (refreshTimer) clearInterval(refreshTimer);
   refreshTimer = setInterval(() => {
-    // 仅刷新当前激活的标签页
-    const activeTab = document.querySelector('.tab-content.active');
-    if (activeTab) {
-      const tabId = activeTab.id;
-      // v0.8.3 Step 12 / G016：自动刷新保留滚动位置（避免打断阅读）
-      // 保存滚动位置 → 加载完成后恢复
-      if (tabId === 'tab-dashboard') {
-        const savedScroll = _saveMainScroll();
-        loadDashboard().finally(() => _restoreMainScroll(savedScroll));
-      } else if (tabId === 'tab-trust-center') {
-        const savedScroll = _saveMainScroll();
-        loadTrustCenter().finally(() => _restoreMainScroll(savedScroll));
+    // v0.8.13 F4: 索引期跳过自动刷新，避免反复触发"加载失败"
+    // 索引期间所有数据接口响应慢，自动刷新只会产生大量超时错误
+    const isIndexing = typeof SidecarHealthMonitor !== 'undefined'
+      && SidecarHealthMonitor
+      && typeof SidecarHealthMonitor.isIndexing === 'function'
+      && SidecarHealthMonitor.isIndexing();
+    if (isIndexing) {
+      console.log('[LRC]Sidecar 索引中，跳过自动刷新');
+    } else {
+      // 仅刷新当前激活的标签页
+      const activeTab = document.querySelector('.tab-content.active');
+      if (activeTab) {
+        const tabId = activeTab.id;
+        // v0.8.3 Step 12 / G016：自动刷新保留滚动位置（避免打断阅读）
+        // 保存滚动位置 → 加载完成后恢复
+        if (tabId === 'tab-dashboard') {
+          const savedScroll = _saveMainScroll();
+          loadDashboard().finally(() => _restoreMainScroll(savedScroll));
+        } else if (tabId === 'tab-trust-center') {
+          const savedScroll = _saveMainScroll();
+          loadTrustCenter().finally(() => _restoreMainScroll(savedScroll));
+        }
       }
     }
     // 始终更新运行时长
@@ -2260,6 +2381,11 @@ async function init() {
         // port_check(5%) → spawn(10%) → health_check(30%) → ready(100%)
         // 前端通过此事件更新启动按钮文字，让用户知道启动进展
         tauriEvent.listen('sidecar-start-progress', (event) => {
+          // v0.8.13 D1: 启动已结束（失败/取消/成功），拒绝滞后的幽灵 progress 事件
+          if (!_startServiceInProgress) {
+            console.log('[LRC]忽略滞后的 sidecar-start-progress 事件');
+            return;
+          }
           const payload = (event && event.payload) || {};
           const progress = payload.progress || 0;
           const message = payload.message || '';
@@ -2302,6 +2428,12 @@ async function init() {
           const payload = (event && event.payload) || {};
           console.error('[LRC] Sidecar 崩溃:', payload);
           showToast(payload.message || '服务异常，请手动重启', 'error', 8000);
+          // v0.8.13 E2: 崩溃事件立即标记不可达，不等2次轮询失败
+          // 直接将 _failCount 拉到阈值，触发 _setReachable(false) 立即生效
+          if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+            SidecarHealthMonitor._failCount = SidecarHealthMonitor._FAIL_THRESHOLD;
+            SidecarHealthMonitor._setReachable(false);
+          }
           // 立即更新状态栏，不等下次轮询
           if (typeof updateStatusBar === 'function') {
             updateStatusBar(false, null);
@@ -4606,6 +4738,7 @@ function drawDaoRing(score) {
 
 // v0.8.11：道同构度自动重试计数器（指数退避 2s/4s/8s，最多 3 次）
 let _daoRetryCount = 0;
+let _daoRetryTimer = null; // v0.8.13 B2: 重试 timer，支持取消与竞态防护
 const _DAO_MAX_RETRIES = 3;
 
 /**
@@ -4613,6 +4746,11 @@ const _DAO_MAX_RETRIES = 3;
  * v0.8.11：超时从 5s 延长到 10s + 自动重试退避（sidecar 索引期间 dao_metrics 响应慢）
  */
 async function loadDaoMetrics() {
+  // v0.8.13 B2: 清除已有的重试 timer，避免竞态
+  if (_daoRetryTimer) {
+    clearTimeout(_daoRetryTimer);
+    _daoRetryTimer = null;
+  }
   try {
     // v0.8.11：超时从 5s 延长到 10s，与 loadDashboard 默认超时一致
     // sidecar 刚启动/索引期间 dao_metrics 计算涉及编码器状态检查，5s 不够
@@ -4624,6 +4762,9 @@ async function loadDaoMetrics() {
       // v0.8.11 P0-5：成功时清除"索引中"提示横幅（如果存在）
       const indexingHint = document.querySelector('.dao-indexing-hint');
       if (indexingHint) indexingHint.remove();
+      // v0.8.13 C1: 清除降级横幅（避免与正常数据矛盾显示）
+      const fallbackBanner = document.querySelector('.dao-fallback-banner');
+      if (fallbackBanner) fallbackBanner.remove();
       const m = data.data;
       // v0.8.1：后端已返回 0-100 区间值，前端直接使用
       // yin_yang_balance: 0-100（阴阳守恒度）
@@ -4677,7 +4818,11 @@ async function loadDaoMetrics() {
       if (isIndexing) {
         _applyDaoMetricsIndexingHint();
       }
-      setTimeout(() => loadDaoMetrics(), delay);
+      // v0.8.13 B2: 保存 timer ID，支持标签页切换时取消
+      _daoRetryTimer = setTimeout(() => {
+        _daoRetryTimer = null;
+        loadDaoMetrics();
+      }, delay);
       return; // 不显示降级横幅，等待重试结果
     }
     // 重试耗尽，重置计数器并显示降级提示
@@ -5657,6 +5802,11 @@ async function switchTab(tabName) {
   // v0.8.4 Step 7 / G021：传入 tabName 作为 excludeTab，避免 abort 目标标签的请求
   _abortActiveTabRequests(tabName);
 
+  // v0.8.13 B4: 切换到 dashboard 时重置索引期重试计数器，让新加载从 0 开始计数
+  if (tabName === 'dashboard') {
+    _dashboardRetryCount = 0;
+  }
+
   // 1. 移除所有标签页与导航项的 active 类
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.app-sidebar .nav-item').forEach(n => n.classList.remove('active'));
@@ -5726,6 +5876,16 @@ function _abortActiveTabRequests(excludeTab) {
   // v0.8.4 Step 7 / G021：不再无条件 abort dashboardAbortController
   // dashboard 的请求取消由 loadDashboard 自身管理（第 396-398 行）
   // 避免切换到 dashboard 时 abort 即将创建的新 dashboardAbortController
+
+  // v0.8.13 B3: 标签页切换时取消索引期重试 timer，避免竞态与资源浪费
+  if (_dashboardRetryTimer) {
+    clearTimeout(_dashboardRetryTimer);
+    _dashboardRetryTimer = null;
+  }
+  if (_daoRetryTimer) {
+    clearTimeout(_daoRetryTimer);
+    _daoRetryTimer = null;
+  }
 }
 window._abortActiveTabRequests = _abortActiveTabRequests;
 // 暴露到 window 便于 CDP 测试与外部调用（修复 N02 测试项 7）
@@ -6480,6 +6640,12 @@ async function switchProject() {
     if (result && result.success) {
       // v0.8.2：用 showInfoModal 替代多行 alert
       showInfoModal('项目切换成功', '项目: ' + result.project_dir + '\n端口: ' + result.port + '\n\n' + (result.message || ''));
+      // v0.8.13 F5: 设置 starting 状态，让 loadDashboard 进入索引期重试路径
+      // 切换项目后 sidecar 重新索引，状态栏应显示"索引中"而非"加载失败"
+      if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+        SidecarHealthMonitor._sidecarStatus = 'starting';
+        SidecarHealthMonitor._setReachable(true);
+      }
       // v0.8.10 L4-04：切换成功后主动触发健康检查，加速状态栏更新
       setTimeout(() => {
         loadDashboard();
@@ -6919,10 +7085,25 @@ window.addEventListener('online', () => {
   if (typeof showToast === 'function') {
     showToast('网络已恢复，正在重新加载数据...', 'success', 2000);
   }
-  // 恢复网络后自动刷新仪表盘（若当前在仪表盘标签页）
+  // v0.8.13 F2: 网络恢复后先检查 sidecar 可达性，再加载仪表盘
+  // 避免网络恢复但 sidecar 未运行时，loadDashboard 反复触发"加载失败"
   const dashboard = document.getElementById('tab-dashboard');
-  if (dashboard && dashboard.classList.contains('active') && typeof loadDashboard === 'function') {
-    try { loadDashboard(); } catch (e) { console.error('[online] 重新加载仪表盘失败:', e); }
+  if (dashboard && dashboard.classList.contains('active')) {
+    if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+      SidecarHealthMonitor.check().then((reachable) => {
+        if (reachable) {
+          if (typeof loadDashboard === 'function') {
+            try { loadDashboard(); } catch (e) { console.error('[online] 重新加载仪表盘失败:', e); }
+          }
+        } else {
+          if (typeof showToast === 'function') {
+            showToast('网络已恢复，但 LRC 服务未运行，请点击启动', 'info');
+          }
+        }
+      });
+    } else if (typeof loadDashboard === 'function') {
+      try { loadDashboard(); } catch (e) { console.error('[online] 重新加载仪表盘失败:', e); }
+    }
   }
 });
 
@@ -6931,7 +7112,8 @@ window.addEventListener('online', () => {
 // 有进行中请求时，刷新/关闭页面前提示用户
 // ============================================================
 window.addEventListener('beforeunload', (e) => {
-  if (pendingRequestCount > 0) {
+  // v0.8.13 D4: 排除后台请求（健康检查等），仅用户主动发起的请求才拦截关闭
+  if (pendingRequestCount - _pendingBackgroundCount > 0) {
     // 现代浏览器忽略自定义消息，但仍需设置 returnValue 触发提示
     e.preventDefault();
     e.returnValue = '';

@@ -1,7 +1,7 @@
 {
   "name": "lrc-desktop",
   "private": true,
-  "version": "0.8.12",
+  "version": "0.8.13",
   "description": "LRC Desktop — 本地优先的 AI 代码记忆桌面应用",
   "type": "module",
   "scripts": {
