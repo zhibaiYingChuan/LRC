@@ -1080,3 +1080,32 @@ powershell -File scripts/preflight_check.ps1
 | Node.js 20 废弃 | download-artifact@v5 | — | — | — (非构建失败) |
 
 > **结论**：三层门禁中任意一层即可拦截 v0.8.7 的全部故障。v0.8.7 之所以失败，是因为三层门禁全部缺失。
+
+### 16.7 CI 步骤自验证规则（v0.8.9 新增）
+
+> **核心教训**：新增 CI 步骤时，不仅要验证"检查什么"，还要验证"步骤本身能否在 CI 环境中执行"。v0.8.8 新增 `cargo check (desktop)` 步骤，但步骤依赖 sidecar 文件存在，CI 环境没有准备，导致三平台全挂。
+
+#### 规则
+
+1. **新增 CI 步骤前，必须列出前置依赖**：步骤是否依赖编译产物、系统库、环境变量等
+2. **新增 CI 步骤后，必须在 CI 环境验证步骤本身可执行**：不能只验证"本地能跑"，CI 环境与本地环境不同
+3. **CI 步骤的检查项必须在三层门禁中一致**：如果门禁2（CI）检查了桌面端编译，门禁1（pre-commit）和门禁3（release preflight）要么也检查，要么明确标注"仅 CI 检查"及原因
+
+#### CI 步骤前置依赖清单模板
+
+每次新增 CI 步骤时，填写以下清单：
+
+| 步骤名 | 前置依赖 | 准备方式 | 已验证 |
+|--------|---------|---------|:------:|
+| cargo check (desktop) | lrc-sidecar 文件（tauri.conf.json resources glob） | 创建占位文件 | ✓ v0.8.9 |
+| Tauri config lint | 无 | — | ✓ |
+| E2E Smoke Test | sidecar 二进制 | cargo build --release | ✓ |
+
+### 16.8 v0.8.9 CI 步骤依赖盲区故障
+
+> **故障**：v0.8.8 新增 `cargo check (desktop)` 步骤，三平台 CI 全部失败（exit 101/1/101）。
+> **根因**：tauri.conf.json 的 `resources: ["lrc-sidecar*"]` 要求 sidecar 文件存在，`tauri_build::build()` 在编译时检查 resources glob，CI 环境没有 sidecar 文件 → panic。
+> **为什么本地通过**：本地 `desktop/src-tauri/` 有缓存的 `lrc-sidecar.exe`。
+> **为什么 Release 通过**：release.yml `build-desktop` 先编译 sidecar 并复制到 `desktop/src-tauri/`。
+> **修复**：ci.yml 新增 `Create placeholder sidecar` 步骤，在 `cargo check (desktop)` 前创建占位文件。
+> **教训**：新增 CI 步骤时，必须考虑步骤的前置依赖，并在 CI 环境验证步骤本身可执行。
