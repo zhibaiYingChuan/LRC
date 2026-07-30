@@ -251,6 +251,13 @@ jobs:
           VERSION="${{ steps.version.outputs.VER }}"
           # 复制 NSIS 安装包（v0.6.0 起：不再使用 MSI/WiX，避免 GitHub 下载 WiX 超时）
           find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.exe" -path "*/nsis/*" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-windows-x86_64-setup.exe \;
+          # 空产物保护：检查是否有文件被收集
+          if [ -z "$(ls -A desktop-artifacts/)" ]; then
+            echo "ERROR: 未找到 Windows NSIS 安装包"
+            echo "bundle 目录内容："
+            find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -type f 2>/dev/null || echo "  (bundle 目录不存在)"
+            exit 1
+          fi
           ls -la desktop-artifacts/
         shell: bash
 
@@ -261,6 +268,13 @@ jobs:
           VERSION="${{ steps.version.outputs.VER }}"
           # 复制 DMG 安装包
           find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.dmg" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-macos-arm64.dmg \;
+          # 空产物保护：检查是否有文件被收集
+          if [ -z "$(ls -A desktop-artifacts/)" ]; then
+            echo "ERROR: 未找到 macOS DMG 安装包"
+            echo "bundle 目录内容："
+            find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -type f 2>/dev/null || echo "  (bundle 目录不存在)"
+            exit 1
+          fi
           ls -la desktop-artifacts/
         shell: bash
 
@@ -274,6 +288,13 @@ jobs:
           find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.deb" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-linux-amd64.deb \;
           # 复制 AppImage
           find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.AppImage" -exec cp {} desktop-artifacts/lrc-desktop-${VERSION}-linux-x86_64.AppImage \;
+          # 空产物保护：检查是否有文件被收集
+          if [ -z "$(ls -A desktop-artifacts/)" ]; then
+            echo "ERROR: 未找到 Linux deb/AppImage 安装包"
+            echo "bundle 目录内容："
+            find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -type f 2>/dev/null || echo "  (bundle 目录不存在)"
+            exit 1
+          fi
           ls -la desktop-artifacts/
         shell: bash
 
@@ -310,7 +331,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v7
         with:
           path: artifacts
 

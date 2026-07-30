@@ -195,15 +195,11 @@ impl GraphMemoryStore {
             }
 
             match e.edge_type {
-                EdgeType::Evolves => {
-                    if !evolution_chain.contains(other) {
-                        evolution_chain.push(other.clone());
-                    }
+                EdgeType::Evolves if !evolution_chain.contains(other) => {
+                    evolution_chain.push(other.clone());
                 }
-                EdgeType::SynthesizesFrom => {
-                    if !synthesis_sources.contains(other) {
-                        synthesis_sources.push(other.clone());
-                    }
+                EdgeType::SynthesizesFrom if !synthesis_sources.contains(other) => {
+                    synthesis_sources.push(other.clone());
                 }
                 _ => {}
             }
