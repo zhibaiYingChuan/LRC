@@ -83,7 +83,7 @@ jobs:
           fi
           echo "  MSRV 一致性验证通过"
 
-      # 7. 版本号一致性检查（8 处版本号必须同步，v0.8.13 新增 Cargo.lock 检查）
+      # 7. 版本号一致性检查（9 处版本号必须同步，v0.8.14 新增 desktop Cargo.lock 检查）
       - name: Version consistency check
         run: |
           CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
@@ -92,15 +92,23 @@ jobs:
           # v0.8.13 修复：检查 Cargo.lock 中 code-memory 包的版本号
           # v0.8.12 CI 失败根因：Cargo.toml=0.8.12 但 Cargo.lock=0.8.11
           LOCK_VER=$(grep -A1 'name = "code-memory"' Cargo.lock | grep 'version' | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          # v0.8.14 修复：检查 desktop/src-tauri/Cargo.lock 中 lrc-desktop 包的版本号
+          # 盲点根因：preflight 只检查根目录 Cargo.lock，漏检 desktop 子项目 Cargo.lock
+          # 导致 lrc-desktop 版本号长期滞后（0.8.11 未同步到 0.8.14）
+          DESKTOP_LOCK_VER=$(grep -A1 'name = "lrc-desktop"' desktop/src-tauri/Cargo.lock | grep 'version' | head -1 | sed 's/.*"\(.*\)".*/\1/')
           echo "版本号检查："
           echo "  Cargo.toml:          $CARGO_VER"
           echo "  desktop Cargo.toml:  $DESKTOP_VER"
           echo "  tauri.conf.json:     $TAURI_VER"
           echo "  Cargo.lock:          $LOCK_VER"
-          if [ "$CARGO_VER" != "$DESKTOP_VER" ] || [ "$CARGO_VER" != "$TAURI_VER" ] || [ "$CARGO_VER" != "$LOCK_VER" ]; then
+          echo "  desktop Cargo.lock:  $DESKTOP_LOCK_VER"
+          if [ "$CARGO_VER" != "$DESKTOP_VER" ] || [ "$CARGO_VER" != "$TAURI_VER" ] || [ "$CARGO_VER" != "$LOCK_VER" ] || [ "$CARGO_VER" != "$DESKTOP_LOCK_VER" ]; then
             echo "ERROR: 版本号不一致"
             if [ "$CARGO_VER" != "$LOCK_VER" ]; then
-              echo "  提示: Cargo.lock 版本号未同步，请本地运行 'cargo check --features server' 后提交 Cargo.lock"
+              echo "  提示: 根目录 Cargo.lock 版本号未同步，请本地运行 'cargo check --features server' 后提交 Cargo.lock"
+            fi
+            if [ "$DESKTOP_VER" != "$DESKTOP_LOCK_VER" ]; then
+              echo "  提示: desktop Cargo.lock 版本号未同步，请在 desktop/src-tauri 目录运行 'cargo check' 后提交 Cargo.lock"
             fi
             exit 1
           fi

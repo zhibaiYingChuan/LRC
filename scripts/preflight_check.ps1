@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # LRC Preflight Check Script (v1.0)
 # ============================================================
 # One-click pre-release audit covering 8 domains (PUSH_STANDARD.md Ch.14)
@@ -180,11 +180,22 @@ if ($cargoLockMatch) {
     if ($lockVerMatch.Success) { $cargoLockVer = $lockVerMatch.Groups[1].Value }
 }
 
+# v0.8.14 修复：必须检查 desktop/src-tauri/Cargo.lock 中 lrc-desktop 包的版本号
+# 盲点根因：preflight 只检查根目录 Cargo.lock，漏检 desktop 子项目的 Cargo.lock
+# 导致 desktop/src-tauri/Cargo.lock 中 lrc-desktop 版本号长期滞后（0.8.11 未同步到 0.8.14）
+$desktopLockMatch = Select-String -Path desktop/src-tauri/Cargo.lock -Pattern 'name = "lrc-desktop"' -Context 0,1 | Select-Object -First 1
+$desktopLockVer = ""
+if ($desktopLockMatch) {
+    $desktopLockMatchResult = [regex]::Match($desktopLockMatch.Context.PostContext, 'version\s*=\s*"(.*)"')
+    if ($desktopLockMatchResult.Success) { $desktopLockVer = $desktopLockMatchResult.Groups[1].Value }
+}
+
 $versions = @{
     "Cargo.toml"         = $cargoLine
     "desktop Cargo.toml" = $desktopLine
     "tauri.conf.json"    = $tauriLine
     "Cargo.lock"         = $cargoLockVer
+    "desktop Cargo.lock" = $desktopLockVer
 }
 
 $allSame = $true
@@ -200,9 +211,12 @@ if ($allSame -and $cargoLine) {
     $detailParts = $versions.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }
     $detail = $detailParts -join ", "
     Write-Check "5. Version" "Version consistency" "FAIL" $detail
-    # v0.8.13 修复：如果 Cargo.lock 版本号不一致，提供自动修复提示
-    if ($cargoLockVer -and $cargoLockVer -ne $cargoVer) {
-        Write-Check "5. Version" "Cargo.lock sync" "FAIL" "Run 'cargo check --features server' to update Cargo.lock, then commit"
+    # v0.8.14 修复：分别针对两个 Cargo.lock 提供精确修复提示（原代码 $cargoVer 未定义是 bug）
+    if ($cargoLockVer -and $cargoLockVer -ne $cargoLine) {
+        Write-Check "5. Version" "Cargo.lock sync" "FAIL" "根目录 Cargo.lock 滞后：运行 'cargo check --features server' 后提交 Cargo.lock"
+    }
+    if ($desktopLockVer -and $desktopLockVer -ne $desktopLine) {
+        Write-Check "5. Version" "desktop Cargo.lock sync" "FAIL" "desktop Cargo.lock 滞后：在 desktop/src-tauri 目录运行 'cargo check' 后提交 Cargo.lock"
     }
 }
 
