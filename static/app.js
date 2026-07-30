@@ -4,7 +4,7 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.10';
+const APP_VERSION = '0.8.11';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -303,6 +303,12 @@ const SidecarHealthMonitor = {
   _pollTimer: null,
   _pollInterval: 10000,  // 10 秒轮询
   _inFlight: false,
+  // v0.8.11 P0-2：存储后端 sidecar 状态（'starting'/'indexing'/'running'/'unknown'）
+  // 后端 /v1/health/system 返回 status 字段，前端需读取以区分"可达但索引中"和"完全就绪"
+  _sidecarStatus: 'unknown',
+  // v0.8.11 P0-1：健康检查失败容错计数（索引期响应慢，连续 2 次失败才判定不可达）
+  _failCount: 0,
+  _FAIL_THRESHOLD: 2,
 
   /**
    * 启动健康监测
@@ -331,26 +337,87 @@ const SidecarHealthMonitor = {
    * v0.8.3 Step 9：改用 fetchWithTimeout 发起请求（修复 N05）
    *   - pendingRequestCount 正确计数（beforeunload 拦截可检测健康检查）
    *   - 错误经 SidecarUnreachableError/SidecarTimeoutError 分类
-   *   - 健康检查超时 3s（短于 10s 轮询周期），错误不弹 Toast
+   * v0.8.11 P0-1：健康检查超时从 3s 延长到 8s + 失败容错计数
+   *   - sidecar 索引期间 /v1/health/system 响应可能 >3s，3s 超时导致误判不可达
+   *   - 连续 2 次失败才判定不可达，避免单次慢响应触发状态栏闪红
+   * v0.8.11 P0-2：解析后端 status 字段，区分 starting/indexing/running
+   *   - 之前只检查 res.ok，导致 indexing 期间健康检查显示"运行中"但 dao_metrics 超时
+   *   - 现在读取 status 字段，供 loadDaoMetrics 等组件判断是否在索引期
    * @returns {Promise<boolean>} 是否可达
    */
   async check() {
     if (this._inFlight) return this._isReachable;
     this._inFlight = true;
     try {
-      // v0.8.3 Step 9：改用 fetchWithTimeout，使 pendingRequestCount 计数
-      // 健康检查超时 3s（短于 10s 轮询周期，避免请求堆积）
-      const res = await fetchWithTimeout(`${API_BASE}/v1/health/system`, {}, 3000);
-      this._setReachable(res.ok);
-      return res.ok;
+      // v0.8.11 P0-1：健康检查超时从 3s 延长到 8s
+      // sidecar 索引期间 /health 需要获取 memory_store 锁，3s 不够
+      // v0.8.11 P0-2 修复：改为访问 /health（返回 status 字段），而非 /v1/health/system（返回详细报告，无 status 字段）
+      // /health 返回 HealthResponse {status: "running"|"indexing"|"starting", ...}
+      // /v1/health/system 返回 health_report()（详细报告，不含 status 字段）
+      const res = await fetchWithTimeout(`${API_BASE}/health`, {}, 8000);
+      if (res.ok) {
+        // v0.8.11 P0-2：解析 status 字段，区分 starting/indexing/running
+        try {
+          const data = await res.json();
+          if (data && data.status && ['starting', 'indexing', 'running'].includes(data.status)) {
+            this._sidecarStatus = data.status;
+          } else {
+            this._sidecarStatus = 'running'; // 有响应但无 status 字段，视为就绪
+          }
+        } catch (jsonErr) {
+          // JSON 解析失败但 HTTP 200，视为就绪
+          this._sidecarStatus = 'running';
+        }
+        // 可达：重置失败计数
+        this._failCount = 0;
+        this._setReachable(true);
+        return true;
+      } else {
+        // HTTP 非 200：计入失败
+        return this._handleCheckFailure();
+      }
     } catch (e) {
       // 错误已由 fetchWithTimeout 分类（SidecarUnreachableError/SidecarTimeoutError）
-      // 健康检查的错误不弹 Toast，仅更新状态（避免每 10s 弹错误 Toast 干扰用户）
-      this._setReachable(false);
-      return false;
+      // v0.8.11 P0-1：失败容错，连续 2 次失败才判定不可达
+      return this._handleCheckFailure();
     } finally {
       this._inFlight = false;
     }
+  },
+
+  /**
+   * v0.8.11 P0-1：健康检查失败容错处理
+   * 连续 _FAIL_THRESHOLD 次失败才判定不可达，避免索引期单次慢响应误判
+   * @returns {boolean} 当前是否可达
+   */
+  _handleCheckFailure() {
+    this._failCount++;
+    if (this._failCount >= this._FAIL_THRESHOLD) {
+      // 超过阈值，判定不可达
+      this._sidecarStatus = 'unknown';
+      this._setReachable(false);
+      return false;
+    }
+    // 未达阈值，保持当前状态（避免状态栏频繁闪红）
+    console.warn('[LRC v' + APP_VERSION + ']健康检查失败 ' + this._failCount + '/' + this._FAIL_THRESHOLD + '，暂不判定不可达');
+    return this._isReachable;
+  },
+
+  /**
+   * v0.8.11 P0-2：获取后端 sidecar 状态
+   * @returns {string} 'starting' | 'indexing' | 'running' | 'unknown'
+   */
+  getSidecarStatus() {
+    return this._sidecarStatus;
+  },
+
+  /**
+   * v0.8.11 P0-2：sidecar 是否正在索引（starting 或 indexing 阶段）
+   * 供组件级数据加载函数判断是否显示"索引中"提示而非"加载失败"
+   * @returns {boolean}
+   */
+  isIndexing() {
+    return this._sidecarStatus === 'starting' || this._sidecarStatus === 'indexing';
   },
 
   /**
@@ -358,6 +425,8 @@ const SidecarHealthMonitor = {
    *
    * 之前仅刷新仪表盘，导致设置页/信任中心页状态不同步。
    * 现在通过自定义事件 + 主动刷新当前 active tab 双轨通知。
+   * v0.8.11 P0-2：广播时携带 sidecarStatus（starting/indexing/running），
+   *   供组件级数据加载函数判断是否显示"索引中"提示而非"加载失败"
    *
    * @param {boolean} online - sidecar 是否可达
    */
@@ -377,8 +446,14 @@ const SidecarHealthMonitor = {
       setTimeout(() => loadTrustCenter(), 500);
     }
     // 3. 发出自定义事件，供其他模块解耦响应
+    // v0.8.11 P0-2：事件携带 sidecarStatus，供 loadDaoMetrics 等组件感知索引期
     window.dispatchEvent(new CustomEvent('lrc:sidecar-state-change', {
-      detail: { online, timestamp: Date.now() }
+      detail: {
+        online,
+        sidecarStatus: this._sidecarStatus,
+        indexing: this.isIndexing(),
+        timestamp: Date.now()
+      }
     }));
   },
 
@@ -4267,9 +4342,10 @@ async function runPrivacyCheck() {
   try {
     // 并行调用三个接口以保证 100ms 内返回
     const [dataLoc, networkAudit, auditIntegrity] = await Promise.all([
-      fetchWithTimeout(`${window.API_BASE}/v1/trust/data-location`, {}, 5000),
-      fetchWithTimeout(`${window.API_BASE}/v1/trust/network-audit`, {}, 5000),
-      fetchWithTimeout(`${window.API_BASE}/v1/trust/audit-integrity`, {}, 5000)
+      // v0.8.11：超时从 5s 延长到 10s，sidecar 索引期间 trust 接口响应慢
+      fetchWithTimeout(`${window.API_BASE}/v1/trust/data-location`, {}, 10000),
+      fetchWithTimeout(`${window.API_BASE}/v1/trust/network-audit`, {}, 10000),
+      fetchWithTimeout(`${window.API_BASE}/v1/trust/audit-integrity`, {}, 10000)
     ]);
 
     const dataLocData = await safeJson(dataLoc);
@@ -4343,7 +4419,8 @@ async function loadCrystallizationHistory() {
   if (!timelineEl) return;
 
   try {
-    const res = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, {}, 5000);
+    // v0.8.11：超时从 5s 延长到 10s
+    const res = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, {}, 10000);
     const data = await safeJson(res);
 
     if (!data.ok || !data.entries || data.entries.length === 0) {
@@ -4464,15 +4541,26 @@ function drawDaoRing(score) {
   ctx.restore();
 }
 
+// v0.8.11：道同构度自动重试计数器（指数退避 2s/4s/8s，最多 3 次）
+let _daoRetryCount = 0;
+const _DAO_MAX_RETRIES = 3;
+
 /**
  * 加载道同构度数据并渲染
+ * v0.8.11：超时从 5s 延长到 10s + 自动重试退避（sidecar 索引期间 dao_metrics 响应慢）
  */
 async function loadDaoMetrics() {
   try {
-    const response = await fetchWithTimeout(`${window.API_BASE}/v1/health/dao_metrics`, {}, 5000);
+    // v0.8.11：超时从 5s 延长到 10s，与 loadDashboard 默认超时一致
+    // sidecar 刚启动/索引期间 dao_metrics 计算涉及编码器状态检查，5s 不够
+    const response = await fetchWithTimeout(`${window.API_BASE}/v1/health/dao_metrics`, {}, 10000);
     const data = await safeJson(response);
 
     if (data.ok && data.data) {
+      _daoRetryCount = 0; // 成功时重置重试计数器
+      // v0.8.11 P0-5：成功时清除"索引中"提示横幅（如果存在）
+      const indexingHint = document.querySelector('.dao-indexing-hint');
+      if (indexingHint) indexingHint.remove();
       const m = data.data;
       // v0.8.1：后端已返回 0-100 区间值，前端直接使用
       // yin_yang_balance: 0-100（阴阳守恒度）
@@ -4508,12 +4596,80 @@ async function loadDaoMetrics() {
       _applyDaoMetricsFallback('数据格式异常');
     }
   } catch (err) {
-    console.warn('[LRC v' + APP_VERSION + ']道同构度加载失败，使用默认值:', err.message);
-    // v0.8.4 Step 4：catch 分支同样补全 4 个小指标 + 显示降级提示
-    const reason = (err && err.name === 'SidecarUnreachableError')
-      ? 'LRC 服务未启动'
-      : (err && err.message) ? err.message : '未知错误';
+    console.warn('[LRC v' + APP_VERSION + ']道同构度加载失败（重试 ' + _daoRetryCount + '/' + _DAO_MAX_RETRIES + '）:', err.message);
+
+    // v0.8.11 P0-5：检查 sidecar 是否正在索引
+    // 索引期间 dao_metrics 接口响应慢是预期行为，不应显示"加载失败"，应显示"索引中"
+    const isIndexing = typeof SidecarHealthMonitor !== 'undefined'
+      && SidecarHealthMonitor
+      && typeof SidecarHealthMonitor.isIndexing === 'function'
+      && SidecarHealthMonitor.isIndexing();
+
+    // v0.8.11：自动重试 + 指数退避（2s/4s/8s），避免 sidecar 索引期间短暂超时导致永久降级
+    if (_daoRetryCount < _DAO_MAX_RETRIES) {
+      _daoRetryCount++;
+      const delay = 2000 * Math.pow(2, _daoRetryCount - 1); // 2s, 4s, 8s
+      console.log('[LRC] 道同构度 ' + delay + 'ms 后自动重试...');
+      // v0.8.11 P0-5：索引期间显示"索引中"提示，而非静默等待重试
+      if (isIndexing) {
+        _applyDaoMetricsIndexingHint();
+      }
+      setTimeout(() => loadDaoMetrics(), delay);
+      return; // 不显示降级横幅，等待重试结果
+    }
+    // 重试耗尽，重置计数器并显示降级提示
+    _daoRetryCount = 0;
+    // v0.8.11 P0-5：重试耗尽时，根据 sidecar 状态区分提示
+    // - sidecar 不可达：显示"LRC 服务未启动"
+    // - sidecar 索引中但响应超时：显示"索引耗时较长，请稍后手动刷新"
+    // - 其他错误：显示实际错误
+    let reason;
+    if (err && err.name === 'SidecarUnreachableError') {
+      reason = 'LRC 服务未启动';
+    } else if (isIndexing) {
+      reason = '索引耗时较长，请稍后手动刷新';
+    } else {
+      reason = (err && err.message) ? err.message : '未知错误';
+    }
     _applyDaoMetricsFallback(reason);
+  }
+}
+
+/**
+ * v0.8.11 P0-5：道同构度"索引中"提示（非降级）
+ * sidecar 索引期间 dao_metrics 响应慢是预期行为，显示"索引中"而非"加载失败"
+ * 区别于 _applyDaoMetricsFallback：不显示红色降级横幅，而是黄色"索引中"提示
+ */
+function _applyDaoMetricsIndexingHint() {
+  const scoreEl = document.getElementById('dao-ring-score');
+  if (scoreEl) scoreEl.textContent = '...';
+  // 4 个小指标保持当前值（不重置为 '--'，避免视觉跳变）
+  // 显示"索引中"提示横幅（黄色，非红色）
+  const panel = document.querySelector('.dao-metrics-panel')
+    || document.getElementById('dao-metrics-panel')
+    || document.getElementById('dao-ring-score')?.closest('.card, .panel, .stat-card');
+  if (panel) {
+    let banner = panel.querySelector('.dao-indexing-hint');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.className = 'dao-indexing-hint';
+      banner.style.cssText = 'background:rgba(0,123,255,0.12);color:#004085;padding:8px 12px;border-radius:4px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:8px;';
+      const spinner = document.createElement('span');
+      spinner.style.cssText = 'display:inline-block;width:12px;height:12px;border:2px solid #004085;border-top-color:transparent;border-radius:50%;animation:lrc-spin 0.8s linear infinite;';
+      spinner.className = 'lrc-spinner';
+      banner.appendChild(spinner);
+      const text = document.createElement('span');
+      text.textContent = 'LRC 服务正在索引代码库，道同构度数据稍后自动加载...';
+      banner.appendChild(text);
+      panel.insertBefore(banner, panel.firstChild);
+    }
+  }
+  // 确保加载动画 keyframes 存在
+  if (!document.getElementById('lrc-spin-keyframes')) {
+    const style = document.createElement('style');
+    style.id = 'lrc-spin-keyframes';
+    style.textContent = '@keyframes lrc-spin{to{transform:rotate(360deg)}}';
+    document.head.appendChild(style);
   }
 }
 
@@ -4525,6 +4681,10 @@ async function loadDaoMetrics() {
  * @param {string} reason - 降级原因
  */
 function _applyDaoMetricsFallback(reason) {
+  // v0.8.11 P0-5：降级时清除"索引中"提示横幅（如果存在）
+  const indexingHint = document.querySelector('.dao-indexing-hint');
+  if (indexingHint) indexingHint.remove();
+
   // 环形图和评分显示 '--'
   drawDaoRing(0);
   const scoreEl = document.getElementById('dao-ring-score');
@@ -4599,7 +4759,8 @@ async function loadEvolutionTimeline() {
 
   try {
     // 从审计日志接口获取演化事件
-    const response = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, {}, 5000);
+    // v0.8.11：超时从 5s 延长到 10s
+    const response = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, {}, 10000);
     const data = await safeJson(response);
 
     if (data.ok && data.events && data.events.length > 0) {
