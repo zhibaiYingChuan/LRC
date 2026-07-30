@@ -1096,6 +1096,38 @@ function updateStatusBar(online, systemData) {
   if (sysVersion) sysVersion.textContent = 'v' + APP_VERSION;
   if (dataDir) dataDir.textContent = '.loong-recall/data/';
   if (uptime) uptime.textContent = formatUptime(Date.now() - startTime);
+
+  // v0.8.14 P1 修复：信任中心"服务状态概览"区块同步更新
+  // 盲点根因：updateStatusBar 只更新 footer 状态栏，遗漏信任中心页面的 4 个状态元素
+  // 导致用户在信任中心看到的状态与实际不符（status-dot=unknown, text=检测中...）
+  const trustDot = $('system-status-dot');
+  const trustText = $('system-status-text');
+  const trustBadge = $('system-status-badge');
+  const trustUptime = $('sys-uptime');
+  if (trustDot && trustText) {
+    // 同步状态点类名和文本（与 footer 状态栏保持一致）
+    if (online) {
+      const isIndexing = typeof SidecarHealthMonitor !== 'undefined'
+        && SidecarHealthMonitor
+        && typeof SidecarHealthMonitor.isIndexing === 'function'
+        && SidecarHealthMonitor.isIndexing();
+      if (isIndexing) {
+        trustDot.className = 'status-dot indexing';
+        trustText.textContent = '索引中...';
+        if (trustBadge) { trustBadge.textContent = '索引中'; trustBadge.className = 'badge badge-warning'; }
+      } else {
+        trustDot.className = 'status-dot online';
+        trustText.textContent = '运行中';
+        if (trustBadge) { trustBadge.textContent = '在线'; trustBadge.className = 'badge badge-success'; }
+      }
+    } else {
+      trustDot.className = 'status-dot offline';
+      trustText.textContent = '已停止 / 不可达';
+      if (trustBadge) { trustBadge.textContent = '离线'; trustBadge.className = 'badge badge-danger'; }
+    }
+  }
+  // 同步运行时长到信任中心
+  if (trustUptime) trustUptime.textContent = formatUptime(Date.now() - startTime);
 }
 
 // ============================================================

@@ -52,6 +52,28 @@
 - **P1-2**: sidecar-crash 后 `_backoffStep` 未重置，恢复检测最慢 60s（app.js:2440）
   — 修复：sidecar-crash 事件处理中重置 `_backoffStep = 0`
 
+#### Playwright 真实用户交互回归测试修复（4处）
+> 用户批评 v0.8.13 仅做单元测试未做真实交互测试，导致 v0.8.12 CI 失败溜过去。
+> v0.8.14 使用 Playwright MCP 做真实用户交互回归测试，发现信任中心状态指示器从未被更新。
+
+- **P1-3**: 信任中心 `#system-status-dot` 从未更新，始终显示 "unknown"（app.js:updateStatusBar）
+  — 根因：updateStatusBar 只更新 footer 状态栏，遗漏信任中心 4 个状态元素
+  — 修复：updateStatusBar 增加 trustDot 同步逻辑
+- **P1-4**: 信任中心 `#system-status-text` 从未更新，始终显示 "检测中..."（app.js:updateStatusBar）
+  — 修复：updateStatusBar 增加 trustText 同步逻辑
+- **P2-1**: 信任中心 `#system-status-badge` 从未更新，始终显示 "--"（app.js:updateStatusBar）
+  — 修复：updateStatusBar 增加 trustBadge 同步逻辑（在线/索引中/离线 + badge-success/warning/danger）
+- **P2-2**: 信任中心 `#sys-uptime` 从未更新，始终显示 "--"（app.js:updateStatusBar）
+  — 修复：updateStatusBar 增加 trustUptime 同步逻辑
+
+#### CI 门禁补漏（Playwright 测试期间发现）
+- **desktop Cargo.lock 检查**：preflight_check.ps1 和 release.yml 漏检 desktop/src-tauri/Cargo.lock
+  — 根因：v0.8.13 只增加了根目录 Cargo.lock 检查，遗漏 desktop 子项目 Cargo.lock
+  — 导致：lrc-desktop 版本号长期滞后（0.8.11 未同步到 0.8.14）
+  — 修复：版本一致性检查从 8 处扩到 9 处（新增 desktop Cargo.lock）
+- **$cargoVer 变量未定义 bug 修复**：preflight_check.ps1 原代码引用了未定义的 $cargoVer（应为 $cargoLine）
+- **UTF-8 BOM 恢复**：Edit 工具丢失了 preflight_check.ps1 的 BOM，导致 PowerShell 5.1 无法解析中文字符串
+
 #### 未修复的已知问题（后续版本处理）
 - P0-3: showPrompt 绕过 processConfirmQueue（需较大重构，风险较高）
 - P0-8: 启动取消后误标不可达（边缘场景）
@@ -66,6 +88,12 @@
 - preflight_check.ps1: 15 passed, 0 failed
 - interaction-resilience-auditor: 五层交互韧性全局审计完成
 - hcse-resilience-validator: HCSE 韧性验证回归测试完成
+- **Playwright MCP 真实用户交互回归测试**:
+  — 仪表盘加载 + 状态指示器一致性验证 ✓
+  — 信任中心状态指示器同步验证（修复后）✓
+  — 标签页切换状态一致性验证（仪表盘/记忆搜索/信任中心）✓
+  — 道同构度数据加载验证 ✓
+  — 发现并修复 4 个信任中心状态指示器未更新问题（P1×2 + P2×2）
 
 ---
 
