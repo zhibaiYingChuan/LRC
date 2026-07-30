@@ -48,8 +48,9 @@ use tokio::sync::{Mutex, RwLock};
 
 /// 基准测试报告缓存（避免每次请求都重新运行耗时的基准测试）
 /// v0.5.6：添加缓存时间戳，支持 1 小时过期机制
-static BENCHMARK_CACHE: std::sync::LazyLock<StdMutex<Option<(serde_json::Value, std::time::Instant)>>> =
-    std::sync::LazyLock::new(|| StdMutex::new(None));
+static BENCHMARK_CACHE: std::sync::LazyLock<
+    StdMutex<Option<(serde_json::Value, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(None));
 
 /// 基准测试缓存有效期：1 小时
 const BENCHMARK_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -2053,7 +2054,10 @@ mod api_contracts_tests {
         let json = r#"{"memories":[{"content":"测试记忆"}]}"#;
         let req: ConsolidateRequest = serde_json::from_str(json).expect("反序列化失败");
         assert_eq!(req.memories.len(), 1);
-        assert_eq!(req.synthesis_similarity, 0.4, "synthesis_similarity 默认值应为 0.4");
+        assert_eq!(
+            req.synthesis_similarity, 0.4,
+            "synthesis_similarity 默认值应为 0.4"
+        );
         assert_eq!(req.min_cluster, 3, "min_cluster 默认值应为 3");
         // ConsolidateMemory 的默认值
         assert_eq!(req.memories[0].memory_type, "fact");
@@ -2137,7 +2141,10 @@ mod api_contracts_tests {
         };
         let json = serde_json::to_value(&resp).expect("序列化失败");
         // 验证字段名与前端预期一致（snake_case）
-        assert!(json.get("luoshu_vector").is_some(), "字段名应为 luoshu_vector");
+        assert!(
+            json.get("luoshu_vector").is_some(),
+            "字段名应为 luoshu_vector"
+        );
         assert!(json.get("bagua_index").is_some());
         assert!(json.get("bagua_category").is_some());
         assert!(json.get("center_value").is_some());
@@ -2192,19 +2199,10 @@ mod api_contracts_tests {
         let approx_eq = |a: f64, b: f64| (a - b).abs() < 1e-3;
         // 验证 data 字段（前端 dashboard 依赖这些名称）
         let data = &json["data"];
-        assert!(approx_eq(
-            data["yin_yang_balance"].as_f64().unwrap(),
-            85.5
-        ));
-        assert!(approx_eq(
-            data["luoshu_deviation"].as_f64().unwrap(),
-            14.5
-        ));
+        assert!(approx_eq(data["yin_yang_balance"].as_f64().unwrap(), 85.5));
+        assert!(approx_eq(data["luoshu_deviation"].as_f64().unwrap(), 14.5));
         assert!(approx_eq(data["bagua_balance"].as_f64().unwrap(), 97.9));
-        assert!(approx_eq(
-            data["synthesis_ratio"].as_f64().unwrap(),
-            30.0
-        ));
+        assert!(approx_eq(data["synthesis_ratio"].as_f64().unwrap(), 30.0));
         assert!(approx_eq(
             data["dao_isomorphism_score"].as_f64().unwrap(),
             0.855

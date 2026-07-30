@@ -596,12 +596,11 @@ fn contains_word(content: &str, word: &str) -> bool {
             let match_end = match_start + word_len;
 
             // 检查前一个字符是否为词边界（非字母）
-            let prefix_ok = match_start == 0
-                || !is_alpha_byte(content_bytes[match_start - 1]);
+            let prefix_ok = match_start == 0 || !is_alpha_byte(content_bytes[match_start - 1]);
 
             // 检查后一个字符是否为词边界（非字母）
-            let suffix_ok = match_end == content_bytes.len()
-                || !is_alpha_byte(content_bytes[match_end]);
+            let suffix_ok =
+                match_end == content_bytes.len() || !is_alpha_byte(content_bytes[match_end]);
 
             if prefix_ok && suffix_ok {
                 return true;
@@ -663,10 +662,9 @@ fn count_word_occurrences(content: &str, word: &str) -> usize {
             let match_start = start + pos;
             let match_end = match_start + word_len;
 
-            let prefix_ok = match_start == 0
-                || !is_alpha_byte(content_bytes[match_start - 1]);
-            let suffix_ok = match_end == content_bytes.len()
-                || !is_alpha_byte(content_bytes[match_end]);
+            let prefix_ok = match_start == 0 || !is_alpha_byte(content_bytes[match_start - 1]);
+            let suffix_ok =
+                match_end == content_bytes.len() || !is_alpha_byte(content_bytes[match_end]);
 
             if prefix_ok && suffix_ok {
                 count += 1;
@@ -807,7 +805,10 @@ impl<P: Persistence> MemoryStore<P> {
     /// v0.6.0+ 参赛扩展：设置探索日志记录器
     /// 由 sidecar 启动时根据 `--exploration-log <path>` 参数注入
     /// 未调用此方法时，所有日志调用为空操作（disabled 模式）
-    pub fn set_exploration_logger(&mut self, logger: crate::engine::exploration_log::ExplorationLogger) {
+    pub fn set_exploration_logger(
+        &mut self,
+        logger: crate::engine::exploration_log::ExplorationLogger,
+    ) {
         self.exploration_logger = logger;
     }
 

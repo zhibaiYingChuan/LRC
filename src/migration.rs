@@ -94,7 +94,13 @@ pub fn scan_legacy_sources() -> Vec<MigrationSource> {
                 if memory_file.exists() {
                     sources.push(MigrationSource {
                         data_dir: data_dir.clone(),
-                        source_type: format!("项目指纹({})", fingerprint_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
+                        source_type: format!(
+                            "项目指纹({})",
+                            fingerprint_dir
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default()
+                        ),
                         is_global: false,
                     });
                 }
@@ -148,8 +154,13 @@ fn read_memories(data_dir: &Path) -> Result<Vec<serde_json::Value>, String> {
 
 /// 获取记忆的 id 和 updated_at（用于去重）
 fn get_id_and_updated(mem: &serde_json::Value) -> (String, String) {
-    let id = mem.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let updated = mem.get("updated_at")
+    let id = mem
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let updated = mem
+        .get("updated_at")
         .and_then(|v| v.as_str())
         .or_else(|| mem.get("created_at").and_then(|v| v.as_str()))
         .unwrap_or("")
@@ -197,7 +208,10 @@ pub fn execute_migration() -> MigrationReport {
                     if id.is_empty() {
                         // 无 id 的记忆直接保留
                         let fake_id = format!("no-id-{}", uuid::Uuid::new_v4());
-                        memory_pool.insert(fake_id, (mem.clone(), source.source_type.clone(), updated.clone()));
+                        memory_pool.insert(
+                            fake_id,
+                            (mem.clone(), source.source_type.clone(), updated.clone()),
+                        );
                         added += 1;
                         continue;
                     }
@@ -205,12 +219,14 @@ pub fn execute_migration() -> MigrationReport {
                         Some(existing) => {
                             // 比较 updated_at，保留最新的
                             if updated > existing.2 {
-                                memory_pool.insert(id, (mem.clone(), source.source_type.clone(), updated));
+                                memory_pool
+                                    .insert(id, (mem.clone(), source.source_type.clone(), updated));
                             }
                             duplicates += 1;
                         }
                         None => {
-                            memory_pool.insert(id, (mem.clone(), source.source_type.clone(), updated));
+                            memory_pool
+                                .insert(id, (mem.clone(), source.source_type.clone(), updated));
                             added += 1;
                         }
                     }
@@ -249,7 +265,7 @@ pub fn execute_migration() -> MigrationReport {
     merged.sort_by(|a, b| {
         let a_time = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
         let b_time = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-        a_time.cmp(&b_time)
+        a_time.cmp(b_time)
     });
 
     report.global_after = merged.len();
@@ -291,7 +307,7 @@ pub fn execute_migration() -> MigrationReport {
                 report.files_backed_up += 1;
                 // 更新对应 source 的 backed_up 状态
                 for s in &mut report.sources {
-                    if s.data_dir == source.data_dir.to_string_lossy().to_string() {
+                    if s.data_dir == source.data_dir.to_string_lossy() {
                         s.backed_up = true;
                         s.status = "已备份(.bak)".to_string();
                     }
@@ -299,7 +315,7 @@ pub fn execute_migration() -> MigrationReport {
             }
             Err(e) => {
                 for s in &mut report.sources {
-                    if s.data_dir == source.data_dir.to_string_lossy().to_string() {
+                    if s.data_dir == source.data_dir.to_string_lossy() {
                         s.status = format!("备份失败: {}", e);
                     }
                 }
@@ -338,10 +354,7 @@ pub fn execute_migration() -> MigrationReport {
             report.memories_added,
             report.files_backed_up
         );
-        crate::data_log::log_operation(
-            crate::data_log::OperationType::Migrate,
-            &details,
-        );
+        crate::data_log::log_operation(crate::data_log::OperationType::Migrate, &details);
     }
 
     report
@@ -390,7 +403,8 @@ mod tests {
         std::fs::write(
             dir.join("memories.json"),
             r#"[{"id":"a","content":"A"},{"id":"b","content":"B"}]"#,
-        ).unwrap();
+        )
+        .unwrap();
         let memories = read_memories(&dir).unwrap();
         assert_eq!(memories.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
@@ -404,7 +418,8 @@ mod tests {
         std::fs::write(
             dir.join("memories.json"),
             r#"{"id":"a","content":"A","long_term":true}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let memories = read_memories(&dir).unwrap();
         assert_eq!(memories.len(), 1);
         std::fs::remove_dir_all(&dir).ok();

@@ -183,11 +183,9 @@ async fn try_run() -> Result<(), String> {
             "model" => {
                 // 解析子命令
                 if i + 1 >= args.len() {
-                    return Err(
-                        "错误: model 子命令需要指定操作\n\
+                    return Err("错误: model 子命令需要指定操作\n\
                          用法: code-memory-server model <list|download|use|remove> [args]"
-                            .to_string(),
-                    );
+                        .to_string());
                 }
                 let subcommand = args[i + 1].clone();
                 let sub_args = &args[i + 2..];
@@ -197,34 +195,28 @@ async fn try_run() -> Result<(), String> {
                     "list" => handle_model_list(),
                     "download" => {
                         if sub_args.is_empty() {
-                            return Err(
-                                "错误: model download 需要指定模型 ID\n\
+                            return Err("错误: model download 需要指定模型 ID\n\
                                  用法: code-memory-server model download <model_id>\n\
                                  示例: code-memory-server model download BAAI/bge-small-zh"
-                                    .to_string(),
-                            );
+                                .to_string());
                         }
                         handle_model_download(&sub_args[0])?
                     }
                     "use" => {
                         if sub_args.is_empty() {
-                            return Err(
-                                "错误: model use 需要指定模型 ID\n\
+                            return Err("错误: model use 需要指定模型 ID\n\
                                  用法: code-memory-server model use <model_id>\n\
                                  示例: code-memory-server model use BAAI/bge-small-zh"
-                                    .to_string(),
-                            );
+                                .to_string());
                         }
                         handle_model_use(&sub_args[0])?
                     }
                     "remove" => {
                         if sub_args.is_empty() {
-                            return Err(
-                                "错误: model remove 需要指定模型 ID\n\
+                            return Err("错误: model remove 需要指定模型 ID\n\
                                  用法: code-memory-server model remove <model_id>\n\
                                  示例: code-memory-server model remove BAAI/bge-small-zh"
-                                    .to_string(),
-                            );
+                                .to_string());
                         }
                         handle_model_remove(&sub_args[0])?
                     }
@@ -617,10 +609,13 @@ async fn try_run() -> Result<(), String> {
         if let Some(ref log_path) = exploration_log_path {
             let logger = code_memory::engine::exploration_log::ExplorationLogger::new(
                 std::path::PathBuf::from(log_path),
-                format!("exp_{}", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis()),
+                format!(
+                    "exp_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                ),
             );
             // 先记录实验配置事件
             logger.log_experiment_config(serde_json::json!({
@@ -1462,11 +1457,7 @@ const RECOMMENDED_MODELS: &[(&str, &str, &str)] = &[
         "384",
         "英文/多语言轻量（~80MB）",
     ),
-    (
-        "multilingual-e5-small",
-        "384",
-        "多语言通用（~120MB）",
-    ),
+    ("multilingual-e5-small", "384", "多语言通用（~120MB）"),
     (
         "microsoft/graphcodebert-base",
         "768",
@@ -1544,8 +1535,8 @@ fn handle_model_list() {
 
         // 检查是否包含必需文件（config.json + 模型权重）
         let has_config = path.join("config.json").exists();
-        let has_weights = path.join("model.safetensors").exists()
-            || path.join("pytorch_model.bin").exists();
+        let has_weights =
+            path.join("model.safetensors").exists() || path.join("pytorch_model.bin").exists();
 
         if !has_config || !has_weights {
             continue;
@@ -1573,7 +1564,7 @@ fn handle_model_list() {
     // 按模型 ID 排序
     models.sort_by(|a, b| a.0.cmp(&b.0));
 
-    println!("  {:<45} {:>10}  {}", "模型 ID", "大小", "目录名");
+    println!("  {:<45} {:>10}  目录名", "模型 ID", "大小");
     println!("  {}", "─".repeat(75));
 
     // 获取当前默认模型（从环境变量，常量定义在 engine 层避免公开层泄露）
@@ -1614,7 +1605,7 @@ fn handle_model_list() {
 fn handle_model_download(model_id: &str) -> Result<(), String> {
     #[cfg(not(feature = "ml"))]
     {
-        return Err(format!(
+        Err(format!(
             "错误: 模型下载功能需要启用 ml feature\n\
              当前编译未启用 ml feature，请使用以下命令重新编译：\n\
              cargo build --features server,ml\n\
@@ -1627,7 +1618,7 @@ fn handle_model_download(model_id: &str) -> Result<(), String> {
             model_id,
             model_id,
             model_id.replace('/', "--")
-        ));
+        ))
     }
 
     #[cfg(feature = "ml")]
@@ -1655,16 +1646,15 @@ fn handle_model_download(model_id: &str) -> Result<(), String> {
                 || dest_dir.join("pytorch_model.bin").exists())
         {
             println!("  ✓ 模型已存在: {}", dest_dir.display());
-            println!("  如需重新下载，请先删除: code-memory-server model remove {}", model_id);
+            println!(
+                "  如需重新下载，请先删除: code-memory-server model remove {}",
+                model_id
+            );
             return Ok(());
         }
 
         // 需要下载的文件列表
-        let files_to_download = [
-            "config.json",
-            "tokenizer.json",
-            "model.safetensors",
-        ];
+        let files_to_download = ["config.json", "tokenizer.json", "model.safetensors"];
 
         let config = DownloadConfig::default();
         let downloader = ModelDownloader::new(config);
@@ -1722,7 +1712,10 @@ fn handle_model_download(model_id: &str) -> Result<(), String> {
             println!("  存储位置: {}", dest_dir.display());
             println!();
             println!("  下一步:");
-            println!("    设为默认模型: code-memory-server model use {}", model_id);
+            println!(
+                "    设为默认模型: code-memory-server model use {}",
+                model_id
+            );
             println!("    启动 LRC:     code-memory-server --src-dir ./src --stdio");
         } else {
             println!("═══════════════════════════════════════════");
@@ -1730,10 +1723,7 @@ fn handle_model_download(model_id: &str) -> Result<(), String> {
             println!("═══════════════════════════════════════════");
             println!();
             println!("{}", manual_download_guide(model_id));
-            return Err(format!(
-                "下载失败，{} 个文件未成功下载",
-                failed_files.len()
-            ));
+            return Err(format!("下载失败，{} 个文件未成功下载", failed_files.len()));
         }
 
         Ok(())
@@ -1834,10 +1824,7 @@ fn handle_model_remove(model_id: &str) -> Result<(), String> {
     println!();
 
     // 询问用户确认
-    if !ask_user_confirmation(&format!(
-        "  确认删除模型 {} ({})？",
-        model_id, size_str
-    )) {
+    if !ask_user_confirmation(&format!("  确认删除模型 {} ({})？", model_id, size_str)) {
         println!("  → 已取消删除");
         return Ok(());
     }

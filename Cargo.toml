@@ -7,8 +7,9 @@ name = "code-memory"
 version = "0.8.7"
 edition = "2021"
 # v0.7.1 P2-5：声明最低支持 Rust 版本（MSRV）
-# 基于依赖矩阵：axum 0.7 (1.66+)、tokio 1.x (1.63+)、reqwest (1.64+)
-rust-version = "1.70"
+# v0.8.8：提升到 1.80（std::sync::LazyLock 需要 1.80+）
+# 基于依赖矩阵：axum 0.7 (1.66+)、tokio 1.x (1.63+)、reqwest (1.64+)、LazyLock (1.80+)
+rust-version = "1.80"
 authors = ["Open Source Contributors"]
 description = "Loong Recall (LRC) — AI 永久记忆系统，为 AI 助手提供语义代码搜索与跨会话记忆"
 license = "Apache-2.0 OR LicenseRef-DaoTi-Research"
