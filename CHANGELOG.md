@@ -4,6 +4,44 @@
 
 ---
 
+## [0.8.12] - 2026-07-31
+
+### 修复
+
+- **P0**: 启动成功后立即更新状态栏，消除"服务已就绪"与"已停止"矛盾显示（app.js:handleStartServiceClick）
+  — 之前：postMessageToParent 返回成功后等待 800ms + 健康检查完成（最多 8s）才更新状态栏
+  — 现在：postMessageToParent 返回成功 = sidecar 已启动，立即调用 `_setReachable(true)` 更新状态栏
+  — 设置 `_sidecarStatus = 'starting'`，状态栏显示"索引中..."（金色圆点）而非"已停止"（红色圆点）
+- **P0**: `loadDashboard()` 索引期失败不再覆盖"运行中/索引中"状态栏（app.js:loadDashboard catch 块）
+  — 之前：索引期 API 超时 → `loadDashboard()` catch → `updateStatusBar(false, null)` → 状态栏闪红
+  — 现在：检测 `SidecarHealthMonitor._isReachable`，若 sidecar 已知可达则不覆盖状态栏
+- **P0**: `loadDashboard()` 索引期自动重试（3 次，3s 间隔）+ "索引中"提示（app.js:loadDashboard catch 块）
+  — 之前：索引期数据加载失败直接显示错误"⚠️ 无法连接到 API 服务"
+  — 现在：显示"LRC 服务正在索引代码库，仪表盘数据稍后自动加载..." + 3s 后自动重试
+- **P0**: 状态栏新增"索引中..."视觉状态（金色圆点 + 脉冲动画）（app.css + app.js:updateStatusBar）
+  — 区别于"运行中"（绿色圆点）和"已停止"（红色圆点），用户可直观感知索引进度
+- **P1**: 健康检查检测到索引完成（starting/indexing → running）时自动刷新状态栏 + 仪表盘（app.js:SidecarHealthMonitor.check）
+  — 之前：`_setReachable(true)` 在状态未变时不触发广播，导致"索引中→运行中"转换不被反映
+  — 现在：检测 `prevStatus → running` 转换，强制触发 `_broadcastSidecarStateChange` 刷新 UI
+
+### 根因分析
+
+v0.8.11 用户测试报告：启动弹窗显示"服务已就绪 (port=3101)"，但状态栏显示"已停止 / 不可达"，道同构度指标未显示，过了一段时间才慢慢恢复正常。
+
+核心问题是**状态同步时序缺陷**：
+1. `postMessageToParent` 返回成功 = sidecar 已启动，但前端等待 800ms + 健康检查完成才更新状态栏
+2. `loadDashboard()` 索引期 API 超时 → catch 块 → `updateStatusBar(false, null)` 覆盖了正确的"运行中"状态
+3. 状态栏只有"运行中/已停止"两态，无法表达"已启动但索引中"的中间状态
+
+### 测试
+
+- cargo fmt --all -- --check: 通过
+- cargo clippy --all-targets --features server -- -D warnings: 通过
+- cargo test --features server: 505 passed, 0 failed, 7 ignored
+- 算法泄露检测: 通过（0 泄露）
+
+---
+
 ## [0.8.11] - 2026-07-31
 
 ### 修复

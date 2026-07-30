@@ -469,6 +469,7 @@
     .status-dot.online { background: var(--jade); animation: pulse 2s infinite; }
     .status-dot.offline { background: var(--cinnabar); }
     .status-dot.unknown { background: var(--gold); }
+    .status-dot.indexing { background: var(--gold); animation: pulse 1s infinite; }
 
     @keyframes pulse {
       0%, 100% { opacity: 1; }
@@ -3342,6 +3343,7 @@ code, pre, .code-block {
 .status-dot.online { background: var(--lrc-玉色-500) !important; animation: pulse 2s infinite !important; }
 .status-dot.offline { background: var(--lrc-朱砂-500) !important; }
 .status-dot.unknown { background: var(--lrc-金色-500) !important; }
+.status-dot.indexing { background: var(--lrc-金色-500) !important; animation: pulse 1s infinite !important; }
 
 .status-bar-left, .status-bar-right {
   display: flex !important;
