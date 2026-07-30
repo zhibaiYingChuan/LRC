@@ -4,7 +4,7 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.11';
+const APP_VERSION = '0.8.12';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -357,6 +357,7 @@ const SidecarHealthMonitor = {
       const res = await fetchWithTimeout(`${API_BASE}/health`, {}, 8000);
       if (res.ok) {
         // v0.8.11 P0-2：解析 status 字段，区分 starting/indexing/running
+        const prevStatus = this._sidecarStatus; // v0.8.12：记录之前的状态，用于检测索引完成
         try {
           const data = await res.json();
           if (data && data.status && ['starting', 'indexing', 'running'].includes(data.status)) {
@@ -371,6 +372,14 @@ const SidecarHealthMonitor = {
         // 可达：重置失败计数
         this._failCount = 0;
         this._setReachable(true);
+        // v0.8.12：索引完成时（starting/indexing → running），强制刷新状态栏 + 仪表盘
+        // _setReachable 在状态未变时不触发广播，需手动触发以反映"索引中→运行中"转换
+        const wasIndexing = prevStatus === 'starting' || prevStatus === 'indexing';
+        const isRunningNow = this._sidecarStatus === 'running';
+        if (wasIndexing && isRunningNow && this._isReachable) {
+          console.log('[LRC v' + APP_VERSION + ']Sidecar 索引完成，刷新状态栏 + 仪表盘');
+          this._broadcastSidecarStateChange(true);
+        }
         return true;
       } else {
         // HTTP 非 200：计入失败
@@ -591,6 +600,9 @@ document.querySelectorAll('.navbar-nav button').forEach(btn => {
 // v0.8.3 Step 10：仪表盘 AbortController（修复 N09 自动刷新请求竞态）
 // 维护一个 AbortController 实例，刷新前 abort 旧请求，避免数据覆盖
 let dashboardAbortController = null;
+// v0.8.12：仪表盘索引期自动重试计数器
+let _dashboardRetryCount = 0;
+const _DASHBOARD_MAX_RETRIES = 3;
 
 async function loadDashboard() {
   const loading = $('dashboard-loading');
@@ -644,6 +656,10 @@ async function loadDashboard() {
 
     renderDashboard(systemData, detailedData, daoData);
     updateStatusBar(true, systemData);
+    // v0.8.12：加载成功时重置索引期重试计数器
+    _dashboardRetryCount = 0;
+    // v0.8.12：加载成功时清除"索引中"错误提示（如果存在）
+    if (error) error.classList.remove('show');
 
     // v0.8.0 桌面端 P2 改进：仪表盘加载成功后自动刷新进化时间线
     // 不 await，避免阻塞 loadDashboard；loadEvolutionTimeline 内部有 try/catch
@@ -664,11 +680,40 @@ async function loadDashboard() {
       return;
     }
     if (loading) loading.classList.add('hidden');
+
+    // v0.8.12：索引期间不覆盖"运行中/索引中"状态栏，显示提示并自动重试
+    const isIndexing = typeof SidecarHealthMonitor !== 'undefined'
+      && SidecarHealthMonitor
+      && typeof SidecarHealthMonitor.isIndexing === 'function'
+      && SidecarHealthMonitor.isIndexing();
+    const sidecarKnownReachable = typeof SidecarHealthMonitor !== 'undefined'
+      && SidecarHealthMonitor
+      && SidecarHealthMonitor._isReachable;
+
+    if (isIndexing && _dashboardRetryCount < _DASHBOARD_MAX_RETRIES) {
+      // 索引期数据加载失败，显示"索引中"提示并自动重试
+      _dashboardRetryCount++;
+      if (error) {
+        error.textContent = 'LRC 服务正在索引代码库，仪表盘数据稍后自动加载...';
+        error.classList.add('show');
+      }
+      // 不覆盖状态栏（保持"索引中..."显示）
+      console.log('[loadDashboard] 索引期加载失败，3s 后自动重试 (' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')');
+      setTimeout(() => loadDashboard(), 3000);
+      return;
+    }
+
+    // 非索引期或重试耗尽，显示错误
+    _dashboardRetryCount = 0;
     if (error) {
       error.textContent = '⚠️ ' + htmlescape(e.message);
       error.classList.add('show');
     }
-    updateStatusBar(false, null);
+    // v0.8.12：仅在 sidecar 确实不可达时才更新状态栏为"已停止"
+    // 避免 sidecar 已启动但数据加载失败时覆盖"运行中"状态
+    if (!sidecarKnownReachable) {
+      updateStatusBar(false, null);
+    }
   } finally {
     // v0.8.3 Step 10：清理 AbortController 引用（仅当当前请求未被打断）
     if (dashboardAbortController === currentSignal) {
@@ -957,10 +1002,22 @@ function updateStatusBar(online, systemData) {
 
   if (dot && text) {
     if (online) {
-      dot.className = 'status-dot online';
-      text.textContent = '运行中';
-      text.style.color = '#2ecc71';
-      text.title = 'LRC 服务运行中';
+      // v0.8.12：索引中显示金色圆点 + "索引中..."，区别于"运行中"
+      const isIndexing = typeof SidecarHealthMonitor !== 'undefined'
+        && SidecarHealthMonitor
+        && typeof SidecarHealthMonitor.isIndexing === 'function'
+        && SidecarHealthMonitor.isIndexing();
+      if (isIndexing) {
+        dot.className = 'status-dot indexing';
+        text.textContent = '索引中...';
+        text.style.color = '#f39c12';
+        text.title = 'LRC 服务正在索引代码库，数据稍后自动加载';
+      } else {
+        dot.className = 'status-dot online';
+        text.textContent = '运行中';
+        text.style.color = '#2ecc71';
+        text.title = 'LRC 服务运行中';
+      }
     } else {
       dot.className = 'status-dot offline';
       text.textContent = '已停止 / 不可达';
@@ -1285,14 +1342,20 @@ async function handleStartServiceClick() {
     // 进度事件 sidecar-start-progress 会实时更新按钮文字，用户不会以为卡住
     const result = await postMessageToParent('lrc-start-service', {}, 120000, startServiceAbortController.signal);
     closeStartServiceModal();
-    // 启动成功后刷新仪表盘 + 强制健康检查
-    setTimeout(() => {
+    // v0.8.12：启动成功后立即更新状态栏，避免"服务已就绪"与"已停止"矛盾显示
+    // postMessageToParent 返回成功 = sidecar 已启动，无需等待健康检查确认
+    if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+      // 设置为 'starting' 状态，状态栏将显示"索引中..."（金色圆点）
+      SidecarHealthMonitor._sidecarStatus = 'starting';
+      // 立即更新状态栏为可达（触发 _broadcastSidecarStateChange → updateStatusBar + loadDashboard）
+      SidecarHealthMonitor._setReachable(true);
+      // 后台运行健康检查，获取实际状态（starting/indexing/running）并更新
+      SidecarHealthMonitor.check();
+    } else {
+      // 降级路径：直接更新状态栏 + 加载仪表盘
+      if (typeof updateStatusBar === 'function') updateStatusBar(true, {});
       loadDashboard();
-      // v0.8.9：启动成功后主动触发一次健康检查，加速状态栏更新
-      if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
-        SidecarHealthMonitor.check();
-      }
-    }, 800);
+    }
   } catch (e) {
     btn.disabled = false;
     btn.textContent = '启动服务';
