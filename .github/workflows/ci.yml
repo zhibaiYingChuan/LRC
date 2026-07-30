@@ -197,3 +197,31 @@ jobs:
           restore-keys: ${{ runner.os }}-build-
       - name: cargo check (server feature)
         run: cargo check --features server
+
+      # v0.8.8 新增：桌面端跨平台编译验证（防止 macOS/Linux 桌面端 CI 失败）
+      - name: Install Linux system dependencies (Tauri)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
+
+      - name: cargo check (desktop)
+        run: cd desktop/src-tauri && cargo check
+
+      # v0.8.8 新增：Tauri 配置校验（确保 targets 不是单一平台）
+      - name: Tauri config lint
+        run: |
+          TARGETS=$(grep -o '"targets"[^,}]*' desktop/src-tauri/tauri.conf.json || echo "NOT_FOUND")
+          echo "targets = $TARGETS"
+          if echo "$TARGETS" | grep -q '"nsis"' && ! echo "$TARGETS" | grep -q '"all"'; then
+            echo "ERROR: targets 仅包含 nsis，macOS/Linux 无 bundle 产物"
+            echo "修复: 将 targets 改为 \"all\""
+            exit 1
+          fi
+        shell: bash

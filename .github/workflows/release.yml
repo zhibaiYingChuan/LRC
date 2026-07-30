@@ -15,9 +15,95 @@ permissions:
 
 jobs:
   # ════════════════════════════════════════════════════════════
+  # Job 0: 发布前预检门禁（v0.8.8 新增）
+  # 在三平台构建前执行全面检查，任一失败则阻止构建，避免资源浪费
+  # 检查项：fmt + clippy + check + test + tauri配置 + MSRV + 版本号
+  # ════════════════════════════════════════════════════════════
+  preflight:
+    name: Preflight Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache Cargo deps
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-preflight-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-preflight-
+
+      # 1. 代码格式检查（与 CI Rustfmt job 对齐）
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # 2. Clippy 静态检查（与 CI Clippy job 对齐，-D warnings）
+      - name: Clippy check (server feature)
+        run: cargo clippy --features server -- -D warnings
+      - name: Clippy check (all targets)
+        run: cargo clippy --all-targets -- -D warnings
+
+      # 3. 编译检查
+      - name: Compile check
+        run: cargo check --features server
+
+      # 4. 单元测试
+      - name: Unit tests
+        run: cargo test --features server
+
+      # 5. Tauri 配置验证（确保 targets 不是单一平台，防止 macOS/Linux 无 bundle）
+      - name: Tauri config lint
+        run: |
+          echo "检查 tauri.conf.json targets 配置..."
+          TARGETS=$(grep -o '"targets"[^,}]*' desktop/src-tauri/tauri.conf.json)
+          echo "  targets = $TARGETS"
+          # 禁止 ["nsis"] 等单平台限定（v0.8.7 根因）
+          if echo "$TARGETS" | grep -q '"nsis"' && ! echo "$TARGETS" | grep -q '"all"'; then
+            echo "ERROR: targets 仅包含 nsis，macOS/Linux 无 bundle 产物"
+            echo "修复: 将 targets 改为 \"all\""
+            exit 1
+          fi
+          echo "  Tauri 配置验证通过"
+
+      # 6. MSRV 一致性检查（主项目与桌面端必须一致）
+      - name: MSRV consistency check
+        run: |
+          MAIN_MSRV=$(grep '^rust-version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          DESKTOP_MSRV=$(grep '^rust-version' desktop/src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "主项目 MSRV: $MAIN_MSRV"
+          echo "桌面端 MSRV: $DESKTOP_MSRV"
+          if [ "$MAIN_MSRV" != "$DESKTOP_MSRV" ]; then
+            echo "ERROR: MSRV 不一致（主项目 $MAIN_MSRV vs 桌面端 $DESKTOP_MSRV）"
+            exit 1
+          fi
+          echo "  MSRV 一致性验证通过"
+
+      # 7. 版本号一致性检查（7 处版本号必须同步）
+      - name: Version consistency check
+        run: |
+          CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          DESKTOP_VER=$(grep '^version' desktop/src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          TAURI_VER=$(grep '"version"' desktop/src-tauri/tauri.conf.json | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "版本号检查："
+          echo "  Cargo.toml:          $CARGO_VER"
+          echo "  desktop Cargo.toml:  $DESKTOP_VER"
+          echo "  tauri.conf.json:     $TAURI_VER"
+          if [ "$CARGO_VER" != "$DESKTOP_VER" ] || [ "$CARGO_VER" != "$TAURI_VER" ]; then
+            echo "ERROR: 版本号不一致"
+            exit 1
+          fi
+          echo "  版本号一致性验证通过"
+
+  # ════════════════════════════════════════════════════════════
   # Job 1: 编译 Sidecar 二进制（裸二进制，供 CLI 用户使用）
   # ════════════════════════════════════════════════════════════
   build-sidecar:
+    needs: preflight
     name: Build Sidecar ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -123,6 +209,7 @@ jobs:
   # 生成 MSI/NSIS（Windows）和 DMG（macOS）
   # ════════════════════════════════════════════════════════════
   build-desktop:
+    needs: preflight
     name: Build Desktop ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:

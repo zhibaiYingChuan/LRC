@@ -4,6 +4,37 @@
 
 ---
 
+## [0.8.8] - 2026-07-30
+
+### 修复
+
+- **P0**: 修复 macOS/Linux 桌面端构建失败 — `desktop/src-tauri/tauri.conf.json` `bundle.targets` 从 `["nsis"]` 改为 `"all"`，恢复三平台全量打包（v0.8.7 根因）
+- **P0**: 修复 CI Clippy 失败（4 处） — `src/backup.rs` 改用 `sort_by_key`；`src/chunker.rs` 抑制 `question_mark` 误报；`src/graph_store.rs` 重构 match 分支
+- **P0**: 修复 E2E Smoke Test 失败 — `.github/workflows/ci.yml` 端点从 `/` 改为 `/dashboard`（根路径 302 重定向）
+- **P1**: 修复 Node.js 20 弃用警告 — `.github/workflows/release.yml` `download-artifact` v5 → v7
+- **P1**: 统一 MSRV 到 1.80 — `Cargo.toml` + `desktop/src-tauri/Cargo.toml`（LazyLock 需要 1.80+）
+
+### 新增
+
+- **三层门禁架构**：将文档规范升级为自动化工具链，构建三层防线确保问题在最早阶段被拦截
+  - **门禁 1（本地）**：`.git/hooks/pre-commit` v2.0 — 新增 `cargo fmt --check` + `cargo clippy -D warnings`（修复 v0.8.7 遗漏）
+  - **门禁 2（CI）**：`.github/workflows/ci.yml` — 新增桌面端 `cargo check` + Tauri 配置校验（禁止 `["nsis"]` 单平台限定）
+  - **门禁 3（Release）**：`.github/workflows/release.yml` 新增 `preflight` job（7 项检查：fmt + clippy + check + test + tauri 配置 + MSRV 一致性 + 版本号一致性），`build-sidecar`/`build-desktop` 依赖其通过
+- **预检脚本**：`scripts/preflight_check.ps1` — 一键 8 域预发布审计（编译/格式/Clippy/测试/泄露/版本号/MSRV/Tauri 配置）
+- **空产物保护**：`release.yml` 收集 macOS/Linux/Windows 安装包时检测空目录，失败即退出而非 `cp` 报错
+
+### 变更
+
+- 版本号升级到 0.8.8（7 处配置文件同步：Cargo.toml×2 + tauri.conf.json + package.json + app.js + index.html×3）
+- `docs/PUSH_STANDARD.md` 新增第十六章「标准化工作流程门禁链（v0.8.8 工具化）」；第 5.6 节标记 preflight 已实现
+
+### 测试
+
+- pre-commit hook 5 项检查全通过（fmt + clippy + check + test + 泄露检测）
+- 481 单元测试通过，0 算法泄露
+
+---
+
 ## [0.8.7] - 2026-07-30
 
 ### 修复
