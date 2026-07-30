@@ -2,7 +2,7 @@
 ///
 /// 管理首次配置流程的状态和持久化。
 /// 存储路径：%APPDATA%\LoongRecall\wizard.json
-/// 
+///
 /// 安全：API Key 使用 AES-256-GCM 加密存储（L1-02），
 /// 配置文件仅当前用户可读写（L1-03）。
 use serde::{Deserialize, Serialize};
@@ -131,7 +131,7 @@ impl WizardConfig {
     }
 
     /// 获取解密后的 API Key
-    /// 
+    ///
     /// 返回 None 表示未配置 API Key（如 Ollama 场景）。
     pub fn get_api_key(&self) -> Option<String> {
         if self.encrypted_api_key.is_empty() {
@@ -162,14 +162,20 @@ impl WizardConfig {
                 let api_key = self.get_api_key()?;
                 let model = self.llm_model.as_deref().unwrap_or("gpt-4o-mini");
                 // 使用用户配置的实际 base_url，而非硬编码 OpenAI 地址
-                let base_url = self.llm_base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+                let base_url = self
+                    .llm_base_url
+                    .as_deref()
+                    .unwrap_or("https://api.openai.com/v1");
                 // M-5 修复：使用 || 分隔符，避免 API Key 中包含冒号时解析错误
                 Some(format!("openai||{}||{}||{}", api_key, model, base_url))
             }
             "ollama" => {
                 let model = self.llm_model.as_deref().unwrap_or("llama3");
                 // 使用用户配置的实际 Ollama host
-                let host = self.llm_base_url.as_deref().unwrap_or("http://localhost:11434");
+                let host = self
+                    .llm_base_url
+                    .as_deref()
+                    .unwrap_or("http://localhost:11434");
                 Some(format!("ollama||{}||{}", model, host))
             }
             _ => None,
@@ -215,7 +221,7 @@ impl Default for WizardState {
 
 impl WizardState {
     /// 加载或创建向导状态
-    /// 
+    ///
     /// 自动迁移：
     ///   1. 版本不匹配 → 重置配置，重新引导用户完成向导
     ///   2. 已有有效配置（project_dir + llm_configured）但 setup_complete 为 false → 自动完成
@@ -278,9 +284,7 @@ impl WizardState {
 
         // ── 自动迁移：已有有效配置但未标记完成 → 自动完成 ──
         if !config.setup_complete && config.project_dir.is_some() && config.llm_configured {
-            tracing::info!(
-                "检测到已有有效配置但向导未完成，自动设置 setup_complete=true"
-            );
+            tracing::info!("检测到已有有效配置但向导未完成，自动设置 setup_complete=true");
             config.setup_complete = true;
             // 立即持久化，避免下次启动仍需手动操作
             if let Ok(json) = serde_json::to_string_pretty(&config) {
@@ -328,7 +332,7 @@ impl WizardState {
     }
 
     /// v0.5.3 新增：重置向导状态，让用户重新进入配置向导
-    /// 
+    ///
     /// v0.5.4 修复：改用 save() 而非删除文件，确保 API Key 在重置后仍然保留。
     /// 原逻辑：删除 wizard.json → 下次 load() 创建全新默认配置 → API Key 丢失。
     /// 新逻辑：save() 写入重置后的配置 → setup_complete=false → API Key 保留。
@@ -357,7 +361,9 @@ impl WizardState {
 
         // 保存重置后的配置（而非删除文件），确保 API Key 不丢失
         self.save()?;
-        tracing::info!("向导状态已重置（LLM 配置和 API Key 已保留），用户下次打开应用时将看到配置向导");
+        tracing::info!(
+            "向导状态已重置（LLM 配置和 API Key 已保留），用户下次打开应用时将看到配置向导"
+        );
         Ok(())
     }
 
@@ -373,27 +379,25 @@ impl WizardState {
             } else {
                 // APPDATA 为空字符串，回退到 dirs crate
                 tracing::warn!("APPDATA 环境变量为空，使用 dirs::config_dir() 作为回退");
-                dirs::config_dir()
-                    .or_else(dirs::data_dir)
-                    .ok_or_else(|| {
-                        "无法确定配置目录：APPDATA 为空且 dirs::config_dir()/data_dir() 均返回 None".to_string()
-                    })?
+                dirs::config_dir().or_else(dirs::data_dir).ok_or_else(|| {
+                    "无法确定配置目录：APPDATA 为空且 dirs::config_dir()/data_dir() 均返回 None"
+                        .to_string()
+                })?
             }
         } else {
             // APPDATA 未设置，回退到 dirs crate
             tracing::warn!("APPDATA 环境变量未设置，使用 dirs::config_dir() 作为回退");
-            dirs::config_dir()
-                .or_else(dirs::data_dir)
-                .ok_or_else(|| {
-                    "无法确定配置目录：APPDATA 未设置且 dirs::config_dir()/data_dir() 均返回 None".to_string()
-                })?
+            dirs::config_dir().or_else(dirs::data_dir).ok_or_else(|| {
+                "无法确定配置目录：APPDATA 未设置且 dirs::config_dir()/data_dir() 均返回 None"
+                    .to_string()
+            })?
         };
 
         Ok(base_dir.join("LoongRecall").join("wizard.json"))
     }
 
     /// 持久化到磁盘
-    /// 
+    ///
     /// 安全：配置文件存储在 %APPDATA%\LoongRecall\ 下，
     /// Windows 默认 ACL 仅允许当前用户 + SYSTEM + Administrators 访问（L1-03）。
     fn save(&self) -> Result<(), String> {
@@ -402,7 +406,10 @@ impl WizardState {
         }
         let json = serde_json::to_string_pretty(&self.config).map_err(|e| e.to_string())?;
         std::fs::write(&self.config_path, json).map_err(|e| e.to_string())?;
-        tracing::debug!("配置已保存 (encrypted_api_key={}B)", self.config.encrypted_api_key.len());
+        tracing::debug!(
+            "配置已保存 (encrypted_api_key={}B)",
+            self.config.encrypted_api_key.len()
+        );
         Ok(())
     }
 }
@@ -425,7 +432,9 @@ mod tests {
     #[test]
     fn test_llm_config_parsing_openai() {
         let mut config = WizardConfig::default();
-        config.parse_llm_config("openai:sk-test:gpt-4o:https://api.openai.com/v1").expect("解析失败");
+        config
+            .parse_llm_config("openai:sk-test:gpt-4o:https://api.openai.com/v1")
+            .expect("解析失败");
         assert!(config.llm_configured);
         assert_eq!(config.llm_type, "openai");
         assert_eq!(config.llm_model, Some("gpt-4o".into()));
@@ -440,7 +449,9 @@ mod tests {
     #[test]
     fn test_llm_config_parsing_openai_new_format() {
         let mut config = WizardConfig::default();
-        config.parse_llm_config("openai||sk-test||gpt-4o||https://api.openai.com/v1").expect("解析失败");
+        config
+            .parse_llm_config("openai||sk-test||gpt-4o||https://api.openai.com/v1")
+            .expect("解析失败");
         assert!(config.llm_configured);
         assert_eq!(config.llm_type, "openai");
         assert_eq!(config.llm_model, Some("gpt-4o".into()));
@@ -454,7 +465,9 @@ mod tests {
     fn test_llm_config_parsing_openai_colon_in_key() {
         let mut config = WizardConfig::default();
         // API Key "sk-abc:def" 包含冒号，旧格式会解析错误
-        config.parse_llm_config("openai||sk-abc:def||gpt-4o||https://api.openai.com/v1").expect("解析失败");
+        config
+            .parse_llm_config("openai||sk-abc:def||gpt-4o||https://api.openai.com/v1")
+            .expect("解析失败");
         assert!(config.llm_configured);
         assert_eq!(config.llm_type, "openai");
         assert_eq!(config.llm_model, Some("gpt-4o".into()));
@@ -467,7 +480,9 @@ mod tests {
     #[test]
     fn test_to_llm_api_string_uses_new_separator() {
         let mut config = WizardConfig::default();
-        config.parse_llm_config("openai||sk-test123||gpt-4o||https://api.deepseek.com/v1").expect("解析失败");
+        config
+            .parse_llm_config("openai||sk-test123||gpt-4o||https://api.deepseek.com/v1")
+            .expect("解析失败");
         let api_string = config.to_llm_api_string().expect("应返回 LLM API 字符串");
         // 应使用 || 分隔符（而非冒号作为字段分隔符）
         assert!(api_string.starts_with("openai||"), "应以 openai|| 开头");
@@ -482,7 +497,9 @@ mod tests {
     #[test]
     fn test_llm_config_parsing_ollama() {
         let mut config = WizardConfig::default();
-        config.parse_llm_config("ollama:llama3:http://localhost:11434").expect("解析失败");
+        config
+            .parse_llm_config("ollama:llama3:http://localhost:11434")
+            .expect("解析失败");
         assert!(config.llm_configured);
         assert_eq!(config.llm_type, "ollama");
         assert_eq!(config.llm_model, Some("llama3".into()));
@@ -495,7 +512,9 @@ mod tests {
     #[test]
     fn test_llm_config_parsing_ollama_new_format() {
         let mut config = WizardConfig::default();
-        config.parse_llm_config("ollama||llama3||http://localhost:11434").expect("解析失败");
+        config
+            .parse_llm_config("ollama||llama3||http://localhost:11434")
+            .expect("解析失败");
         assert!(config.llm_configured);
         assert_eq!(config.llm_type, "ollama");
         assert_eq!(config.llm_model, Some("llama3".into()));

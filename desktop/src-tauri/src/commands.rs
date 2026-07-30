@@ -5,10 +5,10 @@
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::State;
+use tauri::Emitter;
 use tauri::Manager; // Manager trait 提供 get_webview_window 等方法
-use tauri::Emitter; // v0.5.5 P1-2：Emitter trait 提供 emit 方法（open_settings 命令使用）
-// v0.5.4 修复：移除未使用的 Emitter import（emit 已从 detect_agents 中移除）
+use tauri::State; // v0.5.5 P1-2：Emitter trait 提供 emit 方法（open_settings 命令使用）
+                  // v0.5.4 修复：移除未使用的 Emitter import（emit 已从 detect_agents 中移除）
 use tokio::sync::Mutex; // 使用 tokio::sync::Mutex 以支持跨 await 持有
 
 use crate::agent_detector::{AgentDetectorRegistry, AgentInfo, ProjectInfo, RulesStatus};
@@ -29,17 +29,13 @@ async fn get_llm_api_from_wizard(store: &State<'_, AppStore>) -> Option<String> 
 }
 
 /// v0.5.7 新增：sidecar 启动后的公共后处理逻辑（消除 M-15 重复代码）
-/// 
+///
 /// 统一处理 start_sidecar、start_sidecar_for_project、switch_project 三处
 /// sidecar 启动后的自动升级 MCP 配置和写入全局 IDE 规则文件逻辑。
-/// 
+///
 /// 注意：此函数不持有 sidecar 锁，避免锁持有时间过长（M-3/M-4 修复的一部分）。
 /// project_key 用于日志标识，传入 None 表示默认项目。
-async fn post_sidecar_start(
-    store: &State<'_, AppStore>,
-    port: u16,
-    project_key: Option<&str>,
-) {
+async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key: Option<&str>) {
     // v0.5.5：自动检测并升级旧版本 MCP 配置
     // v0.5.6：规则文件改为全局级，不再依赖 project_dir
     let project_dir = {
@@ -52,7 +48,9 @@ async fn post_sidecar_start(
         Ok(upgraded) => {
             if !upgraded.is_empty() {
                 match project_key {
-                    Some(key) => tracing::info!("[sidecar] 自动升级完成（项目 {}）: {:?}", key, upgraded),
+                    Some(key) => {
+                        tracing::info!("[sidecar] 自动升级完成（项目 {}）: {:?}", key, upgraded)
+                    }
                     None => tracing::info!("[sidecar] 自动升级完成: {:?}", upgraded),
                 }
             }
@@ -77,8 +75,15 @@ async fn post_sidecar_start(
             Ok(written) => {
                 if !written.is_empty() {
                     match project_key {
-                        Some(key) => tracing::info!("[sidecar] 已为项目 {} 写入 {} 个全局 IDE 规则文件", key, written.len()),
-                        None => tracing::info!("[sidecar] 已为 {} 个已安装 AI 工具写入全局 IDE 规则文件", written.len()),
+                        Some(key) => tracing::info!(
+                            "[sidecar] 已为项目 {} 写入 {} 个全局 IDE 规则文件",
+                            key,
+                            written.len()
+                        ),
+                        None => tracing::info!(
+                            "[sidecar] 已为 {} 个已安装 AI 工具写入全局 IDE 规则文件",
+                            written.len()
+                        ),
                     }
                 }
             }
@@ -88,7 +93,7 @@ async fn post_sidecar_start(
 }
 
 /// 在主窗口 iframe 中显示仪表盘（统一入口，消除 2 处重复的 JS 注入逻辑）
-/// 
+///
 /// 原先 navigate_main_to_dashboard 和 open_dashboard_window 有几乎相同的逻辑，
 /// 现统一在此函数中。adjust_window 控制是否调整窗口大小和标题。
 fn show_dashboard_in_main_window(
@@ -120,7 +125,9 @@ fn show_dashboard_in_main_window(
                 .map_err(|e| format!("设置标题失败: {e}"))?;
         }
 
-        tracing::info!("仪表盘已在主窗口 iframe 中显示 (port={port}, adjust_window={adjust_window})");
+        tracing::info!(
+            "仪表盘已在主窗口 iframe 中显示 (port={port}, adjust_window={adjust_window})"
+        );
     } else {
         // 回退：通过托盘模块（不创建新窗口）
         tray::open_dashboard(app);
@@ -136,7 +143,10 @@ fn sidecar_error_to_user_message(e: &SidecarStartError) -> String {
     match e {
         SidecarStartError::UserCancelled => "启动已取消。".to_string(),
         SidecarStartError::PortConflict { port, .. } => {
-            format!("端口 {} 已被其他 LRC 服务占用，请先停止现有服务再启动。", port)
+            format!(
+                "端口 {} 已被其他 LRC 服务占用，请先停止现有服务再启动。",
+                port
+            )
         }
         SidecarStartError::BinaryNotFound { .. } => {
             "LRC 服务程序未找到，请重新安装或联系技术支持。".to_string()
@@ -145,7 +155,10 @@ fn sidecar_error_to_user_message(e: &SidecarStartError) -> String {
             format!("启动 LRC 服务失败：{reason}")
         }
         SidecarStartError::HealthCheckTimeout { port, .. } => {
-            format!("LRC 服务健康检查超时（端口 {}），请检查系统资源或重启应用。", port)
+            format!(
+                "LRC 服务健康检查超时（端口 {}），请检查系统资源或重启应用。",
+                port
+            )
         }
         SidecarStartError::ProcessDied { pid, log_hint } => {
             format!("LRC 服务进程（PID={pid}）启动后意外退出{log_hint}。")
@@ -157,14 +170,15 @@ fn sidecar_error_to_user_message(e: &SidecarStartError) -> String {
 }
 
 /// v0.5.4 P1-6 新增：用户友好的错误消息映射
-/// 
+///
 /// 将技术错误信息翻译为用户可理解的提示，并附带修复建议。
 /// 覆盖常见的错误模式：ENOENT、Connection refused、RwLock 毒化等。
 fn user_friendly_error(err: &str) -> String {
     let err_lower = err.to_lowercase();
 
     // ── v0.8.9 G-001：用户取消启动（最优先匹配，避免被其他规则误捕获） ──
-    if err.contains("用户取消启动") || err_lower.contains("cancel") && err_lower.contains("start") {
+    if err.contains("用户取消启动") || err_lower.contains("cancel") && err_lower.contains("start")
+    {
         return "启动已取消。".to_string();
     }
 
@@ -201,11 +215,13 @@ fn user_friendly_error(err: &str) -> String {
     {
         return "LRC 服务文件被占用，请关闭其他 LRC 实例后重试。".to_string();
     }
-    if err_lower.contains("sidecar") && (err_lower.contains("not running") || err_lower.contains("未启动"))
+    if err_lower.contains("sidecar")
+        && (err_lower.contains("not running") || err_lower.contains("未启动"))
     {
         return "LRC 服务未启动，请点击「启动服务」按钮。".to_string();
     }
-    if err_lower.contains("connection refused") || err_lower.contains("connect refused")
+    if err_lower.contains("connection refused")
+        || err_lower.contains("connect refused")
         || err_lower.contains("tcp connect error")
     {
         return "无法连接到 LRC 服务，请检查端口是否被占用，或重启应用。".to_string();
@@ -218,32 +234,41 @@ fn user_friendly_error(err: &str) -> String {
         return "LRC 服务启动超时，请检查端口是否被占用，或关闭防火墙后重试。".to_string();
     }
     // v0.5.4 P2-13 修复：添加中文超时关键词匹配
-    if err_lower.contains("timeout") || err_lower.contains("timed out") || err_lower.contains("超时")
+    if err_lower.contains("timeout")
+        || err_lower.contains("timed out")
+        || err_lower.contains("超时")
     {
         return "LRC 服务启动超时，请检查系统资源是否充足，或重启应用后重试。".to_string();
     }
 
     // ── 配置相关错误 ──
-    if err_lower.contains("rwlock") && (err_lower.contains("poison") || err_lower.contains("poisoned") || err_lower.contains("毒化"))
+    if err_lower.contains("rwlock")
+        && (err_lower.contains("poison")
+            || err_lower.contains("poisoned")
+            || err_lower.contains("毒化"))
     {
         return "LRC 遇到内部错误（配置锁异常），请重启应用。".to_string();
     }
-    if err_lower.contains("serialize") || err_lower.contains("deserialize")
+    if err_lower.contains("serialize")
+        || err_lower.contains("deserialize")
         || err_lower.contains("json") && err_lower.contains("parse")
     {
         return "配置文件格式错误，请尝试重置配置或重启应用。".to_string();
     }
-    if err_lower.contains("permission denied") || err_lower.contains("access denied")
+    if err_lower.contains("permission denied")
+        || err_lower.contains("access denied")
         || err_lower.contains("eacces")
     {
         return "没有权限写入配置文件，请检查磁盘权限或以管理员身份运行。".to_string();
     }
-    if err_lower.contains("disk") || err_lower.contains("no space")
+    if err_lower.contains("disk")
+        || err_lower.contains("no space")
         || err_lower.contains("storage") && err_lower.contains("full")
     {
         return "磁盘空间不足，无法保存配置。请清理磁盘后重试。".to_string();
     }
-    if err_lower.contains("config") && (err_lower.contains("save") || err_lower.contains("write") || err_lower.contains("写入"))
+    if err_lower.contains("config")
+        && (err_lower.contains("save") || err_lower.contains("write") || err_lower.contains("写入"))
     {
         return "无法保存配置，请检查磁盘空间和权限，或重启应用。".to_string();
     }
@@ -254,8 +279,7 @@ fn user_friendly_error(err: &str) -> String {
     {
         return "项目路径不存在，请选择有效的项目目录。".to_string();
     }
-    if err_lower.contains("not a directory") || err_lower.contains("不是有效的目录")
-    {
+    if err_lower.contains("not a directory") || err_lower.contains("不是有效的目录") {
         return "选择的路径不是有效的目录，请选择项目文件夹。".to_string();
     }
 
@@ -268,8 +292,11 @@ fn user_friendly_error(err: &str) -> String {
     }
 
     // ── 端口占用 ──
-    if err_lower.contains("port") && (err_lower.contains("in use") || err_lower.contains("occupied")
-        || err_lower.contains("被占用") || err_lower.contains("already in use"))
+    if err_lower.contains("port")
+        && (err_lower.contains("in use")
+            || err_lower.contains("occupied")
+            || err_lower.contains("被占用")
+            || err_lower.contains("already in use"))
     {
         return "端口被占用，请关闭占用端口的程序，或重启应用自动切换端口。".to_string();
     }
@@ -280,7 +307,10 @@ fn user_friendly_error(err: &str) -> String {
     }
 
     // ── 默认：保留原始错误，但添加前缀引导用户 ──
-    format!("操作失败：{}。如果问题持续，请重启应用或联系技术支持。", err)
+    format!(
+        "操作失败：{}。如果问题持续，请重启应用或联系技术支持。",
+        err
+    )
 }
 
 /// 应用全局状态（线程安全，支持异步）
@@ -367,7 +397,11 @@ pub async fn get_sidecar_status(
                 running: true,
                 state: format!(
                     "Running (external, project: {}, uptime: {}s)",
-                    if probed.src_dir.is_empty() { "unknown" } else { &probed.src_dir },
+                    if probed.src_dir.is_empty() {
+                        "unknown"
+                    } else {
+                        &probed.src_dir
+                    },
                     probed.uptime_seconds
                 ),
                 port: Some(probed.port),
@@ -377,7 +411,10 @@ pub async fn get_sidecar_status(
             // 健康检查失败，清除过期的 sidecar_port
             let mut saved_port = store.sidecar_port.lock().await;
             *saved_port = None;
-            tracing::info!("get_sidecar_status: sidecar_port {} 健康检查失败，已清除", port);
+            tracing::info!(
+                "get_sidecar_status: sidecar_port {} 健康检查失败，已清除",
+                port
+            );
         }
     }
 
@@ -408,8 +445,7 @@ pub async fn start_sidecar(
     store.start_cancel_flag.store(false, Ordering::SeqCst);
 
     // v0.8.9 G-003：创建进度通道，spawn 转发任务将进度事件推送到前端
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::channel::<StartProgress>(32);
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<StartProgress>(32);
     let app_for_progress = app.clone();
     tokio::spawn(async move {
         while let Some(progress) = progress_rx.recv().await {
@@ -432,7 +468,9 @@ pub async fn start_sidecar(
     //   Phase 1: prepare_start（持锁，<1ms）→ 释放锁
     //   Phase 2: spawn_and_wait（不持锁，I/O）
     //   Phase 3: insert_handle（重新获取锁，<1ms）
-    let project_key = effective_src_dir.clone().unwrap_or_else(|| "default".to_string());
+    let project_key = effective_src_dir
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
 
     // Phase 1: 检查是否已运行（持锁，无 I/O）
     let prepare = {
@@ -450,7 +488,9 @@ pub async fn start_sidecar(
             if let Some(probed) = SidecarManager::check_sidecar_health(target_port).await {
                 tracing::info!(
                     "G-002：端口 {} 已有健康 sidecar（src_dir: {}, uptime: {}s），复用现有实例",
-                    target_port, probed.src_dir, probed.uptime_seconds
+                    target_port,
+                    probed.src_dir,
+                    probed.uptime_seconds
                 );
                 // 复用现有 sidecar，不执行 Phase 2/3
                 target_port
@@ -469,18 +509,22 @@ pub async fn start_sidecar(
                     cancel_flag: &store.start_cancel_flag,
                     progress_tx: Some(&progress_tx),
                 };
-                let (child, port) = SidecarManager::spawn_and_wait(
-                    &binary_path,
-                    &project_key,
-                    &start_opts,
-                )
-                .await
-                .map_err(|e| sidecar_error_to_user_message(&e))?;
+                let (child, port) =
+                    SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts)
+                        .await
+                        .map_err(|e| sidecar_error_to_user_message(&e))?;
 
                 // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
                 {
                     let mut sidecar = store.sidecar.lock().await;
-                    sidecar.insert_handle(&project_key, child, port, effective_src_dir, multi_window, llm_api);
+                    sidecar.insert_handle(
+                        &project_key,
+                        child,
+                        port,
+                        effective_src_dir,
+                        multi_window,
+                        llm_api,
+                    );
                 }
 
                 port
@@ -519,8 +563,7 @@ pub async fn start_sidecar_for_project(
     store.start_cancel_flag.store(false, Ordering::SeqCst);
 
     // v0.8.9 G-003：创建进度通道
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::channel::<StartProgress>(32);
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<StartProgress>(32);
     let app_for_progress = app.clone();
     tokio::spawn(async move {
         while let Some(progress) = progress_rx.recv().await {
@@ -546,7 +589,9 @@ pub async fn start_sidecar_for_project(
             if let Some(probed) = SidecarManager::check_sidecar_health(target_port).await {
                 tracing::info!(
                     "G-002：端口 {} 已有健康 sidecar（src_dir: {}），复用现有实例（项目: {}）",
-                    target_port, probed.src_dir, project_key
+                    target_port,
+                    probed.src_dir,
+                    project_key
                 );
                 target_port
             } else {
@@ -564,18 +609,22 @@ pub async fn start_sidecar_for_project(
                     cancel_flag: &store.start_cancel_flag,
                     progress_tx: Some(&progress_tx),
                 };
-                let (child, port) = SidecarManager::spawn_and_wait(
-                    &binary_path,
-                    &project_key,
-                    &start_opts,
-                )
-                .await
-                .map_err(|e| sidecar_error_to_user_message(&e))?;
+                let (child, port) =
+                    SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts)
+                        .await
+                        .map_err(|e| sidecar_error_to_user_message(&e))?;
 
                 // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
                 {
                     let mut sidecar = store.sidecar.lock().await;
-                    sidecar.insert_handle(&project_key, child, port, src_dir, multi_window, llm_api);
+                    sidecar.insert_handle(
+                        &project_key,
+                        child,
+                        port,
+                        src_dir,
+                        multi_window,
+                        llm_api,
+                    );
                 }
 
                 port
@@ -617,7 +666,9 @@ pub async fn stop_sidecar_for_project(
     project_key: String,
 ) -> Result<(), String> {
     let mut sidecar = store.sidecar.lock().await;
-    sidecar.stop_project(&project_key).await
+    sidecar
+        .stop_project(&project_key)
+        .await
         .map_err(|e| user_friendly_error(&e))
 }
 
@@ -625,14 +676,11 @@ pub async fn stop_sidecar_for_project(
 /// v0.5.4 P1-6 修复：错误信息人性化
 /// v0.5.7 二次审计修复：缩小 sidecar 锁持有范围，避免 L1→L2 锁嵌套
 #[tauri::command]
-pub async fn stop_sidecar(
-    store: State<'_, AppStore>,
-) -> Result<(), String> {
+pub async fn stop_sidecar(store: State<'_, AppStore>) -> Result<(), String> {
     // v0.5.7：先持有 sidecar 锁执行 stop()，释放后再获取 sidecar_port 锁
     {
         let mut sidecar = store.sidecar.lock().await;
-        sidecar.stop().await
-            .map_err(|e| user_friendly_error(&e))?;
+        sidecar.stop().await.map_err(|e| user_friendly_error(&e))?;
     } // sidecar 锁在此释放
 
     // 清除端口记录（单独获取 sidecar_port 锁，避免锁嵌套）
@@ -655,9 +703,7 @@ pub struct LlmConfigResponse {
 
 /// 获取 LLM 配置状态
 #[tauri::command]
-pub async fn get_llm_config(
-    store: State<'_, AppStore>,
-) -> Result<LlmConfigResponse, String> {
+pub async fn get_llm_config(store: State<'_, AppStore>) -> Result<LlmConfigResponse, String> {
     let wizard = store.wizard.lock().await;
     let config = wizard.config();
     Ok(LlmConfigResponse {
@@ -683,7 +729,8 @@ pub async fn save_llm_config(
     }
 
     let mut wizard = store.wizard.lock().await;
-    wizard.save_llm_config(&llm_api)
+    wizard
+        .save_llm_config(&llm_api)
         .map_err(|e| user_friendly_error(&e))?;
     let config = wizard.config();
     let response = LlmConfigResponse {
@@ -716,14 +763,13 @@ pub async fn save_llm_config(
 
 /// 清除 LLM 配置
 #[tauri::command]
-pub async fn clear_llm_config(
-    store: State<'_, AppStore>,
-) -> Result<LlmConfigResponse, String> {
+pub async fn clear_llm_config(store: State<'_, AppStore>) -> Result<LlmConfigResponse, String> {
     // v0.5.7 二次审计修复：缩小 wizard 锁持有范围，避免与 sidecar_port 锁嵌套
     {
         let mut wizard = store.wizard.lock().await;
         // 清除 LLM 配置（保留其他配置不变）
-        wizard.save_llm_config("")
+        wizard
+            .save_llm_config("")
             .map_err(|e| user_friendly_error(&e))?;
     } // wizard 锁在此释放
 
@@ -760,7 +806,7 @@ pub struct LlmTestResult {
 }
 
 /// v0.5.4 新增：API Key 输入清洗
-/// 
+///
 /// 用户从网页复制 API Key 时可能带入首尾空格、换行符等不可见字符，
 /// 这些字符会导致 API 请求失败（401/403），且用户难以排查。
 /// 清洗规则：trim 首尾空白 + 移除 \r\n\t 等控制字符。
@@ -794,17 +840,19 @@ pub async fn test_llm_connection(
 
     if provider == "ollama" {
         // Ollama 本地服务测试
-        let resp = client
-            .get(format!("{base}/api/tags"))
-            .send()
-            .await;
+        let resp = client.get(format!("{base}/api/tags")).send().await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                let data: serde_json::Value = r.json().await.map_err(|e| format!("解析响应失败: {e}"))?;
+                let data: serde_json::Value =
+                    r.json().await.map_err(|e| format!("解析响应失败: {e}"))?;
                 let models: Vec<String> = data["models"]
                     .as_array()
-                    .map(|arr| arr.iter().filter_map(|m| m["name"].as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m["name"].as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 Ok(LlmTestResult {
                     success: true,
@@ -821,15 +869,17 @@ pub async fn test_llm_connection(
                 } else {
                     format!("Ollama 连接失败：{e}")
                 };
-                Ok(LlmTestResult { success: false, message: msg, models: None })
-            }
-            Ok(r) => {
                 Ok(LlmTestResult {
                     success: false,
-                    message: format!("Ollama 返回错误 (HTTP {})", r.status()),
+                    message: msg,
                     models: None,
                 })
             }
+            Ok(r) => Ok(LlmTestResult {
+                success: false,
+                message: format!("Ollama 返回错误 (HTTP {})", r.status()),
+                models: None,
+            }),
         }
     } else {
         // 云端 API 测试：先尝试 /models 端点
@@ -843,10 +893,15 @@ pub async fn test_llm_connection(
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                let data: serde_json::Value = r.json().await.map_err(|e| format!("解析响应失败: {e}"))?;
+                let data: serde_json::Value =
+                    r.json().await.map_err(|e| format!("解析响应失败: {e}"))?;
                 let models: Vec<String> = data["data"]
                     .as_array()
-                    .map(|arr| arr.iter().filter_map(|m| m["id"].as_str().map(String::from)).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| m["id"].as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 Ok(LlmTestResult {
                     success: true,
@@ -858,13 +913,11 @@ pub async fn test_llm_connection(
                     models: Some(models),
                 })
             }
-            Ok(r) if r.status() == 401 || r.status() == 403 => {
-                Ok(LlmTestResult {
-                    success: false,
-                    message: "API Key 无效或无权访问，请检查 Key 是否正确".to_string(),
-                    models: None,
-                })
-            }
+            Ok(r) if r.status() == 401 || r.status() == 403 => Ok(LlmTestResult {
+                success: false,
+                message: "API Key 无效或无权访问，请检查 Key 是否正确".to_string(),
+                models: None,
+            }),
             Ok(r) if r.status() == 402 => {
                 // v0.5.4 新增：余额不足
                 Ok(LlmTestResult {
@@ -890,7 +943,11 @@ pub async fn test_llm_connection(
                 } else {
                     format!("网络请求失败：{e}")
                 };
-                Ok(LlmTestResult { success: false, message: msg, models: None })
+                Ok(LlmTestResult {
+                    success: false,
+                    message: msg,
+                    models: None,
+                })
             }
             _ => {
                 // /models 端点不可用，尝试 chat/completions
@@ -909,20 +966,16 @@ pub async fn test_llm_connection(
                     .await;
 
                 match chat_resp {
-                    Ok(r) if r.status().is_success() => {
-                        Ok(LlmTestResult {
-                            success: true,
-                            message: "连接成功！API Key 和模型均验证通过".to_string(),
-                            models: None,
-                        })
-                    }
-                    Ok(r) if r.status() == 401 || r.status() == 403 => {
-                        Ok(LlmTestResult {
-                            success: false,
-                            message: "API Key 无效，请检查 Key 是否正确".to_string(),
-                            models: None,
-                        })
-                    }
+                    Ok(r) if r.status().is_success() => Ok(LlmTestResult {
+                        success: true,
+                        message: "连接成功！API Key 和模型均验证通过".to_string(),
+                        models: None,
+                    }),
+                    Ok(r) if r.status() == 401 || r.status() == 403 => Ok(LlmTestResult {
+                        success: false,
+                        message: "API Key 无效，请检查 Key 是否正确".to_string(),
+                        models: None,
+                    }),
                     Ok(r) if r.status() == 402 => {
                         // v0.5.4 新增：余额不足
                         Ok(LlmTestResult {
@@ -943,17 +996,20 @@ pub async fn test_llm_connection(
                         // v0.5.4 新增：模型不可用
                         Ok(LlmTestResult {
                             success: false,
-                            message: format!("模型 \"{test_model}\" 不可用（404），请确认模型名称是否正确"),
+                            message: format!(
+                                "模型 \"{test_model}\" 不可用（404），请确认模型名称是否正确"
+                            ),
                             models: None,
                         })
                     }
-                    Ok(r) => {
-                        Ok(LlmTestResult {
-                            success: false,
-                            message: format!("连接成功但模型可能不可用 (HTTP {})，请手动设置模型名", r.status()),
-                            models: None,
-                        })
-                    }
+                    Ok(r) => Ok(LlmTestResult {
+                        success: false,
+                        message: format!(
+                            "连接成功但模型可能不可用 (HTTP {})，请手动设置模型名",
+                            r.status()
+                        ),
+                        models: None,
+                    }),
                     Err(e) => {
                         // v0.5.4 修复：网络错误详细分类
                         let msg = if e.is_timeout() {
@@ -963,7 +1019,11 @@ pub async fn test_llm_connection(
                         } else {
                             format!("网络请求失败：{e}")
                         };
-                        Ok(LlmTestResult { success: false, message: msg, models: None })
+                        Ok(LlmTestResult {
+                            success: false,
+                            message: msg,
+                            models: None,
+                        })
                     }
                 }
             }
@@ -975,19 +1035,15 @@ pub async fn test_llm_connection(
 
 /// 检测所有已安装的 Agent
 #[tauri::command]
-pub async fn detect_agents(
-    store: State<'_, AppStore>,
-) -> Result<Vec<AgentInfo>, String> {
+pub async fn detect_agents(store: State<'_, AppStore>) -> Result<Vec<AgentInfo>, String> {
     // v0.5.7 修复：添加后端超时，避免前端超时后后端仍持锁导致死循环
     // detect_all() 内部主要是 Path::exists（轻量），正常 < 1 秒
     // 30 秒超时作为兜底，防止异常情况（如网络盘、杀毒软件扫描）导致卡死
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        async {
-            let registry = store.agent_registry.lock().await;
-            registry.detect_all()
-        }
-    ).await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let registry = store.agent_registry.lock().await;
+        registry.detect_all()
+    })
+    .await;
 
     match result {
         Ok(agents) => {
@@ -996,16 +1052,17 @@ pub async fn detect_agents(
         }
         Err(_) => {
             tracing::error!("detect_agents 超时（30秒），可能存在锁竞争或文件系统慢");
-            Err("AI 工具检测超时（30秒），可能是杀毒软件扫描或网络盘响应慢，请重启应用后重试".to_string())
+            Err(
+                "AI 工具检测超时（30秒），可能是杀毒软件扫描或网络盘响应慢，请重启应用后重试"
+                    .to_string(),
+            )
         }
     }
 }
 
 /// 仅返回已安装的 Agent（过滤掉未安装的）
 #[tauri::command]
-pub async fn detect_installed_agents(
-    store: State<'_, AppStore>,
-) -> Result<Vec<AgentInfo>, String> {
+pub async fn detect_installed_agents(store: State<'_, AppStore>) -> Result<Vec<AgentInfo>, String> {
     let registry = store.agent_registry.lock().await;
     Ok(registry.detect_installed())
 }
@@ -1015,9 +1072,7 @@ pub async fn detect_installed_agents(
 /// 对于不支持 MCP 自动配置的工具，返回手动配置文档。
 /// 前端可据此展示"如何手动配置"面板，包含配置路径、模板和官方文档链接。
 #[tauri::command]
-pub async fn get_agent_config_guide(
-    agent_id: String,
-) -> Result<Option<String>, String> {
+pub async fn get_agent_config_guide(agent_id: String) -> Result<Option<String>, String> {
     // 调用 agent_detector 模块的公开函数获取配置指引
     let guide = crate::agent_detector::get_manual_config_guide(&agent_id);
     Ok(guide.map(|s| s.to_string()))
@@ -1062,20 +1117,21 @@ pub async fn configure_agents(
     // v0.5.7 修复：添加后端超时，避免文件写入慢导致卡死
     // configure() 涉及多个文件读写（MCP 配置 + AI 规则），给 60 秒
     let project_path = project_dir.as_ref().map(std::path::Path::new);
-    let config_result = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        async {
-            let registry = store.agent_registry.lock().await;
-            registry.configure(&agent_ids, port, project_path)
-        }
-    ).await;
+    let config_result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let registry = store.agent_registry.lock().await;
+        registry.configure(&agent_ids, port, project_path)
+    })
+    .await;
 
     let result = match config_result {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => return Err(user_friendly_error(&e)),
         Err(_) => {
             tracing::error!("configure_agents 超时（60秒）");
-            return Err("Agent 配置超时（60秒），可能是磁盘写入慢或杀毒软件拦截，请暂时关闭杀毒软件后重试".to_string());
+            return Err(
+                "Agent 配置超时（60秒），可能是磁盘写入慢或杀毒软件拦截，请暂时关闭杀毒软件后重试"
+                    .to_string(),
+            );
         }
     };
 
@@ -1086,7 +1142,8 @@ pub async fn configure_agents(
     tray::update_tooltip(&app, *count);
     // 持久化 configured_agents 到 wizard.json（P2-05 修复）
     let mut wizard = store.wizard.lock().await;
-    wizard.save_configured_agents(agent_ids)
+    wizard
+        .save_configured_agents(agent_ids)
         .map_err(|e| user_friendly_error(&e))?;
     Ok(result)
 }
@@ -1101,7 +1158,8 @@ pub async fn save_configured_agents(
     agent_ids: Vec<String>,
 ) -> Result<(), String> {
     let mut wizard = store.wizard.lock().await;
-    wizard.save_configured_agents(agent_ids)
+    wizard
+        .save_configured_agents(agent_ids)
         .map_err(|e| user_friendly_error(&e))?;
     tracing::info!("[配置] 已保存 configured_agents");
     Ok(())
@@ -1117,13 +1175,11 @@ pub async fn scan_ide_projects(
     ide_ids: Vec<String>,
 ) -> Result<Vec<ProjectInfo>, String> {
     // v0.5.7 修复：添加后端超时，避免文件系统慢导致卡死
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        async {
-            let registry = store.agent_registry.lock().await;
-            registry.scan_ide_projects(&ide_ids)
-        }
-    ).await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let registry = store.agent_registry.lock().await;
+        registry.scan_ide_projects(&ide_ids)
+    })
+    .await;
 
     match result {
         Ok(projects) => {
@@ -1141,9 +1197,7 @@ pub async fn scan_ide_projects(
 
 /// 获取当前项目目录
 #[tauri::command]
-pub async fn get_project_dir(
-    store: State<'_, AppStore>,
-) -> Result<Option<String>, String> {
+pub async fn get_project_dir(store: State<'_, AppStore>) -> Result<Option<String>, String> {
     let wizard = store.wizard.lock().await;
     Ok(wizard.config().project_dir.clone())
 }
@@ -1165,7 +1219,8 @@ pub async fn set_project_dir(
         return Err(user_friendly_error("路径不是有效的目录"));
     }
     let mut wizard = store.wizard.lock().await;
-    wizard.set_project_dir(&project_dir)
+    wizard
+        .set_project_dir(&project_dir)
         .map_err(|e| user_friendly_error(&e))
 }
 
@@ -1213,15 +1268,21 @@ pub async fn list_sidecar_projects(
 }
 
 /// 获取向导配置状态
-/// 
+///
 /// 前端用于判断是显示配置向导还是"已就绪"面板
 #[tauri::command]
-pub async fn get_wizard_state(
-    store: State<'_, AppStore>,
-) -> Result<WizardStateResponse, String> {
+pub async fn get_wizard_state(store: State<'_, AppStore>) -> Result<WizardStateResponse, String> {
     // v0.5.6 修复 H-2：锁顺序改为先 sidecar（L1）后 sidecar_port（L2），避免 AB-BA 死锁
     // 先获取 wizard 数据并释放锁
-    let (setup_complete, project_dir, llm_configured, llm_type, llm_model, configured_agents, corrupted) = {
+    let (
+        setup_complete,
+        project_dir,
+        llm_configured,
+        llm_type,
+        llm_model,
+        configured_agents,
+        corrupted,
+    ) = {
         let wizard = store.wizard.lock().await;
         let config = wizard.config();
         (
@@ -1251,9 +1312,7 @@ pub async fn get_wizard_state(
         let port = *store.sidecar_port.lock().await;
         if let Some(port) = port {
             // 快速健康检查（2 秒超时，不持有 sidecar 锁）
-            if let Some(probed) =
-                SidecarManager::check_sidecar_health(port).await
-            {
+            if let Some(probed) = SidecarManager::check_sidecar_health(port).await {
                 tracing::info!(
                     "get_wizard_state: 外部 sidecar 运行中，端口 {}，uptime {}s",
                     probed.port,
@@ -1264,7 +1323,10 @@ pub async fn get_wizard_state(
                 // 健康检查失败，清除过期的 sidecar_port
                 let mut saved_port = store.sidecar_port.lock().await;
                 *saved_port = None;
-                tracing::info!("get_wizard_state: sidecar_port {} 健康检查失败，已清除", port);
+                tracing::info!(
+                    "get_wizard_state: sidecar_port {} 健康检查失败，已清除",
+                    port
+                );
                 false
             }
         } else {
@@ -1327,7 +1389,7 @@ pub async fn open_settings(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 /// 更新托盘悬浮提示
-/// 
+///
 /// 前端在 Agent 配置完成后调用，显示当前连接的 Agent 数量。
 #[tauri::command]
 pub async fn update_tray_tooltip(
@@ -1349,7 +1411,7 @@ pub struct SwitchProjectResponse {
 }
 
 /// 切换项目目录
-/// 
+///
 /// 更新项目路径、重启 sidecar 以重新索引新项目。
 /// 契约：托盘菜单"切换项目"调用此命令。
 /// v0.5.4 修复：返回结构化响应（含端口），前端无需再调用 get_sidecar_status
@@ -1370,8 +1432,7 @@ pub async fn switch_project(
     }
 
     // v0.8.9 G-003：创建进度通道
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::channel::<StartProgress>(32);
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<StartProgress>(32);
     let app_for_progress = app.clone();
     tokio::spawn(async move {
         while let Some(progress) = progress_rx.recv().await {
@@ -1391,7 +1452,8 @@ pub async fn switch_project(
     // 1. 保存新项目路径并提取 LLM 配置
     let llm_api = {
         let mut wizard = store.wizard.lock().await;
-        wizard.set_project_dir(&project_dir)
+        wizard
+            .set_project_dir(&project_dir)
             .map_err(|e| user_friendly_error(&e))?;
         wizard.config().to_llm_api_string()
     };
@@ -1407,8 +1469,14 @@ pub async fn switch_project(
             .collect();
         if !installed_agent_ids.is_empty() {
             match registry.write_rules_for_agents(&installed_agent_ids) {
-                Ok(written) => tracing::info!("[切换项目] 已确保 {} 个全局 IDE 规则文件存在: {}", written.len(), project_dir),
-                Err(e) => tracing::warn!("[切换项目] 全局规则文件写入失败（不影响 sidecar）: {}", e),
+                Ok(written) => tracing::info!(
+                    "[切换项目] 已确保 {} 个全局 IDE 规则文件存在: {}",
+                    written.len(),
+                    project_dir
+                ),
+                Err(e) => {
+                    tracing::warn!("[切换项目] 全局规则文件写入失败（不影响 sidecar）: {}", e)
+                }
             }
         }
     }
@@ -1424,8 +1492,7 @@ pub async fn switch_project(
     let prepare = {
         let mut sidecar = store.sidecar.lock().await;
         if sidecar.is_running() {
-            sidecar.stop().await
-                .map_err(|e| user_friendly_error(&e))?;
+            sidecar.stop().await.map_err(|e| user_friendly_error(&e))?;
         }
         // stop 后所有实例已清除，prepare_start 一定返回 NeedStart
         sidecar.prepare_start(&project_key)
@@ -1448,13 +1515,10 @@ pub async fn switch_project(
                 cancel_flag: &store.start_cancel_flag,
                 progress_tx: Some(&progress_tx),
             };
-            let (child, port) = SidecarManager::spawn_and_wait(
-                &binary_path,
-                &project_key,
-                &start_opts,
-            )
-            .await
-            .map_err(|e| sidecar_error_to_user_message(&e))?;
+            let (child, port) =
+                SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts)
+                    .await
+                    .map_err(|e| sidecar_error_to_user_message(&e))?;
 
             // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
             {
@@ -1482,23 +1546,23 @@ pub async fn switch_project(
         success: true,
         port,
         project_dir: project_dir.clone(),
-        message: format!("已切换到项目 {}，sidecar 已重启 (port={})", project_dir, port),
+        message: format!(
+            "已切换到项目 {}，sidecar 已重启 (port={})",
+            project_dir, port
+        ),
     })
 }
 
 /// v0.5.3 新增：重置向导配置，让用户重新进入配置向导
-/// 
+///
 /// 清除 setup_complete 标记和项目/Agent 配置，
 /// 但保留 LLM API Key（避免用户重新输入）。
 /// 调用后用户重新打开应用时将看到配置向导。
 /// v0.5.4 P1-6 修复：错误信息人性化
 #[tauri::command]
-pub async fn reset_wizard(
-    store: State<'_, AppStore>,
-) -> Result<(), String> {
+pub async fn reset_wizard(store: State<'_, AppStore>) -> Result<(), String> {
     let mut wizard = store.wizard.lock().await;
-    wizard.reset()
-        .map_err(|e| user_friendly_error(&e))
+    wizard.reset().map_err(|e| user_friendly_error(&e))
 }
 
 /// v0.5.4 P2-16 修复：标记配置完成
@@ -1507,22 +1571,19 @@ pub async fn reset_wizard(
 /// 修复前：finishConfiguration() 未调用此命令，导致 setup_complete 始终为 false，
 /// 用户每次启动应用都需要重新配置。
 #[tauri::command]
-pub async fn mark_complete(
-    store: State<'_, AppStore>,
-) -> Result<(), String> {
+pub async fn mark_complete(store: State<'_, AppStore>) -> Result<(), String> {
     let mut wizard = store.wizard.lock().await;
-    wizard.mark_complete()
-        .map_err(|e| user_friendly_error(&e))
+    wizard.mark_complete().map_err(|e| user_friendly_error(&e))
 }
 
 /// v0.5.4 P0-4 新增：配置完成后自动验证
-/// 
+///
 /// 验证项：
 /// 1. Sidecar 是否启动成功（通过 /health 端点）
 /// 2. MCP 服务器是否可达（检查端口监听）
 /// 3. LLM 是否配置
 /// 4. Agent 是否已配置
-/// 
+///
 /// 返回结构化验证结果，前端据此显示"一切正常"或具体错误。
 #[derive(Debug, Serialize)]
 pub struct VerifySetupResult {
@@ -1547,9 +1608,7 @@ pub struct VerifySetupResult {
 }
 
 #[tauri::command]
-pub async fn verify_setup(
-    store: State<'_, AppStore>,
-) -> Result<VerifySetupResult, String> {
+pub async fn verify_setup(store: State<'_, AppStore>) -> Result<VerifySetupResult, String> {
     let mut result = VerifySetupResult {
         all_ok: true,
         sidecar_running: false,
@@ -1731,20 +1790,16 @@ pub async fn open_data_dir(store: State<'_, AppStore>) -> Result<String, String>
     }
 
     // 阶段 2：回退到 ~/.loong-recall/ 根目录
-    let home = dirs::home_dir().ok_or_else(|| {
-        user_friendly_error("无法获取用户主目录，请检查系统环境变量。")
-    })?;
+    let home = dirs::home_dir()
+        .ok_or_else(|| user_friendly_error("无法获取用户主目录，请检查系统环境变量。"))?;
     let root = home.join(".loong-recall");
 
     // 目录不存在时创建（首次使用场景）
-    std::fs::create_dir_all(&root).map_err(|e| {
-        user_friendly_error(&format!("创建数据目录失败: {e}"))
-    })?;
+    std::fs::create_dir_all(&root)
+        .map_err(|e| user_friendly_error(&format!("创建数据目录失败: {e}")))?;
 
     let path_str = root.display().to_string();
-    open::that(&root).map_err(|e| {
-        user_friendly_error(&format!("打开数据目录失败: {e}"))
-    })?;
+    open::that(&root).map_err(|e| user_friendly_error(&format!("打开数据目录失败: {e}")))?;
 
     tracing::info!("[数据目录] 已打开根目录: {}", path_str);
     Ok(path_str)
@@ -1759,10 +1814,7 @@ pub async fn open_data_dir(store: State<'_, AppStore>) -> Result<String, String>
 #[tauri::command]
 pub async fn get_rules_status() -> Result<Vec<RulesStatus>, String> {
     let status = AgentDetectorRegistry::get_rules_status();
-    tracing::info!(
-        "[v0.8.0] 规则状态查询完成，共 {} 个工具",
-        status.len()
-    );
+    tracing::info!("[v0.8.0] 规则状态查询完成，共 {} 个工具", status.len());
     Ok(status)
 }
 

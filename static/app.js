@@ -4,7 +4,7 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.9';
+const APP_VERSION = '0.8.10';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -354,6 +354,35 @@ const SidecarHealthMonitor = {
   },
 
   /**
+   * v0.8.10 L4-02/L5-01：广播 sidecar 状态变更至所有受影响 UI 区域
+   *
+   * 之前仅刷新仪表盘，导致设置页/信任中心页状态不同步。
+   * 现在通过自定义事件 + 主动刷新当前 active tab 双轨通知。
+   *
+   * @param {boolean} online - sidecar 是否可达
+   */
+  _broadcastSidecarStateChange(online) {
+    // 1. 状态栏立即更新（不依赖 loadDashboard）
+    if (typeof updateStatusBar === 'function') {
+      updateStatusBar(online, online ? {} : null);
+    }
+    // 2. 根据当前 active tab 刷新对应页面
+    const activeTab = document.querySelector('.navbar-nav button.active, .nav-item.active, [data-tab].active');
+    const tabName = activeTab?.getAttribute('data-tab') || 'dashboard';
+    if (tabName === 'dashboard' && typeof loadDashboard === 'function') {
+      setTimeout(() => loadDashboard(), 500);
+    } else if (tabName === 'settings' && typeof loadSettings === 'function') {
+      setTimeout(() => loadSettings(), 500);
+    } else if (tabName === 'trust-center' && typeof loadTrustCenter === 'function') {
+      setTimeout(() => loadTrustCenter(), 500);
+    }
+    // 3. 发出自定义事件，供其他模块解耦响应
+    window.dispatchEvent(new CustomEvent('lrc:sidecar-state-change', {
+      detail: { online, timestamp: Date.now() }
+    }));
+  },
+
+  /**
    * 更新可达状态，触发 UI 变更
    */
   _setReachable(reachable) {
@@ -375,10 +404,8 @@ const SidecarHealthMonitor = {
         btn.removeAttribute('aria-disabled');
       });
       console.log('[LRC v' + APP_VERSION + ']Sidecar 已恢复可达');
-      // 自动刷新仪表盘
-      if (typeof loadDashboard === 'function') {
-        setTimeout(() => loadDashboard(), 500);
-      }
+      // v0.8.10 L4-02：广播全局状态变更，不再仅刷新仪表盘
+      this._broadcastSidecarStateChange(true);
     } else {
       // 不可达
       if (banner) banner.hidden = false;
@@ -394,6 +421,8 @@ const SidecarHealthMonitor = {
         btn.setAttribute('aria-disabled', 'true');
       });
       console.log('[LRC v' + APP_VERSION + ']Sidecar 不可达，已禁用 API 按钮');
+      // v0.8.10 L4-02：不可达时也广播，确保状态栏和各页面同步显示"已停止"
+      this._broadcastSidecarStateChange(false);
     }
   },
 
@@ -1176,11 +1205,18 @@ async function handleStartServiceClick() {
   startServiceAbortController = new AbortController();
 
   try {
-    const result = await postMessageToParent('lrc-start-service', {}, 60000, startServiceAbortController.signal);
+    // v0.8.9：超时从 60s 延长到 120s，配合 G-003 进度事件反馈
+    // sidecar 首次启动需要索引项目代码，可能超过 60s
+    // 进度事件 sidecar-start-progress 会实时更新按钮文字，用户不会以为卡住
+    const result = await postMessageToParent('lrc-start-service', {}, 120000, startServiceAbortController.signal);
     closeStartServiceModal();
-    // 启动成功后刷新仪表盘
+    // 启动成功后刷新仪表盘 + 强制健康检查
     setTimeout(() => {
       loadDashboard();
+      // v0.8.9：启动成功后主动触发一次健康检查，加速状态栏更新
+      if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+        SidecarHealthMonitor.check();
+      }
     }, 800);
   } catch (e) {
     btn.disabled = false;
@@ -2081,7 +2117,63 @@ async function init() {
           );
         });
 
-        console.log('[LRC] 规则写入事件监听已注册');
+        // v0.8.9 G-003：监听 sidecar 启动进度事件
+        // 后端 spawn_and_wait 在 4 个阶段发送 StartProgress：
+        // port_check(5%) → spawn(10%) → health_check(30%) → ready(100%)
+        // 前端通过此事件更新启动按钮文字，让用户知道启动进展
+        tauriEvent.listen('sidecar-start-progress', (event) => {
+          const payload = (event && event.payload) || {};
+          const progress = payload.progress || 0;
+          const message = payload.message || '';
+          console.log('[LRC] 启动进度:', progress + '%', message);
+          // 更新启动服务模态框中的按钮文字（按钮已 disabled，但文字仍可更新）
+          const btn = document.getElementById('modal-btn-start-service');
+          if (btn) {
+            btn.textContent = message || ('启动中... ' + progress + '%');
+          }
+        });
+
+        // v0.8.10 L5-01：监听后端心跳协程发出的全局 sidecar 事件
+        // 之前前端未监听这 3 个事件，导致手动启动/自动恢复/崩溃场景下 UI 不同步
+
+        // 监听：启动时探测到外部已运行的 sidecar（用户手动启动场景）
+        tauriEvent.listen('sidecar-detected', (event) => {
+          const payload = (event && event.payload) || {};
+          console.log('[LRC] 检测到外部 sidecar:', payload);
+          showToast('检测到已运行的 LRC 服务（端口 ' + (payload.port || '未知') + '）', 'success', 4000);
+          // 主动触发健康监测器，避免等待 10s 轮询
+          if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+            SidecarHealthMonitor._isReachable = false; // 强制触发状态变更
+            SidecarHealthMonitor.check();
+          }
+        });
+
+        // 监听：心跳协程自动恢复死亡实例成功
+        tauriEvent.listen('sidecar-recovered', (event) => {
+          const payload = (event && event.payload) || {};
+          console.log('[LRC] Sidecar 自动恢复:', payload);
+          showToast('LRC 服务已自动恢复', 'success', 4000);
+          if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+            SidecarHealthMonitor._isReachable = false;
+            SidecarHealthMonitor.check();
+          }
+        });
+
+        // 监听：连续 3 次恢复失败，需要用户手动重启
+        tauriEvent.listen('sidecar-crash', (event) => {
+          const payload = (event && event.payload) || {};
+          console.error('[LRC] Sidecar 崩溃:', payload);
+          showToast(payload.message || '服务异常，请手动重启', 'error', 8000);
+          // 立即更新状态栏，不等下次轮询
+          if (typeof updateStatusBar === 'function') {
+            updateStatusBar(false, null);
+          }
+          // 显示不可达横幅
+          const banner = document.getElementById('sidecar-down-banner');
+          if (banner) banner.hidden = false;
+        });
+
+        console.log('[LRC] 事件监听已注册：规则写入 + 启动进度 + sidecar状态(detected/recovered/crash)');
       } else {
         console.warn('[LRC] Tauri 事件 API 不可用，规则写入事件监听未注册');
       }
@@ -3699,11 +3791,19 @@ async function startSidecarForProject() {
     return;
   }
   try {
-    const result = await postMessageToParent('lrc-start-sidecar-for-project', { projectDir: trimmedDir }, 60000);
+    // v0.8.10 L3-01：超时从 60s 延长到 120s，与 handleStartServiceClick 对齐
+    // spawn_and_wait 最坏 40s 健康检查 + 索引期间 HTTP 慢响应，60s 余量不足
+    const result = await postMessageToParent('lrc-start-sidecar-for-project', { projectDir: trimmedDir }, 120000);
     if (result && (result.port || result.success !== false)) {
       // v0.8.2：用 showInfoModal 替代多行 alert
       showInfoModal('sidecar 已启动', '项目 sidecar 已启动\n项目: ' + (result.project_dir || trimmedDir) + '\n端口: ' + (result.port || '未知'));
-      setTimeout(() => loadDashboard(), 500);
+      // v0.8.10 L3-03：启动成功后主动触发健康检查，加速状态栏更新
+      setTimeout(() => {
+        loadDashboard();
+        if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+          SidecarHealthMonitor.check();
+        }
+      }, 500);
     } else {
       showToast('启动项目 sidecar 失败: ' + (result?.message || '未知错误'), 'error');
     }
@@ -6148,15 +6248,21 @@ async function switchProject() {
 
   // 调用桌面端 switch_project 命令
   try {
+    // v0.8.10 L4-01：超时从 60s 延长到 120s，覆盖 stop(5s) + spawn_and_wait(40s) + 索引开销
     const result = await postMessageToParent('lrc-switch-project', {
       projectDir: trimmedDir,  // Tauri 命令参数: project_dir → projectDir (camelCase)
-    }, 60000); // 切换项目涉及 sidecar 重启,超时设为 60s
+    }, 120000);
 
     if (result && result.success) {
       // v0.8.2：用 showInfoModal 替代多行 alert
       showInfoModal('项目切换成功', '项目: ' + result.project_dir + '\n端口: ' + result.port + '\n\n' + (result.message || ''));
-      // 刷新仪表盘以加载新项目的数据
-      setTimeout(() => loadDashboard(), 500);
+      // v0.8.10 L4-04：切换成功后主动触发健康检查，加速状态栏更新
+      setTimeout(() => {
+        loadDashboard();
+        if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+          SidecarHealthMonitor.check();
+        }
+      }, 500);
     } else {
       showToast('项目切换失败: ' + (result?.message || '未知错误'), 'error');
     }

@@ -151,10 +151,13 @@
 - [x] ~~abort 后 Tauri invoke 是否真正中断~~ → ✓ v0.8.9 G-001 修复（cancel_start_sidecar + AtomicBool）
 - [x] ~~启动期间无进度反馈~~ → ✓ v0.8.9 G-003 修复（StartProgress + Tauri event）
 - [x] ~~错误无结构化分类~~ → ✓ v0.8.9 G-004 修复（SidecarStartError 枚举 + 错误码）
-- [ ] sidecar 崩溃后 UI 是否能检测到（而非等到下次操作才发现不可达）
+- [x] ~~sidecar 崩溃后 UI 是否能检测到~~ → ✓ v0.8.10 L5-01 修复（新增 sidecar-crash 事件监听器）
+- [x] ~~前端接入 sidecar-start-progress 事件监听器~~ → ✓ v0.8.9 已接入，v0.8.10 扩展至 sidecar-detected/recovered/crash
+- [x] ~~_setReachable 仅刷新仪表盘导致其他页面状态不同步~~ → ✓ v0.8.10 L4-02 修复（_broadcastSidecarStateChange 全局广播）
+- [x] ~~startSidecarForProject/switchProject 超时 60s 不足~~ → ✓ v0.8.10 L3-01/L4-01 修复（统一 120s）
+- [x] ~~child.kill() 错误静默吞掉~~ → ✓ v0.8.10 L5-03 修复（tracing 日志记录）
 - [ ] 多窗口同时启动 sidecar 的竞态条件
 - [ ] 项目切换时旧 sidecar 是否正确停止
-- [ ] 前端接入 `sidecar-start-progress` 事件监听器（后端已就绪）
 
 ---
 

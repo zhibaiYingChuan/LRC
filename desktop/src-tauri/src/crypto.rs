@@ -29,20 +29,18 @@ fn key_path() -> Result<PathBuf, String> {
         } else {
             // APPDATA 为空字符串，回退到 dirs crate
             tracing::warn!("APPDATA 环境变量为空，使用 dirs::config_dir() 作为密钥文件回退目录");
-            dirs::config_dir()
-                .or_else(dirs::data_dir)
-                .ok_or_else(|| {
-                    "无法确定密钥目录：APPDATA 为空且 dirs::config_dir()/data_dir() 均返回 None".to_string()
-                })?
+            dirs::config_dir().or_else(dirs::data_dir).ok_or_else(|| {
+                "无法确定密钥目录：APPDATA 为空且 dirs::config_dir()/data_dir() 均返回 None"
+                    .to_string()
+            })?
         }
     } else {
         // APPDATA 未设置，回退到 dirs crate
         tracing::warn!("APPDATA 环境变量未设置，使用 dirs::config_dir() 作为密钥文件回退目录");
-        dirs::config_dir()
-            .or_else(dirs::data_dir)
-            .ok_or_else(|| {
-                "无法确定密钥目录：APPDATA 未设置且 dirs::config_dir()/data_dir() 均返回 None".to_string()
-            })?
+        dirs::config_dir().or_else(dirs::data_dir).ok_or_else(|| {
+            "无法确定密钥目录：APPDATA 未设置且 dirs::config_dir()/data_dir() 均返回 None"
+                .to_string()
+        })?
     };
 
     Ok(base_dir.join("LoongRecall").join(".lrc_key"))
@@ -54,9 +52,7 @@ fn key_path() -> Result<PathBuf, String> {
 /// 这确保即使密钥文件被复制到其他机器也无法使用。
 #[cfg(target_os = "windows")]
 fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
-    use windows_sys::Win32::Security::Cryptography::{
-        CryptProtectData, CRYPT_INTEGER_BLOB,
-    };
+    use windows_sys::Win32::Security::Cryptography::{CryptProtectData, CRYPT_INTEGER_BLOB};
 
     let data_in = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
@@ -74,11 +70,11 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
     let result = unsafe {
         CryptProtectData(
             &data_in,
-            std::ptr::null(),        // 描述字符串（可选）
-            std::ptr::null(),        // 额外的熵（可选）
-            std::ptr::null(),        // 保留
-            std::ptr::null(),        // 提示结构（可选）
-            0,                       // 标志（0 = 用户级别保护）
+            std::ptr::null(), // 描述字符串（可选）
+            std::ptr::null(), // 额外的熵（可选）
+            std::ptr::null(), // 保留
+            std::ptr::null(), // 提示结构（可选）
+            0,                // 标志（0 = 用户级别保护）
             &mut data_out,
         )
     };
@@ -89,9 +85,8 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
 
     // 复制加密后的数据
     // SAFETY: data_out.pbData 由 CryptProtectData 分配并填充，非空且大小为 cbData 字节
-    let protected = unsafe {
-        std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec()
-    };
+    let protected =
+        unsafe { std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec() };
 
     // 释放 DPAPI 分配的内存
     // SAFETY: data_out.pbData 由 CryptProtectData 通过 LocalAlloc 分配，必须使用 LocalFree 释放
@@ -105,9 +100,7 @@ fn dpapi_protect(data: &[u8]) -> Result<Vec<u8>, String> {
 /// 使用 DPAPI 解密密钥数据（Windows），非 Windows 平台直接返回原始数据
 #[cfg(target_os = "windows")]
 fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
-    use windows_sys::Win32::Security::Cryptography::{
-        CryptUnprotectData, CRYPT_INTEGER_BLOB,
-    };
+    use windows_sys::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 
     let data_in = CRYPT_INTEGER_BLOB {
         cbData: data.len() as u32,
@@ -124,11 +117,11 @@ fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
     let result = unsafe {
         CryptUnprotectData(
             &data_in,
-            std::ptr::null_mut(),    // 解密后的描述字符串
-            std::ptr::null(),        // 额外的熵（必须与加密时一致）
-            std::ptr::null(),        // 保留
-            std::ptr::null(),        // 提示结构
-            0,                       // 标志
+            std::ptr::null_mut(), // 解密后的描述字符串
+            std::ptr::null(),     // 额外的熵（必须与加密时一致）
+            std::ptr::null(),     // 保留
+            std::ptr::null(),     // 提示结构
+            0,                    // 标志
             &mut data_out,
         )
     };
@@ -138,9 +131,8 @@ fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
     }
 
     // SAFETY: data_out.pbData 由 CryptUnprotectData 分配并填充，大小与加密时一致
-    let unprotected = unsafe {
-        std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec()
-    };
+    let unprotected =
+        unsafe { std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec() };
 
     // SAFETY: data_out.pbData 由 CryptUnprotectData 通过 LocalAlloc 分配，必须使用 LocalFree 释放
     unsafe {
@@ -171,8 +163,7 @@ fn get_or_create_key() -> Result<[u8; 32], String> {
 
     // 尝试读取已有密钥
     if path.exists() {
-        let protected_bytes =
-            std::fs::read(&path).map_err(|e| format!("读取密钥文件失败: {e}"))?;
+        let protected_bytes = std::fs::read(&path).map_err(|e| format!("读取密钥文件失败: {e}"))?;
 
         // 通过 DPAPI 解密恢复原始密钥
         let key_bytes = dpapi_unprotect(&protected_bytes)?;
@@ -210,7 +201,10 @@ fn get_or_create_key() -> Result<[u8; 32], String> {
         }
     }
 
-    tracing::info!("已生成新加密密钥（通过 DPAPI 保护，path={}）", path.display());
+    tracing::info!(
+        "已生成新加密密钥（通过 DPAPI 保护，path={}）",
+        path.display()
+    );
     Ok(key)
 }
 
@@ -226,8 +220,7 @@ pub fn encrypt_api_key(plaintext: &str) -> Result<String, String> {
     }
 
     let key = get_or_create_key()?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| format!("创建加密器失败: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("创建加密器失败: {e}"))?;
 
     // 生成随机 nonce（96-bit / 12 bytes）
     let mut nonce_bytes = [0u8; 12];
@@ -257,8 +250,7 @@ pub fn decrypt_api_key(encrypted: &str) -> Result<String, String> {
         return Ok(String::new());
     }
     let key = get_or_create_key()?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
-        .map_err(|e| format!("创建解密器失败: {e}"))?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("创建解密器失败: {e}"))?;
 
     // 解码 Base64
     let combined = BASE64

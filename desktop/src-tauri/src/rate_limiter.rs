@@ -20,8 +20,8 @@ pub struct RateLimiterConfig {
 impl Default for RateLimiterConfig {
     fn default() -> Self {
         Self {
-            rate: 100.0,  // 每秒 100 个请求
-            burst: 20,    // 允许 20 个突发请求
+            rate: 100.0, // 每秒 100 个请求
+            burst: 20,   // 允许 20 个突发请求
         }
     }
 }
@@ -67,8 +67,7 @@ impl TokenBucket {
         self.last_refill = now;
 
         // 补充令牌 = 经过时间 × 速率
-        self.tokens = (self.tokens + elapsed * self.config.rate)
-            .min(self.config.burst as f64);
+        self.tokens = (self.tokens + elapsed * self.config.rate).min(self.config.burst as f64);
     }
 }
 
@@ -132,9 +131,8 @@ impl RateLimiter {
     /// 清理长时间未活跃的桶（防止内存泄漏）
     pub fn cleanup(&mut self, max_age: Duration) {
         let now = Instant::now();
-        self.buckets.retain(|_, bucket| {
-            now.duration_since(bucket.last_refill) < max_age
-        });
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < max_age);
     }
 
     /// 获取活跃桶数量（用于监控）
@@ -156,10 +154,7 @@ mod tests {
         });
 
         for i in 0..10 {
-            assert!(
-                !limiter.should_throttle("agent-1"),
-                "第 {i} 个请求应被允许"
-            );
+            assert!(!limiter.should_throttle("agent-1"), "第 {i} 个请求应被允许");
         }
     }
 
@@ -199,7 +194,7 @@ mod tests {
     #[test]
     fn test_token_refill_over_time() {
         let mut limiter = RateLimiter::new(RateLimiterConfig {
-            rate: 1000.0,  // 每秒 1000 个（非常大，确保微秒级补充）
+            rate: 1000.0, // 每秒 1000 个（非常大，确保微秒级补充）
             burst: 1,
         });
 
@@ -232,13 +227,13 @@ mod tests {
     }
 
     /// TDD：模拟 100+ 请求压力测试，验证限流生效
-    /// 
+    ///
     /// PRD L3-03 验收标准：超过 100 req/s 返回 429（should_throttle = true）
     #[test]
     fn test_stress_100_requests_per_second() {
         let mut limiter = RateLimiter::new(RateLimiterConfig {
             rate: 100.0,
-            burst: 100,  // 允许首批 100 个请求
+            burst: 100, // 允许首批 100 个请求
         });
 
         // 首批 100 个请求应全部通过
@@ -276,7 +271,10 @@ mod tests {
             }
             assert_eq!(client_passed, 5, "客户端 {client_id} 的 5 个请求应全部通过");
             // 第 6 个应被限流
-            assert!(limiter.should_throttle(&key), "客户端 {client_id} 第 6 个请求应被限流");
+            assert!(
+                limiter.should_throttle(&key),
+                "客户端 {client_id} 第 6 个请求应被限流"
+            );
         }
 
         assert_eq!(limiter.active_buckets(), 10, "应有 10 个活跃桶");
