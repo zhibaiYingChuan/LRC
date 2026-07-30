@@ -439,7 +439,21 @@ impl SidecarManager {
         let pid = child.id();
 
         // 等待健康检查通过
-        let port = Self::wait_for_health_static(&mut child, actual_port).await?;
+        // v0.8.9 修复 G-010：健康检查失败时显式 kill 子进程，防止孤儿进程
+        // std::process::Child 的 Drop 不会 kill 子进程，必须显式 kill + wait
+        let port = match Self::wait_for_health_static(&mut child, actual_port).await {
+            Ok(port) => port,
+            Err(e) => {
+                tracing::warn!(
+                    "健康检查失败，正在清理子进程 (pid: {:?}): {}",
+                    pid,
+                    e
+                );
+                let _ = child.kill();
+                let _ = child.wait(); // 等待子进程退出，避免僵尸进程
+                return Err(e);
+            }
+        };
 
         tracing::info!(
             "Sidecar 已启动: 项目={}, PID={}, port={}",
