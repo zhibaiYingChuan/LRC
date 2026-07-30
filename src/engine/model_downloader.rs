@@ -122,10 +122,7 @@ impl DownloadProgress for ConsoleProgress {
     }
 
     fn on_error(&self, error: &str, attempt: u32) {
-        eprintln!(
-            "[LRC·下载] 第 {} 次尝试失败: {}",
-            attempt, error
-        );
+        eprintln!("[LRC·下载] 第 {} 次尝试失败: {}", attempt, error);
     }
 }
 
@@ -267,7 +264,10 @@ impl std::fmt::Display for DownloadError {
             Self::Network(msg) => write!(f, "网络错误: {}", msg),
             Self::Http(code, msg) => write!(f, "HTTP 错误 {}: {}", code, msg),
             Self::Io(e) => write!(f, "文件系统错误: {}", e),
-            Self::RetriesExhausted { attempts, last_error } => write!(
+            Self::RetriesExhausted {
+                attempts,
+                last_error,
+            } => write!(
                 f,
                 "重试耗尽（共尝试 {} 次），最后一次错误: {}",
                 attempts, last_error
@@ -612,11 +612,7 @@ mod tests {
     /// 测试：URL 构造（modelscope）
     #[test]
     fn test_build_download_url_modelscope() {
-        let url = build_download_url(
-            "BAAI/bge-small-zh",
-            "config.json",
-            MirrorSource::ModelScope,
-        );
+        let url = build_download_url("BAAI/bge-small-zh", "config.json", MirrorSource::ModelScope);
         assert_eq!(
             url,
             "https://modelscope.cn/api/v1/models/BAAI/bge-small-zh/repo?Revision=master&FilePath=config.json"
@@ -723,8 +719,7 @@ mod tests {
         impl DownloadProgress for CountingProgress {
             fn on_progress(&self, downloaded: u64, _total: u64) {
                 self.update_count.fetch_add(1, Ordering::Relaxed);
-                self.last_downloaded
-                    .store(downloaded, Ordering::Relaxed);
+                self.last_downloaded.store(downloaded, Ordering::Relaxed);
             }
         }
 

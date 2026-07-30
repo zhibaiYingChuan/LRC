@@ -307,7 +307,11 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                     None, // 由洛书编码器决定拓扑深度，而非 TTL
                 )
                 .with_source(format!("consolidation:{}", sm.source))
-                .with_privacy(privacy_level, sm.session_id.clone(), sm.user_id.clone());
+                .with_privacy(
+                    privacy_level,
+                    sm.session_id.clone(),
+                    sm.user_id.clone(),
+                );
 
                 match store.remember(memory) {
                     Ok(_) => {
@@ -339,10 +343,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                     }
                     Err(e) => {
                         if self.config.verbose >= 1 {
-                            eprintln!(
-                                "[LRC·结晶] LLM 合成失败，降级到洛书合成: {}",
-                                e
-                            );
+                            eprintln!("[LRC·结晶] LLM 合成失败，降级到洛书合成: {}", e);
                         }
                         false
                     }
@@ -412,10 +413,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     /// - Phase 3：持锁写入合成记忆，释放锁（<1ms）
     ///
     /// 失败时返回 Err，调用方应降级到洛书合成。
-    async fn llm_synthesize_cycle(
-        &self,
-        llm_config: &LlmApiConfig,
-    ) -> Result<usize, String> {
+    async fn llm_synthesize_cycle(&self, llm_config: &LlmApiConfig) -> Result<usize, String> {
         // ===== Phase 1：持锁加载记忆列表 =====
         let candidates: Vec<(String, String)> = {
             let store = self.store.lock().await;
@@ -452,9 +450,10 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
         // ===== Phase 2：无锁，LLM embedding + 聚类 + 总结 =====
         let texts: Vec<&str> = candidates.iter().map(|(_, c)| c.as_str()).collect();
-        let embeddings = llm_config.embed_texts(&texts).await.map_err(|e| {
-            format!("LLM embedding 调用失败: {}", e)
-        })?;
+        let embeddings = llm_config
+            .embed_texts(&texts)
+            .await
+            .map_err(|e| format!("LLM embedding 调用失败: {}", e))?;
 
         if embeddings.len() != candidates.len() {
             return Err(format!(
@@ -465,8 +464,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         }
 
         // 基于余弦相似度聚类（贪心法）
-        let clusters =
-            self.cluster_by_embedding(&embeddings, self.config.synthesis_similarity);
+        let clusters = self.cluster_by_embedding(&embeddings, self.config.synthesis_similarity);
 
         // 信息增量阈值：与 DaoRegulator 默认值一致（0.01）
         const INFO_GAIN_THRESHOLD: f32 = 0.01;
@@ -642,8 +640,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         }
 
         // 基于余弦相似度聚类（贪心法，复用现有算法）
-        let clusters =
-            self.cluster_by_embedding(&embeddings, self.config.synthesis_similarity);
+        let clusters = self.cluster_by_embedding(&embeddings, self.config.synthesis_similarity);
 
         // 信息增量阈值：与 DaoRegulator 默认值一致（0.01）
         const INFO_GAIN_THRESHOLD: f32 = 0.01;
@@ -752,11 +749,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             eprintln!(
                 "[LRC·结晶·Embed] Phase 3 完成：写入 {} 条合成记忆（source={}）",
                 written,
-                if summarizer.is_some() {
-                    "llm"
-                } else {
-                    "local"
-                }
+                if summarizer.is_some() { "llm" } else { "local" }
             );
         }
 
@@ -1199,10 +1192,10 @@ mod tests {
         // 组1（数据库相关）：前 3 条相似，余弦相似度 > 0.9
         // 组2（前端相关）：后 2 条相似
         let embeddings: Vec<Vec<f32>> = vec![
-            vec![1.0, 0.1, 0.05, 0.0, 0.0], // DB-1
-            vec![0.95, 0.15, 0.1, 0.0, 0.0], // DB-2
-            vec![0.9, 0.1, 0.0, 0.05, 0.0],  // DB-3
-            vec![0.0, 0.0, 0.0, 0.1, 1.0],  // FE-1
+            vec![1.0, 0.1, 0.05, 0.0, 0.0],   // DB-1
+            vec![0.95, 0.15, 0.1, 0.0, 0.0],  // DB-2
+            vec![0.9, 0.1, 0.0, 0.05, 0.0],   // DB-3
+            vec![0.0, 0.0, 0.0, 0.1, 1.0],    // FE-1
             vec![0.0, 0.0, 0.05, 0.15, 0.95], // FE-2
         ];
 

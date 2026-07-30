@@ -108,9 +108,7 @@ impl LlmApiConfig {
                 model,
                 endpoint,
             } => embed_openai(endpoint, api_key, model, text).await,
-            LlmApiConfig::Ollama { host, model } => {
-                embed_ollama(host, model, text).await
-            }
+            LlmApiConfig::Ollama { host, model } => embed_ollama(host, model, text).await,
             LlmApiConfig::None => Err("LLM 未配置，无法调用 embedding API".to_string()),
         }
     }
@@ -160,9 +158,7 @@ impl LlmApiConfig {
                 model,
                 endpoint,
             } => summarize_openai(endpoint, api_key, model, &prompt).await,
-            LlmApiConfig::Ollama { host, model } => {
-                summarize_ollama(host, model, &prompt).await
-            }
+            LlmApiConfig::Ollama { host, model } => summarize_ollama(host, model, &prompt).await,
             LlmApiConfig::None => Err("LLM 未配置，无法调用合成 API".to_string()),
         }
     }
@@ -293,11 +289,7 @@ async fn summarize_ollama(host: &str, model: &str, prompt: &str) -> Result<Strin
         format!("解析 Ollama 合成响应失败: {}", e)
     })?;
 
-    let content = body
-        .message
-        .content
-        .trim()
-        .to_string();
+    let content = body.message.content.trim().to_string();
 
     if content.is_empty() {
         return Err("Ollama 合成返回空内容".to_string());
@@ -813,11 +805,7 @@ async fn embed_openai_batch(
 }
 
 /// 通过 Ollama 获取单条文本的 embedding
-async fn embed_ollama(
-    host: &str,
-    model: &str,
-    text: &str,
-) -> Result<Vec<f32>, String> {
+async fn embed_ollama(host: &str, model: &str, text: &str) -> Result<Vec<f32>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
@@ -966,7 +954,10 @@ mod tests {
             } => {
                 assert_eq!(api_key, "sk-test");
                 assert_eq!(model, "qwen-plus");
-                assert_eq!(endpoint, "https://dashscope.aliyuncs.com/compatible-mode/v1");
+                assert_eq!(
+                    endpoint,
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                );
             }
             _ => panic!("应为 OpenAI 配置"),
         }

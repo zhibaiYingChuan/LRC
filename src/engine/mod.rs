@@ -71,19 +71,14 @@ pub use dao_metrics::{compute_avg_luoshu_deviation, DaoMetrics, DaoMetricsSnapsh
 pub use dao_regulator::{
     CatastrophicEvent, CouplingTrendAnalysis, DaoRegulator, DaoRegulatorState, RegulationAction,
 };
-pub use encoder::{CodeEncoder, EmbeddingVector, FastEncoder};
-pub use encoder_registry::EncoderRegistry;
-pub use embedder::{EmbedError, Embedder}; // v0.6.0 统一嵌入器抽象
+#[cfg(feature = "server")]
+pub use embedder::LlmApiEmbedder;
 #[cfg(feature = "ml")]
 pub use embedder::LocalBertEmbedder; // v0.6.0 本地 BERT 嵌入器
-#[cfg(feature = "server")]
-pub use embedder::LlmApiEmbedder; // v0.6.0 LLM API 嵌入器
-// v0.6.0+：model_downloader 在 server 或 ml feature 下均导出
-#[cfg(any(feature = "ml", feature = "server"))]
-pub use model_downloader::{
-    build_download_url, manual_download_guide, ConsoleProgress, DownloadConfig, DownloadError,
-    DownloadProgress, MirrorSource, ModelDownloader,
-}; // v0.6.0 模型下载器
+pub use embedder::{EmbedError, Embedder}; // v0.6.0 统一嵌入器抽象
+pub use encoder::{CodeEncoder, EmbeddingVector, FastEncoder};
+pub use encoder_registry::EncoderRegistry; // v0.6.0 LLM API 嵌入器
+                                           // v0.6.0+：model_downloader 在 server 或 ml feature 下均导出
 pub use health_report::{
     generate_health_report, MemoryHealthStats, SystemHealthReport, SystemMode,
 };
@@ -98,6 +93,11 @@ pub use mirror_trapezoid::{
     evolution_cycle, mirror_project, recursive_compose, recursive_unfold, BaguaProjection,
     ComposeResult, TrapezoidFocusResult, TrapezoidROI, UnfoldResult, BAGUA_CATEGORIES, BAGUA_NAMES,
 };
+#[cfg(any(feature = "ml", feature = "server"))]
+pub use model_downloader::{
+    build_download_url, manual_download_guide, ConsoleProgress, DownloadConfig, DownloadError,
+    DownloadProgress, MirrorSource, ModelDownloader,
+}; // v0.6.0 模型下载器
 pub use retriever::{CodeRetriever, LocalRetriever, RetrievalResult, ScoredChunk};
 pub use synthesis_engine::{SynthesisConfig, SynthesisEngine};
 pub use synthesis_journal::{SynthesisEvent, SynthesisJournal, SynthesisJournalSnapshot};

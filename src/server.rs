@@ -1809,7 +1809,8 @@ async fn icon_asset_handler(
     const ICON_DECAY: &str = include_str!("../static/assets/icons/icon-decay.svg");
     const ICON_LUOSHU: &str = include_str!("../static/assets/icons/icon-luoshu.svg");
     const ICON_MEMORY: &str = include_str!("../static/assets/icons/icon-memory.svg");
-    const ICON_CRYSTALLIZATION: &str = include_str!("../static/assets/icons/icon-crystallization.svg");
+    const ICON_CRYSTALLIZATION: &str =
+        include_str!("../static/assets/icons/icon-crystallization.svg");
     const ICON_PRIVACY: &str = include_str!("../static/assets/icons/icon-privacy.svg");
     const ICON_NETWORK: &str = include_str!("../static/assets/icons/icon-network.svg");
     const ICON_INTEGRITY: &str = include_str!("../static/assets/icons/icon-integrity.svg");
@@ -2013,9 +2014,7 @@ pub async fn update_llm_config(
         }
         // v0.7.1 P2-1 修复：用 spawn_blocking 包裹同步文件 I/O，避免阻塞 Tokio worker 线程
         let save_result = tokio::task::spawn_blocking(|| {
-            if let Err(e) = save_llm_to_config(None) {
-                return Err(e);
-            }
+            save_llm_to_config(None)?;
             save_llm_to_wizard_json("")
         })
         .await;
@@ -2066,9 +2065,7 @@ pub async fn update_llm_config(
             // v0.7.1 P2-1 修复：用 spawn_blocking 包裹同步文件 I/O，避免阻塞 Tokio worker 线程
             let llm_str_for_save = llm_str.clone();
             let save_result = tokio::task::spawn_blocking(move || {
-                if let Err(e) = save_llm_to_config(Some(&llm_str_for_save)) {
-                    return Err(e);
-                }
+                save_llm_to_config(Some(&llm_str_for_save))?;
                 save_llm_to_wizard_json(&llm_str_for_save)
             })
             .await;
@@ -2343,7 +2340,10 @@ async fn embedder_status_handler(
         model_id: default_model_id,
         status: status.to_string(),
         models_dir: models_dir.to_string_lossy().to_string(),
-        available_models: AVAILABLE_EMBEDDER_MODELS.iter().map(|s| s.to_string()).collect(),
+        available_models: AVAILABLE_EMBEDDER_MODELS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
     };
 
     (
@@ -2745,7 +2745,9 @@ fn check_windows_install_path(name: &str) -> Option<String> {
             .join("cursor")],
         "Trae" => vec![
             PathBuf::from(&local_appdata).join("Programs").join("Trae"),
-            PathBuf::from(&local_appdata).join("Programs").join("Trae CN"),
+            PathBuf::from(&local_appdata)
+                .join("Programs")
+                .join("Trae CN"),
         ],
         "Windsurf" => vec![PathBuf::from(&local_appdata)
             .join("Programs")
@@ -2869,9 +2871,12 @@ pub async fn run_stdio(state: Arc<AppState>) {
 /// 可嵌入到已有 axum 应用中，将 MCP 路由挂载到子路径。
 pub fn build_mcp_router(state: Arc<AppState>) -> Router {
     // 创建 v1 API 路由（通过闭包捕获共享状态，状态类型为 ()）
-    let v1_service =
-        crate::v1_api::build_v1_router(state.memory_store.clone(), state.manager.clone(), state.llm_api.clone())
-            .into_service();
+    let v1_service = crate::v1_api::build_v1_router(
+        state.memory_store.clone(),
+        state.manager.clone(),
+        state.llm_api.clone(),
+    )
+    .into_service();
 
     Router::new()
         .route("/mcp", post(mcp_handler))
@@ -2979,8 +2984,7 @@ pub async fn serve_on_listener(
             eprintln!("[sidecar] 设置 TCP_NODELAY 失败: {e}");
         }
         let socket = socket2::SockRef::from(&*stream);
-        let keepalive = socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60));
+        let keepalive = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(60));
         if let Err(e) = socket.set_tcp_keepalive(&keepalive) {
             eprintln!("[sidecar] 设置 TCP keepalive 失败: {e}");
         }
@@ -3658,7 +3662,8 @@ mod tests {
     #[tokio::test]
     async fn test_logo_asset_traversal_encoded() {
         // URL 编码的路径遍历也应返回 404
-        let resp = logo_asset_handler(axum::extract::Path("..%2F..%2Fetc%2Fpasswd".to_string())).await;
+        let resp =
+            logo_asset_handler(axum::extract::Path("..%2F..%2Fetc%2Fpasswd".to_string())).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

@@ -5,8 +5,8 @@ description = "LRC Desktop — 本地优先的 AI 代码记忆桌面应用"
 authors = ["LRC Team"]
 edition = "2021"
 # v0.7.1 P2-5：声明最低支持 Rust 版本（MSRV）
-# Tauri 2.x 要求 Rust 1.77.2+
-rust-version = "1.77"
+# v0.8.8：统一 MSRV 到 1.80（与主项目一致，LazyLock 需要 1.80+，Tauri 2.x 要求 1.77.2+）
+rust-version = "1.80"
 
 [lib]
 name = "lrc_desktop_lib"

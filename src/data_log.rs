@@ -72,11 +72,7 @@ pub fn log_operation(op: OperationType, details: &str) {
     let line = format!("{} | {} | {}\n", timestamp, op.as_str(), details);
 
     // 追加写入
-    match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+    match OpenOptions::new().create(true).append(true).open(&log_path) {
         Ok(mut file) => {
             if let Err(e) = file.write_all(line.as_bytes()) {
                 eprintln!("[data_log] 写入日志失败: {}", e);
@@ -116,11 +112,7 @@ pub fn read_recent_operations(n: usize) -> Vec<LogEntry> {
 
     // 按行解析，取最后 N 行
     let lines: Vec<&str> = content.lines().collect();
-    let start = if lines.len() > n {
-        lines.len() - n
-    } else {
-        0
-    };
+    let start = if lines.len() > n { lines.len() - n } else { 0 };
 
     let mut entries: Vec<LogEntry> = lines[start..]
         .iter()

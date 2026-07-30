@@ -930,7 +930,10 @@ mod tests {
     fn test_detect_default_model_chinese() {
         // 标准中文
         assert_eq!(detect_default_model_by_lang("zh_CN"), "BAAI/bge-small-zh");
-        assert_eq!(detect_default_model_by_lang("zh_CN.UTF-8"), "BAAI/bge-small-zh");
+        assert_eq!(
+            detect_default_model_by_lang("zh_CN.UTF-8"),
+            "BAAI/bge-small-zh"
+        );
         assert_eq!(detect_default_model_by_lang("zh_TW"), "BAAI/bge-small-zh");
         assert_eq!(detect_default_model_by_lang("zh_HK"), "BAAI/bge-small-zh");
         assert_eq!(detect_default_model_by_lang("zh_SG"), "BAAI/bge-small-zh");

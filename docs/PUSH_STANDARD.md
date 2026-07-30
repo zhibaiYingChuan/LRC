@@ -72,10 +72,19 @@ git diff --cached --name-only | Select-String -Pattern '\.env|\.key|\.pem|\.p12|
 python scripts/check_algorithm_leak.py --verbose
 # 期望输出：通过: 公开层文件无核心算法泄露
 
-# 6. 编译验证（主项目）
+# 6. 代码格式检查（与 CI Rustfmt job 对齐，v0.8.8 新增）
+cargo fmt --all -- --check
+# 期望结果：无输出（退出码 0）
+
+# 7. Clippy 静态检查（与 CI Clippy job 对齐，v0.8.8 新增）
+cargo clippy --features server -- -D warnings
+cargo clippy --all-targets -- -D warnings
+# 期望结果：无 warning，无 error
+
+# 8. 编译验证（主项目）
 cargo build --release --features server
 
-# 7. 编译验证（桌面端，发布前才需要）
+# 9. 编译验证（桌面端，发布前才需要）
 cd desktop; npm run build; cd ..
 ```
 
@@ -99,6 +108,31 @@ cd desktop/src-tauri; cargo test; cd ../..
 # 4. CHANGELOG.md 已更新
 # 5. README.md 内容实事求是（无虚假数据）
 # 6. 用户文档已同步更新
+```
+
+### 2.3 跨平台预检（v0.8.8 新增，防止 macOS/Linux CI 失败）
+
+> **强制要求**：打 tag 前必须执行本节检查。v0.8.7 因跳过此检查导致 macOS/Linux 桌面端 CI 失败。
+
+```powershell
+# 1. Tauri 配置验证（确保 targets 不是单一平台）
+# 错误示例："targets": ["nsis"]  ← 仅 Windows，macOS/Linux 无 bundle
+# 正确示例："targets": "all"     ← 三平台全量打包
+Select-String -Path desktop/src-tauri/tauri.conf.json -Pattern '"targets"'
+
+# 2. MSRV 一致性检查（主项目与桌面端必须一致）
+$mainMsrv = (Select-String -Path Cargo.toml -Pattern '^rust-version').Line
+$desktopMsrv = (Select-String -Path desktop/src-tauri/Cargo.toml -Pattern '^rust-version').Line
+Write-Host "主项目 MSRV: $mainMsrv"
+Write-Host "桌面端 MSRV: $desktopMsrv"
+# 期望：两者版本号一致（当前均为 1.80）
+
+# 3. 桌面端编译验证（本地 Windows 可验证编译通过）
+cd desktop/src-tauri; cargo check; cd ../..
+
+# 4. CI 工作流矩阵验证（确认三平台均覆盖）
+Select-String -Path .github/workflows/release.yml -Pattern 'matrix:'
+# 期望：build-sidecar 和 build-desktop 均包含 windows/macos/linux 三平台
 ```
 
 ---
@@ -265,6 +299,44 @@ export RUSTFLAGS="-C link-arg=-Wl,--build-id=sha1"
 cargo build --release --features server --target <YOUR_TARGET>
 sha256sum target/<YOUR_TARGET>/release/code-memory-server
 # 与 Release 中的 .sha256 对比
+```
+
+### 5.6 CI 预检门禁（v0.8.8 新增）
+
+> **强制要求**：`release.yml` 在触发三平台构建前，必须先跑 preflight job 确保基础编译通过。v0.8.7 因无 preflight 导致三平台并行失败浪费时间。
+
+#### Preflight Job 设计
+
+```yaml
+# release.yml 新增 preflight job（在 build-sidecar 和 build-desktop 之前）
+preflight:
+  name: Preflight Check
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v5
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Format check
+      run: cargo fmt --all -- --check
+    - name: Clippy check
+      run: cargo clippy --features server -- -D warnings
+    - name: Compile check
+      run: cargo check --features server
+    - name: Desktop config lint
+      run: |
+        # 验证 tauri.conf.json targets 不是单一平台
+        grep -q '"targets": "all"' desktop/src-tauri/tauri.conf.json || \
+        grep -E '"targets".*\[.*"app".*"dmg".*\]' desktop/src-tauri/tauri.conf.json
+    - name: MSRV consistency check
+      run: |
+        MAIN_MSRV=$(grep '^rust-version' Cargo.toml | cut -d'"' -f2)
+        DESKTOP_MSRV=$(grep '^rust-version' desktop/src-tauri/Cargo.toml | cut -d'"' -f2)
+        echo "Main MSRV: $MAIN_MSRV, Desktop MSRV: $DESKTOP_MSRV"
+        [ "$MAIN_MSRV" = "$DESKTOP_MSRV" ] || { echo "ERROR: MSRV 不一致"; exit 1; }
+
+build-sidecar:
+  needs: preflight    # 必须等 preflight 通过
+build-desktop:
+  needs: preflight    # 必须等 preflight 通过
 ```
 
 ---
@@ -595,19 +667,127 @@ git ls-remote --tags origin vX.Y.Z
 
 > **重要**：仓库中**不需要**也不**应该**包含预编译的二进制文件。CI/CD 会从源码编译所有产物。`build.rs` 会检测 `desktop/src-tauri/lrc-sidecar.exe` 是否存在，本地构建时需手动编译并复制。
 
+### 11.5 CI 失败后的 Tag 处置规则（v0.8.8 新增）
+
+> **强制要求**：Tag 触发 CI 失败时，禁止立即删除 Tag 重打。应按以下决策树处理。
+
+#### CI 失败处置决策树
+
+```
+Tag 触发 CI 失败
+    │
+    ├─ 仅 1-2 个平台失败（如 macOS/Linux 桌面端）？
+    │   ├─ 是 → 保留 Tag，发布 PATCH 版本修复（推荐）
+    │   │        原因：保留 HCSE 可追溯性基线，sidecar + 成功平台产物仍可用
+    │   │        操作：修复 → chore(release): 发布 vX.Y.Z+1 → 打新 Tag
+    │   │
+    │   └─ 否（全部平台失败 / sidecar 编译失败）
+    │       → 删除 Tag，修复后重新打 Tag
+    │         操作：git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z
+    │         修复 → 重新 chore(release) → 重新打 Tag
+    │
+    └─ 是否已创建 GitHub Release？
+        ├─ 是且全平台失败 → 删除 Release + 删除 Tag
+        └─ 是且部分平台失败 → 保留 Release，发布 PATCH 版本
+```
+
+#### v0.8.7 案例应用
+
+- v0.8.7 CI 失败：仅 macOS/Linux 桌面端失败，sidecar + Windows 桌面端成功
+- 处置决策：**保留 v0.8.7 Tag**，发布 v0.8.8 PATCH 修复版
+- 修复内容：tauri.conf.json targets 改 "all" + MSRV 统一 1.80 + clippy 修复
+
 ---
 
-## 十二、附录
+## 十二、MSRV 一致性规范（v0.8.8 新增）
 
-### 12.1 当前仓库状态（v0.8.7）
+> **强制要求**：主项目与桌面端的 `rust-version` 必须一致，防止跨平台编译失败。
+
+### 12.1 MSRV 统一规则
+
+| 项目 | 文件 | 当前 MSRV | 依据 |
+|------|------|----------|------|
+| 主项目 | `Cargo.toml` | 1.80 | `std::sync::LazyLock` 需要 1.80+ |
+| 桌面端 | `desktop/src-tauri/Cargo.toml` | 1.80 | 与主项目一致（Tauri 2.x 要求 1.77.2+，取更高值） |
+
+### 12.2 MSRV 提升流程
+
+当引入新依赖或使用新 std 特性时：
+
+1. 确认所需最低 Rust 版本（如 `LazyLock` → 1.80）
+2. **同步更新** `Cargo.toml` 和 `desktop/src-tauri/Cargo.toml` 的 `rust-version`
+3. 在 CI `preflight` job 中增加 MSRV 一致性校验（见 5.6 节）
+4. 更新本节表格
+
+### 12.3 禁止事项
+
+- **禁止**主项目与桌面端 MSRV 不一致
+- **禁止**降低 MSRV 而不验证依赖兼容性
+- **禁止**使用 nightly-only 特性（CI 使用 stable 工具链）
+
+---
+
+## 十三、CI 失败处理与防复发（v0.8.8 新增）
+
+### 13.1 CI 失败分类
+
+| 失败类型 | 根因模式 | 防复发措施 |
+|---------|---------|-----------|
+| 编译错误（全平台） | MSRV 不兼容 / 语法错误 | preflight job 编译检查 |
+| 编译错误（单平台） | 平台特定代码 / 配置缺失 | 跨平台预检（2.3 节） |
+| 格式化失败 | cargo fmt 未执行 | preflight job fmt 检查 |
+| Clippy 失败 | lint 未修复 | preflight job clippy 检查 |
+| Bundle 缺失 | tauri.conf.json targets 配置错误 | preflight job config lint |
+| 系统依赖缺失 | Linux webkit2gtk 等未安装 | release.yml 已含 apt-get install |
+
+### 13.2 v0.8.7 失败复盘（防复发档案）
+
+| 项目 | 详情 |
+|------|------|
+| 失败现象 | macOS/Linux 桌面端 CI exit 1，Windows 成功 |
+| 根本原因 | `tauri.conf.json` 的 `"targets": ["nsis"]` 仅产出 Windows NSIS 包，macOS/Linux 无 bundle 产物，`find ... -exec cp` 找不到文件 exit 1 |
+| 次要原因 | 主项目 MSRV 1.70 与 LazyLock（1.80+）不兼容；Clippy question_mark lint 未修复 |
+| 修复方案 | targets 改 "all" + MSRV 统一 1.80 + clippy --fix + cargo fmt |
+| 防复发规则 | 新增 2.3 跨平台预检 + 5.6 CI preflight 门禁 + 第十二章 MSRV 规范 |
+
+### 13.3 CI 失败应急流程
+
+```powershell
+# 1. 查看 CI 失败详情（浏览器打开）
+# https://github.com/zhibaiYingChuan/LRC/actions
+
+# 2. 本地复现（按失败平台分类处理）
+#    - 格式/Clippy 错误：cargo fmt && cargo clippy --fix
+#    - 编译错误：cargo check --features server
+#    - 配置错误：检查 tauri.conf.json targets
+
+# 3. 修复后本地验证（执行 2.1 + 2.2 + 2.3 全部检查）
+
+# 4. 按 11.5 节决策树决定是否删除 Tag
+
+# 5. 提交修复并推送
+git add <具体文件>
+git commit -m "fix(ci): 修复跨平台编译失败"
+git push origin main
+
+# 6. 重新打 Tag（如需）
+git tag -a vX.Y.Z -m "vX.Y.Z: 修复跨平台编译"
+git push origin vX.Y.Z
+```
+
+---
+
+## 十四、附录
+
+### 14.1 当前仓库状态（v0.8.7，修复中 → v0.8.8）
 
 - **仓库地址**：https://github.com/zhibaiYingChuan/LRC
 - **主分支**：main
-- **当前版本**：0.8.7
+- **当前版本**：0.8.7（v0.8.8 修复中）
 - **构建工作流**：`.github/workflows/release.yml`
 - **覆盖平台**：Windows、macOS、Linux
 
-### 12.2 相关文档
+### 14.2 相关文档
 
 - [CHANGELOG.md](../CHANGELOG.md) — 变更记录
 - [README.md](../README.md) — 项目说明
@@ -615,10 +795,12 @@ git ls-remote --tags origin vX.Y.Z
 - [.github/workflows/release.yml](../.github/workflows/release.yml) — 构建工作流
 - [.gitignore](../.gitignore) — Git 忽略规则
 
-### 12.3 修订记录
+### 14.3 修订记录
 
 | 日期 | 版本 | 修订内容 |
 |------|------|---------|
 | 2026-07-28 | v1.0 | 初始版本，基于 v0.6.0 迭代经验形成 |
 | 2026-07-28 | v1.1 | 新增第十章旧版本清理规范、第十一章 Tag 构建规范；删除 desktop/src/ 相关要求；明确二进制编译包处理方式 |
 | 2026-07-30 | v1.2 | HCSE 安全评估 + 发布规范专家评审后更新：第 4.1 节版本号同步清单 6→7 处（新增 static/app.js APP_VERSION）；第 4.2 节当前版本 0.6.0→0.8.7；第 10.1 节清理范围补充 v0.8.x 编译产物；第 12.1 节仓库状态更新到 v0.8.7 |
+| 2026-07-30 | v1.3 | 新增第 2.1 节 cargo fmt + clippy 预检规则（与 CI 对齐） |
+| 2026-07-30 | v1.4 | v0.8.7 CI 失败复盘后新增：第 2.3 节跨平台预检、第 5.6 节 CI preflight 门禁、第 11.5 节 CI 失败 Tag 处置决策树、第十二章 MSRV 一致性规范、第十三章 CI 失败处理与防复发；桌面端 MSRV 1.77→1.80 统一 |

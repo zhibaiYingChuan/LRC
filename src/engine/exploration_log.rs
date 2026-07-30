@@ -82,14 +82,14 @@ pub struct DepthDistribution {
 /// 八卦分布快照
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaguaDistribution {
-    pub qian: usize,  // 乾卦·天
-    pub kun: usize,   // 坤卦·地
-    pub zhen: usize,  // 震卦·雷
-    pub xun: usize,   // 巽卦·风
-    pub kan: usize,   // 坎卦·水
-    pub li: usize,    // 离卦·火
-    pub gen: usize,   // 艮卦·山
-    pub dui: usize,   // 兑卦·泽
+    pub qian: usize, // 乾卦·天
+    pub kun: usize,  // 坤卦·地
+    pub zhen: usize, // 震卦·雷
+    pub xun: usize,  // 巽卦·风
+    pub kan: usize,  // 坎卦·水
+    pub li: usize,   // 离卦·火
+    pub gen: usize,  // 艮卦·山
+    pub dui: usize,  // 兑卦·泽
 }
 
 /// 状态快照 payload
@@ -196,9 +196,10 @@ impl ExplorationLogger {
 
     /// 初始化文件句柄（懒加载）
     fn ensure_file(&self) -> std::io::Result<()> {
-        let mut guard = self.file.lock().map_err(|e| {
-            std::io::Error::other(format!("锁失败: {}", e))
-        })?;
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|e| std::io::Error::other(format!("锁失败: {}", e)))?;
         if guard.is_none() {
             // 确保父目录存在
             if let Some(parent) = self.log_path.parent() {
@@ -245,13 +246,13 @@ impl ExplorationLogger {
             metrics,
         };
 
-        let line = serde_json::to_string(&entry)
-            .map_err(std::io::Error::other)?;
+        let line = serde_json::to_string(&entry).map_err(std::io::Error::other)?;
         let line = line + "\n";
 
-        let mut guard = self.file.lock().map_err(|e| {
-            std::io::Error::other(format!("锁失败: {}", e))
-        })?;
+        let mut guard = self
+            .file
+            .lock()
+            .map_err(|e| std::io::Error::other(format!("锁失败: {}", e)))?;
         if let Some(ref mut file) = *guard {
             file.write_all(line.as_bytes())?;
             file.flush()?;
@@ -282,15 +283,13 @@ impl ExplorationLogger {
     }
 
     /// 便捷方法：记录 recall 事件
-    pub fn log_recall(
-        &self,
-        query: &str,
-        top_k: usize,
-        result_count: usize,
-        latency_ms: u64,
-    ) {
+    pub fn log_recall(&self, query: &str, top_k: usize, result_count: usize, latency_ms: u64) {
         // 截断 query 防止日志膨胀
-        let truncated_query = if query.len() > 200 { &query[..200] } else { query };
+        let truncated_query = if query.len() > 200 {
+            &query[..200]
+        } else {
+            query
+        };
         self.log(
             ExplorationEventType::Recall,
             serde_json::json!({
@@ -340,11 +339,7 @@ impl ExplorationLogger {
 
     /// 便捷方法：记录实验配置
     pub fn log_experiment_config(&self, config: serde_json::Value) {
-        self.log(
-            ExplorationEventType::ExperimentConfig,
-            config,
-            None,
-        );
+        self.log(ExplorationEventType::ExperimentConfig, config, None);
     }
 
     /// 便捷方法：记录 sidecar 启动
@@ -437,10 +432,7 @@ mod tests {
         // 准备临时目录
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("exploration.jsonl");
-        let logger = ExplorationLogger::new(
-            log_path.clone(),
-            "test_experiment".to_string(),
-        );
+        let logger = ExplorationLogger::new(log_path.clone(), "test_experiment".to_string());
 
         // 写入一条 remember 事件
         logger.log_remember("fact", 8, &["test".to_string()], 42);
@@ -457,10 +449,7 @@ mod tests {
     fn test_log_recall_includes_query_and_count() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("recall.jsonl");
-        let logger = ExplorationLogger::new(
-            log_path.clone(),
-            "test_recall".to_string(),
-        );
+        let logger = ExplorationLogger::new(log_path.clone(), "test_recall".to_string());
 
         logger.log_recall("如何实现用户认证", 10, 5, 120);
 
@@ -474,10 +463,7 @@ mod tests {
     fn test_log_snapshot_serializes_distribution() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("snapshot.jsonl");
-        let logger = ExplorationLogger::new(
-            log_path.clone(),
-            "test_snapshot".to_string(),
-        );
+        let logger = ExplorationLogger::new(log_path.clone(), "test_snapshot".to_string());
 
         let payload = SnapshotPayload {
             memory_count: 1000,
@@ -487,8 +473,14 @@ mod tests {
                 edge: 400,
             },
             bagua_distribution: BaguaDistribution {
-                qian: 125, kun: 125, zhen: 125, xun: 125,
-                kan: 125, li: 125, gen: 125, dui: 125,
+                qian: 125,
+                kun: 125,
+                zhen: 125,
+                xun: 125,
+                kan: 125,
+                li: 125,
+                gen: 125,
+                dui: 125,
             },
         };
 
@@ -520,10 +512,7 @@ mod tests {
     fn test_log_synthesize_includes_confidence() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("synth.jsonl");
-        let logger = ExplorationLogger::new(
-            log_path.clone(),
-            "test_synth".to_string(),
-        );
+        let logger = ExplorationLogger::new(log_path.clone(), "test_synth".to_string());
 
         logger.log_synthesize(
             &["id-1".to_string(), "id-2".to_string()],
@@ -544,10 +533,7 @@ mod tests {
     fn test_long_query_is_truncated() {
         let dir = tempdir().unwrap();
         let log_path = dir.path().join("trunc.jsonl");
-        let logger = ExplorationLogger::new(
-            log_path.clone(),
-            "test_trunc".to_string(),
-        );
+        let logger = ExplorationLogger::new(log_path.clone(), "test_trunc".to_string());
 
         // 构造超长 query
         let long_query = "a".repeat(500);

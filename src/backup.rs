@@ -82,10 +82,7 @@ pub fn create_backup() -> BackupReport {
 
     // 检查源文件是否存在
     if !memory_file.exists() {
-        report.error = Some(format!(
-            "记忆文件不存在: {}",
-            memory_file.display()
-        ));
+        report.error = Some(format!("记忆文件不存在: {}", memory_file.display()));
         return report;
     }
 
@@ -106,9 +103,7 @@ pub fn create_backup() -> BackupReport {
     }
 
     // 获取备份文件大小
-    report.backup_size = fs::metadata(&backup_file)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    report.backup_size = fs::metadata(&backup_file).map(|m| m.len()).unwrap_or(0);
 
     // 统计记忆数
     if let Ok(content) = fs::read_to_string(&backup_file) {
@@ -144,10 +139,7 @@ pub fn create_backup() -> BackupReport {
         report.old_backups_removed,
         report.total_backups
     );
-    crate::data_log::log_operation(
-        crate::data_log::OperationType::Backup,
-        &details,
-    );
+    crate::data_log::log_operation(crate::data_log::OperationType::Backup, &details);
 
     report
 }
