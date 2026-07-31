@@ -746,6 +746,16 @@ async fn try_run() -> Result<(), String> {
         started_at: chrono::Utc::now(),
     });
 
+    // 启动时为当前项目创建/更新 meta.json（用于显示项目名而非指纹）
+    // 失败时不阻塞服务启动，仅记录警告
+    {
+        let src_path = std::path::Path::new(&src_dir);
+        let data_dir = code_memory::data_dir::DataDir::for_project(src_path);
+        if let Err(e) = data_dir.ensure_meta(src_path) {
+            eprintln!("[warn] 启动时写入项目元信息失败: {}", e);
+        }
+    }
+
     // ════════════════════════════════════════════════════════════
     // 后台索引（所有模式都需要，不阻塞服务启动）
     // ════════════════════════════════════════════════════════════

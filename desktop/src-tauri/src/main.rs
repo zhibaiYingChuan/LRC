@@ -262,6 +262,117 @@ fn main() {
                     }
                 }
 
+                // ════════════════════════════════════════════════════════════════
+                // v0.8.16 入口体验修复：自动启动 sidecar
+                // 用户痛点："打开桌面端，它不应该自动启动后端吗？"
+                // 设计原则：与 VSCode/Cursor 等主流桌面应用对齐，打开即用
+                //
+                // 自动启动条件：
+                //   1. 桌面端无管理的 sidecar 实例（sidecar_running == false）
+                //   2. 未探测到外部 sidecar（probed 为空或未执行探测）
+                //   3. wizard.setup_complete == true（首次安装不自动启动，引导用户走向导）
+                //
+                // 失败处理：
+                //   - 自动启动失败后不重试（与心跳协程的自动恢复不同）
+                //   - 仅发射 sidecar-auto-start-failed 事件，前端显示横幅让用户手动启动
+                // ════════════════════════════════════════════════════════════════
+                {
+                    let state = monitor_handle.state::<AppStore>();
+                    // 检查 wizard 是否已完成配置（首次安装不自动启动）
+                    let setup_complete = {
+                        let wizard = state.wizard.lock().await;
+                        wizard.config().setup_complete
+                    }; // wizard 锁立即释放
+
+                    if setup_complete {
+                        // 再次检查 sidecar 是否已在运行（probe 可能已检测到外部 sidecar）
+                        let sidecar_running = {
+                            let sidecar = state.sidecar.lock().await;
+                            sidecar.is_running()
+                        }; // sidecar 锁立即释放
+
+                        if !sidecar_running {
+                            tracing::info!("[v0.8.16 自动启动] wizard 已完成配置，自动启动 sidecar（全局模式）");
+                            // 通知前端：正在自动启动
+                            let _ = monitor_handle.emit(
+                                "sidecar-auto-starting",
+                                serde_json::json!({
+                                    "message": "正在自动启动 LRC 服务..."
+                                }),
+                            );
+
+                            // P0-2 + P1-2 修复：用 tokio::time::timeout 包裹 start_sidecar
+                            // 根因：start_sidecar 卡死时（如 reqwest DNS 挂起），心跳 loop 永远不会启动
+                            // 修复：60s 整体超时（spawn_and_wait 内部已限 40s，此处兜底）
+                            // 超时后发射失败事件，确保心跳 loop 能继续启动
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(60),
+                                commands::start_sidecar(
+                                    state.clone(),
+                                    monitor_handle.clone(),
+                                    None,  // src_dir=None → 全局模式
+                                    None,  // port=None → 自动选择
+                                    None,  // multi_window=None → 默认值
+                                ),
+                            ).await {
+                                Ok(Ok(port)) => {
+                                    tracing::info!("[v0.8.16 自动启动] sidecar 启动成功，端口 {}", port);
+                                    let _ = monitor_handle.emit(
+                                        "sidecar-auto-started",
+                                        serde_json::json!({
+                                            "port": port,
+                                            "message": "LRC 服务已自动启动"
+                                        }),
+                                    );
+                                }
+                                Ok(Err(e)) => {
+                                    // P1-1 修复：PortConflict 时静默处理（sidecar 已运行，非真正失败）
+                                    // 根因：自动启动与手动启动并发时，第二个 start_sidecar 会检测到端口冲突
+                                    // 修复：检查错误是否为端口冲突，若是则发射 started 事件（复用现有 sidecar）
+                                    let err_str = e.to_string();
+                                    let is_port_conflict = err_str.contains("端口")
+                                        && (err_str.contains("已被") || err_str.contains("已有 sidecar 运行"));
+                                    if is_port_conflict {
+                                        tracing::info!("[v0.8.16 自动启动] 端口已被占用，sidecar 已运行，静默处理: {}", err_str);
+                                        // 发射 started 事件（复用现有 sidecar），而非 failed 事件
+                                        let _ = monitor_handle.emit(
+                                            "sidecar-auto-started",
+                                            serde_json::json!({
+                                                "port": 0,  // 端口未知，前端会通过健康检查获取
+                                                "message": "LRC 服务已在运行"
+                                            }),
+                                        );
+                                    } else {
+                                        tracing::error!("[v0.8.16 自动启动] sidecar 启动失败: {}", e);
+                                        let _ = monitor_handle.emit(
+                                            "sidecar-auto-start-failed",
+                                            serde_json::json!({
+                                                "error": e,
+                                                "message": "LRC 服务自动启动失败，请手动启动"
+                                            }),
+                                        );
+                                    }
+                                }
+                                Err(_elapsed) => {
+                                    // P0-2 修复：整体超时（60s），确保心跳 loop 能继续启动
+                                    tracing::error!("[v0.8.16 自动启动] sidecar 启动整体超时（60s）");
+                                    let _ = monitor_handle.emit(
+                                        "sidecar-auto-start-failed",
+                                        serde_json::json!({
+                                            "error": "自动启动整体超时（60s）",
+                                            "message": "LRC 服务自动启动超时，请手动启动"
+                                        }),
+                                    );
+                                }
+                            }
+                        } else {
+                            tracing::info!("[v0.8.16 自动启动] sidecar 已在运行，跳过自动启动");
+                        }
+                    } else {
+                        tracing::info!("[v0.8.16 自动启动] wizard 未完成配置（setup_complete=false），跳过自动启动，引导用户走向导");
+                    }
+                }
+
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}

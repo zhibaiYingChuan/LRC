@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
@@ -6,7 +6,7 @@
   <!-- 之前完全未配置 CSP，XSS/数据注入防御缺失，HCSE 安全不变量 INV-01 违规 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.openai.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="version" content="0.8.13">
+  <meta name="version" content="0.8.16">
   <link rel="icon" type="image/png" href="/assets/logo/LRC桌面端Logo设计-26aa57e9-7935-4ece-badf-bd52dcccd343.png">
   <title>龙忆 Loong Recall · 仪表盘</title>
   <!-- 龙忆设计系统 v1.0：色阶 + 排版 + 间距 + 圆角 + 阴影 + 动效 -->
@@ -25,7 +25,7 @@
 <div id="sidecar-down-banner" class="sidecar-down-banner" hidden>
   <span class="banner-icon">⚠️</span>
   <span class="banner-text">LRC 服务未运行，部分功能不可用</span>
-  <button class="banner-btn" data-action="openStartServiceModal">启动服务</button>
+  <button class="banner-btn" data-action="handleStartServiceClick">启动服务</button>
 </div>
 
 <!-- ==================== 应用布局：侧边栏 + 主内容区（设计文档 5.1） ==================== -->
@@ -2015,6 +2015,11 @@
         </div>
         <div class="info-grid">
           <div class="info-item">
+            <div class="info-label">项目名称</div>
+            <div class="info-value" id="project-display-name" style="font-size: 1.1em; font-weight: 600;">--</div>
+            <div class="info-hint">从项目路径自动提取，可在记忆中辨识</div>
+          </div>
+          <div class="info-item">
             <div class="info-label">项目指纹</div>
             <div class="info-value" id="project-fingerprint">--</div>
             <div class="info-hint">基于项目路径的 SHA256 哈希前 16 位</div>
@@ -2100,7 +2105,7 @@
 <footer class="status-bar">
   <div class="status-bar-left">
     <span><span class="status-dot unknown" id="status-dot"></span><span id="status-text" class="status-clickable" title="点击启动 LRC 服务">检测中...</span></span>
-    <span>版本 <strong id="status-version">v0.8.15</strong></span>
+    <span>版本 <strong id="status-version">v0.8.16</strong></span>
   </div>
   <div class="status-bar-right">
     <span>数据目录：<code id="status-data-dir" class="status-clickable" title="点击打开数据目录">--</code></span>

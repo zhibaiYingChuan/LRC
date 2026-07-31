@@ -94,6 +94,54 @@ pub fn is_valid_fingerprint(fp: &str) -> bool {
     fp.len() == 16 && fp.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// 从规范化路径中提取项目显示名（路径末段目录名）
+///
+/// 用于将指纹对应的项目路径转换为用户可读的显示名。
+/// 与 `project_fingerprint_with_path` 返回的 `canonical_path` 配合使用。
+///
+/// # 算法
+/// 1. 去除末尾分隔符（同时处理 `/` 和 `\`，兼容跨平台）
+/// 2. 取最后一段目录名
+/// 3. 空路径/根路径兜底返回 "project"
+///
+/// # 幂等性
+/// 同一路径多次调用返回相同结果。
+///
+/// # 示例
+/// ```ignore
+/// assert_eq!(auto_name_from_path("C:\\Users\\me\\code-memory"), "code-memory");
+/// assert_eq!(auto_name_from_path("/home/me/projects/my-app"), "my-app");
+/// assert_eq!(auto_name_from_path("/"), "project");
+/// assert_eq!(auto_name_from_path(""), "project");
+/// ```
+pub fn auto_name_from_path(canonical_path: &str) -> String {
+    // 去除末尾分隔符（同时处理 / 和 \，兼容跨平台路径）
+    let trimmed = canonical_path.trim_end_matches(['/', '\\']);
+
+    if trimmed.is_empty() {
+        return "project".to_string();
+    }
+
+    // 处理 Windows 盘符残留（如 "C:" → 视为根路径）
+    if trimmed.ends_with(':') {
+        return "project".to_string();
+    }
+
+    // 找最后一个路径分隔符（同时处理 / 和 \）
+    let last_sep = trimmed.rfind(['/', '\\']);
+
+    let name = match last_sep {
+        Some(idx) => &trimmed[idx + 1..],
+        None => trimmed,
+    };
+
+    if name.is_empty() {
+        "project".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 // ==================== 单元测试（TDD：红→绿→重构） ====================
 
 #[cfg(test)]
@@ -208,5 +256,55 @@ mod tests {
             fp_abs, fp_rel,
             "相对路径和绝对路径指向同一目录时指纹应一致\n  绝对路径: {fp_abs}\n  相对路径: {fp_rel}"
         );
+    }
+
+    /// 测试: 从 Windows 路径提取项目名
+    #[test]
+    fn test_auto_name_windows_path() {
+        assert_eq!(
+            auto_name_from_path("C:\\Users\\me\\code-memory"),
+            "code-memory"
+        );
+        assert_eq!(auto_name_from_path("C:\\code-memory"), "code-memory");
+    }
+
+    /// 测试: 从 Unix 路径提取项目名
+    #[test]
+    fn test_auto_name_unix_path() {
+        assert_eq!(auto_name_from_path("/home/me/projects/my-app"), "my-app");
+        assert_eq!(auto_name_from_path("/var/www"), "www");
+    }
+
+    /// 测试: 路径末尾带分隔符时正确提取
+    #[test]
+    fn test_auto_name_trailing_separator() {
+        assert_eq!(
+            auto_name_from_path("C:\\Users\\me\\code-memory\\"),
+            "code-memory"
+        );
+        assert_eq!(auto_name_from_path("/home/me/projects/my-app/"), "my-app");
+    }
+
+    /// 测试: 空路径和根路径兜底返回 "project"
+    #[test]
+    fn test_auto_name_empty_and_root() {
+        assert_eq!(auto_name_from_path(""), "project");
+        assert_eq!(auto_name_from_path("/"), "project");
+        assert_eq!(auto_name_from_path("\\"), "project");
+        assert_eq!(auto_name_from_path("C:\\"), "project");
+    }
+
+    /// 测试: 单段路径（无分隔符）直接返回
+    #[test]
+    fn test_auto_name_single_segment() {
+        assert_eq!(auto_name_from_path("code-memory"), "code-memory");
+        assert_eq!(auto_name_from_path("my-app"), "my-app");
+    }
+
+    /// 测试: 幂等性 — 同一路径多次调用返回相同结果
+    #[test]
+    fn test_auto_name_idempotent() {
+        let path = "C:\\Users\\me\\code-memory";
+        assert_eq!(auto_name_from_path(path), auto_name_from_path(path));
     }
 }
