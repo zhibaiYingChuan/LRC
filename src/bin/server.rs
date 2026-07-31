@@ -33,6 +33,22 @@ use code_memory::config::{LrcConfig, DEFAULT_PORT};
 // v0.8.0：migration 模块改为通过 API（POST /v1/migrate）调用，不在启动时自动执行
 use code_memory::data_dir::DataDir;
 
+/// 全局退出码（v0.8.17 引入，解决 P0-2 退出码不区分问题）
+///
+/// 默认值 1（其他未分类错误）。当 SingletonLock::acquire 返回 GuardError 时，
+/// try_run() 会将对应错误码写入此变量，main() 读取后用该码退出进程。
+/// 桌面端 sidecar_manager.rs 通过 child.wait() 获取退出码，据此映射到
+/// 不同的 SidecarStartError 变体，驱动差异化 UX（如"复用现有实例"按钮）。
+///
+/// 退出码协议：
+///   0 = 正常退出
+///   1 = 其他未分类错误（兜底，向后兼容旧版）
+///   2 = 单例锁冲突（MultiWindowDisabled / AlreadyRunning）
+///   3 = 端口绑定失败（NoAvailablePort）
+///   4 = 数据目录错误（DataDirNotAvailable）
+///   5 = 锁获取失败（LockAcquireFailed）
+static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
 #[tokio::main]
 async fn main() {
     // 运行时防护：反调试 + 完整性校验（必须在任何业务逻辑之前执行）
@@ -51,7 +67,9 @@ async fn main() {
         Ok(()) => 0,
         Err(msg) => {
             eprintln!("{msg}");
-            1
+            // 读取 EXIT_CODE 全局变量（try_run() 中 GuardError 会写入对应退出码）
+            // 默认值 1（其他未分类错误），GuardError 会改为 2/3/4/5
+            EXIT_CODE.load(std::sync::atomic::Ordering::SeqCst)
         }
     };
 
@@ -571,8 +589,13 @@ async fn try_run() -> Result<(), String> {
     // ════════════════════════════════════════════════════════════
 
     // ========== 进程守护：单例锁（Drop 时自动清理 ==========
+    // v0.8.17 P0-2 修复：GuardError 时写入退出码到全局变量，main() 据此 exit
+    // 桌面端 sidecar_manager.rs 通过 child.wait() 读取退出码，区分单例冲突 vs 其他错误
     let _singleton_lock = SingletonLock::acquire(std::path::Path::new(&data_dir), multi_window)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            EXIT_CODE.store(e.exit_code(), std::sync::atomic::Ordering::SeqCst);
+            e.to_string()
+        })?;
     log(&format!(
         "   进程锁: 已获取 (PID: {}, 窗口上限: {})",
         std::process::id(),

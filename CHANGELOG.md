@@ -4,6 +4,111 @@
 
 ---
 
+## [0.8.17] - 2026-07-31
+
+### Sidecar 启动失败修复：单例锁冲突退出码协议（四角色协作闭环）
+
+> 用户报告 v0.8.16 sidecar 启动失败：LRC 服务进程（PID=12436）启动后意外退出，
+> 日志末尾显示"当前项目已有 LRC 在运行（PID: XXXX），多窗口记录功能未开启"。
+> 经 interaction-resilience-auditor + hcse-resilience-validator 双智能体审计，
+> 确认根本原因：sidecar 因单例锁冲突**主动退出**（exit(1)），但桌面端**无法区分**
+> "主动退出"和"真实崩溃"，误报为 ProcessDied，用户看到误导性错误信息。
+> 本版本引入退出码协议，彻底解决此问题。
+
+#### P0-2: 退出码协议 — sidecar 主动退出与真实崩溃可区分（RPN 648→72）
+- **GuardError 新增 `exit_code()` 方法**（src/process_guard.rs）
+  — MultiWindowDisabled / AlreadyRunning → exit code 2（单例锁冲突）
+  — NoAvailablePort → exit code 3（端口绑定失败）
+  — DataDirNotAvailable → exit code 4（数据目录错误）
+  — LockAcquireFailed → exit code 5（锁获取失败）
+- **sidecar 用退出码退出**（src/bin/server.rs）
+  — 新增 `EXIT_CODE: AtomicI32` 全局变量（默认 1=其他错误）
+  — SingletonLock::acquire 错误时写入对应退出码
+  — main() 读取 EXIT_CODE 退出，Drop 析构正常执行
+- **SidecarStartError 新增 SingletonConflict 变体**（desktop/src-tauri/src/sidecar_manager.rs）
+  — E008 错误码，前端可据此差异化处理
+  — 包含 existing_port 字段（已探测到的健康 sidecar 端口）
+
+#### P0-3: 秒退检测时序修复 — 100ms→500ms 覆盖单例锁冲突窗口（RPN 504）
+- **spawn 后秒退检测从 100ms 延长到 500ms**（desktop/src-tauri/src/sidecar_manager.rs）
+  — 根因：sidecar 需先执行 risk_aware_guard + CLI 解析 + 配置推导，
+    到达 SingletonLock::acquire 需 200-500ms。100ms 检测只能捕获 DLL 入口前崩溃
+  — 500ms 能同时捕获单例锁冲突（exit code 2）和 DLL 加载失败
+- **进程死亡时获取退出码**（desktop/src-tauri/src/sidecar_manager.rs）
+  — 用 `child.try_wait()` 替代 `is_process_alive()`，获取 ExitStatus
+  — 退出码 2 → 返回 SingletonConflict（而非 ProcessDied）
+  — 其他退出码 → 返回 ProcessDied（兜底，向后兼容旧版 sidecar）
+
+#### P0-1: 单例锁冲突自动复用现有实例（RPN 504）
+- **新增 `find_healthy_sidecar_port()` 函数**（desktop/src-tauri/src/sidecar_manager.rs）
+  — 扫描前 10 个端口（覆盖端口自适应范围），200ms 超时
+  — 用于 SingletonConflict 场景：探测已运行的 sidecar 实例以复用
+- **wait_for_health_static 中也获取退出码**（desktop/src-tauri/src/sidecar_manager.rs）
+  — 健康检查循环中进程死亡时，同样区分 exit code 2 vs 其他
+- **前端识别 [E008] 自动复用**（static/app.js:handleStartServiceClick）
+  — 检测到 [E008] 错误时，不显示"启动失败"，改为"已有实例运行，正在自动复用"
+  — 调用 get_sidecar_status 获取现有实例，自动更新状态栏和仪表盘
+  — 复用成功显示"已复用现有 LRC 实例（端口 XXXX）"
+
+#### P0-4: 结晶周期 208s 风险评估（降级为 P2，不阻塞发布）
+- **评估结论**：结晶流水线通过 `tokio::spawn` 在独立 task 中运行（src/bin/server.rs:838），
+  不会阻塞 /health 路由。HCSE 报告的"结晶 208s 导致健康检查误杀"风险被高估。
+- **待跟踪**：结晶周期耗时 208s（拉取=0, 写入=0, 合成=0）的原因待排查，
+  可能是合成引擎内部 sleep 或 I/O 等待。不影响 sidecar 启动，降级为 P2。
+
+### 循环阶段修复（双智能体回归审计发现 5 个 P0/P1，一次性综合修复）
+
+> v0.8.17 首轮修复后，按四角色协作流程进入循环阶段：
+> interaction-resilience-auditor + hcse-resilience-validator 双智能体回归审计，
+> 发现 4 个 P0 + 1 个 P1 问题（v0.8.17 首轮修复引入的盲点），本次一次性综合修复。
+> 复杂问题 G-014（/health 卡死根因）调用 shannon-six-keys 六钥匙分析。
+
+#### G-013: invokeFn ReferenceError — E008 自动复用路径完全失效（P0，RPN 1000）
+- **根因**：[static/app.js:1488](file:///g:/code-memory/static/app.js#L1488) 调用 `invokeFn('get_sidecar_status')`，
+  但 `invokeFn` 是 [postMessageToParent 内部 const 变量](file:///g:/code-memory/static/app.js#L1205)（块作用域），
+  不在 `handleStartServiceClick` 的作用域链中。IIFE 立即抛 ReferenceError，落入 catch 块显示"复用失败"。
+- **修复**：在 IIFE 内部显式获取 `const invokeFn = window.__TAURI_INTERNALS__?.invoke || window.__TAURI__?.invoke`
+  + 不可用时降级提示。
+
+#### G-001: 500ms 秒退检测窗口不足 — fast-path 为死代码（P0，RPN 810）
+- **根因**：HCSE 韧性验证实测 sidecar 单例锁冲突平均耗时 **1035ms**（3 次测量一致），
+  但 [sidecar_manager.rs:662](file:///g:/code-memory/desktop/src-tauri/src/sidecar_manager.rs#L662) 仅 sleep 500ms。
+  500ms 时 `try_wait()` 必然返回 `Ok(None)`，fast-path（666-684 行）永远不触发，
+  E008 检测延迟至 `wait_for_health_static` 第 2-3 次迭代（~1500ms）。
+- **修复**：将 500ms 改为 **1500ms**，稳定覆盖 sidecar 启动 + risk_aware_guard + CLI 解析 + 配置推导 + SingletonLock::acquire 全流程。
+
+#### G-011: catch 块无条件重置状态 — E008 路径状态污染（P0，RPN 720）
+- **根因**：[static/app.js:1470-1475](file:///g:/code-memory/static/app.js#L1470) catch 块在判断错误类型**之前**
+  无条件重置 `_sidecarStatus = 'unknown'` + `_setReachable(false)`。
+  E008 错误被捕获时状态已被污染，即使 IIFE 成功复用实例，状态栏仍显示矛盾状态。
+- **修复**：用 `const isE008` 提前计算，仅在非 E008 场景重置状态。E008 路径由 IIFE 设置 running 状态。
+
+#### G-008: handleStartServiceClick 入口无防抖守卫（P0，RPN 600）
+- **根因**：[static/app.js:1419](file:///g:/code-memory/static/app.js#L1419) 入口未检查 `_startServiceInProgress`，
+  快速点击 5 次会创建 5 个 AbortController + 5 个 toast 堆叠。
+- **修复**：入口添加 `if (_startServiceInProgress) return` 防抖守卫。
+
+#### G-017: exit code 3/4/5 误判为 ProcessDied（P1，RPN 360）
+- **根因**：[sidecar_manager.rs:686-705](file:///g:/code-memory/desktop/src-tauri/src/sidecar_manager.rs#L686) 仅区分 exit code 2（单例锁冲突），
+  其余 3/4/5 全部落入 `ProcessDied` 分支，用户看到误导性的"意外退出"消息。
+- **修复**：为 exit code 3/4/5 添加专属诊断信息（端口绑定失败/数据目录错误/锁获取失败），嵌入 log_hint。
+
+#### G-014: /health 卡死根因分析（降级为 P1，历史问题，下版本修复）
+- **六钥匙分析结论**：[/health handler](file:///g:/code-memory/src/server.rs#L1673) 持有 `state.manager.lock().await`（1682行）和 `state.memory_store.lock().await`（1691行）。
+  当索引/结晶 task 长时间持有这些锁时，/health 卡死 >10s，导致 `check_sidecar_health()` 返回 None，
+  `find_healthy_sidecar_port()` 无法找到健康实例，E008 自动复用失效。
+- **修复方案**（下版本）：/health 拆分为轻量 liveness（不获取锁，仅返回进程存活 + uptime）+ detailed readiness（获取锁返回详细状态）。
+- **当前缓解**：仅在 sidecar /health 卡死时影响 E008 自动复用，正常 sidecar 不受影响。
+
+#### 未修复问题记录（诚实披露）
+- **P1-1**: 多桌面端窗口并发 spawn 锁竞争（RPN=192）— 锁文件写入非原子，待后续修复
+- **P1-2**: 取消路径 TerminateProcess 不触发 Drop，锁文件残留（RPN=180）— 待后续修复
+- **P1-3**: 健康检查最坏耗时远超 120s 前端超时（RPN=175）— 待后续修复
+- **P2-1**: 锁文件写入非原子（RPN=189）— 待后续修复
+- **P2-2**: is_pid_alive 对 Windows 僵尸进程可能误判存活（RPN=144）— 待后续修复
+
+---
+
 ## [0.8.16] - 2026-07-31
 
 ### 用户体验修复 + 交互韧性修复（四角色协作闭环：测试 → 评估 → 修复 → 循环）

@@ -107,6 +107,29 @@ impl fmt::Display for GuardError {
 
 impl std::error::Error for GuardError {}
 
+impl GuardError {
+    /// 返回该错误对应的 sidecar 进程退出码
+    ///
+    /// 退出码协议（v0.8.17 引入，解决 P0-2 退出码不区分问题）：
+    ///   0 = 正常退出
+    ///   1 = 其他未分类错误（兜底，向后兼容旧版）
+    ///   2 = 单例锁冲突（MultiWindowDisabled / AlreadyRunning）
+    ///   3 = 端口绑定失败（NoAvailablePort）
+    ///   4 = 数据目录错误（DataDirNotAvailable）
+    ///   5 = 锁获取失败（LockAcquireFailed）
+    ///
+    /// 桌面端 sidecar_manager.rs 通过 child.wait() 获取退出码，
+    /// 据此映射到不同的 SidecarStartError 变体，驱动差异化 UX。
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::MultiWindowDisabled { .. } | Self::AlreadyRunning { .. } => 2,
+            Self::NoAvailablePort { .. } => 3,
+            Self::DataDirNotAvailable { .. } => 4,
+            Self::LockAcquireFailed { .. } => 5,
+        }
+    }
+}
+
 // ==================== 单例锁 ====================
 
 /// 进程单例锁 — 通过文件锁确保同一数据目录下运行的 LRC 进程不超过上限
