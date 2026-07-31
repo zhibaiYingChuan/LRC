@@ -542,8 +542,8 @@ pub fn list_all_projects() -> Vec<ProjectListItem> {
         });
     }
 
-    // 按 memory_count 降序排列
-    items.sort_by(|a, b| b.memory_count.cmp(&a.memory_count));
+    // 按 memory_count 降序排列（clippy::unnecessary_sort_by：用 sort_by_key + Reverse）
+    items.sort_by_key(|b| std::cmp::Reverse(b.memory_count));
     items
 }
 
