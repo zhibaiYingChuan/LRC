@@ -1,10 +1,10 @@
-﻿
+
 // ============================================================
 // Loong Recall 仪表盘 — 主应用脚本
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.15';
+const APP_VERSION = '0.8.16';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -543,7 +543,8 @@ const SidecarHealthMonitor = {
       // v0.8.3 Step 8：添加 title 和 aria-disabled 属性（修复 N04）
       apiButtons.forEach(btn => {
         const action = btn.getAttribute('data-action');
-        if (action === 'openStartServiceModal' || action === 'closeStartServiceModal') {
+        // v0.8.16：启动服务按钮不禁用（data-action 改为 handleStartServiceClick）
+        if (action === 'handleStartServiceClick' || action === 'openStartServiceModal' || action === 'closeStartServiceModal') {
           return;  // 启动/关闭服务按钮不禁用
         }
         btn.classList.add('btn-disabled-api');
@@ -892,7 +893,11 @@ async function loadRecentMemories() {
       });
       const typeLabel = typeLabels[m.memory_type] || m.memory_type;
       const typeColor = typeColors[m.memory_type] || 'info';
-      const project = m.project || '全局';
+      // 通过映射表将指纹转为可读项目名（_global_ / null → "全局记忆"）
+      const projectRaw = m.project || '_global_';
+      const project = getProjectDisplayName(projectRaw);
+      const projectPath = getProjectCanonicalPath(projectRaw);
+      const projectTooltip = projectPath ? ` title="${htmlescape(projectPath)}"` : '';
       const importance = m.importance || 0;
       // 重要性星级（1-5星，基于 1-10 分）
       const stars = '★'.repeat(Math.ceil(importance / 2)) + '☆'.repeat(5 - Math.ceil(importance / 2));
@@ -904,7 +909,7 @@ async function loadRecentMemories() {
           </div>
           <div class="recent-memory-content">${htmlescape(m.content_preview)}</div>
           <div class="recent-memory-meta">
-            <span class="recent-memory-project">📂 ${htmlescape(project)}</span>
+            <span class="recent-memory-project"${projectTooltip}>📂 ${htmlescape(project)}</span>
             <span class="recent-memory-importance" title="重要性 ${importance}/10">${stars}</span>
           </div>
         </div>`;
@@ -966,19 +971,17 @@ async function loadMemoryStats() {
     const total = projectEntries.reduce((sum, [_, count]) => sum + count, 0);
     const maxCount = projectEntries[0][1];
 
-    // 项目名称中文映射
-    const projectNameMap = {
-      '_global_': '全局记忆',
-    };
-
     container.innerHTML = projectEntries.slice(0, 8).map(([project, count]) => {
-      const displayName = projectNameMap[project] || project;
+      const displayName = getProjectDisplayName(project);
       const percentage = total > 0 ? (count / total * 100).toFixed(1) : '0.0';
       const barWidth = maxCount > 0 ? (count / maxCount * 100).toFixed(1) : '0.0';
+      // tooltip 显示规范化路径（若映射表命中且有路径），让用户能识别同名项目
+      const canonicalPath = getProjectCanonicalPath(project);
+      const tooltipAttr = canonicalPath ? ` title="${htmlescape(canonicalPath)}"` : '';
       return `
         <div class="project-dist-item">
           <div class="project-dist-header">
-            <span class="project-dist-name">📂 ${htmlescape(displayName)}</span>
+            <span class="project-dist-name"${tooltipAttr}>📂 ${htmlescape(displayName)}</span>
             <span class="project-dist-count">${num(count)} 条 (${percentage}%)</span>
           </div>
           <div class="progress-bar" style="margin-top:4px;">
@@ -1311,43 +1314,21 @@ window.addEventListener('message', (event) => {
   }
 });
 
-/** 打开启动服务模态框 */
+/** 打开启动服务模态框
+ *
+ * v0.8.16 入口体验修复：
+ *   - 移除模态框确认环节，直接调用 handleStartServiceClick 启动服务
+ *   - 保留函数名是为了向后兼容（其他地方可能通过 data-action="openStartServiceModal" 调用）
+ *   - 模态框元素仍保留在 DOM 中（便于回滚），但不再显示
+ */
 function openStartServiceModal() {
-  const modal = document.getElementById('start-service-modal');
-  if (!modal) {
-    console.error('[openStartServiceModal] start-service-modal 元素不存在');
-    return;
-  }
-  // v0.8.3 Step 6：移除 hidden 属性并强制 display:flex（修复 N08 模态框未显示）
-  // 此前仅设置 hidden=false，但 .modal-overlay[hidden] 的 display:none!important 可能仍生效
-  modal.removeAttribute('hidden');
-  // v0.8.4 Step 12 / G023：使用 class 控制 display，避免 inline style 被 CSS 覆盖
-  modal.classList.add('modal-visible');
-  modal.style.display = 'flex';
-  // 强制重排，确保 display 生效
-  void modal.offsetHeight;
-
-  // v0.8.4 Step 12 / N08：验证模态框可见
-  if (modal.offsetParent === null) {
-    console.error('[openStartServiceModal] 模态框仍不可见，检查 CSS');
-    showToast('启动服务窗口无法显示，请刷新页面重试', 'error');
-    return;
-  }
-
-  const btn = document.getElementById('modal-btn-start-service');
-  if (btn) {
-    btn.disabled = false;
-    btn.textContent = '启动服务';
-  }
-  // v0.8.3 Step 6：添加 ESC 键监听（修复 N08）
-  document.addEventListener('keydown', handleStartServiceEsc);
-  // v0.8.4 Step 12 / G023：添加 Tab 焦点陷阱
-  modal.addEventListener('keydown', onStartServiceTabTrap);
-
-  // v0.8.4 Step 12 / CDP 测试 #8：聚焦到模态框内首个可聚焦元素
-  const focusable = modal.querySelectorAll('button:not([disabled]), input:not([disabled])');
-  if (focusable.length > 0) {
-    focusable[0].focus();
+  // v0.8.16：直接启动，不再弹出模态框
+  // 用户痛点："点击启动服务，不应该就直接启动吗？为什么要弹出卡片呢？"
+  if (typeof handleStartServiceClick === 'function') {
+    handleStartServiceClick();
+  } else {
+    console.error('[openStartServiceModal] handleStartServiceClick 未定义，无法启动服务');
+    showToast('启动服务功能异常，请刷新页面重试', 'error');
   }
 }
 
@@ -1420,18 +1401,29 @@ function handleStartServiceEsc(e) {
 window.closeStartServiceModal = closeStartServiceModal;
 // v0.8.4 Step 12 / N08：暴露 openStartServiceModal 供 data-action 和 CDP 测试调用
 window.openStartServiceModal = openStartServiceModal;
+// v0.8.16 入口体验修复：暴露 handleStartServiceClick 供 data-action 直接调用（绕过模态框）
+window.handleStartServiceClick = handleStartServiceClick;
 // v0.8.6 Step 2 / N003 G058：暴露 startServiceAbortController 供 CDP 测试检测（只读 getter）
 Object.defineProperty(window, 'startServiceAbortController', {
   get: function() { return startServiceAbortController; },
   configurable: true
 });
 
-/** 启动服务按钮点击处理 */
+/** 启动服务按钮点击处理
+ *
+ * v0.8.16 入口体验修复：
+ *   - 移除模态框确认环节，点击"启动服务"按钮直接启动
+ *   - 兼容两种场景：有模态框按钮（旧入口）和无模态框（横幅按钮直接触发）
+ *   - 反馈方式：优先用模态框按钮文字，回退到横幅按钮文字 + showToast
+ */
 async function handleStartServiceClick() {
-  const btn = document.getElementById('modal-btn-start-service');
-  if (!btn) return;
-  btn.disabled = true;
-  btn.textContent = '正在启动...';
+  // 兼容两种入口：模态框按钮（旧）或横幅按钮（新，v0.8.16 默认入口）
+  const btn = document.getElementById('modal-btn-start-service')
+    || document.querySelector('#sidecar-down-banner .banner-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '正在启动...';
+  }
 
   // v0.8.6 Step 2 / N003 G058 修复：创建 AbortController，传入 postMessageToParent
   // 取消按钮（closeStartServiceModal）触发 abort 后，Promise.race 立即拒绝
@@ -1444,7 +1436,12 @@ async function handleStartServiceClick() {
     // sidecar 首次启动需要索引项目代码，可能超过 60s
     // 进度事件 sidecar-start-progress 会实时更新按钮文字，用户不会以为卡住
     const result = await postMessageToParent('lrc-start-service', {}, 120000, startServiceAbortController.signal);
-    closeStartServiceModal();
+    // v0.8.16：关闭模态框（如果存在）；隐藏横幅
+    if (typeof closeStartServiceModal === 'function') {
+      closeStartServiceModal();
+    }
+    const banner = document.getElementById('sidecar-down-banner');
+    if (banner) banner.hidden = true;
     // v0.8.12：启动成功后立即更新状态栏，避免"服务已就绪"与"已停止"矛盾显示
     // postMessageToParent 返回成功 = sidecar 已启动，无需等待健康检查确认
     if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
@@ -1465,8 +1462,10 @@ async function handleStartServiceClick() {
       loadDashboard();
     }
   } catch (e) {
-    btn.disabled = false;
-    btn.textContent = '启动服务';
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '启动服务';
+    }
     // v0.8.13 A2: 启动失败/取消后重置状态，避免状态栏残留"索引中"
     if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
       SidecarHealthMonitor._sidecarStatus = 'unknown';
@@ -2471,6 +2470,78 @@ async function init() {
           }
         });
 
+        // v0.8.16 入口体验修复：监听自动启动事件
+        // 用户痛点："打开桌面端，它不应该自动启动后端吗？"
+        // 设计：桌面端 setup 回调自动启动 sidecar，前端监听事件更新 UI
+        tauriEvent.listen('sidecar-auto-starting', (event) => {
+          const payload = (event && event.payload) || {};
+          console.log('[LRC v0.8.16] Sidecar 自动启动中:', payload);
+          // P0-4 修复：设置 _startServiceInProgress=true，允许 progress 事件更新按钮文字
+          // 否则 sidecar-start-progress 事件会被 _startServiceInProgress 守卫静默丢弃
+          _startServiceInProgress = true;
+          // 隐藏横幅（避免显示"服务未运行"与"正在启动"矛盾）
+          const banner = document.getElementById('sidecar-down-banner');
+          if (banner) banner.hidden = true;
+          // 显示"正在启动"提示（非阻塞，3秒后自动消失）
+          showToast(payload.message || '正在自动启动 LRC 服务...', 'info', 3000);
+          // 设置 sidecar 状态为 starting，状态栏显示"索引中..."
+          if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+            SidecarHealthMonitor._sidecarStatus = 'starting';
+            if (typeof updateStatusBar === 'function') {
+              updateStatusBar(false, {});
+            }
+          }
+        });
+
+        tauriEvent.listen('sidecar-auto-started', (event) => {
+          const payload = (event && event.payload) || {};
+          console.log('[LRC v0.8.16] Sidecar 自动启动成功:', payload);
+          // P0-4 修复：自动启动结束，重置 _startServiceInProgress
+          _startServiceInProgress = false;
+          // 隐藏横幅
+          const banner = document.getElementById('sidecar-down-banner');
+          if (banner) banner.hidden = true;
+          // 显示成功提示
+          showToast(payload.message || 'LRC 服务已自动启动', 'success', 3000);
+          // 更新状态栏为可达，触发仪表盘加载
+          if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+            SidecarHealthMonitor._sidecarStatus = 'starting';
+            SidecarHealthMonitor._failCount = 0;
+            SidecarHealthMonitor._backoffStep = 0;
+            SidecarHealthMonitor._setReachable(true);
+            if (typeof updateStatusBar === 'function') {
+              updateStatusBar(true, {});
+            }
+            SidecarHealthMonitor.check();
+          } else {
+            if (typeof updateStatusBar === 'function') updateStatusBar(true, {});
+            loadDashboard();
+          }
+        });
+
+        tauriEvent.listen('sidecar-auto-start-failed', (event) => {
+          const payload = (event && event.payload) || {};
+          console.error('[LRC v0.8.16] Sidecar 自动启动失败:', payload);
+          // P0-4 修复：自动启动结束（失败），重置 _startServiceInProgress
+          _startServiceInProgress = false;
+          // 显示横幅让用户手动启动
+          const banner = document.getElementById('sidecar-down-banner');
+          if (banner) banner.hidden = false;
+          // P0-1 修复（INV-03）：显示具体错误原因，而非仅通用消息
+          // 后端发射事件时同时包含 error（具体原因）和 message（通用消息）
+          const errorDetail = payload.error ? String(payload.error) : '';
+          const genericMsg = payload.message || 'LRC 服务自动启动失败，请手动启动';
+          const toastMsg = errorDetail ? (genericMsg + '（原因：' + errorDetail + '）') : genericMsg;
+          showToast(toastMsg, 'error', 8000);
+          // 重置状态栏
+          if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+            SidecarHealthMonitor._sidecarStatus = 'unknown';
+            if (SidecarHealthMonitor._isReachable) {
+              SidecarHealthMonitor._setReachable(false);
+            }
+          }
+        });
+
         // 监听：连续 3 次恢复失败，需要用户手动重启
         tauriEvent.listen('sidecar-crash', (event) => {
           const payload = (event && event.payload) || {};
@@ -2503,7 +2574,27 @@ async function init() {
   }
 
   loadDashboard();
-  
+
+  // 加载项目映射表（不阻塞 loadDashboard，异步构建"指纹→名称"映射）
+  // 用于仪表盘项目分布显示可读名称而非指纹
+  // P0-3 修复：映射表加载完成后，重新渲染项目分布（避免首屏显示指纹）
+  // 根因：loadDashboard 先于 loadProjectsMap 完成，项目分布用指纹渲染
+  // 修复：映射表就绪后，若 sidecar 可达，异步触发 loadMemoryStats 重新渲染
+  loadProjectsMap().then(() => {
+    if (window._projectMap && window._projectMap.size > 0) {
+      setTimeout(() => {
+        if (typeof loadMemoryStats === 'function' &&
+            typeof SidecarHealthMonitor !== 'undefined' &&
+            SidecarHealthMonitor &&
+            SidecarHealthMonitor._isReachable) {
+          loadMemoryStats().catch(e =>
+            console.warn('[项目映射表] 重新渲染项目分布失败:', e.message)
+          );
+        }
+      }, 100);
+    }
+  });
+
   setTimeout(() => {
     drawRadarChart();
   }, 100);
@@ -2523,6 +2614,146 @@ async function init() {
 document.addEventListener('DOMContentLoaded', init);
 
 // ============================================================
+// V2: 项目名称可读化工具
+// ============================================================
+
+/**
+ * 将项目标识符转换为用户可读的显示名
+ *
+ * 规则：
+ *   - _global_ / 空字符串 → "全局记忆"
+ *   - lme_*（benchmark 数据）→ "基准测试数据"
+ *   - diag_*（诊断数据）→ "诊断数据"
+ *   - 其他 → 原始标识符（可能是项目名如 "code-memory"）
+ *
+ * @param {string} project - 项目标识符（by_project 的 key）
+ * @returns {string} 可读显示名
+ */
+function getProjectDisplayName(project) {
+  if (!project || project === '_global_') {
+    return '全局记忆';
+  }
+  if (project.startsWith('lme_')) {
+    return '基准测试数据';
+  }
+  if (project.startsWith('diag_')) {
+    return '诊断数据';
+  }
+  // 索引1：fingerprint → info（当 project 字段存的是指纹时命中）
+  if (window._projectMap && window._projectMap.has(project)) {
+    return window._projectMap.get(project).display_name;
+  }
+  // 索引2：项目名 → info（当 project 字段存的是名称时，display_name 可能等于 project 本身）
+  // 此处仍返回 project，因为用户存的就是名称，无需转换
+  return project;
+}
+
+/**
+ * 获取项目的规范化路径（用于 tooltip 显示）
+ *
+ * 查找顺序（双索引）：
+ *   1. _projectMap：fingerprint → info（当 project 字段是指纹时命中）
+ *   2. _projectNameToPath：项目名 → info（当 project 字段是名称时命中）
+ *   3. 都未命中返回 null（不显示 tooltip）
+ *
+ * @param {string} project - 项目标识符（by_project 的 key，可能是指纹或名称）
+ * @returns {string|null} 规范化路径，或 null
+ */
+function getProjectCanonicalPath(project) {
+  if (!project || project === '_global_') {
+    return null;
+  }
+  // 索引1：指纹查找
+  if (window._projectMap && window._projectMap.has(project)) {
+    const info = window._projectMap.get(project);
+    return info.canonical_path || null;
+  }
+  // 索引2：项目名查找（v0.8.16 修复 P1-01：支持 by_project key 是名称的情况）
+  if (window._projectNameToPath && window._projectNameToPath.has(project)) {
+    const info = window._projectNameToPath.get(project);
+    return info.canonical_path || null;
+  }
+  return null;
+}
+
+/**
+ * 加载所有项目的元信息映射表（fingerprint → {display_name, canonical_path, ...}）
+ *
+ * 在 init() 中调用一次，供 getProjectDisplayName 和 getProjectCanonicalPath 使用。
+ * 失败时不阻塞页面加载，仅记录警告，getProjectDisplayName 会回退到原逻辑。
+ *
+ * 同时会写入 sessionStorage 缓存（key: _projectMap），有效期 60 秒，
+ * 避免用户在标签页间切换时重复请求。
+ *
+ * v0.8.16 修复 P1-01：构建双索引
+ *   - _projectMap：fingerprint → info（当 by_project key 是指纹时命中）
+ *   - _projectNameToPath：display_name/auto_name → canonical_path（当 by_project key 是项目名时命中）
+ * 这样无论记忆存储时 project 字段填的是指纹还是名称，都能正确反查到 canonical_path。
+ * 同名冲突时以 has_meta=true 的项目为准（meta.json 存在说明路径可信）。
+ */
+async function loadProjectsMap() {
+  // 1. 优先读 sessionStorage 缓存（60 秒内有效）
+  try {
+    const cached = sessionStorage.getItem('_projectMap_cache');
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (parsed && parsed.timestamp && (Date.now() - parsed.timestamp < 60000) && parsed.map) {
+        window._projectMap = new Map(parsed.map);
+        // 同时恢复 name 索引
+        if (parsed.nameMap) {
+          window._projectNameToPath = new Map(parsed.nameMap);
+        }
+        return;
+      }
+    }
+  } catch (e) {
+    // sessionStorage 读取失败：忽略，继续走网络请求
+  }
+
+  // 2. 调用 /api/projects/list 端点
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/api/projects/list');
+    if (!resp.ok) {
+      console.warn('[项目映射表] 加载失败: HTTP ' + resp.status);
+      return;
+    }
+    const data = await resp.json();
+    const projects = (data && data.projects) || [];
+    const map = new Map();
+    const nameMap = new Map();
+    for (const p of projects) {
+      // 索引1：fingerprint → info
+      map.set(p.fingerprint, p);
+      // 索引2：项目名 → canonical_path（用于 by_project key 是名称时的反查）
+      // 优先使用 display_name，其次 auto_name；空值跳过
+      // 同名冲突时：若已存在且新条目 has_meta=true，则覆盖（信任有 meta.json 的项目）
+      const namesToAdd = [p.display_name, p.auto_name].filter(n => n && n.length > 0);
+      for (const name of namesToAdd) {
+        const existing = nameMap.get(name);
+        if (!existing || (p.has_meta && !existing.has_meta)) {
+          nameMap.set(name, p);
+        }
+      }
+    }
+    window._projectMap = map;
+    window._projectNameToPath = nameMap;
+
+    // 3. 写入 sessionStorage 缓存（Map 序列化为 [key, value] 数组）
+    try {
+      sessionStorage.setItem('_projectMap_cache', JSON.stringify({
+        timestamp: Date.now(),
+        map: Array.from(map.entries()),
+        nameMap: Array.from(nameMap.entries()),
+      }));
+    } catch (e) {
+      // sessionStorage 写入失败（如满了）：忽略
+    }
+  } catch (e) {
+    console.warn('[项目映射表] 加载失败:', e.message);
+  }
+}
+
+// ============================================================
 // V2: 项目信息加载
 // ============================================================
 async function loadProjectInfo() {
@@ -2531,11 +2762,18 @@ async function loadProjectInfo() {
     if (!resp.ok) return;
     const data = await resp.json();
 
+    // 保存当前项目信息到全局变量，供其他模块使用
+    window._currentProjectInfo = data;
+
     const el = $('project-fingerprint');
     if (el) el.textContent = data.fingerprint || '--';
 
     const el2 = $('project-canonical-path');
     if (el2) el2.textContent = data.canonical_path || data.src_dir || '--';
+
+    // 显示可读项目名称（新增字段，后端 v0.8.16+ 提供）
+    const elName = $('project-display-name');
+    if (elName) elName.textContent = data.display_name || data.auto_name || '--';
   } catch (e) {
     console.warn('[项目信息] 加载失败:', e.message);
   }
@@ -2594,6 +2832,9 @@ async function backupMemories() {
       const projectData = await projectRes.value.json();
       exportData.fingerprint = projectData.fingerprint || null;
       exportData.canonical_path = projectData.canonical_path || null;
+      // v0.8.16 新增：导出文件含可读项目名，便于用户识别
+      exportData.display_name = projectData.display_name || null;
+      exportData.auto_name = projectData.auto_name || null;
     }
 
     // 获取记忆数据
@@ -2613,9 +2854,13 @@ async function backupMemories() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     const fp = exportData.fingerprint || 'global';
+    // 文件名包含项目名（可读）+ 指纹前 8 位（唯一性），避免同名项目导出覆盖
+    // 例：lrc-export-code-memory-b0bcfec0-2026-07-31T10-30-00.json
+    const fp8 = fp.length >= 8 ? fp.substring(0, 8) : fp;
+    const displayName = (exportData.display_name || exportData.auto_name || fp8).replace(/[\\/:*?"<>|]/g, '_');
     const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     a.href = url;
-    a.download = 'lrc-export-' + fp + '-' + ts + '.json';
+    a.download = 'lrc-export-' + displayName + '-' + fp8 + '-' + ts + '.json';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -4432,6 +4677,10 @@ window.runPrivacyCheck = runPrivacyCheck;
 // v0.6.0 龙忆设计系统补丁：暴露工具函数供 IIFE 外部的新增功能使用
 window.fetchWithTimeout = fetchWithTimeout;
 window.$ = $;
+// v0.8.16 暴露项目映射表相关函数，便于自动化测试和外部调用
+window.loadProjectsMap = loadProjectsMap;
+window.getProjectDisplayName = getProjectDisplayName;
+window.getProjectCanonicalPath = getProjectCanonicalPath;
 window.htmlescape = htmlescape;
 // v0.8.4 Step 9：暴露 sanitizeMemoryType 供外部调用
 window.sanitizeMemoryType = sanitizeMemoryType;

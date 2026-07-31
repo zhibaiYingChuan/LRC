@@ -4,6 +4,97 @@
 
 ---
 
+## [0.8.16] - 2026-07-31
+
+### 用户体验修复 + 交互韧性修复（四角色协作闭环：测试 → 评估 → 修复 → 循环）
+
+> 用户报告两个用户体验问题：
+> 1. 项目级记忆显示 16 字符指纹而非项目名，用户无法辨识记忆归属
+> 2. 桌面端打开后不自动启动后端，点击"启动服务"还弹出模态框，入口体验让期望值降为零
+> 本版本由产品经理参与评估，对两项 P0 入口体验问题进行综合修复。
+> 修复后经 interaction-resilience-auditor + hcse-resilience-validator 双智能体审计，
+> 发现 4 个 P0 + 2 个 P1 韧性问题，一次性综合修复。
+
+#### P0-1: 项目级记忆显示项目名而非指纹（可读性修复）
+- **后端新增 `/api/projects/list` 端点**（src/server.rs）
+  — 批量返回所有已知项目的元信息（fingerprint / display_name / auto_name / custom_name / canonical_path / memory_count / first_seen_at / last_seen_at / has_meta）
+  — 按 memory_count 降序排列
+- **后端新增 `list_all_projects()` 函数**（src/data_dir.rs）
+  — 遍历 projects/ 目录下所有合法 16 位指纹目录
+  — 读取 meta.json（不存在或损坏时兜底用 fingerprint 前 8 位 + "..."）
+  — 统计 memories.json 中的记忆数
+- **后端 `memory_stats_handler` 显示项目名**（src/server.rs）
+  — 构建项目指纹→可读名映射表
+  — 命中映射表时显示"项目名 (指纹)"，未命中时按原值显示
+- **前端新增双索引映射表**（static/app.js:loadProjectsMap）
+  — `_projectMap`：fingerprint → info（用于仪表盘项目分布显示）
+  — `_projectNameToPath`：display_name/auto_name → canonical_path（用于记忆 tooltip 显示路径）
+  — 60 秒 sessionStorage 缓存，减少重复请求
+- **前端仪表盘项目分布显示项目名**（static/app.js:loadDashboard）
+  — 命中映射表时显示项目名，否则降级显示指纹
+- **前端记忆列表 tooltip 显示项目路径**（static/app.js:getProjectCanonicalPath）
+  — 双索引查找：先按项目名查找，再按指纹查找
+- **路径处理修复**（src/project_id.rs:auto_name_from_path）
+  — Windows 盘符残留（"C:" → "project"）兜底
+  — 使用 `trim_end_matches(['/', '\\'])` 替代手动 char 比较（clippy 修复）
+
+#### P0-2: 桌面端入口体验修复（自动启动 + 移除模态框）
+- **Tauri setup 回调自动启动 sidecar**（desktop/src-tauri/src/main.rs）
+  — wizard.setup_complete=true 时自动调用 start_sidecar（全局模式）
+  — 已运行或已探测到外部 sidecar 时跳过自动启动
+  — 首次安装（setup_complete=false）不自动启动，引导用户走向导
+  — 自动启动失败不重试，仅发射 sidecar-auto-start-failed 事件
+- **移除启动服务模态框**（static/app.js:openStartServiceModal）
+  — 直接调用 handleStartServiceClick，不再弹出模态框
+- **横幅按钮直接启动**（static/index.html）
+  — data-action 改为 handleStartServiceClick
+- **新增三个 Tauri 事件监听**（static/app.js）
+  — `sidecar-auto-starting`：显示"正在自动启动"提示，更新状态栏
+  — `sidecar-auto-started`：隐藏横幅，触发仪表盘加载
+  — `sidecar-auto-start-failed`：显示错误提示，显示横幅让用户手动启动
+
+### 测试
+- cargo check --features server: 待验证
+- cargo check (desktop): 待验证
+- preflight_check.ps1: 待验证
+- 交互韧性回归测试: 已完成（interaction-resilience-auditor + hcse-resilience-validator）
+
+### 交互韧性修复（双智能体审计发现 4 P0 + 2 P1，一次性综合修复）
+
+> 交互韧性审计师（interaction-resilience-auditor）和 HCSE 韧性验证架构师（hcse-resilience-validator）
+> 对 v0.8.16 变更进行全局审计，发现 4 个 P0 + 2 个 P1 问题，本次一次性综合修复。
+
+#### P0 修复（阻断性故障）
+- **P0-1: INV-03 违规 — 自动启动失败显示具体错误**（static/app.js:2530-2535）
+  — 根因：前端 toast 仅显示 payload.message（通用消息），丢弃 payload.error（具体原因）
+  — 修复：显示"通用消息（原因：具体错误）"，与手动启动 handleStartServiceClick 行为一致
+- **P0-2: 自动启动阻塞心跳 loop**（desktop/src-tauri/src/main.rs:304-367）
+  — 根因：start_sidecar 卡死时（如 reqwest DNS 挂起），心跳 loop 永远不会启动，全局监控瘫痪
+  — 修复：用 tokio::time::timeout(60s) 包裹 start_sidecar 调用，超时后发射失败事件，确保心跳 loop 能继续启动
+- **P0-3: loadProjectsMap 时序竞态 — 首屏项目分布显示指纹**（static/app.js:2578-2596）
+  — 根因：loadDashboard 先于 loadProjectsMap 完成，项目分布用 16 字符指纹渲染
+  — 修复：loadProjectsMap 完成后，若 sidecar 可达，异步触发 loadMemoryStats() 重新渲染项目分布
+- **P0-4: 自动启动 progress 事件被静默丢弃**（static/app.js:2479-2481, 2499-2500, 2525-2526）
+  — 根因：_startServiceInProgress 守卫仅在 handleStartServiceClick 中设置为 true，自动启动期间为 false
+  — 修复：sidecar-auto-starting 监听器设置 _startServiceInProgress=true，started/failed 监听器重置为 false
+
+#### P1 修复（防御性增强）
+- **P1-1: 自动启动 PortConflict 时静默处理**（desktop/src-tauri/src/main.rs:328-354）
+  — 根因：自动启动与手动启动并发时，第二个 start_sidecar 检测到端口冲突，发射 failed 事件，用户困惑
+  — 修复：检查错误是否为端口冲突，若是则发射 started 事件（复用现有 sidecar），而非 failed 事件
+- **P1-2: 自动启动添加整体超时**（desktop/src-tauri/src/main.rs:304-367）
+  — 根因：自动启动无显式整体超时，依赖 spawn_and_wait 内部 40s 上限
+  — 修复：添加 60s 整体超时（spawn_and_wait 内部已限 40s，此处兜底 reqwest 失效场景）
+
+### 测试
+- cargo check --features server: 待验证
+- cargo check (desktop): 待验证
+- preflight_check.ps1: 待验证
+- 交互韧性回归测试: 已完成（interaction-resilience-auditor + hcse-resilience-validator）
+- 修复后回归测试: 待执行
+
+---
+
 ## [0.8.15] - 2026-07-31
 
 ### 桌面端 sidecar 启动失败修复（四角色协作闭环：auto-debugger诊断 → 产品经理评估 → 工程文化教练督促）
