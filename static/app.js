@@ -4,7 +4,7 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.18';
+const APP_VERSION = '0.8.19';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -328,6 +328,15 @@ const SidecarHealthMonitor = {
    */
   start() {
     if (this._pollTimer) return;
+    // v0.8.19 P0-3 修复（GAP-P0-01）：初始不可达时立即显示 banner
+    // 根因：_setReachable 的"状态未变直接返回"优化（第522行）导致初始 _isReachable=false 时，
+    //   第一次健康检查失败调用 _setReachable(false) 时 wasReachable===reachable===false，
+    //   直接返回，banner 永远不显示，启动按钮不可见，用户被困。
+    // 修复：start() 时如果初始不可达，强制显示 banner，确保用户能看到"启动服务"按钮。
+    if (!this._isReachable) {
+      const banner = document.getElementById('sidecar-down-banner');
+      if (banner) banner.hidden = false;
+    }
     // 立即检测一次
     this.check();
     // v0.8.13 E1: 使用 setTimeout 链式调用，支持指数退避（不可达时拉长间隔）

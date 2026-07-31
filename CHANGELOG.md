@@ -4,6 +4,60 @@
 
 ---
 
+## [0.8.19] - 2026-07-31
+
+### 根因修复：/health handler 卡死 + 全 API 端点 try_lock 防卡死（四角色协作闭环）
+
+> 用户报告 v0.8.16~v0.8.18 连续 3 个版本遇到"无法连接到 API 服务"。
+> 经 interaction-resilience-auditor + hcse-resilience-validator 双智能体真实启动前后端审计，
+> 确认根因：/health handler 同时获取 manager.lock() + memory_store.lock()（[server.rs:1682-1691](file:///g:/code-memory/src/server.rs#L1682)），
+> 结晶流水线长时间持锁时 /health 卡死（实测 5049ms 超时），桌面端误判 sidecar 已死。
+> 本版本对全部关键 API 端点改用 try_lock，彻底消除卡死风险。
+
+#### P0-1: /health handler 改用 try_lock（G-014 / INV-008 根因修复）
+- **修改文件**：[src/server.rs:1673-1708](file:///g:/code-memory/src/server.rs#L1673)
+- **根因**：health_handler 用 `state.manager.lock().await` + `state.memory_store.lock().await` 获取锁，
+  结晶流水线持锁时 /health 卡死 5049ms，桌面端 SidecarHealthMonitor 误判 sidecar 已死
+- **修复**：改用 `try_lock()`，获取不到锁时返回 None/0，/health 永不卡死
+- **验证**：/health 响应时间从 30s 超时 → 3-27ms（5 次连续测试）
+
+#### P0-1b: 全 API 端点 try_lock 防卡死（v1_api.rs 4 个端点）
+- **修改文件**：[src/v1_api.rs](file:///g:/code-memory/src/v1_api.rs)（4 处 lock().await → try_lock）
+- **修改端点**：
+  1. `/v1/health/dao_metrics`（道同构度）— try_lock + 503 lock_busy
+  2. `/v1/health/system`（系统健康报告）— try_lock + 503 lock_busy
+  3. `/v1/memories/stats`（记忆统计）— try_lock + 503 lock_busy
+  4. `/v1/captains-log`（船长日志）— try_lock + 503 lock_busy
+- **验证**：4 个端点从 8s 超时 → 1-8ms 返回 503 lock_busy（结晶期间）或正常 200（结晶完成后）
+
+#### P0-2: E008 字符串匹配改用结构化标记（GAP-03 / INV-010）
+- **修改文件**：[desktop/src-tauri/src/commands.rs:179-196](file:///g:/code-memory/desktop/src-tauri/src/commands.rs#L179) + [desktop/src-tauri/src/main.rs:328-388](file:///g:/code-memory/desktop/src-tauri/src/main.rs#L328)
+- **根因**：v0.8.18 用 `err_str.contains("已有 LRC 实例在运行")` 匹配 E008，Display 措辞变更即静默失效
+- **修复**：commands.rs 加入结构化标记 `[E008:port=XXX]` / `[E008:noport]`，main.rs 匹配标记而非中文字符串
+
+#### P0-3: UI 被困修复 — banner 初始不可达时强制显示（GAP-P0-01）
+- **修改文件**：[static/app.js:329-339](file:///g:/code-memory/static/app.js#L329)
+- **根因**：_setReachable 的"状态未变直接返回"优化导致初始 _isReachable=false 时 banner 永远不显示，
+  启动按钮不可见，用户被困
+- **修复**：start() 时如果初始不可达，强制显示 banner
+
+#### P1-1: 清理提示路径修复（INV-009）
+- **修改文件**：[desktop/src-tauri/src/main.rs:374](file:///g:/code-memory/desktop/src-tauri/src/main.rs#L374)
+- **根因**：提示用户删除 `%APPDATA%\LoongRecall\.lrc.lock`（该路径不存在）
+- **修复**：改为正确路径 `~/.loong-recall/global/data/.lrc.lock` 或 `~/.loong-recall/projects/*/data/.lrc.lock`
+
+### 测试
+
+- cargo build --features server: ✅ 通过
+- cargo check (desktop): ✅ 通过
+- 真实 sidecar 启动测试: ✅ /health 3-27ms（5 次连续测试）
+- API 端点测试: ✅ 4 个端点 try_lock + 503 lock_busy（不再卡死）
+- Playwright 真实用户交互: ✅ sidecar 可达 → banner 隐藏 → 不再显示"无法连接到 API 服务"
+- 交互韧性回归测试: 已完成（interaction-resilience-auditor + hcse-resilience-validator）
+- HCSE 发布合规检查: 已完成
+
+---
+
 ## [0.8.18] - 2026-07-31
 
 ### 紧急热修复：v0.8.17 sidecar 自动启动 E008 误判回归

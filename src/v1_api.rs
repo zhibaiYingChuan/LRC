@@ -585,7 +585,20 @@ pub fn build_v1_router(
             move || {
                 let store = store.clone();
                 async move {
-                    let store = store.lock().await;
+                    // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
+                    let store = match store.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "lock_busy",
+                                    "message": "记忆系统正在执行后台合成，请稍后重试"
+                                })),
+                            ));
+                        }
+                    };
                     match store.dao_metrics_snapshot() {
                         Ok(snapshot) => {
                             let status = if snapshot.dao_isomorphism_score < 0.3 {
@@ -640,7 +653,20 @@ pub fn build_v1_router(
             move || {
                 let store = store.clone();
                 async move {
-                    let mut store = store.lock().await;
+                    // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
+                    let mut store = match store.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "lock_busy",
+                                    "message": "记忆系统正在执行后台合成，请稍后重试"
+                                })),
+                            ));
+                        }
+                    };
                     match store.health_report() {
                         Ok(report) => {
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!(report)))
@@ -971,7 +997,20 @@ pub fn build_v1_router(
             move || {
                 let store = store.clone();
                 async move {
-                    let store = store.lock().await;
+                    // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
+                    let store = match store.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "lock_busy",
+                                    "message": "记忆系统正在执行后台合成，请稍后重试"
+                                })),
+                            ));
+                        }
+                    };
                     match store.stats() {
                         Ok(stats) => {
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
@@ -1381,7 +1420,20 @@ pub fn build_v1_router(
                 let store = store.clone();
                 async move {
                     let project_path = params.get("path").cloned().unwrap_or_else(|| ".".to_string());
-                    let mut store = store.lock().await;
+                    // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
+                    let mut store = match store.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "lock_busy",
+                                    "message": "记忆系统正在执行后台合成，请稍后重试"
+                                })),
+                            ));
+                        }
+                    };
 
                     // 收集系统健康数据
                     let health = store.health_report().ok();
