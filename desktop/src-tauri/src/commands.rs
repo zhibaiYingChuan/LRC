@@ -160,8 +160,18 @@ fn sidecar_error_to_user_message(e: &SidecarStartError) -> String {
                 port
             )
         }
-        SidecarStartError::ProcessDied { pid, log_hint } => {
-            format!("LRC 服务进程（PID={pid}）启动后意外退出{log_hint}。")
+        SidecarStartError::ProcessDied { pid, log_hint, log_empty } => {
+            // v0.8.15 P0-2 修复：日志为空时提供可操作建议
+            // 根因：DLL 加载失败发生在入口前，日志为空，用户无从下手
+            if *log_empty {
+                format!(
+                    "LRC 服务进程（PID={pid}）启动后立即退出{log_hint}。\n\
+                    可能原因：系统缺少 VC++ 运行时库（VCRUNTIME140.dll）。\n\
+                    建议：安装 Microsoft Visual C++ Redistributable 后重试，或联系技术支持。"
+                )
+            } else {
+                format!("LRC 服务进程（PID={pid}）启动后意外退出{log_hint}。")
+            }
         }
         SidecarStartError::HttpClientError { reason } => {
             format!("内部错误：{reason}")

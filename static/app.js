@@ -1,10 +1,10 @@
-
+﻿
 // ============================================================
 // Loong Recall 仪表盘 — 主应用脚本
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.14';
+const APP_VERSION = '0.8.15';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -764,7 +764,7 @@ async function loadDashboard() {
     // 非索引期或重试耗尽，显示错误
     _dashboardRetryCount = 0;
     if (error) {
-      // v0.8.14 P0-5 修复：sidecar 已知可达时（索引期），显示"索引中"提示而非"无法连接"
+      // v0.8.15 P0-5 修复：sidecar 已知可达时（索引期），显示"索引中"提示而非"无法连接"
       // 避免与状态栏"运行中"矛盾
       if (sidecarKnownReachable) {
         error.textContent = '⏳ LRC 服务正在索引代码库，数据稍后自动加载...';
@@ -1097,7 +1097,7 @@ function updateStatusBar(online, systemData) {
   if (dataDir) dataDir.textContent = '.loong-recall/data/';
   if (uptime) uptime.textContent = formatUptime(Date.now() - startTime);
 
-  // v0.8.14 P1 修复：信任中心"服务状态概览"区块同步更新
+  // v0.8.15 P1 修复：信任中心"服务状态概览"区块同步更新
   // 盲点根因：updateStatusBar 只更新 footer 状态栏，遗漏信任中心页面的 4 个状态元素
   // 导致用户在信任中心看到的状态与实际不符（status-dot=unknown, text=检测中...）
   const trustDot = $('system-status-dot');
@@ -1708,7 +1708,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // 点击模态框遮罩关闭
   const modal = document.getElementById('start-service-modal');
-  // v0.8.14 P0-4 修复：去重标志，避免快速点击遮罩产生多个僵尸确认框
+  // v0.8.15 P0-4 修复：去重标志，避免快速点击遮罩产生多个僵尸确认框
   let _pendingOverlayConfirm = false;
   if (modal) {
     modal.addEventListener('click', (e) => {
@@ -1716,7 +1716,7 @@ document.addEventListener('DOMContentLoaded', () => {
       // v0.8.13 D2: 启动进行中点击遮罩需二次确认，避免误取消
       // showConfirm 返回 Promise<boolean>，确认后调用 closeStartServiceModal
       if (startServiceAbortController && !startServiceAbortController.signal.aborted) {
-        // v0.8.14 P0-4: 已有确认框弹出时，忽略后续点击
+        // v0.8.15 P0-4: 已有确认框弹出时，忽略后续点击
         if (_pendingOverlayConfirm) return;
         if (typeof showConfirm === 'function') {
           _pendingOverlayConfirm = true;
@@ -2449,7 +2449,7 @@ async function init() {
           const payload = (event && event.payload) || {};
           console.log('[LRC] 检测到外部 sidecar:', payload);
           showToast('检测到已运行的 LRC 服务（端口 ' + (payload.port || '未知') + '）', 'success', 4000);
-          // v0.8.14 P0-1 修复：不再直接修改 _isReachable，改用正规状态机
+          // v0.8.15 P0-1 修复：不再直接修改 _isReachable，改用正规状态机
           // 重置容错计数和退避步数，让 check() 从干净状态开始
           if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
             SidecarHealthMonitor._failCount = 0;
@@ -2463,7 +2463,7 @@ async function init() {
           const payload = (event && event.payload) || {};
           console.log('[LRC] Sidecar 自动恢复:', payload);
           showToast('LRC 服务已自动恢复', 'success', 4000);
-          // v0.8.14 P0-1 修复：不再直接修改 _isReachable，改用正规状态机
+          // v0.8.15 P0-1 修复：不再直接修改 _isReachable，改用正规状态机
           if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
             SidecarHealthMonitor._failCount = 0;
             SidecarHealthMonitor._backoffStep = 0;
@@ -2480,7 +2480,7 @@ async function init() {
           // 直接将 _failCount 拉到阈值，触发 _setReachable(false) 立即生效
           if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
             SidecarHealthMonitor._failCount = SidecarHealthMonitor._FAIL_THRESHOLD;
-            // v0.8.14 P1-2 修复：重置 _backoffStep，避免恢复检测退避到 60s
+            // v0.8.15 P1-2 修复：重置 _backoffStep，避免恢复检测退避到 60s
             SidecarHealthMonitor._backoffStep = 0;
             SidecarHealthMonitor._setReachable(false);
           }
@@ -5833,7 +5833,7 @@ function showToast(message, type = 'success', duration = 3000) {
 //   4. 暴露到 window 便于 CDP 测试与外部调用
 // 注意：未在 TAB_LOADERS 中列出的标签页仅切换 DOM 不报错
 const TAB_LOADERS = {
-  // v0.8.14 P0-2 修复：dashboard 加载后同时刷新道同构度，避免切换标签页后数据陈旧
+  // v0.8.15 P0-2 修复：dashboard 加载后同时刷新道同构度，避免切换标签页后数据陈旧
   'dashboard': () => loadDashboard().then(() => {
     if (typeof loadDaoMetrics === 'function') return loadDaoMetrics();
   }),
@@ -5939,7 +5939,7 @@ function _abortActiveTabRequests(excludeTab) {
     clearTimeout(_daoRetryTimer);
     _daoRetryTimer = null;
   }
-  // v0.8.14 P0-7/FM-16 修复：清除信任中心重试 timer，避免切换标签页后 timer 泄漏
+  // v0.8.15 P0-7/FM-16 修复：清除信任中心重试 timer，避免切换标签页后 timer 泄漏
   if (typeof _trustRetryTimer !== 'undefined' && _trustRetryTimer) {
     clearTimeout(_trustRetryTimer);
     _trustRetryTimer = null;
@@ -6689,7 +6689,7 @@ async function switchProject() {
   }
 
   // 调用桌面端 switch_project 命令
-  // v0.8.14 P0-6 修复：switchProject 120s 等待期间显示进度反馈
+  // v0.8.15 P0-6 修复：switchProject 120s 等待期间显示进度反馈
   // 避免用户以为卡死
   showToast('正在切换项目并重新索引，请稍候...', 'info', 120000);
   // 监听后端 progress 事件更新提示（声明在 try 外，确保 catch 也能清理）
@@ -6739,7 +6739,7 @@ async function switchProject() {
       showToast('项目切换失败: ' + (result?.message || '未知错误'), 'error');
     }
   } catch (e) {
-    // v0.8.14 P0-6: catch 块也清理 progress 监听器
+    // v0.8.15 P0-6: catch 块也清理 progress 监听器
     if (progressUnlisten) {
       try { progressUnlisten(); } catch (cleanupErr) { /* 忽略 */ }
       progressUnlisten = null;

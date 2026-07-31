@@ -4,6 +4,51 @@
 
 ---
 
+## [0.8.15] - 2026-07-31
+
+### 桌面端 sidecar 启动失败修复（四角色协作闭环：auto-debugger诊断 → 产品经理评估 → 工程文化教练督促）
+
+> 用户报告 v0.8.14 桌面端"无法启动服务"。
+> 按照新的四角色协作流程执行：auto-debugger 系统化诊断 → 产品经理评估形成修复计划 → 工程文化教练督促修复。
+> 根因：Windows 用户机器缺少 VC++ Redistributable（VCRUNTIME140.dll），sidecar 进程在入口点前崩溃，
+> 错误被 CREATE_NO_WINDOW + stderr 重定向吞没，日志为空，用户无从下手。
+
+#### P0 修复（阻断性故障）
+- **P0-1: CI 静态链接 CRT**（release.yml）
+  — Windows target 加入 `RUSTFLAGS="-C target-feature=+crt-static"`
+  — sidecar 二进制内嵌 CRT，不再依赖 VCRUNTIME140.dll
+  — 全新 Windows 机器可直接运行 sidecar
+- **P0-2: 改进 ProcessDied 错误可见性**（sidecar_manager.rs + commands.rs）
+  — 进程死亡时读取 lrc-sidecar.log 内容
+  — 日志为空时明确提示"疑似运行时依赖缺失（如 VC++ Redistributable）"
+  — 日志有内容时提取最后 3 行作为诊断线索
+  — SidecarStartError::ProcessDied 新增 log_empty 字段
+  — commands.rs 用户消息映射：日志为空时提供"安装 VC++ Redistributable"可操作建议
+- **P0-3: 统一 sidecar 二进制查找路径**（main.rs + sidecar_manager.rs）
+  — main.rs 已通过 SidecarManager::new 间接调用 find_sidecar_binary（4路搜索）
+  — 确认 macOS 路径搜索覆盖 Contents/Resources/ 目录
+
+#### P1 修复（防御性增强）
+- **P1-1: 显式设置 sidecar cwd**（sidecar_manager.rs:spawn_and_wait）
+  — 设置 cwd 为 ~/.loong-recall，避免从 System32 启动时路径异常
+- **P1-2: spawn 后 100ms 秒退检测**（sidecar_manager.rs:spawn_and_wait）
+  — spawn 成功后 sleep 100ms 立即检查进程是否已退出
+  — DLL 加载失败时进程在入口前崩溃，秒退检测能在 1s 内反馈错误
+  — 避免用户等待完整的健康检查超时（最坏 40s）
+
+### 四角色协作流程规则（写入 project_memory.md）
+- **测试阶段**：interaction-resilience-auditor + hcse-resilience-validator 做全局回归测试
+- **评估阶段**：产品经理从全局角度评估测试报告，形成修复计划
+- **修复阶段**：复杂问题调用 shannon-six-keys 技能，工程文化教练督促
+- **循环阶段**：回归测试必须循环到零问题才能交付，禁止交半成品
+
+### 测试
+- cargo check --features server: 通过
+- cargo check (desktop): 通过
+- preflight_check.ps1: 待验证
+
+---
+
 ## [0.8.14] - 2026-07-31
 
 ### 全局交互韧性修复（基于双智能体并行审计 + CI 门禁强化）

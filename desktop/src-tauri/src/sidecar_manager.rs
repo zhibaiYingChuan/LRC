@@ -158,7 +158,7 @@ pub enum SidecarStartError {
     /// 健康检查超时（E003）
     HealthCheckTimeout { port: u16, attempts: u32 },
     /// 子进程意外退出（E004）
-    ProcessDied { pid: u32, log_hint: String },
+    ProcessDied { pid: u32, log_hint: String, log_empty: bool },
     /// 用户取消启动（E005）
     UserCancelled,
     /// 端口被外部 sidecar 占用（E006）
@@ -194,7 +194,7 @@ impl std::fmt::Display for SidecarStartError {
             Self::HealthCheckTimeout { port, attempts } => {
                 write!(f, "健康检查超时（端口 {port}, 尝试 {attempts} 次）")
             }
-            Self::ProcessDied { pid, log_hint } => {
+            Self::ProcessDied { pid, log_hint, .. } => {
                 write!(f, "Sidecar 进程 PID={pid} 启动后意外退出{log_hint}")
             }
             Self::UserCancelled => write!(f, "用户取消启动"),
@@ -617,12 +617,45 @@ impl SidecarManager {
             let _ = tx.try_send(StartProgress::new("spawn", 10, "正在启动 LRC 服务进程..."));
         }
 
+        // v0.8.15 P1-1 修复：显式设置 sidecar 子进程 cwd，避免在 System32 下运行
+        // 根因：从开始菜单快捷方式启动时 cwd 可能为 C:\Windows\System32
+        // sidecar 内部可能基于 cwd 做相对路径操作，导致权限或路径异常
+        if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+            let work_dir = std::path::Path::new(&home).join(".loong-recall");
+            let _ = std::fs::create_dir_all(&work_dir);
+            cmd.current_dir(&work_dir);
+            tracing::debug!("Sidecar cwd 设置为: {}", work_dir.display());
+        }
+
         // 启动子进程
         let mut child = cmd.spawn().map_err(|e| SidecarStartError::SpawnFailed {
             reason: e.to_string(),
         })?;
 
         let pid = child.id();
+
+        // v0.8.15 P1-2 修复：spawn 后 100ms 秒退检测
+        // 根因：DLL 加载失败时进程在入口前崩溃，spawn 成功但进程立即退出
+        // 原逻辑要等到健康检查循环才发现进程死亡，浪费用户等待时间
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !Self::is_process_alive(&mut child) {
+            let (log_hint, log_empty) = get_sidecar_log_dir()
+                .map(|d| {
+                    let log_path = d.join("lrc-sidecar.log");
+                    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+                    let is_empty = content.trim().is_empty();
+                    let hint = if is_empty {
+                        format!("，日志为空（{}\\lrc-sidecar.log），疑似运行时依赖缺失", d.display())
+                    } else {
+                        let last_lines: Vec<&str> = content.lines().rev().take(3).collect();
+                        format!("，日志末尾: {}（完整日志: {}\\lrc-sidecar.log）", last_lines.join(" | "), d.display())
+                    };
+                    (hint, is_empty)
+                })
+                .unwrap_or_else(|| (String::new(), false));
+            tracing::error!("v0.8.15 P1-2：sidecar 进程 PID={pid} 启动后 100ms 内退出（秒退）{log_hint}");
+            return Err(SidecarStartError::ProcessDied { pid, log_hint, log_empty });
+        }
 
         // G-003：发送"服务进程已启动"进度
         if let Some(tx) = progress_tx {
@@ -741,10 +774,26 @@ impl SidecarManager {
 
             // 检查进程是否还活着
             if !Self::is_process_alive(child) {
-                let log_hint = get_sidecar_log_dir()
-                    .map(|d| format!("，请查看日志: {}\\lrc-sidecar.log", d.display()))
-                    .unwrap_or_default();
-                return Err(SidecarStartError::ProcessDied { pid, log_hint });
+                // v0.8.15 P0-2 修复：进程死亡时读取日志内容，提供可操作的诊断信息
+                // 根因：DLL 加载失败发生在进程入口前，stderr 重定向未生效，日志为空
+                // 用户陷入"请查看日志"→日志为空→无从下手的死循环
+                let (log_hint, log_empty) = get_sidecar_log_dir()
+                    .map(|d| {
+                        let log_path = d.join("lrc-sidecar.log");
+                        let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+                        let is_empty = content.trim().is_empty();
+                        let hint = if is_empty {
+                            // 日志为空：进程在 stderr 重定向生效前就崩溃了
+                            format!("，日志为空（{}\\lrc-sidecar.log），疑似运行时依赖缺失", d.display())
+                        } else {
+                            // 日志有内容：提取最后 3 行作为诊断线索
+                            let last_lines: Vec<&str> = content.lines().rev().take(3).collect();
+                            format!("，日志末尾: {}（完整日志: {}\\lrc-sidecar.log）", last_lines.join(" | "), d.display())
+                        };
+                        (hint, is_empty)
+                    })
+                    .unwrap_or_else(|| (String::new(), false));
+                return Err(SidecarStartError::ProcessDied { pid, log_hint, log_empty });
             }
 
             // 端口自适应：从起始端口开始扫描
