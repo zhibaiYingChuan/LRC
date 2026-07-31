@@ -1677,19 +1677,34 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     let uptime = chrono::Utc::now() - state.started_at;
     let uptime_seconds = uptime.num_seconds().max(0);
 
-    // 获取索引统计信息
+    // P0-1 修复（G-014 / INV-008）：/health handler 改用 try_lock，避免长任务持锁时卡死
+    // 根因：索引/结晶 task 长时间持有 manager.lock() 或 memory_store.lock() 时，
+    //   /health 获取不到锁会卡死（实测 5049ms 超时），导致桌面端 SidecarHealthMonitor
+    //   误判 sidecar 已死，显示"无法连接到 API 服务"。
+    // 修复：使用 try_lock，获取不到锁时返回 None/0，/health 永远不会卡死。
+    //   副作用：索引期间 /health 返回的 file_count/total_chunks/memory_total 可能为 None/0，
+    //   但这是可接受的——/health 的核心职责是存活探测，不是精确统计。
+
+    // 获取索引统计信息（try_lock，获取不到返回 None）
     let (file_count, total_chunks) = if indexing_complete {
-        let manager = state.manager.lock().await;
-        let stats = manager.get_stats();
-        (Some(stats.file_count), Some(stats.total_chunks))
+        match state.manager.try_lock() {
+            Ok(manager) => {
+                let stats = manager.get_stats();
+                (Some(stats.file_count), Some(stats.total_chunks))
+            }
+            Err(_) => {
+                // 锁被长任务持有，返回 None（不影响存活判定）
+                (None, None)
+            }
+        }
     } else {
         (None, None)
     };
 
-    // 获取记忆库统计
-    let memory_total = {
-        let store = state.memory_store.lock().await;
-        store.stats().map(|s| s.total_memories).unwrap_or(0)
+    // 获取记忆库统计（try_lock，获取不到返回 0）
+    let memory_total = match state.memory_store.try_lock() {
+        Ok(store) => store.stats().map(|s| s.total_memories).unwrap_or(0),
+        Err(_) => 0, // 锁被长任务持有，返回 0（不影响存活判定）
     };
 
     // 判断服务阶段

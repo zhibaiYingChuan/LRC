@@ -178,16 +178,17 @@ fn sidecar_error_to_user_message(e: &SidecarStartError) -> String {
         }
         SidecarStartError::SingletonConflict { pid, existing_port } => {
             // v0.8.17 P0-2 修复：单例锁冲突时明确提示"已有实例运行"，而非"意外退出"
-            // 前端通过 "[E008]" 前缀识别此错误，显示"复用现有实例"按钮
+            // v0.8.19 P0-2 修复（GAP-03/INV-010）：加入结构化标记 [E008:port=XXX] / [E008:noport]
+            //   替代 main.rs 中脆弱的中文字符串匹配，Display 措辞变更不会影响判定
             if let Some(port) = existing_port {
                 format!(
-                    "[E008] 已有 LRC 实例在运行（PID={pid}，端口 {port}）。\n\
+                    "[E008:port={port}] 已有 LRC 实例在运行（PID={pid}，端口 {port}）。\n\
                     新启动的 sidecar 因单例锁冲突主动退出，这是正常行为。\n\
                     点击「复用现有实例」可直接连接到正在运行的 LRC 服务。"
                 )
             } else {
                 format!(
-                    "[E008] 已有 LRC 实例在运行（PID={pid}）。\n\
+                    "[E008:noport] 已有 LRC 实例在运行（PID={pid}）。\n\
                     新启动的 sidecar 因单例锁冲突主动退出，这是正常行为。\n\
                     请在信任中心查看正在运行的实例，或先停止现有实例后再启动。"
                 )

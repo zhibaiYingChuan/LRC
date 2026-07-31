@@ -326,56 +326,57 @@ fn main() {
                                     );
                                 }
                                 Ok(Err(e)) => {
-                                    // P1-1 + v0.8.18 修复：PortConflict / SingletonConflict 处理
-                                    // 根因：
-                                    //   - PortConflict (E006)：自动启动与手动启动并发时，第二个 start_sidecar 检测到端口冲突
-                                    //   - SingletonConflict (E008)：v0.8.17 引入单例锁后，残留 sidecar 进程或僵尸锁文件
-                                    //     导致新 sidecar 主动 exit(2) 退出让位，桌面端却误判为"启动失败"
-                                    // 修复策略（INV-V18-04 差异化处理）：
-                                    //   - PortConflict (E006) / E008+existing_port=Some → 静默复用现有实例，发 started 事件
-                                    //   - E008+existing_port=None → 僵尸 sidecar 场景（进程活着但 /health 卡死或端口丢失），
-                                    //     发 failed 事件并附清理提示，避免前端"幽灵成功"（绿→红闪烁 30s）
+                                    // v0.8.19 P0-2 修复（GAP-03/INV-010）：用结构化标记替代中文字符串匹配
+                                    // 根因：v0.8.18 用 err_str.contains("已有 LRC 实例在运行") 匹配 E008，
+                                    //   Display 措辞变更即静默失效（INV-010 违规）。
+                                    // 修复：commands.rs 的 sidecar_error_to_user_message 已加入结构化标记：
+                                    //   - E008+port: "[E008:port=XXX] ..."
+                                    //   - E008+noport: "[E008:noport] ..."
+                                    //   - E006 PortConflict: "端口 XXX 已被其他 LRC 服务占用..."
+                                    // 策略：
+                                    //   - PortConflict (E006) / [E008:port=] → 静默复用现有实例，发 started 事件
+                                    //   - [E008:noport] → 僵尸 sidecar 场景，发 failed 事件并附正确清理提示
                                     let err_str = e.to_string();
                                     let is_port_conflict = err_str.contains("端口")
-                                        && (err_str.contains("已被") || err_str.contains("已有 sidecar 运行"));
-                                    // v0.8.18 关键修复：识别 E008 单例锁冲突字符串
-                                    // 字符串来源：sidecar_manager.rs Display 实现
-                                    //   - 有端口："已有 LRC 实例在运行（PID=...，端口 ...），已自动复用现有实例"
-                                    //   - 无端口："已有 LRC 实例在运行（PID=...），请复用现有实例或先停止后再启动"
-                                    let is_singleton_conflict = err_str.contains("已有 LRC 实例在运行");
-                                    // INV-V18-04 修复：用"已自动复用现有实例"区分 existing_port=Some vs None
-                                    // "已自动复用现有实例" 仅在 existing_port=Some 时出现在 Display 输出中
-                                    let has_healthy_port = err_str.contains("已自动复用现有实例");
-                                    if is_port_conflict || (is_singleton_conflict && has_healthy_port) {
+                                        && err_str.contains("已被其他 LRC 服务占用");
+                                    let is_e008_with_port = err_str.contains("[E008:port=");
+                                    let is_e008_noport = err_str.contains("[E008:noport]");
+                                    if is_port_conflict || is_e008_with_port {
                                         tracing::info!(
-                                            "[v0.8.18 自动启动] sidecar 已在运行（port_conflict={}, singleton_conflict={}, has_healthy_port={}），静默复用: {}",
-                                            is_port_conflict, is_singleton_conflict, has_healthy_port, err_str
+                                            "[v0.8.19 自动启动] sidecar 已在运行（port_conflict={}, e008_with_port={}），静默复用: {}",
+                                            is_port_conflict, is_e008_with_port, err_str
                                         );
-                                        // 发射 started 事件（复用现有 sidecar），而非 failed 事件
                                         let _ = monitor_handle.emit(
                                             "sidecar-auto-started",
                                             serde_json::json!({
-                                                "port": 0,  // 端口未知，前端会通过健康检查获取
+                                                "port": 0,
                                                 "message": "LRC 服务已在运行"
                                             }),
                                         );
-                                    } else if is_singleton_conflict && !has_healthy_port {
-                                        // INV-V18-04 修复：existing_port=None 场景
-                                        // 场景：残留 sidecar 进程活着但 /health 卡死（G-014），或锁文件 PID 被新进程复用
-                                        // 修复：发 failed 事件并附清理提示，避免前端"幽灵成功"
+                                    } else if is_e008_noport {
+                                        // 僵尸 sidecar 场景：进程活着但 /health 卡死，或锁文件 PID 被新进程复用
+                                        // v0.8.19 P1-1 修复（INV-009）：清理提示路径改为正确路径
+                                        //   旧（错误）：%APPDATA%\LoongRecall\.lrc.lock（该路径不存在）
+                                        //   新（正确）：~/.loong-recall/ 下的 .lrc.lock 文件
                                         tracing::warn!(
-                                            "[v0.8.18 自动启动] 检测到僵尸 sidecar（existing_port=None），提示用户清理: {}",
+                                            "[v0.8.19 自动启动] 检测到僵尸 sidecar（E008:noport），提示用户清理: {}",
                                             err_str
                                         );
+                                        let home_dir = dirs::home_dir()
+                                            .map(|p| p.display().to_string())
+                                            .unwrap_or_else(|| "<用户主目录>".to_string());
                                         let _ = monitor_handle.emit(
                                             "sidecar-auto-start-failed",
                                             serde_json::json!({
                                                 "error": e,
-                                                "message": "检测到残留 LRC 进程但无法连接（可能已卡死）。请打开任务管理器结束所有 lrc-sidecar.exe 进程后重试，或删除 %APPDATA%\\LoongRecall\\.lrc.lock 文件"
+                                                "message": format!(
+                                                    "检测到残留 LRC 进程但无法连接（可能已卡死）。\n请执行以下步骤清理：\n1. 打开任务管理器结束所有 code-memory-server.exe 进程\n2. 删除锁文件：{home}\\.loong-recall\\global\\data\\.lrc.lock\n   或 {home}\\.loong-recall\\projects\\*\\data\\.lrc.lock\n3. 重新打开 LRC 桌面端",
+                                                    home = home_dir
+                                                )
                                             }),
                                         );
                                     } else {
-                                        tracing::error!("[v0.8.16 自动启动] sidecar 启动失败: {}", e);
+                                        tracing::error!("[v0.8.19 自动启动] sidecar 启动失败: {}", e);
                                         let _ = monitor_handle.emit(
                                             "sidecar-auto-start-failed",
                                             serde_json::json!({
