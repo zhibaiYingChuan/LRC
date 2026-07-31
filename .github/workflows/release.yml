@@ -186,6 +186,14 @@ jobs:
           fi
           echo "BIN_NAME=${BIN_NAME}" >> $GITHUB_ENV
 
+          # v0.8.15 P0-1 修复：Windows 静态链接 CRT，消除 VCRUNTIME140.dll 运行时依赖
+          # 根因：用户机器未安装 VC++ Redistributable 时，sidecar 进程在入口点前崩溃
+          # stderr 重定向尚未生效，日志为空，用户无法定位问题
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            export RUSTFLAGS="-C target-feature=+crt-static"
+            echo "已启用 CRT 静态链接 (RUSTFLAGS=$RUSTFLAGS)"
+          fi
+
           cargo build --release --features server --target ${{ matrix.target }}
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp target/${{ matrix.target }}/release/code-memory-server.exe "${BIN_NAME}"
