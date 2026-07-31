@@ -326,20 +326,52 @@ fn main() {
                                     );
                                 }
                                 Ok(Err(e)) => {
-                                    // P1-1 修复：PortConflict 时静默处理（sidecar 已运行，非真正失败）
-                                    // 根因：自动启动与手动启动并发时，第二个 start_sidecar 会检测到端口冲突
-                                    // 修复：检查错误是否为端口冲突，若是则发射 started 事件（复用现有 sidecar）
+                                    // P1-1 + v0.8.18 修复：PortConflict / SingletonConflict 处理
+                                    // 根因：
+                                    //   - PortConflict (E006)：自动启动与手动启动并发时，第二个 start_sidecar 检测到端口冲突
+                                    //   - SingletonConflict (E008)：v0.8.17 引入单例锁后，残留 sidecar 进程或僵尸锁文件
+                                    //     导致新 sidecar 主动 exit(2) 退出让位，桌面端却误判为"启动失败"
+                                    // 修复策略（INV-V18-04 差异化处理）：
+                                    //   - PortConflict (E006) / E008+existing_port=Some → 静默复用现有实例，发 started 事件
+                                    //   - E008+existing_port=None → 僵尸 sidecar 场景（进程活着但 /health 卡死或端口丢失），
+                                    //     发 failed 事件并附清理提示，避免前端"幽灵成功"（绿→红闪烁 30s）
                                     let err_str = e.to_string();
                                     let is_port_conflict = err_str.contains("端口")
                                         && (err_str.contains("已被") || err_str.contains("已有 sidecar 运行"));
-                                    if is_port_conflict {
-                                        tracing::info!("[v0.8.16 自动启动] 端口已被占用，sidecar 已运行，静默处理: {}", err_str);
+                                    // v0.8.18 关键修复：识别 E008 单例锁冲突字符串
+                                    // 字符串来源：sidecar_manager.rs Display 实现
+                                    //   - 有端口："已有 LRC 实例在运行（PID=...，端口 ...），已自动复用现有实例"
+                                    //   - 无端口："已有 LRC 实例在运行（PID=...），请复用现有实例或先停止后再启动"
+                                    let is_singleton_conflict = err_str.contains("已有 LRC 实例在运行");
+                                    // INV-V18-04 修复：用"已自动复用现有实例"区分 existing_port=Some vs None
+                                    // "已自动复用现有实例" 仅在 existing_port=Some 时出现在 Display 输出中
+                                    let has_healthy_port = err_str.contains("已自动复用现有实例");
+                                    if is_port_conflict || (is_singleton_conflict && has_healthy_port) {
+                                        tracing::info!(
+                                            "[v0.8.18 自动启动] sidecar 已在运行（port_conflict={}, singleton_conflict={}, has_healthy_port={}），静默复用: {}",
+                                            is_port_conflict, is_singleton_conflict, has_healthy_port, err_str
+                                        );
                                         // 发射 started 事件（复用现有 sidecar），而非 failed 事件
                                         let _ = monitor_handle.emit(
                                             "sidecar-auto-started",
                                             serde_json::json!({
                                                 "port": 0,  // 端口未知，前端会通过健康检查获取
                                                 "message": "LRC 服务已在运行"
+                                            }),
+                                        );
+                                    } else if is_singleton_conflict && !has_healthy_port {
+                                        // INV-V18-04 修复：existing_port=None 场景
+                                        // 场景：残留 sidecar 进程活着但 /health 卡死（G-014），或锁文件 PID 被新进程复用
+                                        // 修复：发 failed 事件并附清理提示，避免前端"幽灵成功"
+                                        tracing::warn!(
+                                            "[v0.8.18 自动启动] 检测到僵尸 sidecar（existing_port=None），提示用户清理: {}",
+                                            err_str
+                                        );
+                                        let _ = monitor_handle.emit(
+                                            "sidecar-auto-start-failed",
+                                            serde_json::json!({
+                                                "error": e,
+                                                "message": "检测到残留 LRC 进程但无法连接（可能已卡死）。请打开任务管理器结束所有 lrc-sidecar.exe 进程后重试，或删除 %APPDATA%\\LoongRecall\\.lrc.lock 文件"
                                             }),
                                         );
                                     } else {

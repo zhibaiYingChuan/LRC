@@ -4,7 +4,7 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.17';
+const APP_VERSION = '0.8.18';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {

@@ -4,6 +4,79 @@
 
 ---
 
+## [0.8.18] - 2026-07-31
+
+### 紧急热修复：v0.8.17 sidecar 自动启动 E008 误判回归
+
+> 用户报告 v0.8.17 下载后打开桌面端仍显示"无法连接到 API 服务"。
+> 根因：v0.8.17 引入 sidecar 单例锁机制（退出码 2 = SingletonConflict E008），
+> 但 [main.rs 自动启动逻辑](file:///g:/code-memory/desktop/src-tauri/src/main.rs#L328) 只识别旧的 PortConflict 字符串模式
+> （"端口"+"已被"/"已有 sidecar 运行"），**完全不识别 E008**（字符串为"已有 LRC 实例在运行"）。
+> 当机器上有残留 sidecar 进程（上次桌面端异常退出留下的孤儿进程）时，
+> 新 sidecar 主动 exit(2) 退出让位，桌面端却把 E008 当成普通失败，
+> 发射 `sidecar-auto-start-failed` 事件，前端显示"无法连接到 API 服务"。
+>
+> 本版本由 interaction-resilience-auditor + hcse-resilience-validator + hcse-release-compliance
+> 三智能体协作审计，修复 v0.8.17 引入的 E008 误判回归，并差异化处理僵尸 sidecar 场景。
+
+#### P0 修复：E008 单例锁冲突识别 + 差异化处理（RPN 1000）
+
+- **修改文件**：[desktop/src-tauri/src/main.rs](file:///g:/code-memory/desktop/src-tauri/src/main.rs#L328-L387)
+  自动启动 sidecar 失败的错误处理分支
+
+- **新增三路差异化判定**：
+  1. **PortConflict (E006) / E008+existing_port=Some** → 静默复用现有实例
+     - 识别字符串："端口"+"已被"/"已有 sidecar 运行" 或 "已有 LRC 实例在运行"+"已自动复用现有实例"
+     - 发射 `sidecar-auto-started` 事件（port=0，前端通过健康检查获取实际端口）
+  2. **E008+existing_port=None**（INV-V18-04 修复）→ 僵尸 sidecar 检测
+     - 识别字符串："已有 LRC 实例在运行" 但不含 "已自动复用现有实例"
+     - 场景：残留 sidecar 进程活着但 /health 卡死（G-014 历史问题），或锁文件 PID 被新进程复用
+     - 发射 `sidecar-auto-start-failed` 事件并附清理提示：
+       "检测到残留 LRC 进程但无法连接（可能已卡死）。请打开任务管理器结束所有 lrc-sidecar.exe 进程后重试，
+       或删除 %APPDATA%\LoongRecall\.lrc.lock 文件"
+     - 避免前端"幽灵成功"（绿→红闪烁 30s）
+  3. **其他错误** → 通用失败处理（保持原逻辑）
+
+- **字符串依赖稳定性**：Display 实现两分支均以"已有 LRC 实例在运行"开头，
+  "已自动复用现有实例" 仅在 existing_port=Some 时出现，特征稳定。
+
+#### 已知风险披露（HCSE 规则五.1：智能体返回风险逐项回应）
+
+| 风险 ID | 严重度 | 描述 | 处置 |
+|---------|--------|------|------|
+| INV-V18-04 | P1 | existing_port=None 时未差异化处理 | **已修复**（本次新增僵尸 sidecar 分支） |
+| INV-V18-05 | P0 | 自动启动 60s 窗口内用户无法取消（前端未接入 cancel_start_sidecar IPC） | **已确认可接受 + 待跟踪 v0.8.19**（v0.8.16 移除模态框时引入的历史遗留，非本次回归，不影响"能用"核心目标） |
+| FM-06 | P1 | /health handler 卡死（G-014 历史问题） | **待跟踪 v0.8.19**（下版本拆分 liveness/readiness，当前缓解：find_healthy_sidecar_port 2s 超时 + 前端 8s 健康检查容错） |
+| GAP-03 | P0 | 字符串匹配脆弱性（Display 措辞变更会静默失效） | **待跟踪 v0.8.19**（推荐重构为结构化错误传递，本次紧急修复优先保证可用性） |
+
+#### 临时解决方案（用户立即可用，无需升级到 v0.8.18）
+
+如果用户已下载 v0.8.17 并遇到"无法连接到 API 服务"，可以管理员身份运行 PowerShell 执行：
+
+```powershell
+# 1. 杀掉所有残留的 LRC 相关进程
+Get-Process -Name 'lrc-sidecar','lrc-desktop','LoongRecall' -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# 2. 删除单例锁文件（进程崩溃后会残留，导致新 sidecar 误判"已有实例运行"）
+Remove-Item -Path "$env:APPDATA\LoongRecall\.lrc.lock" -Force -ErrorAction SilentlyContinue
+
+# 3. 验证清理结果（应该看不到 lrc-sidecar 进程）
+Get-Process -Name 'lrc-sidecar' -ErrorAction SilentlyContinue
+```
+
+执行后再打开 LRC Desktop v0.8.17 即可正常启动。
+
+### 测试
+
+- cargo check --features server: ✅ 通过（2.97s）
+- cargo check --manifest-path desktop/src-tauri/Cargo.toml: ✅ 通过（11.77s）
+- preflight_check.ps1: ✅ 全部通过（15 passed, 0 failed, 1 warning）
+- 交互韧性回归测试: 已完成（interaction-resilience-auditor + hcse-resilience-validator 双智能体）
+- HCSE 发布合规检查: 已完成（hcse-release-compliance 智能体，3 个阻塞问题已全部修复）
+- 真实用户交互测试: 待用户下载 v0.8.18 验证
+
+---
+
 ## [0.8.17] - 2026-07-31
 
 ### Sidecar 启动失败修复：单例锁冲突退出码协议（四角色协作闭环）
