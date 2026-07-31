@@ -4,7 +4,7 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.16';
+const APP_VERSION = '0.8.17';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -1417,6 +1417,12 @@ Object.defineProperty(window, 'startServiceAbortController', {
  *   - 反馈方式：优先用模态框按钮文字，回退到横幅按钮文字 + showToast
  */
 async function handleStartServiceClick() {
+  // v0.8.17 G-008 修复：防抖守卫，避免快速点击触发多个并发启动
+  // 之前 5 次快速点击会创建 5 个 AbortController + 5 个 toast 堆叠
+  if (_startServiceInProgress) {
+    console.log('[handleStartServiceClick] 启动进行中，忽略重复点击');
+    return;
+  }
   // 兼容两种入口：模态框按钮（旧）或横幅按钮（新，v0.8.16 默认入口）
   const btn = document.getElementById('modal-btn-start-service')
     || document.querySelector('#sidecar-down-banner .banner-btn');
@@ -1466,8 +1472,10 @@ async function handleStartServiceClick() {
       btn.disabled = false;
       btn.textContent = '启动服务';
     }
-    // v0.8.13 A2: 启动失败/取消后重置状态，避免状态栏残留"索引中"
-    if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+    // v0.8.13 A2 + v0.8.17 G-011 修复：启动失败/取消后重置状态，避免状态栏残留"索引中"
+    // E008（单例锁冲突）不重置：sidecar 实际在运行，IIFE 会设置 running 状态
+    const isE008 = !!(e && e.message && e.message.includes('[E008]'));
+    if (!isE008 && typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
       SidecarHealthMonitor._sidecarStatus = 'unknown';
       if (SidecarHealthMonitor._isReachable) {
         SidecarHealthMonitor._setReachable(false);
@@ -1477,6 +1485,47 @@ async function handleStartServiceClick() {
     if (e && e.name === 'AbortError') {
       console.log('[handleStartServiceClick] 用户取消启动服务');
       showToast('已取消启动服务', 'info');
+    } else if (isE008) {
+      // v0.8.17 P0-2 修复：单例锁冲突时自动复用现有 sidecar 实例
+      // sidecar 因检测到已有实例运行而主动退出（exit code 2），这不是真正的失败
+      console.log('[handleStartServiceClick] 检测到单例锁冲突 [E008]，尝试自动复用现有实例');
+      showToast('已有 LRC 实例在运行，正在自动复用...', 'info');
+      // 异步探测现有 sidecar 实例并更新状态
+      (async () => {
+        try {
+          // v0.8.17 G-013 修复：显式获取 invokeFn
+          // postMessageToParent 内的 const invokeFn 不在此作用域，必须重新获取
+          const invokeFn = (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) ||
+                           (window.__TAURI__ && window.__TAURI__.invoke);
+          if (!invokeFn) {
+            console.error('[handleStartServiceClick] Tauri invoke 不可用，无法复用实例');
+            showToast('已有 LRC 实例在运行，但无法调用桌面端 API。请手动刷新页面。', 'warning');
+            return;
+          }
+          const instances = await invokeFn('get_sidecar_status');
+          if (instances && instances.length > 0) {
+            const inst = instances[0];
+            console.log('[handleStartServiceClick] 复用现有 sidecar 实例：端口', inst.port);
+            if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+              SidecarHealthMonitor._sidecarStatus = 'running';
+              SidecarHealthMonitor._setReachable(true);
+            }
+            if (typeof updateStatusBar === 'function') updateStatusBar(true, {});
+            loadDashboard();
+            showToast('已复用现有 LRC 实例（端口 ' + inst.port + '）', 'success');
+          } else {
+            // get_sidecar_status 为空，尝试扫描端口
+            console.log('[handleStartServiceClick] get_sidecar_status 为空，尝试端口扫描');
+            if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+              SidecarHealthMonitor.check();
+            }
+            showToast('已有 LRC 实例在运行，但桌面端未管理它。请刷新页面或查看信任中心。', 'info');
+          }
+        } catch (probeErr) {
+          console.error('[handleStartServiceClick] 探测现有实例失败:', probeErr);
+          showToast('已有 LRC 实例在运行，但复用失败。请手动刷新页面。', 'warning');
+        }
+      })();
     } else {
       // v0.8.3 Step 3：替换阻塞 JS 线程的 alert 为非阻塞 showToast（修复 N07）
       // alert 在 Tauri WebView 中会阻塞整个 JS 线程导致应用卡死

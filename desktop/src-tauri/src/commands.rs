@@ -176,6 +176,23 @@ fn sidecar_error_to_user_message(e: &SidecarStartError) -> String {
         SidecarStartError::HttpClientError { reason } => {
             format!("内部错误：{reason}")
         }
+        SidecarStartError::SingletonConflict { pid, existing_port } => {
+            // v0.8.17 P0-2 修复：单例锁冲突时明确提示"已有实例运行"，而非"意外退出"
+            // 前端通过 "[E008]" 前缀识别此错误，显示"复用现有实例"按钮
+            if let Some(port) = existing_port {
+                format!(
+                    "[E008] 已有 LRC 实例在运行（PID={pid}，端口 {port}）。\n\
+                    新启动的 sidecar 因单例锁冲突主动退出，这是正常行为。\n\
+                    点击「复用现有实例」可直接连接到正在运行的 LRC 服务。"
+                )
+            } else {
+                format!(
+                    "[E008] 已有 LRC 实例在运行（PID={pid}）。\n\
+                    新启动的 sidecar 因单例锁冲突主动退出，这是正常行为。\n\
+                    请在信任中心查看正在运行的实例，或先停止现有实例后再启动。"
+                )
+            }
+        }
     }
 }
 

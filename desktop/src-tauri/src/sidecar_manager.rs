@@ -165,6 +165,13 @@ pub enum SidecarStartError {
     PortConflict { port: u16, src_dir: String },
     /// HTTP 客户端创建失败（E007）
     HttpClientError { reason: String },
+    /// 单例锁冲突（E008，v0.8.17 新增）— sidecar 退出码 2
+    ///
+    /// 场景：已有 sidecar 实例在运行，新 sidecar 因锁冲突主动 exit(2) 退出。
+    /// 与 ProcessDied 的区别：这不是崩溃，而是 sidecar 主动退出让位给已有实例。
+    /// 修复策略：提示用户"已有实例运行"，提供"复用现有实例"按钮（扫描健康端口）。
+    /// existing_port 为已探测到的健康 sidecar 端口（None 表示未探测到）。
+    SingletonConflict { pid: u32, existing_port: Option<u16> },
 }
 
 impl SidecarStartError {
@@ -178,6 +185,7 @@ impl SidecarStartError {
             Self::UserCancelled => "E005",
             Self::PortConflict { .. } => "E006",
             Self::HttpClientError { .. } => "E007",
+            Self::SingletonConflict { .. } => "E008",
         }
     }
 }
@@ -203,6 +211,19 @@ impl std::fmt::Display for SidecarStartError {
             }
             Self::HttpClientError { reason } => {
                 write!(f, "创建 HTTP 客户端失败: {reason}")
+            }
+            Self::SingletonConflict { pid, existing_port } => {
+                if let Some(port) = existing_port {
+                    write!(
+                        f,
+                        "已有 LRC 实例在运行（PID={pid}，端口 {port}），已自动复用现有实例"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "已有 LRC 实例在运行（PID={pid}），请复用现有实例或先停止后再启动"
+                    )
+                }
             }
         }
     }
@@ -634,27 +655,69 @@ impl SidecarManager {
 
         let pid = child.id();
 
-        // v0.8.15 P1-2 修复：spawn 后 100ms 秒退检测
-        // 根因：DLL 加载失败时进程在入口前崩溃，spawn 成功但进程立即退出
-        // 原逻辑要等到健康检查循环才发现进程死亡，浪费用户等待时间
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if !Self::is_process_alive(&mut child) {
-            let (log_hint, log_empty) = get_sidecar_log_dir()
-                .map(|d| {
-                    let log_path = d.join("lrc-sidecar.log");
-                    let content = std::fs::read_to_string(&log_path).unwrap_or_default();
-                    let is_empty = content.trim().is_empty();
-                    let hint = if is_empty {
-                        format!("，日志为空（{}\\lrc-sidecar.log），疑似运行时依赖缺失", d.display())
+        // v0.8.17 P0-3 + G-001 修复：将 100ms → 500ms → 1500ms，覆盖单例锁冲突时间窗口
+        // 根因：sidecar 需先执行 risk_aware_guard + CLI 解析 + 配置推导 + SingletonLock::acquire，
+        // HCSE 韧性验证实测平均耗时 1035ms（3 次测量一致）。500ms 时 try_wait 返回 Ok(None)，
+        // fast-path 为死代码，E008 检测延迟至 wait_for_health_static 第 2-3 次迭代（~1500ms）。
+        // 1500ms 能稳定捕获单例锁冲突（exit code 2）+ DLL 加载失败 + 配置错误。
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // v0.8.17 P0-2 修复：检查进程是否已退出，并获取退出码区分错误类型
+        // 退出码协议：2=单例锁冲突，3=端口冲突，4=数据目录错误，5=锁获取失败，1=其他
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let exit_code = status.code().unwrap_or(1);
+
+                if exit_code == 2 {
+                    // 退出码 2 = 单例锁冲突：sidecar 检测到已有实例运行，主动退出让位
+                    tracing::warn!(
+                        "v0.8.17：sidecar PID={pid} 因单例锁冲突主动退出（exit code 2），\
+                         尝试探测已有 sidecar 实例以复用"
+                    );
+                    // 探测 actual_port 是否有健康 sidecar
+                    let existing_port = if Self::check_sidecar_health(actual_port).await.is_some() {
+                        Some(actual_port)
                     } else {
-                        let last_lines: Vec<&str> = content.lines().rev().take(3).collect();
-                        format!("，日志末尾: {}（完整日志: {}\\lrc-sidecar.log）", last_lines.join(" | "), d.display())
+                        // actual_port 未找到，扫描相邻端口（端口自适应范围）
+                        Self::find_healthy_sidecar_port(actual_port).await
                     };
-                    (hint, is_empty)
-                })
-                .unwrap_or_else(|| (String::new(), false));
-            tracing::error!("v0.8.15 P1-2：sidecar 进程 PID={pid} 启动后 100ms 内退出（秒退）{log_hint}");
-            return Err(SidecarStartError::ProcessDied { pid, log_hint, log_empty });
+                    return Err(SidecarStartError::SingletonConflict { pid, existing_port });
+                }
+
+                // 其他退出码 = 真实崩溃（DLL 缺失、配置错误等）
+                // v0.8.17 G-017 修复：为 exit code 3/4/5 添加专属诊断信息，避免全部误判为"意外退出"
+                let exit_code_hint = match exit_code {
+                    3 => "（退出码 3 = 端口绑定失败 NoAvailablePort，请检查端口占用）",
+                    4 => "（退出码 4 = 数据目录错误 DataDirNotAvailable，请检查数据目录权限）",
+                    5 => "（退出码 5 = 锁获取失败 LockAcquireFailed，请清理 .lrc.lock 文件）",
+                    _ => "",
+                };
+                let (log_hint, log_empty) = get_sidecar_log_dir()
+                    .map(|d| {
+                        let log_path = d.join("lrc-sidecar.log");
+                        let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+                        let is_empty = content.trim().is_empty();
+                        let hint = if is_empty {
+                            format!("{exit_code_hint}，日志为空（{}\\lrc-sidecar.log），疑似运行时依赖缺失", d.display())
+                        } else {
+                            let last_lines: Vec<&str> = content.lines().rev().take(3).collect();
+                            format!("{exit_code_hint}，日志末尾: {}（完整日志: {}\\lrc-sidecar.log）", last_lines.join(" | "), d.display())
+                        };
+                        (hint, is_empty)
+                    })
+                    .unwrap_or_else(|| (exit_code_hint.to_string(), false));
+                tracing::error!(
+                    "v0.8.17：sidecar PID={pid} 启动后 1500ms 内退出（exit code {}）{log_hint}",
+                    exit_code
+                );
+                return Err(SidecarStartError::ProcessDied { pid, log_hint, log_empty });
+            }
+            Ok(None) => {
+                // 进程仍在运行，继续健康检查
+            }
+            Err(e) => {
+                tracing::warn!("try_wait 失败 (pid: {:?}): {}", pid, e);
+            }
         }
 
         // G-003：发送"服务进程已启动"进度
@@ -772,28 +835,49 @@ impl SidecarManager {
                 ));
             }
 
-            // 检查进程是否还活着
-            if !Self::is_process_alive(child) {
-                // v0.8.15 P0-2 修复：进程死亡时读取日志内容，提供可操作的诊断信息
-                // 根因：DLL 加载失败发生在进程入口前，stderr 重定向未生效，日志为空
-                // 用户陷入"请查看日志"→日志为空→无从下手的死循环
-                let (log_hint, log_empty) = get_sidecar_log_dir()
-                    .map(|d| {
-                        let log_path = d.join("lrc-sidecar.log");
-                        let content = std::fs::read_to_string(&log_path).unwrap_or_default();
-                        let is_empty = content.trim().is_empty();
-                        let hint = if is_empty {
-                            // 日志为空：进程在 stderr 重定向生效前就崩溃了
-                            format!("，日志为空（{}\\lrc-sidecar.log），疑似运行时依赖缺失", d.display())
-                        } else {
-                            // 日志有内容：提取最后 3 行作为诊断线索
-                            let last_lines: Vec<&str> = content.lines().rev().take(3).collect();
-                            format!("，日志末尾: {}（完整日志: {}\\lrc-sidecar.log）", last_lines.join(" | "), d.display())
-                        };
-                        (hint, is_empty)
-                    })
-                    .unwrap_or_else(|| (String::new(), false));
-                return Err(SidecarStartError::ProcessDied { pid, log_hint, log_empty });
+            // v0.8.17 P0-2 修复：检查进程是否还活着，并获取退出码区分错误类型
+            // 退出码协议：2=单例锁冲突，3=端口冲突，4=数据目录错误，5=锁获取失败，1=其他
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let exit_code = status.code().unwrap_or(1);
+
+                    if exit_code == 2 {
+                        // 退出码 2 = 单例锁冲突：sidecar 主动退出让位给已有实例
+                        tracing::warn!(
+                            "v0.8.17：sidecar PID={pid} 在健康检查期间因单例锁冲突退出（exit code 2）"
+                        );
+                        let existing_port = Self::find_healthy_sidecar_port(start_port).await;
+                        return Err(SidecarStartError::SingletonConflict { pid, existing_port });
+                    }
+
+                    // 其他退出码 = 真实崩溃
+                    // v0.8.15 P0-2 修复：进程死亡时读取日志内容，提供可操作的诊断信息
+                    let (log_hint, log_empty) = get_sidecar_log_dir()
+                        .map(|d| {
+                            let log_path = d.join("lrc-sidecar.log");
+                            let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+                            let is_empty = content.trim().is_empty();
+                            let hint = if is_empty {
+                                format!("，日志为空（{}\\lrc-sidecar.log），疑似运行时依赖缺失", d.display())
+                            } else {
+                                let last_lines: Vec<&str> = content.lines().rev().take(3).collect();
+                                format!("，日志末尾: {}（完整日志: {}\\lrc-sidecar.log）", last_lines.join(" | "), d.display())
+                            };
+                            (hint, is_empty)
+                        })
+                        .unwrap_or_else(|| (String::new(), false));
+                    tracing::error!(
+                        "v0.8.17：sidecar PID={pid} 在健康检查期间退出（exit code {}）{log_hint}",
+                        exit_code
+                    );
+                    return Err(SidecarStartError::ProcessDied { pid, log_hint, log_empty });
+                }
+                Ok(None) => {
+                    // 进程仍在运行，继续健康检查
+                }
+                Err(e) => {
+                    tracing::warn!("try_wait 失败 (pid: {:?}): {}", pid, e);
+                }
             }
 
             // 端口自适应：从起始端口开始扫描
@@ -837,6 +921,32 @@ impl SidecarManager {
             port: start_port,
             attempts: 20,
         })
+    }
+
+    /// v0.8.17 新增：扫描端口范围寻找健康的 sidecar 实例
+    ///
+    /// 从 start_port 开始扫描前 10 个端口（覆盖常见的端口自适应范围），
+    /// 返回第一个健康 sidecar 的端口。
+    ///
+    /// 设计考量：
+    ///   - 只扫描 10 个端口（而非全部 100 个），最坏耗时 2s（10×200ms）
+    ///   - 200ms 超时确保端口未开放时快速失败
+    ///   - 用于 SingletonConflict 场景：sidecar 因单例锁冲突退出后，
+    ///     桌面端扫描端口寻找已运行的 sidecar 实例以复用
+    pub async fn find_healthy_sidecar_port(start_port: u16) -> Option<u16> {
+        for offset in 0..10u16 {
+            let port = start_port + offset;
+            // 用 200ms 超时包裹 check_sidecar_health（默认 2s 太慢）
+            if let Ok(Some(_)) = tokio::time::timeout(
+                Duration::from_millis(200),
+                Self::check_sidecar_health(port),
+            )
+            .await
+            {
+                return Some(port);
+            }
+        }
+        None
     }
 
     /// v0.5.16 新增：快速检查指定端口上的 sidecar 是否健康
