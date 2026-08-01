@@ -300,6 +300,10 @@ jobs:
             rustup.rs:443
             static.rust-lang.org:443
             index.crates.io:443
+            security.ubuntu.com:443
+            security.ubuntu.com:80
+            archive.ubuntu.com:443
+            archive.ubuntu.com:80
 
       - name: Resolve version
         id: version
@@ -368,10 +372,17 @@ jobs:
         shell: bash
 
       # v0.5.7 新增：Linux 系统依赖（Tauri v2 需要 webkit2gtk 等）
+      # v0.8.23 CI 修复：禁用 apt 镜像列表探测（避免 harden-runner 阻断未知镜像域名导致挂起），
+      #   直接使用白名单中的 archive.ubuntu.com 和 security.ubuntu.com。
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
+          sudo rm -f /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
+          sudo rm -f /etc/apt/apt-mirrors.txt 2>/dev/null || true
+          echo "deb http://archive.ubuntu.com/ubuntu/ noble main restricted universe multiverse" | sudo tee /etc/apt/sources.list
+          echo "deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          sudo apt-get update -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
             libgtk-3-dev \
