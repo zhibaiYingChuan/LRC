@@ -1,0 +1,285 @@
+{
+  "test_type": "v0.8.22 修复后回归测试",
+  "test_time": "2026-08-01 08:17:58",
+  "sidecar_pid": 4228,
+  "sidecar_endpoint": "http://127.0.0.1:3099",
+  "cdp_endpoint": "http://127.0.0.1:9223",
+  "expected_version": "0.8.22",
+  "total": 8,
+  "passed": 2,
+  "failed": 6,
+  "security_breaches": 0,
+  "results": [
+    {
+      "invariant_id": "INV-V0822-P0A",
+      "name": "tokio worker_threads=16，lock_busy 期间 /health 可达",
+      "passed": false,
+      "severity": "P0",
+      "baseline": {
+        "result": "FAIL",
+        "reason": "/health 5005ms 超时"
+      },
+      "evidence": {
+        "matrix": {
+          "/health": {
+            "url": "http://127.0.0.1:3099/health",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 5001.0,
+            "error": "TIMEOUT"
+          },
+          "/v1/health/dao_metrics": {
+            "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 8011.2,
+            "error": "TIMEOUT"
+          },
+          "/v1/health/system": {
+            "url": "http://127.0.0.1:3099/v1/health/system",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 8003.0,
+            "error": "TIMEOUT"
+          },
+          "/v1/health/detailed": {
+            "url": "http://127.0.0.1:3099/v1/health/detailed",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 8022.6,
+            "error": "TIMEOUT"
+          }
+        },
+        "close_wait": 19,
+        "sidecar_proc": {
+          "pid": 4228,
+          "cpu_s": 286.8,
+          "mem_mb": 31.0,
+          "threads": 17,
+          "status": "running"
+        },
+        "violations": [
+          "/health 不可达 (5001.0ms, TIMEOUT)",
+          "/v1/health/dao_metrics 不可达 (8011.2ms, TIMEOUT)",
+          "/v1/health/system 不可达 (8003.0ms, TIMEOUT)",
+          "/v1/health/detailed 不可达 (8022.6ms, TIMEOUT)"
+        ],
+        "lock_busy": null,
+        "version": null,
+        "status": null,
+        "uptime": null
+      },
+      "duration_ms": 237,
+      "reason": "sidecar status=None, lock_busy=None, version=None, uptime=Nones; 上次=FAIL(/health 5005ms 超时); 本次违反: ['/health 不可达 (5001.0ms, TIMEOUT)', '/v1/health/dao_metrics 不可达 (8011.2ms, TIMEOUT)', '/v1/health/system 不可达 (8003.0ms, TIMEOUT)', '/v1/health/detailed 不可达 (8022.6ms, TIMEOUT)']"
+    },
+    {
+      "invariant_id": "INV-V0822-IA01",
+      "name": "loadDaoMetrics AbortController 挂载到 window",
+      "passed": false,
+      "severity": "P1",
+      "baseline": {
+        "result": "FAIL",
+        "reason": "daoAbortController 未定义 (ReferenceError)"
+      },
+      "evidence": {
+        "check": {
+          "window_has_daoAbortController": true,
+          "window_value": "object",
+          "loadDaoMetrics_exists": true,
+          "_abortActiveTabRequests_exists": true
+        },
+        "after_load": {
+          "signal_exists": true,
+          "signal_aborted": false
+        },
+        "after_switch": {
+          "switched": true,
+          "daoAbortController_after_switch": "object"
+        }
+      },
+      "duration_ms": 476,
+      "reason": "window.daoAbortController 存在=True (value=object); loadDaoMetrics 存在=True; 加载后 signal.aborted={'signal_exists': True, 'signal_aborted': False}; 切换后=object; 上次=FAIL(daoAbortController 未定义 (ReferenceError))"
+    },
+    {
+      "invariant_id": "INV-V0822-IA02",
+      "name": "全局错误处理，未捕获异常显示 toast",
+      "passed": false,
+      "severity": "P1",
+      "baseline": {
+        "result": "FAIL",
+        "reason": "注入错误后 0 个 toast"
+      },
+      "evidence": {
+        "check": {
+          "registered": true,
+          "showToast_exists": true,
+          "showToast_on_window": true
+        },
+        "toast": {
+          "toast_count": 0,
+          "toast_texts": []
+        }
+      },
+      "duration_ms": 1863,
+      "reason": "已注册=True, showToast 存在=True, toast 出现=False (count=0); toast 文本=''; 上次=FAIL(注入错误后 0 个 toast)"
+    },
+    {
+      "invariant_id": "INV-V0822-IA03",
+      "name": "SidecarHealthMonitor.online getter 可读",
+      "passed": true,
+      "severity": "P2",
+      "baseline": {
+        "result": "FAIL",
+        "reason": "online 返回 undefined"
+      },
+      "evidence": {
+        "exists": true,
+        "type": "object",
+        "has_online": true,
+        "has_failCount": true,
+        "has_lockBusy": true,
+        "has_sidecarStatus": true,
+        "online_value": false,
+        "online_type": "boolean",
+        "failCount_value": 4,
+        "lockBusy_value": false,
+        "sidecarStatus_value": "unknown"
+      },
+      "duration_ms": 151,
+      "reason": "window.sidecarHealthMonitor 存在=True; online 可读=True (value=False, type=boolean); _failCount=4, _lockBusy=False, _sidecarStatus=unknown; 上次=FAIL(online 返回 undefined)"
+    },
+    {
+      "invariant_id": "INV-LEAK-006",
+      "name": "sidecar HTTP 连接不泄漏 (CloseWait < 10)",
+      "passed": false,
+      "severity": "P1",
+      "baseline": {
+        "result": "FAIL",
+        "reason": "CloseWait=33（阈值 <10）"
+      },
+      "evidence": {
+        "close_wait_initial": 19,
+        "close_wait_all_system": 28,
+        "close_wait_after_5_requests": 28,
+        "sidecar_proc": {
+          "pid": 4228,
+          "cpu_s": 286.8,
+          "mem_mb": 31.0,
+          "threads": 17,
+          "status": "running"
+        }
+      },
+      "duration_ms": 15763,
+      "reason": "初始 CloseWait(端口3099)=19（阈值 <10）; 全系统 CloseWait=28; 5 次请求后 CloseWait=28; sidecar 进程={'pid': 4228, 'cpu_s': 286.8, 'mem_mb': 31.0, 'threads': 17, 'status': 'running'}; 上次=FAIL(CloseWait=33（阈值 <10）)"
+    },
+    {
+      "invariant_id": "INV-LOCK-001",
+      "name": "健康端点不被合成锁阻塞",
+      "passed": false,
+      "severity": "P0",
+      "baseline": {
+        "result": "FAIL",
+        "reason": "4 个端点全部超时"
+      },
+      "evidence": {
+        "matrix": {
+          "/health": {
+            "url": "http://127.0.0.1:3099/health",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 5001.0,
+            "error": "TIMEOUT"
+          },
+          "/v1/health/dao_metrics": {
+            "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 8011.2,
+            "error": "TIMEOUT"
+          },
+          "/v1/health/system": {
+            "url": "http://127.0.0.1:3099/v1/health/system",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 8003.0,
+            "error": "TIMEOUT"
+          },
+          "/v1/health/detailed": {
+            "url": "http://127.0.0.1:3099/v1/health/detailed",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 8022.6,
+            "error": "TIMEOUT"
+          }
+        },
+        "violations": [
+          "/health 不可达 (5001.0ms)",
+          "/v1/health/dao_metrics 不可达 (8011.2ms)",
+          "/v1/health/system 不可达 (8003.0ms)",
+          "/v1/health/detailed 不可达 (8022.6ms)"
+        ]
+      },
+      "duration_ms": 141,
+      "reason": "4 个健康端点响应时间: /health=5001.0ms, /v1/health/dao_metrics=8011.2ms, /v1/health/system=8003.0ms, /v1/health/detailed=8022.6ms; 违反: ['/health 不可达 (5001.0ms)', '/v1/health/dao_metrics 不可达 (8011.2ms)', '/v1/health/system 不可达 (8003.0ms)', '/v1/health/detailed 不可达 (8022.6ms)']; 上次=FAIL(4 个端点全部超时)"
+    },
+    {
+      "invariant_id": "INV-V0822-EXCEPTION",
+      "name": "前端无未捕获异常",
+      "passed": true,
+      "severity": "P1",
+      "baseline": {
+        "result": "FAIL",
+        "reason": "1 个未捕获 ReferenceError"
+      },
+      "evidence": {
+        "exceptions": [],
+        "real_exceptions": []
+      },
+      "duration_ms": 2003,
+      "reason": "测试期间捕获异常数: 0; 过滤测试注入后: 0; 异常列表: []; 上次=FAIL(1 个未捕获 ReferenceError)"
+    },
+    {
+      "invariant_id": "INV-V0822-P1-01",
+      "name": "信任中心端点 try_lock 修复（lock_busy 期间 < 5s 返回 503）",
+      "passed": false,
+      "severity": "P1",
+      "baseline": {
+        "result": "FAIL",
+        "reason": "/v1/trust/data-location, /v1/audit-trail, /v1/trust/audit-integrity 超时"
+      },
+      "evidence": {
+        "trust_matrix": {
+          "/v1/trust/data-location": {
+            "url": "http://127.0.0.1:3099/v1/trust/data-location",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 8022.5,
+            "error": "TIMEOUT"
+          },
+          "/v1/audit-trail": {
+            "url": "http://127.0.0.1:3099/v1/audit-trail",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 8012.2,
+            "error": "TIMEOUT"
+          },
+          "/v1/trust/audit-integrity": {
+            "url": "http://127.0.0.1:3099/v1/trust/audit-integrity",
+            "reachable": false,
+            "status": null,
+            "elapsed_ms": 8016.5,
+            "error": "TIMEOUT"
+          }
+        },
+        "violations": [
+          "/v1/trust/data-location 不可达 (8022.5ms, TIMEOUT)",
+          "/v1/audit-trail 不可达 (8012.2ms, TIMEOUT)",
+          "/v1/trust/audit-integrity 不可达 (8016.5ms, TIMEOUT)"
+        ],
+        "lock_busy_responses": 0
+      },
+      "duration_ms": 138,
+      "reason": "3 个信任端点响应: /v1/trust/data-location=8022.5ms(status=None), /v1/audit-trail=8012.2ms(status=None), /v1/trust/audit-integrity=8016.5ms(status=None); 503 lock_busy 响应数: 0/3; 违反: ['/v1/trust/data-location 不可达 (8022.5ms, TIMEOUT)', '/v1/audit-trail 不可达 (8012.2ms, TIMEOUT)', '/v1/trust/audit-integrity 不可达 (8016.5ms, TIMEOUT)']; 上次=FAIL(/v1/trust/data-location, /v1/audit-trail, /v1/trust/audit-integrity 超时)"
+    }
+  ]
+}

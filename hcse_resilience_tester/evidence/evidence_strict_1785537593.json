@@ -1,0 +1,2527 @@
+[
+  {
+    "name": "sidecar_endpoint_matrix",
+    "type": "network",
+    "ts": "2026-07-31T22:39:36.985617Z",
+    "data": {
+      "/health": {
+        "url": "http://127.0.0.1:3099/health",
+        "reachable": false,
+        "status": null,
+        "elapsed_ms": 5002.7,
+        "error": "TIMEOUT"
+      },
+      "/v1/health/dao_metrics": {
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "reachable": false,
+        "status": null,
+        "elapsed_ms": 8008.3,
+        "error": "TIMEOUT"
+      },
+      "/v1/health/system": {
+        "url": "http://127.0.0.1:3099/v1/health/system",
+        "reachable": false,
+        "status": null,
+        "elapsed_ms": 8011.9,
+        "error": "TIMEOUT"
+      },
+      "/v1/health/detailed": {
+        "url": "http://127.0.0.1:3099/v1/health/detailed",
+        "reachable": false,
+        "status": null,
+        "elapsed_ms": 8004.8,
+        "error": "TIMEOUT"
+      }
+    }
+  },
+  {
+    "name": "sidecar_conn_leak",
+    "type": "network",
+    "ts": "2026-07-31T22:39:36.995616Z",
+    "data": {
+      "close_wait": 9,
+      "process": {
+        "pid": 23104,
+        "cpu_s": 465.7,
+        "mem_mb": 30.5,
+        "threads": 7,
+        "status": "running"
+      }
+    }
+  },
+  {
+    "name": "baseline_dashboard",
+    "type": "screenshot",
+    "ts": "2026-07-31T22:39:40.204363Z",
+    "path": "G:\\code-memory\\hcse_resilience_tester\\screenshots\\baseline_dashboard.png"
+  },
+  {
+    "name": "inv04_statusbar",
+    "type": "dom_state",
+    "ts": "2026-07-31T22:39:41.161513Z",
+    "data": {
+      "statusDotClass": "status-dot lock-busy",
+      "statusText": "后台合成中...",
+      "trustDotClass": "status-dot lock-busy",
+      "trustText": "后台合成中...",
+      "lockBusyClass": true,
+      "hasLockBusyText": true
+    }
+  },
+  {
+    "name": "inv04_lockbusy_display",
+    "type": "screenshot",
+    "ts": "2026-07-31T22:39:41.349350Z",
+    "path": "G:\\code-memory\\hcse_resilience_tester\\screenshots\\inv04_lockbusy_display.png"
+  },
+  {
+    "name": "inv05_dao_metrics",
+    "type": "dom_state",
+    "ts": "2026-07-31T22:39:43.353258Z",
+    "data": {
+      "panelExists": true,
+      "bannerExists": true,
+      "bannerText": "⚠ 道同构度数据加载失败：后台合成中，请稍后刷新重试",
+      "hasServiceNotStarted": false,
+      "hasLockBusyText": true,
+      "panelText": "⚠ 道同构度数据加载失败：后台合成中，请稍后刷新重试\n      \n         道同构度\n        实时健康评分\n      \n      \n        \n        \n          --\n          健康评分\n        \n      \n      \n        \n          --\n          阴阳守恒\n          阴阳平衡度\n        \n        \n          --\n          洛书偏差\n          9维坐标偏差\n        \n        \n          --\n       "
+    }
+  },
+  {
+    "name": "inv05_dao_503_handling",
+    "type": "screenshot",
+    "ts": "2026-07-31T22:39:43.498952Z",
+    "path": "G:\\code-memory\\hcse_resilience_tester\\screenshots\\inv05_dao_503_handling.png"
+  },
+  {
+    "name": "inv_state_002",
+    "type": "dom_state",
+    "ts": "2026-07-31T22:39:43.502950Z",
+    "data": {
+      "dotClass": "status-dot offline",
+      "textContent": "已停止 / 不可达",
+      "monitor": {
+        "online": true,
+        "_lockBusy": false,
+        "_failCount": 2,
+        "_sidecarStatus": "unknown"
+      }
+    }
+  },
+  {
+    "name": "inv_state_002_consistency",
+    "type": "screenshot",
+    "ts": "2026-07-31T22:39:43.652102Z",
+    "path": "G:\\code-memory\\hcse_resilience_tester\\screenshots\\inv_state_002_consistency.png"
+  },
+  {
+    "name": "inv_proc_003",
+    "type": "dom_state",
+    "ts": "2026-07-31T22:39:43.653102Z",
+    "data": {
+      "dotClass": "status-dot offline",
+      "textContent": "已停止 / 不可达",
+      "monitor": {
+        "online": true,
+        "_failCount": 2,
+        "_backoffStep": 1
+      },
+      "fallbackCount": 0,
+      "fallbackTexts": ""
+    }
+  },
+  {
+    "name": "inv_proc_003_crash_detection",
+    "type": "screenshot",
+    "ts": "2026-07-31T22:39:43.785966Z",
+    "path": "G:\\code-memory\\hcse_resilience_tester\\screenshots\\inv_proc_003_crash_detection.png"
+  },
+  {
+    "name": "inv_timeout_004",
+    "type": "dom_state",
+    "ts": "2026-07-31T22:39:53.790921Z",
+    "data": {
+      "ok": true,
+      "elapsed_ms": 10001
+    }
+  },
+  {
+    "name": "exception_path_console",
+    "type": "console",
+    "ts": "2026-07-31T22:39:53.790921Z",
+    "data": [
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935434Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:31.057892Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]健康检查失败 1/2，暂不判定不可达"
+      },
+      {
+        "ts": "2026-07-31T22:39:32.730811Z",
+        "level": "warning",
+        "text": "[Loong Recall] 系统状态浮窗加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.093705Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]Sidecar 不可达，已禁用 API 按钮"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.351352Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]Sidecar 健康监测器已启动，轮询间隔: 10000ms"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.352352Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.352352Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.352352Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.353352Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.353352Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.354352Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.355354Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.355354Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.355354Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.355354Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.355354Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.356353Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 2/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.356353Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 8000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.356353Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.356353Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.356353Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.357356Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 3/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.357356Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 503 lock_busy，显示\"后台合成中\"而非\"服务未启动\""
+      },
+      {
+        "ts": "2026-07-31T22:39:41.388202Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.388202Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.389205Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.389205Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.398586Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.398586Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.398586Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.399585Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.399585Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.399585Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.399585Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.400585Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.400585Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.400585Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.400585Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.400585Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.401585Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.401585Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 2/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.401585Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 8000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.401585Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.402586Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.402586Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.402586Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 3/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.402586Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 503 lock_busy，显示\"后台合成中\"而非\"服务未启动\""
+      },
+      {
+        "ts": "2026-07-31T22:39:43.499952Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]Sidecar 健康监测器已启动，轮询间隔: 10000ms"
+      },
+      {
+        "ts": "2026-07-31T22:39:53.789922Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "ts": "2026-07-31T22:39:53.790921Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      }
+    ]
+  },
+  {
+    "name": "exception_path_network",
+    "type": "network",
+    "ts": "2026-07-31T22:39:53.792919Z",
+    "data": [
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:22.722078Z",
+        "raw": {
+          "requestId": "9156.699",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/system",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397078.550658,
+          "wallTime": 1785537562.721677,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadSysStatusFloat",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 6549,
+                  "columnNumber": 22
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/system",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:22.782454Z",
+        "raw": {
+          "requestId": "9156.700",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/system",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397078.609225,
+          "wallTime": 1785537562.780235,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 723,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 2471,
+                  "columnNumber": 10
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/system",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:22.782454Z",
+        "raw": {
+          "requestId": "9156.701",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/detailed",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397078.609448,
+          "wallTime": 1785537562.780897,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 724,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 2471,
+                  "columnNumber": 10
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/detailed",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:22.782454Z",
+        "raw": {
+          "requestId": "9156.702",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397078.610182,
+          "wallTime": 1785537562.781181,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 725,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 2471,
+                  "columnNumber": 10
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:23.056401Z",
+        "raw": {
+          "requestId": "9156.703",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/health",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397078.885024,
+          "wallTime": 1785537563.056025,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "check",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 416,
+                  "columnNumber": 24
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 377,
+                  "columnNumber": 11
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/health",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:31.057892Z",
+        "raw": {
+          "requestId": "9156.703",
+          "timestamp": 397086.887608,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:32.730811Z",
+        "raw": {
+          "requestId": "9156.699",
+          "timestamp": 397088.560551,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:32.789372Z",
+        "raw": {
+          "requestId": "9156.700",
+          "timestamp": 397088.618557,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:32.789372Z",
+        "raw": {
+          "requestId": "9156.701",
+          "timestamp": 397088.618594,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:32.789372Z",
+        "raw": {
+          "requestId": "9156.702",
+          "timestamp": 397088.618647,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:33.065158Z",
+        "raw": {
+          "requestId": "9156.704",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/health",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397088.894784,
+          "wallTime": 1785537573.065776,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "check",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 416,
+                  "columnNumber": 24
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 377,
+                  "columnNumber": 11
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/health",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:41.093705Z",
+        "raw": {
+          "requestId": "9156.704",
+          "timestamp": 397096.914098,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:41.094706Z",
+        "raw": {
+          "requestId": "9156.705",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/system",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397096.921158,
+          "wallTime": 1785537581.092157,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 723,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 524,
+                  "columnNumber": 25
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/system",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:41.095705Z",
+        "raw": {
+          "requestId": "9156.706",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/detailed",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397096.921315,
+          "wallTime": 1785537581.092296,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 724,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 524,
+                  "columnNumber": 25
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/detailed",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:41.096704Z",
+        "raw": {
+          "requestId": "9156.707",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397096.921413,
+          "wallTime": 1785537581.092394,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 725,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 524,
+                  "columnNumber": 25
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:41.350352Z",
+        "raw": {
+          "requestId": "9156.708",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/health",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397097.18005,
+          "wallTime": 1785537581.351046,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "check",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 416,
+                  "columnNumber": 24
+                },
+                {
+                  "functionName": "start",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 362,
+                  "columnNumber": 9
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "51",
+                  "url": "",
+                  "lineNumber": 3,
+                  "columnNumber": 37
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/health",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:41.387210Z",
+        "raw": {
+          "requestId": "9156.714",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/system",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397097.214338,
+          "wallTime": 1785537581.385339,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "window.fetch",
+                  "scriptId": "52",
+                  "url": "",
+                  "lineNumber": 12,
+                  "columnNumber": 41
+                },
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 723,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 524,
+                  "columnNumber": 25
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/system",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:41.388202Z",
+        "raw": {
+          "requestId": "9156.715",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/detailed",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397097.214605,
+          "wallTime": 1785537581.385597,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "window.fetch",
+                  "scriptId": "52",
+                  "url": "",
+                  "lineNumber": 12,
+                  "columnNumber": 41
+                },
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 724,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 524,
+                  "columnNumber": 25
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/detailed",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:41.388202Z",
+        "raw": {
+          "requestId": "9156.705",
+          "timestamp": 397097.215117,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:41.388202Z",
+        "raw": {
+          "requestId": "9156.706",
+          "timestamp": 397097.215191,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:41.388202Z",
+        "raw": {
+          "requestId": "9156.707",
+          "timestamp": 397097.215443,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:41.398586Z",
+        "raw": {
+          "requestId": "9156.714",
+          "timestamp": 397097.220278,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:41.398586Z",
+        "raw": {
+          "requestId": "9156.715",
+          "timestamp": 397097.220363,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:43.785966Z",
+        "raw": {
+          "requestId": "9156.722",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397099.618291,
+          "wallTime": 1785537583.78929,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDaoMetrics",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 5233,
+                  "columnNumber": 27
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "57",
+                  "url": "",
+                  "lineNumber": 8,
+                  "columnNumber": 16
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "57",
+                  "url": "",
+                  "lineNumber": 2,
+                  "columnNumber": 19
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "57",
+                  "url": "",
+                  "lineNumber": 15,
+                  "columnNumber": 10
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "loadingFailed",
+        "timestamp": "2026-07-31T22:39:49.412725Z",
+        "raw": {
+          "requestId": "9156.708",
+          "timestamp": 397105.195026,
+          "type": "Fetch",
+          "errorText": "net::ERR_ABORTED",
+          "canceled": true
+        },
+        "url": null,
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:52.732140Z",
+        "raw": {
+          "requestId": "9156.723",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/system",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397108.561925,
+          "wallTime": 1785537592.732921,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadSysStatusFloat",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 6549,
+                  "columnNumber": 22
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/system",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:52.776019Z",
+        "raw": {
+          "requestId": "9156.724",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/system",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397108.604863,
+          "wallTime": 1785537592.775858,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 723,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 2471,
+                  "columnNumber": 10
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/system",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:52.776019Z",
+        "raw": {
+          "requestId": "9156.725",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/detailed",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397108.605,
+          "wallTime": 1785537592.775979,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 724,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 2471,
+                  "columnNumber": 10
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/detailed",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      },
+      {
+        "event_type": "requestWillBeSent",
+        "timestamp": "2026-07-31T22:39:52.776019Z",
+        "raw": {
+          "requestId": "9156.726",
+          "loaderId": "63589A79FAE849EB1B3572A78CEBF6AA",
+          "documentURL": "https://tauri.localhost/",
+          "request": {
+            "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+            "method": "GET",
+            "headers": {
+              "sec-ch-ua-platform": "\"Windows\"",
+              "Referer": "",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0",
+              "sec-ch-ua": "\"Chromium\";v=\"150\", \"Not;A=Brand\";v=\"8\", \"Microsoft Edge\";v=\"150\", \"Microsoft Edge WebView2\";v=\"150\"",
+              "sec-ch-ua-mobile": "?0"
+            },
+            "mixedContentType": "none",
+            "initialPriority": "High",
+            "referrerPolicy": "strict-origin-when-cross-origin",
+            "isSameSite": false
+          },
+          "timestamp": 397108.605116,
+          "wallTime": 1785537592.776105,
+          "initiator": {
+            "type": "script",
+            "stack": {
+              "callFrames": [
+                {
+                  "functionName": "fetchWithTimeout",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 128,
+                  "columnNumber": 22
+                },
+                {
+                  "functionName": "loadDashboard",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 725,
+                  "columnNumber": 6
+                },
+                {
+                  "functionName": "",
+                  "scriptId": "18",
+                  "url": "https://tauri.localhost/app.js",
+                  "lineNumber": 2471,
+                  "columnNumber": 10
+                }
+              ]
+            }
+          },
+          "redirectHasExtraInfo": false,
+          "type": "Fetch",
+          "frameId": "F33530DE6985D0FD12B73120964107AA",
+          "hasUserGesture": false
+        },
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "response_timing_ms": null,
+        "exception_text": null
+      }
+    ]
+  },
+  {
+    "name": "l1_l6_coverage_matrix",
+    "type": "matrix",
+    "ts": "2026-07-31T22:39:53.797789Z",
+    "data": [
+      {
+        "layer": "L1",
+        "path": "加载失败",
+        "covered": true,
+        "evidence": "sidecar /health 超时，仪表盘数据加载失败（INV-STATE-002）"
+      },
+      {
+        "layer": "L1",
+        "path": "数据为空",
+        "covered": true,
+        "evidence": "sidecar 卡死导致所有数据为空/降级"
+      },
+      {
+        "layer": "L1",
+        "path": "超时",
+        "covered": true,
+        "evidence": "INV-TIMEOUT-004 验证 fetch 10s 超时"
+      },
+      {
+        "layer": "L2",
+        "path": "打开失败",
+        "covered": false,
+        "evidence": "需手动触发设置对话框，本次未覆盖"
+      },
+      {
+        "layer": "L2",
+        "path": "操作超时",
+        "covered": true,
+        "evidence": "INV-V0821-02 验证自动启动 120s 超时"
+      },
+      {
+        "layer": "L2",
+        "path": "取消中断",
+        "covered": false,
+        "evidence": "需手动点击取消按钮，本次未覆盖；源码已确认 G-001 修复"
+      },
+      {
+        "layer": "L3",
+        "path": "卡片加载失败",
+        "covered": true,
+        "evidence": "INV-V0821-05 验证 dao 卡片 503 lock_busy 处理"
+      },
+      {
+        "layer": "L3",
+        "path": "交互无响应",
+        "covered": true,
+        "evidence": "sidecar 卡死时 dao 卡片无响应（INV-PROC-003）"
+      },
+      {
+        "layer": "L4",
+        "path": "嵌套操作超时",
+        "covered": true,
+        "evidence": "INV-TIMEOUT-004 loadDaoMetrics 嵌套 fetch 超时"
+      },
+      {
+        "layer": "L4",
+        "path": "状态不恢复",
+        "covered": false,
+        "evidence": "需手动操作按钮+断网，本次未覆盖"
+      },
+      {
+        "layer": "L5",
+        "path": "网络断开",
+        "covered": true,
+        "evidence": "sidecar 卡死等效网络断开（INV-PROC-003）"
+      },
+      {
+        "layer": "L5",
+        "path": "进程崩溃",
+        "covered": false,
+        "evidence": "未实际 kill sidecar PID，避免影响其他测试；源码已确认 Drop impl"
+      },
+      {
+        "layer": "L5",
+        "path": "资源耗尽",
+        "covered": true,
+        "evidence": "INV-LEAK-006 连接泄漏 + 端点超时"
+      },
+      {
+        "layer": "L6",
+        "path": "道同构度加载",
+        "covered": true,
+        "evidence": "INV-V0821-05 + INV-TIMEOUT-004"
+      },
+      {
+        "layer": "L6",
+        "path": "记忆统计加载",
+        "covered": false,
+        "evidence": "需单独触发 loadDashboard，本次未覆盖"
+      },
+      {
+        "layer": "L6",
+        "path": "项目分布加载",
+        "covered": false,
+        "evidence": "需单独触发，本次未覆盖"
+      }
+    ]
+  },
+  {
+    "name": "final_console",
+    "type": "console",
+    "ts": "2026-07-31T22:39:53.797789Z",
+    "data": [
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.932199Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.934420Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935434Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.935603Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936129Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.936661Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:07.937637Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "ts": "2026-07-31T22:39:31.057892Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]健康检查失败 1/2，暂不判定不可达"
+      },
+      {
+        "ts": "2026-07-31T22:39:32.730811Z",
+        "level": "warning",
+        "text": "[Loong Recall] 系统状态浮窗加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.093705Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]Sidecar 不可达，已禁用 API 按钮"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.351352Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]Sidecar 健康监测器已启动，轮询间隔: 10000ms"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.352352Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.352352Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.352352Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.353352Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.353352Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.354352Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.355354Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.355354Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.355354Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.355354Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.355354Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.356353Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 2/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.356353Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 8000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.356353Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.356353Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.356353Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.357356Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 3/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.357356Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 503 lock_busy，显示\"后台合成中\"而非\"服务未启动\""
+      },
+      {
+        "ts": "2026-07-31T22:39:41.388202Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.388202Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.389205Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.389205Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.398586Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.398586Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.398586Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.399585Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.399585Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.399585Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.399585Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.400585Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.400585Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.400585Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.400585Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.400585Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.401585Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.401585Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 2/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.401585Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 8000ms 后自动重试..."
+      },
+      {
+        "ts": "2026-07-31T22:39:41.401585Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.402586Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.402586Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.402586Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 3/3）: 后台合成中"
+      },
+      {
+        "ts": "2026-07-31T22:39:41.402586Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 503 lock_busy，显示\"后台合成中\"而非\"服务未启动\""
+      },
+      {
+        "ts": "2026-07-31T22:39:43.499952Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]Sidecar 健康监测器已启动，轮询间隔: 10000ms"
+      },
+      {
+        "ts": "2026-07-31T22:39:53.789922Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "ts": "2026-07-31T22:39:53.790921Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      }
+    ]
+  }
+]

@@ -1,0 +1,726 @@
+﻿{
+    "min_cluster":  2,
+    "memories":  [
+                     {
+                         "content":  "Round5 端到端验证记忆 1 - 测试 consolidate 期间 lock_busy 降级 - 1409553120",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 2 - 测试 consolidate 期间 lock_busy 降级 - 1202809320",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 3 - 测试 consolidate 期间 lock_busy 降级 - 1605410581",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 4 - 测试 consolidate 期间 lock_busy 降级 - 681081998",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 5 - 测试 consolidate 期间 lock_busy 降级 - 1939193128",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 6 - 测试 consolidate 期间 lock_busy 降级 - 1480716042",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 7 - 测试 consolidate 期间 lock_busy 降级 - 1434068304",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 8 - 测试 consolidate 期间 lock_busy 降级 - 908834911",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 9 - 测试 consolidate 期间 lock_busy 降级 - 1530836192",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 10 - 测试 consolidate 期间 lock_busy 降级 - 1745050139",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 11 - 测试 consolidate 期间 lock_busy 降级 - 764014694",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 12 - 测试 consolidate 期间 lock_busy 降级 - 1207582524",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 13 - 测试 consolidate 期间 lock_busy 降级 - 674105452",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 14 - 测试 consolidate 期间 lock_busy 降级 - 845106504",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 15 - 测试 consolidate 期间 lock_busy 降级 - 1181746634",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 16 - 测试 consolidate 期间 lock_busy 降级 - 305652036",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 17 - 测试 consolidate 期间 lock_busy 降级 - 307192004",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 18 - 测试 consolidate 期间 lock_busy 降级 - 455337946",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 19 - 测试 consolidate 期间 lock_busy 降级 - 553178163",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 20 - 测试 consolidate 期间 lock_busy 降级 - 236329602",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 21 - 测试 consolidate 期间 lock_busy 降级 - 127744745",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 22 - 测试 consolidate 期间 lock_busy 降级 - 313875075",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 23 - 测试 consolidate 期间 lock_busy 降级 - 607527577",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 24 - 测试 consolidate 期间 lock_busy 降级 - 1930915214",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 25 - 测试 consolidate 期间 lock_busy 降级 - 1364207200",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 26 - 测试 consolidate 期间 lock_busy 降级 - 352705377",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 27 - 测试 consolidate 期间 lock_busy 降级 - 718457217",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 28 - 测试 consolidate 期间 lock_busy 降级 - 72235535",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 29 - 测试 consolidate 期间 lock_busy 降级 - 1198058784",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 30 - 测试 consolidate 期间 lock_busy 降级 - 668578266",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 31 - 测试 consolidate 期间 lock_busy 降级 - 1875846346",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 32 - 测试 consolidate 期间 lock_busy 降级 - 686204732",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 33 - 测试 consolidate 期间 lock_busy 降级 - 1382098721",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 34 - 测试 consolidate 期间 lock_busy 降级 - 1264295333",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 35 - 测试 consolidate 期间 lock_busy 降级 - 48584701",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 36 - 测试 consolidate 期间 lock_busy 降级 - 594478179",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 37 - 测试 consolidate 期间 lock_busy 降级 - 1458836483",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 38 - 测试 consolidate 期间 lock_busy 降级 - 1225110259",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 39 - 测试 consolidate 期间 lock_busy 降级 - 1035479058",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 40 - 测试 consolidate 期间 lock_busy 降级 - 1256137523",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 41 - 测试 consolidate 期间 lock_busy 降级 - 1104705471",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 42 - 测试 consolidate 期间 lock_busy 降级 - 240357832",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 43 - 测试 consolidate 期间 lock_busy 降级 - 1730115955",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 44 - 测试 consolidate 期间 lock_busy 降级 - 1076472597",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 45 - 测试 consolidate 期间 lock_busy 降级 - 468495077",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 46 - 测试 consolidate 期间 lock_busy 降级 - 1356651200",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 47 - 测试 consolidate 期间 lock_busy 降级 - 1137142990",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 48 - 测试 consolidate 期间 lock_busy 降级 - 1547355783",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 49 - 测试 consolidate 期间 lock_busy 降级 - 1177373080",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 50 - 测试 consolidate 期间 lock_busy 降级 - 1473266365",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 51 - 测试 consolidate 期间 lock_busy 降级 - 589138326",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 52 - 测试 consolidate 期间 lock_busy 降级 - 1496729488",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 53 - 测试 consolidate 期间 lock_busy 降级 - 1228748972",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 54 - 测试 consolidate 期间 lock_busy 降级 - 103572897",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 55 - 测试 consolidate 期间 lock_busy 降级 - 184164696",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 56 - 测试 consolidate 期间 lock_busy 降级 - 1459952065",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 57 - 测试 consolidate 期间 lock_busy 降级 - 776747879",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 58 - 测试 consolidate 期间 lock_busy 降级 - 532742525",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 59 - 测试 consolidate 期间 lock_busy 降级 - 1224584124",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     },
+                     {
+                         "content":  "Round5 端到端验证记忆 60 - 测试 consolidate 期间 lock_busy 降级 - 890320766",
+                         "memory_type":  "fact",
+                         "tags":  [
+                                      "audit",
+                                      "round5",
+                                      "e2e"
+                                  ],
+                         "privacy_level":  "user",
+                         "importance":  5,
+                         "project":  "round5-e2e"
+                     }
+                 ],
+    "synthesis_similarity":  0.3
+}

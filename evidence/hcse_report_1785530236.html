@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>HCSE 韧性验证报告 — LRC v0.8.16 Sidecar 启动路径</title>
+    <style>
+        body { font-family: -apple-system, sans-serif; margin: 2em; color: #333; }
+        h1 { color: #1a5276; border-bottom: 2px solid #2980b9; padding-bottom: 0.3em; }
+        h2 { color: #2c3e50; margin-top: 1.5em; }
+        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background: #f2f2f2; }
+        .violation { border-left: 4px solid; padding: 1em; margin: 1em 0; background: #fafafa; }
+        .violation.p0 { border-color: #e74c3c; }
+        .violation.p1 { border-color: #f39c12; }
+        .summary { background: #eaf2f8; padding: 1em; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <h1>HCSE 韧性验证报告</h1>
+    <div class="summary">
+        <p><b>验证对象:</b> LRC v0.8.16 sidecar 启动路径（spawn_and_wait → SingletonLock）</p>
+        <p><b>生成时间:</b> 2026-08-01 04:37:16</p>
+        <p><b>不变量数:</b> 7 条（INV-001 ~ INV-007）</p>
+        <p><b>组合用例:</b> 10 个</p>
+        <p><b>违规总数:</b> 0 个</p>
+    </div>
+
+    <h2>1. 测试用例追溯矩阵</h2>
+    <table>
+        <tr><th>用例</th><th>用户故事</th><th>NFR</th><th>关联不变量</th></tr>
+        <tr><td>C-01</td><td>US-启动服务</td><td>NFR-可用性</td><td>INV-005</td></tr>
+<tr><td>C-02</td><td>US-错误诊断</td><td>NFR-可观测性</td><td>INV-001, INV-002</td></tr>
+<tr><td>C-03</td><td>US-故障恢复</td><td>NFR-韧性</td><td>INV-002</td></tr>
+<tr><td>C-04</td><td>US-端口冲突</td><td>NFR-可用性</td><td>INV-005</td></tr>
+<tr><td>C-05</td><td>US-后台结晶</td><td>NFR-数据完整性</td><td>INV-003</td></tr>
+<tr><td>C-06</td><td>US-取消启动</td><td>NFR-资源清理</td><td>INV-004</td></tr>
+<tr><td>C-07</td><td>US-慢网络</td><td>NFR-超时韧性</td><td>INV-003, INV-006</td></tr>
+<tr><td>C-08</td><td>US-多窗口切换</td><td>NFR-并发安全</td><td>INV-001, INV-005</td></tr>
+<tr><td>C-09</td><td>US-依赖缺失</td><td>NFR-错误诊断</td><td>INV-002</td></tr>
+    </table>
+
+    <h2>2. 组合测试结果</h2>
+    <table>
+        <tr><th>ID</th><th>结果</th><th>耗时</th><th>违规数</th><th>时间</th></tr>
+        <tr><td>C-01</td><td>PASS</td><td>0ms</td><td>0</td><td>2026-07-31 12:12:58</td></tr>
+<tr><td>C-02</td><td>FAIL</td><td>0ms</td><td>1</td><td>2026-07-31 12:12:58</td></tr>
+<tr><td>C-01</td><td>PASS</td><td>0ms</td><td>0</td><td>2026-08-01 04:36:43</td></tr>
+<tr><td>C-02</td><td>FAIL</td><td>0ms</td><td>1</td><td>2026-08-01 04:36:43</td></tr>
+<tr><td></td><td></td><td>ms</td><td>0</td><td></td></tr>
+<tr><td></td><td></td><td>ms</td><td>0</td><td></td></tr>
+<tr><td></td><td></td><td>ms</td><td>0</td><td></td></tr>
+<tr><td></td><td></td><td>ms</td><td>0</td><td></td></tr>
+<tr><td></td><td></td><td>ms</td><td>0</td><td></td></tr>
+<tr><td></td><td></td><td>ms</td><td>0</td><td></td></tr>
+    </table>
+
+    <h2>3. 不变量违规详情</h2>
+    <p>无不变量违规</p>
+
+    <h2>4. 失败树分析（FTA）</h2>
+    <p>无失败树（无违规）</p>
+
+    <hr>
+    <p><small>本报告由 HCSE evidence_builder.py 自动生成，所有数据经双重消毒（正则+结构剪枝）。
+    敏感字段：authorization/cookie/email/phone/api_key 已脱敏。</small></p>
+</body>
+</html>

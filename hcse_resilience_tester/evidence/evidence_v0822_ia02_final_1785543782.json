@@ -1,0 +1,58 @@
+{
+  "test_type": "IA-02 终极复验",
+  "test_time": "2026-08-01 08:23:02",
+  "passed": false,
+  "reason": "container 存在=False; registered=True; showToast 存在=True; 直接调用 toast 数=0; rejection toast 数=0; window error toast 数=0",
+  "evidence": {
+    "container_check": {
+      "container_exists": false,
+      "container_id": null,
+      "container_class": null,
+      "container_children": 0,
+      "all_toast_containers_count": 0,
+      "all_toast_containers": [],
+      "registered": true,
+      "showToast_exists": true
+    },
+    "body_info": {
+      "body_children_count": 5,
+      "body_children_ids": [
+        {
+          "tag": "DIV",
+          "id": "sidecar-down-banner",
+          "class": "sidecar-down-banner"
+        },
+        {
+          "tag": "DIV",
+          "id": "",
+          "class": "app-layout"
+        },
+        {
+          "tag": "ASIDE",
+          "id": "sys-status-float",
+          "class": "sys-status-float collapsed"
+        },
+        {
+          "tag": "NAV",
+          "id": "",
+          "class": "mobile-tabbar"
+        },
+        {
+          "tag": "SCRIPT",
+          "id": "",
+          "class": ""
+        }
+      ],
+      "url": "https://tauri.localhost/#/dashboard",
+      "title": "龙忆 Loong Recall · 仪表盘"
+    },
+    "after_rejection": {
+      "toast_count": 0,
+      "texts": []
+    },
+    "after_window_error": {
+      "toast_count": 0,
+      "texts": []
+    }
+  }
+}

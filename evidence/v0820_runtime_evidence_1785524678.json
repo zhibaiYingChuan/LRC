@@ -1,0 +1,234 @@
+{
+  "version": "0.8.20",
+  "timestamp": "2026-08-01T03:04:38",
+  "sidecar_base": "http://127.0.0.1:3099",
+  "summary": {
+    "total": 5,
+    "pass": 3,
+    "fail": 2,
+    "exempt": 0
+  },
+  "results": [
+    {
+      "inv_id": "INV-001",
+      "name": "单例锁一致性",
+      "verdict": "FAIL",
+      "evidence": {
+        "lockfile_path": "C:\\Users\\Administrator\\.loong-recall\\global\\data\\.lrc.lock",
+        "lockfile_exists": true,
+        "lockfile_pid": "21008",
+        "health_reachable": false,
+        "health_status": 0,
+        "sidecar_process_count": 1,
+        "issues": [
+          "/health 不可达: TimeoutError: timed out"
+        ]
+      },
+      "timestamp": "2026-08-01T03:02:07"
+    },
+    {
+      "inv_id": "INV-008-ext",
+      "name": "try_lock 端点延迟矩阵",
+      "verdict": "FAIL",
+      "evidence": {
+        "endpoints": [
+          {
+            "endpoint": "/health",
+            "method": "GET",
+            "barrier": "server.rs:1680 try_lock",
+            "ok_count": 0,
+            "avg_latency_ms": 0,
+            "max_latency_ms": 0,
+            "verdict": "FAIL"
+          },
+          {
+            "endpoint": "/v1/health/system",
+            "method": "GET",
+            "barrier": "v1_api.rs:657 try_lock",
+            "ok_count": 0,
+            "avg_latency_ms": 0,
+            "max_latency_ms": 0,
+            "verdict": "FAIL"
+          },
+          {
+            "endpoint": "/v1/health/dao_metrics",
+            "method": "GET",
+            "barrier": "v1_api.rs:589 try_lock",
+            "ok_count": 0,
+            "avg_latency_ms": 0,
+            "max_latency_ms": 0,
+            "verdict": "FAIL"
+          },
+          {
+            "endpoint": "/v1/memories/stats",
+            "method": "GET",
+            "barrier": "v1_api.rs:1001 try_lock",
+            "ok_count": 1,
+            "avg_latency_ms": 6672.0,
+            "max_latency_ms": 6672.0,
+            "verdict": "FAIL"
+          },
+          {
+            "endpoint": "/v1/captains-log",
+            "method": "GET",
+            "barrier": "v1_api.rs:1424 try_lock",
+            "ok_count": 0,
+            "avg_latency_ms": 0,
+            "max_latency_ms": 0,
+            "verdict": "FAIL"
+          }
+        ]
+      },
+      "timestamp": "2026-08-01T03:04:38"
+    },
+    {
+      "inv_id": "INV-008",
+      "name": "/health handler 永不卡死（并发持锁场景）",
+      "verdict": "PASS",
+      "evidence": {
+        "baseline_latency_ms": 0.0,
+        "concurrent_lock_holders": 20,
+        "health_probe_count": 10,
+        "max_latency_ms": 15.0,
+        "avg_latency_ms": 10.5,
+        "target_threshold_ms": 50,
+        "accept_threshold_ms": 100,
+        "target_hit_rate": 1.0,
+        "over_threshold_count": 0,
+        "failed_count": 0,
+        "probes": [
+          {
+            "endpoint": "/health",
+            "status_code": 200,
+            "latency_ms": 0.0,
+            "ok": true,
+            "error": "",
+            "body_snippet": "{\"status\":\"running\",\"service\":\"loong-recall\",\"version\":\"0.8.20\",\"uptime_seconds\":533,\"indexing\":{\"complete\":true,\"file_count\":99,\"total_chunks\":99},\"memory\":{\"total\":0},\"src_dir\":\"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\",\"llm_configured\":false}"
+          },
+          {
+            "endpoint": "/health",
+            "status_code": 200,
+            "latency_ms": 15.0,
+            "ok": true,
+            "error": "",
+            "body_snippet": "{\"status\":\"running\",\"service\":\"loong-recall\",\"version\":\"0.8.20\",\"uptime_seconds\":533,\"indexing\":{\"complete\":true,\"file_count\":99,\"total_chunks\":99},\"memory\":{\"total\":0},\"src_dir\":\"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\",\"llm_configured\":false}"
+          },
+          {
+            "endpoint": "/health",
+            "status_code": 200,
+            "latency_ms": 15.0,
+            "ok": true,
+            "error": "",
+            "body_snippet": "{\"status\":\"running\",\"service\":\"loong-recall\",\"version\":\"0.8.20\",\"uptime_seconds\":533,\"indexing\":{\"complete\":true,\"file_count\":99,\"total_chunks\":99},\"memory\":{\"total\":0},\"src_dir\":\"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\",\"llm_configured\":false}"
+          },
+          {
+            "endpoint": "/health",
+            "status_code": 200,
+            "latency_ms": 15.0,
+            "ok": true,
+            "error": "",
+            "body_snippet": "{\"status\":\"running\",\"service\":\"loong-recall\",\"version\":\"0.8.20\",\"uptime_seconds\":533,\"indexing\":{\"complete\":true,\"file_count\":99,\"total_chunks\":99},\"memory\":{\"total\":0},\"src_dir\":\"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\",\"llm_configured\":false}"
+          },
+          {
+            "endpoint": "/health",
+            "status_code": 200,
+            "latency_ms": 15.0,
+            "ok": true,
+            "error": "",
+            "body_snippet": "{\"status\":\"running\",\"service\":\"loong-recall\",\"version\":\"0.8.20\",\"uptime_seconds\":533,\"indexing\":{\"complete\":true,\"file_count\":99,\"total_chunks\":99},\"memory\":{\"total\":0},\"src_dir\":\"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\",\"llm_configured\":false}"
+          },
+          {
+            "endpoint": "/health",
+            "status_code": 200,
+            "latency_ms": 15.0,
+            "ok": true,
+            "error": "",
+            "body_snippet": "{\"status\":\"running\",\"service\":\"loong-recall\",\"version\":\"0.8.20\",\"uptime_seconds\":533,\"indexing\":{\"complete\":true,\"file_count\":99,\"total_chunks\":99},\"memory\":{\"total\":0},\"src_dir\":\"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\",\"llm_configured\":false}"
+          },
+          {
+            "endpoint": "/health",
+            "status_code": 200,
+            "latency_ms": 0.0,
+            "ok": true,
+            "error": "",
+            "body_snippet": "{\"status\":\"running\",\"service\":\"loong-recall\",\"version\":\"0.8.20\",\"uptime_seconds\":533,\"indexing\":{\"complete\":true,\"file_count\":99,\"total_chunks\":99},\"memory\":{\"total\":0},\"src_dir\":\"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\",\"llm_configured\":false}"
+          },
+          {
+            "endpoint": "/health",
+            "status_code": 200,
+            "latency_ms": 0.0,
+            "ok": true,
+            "error": "",
+            "body_snippet": "{\"status\":\"running\",\"service\":\"loong-recall\",\"version\":\"0.8.20\",\"uptime_seconds\":533,\"indexing\":{\"complete\":true,\"file_count\":99,\"total_chunks\":99},\"memory\":{\"total\":0},\"src_dir\":\"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\",\"llm_configured\":false}"
+          },
+          {
+            "endpoint": "/health",
+            "status_code": 200,
+            "latency_ms": 15.0,
+            "ok": true,
+            "error": "",
+            "body_snippet": "{\"status\":\"running\",\"service\":\"loong-recall\",\"version\":\"0.8.20\",\"uptime_seconds\":533,\"indexing\":{\"complete\":true,\"file_count\":99,\"total_chunks\":99},\"memory\":{\"total\":0},\"src_dir\":\"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\",\"llm_configured\":false}"
+          },
+          {
+            "endpoint": "/health",
+            "status_code": 200,
+            "latency_ms": 15.0,
+            "ok": true,
+            "error": "",
+            "body_snippet": "{\"status\":\"running\",\"service\":\"loong-recall\",\"version\":\"0.8.20\",\"uptime_seconds\":533,\"indexing\":{\"complete\":true,\"file_count\":99,\"total_chunks\":99},\"memory\":{\"total\":3202},\"src_dir\":\"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\",\"llm_configured\":false}"
+          }
+        ]
+      },
+      "timestamp": "2026-08-01T03:04:38"
+    },
+    {
+      "inv_id": "TIMEOUT-001",
+      "name": "超时机制验证（端点 < 8s 响应）",
+      "verdict": "PASS",
+      "evidence": {
+        "endpoints": [
+          {
+            "endpoint": "/health",
+            "latency_ms": 0.0,
+            "ok": true,
+            "within_8s": true
+          },
+          {
+            "endpoint": "/v1/health/system",
+            "latency_ms": 16.0,
+            "ok": true,
+            "within_8s": true
+          },
+          {
+            "endpoint": "/v1/health/dao_metrics",
+            "latency_ms": 0.0,
+            "ok": true,
+            "within_8s": true
+          },
+          {
+            "endpoint": "/v1/memories/stats",
+            "latency_ms": 0.0,
+            "ok": true,
+            "within_8s": true
+          }
+        ],
+        "threshold_ms": 8000
+      },
+      "timestamp": "2026-08-01T03:04:38"
+    },
+    {
+      "inv_id": "FRONTEND-001",
+      "name": "前端状态一致性",
+      "verdict": "PASS",
+      "evidence": {
+        "backend_health_ok": true,
+        "backend_status": 200,
+        "frontend_state": "{\"statusText\":\"运行中\",\"statusDot\":\"status-dot online\",\"bannerHidden\":false,\"version\":\"v0.8.20\",\"daoError\":\"道同构度数据加载失败：LRC 服务未启动\"}",
+        "issues": [
+          "状态矛盾：statusText='运行中' 但 dao_metrics 显示'道同构度数据加载失败：LRC 服务未启动'"
+        ]
+      },
+      "timestamp": "2026-08-01T03:04:38"
+    }
+  ]
+}

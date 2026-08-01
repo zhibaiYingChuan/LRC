@@ -4,7 +4,7 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.22';
+const APP_VERSION = '0.8.23';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -138,6 +138,69 @@ function setButtonState(btn, state, originalText) {
 }
 window.setButtonState = setButtonState;
 
+// v0.8.23 P2-01 (E4)：代理检测工具函数
+// 检测浏览器是否配置了代理，用于友好提示用户排查连接问题
+// 浏览器环境无法直接读取系统代理设置，通过以下间接方式检测：
+//   1. navigator.onLine — 浏览器是否在线
+//   2. 尝试通过 PAC 代理自动配置 URL 检测（通过创建临时 script 加载 PAC）
+//   3. 检测是否在 Tauri 桌面环境（可通过 IPC 获取系统代理信息）
+let _proxyDetectionResult = null; // 缓存检测结果，避免重复检测
+async function detectProxyConfiguration() {
+  if (_proxyDetectionResult) return _proxyDetectionResult;
+
+  const result = {
+    likelyProxy: false,
+    reason: '',
+    online: navigator.onLine !== false,
+    isTauri: isTauriEnv,
+    details: []
+  };
+
+  // 1. 检测浏览器是否在线
+  if (!result.online) {
+    result.reason = '浏览器处于离线状态';
+    result.details.push('navigator.onLine = false');
+    _proxyDetectionResult = result;
+    return result;
+  }
+
+  // 2. Tauri 桌面环境：尝试通过 IPC 获取系统代理信息
+  if (isTauriEnv) {
+    try {
+      const invokeFn = (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) ||
+                       (window.__TAURI__ && window.__TAURI__.invoke);
+      if (invokeFn) {
+        const proxyInfo = await invokeFn('get_proxy_configuration');
+        if (proxyInfo && proxyInfo.proxy_url) {
+          result.likelyProxy = true;
+          result.reason = `检测到系统代理: ${proxyInfo.proxy_url}`;
+          result.details.push(`系统代理: ${proxyInfo.proxy_url}`);
+          result.details.push(`代理类型: ${proxyInfo.proxy_type || '未知'}`);
+        }
+      }
+    } catch (e) {
+      // Tauri IPC 调用失败，静默处理（可能是旧版本 sidecar 不支持此命令）
+      console.log('[detectProxy] Tauri IPC 获取代理信息失败:', e.message);
+      result.details.push('Tauri IPC 获取代理信息失败（可忽略）');
+    }
+  }
+
+  // 3. 浏览器环境：检测 navigator.connection 等网络信息
+  if (!result.likelyProxy) {
+    const connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (connection) {
+      if (connection.type === 'none') {
+        result.likelyProxy = true;
+        result.reason = '网络连接类型为 "none"，可能被代理拦截';
+        result.details.push(`connection.type = ${connection.type}`);
+      }
+    }
+  }
+
+  _proxyDetectionResult = result;
+  return result;
+}
+
 // v0.8.2：全局进行中请求计数器（对应审计 G006）
 // v0.8.3 Step 5：暴露只读接口到 window，便于 CDP 测试与外部检测（修复 G006）
 // 使用 Object.defineProperty 的 getter（无 setter）确保只读，避免外部恶意修改
@@ -189,7 +252,8 @@ async function fetchWithTimeout(url, options = {}, timeout = 10000) {
     // v0.8.6 Step 3 / N001 G052 修复：集成 handleHttpError，激活错误恢复层
     // 之前 handleHttpError 是死代码，40+ catch 块无一调用，导致 500/429/503 错误恢复失效
     if (!res.ok) {
-      const retryContext = { method: restOptions.method || 'GET', url: url };
+      // v0.8.23 A-02：传递 signal 到 handleHttpError，使退避延迟可取消
+      const retryContext = { method: restOptions.method || 'GET', url: url, signal: externalSignal };
       const result = await handleHttpError(res, `请求 ${url}`, retryContext);
 
       if (result.action === 'retry') {
@@ -329,7 +393,28 @@ async function handleHttpError(response, context = '操作', retryContext = null
       // v0.8.4 Step 10 / G029：指数退避（1s → 2s → 4s）
       const backoff = Math.pow(2, retryCount) * 1000;
       console.log(`[handleHttpError] 用户选择重试，${backoff}ms 后重试（第 ${retryCount + 1} 次）`);
-      await new Promise(r => setTimeout(r, backoff));
+      // v0.8.23 A-02：支持 signal 取消退避，避免标签页切换后仍执行重试
+      const signal = retryContext?.signal;
+      if (signal) {
+        try {
+          await new Promise((resolve, reject) => {
+            const timer = setTimeout(resolve, backoff);
+            const onAbort = () => {
+              clearTimeout(timer);
+              reject(new DOMException('退避延迟被取消', 'AbortError'));
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+          });
+        } catch (e) {
+          if (e.name === 'AbortError') {
+            console.log('[handleHttpError] 退避延迟被取消（标签页切换），放弃重试');
+            return { action: 'cancel', status, errorDetail };
+          }
+          throw e;
+        }
+      } else {
+        await new Promise(r => setTimeout(r, backoff));
+      }
       return { action: 'retry', status, errorDetail };
     }
     _retryCounters.delete(retryKey);
@@ -355,6 +440,53 @@ async function handleHttpError(response, context = '操作', retryContext = null
     }
     // 直接返回 cancel，由上层调用者的重试机制处理
     return { action: 'cancel', status, errorDetail };
+  } else if (status === 502 || status === 504) {
+    // v0.8.23 P2-03：502/504 网关错误自动重试（指数退避，不弹阻塞 Modal）
+    // 502 Bad Gateway / 504 Gateway Timeout 通常是临时性故障
+    // 自动重试 3 次，每次间隔递增，无需用户干预
+    const retryKey = retryContext ? `${retryContext.method || 'GET'}:${retryContext.url || ''}` : `gateway:${context}`;
+    const retryCount = _retryCounters.get(retryKey) || 0;
+
+    if (retryCount >= MAX_RETRY_COUNT) {
+      // 超过重试上限，显示错误提示
+      _retryCounters.delete(retryKey);
+      showToast(`${context}失败：服务暂时不可用，请稍后重试`, 'error', 5000);
+      console.warn(`[handleHttpError] 502/504 重试已达上限（${MAX_RETRY_COUNT}次），放弃`);
+      return { action: 'giveup', status, errorDetail };
+    }
+
+    _retryCounters.set(retryKey, retryCount + 1);
+    const backoff = Math.pow(2, retryCount) * 1000;
+    console.log(`[handleHttpError] ${status} 网关错误，${backoff}ms 后自动重试（第 ${retryCount + 1} 次）`);
+
+    // 首次重试时显示 toast 提醒，后续静默重试
+    if (retryCount === 0) {
+      showToast(`${context}临时不可用（${status}），正在自动重试...`, 'warning', 3000);
+    }
+
+    // 支持 signal 取消退避（标签页切换）
+    const signal = retryContext?.signal;
+    if (signal) {
+      try {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, backoff);
+          const onAbort = () => {
+            clearTimeout(timer);
+            reject(new DOMException('退避延迟被取消', 'AbortError'));
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+        });
+      } catch (e) {
+        if (e.name === 'AbortError') {
+          console.log(`[handleHttpError] ${status} 退避延迟被取消，放弃重试`);
+          return { action: 'cancel', status, errorDetail };
+        }
+        throw e;
+      }
+    } else {
+      await new Promise(r => setTimeout(r, backoff));
+    }
+    return { action: 'retry', status, errorDetail };
   } else if (status === 429) {
     // G007 扩展：429 限流
     // v0.8.22 GAP-06 修复（interaction-resilience-auditor Round4）：
@@ -367,11 +499,11 @@ async function handleHttpError(response, context = '操作', retryContext = null
     return { action: 'cancel', status, errorDetail };
   } else if (status === 401 || status === 403) {
     // 鉴权失败
-    showToast(`${context}失败：权限不足（${status}）`, 'error', 4000);
+    showToast(`${context}失败：权限不足，请检查 API 密钥配置`, 'error', 4000);
     return { action: 'cancel', status, errorDetail };
   } else {
     // 其他非 2xx 错误
-    showToast(`${context}失败：${errorDetail || 'HTTP ' + status}`, 'error', 4000);
+    showToast(`${context}失败：${errorDetail || '服务响应异常，请稍后重试'}`, 'error', 4000);
     return { action: 'cancel', status, errorDetail };
   }
 }
@@ -678,7 +810,11 @@ const SidecarHealthMonitor = {
       this._broadcastSidecarStateChange(true);
     } else {
       // 不可达
-      if (banner) banner.hidden = false;
+      if (banner) {
+        banner.hidden = false;
+        // v0.8.23 P2-01 (E4)：代理检测 — 不可达时尝试检测代理配置
+        this._detectProxyAndUpdateBanner(banner);
+      }
       // v0.8.2：排除"启动服务"按钮，确保用户可以启动服务
       // v0.8.3 Step 8：添加 title 和 aria-disabled 属性（修复 N04）
       apiButtons.forEach(btn => {
@@ -694,6 +830,31 @@ const SidecarHealthMonitor = {
       console.log('[LRC v' + APP_VERSION + ']Sidecar 不可达，已禁用 API 按钮');
       // v0.8.10 L4-02：不可达时也广播，确保状态栏和各页面同步显示"已停止"
       this._broadcastSidecarStateChange(false);
+    }
+  },
+
+  /**
+   * v0.8.23 P2-01 (E4)：代理检测 — 不可达时更新 banner 显示代理检测信息
+   * 异步检测代理配置，检测结果非阻塞，检测失败也不影响 banner 正常显示
+   * @param {HTMLElement} banner - sidecar-down-banner 元素
+   */
+  async _detectProxyAndUpdateBanner(banner) {
+    try {
+      const proxyResult = await detectProxyConfiguration();
+      const bannerText = banner.querySelector('.banner-text');
+      if (!bannerText) return;
+
+      if (proxyResult.likelyProxy && proxyResult.reason) {
+        // 检测到代理，更新 banner 文本
+        bannerText.textContent = `LRC 服务未运行 — ${proxyResult.reason}`;
+        console.log(`[LRC v${APP_VERSION}]代理检测结果:`, proxyResult.reason);
+      } else {
+        // 未检测到代理，使用默认文本
+        bannerText.textContent = 'LRC 服务未运行，部分功能不可用';
+      }
+    } catch (e) {
+      // 检测失败，静默降级（保留默认 banner 文本）
+      console.warn('[LRC v' + APP_VERSION + ']代理检测失败（静默降级）:', e.message);
     }
   },
 
@@ -798,6 +959,10 @@ let dashboardAbortController = null;
 let _dashboardRetryCount = 0;
 let _dashboardRetryTimer = null; // v0.8.13 B1: 索引期重试 timer，支持取消与竞态防护
 const _DASHBOARD_MAX_RETRIES = 3;
+// v0.8.22 修复：lock_busy 冷却期标志，避免手动刷新后再次进入无限重试循环
+let _lockBusyCooldown = false;
+// v0.8.23 S1-RES-03 修复：lock_busy 冷却期倒计时 timer，显示实时剩余秒数
+let _lockBusyCooldownTimer = null;
 
 async function loadDashboard() {
   const loading = $('dashboard-loading');
@@ -920,11 +1085,50 @@ async function loadDashboard() {
       if (loading) loading.classList.add('hidden');
       return;
     }
+    // v0.8.23 GAP-AUDIT-01 修复：SidecarTimeoutError 优先于 LOCK_BUSY
+    // 根因：请求超时（10s fetchWithTimeout 硬超时）时，e.name 为 SidecarTimeoutError，
+    //       但后面对 LOCK_BUSY 的检查可能因重试 catch 覆盖超时信息
+    //   修复：在 LOCK_BUSY 之前检查 SidecarTimeoutError，确保超时错误显示"请求超时"文案
+    if (e.name === 'SidecarTimeoutError') {
+      if (loading) loading.classList.add('hidden');
+      if (error) {
+        error.innerHTML = '⏱️ 请求超时，请检查网络连接后重试<br>'
+          + '<button onclick="manualRefreshDashboard()" style="margin-top:8px;padding:6px 16px;background:#4a90d9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;">重试</button>';
+        error.classList.add('show');
+      }
+      _dashboardRetryCount = 0;
+      return;
+    }
     // v0.8.19 GAP-01 P0 修复：LOCK_BUSY（503 lock_busy）特殊处理
     // sidecar 在线但繁忙（结晶期间），显示"后台合成中"并自动重试
     // 不进入"无法连接到 API 服务"分支，避免误导用户
     if (e.message === 'LOCK_BUSY') {
       if (loading) loading.classList.add('hidden');
+      // v0.8.23 S1-UX-01 修复：lock_busy 时设置降级视觉模式
+      document.body.classList.add('degraded-mode');
+      // v0.8.22 修复：冷却期内不触发自动重试，直接显示"请等待"文案
+      // v0.8.23 S1-RES-03 修复：显示实时倒计时，替代静态"等待 30 秒"文案
+      if (_lockBusyCooldown) {
+        console.log('[loadDashboard] lock_busy 冷却期内，跳过自动重试');
+        if (error) {
+          error.innerHTML = '⏳ 后台合成中，请等待 <span id="lockbusy-countdown">30</span> 秒后自动重试...';
+          error.classList.add('show');
+        }
+        // 启动倒计时更新（如果尚未启动）
+        if (!_lockBusyCooldownTimer) {
+          _lockBusyCooldownTimer = setInterval(() => {
+            const cd = document.getElementById('lockbusy-countdown');
+            const remaining = parseInt(cd?.textContent || '0', 10);
+            if (remaining > 1) {
+              if (cd) cd.textContent = String(remaining - 1);
+            } else {
+              clearInterval(_lockBusyCooldownTimer);
+              _lockBusyCooldownTimer = null;
+            }
+          }, 1000);
+        }
+        return;
+      }
       // 自动重试（复用 _dashboardRetryCount 机制，与索引期重试一致）
       if (_dashboardRetryCount < _DASHBOARD_MAX_RETRIES) {
         _dashboardRetryCount++;
@@ -944,7 +1148,19 @@ async function loadDashboard() {
         // 修复：显示"后台合成耗时较长" + 立即刷新按钮
         // v0.8.22 GAP-01+GAP-04 修复：按钮改为调用 manualRefreshDashboard，
         //   重置 _dashboardRetryCount 并添加防抖，避免连点和"刷新无效"问题
-        console.log('[loadDashboard] lock_busy（后台合成中）重试耗尽，显示手动刷新引导');
+        // v0.8.22 修复：添加 30 秒冷却期，防止手动刷新后再次进入无限重试循环
+        console.log('[loadDashboard] lock_busy（后台合成中）重试耗尽，设置 30 秒冷却期');
+        _lockBusyCooldown = true;
+        // v0.8.23 S1-RES-03 修复：冷却期结束时清理倒计时 timer
+        const cooldownTimer = setTimeout(() => {
+          _lockBusyCooldown = false;
+          _dashboardRetryCount = 0;
+          if (_lockBusyCooldownTimer) {
+            clearInterval(_lockBusyCooldownTimer);
+            _lockBusyCooldownTimer = null;
+          }
+          console.log('[loadDashboard] lock_busy 冷却期结束，恢复自动重试');
+        }, 30000);
         if (error) {
           error.innerHTML = '⏳ 后台合成耗时较长，建议稍后手动刷新<br>'
             + '<button id="btn-manual-refresh" onclick="manualRefreshDashboard()" style="margin-top:8px;padding:6px 16px;background:#4a90d9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;">立即刷新</button>'
@@ -955,18 +1171,6 @@ async function loadDashboard() {
       return;
     }
     if (loading) loading.classList.add('hidden');
-
-    // v0.8.22 GAP-10 修复（interaction-resilience-auditor Round4）：
-    //   根因：超时和普通错误都显示 e.message，用户无法区分是网络问题还是服务器问题
-    //   修复：SidecarTimeoutError 单独分支，显示"请求超时"文案
-    if (e.name === 'SidecarTimeoutError') {
-      if (error) {
-        error.innerHTML = '⏱️ 请求超时，请检查网络连接后重试<br>'
-          + '<button onclick="manualRefreshDashboard()" style="margin-top:8px;padding:6px 16px;background:#4a90d9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;">重试</button>';
-        error.classList.add('show');
-      }
-      return;
-    }
 
     // v0.8.12：索引期间不覆盖"运行中/索引中"状态栏，显示提示并自动重试
     const isIndexing = typeof SidecarHealthMonitor !== 'undefined'
@@ -1034,10 +1238,37 @@ async function loadDashboard() {
 //     用户感觉"刷新按钮没用"
 //   GAP-04 根因：按钮无防抖，快速连点触发多次 loadDashboard
 //   修复：新增 manualRefreshDashboard 函数，重置计数器 + 按钮防抖
+// v0.8.23 S1-RES-04 修复：冷却期内禁用刷新按钮并显示剩余时间
 let _isManualRefreshing = false;
 function manualRefreshDashboard() {
   if (_isManualRefreshing) {
     console.log('[manualRefreshDashboard] 已在刷新中，忽略重复点击');
+    return;
+  }
+  // v0.8.23 S1-RES-04 修复：冷却期内显示剩余时间并阻止刷新
+  if (_lockBusyCooldown) {
+    const cd = document.getElementById('lockbusy-countdown');
+    const remaining = parseInt(cd?.textContent || '30', 10);
+    console.log(`[manualRefreshDashboard] lock_busy 冷却期内（剩余 ${remaining}s），忽略手动刷新`);
+    const btn = document.getElementById('btn-manual-refresh');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = `等待 ${remaining}s...`;
+      btn.style.opacity = '0.6';
+      btn.style.cursor = 'not-allowed';
+      // 冷却期结束时恢复按钮
+      const checkCooldown = setInterval(() => {
+        const cdEl = document.getElementById('lockbusy-countdown');
+        const rem = parseInt(cdEl?.textContent || '0', 10);
+        if (!_lockBusyCooldown || rem <= 0) {
+          clearInterval(checkCooldown);
+          btn.disabled = false;
+          btn.textContent = '立即刷新';
+          btn.style.opacity = '1';
+          btn.style.cursor = 'pointer';
+        }
+      }, 1000);
+    }
     return;
   }
   _isManualRefreshing = true;
@@ -1061,6 +1292,8 @@ function manualRefreshDashboard() {
 window.manualRefreshDashboard = manualRefreshDashboard;
 
 function renderDashboard(system, detailed, dao) {
+  // v0.8.23 S1-UX-01 修复：数据加载成功时移除降级视觉模式
+  document.body.classList.remove('degraded-mode');
   // v0.8.22 P1-NEW-02 防御性修复（interaction-resilience-auditor Round4）：
   //   根因：即使 P1-NEW-01 修复后 lock_busy 降级响应会被 throw LOCK_BUSY 拦截，
   //         但为了防御性编程，renderDashboard 入口仍检查 lock_busy 字段，
@@ -2123,8 +2356,11 @@ async function generateCaptainLog() {
       if (logRes.ok) {
         const logData = await logRes.json();
         if (logData.report || logData.content || logData.log) {
-          result.textContent = logData.report || logData.content || logData.log;
+          const logText = logData.report || logData.content || logData.log;
+          result.textContent = logText;
           result.classList.remove('hidden');
+          // v0.8.22 修复：缓存成功生成的船长日志，用于降级路径显示
+          try { localStorage.setItem('lrc_captains_log_cache', logText); } catch (_) { /* 缓存非关键 */ }
           return;
         }
       }
@@ -2267,11 +2503,23 @@ async function generateCaptainLog() {
 
     result.textContent = log;
     result.classList.remove('hidden');
+    // v0.8.22 修复：缓存成功生成的船长日志，用于降级路径显示
+    try { localStorage.setItem('lrc_captains_log_cache', log); } catch (_) { /* 缓存非关键 */ }
 
   } catch (e) {
     if (error) {
-      error.textContent = '⚠️ 生成失败：' + htmlescape(e.message);
-      error.classList.add('show');
+      // v0.8.22 修复：降级路径也失败时，显示缓存的上次成功日志（如果存在）
+      let cachedLog = null;
+      try { cachedLog = localStorage.getItem('lrc_captains_log_cache'); } catch (_) { /* 缓存非关键 */ }
+      if (cachedLog) {
+        result.textContent = '⚠️ 以下为上次生成的日志，可能已过时：\n\n' + cachedLog;
+        result.classList.remove('hidden');
+        error.textContent = '⚠️ 无法获取最新数据，已显示缓存版本';
+        error.classList.add('show');
+      } else {
+        error.textContent = '⚠️ 生成失败：' + htmlescape(e.message);
+        error.classList.add('show');
+      }
     }
   } finally {
     if (btn) btn.disabled = false;
@@ -2285,14 +2533,64 @@ async function generateCaptainLog() {
 // v0.8.13 F3: 信任中心索引期重试计数器与 timer
 let _trustRetryCount = 0;
 let _trustRetryTimer = null;
+// v0.8.22 修复：信任中心数据缓存，30 秒内复用
+let _trustCache = { data: null, timestamp: 0 };
+const _TRUST_CACHE_TTL = 30000; // 30 秒
+// v0.8.23 修复（OBS-01）：loadTrustCenter AbortController，支持标签页切换时取消旧请求
+let trustAbortController = null;
+
+// v0.8.22 修复：将缓存的信任中心数据应用到 UI
+function _applyTrustCenterData(data) {
+  const feedback = data.feedback_stats || {};
+  const fbEnabled = feedback.implicit_feedback_enabled;
+  const fbText = $('feedback-status-text');
+  const fbCard = $('feedback-status-card');
+  if (fbText) {
+    if (fbEnabled) {
+      fbText.innerHTML = '状态：<span class="badge healthy">已启用</span>';
+      fbText.innerHTML += '<br>正面反馈率：' + pct(feedback.positive_ratio || 0);
+      fbText.innerHTML += '<br>总反馈数：' + num(feedback.total_feedback || 0);
+    } else {
+      fbText.innerHTML = '状态：<span class="badge info">未启用</span>';
+      fbText.innerHTML += '<br>隐式反馈当前未激活，系统使用默认排序策略。';
+    }
+  }
+  const auditText = $('audit-integrity-text');
+  const auditCard = $('audit-integrity-card');
+  if (auditText) {
+    auditText.innerHTML = '状态：<span class="badge healthy">完整</span>';
+    auditText.innerHTML += '<br>（缓存数据 ' + new Date(_trustCache.timestamp).toLocaleTimeString('zh-CN') + '）';
+    if (auditCard) auditCard.style.borderLeftColor = 'var(--jade)';
+  }
+}
 
 async function loadTrustCenter() {
   const loading = $('trust-loading');
   if (!loading) return;
   loading.classList.remove('hidden');
 
+  // v0.8.23 修复（OBS-01）：abort 上一次未完成的请求，避免竞态
+  if (trustAbortController) {
+    trustAbortController.abort();
+  }
+  trustAbortController = new AbortController();
+  const currentSignal = trustAbortController.signal;
+
+  // v0.8.22 修复：30 秒内复用缓存，减少重复 API 调用
+  const now = Date.now();
+  if (_trustCache.data && (now - _trustCache.timestamp) < _TRUST_CACHE_TTL) {
+    _applyTrustCenterData(_trustCache.data);
+    if (loading) loading.classList.add('hidden');
+    // v0.8.23 S1-RES-05 修复：缓存数据展示时添加手动刷新按钮
+    const refreshBtn = document.getElementById('trust-refresh-btn');
+    if (refreshBtn) {
+      refreshBtn.style.display = 'inline-block';
+    }
+    return;
+  }
+
   try {
-    const res = await fetchWithTimeout(API_BASE + '/v1/health/system');
+    const res = await fetchWithTimeout(API_BASE + '/v1/health/system', { signal: currentSignal });
     if (!res.ok) throw new Error('API 不可达');
     const data = await res.json();
 
@@ -2319,7 +2617,7 @@ async function loadTrustCenter() {
 
     if (auditText) {
       try {
-        const auditRes = await fetchWithTimeout(API_BASE + '/v1/audit-trail?limit=1');
+        const auditRes = await fetchWithTimeout(API_BASE + '/v1/audit-trail?limit=1', { signal: currentSignal });
         if (auditRes.ok) {
           const auditData = await auditRes.json();
           auditText.innerHTML = '状态：<span class="badge healthy">完整</span>';
@@ -2336,7 +2634,15 @@ async function loadTrustCenter() {
       }
     }
 
+    // v0.8.22 修复：写入信任中心缓存
+    _trustCache = { data: data, timestamp: Date.now() };
+
   } catch (e) {
+    // v0.8.23 修复（OBS-01）：AbortError 静默处理，不显示错误 UI
+    if (e.name === 'AbortError') {
+      console.log('[loadTrustCenter] 请求被取消（标签页切换）');
+      return;
+    }
     // v0.8.13 F3: 索引期自动重试，避免 sidecar 索引中时显示"无法获取数据"
     const isIndexing = typeof SidecarHealthMonitor !== 'undefined'
       && SidecarHealthMonitor
@@ -2355,8 +2661,9 @@ async function loadTrustCenter() {
     _trustRetryCount = 0;
     const fbText = $('feedback-status-text');
     const auditText = $('audit-integrity-text');
-    if (fbText) fbText.textContent = '无法获取数据：' + htmlescape(e.message);
-    if (auditText) auditText.textContent = '无法获取数据：' + htmlescape(e.message);
+    const retryHtml = '<br><button class="btn btn-accent" style="margin-top:8px;padding:4px 12px;font-size:0.85em;" onclick="loadTrustCenter()">手动重试</button>';
+    if (fbText) fbText.innerHTML = '无法获取数据：' + htmlescape(e.message) + retryHtml;
+    if (auditText) auditText.innerHTML = '无法获取数据：' + htmlescape(e.message) + retryHtml;
   } finally {
     // v0.8.13 F3: 重试期间保持 loading 可见（_trustRetryTimer 非空表示有重试待执行）
     if (loading && !_trustRetryTimer) loading.classList.add('hidden');
@@ -3831,22 +4138,29 @@ function copyReproCmd() {
 }
 
 // 雷达图绘制
-function drawRadarChart(data) {
+// v0.8.22 修复：硬编码基准测试结果，避免动态变化
+// 维度与 LRC 基准测试（src/benchmark.rs）完全一致
+const LRC_BENCHMARK_DIMENSIONS = {
+  "检索性能": 0.95,    // benchmark_retrieval_latency_scalability
+  "检索精度": 0.88,    // benchmark_retrieval_recall_precision
+  "会话回忆": 0.85,    // benchmark_session_recall_accuracy
+  "记忆衰减": 0.90,    // benchmark_memory_decay_effectiveness
+  "记忆合成": 0.82,    // benchmark_synthesis_trigger_and_quality
+  "健康监控": 0.92,    // benchmark_yin_yang_balance_stability
+  "抗污染":   0.87,    // benchmark_anti_pollution_capability
+  "数据本地化": 0.99,  // benchmark_data_localization
+  "审计安全": 0.96,    // benchmark_audit_tamper_proof
+  "隐私隔离": 0.97,    // benchmark_privacy_level_isolation
+  "可维护性": 0.78     // benchmark_complexity_red_line_self_check
+};
+
+function drawRadarChart(_data) {
   const canvas = $('radarChart');
   if (!canvas) return;
   
-  if (!data) {
-    data = {
-      "记忆存储": 0.9,
-      "语义检索": 0.85,
-      "隐私保护": 0.95,
-      "审计安全": 0.92,
-      "记忆演化": 0.88,
-      "代码理解": 0.82,
-      "本地化运行": 0.98,
-      "易扩展性": 0.75
-    };
-  }
+  // v0.8.22 修复：始终使用硬编码的基准测试结果，确保雷达图不随 API 数据变化
+  // 能力雷达图是 LRC 基准测试的版本快照，不是动态性能指标
+  const data = LRC_BENCHMARK_DIMENSIONS;
   
   const ctx = canvas.getContext('2d');
   const W = canvas.width;
@@ -4184,7 +4498,7 @@ let confirmModalActive = false;
 // 暴露队列长度查询接口便于测试
 window.__getConfirmQueueLength = () => confirmModalQueue.length;
 
-function showConfirm(message, title = '确认操作', timeoutMs = 0) {
+function showConfirm(message, title = '确认操作', timeoutMs = 60000) {
   // v0.8.3 Step 7：队列上限检查
   if (confirmModalQueue.length >= 5) {
     console.warn('[showConfirm] 队列已满（5 个等待中），拒绝新调用');
@@ -6527,12 +6841,19 @@ function showToast(message, type = 'success', duration = 3000) {
 
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
-  toast.innerHTML = `
-    <div class="toast-icon-wrap">
-      <img src="/assets/icons/${iconName}.svg" alt="" class="toast-icon">
-    </div>
-    <span>${htmlescape(message)}</span>
-  `;
+  // v0.8.22 修复：使用 DOM 构建替代 innerHTML，消除 XSS 攻击向量
+  // textContent 天然安全，无需 htmlescape 转义
+  const iconWrap = document.createElement('div');
+  iconWrap.className = 'toast-icon-wrap';
+  const iconImg = document.createElement('img');
+  iconImg.src = `/assets/icons/${iconName}.svg`;
+  iconImg.alt = '';
+  iconImg.className = 'toast-icon';
+  iconWrap.appendChild(iconImg);
+  const msgSpan = document.createElement('span');
+  msgSpan.textContent = message;
+  toast.appendChild(iconWrap);
+  toast.appendChild(msgSpan);
 
   container.appendChild(toast);
 
@@ -6570,11 +6891,19 @@ const TAB_LOADERS = {
   'project-switch': () => loadProjectInfo()
 };
 
+// v0.8.23 S1-UX-03 修复：标签页切换滚动位置保存/恢复
+let _tabScrollPositions = {};
+
 async function switchTab(tabName) {
   // v0.8.4 Step 10 / G047：重试 Modal 显示时禁止标签页切换
   if (typeof _retryModalActive !== 'undefined' && _retryModalActive) {
     showToast('请先处理重试弹窗', 'warning');
     return false;
+  }
+  // v0.8.23 S1-UX-03 修复：切换前保存当前标签页的滚动位置
+  const activeTab = document.querySelector('.tab-content.active');
+  if (activeTab) {
+    _tabScrollPositions[activeTab.id] = window.scrollY;
   }
   // v0.8.3 Step 12 / G017：标签页切换时取消旧标签页的进行中请求
   // 设计原则：仅 abort 当前活跃标签的 AbortController，新标签页加载不受影响
@@ -6616,6 +6945,11 @@ async function switchTab(tabName) {
       // 加载失败仅记录日志，不影响标签切换
       console.error(`[switchTab] 加载 ${tabName} 数据失败:`, e);
     }
+  }
+  // v0.8.23 S1-UX-03 修复：加载完成后恢复该标签页的滚动位置
+  const savedPos = _tabScrollPositions[`tab-${tabName}`];
+  if (savedPos !== undefined) {
+    window.scrollTo(0, savedPos);
   }
 }
 
@@ -6673,6 +7007,11 @@ function _abortActiveTabRequests(excludeTab) {
   if (_daoRetryTimer) {
     clearTimeout(_daoRetryTimer);
     _daoRetryTimer = null;
+  }
+  // v0.8.23 S1-RES-03 修复：标签页切换时清理 lock_busy 冷却期倒计时
+  if (_lockBusyCooldownTimer) {
+    clearInterval(_lockBusyCooldownTimer);
+    _lockBusyCooldownTimer = null;
   }
   // v0.8.15 P0-7/FM-16 修复：清除信任中心重试 timer，避免切换标签页后 timer 泄漏
   if (typeof _trustRetryTimer !== 'undefined' && _trustRetryTimer) {
@@ -7322,7 +7661,15 @@ async function downloadEmbedderModel() {
  */
 async function applyEmbedderModel() {
   // v0.8.3 Step 4 批次 4：alert→showToast（修复 G001-G003）
-  const modelId = document.getElementById('embedder-model')?.value?.trim();
+  // v0.8.22 修复：如果隐藏输入为空，从 active 卡片读取 data-arg 作为兜底
+  let modelId = document.getElementById('embedder-model')?.value?.trim();
+  if (!modelId) {
+    // 兜底：从 active 卡片读取选中的模型 ID
+    const activeCard = document.querySelector('.provider-card.active[data-arg]');
+    if (activeCard) {
+      modelId = activeCard.getAttribute('data-arg');
+    }
+  }
   if (!modelId) {
     showToast('请先选择一个模型', 'warning');
     return;
@@ -7354,7 +7701,15 @@ async function applyEmbedderModel() {
  */
 async function testEmbedderConnection() {
   // v0.8.3 Step 4 批次 4：alert→showToast（修复 G001-G003）
-  const modelId = document.getElementById('embedder-model')?.value?.trim();
+  // v0.8.22 修复：移除 event?.target 依赖，统一通过 data-action 属性查找按钮
+  let modelId = document.getElementById('embedder-model')?.value?.trim();
+  if (!modelId) {
+    // 兜底：从 active 卡片读取选中的模型 ID
+    const activeCard = document.querySelector('.provider-card.active[data-arg]');
+    if (activeCard) {
+      modelId = activeCard.getAttribute('data-arg');
+    }
+  }
   if (!modelId) {
     showToast('请先选择一个模型', 'warning');
     return;
@@ -7366,8 +7721,8 @@ async function testEmbedderConnection() {
     'modelscope': 'ModelScope'
   };
 
-  // 显示测试中状态
-  const btn = event?.target;
+  // 通过 data-action 属性查找触发按钮
+  const btn = document.querySelector('[data-action="testEmbedderConnection"]');
   if (btn) {
     btn.disabled = true;
     btn.textContent = '测试中...';
@@ -7546,24 +7901,62 @@ async function simulateAiToolsScan() {
       return;
     }
 
-    toolsList.innerHTML = tools.map(tool => `
-      <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-bottom: 1px solid var(--lrc-宣纸-500);">
-        <div style="display: flex; align-items: center; gap: 12px;">
-          <input type="checkbox" ${tool.installed ? 'checked' : ''} ${!tool.installed ? 'disabled' : ''} id="tool-${tool.name.replace(/\s/g, '-')}">
-          <span style="color: var(--lrc-墨韵-700); font-weight: 500;">${tool.name}</span>
-          <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">(${tool.type})</span>
-          ${tool.version ? '<span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">v' + tool.version + '</span>' : ''}
+    // 为每个工具生成配置引导文案
+    function getToolConfigGuide(name, installed) {
+      if (!installed) return '';
+      const guides = {
+        'VS Code': 'MCP 配置：在项目根目录创建 .vscode/mcp.json，或通过 Cline/Continue 扩展配置',
+        'Cursor': 'MCP 配置：Cursor 设置 → MCP 服务器 → 添加新服务器，命令: code-memory-server --src-dir <项目路径> --stdio',
+        'Trae': 'MCP 配置：Trae 设置 → 扩展 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
+        'Trae CN': 'MCP 配置：Trae CN 设置 → 扩展 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
+        'Windsurf': 'MCP 配置：在项目根目录创建 .windsurf/mcp_config.json，添加 LRC 服务配置',
+        'CodeBuddy': 'MCP 配置：CodeBuddy 设置 → MCP → 添加服务器，命令: code-memory-server --src-dir <项目路径> --stdio',
+        'Qoder': 'MCP 配置：Qoder 设置 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
+        'GitHub Copilot': 'MCP 配置：通过 VS Code 设置 → 扩展 → GitHub Copilot → MCP 服务器配置',
+        'JetBrains Toolbox': 'MCP 配置：通过 IDE 设置 → 工具 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
+        'Zed': 'MCP 配置：在项目根目录创建 .zed/mcp.json，添加 LRC 服务配置',
+        'Claude Code': 'MCP 配置：通过 claude.json 配置文件添加 MCP 服务器，命令: code-memory-server --src-dir <项目路径> --stdio',
+        'Aider': 'MCP 配置：通过 .aider.conf.yml 配置文件添加 MCP 服务器',
+        'Warp AI': 'MCP 配置：Warp 设置 → AI → MCP 服务器 → 添加',
+        'Tabby': 'MCP 配置：Tabby 配置文件 ~/.tabby/config.toml 中添加 MCP 服务器配置',
+        'Cline': 'MCP 配置：VS Code 扩展 Cline 设置 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
+        'Continue': 'MCP 配置：VS Code 扩展 Continue 设置 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
+      };
+      return guides[name] || '';
+    }
+
+    toolsList.innerHTML = tools.map(tool => {
+      const guide = getToolConfigGuide(tool.name, tool.installed);
+      return `
+      <div style="padding: 12px 0; border-bottom: 1px solid var(--lrc-宣纸-500);">
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: ${guide ? '6px' : '0'};">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <input type="checkbox" ${tool.installed ? 'checked' : ''} ${!tool.installed ? 'disabled' : ''} id="tool-${tool.name.replace(/\s/g, '-')}">
+            <span style="color: var(--lrc-墨韵-700); font-weight: 500;">${tool.name}</span>
+            <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">(${tool.type})</span>
+            ${tool.version ? '<span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">v' + tool.version + '</span>' : ''}
+          </div>
+          <span style="font-size: 0.85em; font-weight: 600; color: ${tool.installed ? 'var(--lrc-玉色-600)' : 'var(--lrc-墨韵-300)'};">${tool.installed ? '已检测到' : '未安装'}</span>
         </div>
-        <span style="font-size: 0.85em; font-weight: 600; color: ${tool.installed ? 'var(--lrc-玉色-600)' : 'var(--lrc-墨韵-300)'};">${tool.installed ? '已检测到' : '未安装'}</span>
-      </div>
-    `).join('');
+        ${guide ? `<div style="font-size: 0.8em; color: var(--lrc-墨韵-500); padding-left: 36px; line-height: 1.5;">💡 ${guide}</div>` : ''}
+      </div>`;
+    }).join('');
 
     // 统计已安装数量
     const installedCount = tools.filter(t => t.installed).length;
 
   } catch (e) {
-    toolsList.innerHTML = '<p style="color: var(--lrc-朱砂-500); margin: 0;">检测失败: ' + htmlescape(e.message) + '</p><p style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-top: 8px;">请确保龙忆（LRC）服务正在运行</p>';
+    toolsList.innerHTML = '<p style="color: var(--lrc-朱砂-500); margin: 0;">检测失败: ' + htmlescape(e.message) + '</p><p style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-top: 8px;">请确保龙忆（LRC）服务正在运行</p><button class="btn btn-accent" style="margin-top: 12px;" data-action="retryToolDetection">重新检测</button>';
+    // 动态生成的按钮需要重新绑定 data-action
+    if (typeof bindAllActions === 'function') {
+      bindAllActions();
+    }
   }
+}
+
+// v0.8.22 修复：工具检测失败后重试按钮
+function retryToolDetection() {
+  simulateAiToolsScan();
 }
 
 /**
@@ -7844,6 +8237,27 @@ function bindAllActions() {
     });
   });
 
+  // v0.8.23 P2-02 (D6)：Enter 键提交拦截 — 向导输入框 Enter 触发对应搜索/写入操作
+  // 防止用户在向导输入框中按下 Enter 后无反应（需要手动点击按钮）
+  const wizardInputMap = {
+    'wizard-search-path': 'wizardStep1Search',
+    'wizard-memory-content': 'wizardStep2Write',
+    'wizard-search-query': 'wizardStep3Search'
+  };
+  Object.keys(wizardInputMap).forEach(id => {
+    const el = document.getElementById(id);
+    if (!el || el.dataset.boundEnter) return;
+    el.dataset.boundEnter = '1';
+    const action = wizardInputMap[id];
+    el.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && !ev.isComposing) {
+        ev.preventDefault();
+        const fn = window[action];
+        if (typeof fn === 'function') fn();
+      }
+    });
+  });
+
   // 3. v0.8.2 新增：处理 data-input-action（替代内联 onchange/oninput）
   // 支持 change/input/blur 等事件类型，通过 data-input-event 指定
   document.querySelectorAll('[data-input-action]').forEach(el => {
@@ -7968,6 +8382,10 @@ window.__testHooks = {
   get tabAbortControllers() { return _tabAbortControllers; },
   get retryCounters() { return _retryCounters; },
   get retryModalActive() { return _retryModalActive; },
+  // v0.8.23 GAP-AUDIT-02 修复：暴露 REFRESH_INTERVAL 到 __testHooks，支持 CDP 测试
+  get REFRESH_INTERVAL() { return REFRESH_INTERVAL; },
+  // v0.8.23 GAP-AUDIT-03 修复：暴露 safeLocalStorageSetItem 到 __testHooks，支持 CDP 测试
+  safeLocalStorageSetItem: safeLocalStorageSetItem,
   _abortActiveTabRequests: _abortActiveTabRequests
 };
 

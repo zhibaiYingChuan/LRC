@@ -4,6 +4,73 @@
 
 ---
 
+## [0.8.23] - 2026-08-02
+
+### 安全加固 + 交互韧性提升 + 工具检测扩展（发布前合规审计）
+
+> v0.8.22 发布前 HCSE 合规审计（hcse-release-compliance 智能体）发现 CI/CD 权限过宽、
+> Actions 未固定 SHA、缺少运行时的安全加固、前端交互韧性不足（代理检测/Enter 拦截/502 重试缺失）。
+> 本版本综合修复所有安全与韧性缺陷，并通过 WebView2 CDP 交互测试 86/86 PASS。
+
+#### SE-01: CI/CD 权限收紧 + Actions SHA 固定 + harden-runner（安全评级：严重）
+- **修改文件**：
+  - [release.yml](file:///g:/code-memory/.github/workflows/release.yml)
+  - [ci.yml](file:///g:/code-memory/.github/workflows/ci.yml)
+  - [security.yml](file:///g:/code-memory/.github/workflows/security.yml)
+- **根因**：三个 workflow 均使用 `permissions: write-all`，违反最小权限原则；
+  所有第三方 Actions 使用 semver 标签（如 `actions/checkout@v4`），未固定到 Commit SHA，
+  存在供应链投毒风险；缺少 `step-security/harden-runner` 运行时安全加固
+- **修复**：
+  1. 每个 workflow 显式声明 `permissions: contents: read`，仅 release 作业保留 `contents: write`
+  2. 所有 Actions 固定到完整 Commit SHA（`actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683`）
+  3. 所有作业前置 `step-security/harden-runner` 配置 egress 白名单策略
+  4. 集成 `actions/attest-build-provenance` 生成 SLSA 构建来源证明
+
+#### IA-04: 代理检测（E4）+ 降级模式视觉区分（RPN 600）
+- **修改文件**：[static/app.js](file:///g:/code-memory/static/app.js)、[static/app.css](file:///g:/code-memory/static/app.css)
+- **根因**：HTTPS 代理环境下 WebSocket 连接失败时用户无感知，浏览器"正在等待代理隧道"UI 卡住；
+  降级模式（sidecar 不可达）与正常模式 UI 无明显差异，用户不知当前处于降级状态
+- **修复**：
+  1. 新增代理检测逻辑，WebSocket 连接失败时探测是否为代理环境
+  2. 降级模式添加视觉区分（边框高亮 + 提示条 + 功能按钮禁用）
+  3. 覆盖四级交互层级：L1 页面加载、L2 弹窗提示、L3 卡片状态、L4 按钮禁用
+
+#### IA-05: Enter 键拦截（D6）+ 502/504 自动重试（RPN 480）
+- **修改文件**：[static/app.js](file:///g:/code-memory/static/app.js)
+- **根因**：搜索框/输入框按 Enter 时未阻止默认提交行为，页面可能意外刷新；
+  502/504 网关错误时无重试逻辑，用户手动刷新体验差
+- **修复**：
+  1. 搜索框 Enter 事件添加 `preventDefault`，避免页面意外提交
+  2. 502/504 响应添加自动重试机制（最多 3 次，指数退避）
+  3. 重试期间显示"正在重试..."提示，避免用户反复点击
+
+#### IA-06: AbortController 传播 + lock_busy 冷却期倒计时（RPN 360）
+- **修改文件**：[static/app.js](file:///g:/code-memory/static/app.js)
+- **根因**：前序 AbortController 未连接到所有并发请求，标签页切换时仍有竞态残留；
+  lock_busy 状态仅显示"服务忙"，用户不知道何时可重试
+- **修复**：
+  1. 所有带 timeout 的 fetch 调用统一使用 AbortController 并串联 signal
+  2. lock_busy 响应时显示冷却期倒计时（"服务忙，请等待 X 秒后重试"）
+  3. 添加 `__LRC_TEST_HOOKS__` 测试钩子，供 CDP 测试验证状态
+
+#### UX-01: 信任中心刷新按钮 + 工具检测扩展
+- **修改文件**：
+  - [static/index.html](file:///g:/code-memory/static/index.html)
+  - [src/server.rs](file:///g:/code-memory/src/server.rs)
+  - [static/app.js](file:///g:/code-memory/static/app.js)
+- **根因**：信任中心检查结果无法刷新，用户需手动重新加载页面；工具检测未覆盖国产 IDE 路径
+- **修复**：
+  1. 信任中心添加"刷新"按钮，点击重新执行隐私检查
+  2. 工具检测扩展：添加 Trae CN 安装路径扫描
+  3. 桌面快捷方式扫描：检测 LRC 快捷方式冲突
+
+#### 测试：WebView2 CDP 交互测试 86/86 PASS
+- **测试文件**：[tests/](file:///g:/code-memory/tests/)
+- **说明**：新增代理检测、Enter 拦截、502/504 重试、lock_busy 冷却期、降级模式视觉区分、
+  信任中心刷新等 12 项 CDP 测试用例，全部通过（86/86）
+
+---
+
 ## [0.8.22] - 2026-07-31
 
 ### 桌面端图标一致性 + 前端交互韧性修复（双智能体审计）

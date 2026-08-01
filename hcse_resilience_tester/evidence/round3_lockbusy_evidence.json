@@ -1,0 +1,195 @@
+{
+  "audit_start": "2026-08-01T03:14:27.299428+00:00",
+  "cdp_target_id": "80A75CBE916F18A7A2CD263EAC1ACA38",
+  "cdp_target_title": "龙忆 Loong Recall · 仪表盘",
+  "sidecar_endpoints": {
+    "/health": {
+      "status_code": null,
+      "latency_ms": 4006,
+      "error": "timed out",
+      "body_preview": ""
+    },
+    "/v1/health/system": {
+      "status_code": null,
+      "latency_ms": 4018,
+      "error": "timed out",
+      "body_preview": ""
+    },
+    "/v1/health/detailed": {
+      "status_code": null,
+      "latency_ms": 4007,
+      "error": "timed out",
+      "body_preview": ""
+    },
+    "/v1/health/dao_metrics": {
+      "status_code": null,
+      "latency_ms": 4024,
+      "error": "timed out",
+      "body_preview": ""
+    }
+  },
+  "frontend_state": {
+    "appVersion": "0.8.22",
+    "monitor": {
+      "exists": true,
+      "isReachable": false,
+      "sidecarStatus": "unknown",
+      "lockBusy": false,
+      "failCount": 5,
+      "failThreshold": 2,
+      "backoffStep": 4,
+      "pollInterval": 10000,
+      "inFlight": false,
+      "isIndexing": false,
+      "getSidecarStatus": "unknown",
+      "hasCheck": true,
+      "hasStart": true
+    },
+    "daoAbortController": {
+      "exists": true,
+      "signalAborted": false
+    },
+    "globalErrorRegistered": true,
+    "retryCounters": null,
+    "daoRetryCount": null,
+    "daoRetryTimerExists": null,
+    "daoMaxRetries": null,
+    "dashboardRetryCount": null,
+    "dashboardRetryTimerExists": null,
+    "dashboardMaxRetries": null,
+    "statusBar": {
+      "text": "",
+      "outerHTML": "<span class=\"status-dot offline\" id=\"system-status-dot\" style=\"width: 12px; height: 12px;\"></span>"
+    },
+    "statusDot": {
+      "className": "status-dot offline",
+      "text": ""
+    },
+    "statusBarFull": "已停止 / 不可达 版本 v0.8.22 数据目录：.loong-recall/data/ 运行时长：12分钟 5秒",
+    "daoRingScore": "73",
+    "daoFallbackBanner": null,
+    "daoIndexingHint": null,
+    "dashboardError": {
+      "visible": false,
+      "text": "",
+      "innerHTML_preview": ""
+    },
+    "dashboardLoading": {
+      "visible": true
+    },
+    "toasts": {
+      "containerExists": true,
+      "count": 0,
+      "messages": []
+    },
+    "activeTab": "dashboard",
+    "sidecarDownBanner": {
+      "hidden": false,
+      "text": "⚠️ LRC 服务未运行，部分功能不可用 启动服务"
+    },
+    "pendingRequestCount": -53,
+    "pendingBackgroundCount": null
+  },
+  "handleHttpError_503": {
+    "handleHttpErrorSrc": "async function handleHttpError(response, context = '操作', retryContext = null) {\n  const status = response.status;\n  let errorDetail = '';\n  try {\n    const errJson = await response.json();\n    errorDetail = errJson?.error || errJson?.message || '';\n  } catch (e) {\n    try {\n      errorDetail = await response.text();\n    } catch (e2) {\n      errorDetail = `HTTP ${status}`;\n    }\n  }\n  // 限制错误详情长度，避免 Toast 过长\n  if (errorDetail.length > 200) errorDetail = errorDetail.substring(0, 200) + '...';\n\n  console.error(`[handleHttpError] ${context} 失败 [${status}]:`, errorDetail);\n\n  if (status === 500) {\n    // v0.8.13 D3: 自动刷新触发的 500 错误降级为 Toast，不弹阻塞 Modal\n    // 自动刷新失败属于预期内的偶发错误，弹 Modal 会打断用户操作\n    const isAutoRefresh = context && (context.includes('auto-refresh') || context.includes('autoRefresh'));\n    if (isAutoRefresh) {\n      if (typeof showToast === 'function') {\n        showToast('数据自动刷新失败，将在下次刷新时重试', 'warning');\n      }\n      return { action: 'cancel', status, errorDetail };\n    }\n    // v0.8.4 Step 10 / G029：重试次数上限检查\n    const retryKey = retryContext ? `${retryContext.method || 'GET'}:${retryContext.url || ''}` : `default:${context}`;\n    const retryCount = _retryCounters.get(retryKey) || 0;\n\n    if (retryCount >= MAX_RETRY_COUNT) {\n      // 超过重试上限，显示\"停止重试\"+ 引导\n      _retryCounters.delete(retryKey); // 重置计数\n      _retryModalActive = true;\n      try {\n        await showInfoModal('多次重试失败',\n          `${context}已连续失败 ${MAX_RETRY_COUNT} 次。\\n\\n` +\n          `可能原因：\\n` +\n          `• 服务端内部错误\\n` +\n          `• 数据库锁冲突\\n` +\n          `• 资源不足\\n\\n` +\n          `建议操作：\\n` +\n          `• 查看 LRC 服务日志\\n` +\n          `• 重启 LRC 服务\\n` +\n          `• 联系技术支持`\n        );\n      } finally {\n        _retryModalActive = false;\n      }\n      return { action: 'giveup', status, errorDetail };\n    }\n\n    // v0.8.4 Step 10 / G047：重试 Modal 显示时禁止标签页切换\n    _retryModalActive = true;\n    let shouldRetry;\n    try {\n      shouldRetry = await showConfirm(\n        `${context}失败：服务内部错误（第 ${retryCount + 1} 次重试）\\n\\n错误详情：${errorDetail}\\n\\n是否重试？`,\n        '服务错误',\n        0\n      );\n    } finally {\n      _retryModalActive = false;\n    }\n\n    if (shouldRetry) {\n      _retryCounters.set(retryKey, retryCount + 1);\n      // v0.8.4 Step 10 / G029：指数退避（1s → 2s → 4s）\n      const backoff = Math.pow(2, retryCount) * 1000;\n      console.log(`[handleHttpError] 用户选择重试，${backoff}ms 后重试（第 ${retryCount + 1} 次）`);\n      await new Promise(r => setTimeout(r, backoff));\n      return { action: 'retry', status, errorDetail };\n    }\n    _retryCounters.delete(retryKey);\n    return { action: 'cancel', status, errorDetail };\n  } else if (status === 503) {\n    // v0.8.19 GAP-02/GAP-03 修复：503 lock_busy 友好文案 + 1 次自动重试\n    // 根因：v0.8.19 后端 try_lock + 503 lock_busy 已正确返回，但前端 503 分支直接 cancel\n    //   - GAP-02：Toast 文案含完整 URL \"请求 http://127.0.0.1:3099/...\" 对非技术用户是噪声\n    //   - GAP-03：500 错误有 3 次重试，503 直接放弃，行为不一致\n    // 修复：\n    //   - 首次 503 lock_busy：静默重试 1 次（2s 后），与 500 行为一致\n    //   - 重试仍失败：显示友好 Toast（不暴露 URL，文案改为\"后台合成中\"）\n    const lockBusyRetryKey = `503:${context}`;\n    const lockBusyRetryCount = _retryCounters.get(lockBusyRetryKey) || 0;\n\n    if (lockBusyRetryCount < 1) {\n      _retryCounters.set(lockBusyRetryKey, lockBusyRetryCount + 1);\n      console.log(`[handleHttpError] 503 lock_busy，2s 后自动重试（第 ${lockBusyRetryCount + 1} 次）`);\n      await new Promise(r => setTimeout(r, 2000));\n      return { action: 'retry', status, errorDetail };\n    }\n\n    // 重试仍失败：显示友好 Toast（不暴露 URL）\n    _retryCounters.delete(lockBusyRetryKey);\n    showToast('记忆系统正在后台合成，请稍后重试', 'info', 5000);\n    return { action: 'cancel', status, errorDetail };\n  } else if (status === 429) {\n    // G007 扩展：429 限流\n    showToast(`${context}失败：请求过于频繁，请稍后再试`, 'warning', 4000);\n    return { action: 'cancel', status, errorDetail };\n  } else if (status === 401 || status === 403) {\n    // 鉴权失败\n    showToast(`${context}失败：权限不足（${status}）`, 'error', 4000);\n    return { action: 'cancel', status, errorDetail };\n  } else {\n    // 其他非 2xx 错误\n    showToast(`${context}失败：${errorDetail || 'HTTP ' + status}`, 'error', 4000);\n    return { action: 'cancel', status, errorDetail };\n  }\n}",
+    "showToastSrc": "function showToast(message, type = 'success', duration = 3000) {\n  const container = document.getElementById('toast-container');\n  if (!container) return;\n\n  // G011-1：去重检查（1.5s 内相同消息跳过）\n  // v0.8.4 Step 8 / G026 修复：去重检查在显示前，但记录在显示后\n  // 避免被上限跳过的消息也记录时间戳，导致后续调用被误去重\n  const now = Date.now();\n  const dedupKey = `${type}:${message}`;\n  if (_recentToastMessages.has(dedupKey)) {\n    const last = _recentToastMessages.get(dedupKey);\n    if (now - last < _TOAST_DEDUP_WINDOW) {\n      // 重复消息，跳过（但更新时间戳，避免后续显示的 Toast 被误判）\n      _recentToastMessages.set(dedupKey, now);\n      return;\n    }\n  }\n\n  // G011-2：可见 Toast 数量上限管理（在去重检查之后，记录 dedupKey 之前）\n  const visibleToasts = container.querySelectorAll('.toast:not(.toast-leaving)');\n  if (visibleToasts.length >= TOAST_MAX_VISIBLE) {\n    if (type === 'error') {\n      // error 优先：移除最旧的非 error Toast\n      const oldestNonError = Array.from(visibleToasts).find(t => !t.classList.contains('toast-error'));\n      if (oldestNonError) {\n        oldestNonError.classList.add('toast-leaving');\n        setTimeout(() => {\n          if (oldestNonError.parentNode) oldestNonError.parentNode.removeChild(oldestNonError);\n        }, 200);\n      }\n    } else {\n      // 非 error 超出上限，跳过（避免堆积）\n      // v0.8.4 Step 8 / G026：此处不记录 dedupKey，允许后续重试\n      console.log('[showToast] 队列已满，跳过非 error 消息:', message);\n      return;\n    }\n  }\n\n  // v0.8.4 Step 8 / G026 修复：显示后才记录 dedupKey\n  // 确保只有真正显示的 Toast 才占用去重窗口，避免首条被误去重\n  _recentToastMessages.set(dedupKey, now);\n  // 2s 后清理过期记录，避",
+    "maxRetryCount": null,
+    "retryModalActive": null,
+    "lockbusy_branch_preview": "503) {\n    // v0.8.19 GAP-02/GAP-03 修复：503 lock_busy 友好文案 + 1 次自动重试\n    // 根因：v0.8.19 后端 try_lock + 503 lock_busy 已正确返回，但前端 503 分支直接 cancel\n    //   - GAP-02：Toast 文案含完整 URL \"请求 http://127.0.0.1:3099/...\" 对非技术用户是噪声\n    //   - GAP-03：500 错误有 3 次重试，503 直接放弃，行为不一致\n    // 修复：\n    //   - 首次 503 lock_busy：静默重试 1 次（2s 后），与 500 行为一致\n    //   - 重试仍失败：显示友好 Toast（不暴露 URL，文案改为\"后台合成中\"）\n    const lockBusyRetryKey = `503:${context}`;\n    const lockBusyRetryCount = _retryCounters.get(lockBusyRetryKey) || 0;\n\n    if (lockBusyRetryCount < 1) {\n      _retryCounters.set(lockBusyRetryKey, lockBusyRetryCount + 1);\n      console.log(`[handleHttpError] 503 lock_busy，2s 后自动重试（第 ${lockBusyRetryCount + 1} 次）`);\n      await new Promise(r => setTimeout(r, 2000));\n      return { action: 'retry', status, errorDetail };\n"
+  },
+  "loadDaoMetrics_catch": {
+    "loadDaoMetricsSrc": "async function loadDaoMetrics() {\n  // v0.8.13 B2: 清除已有的重试 timer，避免竞态\n  if (_daoRetryTimer) {\n    clearTimeout(_daoRetryTimer);\n    _daoRetryTimer = null;\n  }\n  // v0.8.22 IA-01：abort 上一次未完成的请求（避免旧请求覆盖新数据）\n  if (daoAbortController) {\n    daoAbortController.abort();\n  }\n  daoAbortController = new AbortController();\n  window.daoAbortController = daoAbortController; // v0.8.22 HCSE: 同步到 window 便于 CDP 测试\n  const currentDaoSignal = daoAbortController.signal;\n  try {\n    // v0.8.11：超时从 5s 延长到 10s，与 loadDashboard 默认超时一致\n    // sidecar 刚启动/索引期间 dao_metrics 计算涉及编码器状态检查，5s 不够\n    const response = await fetchWithTimeout(`${window.API_BASE}/v1/health/dao_metrics`, { signal: currentDaoSignal }, 10000);\n    const data = await safeJson(response);\n\n    if (data.ok && data.data) {\n      _daoRetryCount = 0; // 成功时重置重试计数器\n      // v0.8.11 P0-5：成功时清除\"索引中\"提示横幅（如果存在）\n      const indexingHint = document.querySelector('.dao-indexing-hint');\n      if (indexingHint) indexingHint.remove();\n      // v0.8.13 C1: 清除降级横幅（避免与正常数据矛盾显示）\n      const fallbackBanner = document.querySelector('.dao-fallback-banner');\n      if (fallbackBanner) fallbackBanner.remove();\n      const m = data.data;\n      // v0.8.1：后端已返回 0-100 区间值，前端直接使用\n      // yin_yang_balance: 0-100（阴阳守恒度）\n      // luoshu_deviation: 0-100（洛书偏差，越小越好）\n      // bagua_balance: 0-100（八卦均衡度）\n      // synthesis_ratio: 0-100（合成比率百分比）\n      // 计算综合健康评分（0-100）\n      const score = Math.min(100, Math.max(0, Math.round(\n        (m.yin_yang_balance || 80) * 0.25 +\n        (100 - (m.luoshu_deviation || 20)) * 0.25 +\n        (m.bagua_balance || 75) * 0.25 +\n        Math.min(20, (m.synthesis_ratio || 10) / 5) * 5 * 0.25\n      )));\n\n      drawDaoRing(score);\n      const scoreEl = document.getElementById('dao-ring-score');\n      if (scoreEl) scoreEl.textContent = score;\n\n      // 更新四个小指标\n      const setText = (id, val) => {\n        const el = document.getElementById(id);\n        if (el) el.textContent = val;\n      };\n      setText('dao-yin-yang', ((m.yin_yang_balance || 80) / 100).toFixed(2));\n      setText('dao-luoshu-deviation', (m.luoshu_deviation || 0).toFixed(2));\n      setText('dao-bagua-balance', ((m.bagua_balance || 75) / 100).toFixed(2));\n      setText('dao-synthesis-ratio', (m.synthesis_ratio || 0).toFixed(1) + '%');\n\n      console.log(`[LRC v${APP_VERSION}]道同构度加载完成，健康评分: ${score}`);\n    } else {\n      // v0.8.4 Step 4：降级分支补全 4 个小指标（修复 G020 + CDP 测试 #2）\n      // 之前仅设 score=85 但 4 个指标保持空值，导致矛盾状态和 CDP 检测失败\n      _applyDaoMetricsFallback('数据格式异常');\n    }\n  } catch (err) {\n    // v0.8.22 IA-01：AbortError 是切换标签页时的预期行为，不显示错误\n    if (err && (err.name === 'AbortError' || (err.message && err.message.includes('外部取消')))) {\n      console.log('[LRC] 道同构度请求已被取消（标签页切换）');\n      return;\n    }\n    console.warn('[LRC v' + APP_VERSION + ']道同构度加载失败（重试 ' + _daoRetryCount + '/' + _DAO_MAX_RETRIES + '）:', err.message);\n\n    // v0.8.11 P0-5：检查 sidecar 是否正在索引\n    // 索引期间 dao_metrics 接口响应慢是预期行为，不应显示\"加载失败\"，应显示\"索引中\"\n    const isIndexing = typeof SidecarHealthMonitor !== 'undefined'\n      && SidecarHealthMonitor\n      && typeof SidecarHealthMonitor.isIndexing === 'function'\n      && SidecarHealthMonitor.isIndexing();\n\n    // v0.8.11：自动重试 + 指数退避（2s/4s/8s），避免 sidecar 索引期间短暂超时导致永久降级\n    if (_daoRetryCount < _DAO_MAX_RETRIES) {\n      _daoRetryCount++;\n      const delay = 2000 * Math.pow(2, _daoRetryCount - 1); // 2s, 4s, 8s\n      console.log('[LRC] 道同构度 ' + delay + 'ms 后自动重试...');\n      // v0.8.11 P0-5：索引期间显示\"索引中\"提示，而非静默等待重试\n      if (isIndexing) {\n        _applyDaoMetricsIndexingHint();\n      }\n      // v0.8.13 B2: 保存 timer ID，支持标签页切换时取消\n      _daoRetryTimer = setTimeout(() => {\n        _daoRetryTimer = null;\n        loadDaoMetrics();\n      }, delay);\n      return; // 不显示降级横幅，等待重试结果\n    }\n    // 重试耗尽，重置计数器并显示降级提示\n    _daoRetryCount = 0;\n    // v0.8.22 P0-04+INV-05 修复（interaction-resilience-auditor + hcse-resilience-validator）：\n    //   重试耗尽时，根据 sidecar 状态和锁状态区分提示文案\n    //   - 503 lock_busy / _lockBusy=true：显示\"后台合成中\"（sidecar 在线但持锁）\n    //   - sidecar 不可达：显示\"LRC 服务未启动\"\n    //   - sidecar 索引中但响应超时：显示\"索引耗时较长，请稍后手动刷新\"\n    //   - 其他错误：显示实际错误\n    //   根因：原实现未检查 503 lock_busy，将 lock_busy 误报为\"服务未启动\"\n    let reason;\n    if (err && err.status === 503) {\n      // 503 lock_busy：sidecar 在线但后台合成持锁\n      reason = '后台合成中，请稍后刷新';\n      console.log('[LRC] 道同构度 503 lock_busy，显示\"后台合成中\"而非\"服务未启动\"');\n    } else if (typeof SidecarHealthMonitor !== 'undefined'\n      && SidecarHealthMonitor\n      && SidecarHealthMonitor._lockBusy === true) {\n      // /health 返回 lock_busy=true：sidecar 在线但繁忙\n      reason = '后台合成中，请稍后刷新';\n    } else if (err && err.name === 'SidecarUnreachableError') {\n      reason = 'LRC 服务未启动';\n    } else if (isIndexing) {\n      reason = '索引耗时较长，请稍后手动刷新';\n    } else {\n      reason = (err && err.message) ? err.message : '未知错误';\n    }\n    _applyDaoMetricsFallback(reason);\n  }\n}",
+    "catchBlockPreview": "catch (err) {\n    // v0.8.22 IA-01：AbortError 是切换标签页时的预期行为，不显示错误\n    if (err && (err.name === 'AbortError' || (err.message && err.message.includes('外部取消')))) {\n      console.log('[LRC] 道同构度请求已被取消（标签页切换）');\n      return;\n    }\n    console.warn('[LRC v' + APP_VERSION + ']道同构度加载失败（重试 ' + _daoRetryCount + '/' + _DAO_MAX_RETRIES + '）:', err.message);\n\n    // v0.8.11 P0-5：检查 sidecar 是否正在索引\n    // 索引期间 dao_metrics 接口响应慢是预期行为，不应显示\"加载失败\"，应显示\"索引中\"\n    const isIndexing = typeof SidecarHealthMonitor !== 'undefined'\n      && SidecarHealthMonitor\n      && typeof SidecarHealthMonitor.isIndexing === 'function'\n      && SidecarHealthMonitor.isIndexing();\n\n    // v0.8.11：自动重试 + 指数退避（2s/4s/8s），避免 sidecar 索引期间短暂超时导致永久降级\n    if (_daoRetryCount < _DAO_MAX_RETRIES) {\n      _daoRetryCount++;\n      const delay = 2000 * Math.pow(2, _daoRetryCount - 1); // 2s, 4s, 8s\n      console.log('[LRC] 道同构度 ' + delay + 'ms 后自动重试...');\n      // v0.8.11 P0-5：索引期间显示\"索引中\"提示，而非静默等待重试\n      if (isIndexing) {\n        _applyDaoMetricsIndexingHint();\n      }\n      // v0.8.13 B2: 保存 timer ID，支持标签页切换时取消\n      _daoRetryTimer = setTimeout(() => {\n        _daoRetryTimer = null;\n        loadDaoMetrics();\n      }, delay);\n      return; // 不显示降级横幅，等待重试结果\n    }\n    // 重试耗尽，重置计数器并显示降级提示\n    _daoRetryCount = 0;\n    // v0.8.22 P0-04+INV-05 修复（interaction-resilience-auditor + hcse-resilience-validator）：\n    //   重试耗尽时，根据 sidecar 状态和锁状态区分提示文案\n    //   - 503 lock_busy / _lockBusy=true：显示\"后台合成中\"（sidecar 在线但持锁）\n    //   - sidecar 不可达：显示\"L",
+    "hasStatus503Check": true,
+    "hasLockBusyCheck": true,
+    "hasApplyFallback": true
+  },
+  "loadDashboard_catch": {
+    "loadDashboardSrc": "async function loadDashboard() {\n  const loading = $('dashboard-loading');\n  const error = $('dashboard-error');\n  if (!loading) return;\n\n  // v0.8.3 Step 10：abort 上一次未完成的请求（避免旧请求覆盖新数据）\n  if (dashboardAbortController) {\n    dashboardAbortController.abort();\n  }\n  dashboardAbortController = new AbortController();\n  const currentSignal = dashboardAbortController.signal;\n\n  // v0.8.13 B1: 清除已有的索引期重试 timer，避免竞态\n  if (_dashboardRetryTimer) {\n    clearTimeout(_dashboardRetryTimer);\n    _dashboardRetryTimer = null;\n  }\n\n  loading.classList.remove('hidden');\n  if (error) {\n    error.classList.remove('show');\n    error.textContent = '';\n  }\n\n  try {\n    // 并行请求三个端点（传入当前 signal，支持外部 abort）\n    const [systemRes, detailedRes, daoRes] = await Promise.allSettled([\n      fetchWithTimeout(API_BASE + '/v1/health/system', { signal: currentSignal }),\n      fetchWithTimeout(API_BASE + '/v1/health/detailed', { signal: currentSignal }),\n      fetchWithTimeout(API_BASE + '/v1/health/dao_metrics', { signal: currentSignal }),\n    ]);\n\n    // v0.8.3 Step 10：检查是否已被新的请求 abort（若是则静默退出）\n    if (currentSignal.aborted) {\n      console.log('[loadDashboard] 请求被新请求 abort，静默退出');\n      return;\n    }\n\n    let systemData = null;\n    let detailedData = null;\n    let daoData = null;\n\n    if (systemRes.status === 'fulfilled' && systemRes.value.ok) {\n      systemData = await systemRes.value.json();\n    }\n    if (detailedRes.status === 'fulfilled' && detailedRes.value.ok) {\n      detailedData = await detailedRes.value.json();\n    }\n    if (daoRes.status === 'fulfilled' && daoRes.value.ok) {\n      daoData = await daoRes.value.json();\n    }\n\n    // v0.8.19 GAP-01 P0 修复：识别 503 lock_busy，区分于\"无法连接\"\n    // 根因：v0.8.19 后端 try_lock + 503 lock_busy 已正确返回，但前端 loadDashboard\n    //   将 503 lock_busy 误报为\"无法连接到 API 服务\"，导致结晶期间用户仍看到误导性错误\n    // 修复：检查是否有 503 状态码，如果有则 throw LOCK_BUSY，进入 catch 后显示\"后台合成中\"\n    const hasLockBusy = [systemRes, detailedRes, daoRes].some(\n      r => r.status === 'fulfilled' && r.value && r.value.status === 503\n    );\n\n    if (hasLockBusy && !systemData && !daoData) {\n      // sidecar 在线但繁忙（结晶期间），不是\"无法连接\"\n      throw new Error('LOCK_BUSY');\n    }\n\n    if (!systemData && !daoData) {\n      throw new Error('无法连接到 API 服务，请确认 Loong Recall 服务已启动 (' + API_BASE + ')');\n    }\n\n    renderDashboard(systemData, detailedData, daoData);\n    updateStatusBar(true, systemData);\n    // v0.8.12：加载成功时重置索引期重试计数器\n    _dashboardRetryCount = 0;\n    // v0.8.12：加载成功时清除\"索引中\"错误提示（如果存在）\n    if (error) error.classList.remove('show');\n\n    // v0.8.0 桌面端 P2 改进：仪表盘加载成功后自动刷新进化时间线\n    // 不 await，避免阻塞 loadDashboard；loadEvolutionTimeline 内部有 try/catch\n    loadEvolutionTimeline();\n\n    // v0.8.5 Step 2 / G080 修复：恢复上次选中的预设场景\n    // 之前 restoreSelectedScenario 定义但从未被调用，导致刷新后预设场景丢失\n    restoreSelectedScenario();\n\n    loading.classList.add('hidden');\n  } catch (e) {\n    // v0.8.3 Step 10：外部 abort 静默处理，不显示错误\n    if (e.name === 'AbortError' && currentSignal.aborted) {\n      console.log('[loadDashboard] 请求被 abort（正常行为）');\n      // v0.8.4 Step 7 / G033 修复：AbortError 时也要隐藏 loading-overlay\n      // 避免快速切换标签页导致 loading-overlay 永久显示\n      if (loading) loading.classList.add('hidden');\n      return;\n    }\n    // v0.8.19 GAP-01 P0 修复：LOCK_BUSY（503 lock_busy）特殊处理\n    // sidecar 在线但繁忙（结晶期间），显示\"后台合成中\"并自动重试\n    // 不进入\"无法连接到 API 服务\"分支，避免误导用户\n    if (e.message === 'LOCK_BUSY') {\n      if (loading) loading.classList.add('hidden');\n      // 自动重试（复用 _dashboardRetryCount 机制，与索引期重试一致）\n      if (_dashboardRetryCount < _DASHBOARD_MAX_RETRIES) {\n        _dashboardRetryCount++;\n        const retryDelay = 2000 * Math.pow(2, _dashboardRetryCount - 1); // 2s/4s/8s\n        console.log('[loadDashboard] 503 lock_busy，' + retryDelay + 'ms 后自动重试 (' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')');\n        if (error) {\n          error.innerHTML = '⏳ 记忆系统正在执行后台合成，数据稍后自动加载... <span style=\"opacity:0.7;font-size:0.9em\">(' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')</span>';\n          error.classList.add('show');\n        }\n        _dashboardRetryTimer = setTimeout(() => {\n          _dashboardRetryTimer = null;\n          loadDashboard();\n        }, retryDelay);\n      } else {\n        // v0.8.21 P0-03 修复（GAP-P0-03）：重试耗尽后显示手动刷新引导\n        // 原实现重试 3 次后只显示静态文案，用户无操作路径\n        // 修复：显示\"后台合成耗时较长\" + 立即刷新按钮\n        console.log('[loadDashboard] 503 lock_busy 重试耗尽，显示手动刷新引导');\n        if (error) {\n          error.innerHTML = '⏳ 后台合成耗时较长，建议稍后手动刷新<br>'\n            + '<button onclick=\"loadDashboard()\" style=\"margin-top:8px;padding:6px 16px;background:#4a90d9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;\">立即刷新</button>'\n            + '<button onclick=\"this.parentElement.classList.remove(\\'show\\')\" style=\"margin-top:8px;margin-left:8px;padding:6px 16px;background:#666;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;\">关闭</button>';\n          error.classList.add('show');\n        }\n      }\n      return;\n    }\n    if (loading) loading.classList.add('hidden');\n\n    // v0.8.12：索引期间不覆盖\"运行中/索引中\"状态栏，显示提示并自动重试\n    const isIndexing = typeof SidecarHealthMonitor !== 'undefined'\n      && SidecarHealthMonitor\n      && typeof SidecarHealthMonitor.isIndexing === 'function'\n      && SidecarHealthMonitor.isIndexing();\n    const sidecarKnownReachable = typeof SidecarHealthMonitor !== 'undefined'\n      && SidecarHealthMonitor\n      && SidecarHealthMonitor._isReachable;\n\n    if (isIndexing && _dashboardRetryCount < _DASHBOARD_MAX_RETRIES) {\n      // 索引期数据加载失败，显示\"索引中\"提示并自动重试\n      _dashboardRetryCount++;\n      if (error) {\n        error.textContent = 'LRC 服务正在索引代码库，仪表盘数据稍后自动加载...';\n        error.classList.add('show');\n      }\n      // 不覆盖状态栏（保持\"索引中...\"显示）\n      // v0.8.13 B1: 固定 3s 改为指数退避（2s/4s/8s），并保存 timer ID 支持取消\n      const retryDelay = 2000 * Math.pow(2, _dashboardRetryCount - 1); // 2s/4s/8s\n      console.log('[loadDashboard] 索引期加载失败，' + retryDelay + 'ms 后自动重试 (' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')');\n      _dashboardRetryTimer = setTimeout(() => {\n        _dashboardRetryTimer = null;\n        loadDashboard();\n      }, retryDelay);\n      return;\n    }\n\n    // 非索引期或重试耗尽，显示错误\n    _dashboardRetryCount = 0;\n    if (error) {\n      // v0.8.15 P0-5 修复：sidecar 已知可达时（索引期），显示\"索引中\"提示而非\"无法连接\"\n      // 避免与状态栏\"运行中\"矛盾\n      if (sidecarKnownReachable) {\n        error.textContent = '⏳ LRC 服务正在索引代码库，数据稍后自动加载...';\n      } else {\n        error.textContent = '⚠️ ' + htmlescape(e.message);\n      }\n      error.classList.add('show');\n    }\n    // v0.8.12：仅在 sidecar 确实不可达时才更新状态栏为\"已停止\"\n    // 避免 sidecar 已启动但数据加载失败时覆盖\"运行中\"状态\n    // v0.8.22 HCSE GAP-L5-01 修复：检查 SidecarHealthMonitor 实际可达性\n    //   根因：503 lock_busy 时 loadDashboard 失败，sidecarKnownReachable 可能为 false，\n    //         导致 updateStatusBar(false) 覆盖状态栏为\"已停止\"，但 sidecar 实际在线\n    //   修复：增加 SidecarHealthMonitor._isReachable 检查，只有 sidecar 真正不可达时才更新状态栏\n    if (!sidecarKnownReachable && !(typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor._isReachable)) {\n      updateStatusBar(false, null);\n    }\n  } finally {\n    // v0.8.3 Step 10：清理 AbortController 引用（仅当当前请求未被打断）\n    if (dashboardAbortController === currentSignal) {\n      dashboardAbortController = null;\n    }\n    // v0.8.4 Step 7 / G033 兜底：确保所有路径都隐藏 loading-overlay\n    if (loading && !loading.classList.contains('hidden')) {\n      loading.classList.add('hidden');\n    }\n  }\n}",
+    "lockbusyBlockPreview": "LOCK_BUSY，进入 catch 后显示\"后台合成中\"\n    const hasLockBusy = [systemRes, detailedRes, daoRes].some(\n      r => r.status === 'fulfilled' && r.value && r.value.status === 503\n    );\n\n    if (hasLockBusy && !systemData && !daoData) {\n      // sidecar 在线但繁忙（结晶期间），不是\"无法连接\"\n      throw new Error('LOCK_BUSY');\n    }\n\n    if (!systemData && !daoData) {\n      throw new Error('无法连接到 API 服务，请确认 Loong Recall 服务已启动 (' + API_BASE + ')');\n    }\n\n    renderDashboard(systemData, detailedData, daoData);\n    updateStatusBar(true, systemData);\n    // v0.8.12：加载成功时重置索引期重试计数器\n    _dashboardRetryCount = 0;\n    // v0.8.12：加载成功时清除\"索引中\"错误提示（如果存在）\n    if (error) error.classList.remove('show');\n\n    // v0.8.0 桌面端 P2 改进：仪表盘加载成功后自动刷新进化时间线\n    // 不 await，避免阻塞 loadDashboard；loadEvolutionTimeline 内部有 try/catch\n    loadEvolutionTimeline();\n\n    // v0.8.5 Step 2 / G080 修复：恢复上次选中的预设场景\n    // 之前 restoreSelectedScenario 定义但从未被调用，导致刷新后预设场景丢失\n    restoreSelectedScenario();\n\n    loading.classList.add('hidden');\n  } catch (e) {\n    /",
+    "hasHasLockBusyCheck": true,
+    "callsHandleHttpError": false
+  },
+  "toast_dedup_test": {
+    "showToastSrc": "function showToast(message, type = 'success', duration = 3000) {\n  const container = document.getElementById('toast-container');\n  if (!container) return;\n\n  // G011-1：去重检查（1.5s 内相同消息跳过）\n  // v0.8.4 Step 8 / G026 修复：去重检查在显示前，但记录在显示后\n  // 避免被上限跳过的消息也记录时间戳，导致后续调用被误去重\n  const now = Date.now();\n  const dedupKey = `${type}:${message}`;\n  if (_recentToastMessages.has(dedupKey)) {\n    const last = _recentToastMessages.get(dedupKey);\n    if (now - last < _TOAST_DEDUP_WINDOW) {\n      // 重复消息，跳过（但更新时间戳，避免后续显示的 Toast 被误判）\n      _recentToastMessages.set(dedupKey, now);\n      return;\n    }\n  }\n\n  // G011-2：可见 Toast 数量上限管理（在去重检查之后，记录 dedupKey 之前）\n  const visibleToasts = container.querySelectorAll('.toast:not(.toast-leaving)');\n  if (visibleToasts.length >= TOAST_MAX_VISIBLE) {\n    if (type === 'error') {\n      // error 优先：移除最旧的非 error Toast\n      const oldestNonError = Array.from(visibleToasts).find(t => !t.classList.contains('toast-error'));\n      if (oldestNonError) {\n        oldestNonError.classList.add('toast-leaving');\n        setTimeout(() => {\n          if (oldestNonError.parentNode) oldestNonError.parentNode.removeChild(oldestNonError);\n        }, 200);\n      }\n    } else {\n      // 非 error 超出上限，跳过（避免堆积）\n      // v0.8.4 Step 8 / G026：此处不记录 dedupKey，允许后续重试\n      console.log('[showToast] 队列已满，跳过非 error 消息:', message);\n      return;\n    }\n  }\n\n  // v0.8.4 Step 8 / G026 修复：显示后才记录 dedupKey\n  // 确保只有真正显示的 Toast 才占用去重窗口，避免首条被误去重\n  _recentToastMessages.set(dedupKey, now);\n  // 2s 后清理过期记录，避免 Map 无限增长\n  setTimeout(() => {\n    if (_recentToastMessages.get(dedupKey) === now) {\n      _recentToastMessages.delete(dedupKey);\n    }\n  }, 2000);\n\n  const iconMap = {\n    success: 'icon-trust',\n    error: 'icon-decay',\n    warning: 'icon-benchmark',\n    info: 'icon-benchmark'\n  };\n  const iconName = iconMap[type] || iconMap.success;\n\n  const toast = document.createElement('div');\n  toast.className = `toast toast-${type}`;\n  toast.innerHTML = `\n    <div class=\"toast-icon-wrap\">\n      <img src=\"/assets/icons/${iconName}.svg\" alt=\"\" class=\"toast-icon\">\n    </div>\n    <span>${htmlescape(message)}</span>\n  `;\n\n  container.appendChild(toast);\n\n  // 3s 后自动滑出消失\n  setTimeout(() => {\n    toast.classList.add('toast-leaving');\n    setTimeout(() => {\n      if (toast.parentNode) toast.parentNode.removeChild(toast);\n    }, 200);\n  }, duration);\n}",
+    "hasDedup": true,
+    "hasMaxLimit": false,
+    "dedupPreview": "去重检查（1.5s 内相同消息跳过）\n  // v0.8.4 Step 8 / G026 修复：去重检查在显示前，但记录在显示后\n  // 避免被上限跳过的消息也记录时间戳，导致后续调用被误去重\n  const now = Date.now();\n  const dedupKey = `${type}:${message}`;\n  if (_recentToastMessages.has(dedupKey)) {\n    const last = _recentToastMessages.get(dedupKey);\n    if (now - last < _TOAST_DEDUP_WINDOW) {\n      // 重复消息，跳过（但更新时间戳，避免后续显示的 Toast 被误判）\n      _recentToastMessages.set(dedupKey, now);\n      return;\n    }\n  }\n\n  // G011-2：可见 Toast 数量上限管理（在去重检查之后，记录 dedupKey 之前）\n  const visibleToasts = con",
+    "toastTest": {
+      "beforeCount": 0,
+      "afterCount": 1,
+      "dedupEffective": true
+    }
+  },
+  "loadDaoMetrics_trigger": {
+    "before": {
+      "beforeToasts": 1,
+      "beforeMessages": [
+        "记忆系统正在后台合成，请稍后重试"
+      ],
+      "beforeRetryCounters": null,
+      "beforeDaoRetryCount": null
+    },
+    "after": {
+      "afterToasts": 0,
+      "afterMessages": [],
+      "afterRetryCounters": null,
+      "afterDaoRetryCount": null,
+      "afterDaoRetryTimer": null,
+      "consoleLog": [
+        {
+          "ts": 1785554088461,
+          "level": "warn",
+          "msg": "[Loong Recall] 系统状态浮窗加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+        },
+        {
+          "ts": 1785554094551,
+          "level": "warn",
+          "msg": "[LRC v0.8.22]道同构度加载失败（重试 0/3）: 请求超时，请检查 LRC 服务是否正常运行"
+        },
+        {
+          "ts": 1785554094551,
+          "level": "log",
+          "msg": "[LRC] 道同构度 2000ms 后自动重试..."
+        }
+      ],
+      "daoRingScore": "73",
+      "daoFallbackText": null
+    },
+    "lockbusy_log_count": 0,
+    "lockbusy_logs_sample": []
+  },
+  "loadDashboard_trigger": {
+    "before": {
+      "beforeToasts": 0,
+      "beforeRetryCounters": null,
+      "beforeDashboardRetryCount": null
+    },
+    "after": {
+      "afterToasts": 0,
+      "afterMessages": [],
+      "afterRetryCounters": null,
+      "afterDashboardRetryCount": null,
+      "afterDashboardRetryTimer": null,
+      "consoleLog": [
+        {
+          "ts": 1785554106565,
+          "level": "warn",
+          "msg": "[LRC v0.8.22]道同构度加载失败（重试 1/3）: 请求超时，请检查 LRC 服务是否正常运行"
+        },
+        {
+          "ts": 1785554106566,
+          "level": "log",
+          "msg": "[LRC] 道同构度 4000ms 后自动重试..."
+        }
+      ],
+      "dashboardError": {
+        "visible": false,
+        "text": ""
+      }
+    },
+    "lockbusy_log_count": 0,
+    "lockbusy_logs_sample": []
+  },
+  "audit_end": "2026-08-01T03:15:13.557311+00:00"
+}

@@ -1,0 +1,567 @@
+{
+  "meta": {
+    "title": "HCSE 五层交互韧性审计报告 — LRC Desktop",
+    "version": "0.8.22/0.8.23",
+    "timestamp": "2026-08-01T20:49:28.244Z",
+    "target": "ws://127.0.0.1:9222/devtools/page/766A59EFEE29F4050E8CD97E3EF87E61"
+  },
+  "layers": {
+    "L1": {
+      "name": "一级页面",
+      "pass": 21,
+      "fail": 0,
+      "items": [
+        {
+          "name": "页面标题正确",
+          "passed": true,
+          "detail": "title=\"龙忆 Loong Recall · 仪表盘\"",
+          "ts": 1785617369304
+        },
+        {
+          "name": "页面加载完成",
+          "passed": true,
+          "detail": "state=complete",
+          "ts": 1785617369304
+        },
+        {
+          "name": "Tauri 环境检测",
+          "passed": true,
+          "detail": "url=https://tauri.localhost/",
+          "ts": 1785617369305
+        },
+        {
+          "name": "侧边栏存在",
+          "passed": true,
+          "detail": "items=9",
+          "ts": 1785617369306
+        },
+        {
+          "name": "导航栏存在",
+          "passed": true,
+          "detail": "items=8",
+          "ts": 1785617369306
+        },
+        {
+          "name": "导航项数量 >= 6",
+          "passed": true,
+          "detail": "count=9",
+          "ts": 1785617369306
+        },
+        {
+          "name": "关键导航项齐全",
+          "passed": true,
+          "detail": "dashboard=true settings=true trust=true",
+          "ts": 1785617369306
+        },
+        {
+          "name": "状态栏存在",
+          "passed": true,
+          "detail": "text=后台合成中...",
+          "ts": 1785617369308
+        },
+        {
+          "name": "状态圆点存在",
+          "passed": true,
+          "detail": "class=status-dot lock-busy",
+          "ts": 1785617369308
+        },
+        {
+          "name": "健康监测器运行",
+          "passed": true,
+          "detail": "running=true",
+          "ts": 1785617369308
+        },
+        {
+          "name": "仪表盘 DOM 存在",
+          "passed": true,
+          "detail": "sections=11",
+          "ts": 1785617369308
+        },
+        {
+          "name": "道同构度面板存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617369308
+        },
+        {
+          "name": "快速操作区域存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617369308
+        },
+        {
+          "name": "洛书编码器存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617369308
+        },
+        {
+          "name": "记忆统计卡片存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617369308
+        },
+        {
+          "name": "加载遮罩层存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617369309
+        },
+        {
+          "name": "错误提示区域存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617369310
+        },
+        {
+          "name": "服务不可用横幅存在",
+          "passed": true,
+          "detail": "hidden=true",
+          "ts": 1785617369310
+        },
+        {
+          "name": "数据加载超时/空数据兜底",
+          "passed": true,
+          "detail": "loadingHidden=true",
+          "ts": 1785617372315
+        },
+        {
+          "name": "状态栏可点击启动",
+          "passed": true,
+          "detail": "clickable=true",
+          "ts": 1785617372317
+        },
+        {
+          "name": "数据目录可点击",
+          "passed": true,
+          "detail": "text=.loong-recall/data/",
+          "ts": 1785617372318
+        }
+      ]
+    },
+    "L2": {
+      "name": "二级弹窗",
+      "pass": 9,
+      "fail": 0,
+      "items": [
+        {
+          "name": "确认对话框 DOM 存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617372441
+        },
+        {
+          "name": "确认对话框有取消按钮",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617372441
+        },
+        {
+          "name": "确认对话框有确认按钮",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617372441
+        },
+        {
+          "name": "启动服务模态框 DOM 存在",
+          "passed": true,
+          "detail": "hidden=true",
+          "ts": 1785617372442
+        },
+        {
+          "name": "设置页面可切换",
+          "passed": true,
+          "detail": "sections=9",
+          "ts": 1785617373947
+        },
+        {
+          "name": "弹窗 ESC 关闭机制存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617374966
+        },
+        {
+          "name": "模态框遮罩层存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617374967
+        },
+        {
+          "name": "Toast 容器存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617374968
+        },
+        {
+          "name": "showToast 可调用",
+          "passed": true,
+          "detail": "toasts=1",
+          "ts": 1785617375474
+        }
+      ]
+    },
+    "L3": {
+      "name": "三级卡片",
+      "pass": 14,
+      "fail": 0,
+      "items": [
+        {
+          "name": "船长日志标签页可切换",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617376622
+        },
+        {
+          "name": "船长日志输入框存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617376622
+        },
+        {
+          "name": "船长日志生成按钮存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617376622
+        },
+        {
+          "name": "船长日志加载遮罩存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617376622
+        },
+        {
+          "name": "船长日志错误提示存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617376622
+        },
+        {
+          "name": "信任中心标签页可切换",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617378138
+        },
+        {
+          "name": "信任卡片数量 >= 6",
+          "passed": true,
+          "detail": "count=10",
+          "ts": 1785617378138
+        },
+        {
+          "name": "隐私检查按钮存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617378138
+        },
+        {
+          "name": "数据位置验证按钮存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617378138
+        },
+        {
+          "name": "审计完整性验证按钮存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617378138
+        },
+        {
+          "name": "备份/导出/导入按钮存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617378138
+        },
+        {
+          "name": "数据迁移按钮存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617378138
+        },
+        {
+          "name": "AI 规则状态按钮存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617378138
+        },
+        {
+          "name": "信任中心卡片加载失败有错误提示",
+          "passed": true,
+          "detail": "verify=3, v1Catch=true, v2Catch=true, v3Catch=true",
+          "ts": 1785617378140
+        }
+      ]
+    },
+    "L4": {
+      "name": "四级嵌套",
+      "pass": 18,
+      "fail": 0,
+      "items": [
+        {
+          "name": "快速操作项存在",
+          "passed": true,
+          "detail": "count=4",
+          "ts": 1785617379298
+        },
+        {
+          "name": "快速操作项 data-action 完整",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617379298
+        },
+        {
+          "name": "预设场景模板卡片存在",
+          "passed": true,
+          "detail": "count=4",
+          "ts": 1785617379299
+        },
+        {
+          "name": "预设场景默认选中",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617379299
+        },
+        {
+          "name": "预设场景 data-action 完整",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617379299
+        },
+        {
+          "name": "向导步骤输入框存在",
+          "passed": true,
+          "detail": "inputs=3",
+          "ts": 1785617379299
+        },
+        {
+          "name": "向导步骤按钮存在",
+          "passed": true,
+          "detail": "buttons=3",
+          "ts": 1785617379299
+        },
+        {
+          "name": "洛书编码器输入框存在",
+          "passed": true,
+          "detail": "maxlength=500",
+          "ts": 1785617379300
+        },
+        {
+          "name": "洛书编码器按钮存在",
+          "passed": true,
+          "detail": "action=encodeTextToLuoshu",
+          "ts": 1785617379300
+        },
+        {
+          "name": "洛书编码器错误提示区域存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617379300
+        },
+        {
+          "name": "洛书编码器结果区域存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617379300
+        },
+        {
+          "name": "编码模型镜像选择器存在",
+          "passed": true,
+          "detail": "options=2",
+          "ts": 1785617380304
+        },
+        {
+          "name": "编码模型卡片 >= 4",
+          "passed": true,
+          "detail": "count=4",
+          "ts": 1785617380304
+        },
+        {
+          "name": "下载/应用/测试按钮齐全",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617380304
+        },
+        {
+          "name": "下载进度条 DOM 存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617380304
+        },
+        {
+          "name": "LLM 提供商卡片 >= 8",
+          "passed": true,
+          "detail": "count=9",
+          "ts": 1785617380305
+        },
+        {
+          "name": "LLM 配置输入框齐全",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617380305
+        },
+        {
+          "name": "LLM 操作按钮齐全",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617380305
+        }
+      ]
+    },
+    "L5": {
+      "name": "异常全局",
+      "pass": 24,
+      "fail": 0,
+      "items": [
+        {
+          "name": "503 时 loading 隐藏",
+          "passed": true,
+          "detail": "hidden=true",
+          "ts": 1785617384458
+        },
+        {
+          "name": "503 时 error 显示",
+          "passed": true,
+          "detail": "text=⏳ 后台合成中，请等待 30 秒后自动重试...",
+          "ts": 1785617384458
+        },
+        {
+          "name": "请求挂起超时后 loading 隐藏",
+          "passed": true,
+          "detail": "hidden=true",
+          "ts": 1785617397473
+        },
+        {
+          "name": "请求超时有明确错误提示",
+          "passed": true,
+          "detail": "text=⏳ 后台合成中，请等待 30 秒后自动重试...",
+          "ts": 1785617397473
+        },
+        {
+          "name": "快速标签页切换后仍有 active tab",
+          "passed": true,
+          "detail": "tabs=tab-dashboard",
+          "ts": 1785617401498
+        },
+        {
+          "name": "快速标签页切换后无重复 active",
+          "passed": true,
+          "detail": "count=1",
+          "ts": 1785617401498
+        },
+        {
+          "name": "快速标签页切换后状态栏正常",
+          "passed": true,
+          "detail": "text=后台合成中...",
+          "ts": 1785617401498
+        },
+        {
+          "name": "429 限流有友好提示",
+          "passed": true,
+          "detail": "toasts=[\"请求 http://127.0.0.1:3099/v1/health/system失败：请求过于频繁，请等待 5s 后重试\",\"请求 http://127.0.0.1:3099/health失败：请求过于频繁，请等待 5s 后重试\"]",
+          "ts": 1785617403005
+        },
+        {
+          "name": "401 鉴权失败有友好提示",
+          "passed": true,
+          "detail": "toasts=[\"请求 http://127.0.0.1:3099/v1/health/system失败：请求过于频繁，请等待 5s 后重试\",\"请求 http://127.0.0.1:3099/health失败：请求过于频繁，请等待 5s 后重试\",\"请求 http://127.0.0.1:3099/v1/health/system失败：权限不足（401）\"]",
+          "ts": 1785617404030
+        },
+        {
+          "name": "502/504 网关错误有自动重试逻辑",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617404035
+        },
+        {
+          "name": "仪表盘 AbortController 机制存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617404036
+        },
+        {
+          "name": "启动服务 AbortController 存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617404036
+        },
+        {
+          "name": "loadDashboard 使用 AbortController",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617404036
+        },
+        {
+          "name": "pendingRequestCount 存在",
+          "passed": true,
+          "detail": "count=3",
+          "ts": 1785617404036
+        },
+        {
+          "name": "pendingRequestCount 只读",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617404036
+        },
+        {
+          "name": "网络恢复检测机制正常",
+          "passed": true,
+          "detail": "before=true after=false",
+          "ts": 1785617409053
+        },
+        {
+          "name": "系统状态浮窗存在",
+          "passed": true,
+          "detail": "rows=5",
+          "ts": 1785617409054
+        },
+        {
+          "name": "系统状态浮窗可折叠",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617409054
+        },
+        {
+          "name": "自动刷新定时器配置存在",
+          "passed": true,
+          "detail": "interval=30s",
+          "ts": 1785617409055
+        },
+        {
+          "name": "健康检查失败容错阈值存在",
+          "passed": true,
+          "detail": "threshold=2",
+          "ts": 1785617409056
+        },
+        {
+          "name": "索引期容错逻辑存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617409056
+        },
+        {
+          "name": "指数退避机制存在",
+          "passed": true,
+          "detail": "max=60000ms",
+          "ts": 1785617409056
+        },
+        {
+          "name": "手动刷新函数存在（重试耗尽后）",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617409057
+        },
+        {
+          "name": "安全 LocalStorage 写入函数存在",
+          "passed": true,
+          "detail": "",
+          "ts": 1785617409057
+        }
+      ]
+    }
+  },
+  "vulnerabilities": [],
+  "summary": {
+    "total": 86,
+    "pass": 86,
+    "fail": 0
+  }
+}

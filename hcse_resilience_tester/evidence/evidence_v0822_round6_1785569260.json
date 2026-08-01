@@ -1,0 +1,710 @@
+{
+  "meta": {
+    "report_id": "HCSE-ROUND6-C6A97217",
+    "timestamp": "2026-08-01T07:27:28.044873+00:00",
+    "version": "0.8.22",
+    "round": 6
+  },
+  "environment": {
+    "cdp_browser": "Edg/150.0.4078.105",
+    "cdp_protocol": "1.3",
+    "page_title": "龙忆 Loong Recall · 仪表盘",
+    "page_url": "https://tauri.localhost/",
+    "is_desktop": true,
+    "sidecar_health": {
+      "status": 200,
+      "ms": 101,
+      "body": {
+        "status": "running",
+        "service": "loong-recall",
+        "version": "0.8.22",
+        "uptime_seconds": 1900,
+        "indexing": {
+          "complete": true,
+          "file_count": 103,
+          "total_chunks": 103
+        },
+        "memory": {
+          "total": 0
+        },
+        "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+        "llm_configured": false,
+        "lock_busy": true
+      }
+    },
+    "hcse_pid": 17136,
+    "hcse_memory_mb": 34.4,
+    "hcse_cpu_s": 0.4,
+    "close_wait": -1
+  },
+  "modules": {
+    "dashboard": {
+      "module": "dashboard",
+      "tests": [
+        {
+          "name": "dashboard: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "dashboard: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=18108"
+        },
+        {
+          "name": "dashboard: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 18108,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    },
+    "memory-search": {
+      "module": "memory-search",
+      "tests": [
+        {
+          "name": "memory-search: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "memory-search: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=2914"
+        },
+        {
+          "name": "memory-search: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 2914,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    },
+    "captain-log": {
+      "module": "captain-log",
+      "tests": [
+        {
+          "name": "captain-log: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "captain-log: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=1758"
+        },
+        {
+          "name": "captain-log: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 1758,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    },
+    "trust-center": {
+      "module": "trust-center",
+      "tests": [
+        {
+          "name": "trust-center: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "trust-center: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=8302"
+        },
+        {
+          "name": "trust-center: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=1"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 8302,
+        "error_count": 0,
+        "toast_count": 1
+      }
+    },
+    "benchmarks": {
+      "module": "benchmarks",
+      "tests": [
+        {
+          "name": "benchmarks: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "benchmarks: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=12322"
+        },
+        {
+          "name": "benchmarks: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=1"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 12322,
+        "error_count": 0,
+        "toast_count": 1
+      }
+    },
+    "settings": {
+      "module": "settings",
+      "tests": [
+        {
+          "name": "settings: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "settings: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=26358"
+        },
+        {
+          "name": "settings: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=1"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 26358,
+        "error_count": 0,
+        "toast_count": 1
+      }
+    },
+    "project-switch": {
+      "module": "project-switch",
+      "tests": [
+        {
+          "name": "project-switch: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "project-switch: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=10862"
+        },
+        {
+          "name": "project-switch: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=1"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 10862,
+        "error_count": 0,
+        "toast_count": 1
+      }
+    },
+    "system-status": {
+      "module": "system-status",
+      "tests": [
+        {
+          "name": "system-status: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "system-status: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=6767"
+        },
+        {
+          "name": "system-status: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=1"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 6767,
+        "error_count": 0,
+        "toast_count": 1
+      }
+    }
+  },
+  "invariants": {
+    "INV-V0822-P0A": {
+      "id": "INV-V0822-P0A",
+      "name": "tokio worker_threads=16, lock_busy 期间 /health 可达",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "10 轮 /health: 10/10 可达, avg=10.2ms",
+      "evidence": {
+        "health_10": [
+          {
+            "status": 200,
+            "ms": 1
+          },
+          {
+            "status": 200,
+            "ms": 15
+          },
+          {
+            "status": 200,
+            "ms": 2
+          },
+          {
+            "status": 200,
+            "ms": 11
+          },
+          {
+            "status": 200,
+            "ms": 23
+          },
+          {
+            "status": 200,
+            "ms": 1
+          },
+          {
+            "status": 200,
+            "ms": 13
+          },
+          {
+            "status": 200,
+            "ms": 22
+          },
+          {
+            "status": 200,
+            "ms": 3
+          },
+          {
+            "status": 200,
+            "ms": 11
+          }
+        ]
+      },
+      "timestamp": "2026-08-01T07:27:39.712858+00:00"
+    },
+    "INV-V0822-IA01": {
+      "id": "INV-V0822-IA01",
+      "name": "loadDaoMetrics AbortController",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "daoAbortController 存在=True",
+      "evidence": {
+        "daoAbortController_exists": true
+      },
+      "timestamp": "2026-08-01T07:27:39.717835+00:00"
+    },
+    "INV-V0822-IA02": {
+      "id": "INV-V0822-IA02",
+      "name": "全局错误处理注册",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "_lrcGlobalErrorRegistered=True",
+      "evidence": {
+        "global_error_registered": true
+      },
+      "timestamp": "2026-08-01T07:27:39.719835+00:00"
+    },
+    "INV-V0822-IA03": {
+      "id": "INV-V0822-IA03",
+      "name": "SidecarHealthMonitor 挂载到 window",
+      "severity": "P2",
+      "status": "PASS",
+      "detail": "monitor 存在=True, 属性={'exists': True, 'hasOnline': True, 'hasFailCount': True, 'hasLockBusy': False}",
+      "evidence": {
+        "sidecar_health_monitor": {
+          "exists": true,
+          "hasOnline": true,
+          "hasFailCount": true,
+          "hasLockBusy": false
+        }
+      },
+      "timestamp": "2026-08-01T07:27:39.721836+00:00"
+    },
+    "INV-V0821-01": {
+      "id": "INV-V0821-01",
+      "name": "wizard.json 兜底创建（回归）",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "sidecar /health 可达=True",
+      "evidence": {
+        "sidecar_health": {
+          "status": 200,
+          "ms": 1,
+          "body": {
+            "status": "running",
+            "service": "loong-recall",
+            "version": "0.8.22",
+            "uptime_seconds": 1910,
+            "indexing": {
+              "complete": true,
+              "file_count": 103,
+              "total_chunks": 103
+            },
+            "memory": {
+              "total": 0
+            },
+            "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+            "llm_configured": false,
+            "lock_busy": true
+          }
+        }
+      },
+      "timestamp": "2026-08-01T07:27:39.721836+00:00"
+    },
+    "INV-V0821-02": {
+      "id": "INV-V0821-02",
+      "name": "自动启动 120s 超时保护（回归）",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "sidecar 可达=True, uptime=1910s",
+      "evidence": {
+        "uptime": 1910
+      },
+      "timestamp": "2026-08-01T07:27:39.721836+00:00"
+    },
+    "INV-V0821-03": {
+      "id": "INV-V0821-03",
+      "name": "switch_project 120s 超时（回归）",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "Tauri 桥接可用=True",
+      "evidence": {
+        "tauri_available": true
+      },
+      "timestamp": "2026-08-01T07:27:39.737923+00:00"
+    },
+    "INV-V0821-04": {
+      "id": "INV-V0821-04",
+      "name": "状态栏 lockBusy 紫色显示（回归）",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "dot_class=status-dot lock-busy, lock_busy_class=True",
+      "evidence": {
+        "status_dot_class": "status-dot lock-busy"
+      },
+      "timestamp": "2026-08-01T07:27:39.739938+00:00"
+    },
+    "INV-V0821-05": {
+      "id": "INV-V0821-05",
+      "name": "dao 503 lock_busy 文案修复（回归）",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "静态验证通过（app.js:864-918 LOCK_BUSY 分支）",
+      "evidence": {
+        "code_ref": "app.js:864-918"
+      },
+      "timestamp": "2026-08-01T07:27:39.739938+00:00"
+    },
+    "INV-LOCK-001": {
+      "id": "INV-LOCK-001",
+      "name": "健康端点不被合成锁阻塞",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "4 端点全部可达, max=26ms",
+      "evidence": {
+        "endpoints": {
+          "/health": {
+            "status": 200,
+            "ms": 26,
+            "body": {
+              "status": "running",
+              "service": "loong-recall",
+              "version": "0.8.22",
+              "uptime_seconds": 1911,
+              "indexing": {
+                "complete": true,
+                "file_count": 103,
+                "total_chunks": 103
+              },
+              "memory": {
+                "total": 0
+              },
+              "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+              "llm_configured": false,
+              "lock_busy": true
+            }
+          },
+          "/v1/health/dao_metrics": {
+            "status": 200,
+            "ms": 1,
+            "body": {
+              "data": {
+                "active_memories": null,
+                "bagua_balance": 0.0,
+                "crystallized_memories": null,
+                "dao_isomorphism_score": 0.0,
+                "luoshu_deviation": 100.0,
+                "status": "loading",
+                "synthesis_ratio": 0.0,
+                "yin_yang_balance": 0.0
+              },
+              "degraded": true,
+              "lock_busy": true,
+              "message": "记忆系统正在执行后台合成，数据稍后自动加载",
+              "ok": true,
+              "raw": {
+                "archived_memories": 0,
+                "bagua_entropy": 1.0,
+                "compositions_total": 0,
+                "corrections_total": 0,
+                "encodings_total": 0,
+                "recalls_total": 0
+              }
+            }
+          },
+          "/v1/health/system": {
+            "status": 200,
+            "ms": 13,
+            "body": {
+              "degraded": true,
+              "lock_busy": true,
+              "memory_count": null,
+              "message": "记忆系统正在执行后台合成，数据稍后自动加载",
+              "ok": true,
+              "total_edges": null,
+              "total_nodes": null
+            }
+          },
+          "/v1/health/detailed": {
+            "status": 200,
+            "ms": 16,
+            "body": {
+              "catastrophic_events": [],
+              "coupling_trend": [],
+              "degraded": true,
+              "gc_candidates": [],
+              "health": null,
+              "lock_busy": true,
+              "message": "记忆系统正在执行后台合成，数据稍后自动加载",
+              "pending_user_actions": []
+            }
+          }
+        }
+      },
+      "timestamp": "2026-08-01T07:27:39.798395+00:00"
+    },
+    "INV-STATE-002": {
+      "id": "INV-STATE-002",
+      "name": "UI 状态与 sidecar 实际状态一致",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "前端 lockBusy=None, sidecar lockBusy=True",
+      "evidence": {
+        "frontend_online": {},
+        "frontend_lockbusy": null,
+        "sidecar_lockbusy": true
+      },
+      "timestamp": "2026-08-01T07:27:39.815502+00:00"
+    },
+    "INV-PROC-003": {
+      "id": "INV-PROC-003",
+      "name": "sidecar 卡死后前端能检测并降级",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "sidecar 当前健康，前端 statusDot 正常",
+      "evidence": {
+        "sidecar_health": 200
+      },
+      "timestamp": "2026-08-01T07:27:39.815502+00:00"
+    },
+    "INV-TIMEOUT-004": {
+      "id": "INV-TIMEOUT-004",
+      "name": "前端 fetch 超时真正触发",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "fetchWithTimeout 存在=True",
+      "evidence": {
+        "fetch_with_timeout": true
+      },
+      "timestamp": "2026-08-01T07:27:39.817546+00:00"
+    },
+    "INV-LEAK-006": {
+      "id": "INV-LEAK-006",
+      "name": "sidecar HTTP 连接不泄漏",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "CloseWait=-1",
+      "evidence": {
+        "close_wait": -1
+      },
+      "timestamp": "2026-08-01T07:27:39.817546+00:00"
+    },
+    "INV-SANITIZE-006": {
+      "id": "INV-SANITIZE-006",
+      "name": "捕获数据脱敏不变式",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "所有证据经沙箱双重脱敏处理",
+      "evidence": {
+        "sanitizer_type": "双重脱敏（正则+结构裁剪）"
+      },
+      "timestamp": "2026-08-01T07:27:39.817546+00:00"
+    },
+    "INV-RESOURCE-007": {
+      "id": "INV-RESOURCE-007",
+      "name": "资源容量看门狗",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "HCSE 进程内存=34.4MB < 1024MB",
+      "evidence": {
+        "memory_mb": 34.4
+      },
+      "timestamp": "2026-08-01T07:27:39.817546+00:00"
+    }
+  },
+  "exception_paths": {
+    "竞态路径_快速切换": {
+      "category": "竞态路径",
+      "path_type": "快速切换",
+      "status": "PASS",
+      "detail": "新错误数=0, 新Toast数=-1, 最终标签=settings, 页面崩溃=False",
+      "evidence": {
+        "errors_before": 0,
+        "errors_after": 0,
+        "new_errors": 0,
+        "toast_before": 1,
+        "toast_after": 0,
+        "final_tab": "settings",
+        "window_title": "龙忆 Loong Recall · 仪表盘"
+      }
+    },
+    "竞态路径_AbortController": {
+      "category": "竞态路径",
+      "path_type": "AbortController",
+      "status": "PASS",
+      "detail": "daoAbortController 存在=True, 类型=object",
+      "evidence": {
+        "daoAbortControllerExists": true,
+        "daoAbortControllerType": "object",
+        "lrcGlobalErrorRegistered": true,
+        "sidecarHealthMonitorExists": true,
+        "after_switch_aborted": false
+      }
+    },
+    "错误路径_全局错误处理": {
+      "category": "错误路径",
+      "path_type": "全局错误处理",
+      "status": "PASS",
+      "detail": "全局错误注册=True, 新Toast数=1, Toast文本=HCSE-ROUND6-TEST-GLOBAL-ERROR",
+      "evidence": {
+        "global_error_registered": true,
+        "toast_before": 0,
+        "toast_after": 1,
+        "new_toast": 1,
+        "toast_text": "HCSE-ROUND6-TEST-GLOBAL-ERROR"
+      }
+    },
+    "超时路径_fetch超时机制": {
+      "category": "超时路径",
+      "path_type": "fetch超时机制",
+      "status": "PASS",
+      "detail": "fetchWithTimeout=True, safeFetch=False, loadDaoTimeout={'hasAbortController': True, 'hasTimeout': True, 'hasSignal': True}",
+      "evidence": {
+        "has_fetch_with_timeout": true,
+        "has_safe_fetch": false,
+        "load_dao_timeout": {
+          "hasAbortController": true,
+          "hasTimeout": true,
+          "hasSignal": true
+        }
+      }
+    },
+    "卡死路径_前端降级恢复": {
+      "category": "卡死路径",
+      "path_type": "前端降级恢复",
+      "status": "PASS",
+      "detail": "monitor=True, status_dot={'exists': True, 'className': 'status-dot lock-busy', 'text': ''}, banner={'exists': True, 'hidden': True, 'text': 'LRC 服务未运行，部分功能不可用'}",
+      "evidence": {
+        "monitor_status": {
+          "exists": true,
+          "isReachable": {},
+          "failCount": 0,
+          "backoffStep": 0
+        },
+        "status_dot": {
+          "exists": true,
+          "className": "status-dot lock-busy",
+          "text": ""
+        },
+        "banner": {
+          "exists": true,
+          "hidden": true,
+          "text": "LRC 服务未运行，部分功能不可用"
+        }
+      }
+    },
+    "取消路径_Abort取消": {
+      "category": "取消路径",
+      "path_type": "Abort取消",
+      "status": "PASS",
+      "detail": "loadDaoMetrics 可取消={'hasAbort': True, 'hasAbortController': True, 'canCancel': True}",
+      "evidence": {
+        "cancel_analysis": {
+          "hasAbort": true,
+          "hasAbortController": true,
+          "canCancel": true
+        }
+      }
+    }
+  },
+  "evidence_files": [
+    "G:\\code-memory\\hcse_resilience_tester\\screenshots\\round6_baseline_1785569249.png",
+    "G:\\code-memory\\hcse_resilience_tester\\screenshots\\round6_final_1785569259.png"
+  ],
+  "summary": {
+    "total_tests": 46,
+    "passed": 46,
+    "failed": 0,
+    "skipped": 0
+  }
+}

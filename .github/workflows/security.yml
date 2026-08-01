@@ -19,6 +19,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# v0.8.23 S1-SEC-04：最小权限原则 — 安全扫描只需要读取权限
+permissions:
+  contents: read
+
 jobs:
   # ════════════════════════════════════════════════════════════
   # Job 1: cargo-audit 漏洞扫描
@@ -30,11 +34,24 @@ jobs:
     # 定时触发的扫描即使发现漏洞也不阻塞（仅报告），PR 触发的阻塞
     continue-on-error: ${{ github.event_name == 'schedule' }}
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            crates.io:443
+            static.crates.io:443
+            objects.githubusercontent.com:443
+            rustup.rs:443
+            static.rust-lang.org:443
 
       - name: Install cargo-audit
         # 使用 rustsec 官方维护的 action，自动安装 cargo-audit
-        uses: rustsec/audit-check@v2.0.0
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           # 扫描整个工作空间（含 desktop/src-tauri）
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -47,8 +64,21 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            crates.io:443
+            static.crates.io:443
+            objects.githubusercontent.com:443
+            rustup.rs:443
+            static.rust-lang.org:443
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Install cargo-license
         run: cargo install cargo-license --locked || cargo install cargo-license

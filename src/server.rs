@@ -2758,34 +2758,225 @@ async fn embedder_test_handler(
 
 /// GET /api/tools/detect — 检测系统已安装的 IDE 和 Agent 工具
 ///
-/// Windows 下检测 VS Code、Cursor、Trae、Windsurf、Claude Code、Cline。
+/// 检测策略（按优先级）：
+/// 1. 扫描桌面快捷方式（`%USERPROFILE%\Desktop\*.lnk`），匹配已知 AI 工具名称
+/// 2. 对于未通过快捷方式检测到的工具，回退到命令行检测 + Windows 安装路径检测
+/// 3. 覆盖市面上主流 AI 编程工具（IDE + Agent + VS Code 扩展）
 async fn tools_detect_handler(
     State(_state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Cline（VS Code 扩展）— 需在 vec! 初始化前调用
-    let cline_installed = detect_vscode_extension("saoudrizwan.claude-dev");
+    // 第一步：扫描桌面快捷方式，获取已安装工具列表
+    let desktop_tools = scan_desktop_shortcuts();
 
-    // 命令行可调用类工具 + Cline 扩展
-    let tools: Vec<ToolDetectItem> = vec![
-        detect_command_tool("VS Code", "code", &["--version"]),
-        detect_command_tool("Cursor", "cursor", &["--version"]),
-        detect_command_tool("Trae", "trae", &["--version"]),
-        detect_command_tool("Windsurf", "windsurf", &["--version"]),
-        detect_command_tool("Claude Code", "claude", &["--version"]),
-        ToolDetectItem {
-            name: "Cline".to_string(),
-            tool_type: "extension".to_string(),
-            installed: cline_installed,
-            version: None,
-            path: None,
-        },
-    ];
+    // 第二步：对所有已知工具进行深度检测（命令行 + 安装路径）
+    let mut tools: Vec<ToolDetectItem> = Vec::new();
+
+    // VS Code 扩展 — 调用一次 code --list-extensions 即可
+    let cline_installed = detect_vscode_extension("saoudrizwan.claude-dev");
+    let continue_installed = detect_vscode_extension("continue.continue");
+
+    // 已知工具完整列表（按分类）
+    // IDE 类
+    for tool in &[
+        ("VS Code", "code"),
+        ("Cursor", "cursor"),
+        ("Trae", "trae"),
+        ("Trae CN", "trae"),
+        ("Windsurf", "windsurf"),
+        ("CodeBuddy", "codebuddy"),
+        ("Qoder", "qoder"),
+        ("GitHub Copilot", "github-copilot"),
+        ("JetBrains Toolbox", "jetbrains-toolbox"),
+        ("Zed", "zed"),
+    ] {
+        let mut item = detect_command_tool(tool.0, tool.1, &["--version"]);
+        // 如果命令行检测失败，尝试安装路径检测
+        if !item.installed {
+            if let Some(path) = check_windows_install_path(tool.0) {
+                item.installed = true;
+                item.path = Some(path);
+            }
+        }
+        // 如果桌面快捷方式已检测到但上述方法未命中，强制标记为已安装
+        if !item.installed && desktop_tools.iter().any(|t| t == tool.0) {
+            item.installed = true;
+        }
+        tools.push(item);
+    }
+
+    // Agent 类工具
+    for agent_name in &["Claude Code", "Aider", "Warp AI", "Tabby"] {
+        let cmd = match *agent_name {
+            "Claude Code" => "claude",
+            "Aider" => "aider",
+            "Warp AI" => "warp",
+            "Tabby" => "tabby",
+            _ => continue,
+        };
+        let mut item = detect_command_tool(agent_name, cmd, &["--version"]);
+        if !item.installed {
+            if let Some(path) = check_windows_install_path(agent_name) {
+                item.installed = true;
+                item.path = Some(path);
+            }
+        }
+        if !item.installed && desktop_tools.iter().any(|t| t == agent_name) {
+            item.installed = true;
+        }
+        tools.push(item);
+    }
+
+    // VS Code 扩展类
+    tools.push(ToolDetectItem {
+        name: "Cline".to_string(),
+        tool_type: "extension".to_string(),
+        installed: cline_installed,
+        version: None,
+        path: None,
+    });
+    tools.push(ToolDetectItem {
+        name: "Continue".to_string(),
+        tool_type: "extension".to_string(),
+        installed: continue_installed,
+        version: None,
+        path: None,
+    });
+
+    // 去重：同名工具只保留第一个（优先级最高的检测结果）
+    let mut seen = std::collections::HashSet::new();
+    tools.retain(|t| seen.insert(t.name.clone()));
 
     let resp = ToolsDetectResponse { tools };
     (
         StatusCode::OK,
         Json(serde_json::to_value(&resp).unwrap_or_else(|_| serde_json::json!({"tools": []}))),
     )
+}
+
+/// 扫描桌面快捷方式，识别已安装的 AI 工具
+///
+/// 读取 `%USERPROFILE%\Desktop\*.lnk` 文件，匹配已知 AI 工具名称列表。
+/// 返回匹配到的工具名称列表。
+fn scan_desktop_shortcuts() -> Vec<String> {
+    let mut result = Vec::new();
+
+    // 已知 AI 工具名称关键词列表（用于匹配快捷方式文件名）
+    let known_tools = [
+        "VS Code",
+        "Visual Studio Code",
+        "Code",
+        "Cursor",
+        "Trae",
+        "Trae CN",
+        "Windsurf",
+        "CodeBuddy",
+        "Qoder",
+        "Claude",
+        "Claude Code",
+        "GitHub Copilot",
+        "JetBrains",
+        "IntelliJ",
+        "PyCharm",
+        "WebStorm",
+        "GoLand",
+        "Zed",
+        "Aider",
+        "Warp",
+        "Tabby",
+    ];
+
+    // Windows 桌面路径
+    let desktop_path = if cfg!(windows) {
+        std::env::var("USERPROFILE")
+            .ok()
+            .map(|p| PathBuf::from(p).join("Desktop"))
+    } else {
+        None
+    };
+
+    let desktop_path = match desktop_path {
+        Some(p) if p.exists() => p,
+        _ => return result,
+    };
+
+    // 读取桌面目录，查找 .lnk 文件
+    if let Ok(entries) = std::fs::read_dir(&desktop_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("lnk") {
+                continue;
+            }
+            // 从文件名中去除 .lnk 扩展名
+            let file_stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+
+            // 匹配已知工具名称
+            for tool_name in &known_tools {
+                if file_stem.contains(tool_name) || tool_name.contains(&file_stem) {
+                    if !result.contains(&tool_name.to_string()) {
+                        result.push(tool_name.to_string());
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // 额外检查开始菜单和任务栏快捷方式（常见安装位置）
+    let extra_paths = vec![
+        std::env::var("PROGRAMDATA")
+            .ok()
+            .map(|p| PathBuf::from(p).join("Microsoft\\Windows\\Start Menu\\Programs")),
+        std::env::var("APPDATA")
+            .ok()
+            .map(|p| PathBuf::from(p).join("Microsoft\\Windows\\Start Menu\\Programs")),
+    ];
+    for extra in extra_paths.into_iter().flatten() {
+        if !extra.exists() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&extra) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_lnk = path.extension().and_then(|e| e.to_str()) == Some("lnk");
+                let is_dir = path.is_dir();
+                if !is_lnk && !is_dir {
+                    continue;
+                }
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                // 如果是目录，也检查目录名
+                let name_to_check = if is_dir {
+                    path.file_name()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                } else {
+                    name.clone()
+                };
+                for tool_name in &known_tools {
+                    if name_to_check.contains(tool_name) || tool_name.contains(&name_to_check) {
+                        let canonical = match *tool_name {
+                            "Visual Studio Code" | "Code" => "VS Code",
+                            _ => tool_name,
+                        };
+                        if !result.contains(&canonical.to_string()) {
+                            result.push(canonical.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    result
 }
 
 // ---------- 工具检测辅助函数 ----------
@@ -2880,9 +3071,46 @@ fn check_windows_install_path(name: &str) -> Option<String> {
                 .join("Programs")
                 .join("Trae CN"),
         ],
+        "Trae CN" => vec![
+            PathBuf::from(&local_appdata)
+                .join("Programs")
+                .join("Trae CN"),
+            PathBuf::from(&local_appdata).join("Programs").join("Trae"),
+        ],
         "Windsurf" => vec![PathBuf::from(&local_appdata)
             .join("Programs")
             .join("windsurf")],
+        "CodeBuddy" => vec![
+            PathBuf::from(&local_appdata)
+                .join("Programs")
+                .join("CodeBuddy"),
+            PathBuf::from("C:\\Program Files").join("CodeBuddy"),
+        ],
+        "Qoder" => vec![
+            PathBuf::from(&local_appdata).join("Programs").join("Qoder"),
+            PathBuf::from("C:\\Program Files").join("Qoder"),
+        ],
+        "GitHub Copilot" => vec![
+            PathBuf::from(&local_appdata)
+                .join("Programs")
+                .join("GitHub Copilot"),
+            PathBuf::from(&local_appdata).join("GitHub Copilot"),
+        ],
+        "JetBrains Toolbox" => vec![
+            PathBuf::from(&local_appdata)
+                .join("JetBrains")
+                .join("Toolbox"),
+            PathBuf::from("C:\\Program Files")
+                .join("JetBrains")
+                .join("JetBrains Toolbox"),
+        ],
+        "Zed" => vec![PathBuf::from(&local_appdata).join("Programs").join("Zed")],
+        "Claude Code" => vec![PathBuf::from(&local_appdata)
+            .join("Programs")
+            .join("Claude Code")],
+        "Aider" => vec![PathBuf::from(&local_appdata).join("Programs").join("Aider")],
+        "Warp AI" => vec![PathBuf::from(&local_appdata).join("Programs").join("Warp")],
+        "Tabby" => vec![PathBuf::from(&local_appdata).join("Programs").join("Tabby")],
         _ => return None,
     };
 
