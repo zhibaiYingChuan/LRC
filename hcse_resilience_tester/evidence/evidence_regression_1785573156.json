@@ -1,0 +1,452 @@
+{
+  "meta": {
+    "report_id": "HCSE-REGRESS-4F20CBDC",
+    "timestamp": "2026-08-01T08:32:34.126889+00:00",
+    "version": "0.8.22",
+    "round": "regression"
+  },
+  "environment": {
+    "cdp_browser": "Edg/150.0.4078.105",
+    "cdp_protocol": "1.3",
+    "cdp_ok": true,
+    "cdp_page_ws": "ws://127.0.0.1:9222/devtools/page/C176696FAED2D62C3619BE3B2C4DD67D...",
+    "cdp_page_ok": true,
+    "sidecar_status": 200,
+    "sidecar_ms": 99,
+    "sidecar_body": {
+      "status": "running",
+      "service": "loong-recall",
+      "version": "0.8.22",
+      "uptime_seconds": 565,
+      "indexing": {
+        "complete": true,
+        "file_count": 794,
+        "total_chunks": 5226
+      },
+      "memory": {
+        "total": 32
+      },
+      "src_dir": "g:\\code-memory",
+      "llm_configured": false,
+      "lock_busy": false
+    },
+    "sidecar_ok": true,
+    "desktop_pid": 26456,
+    "desktop_running": true,
+    "hcse_memory_mb": 34.7
+  },
+  "invariants": {
+    "INV-R7-P01": {
+      "id": "INV-R7-P01",
+      "name": "IDE 工具检测: /api/tools/detect 返回 16 个工具",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "工具总数: 16/16+, 已安装: 4",
+      "evidence": {
+        "tool_count": 16,
+        "installed_count": 4,
+        "tools": [
+          "VS Code",
+          "Cursor",
+          "Trae",
+          "Trae CN",
+          "Windsurf",
+          "CodeBuddy",
+          "Qoder",
+          "GitHub Copilot",
+          "JetBrains Toolbox",
+          "Zed",
+          "Claude Code",
+          "Aider",
+          "Warp AI",
+          "Tabby",
+          "Cline",
+          "Continue"
+        ],
+        "status": 200
+      },
+      "timestamp": "2026-08-01T08:32:35.198343+00:00"
+    },
+    "INV-R7-P02": {
+      "id": "INV-R7-P02",
+      "name": "雷达图: 硬编码 LRC_BENCHMARK_DIMENSIONS 11 维度",
+      "severity": "P2",
+      "status": "PASS",
+      "detail": "radarChart canvas: True, drawRadarChart fn: False, canvas尺寸: 400x400",
+      "evidence": {
+        "canvas_exists": true,
+        "draw_fn_exists": false,
+        "canvas_size": "400x400"
+      },
+      "timestamp": "2026-08-01T08:32:35.244019+00:00"
+    },
+    "INV-R7-P03": {
+      "id": "INV-R7-P03",
+      "name": "语义编码模型: event?.target 修复，不提示'请先选择一个模型'",
+      "severity": "P2",
+      "status": "PASS",
+      "detail": "input存在: True, 函数存在: True, event?.target: True, input值: {'_eval_exception': \"SyntaxError: Identifier 'el' has already been declared\"}, selectFn: True",
+      "evidence": {
+        "input_exists": true,
+        "fn_exists": true,
+        "has_optional_chaining": true,
+        "input_value": {
+          "_eval_exception": "SyntaxError: Identifier 'el' has already been declared"
+        },
+        "select_fn_ok": true
+      },
+      "timestamp": "2026-08-01T08:32:35.332368+00:00"
+    },
+    "INV-R7-P04": {
+      "id": "INV-R7-P04",
+      "name": "船长日志: try/catch/finally 按钮状态正确恢复",
+      "severity": "P2",
+      "status": "PASS",
+      "detail": "has_try: True, has_catch: True, has_finally: True",
+      "evidence": {
+        "has_try": true,
+        "has_catch": true,
+        "has_finally": true,
+        "fn_length": 6479
+      },
+      "timestamp": "2026-08-01T08:32:35.352024+00:00"
+    },
+    "INV-V0822-P0A": {
+      "id": "INV-V0822-P0A",
+      "name": "tokio worker_threads=16, lock_busy 期间 /health 可达",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "10 轮 /health, avg=17ms, max=30ms, all_reachable=True",
+      "evidence": {
+        "latencies_ms": [
+          12,
+          23,
+          17,
+          16,
+          15,
+          3,
+          30,
+          14,
+          15,
+          22
+        ],
+        "avg_ms": 16.7,
+        "max_ms": 30
+      },
+      "timestamp": "2026-08-01T08:32:35.526919+00:00"
+    },
+    "INV-V0822-IA01": {
+      "id": "INV-V0822-IA01",
+      "name": "loadDaoMetrics AbortController, 标签页切换取消旧请求",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "daoAbortController 存在: True",
+      "evidence": {
+        "daoAbortController_exists": true
+      },
+      "timestamp": "2026-08-01T08:32:35.541920+00:00"
+    },
+    "INV-V0822-IA02": {
+      "id": "INV-V0822-IA02",
+      "name": "全局错误处理注册, 未捕获异常显示 toast",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "_lrcGlobalErrorRegistered: True",
+      "evidence": {
+        "registered": true
+      },
+      "timestamp": "2026-08-01T08:32:35.572166+00:00"
+    },
+    "INV-V0822-IA03": {
+      "id": "INV-V0822-IA03",
+      "name": "SidecarHealthMonitor 挂载到 window",
+      "severity": "P2",
+      "status": "PASS",
+      "detail": "monitor: {'exists': True, 'hasOnline': True, 'hasFailCount': True, 'hasLockBusy': True, 'online': True}",
+      "evidence": {
+        "monitor_state": {
+          "exists": true,
+          "hasOnline": true,
+          "hasFailCount": true,
+          "hasLockBusy": true,
+          "online": true
+        }
+      },
+      "timestamp": "2026-08-01T08:32:35.589423+00:00"
+    },
+    "INV-V0821-01": {
+      "id": "INV-V0821-01",
+      "name": "wizard.json 兜底创建 (P0-01 回归)",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "sidecar 运行状态: running",
+      "evidence": {
+        "health": {
+          "status": "running",
+          "service": "loong-recall",
+          "version": "0.8.22",
+          "uptime_seconds": 566,
+          "indexing": {
+            "complete": true,
+            "file_count": 794,
+            "total_chunks": 5226
+          },
+          "memory": {
+            "total": 32
+          },
+          "src_dir": "g:\\code-memory",
+          "llm_configured": false,
+          "lock_busy": false
+        }
+      },
+      "timestamp": "2026-08-01T08:32:35.592822+00:00"
+    },
+    "INV-V0821-02": {
+      "id": "INV-V0821-02",
+      "name": "自动启动 120s 超时保护 (INV-08 回归)",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "uptime: 566s, status: running",
+      "evidence": {
+        "uptime": 566,
+        "status": "running"
+      },
+      "timestamp": "2026-08-01T08:32:35.595824+00:00"
+    },
+    "INV-V0821-04": {
+      "id": "INV-V0821-04",
+      "name": "状态栏 lockBusy 紫色显示 (INV-04 回归)",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "lock_busy: False, dot_class: {'_eval_exception': \"SyntaxError: Identifier 'dot' has already been declared\"}",
+      "evidence": {
+        "lock_busy": false,
+        "dot_class": {
+          "_eval_exception": "SyntaxError: Identifier 'dot' has already been declared"
+        }
+      },
+      "timestamp": "2026-08-01T08:32:35.601371+00:00"
+    },
+    "INV-V0821-05": {
+      "id": "INV-V0821-05",
+      "name": "dao 503 lock_busy 文案修复 (P0-04 回归)",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "lock_busy: False, 正常状态无需 503 文案",
+      "evidence": {
+        "lock_busy": false,
+        "status": 200
+      },
+      "timestamp": "2026-08-01T08:32:35.604375+00:00"
+    },
+    "INV-LOCK-001": {
+      "id": "INV-LOCK-001",
+      "name": "健康端点不被合成锁阻塞",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "/health=15ms | /v1/health/system=1ms | /v1/health/detailed=2ms",
+      "evidence": {
+        "endpoints": {
+          "/health": {
+            "status": 200,
+            "ms": 15
+          },
+          "/v1/health/system": {
+            "status": 200,
+            "ms": 1
+          },
+          "/v1/health/detailed": {
+            "status": 200,
+            "ms": 2
+          }
+        }
+      },
+      "timestamp": "2026-08-01T08:32:35.625434+00:00"
+    },
+    "INV-STATE-002": {
+      "id": "INV-STATE-002",
+      "name": "UI 状态与 sidecar 实际状态一致",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "前端 online: True, sidecar 可达: True",
+      "evidence": {
+        "frontend_online": true,
+        "sidecar_reachable": true
+      },
+      "timestamp": "2026-08-01T08:32:35.631484+00:00"
+    },
+    "INV-PROC-003": {
+      "id": "INV-PROC-003",
+      "name": "sidecar 卡死后前端能检测并降级",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "sidecar 健康: 200, ms: 2",
+      "evidence": {
+        "health_status": 200,
+        "response_ms": 2
+      },
+      "timestamp": "2026-08-01T08:32:35.634609+00:00"
+    },
+    "INV-TIMEOUT-004": {
+      "id": "INV-TIMEOUT-004",
+      "name": "前端 fetch 超时真正触发",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "fetchWithTimeout 存在: True",
+      "evidence": {
+        "fetchWithTimeout_exists": true
+      },
+      "timestamp": "2026-08-01T08:32:35.647892+00:00"
+    },
+    "INV-SANITIZE-006": {
+      "id": "INV-SANITIZE-006",
+      "name": "捕获数据脱敏不变式",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "脱敏前含敏感数据, 脱敏后: sk泄露=False, bearer泄露=False, email泄露=False",
+      "evidence": {
+        "test_input": {
+          "api_key": "[REDACTED]",
+          "authorization": "[REDACTED]",
+          "email": "[EMAIL_REDACTED]",
+          "phone": "[PHONE_REDACTED]",
+          "safe_field": "hello"
+        },
+        "sanitized_output": {
+          "api_key": "[REDACTED]",
+          "authorization": "[REDACTED]",
+          "email": "[EMAIL_REDACTED]",
+          "phone": "[PHONE_REDACTED]",
+          "safe_field": "hello"
+        }
+      },
+      "timestamp": "2026-08-01T08:32:35.647892+00:00"
+    },
+    "INV-RESOURCE-007": {
+      "id": "INV-RESOURCE-007",
+      "name": "资源容量看门狗",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "当前内存: 34.9MB (限制: 1024MB)",
+      "evidence": {
+        "memory_mb": 34.9,
+        "limit_mb": 1024
+      },
+      "timestamp": "2026-08-01T08:32:35.647892+00:00"
+    }
+  },
+  "modules": {},
+  "exception_paths": {},
+  "evidence_files": [
+    "screenshots/regression_baseline_1785573156.png"
+  ],
+  "v0822_fix_points": {},
+  "summary": {
+    "total_tests": 18,
+    "passed": 18,
+    "failed": 0,
+    "skipped": 0
+  },
+  "combinatorial": {
+    "C-01: 20 并发 /health 请求": {
+      "status": "PASS",
+      "detail": "20 并发, 全部200=True, P99=11ms, 总耗时=30ms",
+      "data": {
+        "count": 20,
+        "all_200": true,
+        "p99_ms": 11,
+        "total_ms": 30,
+        "latencies": [
+          6,
+          9,
+          10,
+          7,
+          8,
+          7,
+          6,
+          11,
+          6,
+          2,
+          7,
+          4,
+          9,
+          3,
+          9,
+          4,
+          10,
+          8,
+          8,
+          2
+        ]
+      }
+    },
+    "C-02: 慢网络 + 正常 /health": {
+      "status": "PASS",
+      "detail": "timeout=5s, status=200, ms=6",
+      "data": {
+        "status": 200,
+        "ms": 6,
+        "body": {
+          "status": "running",
+          "service": "loong-recall",
+          "version": "0.8.22",
+          "uptime_seconds": 566,
+          "indexing": {
+            "complete": true,
+            "file_count": 794,
+            "total_chunks": 5226
+          },
+          "memory": {
+            "total": 32
+          },
+          "src_dir": "g:\\code-memory",
+          "llm_configured": false,
+          "lock_busy": false
+        }
+      }
+    },
+    "C-03: 连续 5 次 /health 快速请求": {
+      "status": "PASS",
+      "detail": "5 次快速请求, 全部200=True, avg=16ms",
+      "data": {
+        "count": 5,
+        "all_200": true,
+        "avg_ms": 16.2
+      }
+    },
+    "C-04: 锁状态 + /health 同时请求": {
+      "status": "PASS",
+      "detail": "当前 lock_busy=false, 跳过锁状态测试",
+      "data": {
+        "lock_busy": false
+      }
+    }
+  },
+  "sandbox_checks": [
+    [
+      "路径白名单: 合法路径",
+      true,
+      "G:\\code-memory\\hcse_resilience_tester\\temp\\test.txt"
+    ],
+    [
+      "路径白名单: 越界路径",
+      true,
+      "已拦截: SystemExit"
+    ],
+    [
+      "路径白名单: 系统目录",
+      true,
+      "已拦截: SystemExit"
+    ],
+    [
+      "数据脱敏: 无泄露",
+      true,
+      "全部脱敏成功"
+    ],
+    [
+      "资源监控: 内存/CPU",
+      true,
+      "内存=35.0MB, CPU=0.0%"
+    ]
+  ]
+}

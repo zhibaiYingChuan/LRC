@@ -1,0 +1,62 @@
+﻿[
+    {
+        "Path":  "global\\data\\.lrc.lock",
+        "Content":  "27192",
+        "LastWrite":  "2026-07-31 15:52:53",
+        "AgeDays":  0
+    },
+    {
+        "Path":  "projects\\3fde848d1f2817cd\\data\\.lrc.lock",
+        "Content":  "20340",
+        "LastWrite":  "2026-07-31 16:25:32",
+        "AgeDays":  0
+    },
+    {
+        "Path":  "projects\\8c64d0932a546458\\.lrc.lock",
+        "Content":  "27256",
+        "LastWrite":  "2026-07-31 16:23:03",
+        "AgeDays":  0
+    },
+    {
+        "Path":  "projects\\8c64d0932a546458\\data\\.lrc.lock",
+        "Content":  "37776",
+        "LastWrite":  "2026-06-21 01:42:51",
+        "AgeDays":  40.6
+    },
+    {
+        "Path":  "projects\\ae2c260ac4fc89d8\\data\\.lrc.lock",
+        "Content":  "11348",
+        "LastWrite":  "2026-07-28 04:35:41",
+        "AgeDays":  3.5
+    },
+    {
+        "Path":  "projects\\b0bcfec004e05d30\\data\\.lrc.lock",
+        "Content":  "19000",
+        "LastWrite":  "2026-07-31 15:27:57",
+        "AgeDays":  0.1
+    },
+    {
+        "Path":  "projects\\b595cfcc3c5f484a\\data\\.lrc.lock",
+        "Content":  "1432",
+        "LastWrite":  "2026-07-31 03:11:17",
+        "AgeDays":  0.6
+    },
+    {
+        "Path":  "projects\\daa6656694f41b52\\data\\.lrc.lock",
+        "Content":  "18568",
+        "LastWrite":  "2026-06-21 06:11:42",
+        "AgeDays":  40.4
+    },
+    {
+        "Path":  "projects\\e5373ffac2fcad62\\data\\.lrc.lock",
+        "Content":  "2864",
+        "LastWrite":  "2026-07-30 12:10:54",
+        "AgeDays":  1.2
+    },
+    {
+        "Path":  "projects\\ff29da4542d3a082\\data\\.lrc.lock",
+        "Content":  "17792,9744",
+        "LastWrite":  "2026-07-28 16:36:58",
+        "AgeDays":  3
+    }
+]

@@ -1,10 +1,10 @@
-﻿[workspace]
+[workspace]
 # 桌面端 Tauri 项目是独立的 Cargo 工作区，不参与主项目构建
 exclude = ["desktop/src-tauri"]
 
 [package]
 name = "code-memory"
-version = "0.8.22"
+version = "0.8.23"
 edition = "2021"
 # v0.7.1 P2-5：声明最低支持 Rust 版本（MSRV）
 # v0.8.8：提升到 1.80（std::sync::LazyLock 需要 1.80+）

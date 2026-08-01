@@ -1,0 +1,26 @@
+﻿{
+  "test_id": "HCSE-V0.8.19-PHASE3-INV010-E008",
+  "timestamp": "2026-07-31T17:46:00+08:00",
+  "invariant": "INV-010",
+  "verdict": "PASS",
+  "scenario": "Launch second sidecar on same data-dir to trigger SingletonConflict (E008)",
+  "steps": [
+    {"step": 1, "action": "Start sidecar A: code-memory-server.exe --src-dir g:\\code-memory\\src --port 3099", "result": "PID=1640, running, lock file content='1640'"},
+    {"step": 2, "action": "Start sidecar B: same --src-dir (same data-dir)", "result": "PID=17792, exited with code=2"},
+    {"step": 3, "action": "Verify exit code", "expected": 2, "actual": 2, "matches": true, "ref": "src/process_guard.rs:125 Self::MultiWindowDisabled => 2"},
+    {"step": 4, "action": "Verify STDERR output", "actual": "当前项目已有 LRC 在运行（PID: 1640），多窗口记录功能未开启。", "matches_display_impl": true, "ref": "src/process_guard.rs:46-58 MultiWindowDisabled Display"},
+    {"step": 5, "action": "Verify sidecar A still alive", "result": "PID=1640 still running, /health returns 200"},
+    {"step": 6, "action": "Verify lock file", "path": "C:\\Users\\Administrator\\.loong-recall\\projects\\b595cfcc3c5f484a\\data\\.lrc.lock", "content": "1640"}
+  ],
+  "desktop_layer_verification": {
+    "ref": "desktop/src-tauri/src/commands.rs:179-196",
+    "marker_with_port": "[E008:port={port}] 已有 LRC 实例在运行（PID={pid}，端口 {port}）...",
+    "marker_no_port": "[E008:noport] 已有 LRC 实例在运行（PID={pid}）...",
+    "main_rs_match_logic": "desktop/src-tauri/src/main.rs:340-343 uses err_str.contains('[E008:port=]') and err_str.contains('[E008:noport]')",
+    "verdict": "PASS — structured markers replace fragile Chinese string matching"
+  },
+  "regression_v0.8.18": {
+    "bug": "main.rs used err_str.contains('已有 LRC 实例在运行') which silently breaks when Display wording changes",
+    "fix": "commands.rs emits [E008:port=XXX]/[E008:noport] markers, main.rs matches on markers"
+  }
+}

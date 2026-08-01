@@ -1,0 +1,8 @@
+﻿cargo : [1m[92m    Finished[0m ]8;;https://doc.rust-lang.org/cargo/reference/profiles.html#default-profiles\`relea
+se` profile [optimized]]8;;\ target(s) in 0.32s
+At line:15 char:9743
++ ... ; $output = cargo build --release --bin code-memory-server 2>&1; $out ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([1m[92m    Fi...get(s) in 0.32s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

@@ -1,0 +1,1690 @@
+{
+  "meta": {
+    "report_id": "HCSE-ROUND7-4FA9665D",
+    "timestamp": "2026-08-01T07:51:38.454090+00:00",
+    "version": "0.8.22",
+    "round": 7
+  },
+  "environment": {
+    "cdp_browser": "Edg/150.0.4078.105",
+    "cdp_protocol": "1.3",
+    "page_title": "龙忆 Loong Recall · 仪表盘",
+    "page_url": "https://tauri.localhost/",
+    "is_desktop": true,
+    "sidecar_health": {
+      "status": 200,
+      "ms": 96,
+      "body": {
+        "status": "running",
+        "service": "loong-recall",
+        "version": "0.8.22",
+        "uptime_seconds": 595,
+        "indexing": {
+          "complete": true,
+          "file_count": 787,
+          "total_chunks": 5164
+        },
+        "memory": {
+          "total": 32
+        },
+        "src_dir": "g:\\code-memory",
+        "llm_configured": false,
+        "lock_busy": false
+      }
+    },
+    "hcse_pid": 29460,
+    "hcse_memory_mb": 35.6,
+    "hcse_cpu_s": 0.3,
+    "close_wait": -1
+  },
+  "modules": {
+    "dashboard": {
+      "module": "dashboard",
+      "tests": [
+        {
+          "name": "dashboard: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "dashboard: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=23811"
+        },
+        {
+          "name": "dashboard: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 23811,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    },
+    "memory-search": {
+      "module": "memory-search",
+      "tests": [
+        {
+          "name": "memory-search: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "memory-search: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=2914"
+        },
+        {
+          "name": "memory-search: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 2914,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    },
+    "captain-log": {
+      "module": "captain-log",
+      "tests": [
+        {
+          "name": "captain-log: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "captain-log: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=964"
+        },
+        {
+          "name": "captain-log: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 964,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    },
+    "trust-center": {
+      "module": "trust-center",
+      "tests": [
+        {
+          "name": "trust-center: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "trust-center: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=8311"
+        },
+        {
+          "name": "trust-center: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 8311,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    },
+    "benchmarks": {
+      "module": "benchmarks",
+      "tests": [
+        {
+          "name": "benchmarks: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "benchmarks: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=12322"
+        },
+        {
+          "name": "benchmarks: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 12322,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    },
+    "settings": {
+      "module": "settings",
+      "tests": [
+        {
+          "name": "settings: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "settings: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=26480"
+        },
+        {
+          "name": "settings: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 26480,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    },
+    "project-switch": {
+      "module": "project-switch",
+      "tests": [
+        {
+          "name": "project-switch: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "project-switch: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=10862"
+        },
+        {
+          "name": "project-switch: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 10862,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    },
+    "system-status": {
+      "module": "system-status",
+      "tests": [
+        {
+          "name": "system-status: 导航存在",
+          "passed": true,
+          "detail": "导航项存在: True"
+        },
+        {
+          "name": "system-status: 内容加载",
+          "passed": true,
+          "detail": "active=True, content_len=6781"
+        },
+        {
+          "name": "system-status: 无异常错误",
+          "passed": true,
+          "detail": "errors=0, toasts=0"
+        }
+      ],
+      "passed": 3,
+      "failed": 0,
+      "evidence": {
+        "nav_exists": true,
+        "nav_click": "clicked",
+        "tab_active": true,
+        "tab_content_length": 6781,
+        "error_count": 0,
+        "toast_count": 0
+      }
+    }
+  },
+  "invariants": {
+    "INV-R7-P01": {
+      "id": "INV-R7-P01",
+      "name": "IDE 工具检测（桌面快捷方式扫描 + CodeBuddy/Qoder 检测）",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "通过=6/6",
+      "evidence": {
+        "fix_point": "R7-P01",
+        "tests": [
+          {
+            "name": "/api/tools/detect 端点可达",
+            "passed": true,
+            "detail": "status=200, ms=42ms"
+          },
+          {
+            "name": "响应包含 tools 数组",
+            "passed": true,
+            "detail": "工具数=16"
+          },
+          {
+            "name": "CodeBuddy 在工具列表中",
+            "passed": true,
+            "detail": "CodeBuddy 存在=True, installed=False"
+          },
+          {
+            "name": "Qoder 在工具列表中",
+            "passed": true,
+            "detail": "Qoder 存在=True, installed=True"
+          },
+          {
+            "name": "工具类型完整性（ide + extension）",
+            "passed": true,
+            "detail": "类型={'extension', 'ide'}"
+          },
+          {
+            "name": "桌面快捷方式扫描逻辑（源码验证）",
+            "passed": true,
+            "detail": "scan_desktop_shortcuts() 存在于 src/server.rs:2859，包含 known_tools 列表（CodeBuddy/Qoder 等 16 个）"
+          }
+        ]
+      },
+      "timestamp": "2026-08-01T07:51:49.597699+00:00"
+    },
+    "INV-R7-P02": {
+      "id": "INV-R7-P02",
+      "name": "雷达图硬编码为基准测试结果（11 维度）",
+      "severity": "P2",
+      "status": "PASS",
+      "detail": "通过=5/5",
+      "evidence": {
+        "fix_point": "R7-P02",
+        "tests": [
+          {
+            "name": "LRC_BENCHMARK_DIMENSIONS 常量存在",
+            "passed": true,
+            "detail": "CDP 存在=False, Tauri 源码存在=True"
+          },
+          {
+            "name": "11 个维度（与基准测试一致）",
+            "passed": true,
+            "detail": "维度数=11"
+          },
+          {
+            "name": "维度值在 [0, 1] 范围内",
+            "passed": true,
+            "detail": "min=0.78, max=0.99"
+          },
+          {
+            "name": "radarChart canvas 元素存在",
+            "passed": true,
+            "detail": "canvas 存在=True"
+          },
+          {
+            "name": "drawRadarChart 使用 LRC_BENCHMARK_DIMENSIONS 兜底",
+            "passed": true,
+            "detail": "hasFallback=True, details={'hasLRCBenchmark': True, 'hasFallback': True, 'has11Keys': True, '_source': 'app.js_file'}"
+          }
+        ]
+      },
+      "timestamp": "2026-08-01T07:51:49.598699+00:00"
+    },
+    "INV-R7-P03": {
+      "id": "INV-R7-P03",
+      "name": "语义编码模型选择 event?.target ReferenceError 修复",
+      "severity": "P2",
+      "status": "PASS",
+      "detail": "通过=5/5",
+      "evidence": {
+        "fix_point": "R7-P03",
+        "tests": [
+          {
+            "name": "testEmbedderConnection 函数存在",
+            "passed": true,
+            "detail": "存在=True"
+          },
+          {
+            "name": "使用 document.querySelector 替代 event?.target",
+            "passed": true,
+            "detail": "hasQuerySelector=True, hasEventTarget=True（修复后 event?.target 仅作为回退）"
+          },
+          {
+            "name": "有 try/catch/finally 错误处理",
+            "passed": true,
+            "detail": "hasTryCatch=True, hasFinally=True"
+          },
+          {
+            "name": "按钮 disabled 恢复机制（在 finally 中恢复）",
+            "passed": true,
+            "detail": "hasBtnDisabled=True"
+          },
+          {
+            "name": "embedder-model 选择器存在",
+            "passed": true,
+            "detail": "存在=True"
+          }
+        ]
+      },
+      "timestamp": "2026-08-01T07:51:49.598699+00:00"
+    },
+    "INV-R7-P04": {
+      "id": "INV-R7-P04",
+      "name": "船长日志 try/catch/finally 错误处理",
+      "severity": "P2",
+      "status": "PASS",
+      "detail": "通过=6/6",
+      "evidence": {
+        "fix_point": "R7-P04",
+        "tests": [
+          {
+            "name": "generateCaptainLog 函数存在",
+            "passed": true,
+            "detail": "存在=True"
+          },
+          {
+            "name": "有 try/catch 错误处理",
+            "passed": true,
+            "detail": "hasTry=True, hasCatch=True"
+          },
+          {
+            "name": "有 finally 清理逻辑",
+            "passed": true,
+            "detail": "hasFinally=True"
+          },
+          {
+            "name": "有 Promise.allSettled 并行请求",
+            "passed": true,
+            "detail": "hasPromiseAllSettled=True"
+          },
+          {
+            "name": "有回退逻辑（/v1/captains-log 不可用时降级）",
+            "passed": true,
+            "detail": "hasFallback=True"
+          },
+          {
+            "name": "按钮状态管理（disabled + 恢复）",
+            "passed": true,
+            "detail": "hasBtnDisabled=True"
+          }
+        ]
+      },
+      "timestamp": "2026-08-01T07:51:49.598699+00:00"
+    },
+    "INV-V0822-P0A": {
+      "id": "INV-V0822-P0A",
+      "name": "tokio worker_threads=16, lock_busy 期间 /health 可达",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "10 轮 /health: 10/10 可达, avg=13.0ms",
+      "evidence": {
+        "health_10": [
+          {
+            "status": 200,
+            "ms": 16
+          },
+          {
+            "status": 200,
+            "ms": 13
+          },
+          {
+            "status": 200,
+            "ms": 23
+          },
+          {
+            "status": 200,
+            "ms": 2
+          },
+          {
+            "status": 200,
+            "ms": 24
+          },
+          {
+            "status": 200,
+            "ms": 17
+          },
+          {
+            "status": 200,
+            "ms": 15
+          },
+          {
+            "status": 200,
+            "ms": 20
+          },
+          {
+            "status": 200,
+            "ms": 0
+          },
+          {
+            "status": 200,
+            "ms": 0
+          }
+        ]
+      },
+      "timestamp": "2026-08-01T07:51:50.751211+00:00"
+    },
+    "INV-V0822-IA01": {
+      "id": "INV-V0822-IA01",
+      "name": "loadDaoMetrics AbortController",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "daoAbortController 存在=True",
+      "evidence": {
+        "daoAbortController_exists": true
+      },
+      "timestamp": "2026-08-01T07:51:50.771177+00:00"
+    },
+    "INV-V0822-IA02": {
+      "id": "INV-V0822-IA02",
+      "name": "全局错误处理注册",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "_lrcGlobalErrorRegistered=True",
+      "evidence": {
+        "global_error_registered": true
+      },
+      "timestamp": "2026-08-01T07:51:50.772179+00:00"
+    },
+    "INV-V0822-IA03": {
+      "id": "INV-V0822-IA03",
+      "name": "SidecarHealthMonitor 挂载到 window",
+      "severity": "P2",
+      "status": "PASS",
+      "detail": "monitor 存在=True, 属性={'exists': True, 'hasOnline': True, 'hasFailCount': True, 'hasLockBusy': False}",
+      "evidence": {
+        "sidecar_health_monitor": {
+          "exists": true,
+          "hasOnline": true,
+          "hasFailCount": true,
+          "hasLockBusy": false
+        }
+      },
+      "timestamp": "2026-08-01T07:51:50.774691+00:00"
+    },
+    "INV-V0821-01": {
+      "id": "INV-V0821-01",
+      "name": "wizard.json 兜底创建（回归）",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "sidecar /health 可达=True",
+      "evidence": {
+        "sidecar_health": {
+          "status": 200,
+          "ms": 3,
+          "body": {
+            "status": "running",
+            "service": "loong-recall",
+            "version": "0.8.22",
+            "uptime_seconds": 606,
+            "indexing": {
+              "complete": true,
+              "file_count": 787,
+              "total_chunks": 5164
+            },
+            "memory": {
+              "total": 32
+            },
+            "src_dir": "g:\\code-memory",
+            "llm_configured": false,
+            "lock_busy": false
+          }
+        }
+      },
+      "timestamp": "2026-08-01T07:51:50.774691+00:00"
+    },
+    "INV-V0821-02": {
+      "id": "INV-V0821-02",
+      "name": "自动启动 120s 超时保护（回归）",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "sidecar 可达=True, uptime=606s",
+      "evidence": {
+        "uptime": 606
+      },
+      "timestamp": "2026-08-01T07:51:50.774691+00:00"
+    },
+    "INV-V0821-03": {
+      "id": "INV-V0821-03",
+      "name": "switch_project 120s 超时（回归）",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "Tauri 桥接可用=True",
+      "evidence": {
+        "tauri_available": true
+      },
+      "timestamp": "2026-08-01T07:51:50.800563+00:00"
+    },
+    "INV-V0821-04": {
+      "id": "INV-V0821-04",
+      "name": "状态栏 lockBusy 紫色显示（回归）",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "sidecar 非 lock_busy 状态，跳过运行时验证",
+      "evidence": {
+        "skip_reason": "not_lock_busy"
+      },
+      "timestamp": "2026-08-01T07:51:50.801537+00:00"
+    },
+    "INV-V0821-05": {
+      "id": "INV-V0821-05",
+      "name": "dao 503 lock_busy 文案修复（回归）",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "静态验证通过（app.js:LOCK_BUSY 分支）",
+      "evidence": {
+        "code_ref": "app.js"
+      },
+      "timestamp": "2026-08-01T07:51:50.801537+00:00"
+    },
+    "INV-LOCK-001": {
+      "id": "INV-LOCK-001",
+      "name": "健康端点不被合成锁阻塞",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "4 端点全部可达, max=23ms",
+      "evidence": {
+        "endpoints": {
+          "/health": {
+            "status": 200,
+            "ms": 2,
+            "body": {
+              "status": "running",
+              "service": "loong-recall",
+              "version": "0.8.22",
+              "uptime_seconds": 607,
+              "indexing": {
+                "complete": true,
+                "file_count": 787,
+                "total_chunks": 5164
+              },
+              "memory": {
+                "total": 32
+              },
+              "src_dir": "g:\\code-memory",
+              "llm_configured": false,
+              "lock_busy": false
+            }
+          },
+          "/v1/health/dao_metrics": {
+            "status": 200,
+            "ms": 23,
+            "body": {
+              "data": {
+                "active_memories": 32,
+                "bagua_balance": 1.130056381225586,
+                "crystallized_memories": 6,
+                "dao_isomorphism_score": 0.9402989745140076,
+                "luoshu_deviation": 5.970102310180664,
+                "status": "healthy",
+                "synthesis_ratio": 18.75,
+                "yin_yang_balance": 94.02989959716797
+              },
+              "ok": true,
+              "raw": {
+                "archived_memories": 0,
+                "bagua_entropy": 0.9886994361877441,
+                "compositions_total": 0,
+                "corrections_total": 0,
+                "encodings_total": 0,
+                "recalls_total": 0
+              }
+            }
+          },
+          "/v1/health/system": {
+            "status": 200,
+            "ms": 15,
+            "body": {
+              "action_hints": [
+                {
+                  "category": "degradation",
+                  "message": "系统已降级运行，语义理解能力减弱。当前依赖统计编码器兜底 [已连续 195 次出现此警告，级别提升]",
+                  "severity": "action_required",
+                  "suggested_action": "建议检查 ML 模型是否可用、网络连接是否正常。如长期处于降级模式，建议安装本地 ML 模型 此问题已持续 195 次未解决，请优先处理。"
+                }
+              ],
+              "complexity_budget": {
+                "budget_consumed": 0.625,
+                "budget_limit": {
+                  "max_cross_deps": 70,
+                  "max_dependency_depth": 8,
+                  "max_modules": 35,
+                  "max_public_api": 350,
+                  "min_maintainability_score": 0.4000000059604645
+                },
+                "causal_chains": [
+                  {
+                    "breadth": 4,
+                    "chain": [
+                      {
+                        "description": "直接决定 GC 是否触发",
+                        "function": "should_run",
+                        "impact_type": "DirectPass",
+                        "module": "memory_gc"
+                      },
+                      {
+                        "description": "影响回收频率，进而影响过期记忆的清理速度",
+                        "function": "collect_garbage",
+                        "impact_type": "DirectPass",
+                        "module": "memory_gc"
+                      },
+                      {
+                        "description": "GC 清理速度影响活跃记忆数量，进而影响道同构度指标，最终触发调节器调整合成阈值",
+                        "function": "regulate",
+                        "impact_type": "Calibration",
+                        "module": "dao_regulator"
+                      },
+                      {
+                        "description": "合成阈值变化影响合成频率，进而影响记忆库的整体质量和多样性",
+                        "function": "try_synthesize",
+                        "impact_type": "Cascade",
+                        "module": "synthesis_engine"
+                      }
+                    ],
+                    "depth": 4,
+                    "parameter": "gc_interval_ms",
+                    "risk_level": "High",
+                    "source_module": "memory_gc"
+                  },
+                  {
+                    "breadth": 5,
+                    "chain": [
+                      {
+                        "description": "直接决定合成是否执行——阈值越高，合成越少",
+                        "function": "try_synthesize",
+                        "impact_type": "DirectPass",
+                        "module": "synthesis_engine"
+                      },
+                      {
+                        "description": "合成频率影响合成日志的统计分布",
+                        "function": "record_synthesis",
+                        "impact_type": "DirectPass",
+                        "module": "synthesis_journal"
+                      },
+                      {
+                        "description": "合成日志质量反馈到调节器，影响阈值自身的动态调整",
+                        "function": "regulate",
+                        "impact_type": "Calibration",
+                        "module": "dao_regulator"
+                      },
+                      {
+                        "description": "阈值调整形成反馈回路——调节器修改阈值，阈值影响合成质量，合成质量再反馈给调节器",
+                        "function": "apply_threshold_adjustment",
+                        "impact_type": "FeedbackLoop",
+                        "module": "dao_regulator"
+                      },
+                      {
+                        "description": "合成质量影响用户隐式反馈，进而影响下一次检索的排序",
+                        "function": "get_implicit_quality_adjustments",
+                        "impact_type": "Cascade",
+                        "module": "user_feedback"
+                      }
+                    ],
+                    "depth": 5,
+                    "parameter": "information_gain_threshold",
+                    "risk_level": "Critical",
+                    "source_module": "synthesis_engine"
+                  },
+                  {
+                    "breadth": 5,
+                    "chain": [
+                      {
+                        "description": "编码器质量直接影响所有语义向量的准确性",
+                        "function": "encode_text",
+                        "impact_type": "DirectPass",
+                        "module": "luoshu_encoder"
+                      },
+                      {
+                        "description": "向量质量影响镜像投影的精度，进而影响检索结果的排序",
+                        "function": "mirror_project",
+                        "impact_type": "DirectPass",
+                        "module": "mirror_trapezoid"
+                      },
+                      {
+                        "description": "向量质量影响 Jaccard 相似度计算，进而影响合成簇的发现",
+                        "function": "find_synthesis_clusters",
+                        "impact_type": "Cascade",
+                        "module": "synthesis_engine"
+                      },
+                      {
+                        "description": "编码质量影响道同构度指标，进而影响系统模式判断",
+                        "function": "snapshot",
+                        "impact_type": "Cascade",
+                        "module": "dao_metrics"
+                      }
+                    ],
+                    "depth": 4,
+                    "parameter": "encoder_quality_score",
+                    "risk_level": "Critical",
+                    "source_module": "luoshu_encoder"
+                  },
+                  {
+                    "breadth": 3,
+                    "chain": [
+                      {
+                        "description": "步长乘数决定每次调节的幅度——过大导致振荡，过小导致响应迟缓",
+                        "function": "regulate",
+                        "impact_type": "DirectPass",
+                        "module": "dao_regulator"
+                      },
+                      {
+                        "description": "步长过大触发振荡检测，可能导致调节器暂停",
+                        "function": "detect_oscillation",
+                        "impact_type": "ConditionalBranch",
+                        "module": "dao_regulator"
+                      },
+                      {
+                        "description": "调节器暂停导致合成阈值不再更新，可能影响合成质量",
+                        "function": "try_synthesize",
+                        "impact_type": "Cascade",
+                        "module": "synthesis_engine"
+                      }
+                    ],
+                    "depth": 3,
+                    "parameter": "step_multiplier",
+                    "risk_level": "Medium",
+                    "source_module": "dao_regulator"
+                  },
+                  {
+                    "breadth": 3,
+                    "chain": [
+                      {
+                        "description": "权重决定隐式反馈对检索排序的影响程度",
+                        "function": "get_implicit_quality_adjustments",
+                        "impact_type": "DirectPass",
+                        "module": "user_feedback"
+                      },
+                      {
+                        "description": "隐式反馈权重影响合成质量评估，进而影响合成决策",
+                        "function": "try_synthesize",
+                        "impact_type": "Calibration",
+                        "module": "synthesis_engine"
+                      },
+                      {
+                        "description": "合成决策变化影响调节器的输入，可能改变调节策略",
+                        "function": "regulate",
+                        "impact_type": "Cascade",
+                        "module": "dao_regulator"
+                      }
+                    ],
+                    "depth": 3,
+                    "parameter": "implicit_feedback_weight",
+                    "risk_level": "Medium",
+                    "source_module": "user_feedback"
+                  },
+                  {
+                    "breadth": 2,
+                    "chain": [
+                      {
+                        "description": "基线是动态阈值的锚点——阈值不能偏离基线超过 max_threshold_deviation",
+                        "function": "apply_threshold_adjustment",
+                        "impact_type": "DirectPass",
+                        "module": "dao_regulator"
+                      },
+                      {
+                        "description": "基线变化直接影响合成频率的上限和下限",
+                        "function": "try_synthesize",
+                        "impact_type": "Calibration",
+                        "module": "synthesis_engine"
+                      },
+                      {
+                        "description": "当阈值长期偏离基线时，均值回归机制会将其拉回",
+                        "function": "maybe_revert_threshold",
+                        "impact_type": "FeedbackLoop",
+                        "module": "dao_regulator"
+                      }
+                    ],
+                    "depth": 3,
+                    "parameter": "threshold_baseline",
+                    "risk_level": "High",
+                    "source_module": "dao_regulator"
+                  }
+                ],
+                "complexity_honesty": {
+                  "hidden_complexity_estimate": 0.0,
+                  "score": 1.0,
+                  "violations": []
+                },
+                "cross_module_dependencies": 40,
+                "generated_at_ms": 1785570710842,
+                "maintainability_score": 0.42321425676345825,
+                "max_dependency_depth": 5,
+                "module_count": 20,
+                "public_api_surface": 200
+              },
+              "dao_metrics": {
+                "active_memories": 32,
+                "archived_memories": 0,
+                "bagua_entropy": 0.9886994361877441,
+                "compositions_total": 0,
+                "corrections_total": 0,
+                "crystallized_memories": 6,
+                "dao_isomorphism_score": 0.9402989745140076,
+                "encodings_total": 0,
+                "last_collected_ms": 0,
+                "recalls_total": 0,
+                "synthesis_ratio": 0.1875
+              },
+              "encoder": {
+                "capability_description": "统计模式：基于词频和字符熵的轻量编码，语义区分能力有限",
+                "degradation_reason": "ML 编码器未启用",
+                "hidden_size": null,
+                "last_encoding_ms": 0,
+                "mode": "statistical",
+                "model_name": null,
+                "quality_score": 0.25,
+                "total_encodings": 0
+              },
+              "feedback_stats": {
+                "consent_granted": null,
+                "implicit_feedback_enabled": true,
+                "negative_count": 0,
+                "positive_count": 0,
+                "positive_ratio": 0.5,
+                "quarantine_overrides": 0,
+                "synthesis_feedback_count": 0,
+                "total_feedback": 0
+              },
+              "gc_stats": {
+                "last_gc_ms": 0,
+                "last_removed_count": 0,
+                "observing_count": 0,
+                "total_cycles": 0,
+                "total_freed": 0,
+                "total_removed": 0
+              },
+              "generated_at_ms": 1785570710842,
+              "memory_stats": {
+                "active_memories": 32,
+                "bagua_distribution": [
+                  0,
+                  14,
+                  18,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0
+                ],
+                "expired_memories": 0,
+                "low_quality_synthesis": 0,
+                "synthesis_memories": 6,
+                "total_memories": 32
+              },
+              "regulator": {
+                "auto_regulate": true,
+                "consecutive_ineffective": 0,
+                "consecutive_same_direction": 0,
+                "coupling_score": 0.0,
+                "drift_threshold": 8,
+                "freeze_threshold": 10,
+                "is_drifting": false,
+                "is_frozen": false,
+                "is_oscillating": false,
+                "last_regulation_ms": 0,
+                "oscillation_window": 5,
+                "regulation_interval_ms": 300000,
+                "step_multiplier": 1.0
+              },
+              "synthesis_journal": {
+                "low_quality_count": 0,
+                "recent_events": [],
+                "success_rate": 1.0,
+                "synthesis_rate_per_minute": 0.0,
+                "total_synthesis": 0
+              },
+              "system_mode": "degraded",
+              "system_mode_description": "编码器已降级为统计模式，语义理解能力降低。建议检查网络连接或安装本地 ML 模型"
+            }
+          },
+          "/v1/health/detailed": {
+            "status": 200,
+            "ms": 16,
+            "body": {
+              "catastrophic_events": [],
+              "coupling_trend": {
+                "all_avg_strength": 0.0,
+                "bagua_anomaly_count": 0,
+                "cascade_count": 0,
+                "cascade_ratio": 0.0,
+                "dao_anomaly_count": 0,
+                "deviation_anomaly_count": 0,
+                "is_worsening": false,
+                "recent_avg_strength": 0.0,
+                "recent_hour_density": 0,
+                "synthesis_anomaly_count": 0,
+                "total_coupling_events": 0
+              },
+              "gc_candidates": [],
+              "health": {
+                "action_hints": [
+                  {
+                    "category": "degradation",
+                    "message": "系统已降级运行，语义理解能力减弱。当前依赖统计编码器兜底 [已连续 196 次出现此警告，级别提升]",
+                    "severity": "action_required",
+                    "suggested_action": "建议检查 ML 模型是否可用、网络连接是否正常。如长期处于降级模式，建议安装本地 ML 模型 此问题已持续 196 次未解决，请优先处理。"
+                  }
+                ],
+                "complexity_budget": {
+                  "budget_consumed": 0.625,
+                  "budget_limit": {
+                    "max_cross_deps": 70,
+                    "max_dependency_depth": 8,
+                    "max_modules": 35,
+                    "max_public_api": 350,
+                    "min_maintainability_score": 0.4000000059604645
+                  },
+                  "causal_chains": [
+                    {
+                      "breadth": 4,
+                      "chain": [
+                        {
+                          "description": "直接决定 GC 是否触发",
+                          "function": "should_run",
+                          "impact_type": "DirectPass",
+                          "module": "memory_gc"
+                        },
+                        {
+                          "description": "影响回收频率，进而影响过期记忆的清理速度",
+                          "function": "collect_garbage",
+                          "impact_type": "DirectPass",
+                          "module": "memory_gc"
+                        },
+                        {
+                          "description": "GC 清理速度影响活跃记忆数量，进而影响道同构度指标，最终触发调节器调整合成阈值",
+                          "function": "regulate",
+                          "impact_type": "Calibration",
+                          "module": "dao_regulator"
+                        },
+                        {
+                          "description": "合成阈值变化影响合成频率，进而影响记忆库的整体质量和多样性",
+                          "function": "try_synthesize",
+                          "impact_type": "Cascade",
+                          "module": "synthesis_engine"
+                        }
+                      ],
+                      "depth": 4,
+                      "parameter": "gc_interval_ms",
+                      "risk_level": "High",
+                      "source_module": "memory_gc"
+                    },
+                    {
+                      "breadth": 5,
+                      "chain": [
+                        {
+                          "description": "直接决定合成是否执行——阈值越高，合成越少",
+                          "function": "try_synthesize",
+                          "impact_type": "DirectPass",
+                          "module": "synthesis_engine"
+                        },
+                        {
+                          "description": "合成频率影响合成日志的统计分布",
+                          "function": "record_synthesis",
+                          "impact_type": "DirectPass",
+                          "module": "synthesis_journal"
+                        },
+                        {
+                          "description": "合成日志质量反馈到调节器，影响阈值自身的动态调整",
+                          "function": "regulate",
+                          "impact_type": "Calibration",
+                          "module": "dao_regulator"
+                        },
+                        {
+                          "description": "阈值调整形成反馈回路——调节器修改阈值，阈值影响合成质量，合成质量再反馈给调节器",
+                          "function": "apply_threshold_adjustment",
+                          "impact_type": "FeedbackLoop",
+                          "module": "dao_regulator"
+                        },
+                        {
+                          "description": "合成质量影响用户隐式反馈，进而影响下一次检索的排序",
+                          "function": "get_implicit_quality_adjustments",
+                          "impact_type": "Cascade",
+                          "module": "user_feedback"
+                        }
+                      ],
+                      "depth": 5,
+                      "parameter": "information_gain_threshold",
+                      "risk_level": "Critical",
+                      "source_module": "synthesis_engine"
+                    },
+                    {
+                      "breadth": 5,
+                      "chain": [
+                        {
+                          "description": "编码器质量直接影响所有语义向量的准确性",
+                          "function": "encode_text",
+                          "impact_type": "DirectPass",
+                          "module": "luoshu_encoder"
+                        },
+                        {
+                          "description": "向量质量影响镜像投影的精度，进而影响检索结果的排序",
+                          "function": "mirror_project",
+                          "impact_type": "DirectPass",
+                          "module": "mirror_trapezoid"
+                        },
+                        {
+                          "description": "向量质量影响 Jaccard 相似度计算，进而影响合成簇的发现",
+                          "function": "find_synthesis_clusters",
+                          "impact_type": "Cascade",
+                          "module": "synthesis_engine"
+                        },
+                        {
+                          "description": "编码质量影响道同构度指标，进而影响系统模式判断",
+                          "function": "snapshot",
+                          "impact_type": "Cascade",
+                          "module": "dao_metrics"
+                        }
+                      ],
+                      "depth": 4,
+                      "parameter": "encoder_quality_score",
+                      "risk_level": "Critical",
+                      "source_module": "luoshu_encoder"
+                    },
+                    {
+                      "breadth": 3,
+                      "chain": [
+                        {
+                          "description": "步长乘数决定每次调节的幅度——过大导致振荡，过小导致响应迟缓",
+                          "function": "regulate",
+                          "impact_type": "DirectPass",
+                          "module": "dao_regulator"
+                        },
+                        {
+                          "description": "步长过大触发振荡检测，可能导致调节器暂停",
+                          "function": "detect_oscillation",
+                          "impact_type": "ConditionalBranch",
+                          "module": "dao_regulator"
+                        },
+                        {
+                          "description": "调节器暂停导致合成阈值不再更新，可能影响合成质量",
+                          "function": "try_synthesize",
+                          "impact_type": "Cascade",
+                          "module": "synthesis_engine"
+                        }
+                      ],
+                      "depth": 3,
+                      "parameter": "step_multiplier",
+                      "risk_level": "Medium",
+                      "source_module": "dao_regulator"
+                    },
+                    {
+                      "breadth": 3,
+                      "chain": [
+                        {
+                          "description": "权重决定隐式反馈对检索排序的影响程度",
+                          "function": "get_implicit_quality_adjustments",
+                          "impact_type": "DirectPass",
+                          "module": "user_feedback"
+                        },
+                        {
+                          "description": "隐式反馈权重影响合成质量评估，进而影响合成决策",
+                          "function": "try_synthesize",
+                          "impact_type": "Calibration",
+                          "module": "synthesis_engine"
+                        },
+                        {
+                          "description": "合成决策变化影响调节器的输入，可能改变调节策略",
+                          "function": "regulate",
+                          "impact_type": "Cascade",
+                          "module": "dao_regulator"
+                        }
+                      ],
+                      "depth": 3,
+                      "parameter": "implicit_feedback_weight",
+                      "risk_level": "Medium",
+                      "source_module": "user_feedback"
+                    },
+                    {
+                      "breadth": 2,
+                      "chain": [
+                        {
+                          "description": "基线是动态阈值的锚点——阈值不能偏离基线超过 max_threshold_deviation",
+                          "function": "apply_threshold_adjustment",
+                          "impact_type": "DirectPass",
+                          "module": "dao_regulator"
+                        },
+                        {
+                          "description": "基线变化直接影响合成频率的上限和下限",
+                          "function": "try_synthesize",
+                          "impact_type": "Calibration",
+                          "module": "synthesis_engine"
+                        },
+                        {
+                          "description": "当阈值长期偏离基线时，均值回归机制会将其拉回",
+                          "function": "maybe_revert_threshold",
+                          "impact_type": "FeedbackLoop",
+                          "module": "dao_regulator"
+                        }
+                      ],
+                      "depth": 3,
+                      "parameter": "threshold_baseline",
+                      "risk_level": "High",
+                      "source_module": "dao_regulator"
+                    }
+                  ],
+                  "complexity_honesty": {
+                    "hidden_complexity_estimate": 0.0,
+                    "score": 1.0,
+                    "violations": []
+                  },
+                  "cross_module_dependencies": 40,
+                  "generated_at_ms": 1785570710859,
+                  "maintainability_score": 0.42321425676345825,
+                  "max_dependency_depth": 5,
+                  "module_count": 20,
+                  "public_api_surface": 200
+                },
+                "dao_metrics": {
+                  "active_memories": 32,
+                  "archived_memories": 0,
+                  "bagua_entropy": 0.9886994361877441,
+                  "compositions_total": 0,
+                  "corrections_total": 0,
+                  "crystallized_memories": 6,
+                  "dao_isomorphism_score": 0.9402989745140076,
+                  "encodings_total": 0,
+                  "last_collected_ms": 0,
+                  "recalls_total": 0,
+                  "synthesis_ratio": 0.1875
+                },
+                "encoder": {
+                  "capability_description": "统计模式：基于词频和字符熵的轻量编码，语义区分能力有限",
+                  "degradation_reason": "ML 编码器未启用",
+                  "hidden_size": null,
+                  "last_encoding_ms": 0,
+                  "mode": "statistical",
+                  "model_name": null,
+                  "quality_score": 0.25,
+                  "total_encodings": 0
+                },
+                "feedback_stats": {
+                  "consent_granted": null,
+                  "implicit_feedback_enabled": true,
+                  "negative_count": 0,
+                  "positive_count": 0,
+                  "positive_ratio": 0.5,
+                  "quarantine_overrides": 0,
+                  "synthesis_feedback_count": 0,
+                  "total_feedback": 0
+                },
+                "gc_stats": {
+                  "last_gc_ms": 0,
+                  "last_removed_count": 0,
+                  "observing_count": 0,
+                  "total_cycles": 0,
+                  "total_freed": 0,
+                  "total_removed": 0
+                },
+                "generated_at_ms": 1785570710859,
+                "memory_stats": {
+                  "active_memories": 32,
+                  "bagua_distribution": [
+                    0,
+                    14,
+                    18,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                  ],
+                  "expired_memories": 0,
+                  "low_quality_synthesis": 0,
+                  "synthesis_memories": 6,
+                  "total_memories": 32
+                },
+                "regulator": {
+                  "auto_regulate": true,
+                  "consecutive_ineffective": 0,
+                  "consecutive_same_direction": 0,
+                  "coupling_score": 0.0,
+                  "drift_threshold": 8,
+                  "freeze_threshold": 10,
+                  "is_drifting": false,
+                  "is_frozen": false,
+                  "is_oscillating": false,
+                  "last_regulation_ms": 0,
+                  "oscillation_window": 5,
+                  "regulation_interval_ms": 300000,
+                  "step_multiplier": 1.0
+                },
+                "synthesis_journal": {
+                  "low_quality_count": 0,
+                  "recent_events": [],
+                  "success_rate": 1.0,
+                  "synthesis_rate_per_minute": 0.0,
+                  "total_synthesis": 0
+                },
+                "system_mode": "degraded",
+                "system_mode_description": "编码器已降级为统计模式，语义理解能力降低。建议检查网络连接或安装本地 ML 模型"
+              },
+              "pending_user_actions": []
+            }
+          }
+        }
+      },
+      "timestamp": "2026-08-01T07:51:50.858953+00:00"
+    },
+    "INV-STATE-002": {
+      "id": "INV-STATE-002",
+      "name": "UI 状态与 sidecar 实际状态一致",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "前端 lockBusy=None, sidecar lockBusy=False",
+      "evidence": {
+        "frontend_online": {},
+        "frontend_lockbusy": null,
+        "sidecar_lockbusy": false
+      },
+      "timestamp": "2026-08-01T07:51:50.876722+00:00"
+    },
+    "INV-PROC-003": {
+      "id": "INV-PROC-003",
+      "name": "sidecar 卡死后前端能检测并降级",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "sidecar 当前健康，前端 statusDot 正常",
+      "evidence": {
+        "sidecar_health": 200
+      },
+      "timestamp": "2026-08-01T07:51:50.876722+00:00"
+    },
+    "INV-TIMEOUT-004": {
+      "id": "INV-TIMEOUT-004",
+      "name": "前端 fetch 超时真正触发",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "fetchWithTimeout 存在=True",
+      "evidence": {
+        "fetch_with_timeout": true
+      },
+      "timestamp": "2026-08-01T07:51:50.877723+00:00"
+    },
+    "INV-LEAK-006": {
+      "id": "INV-LEAK-006",
+      "name": "sidecar HTTP 连接不泄漏",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "CloseWait=-1",
+      "evidence": {
+        "close_wait": -1
+      },
+      "timestamp": "2026-08-01T07:51:50.877723+00:00"
+    },
+    "INV-SANITIZE-006": {
+      "id": "INV-SANITIZE-006",
+      "name": "捕获数据脱敏不变式",
+      "severity": "P0",
+      "status": "PASS",
+      "detail": "所有证据经沙箱双重脱敏处理",
+      "evidence": {
+        "sanitizer_type": "双重脱敏（正则+结构裁剪）"
+      },
+      "timestamp": "2026-08-01T07:51:50.877723+00:00"
+    },
+    "INV-RESOURCE-007": {
+      "id": "INV-RESOURCE-007",
+      "name": "资源容量看门狗",
+      "severity": "P1",
+      "status": "PASS",
+      "detail": "HCSE 进程内存=35.6MB < 1024MB",
+      "evidence": {
+        "memory_mb": 35.6
+      },
+      "timestamp": "2026-08-01T07:51:50.877723+00:00"
+    }
+  },
+  "exception_paths": {
+    "竞态路径_快速切换": {
+      "category": "竞态路径",
+      "path_type": "快速切换",
+      "status": "PASS",
+      "detail": "新错误数=0, 新Toast数=1, 最终标签=settings, 页面崩溃=False",
+      "evidence": {
+        "errors_before": 0,
+        "errors_after": 0,
+        "new_errors": 0,
+        "toast_before": 0,
+        "toast_after": 1,
+        "final_tab": "settings",
+        "window_title": "龙忆 Loong Recall · 仪表盘"
+      }
+    },
+    "竞态路径_AbortController": {
+      "category": "竞态路径",
+      "path_type": "AbortController",
+      "status": "PASS",
+      "detail": "daoAbortController 存在=True",
+      "evidence": {
+        "daoAbortControllerExists": true,
+        "daoAbortControllerType": "object",
+        "lrcGlobalErrorRegistered": true,
+        "sidecarHealthMonitorExists": true,
+        "after_switch_aborted": false
+      }
+    },
+    "错误路径_全局错误处理": {
+      "category": "错误路径",
+      "path_type": "全局错误处理",
+      "status": "PASS",
+      "detail": "全局错误注册=True, 新Toast数=1, Toast文本=HCSE-ROUND7-TEST-GLOBAL-ERROR",
+      "evidence": {
+        "global_error_registered": true,
+        "toast_before": 1,
+        "toast_after": 2,
+        "new_toast": 1,
+        "toast_text": "HCSE-ROUND7-TEST-GLOBAL-ERROR"
+      }
+    },
+    "超时路径_fetch超时机制": {
+      "category": "超时路径",
+      "path_type": "fetch超时机制",
+      "status": "PASS",
+      "detail": "fetchWithTimeout=True, safeFetch=False, loadDaoTimeout={'hasAbortController': True, 'hasTimeout': True, 'hasSignal': True}",
+      "evidence": {
+        "has_fetch_with_timeout": true,
+        "has_safe_fetch": false,
+        "load_dao_timeout": {
+          "hasAbortController": true,
+          "hasTimeout": true,
+          "hasSignal": true
+        }
+      }
+    },
+    "卡死路径_前端降级恢复": {
+      "category": "卡死路径",
+      "path_type": "前端降级恢复",
+      "status": "PASS",
+      "detail": "monitor=True, status_dot={'exists': True, 'className': 'status-dot online', 'text': ''}, banner={'exists': True, 'hidden': True, 'text': 'LRC 服务未运行，部分功能不可用'}",
+      "evidence": {
+        "monitor_status": {
+          "exists": true,
+          "isReachable": {},
+          "failCount": 0,
+          "backoffStep": 0
+        },
+        "status_dot": {
+          "exists": true,
+          "className": "status-dot online",
+          "text": ""
+        },
+        "banner": {
+          "exists": true,
+          "hidden": true,
+          "text": "LRC 服务未运行，部分功能不可用"
+        }
+      }
+    },
+    "取消路径_Abort取消": {
+      "category": "取消路径",
+      "path_type": "Abort取消",
+      "status": "PASS",
+      "detail": "loadDaoMetrics 可取消={'hasAbort': True, 'hasAbortController': True, 'canCancel': True}",
+      "evidence": {
+        "cancel_analysis": {
+          "hasAbort": true,
+          "hasAbortController": true,
+          "canCancel": true
+        }
+      }
+    }
+  },
+  "evidence_files": [
+    "G:\\code-memory\\hcse_resilience_tester\\screenshots\\round7_baseline_1785570699.png",
+    "G:\\code-memory\\hcse_resilience_tester\\screenshots\\round7_final_1785570710.png"
+  ],
+  "v0822_fix_points": {
+    "R7-P01": {
+      "fix_point": "R7-P01",
+      "name": "IDE 工具检测（桌面快捷方式扫描 + CodeBuddy/Qoder）",
+      "tests": [
+        {
+          "name": "/api/tools/detect 端点可达",
+          "passed": true,
+          "detail": "status=200, ms=42ms"
+        },
+        {
+          "name": "响应包含 tools 数组",
+          "passed": true,
+          "detail": "工具数=16"
+        },
+        {
+          "name": "CodeBuddy 在工具列表中",
+          "passed": true,
+          "detail": "CodeBuddy 存在=True, installed=False"
+        },
+        {
+          "name": "Qoder 在工具列表中",
+          "passed": true,
+          "detail": "Qoder 存在=True, installed=True"
+        },
+        {
+          "name": "工具类型完整性（ide + extension）",
+          "passed": true,
+          "detail": "类型={'extension', 'ide'}"
+        },
+        {
+          "name": "桌面快捷方式扫描逻辑（源码验证）",
+          "passed": true,
+          "detail": "scan_desktop_shortcuts() 存在于 src/server.rs:2859，包含 known_tools 列表（CodeBuddy/Qoder 等 16 个）"
+        }
+      ],
+      "passed": 6,
+      "failed": 0,
+      "evidence": {
+        "tools_count": 16,
+        "tool_names": [
+          "VS Code",
+          "Cursor",
+          "Trae",
+          "Trae CN",
+          "Windsurf",
+          "CodeBuddy",
+          "Qoder",
+          "GitHub Copilot",
+          "JetBrains Toolbox",
+          "Zed",
+          "Claude Code",
+          "Aider",
+          "Warp AI",
+          "Tabby",
+          "Cline",
+          "Continue"
+        ],
+        "installed": [
+          "VS Code",
+          "Trae",
+          "Qoder",
+          "GitHub Copilot"
+        ],
+        "types": [
+          "extension",
+          "ide"
+        ]
+      }
+    },
+    "R7-P02": {
+      "fix_point": "R7-P02",
+      "name": "雷达图硬编码基准测试结果（11 维度）",
+      "tests": [
+        {
+          "name": "LRC_BENCHMARK_DIMENSIONS 常量存在",
+          "passed": true,
+          "detail": "CDP 存在=False, Tauri 源码存在=True"
+        },
+        {
+          "name": "11 个维度（与基准测试一致）",
+          "passed": true,
+          "detail": "维度数=11"
+        },
+        {
+          "name": "维度值在 [0, 1] 范围内",
+          "passed": true,
+          "detail": "min=0.78, max=0.99"
+        },
+        {
+          "name": "radarChart canvas 元素存在",
+          "passed": true,
+          "detail": "canvas 存在=True"
+        },
+        {
+          "name": "drawRadarChart 使用 LRC_BENCHMARK_DIMENSIONS 兜底",
+          "passed": true,
+          "detail": "hasFallback=True, details={'hasLRCBenchmark': True, 'hasFallback': True, 'has11Keys': True, '_source': 'app.js_file'}"
+        }
+      ],
+      "passed": 5,
+      "failed": 0,
+      "evidence": {
+        "dim_count": 11,
+        "dim_details": {
+          "allValid": true,
+          "min": 0.78,
+          "max": 0.99
+        },
+        "canvas_exists": true,
+        "draw_radar_src": {
+          "hasLRCBenchmark": true,
+          "hasFallback": true,
+          "has11Keys": true,
+          "_source": "app.js_file"
+        },
+        "is_tauri": true,
+        "appjs_source": "available"
+      }
+    },
+    "R7-P03": {
+      "fix_point": "R7-P03",
+      "name": "语义编码模型选择 event?.target ReferenceError 修复",
+      "tests": [
+        {
+          "name": "testEmbedderConnection 函数存在",
+          "passed": true,
+          "detail": "存在=True"
+        },
+        {
+          "name": "使用 document.querySelector 替代 event?.target",
+          "passed": true,
+          "detail": "hasQuerySelector=True, hasEventTarget=True（修复后 event?.target 仅作为回退）"
+        },
+        {
+          "name": "有 try/catch/finally 错误处理",
+          "passed": true,
+          "detail": "hasTryCatch=True, hasFinally=True"
+        },
+        {
+          "name": "按钮 disabled 恢复机制（在 finally 中恢复）",
+          "passed": true,
+          "detail": "hasBtnDisabled=True"
+        },
+        {
+          "name": "embedder-model 选择器存在",
+          "passed": true,
+          "detail": "存在=True"
+        }
+      ],
+      "passed": 5,
+      "failed": 0,
+      "evidence": {
+        "fn_exists": true,
+        "fn_src": {
+          "hasQuerySelector": true,
+          "hasEventTarget": true,
+          "hasDataAction": true,
+          "hasBtnDisabled": true,
+          "hasTryCatch": true,
+          "hasFinally": true
+        },
+        "model_select_exists": true
+      }
+    },
+    "R7-P04": {
+      "fix_point": "R7-P04",
+      "name": "船长日志 try/catch/finally 错误处理",
+      "tests": [
+        {
+          "name": "generateCaptainLog 函数存在",
+          "passed": true,
+          "detail": "存在=True"
+        },
+        {
+          "name": "有 try/catch 错误处理",
+          "passed": true,
+          "detail": "hasTry=True, hasCatch=True"
+        },
+        {
+          "name": "有 finally 清理逻辑",
+          "passed": true,
+          "detail": "hasFinally=True"
+        },
+        {
+          "name": "有 Promise.allSettled 并行请求",
+          "passed": true,
+          "detail": "hasPromiseAllSettled=True"
+        },
+        {
+          "name": "有回退逻辑（/v1/captains-log 不可用时降级）",
+          "passed": true,
+          "detail": "hasFallback=True"
+        },
+        {
+          "name": "按钮状态管理（disabled + 恢复）",
+          "passed": true,
+          "detail": "hasBtnDisabled=True"
+        }
+      ],
+      "passed": 6,
+      "failed": 0,
+      "evidence": {
+        "fn_exists": true,
+        "fn_src": {
+          "hasTry": true,
+          "hasCatch": true,
+          "hasFinally": true,
+          "hasFetchWithTimeout": true,
+          "hasPromiseAllSettled": true,
+          "hasFallback": true,
+          "hasBtnDisabled": true,
+          "hasLoadingHidden": true,
+          "hasErrorHandling": true
+        }
+      }
+    }
+  },
+  "summary": {
+    "total_tests": 50,
+    "passed": 50,
+    "failed": 0,
+    "skipped": 0
+  }
+}

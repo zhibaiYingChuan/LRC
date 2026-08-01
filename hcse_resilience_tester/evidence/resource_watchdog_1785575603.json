@@ -1,0 +1,56 @@
+[
+  {
+    "timestamp": 1785575590.0740333,
+    "memory_mb": 28.4,
+    "cpu_percent": 40.6,
+    "child_count": 1
+  },
+  {
+    "timestamp": 1785575591.5854414,
+    "memory_mb": 36.3,
+    "cpu_percent": 25.0,
+    "child_count": 0
+  },
+  {
+    "timestamp": 1785575593.1025095,
+    "memory_mb": 36.2,
+    "cpu_percent": 0.0,
+    "child_count": 0
+  },
+  {
+    "timestamp": 1785575594.663882,
+    "memory_mb": 36.2,
+    "cpu_percent": 5.7,
+    "child_count": 0
+  },
+  {
+    "timestamp": 1785575596.2677333,
+    "memory_mb": 36.2,
+    "cpu_percent": 0.0,
+    "child_count": 0
+  },
+  {
+    "timestamp": 1785575597.7803974,
+    "memory_mb": 36.2,
+    "cpu_percent": 6.2,
+    "child_count": 0
+  },
+  {
+    "timestamp": 1785575599.2917056,
+    "memory_mb": 36.2,
+    "cpu_percent": 3.1,
+    "child_count": 0
+  },
+  {
+    "timestamp": 1785575600.8042688,
+    "memory_mb": 36.2,
+    "cpu_percent": 6.2,
+    "child_count": 0
+  },
+  {
+    "timestamp": 1785575602.3207986,
+    "memory_mb": 36.3,
+    "cpu_percent": 50.0,
+    "child_count": 0
+  }
+]

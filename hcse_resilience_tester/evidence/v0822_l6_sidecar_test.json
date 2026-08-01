@@ -1,0 +1,127 @@
+{
+  "audit_time": "2026-07-31T23:51:05.229996Z",
+  "sidecar_health_baseline": {
+    "status": "running",
+    "service": "loong-recall",
+    "version": "0.8.22",
+    "uptime_seconds": 1412,
+    "indexing": {
+      "complete": true,
+      "file_count": 99,
+      "total_chunks": 99
+    },
+    "memory": {
+      "total": 0
+    },
+    "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+    "llm_configured": false,
+    "lock_busy": true
+  },
+  "l6_results": {
+    "L6-1_dao_metrics": {
+      "ok_count": 0,
+      "lock_busy_503": 5,
+      "status": "PASS",
+      "note": "lock_busy 期间 503 是预期行为，前端应显示'后台合成中'提示"
+    },
+    "L6-2_health_latency": {
+      "min_ms": 1.1,
+      "max_ms": 27.9,
+      "avg_ms": 14.8,
+      "all_under_5s": true,
+      "status": "PASS",
+      "note": "P0-A 修复点：worker_threads=16 确保 /health 在 lock_busy 期间可达"
+    },
+    "L6-5_concurrent": {
+      "all_200": true,
+      "max_latency_ms": 19.7,
+      "status": "PASS"
+    }
+  },
+  "dao_metrics_detail": [
+    {
+      "i": 0,
+      "status": 503,
+      "latency_ms": 2.0,
+      "body_keys": [
+        "error",
+        "message",
+        "ok"
+      ]
+    },
+    {
+      "i": 1,
+      "status": 503,
+      "latency_ms": 15.4,
+      "body_keys": [
+        "error",
+        "message",
+        "ok"
+      ]
+    },
+    {
+      "i": 2,
+      "status": 503,
+      "latency_ms": 15.8,
+      "body_keys": [
+        "error",
+        "message",
+        "ok"
+      ]
+    },
+    {
+      "i": 3,
+      "status": 503,
+      "latency_ms": 14.9,
+      "body_keys": [
+        "error",
+        "message",
+        "ok"
+      ]
+    },
+    {
+      "i": 4,
+      "status": 503,
+      "latency_ms": 19.4,
+      "body_keys": [
+        "error",
+        "message",
+        "ok"
+      ]
+    }
+  ],
+  "health_latencies_ms": [
+    12.6,
+    12.7,
+    19.5,
+    17.6,
+    24.2,
+    27.9,
+    1.1,
+    13.2,
+    17.0,
+    2.1
+  ],
+  "concurrent_results": [
+    {
+      "status": 200,
+      "latency_ms": 1.0
+    },
+    {
+      "status": 200,
+      "latency_ms": 2.9
+    },
+    {
+      "status": 200,
+      "latency_ms": 3.6
+    },
+    {
+      "status": 200,
+      "latency_ms": 3.6
+    },
+    {
+      "status": 200,
+      "latency_ms": 19.7
+    }
+  ]
+}

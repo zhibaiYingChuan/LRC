@@ -1,0 +1,260 @@
+{
+  "meta": {
+    "round": 3,
+    "version": "0.8.22",
+    "timestamp": "2026-08-01T03:21:35.703775Z",
+    "sidecar_pid": 25388,
+    "cdp_endpoint": "http://127.0.0.1:9223",
+    "sidecar_endpoint": "http://127.0.0.1:3099",
+    "focus": "HTTP 服务器完全阻塞根因诊断"
+  },
+  "phases": {
+    "cdp_liveness": {
+      "alive": true,
+      "browser_version": "Edg/150.0.4078.105"
+    },
+    "cdp_connect": {
+      "connected": true,
+      "target_id": "80A75CBE916F18A7A2CD263EAC1ACA38",
+      "ws_url": "ws://127.0.0.1:9223/devtools/page/80A75CBE916F18A7A2CD263EAC1ACA38"
+    },
+    "endpoint_matrix": {
+      "/health": {
+        "url": "http://127.0.0.1:3099/health",
+        "status": null,
+        "elapsed_ms": 3038,
+        "reachable": false,
+        "error": "TIMEOUT"
+      },
+      "/v1/health/dao_metrics": {
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "elapsed_ms": 3028,
+        "reachable": false,
+        "error": "TIMEOUT"
+      },
+      "/v1/health/system": {
+        "url": "http://127.0.0.1:3099/v1/health/system",
+        "status": null,
+        "elapsed_ms": 3026,
+        "reachable": false,
+        "error": "TIMEOUT"
+      },
+      "/v1/health/detailed": {
+        "url": "http://127.0.0.1:3099/v1/health/detailed",
+        "status": null,
+        "elapsed_ms": 3009,
+        "reachable": false,
+        "error": "TIMEOUT"
+      }
+    },
+    "sidecar_process": {
+      "pid": 25388,
+      "name": "lrc-sidecar.exe",
+      "status": "running",
+      "cpu_s": 940.1,
+      "cpu_delta_2s": 1.922,
+      "mem_mb": 31.1,
+      "thread_count": 17,
+      "all_blocked": false,
+      "running_thread_count": 17,
+      "create_time": "2026-08-01T11:02:41.037338"
+    },
+    "tcp_connections": {
+      "close_wait": 49,
+      "distribution": {
+        "CLOSE_WAIT": 49,
+        "ESTABLISHED": 3,
+        "LISTEN": 1
+      }
+    },
+    "frontend_state": {
+      "__eval_error__": "Connection is already closed."
+    },
+    "repeat_probe": [
+      {
+        "round": 1,
+        "url": "http://127.0.0.1:3099/health",
+        "status": null,
+        "elapsed_ms": 2021,
+        "reachable": false,
+        "error": "TIMEOUT"
+      },
+      {
+        "round": 2,
+        "url": "http://127.0.0.1:3099/health",
+        "status": null,
+        "elapsed_ms": 2006,
+        "reachable": false,
+        "error": "TIMEOUT"
+      },
+      {
+        "round": 3,
+        "url": "http://127.0.0.1:3099/health",
+        "status": 200,
+        "elapsed_ms": 10,
+        "reachable": true,
+        "body": {
+          "status": "running",
+          "service": "loong-recall",
+          "version": "0.8.22",
+          "uptime_seconds": 1159,
+          "indexing": {
+            "complete": true,
+            "file_count": 99,
+            "total_chunks": 99
+          },
+          "memory": {
+            "total": 3206
+          },
+          "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+          "llm_configured": false,
+          "lock_busy": false
+        }
+      },
+      {
+        "round": 4,
+        "url": "http://127.0.0.1:3099/health",
+        "status": 200,
+        "elapsed_ms": 7,
+        "reachable": true,
+        "body": {
+          "status": "running",
+          "service": "loong-recall",
+          "version": "0.8.22",
+          "uptime_seconds": 1159,
+          "indexing": {
+            "complete": true,
+            "file_count": 99,
+            "total_chunks": 99
+          },
+          "memory": {
+            "total": 3206
+          },
+          "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+          "llm_configured": false,
+          "lock_busy": false
+        }
+      },
+      {
+        "round": 5,
+        "url": "http://127.0.0.1:3099/health",
+        "status": 200,
+        "elapsed_ms": 7,
+        "reachable": true,
+        "body": {
+          "status": "running",
+          "service": "loong-recall",
+          "version": "0.8.22",
+          "uptime_seconds": 1160,
+          "indexing": {
+            "complete": true,
+            "file_count": 99,
+            "total_chunks": 99
+          },
+          "memory": {
+            "total": 3206
+          },
+          "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+          "llm_configured": false,
+          "lock_busy": false
+        }
+      }
+    ],
+    "cdp_events": {
+      "counts": {},
+      "console_messages": [],
+      "exceptions": [],
+      "network_events": []
+    },
+    "screenshot_error": "Connection is already closed.",
+    "security_sandbox": {
+      "path_validator": {
+        "allowed_dirs": [
+          "G:\\code-memory\\hcse_resilience_tester\\temp",
+          "G:\\code-memory\\hcse_resilience_tester\\logs",
+          "G:\\code-memory\\hcse_resilience_tester\\screenshots",
+          "G:\\code-memory\\hcse_resilience_tester\\evidence"
+        ],
+        "violations": [],
+        "status": "PASS"
+      },
+      "sanitizer": {
+        "redaction_count": 0,
+        "status": "PASS"
+      },
+      "resource_watchdog": {
+        "peak_rss_mb": 31.0,
+        "peak_cpu_s": 0.0,
+        "max_memory_mb": 1024,
+        "max_cpu_s": 60,
+        "violations": 0
+      }
+    },
+    "invariant_results": {
+      "INV-HTTP-001": {
+        "status": "FAIL",
+        "severity": "P0",
+        "evidence": "4 端点 max=3038ms"
+      },
+      "INV-V0822-P0A": {
+        "status": "FAIL",
+        "severity": "P0",
+        "evidence": "5 轮探测 3/5 可达"
+      },
+      "INV-LEAK-006": {
+        "status": "FAIL",
+        "severity": "P1",
+        "evidence": "CloseWait=49"
+      },
+      "INV-RUNTIME-001": {
+        "status": "PASS",
+        "severity": "P0",
+        "evidence": "17 线程，运行=17"
+      },
+      "INV-STATE-002": {
+        "status": "FAIL",
+        "severity": "P0",
+        "evidence": "online=None failCount=0"
+      }
+    },
+    "violations": [
+      {
+        "inv_id": "INV-HTTP-001",
+        "description": "所有端点 2s 内响应（实测全部超时 max=3038ms）",
+        "timestamp": "2026-08-01T03:21:48.247549Z",
+        "context": {
+          "cdp_alive": true,
+          "browser_version": "Edg/150.0.4078.105"
+        }
+      },
+      {
+        "inv_id": "INV-LEAK-006",
+        "description": "CloseWait=49 >= 阈值 10（连接泄漏回归）",
+        "timestamp": "2026-08-01T03:21:48.263742Z",
+        "context": {
+          "cdp_alive": true,
+          "browser_version": "Edg/150.0.4078.105"
+        }
+      },
+      {
+        "inv_id": "INV-STATE-002",
+        "description": "sidecar 全超时但前端 online=None failCount=0（状态不一致）",
+        "timestamp": "2026-08-01T03:21:55.329687Z",
+        "context": {
+          "cdp_alive": true,
+          "browser_version": "Edg/150.0.4078.105"
+        }
+      },
+      {
+        "inv_id": "INV-V0822-P0A",
+        "description": "worker_threads=16 修复失效：5 轮探测仅 3/5 可达（Round 2 为 5/5）",
+        "timestamp": "2026-08-01T03:22:01.910087Z",
+        "context": {
+          "cdp_alive": true,
+          "browser_version": "Edg/150.0.4078.105"
+        }
+      }
+    ]
+  }
+}

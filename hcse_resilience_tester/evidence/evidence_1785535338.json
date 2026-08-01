@@ -1,0 +1,1284 @@
+[
+  {
+    "type": "screenshot",
+    "name": "baseline_dashboard",
+    "path": "G:\\code-memory\\hcse_resilience_tester\\screenshots\\baseline_dashboard.png"
+  },
+  {
+    "type": "dom_state",
+    "name": "baseline_state",
+    "timestamp": "2026-07-31T22:02:05.188772Z",
+    "data": "{\"title\":\"龙忆 Loong Recall · 仪表盘\",\"url\":\"https://tauri.localhost/#/settings\",\"statusDot\":{\"className\":\"status-dot offline\",\"text\":\"\"},\"statusText\":\"已停止 / 不可达\",\"sidecarMonitor\":{\"_lockBusy\":true},\"readyState\":\"complete\"}"
+  },
+  {
+    "type": "screenshot",
+    "name": "inv01_wizard_fallback",
+    "path": "G:\\code-memory\\hcse_resilience_tester\\screenshots\\inv01_wizard_fallback.png"
+  },
+  {
+    "type": "dom_state",
+    "name": "inv04_statusbar",
+    "timestamp": "2026-07-31T22:02:06.363463Z",
+    "data": "{\"statusDot\":\"status-dot offline\",\"statusText\":\"已停止 / 不可达\",\"trustDot\":\"status-dot offline\",\"trustText\":\"已停止 / 不可达\",\"sidecarMonitor\":{\"online\":true,\"_lockBusy\":true},\"lockBusyClass\":false,\"hasLockBusyText\":false}"
+  },
+  {
+    "type": "screenshot",
+    "name": "inv04_lockbusy_display",
+    "path": "G:\\code-memory\\hcse_resilience_tester\\screenshots\\inv04_lockbusy_display.png"
+  },
+  {
+    "type": "dom_state",
+    "name": "inv05_dao_metrics",
+    "timestamp": "2026-07-31T22:02:08.015100Z",
+    "data": "{\"bannerExists\":true,\"bannerText\":\"⚠ 道同构度数据加载失败：后台合成中，请稍后刷新重试\",\"hasServiceNotStarted\":false,\"hasLockBusyText\":true,\"panelText\":\"⚠ 道同构度数据加载失败：后台合成中，请稍后刷新重试\\n      \\n         道同构度\\n        实时健康评分\\n      \\n      \\n        \\n        \\n          --\\n          健康评分\\n        \\n      \\n      \\n        \\n          --\\n          阴阳守恒\\n          阴阳平衡度\\n        \\n        \\n          --\\n          洛书偏差\\n          9维坐标偏差\\n        \\n        \\n          --\\n       \"}"
+  },
+  {
+    "type": "screenshot",
+    "name": "inv05_dao_503_handling",
+    "path": "G:\\code-memory\\hcse_resilience_tester\\screenshots\\inv05_dao_503_handling.png"
+  },
+  {
+    "type": "console",
+    "name": "exception_path_console",
+    "timestamp": "2026-07-31T22:02:18.188755Z",
+    "data": [
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "warning",
+        "text": "[Loong Recall] 系统状态浮窗加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 2/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 8000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 3/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]Sidecar 已恢复可达"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]道同构度加载完成，健康评分: 73"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]健康检查失败 1/2，暂不判定不可达"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 2/3）: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 8000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 3/3）: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 503 lock_busy，显示\"后台合成中\"而非\"服务未启动\""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]Sidecar 不可达，已禁用 API 按钮"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "warning",
+        "text": "[Loong Recall] 系统状态浮窗加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "warning",
+        "text": "[switchTab] 标签页 tab-memory 不存在，仅切换导航状态"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "warning",
+        "text": "[switchTab] 标签页 tab-trust 不存在，仅切换导航状态"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "warning",
+        "text": "[设置] 加载配置失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "warning",
+        "text": "[项目信息] 加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.991310Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 2/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.991310Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 8000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.991310Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 3/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.993314Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.993314Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.993314Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.997310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.997310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.997310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.997310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:08.178530Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:09.967106Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:09.968179Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:13.099655Z",
+        "level": "warning",
+        "text": "[Loong Recall] 系统状态浮窗加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:16.527641Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:16.527641Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      }
+    ]
+  },
+  {
+    "type": "network",
+    "name": "exception_path_network",
+    "timestamp": "2026-07-31T22:02:18.188755Z",
+    "data": [
+      {
+        "type": "requestWillBeSent",
+        "url": "https://tauri.localhost/health",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:05.189831Z"
+      },
+      {
+        "type": "responseReceived",
+        "url": "https://tauri.localhost/health",
+        "status": 200,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:05.192795Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "https://tauri.localhost/health",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:05.355020Z"
+      },
+      {
+        "type": "responseReceived",
+        "url": "https://tauri.localhost/health",
+        "status": 200,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:05.358025Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/health",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:06.510493Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:06.513492Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/v1/health/system",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:08.177530Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/v1/health/detailed",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:08.177530Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:08.177530Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:11.983407Z"
+      }
+    ]
+  },
+  {
+    "type": "console",
+    "name": "final_console",
+    "timestamp": "2026-07-31T22:02:18.193758Z",
+    "data": [
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "warning",
+        "text": "[Loong Recall] 系统状态浮窗加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.984313Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 2/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 8000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 3/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]Sidecar 已恢复可达"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]道同构度加载完成，健康评分: 73"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.985316Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]健康检查失败 1/2，暂不判定不可达"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.986316Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 2/3）: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 8000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.987313Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 3/3）: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 503 lock_busy，显示\"后台合成中\"而非\"服务未启动\""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "log",
+        "text": "[LRC v0.8.21]Sidecar 不可达，已禁用 API 按钮"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.988312Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "error",
+        "text": "[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "log",
+        "text": "[handleHttpError] 503 lock_busy，2s 后自动重试（第 1 次）"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "warning",
+        "text": "[Loong Recall] 系统状态浮窗加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.989311Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "warning",
+        "text": "[switchTab] 标签页 tab-memory 不存在，仅切换导航状态"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "warning",
+        "text": "[switchTab] 标签页 tab-trust 不存在，仅切换导航状态"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "warning",
+        "text": "[设置] 加载配置失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.990310Z",
+        "level": "warning",
+        "text": "[项目信息] 加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.991310Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 2/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.991310Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 8000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.991310Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 3/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.993314Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.993314Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.993314Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.994315Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.995311Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.996310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.997310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.997310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.997310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:04.997310Z",
+        "level": "info",
+        "text": ""
+      },
+      {
+        "timestamp": "2026-07-31T22:02:08.178530Z",
+        "level": "log",
+        "text": "[loadDashboard] 请求被新请求 abort，静默退出"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:09.967106Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 0/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:09.968179Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 2000ms 后自动重试..."
+      },
+      {
+        "timestamp": "2026-07-31T22:02:13.099655Z",
+        "level": "warning",
+        "text": "[Loong Recall] 系统状态浮窗加载失败: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:16.527641Z",
+        "level": "warning",
+        "text": "[LRC v0.8.21]道同构度加载失败（重试 1/3）: 请求超时，请检查 LRC 服务是否正常运行"
+      },
+      {
+        "timestamp": "2026-07-31T22:02:16.527641Z",
+        "level": "log",
+        "text": "[LRC] 道同构度 4000ms 后自动重试..."
+      }
+    ]
+  },
+  {
+    "type": "network",
+    "name": "final_network",
+    "timestamp": "2026-07-31T22:02:18.194758Z",
+    "data": [
+      {
+        "type": "requestWillBeSent",
+        "url": "https://tauri.localhost/health",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:05.189831Z"
+      },
+      {
+        "type": "responseReceived",
+        "url": "https://tauri.localhost/health",
+        "status": 200,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:05.192795Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "https://tauri.localhost/health",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:05.355020Z"
+      },
+      {
+        "type": "responseReceived",
+        "url": "https://tauri.localhost/health",
+        "status": 200,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:05.358025Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/health",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:06.510493Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:06.513492Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/v1/health/system",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:08.177530Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/v1/health/detailed",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:08.177530Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:08.177530Z"
+      },
+      {
+        "type": "loadingFailed",
+        "url": "18004.1070",
+        "status": null,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:08.178530Z"
+      },
+      {
+        "type": "loadingFailed",
+        "url": "18004.1071",
+        "status": null,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:08.178530Z"
+      },
+      {
+        "type": "loadingFailed",
+        "url": "18004.1072",
+        "status": null,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:08.178530Z"
+      },
+      {
+        "type": "loadingFailed",
+        "url": "18004.1068",
+        "status": null,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:09.969749Z"
+      },
+      {
+        "type": "requestWillBeSent",
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "status": null,
+        "method": "GET",
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:11.983407Z"
+      },
+      {
+        "type": "loadingFailed",
+        "url": "18004.1069",
+        "status": null,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:13.100657Z"
+      },
+      {
+        "type": "loadingFailed",
+        "url": "18004.1076",
+        "status": null,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:14.518530Z"
+      },
+      {
+        "type": "loadingFailed",
+        "url": "18004.1077",
+        "status": null,
+        "method": null,
+        "timing_ms": null,
+        "timestamp": "2026-07-31T22:02:16.527641Z"
+      }
+    ]
+  }
+]

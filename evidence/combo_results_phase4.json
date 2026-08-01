@@ -1,0 +1,69 @@
+﻿[
+    {
+        "ComboId":  "COMBO-001",
+        "Scenario":  "process_alive + health_timeout + dashboard_reachable",
+        "ProcessAlive":  true,
+        "HealthLatency":  "5050ms+ (TIMEOUT)",
+        "DashboardLatency":  "6ms (200 OK)",
+        "UIText":  "LRC 服务未运行，部分功能不可用",
+        "Verdict":  "INV-003 + INV-008 双重违规",
+        "Severity":  "P0"
+    },
+    {
+        "ComboId":  "COMBO-002",
+        "Scenario":  "terminate_process + lock_residue",
+        "KillMethod":  "Stop-Process -Force (TerminateProcess)",
+        "DropTriggered":  false,
+        "LockResidue":  true,
+        "HealingOnNextSpawn":  true,
+        "Verdict":  "INV-004 违规（TerminateProcess 不触发 Drop）",
+        "Severity":  "P1"
+    },
+    {
+        "ComboId":  "COMBO-003",
+        "Scenario":  "stale_lock_long_residue + healing_only_on_next_spawn",
+        "StaleLockCount":  6,
+        "OldestStaleAge":  "40.6 days",
+        "HealingTriggered":  "PASS (在 next spawn 同 data_dir 时)",
+        "ProactiveCleanup":  "MISSING",
+        "Verdict":  "INV-011 部分违规（无主动清理）",
+        "Severity":  "P1"
+    },
+    {
+        "ComboId":  "COMBO-004",
+        "Scenario":  "dual_sidecar + distinct_data_dirs",
+        "ProcessCount":  2,
+        "PortCount":  2,
+        "Pid1":  27192,
+        "Port1":  3099,
+        "DataDir1":  "global/data/.lrc.lock",
+        "Pid2":  19000,
+        "Port2":  3100,
+        "DataDir2":  "projects/b0bcfec004e05d30/data/.lrc.lock",
+        "SameDataDir":  false,
+        "Verdict":  "INV-012 PASS（不同 data_dir 允许并存）",
+        "Severity":  "P1"
+    },
+    {
+        "ComboId":  "COMBO-005",
+        "Scenario":  "wrong_cleanup_hint_path + user_action_invalid",
+        "HintPath":  "%APPDATA%\\\\LoongRecall\\\\.lrc.lock",
+        "HintPathExists":  false,
+        "RealPath1":  "~/.loong-recall/global/data/.lrc.lock",
+        "RealPath2":  "~/.loong-recall/projects/\u003cfp\u003e/data/.lrc.lock",
+        "UserActionEffective":  false,
+        "Verdict":  "INV-009 强违规（误导用户无效操作）",
+        "Severity":  "P1"
+    },
+    {
+        "ComboId":  "COMBO-006",
+        "Scenario":  "fragile_string_match + display_change_silent_failure",
+        "StringMatches":  5,
+        "CriticalMatch":  "err_str.contains(\u0027已有 LRC 实例在运行\u0027)",
+        "EnumExists":  "SidecarStartError::SingletonConflict",
+        "CodeMethod":  "code() returns \u0027E008\u0027",
+        "EnumUsed":  false,
+        "Verdict":  "INV-010 强违规（结构化错误已存在但未消费）",
+        "Severity":  "P0"
+    }
+]

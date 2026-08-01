@@ -1,0 +1,386 @@
+# ============================================================
+# HCSE 正式安全不变式配置 — LRC Desktop v0.8.23
+# 生成时间: 2026-08-01
+# 范式: 运行时验证优先（CDP WebSocket 实时断言）
+# 重点: v0.8.23 修复 P2-01(E4) / P2-02(D6) / P2-03 / OBS-01 / A-02
+#       及回归验证 v0.8.22 全部修复
+# ============================================================
+#
+# 不变式编号规则: INV-V0823-<修复点>
+#   严重度: P0=阻断级 P1=严重 P2=中等 P3=轻微
+#
+# 判定规则: 所有不变式必须通过 CDP 运行时验证或源代码验证
+# ============================================================
+
+project: "LRC Desktop"
+version: "0.8.23"
+generated_at: "2026-08-01"
+cdp_endpoint: "http://127.0.0.1:9222"
+sidecar_endpoint: "http://127.0.0.1:3099"
+audit_checklist: "docs/HCSE_RESILIENCE_AUDIT.md"
+previous_report: "hcse_resilience_tester/HCSE_V0.8.22_FINAL_AUDIT_REPORT.md"
+
+# ──────────────────────────────────────────────────────────────
+# v0.8.23 修复点专项不变量（5 个，本次重点验证）
+# ──────────────────────────────────────────────────────────────
+
+# INV-V0823-P201: 代理检测工具函数（E4 修复）
+- id: "INV-V0823-P201"
+  name: "detectProxyConfiguration 函数存在且可运行时调用"
+  severity: "P2"
+  category: "代理检测"
+  fix_point: "P2-01 (E4)"
+  description: |
+    v0.8.23 P2-01 (E4) 修复：Sidecar 不可达时无代理检测，
+    用户看到"无法连接"而反复重试。修复：
+    1. 新增 detectProxyConfiguration() 异步函数，检测系统代理配置
+    2. 在 SidecarHealthMonitor 不可达时调用 _detectProxyAndUpdateBanner
+    3. 检测到代理时 banner 显示代理信息，否则显示默认文案
+  code_refs:
+    - file: "static/app.js"
+      lines: "141-235"  # detectProxyConfiguration
+    - file: "static/app.js"
+      lines: "837-859"  # _detectProxyAndUpdateBanner
+    - file: "static/app.js"
+      lines: "815-816"  # 不可达时调用 _detectProxyAndUpdateBanner
+  assertion: |
+    1. window.detectProxyConfiguration 为函数（CDP evaluate 验证）
+    2. detectProxyConfiguration() 返回 Promise，resolve 对象含 likelyProxy/reason/online 字段
+    3. SidecarHealthMonitor._detectProxyAndUpdateBanner 为函数
+    4. 不可达时 banner 文本包含代理信息或默认文案
+  cdp_verification:
+    event: "Runtime.evaluate"
+    steps:
+      - "evaluate: typeof window.detectProxyConfiguration === 'function'"
+      - "evaluate: detectProxyConfiguration().then(r => r.likelyProxy !== undefined && r.reason !== undefined)"
+      - "evaluate: typeof SidecarHealthMonitor._detectProxyAndUpdateBanner === 'function'"
+    on_violation: "INV-V0823-P201 违反：代理检测函数不存在或不可调用"
+  remediation: "确认 app.js:141-235 和 app.js:837-859 代码正确加载"
+
+# INV-V0823-P202: Enter 键提交拦截（D6 修复）
+- id: "INV-V0823-P202"
+  name: "向导输入框 Enter 键触发对应搜索/写入操作"
+  severity: "P2"
+  category: "用户体验"
+  fix_point: "P2-02 (D6)"
+  description: |
+    v0.8.23 P2-02 (D6) 修复：向导输入框 Enter 键无响应，
+    用户需要手动点击按钮。修复：
+    1. 绑定 wizard-search-path → wizardStep1Search
+    2. 绑定 wizard-memory-content → wizardStep2Write
+    3. 绑定 wizard-search-query → wizardStep3Search
+    4. 使用 dataset.boundEnter 标志避免重复绑定
+  code_refs:
+    - file: "static/app.js"
+      lines: "8163-8182"  # Enter 键绑定
+  assertion: |
+    1. 输入框元素存在（wizard-search-path, wizard-memory-content, wizard-search-query）
+    2. 每个输入框 dataset.boundEnter === '1'
+    3. 输入框 keydown 事件监听器存在
+    4. Enter 键触发 preventDefault + 对应函数调用
+  cdp_verification:
+    event: "Runtime.evaluate + DOM 查询"
+    steps:
+      - "evaluate: document.getElementById('wizard-search-path') !== null"
+      - "evaluate: document.getElementById('wizard-search-path')?.dataset.boundEnter === '1'"
+      - "evaluate: document.getElementById('wizard-memory-content')?.dataset.boundEnter === '1'"
+      - "evaluate: document.getElementById('wizard-search-query')?.dataset.boundEnter === '1'"
+    on_violation: "INV-V0823-P202 违反：Enter 键绑定未生效"
+  remediation: "确认 app.js:8163-8182 在 bindAllActions 中正确执行"
+
+# INV-V0823-P203: 502/504 网关错误自动重试（P2-03 修复）
+- id: "INV-V0823-P203"
+  name: "502/504 网关错误自动重试（指数退避，不弹阻塞 Modal）"
+  severity: "P2"
+  category: "重试策略"
+  fix_point: "P2-03"
+  description: |
+    v0.8.23 P2-03 修复：502/504 仅显示 toast，无自动重试。
+    修复：handleHttpError 新增 502/504 分支，自动重试 3 次，
+    指数退避（1s/2s/4s），首次重试时 toast 提示，后续静默。
+    超过重试上限显示"服务暂时不可用"。
+  code_refs:
+    - file: "static/app.js"
+      lines: "443-489"  # 502/504 分支
+  assertion: |
+    1. handleHttpError 对 502 返回 { action: 'retry' }（首次重试）
+    2. handleHttpError 对 504 返回 { action: 'retry' }（首次重试）
+    3. 重试 3 次后返回 { action: 'giveup' }
+    4. 重试期间显示 toast 提示（首次）
+    5. 支持 retryContext.signal 取消退避
+  cdp_verification:
+    event: "Runtime.evaluate"
+    steps:
+      - "evaluate: handleHttpError(new Response(null,{status:502})).then(r => r.action === 'retry')"
+      - "evaluate: handleHttpError(new Response(null,{status:504})).then(r => r.action === 'retry')"
+      - "evaluate: 模拟 3 次重试后 action === 'giveup'"
+    on_violation: "INV-V0823-P203 违反：502/504 重试机制未生效"
+  remediation: "确认 app.js:443-489 502/504 分支逻辑正确"
+
+# INV-V0823-OBS01: loadTrustCenter AbortController（OBS-01 修复）
+- id: "INV-V0823-OBS01"
+  name: "loadTrustCenter AbortController，标签页切换取消旧请求"
+  severity: "P2"
+  category: "竞态防护"
+  fix_point: "OBS-01"
+  description: |
+    v0.8.23 OBS-01 修复：loadTrustCenter 未使用 AbortController，
+    快速切换标签页时旧请求继续运行，可能产生竞态。
+    修复：新增 trustAbortController 变量，每次调用前 abort 上一次请求；
+    AbortError 静默处理，不显示错误 UI。
+  code_refs:
+    - file: "static/app.js"
+      lines: "2484-2521"  # trustAbortController 定义与使用
+    - file: "static/app.js"
+      lines: "2581-2585"  # AbortError 静默处理
+  assertion: |
+    1. window.trustAbortController 变量存在（或可访问）
+    2. 调用 loadTrustCenter 后，trustAbortController 不为 null
+    3. 再次调用 loadTrustCenter 时，旧 trustAbortController 被 abort
+    4. AbortError 不触发 toast 错误提示（console.log 静默处理）
+  cdp_verification:
+    event: "Runtime.evaluate"
+    steps:
+      - "evaluate: typeof window.trustAbortController !== 'undefined' 或 loadTrustCenter 源码中信任 AbortController 存在"
+      - "源码验证：AbortError 分支 return 而非 showToast"
+    on_violation: "INV-V0823-OBS01 违反：loadTrustCenter AbortController 未生效"
+  remediation: "确认 app.js:2484-2521 trustAbortController 正确管理"
+
+# INV-V0823-A02: signal 传递到 handleHttpError（A-02 修复）
+- id: "INV-V0823-A02"
+  name: "fetchWithTimeout 传递 externalSignal 到 handleHttpError，使退避延迟可取消"
+  severity: "P2"
+  category: "信号传播"
+  fix_point: "A-02"
+  description: |
+    v0.8.23 A-02 修复：fetchWithTimeout 的 externalSignal 未传递到
+    handleHttpError，导致标签页切换后退避延迟仍继续执行。
+    修复：fetchWithTimeout 构建 retryContext 时传递 signal: externalSignal；
+    handleHttpError 在 500/502/504 退避延迟中监听 signal.abort。
+  code_refs:
+    - file: "static/app.js"
+      lines: "255-256"  # retryContext 传递 signal
+    - file: "static/app.js"
+      lines: "396-417"  # 500 退避支持 signal 取消
+    - file: "static/app.js"
+      lines: "467-488"  # 502/504 退避支持 signal 取消
+  assertion: |
+    1. fetchWithTimeout 中 retryContext.signal 为 externalSignal
+    2. handleHttpError 500 分支 signal 不为 undefined 时监听 abort
+    3. handleHttpError 502/504 分支 signal 不为 undefined 时监听 abort
+    4. AbortError 退避取消时返回 { action: 'cancel' }
+  cdp_verification:
+    event: "Runtime.evaluate"
+    steps:
+      - "源码验证：retryContext 构建含 signal: externalSignal"
+      - "源码验证：500/502/504 分支 signal.addEventListener('abort', ...)"
+    on_violation: "INV-V0823-A02 违反：signal 未传递或退避不可取消"
+  remediation: "确认 app.js:255-256 和 396-417/467-488 的 signal 传播逻辑"
+
+# ──────────────────────────────────────────────────────────────
+# 回归不变量（v0.8.22 全部修复，确认未回归）
+# ──────────────────────────────────────────────────────────────
+
+- id: "INV-V0823-REGR-01"
+  name: "tokio worker_threads=16 回归验证"
+  severity: "P0"
+  category: "线程池隔离"
+  description: "v0.8.22 P0-A 修复回归验证：worker_threads=16 仍在生效"
+  code_refs:
+    - file: "src/bin/server.rs"
+      lines: "52-59"
+  assertion: "sidecar 源码 [tokio::main(worker_threads = 16)] 存在"
+  cdp_verification:
+    event: "源代码静态分析"
+  on_violation: "INV-V0823-REGR-01 回归：worker_threads 回退"
+
+- id: "INV-V0823-REGR-02"
+  name: "503 lock_busy 30s 冷却期回归验证"
+  severity: "P1"
+  category: "UI 韧性"
+  description: "v0.8.22 P0-4 修复回归验证：503 错误 30s 冷却期仍生效"
+  code_refs:
+    - file: "static/app.js"
+      lines: "431-439"
+  assertion: "503 分支有冷却期逻辑（now - lastToastTime > 30000）"
+  cdp_verification:
+    event: "Runtime.evaluate"
+  on_violation: "INV-V0823-REGR-02 回归：503 冷却期失效"
+
+- id: "INV-V0823-REGR-03"
+  name: "loadDaoMetrics AbortController 回归验证"
+  severity: "P1"
+  category: "竞态防护"
+  description: "v0.8.22 IA-01 修复回归验证：daoAbortController 仍在生效"
+  code_refs:
+    - file: "static/app.js"
+      lines: "5249-5271"
+  assertion: "loadDaoMetrics 入口有 daoAbortController abort 逻辑"
+  cdp_verification:
+    event: "Runtime.evaluate"
+  on_violation: "INV-V0823-REGR-03 回归：daoAbortController 失效"
+
+- id: "INV-V0823-REGR-04"
+  name: "全局错误处理回归验证"
+  severity: "P1"
+  category: "全局错误兜底"
+  description: "v0.8.22 IA-02 修复回归验证：window.onerror 和 onunhandledrejection 已注册"
+  code_refs:
+    - file: "static/app.js"
+      lines: "2787-2808"
+  assertion: "window._lrcGlobalErrorRegistered === true"
+  cdp_verification:
+    event: "Runtime.evaluate"
+    assert: "window._lrcGlobalErrorRegistered === true"
+  on_violation: "INV-V0823-REGR-04 回归：全局错误处理失效"
+
+- id: "INV-V0823-REGR-05"
+  name: "SidecarHealthMonitor 挂载到 window 回归验证"
+  severity: "P2"
+  category: "状态可观测性"
+  description: "v0.8.22 IA-03 修复回归验证：window.sidecarHealthMonitor 可访问"
+  code_refs:
+    - file: "static/app.js"
+      lines: "2810-2814"
+  assertion: "window.sidecarHealthMonitor !== undefined"
+  cdp_verification:
+    event: "Runtime.evaluate"
+    assert: "window.sidecarHealthMonitor !== undefined"
+  on_violation: "INV-V0823-REGR-05 回归：SidecarHealthMonitor 未挂载"
+
+- id: "INV-V0823-REGR-06"
+  name: "503 无自动重试回归验证"
+  severity: "P1"
+  category: "重试策略"
+  description: "v0.8.22 P1-2 修复回归验证：503 返回 action='cancel'"
+  code_refs:
+    - file: "static/app.js"
+      lines: "441-442"
+  assertion: "handleHttpError(503).action === 'cancel'"
+  cdp_verification:
+    event: "Runtime.evaluate"
+    assert: "handleHttpError(new Response(null,{status:503})).then(r => r.action === 'cancel')"
+  on_violation: "INV-V0823-REGR-06 回归：503 仍自动重试"
+
+- id: "INV-V0823-REGR-07"
+  name: "pendingRequestCount 不泄漏回归验证"
+  severity: "P1"
+  category: "资源计数"
+  description: "v0.8.22 P1-3 修复回归验证：pendingRequestCount >= 0"
+  code_refs:
+    - file: "static/app.js"
+      lines: "139-144,179"
+  assertion: "window.pendingRequestCount >= 0"
+  cdp_verification:
+    event: "Runtime.evaluate"
+    assert: "window.pendingRequestCount >= 0"
+  on_violation: "INV-V0823-REGR-07 回归：计数器泄漏"
+
+# ──────────────────────────────────────────────────────────────
+# 既有不变量（持续监控）
+# ──────────────────────────────────────────────────────────────
+
+- id: "INV-LOCK-001"
+  name: "健康端点不被合成锁阻塞"
+  severity: "P0"
+  category: "锁安全"
+  description: "所有 /v1/health/* 端点必须使用 try_lock，lock_busy 期间 < 2s 返回"
+  code_refs:
+    - file: "src/v1_api.rs"
+      lines: "582-719"
+    - file: "src/consolidation.rs"
+      lines: "291,357,419,534"
+  assertion: "lock_busy 期间所有健康端点 < 2000ms 返回（200 或 503）"
+  cdp_verification:
+    event: "Network.responseReceived"
+    url_pattern: "/v1/health/"
+    assert: "response.timing.waitingTime < 2000"
+  on_violation: "INV-LOCK-001 违反：端点仍被合成锁阻塞"
+
+- id: "INV-STATE-002"
+  name: "UI 状态与 sidecar 实际状态一致"
+  severity: "P0"
+  category: "状态一致性"
+  description: "sidecar /health 200 时前端 online=true，不可达时 online=false"
+  code_refs:
+    - file: "static/app.js"
+      lines: "1151-1198"
+  assertion: "sidecar 可达 → 前端 sidecarHealthMonitor.online === true"
+  cdp_verification:
+    event: "Runtime.evaluate"
+  on_violation: "INV-STATE-002 违反：状态不一致"
+
+- id: "INV-TIMEOUT-004"
+  name: "前端 fetch 超时真正触发"
+  severity: "P1"
+  category: "超时机制"
+  description: "fetchWithTimeout 默认 10s 超时，AbortController 真正触发"
+  code_refs:
+    - file: "static/app.js"
+      lines: "106-108"
+  assertion: "fetchWithTimeout 超时配置存在且 AbortController 已注册"
+  cdp_verification:
+    event: "Runtime.evaluate"
+  on_violation: "INV-TIMEOUT-004 违反：超时未触发"
+
+- id: "INV-PROC-003"
+  name: "sidecar 卡死后前端能检测并降级"
+  severity: "P1"
+  category: "进程隔离"
+  description: "sidecar 端点全部超时后，前端应显示 offline 或 _failCount > 0"
+  code_refs:
+    - file: "static/app.js"
+      lines: "398-401"
+  assertion: "sidecar 不可达 → 前端 _failCount>=2 或 _backoffStep>0 或 dotClass 含 offline"
+  cdp_verification:
+    event: "domMutated"
+  on_violation: "INV-PROC-003 违反：前端未检测到 sidecar 卡死"
+
+- id: "INV-SANITIZE-006"
+  name: "捕获数据脱敏不变式"
+  severity: "P0"
+  category: "数据脱敏"
+  description: "所有证据工件写入前必须完成双重脱敏"
+  assertion: "工件中不得出现原始 api_key/authorization/email/phone"
+  cdp_verification:
+    event: "工件写入前"
+  on_violation: "INV-SANITIZE-006 违反：证据工件含原始敏感数据"
+  remediation: "强化 DataSanitizer 正则 + 递归脱敏"
+
+- id: "INV-RESOURCE-007"
+  name: "资源容量看门狗"
+  severity: "P1"
+  category: "资源容量"
+  description: "HCSE 进程内存 ≤ 1024MB，单测试 CPU ≤ 60s"
+  assertion: "rss ≤ 1024MB and cpu_time ≤ 60s"
+  cdp_verification:
+    event: "周期性采样（1s 间隔）"
+  on_violation: "INV-RESOURCE-007 违反：资源超限"
+  remediation: "优化事件队列大小，限制 screencast 帧率"
+
+# ──────────────────────────────────────────────────────────────
+# 汇总
+# ──────────────────────────────────────────────────────────────
+summary:
+  total_invariants: 18
+  by_severity:
+    P0: 4  # REGR-01, LOCK-001, STATE-002, SANITIZE-006
+    P1: 6  # REGR-02, REGR-03, REGR-04, REGR-06, REGR-07, TIMEOUT-004, PROC-003, RESOURCE-007
+    P2: 8  # P201, P202, P203, OBS01, A02, REGR-05
+  by_fix_point:
+    v0.8.23_new: 5  # P201, P202, P203, OBS01, A02
+    v0.8.22_regression: 7  # REGR-01~07
+    legacy: 6  # LOCK-001, STATE-002, TIMEOUT-004, PROC-003, SANITIZE-006, RESOURCE-007
+  interaction_layer_coverage:
+    L1_一级页面: "INV-STATE-002, INV-LOCK-001, INV-PROC-003"
+    L2_二级弹窗: "INV-V0823-P202 (Enter 键), INV-V0823-REGR-02 (503 冷却)"
+    L3_三级卡片: "INV-V0823-P201 (代理检测), INV-V0823-OBS01 (信任中心)"
+    L4_四级嵌套: "INV-V0823-P203 (502/504 重试), INV-V0823-A02 (signal 传播)"
+    L5_异常全局: "INV-V0823-REGR-04 (全局错误), INV-TIMEOUT-004 (超时)"
+    L6_组件级数据加载: "INV-V0823-REGR-03 (dao AbortController), INV-V0823-OBS01 (信任中心)"
+  exception_path_coverage:
+    超时路径: "INV-TIMEOUT-004 (10s fetch 超时)"
+    卡死路径: "INV-LOCK-001 (合成期间端点可达), INV-PROC-003 (sidecar 卡死)"
+    错误路径: "INV-V0823-P203 (502/504 重试), INV-V0823-REGR-02 (503 冷却期)"
+    取消路径: "INV-V0823-OBS01 (信任中心取消), INV-V0823-A02 (退避取消)"
+    竞态路径: "INV-V0823-REGR-03 (dao 竞态), INV-V0823-OBS01 (信任中心竞态)"

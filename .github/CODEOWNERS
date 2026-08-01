@@ -1,0 +1,13 @@
+# LRC 项目 CODEOWNERS
+# 默认所有者
+* @zhibaiYingChuan
+
+# CI/CD 配置变更需要所有者审批
+.github/workflows/ @zhibaiYingChuan
+.github/CODEOWNERS @zhibaiYingChuan
+
+# 核心引擎变更需谨慎审查
+src/engine/ @zhibaiYingChuan
+
+# 安全相关变更
+SECURITY.md @zhibaiYingChuan

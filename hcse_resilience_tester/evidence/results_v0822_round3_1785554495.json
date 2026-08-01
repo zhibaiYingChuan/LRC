@@ -1,0 +1,27 @@
+{
+  "INV-HTTP-001": {
+    "status": "FAIL",
+    "severity": "P0",
+    "evidence": "4 端点 max=3038ms"
+  },
+  "INV-V0822-P0A": {
+    "status": "FAIL",
+    "severity": "P0",
+    "evidence": "5 轮探测 3/5 可达"
+  },
+  "INV-LEAK-006": {
+    "status": "FAIL",
+    "severity": "P1",
+    "evidence": "CloseWait=49"
+  },
+  "INV-RUNTIME-001": {
+    "status": "PASS",
+    "severity": "P0",
+    "evidence": "17 线程，运行=17"
+  },
+  "INV-STATE-002": {
+    "status": "FAIL",
+    "severity": "P0",
+    "evidence": "online=None failCount=0"
+  }
+}

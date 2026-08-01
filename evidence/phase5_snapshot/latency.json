@@ -1,0 +1,30 @@
+﻿[
+    {
+        "Port":  3099,
+        "Endpoint":  "/health",
+        "Status":  "TIMEOUT/FAIL",
+        "LatencyMs":  5049,
+        "BodyLen":  0
+    },
+    {
+        "Port":  3099,
+        "Endpoint":  "/dashboard",
+        "Status":  200,
+        "LatencyMs":  5,
+        "BodyLen":  111662
+    },
+    {
+        "Port":  3100,
+        "Endpoint":  "/health",
+        "Status":  200,
+        "LatencyMs":  1,
+        "BodyLen":  176
+    },
+    {
+        "Port":  3100,
+        "Endpoint":  "/dashboard",
+        "Status":  200,
+        "LatencyMs":  6,
+        "BodyLen":  111662
+    }
+]

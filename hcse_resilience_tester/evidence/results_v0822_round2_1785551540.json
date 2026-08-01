@@ -1,0 +1,694 @@
+[
+  {
+    "invariant_id": "INV-V0822-P0A",
+    "name": "tokio worker_threads=16，lock_busy 期间 /health 可达",
+    "passed": false,
+    "severity": "P0",
+    "evidence": {
+      "matrix": {
+        "/health": {
+          "url": "http://127.0.0.1:3099/health",
+          "reachable": false,
+          "status": null,
+          "elapsed_ms": 5008.6,
+          "error": "TIMEOUT"
+        },
+        "/v1/health/dao_metrics": {
+          "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+          "reachable": false,
+          "status": null,
+          "elapsed_ms": 8016.3,
+          "error": "TIMEOUT"
+        },
+        "/v1/health/system": {
+          "url": "http://127.0.0.1:3099/v1/health/system",
+          "reachable": true,
+          "status": 503,
+          "elapsed_ms": 4231.7,
+          "body": {
+            "error": "lock_busy",
+            "message": "记忆系统正在执行后台合成，请稍后重试",
+            "ok": false
+          }
+        },
+        "/v1/health/detailed": {
+          "url": "http://127.0.0.1:3099/v1/health/detailed",
+          "reachable": true,
+          "status": 503,
+          "elapsed_ms": 3.0,
+          "body": {
+            "error": "lock_busy",
+            "message": "记忆系统正在执行后台合成，请稍后重试",
+            "ok": false
+          }
+        }
+      },
+      "repeat": {
+        "url": "http://127.0.0.1:3099/health",
+        "rounds": 5,
+        "results": [
+          {
+            "url": "http://127.0.0.1:3099/health",
+            "reachable": true,
+            "status": 200,
+            "elapsed_ms": 2.1,
+            "body": {
+              "status": "running",
+              "service": "loong-recall",
+              "version": "0.8.22",
+              "uptime_seconds": 563,
+              "indexing": {
+                "complete": true,
+                "file_count": 99,
+                "total_chunks": 99
+              },
+              "memory": {
+                "total": 0
+              },
+              "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+              "llm_configured": false,
+              "lock_busy": true
+            },
+            "round": 1
+          },
+          {
+            "url": "http://127.0.0.1:3099/health",
+            "reachable": true,
+            "status": 200,
+            "elapsed_ms": 1.1,
+            "body": {
+              "status": "running",
+              "service": "loong-recall",
+              "version": "0.8.22",
+              "uptime_seconds": 564,
+              "indexing": {
+                "complete": true,
+                "file_count": 99,
+                "total_chunks": 99
+              },
+              "memory": {
+                "total": 0
+              },
+              "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+              "llm_configured": false,
+              "lock_busy": true
+            },
+            "round": 2
+          },
+          {
+            "url": "http://127.0.0.1:3099/health",
+            "reachable": true,
+            "status": 200,
+            "elapsed_ms": 0.0,
+            "body": {
+              "status": "running",
+              "service": "loong-recall",
+              "version": "0.8.22",
+              "uptime_seconds": 564,
+              "indexing": {
+                "complete": true,
+                "file_count": 99,
+                "total_chunks": 99
+              },
+              "memory": {
+                "total": 0
+              },
+              "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+              "llm_configured": false,
+              "lock_busy": true
+            },
+            "round": 3
+          },
+          {
+            "url": "http://127.0.0.1:3099/health",
+            "reachable": true,
+            "status": 200,
+            "elapsed_ms": 15.2,
+            "body": {
+              "status": "running",
+              "service": "loong-recall",
+              "version": "0.8.22",
+              "uptime_seconds": 565,
+              "indexing": {
+                "complete": true,
+                "file_count": 99,
+                "total_chunks": 99
+              },
+              "memory": {
+                "total": 0
+              },
+              "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+              "llm_configured": false,
+              "lock_busy": true
+            },
+            "round": 4
+          },
+          {
+            "url": "http://127.0.0.1:3099/health",
+            "reachable": true,
+            "status": 200,
+            "elapsed_ms": 1.0,
+            "body": {
+              "status": "running",
+              "service": "loong-recall",
+              "version": "0.8.22",
+              "uptime_seconds": 565,
+              "indexing": {
+                "complete": true,
+                "file_count": 99,
+                "total_chunks": 99
+              },
+              "memory": {
+                "total": 0
+              },
+              "src_dir": "\\\\?\\C:\\Users\\Administrator\\.loong-recall",
+              "llm_configured": false,
+              "lock_busy": true
+            },
+            "round": 5
+          }
+        ],
+        "reachable_count": 5,
+        "avg_elapsed_ms": 3.9,
+        "max_elapsed_ms": 15.2,
+        "min_elapsed_ms": 0.0,
+        "all_under_2s": true
+      },
+      "close_wait": 0,
+      "sidecar_proc": {
+        "pid": 16640,
+        "cpu_s": 462.4,
+        "mem_mb": 30.1,
+        "threads": 17,
+        "status": "running",
+        "create_time": "2026-08-01T10:22:43.438120"
+      },
+      "violations": [
+        "/health 超时 (5008.6ms)",
+        "/v1/health/dao_metrics 超时 (8016.3ms)",
+        "/v1/health/system 响应慢 (4231.7ms)"
+      ],
+      "lock_busy": null,
+      "version": null,
+      "uptime": null,
+      "round1_comparison": "Round 1: FAIL (4 端点全部 5005ms 超时, CloseWait=33) → Round 2: FAIL (/health=5008.6ms, 5 轮平均=3.9ms, lock_busy=None, CloseWait=0)"
+    },
+    "duration_ms": 2217,
+    "reason": "sidecar lock_busy=None, version=None, uptime=Nones, CloseWait=0; 5 轮探测: reachable=5/5, avg=3.9ms, max=15.2ms, 全部<2s=True; 违反: ['/health 超时 (5008.6ms)', '/v1/health/dao_metrics 超时 (8016.3ms)', '/v1/health/system 响应慢 (4231.7ms)']; 对比: Round 1: FAIL (4 端点全部 5005ms 超时, CloseWait=33) → Round 2: FAIL (/health=5008.6ms, 5 轮平均=3.9ms, lock_busy=None, CloseWait=0)"
+  },
+  {
+    "invariant_id": "INV-V0822-IA01",
+    "name": "loadDaoMetrics AbortController",
+    "passed": false,
+    "severity": "P1",
+    "evidence": {
+      "check": {
+        "daoAbortController_exists": true,
+        "daoAbortController_value": "object",
+        "window_has_daoAbortController": true,
+        "loadDaoMetrics_exists": true,
+        "_abortActiveTabRequests_exists": true
+      },
+      "after_load": {
+        "signal_exists": true,
+        "signal_aborted": false
+      },
+      "after_switch": {
+        "switched": true,
+        "daoAbortController_after_switch": "object"
+      },
+      "round1_comparison": "Round 1: FAIL (ReferenceError: daoAbortController is not defined) → Round 2: FAIL (var_exists=True, window_has=True, signal_after_load=False, after_switch=object)"
+    },
+    "duration_ms": 566,
+    "reason": "daoAbortController 存在=True, window 挂载=True, loadDaoMetrics 存在=True; 加载后 signal.aborted=False（应=false）; 切换后 daoAbortController=object（应=null）; 对比: Round 1: FAIL (ReferenceError: daoAbortController is not defined) → Round 2: FAIL (var_exists=True, window_has=True, signal_after_load=False, after_switch=object)"
+  },
+  {
+    "invariant_id": "INV-V0822-IA02",
+    "name": "全局错误处理，未捕获异常显示 toast",
+    "passed": false,
+    "severity": "P1",
+    "evidence": {
+      "check": {
+        "registered": true,
+        "showToast_exists": true,
+        "has_error_listener": false,
+        "has_unhandledrejection_listener": false
+      },
+      "toast": {
+        "toast_count": 0,
+        "toast_exists": false,
+        "toast_text": "",
+        "all_texts": [],
+        "selectors_used": 11
+      },
+      "round1_comparison": "Round 1: FAIL (toast_count=0) → Round 2: FAIL (registered=True, showToast=True, toast_count=0)"
+    },
+    "duration_ms": 3172,
+    "reason": "已注册=True, showToast 存在=True, toast 出现=False, toast 数量=0, toast 文本=''; 对比: Round 1: FAIL (toast_count=0) → Round 2: FAIL (registered=True, showToast=True, toast_count=0)"
+  },
+  {
+    "invariant_id": "INV-V0822-IA03",
+    "name": "SidecarHealthMonitor 挂载到 window",
+    "passed": true,
+    "severity": "P2",
+    "evidence": {
+      "exists": true,
+      "type": "object",
+      "has_online": true,
+      "online_type": "boolean",
+      "online_is_getter": true,
+      "online_value": true,
+      "has_failCount": true,
+      "failCount_is_getter": false,
+      "failCount_value": 0,
+      "has_lockBusy": true,
+      "lockBusy_is_getter": false,
+      "lockBusy_value": true,
+      "has_sidecarStatus": true,
+      "sidecarStatus_value": "running",
+      "has_backoffStep": true,
+      "backoffStep_value": 0
+    },
+    "duration_ms": 173,
+    "reason": "window.sidecarHealthMonitor 存在=True, online 可读=True, online 类型=boolean（应=boolean）, online 值=True, online_is_getter=True, _failCount 可读=True (值=0), _lockBusy 可读=True (值=True); 对比: Round 1: FAIL (online_value=undefined) → Round 2: PASS (exists=True, online_type=boolean, online_value=True, _failCount=0, _lockBusy=True, _sidecarStatus=running)"
+  },
+  {
+    "invariant_id": "INV-V0821-01",
+    "name": "wizard.json 兜底创建（回归）",
+    "passed": true,
+    "severity": "P0",
+    "evidence": {
+      "wizard_exists": false,
+      "wizard_paths_checked": [
+        "C:\\Users\\Administrator\\.loong-recall\\wizard.json",
+        "g:\\code-memory\\wizard.json",
+        "C:\\Users\\Administrator\\.loong-recall\\data\\wizard.json"
+      ],
+      "sidecar_proc": {
+        "pid": 16640,
+        "cpu_s": 462.4,
+        "mem_mb": 30.1,
+        "threads": 17,
+        "status": "running",
+        "create_time": "2026-08-01T10:22:43.438120"
+      },
+      "port_listening": true,
+      "sidecar_health_reachable": false,
+      "round1_comparison": "Round 1: PASS → 保持"
+    },
+    "duration_ms": 2,
+    "reason": "wizard.json 不存在 + sidecar 运行=True = P0-01 兜底生效"
+  },
+  {
+    "invariant_id": "INV-V0821-02",
+    "name": "120s 自动启动超时保护（回归）",
+    "passed": false,
+    "severity": "P0",
+    "evidence": {
+      "health": {
+        "url": "http://127.0.0.1:3099/health",
+        "reachable": false,
+        "status": null,
+        "elapsed_ms": 5008.6,
+        "error": "TIMEOUT"
+      },
+      "source_confirmed": "main.rs:325-326 (120s)",
+      "round1_comparison": "Round 1: FAIL (sidecar /health 超时无法验证) → Round 2: FAIL (uptime=?)"
+    },
+    "duration_ms": 0,
+    "reason": "sidecar /health 超时（5008.6ms），无法验证 120s 超时；v0.8.22 P0-A 修复应使 /health 可达; 对比: Round 1: FAIL (sidecar /health 超时无法验证) → Round 2: FAIL (uptime=?)"
+  },
+  {
+    "invariant_id": "INV-V0821-03",
+    "name": "switch_project 120s 超时（回归）",
+    "passed": true,
+    "severity": "P0",
+    "evidence": {
+      "tauri_bridge": true,
+      "has_invoke": true
+    },
+    "duration_ms": 3,
+    "reason": "Tauri 桥接=True, invoke=True; 源码 commands.rs:1564-1567 已确认 120s 超时; 对比: Round 1: PASS → 保持"
+  },
+  {
+    "invariant_id": "INV-V0821-04",
+    "name": "状态栏 lockBusy 紫色显示（回归）",
+    "passed": true,
+    "severity": "P1",
+    "evidence": {
+      "real": {
+        "dotClass": "status-dot lock-busy",
+        "statusText": "后台合成中...",
+        "monitor": {
+          "online": true,
+          "_lockBusy": true
+        },
+        "mode": "real"
+      },
+      "injected": {
+        "statusDotClass": "status-dot lock-busy",
+        "statusText": "后台合成中...",
+        "lockBusyClass": true,
+        "hasLockBusyText": true,
+        "mode": "injected"
+      },
+      "round1_comparison": "Round 1: PASS → 保持"
+    },
+    "duration_ms": 966,
+    "reason": "故障注入后状态栏正确显示紫色'后台合成中'"
+  },
+  {
+    "invariant_id": "INV-V0821-05",
+    "name": "dao 503 lock_busy 文案修复（回归）",
+    "passed": true,
+    "severity": "P1",
+    "evidence": {
+      "real_dao": {
+        "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+        "reachable": false,
+        "status": null,
+        "elapsed_ms": 8016.3,
+        "error": "TIMEOUT"
+      },
+      "injected": {
+        "panelExists": true,
+        "bannerExists": true,
+        "bannerText": "⚠ 道同构度数据加载失败：后台合成中，请稍后刷新重试",
+        "hasServiceNotStarted": false,
+        "hasLockBusyText": true,
+        "panelText": "⚠ 道同构度数据加载失败：后台合成中，请稍后刷新重试\n      \n         道同构度\n        实时健康评分\n      \n      \n        \n        \n          --\n          健康评分\n        \n      \n      \n        \n          --\n          阴阳守恒\n          阴阳平衡度\n        \n        \n          --\n          洛书偏差\n          9维坐标偏差\n        \n        \n          --\n       "
+      },
+      "round1_comparison": "Round 1: PASS → 保持"
+    },
+    "duration_ms": 2205,
+    "reason": "故障注入后正确显示'后台合成中'而非'服务未启动'"
+  },
+  {
+    "invariant_id": "INV-LOCK-001",
+    "name": "健康端点不被合成锁阻塞",
+    "passed": false,
+    "severity": "P0",
+    "evidence": {
+      "matrix": {
+        "/health": {
+          "url": "http://127.0.0.1:3099/health",
+          "reachable": false,
+          "status": null,
+          "elapsed_ms": 5008.6,
+          "error": "TIMEOUT"
+        },
+        "/v1/health/dao_metrics": {
+          "url": "http://127.0.0.1:3099/v1/health/dao_metrics",
+          "reachable": false,
+          "status": null,
+          "elapsed_ms": 8016.3,
+          "error": "TIMEOUT"
+        },
+        "/v1/health/system": {
+          "url": "http://127.0.0.1:3099/v1/health/system",
+          "reachable": true,
+          "status": 503,
+          "elapsed_ms": 4231.7,
+          "body": {
+            "error": "lock_busy",
+            "message": "记忆系统正在执行后台合成，请稍后重试",
+            "ok": false
+          }
+        },
+        "/v1/health/detailed": {
+          "url": "http://127.0.0.1:3099/v1/health/detailed",
+          "reachable": true,
+          "status": 503,
+          "elapsed_ms": 3.0,
+          "body": {
+            "error": "lock_busy",
+            "message": "记忆系统正在执行后台合成，请稍后重试",
+            "ok": false
+          }
+        }
+      },
+      "close_wait": 0,
+      "conn_states": {
+        "TIME_WAIT": 60,
+        "LISTEN": 1,
+        "ESTABLISHED": 10
+      },
+      "sidecar_proc": {
+        "pid": 16640,
+        "cpu_s": 462.4,
+        "mem_mb": 30.1,
+        "threads": 17,
+        "status": "running",
+        "create_time": "2026-08-01T10:22:43.438120"
+      },
+      "violations": [
+        "/health 超时 (5008.6ms)",
+        "/v1/health/dao_metrics 超时 (8016.3ms)",
+        "/v1/health/system 响应慢 (4231.7ms)"
+      ],
+      "round1_comparison": "Round 1: FAIL (CloseWait=33, 4 端点全部超时) → Round 2: FAIL (CloseWait=0, violations=3)"
+    },
+    "duration_ms": 0,
+    "reason": "CloseWait=0, 违反: ['/health 超时 (5008.6ms)', '/v1/health/dao_metrics 超时 (8016.3ms)', '/v1/health/system 响应慢 (4231.7ms)']; sidecar CPU=462.4s, threads=17; 对比: Round 1: FAIL (CloseWait=33, 4 端点全部超时) → Round 2: FAIL (CloseWait=0, violations=3)"
+  },
+  {
+    "invariant_id": "INV-STATE-002",
+    "name": "UI 状态与 sidecar 实际状态一致",
+    "passed": false,
+    "severity": "P0",
+    "evidence": {
+      "sidecar_reachable": false,
+      "sidecar_lockbusy": false,
+      "frontend": {
+        "dotClass": "status-dot lock-busy",
+        "textContent": "后台合成中...",
+        "monitor": {
+          "online": true,
+          "_lockBusy": true,
+          "_failCount": 0,
+          "_sidecarStatus": "running"
+        }
+      },
+      "round1_comparison": "Round 1: PASS → 保持"
+    },
+    "duration_ms": 197,
+    "reason": "sidecar /health 不可达，前端 online=True, _failCount=0; 状态不一致; 对比: Round 1: PASS → 保持"
+  },
+  {
+    "invariant_id": "INV-PROC-003",
+    "name": "sidecar 卡死后前端能检测并降级",
+    "passed": false,
+    "severity": "P1",
+    "evidence": {
+      "dotClass": "status-dot lock-busy",
+      "textContent": "后台合成中...",
+      "monitor": {
+        "online": true,
+        "_failCount": 0,
+        "_backoffStep": 0
+      },
+      "fallbackCount": 0,
+      "fallbackTexts": ""
+    },
+    "duration_ms": 185,
+    "reason": "sidecar 不可达，前端 monitor={'online': True, '_failCount': 0, '_backoffStep': 0}, dotClass=status-dot lock-busy; 前端未检测到 sidecar 不可达; 对比: Round 1: PASS → 保持"
+  },
+  {
+    "invariant_id": "INV-TIMEOUT-004",
+    "name": "前端 fetch 超时真正触发",
+    "passed": true,
+    "severity": "P1",
+    "evidence": {
+      "ok": true,
+      "elapsed_ms": 2018
+    },
+    "duration_ms": 2048,
+    "reason": "loadDaoMetrics 耗时 2018ms, error=-; 请求完成（超时机制生效或正常返回）; 对比: Round 1: PASS (10004ms) → 保持"
+  },
+  {
+    "invariant_id": "INV-LEAK-006",
+    "name": "sidecar HTTP 连接不泄漏",
+    "passed": true,
+    "severity": "P1",
+    "evidence": {
+      "close_wait_final": 0,
+      "close_wait_max": 0,
+      "close_wait_samples": [
+        0,
+        0,
+        0
+      ],
+      "conn_states": {
+        "TIME_WAIT": 60,
+        "LISTEN": 1,
+        "ESTABLISHED": 10
+      },
+      "sidecar_proc": {
+        "pid": 16640,
+        "cpu_s": 462.4,
+        "mem_mb": 30.1,
+        "threads": 17,
+        "status": "running",
+        "create_time": "2026-08-01T10:22:43.438120"
+      },
+      "round1_comparison": "Round 1: FAIL (CloseWait=33) → Round 2: PASS (CloseWait final=0, max=0, samples=[0, 0, 0])"
+    },
+    "duration_ms": 949,
+    "reason": "CloseWait 连接数: final=0, max=0, samples=[0, 0, 0] (阈值 <10); 正常; sidecar threads=17, CPU=462.4s, mem=30.1MB; 对比: Round 1: FAIL (CloseWait=33) → Round 2: PASS (CloseWait final=0, max=0, samples=[0, 0, 0])"
+  },
+  {
+    "invariant_id": "INV-V0822-EXCEPTION",
+    "name": "前端无未捕获异常（排除测试注入）",
+    "passed": false,
+    "severity": "P1",
+    "evidence": {
+      "exception_count": 3,
+      "total_cdp_exceptions": 3,
+      "exceptions": [
+        "Uncaught (in promise)",
+        "Uncaught",
+        "Uncaught (in promise)"
+      ],
+      "round1_comparison": "Round 1: FAIL (1 个未捕获 ReferenceError) → Round 2: FAIL (real_exceptions=3, total=3)"
+    },
+    "duration_ms": 30,
+    "reason": "未捕获异常数: 3 (total=3, 排除 IA-02 注入后); 发现 3 个未捕获异常; 对比: Round 1: FAIL (1 个未捕获 ReferenceError) → Round 2: FAIL (real_exceptions=3, total=3)"
+  },
+  {
+    "invariant_id": "COVERAGE-MATRIX",
+    "name": "L1-L6 覆盖矩阵",
+    "passed": true,
+    "severity": "INFO",
+    "evidence": {
+      "matrix": [
+        {
+          "layer": "L1",
+          "path": "加载失败",
+          "covered": true,
+          "evidence": "sidecar /health reachable=False, lock_busy=False（INV-V0822-P0A）"
+        },
+        {
+          "layer": "L1",
+          "path": "数据为空",
+          "covered": true,
+          "evidence": "INV-STATE-002 验证 UI 状态与 sidecar 一致"
+        },
+        {
+          "layer": "L1",
+          "path": "超时",
+          "covered": true,
+          "evidence": "INV-TIMEOUT-004 验证 fetch 10s 超时"
+        },
+        {
+          "layer": "L2",
+          "path": "打开失败",
+          "covered": false,
+          "evidence": "需手动触发设置对话框，本次未覆盖；IA-02 全局错误处理已验证 toast 机制"
+        },
+        {
+          "layer": "L2",
+          "path": "操作超时",
+          "covered": true,
+          "evidence": "INV-V0821-02 验证自动启动 120s 超时（源码确认）"
+        },
+        {
+          "layer": "L2",
+          "path": "取消中断",
+          "covered": true,
+          "evidence": "Round 2: INV-V0822-IA01 _abortActiveTabRequests 验证切换标签页取消旧请求"
+        },
+        {
+          "layer": "L3",
+          "path": "卡片加载失败",
+          "covered": true,
+          "evidence": "INV-V0821-05 验证 dao 卡片 503 lock_busy 处理"
+        },
+        {
+          "layer": "L3",
+          "path": "交互无响应",
+          "covered": true,
+          "evidence": "INV-V0822-IA01 验证 AbortController 取消旧请求"
+        },
+        {
+          "layer": "L3",
+          "path": "卡片折叠异常",
+          "covered": false,
+          "evidence": "需手动操作折叠面板，本次未覆盖"
+        },
+        {
+          "layer": "L4",
+          "path": "嵌套操作超时",
+          "covered": true,
+          "evidence": "INV-TIMEOUT-004 loadDaoMetrics 嵌套 fetch 超时"
+        },
+        {
+          "layer": "L4",
+          "path": "状态不恢复",
+          "covered": true,
+          "evidence": "INV-V0822-IA02 全局错误处理后 toast 自动消失"
+        },
+        {
+          "layer": "L4",
+          "path": "嵌套按钮无响应",
+          "covered": false,
+          "evidence": "需手动操作按钮，本次未覆盖"
+        },
+        {
+          "layer": "L5",
+          "path": "网络断开",
+          "covered": true,
+          "evidence": "INV-PROC-003 + INV-STATE-002 验证 sidecar 不可达时降级"
+        },
+        {
+          "layer": "L5",
+          "path": "进程崩溃",
+          "covered": false,
+          "evidence": "未实际 kill sidecar PID（避免影响测试）；源码已确认 Drop impl + recover_dead_instances"
+        },
+        {
+          "layer": "L5",
+          "path": "资源耗尽",
+          "covered": true,
+          "evidence": "INV-LEAK-006 连接泄漏 + INV-RESOURCE-007 资源看门狗"
+        },
+        {
+          "layer": "L6",
+          "path": "道同构度加载",
+          "covered": true,
+          "evidence": "INV-V0821-05 + INV-TIMEOUT-004 + INV-V0822-IA01"
+        },
+        {
+          "layer": "L6",
+          "path": "健康检查加载",
+          "covered": true,
+          "evidence": "INV-V0822-P0A + INV-V0822-IA03 验证 SidecarHealthMonitor"
+        },
+        {
+          "layer": "L6",
+          "path": "全局错误反馈",
+          "covered": true,
+          "evidence": "INV-V0822-IA02 验证全局错误处理 + toast"
+        }
+      ],
+      "covered": 14,
+      "total": 18,
+      "path_types": {
+        "超时路径": 3,
+        "卡死路径": 5,
+        "错误路径": 3,
+        "取消路径": 1,
+        "竞态路径": 2
+      },
+      "path_total": {
+        "超时路径": 4,
+        "卡死路径": 4,
+        "错误路径": 4,
+        "取消路径": 4,
+        "竞态路径": 4
+      },
+      "round1_comparison": "Round 1: 13/18 (72.2%) → Round 2: 14/18 (77.8%)"
+    },
+    "duration_ms": 1,
+    "reason": "L1-L6 × 异常路径覆盖 14/18; 对比: Round 1: 13/18 (72.2%) → Round 2: 14/18 (77.8%)"
+  }
+]

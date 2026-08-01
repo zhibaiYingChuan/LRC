@@ -12,6 +12,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# v0.8.23 S1-SEC-04：最小权限原则 — CI 只需要读取权限
+permissions:
+  contents: read
+
 jobs:
   # ════════════════════════════════════════════════════════════
   # Job 1: 代码格式检查（cargo fmt）
@@ -20,8 +24,21 @@ jobs:
     name: Rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            crates.io:443
+            static.crates.io:443
+            objects.githubusercontent.com:443
+            rustup.rs:443
+            static.rust-lang.org:443
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt
       - name: Check formatting
@@ -34,12 +51,25 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            crates.io:443
+            static.crates.io:443
+            objects.githubusercontent.com:443
+            rustup.rs:443
+            static.rust-lang.org:443
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: clippy
       - name: Cache Cargo deps
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/
@@ -60,10 +90,23 @@ jobs:
     name: Unit & Integration Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            crates.io:443
+            static.crates.io:443
+            objects.githubusercontent.com:443
+            rustup.rs:443
+            static.rust-lang.org:443
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - name: Cache Cargo deps
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/
@@ -85,11 +128,24 @@ jobs:
     name: E2E Smoke Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            crates.io:443
+            static.crates.io:443
+            objects.githubusercontent.com:443
+            rustup.rs:443
+            static.rust-lang.org:443
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Cache Cargo deps
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/
@@ -116,7 +172,8 @@ jobs:
           fi
 
       - name: Smoke test - /v1/health/system
-        # 验证系统健康端点返回 200
+        # 验证系统健康端点返回 200，并检查响应结构
+        # v0.8.23 A-03：降级路径 CI 测试 — 验证 lock_busy 响应结构
         run: |
           RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3099/v1/health/system)
           echo "GET /v1/health/system → HTTP $RESPONSE"
@@ -125,6 +182,25 @@ jobs:
             cat sidecar.log
             exit 1
           fi
+          # 验证 JSON 响应结构（正常路径 & 降级路径均需包含 lock_busy 字段）
+          BODY=$(curl -s http://127.0.0.1:3099/v1/health/system)
+          echo "响应体: $(echo $BODY | head -c 300)"
+          # 检查 lock_busy 字段存在（正常路径=false，降级路径=true）
+          if ! echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'lock_busy' in d, '缺少 lock_busy 字段'; assert isinstance(d['lock_busy'], bool), 'lock_busy 必须是 boolean'" 2>/dev/null; then
+            echo "FAIL: 响应结构不符合规范（缺少 lock_busy 字段或类型错误）"
+            echo "响应内容: $BODY"
+            cat sidecar.log
+            exit 1
+          fi
+          echo "  ✓ 响应结构验证通过（lock_busy 字段存在且为 boolean）"
+          # 检查 degraded 字段存在（降级路径=true）
+          if ! echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'degraded' in d, '缺少 degraded 字段'; assert isinstance(d['degraded'], bool), 'degraded 必须是 boolean'" 2>/dev/null; then
+            echo "FAIL: 响应结构不符合规范（缺少 degraded 字段或类型错误）"
+            echo "响应内容: $BODY"
+            cat sidecar.log
+            exit 1
+          fi
+          echo "  ✓ 响应结构验证通过（degraded 字段存在且为 boolean）"
 
       - name: Smoke test - /v1/memories/stats
         run: |
@@ -184,10 +260,23 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            crates.io:443
+            static.crates.io:443
+            objects.githubusercontent.com:443
+            rustup.rs:443
+            static.rust-lang.org:443
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - name: Cache Cargo deps
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/

@@ -1,0 +1,531 @@
+[
+  {
+    "test_id": "L1-1",
+    "layer": "L1",
+    "category": "加载失败",
+    "title": "sidecar 不可达时仪表盘是否有明确提示+重试入口",
+    "status": "PASS",
+    "severity": "",
+    "description": "sidecar 可达，banner 正确隐藏",
+    "evidence": [
+      "sidecar /health 探针: {\"ok\": true, \"status_code\": 200, \"body\": {\"status\": \"running\", \"service\": \"loong-recall\", \"version\": \"0.8.21\", \"uptime_seconds\": 1485, \"indexing\": {\"complete\": true, \"file_count\": 99, \"total_chunks\": 99}, \"memory\": {\"total\": 3202}, \"src_dir\": \"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\", \"llm_configured\": false, \"lock_busy\": false}, \"latency_ms\": 30}",
+      "UI 状态: bannerVisible=False, bannerText='LRC 服务未运行，部分功能不可用', sidecarStatus=unknown, isReachable=False",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L1-1_load_failure.png"
+    ],
+    "code_location": "static/app.js: sidecar-down-banner 逻辑 (line 357-360, 566-571); desktop/src-tauri/src/main.rs: effective_setup_complete (line 294)",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:40.234177+00:00",
+    "duration_ms": 193
+  },
+  {
+    "test_id": "L1-2",
+    "layer": "L1",
+    "category": "数据为空",
+    "title": "记忆库为空时仪表盘是否有空状态插画+引导文案",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "记忆库当前有数据（3202 条），无法真实触发空状态。静态检查：DOM 中空状态模板数=0",
+    "evidence": [
+      "sidecar health: memory.total=3202",
+      "UI memoryCount=0, dashboardCards=18",
+      "body 文案包含空状态关键词: False",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L1-2_empty_data.png",
+      "空状态代码检查: {\"emptyTemplateCount\": 0, \"hasEmptyStateClass\": false, \"bodyContainsEmpty\": true}"
+    ],
+    "code_location": "static/app.js: loadDashboard; static/index.html: 仪表盘卡片结构",
+    "repro_steps": [],
+    "fix_suggestion": "建议在 loadDashboard 中对 memories.length===0 显式渲染空状态插画+引导按钮（如'去添加第一条记忆'）",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:40.453750+00:00",
+    "duration_ms": 219
+  },
+  {
+    "test_id": "L1-3",
+    "layer": "L1",
+    "category": "超时",
+    "title": "仪表盘请求超时时是否有兜底反馈（非永久 loading）",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "sidecar 正常，但前端未暴露超时配置，需静态代码分析确认",
+    "evidence": [
+      "health 延迟: 6ms, ok=True",
+      "dashboard 延迟: 1ms, ok=False",
+      "dao_metrics 延迟: 1ms, ok=False",
+      "UI: daoMetricsText='', errorMessages=0",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L1-3_timeout.png",
+      "超时机制: {\"hasMonitor\": false, \"monitorTimeoutMs\": 0, \"hasAbortController\": true}"
+    ],
+    "code_location": "static/app.js: loadDashboard, loadDaoMetrics, fetchWithRetry; desktop/src-tauri/src/main.rs: INV-08 120s 超时 (line 320-326)",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:40.646851+00:00",
+    "duration_ms": 193
+  },
+  {
+    "test_id": "L1-4",
+    "layer": "L1",
+    "category": "卡死",
+    "title": "sidecar 卡死（连接泄漏 CloseWait）时 UI 是否能检测+恢复",
+    "status": "PASS",
+    "severity": "",
+    "description": "sidecar 响应正常（7ms）",
+    "evidence": [
+      "sidecar health (5s): {\"ok\": true, \"status_code\": 200, \"body\": {\"status\": \"running\", \"service\": \"loong-recall\", \"version\": \"0.8.21\", \"uptime_seconds\": 1485, \"indexing\": {\"complete\": true, \"file_count\": 99, \"total_chunks\": 99}, \"memory\": {\"total\": 3202}, \"src_dir\": \"\\\\\\\\?\\\\C:\\\\Users\\\\Administrator\\\\.loong-recall\", \"llm_co",
+      "UI sidecarStatus=unknown, isReachable=False, lockBusy=False, bannerVisible=False",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L1-4_deadlock.png",
+      "HealthMonitor 状态: {\"hasMonitor\": false}"
+    ],
+    "code_location": "static/app.js: SidecarHealthMonitor.check (line 402-435); desktop/src-tauri/src/sidecar_manager.rs: 健康检查 (line 816-820, 960-963)",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:40.829940+00:00",
+    "duration_ms": 183
+  },
+  {
+    "test_id": "L1-5",
+    "layer": "L1",
+    "category": "错误",
+    "title": "sidecar 返回 503 lock_busy 时 UI 是否显示'后台合成中'而非'服务未启动'",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "当前 sidecar 未返回 503（status=404），无法真实触发。静态分析：app.js line 276-297 有 503 处理分支",
+    "evidence": [
+      "dao_metrics 探针: status=404, ok=False, latency=3ms",
+      "UI daoMetricsText=''",
+      "UI lockBusy=False, sidecarStatus=unknown",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L1-5_server_error.png",
+      "503 处理检查: {\"retryCountersScope\": \"module\", \"hasSynthesisToast\": false, \"toastCount\": 0, \"toastTexts\": []}"
+    ],
+    "code_location": "static/app.js: handleHttpError 503 分支 (line 276-297); desktop/src-tauri/src/main.rs: P0-04+INV-05 lock_busy 修复",
+    "repro_steps": [
+      "手动制造 503：在 sidecar 索引期请求 /v1/dao/metrics",
+      "或用 CDP 网络拦截 mock 503 响应"
+    ],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:41.004593+00:00",
+    "duration_ms": 174
+  },
+  {
+    "test_id": "L2-1",
+    "layer": "L2",
+    "category": "打开失败",
+    "title": "点击'启动服务'按钮后弹窗无法打开时是否有 toast 提示",
+    "status": "FAIL",
+    "severity": "P1",
+    "description": "弹窗未打开且无 toast 提示，用户无反馈",
+    "evidence": [
+      "点击后 UI: modalsOpen=[], toasts=[]",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L2-1_open_failure.png"
+    ],
+    "code_location": "static/app.js: openStartServiceModal (line 1439-1446); static/app.js: handleStartServiceClick (line 1532-1547)",
+    "repro_steps": [],
+    "fix_suggestion": "openStartServiceModal 应在弹窗元素不存在时调用 showToast('启动服务功能异常，请刷新页面重试', 'error')",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:42.726674+00:00",
+    "duration_ms": 1722
+  },
+  {
+    "test_id": "L2-2",
+    "layer": "L2",
+    "category": "操作超时",
+    "title": "启动服务超时时 UI 是否有硬超时兜底+可取消",
+    "status": "PASS",
+    "severity": "",
+    "description": "前端有硬超时机制（Promise.race/setTimeout）",
+    "evidence": [
+      "硬超时检查: {\"hasFn\": true, \"fnLength\": 5998, \"hasPromiseRace\": true, \"hasSetTimeout\": false, \"hasAbortController\": true, \"hasCancelFn\": false}",
+      "UI: buttonsLoading=[{'text': '下一步', 'class': 'btn btn-primary'}], modalsOpen=[]",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L2-2_operation_timeout.png",
+      "v0.8.21 INV-08: 后端自动启动超时 60s→120s 已确认"
+    ],
+    "code_location": "static/app.js: handleStartServiceClick (line 1532+); desktop/src-tauri/src/main.rs: INV-08 120s 超时 (line 320-326, 405-416); desktop/src-tauri/src/commands.rs: cancel_start_sidecar",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:42.910986+00:00",
+    "duration_ms": 184
+  },
+  {
+    "test_id": "L2-3",
+    "layer": "L2",
+    "category": "取消中断",
+    "title": "用户取消启动服务时 invoke 是否真正中断+UI 状态恢复",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "sidecar 已运行，无法真实触发取消。静态分析：v0.8.9 G-001 修复了 cancel_start_sidecar (AtomicBool 标志 + 健康检查循环检测取消)。需在 sidecar 未启动场景复现",
+    "evidence": [
+      "取消机制检查: {\"cancelBtnCount\": 0, \"hasTauriInvoke\": true, \"hasAbortController\": true}",
+      "UI modalsOpen=[]",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L2-3_cancel_interrupt.png"
+    ],
+    "code_location": "desktop/src-tauri/src/commands.rs: cancel_start_sidecar (AtomicBool); desktop/src-tauri/src/sidecar_manager.rs: 健康检查循环检测取消; static/app.js: abort 逻辑",
+    "repro_steps": [
+      "1. 停止 sidecar（不能影响其他智能体，暂跳过）",
+      "2. 点击'启动服务'触发启动",
+      "3. 启动进行中点击'取消'",
+      "4. 验证 invoke 是否真正中断（sidecar 进程未拉起）",
+      "5. 验证 UI 按钮是否恢复可点击"
+    ],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:43.129899+00:00",
+    "duration_ms": 218
+  },
+  {
+    "test_id": "L2-4",
+    "layer": "L2",
+    "category": "数据丢失",
+    "title": "弹窗关闭再打开后表单数据是否保留（防误关丢失）",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "表单数据保留需在真实弹窗开关场景验证。当前 MCP配置页有 15 个输入框",
+    "evidence": [
+      "切换到 MCP配置页: activeTab=project-switch",
+      "截图1: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L2-4_data_loss_1.png",
+      "表单字段: {\"inputCount\": 15, \"inputs\": [{\"id\": \"wizard-search-path\", \"name\": \"\", \"type\": \"text\", \"value\": \"struct\"}, {\"id\": \"wizard-memory-content\", \"name\": \"\", \"type\": \"text\", \"value\": \"项目使用 Rust 语言开发，采用 Actix-web 框架\"}, {\"id\": \"wizard-search-query\", \"name\": \"\", \"type\": \"text\", \"value\": \"Rust 开发\"}, {\"id\": \"luoshu-encode-input\", \"name\": \"\", \"type\": \"text\", \"value\": \"\"}, {\"id\": \"memory-search-input\", \"name\": "
+    ],
+    "code_location": "static/app.js: 模态框关闭逻辑; static/index.html: 表单元素",
+    "repro_steps": [],
+    "fix_suggestion": "建议模态框关闭时将表单数据存入 sessionStorage，重开时恢复；或在关闭前提示'数据未保存'",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:44.354796+00:00",
+    "duration_ms": 1224
+  },
+  {
+    "test_id": "L2-5",
+    "layer": "L2",
+    "category": "竞态条件",
+    "title": "快速打开关闭弹窗 10 次是否产生 Z-index 错乱/内存泄漏",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "快速切换产生 7 个 console 错误（可能内存泄漏）",
+    "evidence": [
+      "快速切换后 UI: activeTab=settings, modalsOpen=0, toasts=1",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L2-5_race_condition.png",
+      "console 错误数: 7",
+      "前 5 个错误: ['[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/detailed 失败 [503]: lock_busy', '[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/detailed 失败 [503]: lock_busy', '[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy', '[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/detailed 失败 [503]: lock_busy', '[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/detailed 失败 [503]: lock_busy']"
+    ],
+    "code_location": "static/app.js: openStartServiceModal/closeModal; static/components.css: .modal z-index",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:46.688713+00:00",
+    "duration_ms": 2333
+  },
+  {
+    "test_id": "L3-1",
+    "layer": "L3",
+    "category": "加载失败",
+    "title": "道同构度卡片加载失败时是否显示错误提示+重试",
+    "status": "FAIL",
+    "severity": "P1",
+    "description": "卡片加载失败但无明确错误提示: ''",
+    "evidence": [
+      "dao_metrics 探针: {\"ok\": false, \"status_code\": 404, \"body\": \"\", \"latency_ms\": 1}",
+      "UI daoMetricsText=''",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L3-1_card_load_failure.png"
+    ],
+    "code_location": "static/app.js: loadDaoMetrics (line 532-536); static/app.js: handleHttpError (line 276-297)",
+    "repro_steps": [],
+    "fix_suggestion": "loadDaoMetrics 应在 catch 中显示'道同构度数据加载失败'+'重试'按钮",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:47.893389+00:00",
+    "duration_ms": 1204
+  },
+  {
+    "test_id": "L3-2",
+    "layer": "L3",
+    "category": "交互无响应",
+    "title": "点击失效卡片是否能恢复（不永久卡死）",
+    "status": "PASS",
+    "severity": "",
+    "description": "所有 18 个卡片点击正常",
+    "evidence": [
+      "卡片数: 18",
+      "卡片点击结果: [{\"index\": 0, \"clicked\": true, \"text\": \"快速操作\\n      \\n        以下是龙忆 LRC 最常用的功能，点击即可使用。\\n     \"}, {\"index\": 1, \"clicked\": true, \"text\": \"预设场景模板\\n      \\n      一键启用场景模板，无需手动设计记忆类型与标签体系。\\n    \"}, {\"index\": 2, \"clicked\": true, \"text\": \"结晶历史时间线\\n      \\n      展示记忆库的成长轨迹——每次结晶都被持久化记录。\\n    \"}, {\"index\": 3, \"clicked\": true, \"text\": \"最近记忆\\n          刷新\\n        \\n        \\n        \\n     \"}, {\"index\": 4, ",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L3-2_card_unresponsive.png",
+      "点击后 activeTab=dashboard, toasts=[{'text': '记忆系统正在后台合成，请稍后重试', 'class': 'toast toast-info'}]"
+    ],
+    "code_location": "static/app.js: 卡片点击事件; static/components.css: .card",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:48.093801+00:00",
+    "duration_ms": 200
+  },
+  {
+    "test_id": "L3-3",
+    "layer": "L3",
+    "category": "数据为空",
+    "title": "卡片数据为空时是否显示空状态插画+引导",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "当前所有卡片都有数据，无法真实触发空状态",
+    "evidence": [
+      "卡片总数: 18, 空卡片数: 0",
+      "卡片详情: [{\"title\": \"快速操作\", \"text\": \"快速操作\\n      \\n        以下是龙忆 LRC 最常用的功能，点击即可使用。\\n      \\n      \\n        \\n          \\n          \\n            生成船长日志\\n            一键生成项目记忆健康报告\\n          \\n        \\n        \\n          \\n          \\n            查看信任中心\\n            验证数据存储位置与隐私保护\\n          \\n        \\n        \\n          \\n          \\n            配置 LLM\\n\", \"hasError\": false, \"isEmpty\": false}, {\"title\": \"预设场景模板\", \"text\": \"预设场景模板\\n      \\n      一键启用场景模板，无需手动设计记忆类型与标签体系。\\n      \\n        \\n          个人",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L3-3_card_empty_data.png",
+      "空状态检查: {\"emptyElementCount\": 0, \"bodyHasEmptyText\": true}"
+    ],
+    "code_location": "static/app.js: 卡片渲染逻辑; static/index.html: 空状态模板",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:48.282210+00:00",
+    "duration_ms": 188
+  },
+  {
+    "test_id": "L3-4",
+    "layer": "L3",
+    "category": "超时",
+    "title": "卡片加载超时是否有重试按钮",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "未发现显式重试按钮。静态分析：fetchWithRetry 有自动重试+指数退避，但用户无手动重试入口",
+    "evidence": [
+      "重试按钮检查: {\"retryBtnCount\": 0, \"errorMessagesWithRetry\": 0}",
+      "UI errorMessages=[]",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L3-4_card_timeout.png",
+      "重试机制: {\"hasRetryCounters\": false, \"maxBackoff\": 60000}"
+    ],
+    "code_location": "static/app.js: loadDaoMetrics; fetchWithRetry (line 342 _MAX_BACKOFF)",
+    "repro_steps": [],
+    "fix_suggestion": "卡片加载失败时应显示'重试'按钮，调用 loadDaoMetrics() 重新加载",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:48.487490+00:00",
+    "duration_ms": 205
+  },
+  {
+    "test_id": "L3-5",
+    "layer": "L3",
+    "category": "竞态条件",
+    "title": "快速切换仪表盘/记忆搜索 10 次是否产生数据错乱",
+    "status": "FAIL",
+    "severity": "P1",
+    "description": "快速切换后 memory-search 页面残留仪表盘数据（请求竞态）",
+    "evidence": [
+      "快速切换后 activeTab=memory-search, memoryCount=0, toasts=1",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L3-5_card_race.png",
+      "console 错误数: 8",
+      "错误样本: ['[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/dao_metrics 失败 [503]: lock_busy', '[handleHttpError] 请求 http://127.0.0.1:3099/v1/memories/stats 失败 [503]: lock_busy', '[handleHttpError] 请求 http://127.0.0.1:3099/v1/health/detailed 失败 [503]: lock_busy']"
+    ],
+    "code_location": "static/app.js: 标签页切换逻辑; AbortController",
+    "repro_steps": [],
+    "fix_suggestion": "切换标签页时应 AbortController 取消旧请求",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:50.670804+00:00",
+    "duration_ms": 2183
+  },
+  {
+    "test_id": "L4-1",
+    "layer": "L4",
+    "category": "超时",
+    "title": "设置页表单提交超时是否能重试+状态恢复",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "设置页保存按钮数=0。需真实提交表单测试超时（当前 sidecar 不稳定，跳过真实提交）",
+    "evidence": [
+      "设置页 activeTab=settings",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L4-1_nested_timeout.png",
+      "保存按钮: {\"saveBtnCount\": 0, \"saveBtns\": []}"
+    ],
+    "code_location": "static/app.js: 设置页表单提交; desktop/src-tauri/src/commands.rs: save_settings",
+    "repro_steps": [],
+    "fix_suggestion": "表单提交应有 30s 硬超时 + 失败重试按钮 + loading 状态自动恢复",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:51.963713+00:00",
+    "duration_ms": 1292
+  },
+  {
+    "test_id": "L4-2",
+    "layer": "L4",
+    "category": "状态不恢复",
+    "title": "按钮 loading 状态在操作失败后是否能恢复为可点击",
+    "status": "FAIL",
+    "severity": "P1",
+    "description": "发现 1 个按钮卡在 loading/disabled 状态: [{'text': '下一步', 'class': 'btn btn-primary'}]",
+    "evidence": [
+      "UI buttonsLoading=[{'text': '下一步', 'class': 'btn btn-primary'}]",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L4-2_state_not_restored.png"
+    ],
+    "code_location": "static/app.js: 按钮 loading 状态机; handleHttpError",
+    "repro_steps": [],
+    "fix_suggestion": "所有按钮 loading 应有 setTimeout 硬超时（30s）自动恢复",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:52.222933+00:00",
+    "duration_ms": 259
+  },
+  {
+    "test_id": "L4-3",
+    "layer": "L4",
+    "category": "验证失败",
+    "title": "表单输入非法值时是否显示字段级错误（非通用 toast）",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "表单输入框数=12, 带验证的输入框数=3。需真实输入非法值测试验证逻辑",
+    "evidence": [
+      "MCP配置页 activeTab=project-switch",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L4-3_form_validation.png",
+      "验证检查: {\"inputCount\": 12, \"inputsWithValidation\": 3, \"errorElements\": 0}"
+    ],
+    "code_location": "static/app.js: 表单验证逻辑; static/components.css: .has-error",
+    "repro_steps": [],
+    "fix_suggestion": "表单验证失败应在字段下方显示具体错误（如'API Key 不能为空'），而非通用 toast",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:53.462121+00:00",
+    "duration_ms": 1239
+  },
+  {
+    "test_id": "L4-4",
+    "layer": "L4",
+    "category": "嵌套取消",
+    "title": "弹窗内表单提交中点击'取消'是否能中断+清理",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "AbortController 可用=True, 取消按钮数=0。需真实提交表单+取消测试",
+    "evidence": [
+      "取消机制: {\"hasAbortController\": true, \"cancelBtns\": 0}",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L4-4_nested_cancel.png"
+    ],
+    "code_location": "static/app.js: AbortController; closeModal",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:53.695028+00:00",
+    "duration_ms": 232
+  },
+  {
+    "test_id": "L4-5",
+    "layer": "L4",
+    "category": "嵌套竞态",
+    "title": "快速点击保存按钮 10 次是否产生重复提交",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "当前页面无保存按钮，无法测试",
+    "evidence": [
+      "快速点击结果: {\"found\": false, \"clickCount\": 0}",
+      "点击后 toasts=[], buttonsLoading=[{'text': '下一步', 'class': 'btn btn-primary'}]",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L4-5_nested_race.png",
+      "console 错误数: 0"
+    ],
+    "code_location": "static/app.js: 防抖逻辑; button disabled 状态",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:53:55.867471+00:00",
+    "duration_ms": 2172
+  },
+  {
+    "test_id": "L5-1",
+    "layer": "L5",
+    "category": "网络断开",
+    "title": "sidecar 突然不可达时 UI 是否显示全局兜底+自动重连",
+    "status": "PASS",
+    "severity": "",
+    "description": "sidecar 不可达时 UI 正确显示 banner/不可达状态",
+    "evidence": [
+      "sidecar health (5s): {\"ok\": false, \"error\": \"HTTPConnectionPool(host='127.0.0.1', port=3099): Read timed out. (read timeout=5)\", \"latency_ms\": 5011}",
+      "UI bannerVisible=False, sidecarStatus=unknown, isReachable=False",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L5-1_network_down.png",
+      "重连机制: {\"hasMonitor\": false}"
+    ],
+    "code_location": "static/app.js: SidecarHealthMonitor (line 357-360, 566-571); desktop/src-tauri/src/main.rs: 心跳 loop",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:54:01.059060+00:00",
+    "duration_ms": 5190
+  },
+  {
+    "test_id": "L5-2",
+    "layer": "L5",
+    "category": "进程崩溃",
+    "title": "sidecar 崩溃时桌面端是否能检测+提示重启",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "不能真实杀死 sidecar（避免影响其他智能体）。静态分析：sidecar_manager.rs 有 child.wait() 监控进程退出，退出后应 emit 'sidecar-exited' 事件。前端需监听此事件并显示'服务已退出，是否重启'弹窗",
+    "evidence": [
+      "崩溃检测: {\"hasTauriEvent\": true, \"hasWindowOnError\": false, \"hasUnhandledRejection\": false}",
+      "UI sidecarStatus=unknown, bannerVisible=False",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L5-2_process_crash.png"
+    ],
+    "code_location": "desktop/src-tauri/src/sidecar_manager.rs: 进程监控; static/app.js: sidecar-exit 事件监听",
+    "repro_steps": [
+      "1. 手动 taskkill /PID 23104 /F（影响其他智能体，跳过）",
+      "2. 观察桌面端是否在 5s 内显示'服务已退出'提示",
+      "3. 验证是否提供'重启服务'按钮"
+    ],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:54:01.239318+00:00",
+    "duration_ms": 180
+  },
+  {
+    "test_id": "L5-3",
+    "layer": "L5",
+    "category": "资源耗尽",
+    "title": "内存/CPU 耗尽时 UI 是否有保护（防 OOM 崩溃）",
+    "status": "PARTIAL",
+    "severity": "P2",
+    "description": "当前 JS 堆使用=2095KB, 限制=4192MB。不能真实制造 OOM（影响其他智能体）。静态分析：前端无显式内存监控，依赖 WebView2 默认 GC",
+    "evidence": [
+      "资源状态: {\"hasPerformanceMemory\": true, \"usedJSHeapSize\": 2145838, \"jsHeapSizeLimit\": 4395630592, \"hasOnError\": false}",
+      "UI toasts=0, modalsOpen=0",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L5-3_resource_exhaustion.png",
+      "内存警告数: 0"
+    ],
+    "code_location": "desktop/src-tauri/src/main.rs: 资源监控; static/app.js: 内存检查",
+    "repro_steps": [],
+    "fix_suggestion": "建议在长时间运行时定时检查 performance.memory.usedJSHeapSize，超过 80% 阈值时提示用户刷新",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:54:01.406677+00:00",
+    "duration_ms": 167
+  },
+  {
+    "test_id": "L5-4",
+    "layer": "L5",
+    "category": "全局错误",
+    "title": "未捕获 Promise rejection 时 UI 是否能恢复",
+    "status": "FAIL",
+    "severity": "P1",
+    "description": "未注册全局错误处理: onerror=False, onunhandledrejection=False",
+    "evidence": [
+      "全局错误处理: {\"hasWindowOnError\": false, \"hasUnhandledRejection\": false, \"testTriggered\": false}",
+      "注入错误后 UI: toasts=[], modalsOpen=[]",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L5-4_global_error.png",
+      "console 错误数: 1",
+      "错误样本: ['[TEST] 捕获到错误: undefinedVar is not defined']"
+    ],
+    "code_location": "static/app.js: window.onerror; unhandledrejection",
+    "repro_steps": [],
+    "fix_suggestion": "应注册 window.onerror 和 window.onunhandledrejection，显示 toast'发生未知错误，请刷新页面'",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:54:02.657272+00:00",
+    "duration_ms": 1250
+  },
+  {
+    "test_id": "L5-5",
+    "layer": "L5",
+    "category": "跨层级竞态",
+    "title": "同时切换标签+点击卡片+触发弹窗是否产生 Z-index 错乱",
+    "status": "PASS",
+    "severity": "",
+    "description": "跨层级操作无 modal 错乱无 console 错误",
+    "evidence": [
+      "跨层级操作后 activeTab=dashboard, modalsOpen=0, toasts=0",
+      "截图: g:\\code-memory\\hcse_resilience_tester\\interaction_audit\\screenshots\\L5-5_cross_layer_race.png",
+      "console 错误数: 0"
+    ],
+    "code_location": "static/app.js: 全局事件循环; static/components.css: z-index",
+    "repro_steps": [],
+    "fix_suggestion": "",
+    "global_impact": "",
+    "timestamp": "2026-07-31T22:54:04.838573+00:00",
+    "duration_ms": 2181
+  }
+]

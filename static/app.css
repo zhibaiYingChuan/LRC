@@ -397,6 +397,27 @@
       opacity: 0.7;
     }
 
+    /* v0.8.23 S1-UX-01 修复：lock_busy 降级模式视觉区分 */
+    body.degraded-mode .stat-card,
+    body.degraded-mode .dao-metrics-panel {
+      opacity: 0.6;
+      filter: grayscale(0.3);
+      position: relative;
+    }
+    body.degraded-mode .stat-card::after,
+    body.degraded-mode .dao-metrics-panel::after {
+      content: '⚠ 暂存数据（后台合成中）';
+      position: absolute;
+      top: 4px;
+      right: 8px;
+      font-size: 11px;
+      color: var(--lrc-金色-500, #b8860b);
+      background: rgba(255, 255, 255, 0.85);
+      padding: 2px 6px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+
     body.offline-mode .navbar::after {
       content: '⚠ 离线';
       color: var(--cinnabar);

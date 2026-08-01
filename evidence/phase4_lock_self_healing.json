@@ -1,0 +1,17 @@
+﻿{
+  "test_id": "HCSE-V0.8.19-PHASE4-LOCK_SELF_HEALING",
+  "timestamp": "2026-07-31T17:47:00+08:00",
+  "invariant": "INV-001",
+  "verdict": "PASS",
+  "scenario": "Kill sidecar process, verify lock file self-heals on next spawn",
+  "steps": [
+    {"step": 1, "action": "Sidecar PID=1640 running, lock file content='1640'"},
+    {"step": 2, "action": "Stop-Process -Id 1640 -Force (simulate crash)"},
+    {"step": 3, "action": "Lock file still contains stale PID '1640' (no Drop executed)"},
+    {"step": 4, "action": "Start new sidecar, PID=25744"},
+    {"step": 5, "action": "SingletonLock::acquire reads lock file, detects PID 1640 not alive (is_pid_alive=false via OpenProcess+STILL_ACTIVE check)", "ref": "src/process_guard.rs PID self-healing"},
+    {"step": 6, "action": "Lock file overwritten with new PID '25744'", "actual_content": "25744"},
+    {"step": 7, "action": "/health returns 200 in 3ms"}
+  ],
+  "verdict_detail": "PASS — SingletonLock PID self-healing correctly cleaned up stale PID and wrote new PID"
+}
