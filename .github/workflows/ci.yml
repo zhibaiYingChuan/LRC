@@ -272,8 +272,28 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
+      # v0.8.24 修复：Windows runner 偶发 DNS 解析失败导致 checkout 失败，
+      #   根因：GitHub Actions Windows runner DNS 缓存过期，无法解析 github.com。
+      #   使用 continue-on-error + PowerShell 重试机制，最多重试 1 次。
       - name: Checkout
+        id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        continue-on-error: true
+      - name: Checkout (retry on failure)
+        if: steps.checkout.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 15
+          # 清理上一步失败的 partial checkout
+          Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
+          Remove-Item -Force ".gitattributes" -ErrorAction SilentlyContinue
+          Remove-Item -Force ".gitignore" -ErrorAction SilentlyContinue
+          # 重试 git clone
+          git clone "https://github.com/$env:GITHUB_REPOSITORY.git" .
+          git checkout $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            throw "Checkout retry failed"
+          }
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
@@ -309,6 +329,8 @@ jobs:
       # v0.8.23 CI 修复：禁用 apt 镜像列表探测（避免 harden-runner 阻断未知镜像域名导致挂起），
       #   直接使用白名单中的 archive.ubuntu.com 和 security.ubuntu.com。
       #   添加超时选项防止挂起时死等 SIGTERM。
+      # v0.8.24 CI 修复：apt-get install 也添加超时选项 + --fix-missing，
+      #   根因：apt-get install 挂起时无超时保护，被 GitHub Actions 以 SIGTERM(143) 杀死。
       - name: Install Linux system dependencies (Tauri)
         if: runner.os == 'Linux'
         run: |
@@ -318,7 +340,7 @@ jobs:
           echo "deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
           echo "deb http://security.ubuntu.com/ubuntu/ noble-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
           sudo apt-get update -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30
-          sudo apt-get install -y \
+          sudo apt-get install -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -y --fix-missing \
             libwebkit2gtk-4.1-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
