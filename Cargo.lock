@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "code-memory"
-version = "0.8.19"
+version = "0.8.22"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -3435,6 +3435,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -3452,6 +3453,7 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",

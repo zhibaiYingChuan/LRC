@@ -206,6 +206,10 @@ pub struct WizardState {
     /// v0.5.4 新增：配置是否从损坏状态恢复
     /// 当配置文件读取或解析失败时设为 true，前端可据此提示用户
     pub corrupted_on_load: bool,
+    /// v0.8.21 P0-01 新增：wizard.json 文件在 load() 时是否已存在
+    /// false 表示文件不存在（首次安装或文件意外丢失），
+    /// main.rs 据此在自动启动判断中兜底（避免 wizard.json 丢失导致 sidecar 永不自动启动）
+    pub file_existed: bool,
 }
 
 // v0.6.0 P3-1 修复：实现 Default trait，避免 load() 失败时 panic
@@ -215,6 +219,7 @@ impl Default for WizardState {
             config: WizardConfig::default(),
             config_path: PathBuf::new(),
             corrupted_on_load: false,
+            file_existed: false,
         }
     }
 }
@@ -231,6 +236,8 @@ impl WizardState {
     pub fn load() -> Result<Self, String> {
         let config_path = Self::config_path()?;
         let mut corrupted = false;
+        // v0.8.21 P0-01：记录 wizard.json 是否存在，供 main.rs 自动启动兜底判断
+        let file_existed = config_path.exists();
         let mut config = if config_path.exists() {
             match std::fs::read_to_string(&config_path) {
                 Ok(json) => {
@@ -299,6 +306,7 @@ impl WizardState {
             config,
             config_path,
             corrupted_on_load: corrupted,
+            file_existed,
         })
     }
 

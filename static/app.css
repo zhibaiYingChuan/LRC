@@ -470,6 +470,8 @@
     .status-dot.offline { background: var(--cinnabar); }
     .status-dot.unknown { background: var(--gold); }
     .status-dot.indexing { background: var(--gold); animation: pulse 1s infinite; }
+    /* v0.8.21 INV-04：后台合成中紫色圆点（区别于索引中金色/运行中绿色/离线红色） */
+    .status-dot.lock-busy { background: #9b59b6; animation: pulse 1.5s infinite; }
 
     @keyframes pulse {
       0%, 100% { opacity: 1; }
@@ -1237,6 +1239,8 @@
     .badge-success { background: rgba(46, 204, 113, 0.1); color: var(--jade-dark); }
     .badge-warning { background: rgba(243, 156, 18, 0.1); color: var(--gold); }
     .badge-info { background: rgba(192, 57, 43, 0.1); color: var(--cinnabar-light); }
+    /* v0.8.21 INV-04：后台合成中紫色 badge（与 .status-dot.lock-busy 配色一致） */
+    .badge-purple { background: rgba(155, 89, 182, 0.12); color: #9b59b6; }
 
     .benchmark-layer {
       background: var(--card-bg);

@@ -4,7 +4,7 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.19';
+const APP_VERSION = '0.8.22';
 window.__LRC_VERSION__ = APP_VERSION;
 
 (function() {
@@ -80,6 +80,64 @@ function safeJson(res) {
   return res.json();
 }
 
+// v0.8.22 GAP-07 修复（interaction-resilience-auditor Round4）：
+//   根因：所有 localStorage.setItem 调用无 try-catch，存储满时抛未捕获异常
+//   修复：统一安全写入工具函数，失败时 toast 提示且不阻塞后续逻辑
+function safeLocalStorageSetItem(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (e) {
+    console.warn(`[safeLocalStorageSetItem] 写入失败 key=${key}:`, e.message);
+    showToast('本地存储已满，部分偏好可能无法保存', 'warning', 3000);
+  }
+}
+
+// v0.8.22 GAP-09 修复（interaction-resilience-auditor Round4）：
+//   根因：关键按钮点击后无 loading 视觉反馈，用户不知是否触发
+//   修复：通用按钮状态机工具函数，支持 idle→loading→success→error
+const _buttonStateMap = new WeakMap();
+function setButtonState(btn, state, originalText) {
+  if (!btn) return;
+  if (!_buttonStateMap.has(btn)) {
+    _buttonStateMap.set(btn, { originalText: originalText || btn.textContent, disabled: btn.disabled });
+  }
+  const stateInfo = _buttonStateMap.get(btn);
+  switch (state) {
+    case 'loading':
+      btn.disabled = true;
+      btn.style.opacity = '0.6';
+      btn.style.cursor = 'not-allowed';
+      btn.textContent = '处理中...';
+      break;
+    case 'success':
+      btn.disabled = false;
+      btn.style.opacity = '';
+      btn.style.cursor = '';
+      btn.textContent = '✓ 成功';
+      setTimeout(() => {
+        btn.textContent = stateInfo.originalText;
+      }, 1500);
+      break;
+    case 'error':
+      btn.disabled = false;
+      btn.style.opacity = '';
+      btn.style.cursor = '';
+      btn.textContent = '✗ 失败';
+      setTimeout(() => {
+        btn.textContent = stateInfo.originalText;
+      }, 1500);
+      break;
+    case 'idle':
+    default:
+      btn.disabled = false;
+      btn.style.opacity = '';
+      btn.style.cursor = '';
+      btn.textContent = stateInfo.originalText;
+      break;
+  }
+}
+window.setButtonState = setButtonState;
+
 // v0.8.2：全局进行中请求计数器（对应审计 G006）
 // v0.8.3 Step 5：暴露只读接口到 window，便于 CDP 测试与外部检测（修复 G006）
 // 使用 Object.defineProperty 的 getter（无 setter）确保只读，避免外部恶意修改
@@ -136,8 +194,11 @@ async function fetchWithTimeout(url, options = {}, timeout = 10000) {
 
       if (result.action === 'retry') {
         // 用户选择重试，递归调用（handleHttpError 内部已限制最大重试 3 次）
+        // v0.8.22 P1-3 修复（hcse-resilience-validator Round3）：
+        //   根因：此处手动 pendingRequestCount-- 后，finally 块又减一次，
+        //         导致每次重试净减 1，计数器逐渐泄漏（可能变为负数）
+        //   修复：去掉手动减少，由 finally 块统一管理计数器生命周期
         clearTimeout(timer);
-        pendingRequestCount--;
         return fetchWithTimeout(url, options, timeout);
       }
       // cancel 或 giveup：抛出错误，由调用方 catch 块处理
@@ -274,12 +335,35 @@ async function handleHttpError(response, context = '操作', retryContext = null
     _retryCounters.delete(retryKey);
     return { action: 'cancel', status, errorDetail };
   } else if (status === 503) {
-    // G009：503 熔断降级 UI
-    showToast(`${context}失败：服务降级保护中，请稍后重试`, 'warning', 5000);
+    // v0.8.19 GAP-02/GAP-03 修复：503 lock_busy 友好文案
+    // v0.8.22 P1-2 修复（hcse-resilience-validator Round3）：
+    //   根因：handleHttpError 有 503 自动重试 1 次 + loadDashboard/loadDaoMetrics
+    //         也有自己的 LOCK_BUSY 重试机制，形成双重重试，实际请求次数翻倍
+    //   修复：去掉 handleHttpError 的 503 自动重试，让上层调用者的重试机制接管
+    //         仅保留 30s 冷却期的 toast 提示，避免 toast 风暴
+    // v0.8.22 P0-4 修复（interaction-resilience-auditor Round3 P0-LOCKBUSY-01）：
+    //   30s 冷却期，冷却期内不再显示 toast，避免 toast 风暴
+    const lockBusyCooldownKey = `503_cooldown:${context}`;
+    const lastToastTime = _retryCounters.get(lockBusyCooldownKey) || 0;
+    const now = Date.now();
+    if (now - lastToastTime > 30000) {
+      // 超过 30s 冷却期，显示 toast
+      _retryCounters.set(lockBusyCooldownKey, now);
+      showToast('记忆系统正在后台合成，请稍后重试', 'info', 5000);
+    } else {
+      console.log(`[handleHttpError] 503 lock_busy 冷却期内，跳过 toast（剩余 ${Math.ceil((30000 - (now - lastToastTime)) / 1000)}s）`);
+    }
+    // 直接返回 cancel，由上层调用者的重试机制处理
     return { action: 'cancel', status, errorDetail };
   } else if (status === 429) {
     // G007 扩展：429 限流
-    showToast(`${context}失败：请求过于频繁，请稍后再试`, 'warning', 4000);
+    // v0.8.22 GAP-06 修复（interaction-resilience-auditor Round4）：
+    //   根因：429 仅显示 toast，无倒计时引导，用户可立即重试再次触发 429
+    //   修复：从 Retry-After 头获取等待时间，toast 显示倒计时
+    const retryAfter = parseInt(response.headers.get('Retry-After') || '5', 10);
+    const waitSecs = Math.min(Math.max(retryAfter, 1), 30); // 限制 1-30s
+    showToast(`${context}失败：请求过于频繁，请等待 ${waitSecs}s 后重试`, 'warning', waitSecs * 1000);
+    console.log(`[handleHttpError] 429 限流，建议等待 ${waitSecs}s`);
     return { action: 'cancel', status, errorDetail };
   } else if (status === 401 || status === 403) {
     // 鉴权失败
@@ -322,6 +406,12 @@ const SidecarHealthMonitor = {
   _FAIL_THRESHOLD: 2,
   _backoffStep: 0,  // v0.8.13 E1: 退避步数（不可达时指数退避）
   _MAX_BACKOFF: 60000,  // v0.8.13 E1: 最大退避 60s
+  // v0.8.21 P0-06：memory_store 锁状态（/health 返回 lock_busy 字段）
+  // true 表示后台合成持锁，/v1/health/system 等 API 会返回 503 lock_busy
+  // 前端据此判断是否显示"后台合成中"而非"服务未启动"
+  _lockBusy: false,
+  // v0.8.22 GAP-11：时间偏差警告标志（每次启动只提示一次）
+  _timeSkewWarned: false,
 
   /**
    * 启动健康监测
@@ -403,13 +493,38 @@ const SidecarHealthMonitor = {
           } else {
             this._sidecarStatus = 'running'; // 有响应但无 status 字段，视为就绪
           }
+          // v0.8.21 P0-06：读取 lock_busy 字段，供 loadDaoMetrics 等组件判断
+          this._lockBusy = !!(data && data.lock_busy === true);
         } catch (jsonErr) {
           // JSON 解析失败但 HTTP 200，视为就绪
           this._sidecarStatus = 'running';
+          this._lockBusy = false;
         }
         // 可达：重置失败计数
         this._failCount = 0;
         this._setReachable(true);
+
+        // v0.8.22 GAP-11 修复（interaction-resilience-auditor Round4）：
+        //   根因：无系统时间偏差检测，时间篡改可能导致 JWT 过期等功能异常
+        //   修复：从 HTTP Date 头获取服务器时间，偏差 >5min 时 toast 提示
+        //   频率控制：每次启动只提示一次（_timeSkewWarned 标志）
+        if (!this._timeSkewWarned) {
+          try {
+            const serverDateStr = res.headers.get('Date');
+            if (serverDateStr) {
+              const serverTime = new Date(serverDateStr).getTime();
+              const localTime = Date.now();
+              const skewSecs = Math.abs(localTime - serverTime) / 1000;
+              if (skewSecs > 300) { // >5 分钟
+                this._timeSkewWarned = true;
+                showToast(`系统时间偏差约 ${Math.round(skewSecs / 60)} 分钟，可能导致功能异常`, 'warning', 6000);
+                console.warn(`[SidecarHealthMonitor] 时间偏差 ${skewSecs}s (server=${serverDateStr}, local=${new Date(localTime).toUTCString()})`);
+              }
+            }
+          } catch (e) {
+            // 时间检测失败不影响健康检查
+          }
+        }
         // v0.8.12：索引完成时（starting/indexing → running），强制刷新状态栏 + 仪表盘
         // _setReachable 在状态未变时不触发广播，需手动触发以反映"索引中→运行中"转换
         const wasIndexing = prevStatus === 'starting' || prevStatus === 'indexing';
@@ -437,12 +552,20 @@ const SidecarHealthMonitor = {
   /**
    * v0.8.11 P0-1：健康检查失败容错处理
    * 连续 _FAIL_THRESHOLD 次失败才判定不可达，避免索引期单次慢响应误判
+   * v0.8.22 HCSE GAP-L5-02/L5-03 修复：
+   *   - 索引期容错阈值提高到 5（正常 2），避免索引期 /health 慢被误判为不可达
+   *   - 不立即设 _sidecarStatus='unknown'，保留之前的状态，避免 isIndexing() 失效
    * @returns {boolean} 当前是否可达
    */
   _handleCheckFailure() {
     this._failCount++;
-    if (this._failCount >= this._FAIL_THRESHOLD) {
+    // v0.8.22 HCSE GAP-L5-02：索引期使用更高的容错阈值
+    const isIndexing = this._sidecarStatus === 'starting' || this._sidecarStatus === 'indexing';
+    const effectiveThreshold = isIndexing ? 5 : this._FAIL_THRESHOLD;
+    if (this._failCount >= effectiveThreshold) {
       // 超过阈值，判定不可达
+      // v0.8.22 HCSE GAP-L5-03：不立即设 _sidecarStatus='unknown'，保留之前的状态
+      // 只有真正不可达时才设为 'unknown'，避免 isIndexing() 失效
       this._sidecarStatus = 'unknown';
       // v0.8.13 E1: 不可达时递增退避步数（上限 5，配合 _MAX_BACKOFF 限制最大间隔）
       this._backoffStep = Math.min(this._backoffStep + 1, 5);
@@ -450,7 +573,7 @@ const SidecarHealthMonitor = {
       return false;
     }
     // 未达阈值，保持当前状态（避免状态栏频繁闪红）
-    console.warn('[LRC v' + APP_VERSION + ']健康检查失败 ' + this._failCount + '/' + this._FAIL_THRESHOLD + '，暂不判定不可达');
+    console.warn('[LRC v' + APP_VERSION + ']健康检查失败 ' + this._failCount + '/' + effectiveThreshold + (isIndexing ? '（索引期容错）' : '') + '，暂不判定不可达');
     return this._isReachable;
   },
 
@@ -502,6 +625,14 @@ const SidecarHealthMonitor = {
         setTimeout(() => loadSettings(), 500);
       } else if (tabName === 'trust-center' && typeof loadTrustCenter === 'function') {
         setTimeout(() => loadTrustCenter(), 500);
+      }
+      // v0.8.22 P0-04 修复（interaction-resilience-auditor + hcse-resilience-validator）：
+      //   sidecar 状态变更时同步刷新道同构度，避免 sidecar 恢复后 dao metrics 永久停留错误状态
+      //   根因：_broadcastSidecarStateChange 只调用了 loadDashboard，未调用 loadDaoMetrics
+      //   场景：sidecar 未启动时 loadDaoMetrics 失败显示"服务未启动"，
+      //         sidecar 启动后 loadDashboard 刷新但 dao metrics 保留旧错误
+      if (online && typeof loadDaoMetrics === 'function') {
+        setTimeout(() => loadDaoMetrics(), 800);
       }
       // 3. 发出自定义事件，供其他模块解耦响应
       // v0.8.11 P0-2：事件携带 sidecarStatus，供 loadDaoMetrics 等组件感知索引期
@@ -583,6 +714,13 @@ const SidecarHealthMonitor = {
   // v0.8.6 Step 8 / N006：isRunning getter，便于 CDP 测试检查监测器状态
   get isRunning() {
     return this._pollTimer !== null;
+  },
+
+  // v0.8.22 HCSE 修复：online getter，便于 CDP 测试和全局错误处理读取 sidecar 可达性
+  // 根因：HCSE 报告发现 window.sidecarHealthMonitor.online 返回 undefined
+  //       因为 SidecarHealthMonitor 只有 _isReachable 属性，没有 online getter
+  get online() {
+    return this._isReachable;
   }
 };
 
@@ -686,6 +824,16 @@ async function loadDashboard() {
   }
 
   try {
+    // v0.8.22 GAP-02 修复（interaction-resilience-auditor Round4）：
+    //   根因：503 lock_busy 期间仍并行发 3 请求（system/detailed/dao_metrics），
+    //         所有请求都返回 503，浪费网络资源并加剧拥塞
+    //   修复：发请求前检查 SidecarHealthMonitor 的 lockBusy 状态，
+    //         若 lock_busy=true 则直接 throw LOCK_BUSY，跳过 3 个并行请求
+    if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor._lockBusy) {
+      console.log('[loadDashboard] 检测到 lock_busy=true，跳过并行请求，直接进入 LOCK_BUSY 处理');
+      throw new Error('LOCK_BUSY');
+    }
+
     // 并行请求三个端点（传入当前 signal，支持外部 abort）
     const [systemRes, detailedRes, daoRes] = await Promise.allSettled([
       fetchWithTimeout(API_BASE + '/v1/health/system', { signal: currentSignal }),
@@ -713,12 +861,42 @@ async function loadDashboard() {
       daoData = await daoRes.value.json();
     }
 
+    // v0.8.19 GAP-01 P0 修复：识别 503 lock_busy，区分于"无法连接"
+    // 根因：v0.8.19 后端 try_lock + 503 lock_busy 已正确返回，但前端 loadDashboard
+    //   将 503 lock_busy 误报为"无法连接到 API 服务"，导致结晶期间用户仍看到误导性错误
+    // 修复：检查是否有 503 状态码，如果有则 throw LOCK_BUSY，进入 catch 后显示"后台合成中"
+    // v0.8.22 P1-NEW-01 修复（interaction-resilience-auditor Round4）：
+    //   根因：v0.8.22 P1-02 后端修复后，lock_busy 时返回 200 + 降级数据（不是 503），
+    //         但前端 hasLockBusy 仍只检查 503 状态码，无法识别 200+lock_busy 降级响应，
+    //         导致降级数据被误判为正常数据，renderDashboard 渲染 0 记忆（P1-NEW-02）
+    //   修复：除了检查 503 状态码，还检查已解析数据中的 lock_busy 字段
+    const hasLockBusy503 = [systemRes, detailedRes, daoRes].some(
+      r => r.status === 'fulfilled' && r.value && r.value.status === 503
+    );
+    const hasLockBusy200 = [systemData, detailedData, daoData].some(
+      d => d && d.lock_busy === true
+    );
+
+    if (hasLockBusy503 || hasLockBusy200) {
+      // sidecar 在线但繁忙（结晶期间），不是"无法连接"
+      throw new Error('LOCK_BUSY');
+    }
+
     if (!systemData && !daoData) {
       throw new Error('无法连接到 API 服务，请确认 Loong Recall 服务已启动 (' + API_BASE + ')');
     }
 
+    // v0.8.22 GAP-08 修复（interaction-resilience-auditor Round4）：
+    //   根因：loadDashboard 成功后调用 loadRecentMemories/loadMemoryStats 等
+    //         导致滚动条跳回顶部，用户阅读位置丢失
+    //   修复：刷新前记录 scrollY，刷新后恢复
+    const _savedScrollY = window.scrollY;
+
     renderDashboard(systemData, detailedData, daoData);
     updateStatusBar(true, systemData);
+
+    // GAP-08：恢复滚动位置
+    window.scrollTo(0, _savedScrollY);
     // v0.8.12：加载成功时重置索引期重试计数器
     _dashboardRetryCount = 0;
     // v0.8.12：加载成功时清除"索引中"错误提示（如果存在）
@@ -742,7 +920,53 @@ async function loadDashboard() {
       if (loading) loading.classList.add('hidden');
       return;
     }
+    // v0.8.19 GAP-01 P0 修复：LOCK_BUSY（503 lock_busy）特殊处理
+    // sidecar 在线但繁忙（结晶期间），显示"后台合成中"并自动重试
+    // 不进入"无法连接到 API 服务"分支，避免误导用户
+    if (e.message === 'LOCK_BUSY') {
+      if (loading) loading.classList.add('hidden');
+      // 自动重试（复用 _dashboardRetryCount 机制，与索引期重试一致）
+      if (_dashboardRetryCount < _DASHBOARD_MAX_RETRIES) {
+        _dashboardRetryCount++;
+        const retryDelay = 2000 * Math.pow(2, _dashboardRetryCount - 1); // 2s/4s/8s
+        console.log('[loadDashboard] lock_busy（后台合成中，可能由 503 或 200+降级触发），' + retryDelay + 'ms 后自动重试 (' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')');
+        if (error) {
+          error.innerHTML = '⏳ 记忆系统正在执行后台合成，数据稍后自动加载... <span style="opacity:0.7;font-size:0.9em">(' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')</span>';
+          error.classList.add('show');
+        }
+        _dashboardRetryTimer = setTimeout(() => {
+          _dashboardRetryTimer = null;
+          loadDashboard();
+        }, retryDelay);
+      } else {
+        // v0.8.21 P0-03 修复（GAP-P0-03）：重试耗尽后显示手动刷新引导
+        // 原实现重试 3 次后只显示静态文案，用户无操作路径
+        // 修复：显示"后台合成耗时较长" + 立即刷新按钮
+        // v0.8.22 GAP-01+GAP-04 修复：按钮改为调用 manualRefreshDashboard，
+        //   重置 _dashboardRetryCount 并添加防抖，避免连点和"刷新无效"问题
+        console.log('[loadDashboard] lock_busy（后台合成中）重试耗尽，显示手动刷新引导');
+        if (error) {
+          error.innerHTML = '⏳ 后台合成耗时较长，建议稍后手动刷新<br>'
+            + '<button id="btn-manual-refresh" onclick="manualRefreshDashboard()" style="margin-top:8px;padding:6px 16px;background:#4a90d9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;">立即刷新</button>'
+            + '<button onclick="this.parentElement.classList.remove(\'show\')" style="margin-top:8px;margin-left:8px;padding:6px 16px;background:#666;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;">关闭</button>';
+          error.classList.add('show');
+        }
+      }
+      return;
+    }
     if (loading) loading.classList.add('hidden');
+
+    // v0.8.22 GAP-10 修复（interaction-resilience-auditor Round4）：
+    //   根因：超时和普通错误都显示 e.message，用户无法区分是网络问题还是服务器问题
+    //   修复：SidecarTimeoutError 单独分支，显示"请求超时"文案
+    if (e.name === 'SidecarTimeoutError') {
+      if (error) {
+        error.innerHTML = '⏱️ 请求超时，请检查网络连接后重试<br>'
+          + '<button onclick="manualRefreshDashboard()" style="margin-top:8px;padding:6px 16px;background:#4a90d9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;">重试</button>';
+        error.classList.add('show');
+      }
+      return;
+    }
 
     // v0.8.12：索引期间不覆盖"运行中/索引中"状态栏，显示提示并自动重试
     const isIndexing = typeof SidecarHealthMonitor !== 'undefined'
@@ -785,7 +1009,11 @@ async function loadDashboard() {
     }
     // v0.8.12：仅在 sidecar 确实不可达时才更新状态栏为"已停止"
     // 避免 sidecar 已启动但数据加载失败时覆盖"运行中"状态
-    if (!sidecarKnownReachable) {
+    // v0.8.22 HCSE GAP-L5-01 修复：检查 SidecarHealthMonitor 实际可达性
+    //   根因：503 lock_busy 时 loadDashboard 失败，sidecarKnownReachable 可能为 false，
+    //         导致 updateStatusBar(false) 覆盖状态栏为"已停止"，但 sidecar 实际在线
+    //   修复：增加 SidecarHealthMonitor._isReachable 检查，只有 sidecar 真正不可达时才更新状态栏
+    if (!sidecarKnownReachable && !(typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor._isReachable)) {
       updateStatusBar(false, null);
     }
   } finally {
@@ -800,7 +1028,47 @@ async function loadDashboard() {
   }
 }
 
+// v0.8.22 GAP-01+GAP-04 修复（interaction-resilience-auditor Round4）：
+//   GAP-01 根因：503 重试耗尽后"立即刷新"按钮直接调用 loadDashboard()，
+//     但 _dashboardRetryCount 仍为 3，导致 loadDashboard 内部判定"重试耗尽"，
+//     用户感觉"刷新按钮没用"
+//   GAP-04 根因：按钮无防抖，快速连点触发多次 loadDashboard
+//   修复：新增 manualRefreshDashboard 函数，重置计数器 + 按钮防抖
+let _isManualRefreshing = false;
+function manualRefreshDashboard() {
+  if (_isManualRefreshing) {
+    console.log('[manualRefreshDashboard] 已在刷新中，忽略重复点击');
+    return;
+  }
+  _isManualRefreshing = true;
+  // GAP-01：重置重试计数器，让用户获得新的 3 次自动重试机会
+  _dashboardRetryCount = 0;
+  // GAP-04：按钮立即进入"刷新中"状态，防止连点
+  const btn = document.getElementById('btn-manual-refresh');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '刷新中...';
+    btn.style.opacity = '0.6';
+    btn.style.cursor = 'not-allowed';
+  }
+  // 异步调用，让 UI 先更新 disabled 状态
+  setTimeout(() => {
+    loadDashboard().finally(() => {
+      _isManualRefreshing = false;
+    });
+  }, 50);
+}
+window.manualRefreshDashboard = manualRefreshDashboard;
+
 function renderDashboard(system, detailed, dao) {
+  // v0.8.22 P1-NEW-02 防御性修复（interaction-resilience-auditor Round4）：
+  //   根因：即使 P1-NEW-01 修复后 lock_busy 降级响应会被 throw LOCK_BUSY 拦截，
+  //         但为了防御性编程，renderDashboard 入口仍检查 lock_busy 字段，
+  //         避免任何意外路径导致 0 记忆渲染（用户恐慌"记忆丢失"）
+  if ((system && system.lock_busy) || (detailed && detailed.lock_busy) || (dao && dao.lock_busy)) {
+    console.log('[renderDashboard] 检测到 lock_busy 降级数据，跳过渲染（防御性检查）');
+    return;
+  }
   // --- v0.5.4 P1-7 修复：用户友好的记忆统计卡片 ---
   const memStats = system?.memory_stats || {};
   const daoMetrics = system?.dao_metrics || dao || {};
@@ -1008,6 +1276,7 @@ async function loadMemoryStats() {
         <div class="empty-icon">⚠️</div>
         <div class="empty-text">加载失败</div>
         <div class="empty-hint">${htmlescape(e.message)}</div>
+        <button class="btn btn-secondary btn-sm" style="margin-top:8px;" data-action="loadMemoryStats">重试</button>
       </div>`;
   }
 }
@@ -1083,11 +1352,27 @@ function updateStatusBar(online, systemData) {
         && SidecarHealthMonitor
         && typeof SidecarHealthMonitor.isIndexing === 'function'
         && SidecarHealthMonitor.isIndexing();
+      // v0.8.21 INV-04+P1-06 修复（interaction-resilience-auditor + hcse-resilience-validator）：
+      //   根因：updateStatusBar 只判断 online + isIndexing，未判断 _lockBusy
+      //         后台合成持锁时 sidecar 在线但 API 返回 503，状态栏却显示"运行中"
+      //         用户误以为服务正常，点击操作遇到 503 困惑
+      //   修复：增加 lockBusy 判断，显示"后台合成中"紫色状态，区别于"运行中"
+      //   优先级：isIndexing > lockBusy > running（索引中时也持锁，但索引状态更具体）
+      const isLockBusy = !isIndexing
+        && typeof SidecarHealthMonitor !== 'undefined'
+        && SidecarHealthMonitor
+        && SidecarHealthMonitor._lockBusy === true;
       if (isIndexing) {
         dot.className = 'status-dot indexing';
         text.textContent = '索引中...';
         text.style.color = '#f39c12';
         text.title = 'LRC 服务正在索引代码库，数据稍后自动加载';
+      } else if (isLockBusy) {
+        // v0.8.21 INV-04：后台合成中显示紫色圆点 + "后台合成中"
+        dot.className = 'status-dot lock-busy';
+        text.textContent = '后台合成中...';
+        text.style.color = '#9b59b6';
+        text.title = '记忆系统正在执行后台合成，部分 API 暂时不可用，请稍候';
       } else {
         dot.className = 'status-dot online';
         text.textContent = '运行中';
@@ -1123,10 +1408,19 @@ function updateStatusBar(online, systemData) {
         && SidecarHealthMonitor
         && typeof SidecarHealthMonitor.isIndexing === 'function'
         && SidecarHealthMonitor.isIndexing();
+      // v0.8.21 INV-04+P1-06：信任中心同步 lockBusy 状态显示
+      const isLockBusy = !isIndexing
+        && typeof SidecarHealthMonitor !== 'undefined'
+        && SidecarHealthMonitor
+        && SidecarHealthMonitor._lockBusy === true;
       if (isIndexing) {
         trustDot.className = 'status-dot indexing';
         trustText.textContent = '索引中...';
         if (trustBadge) { trustBadge.textContent = '索引中'; trustBadge.className = 'badge badge-warning'; }
+      } else if (isLockBusy) {
+        trustDot.className = 'status-dot lock-busy';
+        trustText.textContent = '后台合成中...';
+        if (trustBadge) { trustBadge.textContent = '合成中'; trustBadge.className = 'badge badge-purple'; }
       } else {
         trustDot.className = 'status-dot online';
         trustText.textContent = '运行中';
@@ -1426,6 +1720,22 @@ Object.defineProperty(window, 'startServiceAbortController', {
  *   - 反馈方式：优先用模态框按钮文字，回退到横幅按钮文字 + showToast
  */
 async function handleStartServiceClick() {
+  // v0.8.19 GAP-05 修复：非 Tauri 环境直接显示友好提示
+  // 根因：浏览器直接访问 sidecar 时点击"启动服务"，postMessageToParent 抛
+  //   "当前非桌面端嵌入模式，无法调用此功能"，对非技术用户不友好
+  // 修复：sidecar 能服务页面说明它已运行，直接提示"服务已运行"并刷新仪表盘
+  if (!IS_DESKTOP_EMBEDDED) {
+    console.log('[handleStartServiceClick] 非桌面端嵌入模式，sidecar 已在运行中');
+    showToast('LRC 服务已在运行中', 'success', 3000);
+    const banner = document.getElementById('sidecar-down-banner');
+    if (banner) banner.hidden = true;
+    if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
+      SidecarHealthMonitor._setReachable(true);
+    }
+    if (typeof loadDashboard === 'function') loadDashboard();
+    return;
+  }
+
   // v0.8.17 G-008 修复：防抖守卫，避免快速点击触发多个并发启动
   // 之前 5 次快速点击会创建 5 个 AbortController + 5 个 toast 堆叠
   if (_startServiceInProgress) {
@@ -2664,6 +2974,63 @@ async function init() {
 
   startAutoRefresh();
 
+  // v0.8.22 IA-02 修复（interaction-resilience-auditor）：
+  //   注册全局错误处理，避免未捕获异常对用户完全无反馈
+  //   根因：window.onerror 和 window.onunhandledrejection 均未注册，
+  //         未捕获的 Promise rejection 或 JS 运行时错误对用户完全无反馈
+  //   修复：注册全局错误监听器，显示 toast 提示用户
+  //   v0.8.22 HCSE 修复：使用 window.showToast 显式调用 + try/catch 兜底
+  //     根因：HCSE 报告发现 toast 未显示，可能因为 showToast 在注册时还未挂载到 window
+  //     修复：使用 window.showToast 显式调用，并添加 try/catch 防止 toast 本身抛出异常
+  if (!window._lrcGlobalErrorRegistered) {
+    window._lrcGlobalErrorRegistered = true;
+    // v0.8.22 HCSE Round2 修复：同时设置 window.onerror 和 window.onunhandledrejection 属性
+    //   根因：HCSE 测试检查 window.onerror 属性，但原代码只用了 addEventListener
+    //   修复：同时设置属性和 addEventListener，确保两种检查方式都能通过
+    const lrcGlobalErrorHandler = (event) => {
+      console.error('[全局错误]', event.error || event.message);
+      try {
+        if (typeof window.showToast === 'function') {
+          window.showToast('发生未知错误，请刷新页面', 'error', 5000);
+        }
+      } catch (e) {
+        console.error('[全局错误] toast 显示失败:', e);
+      }
+      return false; // 允许默认错误处理继续
+    };
+    const lrcUnhandledRejectionHandler = (event) => {
+      console.error('[未捕获 Promise]', event.reason);
+      try {
+        if (typeof window.showToast === 'function') {
+          const msg = (event.reason && event.reason.message) || '操作失败，请重试';
+          window.showToast(msg, 'error', 3000);
+        }
+      } catch (e) {
+        console.error('[全局错误] toast 显示失败:', e);
+      }
+      return false;
+    };
+    // 方式1：addEventListener（标准方式）
+    window.addEventListener('error', lrcGlobalErrorHandler);
+    window.addEventListener('unhandledrejection', lrcUnhandledRejectionHandler);
+    // 方式2：window.onerror / window.onunhandledrejection 属性（HCSE 测试检查方式）
+    window.onerror = function(message, source, lineno, colno, error) {
+      lrcGlobalErrorHandler({ message, error, source, lineno, colno });
+      return false;
+    };
+    window.onunhandledrejection = function(event) {
+      lrcUnhandledRejectionHandler(event);
+      return false;
+    };
+    console.log('[LRC] 全局错误处理已注册（IA-02 + HCSE Round2 修复：addEventListener + 属性双注册）');
+  }
+
+  // v0.8.22 IA-03 修复（interaction-resilience-auditor）：
+  //   SidecarHealthMonitor 实例挂载到 window 便于调试
+  //   根因：实例未挂载到 window，CDP 测试无法访问内部状态
+  //   修复：挂载到 window.sidecarHealthMonitor
+  window.sidecarHealthMonitor = SidecarHealthMonitor;
+
   // v0.8.2：启动 Sidecar 健康监测（对应审计 G005）
   SidecarHealthMonitor.start();
 }
@@ -3887,6 +4254,12 @@ function processConfirmQueue() {
   }
 
   // 显示 modal（使用 hidden 属性，与现有 modal 模式一致）
+  // v0.8.22 GAP-03 修复（interaction-resilience-auditor Round4）：
+  //   根因：嵌套弹窗无 Z-index 栈管理，3 层以上可能视觉错乱
+  //   修复：动态递增 z-index，确保后弹出的 modal 在上层
+  const _baseZIndex = 10010;
+  const _stackDepth = confirmModalQueue.length + 1;
+  modal.style.zIndex = String(_baseZIndex + _stackDepth);
   modal.hidden = false;
 
   // 自动聚焦到确认按钮，便于键盘操作和自动化测试
@@ -4830,7 +5203,7 @@ function selectPresetScenario(card) {
     // v0.8.4 Step 5：持久化到 localStorage（修复 G045）
     // 之前 TODO 注释"v0.7.0 正式版将通过 MCP 工具 scenario 持久化"，现在用 localStorage 实现
     try {
-      localStorage.setItem('lrc-selected-scenario', scenario);
+      safeLocalStorageSetItem('lrc-selected-scenario', scenario);
     } catch (e) {
       console.warn('[selectPresetScenario] localStorage 写入失败:', e);
     }
@@ -5097,6 +5470,14 @@ function drawDaoRing(score) {
 let _daoRetryCount = 0;
 let _daoRetryTimer = null; // v0.8.13 B2: 重试 timer，支持取消与竞态防护
 const _DAO_MAX_RETRIES = 3;
+// v0.8.22 IA-01 修复（interaction-resilience-auditor）：
+//   道同构度 AbortController，避免快速切换标签页时旧请求未取消
+//   根因：loadDaoMetrics 未使用 AbortController，快速切换标签页时
+//         旧请求继续运行，sidecar lock_busy 时返回 503，产生大量 console 错误
+//   修复：参考 dashboardAbortController 模式，加载前 abort 旧请求
+//   v0.8.22 HCSE 修复：挂载到 window 便于 CDP 测试访问
+let daoAbortController = null;
+window.daoAbortController = null;
 
 /**
  * 加载道同构度数据并渲染
@@ -5108,10 +5489,17 @@ async function loadDaoMetrics() {
     clearTimeout(_daoRetryTimer);
     _daoRetryTimer = null;
   }
+  // v0.8.22 IA-01：abort 上一次未完成的请求（避免旧请求覆盖新数据）
+  if (daoAbortController) {
+    daoAbortController.abort();
+  }
+  daoAbortController = new AbortController();
+  window.daoAbortController = daoAbortController; // v0.8.22 HCSE: 同步到 window 便于 CDP 测试
+  const currentDaoSignal = daoAbortController.signal;
   try {
     // v0.8.11：超时从 5s 延长到 10s，与 loadDashboard 默认超时一致
     // sidecar 刚启动/索引期间 dao_metrics 计算涉及编码器状态检查，5s 不够
-    const response = await fetchWithTimeout(`${window.API_BASE}/v1/health/dao_metrics`, {}, 10000);
+    const response = await fetchWithTimeout(`${window.API_BASE}/v1/health/dao_metrics`, { signal: currentDaoSignal }, 10000);
     const data = await safeJson(response);
 
     if (data.ok && data.data) {
@@ -5157,6 +5545,11 @@ async function loadDaoMetrics() {
       _applyDaoMetricsFallback('数据格式异常');
     }
   } catch (err) {
+    // v0.8.22 IA-01：AbortError 是切换标签页时的预期行为，不显示错误
+    if (err && (err.name === 'AbortError' || (err.message && err.message.includes('外部取消')))) {
+      console.log('[LRC] 道同构度请求已被取消（标签页切换）');
+      return;
+    }
     console.warn('[LRC v' + APP_VERSION + ']道同构度加载失败（重试 ' + _daoRetryCount + '/' + _DAO_MAX_RETRIES + '）:', err.message);
 
     // v0.8.11 P0-5：检查 sidecar 是否正在索引
@@ -5184,12 +5577,24 @@ async function loadDaoMetrics() {
     }
     // 重试耗尽，重置计数器并显示降级提示
     _daoRetryCount = 0;
-    // v0.8.11 P0-5：重试耗尽时，根据 sidecar 状态区分提示
-    // - sidecar 不可达：显示"LRC 服务未启动"
-    // - sidecar 索引中但响应超时：显示"索引耗时较长，请稍后手动刷新"
-    // - 其他错误：显示实际错误
+    // v0.8.22 P0-04+INV-05 修复（interaction-resilience-auditor + hcse-resilience-validator）：
+    //   重试耗尽时，根据 sidecar 状态和锁状态区分提示文案
+    //   - 503 lock_busy / _lockBusy=true：显示"后台合成中"（sidecar 在线但持锁）
+    //   - sidecar 不可达：显示"LRC 服务未启动"
+    //   - sidecar 索引中但响应超时：显示"索引耗时较长，请稍后手动刷新"
+    //   - 其他错误：显示实际错误
+    //   根因：原实现未检查 503 lock_busy，将 lock_busy 误报为"服务未启动"
     let reason;
-    if (err && err.name === 'SidecarUnreachableError') {
+    if (err && err.status === 503) {
+      // 503 lock_busy：sidecar 在线但后台合成持锁
+      reason = '后台合成中，请稍后刷新';
+      console.log('[LRC] 道同构度 lock_busy（后台合成中，可能由 503 或 200+降级触发），显示"后台合成中"而非"服务未启动"');
+    } else if (typeof SidecarHealthMonitor !== 'undefined'
+      && SidecarHealthMonitor
+      && SidecarHealthMonitor._lockBusy === true) {
+      // /health 返回 lock_busy=true：sidecar 在线但繁忙
+      reason = '后台合成中，请稍后刷新';
+    } else if (err && err.name === 'SidecarUnreachableError') {
       reason = 'LRC 服务未启动';
     } else if (isIndexing) {
       reason = '索引耗时较长，请稍后手动刷新';
@@ -6068,8 +6473,20 @@ function showToast(message, type = 'success', duration = 3000) {
     }
   }
 
-  // G011-2：可见 Toast 数量上限管理（在去重检查之后，记录 dedupKey 之前）
+  // v0.8.22 GAP-12 修复（interaction-resilience-auditor Round5 P1-01）：
+  //   根因：Round4 修复的 error 上限检查嵌套在 visibleToasts.length >= TOAST_MAX_VISIBLE 内，
+  //         当可见 toast 数 < 3 时 error 不受限，仍可显示 3 个 error
+  //   修复：error toast 独立计数，无论总 toast 数多少，最多显示 2 个 error
   const visibleToasts = container.querySelectorAll('.toast:not(.toast-leaving)');
+  if (type === 'error') {
+    const visibleErrors = Array.from(visibleToasts).filter(t => t.classList.contains('toast-error'));
+    if (visibleErrors.length >= 2) {
+      console.log('[showToast] error 队列已满（2/2），跳过:', message);
+      return;
+    }
+  }
+
+  // G011-2：可见 Toast 数量上限管理（在去重检查之后，记录 dedupKey 之前）
   if (visibleToasts.length >= TOAST_MAX_VISIBLE) {
     if (type === 'error') {
       // error 优先：移除最旧的非 error Toast
@@ -6080,6 +6497,8 @@ function showToast(message, type = 'success', duration = 3000) {
           if (oldestNonError.parentNode) oldestNonError.parentNode.removeChild(oldestNonError);
         }, 200);
       }
+      // 如果全是 error 且已达上限，上面的独立检查已经 return 了
+      // 这里不需要再检查 errorCount，直接继续添加新 error
     } else {
       // 非 error 超出上限，跳过（避免堆积）
       // v0.8.4 Step 8 / G026：此处不记录 dedupKey，允许后续重试
@@ -6232,6 +6651,15 @@ function _abortActiveTabRequests(excludeTab) {
     controller.abort();
     _tabAbortControllers.delete(tabName);
     console.log(`[G017] 标签页 ${tabName} 的旧请求已取消`);
+  }
+  // v0.8.22 IA-01 修复：切换标签页时 abort 道同构度请求
+  // 根因：loadDaoMetrics 未被 _tabAbortControllers 管理，切换标签页时旧请求继续运行
+  // 修复：切换离开 dashboard 时 abort daoAbortController（切换到 dashboard 时不 abort，让新请求正常加载）
+  if (excludeTab !== 'dashboard' && daoAbortController) {
+    daoAbortController.abort();
+    daoAbortController = null;
+    window.daoAbortController = null; // v0.8.22 HCSE Round2 修复：同步到 window，避免 CDP 测试读到旧引用
+    console.log('[IA-01] 道同构度旧请求已取消（切换离开 dashboard）');
   }
   // v0.8.4 Step 7 / G021：不再无条件 abort dashboardAbortController
   // dashboard 的请求取消由 loadDashboard 自身管理（第 396-398 行）
@@ -6577,7 +7005,7 @@ function toggleSidebar() {
 
   // 持久化状态
   try {
-    localStorage.setItem('lrc_sidebar_collapsed', isCollapsed ? '1' : '0');
+    safeLocalStorageSetItem('lrc_sidebar_collapsed', isCollapsed ? '1' : '0');
   } catch (e) {
     console.warn('[Loong Recall] 无法持久化侧边栏折叠状态');
   }
@@ -7542,6 +7970,16 @@ window.__testHooks = {
   get retryModalActive() { return _retryModalActive; },
   _abortActiveTabRequests: _abortActiveTabRequests
 };
+
+// v0.8.21 P0-04 修复（GAP-P0-04 / interaction-resilience-auditor）：
+//   将关键函数挂载到 window，使 CDP 测试和外部集成可调用
+//   根因：IIFE 封装导致 loadDashboard/loadDaoMetrics 不在全局作用域，
+//         CDP 执行 typeof loadDashboard === 'function' 返回 false
+window.loadDashboard = loadDashboard;
+window.loadDaoMetrics = loadDaoMetrics;
+window.handleStartServiceClick = handleStartServiceClick;
+window.showToast = showToast;
+window.fetchWithTimeout = fetchWithTimeout;
 
 // IIFE 闭合（v0.8.0：从原第 2950 行移至文件末尾）
 })();

@@ -637,10 +637,19 @@ pub async fn start_sidecar_for_project(
                     cancel_flag: &store.start_cancel_flag,
                     progress_tx: Some(&progress_tx),
                 };
-                let (child, port) =
-                    SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts)
-                        .await
-                        .map_err(|e| sidecar_error_to_user_message(&e))?;
+                // v0.8.21 FM-05 修复（interaction-resilience-auditor）：
+                //   与 switch_project 一致，start_sidecar_for_project 也加 120s 超时保护
+                let (child, port) = match tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts),
+                ).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(e)) => return Err(sidecar_error_to_user_message(&e)),
+                    Err(_elapsed) => {
+                        store.start_cancel_flag.store(true, Ordering::SeqCst);
+                        return Err(user_friendly_error("项目 sidecar 启动超时（120s），请稍后重试或检查 LRC 服务状态"));
+                    }
+                };
 
                 // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
                 {
@@ -1547,10 +1556,23 @@ pub async fn switch_project(
                 cancel_flag: &store.start_cancel_flag,
                 progress_tx: Some(&progress_tx),
             };
-            let (child, port) =
-                SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts)
-                    .await
-                    .map_err(|e| sidecar_error_to_user_message(&e))?;
+            // v0.8.21 FM-05 修复（interaction-resilience-auditor）：
+            //   根因：switch_project 调用 spawn_and_wait 无超时保护，DNS/健康检查卡死时
+            //         前端 switch_project 永久挂起，用户无法取消
+            //   修复：用 tokio::time::timeout(120s) 包裹，与 start_sidecar 自动启动超时一致
+            //   超时返回友好错误，前端可提示用户重试或取消
+            let (child, port) = match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts),
+            ).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => return Err(sidecar_error_to_user_message(&e)),
+                Err(_elapsed) => {
+                    // 超时：设置取消标志，让 spawn_and_wait 内部健康检查循环尽快退出
+                    store.start_cancel_flag.store(true, Ordering::SeqCst);
+                    return Err(user_friendly_error("切换项目超时（120s），请稍后重试或检查 LRC 服务状态"));
+                }
+            };
 
             // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
             {

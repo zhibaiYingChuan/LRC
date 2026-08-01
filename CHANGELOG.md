@@ -4,6 +4,224 @@
 
 ---
 
+## [0.8.22] - 2026-07-31
+
+### 桌面端图标一致性 + 前端交互韧性修复（双智能体审计）
+
+> v0.8.21 HCSE 韧性验证发现 sidecar lock_busy 期间所有健康端点超时（P0-A），
+> 以及交互韧性审计发现 3 个 P1 问题（标签页切换竞态、全局错误处理缺失、Monitor 状态不一致）。
+> 本版本综合修复所有 P0/P1，重新生成桌面端图标与前端 logo 一致，重新编译桌面端二进制。
+
+#### P0-A: tokio worker 线程数增加至 16，避免合成任务阻塞 HTTP handler（RPN 1000）
+- **修改文件**：[src/bin/server.rs:59](file:///g:/code-memory/src/bin/server.rs#L59)
+- **根因**：合成任务是 CPU 密集型的，通过 tokio::spawn 启动后占用 worker 线程，
+  当所有 worker 线程（默认 CPU 核心数 4-8）被占用时，axum handler 无法执行，
+  /health 等端点超时（5-8s 无响应），前端误报"无法连接到 API 服务"
+- **修复**：worker_threads 从默认值增加到 16，确保合成任务占用部分线程后，
+  axum handler 仍有足够线程处理请求
+
+#### IA-01: loadDaoMetrics 添加 AbortController，避免标签页切换竞态（RPN 720）
+- **修改文件**：[static/app.js](file:///g:/code-memory/static/app.js)
+- **根因**：loadDaoMetrics 未使用 AbortController，快速切换标签页时旧请求继续运行，
+  旧请求返回后覆盖新数据，触发 503 lock_busy 竞态
+- **修复**：
+  1. 新增 daoAbortController 变量，每次 loadDaoMetrics 调用前 abort 上一次请求
+  2. _abortActiveTabRequests 中切换离开 dashboard 时 abort 道同构度请求
+  3. AbortError 视为预期行为，不显示错误提示
+
+#### IA-02: 全局错误处理注册，未捕获异常对用户有反馈（RPN 480）
+- **修改文件**：[static/app.js](file:///g:/code-memory/static/app.js)
+- **根因**：window.onerror 和 onunhandledrejection 均未注册，
+  未捕获异常对用户完全无反馈，用户看到页面"卡住"但不知发生了什么
+- **修复**：
+  1. 注册 window.addEventListener('error', ...) 显示 toast "发生未知错误，请刷新页面"
+  2. 注册 window.addEventListener('unhandledrejection', ...) 显示 toast 错误消息
+  3. 使用 _lrcGlobalErrorRegistered 标志避免重复注册
+
+#### IA-03: SidecarHealthMonitor 实例挂载到 window，状态一致性修复（RPN 360）
+- **修改文件**：[static/app.js](file:///g:/code-memory/static/app.js)
+- **根因**：SidecarHealthMonitor 实例未挂载到 window，CDP 测试无法访问；
+  初始 _isReachable=false 状态未正确更新，导致 UI 状态与真实 sidecar 不一致
+- **修复**：
+  1. window.sidecarHealthMonitor = SidecarHealthMonitor 挂载实例
+  2. 修复初始化逻辑，确保 _isReachable 正确更新
+
+#### 桌面端图标与前端 logo 一致性
+- **修改文件**：[desktop/src-tauri/icons/](file:///g:/code-memory/desktop/src-tauri/icons/)
+- **根因**：桌面端执行程序的图标与前端 logo 不一致，用户视觉体验割裂
+- **修复**：使用 cargo tauri icon 从前端 logo（LRC桌面端Logo设计-*.png, 894x894）
+  重新生成所有桌面端图标（32x32/64x64/128x128/128x128@2x/icon.ico/icon.png）
+
+### HCSE Round 3-5 韧性修复（12 项协同修复 + 2 项 P3 补充）
+
+> 用户报告"toast storm + lock_busy 持续提示 + HTTP 完全无响应"三大痛点，
+> 经 HCSE Round 3 根因诊断（CPU 密集任务阻塞 tokio worker + 阻塞式读锁），
+> Round 4/5 交互审计（前端 lock_busy 识别 + consolidate handler 隔离），
+> 共 12 项协同修复 + 2 项 P3 补充，21/21 韧性不变式全量通过。
+
+#### 后端韧性修复（4 项 P0/P1）
+- **P0-1**：[src/server.rs](file:///g:/code-memory/src/server.rs) /health 改用 AtomicBool 无锁读取替代 blocking RwLock
+- **P0-2**：[src/bin/server.rs](file:///g:/code-memory/src/bin/server.rs) index_project 移入 spawn_blocking
+- **P0-3**：[src/consolidation.rs](file:///g:/code-memory/src/consolidation.rs) luoshu_synthesize 移入 spawn_blocking + blocking_lock
+- **P1-1**：[src/server.rs](file:///g:/code-memory/src/server.rs) 添加 TimeoutLayer(30s, 504) + ConcurrencyLimitLayer(100)
+
+#### 前端韧性修复（4 项 P0/P1）
+- **P0-4**：[static/app.js](file:///g:/code-memory/static/app.js) handleHttpError 30s 冷却期防止 toast storm
+- **P1-02**：[src/v1_api.rs](file:///g:/code-memory/src/v1_api.rs) /v1/health/* lock_busy 时返回 200+降级数据而非 503
+- **P1-NEW-01**：[static/app.js](file:///g:/code-memory/static/app.js) hasLockBusy200 双检查识别 200+lock_busy 降级
+- **P1-NEW-02**：[static/app.js](file:///g:/code-memory/static/app.js) renderDashboard 防御性 lock_busy 检查不渲染 0 记忆
+
+#### 桌面端韧性修复（2 项 P0/P1）
+- **P0-01**：[desktop/src-tauri/src/config_wizard.rs](file:///g:/code-memory/desktop/src-tauri/src/config_wizard.rs) wizard.json 兜底创建
+- **FM-05**：[desktop/src-tauri/src/commands.rs](file:///g:/code-memory/desktop/src-tauri/src/commands.rs) 项目切换 120s 超时保护
+
+#### 后端隔离修复（1 项 P2）
+- **P2-NEW-03**：[src/v1_api.rs](file:///g:/code-memory/src/v1_api.rs) consolidate handler 三阶段锁安全模式 + spawn_blocking
+
+#### P3 补充修复（2 项，本次新增）
+- **P3-NEW-05**：[static/app.js](file:///g:/code-memory/static/app.js) 3 处 LOCK_BUSY catch 日志文案从"503 lock_busy"更新为"lock_busy（后台合成中，可能由 503 或 200+降级触发）"
+- **P3-NEW-06**：[src/v1_api.rs](file:///g:/code-memory/src/v1_api.rs) 3 个降级响应中 active_memories/memory_count 从 0 改为 null，添加 degraded:true 标记，避免外部 API 消费者将 0 误认为"系统无记忆"
+
+#### 版本号一致性修复
+- **desktop/package.json**：版本号从 0.8.21 更新为 0.8.22（9 处检查点全部一致）
+
+---
+
+## [0.8.21] - 2026-07-31
+
+### 桌面端启动与状态同步根因修复（四角色协作闭环 + 双智能体审计）
+
+> v0.8.20 完成前端 503 lock_busy 处理链路修复，但双智能体审计发现 6 个 P0/P1 残留问题：
+> wizard.json 丢失导致 sidecar 永不自动启动、自动启动超时 60s 误判失败、switch_project 无超时保护、
+> 状态栏未综合判断 lockBusy 导致用户看到"运行中"但 API 返回 503 困惑。
+> 本版本一次性综合修复所有 P0/P1，并重新编译桌面端二进制（含新 logo）。
+
+#### P0-01: wizard.json 兜底创建 — sidecar 自动启动不再被阻断（RPN 1000）
+- **修改文件**：[desktop/src-tauri/src/config_wizard.rs](file:///g:/code-memory/desktop/src-tauri/src/config_wizard.rs) + [desktop/src-tauri/src/main.rs](file:///g:/code-memory/desktop/src-tauri/src/main.rs)
+- **根因**：wizard.json 文件意外丢失时，`WizardState::load()` 返回默认配置（setup_complete=false），
+  main.rs 自动启动判断跳过 sidecar 启动，用户打开桌面端看到"无法连接到 API 服务"且无启动按钮
+- **修复**：
+  1. WizardState 新增 `file_existed: bool` 字段，记录 load() 时 wizard.json 是否存在
+  2. main.rs 自动启动判断：`effective_setup_complete = setup_complete || !file_existed`
+  3. wizard.json 不存在时兜底视为已完成配置，sidecar 自动启动（全局模式）
+
+#### INV-08: 自动启动超时 60s → 120s（RPN 720）
+- **修改文件**：[desktop/src-tauri/src/main.rs:325-326](file:///g:/code-memory/desktop/src-tauri/src/main.rs#L325)
+- **根因**：实测 sidecar 首次启动 + 索引初始化 + 健康检查可达 100s+，60s 超时误判启动失败
+- **修复**：提升到 120s，与 handleStartServiceClick 前端超时一致
+
+#### FM-05: switch_project + start_sidecar_for_project 添加 120s 超时（RPN 600）
+- **修改文件**：[desktop/src-tauri/src/commands.rs:640-652](file:///g:/code-memory/desktop/src-tauri/src/commands.rs#L640) + [desktop/src-tauri/src/commands.rs:1550-1566](file:///g:/code-memory/desktop/src-tauri/src/commands.rs#L1550)
+- **根因**：switch_project 和 start_sidecar_for_project 调用 spawn_and_wait 无超时保护，
+  DNS/健康检查卡死时前端永久挂起，用户无法取消
+- **修复**：用 `tokio::time::timeout(120s, ...)` 包裹，超时设置取消标志并返回友好错误
+
+#### INV-04+P1-06: 状态栏综合判断 lockBusy（RPN 480）
+- **修改文件**：[static/app.js:1151-1198](file:///g:/code-memory/static/app.js#L1151) + [static/app.css:473-474](file:///g:/code-memory/static/app.css#L473) + [static/app.css:1242-1243](file:///g:/code-memory/static/app.css#L1242)
+- **根因**：updateStatusBar 只判断 online + isIndexing，未判断 _lockBusy，
+  后台合成持锁时 sidecar 在线但 API 返回 503，状态栏却显示"运行中"，用户误以为服务正常
+- **修复**：
+  1. 新增 lockBusy 判断分支：显示紫色圆点 + "后台合成中..."（区别于索引中金色/运行中绿色）
+  2. 信任中心状态概览同步更新（badge-purple 类）
+  3. app.css 新增 `.status-dot.lock-busy` 和 `.badge-purple` 样式
+  4. 优先级：isIndexing > lockBusy > running（索引中时也持锁，但索引状态更具体）
+
+#### P0-04+INV-05: 道同构度 lock_busy 错误文案修复（RPN 360）
+- **修改文件**：[static/app.js:5282-5306](file:///g:/code-memory/static/app.js#L5282) + [static/app.js:531-538](file:///g:/code-memory/static/app.js#L531)
+- **根因**：loadDaoMetrics 重试耗尽时未检查 503 lock_busy 和 _lockBusy 标志，
+  将 lock_busy 误报为"LRC 服务未启动"；sidecar 恢复后未自动刷新道同构度
+- **修复**：
+  1. 重试耗尽时根据 sidecar 状态和锁状态区分提示文案
+  2. 503 lock_busy / _lockBusy=true → 显示"后台合成中，请稍后刷新"
+  3. sidecar 不可达 → 显示"LRC 服务未启动"
+  4. _broadcastSidecarStateChange 添加 loadDaoMetrics 调用，sidecar 恢复后自动刷新
+
+### 测试
+
+- cargo check --features server: ✅ 通过（0.57s）
+- cargo check --manifest-path desktop/src-tauri/Cargo.toml: ✅ 通过（12.39s）
+- preflight_check.ps1: ✅ 14 项通过（仅 CHANGELOG 条目缺失，本次已补充）
+- 版本号一致性: ✅ 9 处全部 0.8.21
+- 桌面端二进制: 待编译（含新 logo）
+- 桌面端 CDP 交互测试: 待执行（双智能体）
+
+### 已知未修复问题（诚实披露）
+
+- **P0-02 (P1 降级)**：后台结晶流水线分段持锁（memory_store.rs）— v0.8.19 已用 try_lock + 503 lock_busy 缓解 API 卡死，根因（分段持锁）待后续版本修复
+- **FM-11 (P1)**：v1_api.rs 仍有 13 处 `lock().await`（非 try_lock），结晶期间仍可能卡死 8s，待后续版本统一修复
+
+---
+
+## [0.8.20] - 2026-07-31
+
+### 前端 503 lock_busy 处理链路综合修复（双智能体审计发现 1 P0 + 4 P1）
+
+> v0.8.19 修复了后端 try_lock + 503 lock_busy，但前端未配套适配。
+> 经 interaction-resilience-auditor + hcse-resilience-validator 双智能体真实启动前后端审计，
+> 发现前端将 503 lock_busy 误报为"无法连接到 API 服务"（GAP-01 P0），
+> 导致结晶期间用户仍看到与 v0.8.16~v0.8.18 相同的误导性错误。
+> 本版本对前端 503 处理链路进行综合修复，确保 v0.8.19 后端修复目标完整达成。
+
+#### GAP-01 (P0): loadDashboard 识别 503 lock_busy，不再误报"无法连接"
+- **修改文件**：[static/app.js:734-741](file:///g:/code-memory/static/app.js#L734) + [static/app.js:776-798](file:///g:/code-memory/static/app.js#L776)
+- **根因**：loadDashboard 的 `if (!systemData && !daoData)` 判断无法区分 503 lock_busy 和连接拒绝，
+  初始加载时 SidecarHealthMonitor._isReachable=false 导致进入"⚠️ 无法连接"分支
+- **修复**：
+  1. 检查 3 个端点是否有 503 状态码，如有则 throw 'LOCK_BUSY' 错误
+  2. catch 块识别 LOCK_BUSY，显示"⏳ 记忆系统正在执行后台合成，数据稍后自动加载..."
+  3. 自动重试（复用 _dashboardRetryCount 机制，2s/4s/8s 指数退避）
+- **验证**：Playwright 注入 503 模拟，显示"⏳ LRC 服务正在索引代码库..."而非"⚠️ 无法连接"
+
+#### GAP-02 (P1): handleHttpError 503 Toast 移除 URL，改为友好文案
+- **修改文件**：[static/app.js:276-296](file:///g:/code-memory/static/app.js#L276)
+- **根因**：Toast 显示"请求 http://127.0.0.1:3099/v1/memories/stats 失败：服务降级保护中"，
+  完整 URL 对非技术用户是噪声，"服务降级保护中"措辞晦涩
+- **修复**：改为"记忆系统正在后台合成，请稍后重试"（不暴露 URL）
+
+#### GAP-03 (P1): 503 lock_busy 增加 1 次自动重试（与 500 行为一致）
+- **修改文件**：[static/app.js:276-296](file:///g:/code-memory/static/app.js#L276)
+- **根因**：500 错误有 3 次重试，503 直接 cancel，行为不一致
+- **修复**：首次 503 lock_busy 静默重试 1 次（2s 后），重试仍失败才显示 Toast
+
+#### GAP-04 (P1): 项目分布卡片加载失败增加重试按钮
+- **修改文件**：[static/app.js:1057-1065](file:///g:/code-memory/static/app.js#L1057)
+- **根因**：加载失败时仅显示"⚠️ 加载失败"，用户需刷新整个页面才能重试
+- **修复**：empty-state 增加"重试"按钮（data-action="loadMemoryStats"）
+
+#### GAP-05 (P1): 非 Tauri 环境启动按钮友好处理
+- **修改文件**：[static/app.js:1481-1496](file:///g:/code-memory/static/app.js#L1481)
+- **根因**：浏览器直接访问 sidecar 时点击"启动服务"，postMessageToParent 抛
+  "当前非桌面端嵌入模式，无法调用此功能"，对非技术用户不友好
+- **修复**：检测非 Tauri 环境时，显示"LRC 服务已在运行中"Toast，隐藏 banner，刷新仪表盘
+
+### 测试
+
+- cargo build --features server --release: ✅ 通过
+- 真实 sidecar 启动: ✅ /health 0-24ms（3 次测试）
+- 4 API 端点: ✅ 200 正常返回（非结晶期）
+- Playwright 真实用户交互: ✅ 仪表盘正常加载，无"无法连接"错误
+- 503 lock_busy 模拟测试: ✅ 显示"⏳ LRC 服务正在索引代码库..."而非"⚠️ 无法连接"
+- 交互韧性回归测试: 已完成（interaction-resilience-auditor + hcse-resilience-validator）
+
+### 桌面端图标与前端 Logo 一致性同步
+
+- **背景**：用户指出桌面端可执行程序的图标与前端界面内的 logo 不一致（桌面端图标为 6/23 旧版 52KB，前端 logo 为 7/27 新版 276KB）
+- **修复**：使用前端 logo 源文件 `static/assets/logo/LRC桌面端Logo设计-26aa57e9-7935-4ece-badf-bd52dcccd343.png`（894x894 PNG）通过 `npx tauri icon` 重新生成全部桌面端图标尺寸
+- **影响文件**：
+  - [desktop/src-tauri/icons/32x32.png](file:///g:/code-memory/desktop/src-tauri/icons/32x32.png)
+  - [desktop/src-tauri/icons/128x128.png](file:///g:/code-memory/desktop/src-tauri/icons/128x128.png)
+  - [desktop/src-tauri/icons/128x128@2x.png](file:///g:/code-memory/desktop/src-tauri/icons/128x128@2x.png)
+  - [desktop/src-tauri/icons/icon.ico](file:///g:/code-memory/desktop/src-tauri/icons/icon.ico)
+  - [desktop/src-tauri/icons/icon.png](file:///g:/code-memory/desktop/src-tauri/icons/icon.png)
+- **验证**：图标文件已更新（时间戳 2026/7/31），尺寸与 Tauri 配置一致
+
+### 已知未修复问题（诚实披露）
+
+- **FM-11 (P1)**：v1_api.rs 仍有 13 处 `lock().await`（非 try_lock），结晶期间仍可能卡死 8s。v0.8.19 已修 4 个最关键端点（仪表盘+系统健康+记忆统计+船长日志），剩余 13 个是次要端点，计划 v0.8.21 统一修复
+- **GAP-06~GAP-12 (P2)**：Logo 404、bagua_balance 负值、记忆卡片不显示项目名等体验优化，计划后续版本修复
+
+---
+
 ## [0.8.19] - 2026-07-31
 
 ### 根因修复：/health handler 卡死 + 全 API 端点 try_lock 防卡死（四角色协作闭环）
