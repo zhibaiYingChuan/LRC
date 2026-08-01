@@ -279,12 +279,26 @@ fn main() {
                 {
                     let state = monitor_handle.state::<AppStore>();
                     // 检查 wizard 是否已完成配置（首次安装不自动启动）
-                    let setup_complete = {
+                    // v0.8.21 P0-01 修复（interaction-resilience-auditor）：
+                    //   根因：wizard.json 文件意外丢失时，WizardState::load() 返回默认配置
+                    //         (setup_complete=false)，导致 sidecar 永不自动启动，用户被困
+                    //   修复：wizard.json 不存在时（file_existed=false）兜底视为已完成配置
+                    //         - 首次安装：用户通过向导完成配置后 wizard.json 才会生成
+                    //         - 文件丢失：sidecar 自动启动（全局模式），用户可继续使用
+                    let (setup_complete, file_existed) = {
                         let wizard = state.wizard.lock().await;
-                        wizard.config().setup_complete
+                        (wizard.config().setup_complete, wizard.file_existed)
                     }; // wizard 锁立即释放
 
-                    if setup_complete {
+                    // P0-01 兜底：wizard.json 不存在时强制视为已完成配置
+                    let effective_setup_complete = setup_complete || !file_existed;
+                    if !file_existed && !setup_complete {
+                        tracing::warn!(
+                            "[v0.8.21 自动启动] wizard.json 不存在（file_existed=false），兜底视为已完成配置以避免 sidecar 永不自动启动"
+                        );
+                    }
+
+                    if effective_setup_complete {
                         // 再次检查 sidecar 是否已在运行（probe 可能已检测到外部 sidecar）
                         let sidecar_running = {
                             let sidecar = state.sidecar.lock().await;
@@ -303,10 +317,13 @@ fn main() {
 
                             // P0-2 + P1-2 修复：用 tokio::time::timeout 包裹 start_sidecar
                             // 根因：start_sidecar 卡死时（如 reqwest DNS 挂起），心跳 loop 永远不会启动
-                            // 修复：60s 整体超时（spawn_and_wait 内部已限 40s，此处兜底）
+                            // v0.8.21 INV-08 修复：60s → 120s
+                            //   根因：实测 sidecar 首次启动 + 索引初始化 + 健康检查可达 100s+，
+                            //         60s 超时误判启动失败，导致用户看到"无法连接"
+                            //   修复：提升到 120s，与 handleStartServiceClick 前端超时一致
                             // 超时后发射失败事件，确保心跳 loop 能继续启动
                             match tokio::time::timeout(
-                                std::time::Duration::from_secs(60),
+                                std::time::Duration::from_secs(120),
                                 commands::start_sidecar(
                                     state.clone(),
                                     monitor_handle.clone(),
@@ -387,12 +404,13 @@ fn main() {
                                     }
                                 }
                                 Err(_elapsed) => {
-                                    // P0-2 修复：整体超时（60s），确保心跳 loop 能继续启动
-                                    tracing::error!("[v0.8.16 自动启动] sidecar 启动整体超时（60s）");
+                                    // P0-2 修复：整体超时（120s），确保心跳 loop 能继续启动
+                                    // v0.8.21 INV-08：超时从 60s 提升到 120s
+                                    tracing::error!("[v0.8.16 自动启动] sidecar 启动整体超时（120s）");
                                     let _ = monitor_handle.emit(
                                         "sidecar-auto-start-failed",
                                         serde_json::json!({
-                                            "error": "自动启动整体超时（60s）",
+                                            "error": "自动启动整体超时（120s）",
                                             "message": "LRC 服务自动启动超时，请手动启动"
                                         }),
                                     );
@@ -402,7 +420,10 @@ fn main() {
                             tracing::info!("[v0.8.16 自动启动] sidecar 已在运行，跳过自动启动");
                         }
                     } else {
-                        tracing::info!("[v0.8.16 自动启动] wizard 未完成配置（setup_complete=false），跳过自动启动，引导用户走向导");
+                        tracing::info!(
+                            "[v0.8.16 自动启动] wizard 未完成配置（setup_complete=false, file_existed={}），跳过自动启动，引导用户走向导",
+                            file_existed
+                        );
                     }
                 }
 

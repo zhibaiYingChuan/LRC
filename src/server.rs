@@ -205,6 +205,11 @@ struct HealthResponse {
     src_dir: String,
     /// LLM 是否已配置
     llm_configured: bool,
+    /// v0.8.21 P0-06：memory_store 锁是否被持有（后台合成中）
+    /// 前端据此判断 /v1/health/system 等 API 是否会返回 503 lock_busy
+    /// true 时前端应显示"后台合成中"而非"服务未启动"
+    #[serde(default)]
+    lock_busy: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -231,6 +236,10 @@ pub struct AppState {
     pub src_dir: String,
     /// LLM API 配置（运行时可变，通过 /api/config/llm 动态更新）
     pub llm_api: Arc<RwLock<LlmApiConfig>>,
+    /// v0.8.22 P0-1 修复（hcse-resilience-validator Round3）：
+    ///   LLM 配置状态的无锁缓存，避免 /health 中 llm_api.read().await 阻塞 worker 线程
+    ///   在 LLM 配置更新时同步更新此 AtomicBool
+    pub llm_configured_atomic: Arc<AtomicBool>,
     /// 后台索引是否已完成（AtomicBool 支持无锁读取）
     pub indexing_complete: Arc<AtomicBool>,
     /// 服务启动时间（用于计算 uptime）
@@ -1702,9 +1711,10 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     };
 
     // 获取记忆库统计（try_lock，获取不到返回 0）
-    let memory_total = match state.memory_store.try_lock() {
-        Ok(store) => store.stats().map(|s| s.total_memories).unwrap_or(0),
-        Err(_) => 0, // 锁被长任务持有，返回 0（不影响存活判定）
+    // v0.8.21 P0-06：同时检测锁是否被持有，设置 lock_busy 标志
+    let (memory_total, lock_busy) = match state.memory_store.try_lock() {
+        Ok(store) => (store.stats().map(|s| s.total_memories).unwrap_or(0), false),
+        Err(_) => (0, true), // 锁被长任务持有，返回 0 + lock_busy=true
     };
 
     // 判断服务阶段
@@ -1716,7 +1726,14 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         "indexing"
     };
 
-    let llm_configured = state.llm_api.read().await.is_configured();
+    // v0.8.22 P0-1 修复（hcse-resilience-validator Round3）：
+    //   原实现：state.llm_api.read().await.is_configured() — 阻塞式读锁
+    //   根因：当 tokio runtime 繁忙时，此 .await 点堆积请求，每个消耗一个 worker 线程，
+    //         导致所有 16 个 worker 线程被耗尽，HTTP 服务器完全无法响应（12s 超时）
+    //   修复：改用 AtomicBool 无锁读取，永远不阻塞
+    let llm_configured = state
+        .llm_configured_atomic
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     let response = HealthResponse {
         status,
@@ -1733,6 +1750,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         },
         src_dir: state.src_dir.clone(),
         llm_configured,
+        lock_busy,
     };
 
     (StatusCode::OK, Json(response))
@@ -2092,6 +2110,7 @@ async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 pub async fn update_llm_config(
     memory_store: &Arc<Mutex<MemoryStore<JsonPersistence>>>,
     llm_api: &Arc<RwLock<LlmApiConfig>>,
+    llm_configured_atomic: &Arc<AtomicBool>,
     body: serde_json::Value,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let llm_str = match body.get("llm_api").and_then(|v| v.as_str()) {
@@ -2114,6 +2133,8 @@ pub async fn update_llm_config(
             let mut llm = llm_api.write().await;
             *llm = LlmApiConfig::None;
         }
+        // v0.8.22 P0-1 修复：同步 AtomicBool 无锁缓存（与 RwLock 状态保持一致）
+        llm_configured_atomic.store(false, std::sync::atomic::Ordering::Relaxed);
         // v0.7.1 P2-1 修复：用 spawn_blocking 包裹同步文件 I/O，避免阻塞 Tokio worker 线程
         let save_result = tokio::task::spawn_blocking(|| {
             save_llm_to_config(None)?;
@@ -2164,6 +2185,8 @@ pub async fn update_llm_config(
                 let mut llm = llm_api.write().await;
                 *llm = config;
             }
+            // v0.8.22 P0-1 修复：同步 AtomicBool 无锁缓存（与 RwLock 状态保持一致）
+            llm_configured_atomic.store(true, std::sync::atomic::Ordering::Relaxed);
             // v0.7.1 P2-1 修复：用 spawn_blocking 包裹同步文件 I/O，避免阻塞 Tokio worker 线程
             let llm_str_for_save = llm_str.clone();
             let save_result = tokio::task::spawn_blocking(move || {
@@ -2210,7 +2233,13 @@ async fn config_llm_handler(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    update_llm_config(&state.memory_store, &state.llm_api, body).await
+    update_llm_config(
+        &state.memory_store,
+        &state.llm_api,
+        &state.llm_configured_atomic,
+        body,
+    )
+    .await
 }
 
 /// 保存 LLM API 配置到全局配置文件
@@ -2977,6 +3006,7 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         state.memory_store.clone(),
         state.manager.clone(),
         state.llm_api.clone(),
+        state.llm_configured_atomic.clone(),
     )
     .into_service();
 
@@ -3047,6 +3077,16 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
                 ])
                 .allow_credentials(false),
         )
+        // v0.8.22 P1-1 修复（hcse-resilience-validator Round3 FM-02）：
+        //   根因：handler 阻塞时 TCP 连接不关闭，CLOSE_WAIT 累积 27-49 个（阈值 <10）
+        //   修复1：TimeoutLayer 30s — 单请求超时后自动关闭连接，防止 CLOSE_WAIT 堆积
+        //   修复2：ConcurrencyLimitLayer 100 — 限制最大并发连接数，防止 worker 耗尽
+        //   注意：30s 超时足够 lock_busy 路径返回降级数据（<1ms），只拦截真正卡死的请求
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            std::time::Duration::from_secs(30),
+        ))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(100))
         .with_state(state)
 }
 
@@ -3128,7 +3168,8 @@ mod tests {
             memory_store,
             src_dir: "fixture/src".into(),
             llm_api: Arc::new(RwLock::new(LlmApiConfig::None)),
-            indexing_complete: Arc::new(AtomicBool::new(true)), // 测试环境默认索引已完成
+            llm_configured_atomic: Arc::new(AtomicBool::new(false)), // v0.8.22 P0-1: 无锁缓存
+            indexing_complete: Arc::new(AtomicBool::new(true)),      // 测试环境默认索引已完成
             started_at: chrono::Utc::now(),
         })
     }

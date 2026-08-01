@@ -49,7 +49,14 @@ use code_memory::data_dir::DataDir;
 ///   5 = 锁获取失败（LockAcquireFailed）
 static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
-#[tokio::main]
+// v0.8.22 P0-A 修复（hcse-resilience-validator）：
+//   增加 tokio worker 线程数，避免合成任务阻塞 axum HTTP handler
+//   根因：合成任务是 CPU 密集型的，通过 tokio::spawn 启动后占用 worker 线程，
+//         当所有 worker 线程被占用时，axum handler 无法执行，/health 等端点超时
+//   修复：worker_threads 从默认值（CPU 核心数，通常 4-8）增加到 16，
+//         确保合成任务占用部分线程后，axum handler 仍有足够线程处理请求
+//   后续优化：将 run_cycle 中的 CPU 密集型操作放到 spawn_blocking 中（v0.8.23 计划）
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {
     // 运行时防护：反调试 + 完整性校验（必须在任何业务逻辑之前执行）
     code_memory::guard::risk_aware_guard();
@@ -763,6 +770,10 @@ async fn try_run() -> Result<(), String> {
         memory_store: memory_store.clone(),
         src_dir: src_dir.clone(),
         llm_api: Arc::new(tokio::sync::RwLock::new(llm_api.clone())),
+        // v0.8.22 P0-1 修复：LLM 配置状态无锁缓存，避免 /health 阻塞
+        llm_configured_atomic: Arc::new(std::sync::atomic::AtomicBool::new(
+            llm_api.is_configured(),
+        )),
         // 后台索引状态跟踪（false = 索引中，true = 已完成）
         indexing_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // 服务启动时间（用于 /health 端点计算 uptime）
@@ -788,19 +799,34 @@ async fn try_run() -> Result<(), String> {
     tokio::spawn(async move {
         index_log_bg("[后台] 开始索引项目代码...");
         let mut bg_mgr = CodeMemoryManager::new();
-        match bg_mgr.index_project(&index_src) {
-            Ok(_count) => {
-                let stats = bg_mgr.get_stats();
+        // v0.8.22 P0-2 修复（hcse-resilience-validator Round3）：
+        //   根因：index_project 是 CPU 密集型操作（遍历文件 + 编码），
+        //         原实现直接在 tokio worker 线程上执行，当项目较大时会
+        //         长时间占用 worker 线程，导致 HTTP 服务器无法响应其他请求
+        //   修复：将 index_project 移入 spawn_blocking，在独立阻塞线程执行，
+        //         执行完毕后将 bg_mgr 返回到 async 上下文继续使用
+        let index_src_for_blocking = index_src.clone();
+        let index_result = tokio::task::spawn_blocking(move || {
+            let result = bg_mgr.index_project(&index_src_for_blocking);
+            (bg_mgr, result)
+        })
+        .await;
+        match index_result {
+            Ok((mgr, Ok(_count))) => {
+                let stats = mgr.get_stats();
                 index_log_bg(&format!(
                     "索引完成: {} 个文件 → {} 个代码片段",
                     stats.file_count, stats.total_chunks
                 ));
                 let mut state_mgr = index_state.manager.lock().await;
-                *state_mgr = Box::new(bg_mgr);
+                *state_mgr = Box::new(mgr);
                 index_log_bg("索引已生效，搜索服务已就绪");
             }
-            Err(e) => {
+            Ok((_, Err(e))) => {
                 index_log_bg(&format!("索引失败: {e}（部分文件可能无法检索）"));
+            }
+            Err(e) => {
+                index_log_bg(&format!("索引任务执行失败: {e}（spawn_blocking 异常）"));
             }
         }
         // 无论成功或失败，标记索引阶段已完成

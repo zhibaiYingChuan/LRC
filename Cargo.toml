@@ -1,10 +1,10 @@
-[workspace]
+﻿[workspace]
 # 桌面端 Tauri 项目是独立的 Cargo 工作区，不参与主项目构建
 exclude = ["desktop/src-tauri"]
 
 [package]
 name = "code-memory"
-version = "0.8.19"
+version = "0.8.22"
 edition = "2021"
 # v0.7.1 P2-5：声明最低支持 Rust 版本（MSRV）
 # v0.8.8：提升到 1.80（std::sync::LazyLock 需要 1.80+）
@@ -70,8 +70,8 @@ ureq = { version = "2", optional = true }
 # v0.7.1 P2-4：axum 0.7 → 0.8 升级，tower-http 0.5 → 0.6
 axum = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "io-std", "signal"], optional = true }
-tower = { version = "0.5", optional = true }
-tower-http = { version = "0.6", features = ["cors"], optional = true }
+tower = { version = "0.5", features = ["limit"], optional = true }
+tower-http = { version = "0.6", features = ["cors", "timeout"], optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 # v0.8.1：TCP keepalive 配置（防止 sidecar 连接池泄漏）
 socket2 = { version = "0.6", optional = true }
