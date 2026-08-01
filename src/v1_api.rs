@@ -734,7 +734,18 @@ pub fn build_v1_router(
                     };
                     match store.health_report() {
                         Ok(report) => {
-                            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!(report)))
+                            // v0.8.23 CI 修复：始终添加 lock_busy 和 degraded 字段，
+                            //   满足 CI E2E smoke test 的正常路径和降级路径统一校验
+                            let mut json = serde_json::json!(report);
+                            if let Some(obj) = json.as_object_mut() {
+                                obj.insert("lock_busy".to_string(), serde_json::Value::Bool(false));
+                                let is_degraded = obj.get("system_mode")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s == "degraded")
+                                    .unwrap_or(false);
+                                obj.insert("degraded".to_string(), serde_json::Value::Bool(is_degraded));
+                            }
+                            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(json))
                         }
                         Err(e) => Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
