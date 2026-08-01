@@ -30,6 +30,7 @@ jobs:
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: block
+          # v0.8.23 修复：添加 index.crates.io（cargo clippy 下载依赖时需要）
           allowed-endpoints: >
             github.com:443
             api.github.com:443
@@ -38,6 +39,7 @@ jobs:
             objects.githubusercontent.com:443
             rustup.rs:443
             static.rust-lang.org:443
+            index.crates.io:443
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
@@ -157,6 +159,7 @@ jobs:
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: block
+          # v0.8.23 修复：添加 index.crates.io（cargo build 下载依赖时需要）
           allowed-endpoints: >
             github.com:443
             api.github.com:443
@@ -165,6 +168,7 @@ jobs:
             objects.githubusercontent.com:443
             rustup.rs:443
             static.rust-lang.org:443
+            index.crates.io:443
 
       - name: Resolve version
         id: version
@@ -286,6 +290,7 @@ jobs:
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: block
+          # v0.8.23 修复：添加 index.crates.io（cargo build 下载依赖时需要）
           allowed-endpoints: >
             github.com:443
             api.github.com:443
@@ -294,6 +299,7 @@ jobs:
             objects.githubusercontent.com:443
             rustup.rs:443
             static.rust-lang.org:443
+            index.crates.io:443
 
       - name: Resolve version
         id: version
