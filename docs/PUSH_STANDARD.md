@@ -210,20 +210,38 @@ MAJOR.MINOR.PATCH
 
 ### 4.1 版本号同步要求
 
-发布新版本时，以下文件版本号必须一致：
+发布新版本时，以下 10 处版本号必须一致（release.yml preflight 自动检查）：
 
-1. `Cargo.toml` → `version` 字段
-2. `desktop/src-tauri/Cargo.toml` → `version` 字段
-3. `desktop/src-tauri/tauri.conf.json` → `version` 字段
-4. `desktop/package.json` → `version` 字段
-5. `static/app.js` → `APP_VERSION` 常量（前端版本号唯一来源，status-version 和日志前缀均引用）
-6. `static/index.html` → 显示给用户的版本号（`id="sys-version"` 和 `id="status-version"` 初始值 + `<meta name="version">`）
-7. `CHANGELOG.md` → 最新版本标题
+| # | 文件 | 字段 | 检查方式 |
+|---|------|------|---------|
+| 1 | `Cargo.toml` | `version` | `grep '^version' Cargo.toml` |
+| 2 | `desktop/src-tauri/Cargo.toml` | `version` | `grep '^version' desktop/src-tauri/Cargo.toml` |
+| 3 | `desktop/src-tauri/tauri.conf.json` | `version` | `grep '"version"' desktop/src-tauri/tauri.conf.json` |
+| 4 | `Cargo.lock` | `code-memory` 包版本 | `grep -A1 'name = "code-memory"' Cargo.lock` |
+| 5 | `desktop/src-tauri/Cargo.lock` | `lrc-desktop` 包版本 | `grep -A1 'name = "lrc-desktop"' desktop/src-tauri/Cargo.lock` |
+| 6 | `desktop/package.json` | `version` | `grep '"version"' desktop/package.json` |
+| 7 | `static/app.js` | `APP_VERSION` 常量 | `grep "APP_VERSION" static/app.js` |
+| 8 | `static/index.html` (meta) | `<meta name="version">` | `grep 'name="version"' static/index.html` |
+| 9 | `CHANGELOG.md` | 最新版本标题 | `grep -m1 '^\[' CHANGELOG.md` |
+| 10 | `static/index.html` (status-version) | `<strong id="status-version">` | `grep 'id="status-version"' static/index.html` |
 
-### 4.2 当前版本
+> **注意**：`Cargo.lock` 的版本号不会自动随 `Cargo.toml` 更新。修改 `Cargo.toml` 版本号后，必须运行 `cargo check --features server` 更新 `Cargo.lock`，并提交该文件。同样，`desktop/src-tauri/Cargo.lock` 需要在 `desktop/src-tauri/` 目录下运行 `cargo check` 更新。
 
-- **当前版本**：0.8.7
-- **下一版本**：0.8.8（Bug 修复）或 0.9.0（功能新增）
+### 4.2 版本号硬编码盲点管理
+
+前端文件 `static/index.html` 中存在两处用户可见的版本号：
+1. `<meta name="version" content="0.8.26">` — 供 JS 动态读取
+2. `<strong id="status-version">v0.8.26</strong>` — 状态栏显示
+
+这两处硬编码版本号是 preflight 检查的盲点风险（如果未同步）。发布流程中：
+- `release.yml` preflight 会自动检查 #10 是否与 #1 一致
+- 如果出现不一致，preflight 会输出提示信息，但不会阻塞发布（保留为警告而非错误）
+- 手动修复方式：编辑 `static/index.html` 中的两处版本号
+
+### 4.3 当前版本
+
+- **当前版本**：0.8.26
+- **下一版本**：0.9.0（功能新增）
 
 ---
 

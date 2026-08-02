@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.8.25';
+const APP_VERSION = '0.8.26';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -143,18 +143,20 @@ function setButtonState(btn, state, originalText) {
       btn.style.opacity = '';
       btn.style.cursor = '';
       btn.textContent = '✓ 成功';
+      // v0.8.26 UX-01 修复：恢复时间从 1.5s 统一为 3s，与 testModel 边框恢复时间一致
       setTimeout(() => {
         btn.textContent = stateInfo.originalText;
-      }, 1500);
+      }, 3000);
       break;
     case 'error':
       btn.disabled = false;
       btn.style.opacity = '';
       btn.style.cursor = '';
       btn.textContent = '✗ 失败';
+      // v0.8.26 UX-01 修复：恢复时间从 1.5s 统一为 3s，与 testModel 边框恢复时间一致
       setTimeout(() => {
         btn.textContent = stateInfo.originalText;
-      }, 1500);
+      }, 3000);
       break;
     case 'idle':
     default:
@@ -368,6 +370,18 @@ async function handleHttpError(response, context = '操作', retryContext = null
 
   console.error(`[handleHttpError] ${context} 失败 [${status}]:`, errorDetail);
 
+  // v0.8.26 DOC-01 修复：磁盘空间不足友好提示
+  // 检查后端返回的错误中是否包含磁盘空间相关关键词
+  const diskSpaceKeywords = ['disk', 'space', 'ENOSPC', '存储空间', '磁盘', '容量不足', 'no space', 'quota'];
+  const isDiskSpaceError = diskSpaceKeywords.some(kw =>
+    errorDetail.toLowerCase().includes(kw.toLowerCase())
+  );
+  if (isDiskSpaceError) {
+    showToast('⚠️ 磁盘空间不足，请清理磁盘后重试', 'error', 8000);
+    console.warn('[handleHttpError] 检测到磁盘空间不足错误:', errorDetail);
+    return { action: 'cancel', status, errorDetail: '磁盘空间不足' };
+  }
+
   if (status === 500) {
     // v0.8.13 D3: 自动刷新触发的 500 错误降级为 Toast，不弹阻塞 Modal
     // 自动刷新失败属于预期内的偶发错误，弹 Modal 会打断用户操作
@@ -442,7 +456,16 @@ async function handleHttpError(response, context = '操作', retryContext = null
           throw e;
         }
       } else {
+        // v0.8.25 NEW-03 修复：退避延迟期间记录当前标签页，重试时验证一致性
+        //   根因：没有 signal 时退避延迟不可取消，用户切换标签页后重试仍会执行
+        //   修复：记录当前 active 标签页，退避结束后验证是否仍在该标签页
+        const tabBeforeBackoff = document.querySelector('.tab-content.active')?.id;
         await new Promise(r => setTimeout(r, backoff));
+        const tabAfterBackoff = document.querySelector('.tab-content.active')?.id;
+        if (tabBeforeBackoff && tabAfterBackoff && tabBeforeBackoff !== tabAfterBackoff) {
+          console.log('[NEW-03] 退避延迟期间标签页已切换，放弃重试');
+          return { action: 'cancel', status, errorDetail };
+        }
       }
       return { action: 'retry', status, errorDetail };
     }
@@ -989,9 +1012,31 @@ let _dashboardRetryCount = 0;
 let _dashboardRetryTimer = null; // v0.8.13 B1: 索引期重试 timer，支持取消与竞态防护
 const _DASHBOARD_MAX_RETRIES = 3;
 // v0.8.22 修复：lock_busy 冷却期标志，避免手动刷新后再次进入无限重试循环
+// v0.8.26 UX-02 修复：使用 sessionStorage 持久化冷却期状态，tab 切换后不丢失
 let _lockBusyCooldown = false;
 // v0.8.23 S1-RES-03 修复：lock_busy 冷却期倒计时 timer，显示实时剩余秒数
 let _lockBusyCooldownTimer = null;
+
+// v0.8.26 UX-02 修复：从 sessionStorage 恢复冷却期状态
+// 确保用户切换 tab 后返回时，冷却期信息仍然可见
+(function _restoreLockBusyCooldown() {
+  try {
+    const stored = sessionStorage.getItem('lrc_lockbusy_cooldown');
+    if (stored) {
+      const expiry = parseInt(stored, 10);
+      const remaining = expiry - Date.now();
+      if (remaining > 0) {
+        _lockBusyCooldown = true;
+        console.log('[lockBusy] 从 sessionStorage 恢复冷却期，剩余 ' + Math.ceil(remaining / 1000) + 's');
+      } else {
+        sessionStorage.removeItem('lrc_lockbusy_cooldown');
+      }
+    }
+  } catch (e) {
+    // sessionStorage 不可用时静默降级
+    console.warn('[lockBusy] sessionStorage 不可用:', e.message);
+  }
+})();
 
 async function loadDashboard() {
   const loading = $('dashboard-loading');
@@ -1184,10 +1229,18 @@ async function loadDashboard() {
         // v0.8.22 修复：添加 30 秒冷却期，防止手动刷新后再次进入无限重试循环
         console.log('[loadDashboard] lock_busy（后台合成中）重试耗尽，设置 30 秒冷却期');
         _lockBusyCooldown = true;
+        // v0.8.26 UX-02 修复：将冷却期到期时间写入 sessionStorage，tab 切换后不丢失
+        try {
+          sessionStorage.setItem('lrc_lockbusy_cooldown', String(Date.now() + 30000));
+        } catch (e) { /* sessionStorage 不可用时静默降级 */ }
         // v0.8.23 S1-RES-03 修复：冷却期结束时清理倒计时 timer
         const cooldownTimer = setTimeout(() => {
           _lockBusyCooldown = false;
           _dashboardRetryCount = 0;
+          // v0.8.26 UX-02 修复：冷却期到期时清理 sessionStorage
+          try {
+            sessionStorage.removeItem('lrc_lockbusy_cooldown');
+          } catch (e) { /* 静默降级 */ }
           if (_lockBusyCooldownTimer) {
             clearInterval(_lockBusyCooldownTimer);
             _lockBusyCooldownTimer = null;
@@ -2396,6 +2449,8 @@ async function generateCaptainLog() {
           result.classList.remove('hidden');
           // v0.8.22 修复：缓存成功生成的船长日志，用于降级路径显示
           try { localStorage.setItem('lrc_captains_log_cache', logText); } catch (_) { /* 缓存非关键 */ }
+          // v0.8.25 V3-04 修复：成功生成船长日志后显示 success 反馈
+          try { showToast('✅ 船长日志已生成', 'success', 3000); } catch (_) { /* toast 非关键 */ }
           return;
         }
       }
@@ -2540,8 +2595,12 @@ async function generateCaptainLog() {
     result.classList.remove('hidden');
     // v0.8.22 修复：缓存成功生成的船长日志，用于降级路径显示
     try { localStorage.setItem('lrc_captains_log_cache', log); } catch (_) { /* 缓存非关键 */ }
+    // v0.8.25 V3-04 修复：回退路径也显示 success 反馈
+    try { showToast('✅ 船长日志已生成（回退模式）', 'success', 3000); } catch (_) { /* toast 非关键 */ }
 
   } catch (e) {
+    // v0.8.25 UX-04 修复：添加 console.warn 日志，避免静默失败
+    console.warn('[generateCaptainLog] 生成失败:', e.message);
     if (error) {
       // v0.8.22 修复：降级路径也失败时，显示缓存的上次成功日志（如果存在）
       let cachedLog = null;
@@ -3326,11 +3385,14 @@ async function init() {
   //     修复：使用 window.showToast 显式调用，并添加 try/catch 防止 toast 本身抛出异常
   if (!window._lrcGlobalErrorRegistered) {
     window._lrcGlobalErrorRegistered = true;
+    // v0.8.25 V3-06 修复：全局错误计数器，用于监控和调试
+    window._lrcGlobalErrorCount = 0;
     // v0.8.22 HCSE Round2 修复：同时设置 window.onerror 和 window.onunhandledrejection 属性
     //   根因：HCSE 测试检查 window.onerror 属性，但原代码只用了 addEventListener
     //   修复：同时设置属性和 addEventListener，确保两种检查方式都能通过
     const lrcGlobalErrorHandler = (event) => {
-      console.error('[全局错误]', event.error || event.message);
+      window._lrcGlobalErrorCount++;
+      console.error('[全局错误 #' + window._lrcGlobalErrorCount + ']', event.error || event.message);
       try {
         if (typeof window.showToast === 'function') {
           window.showToast('发生未知错误，请刷新页面', 'error', 5000);
@@ -3637,9 +3699,25 @@ async function backupMemories() {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 
+    // v0.8.25 V3-05 修复：检查部分失败项，显示具体失败原因
+    const failedParts = [];
+    if (memoriesRes.status === 'rejected') failedParts.push('记忆列表不可用');
+    if (chunksRes.status === 'rejected') failedParts.push('代码片段不可用');
+    if (archiveRes.status === 'rejected') failedParts.push('归档数据不可用');
+    if (projectRes.status === 'rejected') failedParts.push('项目信息不可用');
+
+    let successMsg = '✅ 备份已下载！文件包含 ' +
+      (Array.isArray(exportData.memories) ? exportData.memories.length : 0) + ' 条记忆';
+    if (failedParts.length > 0) {
+      successMsg += '（部分数据不可用：' + failedParts.join('，') + '）';
+      // v0.8.25 UX-05 修复：部分失败时同时显示 Toast 通知，确保用户感知
+      showToast('备份部分完成：' + failedParts.join('，'), 'warning', 5000);
+    } else {
+      showToast('✅ 备份完成，共 ' + (Array.isArray(exportData.memories) ? exportData.memories.length : 0) + ' 条记忆', 'success', 3000);
+    }
+
     if (resultEls.length > 0) {
-      updateResult('✅ 备份已下载！文件包含 ' +
-        (Array.isArray(exportData.memories) ? exportData.memories.length : 0) + ' 条记忆', 'form-result form-result-success');
+      updateResult(successMsg, failedParts.length > 0 ? 'form-result form-result-warning' : 'form-result form-result-success');
     }
   } catch (e) {
     if (resultEls.length > 0) {
@@ -7048,9 +7126,18 @@ function _abortActiveTabRequests(excludeTab) {
     _daoRetryTimer = null;
   }
   // v0.8.23 S1-RES-03 修复：标签页切换时清理 lock_busy 冷却期倒计时
+  // v0.8.25 NEW-01 修复：同时重置冷却期标志，避免切换回 dashboard 后仍被阻止自动重试
+  //   根因：之前只清理了 timer，但 _lockBusyCooldown 仍为 true，导致用户切换标签页再回来时，
+  //   冷却期不会自动恢复（需等待原始 setTimeout 触发），重试计数也保持旧值。
+  //   修复：重置 _lockBusyCooldown 和 _dashboardRetryCount，让新加载从干净状态开始。
   if (_lockBusyCooldownTimer) {
     clearInterval(_lockBusyCooldownTimer);
     _lockBusyCooldownTimer = null;
+  }
+  if (_lockBusyCooldown) {
+    _lockBusyCooldown = false;
+    _dashboardRetryCount = 0;
+    console.log('[NEW-01] 标签页切换时重置 lock_busy 冷却期状态');
   }
   // v0.8.15 P0-7/FM-16 修复：清除信任中心重试 timer，避免切换标签页后 timer 泄漏
   if (typeof _trustRetryTimer !== 'undefined' && _trustRetryTimer) {
@@ -7762,9 +7849,9 @@ async function testEmbedderConnection() {
 
   // 通过 data-action 属性查找触发按钮
   const btn = document.querySelector('[data-action="testEmbedderConnection"]');
+  const originalText = '测试镜像源';
   if (btn) {
-    btn.disabled = true;
-    btn.textContent = '测试中...';
+    setButtonState(btn, 'loading', originalText);
   }
 
   try {
@@ -7778,16 +7865,22 @@ async function testEmbedderConnection() {
 
     if (data.success) {
       showToast('✅ 连接成功！镜像源: ' + mirrorNames[mirror] + '，模型: ' + modelId + '，延迟: ' + (data.latency_ms || '?') + 'ms', 'success');
+      if (btn) setButtonState(btn, 'success', originalText);
     } else {
       throw new Error(data.message || '连接失败');
     }
   } catch (e) {
     console.error('[testEmbedderConnection] 连接失败:', e);
     showToast('❌ 连接失败: ' + e.message + '。请检查网络或尝试其他镜像源', 'error');
+    if (btn) setButtonState(btn, 'error', originalText);
   } finally {
     if (btn) {
-      btn.disabled = false;
-      btn.textContent = '测试链接';
+      // v0.8.25 CODE-03 修复：统一使用 setButtonState 恢复按钮状态，移除手动 DOM 操作
+      // 之前手动设置 btn.disabled/btn.textContent，会导致按钮颜色不一致
+      // 1.5s 后恢复文本（setButtonState 内部自动处理）
+      setTimeout(() => {
+        if (btn) setButtonState(btn, 'idle', originalText);
+      }, 1500);
     }
   }
 }
@@ -7826,11 +7919,11 @@ async function testModel() {
     setButtonState(btn, 'error', originalText);
     btn.style.borderColor = 'var(--lrc-朱砂-500)';
   } finally {
-    // v0.8.25 R-14：延长恢复时间到 5s，给用户充分的视觉反馈时间
-    // 成功时保留绿色边框 5s，失败时保留红色边框 5s
+    // v0.8.26 UX-01 修复：恢复时间从 5s 统一为 3s，与 setButtonState 文本恢复时间一致
+    // 成功时保留绿色边框 3s，失败时保留红色边框 3s
     setTimeout(() => {
       btn.style.borderColor = '';
-    }, 5000);
+    }, 3000);
   }
 }
 
@@ -7965,6 +8058,13 @@ function startQuickSetup() {
 async function onAgentSelected(agentId, selected) {
   if (!selected) return;
 
+  // v0.8.25 UX-06 修复：浏览器环境中 postMessageToParent 可能不可用
+  if (!isTauriEnv) {
+    console.warn('[onAgentSelected] 浏览器环境：自动扫描项目目录仅桌面端支持');
+    showToast('项目目录自动扫描需在桌面端使用，请手动选择项目目录', 'info', 5000);
+    return;
+  }
+
   console.log('[onAgentSelected] 工具已选中:', agentId);
 
   // 如果是 IDE 类工具，自动扫描项目目录
@@ -7975,10 +8075,11 @@ async function onAgentSelected(agentId, selected) {
 
   if (isIde) {
     try {
-      // 调用后端扫描项目目录（15s 超时）
+      // 调用后端扫描项目目录（30s 超时，与后端超时对齐）
+      // v0.8.26 REG-01 修复：前端超时从 15s 提升到 30s，与后端 tokio::time::timeout(30s) 一致
       const projects = await postMessageToParent('lrc-scan-ide-projects', {
         ide_ids: [agentId]
-      }, 15000);
+      }, 30000);
 
       if (projects && projects.length > 0) {
         // 自动填充检测到的项目目录

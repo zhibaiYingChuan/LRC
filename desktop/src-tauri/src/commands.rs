@@ -43,9 +43,34 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
         wizard.config().project_dir.clone()
     };
     let project_path = project_dir.as_ref().map(std::path::Path::new);
-    let registry = store.agent_registry.lock().await;
-    match registry.auto_upgrade_configs(port, project_path) {
-        Ok(upgraded) => {
+
+    // v0.8.25 CODE-04 修复：为 auto_upgrade_configs 添加 10s 超时保护
+    //   根因：post_sidecar_start 中的 auto_upgrade_configs 无超时保护，
+    //   文件系统慢（如杀毒软件扫描、网络驱动器）时可能无限阻塞。
+    //   修复：先获取已安装的 agent_ids，再分别在 spawn_blocking 中执行耗时操作，
+    //   各加 10s 超时，避免锁持有时间过长。
+    let installed_agent_ids = {
+        let registry = store.agent_registry.lock().await;
+        registry.detect_installed()
+            .iter()
+            .map(|info| info.id.clone())
+            .collect::<Vec<String>>()
+    };
+
+    // 1. auto_upgrade_configs（10s 超时）
+    let upgrade_result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        {
+            let registry = store.agent_registry.lock().await;
+            let project_path_clone = project_path.map(|p| p.to_path_buf());
+            tokio::task::spawn_blocking(move || {
+                registry.auto_upgrade_configs(port, project_path_clone.as_deref())
+            })
+        }
+    )
+    .await;
+    match upgrade_result {
+        Ok(Ok(Ok(upgraded))) => {
             if !upgraded.is_empty() {
                 match project_key {
                     Some(key) => {
@@ -55,24 +80,32 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
                 }
             }
         }
-        Err(e) => {
+        Ok(Ok(Err(e))) => {
             tracing::warn!("[sidecar] 自动升级失败（不影响 sidecar 运行）: {}", e);
+        }
+        Ok(Err(_)) => {
+            tracing::warn!("[sidecar] 自动升级 spawn_blocking panic（不影响 sidecar 运行）");
+        }
+        Err(_) => {
+            tracing::warn!("[sidecar] 自动升级超时（10s，不影响 sidecar 运行）");
         }
     }
 
-    // v0.5.6：sidecar 启动后自动写入全局 IDE 规则文件
-    // v0.5.11 修复：改为为所有已安装的 AI 工具写入规则，而不只是 configured_agents
-    //   根因：用户反馈"只有 Trae 有规则，CodeBuddy 没有"
-    //   原逻辑只为 configured_agents（用户在向导中勾选的工具）写入规则
-    //   新逻辑为所有已安装的 AI 工具写入规则（除非产品文档不支持规则文件）
-    let installed_agent_ids: Vec<String> = registry
-        .detect_installed()
-        .iter()
-        .map(|info| info.id.clone())
-        .collect();
+    // 2. write_rules_for_agents（10s 超时，v0.8.25 CODE-04 修复）
     if !installed_agent_ids.is_empty() {
-        match registry.write_rules_for_agents(&installed_agent_ids) {
-            Ok(written) => {
+        let write_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            {
+                let registry = store.agent_registry.lock().await;
+                let ids = installed_agent_ids.clone();
+                tokio::task::spawn_blocking(move || {
+                    registry.write_rules_for_agents(&ids)
+                })
+            }
+        )
+        .await;
+        match write_result {
+            Ok(Ok(Ok(written))) => {
                 if !written.is_empty() {
                     match project_key {
                         Some(key) => tracing::info!(
@@ -87,7 +120,15 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
                     }
                 }
             }
-            Err(e) => tracing::warn!("[sidecar] 全局规则文件写入失败（不影响 sidecar）: {}", e),
+            Ok(Ok(Err(e))) => {
+                tracing::warn!("[sidecar] 全局规则文件写入失败（不影响 sidecar）: {}", e);
+            }
+            Ok(Err(_)) => {
+                tracing::warn!("[sidecar] 全局规则文件写入 spawn_blocking panic（不影响 sidecar）");
+            }
+            Err(_) => {
+                tracing::warn!("[sidecar] 全局规则文件写入超时（10s，不影响 sidecar 运行）");
+            }
         }
     }
 }
@@ -1501,22 +1542,37 @@ pub async fn switch_project(
 
     // v0.5.6 修复：切换项目后，确保全局 IDE 规则文件存在
     // v0.5.11 修复：改为为所有已安装的 AI 工具写入规则（与 post_sidecar_start 一致）
+    // v0.8.25 CODE-04 修复：添加 10s 超时保护
     {
-        let registry = store.agent_registry.lock().await;
-        let installed_agent_ids: Vec<String> = registry
-            .detect_installed()
-            .iter()
-            .map(|info| info.id.clone())
-            .collect();
+        let installed_agent_ids = {
+            let registry = store.agent_registry.lock().await;
+            registry.detect_installed()
+                .iter()
+                .map(|info| info.id.clone())
+                .collect::<Vec<String>>()
+        };
         if !installed_agent_ids.is_empty() {
-            match registry.write_rules_for_agents(&installed_agent_ids) {
-                Ok(written) => tracing::info!(
-                    "[切换项目] 已确保 {} 个全局 IDE 规则文件存在: {}",
-                    written.len(),
-                    project_dir
-                ),
-                Err(e) => {
-                    tracing::warn!("[切换项目] 全局规则文件写入失败（不影响 sidecar）: {}", e)
+            let write_result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                {
+                    let registry = store.agent_registry.lock().await;
+                    let ids = installed_agent_ids.clone();
+                    tokio::task::spawn_blocking(move || registry.write_rules_for_agents(&ids))
+                }
+            )
+            .await;
+            match write_result {
+                Ok(Ok(Ok(written))) => {
+                    tracing::info!("[切换项目] 已确保 {} 个全局 IDE 规则文件存在: {}", written.len(), project_dir);
+                }
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!("[切换项目] 全局规则文件写入失败（不影响 sidecar）: {}", e);
+                }
+                Ok(Err(_)) => {
+                    tracing::warn!("[切换项目] 全局规则文件写入 panic（不影响 sidecar）");
+                }
+                Err(_) => {
+                    tracing::warn!("[切换项目] 全局规则文件写入超时（10s，不影响 sidecar）");
                 }
             }
         }

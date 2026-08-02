@@ -1497,15 +1497,17 @@ fn contains_whole_word(haystack: &[u8], needle: &[u8]) -> bool {
             if i > 0 {
                 let prev = haystack[i - 1];
                 if prev.is_ascii_alphanumeric() || prev == b'_' {
-                    continue; // 前一个字符是单词字符，跳过
+                    continue;
                 }
             }
             // 检查后一个字符是否是单词边界
+            // v0.8.25 NEW-04 修复：当 end >= haystack.len() 时，
+            // 数据结束本身就是有效的单词边界，无需额外检查。
             let end = i + needle.len();
             if end < haystack.len() {
                 let next = haystack[end];
                 if next.is_ascii_alphanumeric() || next == b'_' {
-                    continue; // 后一个字符是单词字符，跳过
+                    continue;
                 }
             }
             return true;

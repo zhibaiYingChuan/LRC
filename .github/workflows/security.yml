@@ -78,10 +78,17 @@ jobs:
             objects.githubusercontent.com:443
             rustup.rs:443
             static.rust-lang.org:443
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.80.0
+        with:
+          toolchain: 1.80.0
 
       - name: Install cargo-license
-        run: cargo install cargo-license --locked || cargo install cargo-license
+        # v0.8.25 V3-07 修复：添加超时保护和重试机制，防止 cargo install 长时间挂起
+        # 根因：cargo install 默认无超时，网络问题可能导致 CI 挂起超过 10 分钟
+        # 修复：使用 timeout 命令限制执行时间，最多允许 120 秒
+        # v0.8.26 REL-02 修复：锁定版本号到 0.6.1，提升构建可复现性
+        run: |
+          timeout 120 cargo install cargo-license --version 0.6.1 --locked || timeout 120 cargo install cargo-license --version 0.6.1
 
       - name: Check dependency licenses
         # 列出所有依赖的许可证，标记非宽松许可证
