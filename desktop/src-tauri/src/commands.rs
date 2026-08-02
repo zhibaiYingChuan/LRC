@@ -58,15 +58,15 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
     };
 
     // 1. auto_upgrade_configs（10s 超时）
+    // v0.8.26 修复：克隆 Arc<Mutex> 避免生命周期逃逸（spawn_blocking 需要 'static）
+    let registry_arc = store.agent_registry.clone();
+    let project_path_clone = project_path.map(|p| p.to_path_buf());
     let upgrade_result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        {
-            let registry = store.agent_registry.lock().await;
-            let project_path_clone = project_path.map(|p| p.to_path_buf());
-            tokio::task::spawn_blocking(move || {
-                registry.auto_upgrade_configs(port, project_path_clone.as_deref())
-            })
-        }
+        tokio::task::spawn_blocking(move || {
+            let registry = registry_arc.blocking_lock();
+            registry.auto_upgrade_configs(port, project_path_clone.as_deref())
+        })
     )
     .await;
     match upgrade_result {
@@ -93,15 +93,15 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
 
     // 2. write_rules_for_agents（10s 超时，v0.8.25 CODE-04 修复）
     if !installed_agent_ids.is_empty() {
+        // v0.8.26 修复：克隆 Arc<Mutex> 避免生命周期逃逸
+        let registry_arc = store.agent_registry.clone();
+        let ids = installed_agent_ids.clone();
         let write_result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            {
-                let registry = store.agent_registry.lock().await;
-                let ids = installed_agent_ids.clone();
-                tokio::task::spawn_blocking(move || {
-                    registry.write_rules_for_agents(&ids)
-                })
-            }
+            tokio::task::spawn_blocking(move || {
+                let registry = registry_arc.blocking_lock();
+                registry.write_rules_for_agents(&ids)
+            })
         )
         .await;
         match write_result {
@@ -394,7 +394,7 @@ fn user_friendly_error(err: &str) -> String {
 pub struct AppStore {
     pub wizard: Mutex<WizardState>,
     pub sidecar: Mutex<SidecarManager>,
-    pub agent_registry: Mutex<AgentDetectorRegistry>,
+    pub agent_registry: Arc<Mutex<AgentDetectorRegistry>>,
     /// 速率限制器（L3 运行时保护，防止 IPC 命令滥用）
     pub rate_limiter: Mutex<RateLimiter>,
     /// sidecar 当前端口（启动后记录，供托盘等模块使用）
@@ -1552,13 +1552,15 @@ pub async fn switch_project(
                 .collect::<Vec<String>>()
         };
         if !installed_agent_ids.is_empty() {
+            // v0.8.26 修复：克隆 Arc<Mutex> 避免生命周期逃逸
+            let registry_arc = store.agent_registry.clone();
+            let ids = installed_agent_ids.clone();
             let write_result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                {
-                    let registry = store.agent_registry.lock().await;
-                    let ids = installed_agent_ids.clone();
-                    tokio::task::spawn_blocking(move || registry.write_rules_for_agents(&ids))
-                }
+                tokio::task::spawn_blocking(move || {
+                    let registry = registry_arc.blocking_lock();
+                    registry.write_rules_for_agents(&ids)
+                })
             )
             .await;
             match write_result {
