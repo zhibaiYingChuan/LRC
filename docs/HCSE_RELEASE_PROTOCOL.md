@@ -143,6 +143,8 @@ git diff origin/main...HEAD -- build.rs desktop/src-tauri/build.rs desktop/src-t
 | v0.8.23 | Windows Build Check DNS 失败 | Windows runner DNS 缓存过期，无法解析 github.com | 添加 checkout 重试机制 | 见第八节 |
 | v0.8.23 | Ubuntu Build Check exit 143 | apt-get install 无超时选项，挂起被 SIGTERM 杀死 | 添加 apt-get 超时选项 + --fix-missing | 见第八节 |
 | v0.8.24 | Windows Build Sidecar git clone 失败 | Windows runner TCP 连接重置 / fetch-pack 损坏 | 升级 checkout 重试为 3 次 + 30 秒等待 | 见第八节 |
+| v0.8.24 | Create GitHub Release 连接被拒 | release job 缺 uploads.github.com 白名单 | 添加 uploads.github.com:443 | 见第八节 |
+| v0.8.24 | Generate Build Provenance 签名失败 | provenance job 缺 Sigstore 基础设施白名单 | 添加 fulcio.sigstore.dev / rekor.sigstore.dev / token.actions.githubusercontent.com | 见第八节 |
 
 ---
 
@@ -199,3 +201,30 @@ git diff origin/main...HEAD -- build.rs desktop/src-tauri/build.rs desktop/src-t
 - 所有 `apt-get install` 命令必须添加 `-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30`
 - 必须添加 `--fix-missing` 防止单个包下载失败阻塞整个安装
 - `apt-get update` 也必须添加相同超时选项
+
+### 8.3 GitHub Release API 连接被拒
+
+**故障表现**（`softprops/action-gh-release` 步骤）：
+- `connect ECONNREFUSED <IP>:443`
+- Release 创建成功但资产上传失败
+
+**根因**：release job 的 harden-runner 白名单缺失 `uploads.github.com`，上传产物时连接被阻断。
+
+**强制规则**：
+- 所有调用 `softprops/action-gh-release` 或类似创建 Release 的 job，其 harden-runner 白名单必须包含 `uploads.github.com:443`
+- `api.github.com:443` 和 `github.com:443` 也必须同时存在
+
+### 8.4 Build Provenance 签名证书创建失败
+
+**故障表现**（`actions/attest-build-provenance` 步骤）：
+- `InternalError: error creating signing certificate`
+- Provenance 步骤失败
+
+**根因**：provenance job 的 harden-runner 白名单缺失 Sigstore 基础设施域名，无法获取 OIDC token 和创建签名证书。
+
+**强制规则**：
+- 所有调用 `actions/attest-build-provenance` 的 job，其 harden-runner 白名单必须包含：
+  - `token.actions.githubusercontent.com:443` — OIDC token
+  - `fulcio.sigstore.dev:443` — 签名证书 CA
+  - `rekor.sigstore.dev:443` — 透明日志
+  - `tuf-repo-cdn.sigstore.dev:443` — TUF 元数据（可选）

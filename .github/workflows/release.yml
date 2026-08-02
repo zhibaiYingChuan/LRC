@@ -561,9 +561,11 @@ jobs:
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: block
+          # v0.8.24 修复：添加 uploads.github.com（softprops/action-gh-release 上传产物时需要）
           allowed-endpoints: >
             github.com:443
             api.github.com:443
+            uploads.github.com:443
 
       - name: Download all build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -697,9 +699,14 @@ jobs:
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: block
+          # v0.8.24 修复：添加 Sigstore 基础设施域名（actions/attest-build-provenance 创建签名证书时需要）
           allowed-endpoints: >
             github.com:443
             api.github.com:443
+            token.actions.githubusercontent.com:443
+            fulcio.sigstore.dev:443
+            rekor.sigstore.dev:443
+            tuf-repo-cdn.sigstore.dev:443
 
       - name: Download all build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
