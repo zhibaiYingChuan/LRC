@@ -240,7 +240,7 @@ jobs:
         shell: bash
 
       - name: Install Rust toolchain
-        - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -405,7 +405,7 @@ jobs:
         shell: bash
 
       - name: Install Rust toolchain
-        - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
           targets: ${{ matrix.target }}

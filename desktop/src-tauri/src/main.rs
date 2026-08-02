@@ -85,7 +85,7 @@ fn main() {
                 .join("lrc-sidecar")
                 .with_extension(std::env::consts::EXE_EXTENSION);
             registry.set_lrc_binary_path(lrc_binary.display().to_string());
-            Mutex::new(registry)
+            Arc::new(Mutex::new(registry))
         },
         rate_limiter: Mutex::new(RateLimiter::default()),
         sidecar_port: Mutex::new(None),
