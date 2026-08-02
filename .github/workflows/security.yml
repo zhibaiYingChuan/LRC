@@ -78,7 +78,9 @@ jobs:
             objects.githubusercontent.com:443
             rustup.rs:443
             static.rust-lang.org:443
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.80
+        with:
+          toolchain: 1.80
 
       - name: Install cargo-license
         # v0.8.25 V3-07 修复：添加超时保护和重试机制，防止 cargo install 长时间挂起
