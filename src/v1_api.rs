@@ -42,6 +42,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, RwLock};
@@ -744,6 +745,10 @@ pub fn build_v1_router(
                                     .map(|s| s == "degraded")
                                     .unwrap_or(false);
                                 obj.insert("degraded".to_string(), serde_json::Value::Bool(is_degraded));
+                                // v0.8.25：新增 version 字段，从 Cargo.toml 编译期注入
+                                obj.insert("version".to_string(), serde_json::Value::String(
+                                    env!("CARGO_PKG_VERSION").to_string()
+                                ));
                             }
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(json))
                         }
@@ -1745,6 +1750,93 @@ pub fn build_v1_router(
                             "avg_lines": stats.avg_lines,
                             "type_counts": stats.type_counts,
                         }
+                    })))
+                }
+            }
+        }))
+        // v0.8.25 新增：POST /v1/model/test — 测试模型编码器连通性
+        // 发送一段测试文本到编码器，验证模型是否正常响应
+        // 区别于 /v1/encode（常规编码），此端点仅用于连通性验证
+        .route("/model/test", post({
+            let encoder = encode_encoder.clone();
+            move || {
+                let encoder = encoder.clone();
+                async move {
+                    let test_text = "这是一个模型连通性测试。";
+                    let start = std::time::Instant::now();
+
+                    // v0.8.25 R-12：添加 15s 硬超时保护，防止编码器卡死导致请求挂起
+                    // v0.8.25 GAP-17 修复：添加取消标志，超时后通知任务放弃执行
+                    // 注意：spawn_blocking 提交后，即使 JoinHandle 被 drop，
+                    // 底层的 blocking 线程仍会继续运行已启动的任务（Rust 异步运行时限制）。
+                    // 取消标志可确保：超时后任务即使尚未启动也立即返回，不浪费线程池资源。
+                    let cancel_flag = Arc::new(AtomicBool::new(false));
+                    let cancel_flag_inner = cancel_flag.clone(); // 预留给 spawn_blocking 内部使用
+
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        tokio::task::spawn_blocking(move || {
+                            if cancel_flag_inner.load(Ordering::SeqCst) {
+                                // 取消标志已设置（超时触发），返回空值表示已取消
+                                // 编码器不会被占用，线程池资源立即释放
+                                return None;
+                            }
+                            Some(encoder.encode_text(test_text))
+                        })
+                    )
+                    .await
+                    .map_err(|_| {
+                        // 超时路径：15s 内未完成编码，返回 504 Gateway Timeout
+                        // 设置取消标志，通知 spawn_blocking 任务（如果尚未启动）放弃执行
+                        cancel_flag.store(true, Ordering::SeqCst);
+                        eprintln!(
+                            "[v1/model/test] 超时（15s），编码任务已通知取消。\
+                             如果编码器当前被长时间占用，请检查模型状态或增大超时时间"
+                        );
+                        (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": "model_test_timeout",
+                                "message": "模型测试超时（15s），请确认模型已下载并应用".to_string()
+                            })),
+                        )
+                    })?
+                    .map_err(|e| {
+                        // spawn_blocking 内部 panic 处理
+                        eprintln!("[v1/model/test] spawn_blocking panic: {}", e);
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": "model_test_crashed",
+                                "message": format!("模型测试执行失败: {}", e)
+                            })),
+                        )
+                    })?;
+                    // 检查是否因取消标志导致返回 None
+                    let luoshu_vec = match result {
+                        Some(v) => v,
+                        None => {
+                            eprintln!("[v1/model/test] 编码任务已因取消标志提前终止");
+                            return Err((
+                                StatusCode::GATEWAY_TIMEOUT,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "model_test_cancelled",
+                                    "message": "模型测试任务已被取消".to_string()
+                                })),
+                            ));
+                        }
+                    };
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    Ok::<_, (StatusCode, Json<serde_json::value::Value>)>(Json(serde_json::json!({
+                        "ok": true,
+                        "message": "模型响应正常",
+                        "vector_dim": luoshu_vec.values.len(),
+                        "elapsed_ms": elapsed_ms,
+                        "center_value": luoshu_vec.center_value(),
+                        "bagua_category": crate::engine::mirror_trapezoid::mirror_project(&luoshu_vec).best_category.to_string(),
                     })))
                 }
             }

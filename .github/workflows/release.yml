@@ -99,6 +99,8 @@ jobs:
           echo "  MSRV 一致性验证通过"
 
       # 7. 版本号一致性检查（9 处版本号必须同步，v0.8.14 新增 desktop Cargo.lock 检查）
+      # v0.8.25 V3-01 修复：增加前端文件版本号检查（desktop/package.json、app.js、index.html）
+      # 之前 preflight 漏检前端版本号，导致 app.js APP_VERSION 和 index.html 中版本号滞后
       - name: Version consistency check
         run: |
           CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
@@ -111,13 +113,20 @@ jobs:
           # 盲点根因：preflight 只检查根目录 Cargo.lock，漏检 desktop 子项目 Cargo.lock
           # 导致 lrc-desktop 版本号长期滞后（0.8.11 未同步到 0.8.14）
           DESKTOP_LOCK_VER=$(grep -A1 'name = "lrc-desktop"' desktop/src-tauri/Cargo.lock | grep 'version' | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          # v0.8.25 V3-01：新增前端文件版本号检查
+          PKG_JSON_VER=$(grep '"version"' desktop/package.json | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          APP_JS_VER=$(grep "APP_VERSION" static/app.js | head -1 | sed "s/.*'\(.*\)'.*/\1/")
+          INDEX_HTML_VER=$(grep 'name="version"' static/index.html | head -1 | sed 's/.*content="\(.*\)".*/\1/')
           echo "版本号检查："
-          echo "  Cargo.toml:          $CARGO_VER"
-          echo "  desktop Cargo.toml:  $DESKTOP_VER"
-          echo "  tauri.conf.json:     $TAURI_VER"
-          echo "  Cargo.lock:          $LOCK_VER"
-          echo "  desktop Cargo.lock:  $DESKTOP_LOCK_VER"
-          if [ "$CARGO_VER" != "$DESKTOP_VER" ] || [ "$CARGO_VER" != "$TAURI_VER" ] || [ "$CARGO_VER" != "$LOCK_VER" ] || [ "$CARGO_VER" != "$DESKTOP_LOCK_VER" ]; then
+          echo "  Cargo.toml:           $CARGO_VER"
+          echo "  desktop Cargo.toml:   $DESKTOP_VER"
+          echo "  tauri.conf.json:      $TAURI_VER"
+          echo "  Cargo.lock:           $LOCK_VER"
+          echo "  desktop Cargo.lock:   $DESKTOP_LOCK_VER"
+          echo "  desktop/package.json: $PKG_JSON_VER"
+          echo "  static/app.js:        $APP_JS_VER"
+          echo "  static/index.html:    $INDEX_HTML_VER"
+          if [ "$CARGO_VER" != "$DESKTOP_VER" ] || [ "$CARGO_VER" != "$TAURI_VER" ] || [ "$CARGO_VER" != "$LOCK_VER" ] || [ "$CARGO_VER" != "$DESKTOP_LOCK_VER" ] || [ "$CARGO_VER" != "$PKG_JSON_VER" ] || [ "$CARGO_VER" != "$APP_JS_VER" ] || [ "$CARGO_VER" != "$INDEX_HTML_VER" ]; then
             echo "ERROR: 版本号不一致"
             if [ "$CARGO_VER" != "$LOCK_VER" ]; then
               echo "  提示: 根目录 Cargo.lock 版本号未同步，请本地运行 'cargo check --features server' 后提交 Cargo.lock"
@@ -125,9 +134,18 @@ jobs:
             if [ "$DESKTOP_VER" != "$DESKTOP_LOCK_VER" ]; then
               echo "  提示: desktop Cargo.lock 版本号未同步，请在 desktop/src-tauri 目录运行 'cargo check' 后提交 Cargo.lock"
             fi
+            if [ "$CARGO_VER" != "$PKG_JSON_VER" ]; then
+              echo "  提示: desktop/package.json 版本号未同步，请手动更新"
+            fi
+            if [ "$CARGO_VER" != "$APP_JS_VER" ]; then
+              echo "  提示: static/app.js APP_VERSION 未同步，请手动更新"
+            fi
+            if [ "$CARGO_VER" != "$INDEX_HTML_VER" ]; then
+              echo "  提示: static/index.html meta version 未同步，请手动更新"
+            fi
             exit 1
           fi
-          echo "  版本号一致性验证通过"
+          echo "  版本号一致性验证通过（含前端文件）"
 
   # ════════════════════════════════════════════════════════════
   # Job 1: 编译 Sidecar 二进制（裸二进制，供 CLI 用户使用）
@@ -714,6 +732,7 @@ jobs:
           path: artifacts
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v2
+        # v0.8.25 HCSE 安全合规：固定到完整 Commit SHA（v2 tag 对应 96b4a1ef7235a096b17240c259729fdd70c83d45）
+        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45
         with:
           subject-path: artifacts/**/*

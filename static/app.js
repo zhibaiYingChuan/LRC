@@ -4,8 +4,37 @@
 // 使用 IIFE 模式隔离作用域，仅暴露 HTML onclick 所需的函数到全局
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
-const APP_VERSION = '0.8.23';
+// v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
+const APP_VERSION = '0.8.25';
 window.__LRC_VERSION__ = APP_VERSION;
+
+/**
+ * v0.8.25 新增：从后端动态获取版本号
+ * 调用 /v1/health/system 端点获取 version 字段，
+ * 成功后更新全局版本号并刷新状态栏显示。
+ * 失败时静默降级，使用本地硬编码版本号。
+ */
+async function fetchBackendVersion() {
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/health/system', {}, 5000);
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data && data.version) {
+      window.__LRC_VERSION__ = data.version;
+      // 更新状态栏版本显示
+      const versionEl = document.getElementById('status-version');
+      if (versionEl) versionEl.textContent = 'v' + data.version;
+      const sysVersionEl = document.getElementById('sys-version');
+      if (sysVersionEl) sysVersionEl.textContent = 'v' + data.version;
+      // 更新 meta version
+      const metaVersion = document.querySelector('meta[name="version"]');
+      if (metaVersion) metaVersion.content = data.version;
+    }
+  } catch (e) {
+    // 静默降级：后端不可达时使用本地版本号
+    console.warn('[LRC] 获取后端版本号失败，使用本地版本号:', e.message);
+  }
+}
 
 (function() {
   'use strict';
@@ -1071,6 +1100,10 @@ async function loadDashboard() {
     // 不 await，避免阻塞 loadDashboard；loadEvolutionTimeline 内部有 try/catch
     loadEvolutionTimeline();
 
+    // v0.8.25：仪表盘加载成功后异步获取后端版本号
+    // 不 await，避免阻塞 loadDashboard；fetchBackendVersion 内部有 try/catch
+    fetchBackendVersion();
+
     // v0.8.5 Step 2 / G080 修复：恢复上次选中的预设场景
     // 之前 restoreSelectedScenario 定义但从未被调用，导致刷新后预设场景丢失
     restoreSelectedScenario();
@@ -1620,10 +1653,12 @@ function updateStatusBar(online, systemData) {
     }
   }
 
-  if (version) version.textContent = 'v' + APP_VERSION;
+  // v0.8.25：使用动态获取的版本号，fallback 到本地硬编码
+  const currentVersion = window.__LRC_VERSION__ || APP_VERSION;
+  if (version) version.textContent = 'v' + currentVersion;
   // v0.8.7 Step 3：修复 sys-version 硬编码，统一使用 APP_VERSION 动态填充
   const sysVersion = $('sys-version');
-  if (sysVersion) sysVersion.textContent = 'v' + APP_VERSION;
+  if (sysVersion) sysVersion.textContent = 'v' + currentVersion;
   if (dataDir) dataDir.textContent = '.loong-recall/data/';
   if (uptime) uptime.textContent = formatUptime(Date.now() - startTime);
 
@@ -3340,6 +3375,10 @@ async function init() {
 
   // v0.8.2：启动 Sidecar 健康监测（对应审计 G005）
   SidecarHealthMonitor.start();
+
+  // v0.8.25 修复：在页面初始化阶段立即获取后端版本号，而非仅在 loadDashboard 中调用
+  // 确保状态栏版本号尽早更新，减少硬编码版本号的显示窗口期
+  fetchBackendVersion();
 }
 
 // 页面加载完成后初始化
@@ -7754,6 +7793,48 @@ async function testEmbedderConnection() {
 }
 
 /**
+ * v0.8.25 新增：模型连通性测试
+ * 调用 /v1/model/test 端点，验证模型与 LRC 的连通性。
+ * 区别于 testEmbedderConnection（测试镜像源连通性），此函数测试模型本身是否可用。
+ * v0.8.25 修复：使用 setButtonState 统一按钮状态管理，移除手动 DOM 操作
+ */
+async function testModel() {
+  const btn = document.querySelector('[data-action="testModel"]');
+  if (!btn) return;
+
+  const originalText = btn.textContent;
+  setButtonState(btn, 'loading', originalText);
+
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/v1/model/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' }
+    }, 15000);
+
+    const data = await resp.json();
+
+    if (data.ok) {
+      showToast('✅ 模型测试通过！维度: ' + data.vector_dim + '，耗时: ' + data.elapsed_ms + 'ms', 'success', 5000);
+      setButtonState(btn, 'success', originalText);
+      btn.style.borderColor = 'var(--lrc-玉色-600)';
+    } else {
+      throw new Error(data.message || '模型测试失败');
+    }
+  } catch (e) {
+    console.error('[testModel] 模型测试失败:', e);
+    showToast('❌ 模型测试失败: ' + e.message + '。请确认模型已下载并应用', 'error', 5000);
+    setButtonState(btn, 'error', originalText);
+    btn.style.borderColor = 'var(--lrc-朱砂-500)';
+  } finally {
+    // v0.8.25 R-14：延长恢复时间到 5s，给用户充分的视觉反馈时间
+    // 成功时保留绿色边框 5s，失败时保留红色边框 5s
+    setTimeout(() => {
+      btn.style.borderColor = '';
+    }, 5000);
+  }
+}
+
+/**
  * 切换项目
  * v0.6.1 P1-3 修复: 真正调用 Tauri switch_project 命令,而非演示提示
  * 优先级链路: Tauri 环境调用 invoke → iframe 模式 postMessage → 浏览器演示
@@ -7872,6 +7953,94 @@ function startFullSetup() {
 function startQuickSetup() {
   // 快速模式直接选择文件夹
   selectProjectFolder();
+}
+
+/**
+ * v0.8.25 R-08 新增：选中 AI 工具后的回调逻辑
+ * 当用户在向导中勾选/取消勾选 AI 工具时触发，自动扫描 IDE 项目目录。
+ * 之前此功能为占位函数，未实现任何业务逻辑。
+ * @param {string} agentId - 工具 ID（如 "trae", "cursor"）
+ * @param {boolean} selected - 是否选中
+ */
+async function onAgentSelected(agentId, selected) {
+  if (!selected) return;
+
+  console.log('[onAgentSelected] 工具已选中:', agentId);
+
+  // 如果是 IDE 类工具，自动扫描项目目录
+  const ideCategories = ['ide', 'editor', 'plugin'];
+  // 简单判断：包含常见 IDE 关键词的工具视为 IDE 类
+  const ideKeywords = ['trae', 'cursor', 'code', 'windsurf', 'vscode', 'jetbrains', 'zed'];
+  const isIde = ideKeywords.some(keyword => agentId.toLowerCase().includes(keyword));
+
+  if (isIde) {
+    try {
+      // 调用后端扫描项目目录（15s 超时）
+      const projects = await postMessageToParent('lrc-scan-ide-projects', {
+        ide_ids: [agentId]
+      }, 15000);
+
+      if (projects && projects.length > 0) {
+        // 自动填充检测到的项目目录
+        const projectListEl = document.getElementById('wizard-project-list');
+        if (projectListEl) {
+          projectListEl.innerHTML = projects.map(p => `
+            <div class="project-item" data-path="${htmlescape(p.path || p)}">
+              <input type="checkbox" checked data-action="toggleProject">
+              <span class="project-name">${htmlescape(p.name || p)}</span>
+              <span class="project-path">${htmlescape(p.path || '')}</span>
+            </div>
+          `).join('');
+        }
+        showToast('已自动检测到 ' + projects.length + ' 个项目目录', 'info', 3000);
+      }
+    } catch (e) {
+      // 扫描失败不阻塞，用户可手动选择；但需要给用户友好的反馈
+      // v0.8.25 R-06 修复：超时或失败时显示 Toast 提示，避免用户无感知
+      const isTimeout = e.name === 'SidecarTimeoutError' || e.message?.includes('超时');
+      console.warn('[onAgentSelected] 自动扫描项目目录失败（可手动选择）:', e.message);
+      showToast(
+        isTimeout
+          ? '项目目录扫描超时，您可以手动选择项目目录'
+          : '自动扫描项目目录失败，您可以手动选择',
+        'warning',
+        5000
+      );
+    }
+  }
+}
+
+/**
+ * v0.8.25 R-08 新增：向导下一步逻辑
+ * 封装了步骤推进的完整逻辑：检查项目选择状态、确认跳过、保存配置。
+ * 之前此功能为占位函数，仅做简单的步骤跳转。
+ */
+async function wizardNextStep() {
+  const currentStep = document.querySelector('[id^="setup-step-"][style*="display:"]') ||
+    document.querySelector('[id^="setup-step-"]:not([style*="none"])');
+
+  if (!currentStep) return;
+
+  const stepNum = parseInt(currentStep.id.replace('setup-step-', ''), 10);
+
+  if (stepNum === 1) {
+    // 从步骤 1 到步骤 2：检查项目选择状态
+    const projectsContainer = document.getElementById('selected-projects');
+    const hasProjects = projectsContainer
+      && projectsContainer.children.length > 0
+      && !projectsContainer.querySelector('p');
+
+    if (!hasProjects) {
+      const skip = await showConfirm(
+        '您没有选择任何项目目录，确定跳过此步骤吗？\n\n您可以在后续配置中随时添加项目目录。\n不选择项目目录不影响基础功能使用。',
+        '未选择项目目录'
+      );
+      if (!skip) return;
+    }
+  }
+
+  // 前进到下一步
+  goToStep(stepNum + 1);
 }
 
 /**
@@ -8022,7 +8191,9 @@ function addSelectedProject(projectName) {
 }
 
 /**
- * 检查下一步按钮状态
+ * v0.8.25：检查下一步按钮状态 — 允许跳过项目目录选择
+ * 用户可以选择项目后进入下一步，也可以直接跳过。
+ * 跳过时会在控制台记录，不影响后续流程。
  */
 function checkNextButton() {
   const nextBtn = document.getElementById('step-1-next-btn');
@@ -8030,9 +8201,11 @@ function checkNextButton() {
   if (!nextBtn || !projectsContainer) return;
 
   const hasProjects = projectsContainer.children.length > 0 && !projectsContainer.querySelector('p');
-  nextBtn.disabled = !hasProjects;
-  nextBtn.style.opacity = hasProjects ? '1' : '0.5';
-  nextBtn.style.cursor = hasProjects ? 'pointer' : 'not-allowed';
+  // v0.8.25：不再禁用按钮，始终允许用户进入下一步
+  // 无项目时点击会弹出确认对话框
+  nextBtn.disabled = false;
+  nextBtn.style.opacity = '1';
+  nextBtn.style.cursor = 'pointer';
 }
 
 /**
@@ -8050,8 +8223,38 @@ window.removeProjectFromWizard = removeProjectFromWizard;
 
 /**
  * 跳转到指定步骤
+ * v0.8.25：从步骤 1 跳转到步骤 2 时，检查是否已选择项目
+ * 未选择项目时弹出确认对话框，允许用户跳过
  */
 function goToStep(stepNum) {
+  // v0.8.25：从步骤 1 跳转到步骤 2 时，检查项目选择状态
+  if (stepNum === 2) {
+    const projectsContainer = document.getElementById('selected-projects');
+    const hasProjects = projectsContainer
+      && projectsContainer.children.length > 0
+      && !projectsContainer.querySelector('p');
+    if (!hasProjects) {
+      // 异步确认对话框，避免阻塞
+      showConfirm(
+        '您没有选择任何项目目录，确定跳过此步骤吗？\n\n您可以在后续配置中随时添加项目目录。\n不选择项目目录不影响基础功能使用。',
+        '未选择项目目录'
+      ).then(skip => {
+        if (skip) {
+          // 用户确认跳过，继续跳转
+          doGoToStep(stepNum);
+        }
+        // 用户取消跳过，停留在当前步骤
+      });
+      return;
+    }
+  }
+  doGoToStep(stepNum);
+}
+
+/**
+ * 执行实际步骤跳转（goToStep 的内部实现）
+ */
+function doGoToStep(stepNum) {
   // 隐藏所有步骤
   for (let i = 1; i <= 3; i++) {
     const stepEl = document.getElementById('setup-step-' + i);
@@ -8087,8 +8290,34 @@ function updateSetupLlmFields() {
 
 /**
  * 完成配置
+ * v0.8.25 GAP-16 修复：在跳转到完成页面前保存 LLM 配置（如果已填写）
+ * 之前 finishSetup 仅跳转到步骤 3，不保存任何配置，导致用户在向导中配置的 LLM 设置丢失。
  */
-function finishSetup() {
+async function finishSetup() {
+  // 步骤 1：检查 LLM 是否已配置，如果是则保存
+  const provider = document.getElementById('setup-llm-provider')?.value;
+  if (provider && provider !== 'none') {
+    const apiKey = document.getElementById('setup-llm-api-key')?.value?.trim();
+    if (apiKey && apiKey.length >= 10) {
+      try {
+        // 保存 LLM 配置到后端，确保用户在向导中输入的配置不会丢失
+        const result = await postMessageToParent('lrc-save-llm-config', {
+          provider: provider,
+          api_key: apiKey
+        }, 10000);
+        if (result && result.success !== false) {
+          console.log('[finishSetup] LLM 配置已保存:', provider);
+        } else {
+          console.warn('[finishSetup] LLM 配置保存失败，继续完成向导:', result?.message || '未知错误');
+        }
+      } catch (e) {
+        // 保存失败不阻塞向导完成，用户可在设置中重新配置
+        console.warn('[finishSetup] LLM 配置保存异常，继续完成向导:', e.message);
+      }
+    }
+  }
+
+  // 步骤 2：进入完成页面
   goToStep(3);
 }
 
@@ -8115,6 +8344,9 @@ window.selectProjectFolder = selectProjectFolder;
 window.goToStep = goToStep;
 window.finishSetup = finishSetup;
 window.switchProject = switchProject;
+// v0.8.25 R-08：暴露新函数供 HTML 调用
+window.onAgentSelected = onAgentSelected;
+window.wizardNextStep = wizardNextStep;
 
 // 嵌入模型配置
 window.checkEmbedderStatus = checkEmbedderStatus;
@@ -8122,6 +8354,8 @@ window.selectEmbedderModel = selectEmbedderModel;
 window.downloadEmbedderModel = downloadEmbedderModel;
 window.applyEmbedderModel = applyEmbedderModel;
 window.testEmbedderConnection = testEmbedderConnection;
+// v0.8.25 新增：测试模型连通性
+window.testModel = testModel;
 
 // LLM 提供商配置
 window.switchProviderCategory = switchProviderCategory;
