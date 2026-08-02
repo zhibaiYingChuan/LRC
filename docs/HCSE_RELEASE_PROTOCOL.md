@@ -124,10 +124,12 @@ git diff origin/main...HEAD -- build.rs desktop/src-tauri/build.rs desktop/src-t
 
 任何 CI 故障事后分析必须回答：
 
-1. **故障模式分类**：是否属于已知失败模式？
+1. **故障模式分类**：是否属于已知失败模式？是否属于基础设施故障？
 2. **门禁覆盖**：三层门禁是否应拦截？为什么没拦截？
 3. **检查清单更新**：是否需要在本文档新增检查项？
 4. **智能体盲区**：hcse-release-compliance 调用时是否缺少相关上下文？
+5. **基础设施故障**：故障是否由 GitHub Actions runner 基础设施引起？
+   - 如果是，是否有重试/容错机制？是否需要新增重试规则？
 
 ---
 
@@ -138,3 +140,62 @@ git diff origin/main...HEAD -- build.rs desktop/src-tauri/build.rs desktop/src-t
 | v0.8.7 | macOS/Linux 无 bundle | tauri targets=["nsis"] | 改 "all" | 新增 Tauri config lint |
 | v0.8.8 | 三平台 Build Check 全挂 | cargo check(desktop) 缺 sidecar | 创建占位文件 | 新增 CI 步骤前置依赖清单 |
 | v0.8.9 | pre-commit hook exit 1 | echo Bad fd in PowerShell | exit 0 | hook 末尾强制 exit 0 |
+| v0.8.23 | Windows Build Check DNS 失败 | Windows runner DNS 缓存过期，无法解析 github.com | 添加 checkout 重试机制 | 见第八节 |
+| v0.8.23 | Ubuntu Build Check exit 143 | apt-get install 无超时选项，挂起被 SIGTERM 杀死 | 添加 apt-get 超时选项 + --fix-missing | 见第八节 |
+| v0.8.24 | Windows Build Sidecar git clone 失败 | Windows runner TCP 连接重置 / fetch-pack 损坏 | 升级 checkout 重试为 3 次 + 30 秒等待 | 见第八节 |
+
+---
+
+## 八、基础设施故障模式（v0.8.24 新增）
+
+> 本节记录由 GitHub Actions runner 基础设施引起的故障模式及应对策略。
+> 智能体调用时，必须检查这些模式是否已正确处理。
+
+### 8.1 Windows runner 网络不稳定
+
+**故障表现**（GitHub Actions Windows runner 偶发）：
+- `fetch-pack: invalid index-pack output`
+- `early EOF`
+- `RPC failed; curl 56 Recv failure: Connection was reset`
+- `Could not resolve host: github.com`
+
+**根因**：Windows runner 到 github.com 的底层 TCP 连接不稳定，DNS 解析偶发失败。
+
+**强制规则**：
+- 所有在 Windows runner 上运行的 job，其 `actions/checkout` 步骤必须添加重试机制
+- 重试机制必须满足：最多 3 次，每次等待 ≥ 30 秒
+- 失败后必须清理 `.git` 目录再重试（防止 partial checkout 干扰）
+
+**标准实现模板**：
+```yaml
+- name: Checkout
+  id: checkout
+  uses: actions/checkout@v5
+  continue-on-error: true
+- name: Checkout (retry on failure)
+  if: steps.checkout.outcome == 'failure'
+  shell: pwsh
+  run: |
+    $maxRetries = 3; $retryDelay = 30
+    for ($i = 1; $i -le $maxRetries; $i++) {
+      Start-Sleep -Seconds $retryDelay
+      Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
+      git clone "https://github.com/$env:GITHUB_REPOSITORY.git" .
+      git checkout $env:GITHUB_SHA
+      if ($LASTEXITCODE -eq 0) { return }
+    }
+    throw "Checkout 失败：已重试 $maxRetries 次"
+```
+
+### 8.2 Ubuntu apt-get 挂起
+
+**故障表现**：
+- `Process completed with exit code 143`（SIGTERM）
+- job 在 apt-get install 步骤无限期挂起后被杀死
+
+**根因**：apt-get install 默认无超时选项，下载某个包挂起时进程永不退出。
+
+**强制规则**：
+- 所有 `apt-get install` 命令必须添加 `-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30`
+- 必须添加 `--fix-missing` 防止单个包下载失败阻塞整个安装
+- `apt-get update` 也必须添加相同超时选项
