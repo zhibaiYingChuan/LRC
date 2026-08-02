@@ -153,8 +153,10 @@ jobs:
             artifact: lrc-windows-x86_64.exe
 
     steps:
-      # v0.8.24 修复：Windows runner 偶发 DNS 解析失败导致 checkout 失败，
-      #   根因：GitHub Actions Windows runner DNS 缓存过期，无法解析 github.com。
+      # v0.8.24 修复：Windows runner 网络不稳定导致 git clone 失败，
+      #   根因：GitHub Actions Windows runner 偶发 TCP 连接重置 / DNS 解析失败，
+      #   表现为 fetch-pack: invalid index-pack output / early EOF / curl 56 Recv failure。
+      #   使用 continue-on-error + PowerShell 循环重试，最多 3 次，每次等待 30 秒。
       - name: Checkout
         id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -163,15 +165,23 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         shell: pwsh
         run: |
-          Start-Sleep -Seconds 15
-          Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
-          Remove-Item -Force ".gitattributes" -ErrorAction SilentlyContinue
-          Remove-Item -Force ".gitignore" -ErrorAction SilentlyContinue
-          git clone "https://github.com/$env:GITHUB_REPOSITORY.git" .
-          git checkout $env:GITHUB_SHA
-          if ($LASTEXITCODE -ne 0) {
-            throw "Checkout retry failed"
+          $maxRetries = 3
+          $retryDelay = 30
+          for ($i = 1; $i -le $maxRetries; $i++) {
+            Write-Host "⏳ Checkout 重试 $i/$maxRetries (等待 ${retryDelay}s 后重试)..."
+            Start-Sleep -Seconds $retryDelay
+            Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
+            Remove-Item -Force ".gitattributes" -ErrorAction SilentlyContinue
+            Remove-Item -Force ".gitignore" -ErrorAction SilentlyContinue
+            git clone "https://github.com/$env:GITHUB_REPOSITORY.git" .
+            git checkout $env:GITHUB_SHA
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✓ Checkout 重试成功 (第 $i 次)"
+              return
+            }
+            Write-Host "✗ 第 $i 次重试失败"
           }
+          throw "Checkout 失败：已重试 $maxRetries 次"
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
@@ -301,8 +311,10 @@ jobs:
             artifact-prefix: lrc-desktop-linux
 
     steps:
-      # v0.8.24 修复：Windows runner 偶发 DNS 解析失败导致 checkout 失败，
-      #   根因：GitHub Actions Windows runner DNS 缓存过期，无法解析 github.com。
+      # v0.8.24 修复：Windows runner 网络不稳定导致 git clone 失败，
+      #   根因：GitHub Actions Windows runner 偶发 TCP 连接重置 / DNS 解析失败，
+      #   表现为 fetch-pack: invalid index-pack output / early EOF / curl 56 Recv failure。
+      #   使用 continue-on-error + PowerShell 循环重试，最多 3 次，每次等待 30 秒。
       - name: Checkout
         id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -311,15 +323,23 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         shell: pwsh
         run: |
-          Start-Sleep -Seconds 15
-          Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
-          Remove-Item -Force ".gitattributes" -ErrorAction SilentlyContinue
-          Remove-Item -Force ".gitignore" -ErrorAction SilentlyContinue
-          git clone "https://github.com/$env:GITHUB_REPOSITORY.git" .
-          git checkout $env:GITHUB_SHA
-          if ($LASTEXITCODE -ne 0) {
-            throw "Checkout retry failed"
+          $maxRetries = 3
+          $retryDelay = 30
+          for ($i = 1; $i -le $maxRetries; $i++) {
+            Write-Host "⏳ Checkout 重试 $i/$maxRetries (等待 ${retryDelay}s 后重试)..."
+            Start-Sleep -Seconds $retryDelay
+            Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
+            Remove-Item -Force ".gitattributes" -ErrorAction SilentlyContinue
+            Remove-Item -Force ".gitignore" -ErrorAction SilentlyContinue
+            git clone "https://github.com/$env:GITHUB_REPOSITORY.git" .
+            git checkout $env:GITHUB_SHA
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✓ Checkout 重试成功 (第 $i 次)"
+              return
+            }
+            Write-Host "✗ 第 $i 次重试失败"
           }
+          throw "Checkout 失败：已重试 $maxRetries 次"
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
