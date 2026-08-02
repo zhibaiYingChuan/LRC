@@ -2,6 +2,23 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.32] - 2026-08-03
+
+### 紧急发布：v0.8.31 发布事故修复（构建缓存时间戳bug导致新旧混合包）
+
+#### HCSE R-01：修复 release.yml 构建缓存 key 配置缺陷
+- **严重级别**: P0 Critical（影响所有用户）
+- **根因**：release.yml 中 preflight / build-sidecar / build-desktop 三个 actions/cache 的 key 仅包含 `${{ hashFiles('**/Cargo.lock') }}`，未包含 `.rs` 源码哈希与 `GITHUB_SHA`。v0.8.30 → v0.8.31 依赖版本号依赖不变时 Cargo.lock 哈希完全一致 → cache 100% 命中。结合 actions/checkout 克隆后源文件 mtime 与缓存恢复 target 文件的时间戳不确定性 → cargo 误判所有 `.rs` 变更无需重编。
+- **事故表现（已验证0.8.31安装包）**：S-05 前端「24h内有效 / 重新扫描 按钮显示正确（static/ 前端资源从磁盘重新嵌入），但 S-01 Trae CN 误报、S-02 CodeBuddy 漏检、S-03 齿轮手动修正、S-04 取消确认逻辑完全未生效——因为打包的是 0.8.30 旧 Rust 二进制 + 0.8.31 新前端的混合包。
+- **修复**：
+  1. 三处缓存 key 全部改为：`${{ runner.os }}-<job>-${{ github.sha }}-<target>-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'desktop/**/*.rs', 'static/**') }}`
+  2. restore-keys 第一级保留 SHA，确保跨 tag / 同 SHA 精确命中；跨 SHA 仅降级为 `*-${{ matrix.target }}-`（避免跨提交跳过重编）。
+  3. 同步 10 处版本号 0.8.31 → 0.8.32，强制 CI 无缓存全新构建 + 用户可验证。
+
+### 功能与 v0.8.31（PRODUCT-DOC S-01~S-05（修复完整，本次 CI 全新构建真正生效）
+- 同 0.8.31 条目下方完整 S-01 权重化、S-02 TraeCN 排除、S-03 齿轮手动修正、S-04 取消确认、S-05 扫描缓存 TTL 24h 全部真正进入安装包
+- 发布后请在 0.8.32 安装包中重新验证：Trae CN 已检测、CodeBuddy 快捷方式检测、首项目自动选择、取消确认仅看过项目→取消→空触发。
+
 ## [0.8.31] - 2026-08-02
 
 ### 修复 & 新特性：PRODUCT-DOC S-01~S-05 全面落地（AI工具检测+向导交互+缓存治理）
