@@ -2,6 +2,84 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.26] - 2026-08-02
+
+### 发布基础设施加固 + 版本号盲点消除 + 超时对齐
+
+> v0.8.25 三份审计报告（HCSE 韧性验证 91%/项目入职审计 UX B 代码功能 A-/发布规范合规有条件通过）
+> 综合产出 13 项修复建议，本次迭代优先修复 P0 阻断项和 P2 改进项。
+
+#### REL-01: status-version 硬编码盲点修复（P0）
+- **修改文件**: [static/index.html](file:///g:/code-memory/static/index.html)、[release.yml](file:///g:/code-memory/.github/workflows/release.yml)
+- **根因**: `index.html` 第 2131 行 `id="status-version"` 硬编码版本号未被 preflight 检查覆盖，发布时版本号显示可能滞后
+- **修复**: 
+  1. 将 `status-version` 硬编码值从 `v0.8.25` 更新为 `v0.8.26`
+  2. release.yml preflight 新增 `STATUS_VER` 变量（第 10 处版本号检查）
+  3. 版本号不一致时输出明确提示信息
+
+#### REL-02: cargo-license SHA 锁定（P0）
+- **修改文件**: [security.yml](file:///g:/code-memory/.github/workflows/security.yml)
+- **根因**: `cargo install cargo-license` 未锁定版本号，每次 CI 运行安装最新版，引入不可重现风险
+- **修复**: 添加 `--version 0.6.1` 参数锁定版本号
+
+#### CI-01: Rust 编译器版本固定（P0）
+- **修改文件**: [ci.yml](file:///g:/code-memory/.github/workflows/ci.yml)、[release.yml](file:///g:/code-memory/.github/workflows/release.yml)、[security.yml](file:///g:/code-memory/.github/workflows/security.yml)
+- **根因**: `dtolnay/rust-toolchain` 使用 `# stable` 而非固定版本号，影响构建可复现性
+- **修复**: 全部 9 处 `# stable` 改为 `# 1.80.0`，`with:` 块增加 `toolchain: 1.80.0`
+
+#### REG-01: onAgentSelected 超时对齐（P2）
+- **修改文件**: [static/app.js](file:///g:/code-memory/static/app.js)
+- **根因**: 前端超时 15s 与后端 `tokio::time::timeout(30s)` 不匹配，前端可能在 15s 后误报超时
+- **修复**: 前端超时从 `15000ms` 提升到 `30000ms`，与后端一致
+
+#### UX-01: 按钮恢复时间统一（P3）
+- **修改文件**: [static/app.js](file:///g:/code-memory/static/app.js)
+- **根因**: `setButtonState` 成功/失败文本恢复时间为 1.5s，而 `testModel` 边框恢复时间为 5s，视觉反馈节奏不一致
+- **修复**: 将 `setButtonState` 的 1.5s 和 `testModel` 的 5s 统一为 3s
+
+#### UX-02: tab 切换冷却信息丢失（P3）
+- **修改文件**: [static/app.js](file:///g:/code-memory/static/app.js)
+- **根因**: `_lockBusyCooldown` 和 `_lockBusyCooldownTimer` 是内存变量，用户切换 tab 后冷却期状态丢失
+- **修复**: 使用 `sessionStorage` 持久化冷却期到期时间，页面加载时恢复，到期时清理
+
+#### REL-03: frontend-test 触发条件 null 保护（P2）
+- **修改文件**: [ci.yml](file:///g:/code-memory/.github/workflows/ci.yml)
+- **根因**: HCSE 发布合规审计发现 `github.event.head_commit` 在 push 事件中可能为 null，`contains()` 表达式会报错
+- **修复**: 添加 null 保护：`(github.event.head_commit != null && contains(...))`
+
+#### REL-04: Playwright 浏览器下载备用域名（P3）
+- **修改文件**: [ci.yml](file:///g:/code-memory/.github/workflows/ci.yml)
+- **根因**: harden-runner 白名单仅包含 `playwright.azureedge.net`，Playwright 可能 fallback 到 `cdn.playwright.dev`
+- **修复**: 添加 `cdn.playwright.dev:443` 到 harden-runner allowed-endpoints
+
+#### CI-02: 前端仪表盘冒烟测试（P2 推荐）
+- **修改文件**: [ci.yml](file:///g:/code-memory/.github/workflows/ci.yml)、[tests/frontend/dashboard-smoke.spec.js](file:///g:/code-memory/tests/frontend/dashboard-smoke.spec.js)
+- **新增**: 基于 Playwright 的仪表盘 E2E 冒烟测试，覆盖 4 个测试用例（页面加载/标签页切换/版本号格式/控制台错误）
+- **CI**: 新增 `frontend-test` job，仅在 `static/` 目录变更时触发
+
+#### DOC-01: 磁盘空间不足友好提示（P3）
+- **修改文件**: [static/app.js](file:///g:/code-memory/static/app.js)
+- **根因**: 后端返回磁盘空间不足错误时，前端无针对性的友好提示
+- **修复**: `handleHttpError` 中检测磁盘空间相关关键词（disk/space/ENOSPC/存储空间等），显示友好提示并阻止进一步重试
+
+#### DOC-02: LRC_NETWORK_REQUESTS 环境变量文档（P3）
+- **修改文件**: [docs/USER_GUIDE.md](file:///g:/code-memory/docs/USER_GUIDE.md)
+- **新增**: 在 USER_GUIDE.md 中增加环境变量参考表格，包含 `LRC_LUOSHU_MODEL_ID` 和 `LRC_NETWORK_REQUESTS`
+
+#### DOC-03: 版本号硬编码盲点管理文档（P3）
+- **修改文件**: [docs/PUSH_STANDARD.md](file:///g:/code-memory/docs/PUSH_STANDARD.md)
+- **新增**: 版本号同步要求从 7 处扩展到 10 处，增加版本号硬编码盲点管理小节，更新当前版本号
+
+#### 文档同步
+- **PRE_PUSH_CHECKLIST.md**: 版本号检查从 9 处扩展到 10 处
+- **v0.8.26_optimization_plan.md**: 新增综合优化推进方案文档
+
+---
+
+## [0.8.25] - 2026-08-02
+
+### AI 工具检测修复 + 版本号动态获取 + 模型测试按钮 + 索引文件夹自动配置（四角色协作闭环）
+
 ---
 
 ## [0.8.24] - 2026-08-02
@@ -36,7 +114,7 @@
 
 ---
 
-## [0.8.25] - 2026-08-02
+## [0.8.23] - 2026-08-02
 
 ### AI 工具检测修复 + 版本号动态获取 + 模型测试按钮 + 索引文件夹自动配置（四角色协作闭环）
 
@@ -136,6 +214,43 @@
 |----|------|---------|------|---------|
 | V3-01 | release.yml preflight 未覆盖前端版本号检查 | P2 | [release.yml](file:///g:/code-memory/.github/workflows/release.yml) | preflight 版本号检查新增 3 个前端文件：desktop/package.json、app.js APP_VERSION、index.html meta version |
 | V3-02 | PRE_PUSH_CHECKLIST.md 版本号检查点描述可优化 | P2 | [docs/PRE_PUSH_CHECKLIST.md](file:///g:/code-memory/docs/PRE_PUSH_CHECKLIST.md) | 优化 index.html 版本号检查命令，明确 3 处版本号位置（meta + sys-version + status-version）
+
+#### v0.8.25 五次修复（工程文化教练系统性推进 + 文档同步）
+
+> 基于优化推进方案 v3.0 的 P3 改进项，补充修复 5 项交互和 CI 改进：
+> 1. V3-04: 船长日志生成成功后显示 success Toast 反馈
+> 2. V3-05: backupMemories 备份时部分数据不可用时显示具体失败项
+> 3. V3-06: 全局错误处理器添加错误计数器，用于监控和调试
+> 4. V3-07: security.yml 中 cargo-license 安装添加 120 秒超时保护
+> 5. V3-08: release.yml 添加 SLSA 级别标注注释
+
+| ID | 问题 | 严重级别 | 文件 | 修复内容 |
+|----|------|---------|------|---------|
+| V3-04 | 船长日志无 success 反馈 | P3 | [static/app.js](file:///g:/code-memory/static/app.js) | API 成功路径和回退路径均添加 success Toast 反馈 |
+| V3-05 | backupMemories 部分失败不提示 | P3 | [static/app.js](file:///g:/code-memory/static/app.js) | 检查 Promise.allSettled 结果，显示具体失败项（记忆列表/代码片段/归档数据/项目信息） |
+| V3-06 | 全局错误无计数 | P3 | [static/app.js](file:///g:/code-memory/static/app.js) | 添加 `window._lrcGlobalErrorCount` 计数器，错误日志附带序号 |
+| V3-07 | security.yml cargo-license 安装无超时保护 | P3 | [.github/workflows/security.yml](file:///g:/code-memory/.github/workflows/security.yml) | 添加 `timeout 120` 超时保护，防止网络问题导致 CI 挂起 |
+| V3-08 | release.yml 缺少 SLSA 级别标注 | P3 | [.github/workflows/release.yml](file:///g:/code-memory/.github/workflows/release.yml) | 在 Create Release 步骤添加 SLSA Level 2+ 注释说明 |
+
+#### v0.8.25 六次修复（优化推进方案 v4.0 P2/P3 系统性修复）
+
+> 基于优化推进方案 v4.0 的全面审计结果，系统性修复 13 项 P2/P3 缺陷，
+> 覆盖交互韧性、用户体验、代码功能、发布规范 4 个维度。
+> 修复过程严格遵循工程文化教练框架，分步实施，禁止批量修改。
+
+| ID | 问题 | 严重级别 | 文件 | 修复内容 |
+|----|------|---------|------|---------|
+| UX-01 | "测试链接"按钮文字歧义 | P2 | [static/index.html](file:///g:/code-memory/static/index.html) | 将"测试链接"改为"测试镜像源"，与"测试模型"和"测试连接"形成清晰区分 |
+| NEW-04 | contains_whole_word 边界检查跳过 | P2 | [agent_detector.rs](file:///g:/code-memory/desktop/src-tauri/src/agent_detector.rs) | 数据末尾本身就是有效的单词边界，无需额外检查 |
+| NEW-01 | _lockBusyCooldown 标签页切换时未重置 | P3 | [static/app.js](file:///g:/code-memory/static/app.js) | 标签页切换时同时重置冷却期标志和重试计数器 |
+| NEW-03 | _retryModalActive 退避延迟标签页竞态 | P3 | [static/app.js](file:///g:/code-memory/static/app.js) | 退避延迟开始时记录当前标签页，结束后验证一致性 |
+| UX-02/CODE-03 | testEmbedderConnection 未使用 setButtonState | P3 | [static/app.js](file:///g:/code-memory/static/app.js) | 统一使用 setButtonState 管理按钮状态，移除手动 DOM 操作 |
+| UX-03 | 版本号硬编码窗口期 | P3 | [static/index.html](file:///g:/code-memory/static/index.html) | 初始状态显示 "--" 等待后端返回，动态获取后更新 |
+| UX-04 | 船长日志 catch 太静默 | P3 | [static/app.js](file:///g:/code-memory/static/app.js) | 添加 console.warn 日志，避免静默失败 |
+| UX-05 | backupMemories 部分失败缺少 Toast | P3 | [static/app.js](file:///g:/code-memory/static/app.js) | 部分失败时同时显示 Toast 通知，确保用户感知 |
+| CODE-04 | 超时保护未覆盖所有 IO 操作 | P3 | [commands.rs](file:///g:/code-memory/desktop/src-tauri/src/commands.rs) | 为 auto_upgrade_configs 和 write_rules_for_agents 添加 10s 超时 + spawn_blocking |
+| REL-03 | CHANGELOG 版本号未纳入 preflight 检查 | P3 | [release.yml](file:///g:/code-memory/.github/workflows/release.yml) | preflight 版本号检查增加 CHANGELOG.md 检查（10 处版本号） |
+| UX-06 | 向导在浏览器中无法完整使用 | P3 | [static/app.js](file:///g:/code-memory/static/app.js) | 浏览器环境检测 + Toast 提示，自动跳过仅桌面端支持的功能 |
 
 ---
 
