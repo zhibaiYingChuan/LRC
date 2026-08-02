@@ -250,6 +250,66 @@ jobs:
             exit 1
           fi
 
+      - name: Smoke test - /v1/model/test (POST)
+        # v0.8.25 新增：验证模型测试端点连通性
+        # 注意：CI 环境无 ML 模型，预期返回 ok=false + 明确错误信息，而非断言 ok=true
+        # 测试目标是验证端点响应结构正确（HTTP 200 + 含必要字段）
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST http://127.0.0.1:3099/v1/model/test \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          echo "POST /v1/model/test → HTTP $RESPONSE"
+          if [ "$RESPONSE" != "200" ]; then
+            echo "FAIL: 期望 200，实际 $RESPONSE"
+            cat sidecar.log
+            exit 1
+          fi
+          # 验证响应结构：ok 可为 true/false，但必须包含 error 或 vector_dim 字段
+          BODY=$(curl -s -X POST http://127.0.0.1:3099/v1/model/test -H "Content-Type: application/json" -d '{}')
+          echo "响应体: $(echo $BODY | head -c 200)"
+          if ! echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'ok' in d, '缺少 ok 字段'; assert 'error' in d or 'vector_dim' in d, '缺少 error 或 vector_dim'; assert 'elapsed_ms' in d, '缺少 elapsed_ms'" 2>/dev/null; then
+            echo "FAIL: /v1/model/test 响应结构不符合规范"
+            echo "响应内容: $BODY"
+            cat sidecar.log
+            exit 1
+          fi
+          echo "  ✓ /v1/model/test 响应结构验证通过（CI 无模型，预期 ok=false）"
+
+      - name: Smoke test - /v1/version/check (GET)
+        # v0.8.25 新增：验证版本检查端点连通性
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3099/v1/version/check)
+          echo "GET /v1/version/check → HTTP $RESPONSE"
+          if [ "$RESPONSE" != "200" ]; then
+            echo "FAIL: 期望 200，实际 $RESPONSE"
+            cat sidecar.log
+            exit 1
+          fi
+          # 验证响应包含 current_version 字段
+          BODY=$(curl -s http://127.0.0.1:3099/v1/version/check)
+          echo "响应体: $(echo $BODY | head -c 200)"
+          if ! echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'current_version' in d, '缺少 current_version'; assert 'latest_version' in d, '缺少 latest_version'; assert 'update_available' in d, '缺少 update_available'" 2>/dev/null; then
+            echo "FAIL: /v1/version/check 响应结构不符合规范"
+            echo "响应内容: $BODY"
+            cat sidecar.log
+            exit 1
+          fi
+          echo "  ✓ /v1/version/check 响应结构验证通过"
+
+      - name: Smoke test - /v1/health/system version field
+        # v0.8.25 新增：验证系统健康端点返回 version 字段
+        run: |
+          BODY=$(curl -s http://127.0.0.1:3099/v1/health/system)
+          echo "响应体: $(echo $BODY | head -c 300)"
+          if ! echo "$BODY" | python3 -c "import sys,json; d=json.load(sys.stdin); assert 'version' in d, '缺少 version 字段'; assert isinstance(d['version'], str), 'version 必须是字符串'" 2>/dev/null; then
+            echo "FAIL: /v1/health/system 缺少 version 字段或类型错误"
+            echo "响应内容: $BODY"
+            cat sidecar.log
+            exit 1
+          fi
+          echo "  ✓ /v1/health/system version 字段验证通过"
+
       - name: Dump sidecar log on failure
         if: failure()
         run: |

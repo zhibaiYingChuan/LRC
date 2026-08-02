@@ -272,3 +272,21 @@ docs/cdp_regression_*.js
 # P1: 备份文件（不应入库）
 *.bak
 static/index.html.bak
+
+# v0.8.25 发布合规 P0 阻断：旧版本构建产物（不应入库）
+target_v0.8.20/
+
+# v0.8.25 发布合规 P0 阻断：图标备份目录（不应入库）
+desktop/src-tauri/icons_backup_*/
+
+# v0.8.25 发布合规 P0 阻断：历史测试运行时产物（截图、JSON 结果，非交付内容）
+evidence/
+hcse_resilience_tester/
+
+# v0.8.25 发布合规 V3：本地测试日志和 CI 产物（非交付内容）
+e2e_logs.txt
+e2e_raw.txt
+get_jobs.jq
+jobs.json
+ubuntu_desktop_logs.txt
+temp/sidecar_pid.txt

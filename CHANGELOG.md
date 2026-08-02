@@ -4,6 +4,141 @@
 
 ---
 
+## [0.8.24] - 2026-08-02
+
+### CI/CD 基础设施修复 + 环境容错加固
+
+> v0.8.23 发布后 CI 出现 3 类故障：Windows runner DNS 解析失败、Ubuntu apt-get 被 harden-runner 阻断导致 SIGTERM、
+> Build Check 和 Preflight Check 因镜像不可用退出码非零。本版本针对性修复所有 CI 基础设施故障。
+
+#### CI-01: Windows runner DNS 容错（RPN 800）
+- **修改文件**：[release.yml](file:///g:/code-memory/.github/workflows/release.yml)
+- **根因**：GitHub Actions Windows runner 偶发 DNS 解析失败（`git clone` 时报 `fetch-pack: invalid index-pack output` / `early EOF`）
+- **修复**：
+  1. `actions/checkout@v5` 添加 `retry-count: 3` 和 `retry-wait: 30` 参数
+  2. `git clone` 失败时 PowerShell 自动重试（等待 15 秒后重试，最多 3 次）
+
+#### CI-02: Ubuntu apt-get 超时容错（RPN 750）
+- **修改文件**：[.github/workflows/ci.yml](file:///g:/code-memory/.github/workflows/ci.yml)、[release.yml](file:///g:/code-memory/.github/workflows/release.yml)
+- **根因**：Ubuntu runner 偶发 apt-get 镜像超时，6 分钟无响应后被 SIGTERM（exit code 143）杀死
+- **修复**：
+  1. apt-get install 添加 `-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30`
+  2. 添加 `--fix-missing` 参数
+  3. harden-runner 白名单添加 `uploads.github.com` 和 Sigstore 域名
+
+#### CI-03: Build Check 镜像访问修复（RPN 700）
+- **修改文件**：[.github/workflows/ci.yml](file:///g:/code-memory/.github/workflows/ci.yml)
+- **根因**：harden-runner 阻断 Ubuntu 镜像源导致 apt-get 挂起 14 分钟
+- **修复**：自定义 sources.list 配置国内镜像源，添加超时参数
+
+#### 版本号一致性修复
+- 所有 9 处版本号检查点更新至 v0.8.24（Cargo.toml、Cargo.lock、desktop Cargo.toml、tauri.conf.json、package.json、app.js、index.html、CHANGELOG）
+
+---
+
+## [0.8.25] - 2026-08-02
+
+### AI 工具检测修复 + 版本号动态获取 + 模型测试按钮 + 索引文件夹自动配置（四角色协作闭环）
+
+> v0.8.24 桌面端用户反馈 4 个问题：Trae CN 误检测为 Trae、CodeBuddy 未检测到、版本号硬编码显示不准确、
+> 模型下载后无可用性验证按钮、索引文件夹需强制手动配置。经资深产品经理评估后按 P0/P1 优先级分阶段修复。
+
+#### P0-01: AI 工具检测逻辑修复 — Trae CN 误检测 + CodeBuddy 漏检（RPN 1000）
+- **修改文件**：[desktop/src-tauri/src/agent_detector.rs](file:///g:/code-memory/desktop/src-tauri/src/agent_detector.rs)
+- **根因**：
+  1. Trae CN 快捷方式内容中包含 "Trae" 子串，`search_exe_in_lnk` 使用子串匹配导致误判
+  2. CodeBuddy 的 `binary_paths` 为空数组，仅依赖 `exe_names` 全盘扫描，但扫描可能在时间窗口内未命中
+- **修复**：
+  1. 新增 `contains_whole_word` 全词匹配函数，确保 "Trae CN" 不被误识别为 "Trae"
+  2. TraeDetector 检测时显式排除 Trae CN 快捷方式
+  3. CodeBuddy 新增 6 条常见安装路径到 `binary_paths`
+  4. 新增桌面快捷方式扫描（`%USERPROFILE%/Desktop/*.lnk` + `%PUBLIC%/Desktop/*.lnk`）
+  5. 新增开始菜单扫描（`%APPDATA%/Microsoft/Windows/Start Menu/Programs/*.lnk`）
+  6. 检测优先级：桌面快捷方式 > 开始菜单 > binary_paths > exe_names 全盘扫描
+
+#### P0-02: 索引文件夹自动配置 — wizard 选中工具后自动填充项目目录（RPN 900）
+- **修改文件**：[static/app.js](file:///g:/code-memory/static/app.js)、[static/index.html](file:///g:/code-memory/static/index.html)
+- **根因**：wizard 选中 AI 工具后，前端未自动调用 `scan_ide_projects`，用户需手动配置项目目录才能进入下一步
+- **修复**：
+  1. 选中 IDE 类工具后自动调用 `scan_ide_projects` 填充项目列表
+  2. 允许用户跳过手动选择直接点击"下一步"（弹出确认对话框）
+  3. 非 IDE 工具不触发项目扫描
+
+#### P1-01: 版本号动态获取 — 消除前端硬编码（RPN 600）
+- **修改文件**：[src/v1_api.rs](file:///g:/code-memory/src/v1_api.rs)、[static/app.js](file:///g:/code-memory/static/app.js)、[static/index.html](file:///g:/code-memory/static/index.html)
+- **根因**：前端 `APP_VERSION` 硬编码为 `'0.8.24'`，后端版本号更新后前端显示不一致
+- **修复**：
+  1. `/v1/health/system` 响应新增 `version` 字段（从 `env!("CARGO_PKG_VERSION")` 编译期注入）
+  2. 前端新增 `fetchBackendVersion()` 异步获取后端版本号
+  3. 获取成功后更新状态栏、系统信息面板、meta 标签
+  4. 后端不可达时静默降级，使用本地硬编码版本号作为 fallback
+
+#### P1-02: 模型测试按钮 — 新增模型连通性验证（RPN 500）
+- **修改文件**：[src/v1_api.rs](file:///g:/code-memory/src/v1_api.rs)、[static/app.js](file:///g:/code-memory/static/app.js)、[static/index.html](file:///g:/code-memory/static/index.html)
+- **根因**：仅有"测试连接"按钮（验证 API 端点可达性），缺少"测试模型"按钮（验证模型与 LRC 的连通性）
+- **修复**：
+  1. 后端新增 `POST /v1/model/test` 端点，发送测试文本到编码器验证连通性
+  2. 前端新增"测试模型"按钮，调用 `/v1/model/test` 并显示结果
+  3. 按钮状态变化：loading → success（显示向量维度 + 耗时 + 八卦分类）/ error（显示错误信息）
+
+#### 文档更新
+- [CHANGELOG.md](file:///g:/code-memory/CHANGELOG.md)：新增 v0.8.24/v0.8.25 条目
+- [docs/ARCHITECTURE.md](file:///g:/code-memory/docs/ARCHITECTURE.md)：新增 `/v1/model/test` 端点文档
+- [docs/v0.8.25_optimization_plan.md](file:///g:/code-memory/docs/v0.8.25_optimization_plan.md)：状态更新为"已实施"
+
+#### v0.8.25 二次修复（优化推进方案 v2.0 实施）
+
+> 基于四份审计报告（HCSE 韧性验证 + 项目入职审计 + 发布规范合规 + 产品稳定性）的 42 项发现，
+> 按 RICE 优先级排序后分阶段修复。本阶段修复 P0/P1 剩余项。
+
+| ID | 问题 | 严重级别 | RICE 分 | 文件 |
+|----|------|---------|---------|------|
+| R-02 | `/v1/model/test` 返回硬编码 `vector_dim: 9`，改为 `result.values.len()` | P0 | 100.0 | [src/v1_api.rs](file:///g:/code-memory/src/v1_api.rs) |
+| R-12 | 模型测试后端添加 15s 硬超时保护，超时返回 504 Gateway Timeout | P1 | 36.0 | [src/v1_api.rs](file:///g:/code-memory/src/v1_api.rs) |
+| R-13 | 开始菜单扫描权限不足时添加 `tracing::warn!` 日志 | P2 | 30.0 | [agent_detector.rs](file:///g:/code-memory/desktop/src-tauri/src/agent_detector.rs) |
+| R-14 | `testModel` 按钮恢复时间从 3s 延长到 5s | P2 | 24.0 | [app.js](file:///g:/code-memory/static/app.js) |
+| R-01 | 版本号统一升级到 v0.8.25（9 处检查点） | P0 | 62.5 | 多文件 |
+| R-03 | `actions/attest-build-provenance@v2` 锁定 Commit SHA | P0 | 75.0 | [release.yml](file:///g:/code-memory/.github/workflows/release.yml) |
+| B-01 | `target_v0.8.20/` 构建产物目录入库 | P0 | — | [.gitignore](file:///g:/code-memory/.gitignore) |
+| B-02 | `icons_backup_*` 备份目录入库 | P0 | — | [.gitignore](file:///g:/code-memory/.gitignore) |
+| B-03 | `@tauri-apps/cli` 使用语义版本 `^2` 而非固定版本 | P0 | — | [package.json](file:///g:/code-memory/desktop/package.json) |
+| B-04 | `evidence/` 和 `hcse_resilience_tester/` 测试产物入库 | P0 | — | [.gitignore](file:///g:/code-memory/.gitignore) |
+
+#### v0.8.25 三次修复（工程文化教练系统性推进）
+
+> 基于工程文化教练框架的系统性修复，完成四角色协作闭环的剩余项。
+> 修复 P0/P1 共 5 项：GAP-17（spawn_blocking 线程泄漏）、GAP-16（finishSetup 配置保存）、
+> R-08（onAgentSelected/wizardNextStep 实现）、R-02 后续加固、R-06（wizard 超时友好提示）。
+
+| ID | 问题 | 严重级别 | 文件 | 修复内容 |
+|----|------|---------|------|---------|
+| GAP-17 | `/v1/model/test` spawn_blocking 超时后线程泄漏 | P0 | [src/v1_api.rs](file:///g:/code-memory/src/v1_api.rs) | 添加 `Arc<AtomicBool>` 取消标志机制，超时后通知任务放弃执行 |
+| GAP-16 | `finishSetup` 不保存配置，仅跳转步骤 | P1 | [static/app.js](file:///g:/code-memory/static/app.js) | `finishSetup` 现在先保存 LLM 配置，再跳转到完成页面 |
+| R-08 | `onAgentSelected`/`wizardNextStep` 占位函数未实现 | P1 | [static/app.js](file:///g:/code-memory/static/app.js) | 实现工具选中后自动扫描项目目录 + 向导步骤推进逻辑 |
+| R-06 | `onAgentSelected` 超时无用户反馈 | P1 | [static/app.js](file:///g:/code-memory/static/app.js) | 超时/失败时显示 `showToast` 友好提示，区分超时与一般错误 |
+
+#### CI 修复（发布合规审计发现）
+
+> 发布合规审计发现 `/v1/model/test` CI 测试断言 `ok == True`，但 CI 环境无 ML 模型文件，
+> 端点返回 `ok: false`，导致 CI 必然失败。已修复为验证响应结构而非断言 ok 值。
+
+- **修改文件**：[ci.yml](file:///g:/code-memory/.github/workflows/ci.yml)
+- **修复**：将断言从 `assert d.get('ok') == True` 改为 `assert 'ok' in d; assert 'error' in d or 'vector_dim' in d`
+- **验证**：CI 无模型时预期返回 `ok: false` 和明确的错误信息，HTTP 200 响应正常
+
+#### v0.8.25 四次修复（工程文化教练+发布合规审计补充）
+
+> 基于发布合规审计报告的 P2 建议，补充修复：
+> 1. V3-01: release.yml preflight 增加前端版本号检查（覆盖 desktop/package.json、app.js、index.html 共 3 处新增检查点）
+> 2. V3-02: PRE_PUSH_CHECKLIST.md 版本号检查点优化（明确 index.html 中 3 处版本号检查命令）
+
+| ID | 问题 | 严重级别 | 文件 | 修复内容 |
+|----|------|---------|------|---------|
+| V3-01 | release.yml preflight 未覆盖前端版本号检查 | P2 | [release.yml](file:///g:/code-memory/.github/workflows/release.yml) | preflight 版本号检查新增 3 个前端文件：desktop/package.json、app.js APP_VERSION、index.html meta version |
+| V3-02 | PRE_PUSH_CHECKLIST.md 版本号检查点描述可优化 | P2 | [docs/PRE_PUSH_CHECKLIST.md](file:///g:/code-memory/docs/PRE_PUSH_CHECKLIST.md) | 优化 index.html 版本号检查命令，明确 3 处版本号位置（meta + sys-version + status-version）
+
+---
+
 ## [0.8.23] - 2026-08-02
 
 ### 安全加固 + 交互韧性提升 + 工具检测扩展（发布前合规审计）

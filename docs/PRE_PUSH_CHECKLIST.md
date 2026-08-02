@@ -26,9 +26,9 @@
 | 4 | `Cargo.lock` | 与 #1 一致 | `grep -A1 'name = "code-memory"' Cargo.lock` |
 | 5 | `desktop/src-tauri/Cargo.lock` | 与 #1 一致 | `grep -A1 'name = "lrc-desktop"' desktop/src-tauri/Cargo.lock` |
 | 6 | `desktop/package.json` | 与 #1 一致 | `grep '"version"' desktop/package.json` |
-| 7 | `static/app.js` (APP_VERSION) | 与 #1 一致 | `grep 'APP_VERSION' static/app.js` |
-| 8 | `static/index.html` (meta) | 与 #1 一致 | `grep 'version' static/index.html` |
-| 9 | `CHANGELOG.md` | 新增版本条目 | 确认 CHANGELOG 已更新 |
+| 7 | `static/app.js` (APP_VERSION) | 与 #1 一致（v0.8.25+ 为 fallback，动态版本从后端获取） | `grep "APP_VERSION" static/app.js \| head -1` — 注意匹配 `const APP_VERSION = '0.8.25'` 中的值 |
+| 8 | `static/index.html` (meta + 状态栏 + 系统信息) | 与 #1 一致（共 3 处：meta name="version"、#sys-version、#status-version） | `grep 'name="version"' static/index.html` 检查 meta；`grep 'id="sys-version"' static/index.html` 检查系统信息；`grep 'id="status-version"' static/index.html` 检查状态栏 |
+| 9 | `CHANGELOG.md` | 新增版本条目 | 确认 CHANGELOG 已更新，且条目格式与现有条目一致 |
 
 **同步命令**（版本号不一致时执行）：
 ```bash

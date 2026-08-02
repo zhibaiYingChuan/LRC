@@ -271,7 +271,17 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         secondary_markers: &[],
         mcp_config_template: Some(".codebuddy/mcp.json"),
         mcp_transport: "stdio",
-        binary_paths: &[],
+        // v0.8.25 修复：添加常见的 CodeBuddy 安装路径
+        // 根因：binary_paths 为空导致只能通过 exe_names 扫描检测，但扫描可能遗漏
+        // 修复：覆盖常见安装路径，提高检测率
+        binary_paths: &[
+            "%LOCALAPPDATA%/Programs/CodeBuddy/CodeBuddy.exe",
+            "%LOCALAPPDATA%/Programs/CodeBuddy/CodeBuddy CN.exe",
+            "%PROGRAMFILES%/CodeBuddy/CodeBuddy.exe",
+            "%PROGRAMFILES%/CodeBuddy/CodeBuddy CN.exe",
+            "%LOCALAPPDATA%/Programs/codebuddy/CodeBuddy.exe",
+            "%USERPROFILE%/.codebuddy/CodeBuddy.exe",
+        ],
         exe_names: &["CodeBuddy.exe", "CodeBuddy CN.exe"],
     },
     KnownTool {
@@ -1392,88 +1402,9 @@ fn collect_install_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// 检查标记路径是否存在（保留供未来扩展使用）
-#[allow(dead_code)]
-fn marker_exists(marker: &str) -> bool {
-    resolve_marker(marker).is_some_and(|p| p.exists())
-}
-
-/// v0.5.12 新增：扫描桌面和开始菜单快捷方式，定位 AI 工具 exe
-///
-/// 用户建议：普通人安装程序后，桌面或开始菜单会有快捷方式（.lnk 文件）。
-/// 通过解析快捷方式指向的目标路径，可以快速定位 AI 工具的实际安装位置，
-/// 无论用户将工具安装在哪个磁盘或目录。
-///
-/// 扫描位置：
-///   - 用户桌面（%USERPROFILE%\Desktop）
-///   - 公共桌面（%PUBLIC%\Desktop）
-///   - 用户开始菜单（%APPDATA%\Microsoft\Windows\Start Menu\Programs）
-///   - 系统开始菜单（%ProgramData%\Microsoft\Windows\Start Menu\Programs）
-///
-/// 匹配方式：
-///   - 读取 .lnk 文件的二进制内容
-///   - 搜索 exe_names 中的文件名是否出现在 .lnk 文件中（UTF-16LE 和 ASCII 编码）
-///   - .lnk 文件中目标路径通常以 UTF-16LE 编码存储
-#[allow(dead_code)]
-fn scan_shortcuts(exe_names: &[&str]) -> bool {
-    if exe_names.is_empty() {
-        return false;
-    }
-
-    let shortcut_dirs = collect_shortcut_dirs();
-    if shortcut_dirs.is_empty() {
-        return false;
-    }
-
-    // 将 exe_names 转为小写，用于不区分大小写匹配
-    let targets: Vec<String> = exe_names.iter().map(|n| n.to_lowercase()).collect();
-
-    for dir in &shortcut_dirs {
-        if !dir.exists() {
-            continue;
-        }
-
-        // 递归扫描快捷方式目录（最大深度 3 层）
-        for entry in walkdir::WalkDir::new(dir)
-            .max_depth(3)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-
-            // 只处理 .lnk 文件
-            let is_lnk = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("lnk"))
-                .unwrap_or(false);
-            if !is_lnk {
-                continue;
-            }
-
-            // 读取 .lnk 文件内容
-            let content = match std::fs::read(path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            // 搜索 exe_names 是否出现在 .lnk 文件中
-            if search_exe_in_lnk(&content, &targets) {
-                tracing::debug!(
-                    "[Agent检测] 通过快捷方式定位到 AI 工具: {} -> {}",
-                    path.display(),
-                    exe_names.join("/")
-                );
-                return true;
-            }
-        }
-    }
-
-    false
-}
+/// v0.8.25 移除：scan_shortcuts 和 marker_exists 死代码
+/// 快捷方式扫描已通过 get_scan_cache() + collect_all_lnk_contents() 统一实现，
+/// 无需单独的函数。检测逻辑在 check_known_tool() 策略 3 中使用。
 
 /// 收集快捷方式扫描目录（桌面 + 开始菜单）
 fn collect_shortcut_dirs() -> Vec<PathBuf> {
@@ -1525,23 +1456,107 @@ fn collect_shortcut_dirs() -> Vec<PathBuf> {
 ///
 /// .lnk 文件中目标路径通常以 UTF-16LE 编码存储，
 /// 同时也检查 ASCII 编码以兼容不同格式。
+///
+/// v0.8.25 修复：改用完整单词匹配（whole word match）而非子串匹配
+///   根因：子串匹配会导致误报（如 "Trae CN.exe" 中包含 "Trae" 子串）
+///   修复：使用 contains_whole_word 确保匹配的是完整文件名
 fn search_exe_in_lnk(content: &[u8], targets: &[String]) -> bool {
     for target in targets {
-        // 检查 ASCII 编码
-        let ascii_bytes = target.as_bytes();
-        if contains_subsequence(content, ascii_bytes) {
+        let target_lower = target.to_lowercase();
+
+        // 检查 ASCII 编码（完整单词匹配）
+        let ascii_bytes = target_lower.as_bytes();
+        if contains_whole_word(content, ascii_bytes) {
             return true;
         }
 
-        // 检查 UTF-16LE 编码
-        let utf16_bytes: Vec<u8> = target
+        // 检查 UTF-16LE 编码（完整单词匹配）
+        let utf16_bytes: Vec<u8> = target_lower
             .encode_utf16()
             .flat_map(|c| c.to_le_bytes())
             .collect();
-        if contains_subsequence(content, &utf16_bytes) {
+        if contains_whole_word(content, &utf16_bytes) {
             return true;
         }
     }
+    false
+}
+
+/// v0.8.25 新增：完整单词匹配（字节级）
+///
+/// 确保 needle 在 haystack 中作为完整单词出现，而非子串。
+/// 单词边界定义为：前一个字符不是字母/数字，后一个字符不是字母/数字。
+fn contains_whole_word(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+
+    for i in 0..=haystack.len() - needle.len() {
+        if haystack[i..i + needle.len()].eq_ignore_ascii_case(needle) {
+            // 检查前一个字符是否是单词边界
+            if i > 0 {
+                let prev = haystack[i - 1];
+                if prev.is_ascii_alphanumeric() || prev == b'_' {
+                    continue; // 前一个字符是单词字符，跳过
+                }
+            }
+            // 检查后一个字符是否是单词边界
+            let end = i + needle.len();
+            if end < haystack.len() {
+                let next = haystack[end];
+                if next.is_ascii_alphanumeric() || next == b'_' {
+                    continue; // 后一个字符是单词字符，跳过
+                }
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// v0.8.25 新增：检查 .lnk 内容中是否包含 "Trae CN" 或 "trae cn" 路径
+///
+/// 用于 TraeDetector 排除 Trae CN 的快捷方式，防止误检测。
+/// 检查两个编码：ASCII 和 UTF-16LE。
+fn contains_trae_cn(content: &[u8]) -> bool {
+    // ASCII 编码检查
+    let ascii_patterns = ["trae cn", "Trae CN", "TRAE CN"];
+    for pattern in &ascii_patterns {
+        if contains_subsequence(content, pattern.as_bytes()) {
+            // 进一步确认，确保匹配的是路径中的 "Trae CN" 而非文件名中的 "Trae" 后跟其他内容
+            // 检查 pattern 后面是否跟着 "\" 或 "/" 或 "." 或 " "（表明是完整目录/文件名）
+            let pattern_bytes = pattern.as_bytes();
+            for window in content.windows(pattern_bytes.len() + 1) {
+                if window[..pattern_bytes.len()].eq_ignore_ascii_case(pattern_bytes) {
+                    let next = window[pattern_bytes.len()];
+                    if next == b'\\' || next == b'/' || next == b'.' || next == b' ' {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // v0.8.25 修复：移除未使用的 utf16_patterns 变量
+    // 直接检查完整 "Trae CN" 的 UTF-16LE 编码
+    let full_utf16: Vec<u8> = "Trae CN"
+        .encode_utf16()
+        .flat_map(|c| c.to_le_bytes())
+        .collect();
+    for window in content.windows(full_utf16.len() + 2) {
+        if window[..full_utf16.len()].eq_ignore_ascii_case(&full_utf16) {
+            let next_char_bytes = &window[full_utf16.len()..full_utf16.len() + 2];
+            let next_char = u16::from_le_bytes([next_char_bytes[0], next_char_bytes[1]]);
+            if next_char == b'\\' as u16
+                || next_char == b'/' as u16
+                || next_char == b'.' as u16
+                || next_char == b' ' as u16
+            {
+                return true;
+            }
+        }
+    }
+
     false
 }
 
@@ -1661,8 +1676,15 @@ fn collect_all_lnk_contents() -> Vec<Vec<u8>> {
                 .unwrap_or(false);
 
             if is_lnk {
-                if let Ok(content) = std::fs::read(path) {
-                    lnk_contents.push(content);
+                match std::fs::read(path) {
+                    Ok(content) => lnk_contents.push(content),
+                    Err(e) => {
+                        // v0.8.25 R-13：权限不足时记录日志，便于排查问题
+                        tracing::warn!(
+                            "[Agent检测] 读取快捷方式失败: {} (错误: {})",
+                            path.display(), e
+                        );
+                    }
                 }
             }
         }
@@ -1811,12 +1833,16 @@ impl AgentDetector for DotDirDetector {
 /// v0.5.12 重新设计：移除 dot 目录检测，改用 exe 文件扫描
 ///   根因：dot 目录检测会导致误报（.trae 残留目录存在但用户未安装 Trae 国际版）
 ///   修复：仅检测 Trae.exe 可执行文件是否存在
+///
+/// v0.8.25 修复：排除 Trae CN 的快捷方式，防止 Trae CN 被误检测为 Trae
+///   根因：Trae CN 的快捷方式内容中包含 "Trae" 子串，substring 匹配导致误报
+///   修复：在快捷方式检测中排除包含 "Trae CN" 的条目
 struct TraeDetector;
 
 impl AgentDetector for TraeDetector {
     fn detect(&self) -> bool {
-        // v0.5.12：仅通过 exe 文件检测，避免 dot 目录误报
-        // 策略 1：检测已知安装路径的 Trae.exe
+        // v0.8.25：仅通过 exe 文件检测，避免 dot 目录误报
+        // 策略 1：检测已知安装路径的 Trae.exe（排除 Trae CN 路径）
         let binary_paths = &[
             "%LOCALAPPDATA%/Programs/Trae/Trae.exe",
             "%PROGRAMFILES%/Trae/Trae.exe",
@@ -1829,6 +1855,8 @@ impl AgentDetector for TraeDetector {
         {
             let cache = get_scan_cache();
             let targets: Vec<String> = vec!["trae.exe".to_string()];
+            // v0.8.25 修复：排除 Trae CN 的快捷方式，防止误检测
+            // 检查 exe_names 时，trae.exe 和 trae cn.exe 是不同的，不会误匹配
             if cache
                 .exe_names
                 .iter()
@@ -1836,10 +1864,18 @@ impl AgentDetector for TraeDetector {
             {
                 return true;
             }
+            // v0.8.25 修复：检查快捷方式时，排除包含 "Trae CN" 的条目
+            // 根因：Trae CN 的 .lnk 文件内容中包含 "Trae" 路径前缀，导致子串匹配误报
             if cache
                 .lnk_contents
                 .iter()
-                .any(|content| search_exe_in_lnk(content, &targets))
+                .any(|content| {
+                    // 排除 Trae CN 的快捷方式
+                    if contains_trae_cn(content) {
+                        return false;
+                    }
+                    search_exe_in_lnk(content, &targets)
+                })
             {
                 return true;
             }
