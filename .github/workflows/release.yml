@@ -120,7 +120,7 @@ jobs:
           APP_JS_VER=$(grep "APP_VERSION" static/app.js | head -1 | sed "s/.*'\(.*\)'.*/\1/")
           INDEX_HTML_VER=$(grep 'name="version"' static/index.html | head -1 | sed 's/.*content="\(.*\)".*/\1/')
           # v0.8.25 REL-03：新增 CHANGELOG.md 版本号检查
-          CHANGELOG_VER=$(grep -m1 '^\[' CHANGELOG.md | head -1 | sed 's/\[\(.*\)\].*/\1/' | sed 's/^v//')
+          CHANGELOG_VER=$(grep -m1 '^## \[' CHANGELOG.md | head -1 | sed 's/.*\[\(.*\)\].*/\1/' | sed 's/^v//')
           # v0.8.26 REL-01：新增 status-version 硬编码检查（第10处版本号）
           STATUS_VER=$(grep 'id="status-version"' static/index.html | sed 's/.*>v\(.*\)<.*/\1/')
           echo "版本号检查："

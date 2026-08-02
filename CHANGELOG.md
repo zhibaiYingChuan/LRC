@@ -2,6 +2,19 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.28] - 2026-08-02
+
+### 修复：v0.8.27 Preflight Check 版本号检查失败
+
+> v0.8.27 发布时 release.yml 中 CHANGELOG 版本号检查的 grep 模式 `'^\['` 不匹配 `## [0.8.27]` 格式
+> （CHANGELOG.md 使用 Markdown 二级标题 `## ` 前缀），导致 `CHANGELOG_VER` 为空，Preflight Check 的 Version consistency check 步骤失败。
+
+#### BLT-03: 修复 release.yml CHANGELOG 版本号 grep 模式（P0）
+- **修改文件**: [release.yml](file:///g:/code-memory/.github/workflows/release.yml)
+- **根因**: `grep -m1 '^\['` 只匹配以 `[` 开头的行，但 CHANGELOG.md 格式为 `## [版本号] - 日期`（以 `## ` 前缀开头），导致 `CHANGELOG_VER` 变量为空
+- **修复**: 将 grep 模式改为 `'^## \['`，匹配以 `## [` 开头的行；同时调整 sed 模式为 `'s/.*\[\(.*\)\].*/\1/'` 以正确处理 `## ` 前缀
+- **影响**: 修复后 Preflight Check 的 Version consistency check 10 处版本号全部通过
+
 ## [0.8.27] - 2026-08-02
 
 ### 修复：v0.8.25 安装包打不开 + v0.8.26 CI 失败
