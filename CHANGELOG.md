@@ -2,6 +2,31 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.27] - 2026-08-02
+
+### 修复：v0.8.25 安装包打不开 + v0.8.26 CI 失败
+
+> v0.8.25 发布时 `release.yml` 中 `dtolnay/rust-toolchain` 动作缺少 `toolchain: stable` 参数，
+> 导致默认使用 1.80.0 工具链（不支持 edition2024），生成的安装包不完整无法打开。
+> v0.8.26 因 Rust 生命周期错误导致 CI 全部 exit code 101 崩溃，未生成 Release 产物。
+
+#### BLT-01: 修复 dtolnay/rust-toolchain 缺少 toolchain 参数（P0）
+- **修改文件**: [release.yml](file:///g:/code-memory/.github/workflows/release.yml)
+- **根因**: v0.8.25 的 release.yml 中 3 处 `dtolnay/rust-toolchain` 调用均缺失 `toolchain: stable` 参数，
+  仅靠 `# stable` 注释不足以指定工具链版本，CI runner 使用默认 1.80.0 工具链
+- **修复**: 在所有 3 处 `with:` 块中增加 `toolchain: stable`
+
+#### BLT-02: 修复 Rust 生命周期错误导致 CI exit code 101（P0）
+- **修改文件**: [commands.rs](file:///g:/code-memory/desktop/src-tauri/src/commands.rs)、[main.rs](file:///g:/code-memory/desktop/src-tauri/src/main.rs)
+- **根因**: `spawn_blocking` 要求闭包具有 `'static` 生命周期，但 `store.agent_registry.lock().await`
+  返回的 `MutexGuard` 借用了非静态的 `store` 引用
+- **修复**: 将 `agent_registry` 从 `Mutex<AgentDetectorRegistry>` 改为 `Arc<Mutex<AgentDetectorRegistry>>`
+
+#### BLT-03: 版本号一致性验证（10 处同步，不含 Cargo.lock）
+- 验证结果：Cargo.toml、desktop Cargo.toml、tauri.conf.json、Cargo.lock 根目录、
+  desktop Cargo.lock、package.json、app.js、index.html meta、index.html status-version、CHANGELOG.md
+  全部同步为 0.8.27
+
 ## [0.8.26] - 2026-08-02
 
 ### 发布基础设施加固 + 版本号盲点消除 + 超时对齐
