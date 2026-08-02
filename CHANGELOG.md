@@ -2,6 +2,19 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.30] - 2026-08-02
+
+### 修复：v0.8.29 Preflight Check status-version 提取失败 + 最终发布可用安装包
+
+> v0.8.25 安装包因缺少 `toolchain: stable` 导致 Rust 1.80.0 编译不完整。
+> v0.8.26/27/28/29 Release 均因 Preflight Check 版本号一致性检查失败而终止。
+> 本版本是系列修复的最终版本，修复了 release.yml 中 `STATUS_VER` 提取的 sed 贪婪匹配 bug，并升级到 v0.8.30 重新触发 Release。
+
+#### BLT-05: 修复 v0.8.29 Preflight Check status-version 提取失败（P0）
+- **根因**: `release.yml` 中 `STATUS_VER=$(grep 'id="status-version"' static/index.html | sed 's/.*>v\(.*\)<.*/\1/')` 中 `.*` 贪婪匹配，HTML 行 `<span>版本 <strong id="status-version">v0.8.29</strong></span>` 中 `\(.*\)<` 贪婪匹配到最后一个 `<`（`</span>` 中的 `<`），导致提取到 `0.8.29</strong>` 而非 `0.8.29`，版本号比较失败
+- **修复**: 将 sed 模式改为 `s/.*v\([0-9.]*\).*/\1/`，仅匹配数字和点号，不受 HTML 标签影响
+- **影响**: 修复后 Preflight Check 版本号一致性检查应全部通过，Release 流程正常生成各平台安装包
+
 ## [0.8.29] - 2026-08-02
 
 ### 修复：v0.8.28 Release Preflight Check 版本号检查失败 + 重新发布可用安装包

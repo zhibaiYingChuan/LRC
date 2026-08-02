@@ -122,7 +122,7 @@ jobs:
           # v0.8.25 REL-03：新增 CHANGELOG.md 版本号检查
           CHANGELOG_VER=$(grep -m1 '^## \[' CHANGELOG.md | head -1 | sed 's/.*\[\(.*\)\].*/\1/' | sed 's/^v//')
           # v0.8.26 REL-01：新增 status-version 硬编码检查（第10处版本号）
-          STATUS_VER=$(grep 'id="status-version"' static/index.html | sed 's/.*>v\(.*\)<.*/\1/')
+          STATUS_VER=$(grep 'id="status-version"' static/index.html | sed 's/.*v\([0-9.]*\).*/\1/')
           echo "版本号检查："
           echo "  Cargo.toml:           $CARGO_VER"
           echo "  desktop Cargo.toml:   $DESKTOP_VER"
