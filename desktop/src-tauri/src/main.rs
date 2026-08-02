@@ -29,6 +29,29 @@ use tokio::sync::Mutex; // Tauri 2 异步命令需要 tokio::sync::Mutex (支持
 
 fn main() {
     // ════════════════════════════════════════════════════════════════
+    // v0.8.30 新增：WebView2 CDP 调试支持
+    // 通过环境变量 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS 注入
+    // --remote-debugging-port=9230 参数，启用 Chrome DevTools Protocol
+    // 这样可以通过 CDP 自动化测试桌面端 WebView2 交互
+    // 注意：必须在 Tauri 初始化前设置，否则 WebView2 已启动无法修改
+    // ════════════════════════════════════════════════════════════════
+    #[cfg(target_os = "windows")]
+    {
+        // 读取现有环境变量（避免覆盖其他已有参数）
+        let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
+        // CDP 参数：绑定 127.0.0.1 + 端口 9230 + 允许所有 Origin 连接（开发/测试用）
+        let cdp_args = "--remote-debugging-address=127.0.0.1 --remote-debugging-port=9230 --remote-allow-origins=*";
+        let combined = if existing.trim().is_empty() {
+            cdp_args.to_string()
+        } else {
+            format!("{} {}", existing.trim(), cdp_args)
+        };
+        // 先记录日志（防止后续 move 后无法引用）
+        tracing::info!("[CDP 调试] WebView2 环境变量已设置: {}", &combined);
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", combined);
+    }
+
+    // ════════════════════════════════════════════════════════════════
     // v0.5.1 增强：日志系统
     // 初始化日志输出到 %APPDATA%\LoongRecall\logs\ 目录
     // 同时保留控制台输出（开发模式），方便问题排查
@@ -129,6 +152,9 @@ fn main() {
             commands::verify_setup,
             commands::open_data_dir, // v0.6.0：右下角"数据目录"点击打开文件夹
             commands::get_rules_status, // v0.8.0：信任中心规则状态查询
+            commands::set_agent_manual_override, // v0.8.31 S-03：AI工具手动修正（向导齿轮图标）
+            commands::get_scan_cache_metadata,    // v0.8.31 S-05：获取扫描缓存元数据（时间戳+TTL）
+            commands::force_invalidate_scan_cache, // v0.8.31 S-05：前端「重新扫描」按钮强制失效缓存
         ])
         .manage(app_store)
         // v0.5.4 P2-16 调试：页面加载事件追踪

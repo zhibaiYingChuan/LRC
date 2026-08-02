@@ -39,6 +39,11 @@ pub struct WizardConfig {
     /// 空字符串表示未配置 API Key（Ollama 等不需要 Key 的场景）
     #[serde(default)]
     pub encrypted_api_key: String,
+    /// v0.8.31 S-03：AI 工具手动修正（用户点击齿轮时设置）
+    /// key = agent_id，value = true 表示强制设为已安装，false 表示强制设为未安装
+    /// 优先级：最高（即使自动检测结果相反也以这里为准）
+    #[serde(default)]
+    pub manual_agent_overrides: std::collections::HashMap<String, bool>,
 }
 
 /// serde default 函数：新版本默认版本号
@@ -195,6 +200,7 @@ impl Default for WizardConfig {
             llm_base_url: None,
             configured_agents: Vec::new(),
             encrypted_api_key: String::new(),
+            manual_agent_overrides: std::collections::HashMap::new(),
         }
     }
 }
@@ -339,6 +345,35 @@ impl WizardState {
         self.save()
     }
 
+    /// v0.8.31 S-03：设置/清除 AI 工具的手动修正
+    /// agent_id: 工具 ID（如 "trae"、"codebuddy"）
+    /// override_installed:
+    ///   - Some(true)  = 用户判定为已安装（覆盖自动检测的 installed=false）
+    ///   - Some(false) = 用户判定为未安装（覆盖自动检测的 installed=true）
+    ///   - None        = 清除该工具的手动修正（恢复为自动检测结果）
+    pub fn set_agent_manual_override(
+        &mut self,
+        agent_id: &str,
+        override_installed: Option<bool>,
+    ) -> Result<(), String> {
+        match override_installed {
+            Some(val) => {
+                self.config
+                    .manual_agent_overrides
+                    .insert(agent_id.to_string(), val);
+            }
+            None => {
+                self.config.manual_agent_overrides.remove(agent_id);
+            }
+        }
+        self.save()
+    }
+
+    /// v0.8.31 S-03：获取所有手动修正的拷贝（用于 discover_all_agents 覆盖结果）
+    pub fn get_manual_agent_overrides(&self) -> std::collections::HashMap<String, bool> {
+        self.config.manual_agent_overrides.clone()
+    }
+
     /// v0.5.3 新增：重置向导状态，让用户重新进入配置向导
     ///
     /// v0.5.4 修复：改用 save() 而非删除文件，确保 API Key 在重置后仍然保留。
@@ -351,12 +386,16 @@ impl WizardState {
     ///         仪表盘显示"LLM 未配置"，与桌面端实际配置状态不一致。
     /// 修复后：reset() 只重置 setup_complete 和 configured_agents，保留 LLM 配置，
     ///         用户重新配置时不需要重新输入 LLM API Key。
+    ///
+    /// v0.8.31 S-03：重置时也保留 manual_agent_overrides（用户纠正过的误检不应因重置而丢失）
     pub fn reset(&mut self) -> Result<(), String> {
         let saved_llm_configured = self.config.llm_configured;
         let saved_llm_type = self.config.llm_type.clone();
         let saved_llm_model = self.config.llm_model.clone();
         let saved_llm_base_url = self.config.llm_base_url.clone();
         let saved_key = self.config.encrypted_api_key.clone();
+        // S-03：保留用户对工具检测结果的手动修正
+        let saved_overrides = self.config.manual_agent_overrides.clone();
 
         self.config = WizardConfig::default();
 
@@ -366,11 +405,13 @@ impl WizardState {
         self.config.llm_model = saved_llm_model;
         self.config.llm_base_url = saved_llm_base_url;
         self.config.encrypted_api_key = saved_key;
+        // S-03：恢复手动修正（用户明确纠正过的误检/漏检优先级最高）
+        self.config.manual_agent_overrides = saved_overrides;
 
         // 保存重置后的配置（而非删除文件），确保 API Key 不丢失
         self.save()?;
         tracing::info!(
-            "向导状态已重置（LLM 配置和 API Key 已保留），用户下次打开应用时将看到配置向导"
+            "向导状态已重置（LLM 配置/API Key/工具手动修正 已保留），用户下次打开应用时将看到配置向导"
         );
         Ok(())
     }

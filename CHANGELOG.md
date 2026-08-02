@@ -2,6 +2,32 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.31] - 2026-08-02
+
+### 修复 & 新特性：PRODUCT-DOC S-01~S-05 全面落地（AI工具检测+向导交互+缓存治理）
+
+#### S-01：AI 工具检测策略权重化（lnk>exe>binary，解决 CodeBuddy 漏检）
+- **根因**：原检测仅依赖 binary_paths 硬编码，CodeBuddy 默认安装路径不同 → 完全漏检；二进制检测误报权重高
+- **修复**：DotDirDetector 改为三阶段权重化判定，lnk(3)+exe(2)+binary(1)，总分≥2 判定 installed=true；仅 lnks 单命中（权重 3≥2）即可正确检出，解决 CodeBuddy 用户创建了桌面快捷方式但系统仍显示"未安装"的问题
+
+#### S-02：TraeDetector 三阶段 `contains_trae_cn` 排除（解决 Trae CN 被误报为 Trae 国际版）
+- **根因**：TraeDetector 仅在 lnk 阶段做 Trae CN 排除，binary_paths/exe_names 命中 Trae CN 安装路径时仍误报国际版
+- **修复**：TraeDetector 在所有三个阶段（lnk/exe_names/binary_paths）均先执行 `contains_trae_cn` 扩展版检查，覆盖 空格/连写/中划线/大写 4 种变体
+
+#### S-03：AI 工具检测结果齿轮图标 + 手动修正持久化（用户可纠正误检/漏检）
+- **后端**：WizardConfig 新增 `manual_agent_overrides: HashMap<String,bool>`，暴露 `get_manual_agent_overrides/set_agent_manual_override`；`discover_all_agents` 应用覆盖
+- **前端**：每个工具卡片新增 ⚙️ 齿轮图标，3 选 1 轻量菜单（标记"不是我用的工具"/标记"我用的工具"/恢复自动检测）；localStorage 次级持久化 + 后端持久化双写一致
+- **IPC 新增**：`set_agent_manual_override`
+
+#### S-04：向导 Step 1 首个扫描到的项目自动高亮 + 用户取消全部才弹确认
+- **高亮**：`onAgentSelected → scan_ide_projects` 返回后，第一个项目自动加 `auto-selected-highlight` 样式和「✨ 已自动选择为索引目录」副文案，用户无需手动选
+- **确认弹窗精细化**：新增 `_userCancelledAllProjectsFlag` 状态机，仅在"用户之前看到过项目、亲手取消掉所有勾选"的场景（空→全→空）才弹确认；扫描不到任何项目/首次进入/用户从没选过的场景直接进入下一步，不再过度打扰
+
+#### S-05：全局扫描缓存 24h TTL + 前端「重新扫描」按钮 + 上次扫描时间戳显示
+- **后端**：`OnceLock<ScanCache>` → `RwLock<Option<Arc<ScanCache>>>`，DCL（Double-Checked Lock）实现 TTL=24h 过期；新增 `get_scan_cache_timestamp_ms`、`invalidate_scan_cache` 公共函数
+- **IPC 新增**：`get_scan_cache_metadata`（返回 `timestamp_ms`、`ttl_ms`、`valid`）、`force_invalidate_scan_cache`（前端「重新扫描」按钮强制失效）
+- **前端**：工具列表上方动态插入工具栏，显示「上次扫描：YYYY-MM-DD HH:mm + (24h 内有效 / 已超过 24h 建议重扫)」；提供「🔄 重新扫描（清空缓存）」按钮，执行 invalidate → redetect → 刷新时间戳
+
 ## [0.8.30] - 2026-08-02
 
 ### 修复：v0.8.29 Preflight Check status-version 提取失败 + 最终发布可用安装包

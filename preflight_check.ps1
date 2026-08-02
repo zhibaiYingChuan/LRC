@@ -2,6 +2,16 @@
 # 执行 PRE_PUSH_CHECKLIST.md 中定义的所有检查项
 # 使用方式：.\preflight_check.ps1
 # 依赖：PowerShell 7+, Rust toolchain, Node.js
+# 编码：必须以 UTF-8 with BOM 保存（PS5.1 兼容性要求）
+
+# ══════════════════════════════════════════════════
+# 编码一致性保护 (PowerShell 专家规范，防乱码铁律)
+# ══════════════════════════════════════════════════
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    try { & chcp 65001 > $null } catch { }
+}
+$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$PSDefaultParameterValues['*:Encoding'] = 'utf8'
 
 $ErrorActionPreference = 'Stop'
 $exitCode = 0
@@ -15,7 +25,8 @@ function Check-Item {
         Write-Host "    ✓ 通过" -ForegroundColor Green
     } catch {
         Write-Host "    ✗ 失败: $_" -ForegroundColor Red
-        $script:failedItems += "$Name: $_"
+        # ⚠ PowerShell 铁律：${Name} 显式分隔防止 $Name: 被解析为 Provider 路径
+        $script:failedItems += "${Name}: $($_.Exception.Message)"
         $script:exitCode = 1
     }
 }
@@ -103,8 +114,12 @@ Check-Item -Name "index.html meta version 一致" -Script {
 }
 
 Check-Item -Name "CHANGELOG 有当前版本条目" -Script {
-    if (-not (Select-String -Path "CHANGELOG.md" -Pattern "v$targetVersion")) {
-        throw "CHANGELOG.md 中未找到 v$targetVersion 条目"
+    # ⚠ 兼容两种格式："## v0.8.31" 和 "## [0.8.31] - YYYY-MM-DD"
+    $pattern1 = 'v' + [regex]::Escape($targetVersion)
+    $pattern2 = '\[' + [regex]::Escape($targetVersion) + '\]'
+    if (-not (Select-String -Path "CHANGELOG.md" -Pattern $pattern1) -and
+        -not (Select-String -Path "CHANGELOG.md" -Pattern $pattern2)) {
+        throw "CHANGELOG.md 中未找到 $targetVersion 条目（已检查模式：$pattern1 和 $pattern2）"
     }
 }
 

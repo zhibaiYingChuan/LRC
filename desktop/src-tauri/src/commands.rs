@@ -11,7 +11,10 @@ use tauri::State; // v0.5.5 P1-2：Emitter trait 提供 emit 方法（open_setti
                   // v0.5.4 修复：移除未使用的 Emitter import（emit 已从 detect_agents 中移除）
 use tokio::sync::Mutex; // 使用 tokio::sync::Mutex 以支持跨 await 持有
 
-use crate::agent_detector::{AgentDetectorRegistry, AgentInfo, ProjectInfo, RulesStatus};
+use crate::agent_detector::{
+    get_scan_cache_timestamp_ms, invalidate_scan_cache, AgentDetectorRegistry, AgentInfo,
+    ProjectInfo, RulesStatus,
+};
 use crate::config_wizard::WizardState;
 use crate::rate_limiter::RateLimiter;
 use crate::sidecar_manager::{SidecarManager, SidecarStartError, StartOptions, StartProgress};
@@ -51,7 +54,8 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
     //   各加 10s 超时，避免锁持有时间过长。
     let installed_agent_ids = {
         let registry = store.agent_registry.lock().await;
-        registry.detect_installed()
+        registry
+            .detect_installed()
             .iter()
             .map(|info| info.id.clone())
             .collect::<Vec<String>>()
@@ -66,7 +70,7 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
         tokio::task::spawn_blocking(move || {
             let registry = registry_arc.blocking_lock();
             registry.auto_upgrade_configs(port, project_path_clone.as_deref())
-        })
+        }),
     )
     .await;
     match upgrade_result {
@@ -101,7 +105,7 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
             tokio::task::spawn_blocking(move || {
                 let registry = registry_arc.blocking_lock();
                 registry.write_rules_for_agents(&ids)
-            })
+            }),
         )
         .await;
         match write_result {
@@ -201,7 +205,11 @@ fn sidecar_error_to_user_message(e: &SidecarStartError) -> String {
                 port
             )
         }
-        SidecarStartError::ProcessDied { pid, log_hint, log_empty } => {
+        SidecarStartError::ProcessDied {
+            pid,
+            log_hint,
+            log_empty,
+        } => {
             // v0.8.15 P0-2 修复：日志为空时提供可操作建议
             // 根因：DLL 加载失败发生在入口前，日志为空，用户无从下手
             if *log_empty {
@@ -683,12 +691,16 @@ pub async fn start_sidecar_for_project(
                 let (child, port) = match tokio::time::timeout(
                     std::time::Duration::from_secs(120),
                     SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts),
-                ).await {
+                )
+                .await
+                {
                     Ok(Ok(result)) => result,
                     Ok(Err(e)) => return Err(sidecar_error_to_user_message(&e)),
                     Err(_elapsed) => {
                         store.start_cancel_flag.store(true, Ordering::SeqCst);
-                        return Err(user_friendly_error("项目 sidecar 启动超时（120s），请稍后重试或检查 LRC 服务状态"));
+                        return Err(user_friendly_error(
+                            "项目 sidecar 启动超时（120s），请稍后重试或检查 LRC 服务状态",
+                        ));
                     }
                 };
 
@@ -1159,12 +1171,103 @@ pub async fn get_agent_config_guide(agent_id: String) -> Result<Option<String>, 
 /// 全面发现：已知工具 + 未知 dot 目录中的潜在 AI 工具
 ///
 /// 返回 (已知工具列表, 未知工具列表)
+///
+/// v0.8.31 S-03：应用 manual_agent_overrides 覆盖（用户点击齿轮手动修正的优先级最高）
 #[tauri::command]
 pub async fn discover_all_agents(
     store: State<'_, AppStore>,
 ) -> Result<(Vec<AgentInfo>, Vec<AgentInfo>), String> {
-    let registry = store.agent_registry.lock().await;
-    Ok(registry.discover_all())
+    // 锁顺序约束（Level 1 → Level 2）：先取 agent_registry（L1），释放后再取 wizard（L2）
+    let (mut known_list, unknown_list) = {
+        let registry = store.agent_registry.lock().await;
+        registry.discover_all()
+    }; // agent_registry 锁已释放（<1ms）
+
+    // Level 2：取 wizard 锁读取手动修正
+    let overrides = {
+        let wizard = store.wizard.lock().await;
+        wizard.get_manual_agent_overrides()
+    }; // wizard 锁已释放（<1ms）
+
+    // 对已知工具列表应用手动覆盖（用户纠正优先级最高，无论自动检测结果如何）
+    if !overrides.is_empty() {
+        let mut applied = 0usize;
+        for agent in known_list.iter_mut() {
+            if let Some(&force_installed) = overrides.get(&agent.id) {
+                if agent.installed != force_installed {
+                    tracing::info!(
+                        "[Agent检测] 手动修正生效: id={} 原={} → 强制={}",
+                        agent.id,
+                        agent.installed,
+                        force_installed
+                    );
+                    agent.installed = force_installed;
+                    applied += 1;
+                }
+            }
+        }
+        if applied > 0 {
+            tracing::debug!("[Agent检测] 共应用 {} 条用户手动修正", applied);
+        }
+    }
+
+    Ok((known_list, unknown_list))
+}
+
+// ════════════════════════════════════════════════════════════════
+// v0.8.31 S-05：扫描缓存元数据 + 强制失效命令
+// ════════════════════════════════════════════════════════════════
+// 前端「重新扫描」按钮：
+//   1. 调用 invalidate_scan_cache 清空缓存
+//   2. 调用 discover_all_agents 重新检测（会触发重新扫描）
+//   3. 调用 get_scan_cache_metadata 获取新的扫描时间戳并展示
+// ════════════════════════════════════════════════════════════════
+
+/// v0.8.31 S-05：扫描缓存元数据（返回给前端显示「上次扫描时间」）
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanCacheMetadata {
+    /// 缓存创建时间（ms，UNIX EPOCH），0 表示还没扫描过
+    pub timestamp_ms: u64,
+    /// 缓存 TTL（ms），默认 24h
+    pub ttl_ms: u64,
+    /// 当前缓存是否仍然有效（未过期）
+    pub valid: bool,
+}
+
+/// v0.8.31 S-05：获取扫描缓存的元数据（时间戳、TTL、有效状态）
+#[tauri::command]
+pub async fn get_scan_cache_metadata() -> ScanCacheMetadata {
+    const TTL_MS: u64 = 24 * 60 * 60 * 1000;
+    let ts_ms = get_scan_cache_timestamp_ms();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(std::time::Duration::ZERO)
+        .as_millis() as u64;
+    let age = now.saturating_sub(ts_ms);
+    ScanCacheMetadata {
+        timestamp_ms: ts_ms,
+        ttl_ms: TTL_MS,
+        valid: ts_ms > 0 && age <= TTL_MS,
+    }
+}
+
+/// v0.8.31 S-05：强制使扫描缓存失效
+/// 前端「重新扫描」按钮调用此命令后，应紧接着调用 discover_all_agents 触发新扫描。
+///
+/// v0.8.31 HCSE RISK-P1-02 修复：加入 RateLimiter 防护，避免攻击者高频调用
+///   导致全局 RwLock 写锁竞争（DoS 攻击向量），与 configure_agents 使用同一速率策略。
+#[tauri::command]
+pub async fn force_invalidate_scan_cache(store: State<'_, AppStore>) -> Result<(), String> {
+    // L3 运行时保护：速率限制检查（同一限流桶，避免滥用扫描缓存失效接口）
+    {
+        let mut limiter = store.rate_limiter.lock().await;
+        if limiter.should_throttle("cmd:force_invalidate_scan_cache") {
+            return Err(user_friendly_error("请求过于频繁，请稍后再试"));
+        }
+    }
+
+    invalidate_scan_cache();
+    Ok(())
 }
 
 /// 为选定的 Agent 配置 MCP 连接
@@ -1269,6 +1372,52 @@ pub async fn scan_ide_projects(
             Err("项目扫描超时（30秒），可能是磁盘响应慢，请减少选择的 IDE 数量后重试".to_string())
         }
     }
+}
+
+/// v0.8.31 S-03：设置 AI 工具的手动修正（用户在向导步骤1点击齿轮图标时触发）
+///
+/// # 参数
+/// - agent_id: 工具 ID（如 "trae"、"trae-cn"、"codebuddy"）
+/// - override_installed:
+///   - Some(true)  = 用户强制标记为「已安装」（纠正漏检）
+///   - Some(false) = 用户强制标记为「未安装」（纠正误检）
+///   - None        = 用户选择「恢复自动检测」（清除该工具的手动修正）
+///
+/// # 优先级
+/// manual_override 在 discover_all_agents、detect_agents、detect_installed_agents
+/// 三个查询命令中均以最高优先级应用，永不被自动检测结果覆盖。
+/// 用户通过「重新检测」按钮刷新缓存时，手动修正结果保持不变。
+#[tauri::command]
+pub async fn set_agent_manual_override(
+    store: State<'_, AppStore>,
+    agent_id: String,
+    override_installed: Option<bool>,
+) -> Result<(), String> {
+    // L3 运行时保护：速率限制检查
+    {
+        let mut limiter = store.rate_limiter.lock().await;
+        if limiter.should_throttle("cmd:set_agent_manual_override") {
+            return Err(user_friendly_error("请求过于频繁"));
+        }
+    }
+
+    // 参数校验：agent_id 不能为空字符串
+    let trimmed = agent_id.trim();
+    if trimmed.is_empty() {
+        return Err(user_friendly_error("工具 ID 不能为空"));
+    }
+
+    // Level 2：获取 wizard 锁进行持久化写入
+    let mut wizard = store.wizard.lock().await;
+    let action = match override_installed {
+        Some(true) => "强制标记为已安装",
+        Some(false) => "强制标记为未安装",
+        None => "恢复自动检测",
+    };
+    tracing::info!("[Agent手动修正] 工具={} 操作={}", trimmed, action);
+    wizard
+        .set_agent_manual_override(trimmed, override_installed)
+        .map_err(|e| user_friendly_error(&e))
 }
 
 // ── 项目目录命令 ──
@@ -1546,7 +1695,8 @@ pub async fn switch_project(
     {
         let installed_agent_ids = {
             let registry = store.agent_registry.lock().await;
-            registry.detect_installed()
+            registry
+                .detect_installed()
                 .iter()
                 .map(|info| info.id.clone())
                 .collect::<Vec<String>>()
@@ -1560,12 +1710,16 @@ pub async fn switch_project(
                 tokio::task::spawn_blocking(move || {
                     let registry = registry_arc.blocking_lock();
                     registry.write_rules_for_agents(&ids)
-                })
+                }),
             )
             .await;
             match write_result {
                 Ok(Ok(Ok(written))) => {
-                    tracing::info!("[切换项目] 已确保 {} 个全局 IDE 规则文件存在: {}", written.len(), project_dir);
+                    tracing::info!(
+                        "[切换项目] 已确保 {} 个全局 IDE 规则文件存在: {}",
+                        written.len(),
+                        project_dir
+                    );
                 }
                 Ok(Ok(Err(e))) => {
                     tracing::warn!("[切换项目] 全局规则文件写入失败（不影响 sidecar）: {}", e);
@@ -1622,13 +1776,17 @@ pub async fn switch_project(
             let (child, port) = match tokio::time::timeout(
                 std::time::Duration::from_secs(120),
                 SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts),
-            ).await {
+            )
+            .await
+            {
                 Ok(Ok(result)) => result,
                 Ok(Err(e)) => return Err(sidecar_error_to_user_message(&e)),
                 Err(_elapsed) => {
                     // 超时：设置取消标志，让 spawn_and_wait 内部健康检查循环尽快退出
                     store.start_cancel_flag.store(true, Ordering::SeqCst);
-                    return Err(user_friendly_error("切换项目超时（120s），请稍后重试或检查 LRC 服务状态"));
+                    return Err(user_friendly_error(
+                        "切换项目超时（120s），请稍后重试或检查 LRC 服务状态",
+                    ));
                 }
             };
 

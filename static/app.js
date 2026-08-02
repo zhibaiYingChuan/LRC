@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.8.30';
+const APP_VERSION = '0.8.31';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -1801,6 +1801,11 @@ const POST_MESSAGE_TO_INVOKE = {
   'lrc-open-settings': 'open_settings',
   'lrc-mark-complete': 'mark_complete',
   'lrc-verify-setup': 'verify_setup',
+  // v0.8.31 S-03：AI 工具手动修正（向导齿轮图标点击时调用）
+  'lrc-set-agent-manual-override': 'set_agent_manual_override',
+  // v0.8.31 S-05：扫描缓存元数据查询 + 强制失效（重新扫描按钮使用）
+  'lrc-get-scan-cache-metadata': 'get_scan_cache_metadata',
+  'lrc-force-invalidate-scan-cache': 'force_invalidate_scan_cache',
 };
 
 /**
@@ -5311,15 +5316,59 @@ async function getAgentConfigGuide() {
 async function discoverAllAgents() {
   try {
     const result = await postMessageToParent('lrc-discover-all-agents', {}, 30000);
-    if (Array.isArray(result)) {
-      const count = result.length;
-      const installed = result.filter(a => a.installed).length;
-      const details = result.slice(0, 15).map(a => `• ${a.name || a.id || '未知'} [${a.installed ? '已安装' : '未安装'}]`).join('\n');
-      // v0.8.2：用 showInfoModal 替代多行 alert
-      showInfoModal('发现 Agent', `发现 ${count} 个 Agent（已安装 ${installed} 个）\n\n${details}${count > 15 ? '\n...（仅显示前 15 个）' : ''}`);
+    // ════════════════════════════════════════════════════════════════
+    // v0.8.30 P0 Bug 修复：discover_all_agents 返回元组 (Vec<AgentInfo>, Vec<AgentInfo>)
+    //   result[0] = 已知工具列表（registry 中注册的所有已知 AI 工具）
+    //   result[1] = 未知发现工具（扫描 dot 目录新发现的潜在 AI 工具）
+    // 之前错误：直接当一维数组遍历，导致 result.length=2，且每个元素是数组而非 AgentInfo
+    // 用户反馈"检测的全是错误的"根因：UI 显示"发现2个Agent，0个已安装"（实际上29个工具，2个已安装！）
+    // ════════════════════════════════════════════════════════════════
+    let knownList = [];
+    let unknownList = [];
+    let isTuple = false;
+
+    if (Array.isArray(result) && result.length === 2 && Array.isArray(result[0]) && Array.isArray(result[1])) {
+      // 标准元组格式：(已知[], 未知[])
+      knownList = result[0];
+      unknownList = result[1];
+      isTuple = true;
+    } else if (Array.isArray(result) && result.every(item => item && typeof item === 'object' && ('id' in item || 'name' in item))) {
+      // 兼容一维数组格式（旧版本或接口变化）
+      knownList = result;
     } else {
-      showInfoModal('发现结果', JSON.stringify(result));
+      // 格式异常，兜底显示原始数据
+      showInfoModal('发现结果', typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result));
+      return;
     }
+
+    // 合并统计
+    const totalCount = knownList.length + unknownList.length;
+    const totalInstalled =
+      knownList.filter(a => a.installed).length +
+      unknownList.filter(a => a.installed).length;
+
+    // 格式化已知工具列表（只显示前 N 个，避免弹窗过长）
+    const maxDisplay = 20;
+    const installedFirst = [...knownList].sort((a, b) => (b.installed ? 1 : 0) - (a.installed ? 1 : 0));
+    const knownDetails = installedFirst.slice(0, maxDisplay).map(a => {
+      const mark = a.installed ? '✅ 已安装' : '   未安装';
+      return `${mark}  ${a.icon || '🔧'}  ${a.name || a.id || '未知工具'}`;
+    }).join('\n');
+    const moreHint = knownList.length > maxDisplay ? `\n\n...（仅显示前 ${maxDisplay} 个，还有 ${knownList.length - maxDisplay} 个工具省略）` : '';
+
+    // 未知工具提示
+    const unknownHint = unknownList.length > 0
+      ? `\n\n🔍 另外发现潜在未知工具 ${unknownList.length} 个：\n` + unknownList.slice(0, 10).map(a => `   · ${a.name || a.id || '未命名'}`).join('\n')
+      : '';
+
+    const formatDebug = isTuple ? '' : '\n（提示：后端返回格式不是预期的元组）';
+    showInfoModal(
+      '发现 Agent',
+      `📊 总计：${totalCount} 个支持的工具，已安装 ${totalInstalled} 个\n\n` +
+      `═══════ 已知 AI 工具 ═══════\n${knownDetails}${moreHint}` +
+      unknownHint +
+      formatDebug
+    );
   } catch (e) {
     const errMsg = e.message || String(e);
     if (errMsg.includes('非桌面端嵌入模式') || errMsg.includes('无法调用此功能')) {
@@ -8048,6 +8097,102 @@ function startQuickSetup() {
   selectProjectFolder();
 }
 
+// ============================================================
+// v0.8.31 S-04：项目选择取消确认弹窗精细化控制
+// ============================================================
+// 核心问题：原来"只要项目列表空就弹确认"对"系统扫描不到任何项目"的场景过于打扰。
+// 目标：仅当"用户手动取消掉所有已选中的项目"（非空→全空）时才弹窗，
+//       其他场景（从没选过、自动扫描为空、用户没干预）直接进入下一步。
+// ============================================================
+
+/**
+ * 标记：用户是否主动取消了所有已选中的项目。
+ * true → 下一步按钮点击时弹"确认跳过"对话框
+ * false → 用户没主动干预过项目选择，直接进入下一步
+ * 触发 set 时机：任何项目 checkbox 从 checked→unchecked 后，发现所有项目都未选中
+ * 触发 reset 时机：系统自动选中了项目（onAgentSelected 扫描完成）或用户手动添加了新项目（addSelectedProject）
+ */
+let _userCancelledAllProjectsFlag = false;
+
+/** 重置「用户主动取消所有项目」标志（系统新增了任何已选项目后调用） */
+function resetUserCancelledAllProjectsFlag() {
+  if (_userCancelledAllProjectsFlag) {
+    console.debug('[S-04] 重置「用户取消全部项目」标志：新增了已选项目');
+  }
+  _userCancelledAllProjectsFlag = false;
+}
+
+/** 获取当前「用户主动取消所有项目」标志 */
+function getUserCancelledAllProjectsFlag() {
+  return !!_userCancelledAllProjectsFlag;
+}
+
+/**
+ * 向导中单个项目的 checkbox 变更回调。
+ * 用于跟踪：用户是否把所有已选中的项目都取消了？
+ *
+ * 判定算法：
+ * 1. 取向导中所有容器的项目 checkbox（两套 UI：wizard-project-list + selected-projects）
+ * 2. 统计当前 checked 的数量
+ * 3. 若本次是"取消勾选"且 total_checked === 0 → 置标志位 = true
+ * 4. 若本次是"勾选上" → 标志位 = false（用户又选回来了，不应该打扰）
+ */
+function onWizardProjectCheckboxChanged(checkboxEl) {
+  const allChecked = _countAllWizardProjectCheckedBoxes();
+  const justChecked = checkboxEl && checkboxEl.checked;
+  if (justChecked) {
+    // 用户新勾选了某个项目 → 绝不属于"用户主动取消全部"
+    resetUserCancelledAllProjectsFlag();
+  } else {
+    // 用户取消勾选
+    if (allChecked === 0) {
+      console.log('[S-04] 检测到用户把所有已选项目全部取消勾选，下一步点击将显示确认弹窗');
+      _userCancelledAllProjectsFlag = true;
+    }
+  }
+  // 同步更新 next 按钮状态
+  if (typeof checkNextButton === 'function') checkNextButton();
+}
+
+/** 向导中所有项目容器（两套 UI）中勾选的 checkbox 总数 */
+function _countAllWizardProjectCheckedBoxes() {
+  let count = 0;
+  const selectors = [
+    '#wizard-project-list input[type="checkbox"]',
+    '#selected-projects input[type="checkbox"]',
+  ];
+  for (const sel of selectors) {
+    document.querySelectorAll(sel).forEach(cb => {
+      if (cb.checked) count += 1;
+    });
+  }
+  return count;
+}
+
+/**
+ * 向导中是否存在"用户可选择但未选中"的项目列表？
+ * 如果 wizard-project-list 或 selected-projects 根本没有任何项目条目（条目数为 0），
+ * 那么即使空也属于「扫描不到项目」，不应该弹确认。
+ * 弹窗条件：
+ *   (项目条目数 > 0 且 allChecked = 0 且 userCancelledAllProjects=true)
+ * 也就是"用户之前看到过项目、亲手取消掉了所有勾选"的情况才是真正需要确认的。
+ */
+function shouldShowConfirmSkipProjects() {
+  // 用户明确取消过的标志位优先
+  if (getUserCancelledAllProjectsFlag()) return true;
+
+  // 回退判定：项目条目数 > 0 且 checked 数 = 0
+  let entryCount = 0;
+  document.querySelectorAll('#wizard-project-list .project-item, #selected-projects [data-project]').forEach(() => entryCount++);
+  const checkedCount = _countAllWizardProjectCheckedBoxes();
+  if (entryCount > 0 && checkedCount === 0) {
+    // 条目存在但都没勾 → 可能是用户取消的，也可能系统默认没勾；保守起见不弹窗（避免误打扰）
+    // 只有标志位为真时才弹窗，所以这里返回 false
+    return false;
+  }
+  return false;
+}
+
 /**
  * v0.8.25 R-08 新增：选中 AI 工具后的回调逻辑
  * 当用户在向导中勾选/取消勾选 AI 工具时触发，自动扫描 IDE 项目目录。
@@ -8084,16 +8229,39 @@ async function onAgentSelected(agentId, selected) {
       if (projects && projects.length > 0) {
         // 自动填充检测到的项目目录
         const projectListEl = document.getElementById('wizard-project-list');
+        // v0.8.31 S-04：第一个项目高亮为"已自动选择为索引目录"（副文案 + 样式）
+        // 并重置「用户主动取消全部」标志，因为现在系统自动选择了新的项目
+        resetUserCancelledAllProjectsFlag();
         if (projectListEl) {
-          projectListEl.innerHTML = projects.map(p => `
-            <div class="project-item" data-path="${htmlescape(p.path || p)}">
-              <input type="checkbox" checked data-action="toggleProject">
-              <span class="project-name">${htmlescape(p.name || p)}</span>
-              <span class="project-path">${htmlescape(p.path || '')}</span>
-            </div>
-          `).join('');
+          projectListEl.innerHTML = projects.map((p, idx) => {
+            const isFirst = idx === 0;
+            // S-04：第一个项目添加 auto-selected-highlight 样式容器 + 已自动选择副文案
+            const highlightStyle = isFirst
+              ? '; border:1px solid var(--lrc-玉色-500); background: rgba(46, 204, 113, 0.08); border-radius: var(--radius-sm);'
+              : '';
+            const highlightBadge = isFirst
+              ? `<div data-role="auto-selected-badge" style="margin-left:28px;margin-top:4px;font-size:0.78em;color:var(--lrc-玉色-700);font-weight:500;line-height:1.4;">
+                   ✨ 已自动选择为索引目录（如需修改可取消勾选或选择其他项目）
+                 </div>`
+              : '';
+            const highlightClass = isFirst ? ' auto-selected-highlight' : '';
+            return `
+              <div class="project-item${highlightClass}" data-path="${htmlescape(p.path || p)}" data-auto="${isFirst ? '1' : '0'}" style="${highlightStyle}">
+                <input type="checkbox" checked data-action="toggleProject" onchange="onWizardProjectCheckboxChanged(this);">
+                <span class="project-name">${htmlescape(p.name || p)}</span>
+                <span class="project-path">${htmlescape(p.path || '')}</span>
+                ${highlightBadge}
+              </div>
+            `;
+          }).join('');
         }
-        showToast('已自动检测到 ' + projects.length + ' 个项目目录', 'info', 3000);
+        // selected-projects 区域（另一套UI）也同步一下，让 checkNextButton 能检测到有项目
+        const firstPath = projects[0].path || projects[0];
+        const firstDisplay = projects[0].name || firstPath;
+        if (typeof addSelectedProject === 'function' && firstDisplay) {
+          addSelectedProject(String(firstDisplay));
+        }
+        showToast('已自动检测到 ' + projects.length + ' 个项目目录（第一个已高亮为默认索引目录）', 'info', 4000);
       }
     } catch (e) {
       // 扫描失败不阻塞，用户可手动选择；但需要给用户友好的反馈
@@ -8126,15 +8294,12 @@ async function wizardNextStep() {
 
   if (stepNum === 1) {
     // 从步骤 1 到步骤 2：检查项目选择状态
-    const projectsContainer = document.getElementById('selected-projects');
-    const hasProjects = projectsContainer
-      && projectsContainer.children.length > 0
-      && !projectsContainer.querySelector('p');
-
-    if (!hasProjects) {
+    // v0.8.31 S-04 修复：仅当「用户主动取消掉所有已选项目」时才弹确认，
+    //   避免对「系统扫描不到项目」「从没选过项目」的场景过度打扰
+    if (shouldShowConfirmSkipProjects()) {
       const skip = await showConfirm(
-        '您没有选择任何项目目录，确定跳过此步骤吗？\n\n您可以在后续配置中随时添加项目目录。\n不选择项目目录不影响基础功能使用。',
-        '未选择项目目录'
+        '您已取消所有项目目录的勾选，确定跳过此步骤吗？\n\n您可以在后续配置中随时添加项目目录。\n不选择项目目录不影响基础功能使用。',
+        '已取消所有项目目录选择'
       );
       if (!skip) return;
     }
@@ -8146,13 +8311,21 @@ async function wizardNextStep() {
 
 /**
  * 检测 AI 工具（调用后端 API 实时检测）
+ *
+ * v0.8.31 S-05：检测完成后调用 get_scan_cache_metadata 显示「上次扫描时间」
+ *   并提供「重新扫描」按钮（强制失效缓存后再重扫）
  */
 async function simulateAiToolsScan() {
   const toolsList = document.getElementById('ai-tools-list');
   if (!toolsList) return;
 
+  // v0.8.31 S-05：如果没有工具栏，动态插入（上次扫描时间 + 重新扫描按钮）
+  ensureAiToolsToolbar();
+
   // 显示扫描中状态
   toolsList.innerHTML = '<p style="color: var(--lrc-墨韵-400); margin: 0;"><span class="loading-spinner"></span> 正在扫描已安装的 IDE & Agent 工具...</p>';
+  // S-05：如果扫描中，同时让"上次扫描时间"显示「扫描中...」
+  updateLastScanTsUi(null, true);
 
   try {
     const resp = await fetchWithTimeout(API_BASE + '/api/tools/detect', {
@@ -8195,28 +8368,58 @@ async function simulateAiToolsScan() {
       return guides[name] || '';
     }
 
+    // v0.8.31 S-03：初始化时读取 localStorage 的手动修正，让用户上次的选择即使后端没写也能恢复
+    const localOverrides = getLocalManualOverrides();
     toolsList.innerHTML = tools.map(tool => {
       const guide = getToolConfigGuide(tool.name, tool.installed);
+      const agentId = toolNameToAgentId(tool.name);
+      // 已手动修正？（从 localStorage 读取，后端 discover_all_agents 也会应用但这里是 sidecar API）
+      const hasLocalOverride = Object.prototype.hasOwnProperty.call(localOverrides, agentId);
+      const finalInstalled = hasLocalOverride ? !!localOverrides[agentId] : tool.installed;
+      const manualBadgeStyle = hasLocalOverride
+        ? 'display:inline-block; margin-right:6px; font-size:0.75em; padding:1px 5px; border-radius:3px; background:var(--lrc-金色-200); color:var(--lrc-金色-800); border:1px solid var(--lrc-金色-400);'
+        : 'display:none; margin-right:6px; font-size:0.75em; padding:1px 5px; border-radius:3px; background:var(--lrc-金色-200); color:var(--lrc-金色-800); border:1px solid var(--lrc-金色-400);';
+      // 齿轮图标 hover 效果 + 点击菜单
+      const gearBtn = `<button type="button" data-role="tool-gear-btn" 
+        onclick="event.stopPropagation(); event.preventDefault(); showToolGearMenu('${tool.name.replace(/'/g, "\\'")}', ${finalInstalled}, this);"
+        title="检测结果不对？点此手动修正"
+        style="background:none;border:none;cursor:pointer;font-size:1em;padding:2px 4px;border-radius:4px;opacity:0.55;transition:all 0.15s;margin-right:4px;"
+        onmouseover="this.style.opacity='1';this.style.background='var(--lrc-宣纸-500)';"
+        onmouseout="this.style.opacity='0.55';this.style.background='transparent';">⚙️</button>`;
       return `
-      <div style="padding: 12px 0; border-bottom: 1px solid var(--lrc-宣纸-500);">
+      <div data-agent-id="${htmlescape(agentId)}" style="padding: 12px 0; border-bottom: 1px solid var(--lrc-宣纸-500);">
         <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: ${guide ? '6px' : '0'};">
           <div style="display: flex; align-items: center; gap: 12px;">
-            <input type="checkbox" ${tool.installed ? 'checked' : ''} ${!tool.installed ? 'disabled' : ''} id="tool-${tool.name.replace(/\s/g, '-')}">
-            <span style="color: var(--lrc-墨韵-700); font-weight: 500;">${tool.name}</span>
-            <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">(${tool.type})</span>
-            ${tool.version ? '<span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">v' + tool.version + '</span>' : ''}
+            <input type="checkbox" ${finalInstalled ? 'checked' : ''} ${!finalInstalled && !hasLocalOverride ? 'disabled' : ''} id="tool-${tool.name.replace(/\s/g, '-')}"
+              data-auto-install-disabled="${!tool.installed ? 'true' : 'false'}"
+              onchange="if(this.checked && typeof onAgentSelected==='function') onAgentSelected('${htmlescape(agentId)}', true);">
+            <span style="color: var(--lrc-墨韵-700); font-weight: 500;">${htmlescape(tool.name)}</span>
+            <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">(${htmlescape(tool.type || '')})</span>
+            ${tool.version ? '<span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">v' + htmlescape(tool.version) + '</span>' : ''}
           </div>
-          <span style="font-size: 0.85em; font-weight: 600; color: ${tool.installed ? 'var(--lrc-玉色-600)' : 'var(--lrc-墨韵-300)'};">${tool.installed ? '已检测到' : '未安装'}</span>
+          <div style="display:flex; align-items:center;">
+            ${gearBtn}
+            <span data-role="manual-override-badge" style="${manualBadgeStyle}" title="用户手动指定，不受自动检测影响">🔧 用户指定</span>
+            <span data-role="tool-status"
+              data-auto-status="${tool.installed ? '已检测到' : '未安装'}"
+              data-auto-status-installed="${tool.installed ? 'true' : 'false'}"
+              data-auto-status-checked="${tool.installed ? 'true' : 'false'}"
+              style="font-size: 0.85em; font-weight: 600; color: ${finalInstalled ? 'var(--lrc-玉色-600)' : 'var(--lrc-墨韵-300)'};">${finalInstalled ? '已检测到' : '未安装'}</span>
+          </div>
         </div>
-        ${guide ? `<div style="font-size: 0.8em; color: var(--lrc-墨韵-500); padding-left: 36px; line-height: 1.5;">💡 ${guide}</div>` : ''}
+        ${guide ? `<div style="font-size: 0.8em; color: var(--lrc-墨韵-500); padding-left: 36px; line-height: 1.5;">💡 ${htmlescape(guide)}</div>` : ''}
       </div>`;
     }).join('');
 
     // 统计已安装数量
     const installedCount = tools.filter(t => t.installed).length;
+    // S-05：工具列表渲染完成后，刷新「上次扫描时间」显示
+    refreshScanCacheMetadataUi();
 
   } catch (e) {
     toolsList.innerHTML = '<p style="color: var(--lrc-朱砂-500); margin: 0;">检测失败: ' + htmlescape(e.message) + '</p><p style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-top: 8px;">请确保龙忆（LRC）服务正在运行</p><button class="btn btn-accent" style="margin-top: 12px;" data-action="retryToolDetection">重新检测</button>';
+    // S-05：即使失败也刷新「上次扫描时间」（用上次的缓存数据，若有）
+    refreshScanCacheMetadataUi();
     // 动态生成的按钮需要重新绑定 data-action
     if (typeof bindAllActions === 'function') {
       bindAllActions();
@@ -8227,6 +8430,412 @@ async function simulateAiToolsScan() {
 // v0.8.22 修复：工具检测失败后重试按钮
 function retryToolDetection() {
   simulateAiToolsScan();
+}
+
+// ============================================================
+// v0.8.31 S-05：扫描缓存 UI 控制（上次扫描时间 + 重新扫描按钮）
+// ============================================================
+
+/**
+ * 确保工具列表上方有工具栏（上次扫描时间 + 重新扫描按钮）。
+ * 不存在时动态插入（避免修改原 HTML）。
+ */
+function ensureAiToolsToolbar() {
+  const toolsList = document.getElementById('ai-tools-list');
+  if (!toolsList) return;
+  // 已存在就不重复创建
+  if (document.getElementById('lrc-ai-tools-toolbar')) return;
+  const toolbar = document.createElement('div');
+  toolbar.id = 'lrc-ai-tools-toolbar';
+  toolbar.style.cssText = [
+    'display:flex; align-items:center; justify-content:space-between;',
+    'margin: 0 0 10px 0; padding: 6px 2px; font-size: 0.85em; color: var(--lrc-墨韵-500);',
+    'border-bottom:1px dashed var(--lrc-宣纸-500);',
+  ].join('');
+  toolbar.innerHTML = `
+    <div data-role="last-scan-ts" style="display:flex; align-items:center; gap:6px;">
+      <span>📅</span>
+      <span data-role="last-scan-text">上次扫描：</span>
+      <span data-role="last-scan-value" style="color: var(--lrc-墨韵-700); font-weight: 500;">加载中...</span>
+      <span data-role="last-scan-valid" style="display:none; padding: 1px 6px; border-radius: 3px; font-size: 0.9em; background: var(--lrc-玉色-100); color: var(--lrc-玉色-700); margin-left: 6px;">24h 内有效</span>
+    </div>
+    <div style="display:flex; align-items:center; gap:8px;">
+      <button type="button" class="btn" data-role="btn-refresh-scan-cache"
+        title="清空扫描缓存，重新扫描桌面快捷方式和安装目录（检测结果不准确时使用）"
+        style="padding: 4px 10px; font-size: 0.85em; border-radius: var(--radius-sm); background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); cursor: pointer; color: var(--lrc-墨韵-700);"
+        onclick="if(typeof rescanToolsWithInvalidate==='function') rescanToolsWithInvalidate();">
+        🔄 重新扫描（清空缓存）
+      </button>
+    </div>
+  `;
+  // 插入到 ai-tools-list 之前
+  if (toolsList.parentNode) {
+    toolsList.parentNode.insertBefore(toolbar, toolsList);
+  }
+}
+
+/**
+ * 更新「上次扫描时间」文本（不发请求，用于扫描中提示）。
+ * @param {object|null} meta - 已有的元数据，null 表示加载/未知
+ * @param {boolean} scanning - 是否正在扫描中（显示「扫描中...」）
+ */
+function updateLastScanTsUi(meta, scanning) {
+  const valueEl = document.querySelector('[data-role="last-scan-value"]');
+  const validEl = document.querySelector('[data-role="last-scan-valid"]');
+  if (!valueEl) return;
+
+  if (scanning) {
+    valueEl.textContent = '扫描中...';
+    valueEl.style.color = 'var(--lrc-金色-700)';
+    if (validEl) validEl.style.display = 'none';
+    return;
+  }
+
+  if (!meta || !meta.timestamp_ms) {
+    valueEl.textContent = '尚未扫描';
+    valueEl.style.color = 'var(--lrc-墨韵-400)';
+    if (validEl) validEl.style.display = 'none';
+    return;
+  }
+
+  try {
+    const dt = new Date(Number(meta.timestamp_ms));
+    if (isNaN(dt.getTime())) throw new Error('invalid ts');
+    const pad = n => String(n).padStart(2, '0');
+    const text = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+    valueEl.textContent = text;
+    valueEl.style.color = 'var(--lrc-墨韵-700)';
+    if (validEl) {
+      if (meta.valid) {
+        validEl.style.display = 'inline-block';
+        validEl.textContent = '24h 内有效';
+        validEl.style.background = 'var(--lrc-玉色-100)';
+        validEl.style.color = 'var(--lrc-玉色-700)';
+      } else {
+        validEl.style.display = 'inline-block';
+        validEl.textContent = '已超过 24h，建议重扫';
+        validEl.style.background = 'var(--lrc-金色-100)';
+        validEl.style.color = 'var(--lrc-金色-800)';
+      }
+    }
+  } catch (e) {
+    valueEl.textContent = '时间解析失败';
+    if (validEl) validEl.style.display = 'none';
+  }
+}
+
+/**
+ * 调用 Tauri get_scan_cache_metadata 命令并刷新 UI 显示「上次扫描时间」
+ */
+async function refreshScanCacheMetadataUi() {
+  if (!isTauriEnv) {
+    updateLastScanTsUi(null, false);
+    return;
+  }
+  try {
+    const meta = await postMessageToParent('lrc-get-scan-cache-metadata', null, 8000);
+    updateLastScanTsUi(meta || null, false);
+  } catch (e) {
+    console.warn('[S-05] 获取扫描缓存元数据失败：', e.message);
+    updateLastScanTsUi(null, false);
+  }
+}
+
+/**
+ * 用户点击「重新扫描（清空缓存）」按钮。
+ * 流程：invalidate 缓存 → 重新调用 simulateAiToolsScan（会触发重新扫描）→ 刷新时间戳
+ */
+async function rescanToolsWithInvalidate() {
+  if (typeof showToast === 'function') {
+    showToast('正在清空扫描缓存并重新检测，请稍候...', 'info', 4000);
+  }
+  // 桌面端才调 IPC，浏览器模式直接重试
+  if (isTauriEnv) {
+    try {
+      await postMessageToParent('lrc-force-invalidate-scan-cache', null, 8000);
+      console.log('[S-05] 扫描缓存已成功失效');
+    } catch (e) {
+      console.warn('[S-05] 强制失效缓存失败（不影响重扫）：', e.message);
+    }
+  }
+  // 重新触发检测（此时缓存已失效，get_scan_cache 内部会重扫）
+  await simulateAiToolsScan();
+  if (typeof showToast === 'function') {
+    showToast('重新扫描完成！如结果仍不准确，可点击工具卡片右侧 ⚙️ 齿轮手动修正', 'success', 4500);
+  }
+}
+
+// ============================================================
+// v0.8.31 S-03：AI 工具手动修正（向导齿轮图标逻辑）
+// ============================================================
+
+/**
+ * 工具显示名 → 后端 agent_id 的映射表
+ * 用于前端按钮点击时，将 /api/tools/detect 返回的 name 正确映射到
+ * discover_all_agents 注册的工具 ID，保证后端 manual_override 持久化正确。
+ */
+const TOOL_NAME_TO_AGENT_ID_MAP = {
+  'Trae': 'trae',
+  'Trae CN': 'trae-cn',
+  'Cursor': 'cursor',
+  'VS Code': 'vscode',
+  'Windsurf': 'windsurf',
+  'Kiro': 'kiro',
+  'Claude Desktop': 'claude-desktop',
+  'Gemini CLI': 'gemini-cli',
+  'CodeBuddy': 'codebuddy',
+  'CodeBuddy (腾讯)': 'codebuddy',
+  'Comate': 'comate',
+  'Comate (百度)': 'comate',
+  'Zed': 'zed',
+  'Sublime Text': 'sublime-text',
+  'Neovim': 'neovim',
+  'Vim': 'vim',
+  'JetBrains Toolbox': 'jetbrains-toolbox',
+  'IntelliJ IDEA': 'intellij-idea',
+  'PyCharm': 'pycharm',
+  'GoLand': 'goland',
+  'WebStorm': 'webstorm',
+  'CLion': 'clion',
+  'RustRover': 'rustrover',
+  'Qwen Code': 'qwen-code',
+  'Aider': 'aider',
+  'Cline': 'cline',
+  'Continue': 'continue',
+  'Windsurf Cascade': 'windsurf',
+  'Qoder': 'qoder',
+  'Cody Sourcegraph': 'cody-sourcegraph',
+  'Tabnine': 'tabnine',
+  'Codeium': 'codeium',
+  'Replit AI': 'replit-ai',
+  'DeepSeek Coder': 'deepseek-coder',
+  'GitHub Copilot': 'github-copilot',
+  'Claude Code': 'claude-code',
+  'Warp AI': 'warp-ai',
+  'Tabby': 'tabby',
+};
+
+/** 将工具显示名映射为后端 agent_id（找不到时返回原始名做最佳努力匹配） */
+function toolNameToAgentId(displayName) {
+  if (!displayName) return '';
+  const trimmed = String(displayName).trim();
+  return TOOL_NAME_TO_AGENT_ID_MAP[trimmed] || trimmed;
+}
+
+/** localStorage 次级备份 key（即使后端 IPC 失败，也至少在重启前保持一致） */
+const LS_MANUAL_OVERRIDE_KEY = 'lrc_agent_manual_overrides_v1';
+
+/** 从 localStorage 读取所有手动修正（次级备份，用于非桌面端环境或 IPC 失败时降级） */
+function getLocalManualOverrides() {
+  try {
+    const raw = localStorage.getItem(LS_MANUAL_OVERRIDE_KEY);
+    if (!raw) return {};
+    const obj = JSON.parse(raw);
+    return (obj && typeof obj === 'object') ? obj : {};
+  } catch (e) {
+    console.warn('[manualOverride] localStorage 读取失败，降级为空:', e.message);
+    return {};
+  }
+}
+
+/** 将单个手动修正写入 localStorage（次级备份），返回 true=成功 false=失败 */
+function setLocalManualOverride(agentId, overrideInstalled) {
+  try {
+    const all = getLocalManualOverrides();
+    if (overrideInstalled === null || overrideInstalled === undefined) {
+      delete all[agentId]; // None = 清除此工具的手动修正
+    } else {
+      all[agentId] = !!overrideInstalled;
+    }
+    localStorage.setItem(LS_MANUAL_OVERRIDE_KEY, JSON.stringify(all));
+    return true;
+  } catch (e) {
+    console.warn('[manualOverride] localStorage 写入失败:', e.message);
+    return false;
+  }
+}
+
+/**
+ * 用户通过齿轮菜单点击"修正工具检测结果"。
+ * 流程：
+ *   1. 立即写 localStorage（UI 立刻响应，不等待 IPC）
+ *   2. 桌面端环境下异步写后端持久化（IPC 失败时 Toast 提醒用户）
+ *   3. 更新 UI：状态文字 + checkbox checked + 已手动修正标记
+ *
+ * @param {string} toolDisplayName - 工具显示名（来自 api/tools/detect 的 name 字段）
+ * @param {boolean|null} overrideInstalled - true=强制已安装, false=强制未安装, null=恢复自动检测
+ */
+async function applyAgentManualOverride(toolDisplayName, overrideInstalled) {
+  const agentId = toolNameToAgentId(toolDisplayName);
+  if (!agentId) {
+    showToast('无法识别工具：' + toolDisplayName, 'error', 4000);
+    return;
+  }
+
+  // ── Step 1：立即写 localStorage 并更新 UI，零延迟响应 ──
+  setLocalManualOverride(agentId, overrideInstalled);
+  refreshSingleToolCardUi(agentId, overrideInstalled);
+
+  // ── Step 2：桌面端环境写后端持久化（wizard.json），失败时次级 Toast 提示 ──
+  let persistOk = true;
+  if (isTauriEnv) {
+    try {
+      // 对于 null，传 undefined 让 Tauri 序列化为 Option::<bool>::None
+      const payload = overrideInstalled === null
+        ? { agent_id: agentId, override_installed: null }
+        : { agent_id: agentId, override_installed: !!overrideInstalled };
+      await postMessageToParent('lrc-set-agent-manual-override', payload, 15000);
+      console.log('[manualOverride] 后端持久化成功:', agentId, '→', overrideInstalled);
+    } catch (e) {
+      persistOk = false;
+      console.warn('[manualOverride] 后端持久化失败（已降级为本地临时生效）:', e.message);
+    }
+  }
+
+  // ── Step 3：Toast 反馈 ──
+  const actionText = overrideInstalled === true ? '已标记为安装'
+    : overrideInstalled === false ? '已标记为未安装'
+    : '已恢复自动检测';
+  const persistHint = persistOk ? '' : '（本地临时生效，重启后可能丢失）';
+  showToast(`${toolDisplayName}：${actionText}${persistHint}`, persistOk ? 'success' : 'warning', 3500);
+
+  // 变更后重新检查下一步按钮（防止用户取消所有安装后误以为项目已选）
+  if (typeof checkNextButton === 'function') checkNextButton();
+}
+
+/**
+ * 根据最新的手动覆盖状态，刷新单个工具卡片的 UI 显示：
+ *   - checkbox checked 状态
+ *   - checkbox disabled 状态（手动覆盖时允许用户勾选未安装的工具）
+ *   - 右侧"已检测到/未安装"文字 + 🔧 用户手动指定标记
+ */
+function refreshSingleToolCardUi(agentId, overrideInstalled) {
+  // 找卡片：当前渲染使用 tool.name 替换空格为 - 作为 checkbox id 前缀，
+  // 此处使用 agentId 反查 name，或直接通过 data-agent-id 查找（下面渲染新加入 data-agent-id）
+  const cards = document.querySelectorAll('[data-agent-id="' + agentId + '"]');
+  cards.forEach(card => {
+    const statusEl = card.querySelector('[data-role="tool-status"]');
+    const cb = card.querySelector('input[type="checkbox"]');
+    const manualBadge = card.querySelector('[data-role="manual-override-badge"]');
+
+    // 状态文本 + 颜色
+    if (statusEl) {
+      if (overrideInstalled === null) {
+        // 恢复为自动检测 → 需要重新拉数据，这里只移除手动标记，让用户点重新检测
+        statusEl.textContent = statusEl.dataset.autoStatus || statusEl.textContent;
+        statusEl.style.color = '';
+      } else {
+        statusEl.textContent = overrideInstalled ? '已检测到' : '未安装';
+        statusEl.style.color = overrideInstalled ? 'var(--lrc-玉色-600)' : 'var(--lrc-墨韵-300)';
+      }
+    }
+
+    // checkbox：手动修正为已安装时，用户能勾；手动修正为未安装时，用户应该勾不上
+    if (cb) {
+      if (overrideInstalled === null) {
+        cb.checked = !!statusEl?.dataset?.autoStatusChecked;
+        cb.disabled = !statusEl?.dataset?.autoStatusInstalled
+          && cb.dataset.autoInstallDisabled !== 'false';
+      } else {
+        cb.checked = !!overrideInstalled;
+        // 手动修正为未安装时仍允许用户勾选（万一用户想先选）
+        cb.disabled = false;
+      }
+    }
+
+    // 手动修正小徽章
+    if (manualBadge) {
+      manualBadge.style.display = overrideInstalled === null ? 'none' : 'inline-block';
+    }
+  });
+}
+
+/**
+ * 点击工具卡片上的齿轮图标时，弹出菜单（这不是我用的 / 改成我在用的 / 恢复自动检测）。
+ * 使用原生 showConfirm 风格的简化实现：连点两次确认 -> 执行操作；
+ * 更完整的实现用自定义弹窗，这里使用三选一的原生 confirm + prompt 组合。
+ *
+ * 更好的 UX：直接弹出一个 3 选 1 的自定义小菜单，避免三次原生弹窗打断用户。
+ * 下面提供一个基于 data-action 事件委托的轻量实现。
+ *
+ * @param {string} toolDisplayName - 工具显示名
+ * @param {HTMLElement} anchorEl - 齿轮图标锚点（用于定位小菜单）
+ */
+function showToolGearMenu(toolDisplayName, currentInstalled, anchorEl) {
+  // 清理之前的菜单（避免重复叠加）
+  document.querySelectorAll('.lrc-agent-gear-menu').forEach(m => m.remove());
+
+  const agentId = toolNameToAgentId(toolDisplayName);
+  const localOverrides = getLocalManualOverrides();
+  const hasManual = Object.prototype.hasOwnProperty.call(localOverrides, agentId);
+
+  const menu = document.createElement('div');
+  menu.className = 'lrc-agent-gear-menu';
+  menu.style.cssText = `
+    position:absolute; z-index:99999; background:var(--lrc-宣纸-100);
+    border:1px solid var(--lrc-宣纸-600); border-radius:var(--radius-md);
+    box-shadow:0 6px 24px rgba(0,0,0,0.15); padding:6px 0; min-width:200px;
+    font-size:0.9em; color:var(--lrc-墨韵-700);
+  `;
+  menu.setAttribute('data-tool-name', toolDisplayName);
+  menu.innerHTML = `
+    <div data-gear-action="mark-not-installed" style="padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;" onmouseover="this.style.background='var(--lrc-宣纸-400)'" onmouseout="this.style.background='transparent'">
+      <span>🚫</span><span>这不是我用的工具</span>
+    </div>
+    <div data-gear-action="mark-installed" style="padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;" onmouseover="this.style.background='var(--lrc-宣纸-400)'" onmouseout="this.style.background='transparent'">
+      <span>✅</span><span>改为我正在用的工具</span>
+    </div>
+    <div data-gear-action="reset" ${hasManual ? '' : 'style="opacity:0.4;pointer-events:none"'} style="padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;border-top:1px solid var(--lrc-宣纸-500);margin-top:4px;padding-top:10px;" onmouseover="this.style.background='var(--lrc-宣纸-400)'" onmouseout="this.style.background='transparent'">
+      <span>♻️</span><span>恢复自动检测</span>
+    </div>
+  `;
+
+  // 定位到齿轮按钮附近
+  document.body.appendChild(menu);
+  const r = anchorEl.getBoundingClientRect();
+  const scrollY = window.scrollY || 0;
+  const scrollX = window.scrollX || 0;
+  let left = r.left + scrollX;
+  let top = r.bottom + scrollY + 6;
+  // 边界修正：菜单超出视口右/下
+  const mr = menu.getBoundingClientRect();
+  if (left + mr.width > window.innerWidth + scrollX) {
+    left = r.right + scrollX - mr.width;
+  }
+  if (top + mr.height > window.innerHeight + scrollY) {
+    top = r.top + scrollY - mr.height - 6;
+  }
+  menu.style.left = Math.max(4, left) + 'px';
+  menu.style.top = Math.max(4, top) + 'px';
+
+  // 点击菜单项执行动作
+  menu.addEventListener('click', async (e) => {
+    const actionEl = e.target.closest('[data-gear-action]');
+    if (!actionEl) return;
+    const action = actionEl.getAttribute('data-gear-action');
+    const toolName = menu.getAttribute('data-tool-name');
+    menu.remove();
+    document.querySelectorAll('.lrc-agent-gear-menu').forEach(m => m.remove());
+
+    if (action === 'mark-not-installed') {
+      await applyAgentManualOverride(toolName, false);
+    } else if (action === 'mark-installed') {
+      await applyAgentManualOverride(toolName, true);
+    } else if (action === 'reset') {
+      await applyAgentManualOverride(toolName, null);
+    }
+  });
+
+  // 点击页面任意位置关闭菜单（一次性）
+  setTimeout(() => {
+    const closeHandler = (ev) => {
+      if (!ev.target.closest('.lrc-agent-gear-menu') && !ev.target.closest('[data-role="tool-gear-btn"]')) {
+        document.querySelectorAll('.lrc-agent-gear-menu').forEach(m => m.remove());
+        document.removeEventListener('click', closeHandler, true);
+      }
+    };
+    document.addEventListener('click', closeHandler, true);
+  }, 0);
 }
 
 /**
@@ -8263,6 +8872,9 @@ function addSelectedProject(projectName) {
   if (projectsContainer.querySelector('p')) {
     projectsContainer.innerHTML = '';
   }
+
+  // v0.8.31 S-04：用户手动新增了项目 → 取消「用户主动取消全部项目」的判定
+  resetUserCancelledAllProjectsFlag();
 
   const projectEl = document.createElement('div');
   projectEl.setAttribute('data-project', projectName);
@@ -8316,6 +8928,20 @@ function checkNextButton() {
 function removeProjectFromWizard(btn) {
   if (!btn || !btn.parentElement || !btn.parentElement.parentElement) return;
   btn.parentElement.parentElement.remove();
+
+  // v0.8.31 S-04：用户手动移除了项目 → 如果移除后所有项目都没有了，视为「用户主动取消全部」
+  const projectsContainer = document.getElementById('selected-projects');
+  if (projectsContainer) {
+    const remainingEntries = projectsContainer.children.length > 0 && !projectsContainer.querySelector('p');
+    if (!remainingEntries) {
+      const checkedBoxes = _countAllWizardProjectCheckedBoxes();
+      if (checkedBoxes === 0) {
+        console.log('[S-04] 用户手动移除了所有项目条目，下一步点击将显示确认弹窗');
+        _userCancelledAllProjectsFlag = true;
+      }
+    }
+  }
+
   if (typeof checkNextButton === 'function') {
     checkNextButton();
   }
@@ -8329,16 +8955,14 @@ window.removeProjectFromWizard = removeProjectFromWizard;
  */
 function goToStep(stepNum) {
   // v0.8.25：从步骤 1 跳转到步骤 2 时，检查项目选择状态
+  // v0.8.31 S-04 修复：仅当「用户主动取消掉所有已选项目」时才弹确认，
+  //   避免对「系统扫描不到项目」「从没选过项目」的场景过度打扰
   if (stepNum === 2) {
-    const projectsContainer = document.getElementById('selected-projects');
-    const hasProjects = projectsContainer
-      && projectsContainer.children.length > 0
-      && !projectsContainer.querySelector('p');
-    if (!hasProjects) {
+    if (shouldShowConfirmSkipProjects()) {
       // 异步确认对话框，避免阻塞
       showConfirm(
-        '您没有选择任何项目目录，确定跳过此步骤吗？\n\n您可以在后续配置中随时添加项目目录。\n不选择项目目录不影响基础功能使用。',
-        '未选择项目目录'
+        '您已取消所有项目目录的勾选，确定跳过此步骤吗？\n\n您可以在后续配置中随时添加项目目录。\n不选择项目目录不影响基础功能使用。',
+        '已取消所有项目目录选择'
       ).then(skip => {
         if (skip) {
           // 用户确认跳过，继续跳转
@@ -8448,6 +9072,30 @@ window.switchProject = switchProject;
 // v0.8.25 R-08：暴露新函数供 HTML 调用
 window.onAgentSelected = onAgentSelected;
 window.wizardNextStep = wizardNextStep;
+
+// v0.8.31 S-03：暴露齿轮图标的手动修正函数，供内联 onclick 和调试使用
+window.retryToolDetection = retryToolDetection;
+window.toolNameToAgentId = toolNameToAgentId;
+window.getLocalManualOverrides = getLocalManualOverrides;
+window.setLocalManualOverride = setLocalManualOverride;
+window.applyAgentManualOverride = applyAgentManualOverride;
+window.refreshSingleToolCardUi = refreshSingleToolCardUi;
+window.showToolGearMenu = showToolGearMenu;
+
+// v0.8.31 S-04：暴露项目选择取消确认的标志位控制函数
+window.resetUserCancelledAllProjectsFlag = resetUserCancelledAllProjectsFlag;
+window.getUserCancelledAllProjectsFlag = getUserCancelledAllProjectsFlag;
+window.onWizardProjectCheckboxChanged = onWizardProjectCheckboxChanged;
+window.shouldShowConfirmSkipProjects = shouldShowConfirmSkipProjects;
+window.addSelectedProject = addSelectedProject;
+
+// v0.8.31 S-05：暴露扫描缓存 UI 控制函数（供 onclick 和调试使用）
+window.simulateAiToolsScan = simulateAiToolsScan;
+window.retryToolDetection = retryToolDetection;
+window.ensureAiToolsToolbar = ensureAiToolsToolbar;
+window.updateLastScanTsUi = updateLastScanTsUi;
+window.refreshScanCacheMetadataUi = refreshScanCacheMetadataUi;
+window.rescanToolsWithInvalidate = rescanToolsWithInvalidate;
 
 // 嵌入模型配置
 window.checkEmbedderStatus = checkEmbedderStatus;
