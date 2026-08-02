@@ -17,7 +17,7 @@
 ///   - 其他 AI 工具：Z-Brain, Functional Hub, Tabby, PearAI, Zed, JetBrains AI
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+// v0.8.31 S-05：OnceLock 已被替换为 RwLock<Option<Arc<_>>>，不再需要
 
 /// Agent 信息（返回给前端展示）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1402,9 +1402,9 @@ fn collect_install_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// v0.8.25 移除：scan_shortcuts 和 marker_exists 死代码
-/// 快捷方式扫描已通过 get_scan_cache() + collect_all_lnk_contents() 统一实现，
-/// 无需单独的函数。检测逻辑在 check_known_tool() 策略 3 中使用。
+// v0.8.25 移除：scan_shortcuts 和 marker_exists 死代码
+// 快捷方式扫描已通过 get_scan_cache() + collect_all_lnk_contents() 统一实现，
+// 无需单独的函数。检测逻辑在 check_known_tool() 策略 3 中使用。
 
 /// 收集快捷方式扫描目录（桌面 + 开始菜单）
 fn collect_shortcut_dirs() -> Vec<PathBuf> {
@@ -1520,18 +1520,35 @@ fn contains_whole_word(haystack: &[u8], needle: &[u8]) -> bool {
 ///
 /// 用于 TraeDetector 排除 Trae CN 的快捷方式，防止误检测。
 /// 检查两个编码：ASCII 和 UTF-16LE。
+///
+/// v0.8.31 S-02：扩展变体覆盖（PRODUCT-DOC Q3 + S-02）
+///   变体模式："Trae CN" / "TraeCN" / "trae-cn" / "TRAE CN" 及所有大小写组合
 fn contains_trae_cn(content: &[u8]) -> bool {
-    // ASCII 编码检查
-    let ascii_patterns = ["trae cn", "Trae CN", "TRAE CN"];
+    // ASCII 编码检查（覆盖所有四种变体：空格 / 连写 / 中划线 / 大写）
+    let ascii_patterns = [
+        "trae cn", // 空格
+        "traecn",  // 连写
+        "trae-cn", // 中划线
+    ];
     for pattern in &ascii_patterns {
-        if contains_subsequence(content, pattern.as_bytes()) {
-            // 进一步确认，确保匹配的是路径中的 "Trae CN" 而非文件名中的 "Trae" 后跟其他内容
-            // 检查 pattern 后面是否跟着 "\" 或 "/" 或 "." 或 " "（表明是完整目录/文件名）
-            let pattern_bytes = pattern.as_bytes();
-            for window in content.windows(pattern_bytes.len() + 1) {
-                if window[..pattern_bytes.len()].eq_ignore_ascii_case(pattern_bytes) {
-                    let next = window[pattern_bytes.len()];
-                    if next == b'\\' || next == b'/' || next == b'.' || next == b' ' {
+        let pattern_bytes = pattern.as_bytes();
+        // 先做快速子串检查（不检查边界）
+        if contains_subsequence(content, pattern_bytes) {
+            // 严格边界验证：pattern 前后必须是合法边界字符（\ / . 空格 空开头 / 空结尾）
+            for i in 0..content.len().saturating_sub(pattern_bytes.len() - 1) {
+                let end = i + pattern_bytes.len();
+                if content[i..end].eq_ignore_ascii_case(pattern_bytes) {
+                    let prev_ok = i == 0
+                        || matches!(
+                            content[i - 1],
+                            b'\\' | b'/' | b'.' | b' ' | b'-' | b'_' | b'\0'
+                        );
+                    let next_ok = end >= content.len()
+                        || matches!(
+                            content[end],
+                            b'\\' | b'/' | b'.' | b' ' | b'-' | b'_' | b'\0'
+                        );
+                    if prev_ok && next_ok {
                         return true;
                     }
                 }
@@ -1539,21 +1556,31 @@ fn contains_trae_cn(content: &[u8]) -> bool {
         }
     }
 
-    // v0.8.25 修复：移除未使用的 utf16_patterns 变量
-    // 直接检查完整 "Trae CN" 的 UTF-16LE 编码
-    let full_utf16: Vec<u8> = "Trae CN"
-        .encode_utf16()
-        .flat_map(|c| c.to_le_bytes())
-        .collect();
-    for window in content.windows(full_utf16.len() + 2) {
-        if window[..full_utf16.len()].eq_ignore_ascii_case(&full_utf16) {
-            let next_char_bytes = &window[full_utf16.len()..full_utf16.len() + 2];
-            let next_char = u16::from_le_bytes([next_char_bytes[0], next_char_bytes[1]]);
-            if next_char == b'\\' as u16
-                || next_char == b'/' as u16
-                || next_char == b'.' as u16
-                || next_char == b' ' as u16
-            {
+    // UTF-16LE 编码检查（同上三种模式 + 全大写版本）
+    let utf16_patterns = ["Trae CN", "TraeCN", "trae-cn"];
+    for pattern in &utf16_patterns {
+        let pat_bytes: Vec<u8> = pattern
+            .encode_utf16()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+        let step = 2usize; // UTF-16LE 每个字符 2 字节
+        let wnd_sz = pat_bytes.len() + step;
+        for window in content.windows(wnd_sz) {
+            if window[..pat_bytes.len()].eq_ignore_ascii_case(&pat_bytes) {
+                let next_char_bytes = &window[pat_bytes.len()..wnd_sz];
+                let next_char = u16::from_le_bytes([next_char_bytes[0], next_char_bytes[1]]);
+                if matches!(
+                    next_char as u32,
+                    0x0000 | 0x0020 | 0x002E | 0x002F | 0x005C | 0x002D | 0x005F
+                ) {
+                    return true;
+                }
+            }
+        }
+        // 末尾边界情况：pattern 在内容结尾
+        if content.len() >= pat_bytes.len() {
+            let tail = &content[content.len() - pat_bytes.len()..];
+            if tail.eq_ignore_ascii_case(&pat_bytes) {
                 return true;
             }
         }
@@ -1574,9 +1601,19 @@ fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
 
 // ════════════════════════════════════════════════════════════════
 // v0.5.12 性能优化：全局扫描缓存
+// v0.8.31 S-05：支持 24h 自动过期 + 前端 invalidate_scan_cache IPC 强制失效
 // ════════════════════════════════════════════════════════════════
 // 根因：每个工具都重复扫描安装目录和快捷方式目录（22 个工具 × 重复扫描 = 慢）
 // 优化：一次性扫描所有目录，所有工具共享缓存，将总时间从 N×扫描 降低到 1×扫描
+// S-05 新增：
+//   - ScanCache 记录 timestamp_ms（创建时间）
+//   - get_scan_cache() 返回 Arc<ScanCache>，超过 24h 自动重新扫描
+//   - invalidate_scan_cache() 清空全局缓存，供前端「重新扫描」按钮调用
+//   - get_scan_cache_timestamp_ms() 暴露时间戳给前端显示「上次扫描时间」
+// ════════════════════════════════════════════════════════════════
+
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 扫描缓存（一次性扫描，所有工具共享）
 struct ScanCache {
@@ -1584,26 +1621,85 @@ struct ScanCache {
     exe_names: Vec<String>,
     /// 所有 .lnk 文件内容
     lnk_contents: Vec<Vec<u8>>,
+    /// v0.8.31 S-05：缓存创建时间（ms，UNIX EPOCH），用于判断 24h 过期 + 前端显示
+    timestamp_ms: u64,
 }
 
-/// 全局扫描缓存（首次调用时扫描，后续调用直接返回缓存）
-static SCAN_CACHE: OnceLock<ScanCache> = OnceLock::new();
+/// v0.8.31 S-05：扫描缓存 TTL（毫秒），默认 24h
+const SCAN_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// 获取扫描缓存（首次调用时扫描，后续调用直接返回缓存）
-fn get_scan_cache() -> &'static ScanCache {
-    SCAN_CACHE.get_or_init(|| {
-        let exe_names = collect_all_exe_names();
-        let lnk_contents = collect_all_lnk_contents();
-        tracing::info!(
-            "[Agent检测] 全局扫描缓存已建立: {} 个 exe 文件, {} 个 .lnk 文件",
-            exe_names.len(),
-            lnk_contents.len()
-        );
-        ScanCache {
-            exe_names,
-            lnk_contents,
+/// 全局扫描缓存（v0.8.31 S-05：改为 RwLock<Option<Arc<_>>>，支持过期和强制失效）
+static SCAN_CACHE: RwLock<Option<Arc<ScanCache>>> = RwLock::new(None);
+
+/// 当前 UNIX 时间（毫秒），用于过期判定
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_millis() as u64
+}
+
+/// 获取扫描缓存（首次调用时扫描；24h 过期后自动重新扫描；支持 Arc 共享）
+fn get_scan_cache() -> Arc<ScanCache> {
+    // 读锁快速路径：存在且未过期 → 直接返回 clone
+    {
+        let read_guard = SCAN_CACHE.read().expect("SCAN_CACHE RwLock 被污染");
+        if let Some(cache) = read_guard.as_ref() {
+            let age = now_ms().saturating_sub(cache.timestamp_ms);
+            if age <= SCAN_CACHE_TTL_MS {
+                return Arc::clone(cache);
+            }
+            tracing::info!(
+                "[Agent检测] 扫描缓存已过期（age={}s / TTL=24h），准备重新扫描",
+                age / 1000
+            );
         }
-    })
+    }
+
+    // 写锁路径：需要重新扫描（先检查一次，防止双锁竞态）
+    let mut write_guard = SCAN_CACHE.write().expect("SCAN_CACHE RwLock 被污染");
+    if let Some(cache) = write_guard.as_ref() {
+        let age = now_ms().saturating_sub(cache.timestamp_ms);
+        if age <= SCAN_CACHE_TTL_MS {
+            return Arc::clone(cache);
+        }
+    }
+
+    // 真实扫描一次
+    let exe_names = collect_all_exe_names();
+    let lnk_contents = collect_all_lnk_contents();
+    let timestamp_ms = now_ms();
+    tracing::info!(
+        "[Agent检测] 全局扫描缓存已重建: {} 个 exe 文件, {} 个 .lnk 文件 (timestamp_ms={})",
+        exe_names.len(),
+        lnk_contents.len(),
+        timestamp_ms
+    );
+    let cache = Arc::new(ScanCache {
+        exe_names,
+        lnk_contents,
+        timestamp_ms,
+    });
+    *write_guard = Some(Arc::clone(&cache));
+    cache
+}
+
+/// v0.8.31 S-05：获取当前扫描缓存的创建时间（ms），未扫描过则返回 0
+pub fn get_scan_cache_timestamp_ms() -> u64 {
+    let read_guard = SCAN_CACHE.read().expect("SCAN_CACHE RwLock 被污染");
+    read_guard.as_ref().map(|c| c.timestamp_ms).unwrap_or(0)
+}
+
+/// v0.8.31 S-05：强制使扫描缓存失效（下次调用 get_scan_cache 会重新扫描）
+/// 用于前端「重新扫描」按钮调用 invalidate_scan_cache IPC
+pub fn invalidate_scan_cache() {
+    let mut write_guard = SCAN_CACHE.write().expect("SCAN_CACHE RwLock 被污染");
+    let old_ts = write_guard.as_ref().map(|c| c.timestamp_ms).unwrap_or(0);
+    *write_guard = None;
+    tracing::info!(
+        "[Agent检测] 扫描缓存已被用户强制失效 (old_timestamp_ms={})",
+        old_ts
+    );
 }
 
 /// 一次性扫描所有安装目录，收集所有 exe 文件名（小写）
@@ -1684,7 +1780,8 @@ fn collect_all_lnk_contents() -> Vec<Vec<u8>> {
                         // v0.8.25 R-13：权限不足时记录日志，便于排查问题
                         tracing::warn!(
                             "[Agent检测] 读取快捷方式失败: {} (错误: {})",
-                            path.display(), e
+                            path.display(),
+                            e
                         );
                     }
                 }
@@ -1711,65 +1808,93 @@ impl DotDirDetector {
 
     /// 使用已知工具数据库中的信息进行检测
     ///
-    /// v0.5.12 重新设计：采用 exe 文件扫描检测，替代 dot 目录检测
-    ///   根因：dot 目录检测会导致误报（如 .gemini、.trae 残留目录）
-    ///         用户建议：像 SpaceSniffer 一样扫描 exe 文件确定实际安装的工具
+    /// v0.5.12 重新设计：采用 exe 文件扫描检测
     ///
-    /// 策略（按优先级）：
-    ///   1. 有 binary_paths 的工具 → 检测已知路径的二进制文件是否存在（最快）
-    ///   2. 有 exe_names 的工具 → 扫描常见安装目录匹配可执行文件名（灵活）
-    ///   3. 有 exe_names 的工具 → 扫描桌面和开始菜单快捷方式定位 exe（用户建议）
-    ///   4. 以上均未匹配 → 不检测（返回 false，避免误报）
+    /// v0.8.31（S-01，PRODUCT-DOC 执行）：证据链权重化判定
+    ///   策略（按权重由高到低，不再提前 return）：
+    ///     lnk 快捷方式扫描 → 权重 3（用户桌面/开始菜单有快捷方式=实际使用的最强信号）
+    ///     exe 安装目录扫描 → 权重 2（工具已安装但可能未使用）
+    ///     binary_paths 硬编码 → 权重 1（兜底）
+    ///   判定规则：
+    ///     ① 无 exe_names 的工具（仅能通过 binary_paths 检测）→ 沿用旧行为 binary_hit 直接判定
+    ///     ② 有 exe_names 的工具 → 总权重 ≥ 2 时 installed = true（单独 lnk 命中 3 ≥ 2，天然满足）
     fn check_known_tool(&self) -> bool {
-        // 策略 1：检测已知路径的二进制文件（最快，最准确）
-        if !self.tool.binary_paths.is_empty() && binary_exists(self.tool.binary_paths) {
-            tracing::debug!("[Agent检测] {} — 通过 binary_paths 检测到", self.tool.name);
-            return true;
-        }
+        let mut lnk_hit = false;
+        let mut exe_hit = false;
+        let mut binary_hit = false;
 
-        // 策略 2 & 3：使用全局缓存（避免每个工具都重复扫描安装目录和快捷方式目录）
-        // v0.5.12 性能优化：一次性扫描所有目录，所有工具共享缓存
-        if !self.tool.exe_names.is_empty() {
-            let cache = get_scan_cache();
+        // 先取缓存一次（所有层共享）
+        let cache_opt = if !self.tool.exe_names.is_empty() {
+            Some(get_scan_cache())
+        } else {
+            None
+        };
+
+        // 第一层（权重 3）：快捷方式 lnk 内容扫描（用户建议的最高置信度证据）
+        if let Some(cache) = cache_opt.as_ref() {
             let targets: Vec<String> = self
                 .tool
                 .exe_names
                 .iter()
                 .map(|n| n.to_lowercase())
                 .collect();
-
-            // 策略 2：在缓存的 exe 文件名中搜索
-            if cache
-                .exe_names
-                .iter()
-                .any(|exe| targets.iter().any(|t| exe == t))
-            {
-                tracing::debug!(
-                    "[Agent检测] {} — 通过 exe_names 扫描检测到（缓存）",
-                    self.tool.name
-                );
-                return true;
-            }
-
-            // 策略 3：在缓存的 .lnk 文件内容中搜索
             if cache
                 .lnk_contents
                 .iter()
                 .any(|content| search_exe_in_lnk(content, &targets))
             {
-                tracing::debug!(
-                    "[Agent检测] {} — 通过快捷方式扫描检测到（缓存）",
-                    self.tool.name
-                );
-                return true;
+                lnk_hit = true;
+            }
+
+            // 第二层（权重 2）：安装目录 exe 文件名匹配
+            if cache
+                .exe_names
+                .iter()
+                .any(|exe| targets.iter().any(|t| exe == t))
+            {
+                exe_hit = true;
             }
         }
 
-        tracing::debug!(
-            "[Agent检测] {} — 未检测到可执行文件（binary_paths、exe_names、快捷方式均未匹配）",
-            self.tool.name
-        );
-        false
+        // 第三层（权重 1）：binary_paths 硬编码路径（兜底）
+        if !self.tool.binary_paths.is_empty() && binary_exists(self.tool.binary_paths) {
+            binary_hit = true;
+        }
+
+        // 判定（v0.8.31：权重总和 + 无 exe_names 时兼容旧行为）
+        let installed = if self.tool.exe_names.is_empty() {
+            binary_hit
+        } else {
+            let score = (lnk_hit as u8) * 3 + (exe_hit as u8) * 2 + (binary_hit as u8);
+            score >= 2
+        };
+
+        if installed {
+            let mut methods = Vec::new();
+            if lnk_hit {
+                methods.push("lnk(3)");
+            }
+            if exe_hit {
+                methods.push("exe(2)");
+            }
+            if binary_hit {
+                methods.push("binary(1)");
+            }
+            tracing::debug!(
+                "[Agent检测] {} — 已安装, 证据={:?}",
+                self.tool.name,
+                methods
+            );
+        } else {
+            tracing::debug!(
+                "[Agent检测] {} — 未检测到可执行文件（lnk={} exe={} binary={})",
+                self.tool.name,
+                lnk_hit,
+                exe_hit,
+                binary_hit
+            );
+        }
+        installed
     }
 }
 
@@ -1843,47 +1968,77 @@ struct TraeDetector;
 
 impl AgentDetector for TraeDetector {
     fn detect(&self) -> bool {
-        // v0.8.25：仅通过 exe 文件检测，避免 dot 目录误报
-        // 策略 1：检测已知安装路径的 Trae.exe（排除 Trae CN 路径）
-        let binary_paths = &[
-            "%LOCALAPPDATA%/Programs/Trae/Trae.exe",
-            "%PROGRAMFILES%/Trae/Trae.exe",
-        ];
-        if binary_exists(binary_paths) {
-            return true;
+        // v0.8.31 S-01：证据链权重化（不再提前 return）
+        //   lnk(3) → exe(2) → binary(1)，总分 ≥ 2 判定 installed
+        // v0.8.31 S-02：三阶段均执行 contains_trae_cn（扩展版）排除，防止 Trae CN 残留路径误报
+        let mut lnk_hit = false;
+        let mut exe_hit = false;
+        let mut binary_hit = false;
+
+        let cache = get_scan_cache();
+        let targets: Vec<String> = vec!["trae.exe".to_string()];
+
+        // 第一层（权重 3）：快捷方式 lnk（含 Trae CN 排除）
+        if cache.lnk_contents.iter().any(|content| {
+            if contains_trae_cn(content) {
+                return false;
+            }
+            search_exe_in_lnk(content, &targets)
+        }) {
+            lnk_hit = true;
         }
 
-        // 策略 2 & 3：使用全局缓存（避免重复扫描安装目录和快捷方式目录）
+        // 第二层（权重 2）：安装目录 exe 文件匹配（含 Trae CN 文件名/路径排除）
+        if cache.exe_names.iter().any(|exe| {
+            // S-02：先排除含 Trae CN 变体的文件名（即使极罕见）
+            if contains_trae_cn(exe.as_bytes()) {
+                return false;
+            }
+            targets.iter().any(|t| exe == t)
+        }) {
+            exe_hit = true;
+        }
+
+        // 第三层（权重 1）：硬编码 binary_paths（含 Trae CN 路径排除）
         {
-            let cache = get_scan_cache();
-            let targets: Vec<String> = vec!["trae.exe".to_string()];
-            // v0.8.25 修复：排除 Trae CN 的快捷方式，防止误检测
-            // 检查 exe_names 时，trae.exe 和 trae cn.exe 是不同的，不会误匹配
-            if cache
-                .exe_names
+            let all_paths = [
+                "%LOCALAPPDATA%/Programs/Trae/Trae.exe",
+                "%PROGRAMFILES%/Trae/Trae.exe",
+            ];
+            // S-02：先过滤掉含 Trae CN 变体的路径（兼容未来扩展/误配置）
+            let filtered: Vec<&str> = all_paths
                 .iter()
-                .any(|exe| targets.iter().any(|t| exe == t))
-            {
-                return true;
-            }
-            // v0.8.25 修复：检查快捷方式时，排除包含 "Trae CN" 的条目
-            // 根因：Trae CN 的 .lnk 文件内容中包含 "Trae" 路径前缀，导致子串匹配误报
-            if cache
-                .lnk_contents
-                .iter()
-                .any(|content| {
-                    // 排除 Trae CN 的快捷方式
-                    if contains_trae_cn(content) {
-                        return false;
-                    }
-                    search_exe_in_lnk(content, &targets)
-                })
-            {
-                return true;
+                .copied()
+                .filter(|p| !contains_trae_cn(p.as_bytes()))
+                .collect();
+            if !filtered.is_empty() && binary_exists(&filtered) {
+                binary_hit = true;
             }
         }
 
-        false
+        let score = (lnk_hit as u8) * 3 + (exe_hit as u8) * 2 + (binary_hit as u8);
+        let installed = score >= 2;
+        if installed {
+            let mut methods = Vec::new();
+            if lnk_hit {
+                methods.push("lnk(3)");
+            }
+            if exe_hit {
+                methods.push("exe(2)");
+            }
+            if binary_hit {
+                methods.push("binary(1)");
+            }
+            tracing::debug!("[Agent检测] Trae(国际版) — 已安装, 证据={:?}", methods);
+        } else {
+            tracing::debug!(
+                "[Agent检测] Trae(国际版) — 未安装 (lnk={} exe={} binary={})",
+                lnk_hit,
+                exe_hit,
+                binary_hit
+            );
+        }
+        installed
     }
 
     fn config_path(&self) -> Option<PathBuf> {
@@ -1969,37 +2124,65 @@ struct TraeCNDetector;
 
 impl AgentDetector for TraeCNDetector {
     fn detect(&self) -> bool {
-        // v0.5.12：仅通过 exe 文件检测，避免 dot 目录误报
-        // 策略 1：检测已知安装路径的 Trae CN.exe
+        // v0.8.31 S-01：证据链权重化（不再提前 return）
+        //   lnk(3) → exe(2) → binary(1)，总分 ≥ 2 判定 installed
+        let mut lnk_hit = false;
+        let mut exe_hit = false;
+        let mut binary_hit = false;
+
+        let cache = get_scan_cache();
+        let targets: Vec<String> = vec!["trae cn.exe".to_string()];
+
+        // 第一层（权重 3）：快捷方式 lnk
+        if cache
+            .lnk_contents
+            .iter()
+            .any(|content| search_exe_in_lnk(content, &targets))
+        {
+            lnk_hit = true;
+        }
+
+        // 第二层（权重 2）：安装目录 exe 文件匹配
+        if cache
+            .exe_names
+            .iter()
+            .any(|exe| targets.iter().any(|t| exe == t))
+        {
+            exe_hit = true;
+        }
+
+        // 第三层（权重 1）：硬编码 binary_paths
         let binary_paths = &[
             "%LOCALAPPDATA%/Programs/Trae CN/Trae CN.exe",
             "%PROGRAMFILES%/Trae CN/Trae CN.exe",
         ];
         if binary_exists(binary_paths) {
-            return true;
+            binary_hit = true;
         }
 
-        // 策略 2 & 3：使用全局缓存（避免重复扫描安装目录和快捷方式目录）
-        {
-            let cache = get_scan_cache();
-            let targets: Vec<String> = vec!["trae cn.exe".to_string()];
-            if cache
-                .exe_names
-                .iter()
-                .any(|exe| targets.iter().any(|t| exe == t))
-            {
-                return true;
+        let score = (lnk_hit as u8) * 3 + (exe_hit as u8) * 2 + (binary_hit as u8);
+        let installed = score >= 2;
+        if installed {
+            let mut methods = Vec::new();
+            if lnk_hit {
+                methods.push("lnk(3)");
             }
-            if cache
-                .lnk_contents
-                .iter()
-                .any(|content| search_exe_in_lnk(content, &targets))
-            {
-                return true;
+            if exe_hit {
+                methods.push("exe(2)");
             }
+            if binary_hit {
+                methods.push("binary(1)");
+            }
+            tracing::debug!("[Agent检测] Trae CN — 已安装, 证据={:?}", methods);
+        } else {
+            tracing::debug!(
+                "[Agent检测] Trae CN — 未安装 (lnk={} exe={} binary={})",
+                lnk_hit,
+                exe_hit,
+                binary_hit
+            );
         }
-
-        false
+        installed
     }
 
     fn config_path(&self) -> Option<PathBuf> {

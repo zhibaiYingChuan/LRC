@@ -158,7 +158,11 @@ pub enum SidecarStartError {
     /// 健康检查超时（E003）
     HealthCheckTimeout { port: u16, attempts: u32 },
     /// 子进程意外退出（E004）
-    ProcessDied { pid: u32, log_hint: String, log_empty: bool },
+    ProcessDied {
+        pid: u32,
+        log_hint: String,
+        log_empty: bool,
+    },
     /// 用户取消启动（E005）
     UserCancelled,
     /// 端口被外部 sidecar 占用（E006）
@@ -171,7 +175,10 @@ pub enum SidecarStartError {
     /// 与 ProcessDied 的区别：这不是崩溃，而是 sidecar 主动退出让位给已有实例。
     /// 修复策略：提示用户"已有实例运行"，提供"复用现有实例"按钮（扫描健康端口）。
     /// existing_port 为已探测到的健康 sidecar 端口（None 表示未探测到）。
-    SingletonConflict { pid: u32, existing_port: Option<u16> },
+    SingletonConflict {
+        pid: u32,
+        existing_port: Option<u16>,
+    },
 }
 
 impl SidecarStartError {
@@ -710,7 +717,11 @@ impl SidecarManager {
                     "v0.8.17：sidecar PID={pid} 启动后 1500ms 内退出（exit code {}）{log_hint}",
                     exit_code
                 );
-                return Err(SidecarStartError::ProcessDied { pid, log_hint, log_empty });
+                return Err(SidecarStartError::ProcessDied {
+                    pid,
+                    log_hint,
+                    log_empty,
+                });
             }
             Ok(None) => {
                 // 进程仍在运行，继续健康检查
@@ -858,10 +869,17 @@ impl SidecarManager {
                             let content = std::fs::read_to_string(&log_path).unwrap_or_default();
                             let is_empty = content.trim().is_empty();
                             let hint = if is_empty {
-                                format!("，日志为空（{}\\lrc-sidecar.log），疑似运行时依赖缺失", d.display())
+                                format!(
+                                    "，日志为空（{}\\lrc-sidecar.log），疑似运行时依赖缺失",
+                                    d.display()
+                                )
                             } else {
                                 let last_lines: Vec<&str> = content.lines().rev().take(3).collect();
-                                format!("，日志末尾: {}（完整日志: {}\\lrc-sidecar.log）", last_lines.join(" | "), d.display())
+                                format!(
+                                    "，日志末尾: {}（完整日志: {}\\lrc-sidecar.log）",
+                                    last_lines.join(" | "),
+                                    d.display()
+                                )
                             };
                             (hint, is_empty)
                         })
@@ -870,7 +888,11 @@ impl SidecarManager {
                         "v0.8.17：sidecar PID={pid} 在健康检查期间退出（exit code {}）{log_hint}",
                         exit_code
                     );
-                    return Err(SidecarStartError::ProcessDied { pid, log_hint, log_empty });
+                    return Err(SidecarStartError::ProcessDied {
+                        pid,
+                        log_hint,
+                        log_empty,
+                    });
                 }
                 Ok(None) => {
                     // 进程仍在运行，继续健康检查
@@ -937,11 +959,9 @@ impl SidecarManager {
         for offset in 0..10u16 {
             let port = start_port + offset;
             // 用 200ms 超时包裹 check_sidecar_health（默认 2s 太慢）
-            if let Ok(Some(_)) = tokio::time::timeout(
-                Duration::from_millis(200),
-                Self::check_sidecar_health(port),
-            )
-            .await
+            if let Ok(Some(_)) =
+                tokio::time::timeout(Duration::from_millis(200), Self::check_sidecar_health(port))
+                    .await
             {
                 return Some(port);
             }
