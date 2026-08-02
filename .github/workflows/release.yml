@@ -40,9 +40,8 @@ jobs:
             rustup.rs:443
             static.rust-lang.org:443
             index.crates.io:443
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.80.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.80.0
           components: rustfmt, clippy
       - name: Cache Cargo deps
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -240,9 +239,8 @@ jobs:
         shell: bash
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.80.0
+       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.80.0
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo deps
@@ -405,9 +403,8 @@ jobs:
         shell: bash
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.80.0
+       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: 1.80.0
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo deps (sidecar)
