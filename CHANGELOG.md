@@ -2,6 +2,21 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.29] - 2026-08-02
+
+### 修复：v0.8.28 Release Preflight Check 版本号检查失败 + 重新发布可用安装包
+
+> v0.8.25 安装包因缺少 `toolchain: stable` 参数导致使用 1.80.0 工具链编译，生成不完整安装包。
+> v0.8.26/27/28 Release 均因 Preflight Check 版本号一致性检查失败而终止，未生成安装包。
+> 本版本在 v0.8.28 基础上将版本号更新至 0.8.29，重新触发 Release 流程。
+
+#### BLT-04: 修复 v0.8.25 安装包打不开 + v0.8.26/27/28 Release 失败（P0）
+- **根因**: 
+  - v0.8.25: release.yml 中 3 处 `dtolnay/rust-toolchain` 缺少 `toolchain: stable`，默认使用 1.80.0 工具链（不支持 edition2024 依赖），生成不完整安装包
+  - v0.8.26/27/28: Release Preflight Check 的 Version consistency check 步骤失败，导致所有构建 job 被跳过
+- **修复**: 已在 v0.8.27/v0.8.28 中修复 release.yml（添加 `toolchain: stable` + 修正 CHANGELOG grep 模式），本版本升级到 v0.8.29 重新触发 Release
+- **影响**: 修复后 Release 流程应正常生成各平台安装包
+
 ## [0.8.28] - 2026-08-02
 
 ### 修复：v0.8.27 Preflight Check 版本号检查失败
