@@ -207,6 +207,8 @@ jobs:
       #   表现为 fetch-pack: invalid index-pack output / early EOF / curl 56 Recv failure。
       #   使用 continue-on-error + PowerShell 循环重试，最多 5 次，指数退避（15s/30s/60s/120s/240s）。
       # v0.8.39 增强：DNS 解析失败时刷新 DNS 缓存后再重试。
+      # v0.8.40 增强：在 git clone 前先测试 DNS 解析，DNS 恢复后才执行 clone，
+      #   避免"DNS 不通但强行 clone"的无效重试循环。
       - name: Checkout
         id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -224,6 +226,24 @@ jobs:
             # 刷新 DNS 缓存，解决偶发 DNS 解析失败
             Write-Host "  → 刷新 DNS 缓存..."
             ipconfig /flushdns 2>$null
+            Start-Sleep -Seconds 2
+            # v0.8.40 增强：先测试 DNS 解析，不通则不执行 clone
+            Write-Host "  → 测试 DNS 解析 github.com..."
+            $dnsOk = $false
+            try {
+              $addresses = [System.Net.Dns]::GetHostAddresses("github.com")
+              if ($addresses -and $addresses.Length -gt 0) {
+                Write-Host "    ✓ DNS 解析成功: $($addresses[0].IPAddressToString)"
+                $dnsOk = $true
+              }
+            } catch {
+              Write-Host "    ✗ DNS 解析异常: $_"
+            }
+            if (-not $dnsOk) {
+              Write-Host "  → DNS 不可用，跳过本次重试（等待下次循环）"
+              continue
+            }
+            # DNS 解析成功，清理旧文件并执行 git clone
             Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
             Remove-Item -Force ".gitattributes" -ErrorAction SilentlyContinue
             Remove-Item -Force ".gitignore" -ErrorAction SilentlyContinue
@@ -413,6 +433,8 @@ jobs:
       #   表现为 fetch-pack: invalid index-pack output / early EOF / curl 56 Recv failure。
       #   使用 continue-on-error + PowerShell 循环重试，最多 5 次，指数退避（15s/30s/60s/120s/240s）。
       # v0.8.39 增强：DNS 解析失败时刷新 DNS 缓存后再重试。
+      # v0.8.40 增强：在 git clone 前先测试 DNS 解析，DNS 恢复后才执行 clone，
+      #   避免"DNS 不通但强行 clone"的无效重试循环。
       - name: Checkout
         id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -430,6 +452,24 @@ jobs:
             # 刷新 DNS 缓存，解决偶发 DNS 解析失败
             Write-Host "  → 刷新 DNS 缓存..."
             ipconfig /flushdns 2>$null
+            Start-Sleep -Seconds 2
+            # v0.8.40 增强：先测试 DNS 解析，不通则不执行 clone
+            Write-Host "  → 测试 DNS 解析 github.com..."
+            $dnsOk = $false
+            try {
+              $addresses = [System.Net.Dns]::GetHostAddresses("github.com")
+              if ($addresses -and $addresses.Length -gt 0) {
+                Write-Host "    ✓ DNS 解析成功: $($addresses[0].IPAddressToString)"
+                $dnsOk = $true
+              }
+            } catch {
+              Write-Host "    ✗ DNS 解析异常: $_"
+            }
+            if (-not $dnsOk) {
+              Write-Host "  → DNS 不可用，跳过本次重试（等待下次循环）"
+              continue
+            }
+            # DNS 解析成功，清理旧文件并执行 git clone
             Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
             Remove-Item -Force ".gitattributes" -ErrorAction SilentlyContinue
             Remove-Item -Force ".gitignore" -ErrorAction SilentlyContinue
