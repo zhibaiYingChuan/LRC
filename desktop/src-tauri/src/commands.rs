@@ -630,10 +630,45 @@ pub async fn start_sidecar(
                     progress_tx: Some(&progress_tx),
                     data_dir: _dev_dd.as_deref(),
                 };
-                let (child, port) =
-                    SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts)
-                        .await
-                        .map_err(|e| sidecar_error_to_user_message(&e))?;
+                let (child, port) = match SidecarManager::spawn_and_wait(
+                    &binary_path,
+                    &project_key,
+                    &start_opts,
+                )
+                .await
+                {
+                    Ok(pair) => pair,
+                    Err(crate::sidecar_manager::SidecarStartError::SingletonConflict {
+                        pid,
+                        existing_port: None,
+                    }) => {
+                        // v0.8.39 修复：SingletonConflict 且 health check 不可达时，
+                        // 强制终止旧进程后重启，而不是让用户手动操作。
+                        tracing::warn!(
+                            "E008: 旧 sidecar (PID={}) 不可达，强制终止后重启",
+                            pid
+                        );
+                        if crate::sidecar_manager::kill_process_by_pid(pid) {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            // 重试启动
+                            SidecarManager::spawn_and_wait(
+                                &binary_path,
+                                &project_key,
+                                &start_opts,
+                            )
+                            .await
+                            .map_err(|e| sidecar_error_to_user_message(&e))?
+                        } else {
+                            let err_msg = format!(
+                                "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
+                                 请手动结束该进程后重试",
+                                pid
+                            );
+                            return Err(err_msg);
+                        }
+                    }
+                    Err(e) => return Err(sidecar_error_to_user_message(&e)),
+                };
 
                 // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
                 {
@@ -750,6 +785,47 @@ pub async fn start_sidecar_for_project(
                 .await
                 {
                     Ok(Ok(result)) => result,
+                    Ok(Err(crate::sidecar_manager::SidecarStartError::SingletonConflict {
+                        pid,
+                        existing_port: None,
+                    })) => {
+                        // v0.8.39 修复：SingletonConflict 且 health check 不可达时，
+                        // 强制终止旧进程后重启
+                        tracing::warn!(
+                            "E008: 旧 sidecar (PID={}) 不可达，强制终止后重启（项目: {}）",
+                            pid,
+                            project_key
+                        );
+                        if !crate::sidecar_manager::kill_process_by_pid(pid) {
+                            return Err(format!(
+                                "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
+                                 请手动结束该进程后重试",
+                                pid
+                            ));
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(120),
+                            SidecarManager::spawn_and_wait(
+                                &binary_path,
+                                &project_key,
+                                &start_opts,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(result)) => result,
+                            Ok(Err(e)) => {
+                                return Err(sidecar_error_to_user_message(&e))
+                            }
+                            Err(_elapsed) => {
+                                store.start_cancel_flag.store(true, Ordering::SeqCst);
+                                return Err(user_friendly_error(
+                                    "项目 sidecar 启动超时（120s），请稍后重试或检查 LRC 服务状态",
+                                ));
+                            }
+                        }
+                    }
                     Ok(Err(e)) => return Err(sidecar_error_to_user_message(&e)),
                     Err(_elapsed) => {
                         store.start_cancel_flag.store(true, Ordering::SeqCst);

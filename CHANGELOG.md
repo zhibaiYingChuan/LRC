@@ -2,6 +2,18 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.39] - 2026-08-03
+
+### SingletonConflict 自动终止旧进程 + 重启
+
+**问题：** 启动时健康检查无法检测到现有 sidecar 进程（PID 存在但端口不可达），触发 E008:noport 单例锁冲突，新 sidecar 主动退出，用户需手动停止旧实例。
+
+**修复：** 新增 `kill_process_by_pid` 函数（跨平台：Windows 用 `taskkill /F`，Unix 用 `SIGKILL`），当 `SingletonConflict` 且 `existing_port=None` 时，自动强制终止旧进程后重试启动。
+
+**涉及文件：**
+- `desktop/src-tauri/src/sidecar_manager.rs`：新增 `kill_process_by_pid` 函数
+- `desktop/src-tauri/src/commands.rs`：`start_sidecar` 和 `start_sidecar_for_project` 中处理 `SingletonConflict` 错误，自动终止旧进程后重启
+
 ## [0.8.38] - 2026-08-03
 
 ### 端口区间自动检测 + 开发版完全独立文件夹
