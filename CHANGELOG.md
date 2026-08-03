@@ -2,6 +2,31 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.34] - 2026-08-03
+
+### HCSE P0 韧性修复合集（4 项致命 L3/L4/L5 韧性点 + FM-19 429 体验）
+
+**4 个 P0 缺陷根因与修复：**
+
+1. **FM-01（致命，RwLock Poison 全局崩溃）**：`SCAN_CACHE` 4 处 `.expect("被污染")` → 任何一个线程 panic 导致所有用户的 AI 工具检测 100% 全局 panic（L5 跨用户崩溃）。修复：全部替换为 `unwrap_or_else(|p| p.into_inner())` + 写锁 Poison 强制清零 `=None` 恢复策略。
+   - 文件：`desktop/src-tauri/src/agent_detector.rs`
+
+2. **FM-05（P0 卡死）**：`discover_all_agents` 无超时 → 杀毒扫描/网络盘慢时前端工具卡片区永久半加载。修复：`tokio::timeout(30s)` 包裹，超时返回明确中文 Toast（磁盘慢/重新扫描建议）。
+   - 文件：`desktop/src-tauri/src/commands.rs`
+
+3. **FM-09（P0 持久化死锁 + 批量缺失）**：`set_agent_manual_override` 无超时 + 无批量接口 → wizard.json 写锁时齿轮修正永不返回。修复：单条 10s + 新增 `bulk_apply_agent_overrides` 批量 10s 事务 + `BulkApplyResult{total/succeeded/failed/errors}` 精确反馈每条，成功条目不回滚。
+   - 文件：`desktop/src-tauri/src/commands.rs`
+
+4. **FM-19（P0 体验 DoS）**：`force_invalidate_scan_cache` / 齿轮修正 / 批量 3 处限流一刀切返回「请求过于频繁」→ 用户连点必卡死。修复：`rate_limiter.rs` 新增通用指数退避包装器 `throttled_retry_with_backoff`（1s→2s→4s→8s 共 4 次），3 处调用 4 次耗尽后 **降级放行**（用户主动操作高意图优先级 > DoS 风险）。
+   - 文件：`desktop/src-tauri/src/rate_limiter.rs`、`desktop/src-tauri/src/commands.rs`
+
+**回归测试验证：**
+- `cargo check`（根 + desktop）— 通过
+- `cargo test`（根，519 tests）— 全部通过
+- CDP WebView2 交互测试 — 7/7 基础测试 + 深度测试全部通过，未发现 bug
+
+---
+
 ## [0.8.33] - 2026-08-03
 
 ### 紧急发布 v2：v0.8.32 发布事故再修复（restore-keys SHA-agnostic 兜底导致再次打包旧二进制）

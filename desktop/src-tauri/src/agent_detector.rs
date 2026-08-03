@@ -1642,8 +1642,11 @@ fn now_ms() -> u64 {
 /// 获取扫描缓存（首次调用时扫描；24h 过期后自动重新扫描；支持 Arc 共享）
 fn get_scan_cache() -> Arc<ScanCache> {
     // 读锁快速路径：存在且未过期 → 直接返回 clone
+    // v0.8.33 HCSE FM-01 RwLock Poison 恢复：线程 panic 后仍可用 into_inner() 继续运行
     {
-        let read_guard = SCAN_CACHE.read().expect("SCAN_CACHE RwLock 被污染");
+        let read_guard = SCAN_CACHE
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(cache) = read_guard.as_ref() {
             let age = now_ms().saturating_sub(cache.timestamp_ms);
             if age <= SCAN_CACHE_TTL_MS {
@@ -1657,7 +1660,12 @@ fn get_scan_cache() -> Arc<ScanCache> {
     }
 
     // 写锁路径：需要重新扫描（先检查一次，防止双锁竞态）
-    let mut write_guard = SCAN_CACHE.write().expect("SCAN_CACHE RwLock 被污染");
+    // v0.8.33 HCSE FM-01 Poison 恢复：Poison 后重置为 None → 下一次 clean 扫描
+    let mut write_guard = SCAN_CACHE.write().unwrap_or_else(|mut poisoned| {
+        // Poison 恢复安全策略：先强制清空，避免带着半污染状态进入逻辑
+        **poisoned.get_mut() = None;
+        poisoned.into_inner()
+    });
     if let Some(cache) = write_guard.as_ref() {
         let age = now_ms().saturating_sub(cache.timestamp_ms);
         if age <= SCAN_CACHE_TTL_MS {
@@ -1686,14 +1694,21 @@ fn get_scan_cache() -> Arc<ScanCache> {
 
 /// v0.8.31 S-05：获取当前扫描缓存的创建时间（ms），未扫描过则返回 0
 pub fn get_scan_cache_timestamp_ms() -> u64 {
-    let read_guard = SCAN_CACHE.read().expect("SCAN_CACHE RwLock 被污染");
+    // v0.8.33 HCSE FM-01 Poison 恢复
+    let read_guard = SCAN_CACHE
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     read_guard.as_ref().map(|c| c.timestamp_ms).unwrap_or(0)
 }
 
 /// v0.8.31 S-05：强制使扫描缓存失效（下次调用 get_scan_cache 会重新扫描）
 /// 用于前端「重新扫描」按钮调用 invalidate_scan_cache IPC
 pub fn invalidate_scan_cache() {
-    let mut write_guard = SCAN_CACHE.write().expect("SCAN_CACHE RwLock 被污染");
+    // v0.8.33 HCSE FM-01 Poison 恢复：即使先前 panic 也保证 =None 能写成功
+    let mut write_guard = SCAN_CACHE.write().unwrap_or_else(|mut poisoned| {
+        **poisoned.get_mut() = None;
+        poisoned.into_inner()
+    });
     let old_ts = write_guard.as_ref().map(|c| c.timestamp_ms).unwrap_or(0);
     *write_guard = None;
     tracing::info!(

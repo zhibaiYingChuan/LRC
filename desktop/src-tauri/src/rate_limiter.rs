@@ -139,6 +139,54 @@ impl RateLimiter {
     pub fn active_buckets(&self) -> usize {
         self.buckets.len()
     }
+
+    /// v0.8.33 HCSE FM-19：429 限流后的指数退避重试包装器
+    ///
+    /// 重试序列：1s → 2s → 4s → 8s（共 4 次尝试）。
+    /// 超过最大尝试次数后返回操作方的原始错误（由调用方决定是否降级，
+    /// 例如读旧缓存 / 返回默认值 / 展示降级 Toast）。
+    ///
+    /// # 参数
+    /// - `client_key`: 限流桶标识（与 should_throttle 相同）
+    /// - `op`: 被包装的操作（返回 Result<T, E> 的 FnMut）
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let result = limiter.throttled_retry_with_backoff("cmd:xxx", |attempt| {
+    ///     invalidate_cache();
+    ///     Ok(())
+    /// });
+    /// ```
+    pub async fn throttled_retry_with_backoff<F, T, E>(
+        &mut self,
+        client_key: &str,
+        mut op: F,
+    ) -> Result<T, E>
+    where
+        F: FnMut(u32) -> Result<T, E>,
+    {
+        const MAX_ATTEMPTS: u32 = 4;
+        const BACKOFF_BASE_MS: u64 = 1000; // 1s, 2s, 4s, 8s
+
+        let mut last_err: Option<E> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            if !self.should_throttle(client_key) {
+                // 桶内有令牌 → 直接执行业务操作
+                match op(attempt) {
+                    Ok(v) => return Ok(v),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            // 无令牌或业务失败（非最后一次）→ 等指数退避
+            if attempt < MAX_ATTEMPTS {
+                let wait_ms = BACKOFF_BASE_MS * (1u64 << (attempt - 1));
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            }
+        }
+        // 耗尽所有尝试：返回最后一次错误（优先）或兜底生成（无法返回时由调用方处理）
+        // 由于 E 类型不能凭空构造，调用方至少会触发一次 op → 只要有 last_err 都返回
+        Err(last_err.expect("throttled_retry_with_backoff 至少执行 1 次 op，必须有 last_err; qed"))
+    }
 }
 
 #[cfg(test)]

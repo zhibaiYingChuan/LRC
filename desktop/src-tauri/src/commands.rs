@@ -1173,45 +1173,57 @@ pub async fn get_agent_config_guide(agent_id: String) -> Result<Option<String>, 
 /// 返回 (已知工具列表, 未知工具列表)
 ///
 /// v0.8.31 S-03：应用 manual_agent_overrides 覆盖（用户点击齿轮手动修正的优先级最高）
+/// v0.8.33 HCSE FM-05：外层 30 秒超时兜底，防止磁盘卡死/网络盘慢导致前端卡死
 #[tauri::command]
 pub async fn discover_all_agents(
     store: State<'_, AppStore>,
 ) -> Result<(Vec<AgentInfo>, Vec<AgentInfo>), String> {
-    // 锁顺序约束（Level 1 → Level 2）：先取 agent_registry（L1），释放后再取 wizard（L2）
-    let (mut known_list, unknown_list) = {
-        let registry = store.agent_registry.lock().await;
-        registry.discover_all()
-    }; // agent_registry 锁已释放（<1ms）
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        // 锁顺序约束（Level 1 → Level 2）：先取 agent_registry（L1），释放后再取 wizard（L2）
+        let (mut known_list, unknown_list) = {
+            let registry = store.agent_registry.lock().await;
+            registry.discover_all()
+        }; // agent_registry 锁已释放（<1ms）
 
-    // Level 2：取 wizard 锁读取手动修正
-    let overrides = {
-        let wizard = store.wizard.lock().await;
-        wizard.get_manual_agent_overrides()
-    }; // wizard 锁已释放（<1ms）
+        // Level 2：取 wizard 锁读取手动修正
+        let overrides = {
+            let wizard = store.wizard.lock().await;
+            wizard.get_manual_agent_overrides()
+        }; // wizard 锁已释放（<1ms）
 
-    // 对已知工具列表应用手动覆盖（用户纠正优先级最高，无论自动检测结果如何）
-    if !overrides.is_empty() {
-        let mut applied = 0usize;
-        for agent in known_list.iter_mut() {
-            if let Some(&force_installed) = overrides.get(&agent.id) {
-                if agent.installed != force_installed {
-                    tracing::info!(
-                        "[Agent检测] 手动修正生效: id={} 原={} → 强制={}",
-                        agent.id,
-                        agent.installed,
-                        force_installed
-                    );
-                    agent.installed = force_installed;
-                    applied += 1;
+        // 对已知工具列表应用手动覆盖（用户纠正优先级最高，无论自动检测结果如何）
+        if !overrides.is_empty() {
+            let mut applied = 0usize;
+            for agent in known_list.iter_mut() {
+                if let Some(&force_installed) = overrides.get(&agent.id) {
+                    if agent.installed != force_installed {
+                        tracing::info!(
+                            "[Agent检测] 手动修正生效: id={} 原={} → 强制={}",
+                            agent.id,
+                            agent.installed,
+                            force_installed
+                        );
+                        agent.installed = force_installed;
+                        applied += 1;
+                    }
                 }
             }
+            if applied > 0 {
+                tracing::debug!("[Agent检测] 共应用 {} 条用户手动修正", applied);
+            }
         }
-        if applied > 0 {
-            tracing::debug!("[Agent检测] 共应用 {} 条用户手动修正", applied);
+
+        (known_list, unknown_list)
+    })
+    .await;
+
+    match result {
+        Ok(tuple) => Ok(tuple),
+        Err(_) => {
+            tracing::error!("discover_all_agents 触发 HCSE FM-05 30 秒超时兜底");
+            Err("AI 工具检测超时（30 秒）。可能是磁盘响应慢或网络盘扫描卡住，请点击「重新扫描」重试，或关闭杀毒软件后再试。".to_string())
         }
     }
-
-    Ok((known_list, unknown_list))
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1256,16 +1268,30 @@ pub async fn get_scan_cache_metadata() -> ScanCacheMetadata {
 ///
 /// v0.8.31 HCSE RISK-P1-02 修复：加入 RateLimiter 防护，避免攻击者高频调用
 ///   导致全局 RwLock 写锁竞争（DoS 攻击向量），与 configure_agents 使用同一速率策略。
+/// v0.8.33 HCSE FM-19：触发 429 时 1/2/4/8s 指数退避重试 4 次；耗尽后降级直接执行（
+///   因为前端「重新扫描」是用户高意图操作，DoS 风险远低于后端配置持久化写入场景）。
 #[tauri::command]
 pub async fn force_invalidate_scan_cache(store: State<'_, AppStore>) -> Result<(), String> {
-    // L3 运行时保护：速率限制检查（同一限流桶，避免滥用扫描缓存失效接口）
-    {
-        let mut limiter = store.rate_limiter.lock().await;
-        if limiter.should_throttle("cmd:force_invalidate_scan_cache") {
-            return Err(user_friendly_error("请求过于频繁，请稍后再试"));
+    const KEY: &str = "cmd:force_invalidate_scan_cache";
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let pass = {
+            let mut limiter = store.rate_limiter.lock().await;
+            !limiter.should_throttle(KEY)
+        };
+        if pass {
+            break;
         }
+        if attempts >= 4 {
+            tracing::warn!(
+                "[扫描缓存失效] 限流4次重试全部耗尽，HCSE FM-19降级放行（避免用户点击卡死）"
+            );
+            break; // 降级：直接放行（RwLock 写锁竞争风险 vs 用户体验，选择后者）
+        }
+        let wait_ms = 1000u64 * (1u64 << (attempts - 1));
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
     }
-
     invalidate_scan_cache();
     Ok(())
 }
@@ -1387,37 +1413,176 @@ pub async fn scan_ide_projects(
 /// manual_override 在 discover_all_agents、detect_agents、detect_installed_agents
 /// 三个查询命令中均以最高优先级应用，永不被自动检测结果覆盖。
 /// 用户通过「重新检测」按钮刷新缓存时，手动修正结果保持不变。
+///
+/// v0.8.33 HCSE FM-09：单个修正 10s 超时兜底；FM-19 触发 429 时 1/2/4/8s 指数退避重试 4 次；
+///   限流耗尽后降级放行（手动修正是用户主动高意图操作，DoS 风险远低于配置写入）。
 #[tauri::command]
 pub async fn set_agent_manual_override(
     store: State<'_, AppStore>,
     agent_id: String,
     override_installed: Option<bool>,
 ) -> Result<(), String> {
-    // L3 运行时保护：速率限制检查
-    {
-        let mut limiter = store.rate_limiter.lock().await;
-        if limiter.should_throttle("cmd:set_agent_manual_override") {
-            return Err(user_friendly_error("请求过于频繁"));
-        }
-    }
-
-    // 参数校验：agent_id 不能为空字符串
-    let trimmed = agent_id.trim();
+    // 参数校验先做（不占限流桶；空输入直接拒）
+    let trimmed = agent_id.trim().to_string();
     if trimmed.is_empty() {
         return Err(user_friendly_error("工具 ID 不能为空"));
     }
 
-    // Level 2：获取 wizard 锁进行持久化写入
-    let mut wizard = store.wizard.lock().await;
+    // L3 运行时保护：FM-19 指数退避限流（1s / 2s / 4s / 8s 共 4 次）
+    const THROTTLE_KEY: &str = "cmd:set_agent_manual_override";
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let pass = {
+            let mut limiter = store.rate_limiter.lock().await;
+            !limiter.should_throttle(THROTTLE_KEY)
+        };
+        if pass {
+            break;
+        }
+        if attempts >= 4 {
+            tracing::warn!(
+                "[Agent手动修正] 限流4次重试全部耗尽，HCSE FM-19降级放行（id={}）",
+                trimmed
+            );
+            break; // 降级：放行（该操作是用户主动点击齿轮产生，DoS概率低）
+        }
+        let wait_ms = 1000u64 * (1u64 << (attempts - 1));
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+    }
+
     let action = match override_installed {
         Some(true) => "强制标记为已安装",
         Some(false) => "强制标记为未安装",
         None => "恢复自动检测",
     };
-    tracing::info!("[Agent手动修正] 工具={} 操作={}", trimmed, action);
-    wizard
-        .set_agent_manual_override(trimmed, override_installed)
-        .map_err(|e| user_friendly_error(&e))
+
+    // HCSE FM-09：10 秒超时（Wizard::set_agent_manual_override → 内部持久化 wizard.json）
+    let store_clone = store.clone();
+    let trimmed_clone = trimmed.clone();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+        let mut wizard = store_clone.wizard.lock().await;
+        wizard
+            .set_agent_manual_override(&trimmed_clone, override_installed)
+            .map_err(|e| user_friendly_error(&e))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            tracing::info!("[Agent手动修正] 工具={} 操作={}", trimmed, action);
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            tracing::error!(
+                "[Agent手动修正] HCSE FM-09 10秒超时：工具={} 操作={}",
+                trimmed,
+                action
+            );
+            Err(format!(
+                "手动修正超时（10秒）：工具={}。可能是配置文件写入被杀毒软件拦截，请关闭杀毒软件后重试，或点击「重新扫描」后再修正。",
+                trimmed
+            ))
+        }
+    }
+}
+
+/// v0.8.33 HCSE FM-09：批量应用 AI 工具手动修正（恢复/跨端同步场景）
+///
+/// 整批 10 秒超时；成功条目不回滚；失败时用 BulkApplyResult.errors 返回每条错误。
+#[tauri::command]
+pub async fn bulk_apply_agent_overrides(
+    store: State<'_, AppStore>,
+    overrides: std::collections::HashMap<String, Option<bool>>,
+) -> Result<BulkApplyResult, String> {
+    use std::collections::HashMap;
+
+    let total = overrides.len();
+    if total == 0 {
+        return Ok(BulkApplyResult {
+            total: 0,
+            succeeded: 0,
+            failed: 0,
+            errors: HashMap::new(),
+        });
+    }
+
+    // FM-19 指数退避（批量桶单独隔离，避免影响 user-interactive 单个修改）
+    const THROTTLE_KEY: &str = "cmd:bulk_apply_agent_overrides";
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        let pass = {
+            let mut limiter = store.rate_limiter.lock().await;
+            !limiter.should_throttle(THROTTLE_KEY)
+        };
+        if pass {
+            break;
+        }
+        if attempts >= 4 {
+            tracing::warn!("[批量修正] 限流耗尽4次，FM-19降级放行（{}条）", total);
+            break;
+        }
+        let wait_ms = 1000u64 * (1u64 << (attempts - 1));
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+    }
+
+    let store_clone = store.clone();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async move {
+        let mut wizard = store_clone.wizard.lock().await;
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+        let mut errors: HashMap<String, String> = HashMap::new();
+        for (agent_id, val) in overrides {
+            let trimmed = agent_id.trim().to_string();
+            if trimmed.is_empty() {
+                failed += 1;
+                errors.insert(agent_id, "工具 ID 不能为空".to_string());
+                continue;
+            }
+            match wizard.set_agent_manual_override(&trimmed, val) {
+                Ok(()) => succeeded += 1,
+                Err(e) => {
+                    failed += 1;
+                    errors.insert(trimmed, e);
+                }
+            }
+        }
+        BulkApplyResult {
+            total,
+            succeeded,
+            failed,
+            errors,
+        }
+    })
+    .await;
+
+    match result {
+        Ok(r) => {
+            tracing::info!(
+                "[批量修正] HCSE FM-09 完成：total={} ok={} fail={}",
+                r.total,
+                r.succeeded,
+                r.failed
+            );
+            Ok(r)
+        }
+        Err(_) => {
+            tracing::error!("[批量修正] HCSE FM-09 10秒超时");
+            Err("批量手动修正超时（10秒）：请减少一次性修改的工具数量后重试。".to_string())
+        }
+    }
+}
+
+/// v0.8.33 HCSE FM-09：bulk_apply_agent_overrides 的返回结构
+#[derive(Debug, Clone, Serialize)]
+pub struct BulkApplyResult {
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    /// key = 出错的 agent_id，value = 错误消息
+    pub errors: std::collections::HashMap<String, String>,
 }
 
 // ── 项目目录命令 ──
