@@ -661,7 +661,7 @@ pub async fn start_sidecar(
                         } else {
                             let err_msg = format!(
                                 "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
-                                 请手动结束该进程后重试",
+                                 请以管理员身份运行或检查杀毒软件拦截",
                                 pid
                             );
                             return Err(err_msg);
