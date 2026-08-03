@@ -37,7 +37,7 @@ function Check-Item {
 }
 
 Write-Host "══════════════════════════════════════════════════" -ForegroundColor Cyan
-Write-Host " LRC 推送前预检脚本 v0.8.35" -ForegroundColor Cyan
+Write-Host " LRC 推送前预检脚本 v0.8.36" -ForegroundColor Cyan
 Write-Host "══════════════════════════════════════════════════" -ForegroundColor Cyan
 
 # 一、代码质量检查

@@ -2,6 +2,16 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.36] - 2026-08-03
+
+### CI 修复：Windows Desktop 构建 Install Tauri CLI 步骤 DNS 解析失败
+
+**根因：** GitHub Actions Windows runner 偶发 DNS 解析失败（`Could not resolve host: github.com`），导致 `cargo install tauri-cli` 无法下载依赖，进程以 exit code 101 退出。
+
+**修复：** 将 `Install Tauri CLI` 步骤改为 PowerShell 重试循环（最多 3 次，每次等待 15 秒）+ 设置 `CARGO_HTTP_CHECK_REVOKE=false`。
+
+- 文件：`.github/workflows/release.yml`（Install Tauri CLI 步骤）
+
 ## [0.8.35] - 2026-08-03
 
 ### CI 修复：Windows 构建 SSL 证书吊销检查失败
