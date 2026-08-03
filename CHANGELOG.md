@@ -2,6 +2,27 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.42] - 2026-08-03
+
+### 修复：Preflight Check Linux CI 进程名检查缺少下划线版匹配
+
+**问题根因：** Cargo 编译二进制时将包名连字符替换为下划线（`code-memory` → `code_memory`），但 `is_pid_alive()` 的 Linux 实现只检查连字符版。Linux `/proc/{pid}/comm` 截断到 15 字符，测试二进制被截断为 `code_memory_ser`，不匹配 `code-memory`，导致 `test_current_pid_is_alive` 和 `test_reject_when_lock_exists_and_pid_alive` 在 Linux 上失败，Preflight Check 退出码 101。
+
+**修复：** 在 `process_guard.rs` 和 `sidecar_manager.rs` 的所有进程名检查中同时添加 `code_memory`（下划线版）匹配。
+
+**涉及文件：**
+- `src/process_guard.rs`：`is_pid_alive()` Linux 实现和 `is_process_matches_sidecar()` 增加 `code_memory` 检查
+- `desktop/src-tauri/src/sidecar_manager.rs`：`kill_process_by_pid()` Windows 和 Unix 实现增加 `code_memory` 检查
+
+### 修复：Security Audit 工作流 harden-runner 缺少 index.crates.io 端点
+
+**问题根因：** v0.8.23 修复 CI/Release 工作流的 harden-runner 时漏掉了 Security Audit 工作流，`cargo install cargo-audit` 因缺少 `index.crates.io:443` 被 egress-policy 拦截。
+
+**修复：** 在 Security Audit 工作流的两个 job（Cargo Audit、License Check）的 allowed-endpoints 中添加 `index.crates.io:443`。
+
+**涉及文件：**
+- `.github/workflows/security.yml`：两个 harden-runner 配置添加 `index.crates.io:443`
+
 ## [0.8.41] - 2026-08-03
 
 ### 根因修复：E008:noport 单例锁冲突（PID 重用误判）
