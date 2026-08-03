@@ -458,13 +458,16 @@ fn is_process_matches_sidecar(pid: u32) -> bool {
             false
         }
         Err(e) => {
-            // tasklist 执行失败时（极少见），保守起见认为 PID 属于 sidecar
-            // 避免因 tasklist 故障导致 sidecar 无法启动
+            // v0.8.43 修复：tasklist 执行失败时返回 false，而非保守返回 true。
+            // 根因：保守返回 true 导致锁文件中的残留 PID 永远无法被清理，
+            // 新 sidecar 反复检测到"已有实例在运行"并以 exit code 2 退出，
+            // 形成死亡螺旋（E008:noport 反复出现）。
+            // 安全分析：即使 tasklist 临时故障，port check 也会阻止双实例。
             eprintln!(
-                "[进程守护] 执行 tasklist 检查 PID={} 失败: {}，保守通过",
+                "[进程守护] 执行 tasklist 检查 PID={} 失败: {}，视为非 sidecar",
                 pid, e
             );
-            true
+            false
         }
     }
 }

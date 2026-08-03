@@ -650,21 +650,79 @@ pub async fn start_sidecar(
                         );
                         if crate::sidecar_manager::kill_process_by_pid(pid) {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            // 重试启动
-                            SidecarManager::spawn_and_wait(
-                                &binary_path,
-                                &project_key,
-                                &start_opts,
+                            // v0.8.44 R1 修复（HCSE 韧性验证）：二级重试添加 120s 显式超时
+                            //   根因：start_sidecar 的二级重试无显式超时，与 start_sidecar_for_project 不一致
+                            //   修复：用 tokio::time::timeout(120s) 包裹
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(120),
+                                SidecarManager::spawn_and_wait(
+                                    &binary_path,
+                                    &project_key,
+                                    &start_opts,
+                                ),
                             )
                             .await
-                            .map_err(|e| sidecar_error_to_user_message(&e))?
+                            {
+                                Ok(Ok(pair)) => pair,
+                                Ok(Err(e)) => return Err(sidecar_error_to_user_message(&e)),
+                                Err(_) => return Err("启动超时（120s），请检查系统资源后重试。".to_string()),
+                            }
                         } else {
-                            let err_msg = format!(
-                                "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
-                                 请以管理员身份运行或检查杀毒软件拦截",
+                            // v0.8.43 修复（GAP-L1-08 P0）：三级兜底 — kill 失败后清理锁文件再重试一次
+                            // 根因：审计报告指出 kill_process_by_pid 失败后无三级操作路径，用户被困
+                            // 修复：尝试清理锁文件（最后手段），然后重试一次启动
+                            tracing::warn!(
+                                "E008 三级兜底：kill_process_by_pid(PID={}) 失败，尝试清理锁文件后重试",
                                 pid
                             );
-                            return Err(err_msg);
+                            // 尝试清理锁文件
+                            let lock_dir = {
+                                let home = std::env::var("USERPROFILE")
+                                    .or_else(|_| std::env::var("HOME"))
+                                    .unwrap_or_else(|_| ".".to_string());
+                                std::path::PathBuf::from(home)
+                                    .join(".loong-recall")
+                                    .join("global")
+                                    .join("data")
+                            };
+                            let lock_path = lock_dir.join(".lrc.lock");
+                            if lock_path.exists() {
+                                let _ = std::fs::write(&lock_path, "");
+                                tracing::warn!("E008 三级兜底：已清空锁文件 {}", lock_path.display());
+                            }
+                            // v0.8.44 R1 修复（HCSE 韧性验证）：三级兜底添加 120s 显式超时
+                            //   根因：start_sidecar 的三级兜底无显式超时，与 start_sidecar_for_project 不一致
+                            //   修复：用 tokio::time::timeout(120s) 包裹
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(120),
+                                SidecarManager::spawn_and_wait(
+                                    &binary_path,
+                                    &project_key,
+                                    &start_opts,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(pair)) => pair,
+                                Ok(Err(e)) => {
+                                    // 三级兜底也失败，给用户明确的操作指引
+                                    let err_msg = format!(
+                                        "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
+                                         请以管理员身份运行或检查杀毒软件拦截。\
+                                         （错误详情: {}）",
+                                        pid,
+                                        sidecar_error_to_user_message(&e)
+                                    );
+                                    return Err(err_msg);
+                                }
+                                Err(_) => {
+                                    return Err(format!(
+                                        "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
+                                         启动超时（120s），请检查系统资源后重试。",
+                                        pid
+                                    ));
+                                }
+                            }
                         }
                     }
                     Err(e) => return Err(sidecar_error_to_user_message(&e)),
@@ -797,32 +855,77 @@ pub async fn start_sidecar_for_project(
                             project_key
                         );
                         if !crate::sidecar_manager::kill_process_by_pid(pid) {
-                            return Err(format!(
-                                "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
-                                 请手动结束该进程后重试",
+                            // v0.8.43 修复（GAP-L1-08 P0）：三级兜底 — kill 失败后清理锁文件再重试一次
+                            tracing::warn!(
+                                "E008 三级兜底（项目）：kill_process_by_pid(PID={}) 失败，尝试清理锁文件后重试",
                                 pid
-                            ));
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(120),
-                            SidecarManager::spawn_and_wait(
-                                &binary_path,
-                                &project_key,
-                                &start_opts,
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(Ok(result)) => result,
-                            Ok(Err(e)) => {
-                                return Err(sidecar_error_to_user_message(&e))
+                            );
+                            let lock_dir = {
+                                let home = std::env::var("USERPROFILE")
+                                    .or_else(|_| std::env::var("HOME"))
+                                    .unwrap_or_else(|_| ".".to_string());
+                                std::path::PathBuf::from(home)
+                                    .join(".loong-recall")
+                                    .join("global")
+                                    .join("data")
+                            };
+                            let lock_path = lock_dir.join(".lrc.lock");
+                            if lock_path.exists() {
+                                let _ = std::fs::write(&lock_path, "");
+                                tracing::warn!("E008 三级兜底（项目）：已清空锁文件 {}", lock_path.display());
                             }
-                            Err(_elapsed) => {
-                                store.start_cancel_flag.store(true, Ordering::SeqCst);
-                                return Err(user_friendly_error(
-                                    "项目 sidecar 启动超时（120s），请稍后重试或检查 LRC 服务状态",
-                                ));
+                            // 最后尝试一次启动（带 120s 超时）
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(120),
+                                SidecarManager::spawn_and_wait(
+                                    &binary_path,
+                                    &project_key,
+                                    &start_opts,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(result)) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                    result
+                                }
+                                Ok(Err(e)) => {
+                                    return Err(format!(
+                                        "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
+                                         请手动结束该进程后重试。（错误详情: {}）",
+                                        pid,
+                                        sidecar_error_to_user_message(&e)
+                                    ));
+                                }
+                                Err(_elapsed) => {
+                                    store.start_cancel_flag.store(true, Ordering::SeqCst);
+                                    return Err(user_friendly_error(
+                                        "项目 sidecar 启动超时（120s），请稍后重试或检查 LRC 服务状态",
+                                    ));
+                                }
+                            }
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(120),
+                                SidecarManager::spawn_and_wait(
+                                    &binary_path,
+                                    &project_key,
+                                    &start_opts,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(result)) => result,
+                                Ok(Err(e)) => {
+                                    return Err(sidecar_error_to_user_message(&e))
+                                }
+                                Err(_elapsed) => {
+                                    store.start_cancel_flag.store(true, Ordering::SeqCst);
+                                    return Err(user_friendly_error(
+                                        "项目 sidecar 启动超时（120s），请稍后重试或检查 LRC 服务状态",
+                                    ));
+                                }
                             }
                         }
                     }
