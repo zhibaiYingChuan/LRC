@@ -2,6 +2,16 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.35] - 2026-08-03
+
+### CI 修复：Windows 构建 SSL 证书吊销检查失败
+
+**根因：** `harden-runner` 的 `egress-policy: block` 阻止了 Windows schannel 所需的 OCSP 证书吊销检查服务器（`ocsp.sectigo.com`、`crl.sectigo.com`、`ocsp2.globalsign.com` 等），导致 cargo 下载依赖时 SSL 握手失败。
+
+**修复：** 在 Windows 平台的 `cargo build` / `cargo tauri build` 前设置 `CARGO_HTTP_CHECK_REVOKE=false`，跳过 SSL 证书吊销检查（CI 环境标准做法）。
+
+- 文件：`.github/workflows/release.yml`（3 处：Build Sidecar / Build Desktop sidecar / Build Desktop app）
+
 ## [0.8.34] - 2026-08-03
 
 ### HCSE P0 韧性修复合集（4 项致命 L3/L4/L5 韧性点 + FM-19 429 体验）
