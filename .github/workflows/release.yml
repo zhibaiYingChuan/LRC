@@ -44,21 +44,32 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - name: Cache Cargo deps
+      # v0.8.33 HCSE R-02 双层缓存拆分：外部 crate 下载 vs 本项目编译产物
+      # 外部依赖（registry / git）跨 tag 共享没问题，加速依赖下载
+      - name: Cache Cargo registry (external crates only)
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/
             ~/.cargo/git/
-            target/
-          # v0.8.32 HCSE R-01 修复：Preflight/sidecar/desktop 缓存 key 必须包含源码哈希 + SHA
-          # 根因(v0.8.31发布事故)：仅 Cargo.lock 哈希时，.rs 修改但 Cargo.lock 不变会 100% 命中缓存，
-          #   结合 actions/checkout 不保留 Git mtime，cargo 误判无需重编，最终打包旧二进制+新前端资源
-          # 修复：key 级加入 github.sha + 所有 src/**/*.rs / static/** 哈希；restore-keys 只做跨 SHA 降级复用
-          key: ${{ runner.os }}-preflight-${{ github.sha }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'desktop/**/*.rs', 'static/**') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-preflight-${{ github.sha }}-${{ hashFiles('**/Cargo.lock') }}-
-            ${{ runner.os }}-preflight-
+            ${{ runner.os }}-cargo-registry-
+
+      # 本项目编译产物强制 100% 隔离：key 带 SHA，restore-keys 仅保留 SHA 级前缀 → 新 tag 必然 miss
+      - name: Cache target/ (project artifacts, SHA-locked)
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            target/
+          key: ${{ runner.os }}-preflight-target-${{ github.sha }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'desktop/**/*.rs', 'static/**') }}
+          restore-keys: |
+            ${{ runner.os }}-preflight-target-${{ github.sha }}-
+
+      # v0.8.33 HCSE R-02 核爆级保险：即使缓存 restore 了 target/ 也清光所有编译产物
+      # 与 restore-keys 删除兜底 + key 含 SHA 形成双保险，cargo 必须从 Compiling xxx v0.8.33 开始重编
+      - name: Force clean target/ (defense-in-depth against stale cache)
+        run: cargo clean
 
       # 1. 代码格式检查（与 CI Rustfmt job 对齐）
       - name: Format check
@@ -251,18 +262,29 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Cache Cargo deps
+      - name: Cache Cargo registry (external crates only)
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/
             ~/.cargo/git/
-            target/
-          # v0.8.32 HCSE R-01：build-sidecar 缓存 key 加 SHA + 源码哈希（详见 preflight 修复说明）
-          key: ${{ runner.os }}-sidecar-${{ github.sha }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'desktop/**/*.rs', 'static/**') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-sidecar-${{ github.sha }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}-
-            ${{ runner.os }}-sidecar-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Cache target/ (sidecar artifacts, SHA-locked)
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            target/
+          # v0.8.33 HCSE R-02：新 tag（新 SHA）100% 不会命中 → cache miss → cargo clean 后从 0 重编
+          key: ${{ runner.os }}-sidecar-target-${{ github.sha }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'desktop/**/*.rs', 'static/**') }}
+          restore-keys: |
+            ${{ runner.os }}-sidecar-target-${{ github.sha }}-${{ matrix.target }}-
+
+      # v0.8.33 HCSE R-02：核爆级双保险 —— 无论缓存是否 restore，清空所有 target/ 编译产物
+      - name: Force clean target/ (defense-in-depth against stale .rlib)
+        run: cargo clean
 
       - name: Set reproducible build env vars
         run: |
@@ -419,33 +441,44 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Cache Cargo deps (sidecar)
+      - name: Cache Cargo registry (external crates only)
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             ~/.cargo/registry/
             ~/.cargo/git/
-            target/
-          # v0.8.32 HCSE R-01：build-desktop sidecar 子缓存 key 加 SHA（详见 preflight 修复说明）
-          key: ${{ runner.os }}-sidecar-${{ github.sha }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'desktop/**/*.rs', 'static/**') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-sidecar-${{ github.sha }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}-
-            ${{ runner.os }}-sidecar-${{ matrix.target }}-
+            ${{ runner.os }}-cargo-registry-
 
-      - name: Cache Cargo deps (desktop)
+      - name: Cache target/ (build-desktop sidecar subdir, SHA-locked)
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
-            ~/.cargo/registry/
-            ~/.cargo/git/
-            desktop/src-tauri/target/
-          # v0.8.32 HCSE R-01：build-desktop 缓存 key 加 SHA + 源码哈希（v0.8.31 发布事故根因）
-          # 之前仅用 Cargo.lock 哈希 + restore-keys 无 SHA 导致跨 tag 命中旧 target/，
-          # cargo 跳过重编，最终发布包为 0.8.30 旧 Rust 二进制 + 0.8.31 新前端静态资源
-          key: ${{ runner.os }}-desktop-${{ github.sha }}-${{ matrix.target }}-${{ hashFiles('desktop/**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'desktop/**/*.rs', 'static/**') }}
+            target/
+          # v0.8.33 HCSE R-02：新 tag（新 SHA）100% 不会命中任何历史缓存
+          key: ${{ runner.os }}-desktop-sidecar-target-${{ github.sha }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'desktop/**/*.rs', 'static/**') }}
           restore-keys: |
-            ${{ runner.os }}-desktop-${{ github.sha }}-${{ matrix.target }}-${{ hashFiles('desktop/**/Cargo.lock') }}-
-            ${{ runner.os }}-desktop-${{ matrix.target }}-
+            ${{ runner.os }}-desktop-sidecar-target-${{ github.sha }}-${{ matrix.target }}-
+
+      - name: Cache desktop target/ (Tauri desktop target subdir, SHA-locked)
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            desktop/src-tauri/target/
+          # v0.8.33 HCSE R-02：桌面端 Tauri 编译产物 100% 与 SHA 绑定
+          key: ${{ runner.os }}-desktop-tauri-target-${{ github.sha }}-${{ matrix.target }}-${{ hashFiles('desktop/**/Cargo.lock') }}-${{ hashFiles('src/**/*.rs', 'desktop/**/*.rs', 'static/**') }}
+          restore-keys: |
+            ${{ runner.os }}-desktop-tauri-target-${{ github.sha }}-${{ matrix.target }}-
+
+      # v0.8.33 HCSE R-02：核爆级双保险 —— 无论缓存是否 restore 都清光两个 target/
+      # 彻底杜绝任何情况的跳过重编（v0.8.31 / v0.8.32 两次事故根因）
+      - name: Force clean ROOT target/ + DESKTOP target/ (defense-in-depth)
+        run: |
+          cargo clean
+          cargo clean --manifest-path desktop/src-tauri/Cargo.toml
+          echo "✅ 两个 target/ 目录全部清空，cargo 必须从 Compiling 开始重编"
+        shell: bash
 
       # 步骤 1: 先编译 sidecar 二进制
       - name: Build sidecar binary
