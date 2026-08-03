@@ -537,6 +537,19 @@ fn main() {
                                     llm_api,
                                 } = info;
 
+                                // v0.8.37 开发模式使用独立数据目录
+                                let _dev_dd = {
+                                    let is_dev = std::env::var("TAURI_DEV").is_ok()
+                                        || std::env::var("LRC_DEV_MODE").is_ok();
+                                    if is_dev {
+                                        let home = std::env::var("USERPROFILE")
+                                            .or_else(|_| std::env::var("HOME"))
+                                            .unwrap_or_else(|_| ".".to_string());
+                                        Some(format!("{}/.loong-recall/dev/data", home))
+                                    } else {
+                                        None
+                                    }
+                                };
                                 let start_opts = StartOptions {
                                     src_dir: src_dir.as_deref(),
                                     port: None,
@@ -544,6 +557,7 @@ fn main() {
                                     llm_api: llm_api.as_deref(),
                                     cancel_flag: &heartbeat_cancel,
                                     progress_tx: None, // G-003：心跳恢复不需要进度反馈
+                                    data_dir: _dev_dd.as_deref(),
                                 };
                                 match SidecarManager::spawn_and_wait(
                                     &binary_path,
