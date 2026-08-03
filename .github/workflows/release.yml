@@ -205,7 +205,8 @@ jobs:
       # v0.8.24 修复：Windows runner 网络不稳定导致 git clone 失败，
       #   根因：GitHub Actions Windows runner 偶发 TCP 连接重置 / DNS 解析失败，
       #   表现为 fetch-pack: invalid index-pack output / early EOF / curl 56 Recv failure。
-      #   使用 continue-on-error + PowerShell 循环重试，最多 3 次，每次等待 30 秒。
+      #   使用 continue-on-error + PowerShell 循环重试，最多 5 次，指数退避（15s/30s/60s/120s/240s）。
+      # v0.8.39 增强：DNS 解析失败时刷新 DNS 缓存后再重试。
       - name: Checkout
         id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -214,15 +215,21 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         shell: pwsh
         run: |
-          $maxRetries = 3
-          $retryDelay = 30
+          $maxRetries = 5
+          $baseDelay = 15
           for ($i = 1; $i -le $maxRetries; $i++) {
-            Write-Host "⏳ Checkout 重试 $i/$maxRetries (等待 ${retryDelay}s 后重试)..."
-            Start-Sleep -Seconds $retryDelay
+            $delay = $baseDelay * [Math]::Pow(2, $i - 1)
+            Write-Host "⏳ Checkout 重试 $i/$maxRetries (等待 ${delay}s 后重试)..."
+            Start-Sleep -Seconds $delay
+            # 刷新 DNS 缓存，解决偶发 DNS 解析失败
+            Write-Host "  → 刷新 DNS 缓存..."
+            ipconfig /flushdns 2>$null
             Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
             Remove-Item -Force ".gitattributes" -ErrorAction SilentlyContinue
             Remove-Item -Force ".gitignore" -ErrorAction SilentlyContinue
-            git clone "https://github.com/$env:GITHUB_REPOSITORY.git" .
+            $repoUrl = "https://github.com/$env:GITHUB_REPOSITORY.git"
+            Write-Host "  → git clone $repoUrl"
+            git clone $repoUrl .
             git checkout $env:GITHUB_SHA
             if ($LASTEXITCODE -eq 0) {
               Write-Host "✓ Checkout 重试成功 (第 $i 次)"
@@ -230,7 +237,7 @@ jobs:
             }
             Write-Host "✗ 第 $i 次重试失败"
           }
-          throw "Checkout 失败：已重试 $maxRetries 次"
+          throw "Checkout 失败：已重试 $maxRetries 次，请手动重启 workflow"
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
@@ -384,7 +391,8 @@ jobs:
       # v0.8.24 修复：Windows runner 网络不稳定导致 git clone 失败，
       #   根因：GitHub Actions Windows runner 偶发 TCP 连接重置 / DNS 解析失败，
       #   表现为 fetch-pack: invalid index-pack output / early EOF / curl 56 Recv failure。
-      #   使用 continue-on-error + PowerShell 循环重试，最多 3 次，每次等待 30 秒。
+      #   使用 continue-on-error + PowerShell 循环重试，最多 5 次，指数退避（15s/30s/60s/120s/240s）。
+      # v0.8.39 增强：DNS 解析失败时刷新 DNS 缓存后再重试。
       - name: Checkout
         id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -393,15 +401,21 @@ jobs:
         if: steps.checkout.outcome == 'failure'
         shell: pwsh
         run: |
-          $maxRetries = 3
-          $retryDelay = 30
+          $maxRetries = 5
+          $baseDelay = 15
           for ($i = 1; $i -le $maxRetries; $i++) {
-            Write-Host "⏳ Checkout 重试 $i/$maxRetries (等待 ${retryDelay}s 后重试)..."
-            Start-Sleep -Seconds $retryDelay
+            $delay = $baseDelay * [Math]::Pow(2, $i - 1)
+            Write-Host "⏳ Checkout 重试 $i/$maxRetries (等待 ${delay}s 后重试)..."
+            Start-Sleep -Seconds $delay
+            # 刷新 DNS 缓存，解决偶发 DNS 解析失败
+            Write-Host "  → 刷新 DNS 缓存..."
+            ipconfig /flushdns 2>$null
             Remove-Item -Recurse -Force ".git" -ErrorAction SilentlyContinue
             Remove-Item -Force ".gitattributes" -ErrorAction SilentlyContinue
             Remove-Item -Force ".gitignore" -ErrorAction SilentlyContinue
-            git clone "https://github.com/$env:GITHUB_REPOSITORY.git" .
+            $repoUrl = "https://github.com/$env:GITHUB_REPOSITORY.git"
+            Write-Host "  → git clone $repoUrl"
+            git clone $repoUrl .
             git checkout $env:GITHUB_SHA
             if ($LASTEXITCODE -eq 0) {
               Write-Host "✓ Checkout 重试成功 (第 $i 次)"
@@ -409,7 +423,7 @@ jobs:
             }
             Write-Host "✗ 第 $i 次重试失败"
           }
-          throw "Checkout 失败：已重试 $maxRetries 次"
+          throw "Checkout 失败：已重试 $maxRetries 次，请手动重启 workflow"
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
