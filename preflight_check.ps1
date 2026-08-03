@@ -1,4 +1,4 @@
-# LRC 推送前预检脚本
+﻿# LRC 推送前预检脚本
 # 执行 PRE_PUSH_CHECKLIST.md 中定义的所有检查项
 # 使用方式：.\preflight_check.ps1
 # 依赖：PowerShell 7+, Rust toolchain, Node.js
@@ -20,10 +20,15 @@ $failedItems = @()
 function Check-Item {
     param([string]$Name, [scriptblock]$Script)
     Write-Host "  [检查] $Name..." -ForegroundColor Yellow
+    # 临时放松 ErrorActionPreference，避免 cargo/外部命令的 stderr 正常输出被误判为异常
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         & $Script
+        $ErrorActionPreference = $prevEAP
         Write-Host "    ✓ 通过" -ForegroundColor Green
     } catch {
+        $ErrorActionPreference = $prevEAP
         Write-Host "    ✗ 失败: $_" -ForegroundColor Red
         # ⚠ PowerShell 铁律：${Name} 显式分隔防止 $Name: 被解析为 Provider 路径
         $script:failedItems += "${Name}: $($_.Exception.Message)"
@@ -109,7 +114,8 @@ Check-Item -Name "app.js APP_VERSION 一致" -Script {
 }
 
 Check-Item -Name "index.html meta version 一致" -Script {
-    $v = (Select-String -Path "static/index.html" -Pattern 'version\s*=\s*"([^"]+)"' | ForEach-Object { $_.Matches.Groups[1].Value })
+    # 匹配 <meta name="version" content="0.8.34"> 格式
+    $v = (Select-String -Path "static/index.html" -Pattern 'name="version"\s+content="([^"]+)"' | ForEach-Object { $_.Matches.Groups[1].Value })
     if ($v -ne $targetVersion) { throw "版本不一致: 期望 $targetVersion, 实际 $v" }
 }
 

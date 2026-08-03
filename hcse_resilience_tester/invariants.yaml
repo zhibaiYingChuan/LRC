@@ -1,277 +1,221 @@
-# ============================================================
-# HCSE 正式安全不变式配置 — LRC Desktop v0.8.20
-# 生成时间: 2026-07-31
-# 范式: 每个不变式必须可由 CDP 事件 / 网络 / DOM 状态验证
-# ============================================================
-#
-# 不变式编号规则: INV-<域>-<序号>
-#   域: LOCK(锁) / STATE(状态) / PROC(进程) / TIMEOUT(超时)
-#        CANCEL(取消) / SANITIZE(脱敏) / RESOURCE(资源)
-#
-# 严重度: P0=阻断级(数据丢失/死锁) P1=严重(功能不可用)
-#         P2=中等(体验受损) P3=轻微(可接受降级)
-# ============================================================
+# HCSE 硬安全不变量定义（v0.8.33 / L1-L5 韧性审计专用）
+# 每条不变量均为 CDP RV-Monitor 在运行时实时断言的绝对命题。
+# 违反任一不变量 → 立即终止用例 + 生成 Invariant Violation Report + 录屏。
+---
+invariants:
+  # ===== L1 一级页面（MCP配置向导 Step1） =====
+  - id: INV-L1-01
+    layer: L1
+    title: "扫描超时UI兜底不变量"
+    description: >
+      当 scan_ide_projects IPC 调用从 request 到 responseReceived 间隔 >20s 时，
+      3s 内必须出现以下任一可观察 DOM 证据：
+        a) 含"取消"文本的可点击按钮（data-action=cancel 或 id=scan-cancel-btn）；
+        b) .loading-spinner 容器 + 超过 80% 宽度的进度文案（或 cancel button）；
+        c) showToast 触发包含"超时/扫描"字样的 warning/error toast。
+    severity: P0
+    assert: |
+      event.type == 'ipc:scan_ide_projects:timeout'
+        implies (within(3s, 'dom.toast:warning|error')
+                 or within(3s, 'dom.query:button:contains(取消):visible')
+                 or within(3s, 'dom.query:.loading-spinner:visible'))
+    evidence_cdp: ["Network.requestWillBeSent", "Network.responseReceived",
+                   "Runtime.consoleAPICalled", "DOM.querySelector", "Page.screencastFrame"]
 
-project: "LRC Desktop"
-version: "0.8.20"
-generated_at: "2026-07-31"
-cdp_endpoint: "http://127.0.0.1:9223"
-sidecar_endpoint: "http://127.0.0.1:3099"
+  - id: INV-L1-02
+    layer: L1
+    title: "卡死路径30sUI恢复不变量"
+    description: >
+      DotDirDetector/collect_shortcut_dirs 若永不返回（通过 CDP 注入 sleep 或 mock 永不
+      resolve 的 Promise），从调用起点起 30s±2s 窗口内：
+        1) 前端必须显示「重新扫描」按钮；
+        2) scan_ide_projects 的 Promise 必须被 reject（window.error 或 console.error）；
+        3) UI 不能残留未清理的 loading-spinner（5s 内消失）。
+    severity: P0
+    assert: |
+      inject_stall('agent_detector.collect_shortcut_dirs')
+        implies (within(32s, 'dom.query:button:contains(重新扫描):visible')
+                 and within(32s, 'ipc:scan_ide_projects:rejected')
+                 and within(35s, 'dom.query_missing:.loading-spinner'))
+    evidence_cdp: ["Runtime.evaluate", "Network.loadingFailed",
+                   "Page.screencastFrame", "Runtime.exceptionThrown"]
 
-# ──────────────────────────────────────────────────────────────
-# INV-LOCK-001: 关键健康端点锁安全不变式
-# ──────────────────────────────────────────────────────────────
-- id: "INV-LOCK-001"
-  name: "健康检查端点不得被后台合成流水线阻塞"
-  severity: "P0"
-  category: "锁安全"
-  description: |
-    所有 /v1/health/* 端点必须使用 try_lock 而非 lock().await。
-    后台合成周期（consolidation.rs）持有 store.lock() 期间，
-    健康检查端点必须在 < 100ms 内返回（200 或 503 lock_busy），
-    不得阻塞超过 1 秒。
-  code_refs:
-    - file: "src/v1_api.rs"
-      lines: "582-649"  # /v1/health/dao_metrics (try_lock ✓)
-    - file: "src/v1_api.rs"
-      lines: "650-684"  # /v1/health/system (try_lock ✓)
-    - file: "src/v1_api.rs"
-      lines: "685-719"  # /v1/health/detailed (lock().await ✗ 已知违规)
-    - file: "src/consolidation.rs"
-      lines: "291,357,419,534"  # 后台合成持锁点
-  assertion: |
-    对 /v1/health/detailed 发起请求时，即使后台合成正在执行，
-    响应时间必须 < 2000ms。若 > 5000ms 则判定不变式违反。
-  cdp_verification:
-    event: "Network.responseReceived"
-    url_pattern: "/v1/health/detailed"
-    assert: "response.timing.waitingTime < 2000"
-    on_violation: "INV-LOCK-001 违反：/v1/health/detailed 仍使用 lock().await，被合成锁阻塞"
-  remediation: |
-    将 src/v1_api.rs:692 的 `let mut store = store.lock().await;`
-    改为 try_lock 模式，lock_busy 时返回 503 + 降级数据。
+  # ===== L2 二级弹窗（项目删除确认） =====
+  - id: INV-L2-01
+    layer: L2
+    title: "删除确认幂等不变量"
+    description: >
+      连续 3 次触发"项目删除确认"弹窗，且用户连续点击"取消/关闭"：
+        a) confirm-modal DOM 中不能出现 3 个叠加（必须 ≤1 个 data-role=confirm-modal visible）；
+        b) showConfirm 内部队列 confirmModalQueue 长度 ≤5（从 window.confirmModalQueue 读）；
+        c) 最后一次关闭后 1s 内，无 pending 的 delete-project IPC 调用。
+    severity: P1
+    assert: |
+      repeat(action=openDeleteProjectConfirm, times=3, click=cancel)
+        implies (count('dom.query:.confirm-modal:visible') <= 1
+                 and len(window.confirmModalQueue) <= 5
+                 and within(1s, count_pending_ipc('delete-project') == 0))
+    evidence_cdp: ["DOM.getDocument", "Runtime.evaluate",
+                   "Network.requestWillBeSent", "DOM.querySelector"]
 
-# ──────────────────────────────────────────────────────────────
-# INV-STATE-002: 前端状态与 sidecar 实际状态一致性不变式
-# ──────────────────────────────────────────────────────────────
-- id: "INV-STATE-002"
-  name: "UI 状态显示必须与 sidecar /health 实际状态一致"
-  severity: "P0"
-  category: "状态一致性"
-  description: |
-    当 sidecar /health 返回 200 (status=running) 时：
-      1. 状态栏必须显示"运行中"（statusDot=online）
-      2. 道同构度区域不得显示"LRC 服务未启动"
-      3. 仪表盘统计不得全部为 "--"（应在 30 秒内填充）
-    当 /v1/health/dao_metrics 返回 503 lock_busy 时：
-      - 前端必须区分"服务繁忙"与"服务未启动"
-      - 不得将 503 lock_busy 误报为"LRC 服务未启动"
-  code_refs:
-    - file: "static/app.js"
-      lines: "5261-5262"  # SidecarUnreachableError → "LRC 服务未启动" 误判点
-    - file: "static/app.js"
-      lines: "106-178"  # fetchWithTimeout 错误分类
-    - file: "static/app.js"
-      lines: "682-780"  # loadDashboard 状态渲染
-    - file: "static/app.js"
-      lines: "5174-5270"  # loadDaoMetrics 错误处理
-  assertion: |
-    在 sidecar /health=200 且 /v1/health/dao_metrics=503 的状态下：
-      - DOM 中不得出现文本 "LRC 服务未启动"（class=dao-fallback-banner）
-      - statusDot 元素 className 必须包含 "online"
-    若 30 秒内道同构度区域显示"LRC 服务未启动"，判定不变式违反。
-  cdp_verification:
-    event: "domMutated + Network.responseReceived"
-    steps:
-      - "GET /health 期望 200"
-      - "GET /v1/health/dao_metrics 期望 503"
-      - "DOM 查询 .dao-fallback-banner 文本不得包含 'LRC 服务未启动'"
-      - "DOM 查询 #status-dot className 必须包含 'online'"
-    on_violation: "INV-STATE-002 违反：503 lock_busy 被误报为服务未启动"
-  remediation: |
-    1. fetchWithTimeout 不应在 503 时抛出 SidecarUnreachableError（503 是有效 HTTP 响应）
-    2. loadDaoMetrics 应检查 response.status === 503 并显示"后台合成中"而非"服务未启动"
-    3. _applyDaoMetricsFallback 的 reason 分支应增加 lock_busy 专用文案
+  # ===== L3 三级卡片（AI工具检测卡片） =====
+  - id: INV-L3-01
+    layer: L3
+    title: "工具卡片检测-状态一致性不变量"
+    description: >
+      任意单个 AI 工具卡片：checkbox 的最终 checked 状态必须与卡片右侧
+      data-role=tool-status 的"已检测到/未安装"文本语义一致（手动修正徽章出现时除外）：
+        - status == "已检测到" => checked=true OR data-role=manual-override-badge visible
+        - status == "未安装" => checked=false OR badge visible
+    severity: P1
+    assert: |
+      for_each card in 'dom.query:[data-agent-id]' :
+        (card.status == '已检测到' implies (card.checkbox.checked or card.badge.visible))
+        and
+        (card.status == '未安装' implies (not card.checkbox.checked or card.badge.visible))
+    evidence_cdp: ["DOM.querySelectorAll", "Runtime.evaluate", "Page.screencastFrame"]
 
-# ──────────────────────────────────────────────────────────────
-# INV-PROC-003: sidecar 进程崩溃自动恢复不变式
-# ──────────────────────────────────────────────────────────────
-- id: "INV-PROC-003"
-  name: "sidecar 进程崩溃后必须在 60 秒内自动恢复或明确提示"
-  severity: "P1"
-  category: "进程隔离"
-  description: |
-    sidecar 进程意外退出时：
-      1. 心跳协程必须在 30 秒内检测到（2 次心跳失败）
-      2. recover_dead_instances 应自动重启 sidecar
-      3. 若重启失败，前端必须显示明确的崩溃错误（非"服务未启动"）
-      4. 不得产生僵尸进程（Drop 时必须 kill + wait）
-  code_refs:
-    - file: "desktop/src-tauri/src/sidecar_manager.rs"
-      lines: "294-335"  # Drop impl: kill + try_wait 3s
-    - file: "desktop/src-tauri/src/sidecar_manager.rs"
-      lines: "1251-1311"  # recover_dead_instances
-    - file: "desktop/src-tauri/src/sidecar_manager.rs"
-      lines: "1149-1175"  # start_for_project 三阶段
-  assertion: |
-    强制 kill sidecar PID 后：
-      - 60 秒内 sidecar /health 恢复 200，或
-      - 前端显示 ProcessDied 错误（含 PID + 日志路径）
-    不得出现"静默无响应"状态。
-  cdp_verification:
-    event: "Network.responseReceived + console.exceptionThrown"
-    steps:
-      - "记录 sidecar PID"
-      - "外部 kill -9 PID"
-      - "轮询 /health 60 秒，期望 200 恢复 或 错误提示"
-    on_violation: "INV-PROC-003 违反：sidecar 崩溃后无恢复无提示"
-  remediation: |
-    确认心跳协程间隔 ≤ 15 秒，recover_dead_instances 被调用。
+  # ===== L4 四级嵌套（齿轮菜单+手动修正+缓存失效） =====
+  - id: INV-L4-01
+    layer: L4
+    title: "手动修正写入失败状态回滚不变量"
+    description: >
+      当 set_agent_manual_override 写入 wizard.json 返回 Err（磁盘只读/权限不足/
+      速率限制429）时：
+        1) localStorage['lrc_agent_manual_overrides_v1'] 中该 agent_id 的值在用户
+           点击齿轮菜单右上角 X 关闭后 500ms 内恢复为关闭前的原值；
+        2) 工具卡片 data-role=manual-override-badge 的 display 必须与
+           localStorage 当前值同步；
+        3) showToast 必须出现包含"本地临时生效，重启后可能丢失"或"写入失败"的
+           warning/error 提示。
+    severity: P0
+    assert: |
+      inject_error('ipc:set_agent_manual_override', err='EACCES')
+        and user_action('gear_menu_close_x')
+          implies (
+            within(500ms, local_storage('lrc_agent_manual_overrides_v1')[agentId] == originalValue)
+            and within(800ms, badge_display_sync_with_ls())
+            and within(1500ms, 'dom.toast:warning|error:contains(本地临时生效|写入失败)')
+          )
+    evidence_cdp: ["Network.loadingFailed", "Runtime.evaluate",
+                   "DOM.querySelector", "Page.screencastFrame"]
 
-# ──────────────────────────────────────────────────────────────
-# INV-TIMEOUT-004: 超时机制真正触发不变式
-# ──────────────────────────────────────────────────────────────
-- id: "INV-TIMEOUT-004"
-  name: "所有 invoke/RPC/网络调用超时必须真正触发而非仅存在代码中"
-  severity: "P1"
-  category: "超时机制"
-  description: |
-    1. sidecar 启动健康检查超时：wait_for_health_static 20 次 × 500ms = 10s
-       超时后必须返回 HealthCheckTimeout 错误，不得无限等待
-    2. fetchWithTimeout 默认 10s 超时必须触发 AbortController
-    3. /v1/health/detailed 超时 10s 时 UI 必须有兜底反馈
-    4. LLM 测试连接超时 10s 必须返回明确超时提示
-  code_refs:
-    - file: "desktop/src-tauri/src/sidecar_manager.rs"
-      lines: "809-924"  # wait_for_health_static 20 次 × 500ms
-    - file: "static/app.js"
-      lines: "106-178"  # fetchWithTimeout AbortController
-    - file: "src/v1_api.rs"
-      lines: "685-719"  # /v1/health/detailed 无超时保护
-    - file: "desktop/src-tauri/src/commands.rs"
-      lines: "853-1060"  # test_llm_connection 10s 超时
-  assertion: |
-    注入 sidecar 健康检查永不返回（绑定端口但不响应 /health）：
-      - 10 秒后必须收到 HealthCheckTimeout 错误
-      - 不得阻塞超过 15 秒
-    注入 /v1/health/detailed 慢响应（锁持有 30 秒）：
-      - 前端必须在 10 秒后显示超时反馈
-  cdp_verification:
-    event: "Network.requestWillBeSent + Network.loadingFailed"
-    assert: "requestWillBeSent 到 loadingFinished/loadingFailed 间隔 < 12000ms"
-    on_violation: "INV-TIMEOUT-004 违反：超时未触发，请求永久挂起"
-  remediation: |
-    /v1/health/detailed 应改用 try_lock；前端 loadDashboard 应为 detailed 请求
-    单独设置 8s 超时，超时后显示降级数据。
+  - id: INV-L4-02
+    layer: L4
+    title: "扫描缓存失效ID一致性不变量"
+    description: >
+      点击「重新扫描（清空缓存）」按钮后，必须严格按顺序完成 3 步：
+        ① force_invalidate_scan_cache → Ok；
+        ② discover_all_agents 重新执行（Network 中存在新 requestId）；
+        ③ get_scan_cache_metadata 返回的 timestamp_ms 必须 > 调用前的旧 timestamp_ms
+          （若后端调用距 1970-01-01 < 1s 或为 0 视为异常 → showToast 报错）。
+      若 ① 失败，②③ 仍必须可执行且 ③ 结果 不 出现 valid=true 且 timestamp_ms 不变。
+    severity: P1
+    assert: |
+      sequence(
+        action('rescanToolsWithInvalidate'),
+        order(
+          ipc('lrc-force-invalidate-scan-cache'),
+          ipc('lrc-discover-all-agents'),
+          ipc('lrc-get-scan-cache-metadata'): { new_ts > old_ts or new_ts == 0 and not valid }
+        )
+      )
+    evidence_cdp: ["Network.requestWillBeSent", "Network.responseReceived",
+                   "Runtime.evaluate", "Page.screencastFrame"]
 
-# ──────────────────────────────────────────────────────────────
-# INV-CANCEL-005: 用户取消操作正确中断与清理不变式
-# ──────────────────────────────────────────────────────────────
-- id: "INV-CANCEL-005"
-  name: "用户取消 sidecar 启动时必须正确中断并清理子进程"
-  severity: "P1"
-  category: "取消路径"
-  description: |
-    1. 前端 abort 启动请求时，cancel_start_sidecar 必须设置 cancel_flag
-    2. spawn_and_wait 健康检查循环必须检测 cancel_flag 并立即终止
-    3. 已 spawn 的子进程必须被 kill + wait（不得残留孤儿进程）
-    4. cancel_flag 必须在下次启动前重置（避免永久失效）
-  code_refs:
-    - file: "desktop/src-tauri/src/commands.rs"
-      lines: "682-687"  # cancel_start_sidecar
-    - file: "desktop/src-tauri/src/sidecar_manager.rs"
-      lines: "823-827"  # wait_for_health_static cancel_flag 检查
-    - file: "desktop/src-tauri/src/commands.rs"
-      lines: "472-473"  # start_sidecar 入口重置 cancel_flag
-    - file: "desktop/src-tauri/src/commands.rs"
-      lines: "1462-1464"  # switch_project 重置 cancel_flag
-  assertion: |
-    触发 start_sidecar 后立即调用 cancel_start_sidecar：
-      - spawn_and_wait 必须在 1 秒内返回 UserCancelled
-      - 不得残留 sidecar 子进程（ps 无 lrc-sidecar）
-      - 再次 start_sidecar 必须能正常启动（cancel_flag 已重置）
-  cdp_verification:
-    event: "Runtime.exceptionThrown + Network.responseReceived"
-    steps:
-      - "invoke start_sidecar"
-      - "立即 invoke cancel_start_sidecar"
-      - "1 秒内检查 start_sidecar 返回 UserCancelled"
-      - "查询进程列表无残留 lrc-sidecar"
-    on_violation: "INV-CANCEL-005 违反：取消后残留孤儿进程或 cancel_flag 未重置"
-  remediation: "确保 spawn_and_wait 在 spawn 后也检查 cancel_flag"
+  # ===== L5 异常全局（CDP断连/侧载进程崩溃） =====
+  - id: INV-L5-01
+    layer: L5
+    title: "IPC超时8s熔断不变量"
+    description: >
+      对 discover_all_agents / lrc-force-invalidate-scan-cache 两个 IPC，
+      若后端持续挂起（>=9s 无 response）：
+        1) postMessageToParent 必须在 8s±0.5s 内 reject，错误含"超时"关键字；
+        2) 前端 1s 内必须出现：AbortController.signal.aborted === true 或
+           window.__testHooks 中对应 AbortController 引用 abort 状态为 true；
+        3) 熔断后 3s 内 showToast 触发，且同一条错误 toast 在 1.5s 去重窗口不重复>2次。
+    severity: P0
+    assert: |
+      for ipc_name in ['lrc-discover-all-agents','lrc-force-invalidate-scan-cache']:
+        stall_ipc(ipc_name, duration=9500ms)
+          implies (
+            within(8500ms, ipc(ipc_name):rejected and error_msg_contains('超时'))
+            and within(9500ms, abort_signal_for(ipc_name).aborted === true)
+            and within(11000ms, 'dom.toast:warning|error')
+            and dedup_count(toast_same_key, 1500ms) <= 2
+          )
+    evidence_cdp: ["Network.requestWillBeSent", "Network.loadingFailed",
+                   "Runtime.evaluate", "Runtime.exceptionThrown",
+                   "Page.screencastFrame", "Browser.getVersion"]
 
-# ──────────────────────────────────────────────────────────────
-# INV-SANITIZE-006: 捕获数据脱敏不变式
-# ──────────────────────────────────────────────────────────────
-- id: "INV-SANITIZE-006"
-  name: "所有证据工件写入前必须完成双重脱敏"
-  severity: "P0"
-  category: "数据脱敏"
-  description: |
-    HCSE 证据包（logs/screenshots/evidence）写入前必须：
-      1. 删除所有 cookie 字段的 value 属性
-      2. 替换 authorization 头为 [BEARER_TOKEN_REDACTED]
-      3. 替换响应体中的 email/phone 字段为 [REDACTED]
-      4. 替换 api_key 字段为 [API_KEY_REDACTED]
-    任何工件中不得出现原始敏感数据。
-  code_refs:
-    - file: "hcse_resilience_tester/rv_monitor.py"
-      lines: "Sanitizer.sanitize"
-    - file: "hcse_resilience_tester/evidence_builder.py"
-      lines: "EvidenceBuilder.write_artifact"
-  assertion: |
-    对证据包目录执行 grep -rE "(api_key|authorization|bearer|@.*\..*\.)" 
-    不得返回任何原始敏感值（仅允许 [REDACTED] 标记）。
-  cdp_verification:
-    event: "所有写入事件"
-    assert: "工件内容不匹配敏感数据正则"
-    on_violation: "INV-SANITIZE-006 违反：证据工件含原始敏感数据"
-  remediation: "强化 Sanitizer 正则，对所有嵌套层级递归脱敏"
+  - id: INV-L5-02
+    layer: L5
+    title: "侧载进程崩溃UI自愈合不变量"
+    description: >
+      通过 Runtime.evaluate 模拟向 sidecar pid 发送 SIGKILL / taskkill：
+        1) 5s 内 sidecar-crash 事件必须触发或 get_sidecar_status 返回空数组；
+        2) 10s 内状态栏必须从绿色"运行中"转为红色/灰色"不可达"；
+        3) 20s 内用户可见"启动服务"按钮可点击（disabled=false）；
+        4) 仪表盘所有数据卡片不得残留"索引中/加载中"永久占位（30s 内显示错误提示或重试按钮）。
+    severity: P0
+    assert: |
+      kill_process(sidecar_pid)
+        implies (
+          within(5s,  event('sidecar-crash')  or get_sidecar_status() == [])
+          and within(10s, dom.status_bar_color() in {red, gray})
+          and within(20s, dom.query:'#btn-start-service:enabled')
+          and within(30s, no_pending_loading_spinner_on_dashboard())
+        )
+    evidence_cdp: ["Runtime.evaluate", "Network.responseReceived",
+                   "Page.screencastFrame", "Target.attachedToTarget",
+                   "Browser.getVersion"]
 
-# ──────────────────────────────────────────────────────────────
-# INV-RESOURCE-007: 资源容量看门狗不变式
-# ──────────────────────────────────────────────────────────────
-- id: "INV-RESOURCE-007"
-  name: "测试进程资源使用不得超出容量上限"
-  severity: "P1"
-  category: "资源容量"
-  description: |
-    1. HCSE 测试进程内存使用 ≤ 1024 MB（MAX_MEMORY_USAGE）
-    2. 单次测试 CPU 时间 ≤ 60 秒（MAX_CPU_TIME）
-    3. 超限时优先终止子 CDP 会话，而非整个测试脚本
-    4. sidecar 子进程内存 ≤ 512 MB（独立监控）
-  code_refs:
-    - file: "hcse_resilience_tester/rv_monitor.py"
-      lines: "ResourceWatchdog"
-  assertion: |
-    psutil.Process(hcse_pid).memory_info().rss ≤ 1024 MB
-    psutil.Process(hcse_pid).cpu_time() ≤ 60s（单测试用例）
-  cdp_verification:
-    event: "周期性采样（1s 间隔）"
-    assert: "rss <= 1024*1024*1024 and cpu_time <= 60"
-    on_violation: "INV-RESOURCE-007 违反：资源超限，终止子会话"
-  remediation: "优化事件队列大小，限制 screencast 帧率"
+# ===== 超时机制对照（供 rv_monitor.py 与 Phase3 断言参考） =====
+timeout_sla:
+  - ipc: discover_all_agents
+    frontend_ms: 30000
+    backend_ms: null                 # null 表示后端无 tokio::time::timeout 包装（风险点）
+    breaker: postMessageToParent.race + setTimeout
+    # ===== HCSE 测试注入：将前端超时从默认 30s 压缩到 6s，确保 6.5s 内真实触发 =====
+    test_override_ms: 6000
+    test_expect_toast: "AI工具检测超时，请重试"
+  - ipc: set_agent_manual_override
+    frontend_ms: 15000
+    backend_ms: null
+    breaker: rate_limiter should_throttle ("cmd:set_agent_manual_override")
+    test_override_ms: 1500
+    test_expect_toast: "本地临时生效，重启后可能丢失"
+  - ipc: get_scan_cache_metadata
+    frontend_ms: 8000
+    backend_ms: 0                    # 纯内存读，理论 <1ms
+    breaker: postMessageToParent setTimeout
+  - ipc: force_invalidate_scan_cache
+    frontend_ms: 8000
+    backend_ms: null
+    breaker: rate_limiter should_throttle ("cmd:force_invalidate_scan_cache")
+    # HCSE 测试：压缩到 800ms，确认 RateLimiter (300ms 窗口) 第 2 次立即拦截 429
+    test_override_ms: 800
+    test_ratelimit_window_ms: 300
+    test_expect_toast: "请求过于频繁"
+  - ipc: scan_ide_projects
+    frontend_ms: 30000
+    backend_ms: 30000                # commands.rs:1359 tokio::time::timeout(30s)
+    breaker: backend + frontend double-wrapped
+    # 注：static/app.js:5441 实际传 60000ms，与 invariants 默认不一致
+    test_override_ms: 6000
+    test_expect_toast: "扫描 IDE 项目失败"
 
-# ──────────────────────────────────────────────────────────────
-# 汇总：7 个不变式覆盖 5 个域
-# ──────────────────────────────────────────────────────────────
-summary:
-  total_invariants: 7
-  by_severity:
-    P0: 3  # INV-LOCK-001, INV-STATE-002, INV-SANITIZE-006
-    P1: 4  # INV-PROC-003, INV-TIMEOUT-004, INV-CANCEL-005, INV-RESOURCE-007
-  by_domain:
-    LOCK: 1
-    STATE: 1
-    PROC: 1
-    TIMEOUT: 1
-    CANCEL: 1
-    SANITIZE: 1
-    RESOURCE: 1
-  coverage:
-    - "L1 一级页面（仪表盘）: INV-STATE-002, INV-LOCK-001"
-    - "L2 二级弹窗（配置向导/设置）: INV-CANCEL-005"
-    - "L3 三级卡片（道同构度卡片）: INV-STATE-002"
-    - "L4 四级嵌套（启动/重试按钮）: INV-CANCEL-005, INV-TIMEOUT-004"
-    - "L5 异常全局（网络断开/进程崩溃）: INV-PROC-003, INV-LOCK-001"
-    - "L6 组件级数据加载: INV-LOCK-001, INV-STATE-002, INV-TIMEOUT-004"
+# ===== 路径白名单（Phase6 TEE 沙箱） =====
+sandbox:
+  allowed_path_prefixes:
+    - "./temp"
+    - "./logs"
+    - "./screenshots"
+    - "./evidence"
+  max_memory_mb: 1024
+  max_cpu_seconds: 60
+
+sanitization:
+  drop_cookie_value: true
+  redact_authorization_header: "[BEARER_TOKEN_REDACTED]"
+  redact_fields: ["email", "phone", "api_key", "encrypted_api_key"]
