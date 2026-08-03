@@ -2,6 +2,39 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.40] - 2026-08-03
+
+### 修复：`kill_process_by_pid` 竞态条件（进程已不存在时未正确处理）
+
+**问题：** 当旧 sidecar 进程在检测和终止之间已自销毁时，`taskkill /F` 因"找不到进程"报错，`kill_process_by_pid` 返回 `false`，导致用户看到"无法终止旧进程，请手动结束"的错误提示，但任务管理器中已无该进程。
+
+**修复：** 改为"先检测再终止"模式——Windows 用 `tasklist /FI "PID eq <pid>" /NH`、Unix 用 `kill -0 <pid>` 先检查进程是否存在，仅当进程确实存在时执行强制终止，不存在时直接返回 `true`。
+
+**涉及文件：**
+- `desktop/src-tauri/src/sidecar_manager.rs`：`kill_process_by_pid` 增加进程存在性检测
+- `desktop/src-tauri/src/commands.rs`：错误消息从"请手动结束"改为"权限不足或杀毒软件拦截"
+
+### CI 编译产物版本校验（防御性门禁）
+
+**问题：** CI 缓存可能复用旧 Rust 二进制，导致"新前端+旧引擎核心"混合产物（v0.8.31-v0.8.33 三次事故的根因）。
+
+**修复：** 在 `release.yml` 的 Build Sidecar 和 Build Desktop 两个 job 中，编译后执行 `./code-memory-server --version` 验证版本号与 `${GITHUB_REF_NAME#v}` 一致，版本不匹配时 CI 直接 FAIL。
+
+**涉及文件：**
+- `.github/workflows/release.yml`：新增 2 处版本校验步骤
+- `src/bin/server.rs`：新增 `--version` / `-V` 标志
+
+### 引擎代码归档流程规范
+
+**新增规则：** 当 `src/engine/` 核心文件发生重大变更时，旧版本文件必须立即移入 `src/engine/archive/` 目录，不得等到发布时再归档。此规则已写入 `project_memory.md`。
+
+### CI checkout 重试增强
+
+**修复：** Windows runner 偶发 DNS 解析失败（`Could not resolve host: github.com`），重试策略从 3 次固定 30s 提升为 5 次指数退避（15s/30s/60s/120s/240s），每次重试前刷新 DNS 缓存。
+
+**涉及文件：**
+- `.github/workflows/release.yml`：checkout 重试策略更新
+
 ## [0.8.39] - 2026-08-03
 
 ### SingletonConflict 自动终止旧进程 + 重启
