@@ -187,6 +187,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    # v0.8.42 修复：Windows runner DNS 不稳定，设置 continue-on-error 不阻塞整体发布
+    #   Linux/macOS 构建必须成功，Windows 构建失败可后续手动重试
+    continue-on-error: ${{ matrix.continue-on-error == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -194,12 +197,15 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: lrc-linux-x86_64
+            continue-on-error: false
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: lrc-macos-arm64
+            continue-on-error: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: lrc-windows-x86_64.exe
+            continue-on-error: true
 
     steps:
       # v0.8.24 修复：Windows runner 网络不稳定导致 git clone 失败，
@@ -209,6 +215,8 @@ jobs:
       # v0.8.39 增强：DNS 解析失败时刷新 DNS 缓存后再重试。
       # v0.8.40 增强：在 git clone 前先测试 DNS 解析，DNS 恢复后才执行 clone，
       #   避免"DNS 不通但强行 clone"的无效重试循环。
+      # v0.8.42 增强：系统 DNS 失败时尝试 nslookup 备用 DNS（Google 8.8.8.8），
+      #   成功后将 IP 写入 hosts 文件，使 git clone 绕过系统 DNS 解析。
       - name: Checkout
         id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -227,20 +235,64 @@ jobs:
             Write-Host "  → 刷新 DNS 缓存..."
             ipconfig /flushdns 2>$null
             Start-Sleep -Seconds 2
-            # v0.8.40 增强：先测试 DNS 解析，不通则不执行 clone
-            Write-Host "  → 测试 DNS 解析 github.com..."
+            # v0.8.42 增强：三步 DNS 解析兜底策略
+            #   方法 1: 系统 DNS（[System.Net.Dns]::GetHostAddresses）
+            #   方法 2: 备用 DNS（nslookup google.com 8.8.8.8）
+            #   方法 3: 写入 hosts 文件（使 git clone 绕过系统 DNS）
+            Write-Host "  → 尝试 DNS 解析 github.com..."
             $dnsOk = $false
+            $resolvedIp = $null
+            # 方法 1: 系统 DNS
             try {
               $addresses = [System.Net.Dns]::GetHostAddresses("github.com")
               if ($addresses -and $addresses.Length -gt 0) {
-                Write-Host "    ✓ DNS 解析成功: $($addresses[0].IPAddressToString)"
+                $resolvedIp = $addresses[0].IPAddressToString
+                Write-Host "    ✓ 系统 DNS 解析成功: $resolvedIp"
                 $dnsOk = $true
               }
             } catch {
-              Write-Host "    ✗ DNS 解析异常: $_"
+              Write-Host "    ✗ 系统 DNS 解析失败: $_"
+            }
+            # 方法 2: 备用 DNS（Google 8.8.8.8）
+            if (-not $dnsOk) {
+              Write-Host "  → 尝试备用 DNS (nslookup github.com 8.8.8.8)..."
+              try {
+                $nslookup = nslookup github.com 8.8.8.8 2>$null
+                if ($nslookup -match 'Address:\s+(\d+\.\d+\.\d+\.\d+)') {
+                  $resolvedIp = $matches[1]
+                  Write-Host "    ✓ 备用 DNS 解析成功: $resolvedIp"
+                  $dnsOk = $true
+                } else {
+                  Write-Host "    ✗ 备用 DNS 无法解析"
+                }
+              } catch {
+                Write-Host "    ✗ 备用 DNS 解析异常: $_"
+              }
+            }
+            # 方法 3: 写入 hosts 文件（使 git clone 使用 hosts 解析而非系统 DNS）
+            if ($dnsOk -and $resolvedIp) {
+              try {
+                $hostsFile = "$env:windir\System32\drivers\etc\hosts"
+                # 先清理旧条目（避免重复）
+                $content = Get-Content $hostsFile -Encoding ASCII -ErrorAction SilentlyContinue
+                $newContent = $content | Where-Object { $_ -notmatch '\s+github\.com$' }
+                $newContent | Set-Content $hostsFile -Encoding ASCII -ErrorAction SilentlyContinue
+                # 添加新条目
+                "$resolvedIp github.com" | Out-File -FilePath $hostsFile -Append -Encoding ASCII
+                Write-Host "    → 已将 $resolvedIp github.com 写入 hosts 文件"
+                # 验证 hosts 生效
+                try {
+                  $testAddr = [System.Net.Dns]::GetHostAddresses("github.com")
+                  Write-Host "    ✓ hosts 写入后 DNS 验证通过: $($testAddr[0].IPAddressToString)"
+                } catch {
+                  Write-Host "    ⚠ hosts 写入后 DNS 验证仍失败，继续尝试"
+                }
+              } catch {
+                Write-Host "    ⚠ hosts 文件写入失败: $_"
+              }
             }
             if (-not $dnsOk) {
-              Write-Host "  → DNS 不可用，跳过本次重试（等待下次循环）"
+              Write-Host "  → 所有 DNS 解析方法均失败，跳过本次重试（等待下次循环）"
               continue
             }
             # DNS 解析成功，清理旧文件并执行 git clone
@@ -412,6 +464,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
+    # v0.8.42 修复：Windows runner DNS 不稳定，设置 continue-on-error 不阻塞整体发布
+    #   Linux/macOS 构建必须成功，Windows 构建失败可后续手动重试
+    continue-on-error: ${{ matrix.continue-on-error == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -419,13 +474,16 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact-prefix: lrc-desktop-windows
+            continue-on-error: true
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact-prefix: lrc-desktop-macos
+            continue-on-error: false
           # v0.5.7 新增：Linux 桌面端构建（AppImage + deb）
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact-prefix: lrc-desktop-linux
+            continue-on-error: false
 
     steps:
       # v0.8.24 修复：Windows runner 网络不稳定导致 git clone 失败，
@@ -435,6 +493,8 @@ jobs:
       # v0.8.39 增强：DNS 解析失败时刷新 DNS 缓存后再重试。
       # v0.8.40 增强：在 git clone 前先测试 DNS 解析，DNS 恢复后才执行 clone，
       #   避免"DNS 不通但强行 clone"的无效重试循环。
+      # v0.8.42 增强：系统 DNS 失败时尝试 nslookup 备用 DNS（Google 8.8.8.8），
+      #   成功后将 IP 写入 hosts 文件，使 git clone 绕过系统 DNS 解析。
       - name: Checkout
         id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -453,20 +513,64 @@ jobs:
             Write-Host "  → 刷新 DNS 缓存..."
             ipconfig /flushdns 2>$null
             Start-Sleep -Seconds 2
-            # v0.8.40 增强：先测试 DNS 解析，不通则不执行 clone
-            Write-Host "  → 测试 DNS 解析 github.com..."
+            # v0.8.42 增强：三步 DNS 解析兜底策略
+            #   方法 1: 系统 DNS（[System.Net.Dns]::GetHostAddresses）
+            #   方法 2: 备用 DNS（nslookup google.com 8.8.8.8）
+            #   方法 3: 写入 hosts 文件（使 git clone 绕过系统 DNS）
+            Write-Host "  → 尝试 DNS 解析 github.com..."
             $dnsOk = $false
+            $resolvedIp = $null
+            # 方法 1: 系统 DNS
             try {
               $addresses = [System.Net.Dns]::GetHostAddresses("github.com")
               if ($addresses -and $addresses.Length -gt 0) {
-                Write-Host "    ✓ DNS 解析成功: $($addresses[0].IPAddressToString)"
+                $resolvedIp = $addresses[0].IPAddressToString
+                Write-Host "    ✓ 系统 DNS 解析成功: $resolvedIp"
                 $dnsOk = $true
               }
             } catch {
-              Write-Host "    ✗ DNS 解析异常: $_"
+              Write-Host "    ✗ 系统 DNS 解析失败: $_"
+            }
+            # 方法 2: 备用 DNS（Google 8.8.8.8）
+            if (-not $dnsOk) {
+              Write-Host "  → 尝试备用 DNS (nslookup github.com 8.8.8.8)..."
+              try {
+                $nslookup = nslookup github.com 8.8.8.8 2>$null
+                if ($nslookup -match 'Address:\s+(\d+\.\d+\.\d+\.\d+)') {
+                  $resolvedIp = $matches[1]
+                  Write-Host "    ✓ 备用 DNS 解析成功: $resolvedIp"
+                  $dnsOk = $true
+                } else {
+                  Write-Host "    ✗ 备用 DNS 无法解析"
+                }
+              } catch {
+                Write-Host "    ✗ 备用 DNS 解析异常: $_"
+              }
+            }
+            # 方法 3: 写入 hosts 文件（使 git clone 使用 hosts 解析而非系统 DNS）
+            if ($dnsOk -and $resolvedIp) {
+              try {
+                $hostsFile = "$env:windir\System32\drivers\etc\hosts"
+                # 先清理旧条目（避免重复）
+                $content = Get-Content $hostsFile -Encoding ASCII -ErrorAction SilentlyContinue
+                $newContent = $content | Where-Object { $_ -notmatch '\s+github\.com$' }
+                $newContent | Set-Content $hostsFile -Encoding ASCII -ErrorAction SilentlyContinue
+                # 添加新条目
+                "$resolvedIp github.com" | Out-File -FilePath $hostsFile -Append -Encoding ASCII
+                Write-Host "    → 已将 $resolvedIp github.com 写入 hosts 文件"
+                # 验证 hosts 生效
+                try {
+                  $testAddr = [System.Net.Dns]::GetHostAddresses("github.com")
+                  Write-Host "    ✓ hosts 写入后 DNS 验证通过: $($testAddr[0].IPAddressToString)"
+                } catch {
+                  Write-Host "    ⚠ hosts 写入后 DNS 验证仍失败，继续尝试"
+                }
+              } catch {
+                Write-Host "    ⚠ hosts 文件写入失败: $_"
+              }
             }
             if (-not $dnsOk) {
-              Write-Host "  → DNS 不可用，跳过本次重试（等待下次循环）"
+              Write-Host "  → 所有 DNS 解析方法均失败，跳过本次重试（等待下次循环）"
               continue
             }
             # DNS 解析成功，清理旧文件并执行 git clone

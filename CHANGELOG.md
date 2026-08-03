@@ -23,6 +23,28 @@
 **涉及文件：**
 - `.github/workflows/security.yml`：两个 harden-runner 配置添加 `index.crates.io:443`
 
+### 改进：Windows 构建 DNS 重试三阶兜底 + 熔断降级
+
+**问题根因：** GitHub Actions Windows runner 偶发 DNS 解析失败，重试 5 次后仍然失败导致整个 Release 被阻塞。
+
+**修复（三阶兜底）：**
+1. 系统 DNS 解析 `github.com`（`[System.Net.Dns]::GetHostAddresses`）
+2. 备用 DNS 解析（`nslookup github.com 8.8.8.8`）
+3. 将解析结果写入 `%windir%\System32\drivers\etc\hosts`，使 `git clone` 绕过系统 DNS
+
+**熔断降级：** Windows 构建设置 `continue-on-error: true`，即使 DNS 持续失败也不阻塞 Linux/macOS 构建和 Release 发布。
+
+**涉及文件：**
+- `.github/workflows/release.yml`：Build Sidecar 和 Build Desktop 的 matrix 增加 `continue-on-error` + checkout 重试脚本增加备用 DNS + hosts 写入
+
+### 新增：发布流程规范文档
+
+**内容：** 创建 `docs/RELEASE_PROCESS.md`，标准化发布流程，包括：
+- 发布前准备（版本号同步、本地预检、泄露检测、CHANGELOG 更新）
+- 发布执行（提交规范、tag 推送）
+- 推送后监控（CI 状态检查、已知失败模式处理）
+- 发布后检查清单、Windows 构建失败后续处理、版本号策略
+
 ## [0.8.41] - 2026-08-03
 
 ### 根因修复：E008:noport 单例锁冲突（PID 重用误判）
