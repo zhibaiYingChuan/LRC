@@ -602,6 +602,17 @@ pub async fn start_sidecar(
                 );
                 // 复用现有 sidecar，不执行 Phase 2/3
                 target_port
+            } else if let Some(found) = SidecarManager::find_healthy_sidecar_port(target_port).await
+            {
+                // v0.8.38 新增：扫描端口区间（3099-3119）寻找健康 sidecar
+                // 根因：用户关闭桌面端后重新打开，旧 sidecar 仍在端口 3099 运行，
+                // 但桌面端可能因端口自适应/设备切换而误判无 sidecar，
+                // 尝试启动新 sidecar 时触发单例锁冲突 E008。
+                tracing::info!(
+                    "G-002：端口区间扫描发现健康 sidecar 在端口 {}，复用现有实例",
+                    found
+                );
+                found
             } else {
                 // Phase 2: 启动子进程 + 健康检查（不持锁，I/O，最多 40s）
                 let binary_path = {
@@ -704,6 +715,15 @@ pub async fn start_sidecar_for_project(
                     project_key
                 );
                 target_port
+            } else if let Some(found) = SidecarManager::find_healthy_sidecar_port(target_port).await
+            {
+                // v0.8.38 新增：扫描端口区间（3099-3119）寻找健康 sidecar
+                tracing::info!(
+                    "G-002：端口区间扫描发现健康 sidecar 在端口 {}，复用现有实例（项目: {}）",
+                    found,
+                    project_key
+                );
+                found
             } else {
                 // Phase 2: 启动子进程 + 健康检查（不持锁，I/O，最多 40s）
                 let binary_path = {
