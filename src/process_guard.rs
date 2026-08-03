@@ -321,6 +321,9 @@ impl Drop for SingletonLock {
 ///
 /// Windows: 通过 OpenProcess 检查进程是否存在
 /// Linux/macOS: 检查 /proc/{pid} 目录是否存在（或发送信号 0）
+///
+/// v0.8.41 修复：Windows 上增加了进程名验证，防止 PID 被其他进程重用时
+/// 误判为"sidecar 仍在运行"（这是 E008:noport 频繁出现的根因）。
 fn is_pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -351,7 +354,22 @@ fn is_pid_alive(pid: u32) -> bool {
             return false; // GetExitCodeProcess 失败 → 假设进程已死
         }
 
-        exit_code == STILL_ACTIVE // 259 表示进程仍在运行
+        if exit_code != STILL_ACTIVE {
+            return false; // 进程已退出
+        }
+
+        // v0.8.41 修复：PID 可能已被其他进程重用（Windows PID 回收机制），
+        // 此时 GetExitCodeProcess 对任何进程都返回 STILL_ACTIVE。
+        // 必须验证进程名是否匹配 sidecar 二进制，否则会误判为"sidecar 仍在运行"。
+        if !is_process_matches_sidecar(pid) {
+            eprintln!(
+                "[进程守护] 检测到 PID {} 已被其他进程重用，自动清理残留锁记录",
+                pid
+            );
+            return false;
+        }
+
+        true
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -360,7 +378,86 @@ fn is_pid_alive(pid: u32) -> bool {
         // 注意：macOS 虽然没有 /proc，但有相同的进程语义，
         // 可以通过 kill(pid, 0) 检查进程是否存在
         let path = std::path::PathBuf::from(format!("/proc/{}", pid));
+        if !path.exists() {
+            return false;
+        }
+        // v0.8.41 修复：Unix 平台也检查进程名，防止 PID 重用
+        let comm_path = path.join("comm");
+        if let Ok(content) = std::fs::read_to_string(&comm_path) {
+            let name = content.trim();
+            // 允许的进程名：lrc-sidecar、code-memory-server 等
+            if name.contains("lrc-sidecar")
+                || name.contains("code-memory")
+                || name.contains("lrc_sidecar")
+            {
+                return true;
+            }
+            // 如果 /proc/{pid}/comm 内容不匹配，说明 PID 已被其他进程重用
+            eprintln!(
+                "[进程守护] PID {} 的进程名 '{}' 不匹配 sidecar，视为残留",
+                pid, name
+            );
+            return false;
+        }
+        // 无法读取 comm 文件时走保守路径：仅检查 /proc/{pid} 存在
         path.exists()
+    }
+}
+
+/// v0.8.41 新增：验证指定 PID 的进程名是否匹配 sidecar 二进制
+///
+/// 使用 tasklist 查询进程名，通过 CSV 输出解析 image_name 列。
+/// 这是语言无关的检测方式，不受 Windows 系统语言版本影响。
+/// 与当前可执行文件名对比，避免误杀其他进程。
+#[cfg(target_os = "windows")]
+fn is_process_matches_sidecar(pid: u32) -> bool {
+    // 获取当前 sidecar 可执行文件的文件名（不含路径）
+    let current_exe = std::env::current_exe().ok();
+    let current_name = current_exe
+        .as_ref()
+        .and_then(|p| p.file_stem())
+        .and_then(|n| n.to_str())
+        .map(|n| n.to_lowercase());
+
+    // 使用 tasklist 获取指定 PID 的进程名
+    // 输出格式（CSV, /NH 去掉表头）:
+    //   "lrc-sidecar.exe","15228","Console","1","10,000 K"
+    let output = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+        .output();
+
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let lower = stdout.to_lowercase();
+
+            // 策略 1: 与当前可执行文件名对比（最精确）
+            if let Some(ref name) = current_name {
+                if lower.contains(name) {
+                    return true;
+                }
+            }
+
+            // 策略 2: 兜底检查常见 sidecar 名称
+            // 注意：不同版本、不同平台下 sidecar 名称可能不同
+            if lower.contains("lrc-sidecar")
+                || lower.contains("code-memory")
+                || lower.contains("lrc_sidecar")
+            {
+                return true;
+            }
+
+            false
+        }
+        Err(e) => {
+            // tasklist 执行失败时（极少见），保守起见认为 PID 属于 sidecar
+            // 避免因 tasklist 故障导致 sidecar 无法启动
+            eprintln!(
+                "[进程守护] 执行 tasklist 检查 PID={} 失败: {}，保守通过",
+                pid, e
+            );
+            true
+        }
     }
 }
 

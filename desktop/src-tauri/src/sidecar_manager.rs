@@ -157,64 +157,100 @@ pub struct StartOptions<'a> {
 /// 视为终止成功。这是修复竞态条件的核心——PID 在检测和终止之间已消失时，
 /// 不应返回 false 导致启动失败。
 ///
+/// v0.8.41 修复：在 kill 前验证进程名，避免误杀被 PID 重用后的其他进程。
+/// 这是 E008:noport 根因修复的一部分——PID 可能已被系统进程重用。
+///
 /// Windows 使用 taskkill /F，Unix 使用 SIGKILL
 pub fn kill_process_by_pid(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
-        // 步骤 1: 先检查进程是否还存在（tasklist 输出中是否包含该 PID）
-        // 使用 tasklist /FI "PID eq <pid>" /NH 查询，PID 出现在输出中 → 进程存在
-        // 这是语言无关的检测方式，不受 Windows 语言版本影响
+        // 步骤 1: 检查进程是否存在，并验证进程名是否匹配 sidecar
+        // 使用 tasklist /FI "PID eq <pid>" /FO CSV /NH 查询
+        // CSV 输出格式: "image_name.exe","pid","session_name","session#","mem_usage"
         let check = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
             .output();
-        let process_alive = match &check {
+        let process_status = match &check {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                stdout.contains(&pid.to_string())
-            }
-            Err(_) => {
-                // tasklist 执行失败（极少见），保守起见认为进程存在
-                true
-            }
-        };
-        if !process_alive {
-            tracing::warn!(
-                "旧 sidecar 进程 (PID={}) 已不存在，无需终止（竞态条件已处理）",
-                pid
-            );
-            return true;
-        }
-        // 步骤 2: 进程确实存在，强制终止
-        match std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output()
-        {
-            Ok(output) => {
-                if output.status.success() {
-                    tracing::warn!("已强制终止旧 sidecar 进程 (PID={})", pid);
-                    true
+                let lower = stdout.to_lowercase();
+
+                // 检查 PID 是否存在于输出中
+                if !lower.contains(&pid.to_string()) {
+                    // PID 不存在 → 进程已消失，视为终止成功
+                    "not_found"
+                } else if lower.contains("lrc-sidecar")
+                    || lower.contains("code-memory")
+                    || lower.contains("lrc_sidecar")
+                {
+                    // PID 存在且进程名匹配 sidecar → 可以安全终止
+                    "sidecar"
                 } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    tracing::warn!("终止旧 sidecar 进程 (PID={}) 失败: {}", pid, stderr);
-                    false
+                    // PID 存在但进程名不是 sidecar → PID 已被其他进程重用！
+                    // 这是 E008:noport 的根因：旧 sidecar 已死，PID 被其他进程占用
+                    tracing::warn!(
+                        "PID={} 已被其他进程重用（进程名不匹配 sidecar），跳过终止",
+                        pid
+                    );
+                    "reused"
                 }
             }
-            Err(e) => {
-                tracing::warn!("执行 taskkill 失败 (PID={}): {}", pid, e);
-                false
+            Err(_) => {
+                // tasklist 执行失败（极少见），保守起见认为进程存在且是 sidecar
+                "sidecar"
+            }
+        };
+
+        match process_status {
+            "not_found" => {
+                tracing::warn!(
+                    "旧 sidecar 进程 (PID={}) 已不存在，无需终止（竞态条件已处理）",
+                    pid
+                );
+                return true;
+            }
+            "reused" => {
+                // PID 被其他进程重用，不能 kill，但视为"终止成功"（因为旧 sidecar 已死）
+                // 锁文件中的残留记录会在新 sidecar 的 acquire() 中被清理
+                tracing::warn!(
+                    "PID={} 已被其他进程重用，旧 sidecar 已死，视为终止成功",
+                    pid
+                );
+                return true;
+            }
+            _ => {
+                // 步骤 2: 确认是 sidecar 进程，强制终止
+                match std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .output()
+                {
+                    Ok(output) => {
+                        if output.status.success() {
+                            tracing::warn!("已强制终止旧 sidecar 进程 (PID={})", pid);
+                            true
+                        } else {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            tracing::warn!("终止旧 sidecar 进程 (PID={}) 失败: {}", pid, stderr);
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("执行 taskkill 失败 (PID={}): {}", pid, e);
+                        false
+                    }
+                }
             }
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // Unix: 先检查进程是否还存在（kill -0 信号不发送，仅检测进程存在）
-        // kill -0 <pid> 成功（exit 0）= 进程存在，失败（exit 1）= 进程不存在
+        // Unix: 先检查进程是否还存在
         let alive_check = std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .output();
         let process_alive = match &alive_check {
             Ok(output) => output.status.success(),
-            Err(_) => true, // 保守起见认为进程存在
+            Err(_) => true,
         };
         if !process_alive {
             tracing::warn!(
@@ -222,6 +258,22 @@ pub fn kill_process_by_pid(pid: u32) -> bool {
                 pid
             );
             return true;
+        }
+        // 检查进程名是否匹配 sidecar
+        let comm_path = std::path::PathBuf::from(format!("/proc/{}/comm", pid));
+        if let Ok(content) = std::fs::read_to_string(&comm_path) {
+            let name = content.trim();
+            if !name.contains("lrc-sidecar")
+                && !name.contains("code-memory")
+                && !name.contains("lrc_sidecar")
+            {
+                tracing::warn!(
+                    "PID={} 进程名 '{}' 不匹配 sidecar，跳过终止（PID 已重用）",
+                    pid,
+                    name
+                );
+                return true;
+            }
         }
         // 先尝试 SIGTERM（优雅终止）
         let result = std::process::Command::new("kill")
@@ -229,7 +281,6 @@ pub fn kill_process_by_pid(pid: u32) -> bool {
             .output();
         if let Ok(output) = &result {
             if output.status.success() {
-                // 等待 1 秒让进程优雅退出
                 std::thread::sleep(std::time::Duration::from_secs(1));
             }
         }
