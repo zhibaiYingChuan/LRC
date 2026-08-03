@@ -2,6 +2,26 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.41] - 2026-08-03
+
+### 根因修复：E008:noport 单例锁冲突（PID 重用误判）
+
+**问题根因（六钥匙分析）：**
+- **简化**：`is_pid_alive()` 用 `OpenProcess` + `GetExitCodeProcess` 检查 PID 是否存活
+- **泛化**：这是 **PID 重用问题**——Windows 进程退出后 PID 可被其他进程（如 svchost）重用
+- **繁衍（逆向）**：目标 = 启动成功 → 需要 `is_pid_alive()` 不误判 → 需要验证进程名，而非仅 PID
+- **类比**：类似"门禁卡只检查了卡号，没检查持卡人身份"——PID 是卡号，进程名是身份
+
+**修复（两层防御）：**
+
+**第一层（根因）**：[`src/process_guard.rs`](file:///g:/code-memory/src/process_guard.rs) → `is_pid_alive()` 在确认 PID 存活后，Windows 用 `tasklist` / Unix 用 `/proc/{pid}/comm` 验证进程名是否匹配 sidecar 二进制。不匹配 → PID 被重用 → 视为死锁，自动清理锁文件中的残留记录。
+
+**第二层（防御）**：[`desktop/src-tauri/src/sidecar_manager.rs`](file:///g:/code-memory/desktop/src-tauri/src/sidecar_manager.rs) → `kill_process_by_pid()` 在 kill 前也用 `tasklist` 验证进程名，确认是 sidecar 进程才执行 `taskkill /F`，避免误杀系统进程。
+
+**涉及文件：**
+- `src/process_guard.rs`：`is_pid_alive()` 增加进程名验证，新增 `is_process_matches_sidecar()` 函数
+- `desktop/src-tauri/src/sidecar_manager.rs`：`kill_process_by_pid()` 增加进程名验证，识别 `not_found`/`reused`/`sidecar` 三种状态
+
 ## [0.8.40] - 2026-08-03
 
 ### 修复：`kill_process_by_pid` 竞态条件（进程已不存在时未正确处理）
