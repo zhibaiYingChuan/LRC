@@ -2,9 +2,31 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.33] - 2026-08-03
+
+### 紧急发布 v2：v0.8.32 发布事故再修复（restore-keys SHA-agnostic 兜底导致再次打包旧二进制）
+
+#### HCSE R-02：彻底解决「新旧混合包」根因 —— 双层缓存拆分 + 双保险核爆策略
+- **严重级别**: P0 Critical（影响所有用户，v0.8.31 / v0.8.32 连续两版均为混合包）
+- **v0.8.32 失败根因**: 缓存 `key` 带了 `github.sha`（新 tag 必变 ✅），但 `restore-keys` 最底部兜底行 `*-${{ matrix.target }}-` **不包含 SHA** → 主 key 不命中时 actions/cache 沿着 restore-keys 降级，命中了 v0.8.30 / v0.8.31 留下的任意 tag 旧缓存 → 完整 restore 了旧的 `target/` 目录 + 里面已编译的 `.rlib/.o` → cargo 比较 mtime 后判定「编译产物比源文件新」→ **再次静默跳过重编**！临床表现与 v0.8.31 完全一致：S-05 前端 UI（版本号 0.8.32 / 24h 显示）生效，但 S-01（Trae CN=未安装反了/Trae=已安装）、S-02（CodeBuddy 漏检）、S-03（齿轮图标消失）、S-04（自动徽章）四个 Rust 后端修复 0% 生效。
+- **三层核爆修复（100% 保证重编）**：
+  1. **双缓存架构拆分**：将所有 `actions/cache` 拆为两个独立步骤
+     - `Cache Cargo registry`（仅 `~/.cargo/registry/` + `~/.cargo/git/` —— 外部 crate 下载）：跨 tag 共享 restore-keys，OK，安全，节省依赖下载时间
+     - `Cache target/`（本项目编译产物）：`key` 含 `SHA + .rs 哈希`，`restore-keys` **只有含 SHA 的前缀**，彻底删除所有不包含 SHA 的兜底行 → 新 tag 100% cache miss
+  2. **每个 Job 都强制 `cargo clean`**：即使 `restore-keys` 理论上已经无兜底，仍在 Preflight / Build Sidecar / Build Desktop 三个 Job 的所有 cargo 命令前显式执行 `cargo clean`（Build Desktop 还额外清 `desktop/src-tauri/target/` 两个子目录）—— 无论任何缓存恢复都立即清空所有已编译的 `.rlib/.o`，物理上强制 cargo 必须从 `Compiling xxx v0.8.33` 第一行开始重编
+  3. **版本号同步 0.8.32 → 0.8.33**：用户界面可验证，与 v0.8.32 混合包彻底划清界限
+- **验证点（v0.8.33 构建日志必须全部满足）**：
+  - Preflight Job 日志：`Force clean target/` 步骤存在 + 无报错退出
+  - Build Sidecar Job 日志：`Force clean target/` 步骤存在 + `Build sidecar binary` 前 20 行出现 `Compiling code-memory v0.8.33`
+  - Build Desktop Job 日志：`Force clean ROOT target/ + DESKTOP target/` 步骤存在 + `Build sidecar binary`/`Build desktop app` 前 20 行出现 `Compiling lrc-desktop v0.8.33`
+  - 用户界面 v0.8.33 安装包：Trae CN=已检测到 / Trae 国际版=未安装 / CodeBuddy=已检测到 / 齿轮图标存在 / 首项目自动高亮徽章 ✨
+
+---
+
 ## [0.8.32] - 2026-08-03
 
 ### 紧急发布：v0.8.31 发布事故修复（构建缓存时间戳bug导致新旧混合包）
+### ⚠️ 版本状态：DEPRECATED（v0.8.32 仍为混合包，请跳过本版，直接使用 v0.8.33+）
 
 #### HCSE R-01：修复 release.yml 构建缓存 key 配置缺陷
 - **严重级别**: P0 Critical（影响所有用户）
