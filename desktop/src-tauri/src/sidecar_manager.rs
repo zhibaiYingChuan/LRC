@@ -148,15 +148,43 @@ pub struct StartOptions<'a> {
     pub data_dir: Option<&'a str>,
 }
 
-/// v0.8.39 新增：通过 PID 强制终止进程
+/// 通过 PID 强制终止进程
 ///
 /// 用于 SingletonConflict 场景：健康检查无法检测到现有 sidecar 时，
 /// 强制终止旧进程后重新启动新 sidecar。
+///
+/// v0.8.39 修复（v2）：如果进程已不存在（taskkill/kill -9 报错 "not found"），
+/// 视为终止成功。这是修复竞态条件的核心——PID 在检测和终止之间已消失时，
+/// 不应返回 false 导致启动失败。
 ///
 /// Windows 使用 taskkill /F，Unix 使用 SIGKILL
 pub fn kill_process_by_pid(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
+        // 步骤 1: 先检查进程是否还存在（tasklist 输出中是否包含该 PID）
+        // 使用 tasklist /FI "PID eq <pid>" /NH 查询，PID 出现在输出中 → 进程存在
+        // 这是语言无关的检测方式，不受 Windows 语言版本影响
+        let check = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+            .output();
+        let process_alive = match &check {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                stdout.contains(&pid.to_string())
+            }
+            Err(_) => {
+                // tasklist 执行失败（极少见），保守起见认为进程存在
+                true
+            }
+        };
+        if !process_alive {
+            tracing::warn!(
+                "旧 sidecar 进程 (PID={}) 已不存在，无需终止（竞态条件已处理）",
+                pid
+            );
+            return true;
+        }
+        // 步骤 2: 进程确实存在，强制终止
         match std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
             .output()
@@ -179,6 +207,22 @@ pub fn kill_process_by_pid(pid: u32) -> bool {
     }
     #[cfg(not(target_os = "windows"))]
     {
+        // Unix: 先检查进程是否还存在（kill -0 信号不发送，仅检测进程存在）
+        // kill -0 <pid> 成功（exit 0）= 进程存在，失败（exit 1）= 进程不存在
+        let alive_check = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output();
+        let process_alive = match &alive_check {
+            Ok(output) => output.status.success(),
+            Err(_) => true, // 保守起见认为进程存在
+        };
+        if !process_alive {
+            tracing::warn!(
+                "旧 sidecar 进程 (PID={}) 已不存在，无需终止（竞态条件已处理）",
+                pid
+            );
+            return true;
+        }
         // 先尝试 SIGTERM（优雅终止）
         let result = std::process::Command::new("kill")
             .arg(&pid.to_string())
