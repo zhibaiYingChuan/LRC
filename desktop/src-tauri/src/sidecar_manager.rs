@@ -148,6 +148,70 @@ pub struct StartOptions<'a> {
     pub data_dir: Option<&'a str>,
 }
 
+/// v0.8.39 新增：通过 PID 强制终止进程
+///
+/// 用于 SingletonConflict 场景：健康检查无法检测到现有 sidecar 时，
+/// 强制终止旧进程后重新启动新 sidecar。
+///
+/// Windows 使用 taskkill /F，Unix 使用 SIGKILL
+pub fn kill_process_by_pid(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        match std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output()
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    tracing::warn!("已强制终止旧 sidecar 进程 (PID={})", pid);
+                    true
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!("终止旧 sidecar 进程 (PID={}) 失败: {}", pid, stderr);
+                    false
+                }
+            }
+            Err(e) => {
+                tracing::warn!("执行 taskkill 失败 (PID={}): {}", pid, e);
+                false
+            }
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // 先尝试 SIGTERM（优雅终止）
+        let result = std::process::Command::new("kill")
+            .arg(&pid.to_string())
+            .output();
+        if let Ok(output) = &result {
+            if output.status.success() {
+                // 等待 1 秒让进程优雅退出
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        // 再尝试 SIGKILL（强制终止）
+        match std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output()
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    tracing::warn!("已强制终止旧 sidecar 进程 (PID={})", pid);
+                    true
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!("终止旧 sidecar 进程 (PID={}) 失败: {}", pid, stderr);
+                    false
+                }
+            }
+            Err(e) => {
+                tracing::warn!("执行 kill 失败 (PID={}): {}", pid, e);
+                false
+            }
+        }
+    }
+}
+
 /// 结构化启动错误（G-004：错误码 + 分类体系）
 ///
 /// 替代原先的 `String` 错误，提供机器可读的错误码和分类，

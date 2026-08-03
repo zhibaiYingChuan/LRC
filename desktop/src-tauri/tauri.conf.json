@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicoverbruggen/wuffs/main/static/tauri-schema.json",
   "productName": "LRC Desktop",
-  "version": "0.8.38",
+  "version": "0.8.39",
   "identifier": "com.loongcode.lrc-desktop",
   "build": {
     "frontendDist": "../../static",
