@@ -311,9 +311,15 @@ jobs:
           # v0.8.15 P0-1 修复：Windows 静态链接 CRT，消除 VCRUNTIME140.dll 运行时依赖
           # 根因：用户机器未安装 VC++ Redistributable 时，sidecar 进程在入口点前崩溃
           # stderr 重定向尚未生效，日志为空，用户无法定位问题
+          # v0.8.34 修复：harden-runner 阻止 OCSP 证书吊销检查，导致 Windows schannel SSL 握手失败
+          # 根因：Windows 上 cargo 使用 schannel TLS 后端，需要访问 OCSP 服务器验证证书吊销
+          # 但 harden-runner 的 egress-policy: block 阻止了 ocsp.sectigo.com 等域名
+          # 修复：设置 CARGO_HTTP_CHECK_REVOKE=false 跳过 SSL 吊销检查
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             export RUSTFLAGS="-C target-feature=+crt-static"
             echo "已启用 CRT 静态链接 (RUSTFLAGS=$RUSTFLAGS)"
+            export CARGO_HTTP_CHECK_REVOKE=false
+            echo "已禁用 SSL 证书吊销检查 (CARGO_HTTP_CHECK_REVOKE=false)"
           fi
 
           cargo build --release --features server --target ${{ matrix.target }}
@@ -481,8 +487,13 @@ jobs:
         shell: bash
 
       # 步骤 1: 先编译 sidecar 二进制
+      # v0.8.34 修复：Windows 上 harden-runner 阻止 OCSP 证书吊销检查，需禁用 SSL 吊销检查
       - name: Build sidecar binary
         run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            export CARGO_HTTP_CHECK_REVOKE=false
+            echo "已禁用 SSL 证书吊销检查 (CARGO_HTTP_CHECK_REVOKE=false)"
+          fi
           cargo build --release --features server --target ${{ matrix.target }}
           echo "Sidecar binary built at target/${{ matrix.target }}/release/"
         shell: bash
@@ -536,9 +547,14 @@ jobs:
 
       # 步骤 4: 构建 Tauri 桌面端安装包
       # sidecar 已手动复制，build.rs 会检测到哈希一致并跳过复制
+      # v0.8.34 修复：Windows 上 harden-runner 阻止 OCSP 证书吊销检查，需禁用 SSL 吊销检查
       - name: Build desktop app
         run: |
           cd desktop/src-tauri
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            export CARGO_HTTP_CHECK_REVOKE=false
+            echo "已禁用 SSL 证书吊销检查 (CARGO_HTTP_CHECK_REVOKE=false)"
+          fi
           cargo tauri build --target ${{ matrix.target }}
         shell: bash
 

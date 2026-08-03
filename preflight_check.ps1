@@ -1,4 +1,4 @@
-﻿# LRC 推送前预检脚本
+# LRC 推送前预检脚本
 # 执行 PRE_PUSH_CHECKLIST.md 中定义的所有检查项
 # 使用方式：.\preflight_check.ps1
 # 依赖：PowerShell 7+, Rust toolchain, Node.js
@@ -37,7 +37,7 @@ function Check-Item {
 }
 
 Write-Host "══════════════════════════════════════════════════" -ForegroundColor Cyan
-Write-Host " LRC 推送前预检脚本 v0.8.23" -ForegroundColor Cyan
+Write-Host " LRC 推送前预检脚本 v0.8.35" -ForegroundColor Cyan
 Write-Host "══════════════════════════════════════════════════" -ForegroundColor Cyan
 
 # 一、代码质量检查
