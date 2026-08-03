@@ -2,6 +2,22 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.37] - 2026-08-03
+
+### 开发版与稳定版数据/端口隔离
+
+**问题：** `npm run tauri dev` 启动的开发版与已安装的稳定版共享同一端口（3099）和数据目录（`~/.loong-recall/global/data/`），导致单例锁冲突 —— 新 sidecar 因 `E008:noport` 错误主动退出。
+
+**修复：** 检测 `TAURI_DEV` 环境变量，开发模式自动使用独立配置：
+- **端口：** 3100（稳定版 3099）
+- **数据目录：** `~/.loong-recall/dev/data/`（稳定版 `~/.loong-recall/global/data/`）
+- 用户也可通过设置 `LRC_DEV_MODE=true` 环境变量手动切换开发模式
+
+**涉及文件：**
+- `desktop/src-tauri/src/sidecar_manager.rs`：`StartOptions` 新增 `data_dir` 字段，`spawn_and_wait` 传递 `--data-dir` 参数
+- `desktop/src-tauri/src/commands.rs`：新增 `is_dev_mode()` / `dev_mode_port()` / `dev_mode_data_dir()` 辅助函数
+- `desktop/src-tauri/src/main.rs`：心跳恢复也使用开发模式数据目录
+
 ## [0.8.36] - 2026-08-03
 
 ### CI 修复：Windows Desktop 构建 Install Tauri CLI 步骤 DNS 解析失败

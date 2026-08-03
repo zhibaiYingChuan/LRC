@@ -143,6 +143,9 @@ pub struct StartOptions<'a> {
     pub cancel_flag: &'a AtomicBool,
     /// 进度事件发送端（G-003：用于通知前端启动进度）
     pub progress_tx: Option<&'a tokio::sync::mpsc::Sender<StartProgress>>,
+    /// 自定义数据目录（v0.8.37 新增，用于开发版与稳定版数据隔离）
+    /// 设置后 sidecar 使用此目录而非默认的 ~/.loong-recall/global/data/
+    pub data_dir: Option<&'a str>,
 }
 
 /// 结构化启动错误（G-004：错误码 + 分类体系）
@@ -548,6 +551,7 @@ impl SidecarManager {
             llm_api,
             cancel_flag,
             progress_tx,
+            data_dir,
         } = *opts;
         let actual_port = port.unwrap_or(DEFAULT_SIDECAR_PORT);
 
@@ -570,6 +574,12 @@ impl SidecarManager {
             // v0.6.0 修复:桌面端无 src_dir 时使用全局模式,避免基于 cwd 生成指纹目录
             // 桌面端场景无明确项目概念,全局模式更符合用户直觉
             cmd.arg("--global");
+        }
+
+        // v0.8.37 新增：自定义数据目录（开发版与稳定版数据隔离）
+        if let Some(dd) = data_dir {
+            cmd.args(["--data-dir", dd]);
+            tracing::info!("使用自定义数据目录: {}", dd);
         }
 
         // 多窗口模式
@@ -1150,6 +1160,7 @@ impl SidecarManager {
             llm_api: llm_api.as_deref(),
             cancel_flag,
             progress_tx,
+            data_dir: None,
         };
         self.start_for_project(&project_key, &opts).await
     }
@@ -1299,6 +1310,7 @@ impl SidecarManager {
                 llm_api: effective_llm.as_deref(),
                 cancel_flag,
                 progress_tx: None, // G-003：心跳恢复不需要进度反馈
+                data_dir: None,
             };
             match Self::spawn_and_wait(&self.binary_path, &project_key, &start_opts).await {
                 Ok((child, port)) => {
@@ -1589,6 +1601,7 @@ mod tests {
             llm_api: None,
             cancel_flag: &cancel_flag,
             progress_tx: None, // G-003：测试不需要进度反馈
+            data_dir: None,
         };
         let result =
             SidecarManager::spawn_and_wait("nonexistent-binary-xyz.exe", "test_project", &opts)
@@ -1660,6 +1673,7 @@ mod tests {
                     llm_api: None,
                     cancel_flag: &cancel_flag,
                     progress_tx: None, // G-003：测试不需要进度反馈
+                    data_dir: None,
                 };
                 let _ =
                     SidecarManager::spawn_and_wait("nonexistent.exe", &project_key, &opts).await;
@@ -1880,6 +1894,7 @@ mod tests {
                 llm_api: info.llm_api.as_deref(),
                 cancel_flag: &heartbeat_cancel,
                 progress_tx: None, // G-003：测试不需要进度反馈
+                data_dir: None,
             };
             let _ = SidecarManager::spawn_and_wait(&binary_path, &info.project_key, &opts).await;
             // spawn_and_wait 会快速失败（binary 不存在）
@@ -1948,6 +1963,7 @@ mod tests {
             llm_api: None,
             cancel_flag: &cancel_flag,
             progress_tx: None, // G-003：测试不需要进度反馈
+            data_dir: None,
         };
         let _ = SidecarManager::spawn_and_wait(&binary_path, "test_project", &opts).await;
 

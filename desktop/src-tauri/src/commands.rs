@@ -501,6 +501,37 @@ pub async fn get_sidecar_status(
 /// 启动 sidecar 进程
 /// v0.5.4 P1-6 修复：错误信息人性化
 /// v0.8.9 G-003：通过 Tauri event 向前端推送启动进度
+/// v0.8.37 新增：检测是否处于开发模式
+///
+/// 开发模式下（npm run tauri dev），使用独立的端口和数据目录，
+/// 避免与稳定版（已安装的桌面端）冲突。
+/// 稳定版端口: 3099, 数据目录: ~/.loong-recall/global/data/
+/// 开发版端口: 3100, 数据目录: ~/.loong-recall/dev/data/
+fn is_dev_mode() -> bool {
+    std::env::var("TAURI_DEV").is_ok() || std::env::var("LRC_DEV_MODE").is_ok()
+}
+
+/// 获取开发模式的端口（如果处于开发模式且未指定端口）
+fn dev_mode_port(requested_port: Option<u16>) -> u16 {
+    if is_dev_mode() && requested_port.is_none() {
+        3100
+    } else {
+        requested_port.unwrap_or(crate::sidecar_manager::DEFAULT_SIDECAR_PORT)
+    }
+}
+
+/// 获取开发模式的数据目录（如果处于开发模式）
+fn dev_mode_data_dir() -> Option<String> {
+    if is_dev_mode() {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".to_string());
+        Some(format!("{}/.loong-recall/dev/data", home))
+    } else {
+        None
+    }
+}
+
 /// v0.8.9 G-004：使用结构化错误 SidecarStartError
 #[tauri::command]
 pub async fn start_sidecar(
@@ -561,7 +592,7 @@ pub async fn start_sidecar(
             // v0.8.9 G-002：Phase 1.5 — 检测端口是否被外部 sidecar 占用
             // 场景：桌面端崩溃后重启，旧 sidecar 仍在端口上运行。
             // 复用现有 sidecar，避免 spawn 重复进程（孤儿进程问题）。
-            let target_port = port.unwrap_or(crate::sidecar_manager::DEFAULT_SIDECAR_PORT);
+            let target_port = dev_mode_port(port);
             if let Some(probed) = SidecarManager::check_sidecar_health(target_port).await {
                 tracing::info!(
                     "G-002：端口 {} 已有健康 sidecar（src_dir: {}, uptime: {}s），复用现有实例",
@@ -578,6 +609,7 @@ pub async fn start_sidecar(
                     sidecar.binary_path().to_string()
                 }; // 锁立即释放
 
+                let _dev_dd = dev_mode_data_dir();
                 let start_opts = StartOptions {
                     src_dir: effective_src_dir.as_deref(),
                     port,
@@ -585,6 +617,7 @@ pub async fn start_sidecar(
                     llm_api: llm_api.as_deref(),
                     cancel_flag: &store.start_cancel_flag,
                     progress_tx: Some(&progress_tx),
+                    data_dir: _dev_dd.as_deref(),
                 };
                 let (child, port) =
                     SidecarManager::spawn_and_wait(&binary_path, &project_key, &start_opts)
@@ -662,7 +695,7 @@ pub async fn start_sidecar_for_project(
         crate::sidecar_manager::PrepareResult::AlreadyRunning(port) => port,
         crate::sidecar_manager::PrepareResult::NeedStart => {
             // v0.8.9 G-002：Phase 1.5 — 检测端口是否被外部 sidecar 占用
-            let target_port = port.unwrap_or(crate::sidecar_manager::DEFAULT_SIDECAR_PORT);
+            let target_port = dev_mode_port(port);
             if let Some(probed) = SidecarManager::check_sidecar_health(target_port).await {
                 tracing::info!(
                     "G-002：端口 {} 已有健康 sidecar（src_dir: {}），复用现有实例（项目: {}）",
@@ -678,6 +711,7 @@ pub async fn start_sidecar_for_project(
                     sidecar.binary_path().to_string()
                 };
 
+                let _dev_dd = dev_mode_data_dir();
                 let start_opts = StartOptions {
                     src_dir: src_dir.as_deref(),
                     port,
@@ -685,6 +719,7 @@ pub async fn start_sidecar_for_project(
                     llm_api: llm_api.as_deref(),
                     cancel_flag: &store.start_cancel_flag,
                     progress_tx: Some(&progress_tx),
+                    data_dir: _dev_dd.as_deref(),
                 };
                 // v0.8.21 FM-05 修复（interaction-resilience-auditor）：
                 //   与 switch_project 一致，start_sidecar_for_project 也加 120s 超时保护
@@ -1925,6 +1960,7 @@ pub async fn switch_project(
                 sidecar.binary_path().to_string()
             };
 
+            let _dev_dd = dev_mode_data_dir();
             let start_opts = StartOptions {
                 src_dir: Some(&project_dir),
                 port: None,
@@ -1932,6 +1968,7 @@ pub async fn switch_project(
                 llm_api: llm_api.as_deref(),
                 cancel_flag: &store.start_cancel_flag,
                 progress_tx: Some(&progress_tx),
+                data_dir: _dev_dd.as_deref(),
             };
             // v0.8.21 FM-05 修复（interaction-resilience-auditor）：
             //   根因：switch_project 调用 spawn_and_wait 无超时保护，DNS/健康检查卡死时
