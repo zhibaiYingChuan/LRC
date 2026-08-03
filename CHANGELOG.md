@@ -22,6 +22,16 @@
 - `src/process_guard.rs`：`is_pid_alive()` 增加进程名验证，新增 `is_process_matches_sidecar()` 函数
 - `desktop/src-tauri/src/sidecar_manager.rs`：`kill_process_by_pid()` 增加进程名验证，识别 `not_found`/`reused`/`sidecar` 三种状态
 
+### 修复：Preflight Check 在 Linux CI 上因进程名检查不匹配退出码 101
+
+**问题根因：** Cargo 编译二进制时会将包名中的连字符替换为下划线（`code-memory` → `code_memory`），但 `is_pid_alive()` 的 Linux 实现只检查 `code-memory`（连字符版）。Linux 的 `/proc/{pid}/comm` 将进程名截断到 15 字符（TASK_COMM_LEN），测试二进制 `code_memory_server-xxx` 被截断为 `code_memory_ser`，完全不匹配 `code-memory`，导致 `is_pid_alive()` 返回 `false`。这使 `test_current_pid_is_alive` 和 `test_reject_when_lock_exists_and_pid_alive` 在 Linux 上失败，Preflight Check 退出码 101。
+
+**修复：** 在 `is_pid_alive()`（Linux）和 `is_process_matches_sidecar()`（Windows）以及 `kill_process_by_pid()`（桌面端）的所有进程名检查中，同时添加 `code_memory`（下划线版）匹配。
+
+**涉及文件：**
+- `src/process_guard.rs`：`is_pid_alive()` Linux 实现和 `is_process_matches_sidecar()` 增加 `code_memory` 检查
+- `desktop/src-tauri/src/sidecar_manager.rs`：`kill_process_by_pid()` Windows 和 Unix 实现增加 `code_memory` 检查
+
 ## [0.8.40] - 2026-08-03
 
 ### 修复：`kill_process_by_pid` 竞态条件（进程已不存在时未正确处理）

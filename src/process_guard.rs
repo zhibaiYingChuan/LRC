@@ -386,9 +386,14 @@ fn is_pid_alive(pid: u32) -> bool {
         if let Ok(content) = std::fs::read_to_string(&comm_path) {
             let name = content.trim();
             // 允许的进程名：lrc-sidecar、code-memory-server 等
+            // 注意：Cargo 编译时会将包名中的连字符替换为下划线，所以
+            // "code-memory" 可能以 "code_memory" 出现在二进制名或 comm 中
+            // Linux 的 /proc/{pid}/comm 截断到 15 字符（TASK_COMM_LEN），
+            // 所以 "code_memory_server-xxx" 会被截断为 "code_memory_ser"
             if name.contains("lrc-sidecar")
-                || name.contains("code-memory")
                 || name.contains("lrc_sidecar")
+                || name.contains("code-memory")
+                || name.contains("code_memory")
             {
                 return true;
             }
@@ -440,9 +445,12 @@ fn is_process_matches_sidecar(pid: u32) -> bool {
 
             // 策略 2: 兜底检查常见 sidecar 名称
             // 注意：不同版本、不同平台下 sidecar 名称可能不同
+            // Cargo 编译时会将包名中的连字符替换为下划线，所以
+            // "code-memory" 可能以 "code_memory" 出现在二进制名中
             if lower.contains("lrc-sidecar")
-                || lower.contains("code-memory")
                 || lower.contains("lrc_sidecar")
+                || lower.contains("code-memory")
+                || lower.contains("code_memory")
             {
                 return true;
             }

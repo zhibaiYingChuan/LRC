@@ -180,8 +180,9 @@ pub fn kill_process_by_pid(pid: u32) -> bool {
                     // PID 不存在 → 进程已消失，视为终止成功
                     "not_found"
                 } else if lower.contains("lrc-sidecar")
-                    || lower.contains("code-memory")
                     || lower.contains("lrc_sidecar")
+                    || lower.contains("code-memory")
+                    || lower.contains("code_memory")
                 {
                     // PID 存在且进程名匹配 sidecar → 可以安全终止
                     "sidecar"
@@ -264,8 +265,9 @@ pub fn kill_process_by_pid(pid: u32) -> bool {
         if let Ok(content) = std::fs::read_to_string(&comm_path) {
             let name = content.trim();
             if !name.contains("lrc-sidecar")
-                && !name.contains("code-memory")
                 && !name.contains("lrc_sidecar")
+                && !name.contains("code-memory")
+                && !name.contains("code_memory")
             {
                 tracing::warn!(
                     "PID={} 进程名 '{}' 不匹配 sidecar，跳过终止（PID 已重用）",
