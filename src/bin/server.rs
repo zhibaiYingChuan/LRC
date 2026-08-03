@@ -255,6 +255,10 @@ async fn try_run() -> Result<(), String> {
                 }
                 return Ok(());
             }
+            "--version" | "-V" => {
+                println!("{}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "--help" | "-h" => {
                 print_help();
                 return Ok(());
@@ -1954,6 +1958,7 @@ fn print_help() {
     );
     println!("  --stdio             使用 stdio 传输模式（IDE 标准 MCP，推荐）");
     println!("  --global            记忆跨项目共享 (~/.loong-recall/global/data/)");
+    println!("  --version, -V       显示版本号并退出");
     println!("  --db-path <路径>    自定义记忆数据存储路径（优先级最高）");
     println!("  --data-dir <路径>   自定义数据根目录（V2 统一数据目录）");
     println!("  --llm-api <配置>    配置 LLM 查询翻译 (Tier 2)，格式见下方说明");

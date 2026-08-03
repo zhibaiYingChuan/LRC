@@ -338,6 +338,26 @@ jobs:
           echo "Built: ${BIN_NAME}"
         shell: bash
 
+      # v0.8.39 新增：编译产物版本校验（防御性门禁）
+      # 防止 CI 缓存导致"新前端+旧引擎二进制"混合产物
+      # 规则：编译产物版本号必须与 ${GITHUB_REF_NAME#v} 一致
+      - name: Verify binary version matches tag
+        if: always()
+        run: |
+          VERSION_TAG="${GITHUB_REF_NAME#v}"
+          echo "📋 期望版本: ${VERSION_TAG}"
+          echo "📋 编译产物: ${BIN_NAME}"
+          # 使用 --version 获取编译产物的版本号
+          BIN_VERSION=$(./"${BIN_NAME}" --version 2>/dev/null || echo "unknown")
+          echo "📋 实际版本: ${BIN_VERSION}"
+          if [ "${BIN_VERSION}" != "${VERSION_TAG}" ]; then
+            echo "❌ 编译产物版本 (${BIN_VERSION}) 与 tag 版本 (${VERSION_TAG}) 不匹配！"
+            echo "❌ 可能旧缓存二进制被复用，请检查 cargo clean 是否生效"
+            exit 1
+          fi
+          echo "✅ 编译产物版本一致: ${BIN_VERSION}"
+        shell: bash
+
       - name: macOS code signing (Ad-Hoc)
         if: runner.os == 'macOS'
         run: |
@@ -510,6 +530,26 @@ jobs:
           fi
           cargo build --release --features server --target ${{ matrix.target }}
           echo "Sidecar binary built at target/${{ matrix.target }}/release/"
+        shell: bash
+
+      # v0.8.39 新增：编译产物版本校验（Build Desktop 同样执行）
+      - name: Verify sidecar binary version matches tag
+        run: |
+          VERSION_TAG="${GITHUB_REF_NAME#v}"
+          echo "📋 期望版本: ${VERSION_TAG}"
+          SIDECAR_BIN="target/${{ matrix.target }}/release/code-memory-server"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            SIDECAR_BIN="${SIDECAR_BIN}.exe"
+          fi
+          echo "📋 编译产物: ${SIDECAR_BIN}"
+          BIN_VERSION=$("${SIDECAR_BIN}" --version 2>/dev/null || echo "unknown")
+          echo "📋 实际版本: ${BIN_VERSION}"
+          if [ "${BIN_VERSION}" != "${VERSION_TAG}" ]; then
+            echo "❌ 编译产物版本 (${BIN_VERSION}) 与 tag 版本 (${VERSION_TAG}) 不匹配！"
+            echo "❌ 可能旧缓存二进制被复用，请检查 cargo clean 是否生效"
+            exit 1
+          fi
+          echo "✅ 编译产物版本一致: ${BIN_VERSION}"
         shell: bash
 
       # 步骤 2: 手动复制 sidecar 到 desktop/src-tauri/（确保 build.rs 能找到）
