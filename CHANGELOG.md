@@ -2,6 +2,45 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.44] - 2026-08-03
+
+### 修复：HCSE 韧性验证 + 交互韧性审计 Round5 发现的问题（P0/P1）
+
+**P0 — 仪表盘 API 全失败时无重试按钮（GAP-L1-01）：** 仪表盘 API 全部失败时，error 遮罩添加"立即刷新"按钮（复用 `manualRefreshDashboard` 机制），用户可一键重试，无需刷新页面。
+
+**P0 — 索引期健康检查失败后 banner 显示错误信息（GAP-L5-01）：** 索引期健康检查 5 次失败后，保留 `_sidecarStatus` 为 `starting`/`indexing`，banner 显示"⏳ LRC 服务正在索引代码库，请稍候..."而非"服务未运行"。同时索引期不禁用 API 按钮，避免用户误判服务不可用。
+
+**P0 — beforeunload 拦截后"留下"无反馈（GAP-L5-04）：** 用户选择"留下"后，通过 `visibilitychange` 事件检测并显示 Toast"页面关闭已取消，后台任务仍在进行中"，消除用户不确定感。
+
+**P1 — `start_sidecar` 三级兜底缺显式超时（HCSE R1）：** 为 `start_sidecar` 的二级重试和三级兜底添加 `tokio::time::timeout(120s)` 显式超时保护，与 `start_sidecar_for_project` 和 `switch_project` 一致，防止 DNS/健康检查卡死时永久挂起。
+
+**P1 — `retryLoadBenchmarks` 自动重试死代码修复（审计发现）：** `loadBenchmarks` 内部 catch 捕获所有错误后不重新抛出，导致 `retryLoadBenchmarks` 的 `await loadBenchmarks()` 永远不会抛异常，自动重试机制（死代码）永远不触发，用户只能手动点击重试按钮。修复：显示 UI 错误后重新抛出异常，让自动重试机制生效。
+
+**涉及文件：**
+- `static/app.js`：仪表盘重试按钮、索引期 banner 提示、beforeunload 反馈、基准报告自动重试修复
+- `desktop/src-tauri/src/commands.rs`：`start_sidecar` 三级兜底显式超时
+
+## [0.8.43] - 2026-08-03
+
+### 修复：五层交互韧性审计发现的问题（P0/P1/P2）
+
+**P0 — Error Toast 环形队列修复：** error 上限从 2 提升到 3，超过上限时使用环形队列（移除最旧 error）而非静默丢弃。根因：审计报告 GAP-L1-08 指出第 3 个 error 被静默跳过，关键错误信息丢失。
+
+**P0 — E008 三级兜底修复：** `kill_process_by_pid` 失败时，增加锁文件清理后的第三次重试，而非直接返回错误让用户手动操作。根因：审计报告指出 kill 失败后无三级操作路径，用户被困。
+
+**P1 — 启动按钮竞态窗口修复：** 将 `btn.disabled = true` 移到 `_startServiceInProgress` 检查之前，消除 1μs 竞态窗口。根因：审计报告 GAP-L1-09 指出 btn.disabled 设置在守卫之后，极端场景下两次点击可穿透。
+
+**P1 — loadBenchmarks 添加重试机制：** 失败时显示重试按钮 + 自动重试 3 次（指数退避 2s/4s/8s）。根因：审计报告 GAP-L1-03 指出基准报告失败时仅显示错误文案，无自动重试机制。
+
+**P1 — loadSettings 添加用户可见错误反馈：** 失败时显示 Toast 告知用户配置加载失败。根因：审计报告 GAP-L1-04 指出设置加载失败时仅 console.warn，用户无感知。
+
+**P2 — loadDataLogs 添加重试按钮：** 失败时在错误信息下方显示重试按钮。根因：审计报告 GAP-L6-03 指出数据日志失败时无重试按钮。
+
+**涉及文件：**
+- `static/app.js`：Toast 环形队列、启动按钮竞态窗口、loadBenchmarks 重试、loadSettings Toast、loadDataLogs 重试按钮
+- `desktop/src-tauri/src/commands.rs`：E008 三级兜底（kill 失败后清理锁文件重试）
+- `desktop/src-tauri/src/sidecar_manager.rs`：E008 死亡螺旋锁文件清理（v0.8.43 改进）
+
 ## [0.8.42] - 2026-08-03
 
 ### 修复：Preflight Check Linux CI 进程名检查缺少下划线版匹配

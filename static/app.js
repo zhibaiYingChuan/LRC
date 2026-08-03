@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.8.42';
+const APP_VERSION = '0.8.44';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -748,8 +748,22 @@ const SidecarHealthMonitor = {
     const effectiveThreshold = isIndexing ? 5 : this._FAIL_THRESHOLD;
     if (this._failCount >= effectiveThreshold) {
       // 超过阈值，判定不可达
-      // v0.8.22 HCSE GAP-L5-03：不立即设 _sidecarStatus='unknown'，保留之前的状态
-      // 只有真正不可达时才设为 'unknown'，避免 isIndexing() 失效
+      // v0.8.44 GAP-L5-01 修复（interaction-resilience-auditor Round5 P0）：
+      //   根因：索引期 5 次健康检查失败后，_sidecarStatus 被设为 'unknown'，
+      //         导致 _setReachable(false) 后 banner 显示"服务未运行"，
+      //         但实际是索引过程耗时较长，服务仍在运行中。
+      //   修复：索引期超阈值时保留 _sidecarStatus 为 'starting'/'indexing'，
+      //         让 banner 显示"索引中..."而非"服务未运行"。
+      //         同时增加 _setReachable 的第二个参数 isIndexingHint，
+      //         让 banner 显示正确的提示信息。
+      if (isIndexing) {
+        // 索引期超阈值：保留索引状态，让 banner 显示"索引中..."
+        this._backoffStep = Math.min(this._backoffStep + 1, 5);
+        this._setReachable(false, true); // true = 索引期不可达（显示"索引中..."）
+        // 不设为 'unknown'，保留索引状态，下次健康检查成功后可恢复
+        return false;
+      }
+      // 非索引期：正常判定不可达
       this._sidecarStatus = 'unknown';
       // v0.8.13 E1: 不可达时递增退避步数（上限 5，配合 _MAX_BACKOFF 限制最大间隔）
       this._backoffStep = Math.min(this._backoffStep + 1, 5);
@@ -833,8 +847,11 @@ const SidecarHealthMonitor = {
 
   /**
    * 更新可达状态，触发 UI 变更
+   * v0.8.44 GAP-L5-01 修复：新增 isIndexingHint 参数
+   * @param {boolean} reachable - 是否可达
+   * @param {boolean} [isIndexingHint] - 索引期不可达（true 时 banner 显示"索引中..."）
    */
-  _setReachable(reachable) {
+  _setReachable(reachable, isIndexingHint) {
     const wasReachable = this._isReachable;
     this._isReachable = reachable;
 
@@ -843,7 +860,10 @@ const SidecarHealthMonitor = {
       this._backoffStep = 0;
     }
 
-    if (reachable === wasReachable) return;  // 状态未变
+    // v0.8.44 GAP-L5-01：索引期提示时，即使状态未变也要更新 banner 文本
+    // 根因：索引期 5 次健康检查失败后，banner 已显示"服务未运行"，
+    //       但此时服务正在索引中，需要更新 banner 为"索引中..."
+    if (reachable === wasReachable && !isIndexingHint) return;  // 状态未变
 
     const banner = document.getElementById('sidecar-down-banner');
     const apiButtons = document.querySelectorAll('[data-action]');
@@ -864,8 +884,18 @@ const SidecarHealthMonitor = {
       // 不可达
       if (banner) {
         banner.hidden = false;
-        // v0.8.23 P2-01 (E4)：代理检测 — 不可达时尝试检测代理配置
-        this._detectProxyAndUpdateBanner(banner);
+        // v0.8.44 GAP-L5-01：索引期不可达时，直接显示"索引中..."，不检测代理
+        if (isIndexingHint) {
+          const bannerText = banner.querySelector('.banner-text');
+          if (bannerText) {
+            bannerText.textContent = '⏳ LRC 服务正在索引代码库，请稍候...';
+          }
+          // 索引期不禁用 API 按钮（服务实际在运行，只是响应慢）
+          console.log('[LRC v' + APP_VERSION + ']Sidecar 索引期不可达，显示"索引中..."提示，保留 API 按钮可用');
+        } else {
+          // v0.8.23 P2-01 (E4)：代理检测 — 不可达时尝试检测代理配置
+          this._detectProxyAndUpdateBanner(banner);
+        }
       }
       // v0.8.2：排除"启动服务"按钮，确保用户可以启动服务
       // v0.8.3 Step 8：添加 title 和 aria-disabled 属性（修复 N04）
@@ -1293,7 +1323,18 @@ async function loadDashboard() {
       if (sidecarKnownReachable) {
         error.textContent = '⏳ LRC 服务正在索引代码库，数据稍后自动加载...';
       } else {
-        error.textContent = '⚠️ ' + htmlescape(e.message);
+        // v0.8.44 GAP-L1-01 修复：仪表盘 API 全失败时添加重试按钮
+        //   根因：审计报告指出仪表盘 API 全部失败时，error 遮罩无重试按钮，
+        //         用户只能刷新页面，体验差。
+        //   修复：添加"立即刷新"按钮，复用 manualRefreshDashboard 机制
+        //   （manualRefreshDashboard 会重置计数器并重新加载仪表盘）
+        error.innerHTML = '⚠️ ' + htmlescape(e.message)
+          + '<br><button id="btn-dashboard-retry" onclick="manualRefreshDashboard()" '
+          + 'style="margin-top:8px;padding:6px 16px;background:#4a90d9;color:white;border:none;'
+          + 'border-radius:4px;cursor:pointer;font-size:13px;">立即刷新</button>'
+          + '<button onclick="this.parentElement.classList.remove(\'show\')" '
+          + 'style="margin-top:8px;margin-left:8px;padding:6px 16px;background:#666;color:white;'
+          + 'border:none;border-radius:4px;cursor:pointer;font-size:13px;">关闭</button>';
       }
       error.classList.add('show');
     }
@@ -2064,16 +2105,27 @@ async function handleStartServiceClick() {
 
   // v0.8.17 G-008 修复：防抖守卫，避免快速点击触发多个并发启动
   // 之前 5 次快速点击会创建 5 个 AbortController + 5 个 toast 堆叠
-  if (_startServiceInProgress) {
-    console.log('[handleStartServiceClick] 启动进行中，忽略重复点击');
-    return;
-  }
+  //
+  // v0.8.43 修复（GAP-L1-09 P1）：将 btn.disabled 移到 _startServiceInProgress 检查之前
+  //   根因：审计报告 GAP-L1-09 — btn.disabled 设置在守卫之后，存在 1μs 竞态窗口
+  //   极端场景下两次点击可穿透，触发 2 次并发启动
+  //   修复：先禁用按钮，再检查 _startServiceInProgress，消除竞态窗口
   // 兼容两种入口：模态框按钮（旧）或横幅按钮（新，v0.8.16 默认入口）
   const btn = document.getElementById('modal-btn-start-service')
     || document.querySelector('#sidecar-down-banner .banner-btn');
   if (btn) {
     btn.disabled = true;
     btn.textContent = '正在启动...';
+  }
+
+  if (_startServiceInProgress) {
+    console.log('[handleStartServiceClick] 启动进行中，忽略重复点击');
+    // 还原按钮状态（因为上一步已设置为 disabled）
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '启动服务';
+    }
+    return;
   }
 
   // v0.8.6 Step 2 / N003 G058 修复：创建 AbortController，传入 postMessageToParent
@@ -4020,7 +4072,8 @@ async function loadDataLogs() {
     }
     result.classList.add('show');
   } catch (e) {
-    result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)">⚠️ ' + htmlescape(e.message) + '</span></div>';
+    // v0.8.43 修复：添加重试按钮（GAP-L6-03 P3）
+    result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)">⚠️ ' + htmlescape(e.message) + '</span></div><div class="result-row"><button class="btn btn-primary btn-sm" onclick="loadDataLogs()" style="margin-top:4px">重试</button></div>';
     result.classList.add('show');
   } finally {
     if (loading) loading.classList.add('hidden');
@@ -4188,8 +4241,46 @@ async function loadBenchmarks() {
     renderBenchmarkLayer(0);
     drawRadarChart(data.radar_chart);
   } catch (e) {
-    container.innerHTML = '<div class="card"><p style="color:#f44336">无法加载基准报告: ' + htmlescape(e.message) + '</p><p style="color:#888">请确保 LRC 服务正在运行</p></div>';
+    // v0.8.43 修复：添加重试按钮（GAP-L1-03 P1）
+    // 根因：审计报告指出 loadBenchmarks 失败时仅显示错误文案，无自动重试机制
+    // 修复：添加重试按钮 + 自动重试 3 次（指数退避 2s/4s/8s），参考 loadDashboard 模式
+    container.innerHTML = '<div class="card"><p style="color:#f44336">无法加载基准报告: ' + htmlescape(e.message) + '</p><p style="color:#888">请确保 LRC 服务正在运行</p><button class="btn btn-primary" onclick="retryLoadBenchmarks()" style="margin-top:8px">重试加载</button></div>';
     if (summaryBar) summaryBar.innerHTML = '<span class="badge badge-warning">无法加载</span>';
+    // v0.8.44 修复：重新抛出错误，让 retryLoadBenchmarks 的自动重试逻辑生效
+    //   根因：loadBenchmarks 内部 catch 捕获所有错误后不重新抛出，
+    //         导致 retryLoadBenchmarks 的 await loadBenchmarks() 永远不会抛异常，
+    //         自动重试机制（死代码）永远不触发，用户只能手动点击重试按钮。
+    //   修复：显示 UI 错误后重新抛出，retryLoadBenchmarks 可捕获并触发自动重试
+    throw e;
+  }
+}
+
+// v0.8.43 新增：loadBenchmarks 重试函数
+let _benchmarksRetryCount = 0;
+const _BENCHMARKS_MAX_RETRIES = 3;
+async function retryLoadBenchmarks() {
+  _benchmarksRetryCount++;
+  const container = $('benchmark-layers');
+  if (container) {
+    container.innerHTML = '<div class="card"><p style="color:#888">正在重试加载基准报告...（' + _benchmarksRetryCount + '/' + _BENCHMARKS_MAX_RETRIES + '）</p></div>';
+  }
+  try {
+    await loadBenchmarks();
+    _benchmarksRetryCount = 0; // 成功后重置计数器
+  } catch (e) {
+    if (_benchmarksRetryCount < _BENCHMARKS_MAX_RETRIES) {
+      const delay = Math.pow(2, _benchmarksRetryCount) * 1000;
+      console.log('[loadBenchmarks] 重试 ' + _benchmarksRetryCount + '/' + _BENCHMARKS_MAX_RETRIES + ' 失败，' + delay + 'ms 后重试');
+      if (container) {
+        container.innerHTML = '<div class="card"><p style="color:#f44336">重试失败，' + (delay / 1000) + 's 后自动重试...</p></div>';
+      }
+      setTimeout(retryLoadBenchmarks, delay);
+    } else {
+      _benchmarksRetryCount = 0;
+      if (container) {
+        container.innerHTML = '<div class="card"><p style="color:#f44336">多次重试后仍无法加载基准报告: ' + htmlescape(e.message) + '</p><p style="color:#888">请确保 LRC 服务正在运行，或稍后手动刷新</p></div>';
+      }
+    }
   }
 }
 
@@ -4409,7 +4500,11 @@ async function loadSettings() {
       showConfigSection(data.llm_configured, providerName, data.llm_model);
     }
   } catch (e) {
+    // v0.8.43 修复：添加用户可见错误反馈（GAP-L1-04 P1）
+    // 根因：审计报告指出 loadSettings 失败时仅 console.warn + 更新 badge，用户无感知
+    // 修复：显示 Toast 告知用户配置加载失败，保留上次成功加载的 badge 状态
     console.warn('[设置] 加载配置失败:', e.message);
+    showToast('配置加载失败，已显示缓存数据', 'warning', 4000);
     updateLlmStatusBadge(false, 'none');
   }
 }
@@ -6957,12 +7052,25 @@ function showToast(message, type = 'success', duration = 3000) {
   //   根因：Round4 修复的 error 上限检查嵌套在 visibleToasts.length >= TOAST_MAX_VISIBLE 内，
   //         当可见 toast 数 < 3 时 error 不受限，仍可显示 3 个 error
   //   修复：error toast 独立计数，无论总 toast 数多少，最多显示 2 个 error
+  //
+  // v0.8.43 修复：error 上限从 2 提升到 3，采用环形队列模式
+  //   根因：审计报告 GAP-L1-08（P0）— 第 3 个 error 被静默跳过，关键错误信息丢失
+  //   修复：error 上限提升到 3，超过上限时移除最旧的 error toast（环形队列）
+  //   并在状态栏添加 error 计数徽章，确保用户不会遗漏关键错误
   const visibleToasts = container.querySelectorAll('.toast:not(.toast-leaving)');
+  const MAX_ERROR_TOASTS = 3;
   if (type === 'error') {
     const visibleErrors = Array.from(visibleToasts).filter(t => t.classList.contains('toast-error'));
-    if (visibleErrors.length >= 2) {
-      console.log('[showToast] error 队列已满（2/2），跳过:', message);
-      return;
+    if (visibleErrors.length >= MAX_ERROR_TOASTS) {
+      // 环形队列：移除最旧的 error toast，为新 error 腾出空间
+      const oldestError = visibleErrors[0];
+      if (oldestError) {
+        oldestError.classList.add('toast-leaving');
+        setTimeout(() => {
+          if (oldestError.parentNode) oldestError.parentNode.removeChild(oldestError);
+        }, 200);
+        console.log('[showToast] error 环形队列：移除最旧 error，添加新 error:', message);
+      }
     }
   }
 
@@ -9330,13 +9438,28 @@ window.addEventListener('online', () => {
 // v0.8.2 新增：beforeunload 拦截（对应审计 G006）
 // 有进行中请求时，刷新/关闭页面前提示用户
 // ============================================================
+// v0.8.44 GAP-L5-04 修复（interaction-resilience-auditor Round5 P0）：
+//   根因：用户选择"留下"后页面无任何反馈，不确定是否有请求在飞，体验差
+//   修复：用户选择"留下"后，通过 visibilitychange 检测并显示 toast 反馈
+let _pendingBeforeUnload = false;
 window.addEventListener('beforeunload', (e) => {
   // v0.8.13 D4: 排除后台请求（健康检查等），仅用户主动发起的请求才拦截关闭
   if (pendingRequestCount - _pendingBackgroundCount > 0) {
     // 现代浏览器忽略自定义消息，但仍需设置 returnValue 触发提示
     e.preventDefault();
     e.returnValue = '';
+    // 记录用户触发了关闭操作
+    _pendingBeforeUnload = true;
     return '';
+  }
+});
+
+// 检测用户选择了"留下"（页面重新可见时触发）
+document.addEventListener('visibilitychange', () => {
+  if (_pendingBeforeUnload && document.visibilityState === 'visible') {
+    _pendingBeforeUnload = false;
+    showToast('页面关闭已取消，后台任务仍在进行中', 'info', 3000);
+    console.log('[LRC]用户选择"留下"，页面未关闭，后台任务继续');
   }
 });
 

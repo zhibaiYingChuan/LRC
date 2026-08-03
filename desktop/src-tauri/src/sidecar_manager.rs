@@ -197,8 +197,10 @@ pub fn kill_process_by_pid(pid: u32) -> bool {
                 }
             }
             Err(_) => {
-                // tasklist 执行失败（极少见），保守起见认为进程存在且是 sidecar
-                "sidecar"
+                // v0.8.43 修复：tasklist 执行失败时视为"未找到进程"而非"sidecar"。
+                // 根因：保守返回 "sidecar" 导致 taskkill 对已不存在的 PID 执行失败，
+                // 返回 false，阻止桌面端继续启动流程，形成卡死。
+                "not_found"
             }
         };
 
@@ -208,7 +210,7 @@ pub fn kill_process_by_pid(pid: u32) -> bool {
                     "旧 sidecar 进程 (PID={}) 已不存在，无需终止（竞态条件已处理）",
                     pid
                 );
-                return true;
+                true
             }
             "reused" => {
                 // PID 被其他进程重用，不能 kill，但视为"终止成功"（因为旧 sidecar 已死）
@@ -217,7 +219,7 @@ pub fn kill_process_by_pid(pid: u32) -> bool {
                     "PID={} 已被其他进程重用，旧 sidecar 已死，视为终止成功",
                     pid
                 );
-                return true;
+                true
             }
             _ => {
                 // 步骤 2: 确认是 sidecar 进程，强制终止
@@ -859,6 +861,46 @@ impl SidecarManager {
                         // actual_port 未找到，扫描相邻端口（端口自适应范围）
                         Self::find_healthy_sidecar_port(actual_port).await
                     };
+
+                    // v0.8.43 修复：无健康 sidecar 时清理锁文件中的残留 PID，打破死亡螺旋
+                    // 根因：exit code 2 仅表示 sidecar 检测到锁文件中有"存活"的 PID，
+                    // 但该 PID 可能已被其他进程重用（is_pid_alive 误判）。
+                    // 桌面端收到 SingletonConflict 后尝试终止 sidecar 的 PID（已死），
+                    // 但锁文件中的残留 PID 永远不会被清理，新 sidecar 重复同一错误。
+                    if existing_port.is_none() {
+                        let lock_dir = data_dir.map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| {
+                                // 默认全局数据目录（与 sidecar --global 一致）
+                                let home = std::env::var("USERPROFILE")
+                                    .or_else(|_| std::env::var("HOME"))
+                                    .unwrap_or_else(|_| ".".to_string());
+                                std::path::PathBuf::from(home)
+                                    .join(".loong-recall")
+                                    .join("global")
+                                    .join("data")
+                            });
+                        let lock_path = lock_dir.join(".lrc.lock");
+                        if lock_path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(&lock_path) {
+                                let stale_pids: Vec<&str> = content.split(',')
+                                    .map(|s| s.trim())
+                                    .filter(|s| !s.is_empty())
+                                    .collect();
+                                tracing::warn!(
+                                    "E008 死亡螺旋检测：锁文件 {} 含残留 PID=[{}]，清理后重试",
+                                    lock_path.display(),
+                                    stale_pids.join(",")
+                                );
+                            }
+                            // 清空锁文件（删除残留 PID，让新 sidecar 创建新锁）
+                            let _ = std::fs::write(&lock_path, "");
+                            tracing::warn!(
+                                "已清空锁文件 {}，打破 E008 死亡螺旋",
+                                lock_path.display()
+                            );
+                        }
+                    }
+
                     return Err(SidecarStartError::SingletonConflict { pid, existing_port });
                 }
 
