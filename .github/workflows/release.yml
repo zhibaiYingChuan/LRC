@@ -516,11 +516,28 @@ jobs:
         shell: bash
 
       # 步骤 3: 安装 Tauri CLI v2
+      # v0.8.35 修复：Windows runner 间歇性 DNS 解析失败（Could not resolve host: github.com）
+      # 根因：GitHub Actions Windows runner 偶发 TCP 连接重置 / DNS 缓存失效
+      # 修复：添加重试循环（最多 3 次，每次等待 15 秒）+ Windows 禁用 SSL 吊销检查
       - name: Install Tauri CLI
+        shell: pwsh
         run: |
-          cargo install tauri-cli --version "^2.0" --locked || \
-            cargo install tauri-cli --version "^2.0"
-        shell: bash
+          $maxRetries = 3
+          $retryDelay = 15
+          if ("${{ runner.os }}" -eq "Windows") { $env:CARGO_HTTP_CHECK_REVOKE = "false" }
+          for ($i = 1; $i -le $maxRetries; $i++) {
+            Write-Host "⏳ 安装 tauri-cli ($i/$maxRetries)..."
+            cargo install tauri-cli --version "^2.0" --locked 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "✓ tauri-cli 安装成功"
+              return
+            }
+            if ($i -lt $maxRetries) {
+              Write-Host "✗ 第 $i 次失败，等待 ${retryDelay}s 后重试..."
+              Start-Sleep -Seconds $retryDelay
+            }
+          }
+          throw "tauri-cli 安装失败：已重试 $maxRetries 次"
 
       # v0.5.7 新增：Linux 系统依赖（Tauri v2 需要 webkit2gtk 等）
       # v0.8.23 CI 修复：禁用 apt 镜像列表探测（避免 harden-runner 阻断未知镜像域名导致挂起），
