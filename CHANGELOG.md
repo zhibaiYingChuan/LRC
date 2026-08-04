@@ -2,6 +2,24 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.46] - 2026-08-04
+
+### 修复：AI 工具检测误检 + Qoder 自动配置 + 前端配置指南优化
+
+**问题根因：** 工具检测使用双向模糊匹配（`file_stem.contains(tool_name) || tool_name.contains(&file_stem)`），导致短关键词误匹配（如 "CodeBuddy CN" 误判为 "Code"→VS Code、"Trae CN" 误判为 "Trae"）；安装路径检查仅覆盖 `%LOCALAPPDATA%\Programs` 和 `C:\Program Files`，未覆盖 `%APPDATA%` 和自定义盘符；开始菜单存在 `GitHub, Inc` 目录触发 GitHub Copilot 误检。
+
+**修复：**
+- **误检修复**：实现 `match_tool_alias`，采用整词边界 + 最长优先匹配策略，杜绝短词误检；分离 Trae 与 Trae CN 安装路径检测，避免相互干扰
+- **新增 Qoder 支持**：添加到 KNOWN_TOOLS，支持自动配置写入 `~/.qoder/settings.json`
+- **聚焦主流工具**：移除 Kiro、Comate、Tongyi Lingma、Aider、Warp AI、Tabby 等冷门工具，保留 Trae CN、CodeBuddy、Qoder 等大众熟知工具
+- **前端优化**：仅展示用户已安装的 AI 工具；配置指南区分自动/手动配置；新增详细配置教程章节
+
+**涉及文件：**
+- `src/server.rs`（检测逻辑）
+- `desktop/src-tauri/src/agent_detector.rs`（工具定义）
+- `src/bin/server.rs`（MCP 自动配置）
+- `static/app.js`、`static/index.html`（前端展示与配置指南）
+
 ## [0.8.45] - 2026-08-04
 
 ### 修复：桌面端 CDP 回归测试 + 代码审计发现的问题（P0/P1）
