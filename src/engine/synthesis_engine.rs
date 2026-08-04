@@ -132,7 +132,7 @@ impl SynthesisEngine {
         //       高重要性记忆更可能形成高价值合成，复杂度从 O(N²) 降至 O(K²)。
         const MAX_CLUSTER_CANDIDATES: usize = 500;
         if candidates.len() > MAX_CLUSTER_CANDIDATES {
-            candidates.sort_by(|a, b| b.importance.value().cmp(&a.importance.value()));
+            candidates.sort_by_key(|b| std::cmp::Reverse(b.importance.value()));
             candidates.truncate(MAX_CLUSTER_CANDIDATES);
         }
 
