@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.8.44';
+const APP_VERSION = '0.8.45';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -670,6 +670,8 @@ const SidecarHealthMonitor = {
       if (res.ok) {
         // v0.8.11 P0-2：解析 status 字段，区分 starting/indexing/running
         const prevStatus = this._sidecarStatus; // v0.8.12：记录之前的状态，用于检测索引完成
+        // v0.8.45 修复：记录之前 lock_busy 状态，用于检测结晶状态变化（true→false / false→true）
+        const prevLockBusy = this._lockBusy;
         try {
           const data = await res.json();
           if (data && data.status && ['starting', 'indexing', 'running'].includes(data.status)) {
@@ -679,6 +681,14 @@ const SidecarHealthMonitor = {
           }
           // v0.8.21 P0-06：读取 lock_busy 字段，供 loadDaoMetrics 等组件判断
           this._lockBusy = !!(data && data.lock_busy === true);
+          // v0.8.45 修复：lock_busy 状态变化时刷新状态栏 + 仪表盘
+          //   根因：_setReachable(第 866 行) 在 isReachable 未变时直接 return，不触发广播，
+          //         导致结晶结束（lock_busy true→false）后状态栏仍显示"后台合成中"。
+          //   修复：lock_busy 变化时显式广播，触发 updateStatusBar 刷新状态栏 + 重新加载仪表盘。
+          if (prevLockBusy !== this._lockBusy) {
+            console.log('[LRC v' + APP_VERSION + ']lock_busy 状态变化: ' + prevLockBusy + ' → ' + this._lockBusy + '，刷新状态栏 + 仪表盘');
+            this._broadcastSidecarStateChange(true);
+          }
         } catch (jsonErr) {
           // JSON 解析失败但 HTTP 200，视为就绪
           this._sidecarStatus = 'running';
@@ -1097,10 +1107,18 @@ async function loadDashboard() {
     //   根因：503 lock_busy 期间仍并行发 3 请求（system/detailed/dao_metrics），
     //         所有请求都返回 503，浪费网络资源并加剧拥塞
     //   修复：发请求前检查 SidecarHealthMonitor 的 lockBusy 状态，
-    //         若 lock_busy=true 则直接 throw LOCK_BUSY，跳过 3 个并行请求
+    //         若 lock_busy=true 则跳过 3 个并行请求
+    // v0.8.45 修复（lock_busy 冻结仪表盘根因）：
+    //   根因：健康监控已检测到 lock_busy 时，原实现 throw LOCK_BUSY 进入 catch，
+    //         走"请等待/倒计时"路径，绕过下方 hasLockBusy200 分支的降级渲染，
+    //         导致仪表盘不渲染降级数据 + 不添加"合成中"标记（用户感知"卡片锁死"）
+    //   修复：不再 throw，直接渲染降级数据 + 添加"合成中"标记 + 后台指数退避重试
     if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor._lockBusy) {
-      console.log('[loadDashboard] 检测到 lock_busy=true，跳过并行请求，直接进入 LOCK_BUSY 处理');
-      throw new Error('LOCK_BUSY');
+      console.log('[loadDashboard] 检测到 lock_busy=true，渲染降级数据 + 后台重试');
+      renderDashboard(null, null, null);
+      scheduleLockBusyRetry();
+      loading.classList.add('hidden');
+      return;
     }
 
     // 并行请求三个端点（传入当前 signal，支持外部 abort）
@@ -1139,16 +1157,28 @@ async function loadDashboard() {
     //         但前端 hasLockBusy 仍只检查 503 状态码，无法识别 200+lock_busy 降级响应，
     //         导致降级数据被误判为正常数据，renderDashboard 渲染 0 记忆（P1-NEW-02）
     //   修复：除了检查 503 状态码，还检查已解析数据中的 lock_busy 字段
-    const hasLockBusy503 = [systemRes, detailedRes, daoRes].some(
-      r => r.status === 'fulfilled' && r.value && r.value.status === 503
-    );
-    const hasLockBusy200 = [systemData, detailedData, daoData].some(
-      d => d && d.lock_busy === true
-    );
+    // v0.8.45 修复（detailed/system 锁竞争误判）：
+    //   根因：/health/detailed 与 /health/system 共享同一 metrics_store 锁，
+    //         并行请求时存在竞争窗口，detailed 偶发 lock_busy:true，
+    //         即使 system 主数据源正常，前端仍被误判为降级（degraded 数据残留）
+    //   修复：lock_busy 判定仅基于 system 主数据源，detailed 的瞬时锁竞争不再触发降级
+    // v0.8.45 再修复（503 判定范围）：hasLockBusy503 之前检查三个端点，
+    //   当 detailed/dao 因锁竞争偶发返回 503 时也会触发降级，即使 system 正常。
+    //   改为仅以 system 主数据源的状态码为准，与上方注释语义保持一致。
+    const hasLockBusy503 = systemRes.status === 'fulfilled' && systemRes.value && systemRes.value.status === 503;
+    const hasLockBusy200 = systemData?.lock_busy === true;
 
     if (hasLockBusy503 || hasLockBusy200) {
-      // sidecar 在线但繁忙（结晶期间），不是"无法连接"
-      throw new Error('LOCK_BUSY');
+      // v0.8.45 修复：lock_busy 时不再 throw LOCK_BUSY 冻结仪表盘，
+      //   改为渲染降级数据 + 显示"后台合成中"提示 + 后台继续重试
+      //   根因：之前 throw LOCK_BUSY 后进入 3 次重试 + 30 秒冷却期，
+      //         用户看到的是"请等待"而非仪表盘，感知为"卡片锁死"
+      //   修复：renderDashboard 渲染降级数据，同时后台继续重试
+      renderDashboard(systemData, detailedData, daoData);
+      // 后台继续重试（不阻塞 UI，使用 LOCK_BUSY 路径的重试逻辑）
+      scheduleLockBusyRetry();
+      loading.classList.add('hidden');
+      return;
     }
 
     if (!systemData && !daoData) {
@@ -1418,16 +1448,104 @@ function manualRefreshDashboard() {
 }
 window.manualRefreshDashboard = manualRefreshDashboard;
 
+/**
+ * v0.8.45 新增：lock_busy 时的后台重试调度器
+ * 在渲染降级数据后，后台继续重试加载完整数据，
+ * 不阻塞 UI，不进入冷却期。
+ * 重试策略：3 次指数退避（2s/4s/8s），成功后自动更新 UI
+ */
+function scheduleLockBusyRetry() {
+  const MAX_RETRIES = 3;
+  let retryCount = 0;
+
+  function doRetry() {
+    if (retryCount >= MAX_RETRIES) {
+      console.log('[scheduleLockBusyRetry] 重试耗尽，等待下次自动加载');
+      return;
+    }
+    retryCount++;
+    const delay = 2000 * Math.pow(2, retryCount - 1); // 2s/4s/8s
+    console.log('[scheduleLockBusyRetry] ' + delay + 'ms 后后台重试 (' + retryCount + '/' + MAX_RETRIES + ')');
+    setTimeout(async () => {
+      try {
+        const [systemRes, detailedRes, daoRes] = await Promise.allSettled([
+          fetchWithTimeout(API_BASE + '/v1/health/system', {}, 8000),
+          fetchWithTimeout(API_BASE + '/v1/health/detailed', {}, 8000),
+          fetchWithTimeout(API_BASE + '/v1/health/dao_metrics', {}, 8000),
+        ]);
+        let systemData = null, detailedData = null, daoData = null;
+        if (systemRes.status === 'fulfilled' && systemRes.value.ok) {
+          systemData = await systemRes.value.json();
+        }
+        if (detailedRes.status === 'fulfilled' && detailedRes.value.ok) {
+          detailedData = await detailedRes.value.json();
+        }
+        if (daoRes.status === 'fulfilled' && daoRes.value.ok) {
+          daoData = await daoRes.value.json();
+        }
+        // 检查是否仍处于 lock_busy
+        const stillBusy = [systemData, detailedData, daoData].some(d => d && d.lock_busy === true);
+        if (stillBusy) {
+          console.log('[scheduleLockBusyRetry] 仍处于 lock_busy，继续重试');
+          doRetry();
+        } else {
+          console.log('[scheduleLockBusyRetry] lock_busy 已解除，刷新仪表盘');
+          // 移除"合成中"标记
+          const badge = document.querySelector('.dao-degraded-badge');
+          if (badge) badge.remove();
+          renderDashboard(systemData, detailedData, daoData);
+        }
+      } catch (e) {
+        console.warn('[scheduleLockBusyRetry] 后台重试失败:', e.message);
+        doRetry();
+      }
+    }, delay);
+  }
+
+  doRetry();
+}
+window.scheduleLockBusyRetry = scheduleLockBusyRetry;
+
 function renderDashboard(system, detailed, dao) {
   // v0.8.23 S1-UX-01 修复：数据加载成功时移除降级视觉模式
   document.body.classList.remove('degraded-mode');
-  // v0.8.22 P1-NEW-02 防御性修复（interaction-resilience-auditor Round4）：
-  //   根因：即使 P1-NEW-01 修复后 lock_busy 降级响应会被 throw LOCK_BUSY 拦截，
-  //         但为了防御性编程，renderDashboard 入口仍检查 lock_busy 字段，
-  //         避免任何意外路径导致 0 记忆渲染（用户恐慌"记忆丢失"）
-  if ((system && system.lock_busy) || (detailed && detailed.lock_busy) || (dao && dao.lock_busy)) {
-    console.log('[renderDashboard] 检测到 lock_busy 降级数据，跳过渲染（防御性检查）');
-    return;
+  // v0.8.45 修复：lock_busy 降级数据不再跳过渲染，改为渲染降级 UI
+  //   根因：之前 return 跳过渲染导致仪表盘无数据，用户感知为"卡片锁死"
+  //   修复：显示降级数据 + 标题栏添加"合成中"标记
+  // v0.8.45 修复：当健康监控已检测到 lock_busy 但数据为 null（提前跳过并行请求）时，
+  //   仍应渲染降级 UI，故 isDegraded 同时考虑 SidecarHealthMonitor._lockBusy
+  // v0.8.45 修复（lock_busy 恢复后 badge/degraded-mode 残留根因）：
+  //   根因：isDegraded 依赖 SidecarHealthMonitor._lockBusy，而健康监控轮询滞后，
+  //         结晶已结束（system 主数据源返回 lock_busy=false）但 _lockBusy 仍为 true，
+  //         导致 renderDashboard 误判为降级并残留"合成中"badge 与 degraded-mode。
+  //   修复：当 system 主数据源明确返回 lock_busy 布尔值时，以实际数据为准，
+  //         仅当 system 无明确状态（renderDashboard(null) 降级路径）时才依赖 _lockBusy 兜底。
+  // v0.8.45 再修复（detailed/dao 锁竞争误判）：system 明确返回 lock_busy=false 时，
+  //   即使 detailed/dao 因偶发锁竞争带 lock_busy:true，也应以 system 为准判定为正常，
+  //   避免残留"合成中"badge。仅当 system 无明确状态时，才参考 detailed/dao 与 _lockBusy。
+  const hasFreshSystemState = system && typeof system.lock_busy === 'boolean';
+  const isDegraded = hasFreshSystemState
+    ? !!system.lock_busy
+    : (detailed && detailed.lock_busy) || (dao && dao.lock_busy)
+      || (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor._lockBusy);
+  if (isDegraded) {
+    console.log('[renderDashboard] 渲染降级数据（lock_busy），后台合成中');
+    document.body.classList.add('degraded-mode');
+    // 在道同构度标题后添加"合成中"标记
+    const daoTitle = document.querySelector('.dao-metrics-panel .card-title');
+    if (daoTitle && !daoTitle.querySelector('.dao-degraded-badge')) {
+      const badge = document.createElement('span');
+      badge.className = 'dao-degraded-badge';
+      badge.style.cssText = 'margin-left:8px;font-size:0.75em;padding:2px 8px;border-radius:10px;background:var(--lrc-金色-200);color:var(--lrc-金色-800);border:1px solid var(--lrc-金色-400);';
+      badge.textContent = '合成中';
+      daoTitle.appendChild(badge);
+    }
+  } else {
+    // v0.8.45 修复：lock_busy 解除后移除残留的"合成中"标记
+    // 根因：之前只移除 degraded-mode body 类，未删除 .dao-degraded-badge DOM，
+    //       导致结晶结束后标题栏仍残留"合成中"徽标
+    const badge = document.querySelector('.dao-degraded-badge');
+    if (badge) badge.remove();
   }
   // --- v0.5.4 P1-7 修复：用户友好的记忆统计卡片 ---
   const memStats = system?.memory_stats || {};
@@ -1488,6 +1606,24 @@ async function loadRecentMemories() {
 
   try {
     const res = await fetchWithTimeout(API_BASE + '/v1/memories/recent?limit=5');
+    // v0.8.45 修复：503 lock_busy 时显示"后台合成中"而非"加载失败"
+    //   根因：之前当内存系统在锁状态下（合成中），/v1/memories/recent 返回 503，
+    //         前端 catch 后显示"加载失败"，用户感知为"最近记忆不可用"
+    //   修复：检查 503 响应，尝试解析 lock_busy 字段，显示友好提示
+    if (res.status === 503) {
+      try {
+        const errBody = await res.json();
+        if (errBody && errBody.lock_busy === true) {
+          container.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-icon">⏳</div>
+              <div class="empty-text">后台合成中</div>
+              <div class="empty-hint">记忆系统正在执行后台合成，最近记忆稍后自动加载</div>
+            </div>`;
+          return;
+        }
+      } catch (_) { /* 解析失败，降级到默认错误处理 */ }
+    }
     if (!res.ok) throw new Error('最近记忆 API 不可用');
     const data = await res.json();
     const memories = data.memories || [];
@@ -1552,12 +1688,28 @@ async function loadRecentMemories() {
         </div>`;
     }).join('');
   } catch (e) {
-    container.innerHTML = `
-      <div class="empty-state">
-        <div class="empty-icon">⚠️</div>
-        <div class="empty-text">加载失败</div>
-        <div class="empty-hint">${htmlescape(e.message)}</div>
-      </div>`;
+    // v0.8.45 修复：lock_busy 时显示"后台合成中"而非"加载失败"
+    // 检查错误消息是否包含 lock_busy 特征
+    const isLockBusy = e.message && (
+      e.message.includes('lock_busy') ||
+      e.message.includes('503') ||
+      e.message.includes('Service Unavailable')
+    );
+    if (isLockBusy) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">⏳</div>
+          <div class="empty-text">后台合成中</div>
+          <div class="empty-hint">记忆系统正在执行后台合成，最近记忆稍后自动加载</div>
+        </div>`;
+    } else {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">⚠️</div>
+          <div class="empty-text">加载失败</div>
+          <div class="empty-hint">${htmlescape(e.message)}</div>
+        </div>`;
+    }
   }
 }
 
@@ -1574,6 +1726,21 @@ async function loadMemoryStats() {
 
   try {
     const res = await fetchWithTimeout(API_BASE + '/v1/memories/stats');
+    // v0.8.45 修复：503 lock_busy 时显示"后台合成中"而非"加载失败"
+    if (res.status === 503) {
+      try {
+        const errBody = await res.json();
+        if (errBody && errBody.lock_busy === true) {
+          container.innerHTML = `
+            <div class="empty-state">
+              <div class="empty-icon">⏳</div>
+              <div class="empty-text">后台合成中</div>
+              <div class="empty-hint">记忆系统正在执行后台合成，项目分布稍后自动加载</div>
+            </div>`;
+          return;
+        }
+      } catch (_) { /* 解析失败，降级到默认错误处理 */ }
+    }
     if (!res.ok) throw new Error('记忆统计 API 不可用');
     const data = await res.json();
 
@@ -1631,13 +1798,28 @@ async function loadMemoryStats() {
       container.innerHTML += `<div class="text-center text-dim" style="margin-top:8px;font-size:11px;">还有 ${projectEntries.length - 8} 个项目未显示</div>`;
     }
   } catch (e) {
-    container.innerHTML = `
-      <div class="empty-state">
-        <div class="empty-icon">⚠️</div>
-        <div class="empty-text">加载失败</div>
-        <div class="empty-hint">${htmlescape(e.message)}</div>
-        <button class="btn btn-secondary btn-sm" style="margin-top:8px;" data-action="loadMemoryStats">重试</button>
-      </div>`;
+    // v0.8.45 修复：lock_busy 时显示"后台合成中"而非"加载失败"
+    const isLockBusy = e.message && (
+      e.message.includes('lock_busy') ||
+      e.message.includes('503') ||
+      e.message.includes('Service Unavailable')
+    );
+    if (isLockBusy) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">⏳</div>
+          <div class="empty-text">后台合成中</div>
+          <div class="empty-hint">记忆系统正在执行后台合成，项目分布稍后自动加载</div>
+        </div>`;
+    } else {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">⚠️</div>
+          <div class="empty-text">加载失败</div>
+          <div class="empty-hint">${htmlescape(e.message)}</div>
+          <button class="btn btn-secondary btn-sm" style="margin-top:8px;" data-action="loadMemoryStats">重试</button>
+        </div>`;
+    }
   }
 }
 
@@ -1657,6 +1839,16 @@ async function loadAuditLog() {
   if (!tbody) return;
   try {
     const res = await fetchWithTimeout(API_BASE + '/v1/audit-trail?limit=5');
+    // v0.8.45 修复：503 lock_busy 时显示"后台合成中"而非"加载失败"
+    if (res.status === 503) {
+      try {
+        const errBody = await res.json();
+        if (errBody && errBody.lock_busy === true) {
+          tbody.innerHTML = '<tr><td colspan="3" class="text-center text-dim">⏳ 后台合成中，日志稍后自动加载</td></tr>';
+          return;
+        }
+      } catch (_) { /* 解析失败，降级到默认错误处理 */ }
+    }
     if (!res.ok) throw new Error('审计日志 API 不可用');
     const data = await res.json();
     const events = data.events || [];
@@ -1691,7 +1883,15 @@ async function loadAuditLog() {
       </tr>`;
     }).join('');
   } catch (e) {
-    tbody.innerHTML = '<tr><td colspan="3" class="text-center text-dim">审计日志加载失败</td></tr>';
+    // v0.8.45 修复：lock_busy 时显示"后台合成中"而非"加载失败"
+    const isLockBusy = e.message && (
+      e.message.includes('lock_busy') ||
+      e.message.includes('503') ||
+      e.message.includes('Service Unavailable')
+    );
+    tbody.innerHTML = isLockBusy
+      ? '<tr><td colspan="3" class="text-center text-dim">⏳ 后台合成中，日志稍后自动加载</td></tr>'
+      : '<tr><td colspan="3" class="text-center text-dim">审计日志加载失败</td></tr>';
   }
 }
 
@@ -8568,10 +8768,9 @@ function ensureAiToolsToolbar() {
       <span data-role="last-scan-valid" style="display:none; padding: 1px 6px; border-radius: 3px; font-size: 0.9em; background: var(--lrc-玉色-100); color: var(--lrc-玉色-700); margin-left: 6px;">24h 内有效</span>
     </div>
     <div style="display:flex; align-items:center; gap:8px;">
-      <button type="button" class="btn" data-role="btn-refresh-scan-cache"
+      <button type="button" class="btn" data-action="rescanToolsWithInvalidate"
         title="清空扫描缓存，重新扫描桌面快捷方式和安装目录（检测结果不准确时使用）"
-        style="padding: 4px 10px; font-size: 0.85em; border-radius: var(--radius-sm); background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); cursor: pointer; color: var(--lrc-墨韵-700);"
-        onclick="if(typeof rescanToolsWithInvalidate==='function') rescanToolsWithInvalidate();">
+        style="padding: 4px 10px; font-size: 0.85em; border-radius: var(--radius-sm); background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); cursor: pointer; color: var(--lrc-墨韵-700);">
         🔄 重新扫描（清空缓存）
       </button>
     </div>
@@ -8579,6 +8778,11 @@ function ensureAiToolsToolbar() {
   // 插入到 ai-tools-list 之前
   if (toolsList.parentNode) {
     toolsList.parentNode.insertBefore(toolbar, toolsList);
+  }
+  // v0.8.45 修复：动态创建的 data-action 按钮需要重新绑定事件
+  //   根因：之前未调用 bindAllActions，重新扫描按钮的点击事件从未绑定
+  if (typeof bindAllActions === 'function') {
+    bindAllActions();
   }
 }
 
@@ -8637,7 +8841,8 @@ function updateLastScanTsUi(meta, scanning) {
  */
 async function refreshScanCacheMetadataUi() {
   if (!isTauriEnv) {
-    updateLastScanTsUi(null, false);
+    // v0.8.44 修复：浏览器模式下显示"实时扫描"而非"尚未扫描"
+    updateLastScanTsUi({ timestamp_ms: Date.now(), valid: true }, false);
     return;
   }
   try {
@@ -8654,6 +8859,17 @@ async function refreshScanCacheMetadataUi() {
  * 流程：invalidate 缓存 → 重新调用 simulateAiToolsScan（会触发重新扫描）→ 刷新时间戳
  */
 async function rescanToolsWithInvalidate() {
+  // v0.8.45 修复：为重新扫描按钮添加视觉反馈
+  //   根因：之前点击按钮后无任何视觉反馈，用户感知为"按钮无交互反应"
+  //   修复：禁用按钮 + 显示"扫描中..."文本，扫描完成后恢复
+  const btn = document.querySelector('[data-action="rescanToolsWithInvalidate"]');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '⏳ 扫描中...';
+    btn.style.opacity = '0.6';
+    btn.style.cursor = 'not-allowed';
+  }
+
   if (typeof showToast === 'function') {
     showToast('正在清空扫描缓存并重新检测，请稍候...', 'info', 4000);
   }
@@ -8668,6 +8884,15 @@ async function rescanToolsWithInvalidate() {
   }
   // 重新触发检测（此时缓存已失效，get_scan_cache 内部会重扫）
   await simulateAiToolsScan();
+
+  // 恢复按钮状态
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = '🔄 重新扫描（清空缓存）';
+    btn.style.opacity = '';
+    btn.style.cursor = '';
+  }
+
   if (typeof showToast === 'function') {
     showToast('重新扫描完成！如结果仍不准确，可点击工具卡片右侧 ⚙️ 齿轮手动修正', 'success', 4500);
   }
@@ -9062,25 +9287,11 @@ window.removeProjectFromWizard = removeProjectFromWizard;
  * 未选择项目时弹出确认对话框，允许用户跳过
  */
 function goToStep(stepNum) {
-  // v0.8.25：从步骤 1 跳转到步骤 2 时，检查项目选择状态
-  // v0.8.31 S-04 修复：仅当「用户主动取消掉所有已选项目」时才弹确认，
-  //   避免对「系统扫描不到项目」「从没选过项目」的场景过度打扰
-  if (stepNum === 2) {
-    if (shouldShowConfirmSkipProjects()) {
-      // 异步确认对话框，避免阻塞
-      showConfirm(
-        '您已取消所有项目目录的勾选，确定跳过此步骤吗？\n\n您可以在后续配置中随时添加项目目录。\n不选择项目目录不影响基础功能使用。',
-        '已取消所有项目目录选择'
-      ).then(skip => {
-        if (skip) {
-          // 用户确认跳过，继续跳转
-          doGoToStep(stepNum);
-        }
-        // 用户取消跳过，停留在当前步骤
-      });
-      return;
-    }
-  }
+  // v0.8.45 修复：始终允许跳过项目选择，不再阻塞步骤跳转
+  //   根因：之前仅当 _userCancelledAllProjectsFlag 为 true 时弹确认弹窗，
+  //         但用户可能从未选择过任何项目，或不想选择项目只想跳过。
+  //         用户反馈"必须选择文件夹"，说明弹窗逻辑在某些场景下阻塞了导航。
+  //   修复：移除确认弹窗，用户始终可以跳过项目选择，后续可在设置中随时添加。
   doGoToStep(stepNum);
 }
 
@@ -9107,6 +9318,20 @@ function doGoToStep(stepNum) {
     if (lineEl) {
       lineEl.style.background = i < stepNum ? 'var(--lrc-金色-500)' : 'var(--lrc-宣纸-500)';
     }
+  }
+
+  // v0.8.44 修复：进入步骤 1 时自动触发 AI 工具扫描（不依赖用户点击"开始完整配置"）
+  if (stepNum === 1) {
+    // 确保下一步按钮可用（用户可跳过项目选择）
+    if (typeof checkNextButton === 'function') {
+      checkNextButton();
+    }
+    // 延迟触发扫描，确保 DOM 已渲染
+    setTimeout(() => {
+      if (typeof simulateAiToolsScan === 'function' && document.getElementById('setup-step-1')?.style.display !== 'none') {
+        simulateAiToolsScan();
+      }
+    }, 300);
   }
 }
 

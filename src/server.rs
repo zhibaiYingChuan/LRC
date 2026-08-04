@@ -2424,7 +2424,7 @@ struct EmbedderTestResponse {
 #[derive(Debug, Serialize)]
 struct ToolDetectItem {
     name: String,
-    /// 工具类型："ide" 或 "extension"
+    /// 工具类型："ide"、"agent" 或 "extension"
     #[serde(rename = "type")]
     tool_type: String,
     installed: bool,
@@ -2789,7 +2789,7 @@ async fn tools_detect_handler(
         ("JetBrains Toolbox", "jetbrains-toolbox"),
         ("Zed", "zed"),
     ] {
-        let mut item = detect_command_tool(tool.0, tool.1, &["--version"]);
+        let mut item = detect_command_tool(tool.0, tool.1, &["--version"], "ide");
         // 如果命令行检测失败，尝试安装路径检测
         if !item.installed {
             if let Some(path) = check_windows_install_path(tool.0) {
@@ -2813,7 +2813,7 @@ async fn tools_detect_handler(
             "Tabby" => "tabby",
             _ => continue,
         };
-        let mut item = detect_command_tool(agent_name, cmd, &["--version"]);
+        let mut item = detect_command_tool(agent_name, cmd, &["--version"], "agent");
         if !item.installed {
             if let Some(path) = check_windows_install_path(agent_name) {
                 item.installed = true;
@@ -2984,7 +2984,8 @@ fn scan_desktop_shortcuts() -> Vec<String> {
 /// 检测命令行工具是否安装，并解析版本号
 ///
 /// 优先通过 PATH 执行命令；失败时回退到检查 Windows 常见安装路径。
-fn detect_command_tool(name: &str, cmd: &str, args: &[&str]) -> ToolDetectItem {
+/// `tool_type` 参数指定工具类型："ide"、"agent" 或 "extension"
+fn detect_command_tool(name: &str, cmd: &str, args: &[&str], tool_type: &str) -> ToolDetectItem {
     // 优先：通过 PATH 执行命令
     if let Ok(output) = Command::new(cmd).args(args).output() {
         if output.status.success() {
@@ -2998,7 +2999,7 @@ fn detect_command_tool(name: &str, cmd: &str, args: &[&str]) -> ToolDetectItem {
             let path = which_path(cmd);
             return ToolDetectItem {
                 name: name.to_string(),
-                tool_type: "ide".to_string(),
+                tool_type: tool_type.to_string(),
                 installed: true,
                 version,
                 path,
@@ -3010,7 +3011,7 @@ fn detect_command_tool(name: &str, cmd: &str, args: &[&str]) -> ToolDetectItem {
     if let Some(path) = check_windows_install_path(name) {
         return ToolDetectItem {
             name: name.to_string(),
-            tool_type: "ide".to_string(),
+            tool_type: tool_type.to_string(),
             installed: true,
             version: None,
             path: Some(path),
@@ -3019,7 +3020,7 @@ fn detect_command_tool(name: &str, cmd: &str, args: &[&str]) -> ToolDetectItem {
 
     ToolDetectItem {
         name: name.to_string(),
-        tool_type: "ide".to_string(),
+        tool_type: tool_type.to_string(),
         installed: false,
         version: None,
         path: None,

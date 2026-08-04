@@ -290,3 +290,17 @@ get_jobs.jq
 jobs.json
 ubuntu_desktop_logs.txt
 temp/sidecar_pid.txt
+
+# v0.8.45 发布合规：本地开发运行目录与临时文档（非交付内容）
+target-dev/
+scripts/cdp_*.js
+scripts/cdp-exec.ps1
+scripts/cdp-exec2.ps1
+scripts/dev-proxy.py
+scripts/run-dev.ps1
+scripts/run-dev.bat
+PRODUCT-DOC.md
+grill-state.json
+docs/HCSE_RESILIENCE_AUDIT_REPORT_L6.md
+docs/SESSION_*.md
+docs/hcse_resilience_v0.8.42.md
