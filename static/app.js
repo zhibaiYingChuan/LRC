@@ -4292,12 +4292,9 @@ const RULES_TOOL_NAMES = {
   'codebuddy': 'CodeBuddy',
   'windsurf': 'Windsurf',
   'cline': 'Cline',
-  'roo-code': 'Roo Code',
-  'comate': 'Comate',
   'vscode': 'GitHub Copilot',
   'jetbrains-ai': 'JetBrains AI',
   'gemini-cli': 'Gemini CLI',
-  'aider': 'Aider',
 };
 
 /// 加载所有 AI 工具的规则文件状态
@@ -8653,23 +8650,22 @@ async function simulateAiToolsScan() {
     }
 
     // 为每个工具生成配置引导文案
+    // 自动配置 = 后端 --install-ide 实际支持 + 官方文档确认可行
     function getToolConfigGuide(name, installed) {
       if (!installed) return '';
       const guides = {
-        'VS Code': 'MCP 配置：在项目根目录创建 .vscode/mcp.json，或通过 Cline/Continue 扩展配置',
-        'Cursor': 'MCP 配置：Cursor 设置 → MCP 服务器 → 添加新服务器，命令: code-memory-server --src-dir <项目路径> --stdio',
-        'Trae': 'MCP 配置：Trae 设置 → 扩展 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
-        'Trae CN': 'MCP 配置：Trae CN 设置 → 扩展 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
-        'Windsurf': 'MCP 配置：在项目根目录创建 .windsurf/mcp_config.json，添加 LRC 服务配置',
-        'CodeBuddy': 'MCP 配置：CodeBuddy 设置 → MCP → 添加服务器，命令: code-memory-server --src-dir <项目路径> --stdio',
-        'Qoder': 'MCP 配置：Qoder 设置 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
+        'VS Code': '已自动配置：MCP 配置已写入全局设置，无需手动操作',
+        'Cursor': '已自动配置：MCP 配置已写入全局设置，无需手动操作',
+        'Trae': '已自动配置：MCP 配置已写入全局设置，无需手动操作',
+        'Trae CN': '已自动配置：MCP 配置已写入全局设置，无需手动操作',
+        'Windsurf': '已自动配置：MCP 配置已写入全局设置，无需手动操作',
+        'CodeBuddy': '已自动配置：MCP 配置已写入全局设置，无需手动操作',
+        'CodeBuddy CN': '已自动配置：MCP 配置已写入全局设置（~/.codebuddy/.mcp.json），无需手动操作',
+        'Qoder': '已自动配置：MCP 配置已写入全局设置（~/.qoder/settings.json），无需手动操作；若重启后未生效，可点击右上角用户图标 → Qoder Settings → MCP 确认',
         'GitHub Copilot': 'MCP 配置：通过 VS Code 设置 → 扩展 → GitHub Copilot → MCP 服务器配置',
         'JetBrains Toolbox': 'MCP 配置：通过 IDE 设置 → 工具 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
         'Zed': 'MCP 配置：在项目根目录创建 .zed/mcp.json，添加 LRC 服务配置',
         'Claude Code': 'MCP 配置：通过 claude.json 配置文件添加 MCP 服务器，命令: code-memory-server --src-dir <项目路径> --stdio',
-        'Aider': 'MCP 配置：通过 .aider.conf.yml 配置文件添加 MCP 服务器',
-        'Warp AI': 'MCP 配置：Warp 设置 → AI → MCP 服务器 → 添加',
-        'Tabby': 'MCP 配置：Tabby 配置文件 ~/.tabby/config.toml 中添加 MCP 服务器配置',
         'Cline': 'MCP 配置：VS Code 扩展 Cline 设置 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
         'Continue': 'MCP 配置：VS Code 扩展 Continue 设置 → MCP 服务器 → 添加，命令: code-memory-server --src-dir <项目路径> --stdio',
       };
@@ -8678,12 +8674,24 @@ async function simulateAiToolsScan() {
 
     // v0.8.31 S-03：初始化时读取 localStorage 的手动修正，让用户上次的选择即使后端没写也能恢复
     const localOverrides = getLocalManualOverrides();
-    toolsList.innerHTML = tools.map(tool => {
-      const guide = getToolConfigGuide(tool.name, tool.installed);
+    // v0.8.46 优化：只展示用户匹配到的（已安装）工具，避免展示无关工具列表
+    const effectiveTools = tools.map(tool => {
       const agentId = toolNameToAgentId(tool.name);
-      // 已手动修正？（从 localStorage 读取，后端 discover_all_agents 也会应用但这里是 sidecar API）
       const hasLocalOverride = Object.prototype.hasOwnProperty.call(localOverrides, agentId);
       const finalInstalled = hasLocalOverride ? !!localOverrides[agentId] : tool.installed;
+      return { ...tool, agentId, hasLocalOverride, finalInstalled };
+    }).filter(t => t.finalInstalled);
+
+    if (effectiveTools.length === 0) {
+      toolsList.innerHTML = '<p style="color: var(--lrc-墨韵-400); margin: 0;">未检测到已安装的 IDE 或 Agent 工具</p>';
+      return;
+    }
+
+    toolsList.innerHTML = effectiveTools.map(tool => {
+      const guide = getToolConfigGuide(tool.name, tool.installed);
+      const agentId = tool.agentId;
+      const hasLocalOverride = tool.hasLocalOverride;
+      const finalInstalled = tool.finalInstalled;
       const manualBadgeStyle = hasLocalOverride
         ? 'display:inline-block; margin-right:6px; font-size:0.75em; padding:1px 5px; border-radius:3px; background:var(--lrc-金色-200); color:var(--lrc-金色-800); border:1px solid var(--lrc-金色-400);'
         : 'display:none; margin-right:6px; font-size:0.75em; padding:1px 5px; border-radius:3px; background:var(--lrc-金色-200); color:var(--lrc-金色-800); border:1px solid var(--lrc-金色-400);';
@@ -8712,7 +8720,7 @@ async function simulateAiToolsScan() {
               data-auto-status="${tool.installed ? '已检测到' : '未安装'}"
               data-auto-status-installed="${tool.installed ? 'true' : 'false'}"
               data-auto-status-checked="${tool.installed ? 'true' : 'false'}"
-              style="font-size: 0.85em; font-weight: 600; color: ${finalInstalled ? 'var(--lrc-玉色-600)' : 'var(--lrc-墨韵-300)'};">${finalInstalled ? '已检测到' : '未安装'}</span>
+              style="font-size: 0.85em; font-weight: 600; color: var(--lrc-玉色-600);">已检测到</span>
           </div>
         </div>
         ${guide ? `<div style="font-size: 0.8em; color: var(--lrc-墨韵-500); padding-left: 36px; line-height: 1.5;">💡 ${htmlescape(guide)}</div>` : ''}
@@ -8720,7 +8728,7 @@ async function simulateAiToolsScan() {
     }).join('');
 
     // 统计已安装数量
-    const installedCount = tools.filter(t => t.installed).length;
+    const installedCount = effectiveTools.length;
     // S-05：工具列表渲染完成后，刷新「上次扫描时间」显示
     refreshScanCacheMetadataUi();
 
@@ -8913,17 +8921,12 @@ const TOOL_NAME_TO_AGENT_ID_MAP = {
   'Cursor': 'cursor',
   'VS Code': 'vscode',
   'Windsurf': 'windsurf',
-  'Kiro': 'kiro',
   'Claude Desktop': 'claude-desktop',
   'Gemini CLI': 'gemini-cli',
   'CodeBuddy': 'codebuddy',
+  'CodeBuddy CN': 'codebuddy',
   'CodeBuddy (腾讯)': 'codebuddy',
-  'Comate': 'comate',
-  'Comate (百度)': 'comate',
   'Zed': 'zed',
-  'Sublime Text': 'sublime-text',
-  'Neovim': 'neovim',
-  'Vim': 'vim',
   'JetBrains Toolbox': 'jetbrains-toolbox',
   'IntelliJ IDEA': 'intellij-idea',
   'PyCharm': 'pycharm',
@@ -8932,20 +8935,14 @@ const TOOL_NAME_TO_AGENT_ID_MAP = {
   'CLion': 'clion',
   'RustRover': 'rustrover',
   'Qwen Code': 'qwen-code',
-  'Aider': 'aider',
   'Cline': 'cline',
   'Continue': 'continue',
   'Windsurf Cascade': 'windsurf',
   'Qoder': 'qoder',
-  'Cody Sourcegraph': 'cody-sourcegraph',
-  'Tabnine': 'tabnine',
-  'Codeium': 'codeium',
   'Replit AI': 'replit-ai',
   'DeepSeek Coder': 'deepseek-coder',
   'GitHub Copilot': 'github-copilot',
   'Claude Code': 'claude-code',
-  'Warp AI': 'warp-ai',
-  'Tabby': 'tabby',
 };
 
 /** 将工具显示名映射为后端 agent_id（找不到时返回原始名做最佳努力匹配） */

@@ -2774,8 +2774,10 @@ async fn tools_detect_handler(
     // VS Code 扩展 — 调用一次 code --list-extensions 即可
     let cline_installed = detect_vscode_extension("saoudrizwan.claude-dev");
     let continue_installed = detect_vscode_extension("continue.continue");
+    let copilot_installed = detect_vscode_extension("github.copilot");
 
     // 已知工具完整列表（按分类）
+    // 仅收录大众熟知的主流工具（国内外），冷门工具不在此列。
     // IDE 类
     for tool in &[
         ("VS Code", "code"),
@@ -2783,9 +2785,9 @@ async fn tools_detect_handler(
         ("Trae", "trae"),
         ("Trae CN", "trae"),
         ("Windsurf", "windsurf"),
+        ("CodeBuddy CN", "codebuddy"),
         ("CodeBuddy", "codebuddy"),
         ("Qoder", "qoder"),
-        ("GitHub Copilot", "github-copilot"),
         ("JetBrains Toolbox", "jetbrains-toolbox"),
         ("Zed", "zed"),
     ] {
@@ -2804,27 +2806,19 @@ async fn tools_detect_handler(
         tools.push(item);
     }
 
-    // Agent 类工具
-    for agent_name in &["Claude Code", "Aider", "Warp AI", "Tabby"] {
-        let cmd = match *agent_name {
-            "Claude Code" => "claude",
-            "Aider" => "aider",
-            "Warp AI" => "warp",
-            "Tabby" => "tabby",
-            _ => continue,
-        };
-        let mut item = detect_command_tool(agent_name, cmd, &["--version"], "agent");
-        if !item.installed {
-            if let Some(path) = check_windows_install_path(agent_name) {
-                item.installed = true;
-                item.path = Some(path);
-            }
-        }
-        if !item.installed && desktop_tools.iter().any(|t| t == agent_name) {
+    // Agent 类工具（仅保留大众熟知的 CLI Agent）
+    let agent_name = "Claude Code";
+    let mut item = detect_command_tool(agent_name, "claude", &["--version"], "agent");
+    if !item.installed {
+        if let Some(path) = check_windows_install_path(agent_name) {
             item.installed = true;
+            item.path = Some(path);
         }
-        tools.push(item);
     }
+    if !item.installed && desktop_tools.iter().any(|t| t == agent_name) {
+        item.installed = true;
+    }
+    tools.push(item);
 
     // VS Code 扩展类
     tools.push(ToolDetectItem {
@@ -2841,6 +2835,13 @@ async fn tools_detect_handler(
         version: None,
         path: None,
     });
+    tools.push(ToolDetectItem {
+        name: "GitHub Copilot".to_string(),
+        tool_type: "extension".to_string(),
+        installed: copilot_installed,
+        version: None,
+        path: None,
+    });
 
     // 去重：同名工具只保留第一个（优先级最高的检测结果）
     let mut seen = std::collections::HashSet::new();
@@ -2853,36 +2854,54 @@ async fn tools_detect_handler(
     )
 }
 
+/// 匹配快捷方式名称对应的规范工具名
+///
+/// 采用"整词边界 + 最长优先"策略，杜绝短词误检：
+/// - 要求工具别名作为完整单词出现（被空格/开头/结尾包围），
+///   避免 "CodeBuddy CN" 误匹配 "Code"（VS Code）、"Trae CN" 误匹配 "Trae"。
+/// - 多个别名命中时取最长者（"Trae CN" 优先于 "Trae"），避免子串重叠歧义。
+/// - 返回规范工具名（与工具检测列表一致），未命中返回 None。
+fn match_tool_alias(name: &str, known_tools: &[(&str, &str)]) -> Option<String> {
+    let mut best: Option<(&str, usize)> = None;
+    for (alias, canonical) in known_tools {
+        let is_word_match = name.eq_ignore_ascii_case(alias)
+            || name.starts_with(&format!("{} ", alias))
+            || name.ends_with(&format!(" {}", alias))
+            || name.contains(&format!(" {} ", alias));
+        if is_word_match && best.map_or(true, |(_, blen)| alias.len() > blen) {
+            best = Some((canonical, alias.len()));
+        }
+    }
+    best.map(|(c, _)| c.to_string())
+}
+
 /// 扫描桌面快捷方式，识别已安装的 AI 工具
 ///
-/// 读取 `%USERPROFILE%\Desktop\*.lnk` 文件，匹配已知 AI 工具名称列表。
-/// 返回匹配到的工具名称列表。
+/// 读取 `%USERPROFILE%\Desktop\*.lnk` 及开始菜单快捷方式，
+/// 匹配已知 AI 工具名称列表。返回匹配到的工具名称列表。
 fn scan_desktop_shortcuts() -> Vec<String> {
     let mut result = Vec::new();
 
-    // 已知 AI 工具名称关键词列表（用于匹配快捷方式文件名）
-    let known_tools = [
-        "VS Code",
-        "Visual Studio Code",
-        "Code",
-        "Cursor",
-        "Trae",
-        "Trae CN",
-        "Windsurf",
-        "CodeBuddy",
-        "Qoder",
-        "Claude",
-        "Claude Code",
-        "GitHub Copilot",
-        "JetBrains",
-        "IntelliJ",
-        "PyCharm",
-        "WebStorm",
-        "GoLand",
-        "Zed",
-        "Aider",
-        "Warp",
-        "Tabby",
+    // 已知 AI 工具名称（别名 → 规范名），用于匹配快捷方式文件名。
+    // 仅收录大众熟知的工具，采用整词边界 + 最长优先匹配。
+    let known_tools: &[(&str, &str)] = &[
+        ("Visual Studio Code", "VS Code"),
+        ("VS Code", "VS Code"),
+        ("Cursor", "Cursor"),
+        ("Trae CN", "Trae CN"),
+        ("Trae", "Trae"),
+        ("Windsurf", "Windsurf"),
+        ("CodeBuddy CN", "CodeBuddy CN"),
+        ("CodeBuddy", "CodeBuddy"),
+        ("Qoder", "Qoder"),
+        ("Claude Code", "Claude Code"),
+        ("Claude", "Claude Code"),
+        ("Zed", "Zed"),
+        ("JetBrains Toolbox", "JetBrains Toolbox"),
+        ("IntelliJ IDEA", "IntelliJ IDEA"),
+        ("PyCharm", "PyCharm"),
+        ("WebStorm", "WebStorm"),
+        ("GoLand", "GoLand"),
     ];
 
     // Windows 桌面路径
@@ -2913,13 +2932,10 @@ fn scan_desktop_shortcuts() -> Vec<String> {
                 .map(|s| s.to_string())
                 .unwrap_or_default();
 
-            // 匹配已知工具名称
-            for tool_name in &known_tools {
-                if file_stem.contains(tool_name) || tool_name.contains(&file_stem) {
-                    if !result.contains(&tool_name.to_string()) {
-                        result.push(tool_name.to_string());
-                    }
-                    break;
+            // 匹配已知工具名称（整词边界 + 最长优先）
+            if let Some(canonical) = match_tool_alias(&file_stem, known_tools) {
+                if !result.contains(&canonical) {
+                    result.push(canonical);
                 }
             }
         }
@@ -2960,16 +2976,10 @@ fn scan_desktop_shortcuts() -> Vec<String> {
                 } else {
                     name.clone()
                 };
-                for tool_name in &known_tools {
-                    if name_to_check.contains(tool_name) || tool_name.contains(&name_to_check) {
-                        let canonical = match *tool_name {
-                            "Visual Studio Code" | "Code" => "VS Code",
-                            _ => tool_name,
-                        };
-                        if !result.contains(&canonical.to_string()) {
-                            result.push(canonical.to_string());
-                        }
-                        break;
+                // 匹配已知工具名称（整词边界 + 最长优先）
+                if let Some(canonical) = match_tool_alias(&name_to_check, known_tools) {
+                    if !result.contains(&canonical) {
+                        result.push(canonical);
                     }
                 }
             }
@@ -3066,18 +3076,12 @@ fn check_windows_install_path(name: &str) -> Option<String> {
         "Cursor" => vec![PathBuf::from(&local_appdata)
             .join("Programs")
             .join("cursor")],
-        "Trae" => vec![
-            PathBuf::from(&local_appdata).join("Programs").join("Trae"),
-            PathBuf::from(&local_appdata)
-                .join("Programs")
-                .join("Trae CN"),
-        ],
-        "Trae CN" => vec![
-            PathBuf::from(&local_appdata)
-                .join("Programs")
-                .join("Trae CN"),
-            PathBuf::from(&local_appdata).join("Programs").join("Trae"),
-        ],
+        // 注意：Trae 与 Trae CN 路径严格分离，避免一个安装目录触发两个工具误检。
+        // Trae CN 常装在自定义盘符（如 D:\Trae CN），由快捷方式检测兜底。
+        "Trae" => vec![PathBuf::from(&local_appdata).join("Programs").join("Trae")],
+        "Trae CN" => vec![PathBuf::from(&local_appdata)
+            .join("Programs")
+            .join("Trae CN")],
         "Windsurf" => vec![PathBuf::from(&local_appdata)
             .join("Programs")
             .join("windsurf")],
@@ -3086,6 +3090,14 @@ fn check_windows_install_path(name: &str) -> Option<String> {
                 .join("Programs")
                 .join("CodeBuddy"),
             PathBuf::from("C:\\Program Files").join("CodeBuddy"),
+        ],
+        // CodeBuddy CN（腾讯中文版）：安装目录常为自定义盘符（如 H:\CodeBuddy CN），
+        // 由快捷方式检测兜底；此处补充常见程序目录。
+        "CodeBuddy CN" => vec![
+            PathBuf::from(&local_appdata)
+                .join("Programs")
+                .join("CodeBuddy CN"),
+            PathBuf::from("C:\\Program Files").join("CodeBuddy CN"),
         ],
         "Qoder" => vec![
             PathBuf::from(&local_appdata).join("Programs").join("Qoder"),
@@ -3109,9 +3121,6 @@ fn check_windows_install_path(name: &str) -> Option<String> {
         "Claude Code" => vec![PathBuf::from(&local_appdata)
             .join("Programs")
             .join("Claude Code")],
-        "Aider" => vec![PathBuf::from(&local_appdata).join("Programs").join("Aider")],
-        "Warp AI" => vec![PathBuf::from(&local_appdata).join("Programs").join("Warp")],
-        "Tabby" => vec![PathBuf::from(&local_appdata).join("Programs").join("Tabby")],
         _ => return None,
     };
 

@@ -207,19 +207,6 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         ],
         exe_names: &["Windsurf.exe"],
     },
-    KnownTool {
-        id: "kiro",
-        name: "Kiro",
-        icon: "🔮",
-        category: "ide",
-        supports_mcp: true,
-        primary_marker: ".kiro",
-        secondary_markers: &[],
-        mcp_config_template: Some(".kiro/settings/mcp.json"),
-        mcp_transport: "stdio",
-        binary_paths: &["%LOCALAPPDATA%/Programs/Kiro/Kiro.exe"],
-        exe_names: &["Kiro.exe"],
-    },
     // ═══ 桌面应用类 ═══
     KnownTool {
         id: "claude-desktop",
@@ -263,13 +250,14 @@ const KNOWN_TOOLS: &[KnownTool] = &[
     // ═══ AI 编码助手类 ═══
     KnownTool {
         id: "codebuddy",
-        name: "CodeBuddy (腾讯)",
+        name: "CodeBuddy CN",
         icon: "🤝",
         category: "ai-assistant",
         supports_mcp: true,
         primary_marker: ".codebuddy",
         secondary_markers: &[],
-        mcp_config_template: Some(".codebuddy/mcp.json"),
+        // 官方文档优先级（高→低）：~/.codebuddy/.mcp.json（推荐）→ ~/.codebuddy/mcp.json（已废弃）
+        mcp_config_template: Some(".codebuddy/.mcp.json"),
         mcp_transport: "stdio",
         // v0.8.25 修复：添加常见的 CodeBuddy 安装路径
         // 根因：binary_paths 为空导致只能通过 exe_names 扫描检测，但扫描可能遗漏
@@ -284,189 +272,7 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         ],
         exe_names: &["CodeBuddy.exe", "CodeBuddy CN.exe"],
     },
-    KnownTool {
-        id: "comate",
-        name: "Comate (百度)",
-        icon: "🐻",
-        category: "ai-assistant",
-        supports_mcp: true,
-        primary_marker: ".comate",
-        secondary_markers: &[],
-        mcp_config_template: Some(".comate/mcp.json"),
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["comate.exe", "Comate.exe"],
-    },
     // ═══ 国产 AI 工具 ═══
-    KnownTool {
-        id: "tongyi-lingma",
-        name: "通义灵码 (阿里云)",
-        icon: "☁️",
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".lingma",
-        secondary_markers: &[".tongyi-lingma"],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["tongyi-lingma.exe", "Lingma.exe"],
-    },
-    KnownTool {
-        id: "marscode",
-        name: "豆包 MarsCode (字节)",
-        icon: "🫘",
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".marscode",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["MarsCode.exe", "marscode.exe"],
-    },
-    KnownTool {
-        id: "codegeex",
-        name: "智谱 CodeGeeX",
-        icon: "🧬", // v0.5.7 修复 L-1：从 🧠 改为 🧬（避免与 claude-desktop 重复）
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".codegeex",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["CodeGeeX.exe", "codegeex.exe"],
-    },
-    KnownTool {
-        id: "tencent-ai-code",
-        name: "腾讯云 AI 代码助手",
-        icon: "🐧", // v0.5.7 修复 L-1：从 ☁️ 改为 🐧（腾讯企鹅，避免与 tongyi-lingma 重复）
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".tencent-ai-code",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["tencent-ai-code.exe", "TencentAICode.exe"],
-    },
-    KnownTool {
-        id: "huawei-codearts",
-        name: "华为 CodeArts Snap",
-        icon: "🔷",
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".codearts-snap",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["CodeArts.exe", "codearts-snap.exe"],
-    },
-    KnownTool {
-        id: "roo-code",
-        name: "Roo Code",
-        icon: "🦘",
-        category: "ai-assistant",
-        supports_mcp: true,
-        primary_marker: ".roo",
-        secondary_markers: &[],
-        mcp_config_template: Some(".roo/mcp.json"),
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &[],
-    },
-    KnownTool {
-        id: "cline",
-        name: "Cline",
-        icon: "🧗",
-        category: "ai-assistant",
-        supports_mcp: true,
-        primary_marker: ".cline",
-        secondary_markers: &[],
-        mcp_config_template: Some(".cline/mcp.json"),
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &[],
-    },
-    KnownTool {
-        id: "continue",
-        name: "Continue.dev",
-        icon: "🔄",
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".continue",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &[],
-    },
-    KnownTool {
-        id: "cody",
-        name: "Cody (Sourcegraph)",
-        icon: "🦊",
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".cody",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &[],
-    },
-    KnownTool {
-        id: "aider",
-        name: "Aider",
-        icon: "💬",
-        category: "cli",
-        supports_mcp: false,
-        primary_marker: ".aider",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["aider"],
-    },
-    KnownTool {
-        id: "augment",
-        name: "Augment Code",
-        icon: "⚡",
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".augment",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &[],
-    },
-    KnownTool {
-        id: "amazon-q",
-        name: "Amazon Q Developer",
-        icon: "📦", // v0.5.7 修复 L-1：从 ☁️ 改为 📦（Amazon 包裹，避免与 tongyi-lingma 重复）
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".aws",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["amazon-q.exe", "AmazonQ.exe"],
-    },
-    KnownTool {
-        id: "tabby",
-        name: "Tabby",
-        icon: "🐱",
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".tabby",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["tabby.exe", "Tabby.exe"],
-    },
     KnownTool {
         id: "jetbrains-ai",
         name: "JetBrains AI",
@@ -490,19 +296,6 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         ],
     },
     KnownTool {
-        id: "pearai",
-        name: "PearAI",
-        icon: "🍐",
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".pearai",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["PearAI.exe", "pearai.exe"],
-    },
-    KnownTool {
         id: "zed",
         name: "Zed",
         icon: "🚀", // v0.5.7 修复 L-1：从 ⚡ 改为 🚀（高性能编辑器，避免与 augment 重复）
@@ -514,86 +307,6 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_transport: "stdio",
         binary_paths: &["%LOCALAPPDATA%/Programs/Zed/Zed.exe"],
         exe_names: &["Zed.exe", "zed.exe"],
-    },
-    // ═══ AI 浏览器 / 平台类 ═══
-    KnownTool {
-        id: "agent-browser",
-        name: "Agent Browser",
-        icon: "🌐",
-        category: "browser",
-        supports_mcp: false,
-        primary_marker: ".agent-browser",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "http",
-        binary_paths: &[],
-        exe_names: &["agent-browser.exe", "AgentBrowser.exe"],
-    },
-    KnownTool {
-        id: "opencode",
-        name: "OpenCode",
-        icon: "🔓",
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".opencode",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[],
-        exe_names: &["opencode"],
-    },
-    // ═══ 其他 AI 工具 ═══
-    KnownTool {
-        id: "z-brain",
-        name: "Z-Brain",
-        icon: "🧬",
-        category: "desktop",
-        supports_mcp: false,
-        primary_marker: "%APPDATA%/Z-Brain",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "http",
-        binary_paths: &[],
-        exe_names: &["z-brain.exe", "ZBrain.exe"],
-    },
-    KnownTool {
-        id: "functional-hub",
-        name: "Functional Hub Agent",
-        icon: "🔧",
-        category: "desktop",
-        supports_mcp: false,
-        primary_marker: "%APPDATA%/functional-hub-agent",
-        secondary_markers: &["%APPDATA%/com.functional-hub.agent"],
-        mcp_config_template: None,
-        mcp_transport: "http",
-        binary_paths: &[],
-        exe_names: &["functional-hub.exe", "FunctionalHub.exe"],
-    },
-    KnownTool {
-        id: "sillytavern",
-        name: "酒馆 (SillyTavern)",
-        icon: "🏮",
-        category: "desktop",
-        supports_mcp: false,
-        primary_marker: "SillyTavern",
-        secondary_markers: &["Documents/SillyTavern"],
-        mcp_config_template: None,
-        mcp_transport: "http",
-        binary_paths: &[],
-        exe_names: &["SillyTavern.exe", "sillytavern.exe"],
-    },
-    KnownTool {
-        id: "memorix",
-        name: "Memorix",
-        icon: "🧿",
-        category: "desktop",
-        supports_mcp: false,
-        primary_marker: ".memorix",
-        secondary_markers: &[],
-        mcp_config_template: None,
-        mcp_transport: "http",
-        binary_paths: &[],
-        exe_names: &["memorix.exe", "Memorix.exe"],
     },
     // ═══ v0.6.0 新增：补充遗漏的主流 AI 工具 ═══
     // Claude Code CLI — Anthropic 官方命令行工具（不同于 Claude Desktop）
@@ -610,37 +323,6 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_transport: "stdio",
         binary_paths: &[],
         exe_names: &["claude", "claude.exe"],
-    },
-    // Sublime Text — 老牌代码编辑器，通过插件支持 AI 功能
-    KnownTool {
-        id: "sublime-text",
-        name: "Sublime Text",
-        icon: "📝",
-        category: "ide",
-        supports_mcp: false,
-        primary_marker: "AppData/Roaming/Sublime Text",
-        secondary_markers: &["%APPDATA%/Sublime Text"],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &[
-            "%PROGRAMFILES%/Sublime Text/sublime_text.exe",
-            "%LOCALAPPDATA%/Programs/Sublime Text/sublime_text.exe",
-        ],
-        exe_names: &["sublime_text.exe", "subl.exe"],
-    },
-    // Tabnine — 独立 AI 编码助手，有 VSCode 插件也有独立应用
-    KnownTool {
-        id: "tabnine",
-        name: "Tabnine",
-        icon: "🔢",
-        category: "ai-assistant",
-        supports_mcp: false,
-        primary_marker: ".tabnine",
-        secondary_markers: &["%APPDATA%/Tabnine"],
-        mcp_config_template: None,
-        mcp_transport: "stdio",
-        binary_paths: &["%LOCALAPPDATA%/Programs/Tabnine/Tabnine.exe"],
-        exe_names: &["Tabnine.exe", "tabnine.exe"],
     },
     // Qwen Code — 阿里通义千问 CLI 工具（与通义灵码不同）
     // 通过 npm install -g @qwen-code/qwen-code 安装，命令为 qwen
@@ -684,6 +366,24 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_transport: "stdio",
         binary_paths: &[],
         exe_names: &["deepseek", "deepseek-coder", "deepseek.exe"],
+    },
+    // Qoder — AI 编程 IDE（字节跳动海外版），支持 MCP 全局配置
+    // 官方文档：user 级配置写入 ~/.qoder/settings.json，project 级写入 .qoder/settings.local.json
+    KnownTool {
+        id: "qoder",
+        name: "Qoder",
+        icon: "🛠️",
+        category: "ide",
+        supports_mcp: true,
+        primary_marker: ".qoder",
+        secondary_markers: &["%APPDATA%/Qoder", "%USERPROFILE%/.qoder"],
+        mcp_config_template: Some("%USERPROFILE%/.qoder/settings.json"),
+        mcp_transport: "stdio",
+        binary_paths: &[
+            "%LOCALAPPDATA%/Programs/Qoder/Qoder.exe",
+            "%APPDATA%/Qoder/Qoder.exe",
+        ],
+        exe_names: &["Qoder.exe", "qoder.exe"],
     },
     // v0.5.4 P2-20 修复：移除 loong-recall 条目
     // 原因：~/.loong-recall 是 LRC 桌面端自己的数据目录，不是独立的 AI 工具。
@@ -3777,7 +3477,7 @@ mod tests {
         assert!(ids.contains(&"claude-desktop".to_string()));
         assert!(ids.contains(&"generic-mcp".to_string()));
         // 新增的工具
-        assert!(ids.contains(&"kiro".to_string()));
+        assert!(ids.contains(&"qoder".to_string()));
         assert!(ids.contains(&"gemini-cli".to_string()));
         assert!(ids.contains(&"codebuddy".to_string()));
     }
@@ -3868,15 +3568,15 @@ mod tests {
         let ids: Vec<_> = KNOWN_TOOLS.iter().map(|t| t.id).collect();
         // v0.6.0 新增的 6 个工具
         assert!(ids.contains(&"claude-code"), "缺少 claude-code 工具");
-        assert!(ids.contains(&"sublime-text"), "缺少 sublime-text 工具");
-        assert!(ids.contains(&"tabnine"), "缺少 tabnine 工具");
         assert!(ids.contains(&"qwen-code"), "缺少 qwen-code 工具");
         assert!(ids.contains(&"replit"), "缺少 replit 工具");
         assert!(ids.contains(&"deepseek-coder"), "缺少 deepseek-coder 工具");
-        // 工具总数应至少 36 个（原 30 + 新增 6）
+        // v0.8.46 新增：Qoder
+        assert!(ids.contains(&"qoder"), "缺少 qoder 工具");
+        // 工具总数应至少 12 个（精简后的主流工具下限）
         assert!(
-            KNOWN_TOOLS.len() >= 36,
-            "工具总数 {} 少于预期 36",
+            KNOWN_TOOLS.len() >= 12,
+            "工具总数 {} 少于预期 12",
             KNOWN_TOOLS.len()
         );
     }
@@ -3885,20 +3585,16 @@ mod tests {
     #[test]
     fn test_manual_config_guide_for_non_mcp_tools() {
         // 不支持 MCP 的工具应返回配置指引
-        assert!(get_manual_config_guide("tongyi-lingma").is_some());
-        assert!(get_manual_config_guide("marscode").is_some());
-        assert!(get_manual_config_guide("codegeex").is_some());
-        assert!(get_manual_config_guide("continue").is_some());
-        assert!(get_manual_config_guide("aider").is_some());
-        assert!(get_manual_config_guide("sublime-text").is_some());
-        assert!(get_manual_config_guide("tabnine").is_some());
         assert!(get_manual_config_guide("deepseek-coder").is_some());
+        assert!(get_manual_config_guide("codex-cli").is_some());
+        assert!(get_manual_config_guide("jetbrains-ai").is_some());
+        assert!(get_manual_config_guide("zed").is_some());
 
         // 指引内容应包含关键信息
-        let guide = get_manual_config_guide("continue").unwrap();
+        let guide = get_manual_config_guide("codex-cli").unwrap();
         assert!(
-            guide.contains("config.json"),
-            "Continue 指引应包含配置文件路径"
+            guide.contains("Codex CLI"),
+            "Codex CLI 指引应包含工具名"
         );
         assert!(guide.contains("127.0.0.1:3099"), "指引应包含 LRC 端点");
     }
