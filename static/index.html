@@ -822,7 +822,7 @@
         LRC 通过 <strong>HTTP 模式</strong>自动为 AI 工具配置 MCP 连接。配置完成后无需手动操作。
       </p>
       <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
-        <li><strong>支持的 IDE</strong>：Trae、Trae CN、Cursor、VS Code、CodeBuddy 等 36+ 工具。</li>
+        <li><strong>支持的 IDE</strong>：Trae、Trae CN、Cursor、VS Code、CodeBuddy、Qoder、Windsurf、Zed、JetBrains 等主流工具。</li>
         <li><strong>配置位置</strong>：用户级配置（<code>~/.trae/mcp.json</code> 等），对所有项目生效。</li>
         <li><strong>部分 IDE 限制</strong>：Cursor、VS Code 需在项目目录下手动创建 <code>mcp.json</code>，LRC 无法自动写入项目级配置。</li>
         <li><strong>规则文件</strong>：LRC 会自动为已安装的 AI 工具写入全局规则文件（如 <code>~/.trae-cn/user_rules/rules.md</code>），让 AI 知道如何使用记忆工具。</li>
@@ -849,9 +849,77 @@
       </p>
     </div>
 
-    <!-- ==================== 3. 常见问题（FAQ） ==================== -->
+    <!-- ==================== 3. 配置教程（手动配置 + 规则配置） ==================== -->
     <div class="card">
-      <div class="card-title"><img src="/assets/icons/icon-info.svg" alt="" width="18" height="18"> 三、常见问题（FAQ）</div>
+      <div class="card-title"><img src="/assets/icons/icon-config.svg" alt="" width="18" height="18"> 三、配置教程（手动配置 + 规则配置）</div>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">3.1 自动配置（推荐，无需手动）</h4>
+      <p style="line-height: 1.7; color: var(--text);">
+        在配置向导中勾选已检测到的 AI 工具（Trae / Trae CN、CodeBuddy、Cursor、VS Code、Windsurf、Qoder 等），LRC 会自动写入 MCP 配置，<strong>无需手动操作</strong>。完成后重启对应 AI 工具即可使用。
+      </p>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">3.2 手动配置教程（备用，以 Qoder 为例）</h4>
+      <p style="line-height: 1.7; color: var(--text);">
+        以下工具需手动配置：Zed、JetBrains、GitHub Copilot、Claude Code、Claude Desktop。若你希望自行配置，下面以 <strong>Qoder</strong> 为例（官方文档：<a href="https://docs.qoder.com/en/cli/mcp-servers" target="_blank">docs.qoder.com</a>）：
+      </p>
+      <p style="line-height: 1.7; color: var(--text);">
+        <strong>方式一（推荐，命令行自动配置）</strong>：若已安装 Qoder CLI（<code>qodercli</code>），在终端一条命令即可添加 LRC 服务（将 <code>&lt;项目路径&gt;</code> 替换为你的项目目录）：
+      </p>
+      <pre style="background: var(--lrc-宣纸-300); padding: 12px; border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500); overflow-x: auto; font-size: 0.85em; line-height: 1.6;"><code>qodercli mcp add loong-recall -- code-memory-server --src-dir &lt;项目路径&gt; --stdio</code></pre>
+      <p style="line-height: 1.7; color: var(--text);">
+        配置默认写入用户级文件 <code>~/.qoder/settings.json</code>，对所有项目生效。若 Qoder 已在运行，输入 <code>/mcp reload</code> 重新加载即可。
+      </p>
+      <p style="line-height: 1.7; color: var(--text);">
+        <strong>方式二（图形界面手动配置）</strong>：
+      </p>
+      <ol style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li>打开 Qoder，点击右上角用户头像 → <strong>Qoder 设置</strong>（或按 <code>Ctrl + Shift + ,</code>）。</li>
+        <li>左侧导航栏选择 <strong>MCP</strong>，进入 <strong>My Servers</strong> 标签页。</li>
+        <li>点击右上角 <strong>+ Add</strong>，在打开的 JSON 文件中粘贴以下配置（将 <code>&lt;项目路径&gt;</code> 替换为你的项目目录）：</li>
+      </ol>
+      <pre style="background: var(--lrc-宣纸-300); padding: 12px; border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500); overflow-x: auto; font-size: 0.85em; line-height: 1.6;"><code>{
+  "mcpServers": {
+    "loong-recall": {
+      "command": "code-memory-server",
+      "args": ["--src-dir", "&lt;项目路径&gt;", "--stdio"]
+    }
+  }
+}</code></pre>
+      <ol start="4" style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li>关闭文件并点击 <strong>Save</strong>，新的 MCP 服务器会出现在列表中（链接图标表示连接成功）。</li>
+        <li>重启 Qoder，在对话中即可使用 LRC 的记忆工具。</li>
+      </ol>
+      <p style="line-height: 1.7; color: var(--text); margin-top: 8px;">
+        <strong>其他工具手动配置位置</strong>：Zed 创建 <code>.zed/mcp.json</code>；JetBrains 在 设置 → 工具 → MCP 服务器 → 添加；GitHub Copilot 在 VS Code 设置 → 扩展 → GitHub Copilot → MCP；Claude Code 使用 <code>claude mcp add</code> 命令；Claude Desktop 编辑 <code>claude_desktop_config.json</code>。
+      </p>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">3.3 规则配置教程</h4>
+      <p style="line-height: 1.7; color: var(--text);">
+        LRC 会自动为已安装的 AI 工具写入<strong>全局规则文件</strong>，让 AI 知道如何正确使用记忆工具（remember / recall / search_code 等）。规则文件位置：
+      </p>
+      <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li><strong>Trae CN</strong>：<code>~/.trae-cn/user_rules/rules.md</code></li>
+        <li><strong>CodeBuddy CN</strong>：<code>C:\Users\用户名\.codebuddy\rules</code></li>
+        <li><strong>其他工具</strong>：对应的用户规则目录（如 <code>~/.cursor/rules/</code>、<code>~/.windsurf/rules/</code> 等）。</li>
+      </ul>
+      <p style="line-height: 1.7; color: var(--text);">
+        规则文件内容说明各工具应如何调用 LRC 的 MCP 工具、何时使用记忆、如何组织记忆。建议在首次配置后，在 AI 对话中发送 <code>"请列出你当前可用的工具"</code> 确认 LRC 工具已生效。若需要自定义规则，可编辑对应规则文件，LRC 不会覆盖用户自定义内容。
+      </p>
+
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">3.4 更多文档与仓库</h4>
+      <p style="line-height: 1.7; color: var(--text);">
+        本页面为使用简介。更详细的用户指南、常见问题、API 参考与基准测试结果，请访问项目仓库文档：
+      </p>
+      <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
+        <li><strong>项目仓库</strong>：<a href="#tab-api-docs">Loong Recall（code-memory）</a></li>
+        <li><strong>基准测试报告</strong>：见「基准报告」标签页。</li>
+        <li><strong>发布流程</strong>：见 <code>docs/RELEASE_PROCESS.md</code>。</li>
+      </ul>
+    </div>
+
+    <!-- ==================== 4. 常见问题（FAQ） ==================== -->
+    <div class="card">
+      <div class="card-title"><img src="/assets/icons/icon-info.svg" alt="" width="18" height="18"> 四、常见问题（FAQ）</div>
 
       <details style="margin: 8px 0; padding: 10px 14px; background: var(--lrc-宣纸-300); border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500);">
         <summary style="cursor: pointer; font-weight: 600; color: var(--ink);">Q1：为什么 AI 工具提示"无法连接到 LRC 服务"？</summary>
@@ -889,13 +957,13 @@
       <details style="margin: 8px 0; padding: 10px 14px; background: var(--lrc-宣纸-300); border-radius: var(--radius-md); border: 1px solid var(--lrc-宣纸-500);">
         <summary style="cursor: pointer; font-weight: 600; color: var(--ink);">Q5：LRC 支持哪些 AI 工具？</summary>
         <div style="margin-top: 10px; line-height: 1.7; color: var(--text);">
-          <p>支持 36+ 工具，包括：</p>
+          <p>支持主流 AI 工具（大众熟知、国内外），包括：</p>
           <ul style="padding-left: 22px;">
-            <li><strong>IDE 类</strong>：Trae、Trae CN、Cursor、VS Code、JetBrains 系列、Sublime Text、Vim/Neovim、Zed</li>
-            <li><strong>CLI 类</strong>：Claude Code CLI、Qwen Code、Aider、Continue.dev、Cline</li>
-            <li><strong>Agent 类</strong>：Windsurf、Cody Sourcegraph、Tabnine、Codeium、Replit AI、DeepSeek Coder</li>
+            <li><strong>IDE 类</strong>：Trae、Trae CN、Cursor、VS Code、Windsurf、CodeBuddy、Qoder、JetBrains 系列、Zed、Replit</li>
+            <li><strong>CLI 类</strong>：Claude Code CLI、Qwen Code、Gemini CLI、OpenAI Codex CLI、DeepSeek Coder</li>
+            <li><strong>桌面类</strong>：Claude Desktop；AI 拓展：GitHub Copilot、Cline、Continue</li>
           </ul>
-          <p>对于不支持 MCP 的工具（如 Vim），LRC 会提供手动配置指南。</p>
+          <p>对于不支持 MCP 自动配置的工具，LRC 会提供手动配置指南。</p>
         </div>
       </details>
 
@@ -937,9 +1005,9 @@
 
     <!-- ==================== 4. 使用技巧 ==================== -->
     <div class="card">
-      <div class="card-title"><img src="/assets/icons/icon-smile.svg" alt="" width="18" height="18"> 四、使用技巧</div>
+      <div class="card-title"><img src="/assets/icons/icon-smile.svg" alt="" width="18" height="18"> 五、使用技巧</div>
 
-      <h4 style="margin: 12px 0 6px; color: var(--ink);">4.1 高效记忆的写法</h4>
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">5.1 高效记忆的写法</h4>
       <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
         <li><strong>具体而非抽象</strong>：<code>"认证模块位于 src/auth/jwt.rs，核心函数是 issue_token()"</code> 优于 <code>"项目有认证功能"</code>。</li>
         <li><strong>包含文件路径</strong>：让 AI 在后续会话中能精确定位。</li>
@@ -947,7 +1015,7 @@
         <li><strong>分批记录</strong>：将复杂信息拆成多条小记忆，LRC 会自动关联。</li>
       </ul>
 
-      <h4 style="margin: 12px 0 6px; color: var(--ink);">4.2 自然语言搜索技巧</h4>
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">5.2 自然语言搜索技巧</h4>
       <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
         <li><strong>问"在哪里"</strong>：<code>"用户认证的逻辑在哪里？"</code></li>
         <li><strong>问"是什么"</strong>：<code>"这个项目的数据库 schema 是什么？"</code></li>
@@ -955,7 +1023,7 @@
         <li><strong>问"如何做"</strong>：<code>"如何添加一个新的 API 端点？"</code></li>
       </ul>
 
-      <h4 style="margin: 12px 0 6px; color: var(--ink);">4.3 系统托盘管理</h4>
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">5.3 系统托盘管理</h4>
       <p style="line-height: 1.7; color: var(--text);">
         LRC 设计为后台静默运行，关闭主窗口后可通过<strong>系统托盘图标</strong>（任务栏右下角）右键菜单管理：
       </p>
@@ -968,7 +1036,7 @@
 
     <!-- ==================== 5. REST API 参考 ==================== -->
     <div class="card">
-      <div class="card-title"><img src="/assets/icons/icon-audit.svg" alt="" width="18" height="18"> 五、REST API 参考</div>
+      <div class="card-title"><img src="/assets/icons/icon-audit.svg" alt="" width="18" height="18"> 六、REST API 参考</div>
       <p class="text-sm text-dim mt-4" style="margin-top:0; margin-bottom: 12px;">
         以下端点供开发者集成与自动化测试使用。普通用户无需关注。
       </p>
@@ -1000,9 +1068,9 @@
       </p>
     </div>
 
-    <!-- ==================== 6. 更多资源 ==================== -->
+    <!-- ==================== 7. 更多资源 ==================== -->
     <div class="card">
-      <div class="card-title"><img src="/assets/icons/icon-info.svg" alt="" width="18" height="18"> 六、更多资源</div>
+      <div class="card-title"><img src="/assets/icons/icon-info.svg" alt="" width="18" height="18"> 七、更多资源</div>
       <ul style="line-height: 1.9; padding-left: 22px; color: var(--text);">
         <li><strong>信任中心</strong>：在左侧导航栏点击"信任中心"，验证数据存储位置与隐私保护。</li>
         <li><strong>船长日志</strong>：一键生成项目记忆健康报告，了解 LRC 的工作状态。</li>
@@ -1593,18 +1661,16 @@
           <div>
             <h4 style="margin: 0 0 8px 0; color: var(--lrc-墨韵-700);">MCP 配置指南</h4>
             <p style="margin: 0 0 12px 0; color: var(--lrc-墨韵-500); font-size: 0.9em; line-height: 1.8;">
-              龙忆（LRC）可将自动配置写入支持全局 MCP 配置的工具。以下工具需手动配置：
+              龙忆（LRC）支持<strong>自动写入</strong>以下工具的 MCP 配置（Trae / Trae CN、CodeBuddy、Cursor、VS Code、Windsurf、Qoder、Cline 等），选择项目后无需手动操作。
+              以下工具需<strong>手动配置</strong>：
             </p>
             <div style="font-size: 0.85em; color: var(--lrc-墨韵-500); line-height: 2;">
               <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px 24px;">
-                <div><strong>Cursor</strong>：设置 → MCP 服务器 → 添加</div>
-                <div><strong>VS Code</strong>：创建 <code>.vscode/mcp.json</code> 或通过 Cline 扩展</div>
-                <div><strong>Trae / Trae CN</strong>：设置 → 扩展 → MCP 服务器 → 添加</div>
-                <div><strong>Windsurf</strong>：创建 <code>.windsurf/mcp_config.json</code></div>
-                <div><strong>CodeBuddy</strong>：设置 → MCP → 添加服务器</div>
-                <div><strong>Qoder</strong>：设置 → MCP 服务器 → 添加</div>
                 <div><strong>Zed</strong>：创建 <code>.zed/mcp.json</code></div>
                 <div><strong>JetBrains IDE</strong>：设置 → 工具 → MCP 服务器 → 添加</div>
+                <div><strong>GitHub Copilot</strong>：VS Code 设置 → 扩展 → GitHub Copilot → MCP</div>
+                <div><strong>Claude Code</strong>：<code>claude mcp add</code> 命令或 <code>~/.claude.json</code></div>
+                <div><strong>Claude Desktop</strong>：编辑 <code>claude_desktop_config.json</code></div>
               </div>
             </div>
             <p style="margin: 12px 0 0 0; color: var(--lrc-墨韵-500); font-size: 0.9em;">

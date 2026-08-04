@@ -1186,6 +1186,9 @@ const SUPPORTED_IDES: &[(&str, &str, bool)] = &[
     ("cursor", "IDE", true),
     ("vscode", "IDE", true),
     ("windsurf", "IDE", true),
+    ("codebuddy", "IDE", true),
+    // Qoder：用户级配置 ~/.qoder/settings.json（官方文档确认支持 mcpServers 结构）
+    ("qoder", "IDE", true),
     ("kiro", "IDE", true),
     ("gemini", "CLI/桌面", true),
     ("gemini-cli", "CLI/桌面", true),
@@ -1242,6 +1245,22 @@ fn get_ide_config_path(ide: &str) -> PathBuf {
             }
         }
         "windsurf" => home.join(".windsurf").join("mcp.json"),
+        // CodeBuddy（腾讯）：用户级配置文件
+        // 官方文档优先级（高→低）：~/.codebuddy/.mcp.json（推荐）→ ~/.codebuddy/mcp.json（已废弃）→ ~/.codebuddy.json
+        // 写入规则：若存在任意一个则写入第一个存在的文件，否则创建最高优先级的 .mcp.json
+        "codebuddy" => {
+            let mcp_dot = home.join(".codebuddy").join(".mcp.json");
+            let mcp_legacy = home.join(".codebuddy").join("mcp.json");
+            if mcp_dot.exists() {
+                mcp_dot
+            } else if mcp_legacy.exists() {
+                mcp_legacy
+            } else {
+                mcp_dot
+            }
+        }
+        // Qoder：用户级配置 ~/.qoder/settings.json（保留原有 enabledPlugins 等字段）
+        "qoder" => home.join(".qoder").join("settings.json"),
         "kiro" => home.join(".kiro").join("settings").join("mcp.json"),
         "gemini" | "gemini-cli" => home.join(".gemini").join("settings.json"),
         "comate" => home.join(".comate").join("mcp.json"),
@@ -1250,7 +1269,9 @@ fn get_ide_config_path(ide: &str) -> PathBuf {
         "cloudbase" | "cloudbase-mcp" => home.join(".cloudbase-mcp").join("mcp.json"),
         _ => {
             eprintln!("错误: 不支持的 IDE/工具: {ide}");
-            eprintln!("支持的 IDE: trae, trae-cn, cursor, vscode, windsurf, kiro");
+            eprintln!(
+                "支持的 IDE: trae, trae-cn, cursor, vscode, windsurf, codebuddy, qoder, kiro"
+            );
             eprintln!("支持的 CLI/桌面工具: gemini, gemini-cli, comate, roo, cline, cloudbase");
             eprintln!("用法: code-memory-server --install-ide <名称>");
             std::process::exit(1);
@@ -1971,7 +1992,7 @@ fn print_help() {
     println!("  --tray               启用系统托盘图标（Windows 原生，右键菜单操作）");
     println!("  --multi-window <N>   多窗口上限 (1~20, 默认 1)，允许同项目多窗口运行");
     println!("  --install-ide <IDE>  自动配置 IDE/工具的 MCP 连接");
-    println!("                       IDE: trae, trae-cn, cursor, vscode, windsurf, kiro");
+    println!("                       IDE: trae, trae-cn, cursor, vscode, windsurf, codebuddy, qoder, kiro");
     println!("                       CLI/桌面: gemini, comate, roo, cline, cloudbase");
     println!("                       多工具用逗号分隔: --install-ide trae,cursor");
     println!("  --benchmark         运行三层基准测试（人类可读输出）");
