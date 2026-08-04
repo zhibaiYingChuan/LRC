@@ -120,10 +120,21 @@ impl SynthesisEngine {
     ) -> Result<Vec<Vec<Memory>>, crate::persistence::PersistenceError> {
         let all = persistence.load_all_memories()?;
 
-        let candidates: Vec<&Memory> = all
+        let mut candidates: Vec<&Memory> = all
             .iter()
             .filter(|m| !m.is_expired() && m.memory_type != MemoryType::Synthesis)
             .collect();
+
+        // v0.8.45 性能修复：限制候选数，避免 O(n²) 全对比较导致 CPU 耗尽
+        // 根因：全局数据量大（数千条记忆）时，全对 Jaccard 比较耗时数百秒，
+        //       且持锁期间导致 lock_busy 长期为 true，阻塞用户访问记忆数据。
+        // 修复：仅对重要性最高的前 MAX_CLUSTER_CANDIDATES 条记忆做聚类，
+        //       高重要性记忆更可能形成高价值合成，复杂度从 O(N²) 降至 O(K²)。
+        const MAX_CLUSTER_CANDIDATES: usize = 500;
+        if candidates.len() > MAX_CLUSTER_CANDIDATES {
+            candidates.sort_by(|a, b| b.importance.value().cmp(&a.importance.value()));
+            candidates.truncate(MAX_CLUSTER_CANDIDATES);
+        }
 
         if candidates.len() < self.config.min_cluster {
             return Ok(Vec::new());

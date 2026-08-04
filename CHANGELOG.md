@@ -2,6 +2,27 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.45] - 2026-08-04
+
+### 修复：桌面端 CDP 回归测试 + 代码审计发现的问题（P0/P1）
+
+**P0 — lock_busy 时仪表盘"卡片锁死"修复：** 结晶期间侧边栏返回 `lock_busy` 时，`loadDashboard` 不再 `throw LOCK_BUSY` 冻结仪表盘，改为渲染降级数据 + 标题栏添加"合成中"标记 + 后台指数退避重试（2s/4s/8s）自动恢复。`renderDashboard` 不再因 lock_busy 跳过渲染，避免用户感知为"卡片锁死/记忆丢失"。
+
+**P0 — 最近记忆/统计/审计日志 lock_busy 友好提示：** 三个接口在 503 lock_busy 时显示"后台合成中"而非"加载失败"，消除用户对"记忆不可用"的恐慌。
+
+**P1 — AI 工具重新扫描按钮无事件绑定修复：** 动态创建的 `data-action="rescanToolsWithInvalidate"` 按钮在 `ensureAiToolsToolbar` 中未调用 `bindAllActions`，导致点击无反应。修复：创建后调用 `bindAllActions()` 重新绑定事件。
+
+**P1 — 重新扫描按钮无视觉反馈修复：** 点击后禁用按钮 + 显示"⏳ 扫描中..."，完成后恢复，消除"按钮无交互反应"感知。
+
+**P1 — 配置向导跳过项目选择被阻塞修复：** `goToStep` 移除"取消所有项目选择"确认弹窗，用户始终可以跳过项目选择，后续可在设置中随时添加。
+
+**P1 — AI 工具检测类型区分修复：** `detect_command_tool` 增加 `tool_type` 参数，IDE 与 Agent 工具正确标注类型（`ide`/`agent`），不再全部标为 `ide`。
+
+**涉及文件：**
+- `static/app.js`：lock_busy 降级渲染、后台重试调度、按钮事件绑定、跳过项目选择、版本号
+- `src/server.rs`：工具类型区分（ide/agent）
+- `desktop/src-tauri/src/main.rs`：WebView2 CDP 调试端口 9230
+
 ## [0.8.44] - 2026-08-03
 
 ### 修复：HCSE 韧性验证 + 交互韧性审计 Round5 发现的问题（P0/P1）
