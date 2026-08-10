@@ -1713,10 +1713,14 @@ impl<P: Persistence> MemoryStore<P> {
             self.dao_metrics.record_encoding();
         }
 
-        // 注意：跳过 luoshu_synthesize()，因为：
-        // 1. 合成操作（簇发现、摘要生成）对 LongMemEval 检索无直接帮助
-        // 2. 合成在大批量数据下耗时巨大（O(N^2) 级别）
-        // 3. 记忆检索依赖 recall / trapezoid_focus_recall，不依赖合成结果
+        // 注意：此处不在关键路径内执行合成（luoshu_synthesize），因为：
+        // 1. 合成操作（簇发现、摘要生成）在大批量数据下耗时巨大（O(N^2) 级别）
+        // 2. 合成会延后到健康检查（system_health/memory_stats）时通过 run_pending_synthesis 执行
+        //
+        // v0.6.x 参赛修复：与单条 remember 路径保持一致，批量注入后同样标记待合成，
+        // 使"完整 LRC"实验组（full_lrc）能真实运行演化（合成）机制，而非静默跳过。
+        // 该标记仅置位，实际合成仍由后台健康检查执行，不阻塞本调用。
+        self.synthesis_pending = true;
 
         // v0.5.4 写操作后标记缓存为脏
         self.invalidate_cache();
