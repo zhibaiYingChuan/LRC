@@ -31,6 +31,12 @@ jobs:
   cargo-audit:
     name: Cargo Audit
     runs-on: ubuntu-latest
+    # v0.8.46 fix: rustsec/audit-check 需要 checks:write 权限创建 Check Run 检查状态
+    # 根因：GITHUB_TOKEN 默认只授予 contents:read，audit-check 发布 Check Run 时被拒
+    # 保持最小权限：仅本 job 追加 checks:write，其余权限维持只读
+    permissions:
+      contents: read
+      checks: write
     # 定时触发的扫描即使发现漏洞也不阻塞（仅报告），PR 触发的阻塞
     continue-on-error: ${{ github.event_name == 'schedule' }}
     steps:
