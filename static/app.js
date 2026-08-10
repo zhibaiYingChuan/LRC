@@ -6002,8 +6002,18 @@ function selectPresetScenario(card) {
 /**
  * v0.8.4 Step 5：恢复用户上次选择的预设场景（修复 G045）
  * 在页面初始化时调用，从 localStorage 读取并恢复选中状态
+ *
+ * v0.8.46 修复（P0 无限循环）：
+ *   根因：健康检查每 10 秒轮询 → 检测到状态变化 → 广播 → 触发 loadDashboard
+ *         → 调用 restoreSelectedScenario → 健康检查再次轮询，形成完整闭环。
+ *   修复：单次执行标记 scenarioRestored，页面生命周期内只允许恢复一次。
+ *         如需手动重新恢复，调用 resetScenarioRestore() 重置标记。
  */
+let scenarioRestored = false;
+
 function restoreSelectedScenario() {
+  if (scenarioRestored) return; // 守卫：已恢复过，直接返回
+  scenarioRestored = true;
   try {
     // v0.8.5 Step 2 / G080 修复：若无保存值，默认到 coding-helper
     let saved = localStorage.getItem('lrc-selected-scenario');
@@ -6020,6 +6030,14 @@ function restoreSelectedScenario() {
   } catch (e) {
     console.warn('[restoreSelectedScenario] 读取 localStorage 失败:', e);
   }
+}
+
+/**
+ * 重置场景恢复标记，允许用户手动切换场景时重新恢复
+ * 由 selectPresetScenario 在用户主动点击时调用
+ */
+function resetScenarioRestore() {
+  scenarioRestored = false;
 }
 
 /**
