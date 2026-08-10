@@ -2,6 +2,21 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.47] - 2026-08-10
+
+### 修复：前端三个关键问题 + Security Audit CI 权限配置
+
+**P0 — restoreSelectedScenario 无限循环修复：** 健康检查每 10 秒轮询 → 检测到 lock_busy 变化 → 广播 → loadDashboard → restoreSelectedScenario 形成递归循环。修复：添加 `scenarioRestored` 单次执行标记守卫，确保场景恢复阶段只执行一次。
+
+**P2 — Logo 404 修复：** index.html 引用不存在的 PNG 文件（`LRC桌面端Logo设计-...png`），后端 `logo_asset_handler` 仅支持 SVG 格式。修复：改为引用 `logo-primary.svg`。
+
+**CI — Cargo Audit 权限修复：** `rustsec/audit-check` 需要 `checks:write` 权限创建 Check Run，但 security.yml 仅声明 `contents:read`，导致 `Resource not accessible by integration` 错误。修复：在 cargo-audit job 级添加 `permissions: { contents: read, checks: write }`。
+
+**涉及文件：**
+- `static/app.js`（P0 无限循环修复）
+- `static/index.html`（P2 Logo 404 修复）
+- `.github/workflows/security.yml`（CI 权限修复）
+
 ## [0.8.46] - 2026-08-04
 
 ### 修复：AI 工具检测误检 + Qoder 自动配置 + 前端配置指南优化
