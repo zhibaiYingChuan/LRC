@@ -140,6 +140,7 @@ jobs:
           CHANGELOG_VER=$(grep -m1 '^## \[' CHANGELOG.md | head -1 | sed 's/.*\[\(.*\)\].*/\1/' | sed 's/^v//')
           # v0.8.48 FIX-016：从 Cargo.toml 读取版本号，避免 HTML 结构依赖
           STATUS_VER=$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/')
+          # 注：static/index.html 中 id="status-version" 硬编码版本号 → 已改为从 Cargo.toml 读取，不再单独校验
           echo "版本号检查："
           echo "  Cargo.toml:           $CARGO_VER"
           echo "  desktop Cargo.toml:   $DESKTOP_VER"
@@ -150,8 +151,7 @@ jobs:
           echo "  static/app.js:        $APP_JS_VER"
           echo "  static/index.html:    $INDEX_HTML_VER"
           echo "  CHANGELOG.md:         $CHANGELOG_VER"
-          echo "  status-version:       $STATUS_VER"
-          if [ "$CARGO_VER" != "$DESKTOP_VER" ] || [ "$CARGO_VER" != "$TAURI_VER" ] || [ "$CARGO_VER" != "$LOCK_VER" ] || [ "$CARGO_VER" != "$DESKTOP_LOCK_VER" ] || [ "$CARGO_VER" != "$PKG_JSON_VER" ] || [ "$CARGO_VER" != "$APP_JS_VER" ] || [ "$CARGO_VER" != "$INDEX_HTML_VER" ] || [ "$CARGO_VER" != "$CHANGELOG_VER" ] || [ "$CARGO_VER" != "$STATUS_VER" ]; then
+          if [ "$CARGO_VER" != "$DESKTOP_VER" ] || [ "$CARGO_VER" != "$TAURI_VER" ] || [ "$CARGO_VER" != "$LOCK_VER" ] || [ "$CARGO_VER" != "$DESKTOP_LOCK_VER" ] || [ "$CARGO_VER" != "$PKG_JSON_VER" ] || [ "$CARGO_VER" != "$APP_JS_VER" ] || [ "$CARGO_VER" != "$INDEX_HTML_VER" ] || [ "$CARGO_VER" != "$CHANGELOG_VER" ]; then
             echo "ERROR: 版本号不一致"
             if [ "$CARGO_VER" != "$LOCK_VER" ]; then
               echo "  提示: 根目录 Cargo.lock 版本号未同步，请本地运行 'cargo check --features server' 后提交 Cargo.lock"
@@ -170,9 +170,6 @@ jobs:
             fi
             if [ "$CARGO_VER" != "$CHANGELOG_VER" ]; then
               echo "  提示: CHANGELOG.md 最顶部版本号未同步，请手动更新 CHANGELOG.md"
-            fi
-            if [ "$CARGO_VER" != "$STATUS_VER" ]; then
-              echo "  提示: static/index.html 中 id=\"status-version\" 版本号硬编码未同步，请手动更新"
             fi
             exit 1
           fi
