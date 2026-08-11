@@ -1,4 +1,4 @@
-// 隐藏控制台窗口：后台进程不需要 CMD 窗口
+﻿// 隐藏控制台窗口：后台进程不需要 CMD 窗口
 // MCP stdio 模式下 stdin/stdout 仍然可用，不受影响
 #![windows_subsystem = "windows"]
 

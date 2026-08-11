@@ -1168,7 +1168,7 @@ pub fn build_v1_router(
                 async move {
                     // 限制最大返回数量，防止滥用
                     let limit = params.limit.unwrap_or(5).clamp(1, 20);
-                    // v0.8.45 修复：改用 try_lock，避免 lock_busy 期间挂起超时（与 /memories/stats 一致）
+                    // v0.8.45 修复：改用 try_read，避免 lock_busy 期间挂起超时（与 /memories/stats 一致）
                     //   根因：原实现 lock().await 在结晶持锁时阻塞等待，前端 fetchWithTimeout 8s 超时
                     //         显示"加载失败"，而非 v0.8.45 前端预期的"后台合成中"降级提示
                     let store = match store.try_lock() {
@@ -1253,7 +1253,7 @@ pub fn build_v1_router(
                 async move {
                     // 限制最大返回数量，防止内存溢出
                     let limit = params.limit.unwrap_or(10000).clamp(1, 50000);
-                    // v0.8.45 修复：改用 try_lock，避免 lock_busy 期间挂起超时（与 /memories/recent 一致）
+                    // v0.8.45 修复：改用 try_read，避免 lock_busy 期间挂起超时（与 /memories/recent 一致）
                     let store = match store.try_lock() {
                         Ok(guard) => guard,
                         Err(_) => {
@@ -1422,7 +1422,7 @@ pub fn build_v1_router(
             move || {
                 let store = store.clone();
                 async move {
-                    // v0.8.22 HCSE 修复：改用 try_lock，避免 lock_busy 期间超时
+                    // v0.8.22 HCSE 修复：改用 try_read，避免 lock_busy 期间超时
                     let store = match store.try_lock() {
                         Ok(guard) => guard,
                         Err(_) => {
@@ -1560,7 +1560,7 @@ pub fn build_v1_router(
             move || {
                 let store = store.clone();
                 async move {
-                    // v0.8.22 HCSE 修复：改用 try_lock，避免 lock_busy 期间超时
+                    // v0.8.22 HCSE 修复：改用 try_read，避免 lock_busy 期间超时
                     let store = match store.try_lock() {
                         Ok(guard) => guard,
                         Err(_) => {
