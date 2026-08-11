@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.8.46';
+const APP_VERSION = '0.8.48';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -1457,6 +1457,7 @@ window.manualRefreshDashboard = manualRefreshDashboard;
 function scheduleLockBusyRetry() {
   const MAX_RETRIES = 3;
   let retryCount = 0;
+  let retryTimer = null;
 
   function doRetry() {
     if (retryCount >= MAX_RETRIES) {
@@ -1466,7 +1467,7 @@ function scheduleLockBusyRetry() {
     retryCount++;
     const delay = 2000 * Math.pow(2, retryCount - 1); // 2s/4s/8s
     console.log('[scheduleLockBusyRetry] ' + delay + 'ms 后后台重试 (' + retryCount + '/' + MAX_RETRIES + ')');
-    setTimeout(async () => {
+    retryTimer = setTimeout(async () => {
       try {
         const [systemRes, detailedRes, daoRes] = await Promise.allSettled([
           fetchWithTimeout(API_BASE + '/v1/health/system', {}, 8000),
@@ -1501,6 +1502,20 @@ function scheduleLockBusyRetry() {
       }
     }, delay);
   }
+
+  function cancelLockBusyRetry() {
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+      console.log('[scheduleLockBusyRetry] 页面卸载，已取消重试定时器');
+    }
+  }
+
+  // 页面卸载时清理定时器
+  window.addEventListener('pagehide', cancelLockBusyRetry);
+  window.addEventListener('visibilitychange', () => {
+    if (document.hidden) cancelLockBusyRetry();
+  });
 
   doRetry();
 }
@@ -3649,7 +3664,15 @@ async function init() {
     //   修复：同时设置属性和 addEventListener，确保两种检查方式都能通过
     const lrcGlobalErrorHandler = (event) => {
       window._lrcGlobalErrorCount++;
-      console.error('[全局错误 #' + window._lrcGlobalErrorCount + ']', event.error || event.message);
+      // v0.8.48 FIX-013/014 优化：错误日志补充上下文（来源、行号、列号、堆栈）
+      const src = event.source || event.filename || 'unknown';
+      const loc = (event.lineno ? ':' + event.lineno : '') + (event.colno ? ':' + event.colno : '');
+      const stack = event.error && event.error.stack ? '\n' + event.error.stack.split('\n').slice(0, 5).join('\n') : '';
+      console.error(
+        '[全局错误 #' + window._lrcGlobalErrorCount + '] ' +
+        (event.message || event.error?.message || '未知错误') +
+        ' @ ' + src + loc + stack
+      );
       try {
         if (typeof window.showToast === 'function') {
           window.showToast('发生未知错误，请刷新页面', 'error', 5000);
@@ -3660,10 +3683,15 @@ async function init() {
       return false; // 允许默认错误处理继续
     };
     const lrcUnhandledRejectionHandler = (event) => {
-      console.error('[未捕获 Promise]', event.reason);
+      // v0.8.48 FIX-014 优化：Promise rejection 日志补充错误类型、消息、堆栈
+      const reason = event.reason || event;
+      const errType = reason && reason.constructor ? reason.constructor.name : typeof reason;
+      const errMsg = (reason && reason.message) || String(reason) || '未知错误';
+      const errStack = reason && reason.stack ? '\n' + reason.stack.split('\n').slice(0, 5).join('\n') : '';
+      console.error('[未捕获 Promise] [' + errType + '] ' + errMsg + errStack);
       try {
         if (typeof window.showToast === 'function') {
-          const msg = (event.reason && event.reason.message) || '操作失败，请重试';
+          const msg = (reason && reason.message) || '操作失败，请重试';
           window.showToast(msg, 'error', 3000);
         }
       } catch (e) {

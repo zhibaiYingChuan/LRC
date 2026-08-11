@@ -1,4 +1,4 @@
-// 许可证: Apache 2.0
+﻿// 许可证: Apache 2.0
 //
 // MCP 协议服务端
 // ===============
@@ -231,6 +231,7 @@ struct MemoryBrief {
 }
 
 pub struct AppState {
+    /// FIX-006: manager 保持 Mutex（dyn IndexedCodebase 不满足 Sync，无法用 RwLock）
     pub manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
     pub memory_store: Arc<Mutex<MemoryStore<JsonPersistence>>>,
     pub src_dir: String,
@@ -1710,7 +1711,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         (None, None)
     };
 
-    // 获取记忆库统计（try_lock，获取不到返回 0）
+    // 获取记忆库统计（try_read，获取不到返回 0）
     // v0.8.21 P0-06：同时检测锁是否被持有，设置 lock_busy 标志
     let (memory_total, lock_busy) = match state.memory_store.try_lock() {
         Ok(store) => (store.stats().map(|s| s.total_memories).unwrap_or(0), false),

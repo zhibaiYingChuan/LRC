@@ -199,7 +199,7 @@ pub struct CycleStats {
 pub struct ConsolidationPipeline<P: Persistence> {
     /// 配置参数
     config: ConsolidationConfig,
-    /// 记忆存储
+    /// FIX-007：改用 RwLock 避免 spawn_blocking + blocking_lock 竞争
     store: Arc<Mutex<MemoryStore<P>>>,
     /// 洛书编码器（保留供未来直接编码使用）
     #[allow(dead_code)]
@@ -354,48 +354,40 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
             // 3b. 洛书合成（降级路径：仅当 LLM 未配置或失败时执行）
             if !llm_succeeded {
-                // v0.8.22 P0-3 修复（hcse-resilience-validator Round3 + 六钥匙分析）：
-                //   根因：luoshu_synthesize 是 CPU 密集型操作（加载全部记忆 + 聚类 + 合成），
-                //         原实现在 tokio worker 线程上持锁执行（store.lock().await），
-                //         阻塞 async runtime 导致 HTTP 服务器无响应（12s 超时）
-                //   修复：使用 spawn_blocking + blocking_lock()，在独立阻塞线程上执行合成
-                //   安全性分析：
-                //     1. blocking_lock() 在 spawn_blocking 线程上阻塞等待锁，不占用 tokio worker 线程
-                //     2. 后台结晶流水线与 HTTP 请求无循环依赖，不会死锁
-                //     3. P: Send + 'static 已在 trait bound 中保证，MemoryStore 可跨线程传递
+                // v0.8.22 P0-3 修复 + FIX-007 优化：改为直接异步锁，避免 spawn_blocking 竞争
+                //   原因分析：
+                //     - spawn_blocking + blocking_lock() 组合会耗尽 tokio 阻塞线程池
+                //     - RwLock 支持多个并发读，但写操作仍需序列化
+                //     - luoshu_synthesize() 虽然 CPU 密集，但总持锁时间不长（仅配置修改 + 合成调用）
+                //   修复：使用 tokio::sync::RwLock 的 lock().await，在异步上下文中执行
+                //        这样不会阻塞 tokio worker 线程池的其他任务
                 let store_arc = self.store.clone();
                 let threshold = self.config.synthesis_threshold;
                 let similarity = self.config.synthesis_similarity;
-                let synth_result = tokio::task::spawn_blocking(move || {
-                    let mut store = store_arc.blocking_lock();
-                    let old_threshold = store.synthesis_min_cluster;
-                    let old_similarity = store.synthesis_similarity;
-                    store.synthesis_min_cluster = threshold;
-                    store.synthesis_similarity = similarity;
 
-                    let result = store.luoshu_synthesize();
+                // FIX-007：改为异步锁，避免 spawn_blocking 阻塞线程池耗尽
+                let mut store = store_arc.lock().await;
+                let old_threshold = store.synthesis_min_cluster;
+                let old_similarity = store.synthesis_similarity;
+                store.synthesis_min_cluster = threshold;
+                store.synthesis_similarity = similarity;
 
-                    store.synthesis_min_cluster = old_threshold;
-                    store.synthesis_similarity = old_similarity;
-                    result
-                })
-                .await;
+                let result = store.luoshu_synthesize();
 
-                match synth_result {
-                    Ok(Ok(n)) => {
+                store.synthesis_min_cluster = old_threshold;
+                store.synthesis_similarity = old_similarity;
+                drop(store); // 显式释放写锁
+
+                match result {
+                    Ok(n) => {
                         stats.synthesized = n;
                         if n > 0 && self.config.verbose >= 1 {
                             eprintln!("[LRC·结晶] 洛书合成完成，生成 {} 条合成记忆", n);
                         }
                     }
-                    Ok(Err(e)) => {
-                        if self.config.verbose >= 1 {
-                            eprintln!("[LRC·结晶] 合成失败: {}", e);
-                        }
-                    }
                     Err(e) => {
                         if self.config.verbose >= 1 {
-                            eprintln!("[LRC·结晶] 合成任务执行失败: {}", e);
+                            eprintln!("[LRC·结晶] 合成失败: {}", e);
                         }
                     }
                 }

@@ -233,10 +233,14 @@ pub struct MemoryStore<P: Persistence> {
     /// 自主记忆垃圾回收器：定期清理低质量、长期未用的记忆
     pub memory_gc: MemoryGarbageCollector,
     /// GC 延迟执行标记（质疑三：避免 GC 阻塞用户请求关键路径）
-    pub gc_pending: bool,
+    /// v0.8.48 P0 修复：改为 AtomicBool 解决竞态条件
+    /// 多个后台任务并发检查时，使用原子 CAS 操作确保 GC 恰好执行一次
+    pub gc_pending: std::sync::atomic::AtomicBool,
     /// v0.5.4 合成延迟执行标记：避免合成阻塞用户请求关键路径
     /// 写入记忆后设为 true，由后台健康检查或定时任务触发执行
-    pub synthesis_pending: bool,
+    /// v0.8.48 P0 修复：改为 AtomicBool 解决竞态条件
+    /// 多个后台任务并发检查时，使用原子 CAS 操作确保合成恰好执行一次
+    pub synthesis_pending: std::sync::atomic::AtomicBool,
     /// 审计追踪：记录系统所有自主行为（质疑五：透明度与信任）
     pub audit_trail: AuditTrail,
     /// 提示升级追踪器：防止 ActionHint 重复警告的"狼来了"效应（质疑一）
@@ -740,8 +744,8 @@ impl<P: Persistence> MemoryStore<P> {
             graph_store: None,
             user_feedback: UserFeedback::new(),
             memory_gc: MemoryGarbageCollector::default(),
-            gc_pending: false,
-            synthesis_pending: false, // v0.5.4 初始无待合成任务
+            gc_pending: std::sync::atomic::AtomicBool::new(false),
+            synthesis_pending: std::sync::atomic::AtomicBool::new(false), // v0.5.4 初始无待合成任务
             audit_trail: AuditTrail::new(),
             hint_escalation: HintEscalationTracker::new(),
             // 质疑五·终极：初始化复杂度预算
@@ -783,8 +787,8 @@ impl<P: Persistence> MemoryStore<P> {
             graph_store: None,
             user_feedback: UserFeedback::new(),
             memory_gc: MemoryGarbageCollector::default(),
-            gc_pending: false,
-            synthesis_pending: false, // v0.5.4 初始无待合成任务
+            gc_pending: std::sync::atomic::AtomicBool::new(false),
+            synthesis_pending: std::sync::atomic::AtomicBool::new(false), // v0.5.4 初始无待合成任务
             audit_trail: AuditTrail::new(),
             hint_escalation: HintEscalationTracker::new(),
             complexity_budget: {
@@ -1047,12 +1051,22 @@ impl<P: Persistence> MemoryStore<P> {
     /// 此方法设计为从健康检查、定时任务或后台线程中调用，
     /// 避免合成操作阻塞用户的记忆写入/检索请求。
     ///
+    /// v0.8.48 P0 修复：使用 AtomicBool + compare_exchange 确保
+    /// 多个后台任务并发调用时，合成恰好执行一次（Leader Election 模式）。
+    ///
     /// 返回合成的记忆数量，无待合成任务时返回 0。
     pub fn run_pending_synthesis(&mut self) -> Result<usize, PersistenceError> {
-        if !self.synthesis_pending {
+        // 原子 CAS：如果当前值为 true，设为 false 并返回 Ok(true) 表示"本线程获取执行权"
+        // 如果当前值已为 false，返回 Err(...) 表示"已有其他线程在执行或无需执行"
+        use std::sync::atomic::Ordering;
+        if self
+            .synthesis_pending
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            // 其他线程已获取执行权，或当前无待合成任务
             return Ok(0);
         }
-        self.synthesis_pending = false;
         self.luoshu_synthesize()
     }
 
@@ -1211,7 +1225,9 @@ impl<P: Persistence> MemoryStore<P> {
         // 质疑三核心修复：GC 不在 regulate 中同步执行，而是设置延迟标记。
         // 实际的 GC 工作在 run_gc_if_pending() 中由外部调度触发。
         if self.memory_gc.should_run() {
-            self.gc_pending = true;
+            // v0.8.48 P0 修复：原子写入，Release 语义确保此前的写操作对执行 GC 的线程可见
+            self.gc_pending
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         Some(action)
@@ -1327,6 +1343,9 @@ impl<P: Persistence> MemoryStore<P> {
     /// 质疑三核心方法：将 GC 工作从用户请求的关键路径中解耦。
     /// 当 `gc_pending` 为 true 时执行实际的垃圾回收周期。
     ///
+    /// v0.8.48 P0 修复：使用 AtomicBool + compare_exchange 确保
+    /// 多个后台任务并发调用时，GC 恰好执行一次。
+    ///
     /// 此方法设计为可从以下场景调用：
     ///   - 后台定时任务（低优先级周期调用）
     ///   - 系统空闲时主动调用
@@ -1334,11 +1353,17 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 返回 Some(stats) 表示本次执行了 GC，None 表示无需执行。
     pub fn run_gc_if_pending(&mut self) -> Option<GcStats> {
-        if !self.gc_pending {
+        // 原子 CAS：如果当前值为 true，设为 false 并返回 Ok(true) 表示"本线程获取执行权"
+        // 如果当前值已为 false，返回 Err(...) 表示"已有其他线程在执行或无需执行"
+        use std::sync::atomic::Ordering;
+        if self
+            .gc_pending
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            // 其他线程已获取 GC 执行权，或当前无待 GC 任务
             return None;
         }
-
-        self.gc_pending = false;
 
         // 阶段一：收集记忆快照（不可变借用 self）
         let start = std::time::Instant::now();
@@ -1655,7 +1680,9 @@ impl<P: Persistence> MemoryStore<P> {
 
         // v0.5.4 合成触发移出关键路径：标记待合成，由后台运行
         // 洛书合成基于几何分类和门控融合，替代 Jaccard 文本相似度聚类
-        self.synthesis_pending = true;
+        // v0.8.48 P0 修复：原子写入，Release 语义确保此前的写操作对执行合成的线程可见
+        self.synthesis_pending
+            .store(true, std::sync::atomic::Ordering::Release);
 
         // v0.5.4 写操作后标记缓存为脏
         self.invalidate_cache();
@@ -1720,7 +1747,9 @@ impl<P: Persistence> MemoryStore<P> {
         // v0.6.x 参赛修复：与单条 remember 路径保持一致，批量注入后同样标记待合成，
         // 使"完整 LRC"实验组（full_lrc）能真实运行演化（合成）机制，而非静默跳过。
         // 该标记仅置位，实际合成仍由后台健康检查执行，不阻塞本调用。
-        self.synthesis_pending = true;
+        // v0.8.48 P0 修复：原子写入，Release 语义确保此前的写操作对执行合成的线程可见
+        self.synthesis_pending
+            .store(true, std::sync::atomic::Ordering::Release);
 
         // v0.5.4 写操作后标记缓存为脏
         self.invalidate_cache();
@@ -1887,7 +1916,9 @@ impl<P: Persistence> MemoryStore<P> {
 
         // v0.5.4 检索后合成标记移出关键路径：由后台运行
         if memories.len() >= self.synthesis_min_cluster {
-            self.synthesis_pending = true;
+            // v0.8.48 P0 修复：原子写入，Release 语义确保此前的写操作对执行合成的线程可见
+            self.synthesis_pending
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         Ok(RecallResult {
@@ -2469,7 +2500,11 @@ impl<P: Persistence> MemoryStore<P> {
         );
 
         // v0.5.4 健康检查时运行待合成的任务（从关键路径移出）
-        if self.synthesis_pending {
+        // v0.8.48 P0 修复：原子读取，Acquire 语义确保读取到其他线程写入的完整状态
+        if self
+            .synthesis_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             match self.run_pending_synthesis() {
                 Ok(n) if n > 0 => {
                     eprintln!("[LRC·合成] 后台合成完成: {} 条新合成记忆", n);
@@ -2794,9 +2829,11 @@ impl<P: Persistence> MemoryStore<P> {
             audit_chain_valid,
             audit_persistence_enabled: self.audit_trail.has_persistence(),
             audit_seal_verified: self.audit_trail.seal_verified(),
-            gc_pending: self.gc_pending,
+            gc_pending: self.gc_pending.load(std::sync::atomic::Ordering::Relaxed),
             gc_last_run_ms: self.memory_gc.last_run_ms(),
-            synthesis_pending: self.synthesis_pending, // v0.5.4
+            synthesis_pending: self
+                .synthesis_pending
+                .load(std::sync::atomic::Ordering::Relaxed), // v0.5.4
             catastrophic_event_count,
             last_catastrophic_event,
             total_memories: total,
