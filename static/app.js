@@ -1376,6 +1376,10 @@ async function loadDashboard() {
     //   修复：增加 SidecarHealthMonitor._isReachable 检查，只有 sidecar 真正不可达时才更新状态栏
     if (!sidecarKnownReachable && !(typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor._isReachable)) {
       updateStatusBar(false, null);
+      // v0.8.48 修复：后端不可达时同步更新浮窗为降级状态，避免残留 "--"
+      if (typeof setDegradedStatusFloat === 'function') {
+        setDegradedStatusFloat('不可用');
+      }
     }
   } finally {
     // v0.8.3 Step 10：清理 AbortController 引用（仅当当前请求未被打断）
@@ -7709,8 +7713,18 @@ function dismissWelcome() {
 async function loadSysStatusFloat() {
   try {
     const res = await fetchWithTimeout(API_BASE + '/v1/health/system');
-    if (!res.ok) return;
+    if (!res.ok) {
+      // v0.8.48 修复：非 200 响应时显示降级状态而非保留 "--"
+      setDegradedStatusFloat();
+      return;
+    }
     const data = await res.json();
+
+    // v0.8.48 修复：lock_busy 降级时显示"后台合成中"而非保留 "--"
+    if (data.lock_busy) {
+      setDegradedStatusFloat('后台合成中');
+      return;
+    }
 
     // ML 模型状态
     const encoder = data.encoder || {};
@@ -7805,6 +7819,25 @@ async function loadSysStatusFloat() {
     // 静默失败：浮窗不影响主功能
     console.warn('[Loong Recall] 系统状态浮窗加载失败:', e.message);
   }
+}
+
+/**
+ * v0.8.48 新增：降级显示系统状态浮窗（避免保留 HTML 初始 "--"）
+ * 当后端不可达或 lock_busy 时，显示有意义的状态而非 "--"
+ * @param {string} [degradeText] 降级原因文案
+ */
+function setDegradedStatusFloat(degradeText) {
+  const encoderText = degradeText || '不可用';
+  const elIds = ['float-ml-model', 'float-encoder-type', 'float-cache-status', 'float-sys-mode', 'float-quality-score'];
+  for (const id of elIds) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.textContent = encoderText;
+      el.className = 'sys-status-value warning';
+    }
+  }
+  const qualityFill = document.getElementById('float-quality-fill');
+  if (qualityFill) qualityFill.style.width = '0%';
 }
 
 /**
