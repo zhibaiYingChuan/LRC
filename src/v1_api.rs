@@ -319,6 +319,8 @@ pub fn build_v1_router(
     llm_api: Arc<RwLock<LlmApiConfig>>,
     // v0.8.22 P0-1 修复：传入 LLM 配置状态的无锁缓存，便于 /v1/config/llm 更新时同步
     llm_configured_atomic: Arc<std::sync::atomic::AtomicBool>,
+    // v0.9.0: 开发模式标志，注入到 /health/system 响应中
+    dev_mode: bool,
 ) -> Router {
     let consolidate_store = store.clone();
     let enrich_store = store.clone();
@@ -714,6 +716,7 @@ pub fn build_v1_router(
             let store = metrics_store.clone();
             move || {
                 let store = store.clone();
+                let dv = dev_mode;
                 async move {
                     // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
                     // v0.8.22 P1-02：lock_busy 时返回降级数据而非 503
@@ -728,6 +731,7 @@ pub fn build_v1_router(
                                 "ok": true,
                                 "lock_busy": true,
                                 "degraded": true,
+                                "dev_mode": dv,
                                 "message": "记忆系统正在执行后台合成，数据稍后自动加载",
                                 "system_mode": "healthy",
                                 "system_mode_description": "后台合成中，数据稍后刷新",
@@ -782,6 +786,13 @@ pub fn build_v1_router(
                                 obj.insert("version".to_string(), serde_json::Value::String(
                                     env!("CARGO_PKG_VERSION").to_string()
                                 ));
+                                // v0.9.0：新增 dev_mode 标志（前端据此显示开发模式 UI）
+                                obj.insert("dev_mode".to_string(), serde_json::Value::Bool(dv));
+                                // v0.9.0：新增 consolidation 结晶状态（前端可观测结晶引擎）
+                                obj.insert("consolidation".to_string(), serde_json::json!({
+                                    "status": "active",
+                                    "supported": true
+                                }));
                             }
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(json))
                         }

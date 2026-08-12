@@ -2,6 +2,28 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.0] - 2026-08-12
+
+### 前后端数据流断层修复（"龙门"）
+
+**根因：** v0.8.48 桌面版安装后系统状态面板全线显示 `--`。
+
+**P0 修复：**
+- **catch 块降级更新**：`loadSysStatusFloat` 的 catch 块补充 `setDegradedStatusFloat()` 调用，sidecar 未启动时显示"不可用"而非 `--`
+- **Tauri 端口竞态**：`initSysStatusFloat` 在 Tauri 环境延迟首次加载至 2500ms，确保 IPC `get_sidecar_status` 完成后再发起 API 请求
+- **meta 端口同步**：新增 `_readSidecarPortFromMeta()` 从 `<meta name="lrc-sidecar-port">` 同步读取端口，消除异步 IPC 竞争
+
+**P1 修复：**
+- **renderDashboard 部分成功降级**：引入 `dashboardHealth` 对象追踪各数据源状态，system 成功但 dao_metrics 失败时记忆卡片正常显示、道同构度面板降级
+
+**P2 增强：**
+- **开发模式端口锁定**：新增 `--dev` CLI 标志，强制绑定端口 3111，跳过端口自适应
+- **结晶状态可观测**：`/v1/health/system` 新增 `consolidation` 字段
+
+**文档：**
+- 新增 `docs/审计报告_v0.8.48_前后端数据流断层.md`
+- 新增 `docs/修复计划_v0.9.0_龙门.md`
+
 ## [0.8.48] - 2026-08-11
 
 ### 版本升级 + 并发锁优化 + 全局架构修复

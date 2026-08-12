@@ -1,4 +1,4 @@
-﻿// 隐藏控制台窗口：后台进程不需要 CMD 窗口
+// 隐藏控制台窗口：后台进程不需要 CMD 窗口
 // MCP stdio 模式下 stdin/stdout 仍然可用，不受影响
 #![windows_subsystem = "windows"]
 
@@ -112,6 +112,7 @@ async fn try_run() -> Result<(), String> {
     let mut tray_mode = false; // --tray：启用系统托盘图标
     let mut export_path: Option<String> = None; // V2: --export 导出记忆
     let mut import_path: Option<String> = None; // V2: --import 导入记忆
+    let mut dev_mode = false; // v0.9.0: --dev 开发模式，端口锁定 3111
 
     // v0.6.0+ 参赛扩展：参照系实验 CLI 参数
     // 设计原则：默认启用所有功能（避免"无声失败"），由用户通过 flag 显式禁用
@@ -181,6 +182,20 @@ async fn try_run() -> Result<(), String> {
                     return Err("错误: --data-dir 需要指定路径\n\
                          用法: code-memory-server --data-dir ~/my-lrc-data"
                         .to_string());
+                }
+            }
+            "--dev" => {
+                // v0.9.0: 开发模式 — 端口锁定 3111，数据目录隔离
+                dev_mode = true;
+                if !port_explicitly_set {
+                    port = 3111;
+                }
+                if data_dir.is_none() {
+                    // 开发模式默认使用独立数据目录，防止污染生产数据
+                    let home = std::env::var("USERPROFILE")
+                        .or_else(|_| std::env::var("HOME"))
+                        .unwrap_or_else(|_| ".".to_string());
+                    data_dir = Some(format!("{}/.loong-recall/dev/data/", home));
                 }
             }
             "--llm-api" => {
@@ -782,6 +797,8 @@ async fn try_run() -> Result<(), String> {
         indexing_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         // 服务启动时间（用于 /health 端点计算 uptime）
         started_at: chrono::Utc::now(),
+        // v0.9.0: 开发模式标志
+        dev_mode,
     });
 
     // 启动时为当前项目创建/更新 meta.json（用于显示项目名而非指纹）
