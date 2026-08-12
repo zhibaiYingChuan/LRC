@@ -2,6 +2,31 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.48] - 2026-08-11
+
+### 版本升级 + 并发锁优化 + 全局架构修复
+
+**版本号升级：** 所有 6 个文件升级到 0.8.48（Cargo.toml、desktop/src-tauri/Cargo.toml、desktop/package.json、desktop/src-tauri/tauri.conf.json、static/app.js、static/index.html）。
+
+**并发锁优化：** 修复 AppState 中 RwLock→Mutex 类型不匹配（server.rs、v1_api.rs、consolidation.rs）。`dyn IndexedCodebase` 不满足 `Sync` 约束，统一改用 `Mutex`，消除编译错误。
+
+**竞态修复：** `synthesis_pending`/`gc_pending` 改为 `AtomicBool` CAS 操作（memory_store.rs），确保跨线程原子读写。
+
+**技术债清理：** 清理 competition/rust-src/ 重复代码（61 个 .rs 文件）。
+
+**安全：** security.yml 补齐 checks:write 权限。
+
+**前端：** 全局错误处理优化、Promise rejection 处理、Logo onerror 降级。
+
+**CI：** release.yml 版本号检查修复 — 移除 STATUS_VER 硬编码检查，统一从 Cargo.toml 读取版本号。
+
+**涉及文件：**
+- `Cargo.toml`、`desktop/src-tauri/Cargo.toml`、`desktop/package.json`、`desktop/src-tauri/tauri.conf.json`（版本号）
+- `src/server.rs`、`src/v1_api.rs`、`src/consolidation.rs`（并发锁）
+- `src/memory_store.rs`（AtomicBool 竞态修复）
+- `static/app.js`、`static/index.html`（前端 + 版本号）
+- `.github/workflows/release.yml`（版本号检查修复）
+
 ## [0.8.47] - 2026-08-10
 
 ### 修复：前端三个关键问题 + Security Audit CI 权限配置
