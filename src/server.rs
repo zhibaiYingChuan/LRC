@@ -1,4 +1,4 @@
-﻿// 许可证: Apache 2.0
+// 许可证: Apache 2.0
 //
 // MCP 协议服务端
 // ===============
@@ -245,6 +245,8 @@ pub struct AppState {
     pub indexing_complete: Arc<AtomicBool>,
     /// 服务启动时间（用于计算 uptime）
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// v0.9.0: 是否为开发模式（--dev CLI 标志）
+    pub dev_mode: bool,
 }
 
 // ==================== MCP 请求处理 ====================
@@ -3246,6 +3248,7 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         state.manager.clone(),
         state.llm_api.clone(),
         state.llm_configured_atomic.clone(),
+        state.dev_mode,
     )
     .into_service();
 
@@ -3410,6 +3413,7 @@ mod tests {
             llm_configured_atomic: Arc::new(AtomicBool::new(false)), // v0.8.22 P0-1: 无锁缓存
             indexing_complete: Arc::new(AtomicBool::new(true)),      // 测试环境默认索引已完成
             started_at: chrono::Utc::now(),
+            dev_mode: false,
         })
     }
 

@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.8.48';
+const APP_VERSION = '0.9.0';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -51,9 +51,25 @@ const isTauriEnv = (typeof window.__TAURI__ !== 'undefined') ||
     window.location.origin.includes('tauri.localhost') ||
     window.location.origin.startsWith('tauri://')
   ));
+// v0.9.0 P0 修复：优先从 <meta name="lrc-sidecar-port"> 标签同步读取端口
+// 桌面端在注入 HTML 前将 sidecar 实际端口写入 meta 标签，消除 IPC 竞态
+function _readSidecarPortFromMeta() {
+  try {
+    const meta = document.querySelector('meta[name="lrc-sidecar-port"]');
+    if (meta && meta.content) {
+      const port = parseInt(meta.content, 10);
+      if (port > 0 && port < 65536) {
+        console.log('[LRC] meta 标签发现 sidecar 端口: ' + port);
+        return port;
+      }
+    }
+  } catch (e) { /* 静默降级 */ }
+  return null;
+}
+const META_SIDECAR_PORT = _readSidecarPortFromMeta();
 const DEFAULT_API_BASE = isTauriEnv
-  ? 'http://127.0.0.1:3099'  // Tauri 环境：直连 sidecar（初始值，异步会通过 IPC 更新为实际端口）
-  : (window.location.origin || 'http://localhost:3099');  // 浏览器环境：同源访问
+  ? (META_SIDECAR_PORT ? `http://127.0.0.1:${META_SIDECAR_PORT}` : 'http://127.0.0.1:3099')
+  : (window.location.origin || 'http://localhost:3099');
 // v0.6.0 P0-1 修复：Tauri 环境下 sidecar 可能端口自适应到非 3099，需改为 let 以便异步更新
 let API_BASE = new URLSearchParams(window.location.search).get('api') || DEFAULT_API_BASE;
 const REFRESH_INTERVAL = 30000; // 30 秒自动刷新
@@ -1367,6 +1383,11 @@ async function loadDashboard() {
           + 'border:none;border-radius:4px;cursor:pointer;font-size:13px;">关闭</button>';
       }
       error.classList.add('show');
+      // v0.9.0 修复：全部失败时更新统计卡片为"不可用"，避免残留 "--"
+      ['stat-total', 'stat-active', 'stat-crystallized', 'stat-today'].forEach(function(id) {
+        var el = document.getElementById(id);
+        if (el) el.textContent = '不可用';
+      });
     }
     // v0.8.12：仅在 sidecar 确实不可达时才更新状态栏为"已停止"
     // 避免 sidecar 已启动但数据加载失败时覆盖"运行中"状态
@@ -1526,6 +1547,15 @@ function scheduleLockBusyRetry() {
 window.scheduleLockBusyRetry = scheduleLockBusyRetry;
 
 function renderDashboard(system, detailed, dao) {
+  // v0.9.0 新增：数据源健康状态追踪（逐面板降级，非全有或全无）
+  const health = {
+    system: system !== null && system !== undefined,
+    detailed: detailed !== null && detailed !== undefined,
+    dao: dao !== null && dao !== undefined,
+  };
+  health.allOk = health.system && health.detailed && health.dao;
+  health.allFailed = !health.system && !health.dao;
+
   // v0.8.23 S1-UX-01 修复：数据加载成功时移除降级视觉模式
   document.body.classList.remove('degraded-mode');
   // v0.8.45 修复：lock_busy 降级数据不再跳过渲染，改为渲染降级 UI
@@ -1594,9 +1624,12 @@ function renderDashboard(system, detailed, dao) {
   const sysMode = $('sys-mode');
 
   // 服务状态：基于 dao_isomorphism_score 判断
-  const daoScore = daoMetrics.dao_isomorphism_score ?? 0;
+  // v0.9.0 修复：dao 数据不可用时显示"部分不可用"而非误导性的健康评分
+  const daoScore = health.dao ? (daoMetrics.dao_isomorphism_score ?? 0) : null;
   if (sysHealthStatus) {
-    if (daoScore >= 0.5) {
+    if (daoScore === null) {
+      sysHealthStatus.innerHTML = '<span class="badge warning">⚠ 部分数据暂不可用</span>';
+    } else if (daoScore >= 0.5) {
       sysHealthStatus.innerHTML = '<span class="badge healthy">✓ 正常运行</span>';
     } else if (daoScore >= 0.3) {
       sysHealthStatus.innerHTML = '<span class="badge warning">⚠ 需关注</span>';
@@ -7816,8 +7849,9 @@ async function loadSysStatusFloat() {
       qualityFill.style.width = (qualityScore * 100) + '%';
     }
   } catch (e) {
-    // 静默失败：浮窗不影响主功能
+    // v0.9.0 P0 修复：网络不可达时更新 DOM 为降级状态，避免保留 HTML 初始 "--"
     console.warn('[Loong Recall] 系统状态浮窗加载失败:', e.message);
+    setDegradedStatusFloat();
   }
 }
 
@@ -7879,8 +7913,11 @@ function initSysStatusFloat() {
     // 忽略 localStorage 错误
   }
 
-  // 首次加载
-  setTimeout(loadSysStatusFloat, 600);
+  // v0.9.0 P0 修复：Tauri 环境下延迟首次加载，确保 IPC 端口发现已完成
+  // 根因：600ms 不足以让 IPC get_sidecar_status 返回，导致 API_BASE 仍为默认 3099
+  // 如果 sidecar 实际在非 3099 端口，首次加载全部失败，所有字段保留 "--"
+  const initialDelay = isTauriEnv ? 2500 : 600;
+  setTimeout(loadSysStatusFloat, initialDelay);
 
   // 定时刷新（每 30 秒）
   setInterval(loadSysStatusFloat, 30000);
