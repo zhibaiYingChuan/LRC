@@ -720,16 +720,49 @@ pub fn build_v1_router(
                     let mut store = match store.try_lock() {
                         Ok(guard) => guard,
                         Err(_) => {
-                            // v0.8.22 P3-NEW-06 修复：memory_count/total_nodes/total_edges 改为 null，
-                            //   避免外部 API 消费者将 0 误认为"系统无记忆"。
+                            // v0.8.48 修复：lock_busy 降级时返回完整的系统状态框架
+                            //   前端会在 loadDashboard 中检测 lock_busy 并渲染降级数据
+                            //   系统浮窗需要 encoder / system_mode / memory_stats 字段，
+                            //   不能返回 null，否则前端显示 "--"
                             return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                                 "ok": true,
                                 "lock_busy": true,
                                 "degraded": true,
                                 "message": "记忆系统正在执行后台合成，数据稍后自动加载",
-                                "memory_count": null,
-                                "total_nodes": null,
-                                "total_edges": null
+                                "system_mode": "healthy",
+                                "system_mode_description": "后台合成中，数据稍后刷新",
+                                "encoder": {
+                                    "mode": "statistical",
+                                    "model_name": null,
+                                    "hidden_size": null,
+                                    "degradation_reason": "系统合成中",
+                                    "total_encodings": 0,
+                                    "last_encoding_ms": 0,
+                                    "capability_description": "系统合成中",
+                                    "quality_score": 0.0
+                                },
+                                "memory_stats": {
+                                    "total_memories": 0,
+                                    "active_memories": 0,
+                                    "synthesis_memories": 0,
+                                    "expired_memories": 0,
+                                    "low_quality_synthesis": 0,
+                                    "bagua_distribution": [0, 0, 0, 0, 0, 0, 0, 0]
+                                },
+                                "dao_metrics": {
+                                    "active_memories": 0,
+                                    "crystallized_memories": 0,
+                                    "archived_memories": 0,
+                                    "encodings_total": 0,
+                                    "compositions_total": 0,
+                                    "recalls_total": 0,
+                                    "corrections_total": 0,
+                                    "yin_yang_balance": 0.0,
+                                    "luoshu_deviation": 0.0,
+                                    "bagua_balance": 0.0,
+                                    "synthesis_ratio": 0.0,
+                                    "dao_isomorphism_score": 0.0
+                                }
                             })));
                         }
                     };
