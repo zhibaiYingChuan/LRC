@@ -161,33 +161,48 @@ impl LrcConfig {
     /// Windows: `%APPDATA%\LoongRecall\config.json`
     /// Linux: `~/.config/LoongRecall/config.json`
     /// macOS: `~/Library/Application Support/LoongRecall/config.json`
+    /// v0.9.0 开发模式隔离：开发模式下使用 `dev/config.json`
     pub fn get_config_path() -> io::Result<PathBuf> {
         #[cfg(windows)]
         {
             let app_data = std::env::var("APPDATA")
                 .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "APPDATA not found"))?;
-            Ok(Path::new(&app_data).join("LoongRecall").join("config.json"))
+            let base = Path::new(&app_data).join("LoongRecall");
+            let is_dev = std::env::var("LRC_DEV_MODE").is_ok();
+            if is_dev {
+                Ok(base.join("dev").join("config.json"))
+            } else {
+                Ok(base.join("config.json"))
+            }
         }
 
         #[cfg(target_os = "linux")]
         {
             let home = std::env::var("HOME")
                 .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME not found"))?;
-            Ok(Path::new(&home)
-                .join(".config")
-                .join("LoongRecall")
-                .join("config.json"))
+            let base = Path::new(&home).join(".config").join("LoongRecall");
+            let is_dev = std::env::var("LRC_DEV_MODE").is_ok();
+            if is_dev {
+                Ok(base.join("dev").join("config.json"))
+            } else {
+                Ok(base.join("config.json"))
+            }
         }
 
         #[cfg(target_os = "macos")]
         {
             let home = std::env::var("HOME")
                 .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME not found"))?;
-            Ok(Path::new(&home)
+            let base = Path::new(&home)
                 .join("Library")
                 .join("Application Support")
-                .join("LoongRecall")
-                .join("config.json"))
+                .join("LoongRecall");
+            let is_dev = std::env::var("LRC_DEV_MODE").is_ok();
+            if is_dev {
+                Ok(base.join("dev").join("config.json"))
+            } else {
+                Ok(base.join("config.json"))
+            }
         }
 
         #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]

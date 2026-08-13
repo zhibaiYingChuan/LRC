@@ -20,9 +20,16 @@
 - **开发模式端口锁定**：新增 `--dev` CLI 标志，强制绑定端口 3111，跳过端口自适应
 - **结晶状态可观测**：`/v1/health/system` 新增 `consolidation` 字段
 
+**产品健康状态修复（用户生命周期审计）：**
+- **P0-2 审计追踪接线**：`memory_store.rs` 新增 `record_audit()` 辅助方法，GC 清理记录 `GcCleanup`、结晶合成记录 `SynthesisCreated`，修复审计追踪「已存在但未接线」（`audit_trail.record()` 从未被业务代码调用）
+- **P1-1 前端仪表盘可见性**：`app.js` 基于向导完成状态（`setup_complete`）条件隐藏「5分钟快速体验」向导卡片，老用户直达仪表盘、首次用户保留引导
+- **P2-1 八卦均衡度公式**：`v1_api.rs` 修正 `bagua_balance` 派生公式方向颠倒（`(1.0-entropy)*100` → `(entropy/3.0)*100`）
+- **server 后台退出**：`process_guard.rs` 修正 `wait_for_shutdown_signal()` 在无控制台环境 ctrl_c 失败即退出、触发 `select!` 关闭分支的问题
+- **审计前端字段名映射**：`app.js` 修正演化时间线 `event.type`→`event_type`、`timestamp`→`timestamp_ms`，结晶历史 `data.entries`→`data.events`
+- **稳定版端口注入**：`release.yml` 桌面端构建前替换 meta 端口 3111→3099；`package.json` dev 脚本改用 `cross-env` 跨平台
+
 **文档：**
-- 新增 `docs/审计报告_v0.8.48_前后端数据流断层.md`
-- 新增 `docs/修复计划_v0.9.0_龙门.md`
+- 新增 `docs/DEV_ISOLATION_SPEC.md`（开发/稳定版隔离规范）
 
 ## [0.8.48] - 2026-08-11
 

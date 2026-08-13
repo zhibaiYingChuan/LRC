@@ -2252,17 +2252,25 @@ fn save_llm_to_config(llm_api: Option<&str>) -> Result<(), String> {
     cfg.save()
 }
 
-/// v0.5.5 新增：同步保存 LLM 配置到 wizard.json
+/// v0.9.0 开发模式隔离：获取正确的 wizard.json 路径
 ///
+/// 开发模式下使用 %APPDATA%\LoongRecall\dev\wizard.json，与稳定版完全隔离。
+fn wizard_json_path() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var("APPDATA").ok()?;
+    let loong_dir = std::path::PathBuf::from(appdata).join("LoongRecall");
+    let is_dev = std::env::var("LRC_DEV_MODE").is_ok();
+    let path = if is_dev {
+        loong_dir.join("dev").join("wizard.json")
+    } else {
+        loong_dir.join("wizard.json")
+    };
+    Some(path)
+}
+
 /// 仪表盘修改 LLM 配置后，同步到 wizard.json，确保桌面端和仪表盘配置一致。
-/// wizard.json 路径：%APPDATA%\LoongRecall\wizard.json
 /// API Key 使用 AES-256-GCM 加密存储（与桌面端一致）。
 fn save_llm_to_wizard_json(llm_api: &str) -> Result<(), String> {
-    let appdata =
-        std::env::var("APPDATA").map_err(|e| format!("读取 APPDATA 环境变量失败: {}", e))?;
-    let wizard_path = std::path::PathBuf::from(&appdata)
-        .join("LoongRecall")
-        .join("wizard.json");
+    let wizard_path = wizard_json_path().ok_or_else(|| "读取 APPDATA 环境变量失败".to_string())?;
 
     // 读取现有 wizard.json（如果存在），保留非 LLM 字段
     let mut wizard: serde_json::Value = if wizard_path.exists() {

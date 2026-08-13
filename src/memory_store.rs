@@ -40,7 +40,7 @@
 //   - 系统健康异常 → 查看 DaoRegulator 的调节历史 + DaoMetrics 快照
 // ============================================================
 
-use crate::engine::audit_trail::AuditTrail;
+use crate::engine::audit_trail::{AuditEventType, AuditTrail};
 use crate::engine::complexity_budget::ComplexityBudget;
 use crate::engine::dao_metrics::DaoMetrics;
 use crate::engine::dao_regulator::{DaoRegulator, RegulationAction};
@@ -1009,6 +1009,13 @@ impl<P: Persistence> MemoryStore<P> {
                     ..Default::default()
                 }),
             );
+            // 记录审计：结晶流水线合成创建记忆（系统自主行为）
+            self.record_audit(
+                AuditEventType::SynthesisCreated,
+                format!("洛书合成创建 {} 条合成记忆", luoshu_result),
+                "结晶流水线检测到相似记忆簇，自动合成新记忆",
+                Vec::new(),
+            );
             return Ok(luoshu_result);
         }
 
@@ -1024,6 +1031,13 @@ impl<P: Persistence> MemoryStore<P> {
             eprintln!(
                 "[LRC] 洛书合成未触发（可能因 ML 编码器降级），回退到 Jaccard 合成：{} 条",
                 jaccard_result
+            );
+            // 记录审计：Jaccard 降级合成创建记忆（系统自主行为）
+            self.record_audit(
+                AuditEventType::SynthesisCreated,
+                format!("Jaccard 降级合成创建 {} 条合成记忆", jaccard_result),
+                "洛书合成未触发（可能因 ML 编码器降级），回退到 Jaccard 文本相似度合成",
+                Vec::new(),
             );
         }
 
@@ -1337,6 +1351,26 @@ impl<P: Persistence> MemoryStore<P> {
         self.user_feedback.get_implicit_quality_adjustments()
     }
 
+    /// 记录审计事件（封装 audit_trail.record()，降低各调用点的重复代码）
+    ///
+    /// 用于系统自主行为（GC 清理、合成、调节等）的可回溯审计。
+    /// 事件通过哈希链防篡改，并异步持久化到审计日志文件。
+    fn record_audit(
+        &mut self,
+        event_type: AuditEventType,
+        description: impl Into<String>,
+        reason: impl Into<String>,
+        affected_memory_ids: Vec<String>,
+    ) {
+        self.audit_trail.record(
+            event_type,
+            description.into(),
+            reason.into(),
+            affected_memory_ids,
+            std::collections::HashMap::new(),
+        );
+    }
+
     /// 道枢映射: 兑卦·泽 (☱) — 说以利贞，GC调度如泽水之自然净化
     /// 执行延迟的垃圾回收（质疑三：异步 GC）
     ///
@@ -1376,6 +1410,18 @@ impl<P: Persistence> MemoryStore<P> {
         // 阶段三：执行删除（可变借用 self.persistence）
         for id in &to_delete {
             let _ = self.persistence.delete_memory(id);
+        }
+        // 记录审计：GC 垃圾回收（系统自主行为，需可回溯）
+        if !to_delete.is_empty() {
+            self.record_audit(
+                AuditEventType::GcCleanup,
+                format!("GC 垃圾回收清理 {} 条记忆", to_delete.len()),
+                format!(
+                    "累计回收 {} 条，最近移除 {} 条",
+                    gc_stats.total_freed, gc_stats.last_removed_count
+                ),
+                to_delete.clone(),
+            );
         }
         // v0.5.4 写操作后标记缓存为脏
         if !to_delete.is_empty() {
@@ -3630,6 +3676,50 @@ mod tests {
             .iter()
             .any(|m| m.memory_type == MemoryType::Synthesis);
         assert!(has_synthesis, "应包含合成记忆");
+    }
+
+    /// v0.9.0 Fix-02 验证：结晶合成时记录审计事件（SynthesisCreated）
+    #[test]
+    fn test_audit_trail_records_synthesis() {
+        let (_dir, mut store) = make_store_with_threshold(0.9);
+
+        // 写入 3 条相似记忆触发合成
+        store
+            .remember(make_test_memory(
+                "项目使用 PostgreSQL 数据库",
+                MemoryType::Fact,
+            ))
+            .expect("应成功记住");
+        store
+            .remember(make_test_memory(
+                "项目数据库连接使用 PostgreSQL",
+                MemoryType::Fact,
+            ))
+            .expect("应成功记住");
+        store
+            .remember(make_test_memory(
+                "PostgreSQL 是项目的主数据库",
+                MemoryType::Fact,
+            ))
+            .expect("应成功记住");
+
+        // 触发合成
+        store.run_pending_synthesis().expect("合成应成功");
+
+        // 验证审计事件已记录（total_count > 0）
+        let count = store.audit_trail.total_count();
+        assert!(count > 0, "合成后审计事件数应 > 0，实际: {}", count);
+
+        // 验证事件类型为 SynthesisCreated
+        let query = crate::engine::audit_trail::AuditQuery {
+            from_ms: None,
+            to_ms: None,
+            event_types: Some(vec![AuditEventType::SynthesisCreated]),
+            memory_id: None,
+            limit: None,
+        };
+        let events = store.audit_trail.query(&query);
+        assert!(!events.is_empty(), "应包含 SynthesisCreated 审计事件");
     }
 
     /// 验证：洛书合成基于 MirrorProject 分类，不同八卦类别的记忆不触发合成

@@ -416,10 +416,18 @@ impl WizardState {
         Ok(())
     }
 
+    /// 检测是否处于开发模式
+    ///
+    /// 开发模式下使用独立的配置文件路径，与稳定版完全隔离。
+    fn is_dev_mode() -> bool {
+        std::env::var("TAURI_DEV").is_ok() || std::env::var("LRC_DEV_MODE").is_ok()
+    }
+
     /// 配置存储路径
     ///
     /// M-14 修复：APPDATA 未设置时使用 dirs crate 回退，而非当前目录（安全风险）。
     /// 优先级：APPDATA 环境变量 → dirs::config_dir() → dirs::data_dir() → 错误
+    /// v0.9.0：开发模式使用独立路径 %APPDATA%\LoongRecall\dev\wizard.json，与稳定版完全隔离
     fn config_path() -> Result<PathBuf, String> {
         // 优先使用 APPDATA 环境变量（保持向后兼容）
         let base_dir = if let Ok(appdata) = std::env::var("APPDATA") {
@@ -442,7 +450,16 @@ impl WizardState {
             })?
         };
 
-        Ok(base_dir.join("LoongRecall").join("wizard.json"))
+        // v0.9.0 开发模式隔离：使用独立配置文件，不与稳定版共享
+        let loong_dir = base_dir.join("LoongRecall");
+        let path = if Self::is_dev_mode() {
+            let dev_path = loong_dir.join("dev").join("wizard.json");
+            tracing::info!("[开发模式] 向导配置路径: {}", dev_path.display());
+            dev_path
+        } else {
+            loong_dir.join("wizard.json")
+        };
+        Ok(path)
     }
 
     /// 持久化到磁盘

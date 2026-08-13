@@ -260,8 +260,14 @@ impl DataDir {
     /// 获取全局锁文件路径（V2 移至根目录）
     ///
     /// 锁文件路径：~/.loong-recall/.lrc.lock
+    /// v0.9.0 开发模式隔离：开发模式下使用独立的锁文件 .lrc-dev.lock
     pub fn global_lock_path(&self) -> PathBuf {
-        self.root.join(".lrc.lock")
+        let is_dev = std::env::var("LRC_DEV_MODE").is_ok();
+        if is_dev {
+            self.root.join(".lrc-dev.lock")
+        } else {
+            self.root.join(".lrc.lock")
+        }
     }
 
     /// 获取项目级锁文件路径（向后兼容旧版）

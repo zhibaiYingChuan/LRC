@@ -187,9 +187,10 @@ async fn try_run() -> Result<(), String> {
             "--dev" => {
                 // v0.9.0: 开发模式 — 端口锁定 3111，数据目录隔离
                 dev_mode = true;
-                if !port_explicitly_set {
-                    port = 3111;
-                }
+                port = 3111;
+                port_explicitly_set = true; // 防止 saved_config 覆盖
+                                            // 设置环境变量，供 downstream 代码（如 wizard.json 路径）识别开发模式
+                std::env::set_var("LRC_DEV_MODE", "1");
                 if data_dir.is_none() {
                     // 开发模式默认使用独立数据目录，防止污染生产数据
                     let home = std::env::var("USERPROFILE")
@@ -462,7 +463,12 @@ async fn try_run() -> Result<(), String> {
 
     // 处理 --install-ide 命令（自动配置 IDE 的 MCP 连接）
     // V2: 支持逗号分隔多 IDE
+    // v0.9.0 开发模式隔离：开发模式下禁止安装 IDE 配置（避免修改稳定版用户的全局 IDE 配置）
     if let Some(ref ide) = install_ide {
+        if dev_mode {
+            eprintln!("[开发模式] --install-ide 被拒绝：开发模式下禁止修改全局 IDE 配置。请使用稳定版二进制执行此操作。");
+            return Err("开发模式下不允许安装 IDE 配置（避免修改稳定版用户的全局 IDE 配置）。请使用稳定版二进制执行 --install-ide。".to_string());
+        }
         let ides: Vec<&str> = ide
             .split(',')
             .map(|s| s.trim())
@@ -1008,11 +1014,15 @@ async fn try_run() -> Result<(), String> {
 ///   - openai: "openai:{api_key}:{model}:{base_url}"
 ///   - ollama: "ollama:{model}:{host}"
 fn load_llm_from_wizard_json() -> Option<String> {
-    // wizard.json 路径：%APPDATA%\LoongRecall\wizard.json
+    // v0.9.0 开发模式隔离：使用独立的 wizard.json 路径
     let appdata = std::env::var("APPDATA").ok()?;
-    let wizard_path = std::path::PathBuf::from(appdata)
-        .join("LoongRecall")
-        .join("wizard.json");
+    let loong_dir = std::path::PathBuf::from(appdata).join("LoongRecall");
+    let is_dev = std::env::var("LRC_DEV_MODE").is_ok();
+    let wizard_path = if is_dev {
+        loong_dir.join("dev").join("wizard.json")
+    } else {
+        loong_dir.join("wizard.json")
+    };
 
     if !wizard_path.exists() {
         return None;

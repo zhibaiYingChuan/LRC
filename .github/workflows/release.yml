@@ -757,6 +757,19 @@ jobs:
             libssl-dev
         shell: bash
 
+      # 步骤 3.5: 稳定版端口替换 — 将 meta 标签的 3111 替换为 3099
+      # v0.9.0 修复：index.html 的 meta 标签默认 3111（开发版），
+      # 稳定版打包前必须替换为 3099，否则稳定版前端 fallback 端口错误
+      - name: Replace sidecar port meta (3111 → 3099)
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            sed -i '' 's/content="3111"/content="3099"/g' static/index.html
+          else
+            sed -i 's/content="3111"/content="3099"/g' static/index.html
+          fi
+          echo "已替换 meta 端口为 3099（稳定版）"
+        shell: bash
+
       # 步骤 4: 构建 Tauri 桌面端安装包
       # sidecar 已手动复制，build.rs 会检测到哈希一致并跳过复制
       # v0.8.34 修复：Windows 上 harden-runner 阻止 OCSP 证书吊销检查，需禁用 SSL 吊销检查
