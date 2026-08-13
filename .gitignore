@@ -304,3 +304,18 @@ grill-state.json
 docs/HCSE_RESILIENCE_AUDIT_REPORT_L6.md
 docs/SESSION_*.md
 docs/hcse_resilience_v0.8.42.md
+
+# v0.9.0 发布清理：中文开发过程文档（不交付用户）
+docs/修复计划_*.md
+docs/审计报告_*.md
+docs/*_优化计划*.md
+docs/*_专项报告.md
+docs/HCSE_RESILIENCE_AUDIT*.md
+docs/hcse_resilience_*.md
+docs/v0.*_optimization_plan*.md
+docs/*专项报告*.md
+docs/*并发安全*.md
+
+# v0.9.0 发布清理：本地测试/临时目录（不交付用户）
+temp/
+tmp/

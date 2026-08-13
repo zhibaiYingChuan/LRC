@@ -39,6 +39,15 @@ async fn get_llm_api_from_wizard(store: &State<'_, AppStore>) -> Option<String> 
 /// 注意：此函数不持有 sidecar 锁，避免锁持有时间过长（M-3/M-4 修复的一部分）。
 /// project_key 用于日志标识，传入 None 表示默认项目。
 async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key: Option<&str>) {
+    // v0.9.0 开发模式隔离：开发模式下严禁修改用户的 MCP 配置和 IDE 规则文件
+    // 这些操作会触达稳定版用户的全局配置文件，导致端口被意外切换
+    if is_dev_mode() {
+        tracing::info!(
+            "[开发模式] 跳过 MCP 自动升级和 IDE 规则写入（避免触碰稳定版用户配置）"
+        );
+        return;
+    }
+
     // v0.5.5：自动检测并升级旧版本 MCP 配置
     // v0.5.6：规则文件改为全局级，不再依赖 project_dir
     let project_dir = {
@@ -514,7 +523,7 @@ fn is_dev_mode() -> bool {
 /// 获取开发模式的端口（如果处于开发模式且未指定端口）
 fn dev_mode_port(requested_port: Option<u16>) -> u16 {
     if is_dev_mode() && requested_port.is_none() {
-        3100
+        3111
     } else {
         requested_port.unwrap_or(crate::sidecar_manager::DEFAULT_SIDECAR_PORT)
     }
@@ -1541,6 +1550,14 @@ pub async fn configure_agents(
     agent_ids: Vec<String>,
     port: u16,
 ) -> Result<Vec<String>, String> {
+    // v0.9.0 开发模式隔离：开发模式下禁止修改用户的全局 MCP 配置和 IDE 规则文件
+    if is_dev_mode() {
+        tracing::warn!(
+            "[开发模式] configure_agents 被调用但被拒绝（避免触碰稳定版用户配置）"
+        );
+        return Err("开发模式下不允许配置 Agent（避免修改稳定版用户的全局 IDE 配置）。请使用稳定版桌面端进行配置。".to_string());
+    }
+
     // L3 运行时保护：速率限制检查
     {
         let mut limiter = store.rate_limiter.lock().await;
@@ -1985,7 +2002,9 @@ pub async fn open_dashboard_window(
     app: tauri::AppHandle,
     store: State<'_, AppStore>,
 ) -> Result<(), String> {
-    let port = store.sidecar_port.lock().await.unwrap_or(3099);
+    // v0.9.0 开发模式隔离：开发模式默认端口 3111
+    let dev_default = if is_dev_mode() { 3111 } else { 3099 };
+    let port = store.sidecar_port.lock().await.unwrap_or(dev_default);
     show_dashboard_in_main_window(&app, port, false)
 }
 
@@ -1999,7 +2018,9 @@ pub async fn navigate_main_to_dashboard(
     app: tauri::AppHandle,
     store: State<'_, AppStore>,
 ) -> Result<(), String> {
-    let port = store.sidecar_port.lock().await.unwrap_or(3099);
+    // v0.9.0 开发模式隔离：开发模式默认端口 3111
+    let dev_default = if is_dev_mode() { 3111 } else { 3099 };
+    let port = store.sidecar_port.lock().await.unwrap_or(dev_default);
     show_dashboard_in_main_window(&app, port, true)
 }
 
@@ -2091,7 +2112,8 @@ pub async fn switch_project(
     // v0.5.6 修复：切换项目后，确保全局 IDE 规则文件存在
     // v0.5.11 修复：改为为所有已安装的 AI 工具写入规则（与 post_sidecar_start 一致）
     // v0.8.25 CODE-04 修复：添加 10s 超时保护
-    {
+    // v0.9.0 开发模式隔离：开发模式下跳过规则写入（避免触碰稳定版用户配置）
+    if !is_dev_mode() {
         let installed_agent_ids = {
             let registry = store.agent_registry.lock().await;
             registry

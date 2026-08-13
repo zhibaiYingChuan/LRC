@@ -187,7 +187,7 @@ pub struct CorrectResponse {
 /// 字段说明：
 ///   - yin_yang_balance: 阴阳守恒度（0-100），派生自 dao_isomorphism_score * 100
 ///   - luoshu_deviation: 洛书偏差（0-100），派生自 (1 - dao_isomorphism_score) * 100
-///   - bagua_balance: 八卦均衡度（0-100），派生自 (1 - bagua_entropy) * 100
+///   - bagua_balance: 八卦均衡度（0-100），派生自 (bagua_entropy / 3.0) * 100（熵越大越均匀）
 ///   - synthesis_ratio: 合成比率（0-100 百分比），原始值 * 100
 #[derive(Debug, Serialize)]
 pub struct DaoMetricsData {
@@ -665,7 +665,7 @@ pub fn build_v1_router(
                             // v0.8.1：派生前端友好字段（0-100 区间）
                             let yin_yang_balance = snapshot.dao_isomorphism_score * 100.0;
                             let luoshu_deviation = (1.0 - snapshot.dao_isomorphism_score) * 100.0;
-                            let bagua_balance = (1.0 - snapshot.bagua_entropy) * 100.0;
+                            let bagua_balance = (snapshot.bagua_entropy / 3.0) * 100.0;
                             let synthesis_ratio_pct = snapshot.synthesis_ratio * 100.0;
 
                             // v0.8.22 P1-02 类型修复：lock_busy 路径返回 serde_json::Value，

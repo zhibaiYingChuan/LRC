@@ -37,17 +37,24 @@ fn main() {
     // ════════════════════════════════════════════════════════════════
     #[cfg(target_os = "windows")]
     {
+        // 检测是否处于开发模式（TAURI_DEV 由 cargo tauri dev 自动设置，LRC_DEV_MODE 供手动设置）
+        let is_dev = std::env::var("TAURI_DEV").is_ok() || std::env::var("LRC_DEV_MODE").is_ok();
+        // v0.9.0 开发模式隔离：开发模式 CDP 端口 9231，稳定版 9230
+        let cdp_port = if is_dev { "9231" } else { "9230" };
         // 读取现有环境变量（避免覆盖其他已有参数）
         let existing = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").unwrap_or_default();
-        // CDP 参数：绑定 127.0.0.1 + 端口 9230 + 允许所有 Origin 连接（开发/测试用）
-        let cdp_args = "--remote-debugging-address=127.0.0.1 --remote-debugging-port=9230 --remote-allow-origins=*";
+        // CDP 参数：绑定 127.0.0.1 + 端口 + 允许所有 Origin 连接（开发/测试用）
+        let cdp_args = format!(
+            "--remote-debugging-address=127.0.0.1 --remote-debugging-port={} --remote-allow-origins=*",
+            cdp_port
+        );
         let combined = if existing.trim().is_empty() {
-            cdp_args.to_string()
+            cdp_args
         } else {
             format!("{} {}", existing.trim(), cdp_args)
         };
         // 先记录日志（防止后续 move 后无法引用）
-        tracing::info!("[CDP 调试] WebView2 环境变量已设置: {}", &combined);
+        tracing::info!("[CDP 调试] WebView2 环境变量已设置 (端口: {}): {}", cdp_port, &combined);
         std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", combined);
     }
 
@@ -259,29 +266,57 @@ fn main() {
                         // 关联函数调用，不持有 sidecar 锁，不会阻塞 start_sidecar 等命令
                         let probed = SidecarManager::probe_existing_sidecar().await;
                         if !probed.is_empty() {
-                            // 短暂获取 sidecar_port 锁存储结果
-                            {
-                                let mut sidecar_port = state.sidecar_port.lock().await;
-                                *sidecar_port = Some(probed[0].port);
-                            }
-                            tracing::info!(
-                                "启动时探测：检测到外部 sidecar，端口 {}，项目 {}",
-                                probed[0].port,
-                                if probed[0].src_dir.is_empty() {
-                                    "unknown"
+                            // v0.9.0 开发模式隔离：优先选择开发端口 3111，避免意外连接稳定版
+                            let is_dev_mode = std::env::var("TAURI_DEV").is_ok()
+                                || std::env::var("LRC_DEV_MODE").is_ok();
+                            if is_dev_mode {
+                                // 开发模式：优先选 3111（开发端口），找不到则跳过（禁止回退到稳定版 3099）
+                                if let Some(dev_sidecar) = probed.iter().find(|p| p.port == 3111) {
+                                    let mut sidecar_port = state.sidecar_port.lock().await;
+                                    *sidecar_port = Some(dev_sidecar.port);
+                                    tracing::info!(
+                                        "启动时探测：检测到外部 sidecar，端口 {}，项目 {} [开发模式]",
+                                        dev_sidecar.port,
+                                        if dev_sidecar.src_dir.is_empty() { "unknown" } else { &dev_sidecar.src_dir }
+                                    );
+                                    let _ = monitor_handle.emit(
+                                        "sidecar-detected",
+                                        serde_json::json!({
+                                            "port": dev_sidecar.port,
+                                            "src_dir": dev_sidecar.src_dir,
+                                            "message": "检测到已运行的 LRC 服务"
+                                        }),
+                                    );
                                 } else {
-                                    &probed[0].src_dir
+                                    tracing::warn!(
+                                        "[开发模式] 未找到 3111 端口的开发版 sidecar，跳过探测（禁止回退到稳定版）"
+                                    );
                                 }
-                            );
-                            // 通知前端状态已更新（前端可据此刷新向导状态）
-                            let _ = monitor_handle.emit(
-                                "sidecar-detected",
-                                serde_json::json!({
-                                    "port": probed[0].port,
-                                    "src_dir": probed[0].src_dir,
-                                    "message": "检测到已运行的 LRC 服务"
-                                }),
-                            );
+                            } else {
+                                // 短暂获取 sidecar_port 锁存储结果
+                                {
+                                    let mut sidecar_port = state.sidecar_port.lock().await;
+                                    *sidecar_port = Some(probed[0].port);
+                                }
+                                tracing::info!(
+                                    "启动时探测：检测到外部 sidecar，端口 {}，项目 {}",
+                                    probed[0].port,
+                                    if probed[0].src_dir.is_empty() {
+                                        "unknown"
+                                    } else {
+                                        &probed[0].src_dir
+                                    }
+                                );
+                                // 通知前端状态已更新（前端可据此刷新向导状态）
+                                let _ = monitor_handle.emit(
+                                    "sidecar-detected",
+                                    serde_json::json!({
+                                        "port": probed[0].port,
+                                        "src_dir": probed[0].src_dir,
+                                        "message": "检测到已运行的 LRC 服务"
+                                    }),
+                                );
+                            }
                         } else {
                             tracing::info!("启动时探测：未检测到外部 sidecar");
                         }

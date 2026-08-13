@@ -34,7 +34,7 @@
 
 > 完整报告见 [基准测试汇总](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md)。
 >
-> **数据版本说明**：上述数据基于 v0.5.6 基准测试（2026-06-23），当前 v0.8.7 版本的检索引擎已有演进，最新数据以重新测试为准。
+> **数据版本说明**：上述数据基于 v0.5.6 基准测试（2026-06-23），当前 v0.9.0 版本的检索引擎已有演进，最新数据以重新测试为准。
 
 ---
 
@@ -45,7 +45,7 @@
 1. 前往 [Releases](https://github.com/zhibaiYingChuan/LRC/releases) 下载最新安装包
 2. 双击安装，启动 LRC Desktop
 3. 按向导选择项目、配置 LLM（可选）、连接 AI 工具
-4. 重启 IDE，AI 自动发现 12 个 MCP 工具
+4. 重启 IDE，AI 自动发现 13 个 MCP 工具
 
 > 桌面端自动完成所有配置：检测 AI 工具、写入 MCP 配置、写入 AI 规则文件。
 
@@ -135,12 +135,13 @@ v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计
 
 ---
 
-## 12 个 MCP 工具
+## 13 个 MCP 工具
 
 | 类别 | 工具 | 用途 |
 |------|------|------|
 | **代码搜索** | `search_code` `codebase_stats` | 关键词定位代码、查看索引状态 |
-| **记忆管理** | `remember` `recall` `forget` `update_memory` `list_memories` `memory_stats` `archive` `correct_memory` `recall_enhanced` `dao_metrics` | 写入、检索、删除、更新、列表、统计、归档、修正、增强检索、健康指标 |
+| **记忆管理** | `remember` `batch_remember` `recall` `forget` `update_memory` `list_memories` `memory_stats` `archive` `correct_memory` `recall_enhanced` | 写入、批量写入、检索、删除、更新、列表、统计、归档、修正、增强检索 |
+| **系统监控** | `system_health` | 查看系统健康状态 |
 
 ---
 

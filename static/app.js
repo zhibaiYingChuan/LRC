@@ -67,9 +67,11 @@ function _readSidecarPortFromMeta() {
   return null;
 }
 const META_SIDECAR_PORT = _readSidecarPortFromMeta();
+// v0.9.0 开发模式隔离：开发版默认端口 3111（meta 标签注入），稳定版 3099（release 构建时替换 meta）
+const STABLE_DEFAULT_PORT = 3099;
 const DEFAULT_API_BASE = isTauriEnv
-  ? (META_SIDECAR_PORT ? `http://127.0.0.1:${META_SIDECAR_PORT}` : 'http://127.0.0.1:3099')
-  : (window.location.origin || 'http://localhost:3099');
+  ? (META_SIDECAR_PORT ? `http://127.0.0.1:${META_SIDECAR_PORT}` : `http://127.0.0.1:${STABLE_DEFAULT_PORT}`)
+  : (window.location.origin || `http://localhost:${STABLE_DEFAULT_PORT}`);
 // v0.6.0 P0-1 修复：Tauri 环境下 sidecar 可能端口自适应到非 3099，需改为 let 以便异步更新
 let API_BASE = new URLSearchParams(window.location.search).get('api') || DEFAULT_API_BASE;
 const REFRESH_INTERVAL = 30000; // 30 秒自动刷新
@@ -3579,6 +3581,21 @@ async function init() {
           // 隐藏横幅
           const banner = document.getElementById('sidecar-down-banner');
           if (banner) banner.hidden = true;
+          // v0.9.0 Fix-03：基于向导完成状态条件隐藏「5分钟快速体验」向导卡片。
+          // 已完成配置（setup_complete=true）的用户直达仪表盘；
+          // 真正首次（未完成向导）用户保留引导，避免 onboarding 永久缺失。
+          postMessageToParent('lrc-get-wizard-state', {}, 5000)
+            .then((wizard) => {
+              if (wizard && wizard.setup_complete) {
+                const quickstartWizard = document.getElementById('quickstart-wizard');
+                if (quickstartWizard) quickstartWizard.hidden = true;
+              }
+            })
+            .catch(() => {
+              // 非桌面端嵌入模式（纯 Web 端）无向导状态，隐藏向导卡片直接展示仪表盘
+              const quickstartWizard = document.getElementById('quickstart-wizard');
+              if (quickstartWizard) quickstartWizard.hidden = true;
+            });
           // 显示成功提示
           showToast(payload.message || 'LRC 服务已自动启动', 'success', 3000);
           // 更新状态栏为可达，触发仪表盘加载
@@ -5372,7 +5389,7 @@ async function getWizardState() {
     if (result) {
       const lines = [
         '向导状态:',
-        '• 已完成: ' + (result.completed ? '是' : '否'),
+        '• 已完成: ' + (result.setup_complete ? '是' : '否'),
         '• 项目目录: ' + (result.project_dir || '（未设置）'),
         '• LLM 已配置: ' + (result.llm_configured ? '是' : '否'),
         '• Agent 已配置: ' + (result.agent_configured ? '是' : '否'),
@@ -6203,13 +6220,13 @@ async function loadCrystallizationHistory() {
     const res = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, {}, 10000);
     const data = await safeJson(res);
 
-    if (!data.ok || !data.entries || data.entries.length === 0) {
+    if (!data.events || data.events.length === 0) {
       // 保持现有的示例数据（v0.8.0 预览模式）
       return;
     }
 
-    // 过滤出结晶相关事件
-    const crystallizationEvents = data.entries.filter(function(e) {
+    // 过滤出结晶相关事件（v0.9.0 修复：audit-trail 响应字段是 events，非 entries）
+    const crystallizationEvents = data.events.filter(function(e) {
       return e.event_type && (e.event_type.includes('crystalliz') || e.event_type.includes('synthesi') || e.event_type.includes('consolidat'));
     });
 
@@ -6222,7 +6239,7 @@ async function loadCrystallizationHistory() {
       return `
         <div class="crystallization-event">
           <div class="crystallization-event-title">${htmlescape(e.event_type || '结晶事件')}</div>
-          <div class="crystallization-event-time">${htmlescape(e.timestamp || '--')}</div>
+          <div class="crystallization-event-time">${htmlescape(e.timestamp_ms || '--')}</div>
           <div class="crystallization-event-desc">${htmlescape(e.description || e.details || '--')}</div>
         </div>
       `;
@@ -6588,30 +6605,45 @@ async function loadEvolutionTimeline() {
     const response = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, {}, 10000);
     const data = await safeJson(response);
 
-    if (data.ok && data.events && data.events.length > 0) {
+    if (data.events && data.events.length > 0) {
       const html = data.events.map(event => {
-        const typeClass = event.type || 'audit';
-        const typeLabel = {
-          crystallization: '结晶',
-          synthesis: '合成',
-          decay: '衰减',
-          audit: '审计'
-        }[typeClass] || '事件';
-        const iconMap = {
-          crystallization: 'icon-crystallization',
-          synthesis: 'icon-luoshu',
-          decay: 'icon-decay',
-          audit: 'icon-audit'
+        // v0.9.0 修复：audit-trail 事件字段是 event_type（snake_case），非 type
+        const rawType = event.event_type || 'audit';
+        const typeLabelMap = {
+          synthesis_created: '结晶合成',
+          memory_deleted: '记忆删除',
+          memory_isolated: '记忆隔离',
+          gc_cleanup: 'GC 清理',
+          decay_rate_changed: '衰减调整',
+          regulation_applied: '调节应用',
+          feedback_processed: '反馈处理',
+          comprehensive_rebalance: '综合再平衡',
+          catastrophic_event: '灾难检测',
+          chronic_degradation: '慢性恶化',
         };
-        const iconName = iconMap[typeClass] || 'icon-audit';
+        const typeLabel = typeLabelMap[rawType] || rawType;
+        const iconMap = {
+          synthesis_created: 'icon-crystallization',
+          memory_deleted: 'icon-delete',
+          memory_isolated: 'icon-folder',
+          gc_cleanup: 'icon-delete',
+          decay_rate_changed: 'icon-decay',
+          regulation_applied: 'icon-settings',
+          feedback_processed: 'icon-smile',
+          comprehensive_rebalance: 'icon-bagua',
+          catastrophic_event: 'icon-warning',
+          chronic_degradation: 'icon-warning',
+        };
+        const iconName = iconMap[rawType] || 'icon-audit';
+        const typeClass = rawType;
         return `
           <li class="evolution-event ${typeClass}">
             <div class="evolution-event-dot"></div>
-            <div class="evolution-event-time">${event.timestamp || '--'}</div>
+            <div class="evolution-event-time">${event.timestamp_ms || '--'}</div>
             <span class="evolution-event-type">
               <img src="/assets/icons/${iconName}.svg" alt="" width="12" height="12"> ${typeLabel}
             </span>
-            <div class="evolution-event-desc">${htmlescape(event.description || event.desc || '')}</div>
+            <div class="evolution-event-desc">${htmlescape(event.description || event.reason || '')}</div>
           </li>
         `;
       }).join('');

@@ -547,7 +547,12 @@ pub async fn wait_for_shutdown_signal() {
                 eprintln!("\n[进程守护] 收到 Ctrl+C 信号，正在关闭...");
             }
             Err(e) => {
-                eprintln!("[进程守护] 信号监听失败: {}", e);
+                eprintln!("[进程守护] 信号监听失败（可能为无控制台/后台环境）: {}", e);
+                // v0.9.0 修复：无控制台环境（如 --daemon / Start-Process 后台启动）下
+                // tokio::signal::ctrl_c() 会立即失败。若直接返回，上层 tokio::select!
+                // 的关闭分支会被触发，导致 server 意外退出。
+                // 改为挂起等待，让 server 继续在 serve_on_listener 分支上运行。
+                std::future::pending::<()>().await;
             }
         }
     }
