@@ -337,3 +337,8 @@ docs/RELEASE_PROCESS.md
 docs/PRODUCT_ROADMAP_v1.0.md
 tests/frontend/dashboard-smoke.spec.js
 tests/frontend/playwright.config.js
+
+# v0.9.1 发布清理：根目录开发残留（旧版预检脚本与 ws 测试依赖，不交付用户）
+/preflight_check.ps1
+/package.json
+/package-lock.json
