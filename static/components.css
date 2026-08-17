@@ -993,6 +993,93 @@
 }
 
 /* ════════════════════════════════════════════════════════════
+   P1-1 修复：齿轮菜单按钮与菜单项（替代内联 hover，规避 CSP 拦截）
+   ════════════════════════════════════════════════════════════ */
+.tool-gear-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1em;
+  padding: 2px 4px;
+  border-radius: 4px;
+  opacity: 0.55;
+  transition: all 0.15s;
+  margin-right: 4px;
+}
+.tool-gear-btn:hover {
+  opacity: 1;
+  background: var(--lrc-宣纸-500);
+}
+.lrc-agent-gear-menu-item {
+  padding: 8px 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.lrc-agent-gear-menu-item:hover {
+  background: var(--lrc-宣纸-400);
+}
+.lrc-agent-gear-menu-item[data-disabled='1'] {
+  opacity: 0.4;
+  pointer-events: none;
+}
+.gear-menu-item-reset {
+  border-top: 1px solid var(--lrc-宣纸-500);
+  margin-top: 4px;
+  padding-top: 10px;
+}
+
+/* ════════════════════════════════════════════════════════════
+   引导页重设计：工具卡片徽章 + 手动添加模态框（替代内联 style，统一视觉）
+   ════════════════════════════════════════════════════════════ */
+.lrc-tool-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72em;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  white-space: nowrap;
+}
+.lrc-tool-badge-auto {
+  background: var(--lrc-玉色-50);
+  color: var(--lrc-玉色-600);
+  border: 1px solid var(--lrc-玉色-200);
+}
+.lrc-tool-badge-manual {
+  background: var(--lrc-金色-50);
+  color: var(--lrc-金色-700);
+  border: 1px solid var(--lrc-金色-200);
+}
+.lrc-tool-badge-added {
+  background: var(--lrc-金色-200);
+  color: var(--lrc-金色-800);
+  border: 1px solid var(--lrc-金色-400);
+}
+
+.lrc-manual-add-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.lrc-manual-add-panel {
+  background: var(--lrc-宣纸-100);
+  border-radius: var(--radius-lg);
+  max-width: 640px;
+  width: 100%;
+  max-height: 80vh;
+  overflow: auto;
+  padding: 24px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.2);
+}
+
+/* ════════════════════════════════════════════════════════════
    v0.6.0 补齐动效工具类（设计文档 4.2）
    9 种预设动效的通用工具类
    ════════════════════════════════════════════════════════════ */

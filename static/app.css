@@ -512,6 +512,17 @@
       gap: 16px;
     }
 
+    /* v0.9.0 修复：AI 规则文件状态卡片占满整行，让规则导入路径完整可见 */
+    #rules-status-card {
+      grid-column: 1 / -1;
+    }
+    #rules-status-card .verify-result .result-label[title] {
+      overflow: visible;
+      text-overflow: clip;
+      white-space: normal;
+      word-break: break-all;
+    }
+
     .trust-card {
       background: var(--card-bg);
       border-radius: var(--radius);
@@ -552,16 +563,26 @@
     .verify-result .result-row {
       display: flex;
       justify-content: space-between;
+      align-items: center;
+      gap: 8px;
       padding: 4px 0;
       border-bottom: 1px solid rgba(26,26,46,0.05);
+      min-width: 0;
+      overflow: hidden;
     }
 
     .verify-result .result-row:last-child { border-bottom: none; }
 
     .verify-result .result-label { color: var(--text-dim); }
-    .verify-result .result-value { font-weight: 600; color: var(--ink); }
+    .verify-result .result-value { font-weight: 600; color: var(--ink); white-space: nowrap; flex-shrink: 0; }
     .verify-result .result-value.valid { color: var(--jade); }
     .verify-result .result-value.invalid { color: var(--cinnabar); }
+    /* v0.9.0 修复：规则路径列（带 title 属性）收缩省略，避免超出卡片 */
+    .verify-result .result-row .result-label[title] {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
 
     /* 信任中心按钮组 */
     .trust-actions {
@@ -2405,6 +2426,24 @@ code, pre, .code-block {
   color: var(--lrc-金色-700);
   margin-top: var(--space-2);
   letter-spacing: 2px;
+}
+
+.welcome-status {
+  font-size: var(--type-body-size);
+  color: var(--lrc-墨韵-500);
+  margin-top: var(--space-2);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.welcome-status::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--lrc-玉色-500);
+  flex-shrink: 0;
 }
 
 .welcome-close {

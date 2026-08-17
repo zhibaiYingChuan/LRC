@@ -2460,19 +2460,20 @@ struct ToolsDetectResponse {
 async fn embedder_status_handler(
     State(_state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // 模型目录：相对于当前工作目录
-    let models_dir = PathBuf::from("models");
+    // v0.9.0 修复：使用统一模型目录 ~/.loong-recall/models/（而非相对 cwd）
+    let models_dir = crate::engine::model_resolver::default_models_dir();
     // 默认模型 ID（与 luoshu_encoder_ml.rs 中 detect_default_model 中文分支一致）
     let default_model_id = "BAAI/bge-small-zh".to_string();
 
-    // 检查是否已下载：本地目录名以 "--" 替换 "/"，并要求 config.json 已存在
+    // 检查是否已下载：本地目录名以 "--" 替换 "/"
     let local_dir = default_model_id.replace('/', "--");
     let model_dir = models_dir.join(&local_dir);
-    let config_path = model_dir.join("config.json");
 
-    let status = if config_path.exists() {
+    // v0.9.0 修复：ready 判断需校验权重文件（config.json + safetensors/pytorch_model.bin），
+    // 不能只看 config.json，否则只有配置文件没有权重也会误判为 ready
+    let status = if crate::engine::model_resolver::check_model_ready(&default_model_id) {
         "ready"
-    } else if models_dir.exists() {
+    } else if model_dir.exists() {
         "not_downloaded"
     } else {
         "unknown"
@@ -2569,11 +2570,21 @@ async fn embedder_download_handler(
         let progress = ConsoleProgress::new();
 
         // 模型所需核心文件（按依赖顺序）
-        let files = ["config.json", "tokenizer.json", "model.safetensors"];
+        // v0.9.0 修复：权重文件支持 safetensors / pytorch_model.bin 双格式 fallback。
+        // bge-small-zh 等部分模型只有 pytorch_model.bin（无 model.safetensors），
+        // 若只下载 model.safetensors 必然失败，导致模型不完整、始终降级。
+        let config_files = ["config.json", "tokenizer.json"];
         let local_dir = model_id_clone.replace('/', "--");
-        let base_dir = PathBuf::from("models").join(&local_dir);
+        // v0.9.0 修复：下载到统一模型目录 ~/.loong-recall/models/
+        let base_dir = crate::engine::model_resolver::default_models_dir().join(&local_dir);
+        if let Err(e) = std::fs::create_dir_all(&base_dir) {
+            eprintln!("[LRC·嵌入] 创建模型目录失败 {}: {}", base_dir.display(), e);
+            EMBEDDER_DOWNLOADING.store(false, Ordering::SeqCst);
+            return;
+        }
 
-        for file in &files {
+        // 1. 下载必需的配置文件（config.json + tokenizer.json）
+        for file in &config_files {
             let url = build_download_url(&model_id_clone, file, mirror);
             let dest = base_dir.join(file);
             eprintln!("[LRC·嵌入] 下载 {}: {}", file, url);
@@ -2583,6 +2594,39 @@ async fn embedder_download_handler(
                 return;
             }
         }
+
+        // 2. 下载权重文件：safetensors 优先，失败则 fallback 到 pytorch_model.bin
+        let weights_ok = {
+            let url = build_download_url(&model_id_clone, "model.safetensors", mirror);
+            let dest = base_dir.join("model.safetensors");
+            eprintln!("[LRC·嵌入] 下载 model.safetensors: {}", url);
+            match downloader.download_with_retry(&url, &dest, &progress) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!(
+                        "[LRC·嵌入] model.safetensors 下载失败: {}，尝试 pytorch_model.bin",
+                        e
+                    );
+                    let alt_url = build_download_url(&model_id_clone, "pytorch_model.bin", mirror);
+                    let alt_dest = base_dir.join("pytorch_model.bin");
+                    eprintln!("[LRC·嵌入] 下载 pytorch_model.bin: {}", alt_url);
+                    match downloader.download_with_retry(&alt_url, &alt_dest, &progress) {
+                        Ok(()) => true,
+                        Err(e2) => {
+                            eprintln!("[LRC·嵌入] pytorch_model.bin 下载也失败: {}", e2);
+                            false
+                        }
+                    }
+                }
+            }
+        };
+
+        if !weights_ok {
+            eprintln!("[LRC·嵌入] 模型 {} 权重文件下载失败", model_id_clone);
+            EMBEDDER_DOWNLOADING.store(false, Ordering::SeqCst);
+            return;
+        }
+
         eprintln!("[LRC·嵌入] 模型 {} 下载完成", model_id_clone);
         EMBEDDER_DOWNLOADING.store(false, Ordering::SeqCst);
     });

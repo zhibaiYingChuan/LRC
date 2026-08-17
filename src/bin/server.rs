@@ -645,13 +645,41 @@ async fn try_run() -> Result<(), String> {
         return Err(format!("错误: 指定路径不是目录: {src_dir}"));
     }
 
-    // 创建持久化后端和记忆存储
+    // 创建持久化后端
     let persistence = JsonPersistence::new(&data_dir).map_err(|e| {
         format!(
             "致命错误: 无法创建数据目录或初始化持久化后端\n  路径: {data_dir}\n  原因: {e}\n  建议: 检查磁盘空间和目录写入权限"
         )
     })?;
-    let memory_store = Arc::new(Mutex::new(MemoryStore::new(persistence)));
+
+    // v0.9.0 修复：根据 mode 加载编码器
+    // 此前 `--mode smart` 是死参数，MemoryStore::new 永远用统计编码器，
+    // 导致"下载模型后仍降级"。现在 ml feature 下：
+    //   - --mode smart 显式启用，或本地模型已就绪时，加载 ML 语义编码器
+    //   - 否则降级到统计编码器（零网络、零下载、秒启动）
+    #[cfg(feature = "ml")]
+    let (store, ml_loaded) = {
+        let want_ml = mode == "smart" || local_ml_model_ready();
+        let (encoder, loaded) = if want_ml {
+            // v0.9.1 算法泄露合规：通过 engine 层工厂函数创建编码器
+            match code_memory::engine::create_smart_encoder() {
+                Ok((enc, true)) => {
+                    log("  ✓ ML 语义编码器加载成功（Smart Match 已启用）");
+                    (enc, true)
+                }
+                _ => {
+                    log("  ⚠ ML 编码器加载失败，降级统计模式");
+                    (code_memory::engine::create_statistical_encoder(), false)
+                }
+            }
+        } else {
+            (code_memory::engine::create_statistical_encoder(), false)
+        };
+        (MemoryStore::new_with_encoder(persistence, encoder), loaded)
+    };
+    #[cfg(not(feature = "ml"))]
+    let (store, ml_loaded) = (MemoryStore::new(persistence), false);
+    let memory_store = Arc::new(Mutex::new(store));
 
     // ╔═══════════════════════════════════════════════════════════════╗
     // ║ v0.6.0+ 参赛扩展：应用参照系实验 CLI 参数                   ║
@@ -747,8 +775,10 @@ async fn try_run() -> Result<(), String> {
         store_guard.set_llm_configured(llm_api_configured);
         if llm_api_configured {
             log("  编码器模式: LLM 增强模式（语义理解由 LLM 提供）");
+        } else if ml_loaded {
+            log("  编码器模式: ML 语义模式（本地模型已加载）");
         } else {
-            log("  编码器模式: 基础模式（建议配置 LLM 增强语义理解）");
+            log("  编码器模式: 基础模式（建议配置 LLM 或下载 ML 模型增强语义理解）");
         }
     }
 
@@ -1106,6 +1136,18 @@ fn load_llm_from_wizard_json() -> Option<String> {
     };
 
     Some(llm_api_str)
+}
+
+/// v0.9.0 新增：检查本地 ML 语义模型是否已就绪（不联网）
+///
+/// 复用 engine 层 model_resolver 的统一检测逻辑（models/ 目录 + 可执行文件同级 + ~/.loong-recall/models/ + HF 缓存），
+/// 存在则返回 true，由调用方决定加载 ML 编码器；
+/// 不存在则返回 false，直接使用统计编码器（避免联网下载导致启动延迟）。
+#[cfg(feature = "ml")]
+fn local_ml_model_ready() -> bool {
+    let model_id =
+        std::env::var("LRC_LUOSHU_MODEL_ID").unwrap_or_else(|_| "BAAI/bge-small-zh".to_string());
+    code_memory::engine::model_resolver::check_model_ready(&model_id)
 }
 
 /// 交互式询问用户确认（带超时保护，防止 Hidden 窗口环境 stdin 阻塞）
@@ -1580,21 +1622,9 @@ const RECOMMENDED_MODELS: &[(&str, &str, &str)] = &[
 ///
 /// 优先使用当前工作目录下的 models/，其次使用可执行文件同级目录的 models/
 fn get_models_dir() -> PathBuf {
-    // 优先使用当前工作目录
-    if let Ok(cwd) = std::env::current_dir() {
-        let dir = cwd.join("models");
-        if dir.exists() {
-            return dir;
-        }
-    }
-    // 其次使用可执行文件同级目录
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            return exe_dir.join("models");
-        }
-    }
-    // 默认回退到当前目录
-    PathBuf::from("models")
+    // v0.9.0 修复：统一使用标准模型目录 ~/.loong-recall/models/
+    // 模型下载、列表、使用都基于此目录，不依赖 cwd（避免 sidecar 运行时 cwd 不一致）
+    code_memory::engine::model_resolver::default_models_dir()
 }
 
 /// 处理 `model list` 子命令

@@ -186,8 +186,15 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 tracing::info!("[v0.8.0] 启动时自动写入 AI 规则文件（不依赖 sidecar）");
                 let registry = AgentDetectorRegistry::new();
-                let tool_ids = AgentDetectorRegistry::get_all_rules_capable_tool_ids();
-                tracing::info!("[v0.8.0] 待写入规则的工具数: {}", tool_ids.len());
+                // v0.9.0 修复：只写入已安装工具的规则文件，避免为未安装的 AI 工具
+                // 创建规则文件（用户明明只有 2-3 个工具，却看到一整排"已写入"）。
+                // 复用 detect_installed() 与配置向导一致的检测逻辑。
+                let tool_ids: Vec<String> = registry
+                    .detect_installed()
+                    .into_iter()
+                    .map(|a| a.id)
+                    .collect();
+                tracing::info!("[v0.9.0] 待写入规则的已安装工具数: {}", tool_ids.len());
 
                 match registry.write_rules_for_agents(&tool_ids) {
                     Ok(written) => {
@@ -573,21 +580,26 @@ fn main() {
                                 } = info;
 
                                 // v0.8.37 开发模式使用独立数据目录
-                                let _dev_dd = {
-                                    let is_dev = std::env::var("TAURI_DEV").is_ok()
-                                        || std::env::var("LRC_DEV_MODE").is_ok();
-                                    if is_dev {
-                                        let home = std::env::var("USERPROFILE")
-                                            .or_else(|_| std::env::var("HOME"))
-                                            .unwrap_or_else(|_| ".".to_string());
-                                        Some(format!("{}/.loong-recall/dev/data", home))
-                                    } else {
-                                        None
-                                    }
+                                // v0.9.0 修复：崩溃恢复在 dev 模式下也必须用 3111，
+                                // 而非 None→默认 3099，否则会复用稳定版 sidecar（违反开发/稳定隔离）。
+                                let is_dev = std::env::var("TAURI_DEV").is_ok()
+                                    || std::env::var("LRC_DEV_MODE").is_ok();
+                                let _dev_dd = if is_dev {
+                                    let home = std::env::var("USERPROFILE")
+                                        .or_else(|_| std::env::var("HOME"))
+                                        .unwrap_or_else(|_| ".".to_string());
+                                    Some(format!("{}/.loong-recall/dev/data", home))
+                                } else {
+                                    None
+                                };
+                                let target_port = if is_dev {
+                                    3111
+                                } else {
+                                    sidecar_manager::DEFAULT_SIDECAR_PORT
                                 };
                                 let start_opts = StartOptions {
                                     src_dir: src_dir.as_deref(),
-                                    port: None,
+                                    port: Some(target_port),
                                     multi_window,
                                     llm_api: llm_api.as_deref(),
                                     cancel_flag: &heartbeat_cancel,

@@ -398,7 +398,7 @@ jobs:
             echo "已禁用 SSL 证书吊销检查 (CARGO_HTTP_CHECK_REVOKE=false)"
           fi
 
-          cargo build --release --features server --target ${{ matrix.target }}
+          cargo build --release --features server,ml --target ${{ matrix.target }}
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp target/${{ matrix.target }}/release/code-memory-server.exe "${BIN_NAME}"
           else
@@ -669,7 +669,7 @@ jobs:
             export CARGO_HTTP_CHECK_REVOKE=false
             echo "已禁用 SSL 证书吊销检查 (CARGO_HTTP_CHECK_REVOKE=false)"
           fi
-          cargo build --release --features server --target ${{ matrix.target }}
+          cargo build --release --features server,ml --target ${{ matrix.target }}
           echo "Sidecar binary built at target/${{ matrix.target }}/release/"
         shell: bash
 

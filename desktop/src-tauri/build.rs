@@ -87,6 +87,23 @@ fn sync_sidecar_binary() {
     let candidates: Vec<PathBuf> = {
         let mut paths = Vec::new();
 
+        // v0.9.0 修复：优先使用当前 PROFILE 的编译产物
+        // （debug 构建 desktop 时用 debug 的 code-memory-server，release 用 release 的），
+        // 避免 debug 构建时误用旧 release 二进制覆盖 lrc-sidecar，导致 dev 模式加载旧 sidecar。
+        let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+        if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+            // 候选 0a: $CARGO_TARGET_DIR/{profile}/（当前 profile，优先）
+            let p = PathBuf::from(&target_dir).join(&profile).join(binary_name);
+            paths.push(p);
+            if !target_triple.is_empty() {
+                let p2 = PathBuf::from(&target_dir)
+                    .join(&target_triple)
+                    .join(&profile)
+                    .join(binary_name);
+                paths.push(p2);
+            }
+        }
+
         // 候选 1: $CARGO_TARGET_DIR/{target_triple}/release/（自定义 target-dir + 交叉编译）
         if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
             if !target_triple.is_empty() {
@@ -116,7 +133,22 @@ fn sync_sidecar_binary() {
                             .or_else(|| trimmed.split_whitespace().nth(1))
                         {
                             let dir = dir.trim().trim_matches('"');
-                            // 交叉编译路径
+                            // v0.9.0 修复：优先当前 PROFILE 的编译产物
+                            // （debug 构建 desktop 时用 debug 的 code-memory-server）
+                            let p_profile = PathBuf::from(dir).join(&profile).join(binary_name);
+                            if p_profile.exists() {
+                                paths.push(p_profile);
+                            }
+                            if !target_triple.is_empty() {
+                                let p2 = PathBuf::from(dir)
+                                    .join(&target_triple)
+                                    .join(&profile)
+                                    .join(binary_name);
+                                if p2.exists() {
+                                    paths.push(p2);
+                                }
+                            }
+                            // 交叉编译路径（release）
                             if !target_triple.is_empty() {
                                 let p = PathBuf::from(dir)
                                     .join(&target_triple)
@@ -130,7 +162,7 @@ fn sync_sidecar_binary() {
                                     paths.push(p);
                                 }
                             }
-                            // 非交叉编译路径
+                            // 非交叉编译路径（release）
                             let p = PathBuf::from(dir).join("release").join(binary_name);
                             if p.exists() {
                                 println!("cargo:info=从 cargo config 找到 target-dir: {}", dir);

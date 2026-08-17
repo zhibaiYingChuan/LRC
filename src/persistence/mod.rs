@@ -87,6 +87,20 @@ pub trait Persistence: Send + Sync {
         Ok(())
     }
 
+    /// 批量保存记忆（新增或更新），单次序列化 + 单次磁盘写入
+    ///
+    /// 相比循环调用 `save_memory`（每条触发一次全量序列化+磁盘写入 O(n)），
+    /// 此方法将 N 次 O(n) 磁盘 I/O 降为 1 次 O(n)，适用于批量合成/批量写入场景。
+    ///
+    /// 默认实现：循环调用 `save_memory`（向后兼容）。
+    /// 推荐在具体后端重写为单次序列化+单次磁盘写入。
+    fn save_memories(&self, memories: &[Memory]) -> Result<(), PersistenceError> {
+        for m in memories {
+            self.save_memory(m)?;
+        }
+        Ok(())
+    }
+
     /// 加载所有记忆
     fn load_all_memories(&self) -> Result<Vec<Memory>, PersistenceError>;
 

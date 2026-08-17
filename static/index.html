@@ -6,10 +6,10 @@
   <!-- 之前完全未配置 CSP，XSS/数据注入防御缺失，HCSE 安全不变量 INV-01 违规 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.openai.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="version" content="0.9.0">
+  <meta name="version" content="0.9.1">
   <!-- v0.9.0 开发模式隔离：注入 sidecar 端口号，前端通过此标签获取正确的 API 端点 -->
   <!-- 开发版默认 3111，稳定版打包时替换为 3099 -->
-  <meta name="lrc-sidecar-port" content="3111">
+  <meta name="lrc-sidecar-port" content="3099">
   <link rel="icon" type="image/svg+xml" href="/assets/logo/logo-horizontal.svg">
   <title>龙忆 Loong Recall · 仪表盘</title>
   <!-- 龙忆设计系统 v1.0：色阶 + 排版 + 间距 + 圆角 + 阴影 + 动效 -->
@@ -122,22 +122,23 @@
   <!-- ========== 仪表盘标签页 ========== -->
   <section class="tab-content active" id="tab-dashboard">
 
-    <!-- ==================== 欢迎区（设计文档 5.2.1：仅首次使用时显示，可关闭） ==================== -->
+    <!-- ==================== 欢迎区（仅首次使用时显示，可关闭） ==================== -->
     <div class="welcome-banner" id="welcome-banner" hidden>
       <div class="welcome-content">
         <div class="welcome-greeting" id="welcome-greeting">欢迎回来</div>
         <div class="welcome-date" id="welcome-date">--</div>
         <div class="welcome-poem" id="welcome-poem">昨日之忆，今日之智</div>
+        <div class="welcome-status" id="welcome-status">记忆库状态加载中…</div>
       </div>
-      <button class="welcome-close" data-action="dismissWelcome" aria-label="关闭欢迎">
-        <img src="/assets/icons/icon-decay.svg" alt="" width="14" height="14">
+      <button class="welcome-close" data-action="dismissWelcome" aria-label="关闭欢迎信息">
+        <img src="/assets/icons/icon-close.svg" alt="" width="14" height="14">
       </button>
     </div>
 
-    <!-- 5分钟快速体验向导（龙忆设计系统：金色主题） -->
+    <!-- 快速体验向导（龙忆设计系统：金色主题） -->
     <div class="wizard-card" id="quickstart-wizard">
-      <div class="wizard-title"><img src="/assets/icons/icon-luoshu.svg" alt="" width="20" height="20" style="vertical-align:middle;"> 5分钟快速体验</div>
-      <div class="wizard-subtitle">跟随以下三个步骤，快速上手龙忆 Loong Recall 记忆系统</div>
+      <div class="wizard-title"><img src="/assets/icons/icon-luoshu.svg" alt="" width="20" height="20" style="vertical-align:middle;"> 3 分钟走通完整流程</div>
+      <div class="wizard-subtitle">龙忆做三件事：搜代码、记知识、找记忆。各点一次，你就知道它怎么用了。</div>
       <div class="wizard-steps">
         <!-- 步骤一：搜索代码 -->
         <div class="wizard-step" id="wizard-step-1">
@@ -146,8 +147,8 @@
             <span class="wizard-step-title"><img src="/assets/icons/icon-search-lrc.svg" alt="" width="14" height="14" style="vertical-align:middle;"> 搜索代码</span>
             <span class="wizard-check">✓</span>
           </div>
-          <div class="wizard-step-desc">搜索代码库中的函数、结构体或关键字</div>
-          <input type="text" class="input" id="wizard-search-path" placeholder="搜索代码关键词（如：struct、fn、MemoryStore）" value="struct" required maxlength="200">
+          <div class="wizard-step-desc">输入函数名、结构体名或一个关键词，龙忆会从你项目的代码里返回最相关的片段，并标出它在哪个文件、第几行。</div>
+          <input type="text" class="input" id="wizard-search-path" placeholder="输入关键词，如 struct、fn、MemoryStore" value="struct" required maxlength="200">
           <button class="btn btn-accent" data-action="wizardStep1Search">搜索代码</button>
           <div class="wizard-result" id="wizard-step1-result"></div>
         </div>
@@ -159,7 +160,7 @@
             <span class="wizard-step-title"><img src="/assets/icons/icon-memory.svg" alt="" width="14" height="14" style="vertical-align:middle;"> 写入记忆</span>
             <span class="wizard-check">✓</span>
           </div>
-          <div class="wizard-step-desc">将示例内容写入记忆库</div>
+          <div class="wizard-step-desc">把一段对项目有用的知识记进龙忆。写进去之后，你可以用自然语言把它找回来，而不是死记关键词。</div>
           <input type="text" class="input" id="wizard-memory-content"
             value="项目使用 Rust 语言开发，采用 Actix-web 框架" placeholder="记忆内容..." required maxlength="2000">
           <button class="btn btn-accent" data-action="wizardStep2Write">写入记忆</button>
@@ -173,51 +174,12 @@
             <span class="wizard-step-title"><img src="/assets/icons/icon-crystallization.svg" alt="" width="14" height="14" style="vertical-align:middle;"> 检索记忆</span>
             <span class="wizard-check">✓</span>
           </div>
-          <div class="wizard-step-desc">检索刚写入的记忆，验证记忆系统</div>
+          <div class="wizard-step-desc">用一句人话提问（不用写关键词），龙忆会把你刚才写入的那条记忆找回来——看到它，就说明记忆真的生效了。</div>
           <input type="text" class="input" id="wizard-search-query"
-            value="Rust 开发" placeholder="搜索关键词..." required maxlength="200">
+            value="这个项目用什么语言开发" placeholder="用自然语言提问，如「这个项目用什么语言开发」" required maxlength="200">
           <button class="btn btn-accent" data-action="wizardStep3Search">检索记忆</button>
           <div class="wizard-result" id="wizard-step3-result"></div>
         </div>
-      </div>
-    </div>
-
-    <!-- ==================== 快速操作区域（龙忆设计系统：玉色色条） ==================== -->
-    <div class="card" style="border-left: 3px solid var(--lrc-玉色-500);">
-      <div class="card-title" style="font-size: 18px; color: var(--lrc-玉色-600);">
-        <img src="/assets/icons/icon-bagua.svg" alt="" width="18" height="18" style="vertical-align:middle; margin-right: 6px;"> 快速操作</div>
-      <p class="text-sm text-dim mb-4">
-        以下是龙忆 LRC 最常用的功能，点击即可使用。
-      </p>
-      <div class="quick-actions-grid">
-        <a href="#tab-captain-log" class="quick-action-item" data-action="switchToTab" data-arg="captain-log">
-          <span class="quick-action-icon"><img src="/assets/icons/icon-captain-log.svg" alt="" width="24" height="24"></span>
-          <div>
-            <div class="quick-action-title">生成船长日志</div>
-            <div class="quick-action-desc">一键生成项目记忆健康报告</div>
-          </div>
-        </a>
-        <a href="#tab-trust-center" class="quick-action-item" data-action="switchToTab" data-arg="trust-center">
-          <span class="quick-action-icon"><img src="/assets/icons/icon-trust.svg" alt="" width="24" height="24"></span>
-          <div>
-            <div class="quick-action-title">查看信任中心</div>
-            <div class="quick-action-desc">验证数据存储位置与隐私保护</div>
-          </div>
-        </a>
-        <a href="#tab-settings" class="quick-action-item" data-action="switchToTab" data-arg="settings">
-          <span class="quick-action-icon"><img src="/assets/icons/icon-bagua.svg" alt="" width="24" height="24"></span>
-          <div>
-            <div class="quick-action-title">配置 LLM</div>
-            <div class="quick-action-desc">启用自然语言搜索代码功能</div>
-          </div>
-        </a>
-        <a href="#tab-api-docs" class="quick-action-item" data-action="switchToTab" data-arg="api-docs">
-          <span class="quick-action-icon"><img src="/assets/icons/icon-audit.svg" alt="" width="24" height="24"></span>
-          <div>
-            <div class="quick-action-title">查看用户文档</div>
-            <div class="quick-action-desc">快速上手、配置指南、常见问题与 API 参考</div>
-          </div>
-        </a>
       </div>
     </div>
 
@@ -723,7 +685,7 @@
           </div>
         </div>
         <p class="text-sm text-dim mt-2">
-          规则文件版本 <code>v0.8.0</code>。全新安装后首次启动自动写入，无需手动操作。
+          规则文件版本 <code id="rules-version-text">v0.9.1</code>。全新安装后首次启动自动写入，无需手动操作。
         </p>
       </div>
     </div>
@@ -732,7 +694,7 @@
       <span class="loading-spinner"></span> 正在获取信任中心数据...
     </div>
     <!-- v0.8.23 S1-RES-05 修复：信任中心手动刷新按钮 -->
-    <button id="trust-refresh-btn" class="btn btn-outline btn-sm" onclick="loadTrustCenter()" style="margin-top: 8px; display: none;">🔄 刷新信任中心数据</button>
+    <button id="trust-refresh-btn" class="btn btn-outline btn-sm" data-action="loadTrustCenter" style="margin-top: 8px; display: none;"><img src="/assets/icons/icon-refresh.svg" alt="" width="14" height="14" style="vertical-align: middle; margin-right: 4px;">刷新信任中心数据</button>
   </section>
 
   <!-- ========== 用户文档标签页（原 API 文档，v0.6.0 扩展为综合用户指南） ========== -->
@@ -1541,7 +1503,7 @@
         <div style="display: flex; align-items: center; justify-content: center; gap: 16px; margin-bottom: 32px;">
           <div class="step-indicator active" id="step-1">
             <div class="step-number">1</div>
-            <div class="step-label">检测 IDE & Agent</div>
+            <div class="step-label">检测工具</div>
           </div>
           <div style="flex: 1; height: 2px; background: var(--lrc-宣纸-500); max-width: 80px;" id="step-line-1"></div>
           <div class="step-indicator" id="step-2">
@@ -1551,25 +1513,25 @@
           <div style="flex: 1; height: 2px; background: var(--lrc-宣纸-500); max-width: 80px;" id="step-line-2"></div>
           <div class="step-indicator" id="step-3">
             <div class="step-number">✓</div>
-            <div class="step-label">完成配置</div>
+            <div class="step-label">完成</div>
           </div>
         </div>
 
-        <!-- 步骤 1：检测 IDE & Agent 工具并选择项目 -->
+        <!-- 步骤 1：检测工具并选择项目 -->
         <div id="setup-step-1">
           <h3 style="margin: 0 0 24px 0; text-align: center; color: var(--lrc-墨韵-700); font-family: var(--font-serif);">
-            第 1 步：检测 IDE & Agent 工具并选择项目
+            检测你的 AI 工具
           </h3>
           <p style="text-align: center; color: var(--lrc-墨韵-500); margin-bottom: 32px;">
-            龙忆（LRC）将扫描你电脑上的 IDE 和 Agent 工具，并自动检测对应项目。勾选你需要的工具和项目即可。
+            龙忆会自动扫描你电脑上已安装的 IDE 与 Agent 工具，并为你勾选已支持 MCP 的那些。扫描完成后，挑一个工具、选一个项目，就能让 AI 直接查你的代码记忆。
           </p>
 
-          <!-- IDE & Agent 工具检测 -->
+          <!-- AI 工具检测 -->
           <div style="margin-bottom: 32px;">
             <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px;">
-              <img src="/assets/icons/icon-search.svg" alt="" width="20" height="20" style="opacity: 0.7;">
-              <h4 style="margin: 0; color: var(--lrc-墨韵-700); font-size: 1em;">IDE & Agent 工具</h4>
-              <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">已安装且支持 <span class="term-tooltip">MCP<span class="tooltip-content">模型上下文协议（Model Context Protocol），一种让 AI 工具安全访问本地资源的开放协议。龙忆（LRC）通过 MCP 为 IDE 和 Agent 提供代码记忆检索能力。</span></span> 的工具会自动勾选</span>
+              <img src="/assets/icons/icon-tools.svg" alt="" width="20" height="20" style="opacity: 0.7;">
+              <h4 style="margin: 0; color: var(--lrc-墨韵-700); font-size: 1em;">AI 工具</h4>
+              <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">仅显示已安装的工具 · 已支持 <span class="term-tooltip">MCP<span class="tooltip-content">模型上下文协议（Model Context Protocol），一种让 AI 工具安全访问本地资源的开放协议。龙忆（LRC）通过 MCP 为 IDE 和 Agent 提供代码记忆检索能力。</span></span> 的会自动勾选</span>
             </div>
             <div id="ai-tools-list" style="background: var(--lrc-宣纸-300); border-radius: var(--radius-md); padding: 20px; text-align: center;">
               <p style="color: var(--lrc-墨韵-400); margin: 0;">正在扫描工具...</p>
@@ -1581,7 +1543,7 @@
             <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 16px;">
               <img src="/assets/icons/icon-folder.svg" alt="" width="20" height="20" style="opacity: 0.7;">
               <h4 style="margin: 0; color: var(--lrc-墨韵-700); font-size: 1em;">索引项目</h4>
-              <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">选择要让龙忆（LRC）记住代码的项目</span>
+              <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">选一个项目，让龙忆记住它的代码</span>
             </div>
 
             <!-- 选择文件夹按钮 -->
@@ -1608,10 +1570,10 @@
         <!-- 步骤 2：配置 LLM -->
         <div id="setup-step-2" style="display: none;">
           <h3 style="margin: 0 0 24px 0; text-align: center; color: var(--lrc-墨韵-700); font-family: var(--font-serif);">
-            第 2 步：配置 LLM（可选）
+            配置 LLM（可选）
           </h3>
           <p style="text-align: center; color: var(--lrc-墨韵-500); margin-bottom: 32px;">
-            配置 LLM 以启用自然语言搜索代码。不配置也可以使用基础功能。
+            配置一个 LLM，就能用一句自然语言搜索代码和记忆。暂时不配也没关系，你可以随时在「设置」里补上。
           </p>
 
           <div style="max-width: 500px; margin: 0 auto 32px auto;">
@@ -1642,14 +1604,13 @@
         <!-- 步骤 3：完成 -->
         <div id="setup-step-3" style="display: none; text-align: center;">
           <div style="margin-bottom: 24px;">
-            <img src="/assets/icons/icon-smile.svg" alt="" width="64" height="64" style="filter: brightness(0) saturate(100%) invert(72%) sepia(52%) saturate(500%) hue-rotate(5deg) brightness(90%) contrast(85%);">
+            <img src="/assets/icons/icon-check-circle.svg" alt="" width="64" height="64" style="color: var(--lrc-玉色-500);">
           </div>
           <h3 style="margin: 0 0 16px 0; color: var(--lrc-墨韵-700); font-family: var(--font-serif); font-size: 1.5em;">
-            配置完成！
+            配置完成
           </h3>
           <p style="color: var(--lrc-墨韵-500); margin-bottom: 32px; line-height: 1.8;">
-            龙忆（LRC）正在索引你的代码，完成后即可使用。<br>
-            你可以随时在设置中修改配置。
+            龙忆已经在后台索引你选的项目代码。索引完成后，你的 AI 工具就能直接查询这段代码的记忆了。配置随时可在「设置」中修改。
           </p>
           <button class="btn btn-primary" data-action="switchToTab" data-arg="dashboard">
             进入仪表盘
@@ -1658,33 +1619,6 @@
       </div>
     </div>
 
-    <!-- 注意事项 -->
-    <div class="section">
-      <div class="narrative-card" style="background: rgba(212, 168, 67, 0.05); border: 1px solid var(--lrc-金色-300);">
-        <div style="display: flex; align-items: flex-start; gap: 12px;">
-          <img src="/assets/icons/icon-warning.svg" alt="" width="28" height="28" style="flex-shrink: 0; margin-top: 2px; filter: brightness(0) saturate(100%) invert(72%) sepia(52%) saturate(500%) hue-rotate(5deg) brightness(90%) contrast(85%);">
-          <div>
-            <h4 style="margin: 0 0 8px 0; color: var(--lrc-墨韵-700);">MCP 配置指南</h4>
-            <p style="margin: 0 0 12px 0; color: var(--lrc-墨韵-500); font-size: 0.9em; line-height: 1.8;">
-              龙忆（LRC）支持<strong>自动写入</strong>以下工具的 MCP 配置（Trae / Trae CN、CodeBuddy、Cursor、VS Code、Windsurf、Qoder、Cline 等），选择项目后无需手动操作。
-              以下工具需<strong>手动配置</strong>：
-            </p>
-            <div style="font-size: 0.85em; color: var(--lrc-墨韵-500); line-height: 2;">
-              <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px 24px;">
-                <div><strong>Zed</strong>：创建 <code>.zed/mcp.json</code></div>
-                <div><strong>JetBrains IDE</strong>：设置 → 工具 → MCP 服务器 → 添加</div>
-                <div><strong>GitHub Copilot</strong>：VS Code 设置 → 扩展 → GitHub Copilot → MCP</div>
-                <div><strong>Claude Code</strong>：<code>claude mcp add</code> 命令或 <code>~/.claude.json</code></div>
-                <div><strong>Claude Desktop</strong>：编辑 <code>claude_desktop_config.json</code></div>
-              </div>
-            </div>
-            <p style="margin: 12px 0 0 0; color: var(--lrc-墨韵-500); font-size: 0.9em;">
-              所有工具的 MCP 命令格式：<code style="background: var(--lrc-宣纸-400); padding: 1px 6px; border-radius: 3px; font-size: 0.9em;">code-memory-server --src-dir &lt;项目路径&gt; --stdio</code>
-            </p>
-          </div>
-        </div>
-      </div>
-    </div>
   </section>
 
   <!-- ========== 设置标签页 ========== -->
@@ -1693,6 +1627,28 @@
       <div class="section-header" style="text-align: left;">
         <h2 class="section-title"><img src="/assets/icons/icon-bagua.svg" alt="" width="24" height="24" style="vertical-align:middle; margin-right: 10px;"> 系统设置</h2>
         <p class="section-subtitle">配置龙忆 Loong Recall 的各项参数，提升搜索理解力</p>
+      </div>
+    </div>
+
+    <!-- P2 修复: 新手欢迎引导可复现入口（关闭后仍可重新显示） -->
+    <div class="section" id="welcome-reopen-section">
+      <div class="narrative-card">
+        <div class="settings-section-header">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="settings-icon-badge" style="background: linear-gradient(135deg, var(--lrc-金色-400), var(--lrc-金色-600));">
+              <img src="/assets/icons/icon-bagua.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <div>
+              <h3 class="settings-section-title">界面引导</h3>
+              <p class="settings-section-desc">新手欢迎引导关闭后仍可重新显示，便于回顾使用引导</p>
+            </div>
+          </div>
+        </div>
+        <div style="padding: 16px 0;">
+          <button class="btn btn-outline" data-action="reopenWelcome">
+            重新显示欢迎引导
+          </button>
+        </div>
       </div>
     </div>
 
@@ -2199,7 +2155,7 @@
 <footer class="status-bar">
   <div class="status-bar-left">
     <span><span class="status-dot unknown" id="status-dot"></span><span id="status-text" class="status-clickable" title="点击启动 LRC 服务">检测中...</span></span>
-    <span>版本 <strong id="status-version">v0.9.0</strong></span>
+    <span>版本 <strong id="status-version">v0.9.1</strong></span>
   </div>
   <div class="status-bar-right">
     <span>数据目录：<code id="status-data-dir" class="status-clickable" title="点击打开数据目录">--</code></span>
@@ -2237,6 +2193,22 @@
     <div class="modal-footer">
       <button class="btn btn-secondary" id="confirm-modal-cancel" data-autotest="confirm-cancel">取消</button>
       <button class="btn btn-danger" id="confirm-modal-ok" data-autotest="confirm-ok">确认</button>
+    </div>
+  </div>
+</div>
+
+<!-- P1-2 修复：独立信息展示面板（非确认框），用于只读/查询结果展示。
+     与 #confirm-modal 完全隔离，避免纯信息弹窗被测试误判为 confirmOpen。 -->
+<div class="modal-overlay" id="info-panel" hidden>
+  <div class="modal-card">
+    <div class="modal-header">
+      <h3 id="info-panel-title">提示</h3>
+    </div>
+    <div class="modal-body">
+      <div id="info-panel-message" class="confirm-message" style="white-space:pre-wrap; word-break:break-word;"></div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-primary" id="info-panel-close" data-autotest="info-panel-close">关闭</button>
     </div>
   </div>
 </div>
