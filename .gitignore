@@ -327,3 +327,13 @@ docs/引导页重设计规范_*.md
 # v0.9.1 发布清理：CDP 回归测试脚本与报告（不交付用户）
 tests/frontend/cdp-regression*.js
 tests/frontend/cdp-regression-report.*
+
+# v0.9.1 发布清理：开发/发布流程文档与测试脚本（不交付用户，本地开发自用）
+docs/DEV_ISOLATION_SPEC.md
+docs/HCSE_RELEASE_PROTOCOL.md
+docs/PRE_PUSH_CHECKLIST.md
+docs/PUSH_STANDARD.md
+docs/RELEASE_PROCESS.md
+docs/PRODUCT_ROADMAP_v1.0.md
+tests/frontend/dashboard-smoke.spec.js
+tests/frontend/playwright.config.js
