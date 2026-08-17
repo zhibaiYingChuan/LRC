@@ -605,6 +605,12 @@ jobs:
             archive.ubuntu.com:80
             # v0.8.23 修复：cargo tauri build 需要下载 AppImage 工具
             release-assets.githubusercontent.com:443
+            # v0.9.1 修复：Windows 构建 cargo tauri build 需要下载 NSIS + WebView2 工具
+            # 根因：harden-runner egress-policy: block 阻止这些域名 → 构建挂起 → runner 失联
+            downloads.sourceforge.net:443
+            go.microsoft.com:443
+            aka.ms:443
+            download.visualstudio.microsoft.com:443
 
       - name: Resolve version
         id: version
@@ -893,7 +899,8 @@ jobs:
             uploads.github.com:443
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # v0.9.1 修复：v4 触发 Node.js 20 弃用警告，升级到 v7（Node.js 24）
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: artifacts
 
@@ -1037,12 +1044,13 @@ jobs:
             tuf-repo-cdn.sigstore.dev:443
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        # v0.9.1 修复：v4 触发 Node.js 20 弃用警告，升级到 v7（Node.js 24）
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           path: artifacts
 
       - name: Attest build provenance
-        # v0.8.25 HCSE 安全合规：固定到完整 Commit SHA（v2 tag 对应 96b4a1ef7235a096b17240c259729fdd70c83d45）
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45
+        # v0.9.1 修复：v2 触发 Node.js 20 弃用警告，升级到 v4.2.2（Node.js 24）
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: artifacts/**/*
