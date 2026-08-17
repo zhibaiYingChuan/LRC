@@ -35,6 +35,18 @@ pub fn check_model_ready(model_id: &str) -> bool {
         }
     }
 
+    // v0.9.0 新增：检查 ~/.loong-recall/models/ 标准目录
+    // 统一模型目录，不依赖 cwd 或 exe_dir，所有模型下载和管理都使用此目录
+    if let Some(home) = home_dir() {
+        let lrc_models = home
+            .join(".loong-recall")
+            .join("models")
+            .join(&local_model_name);
+        if model_files_exist(&lrc_models) {
+            return true;
+        }
+    }
+
     // 3. 检查 HuggingFace 缓存（~/.cache/huggingface/hub/）
     if let Some(cache_dir) = dirs_next::cache_dir() {
         let folder_name = format!("models--{}", local_model_name);
@@ -60,6 +72,32 @@ pub fn check_model_ready(model_id: &str) -> bool {
 fn model_files_exist(dir: &std::path::Path) -> bool {
     dir.join("config.json").exists()
         && (dir.join("model.safetensors").exists() || dir.join("pytorch_model.bin").exists())
+}
+
+/// 获取用户主目录（跨平台：Windows USERPROFILE / Unix HOME）
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+        .map(std::path::PathBuf::from)
+}
+
+/// v0.9.0 新增：获取统一的模型根目录
+///
+/// 所有模型下载、列表、加载都使用此目录，避免 cwd 不一致导致找不到模型。
+/// 目录解析优先级：
+///   1. 环境变量 `LRC_MODELS_DIR`（显式指定）
+///   2. `~/.loong-recall/models/`（默认标准目录）
+///   3. `./models`（回退）
+pub fn default_models_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("LRC_MODELS_DIR") {
+        if !dir.trim().is_empty() {
+            return std::path::PathBuf::from(dir);
+        }
+    }
+    home_dir()
+        .map(|h| h.join(".loong-recall").join("models"))
+        .unwrap_or_else(|| std::path::PathBuf::from("models"))
 }
 
 #[cfg(test)]

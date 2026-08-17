@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.9.0';
+const APP_VERSION = '0.9.1';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -370,6 +370,48 @@ const MAX_RETRY_COUNT = 3;
 // v0.8.4 Step 10 / G047：重试 Modal 激活标志，禁止标签页切换
 let _retryModalActive = false;
 
+/**
+ * P0-2 修复：后端错误文案人话化映射层
+ * 将后端返回的技术术语（invalid args 'provider'、lock_busy、connection refused 等）
+ * 统一翻译为用户可理解的中文提示，避免技术细节直接上屏。
+ * 已经是中文或无法识别的短文本则原样透传。
+ * @param {string} errorDetail - 后端原始错误文本
+ * @returns {string} 人话化后的文案
+ */
+function humanizeErrorDetail(errorDetail) {
+  if (!errorDetail) return '';
+  const raw = String(errorDetail);
+  const lower = raw.toLowerCase();
+
+  // 锁冲突 / 后台合成中
+  if (lower.includes('lock_busy') || lower.includes('lock busy')) {
+    return '记忆系统正在后台合成，请稍后重试';
+  }
+  // 参数错误（最常见：invalid args 'provider'）
+  if (lower.includes('invalid args') || lower.includes('invalid argument')) {
+    if (/provider/i.test(raw)) {
+      return '模型提供方（provider）配置无效，请检查 LLM 设置';
+    }
+    return '请求参数无效，请检查输入内容';
+  }
+  // 连接失败 / 服务未启动
+  if (lower.includes('connection refused') || lower.includes('fetch failed') || lower.includes('network error')) {
+    return '无法连接到本地服务，请确认 LRC 服务已启动';
+  }
+  // 超时
+  if (lower.includes('timeout') || lower.includes('timed out')) {
+    return '操作超时，请稍后重试';
+  }
+  // 本地编码模型未就绪
+  if (lower.includes('embedding') && (lower.includes('not ready') || lower.includes('loading'))) {
+    return '本地模型尚未就绪，请稍后再试';
+  }
+  // 原始错误本身已经是中文或较短，直接透传
+  return raw;
+}
+// 暴露到 window 供测试与后续调用点复用
+window.humanizeErrorDetail = humanizeErrorDetail;
+
 async function handleHttpError(response, context = '操作', retryContext = null) {
   const status = response.status;
   let errorDetail = '';
@@ -441,7 +483,7 @@ async function handleHttpError(response, context = '操作', retryContext = null
     let shouldRetry;
     try {
       shouldRetry = await showConfirm(
-        `${context}失败：服务内部错误（第 ${retryCount + 1} 次重试）\n\n错误详情：${errorDetail}\n\n是否重试？`,
+        `${context}失败：服务内部错误（第 ${retryCount + 1} 次重试）\n\n错误详情：${humanizeErrorDetail(errorDetail) || errorDetail}\n\n是否重试？`,
         '服务错误',
         0
       );
@@ -573,7 +615,8 @@ async function handleHttpError(response, context = '操作', retryContext = null
     return { action: 'cancel', status, errorDetail };
   } else {
     // 其他非 2xx 错误
-    showToast(`${context}失败：${errorDetail || '服务响应异常，请稍后重试'}`, 'error', 4000);
+    // P0-2：通过人话化映射层翻译技术术语，避免 raw errorDetail 直接上屏
+    showToast(`${context}失败：${humanizeErrorDetail(errorDetail) || '服务响应异常，请稍后重试'}`, 'error', 4000);
     return { action: 'cancel', status, errorDetail };
   }
 }
@@ -1096,6 +1139,54 @@ let _lockBusyCooldownTimer = null;
   }
 })();
 
+/**
+ * 引导交互生命周期状态机（产品经理重设计）：
+ * 根据「配置状态」+「记忆库状态」动态决定引导显示，而非静态堆砌。
+ *   - 未配置（setup_complete=false）：显示配置向导，隐藏快速体验（还没配置好，无法体验）
+ *   - 已配置、未体验（setup_complete=true 且记忆库为空）：隐藏配置向导，显示快速体验
+ *   - 已体验（记忆库有记忆）：收起所有引导，专注进阶使用
+ */
+async function applyOnboardingState() {
+  const quickstartWizard = document.getElementById('quickstart-wizard');
+  const setupSection = document.getElementById('setup-steps-section');
+
+  // 1. 向导完成状态
+  let setupComplete = false;
+  try {
+    const wizard = await postMessageToParent('lrc-get-wizard-state', {}, 5000);
+    setupComplete = !!(wizard && wizard.setup_complete);
+  } catch (_) {
+    // 纯 Web 端无向导状态，默认视为未配置
+  }
+
+  // 2. 记忆库状态
+  let totalMemories = 0;
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/health/system', {}, 5000);
+    if (res.ok) {
+      const data = await res.json();
+      totalMemories = Number((data && data.memory_stats && data.memory_stats.total_memories) || 0);
+    }
+  } catch (_) {
+    // 获取失败默认 0
+  }
+
+  // 3. 状态机决定显示
+  if (!setupComplete) {
+    // 状态 1：未配置 → 显示配置向导，隐藏快速体验
+    if (setupSection) setupSection.style.display = '';
+    if (quickstartWizard) quickstartWizard.hidden = true;
+  } else if (totalMemories === 0) {
+    // 状态 2：已配置、未体验 → 隐藏配置向导，显示快速体验
+    if (setupSection) setupSection.style.display = 'none';
+    if (quickstartWizard) quickstartWizard.hidden = false;
+  } else {
+    // 状态 3：已体验 → 全部收起
+    if (setupSection) setupSection.style.display = 'none';
+    if (quickstartWizard) quickstartWizard.hidden = true;
+  }
+}
+
 async function loadDashboard() {
   const loading = $('dashboard-loading');
   const error = $('dashboard-error');
@@ -1230,6 +1321,9 @@ async function loadDashboard() {
     // v0.8.5 Step 2 / G080 修复：恢复上次选中的预设场景
     // 之前 restoreSelectedScenario 定义但从未被调用，导致刷新后预设场景丢失
     restoreSelectedScenario();
+
+    // 引导生命周期状态机：根据配置/记忆库状态动态显示引导（不 await，避免阻塞）
+    applyOnboardingState();
 
     loading.classList.add('hidden');
   } catch (e) {
@@ -1600,7 +1694,9 @@ function renderDashboard(system, detailed, dao) {
   }
   // --- v0.5.4 P1-7 修复：用户友好的记忆统计卡片 ---
   const memStats = system?.memory_stats || {};
-  const daoMetrics = system?.dao_metrics || dao || {};
+  // v0.9.0 修复：dao_metrics 降级路径字段层级对齐
+  // （system 端点失败时 dao 是 {ok, data:{...}, raw:{...}}，需取 dao.data 而非 dao 本身）
+  const daoMetrics = system?.dao_metrics || (dao && dao.data) || {};
 
   // 记忆总数 = 活跃 + 结晶 + 归档
   const totalMemories = memStats.total_memories
@@ -1640,8 +1736,9 @@ function renderDashboard(system, detailed, dao) {
     }
   }
 
-  if (sysDataDir) sysDataDir.textContent = '.loong-recall/data/';
-  if (sysDataDirSettings) sysDataDirSettings.textContent = '.loong-recall/data/';
+  // v0.9.0 修复：数据目录改为 v0.8.0+ 全局模式真实路径（曾硬编码旧版 .loong-recall/data/）
+  if (sysDataDir) sysDataDir.textContent = '~/.loong-recall/global/data/';
+  if (sysDataDirSettings) sysDataDirSettings.textContent = '~/.loong-recall/global/data/';
   if (sysMode) sysMode.innerHTML = statusBadge(system?.system_mode || 'unknown');
 
   // --- v0.5.4 P1-7 修复：并行加载最近记忆、项目分布、活动日志 ---
@@ -1680,6 +1777,16 @@ async function loadRecentMemories() {
     }
     if (!res.ok) throw new Error('最近记忆 API 不可用');
     const data = await res.json();
+    // v0.9.1 修复：后端 lock_busy 时返回 200 + 降级数据（非 503），成功路径也需识别
+    if (data.lock_busy === true) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">⏳</div>
+          <div class="empty-text">后台合成中</div>
+          <div class="empty-hint">记忆系统正在执行后台合成，最近记忆稍后自动加载</div>
+        </div>`;
+      return;
+    }
     const memories = data.memories || [];
 
     if (memories.length === 0) {
@@ -1797,6 +1904,16 @@ async function loadMemoryStats() {
     }
     if (!res.ok) throw new Error('记忆统计 API 不可用');
     const data = await res.json();
+    // v0.9.1 修复：后端 lock_busy 时返回 200 + 降级数据（非 503），成功路径也需识别
+    if (data.lock_busy === true) {
+      container.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-icon">⏳</div>
+          <div class="empty-text">后台合成中</div>
+          <div class="empty-hint">记忆系统正在执行后台合成，项目分布稍后自动加载</div>
+        </div>`;
+      return;
+    }
 
     // 更新系统信息卡片
     if (sysStorageSize) {
@@ -1905,6 +2022,11 @@ async function loadAuditLog() {
     }
     if (!res.ok) throw new Error('审计日志 API 不可用');
     const data = await res.json();
+    // v0.9.1 修复：后端 lock_busy 时返回 200 + 降级数据（非 503），成功路径也需识别
+    if (data.lock_busy === true) {
+      tbody.innerHTML = '<tr><td colspan="3" class="text-center text-dim">⏳ 后台合成中，日志稍后自动加载</td></tr>';
+      return;
+    }
     const events = data.events || [];
 
     if (events.length === 0) {
@@ -1929,7 +2051,8 @@ async function loadAuditLog() {
     tbody.innerHTML = events.map(e => {
       const time = new Date(e.timestamp_ms).toLocaleString('zh-CN');
       const type = typeLabels[e.event_type] || htmlescape(e.event_type);
-      const desc = htmlescape(e.description.length > 50 ? e.description.slice(0, 50) + '...' : e.description);
+      // v0.9.0 修复：description 空值保护（避免某条事件缺字段导致整表加载失败）
+      const desc = htmlescape((e.description || '').length > 50 ? (e.description || '').slice(0, 50) + '...' : (e.description || ''));
       return `<tr>
         <td style="white-space:nowrap">${time}</td>
         <td><span class="badge info">${type}</span></td>
@@ -2007,7 +2130,8 @@ function updateStatusBar(online, systemData) {
   // v0.8.7 Step 3：修复 sys-version 硬编码，统一使用 APP_VERSION 动态填充
   const sysVersion = $('sys-version');
   if (sysVersion) sysVersion.textContent = 'v' + currentVersion;
-  if (dataDir) dataDir.textContent = '.loong-recall/data/';
+  // v0.9.0 修复：数据目录改为全局模式真实路径（曾硬编码旧版 .loong-recall/data/）
+  if (dataDir) dataDir.textContent = '~/.loong-recall/global/data/';
   if (uptime) uptime.textContent = formatUptime(Date.now() - startTime);
 
   // v0.8.15 P1 修复：信任中心"服务状态概览"区块同步更新
@@ -2754,6 +2878,12 @@ async function generateCaptainLog() {
       const logRes = await fetchWithTimeout(API_BASE + '/v1/captains-log', {}, 30000);
       if (logRes.ok) {
         const logData = await logRes.json();
+        // v0.9.1 修复：后端 lock_busy 时返回 200 降级数据（非 503），成功路径需识别
+        if (logData.lock_busy === true) {
+          result.textContent = logData.report || '⏳ 记忆系统正在执行后台合成，船长日志稍后自动加载...';
+          result.classList.remove('hidden');
+          return;
+        }
         if (logData.report || logData.content || logData.log) {
           const logText = logData.report || logData.content || logData.log;
           result.textContent = logText;
@@ -3141,7 +3271,8 @@ async function verifyNetworkAudit() {
       <div class="result-row"><span class="result-label">无分析</span><span class="result-value valid">✅ ${data.no_analytics ? '确认' : '未能确认'}</span></div>
     `;
 
-    if (data.requests.length > 0) {
+    // v0.9.0 修复：requests 空值保护（与 runPrivacyCheck 一致）
+    if ((data.requests || []).length > 0) {
       html += '<div class="result-row"><span class="result-label">已记录请求</span><span class="result-value">';
       html += data.requests.map(r => '<div>' + htmlescape(r) + '</div>').join('');
       html += '</span></div>';
@@ -3172,6 +3303,17 @@ async function verifyAuditIntegrity() {
     const res = await fetchWithTimeout(API_BASE + '/v1/trust/audit-integrity');
     if (!res.ok) throw new Error('API 不可达');
     const data = await res.json();
+
+    // v0.9.1 修复：后端 lock_busy 时返回 200 降级数据（非 503），成功路径需识别
+    if (data.lock_busy === true) {
+      result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--ink)">⏳ 后台合成中，完整性验证稍后自动加载</span></div>';
+      result.classList.add('show');
+      const auditText = $('audit-integrity-text');
+      if (auditText) {
+        auditText.innerHTML = '状态：<span class="badge info">后台合成中</span>';
+      }
+      return;
+    }
 
     const hashCls = data.hash_chain_valid ? 'valid' : 'invalid';
     const anchorCls = data.anchor_chain_valid ? 'valid' : 'invalid';
@@ -3249,7 +3391,7 @@ async function wizardStep1Search() {
         html += '<div class="code-result" style="margin:6px 0;padding:6px;background:#1a1a2e;border-radius:4px;font-size:11px">' +
           '<span style="color:#f1c40f">#' + r.rank + '</span> ' +
           '<span style="color:#2ecc71">' + htmlescape(r.file_path) + ':' + r.start_line + '</span> ' +
-          '<span style="color:#e74c3c">' + (r.score * 100).toFixed(0) + '%</span><br>' +
+          '<span style="color:#e74c3c">' + ((r.score || 0) * 100).toFixed(0) + '%</span><br>' +
           '<code style="color:#ddd">' + htmlescape(codePreview) + '</code>' +
           '</div>';
       }
@@ -3336,7 +3478,7 @@ async function wizardStep3Search() {
       const items = data.memories.slice(0, 3).map(m => {
         const memContent = m.content || '';
         return '📝 ' + htmlescape(memContent.length > 60 ? memContent.slice(0, 60) + '...' : memContent) +
-        ' (' + (m.score * 100).toFixed(0) + '%)'
+        ' (' + ((m.score || 0) * 100).toFixed(0) + '%)'
       }).join('<br>');
       result.innerHTML = '✅ 检索成功！找到 ' + htmlescape(String(data.total)) + ' 条相关记忆：<br>' + items;
     } else {
@@ -3481,7 +3623,7 @@ async function init() {
           console.log('[LRC] 规则写入完成:', payload);
           if (payload.written_count > 0) {
             showToast(
-              '已为 ' + payload.written_count + ' 个 AI 工具写入 LRC 规则（v0.8.0）',
+              '已为 ' + payload.written_count + ' 个 AI 工具写入 LRC 规则（v' + APP_VERSION + '）',
               'success',
               4000
             );
@@ -3581,21 +3723,8 @@ async function init() {
           // 隐藏横幅
           const banner = document.getElementById('sidecar-down-banner');
           if (banner) banner.hidden = true;
-          // v0.9.0 Fix-03：基于向导完成状态条件隐藏「5分钟快速体验」向导卡片。
-          // 已完成配置（setup_complete=true）的用户直达仪表盘；
-          // 真正首次（未完成向导）用户保留引导，避免 onboarding 永久缺失。
-          postMessageToParent('lrc-get-wizard-state', {}, 5000)
-            .then((wizard) => {
-              if (wizard && wizard.setup_complete) {
-                const quickstartWizard = document.getElementById('quickstart-wizard');
-                if (quickstartWizard) quickstartWizard.hidden = true;
-              }
-            })
-            .catch(() => {
-              // 非桌面端嵌入模式（纯 Web 端）无向导状态，隐藏向导卡片直接展示仪表盘
-              const quickstartWizard = document.getElementById('quickstart-wizard');
-              if (quickstartWizard) quickstartWizard.hidden = true;
-            });
+          // 引导显示改由 applyOnboardingState() 生命周期状态机统一处理（在 loadDashboard 内调用），
+          // 此处不再单独隐藏 quickstart-wizard，避免与状态机逻辑冲突。
           // 显示成功提示
           showToast(payload.message || 'LRC 服务已自动启动', 'success', 3000);
           // 更新状态栏为可达，触发仪表盘加载
@@ -3955,7 +4084,9 @@ async function loadProjectInfo() {
 // V2: 记忆数据导出（浏览器端触发下载）
 // ============================================================
 async function backupMemories() {
-  const btn = $('btn-backup-memories');
+  // v0.9.0 修复 H-1：HTML 中该按钮无 id（仅 data-action），原 $('btn-backup-memories') 恒为 null，
+  // 导致防重复提交是死代码。改为查询所有触发按钮并统一禁用。
+  const btns = document.querySelectorAll('[data-action="backupMemories"]');
   // v0.8.0：同时更新设置页 backup-result 和信任中心 trust-backup-result
   const resultEls = [$('backup-result'), $('trust-backup-result')].filter(Boolean);
   const updateResult = (text, cls) => {
@@ -3965,7 +4096,7 @@ async function backupMemories() {
       el.className = cls || 'form-result';
     });
   };
-  if (btn) btn.disabled = true;
+  btns.forEach(b => b.disabled = true);
   if (resultEls.length > 0) {
     updateResult('⏳ 正在准备备份文件...');
   }
@@ -4012,13 +4143,20 @@ async function backupMemories() {
     // 获取记忆数据
     if (memoriesRes.status === 'fulfilled' && memoriesRes.value.ok) {
       const memoriesData = await memoriesRes.value.json();
+      // v0.9.1 修复：后端 lock_busy 时返回 200 + 降级数据（非 503），避免导出空备份
+      if (memoriesData.lock_busy === true) {
+        updateResult('⏳ 后台合成中，请稍后再导出备份', 'form-result form-result-warning');
+        showToast('记忆系统正在后台合成，请稍后再导出备份', 'warning', 5000);
+        return;
+      }
       exportData.memories = memoriesData.memories || memoriesData.data || [];
     }
 
     // 获取代码片段
     if (chunksRes.status === 'fulfilled' && chunksRes.value.ok) {
       const chunksData = await chunksRes.value.json();
-      exportData.chunks = chunksData.chunks || chunksData.data || [];
+      // v0.9.0 修复：字段名对齐后端（/v1/code/search 返回 results，而非 chunks/data）
+      exportData.chunks = chunksData.results || chunksData.chunks || chunksData.data || [];
     }
 
     // 创建下载
@@ -4063,7 +4201,7 @@ async function backupMemories() {
       updateResult('⚠️ 备份失败: ' + htmlescape(e.message), 'form-result form-result-error');
     }
   } finally {
-    if (btn) btn.disabled = false;
+    btns.forEach(b => b.disabled = false);
   }
 }
 
@@ -4227,6 +4365,10 @@ async function migrateData() {
     return;
   }
 
+  // v0.9.0 修复 M-1：迁移期间禁用按钮，防止重复触发 POST /v1/migrate
+  const migrateBtn = document.querySelector('[data-action="migrateData"]');
+  if (migrateBtn) migrateBtn.disabled = true;
+
   result.style.display = '';
   result.textContent = '⏳ 正在扫描并迁移数据...';
   result.className = 'form-result';
@@ -4245,9 +4387,10 @@ async function migrateData() {
 
     // 格式化迁移报告
     const sources = data.sources_scanned || 0;
-    const totalFound = data.total_memories_found || 0;
-    const merged = data.merged_count || 0;
-    const backups = data.backups_created || 0;
+    // v0.9.0 修复：字段名对齐后端 MigrationReport（曾误用 total_memories_found/merged_count/backups_created）
+    const totalFound = data.global_before || 0;
+    const merged = data.memories_added || 0;
+    const backups = data.files_backed_up || 0;
 
     result.innerHTML =
       '✅ 迁移完成！<br>' +
@@ -4266,6 +4409,9 @@ async function migrateData() {
   } catch (e) {
     result.textContent = '⚠️ 迁移失败: ' + htmlescape(e.message);
     result.className = 'form-result form-result-error';
+  } finally {
+    // v0.9.0 修复 M-1：无论成功/失败都恢复迁移按钮
+    if (migrateBtn) migrateBtn.disabled = false;
   }
 }
 
@@ -4276,6 +4422,10 @@ async function migrateData() {
 async function createBackup() {
   const result = $('backup-result-trust');
   if (!result) return;
+
+  // v0.9.0 修复 L-1：备份期间禁用按钮，防止重复触发 POST /v1/backup
+  const backupBtn = document.querySelector('[data-action="createBackup"]');
+  if (backupBtn) backupBtn.disabled = true;
 
   result.style.display = '';
   result.textContent = '⏳ 正在创建备份...';
@@ -4310,6 +4460,9 @@ async function createBackup() {
   } catch (e) {
     result.textContent = '⚠️ 备份失败: ' + htmlescape(e.message);
     result.className = 'form-result form-result-error';
+  } finally {
+    // v0.9.0 修复 L-1：无论成功/失败都恢复备份按钮
+    if (backupBtn) backupBtn.disabled = false;
   }
 }
 
@@ -4379,10 +4532,30 @@ const RULES_TOOL_NAMES = {
   'gemini-cli': 'Gemini CLI',
 };
 
+/// 给 Tauri invoke 增加超时兜底（Promise.race + setTimeout），防止 invoke 永不返回导致 UI 卡死
+async function invokeWithTimeout(invokeFn, cmdName, args, timeoutMs) {
+  if (!invokeFn) throw new Error('Tauri 环境下无法调用 invoke');
+  let timeoutId = null;
+  const invokePromise = invokeFn(cmdName, args);
+  const timeoutPromise = new Promise((_, rejectTimeout) => {
+    timeoutId = setTimeout(() => {
+      rejectTimeout(new Error('请求超时（' + timeoutMs + 'ms），请稍后重试'));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([invokePromise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 /// 加载所有 AI 工具的规则文件状态
 async function loadRulesStatus() {
   const result = $('rules-status-result');
   const loading = $('rules-status-loading');
+  // v0.9.0 修复：动态同步规则版本号（消除 index.html 硬编码 v0.8.0）
+  const rulesVerEl = document.getElementById('rules-version-text');
+  if (rulesVerEl) rulesVerEl.textContent = 'v' + APP_VERSION;
   if (!result) return;
   if (loading) loading.classList.remove('hidden');
   result.classList.remove('show');
@@ -4395,7 +4568,8 @@ async function loadRulesStatus() {
       if (!invokeFn) {
         throw new Error('Tauri 环境下无法调用 invoke');
       }
-      const statusList = await invokeFn('get_rules_status');
+      // v0.9.0 修复：get_rules_status invoke 无超时，增加 10s 超时兜底，防止查询卡死
+      const statusList = await invokeWithTimeout(invokeFn, 'get_rules_status', undefined, 10000);
       renderRulesStatus(result, statusList);
     } else {
       // 非 Tauri 环境不支持
@@ -4424,10 +4598,15 @@ function renderRulesStatus(container, statusList) {
   let html = '<div class="result-row" style="font-weight:600;">' +
     '<span class="result-label">总计 ' + total + ' 个工具</span>' +
     '<span class="result-value">已写入 ' + written + ' · 需更新 ' + outdated + '</span>' +
+    '</div>' +
+    // v0.9.0 修复：添加手动导入提示，说明规则文件自动写入 + MCP 配置方式
+    '<div class="result-row" style="font-size:11px;color:var(--text-dim);padding:4px 0;border-bottom:1px solid rgba(26,26,46,0.05);">' +
+    '规则文件由 LRC 启动时自动写入，无需手动操作。如需配置 MCP 连接，请到「配置向导」完成，部分工具需在 IDE 内手动添加 MCP 服务器。' +
     '</div>';
 
   statusList.forEach(s => {
-    const name = RULES_TOOL_NAMES[s.tool_id] || s.tool_id;
+    // v0.9.0 修复：优先使用后端返回的工具名（s.name），避免前端硬编码映射不全会显示原始 ID
+    const name = s.name || RULES_TOOL_NAMES[s.tool_id] || s.tool_id;
     let statusBadge = '';
     let statusColor = '';
 
@@ -4435,21 +4614,22 @@ function renderRulesStatus(container, statusList) {
       statusBadge = '未写入';
       statusColor = 'var(--cinnabar)';
     } else if (s.needs_update) {
-      statusBadge = '需更新（v' + (s.version || '?') + '→v0.8.0）';
+      statusBadge = '需更新（v' + (s.version || '?') + '→v' + APP_VERSION + '）';
       statusColor = 'var(--lrc-金色-500)';
     } else {
       statusBadge = '已最新（v' + (s.version || '?') + '）';
       statusColor = 'var(--lrc-竹青-500)';
     }
 
-    const pathDisplay = s.rules_path.length > 60
-      ? '...' + s.rules_path.substring(s.rules_path.length - 57)
-      : s.rules_path;
+    // v0.9.0 修复：不截断路径，完整显示（卡片已拉宽 + word-break 换行）
+    const fullPath = s.rules_path;
 
-    html += '<div class="result-row">' +
-      '<span class="result-label" style="min-width:100px;">' + htmlescape(name) + '</span>' +
-      '<span class="result-value" style="color:' + statusColor + ';">' + statusBadge + '</span>' +
-      '<span class="result-label text-sm text-dim" style="font-size:11px;min-width:0;flex:1;margin-left:8px;" title="' + htmlescape(s.rules_path) + '">' + htmlescape(pathDisplay) + '</span>' +
+    html += '<div class="result-row" style="flex-direction:column;align-items:stretch;gap:2px;">' +
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">' +
+        '<span class="result-label" style="font-weight:600;">' + htmlescape(name) + '</span>' +
+        '<span class="result-value" style="color:' + statusColor + ';white-space:nowrap;">' + statusBadge + '</span>' +
+      '</div>' +
+      '<div class="result-label text-sm text-dim" style="font-size:11px;word-break:break-all;white-space:normal;line-height:1.5;padding-left:0;" title="' + htmlescape(fullPath) + '">📄 ' + htmlescape(fullPath) + '</div>' +
       '</div>';
   });
 
@@ -4458,6 +4638,10 @@ function renderRulesStatus(container, statusList) {
 
 /// 重新写入规则文件（通过启动 sidecar 触发规则写入，或提示重启应用）
 async function retryWriteRules() {
+  // v0.9.0 修复：写入规则期间禁用按钮，防止重复触发 start_sidecar
+  const retryBtn = document.querySelector('[data-action="retryWriteRules"]');
+  if (retryBtn) retryBtn.disabled = true;
+
   showToast('正在重新写入规则文件...', 'info', 2000);
 
   try {
@@ -4468,7 +4652,8 @@ async function retryWriteRules() {
                        (window.__TAURI__ && window.__TAURI__.invoke);
       if (invokeFn) {
         try {
-          await invokeFn('start_sidecar');
+          // v0.9.0 修复：start_sidecar 无超时，增加 15s 超时兜底，防止写入卡死
+          await invokeWithTimeout(invokeFn, 'start_sidecar', undefined, 15000);
           showToast('规则文件重新写入完成，请查看状态确认', 'success', 3000);
           // 自动刷新规则状态
           setTimeout(() => loadRulesStatus(), 2000);
@@ -4484,6 +4669,8 @@ async function retryWriteRules() {
     }
   } catch (e) {
     showToast('规则写入失败: ' + (e.message || String(e)), 'error', 4000);
+  } finally {
+    if (retryBtn) retryBtn.disabled = false;
   }
 }
 
@@ -4503,13 +4690,14 @@ async function loadBenchmarks() {
     window.__benchmarkData = data;
 
     // 动态生成摘要栏
-    const s = data.summary;
+    // v0.9.0 修复：summary/layers 空值保护（后端缺字段时避免 TypeError）
+    const s = data.summary || {};
     const passedCount = s.passed || 0;
     const totalCount = s.total_tests || 0;
     const statusText = s.status === 'PASS' ? (passedCount + '/' + totalCount + ' 全部通过') : (passedCount + '/' + totalCount + ' 部分通过');
     const statusClass = s.status === 'PASS' ? 'badge-success' : 'badge-warning';
     let summaryHtml = '<span class="badge ' + statusClass + '">' + htmlescape(statusText) + '</span>';
-    for (const layer of data.layers) {
+    for (const layer of (data.layers || [])) {
       summaryHtml += ' <span class="badge badge-info">' +
         htmlescape(layer.name.split('：')[0]) + '：' + layer.passed + '/' + layer.total +
         '</span>';
@@ -5149,32 +5337,60 @@ function processConfirmQueue() {
 }
 
 /**
- * v0.8.2：信息展示模态框（替代多行 alert）
- * v0.8.4 Step 3：改为入队模式，复用 processConfirmQueue 串行处理（修复 G022 队列死锁）
- * 之前直接操作 confirm-modal DOM，与 showConfirm 共用 DOM 但未释放 confirmModalActive，
- * 导致 showConfirm 队列永久阻塞。现在入队等待，由 processConfirmQueue 统一调度。
+ * P1-2 修复：信息展示面板（只读/查询结果展示）。
+ * 改用独立的 #info-panel（非 #confirm-modal），避免纯信息弹窗被测试误判为 confirmOpen，
+ * 也不再占用 confirmModalQueue / confirmModalActive（解除与 showConfirm 的单例耦合）。
+ * 语义：非阻塞展示，用户点击「关闭」或按 ESC 后 resolve；若被新调用覆盖，旧的 Promise 立即 resolve。
  * @param {string} title - 标题
- * @param {string} content - 内容（支持换行 \n）
- * @returns {Promise<undefined>} 用户点击"知道了"后 resolve
+ * @param {string} content - 内容（支持换行 \n，通过 CSS white-space:pre-wrap 保留）
+ * @returns {Promise<undefined>} 用户关闭面板后 resolve
  */
+let _infoPanelResolve = null;
 function showInfoModal(title, content) {
-  // v0.8.4 Step 3：队列上限检查（与 showConfirm 一致）
-  if (confirmModalQueue.length >= 5) {
-    console.warn('[showInfoModal] 队列已满（5 个等待中），降级为 Toast 显示');
-    showToast(content, 'info');
+  const panel = $('info-panel');
+  const titleEl = $('info-panel-title');
+  const msgEl = $('info-panel-message');
+  const closeBtn = $('info-panel-close');
+
+  if (!panel || !msgEl || !closeBtn) {
+    // 降级：DOM 不存在时回退到 Toast（轻量反馈，绝不污染 #confirm-modal）
+    console.warn('[showInfoModal] info-panel DOM 不存在，降级为 Toast');
+    showToast(content, 'info', 5000);
     return Promise.resolve(undefined);
   }
 
-  // v0.8.4 Step 3：入队等待，由 processConfirmQueue 处理 isInfoOnly 标记
+  // 若上一次信息面板尚未关闭，先 resolve 上一次，避免 Promise 悬挂
+  if (_infoPanelResolve) {
+    const prev = _infoPanelResolve;
+    _infoPanelResolve = null;
+    prev(undefined);
+  }
+
+  if (titleEl) titleEl.textContent = title;
+  // 使用 textContent + CSS white-space:pre-wrap，保留换行且规避 XSS
+  msgEl.textContent = content;
+
   return new Promise((resolve) => {
-    confirmModalQueue.push({
-      message: content,
-      title: title,
-      timeoutMs: 0, // showInfoModal 无超时
-      resolve: resolve,
-      isInfoOnly: true // 标记为纯信息展示，隐藏取消按钮
-    });
-    processConfirmQueue();
+    _infoPanelResolve = resolve;
+
+    const onClose = () => {
+      panel.hidden = true;
+      closeBtn.removeEventListener('click', onClose);
+      document.removeEventListener('keydown', onEsc);
+      if (_infoPanelResolve === resolve) {
+        _infoPanelResolve = null;
+        resolve(undefined);
+      }
+    };
+    const onEsc = (ev) => {
+      if (ev.key === 'Escape') onClose();
+    };
+
+    closeBtn.addEventListener('click', onClose);
+    document.addEventListener('keydown', onEsc);
+
+    panel.hidden = false;
+    setTimeout(() => closeBtn.focus(), 50);
   });
 }
 
@@ -5273,6 +5489,10 @@ async function clearLlmConfig() {
   resultEl.className = 'form-result';
   resultEl.textContent = '⏳ 正在清除...';
 
+  // v0.9.0 修复：清除期间禁用按钮，防止重复触发 POST /v1/config/llm
+  const clearBtn = document.querySelector('[data-action="clearLlmConfig"]');
+  if (clearBtn) clearBtn.disabled = true;
+
   try {
     const resp = await fetchWithTimeout(API_BASE + '/v1/config/llm', {
       method: 'POST',
@@ -5303,6 +5523,8 @@ async function clearLlmConfig() {
   } catch (e) {
     resultEl.className = 'form-result error';
     resultEl.textContent = '❌ ' + e.message;
+  } finally {
+    if (clearBtn) clearBtn.disabled = false;
   }
 }
 
@@ -5369,8 +5591,11 @@ async function pickProjectDirectory() {
       showToast('已选择项目目录: ' + result.project_dir, 'success');
     } else if (result && result.success === false) {
       showToast('选择项目目录失败: ' + (result.message || '用户取消'), 'error');
-    } else {
+    } else if (result) {
       showToast('操作完成: ' + JSON.stringify(result), 'success');
+    } else {
+      // P0-2 修复：result 为空（用户取消）时，不再显示「操作完成: null」
+      showToast('已取消选择项目目录', 'info');
     }
   } catch (e) {
     const errMsg = e.message || String(e);
@@ -5466,22 +5691,39 @@ async function getLlmConfig() {
   }
 }
 
-/** v0.6.1 P0-3 第二批: 测试 LLM 连接（向桌面端配置的 LLM 发起测试请求） */
+/** v0.6.1 P0-3 第二批: 测试 LLM 连接（复用设置页表单 + sidecar 端点测试） */
 async function testLlmConnection() {
+  // P0-2 修复：旧 Tauri 命令 lrc-test-llm-connection 需要 provider/api_key/base_url/model 四个参数，
+  // 但「已保存的 API Key」后端出于安全不返回，前端无法拼齐参数 → 一直报 invalid args 'provider'。
+  // 改为复用设置页「测试连接」的同款 sidecar 端点，从表单读取当前填写的配置，功能真正可用。
   try {
-    const result = await postMessageToParent('lrc-test-llm-connection', {}, 60000);
-    if (result && result.success !== false) {
-      // v0.8.2：用 showToast 替代 alert
-      showToast('LLM 连接测试成功，' + (result.message || '连接正常'), 'success');
+    const provider = document.getElementById('llm-provider')?.value || '';
+    const endpoint = document.getElementById('llm-endpoint')?.value?.trim();
+    const apiKey = document.getElementById('llm-api-key')?.value?.trim();
+
+    if (!endpoint || !apiKey) {
+      showToast('请先在「LLM 配置」区填写 API 地址和密钥', 'warning');
+      return;
+    }
+
+    const resp = await fetchWithTimeout(`${window.API_BASE}/v1/config/llm/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ endpoint, api_key: apiKey, provider })
+    }, 15000);
+
+    const data = await resp.json();
+    if (data.ok) {
+      showToast('LLM 连接成功，延迟 ' + (data.latency_ms ?? '--') + 'ms', 'success');
     } else {
-      showToast('LLM 连接测试失败: ' + (result?.message || '未知错误'), 'error');
+      showToast('LLM 连接失败: ' + humanizeErrorDetail(data.message || `HTTP ${data.status}`), 'error');
     }
   } catch (e) {
     const errMsg = e.message || String(e);
     if (errMsg.includes('非桌面端嵌入模式') || errMsg.includes('无法调用此功能')) {
       showToast('此功能仅在桌面端可用，请在 Loong Recall 桌面应用中使用', 'warning');
     } else {
-      showToast('LLM 连接测试失败: ' + errMsg, 'error');
+      showToast('LLM 连接测试失败: ' + humanizeErrorDetail(errMsg), 'error');
     }
   }
 }
@@ -5654,34 +5896,43 @@ async function stopSidecarForProject() {
   }
 }
 
-/** v0.6.1 P0-3 第三批: 获取 Agent 配置指南（返回每个 Agent 的配置说明） */
+/** v0.6.1 P0-3 第三批: 获取已安装 Agent 的配置指南（逐个工具获取配置说明） */
 async function getAgentConfigGuide() {
+  // P0-2 修复：旧实现调用 lrc-get-agent-config-guide 未传 agent_id，一直报 invalid args 'agentId'。
+  // 改为：先发现已安装工具，再逐个获取配置指南，汇总展示，错误信息人话化。
   try {
-    const result = await postMessageToParent('lrc-get-agent-config-guide', {}, 10000);
-    if (result) {
-      let text = 'Agent 配置指南:\n\n';
-      if (Array.isArray(result)) {
-        result.forEach(item => {
-          text += '• ' + (item.name || item.id || '未知') + '\n  ' + (item.guide || item.config_guide || '（无说明）') + '\n\n';
-        });
-      } else if (typeof result === 'object') {
-        Object.entries(result).forEach(([key, value]) => {
-          text += '• ' + key + ': ' + (typeof value === 'string' ? value : JSON.stringify(value)) + '\n';
-        });
-      } else {
-        text += String(result);
-      }
-      // v0.8.2：用 showInfoModal 替代多行 alert
-      showInfoModal('Agent 配置指南', text);
-    } else {
-      showToast('无配置指南', 'info');
+    const discovered = await postMessageToParent('lrc-discover-all-agents', {}, 30000);
+    let installed = [];
+    if (Array.isArray(discovered) && discovered.length === 2 && Array.isArray(discovered[0]) && Array.isArray(discovered[1])) {
+      // 标准元组格式：(已知[], 未知[])
+      installed = discovered[0].filter(a => a && a.installed);
+    } else if (Array.isArray(discovered)) {
+      installed = discovered.filter(a => a && a.installed);
     }
+
+    if (!installed.length) {
+      showInfoModal('Agent 配置指南', '未检测到已安装的 AI 工具。\n\n可在引导页或「发现所有 Agent」中查看支持的工具，并手动添加。');
+      return;
+    }
+
+    const lines = [];
+    for (const agent of installed) {
+      const agentId = agent.id || agent.name || '';
+      const name = agent.name || agentId || '未知工具';
+      try {
+        const guide = await postMessageToParent('lrc-get-agent-config-guide', { agentId }, 10000);
+        lines.push('• ' + name + (guide ? '\n  ' + guide : '\n  （无配置说明）'));
+      } catch (_) {
+        lines.push('• ' + name);
+      }
+    }
+    showInfoModal('Agent 配置指南', '已安装 ' + installed.length + ' 个工具：\n\n' + lines.join('\n\n'));
   } catch (e) {
     const errMsg = e.message || String(e);
     if (errMsg.includes('非桌面端嵌入模式') || errMsg.includes('无法调用此功能')) {
       showToast('此功能仅在桌面端可用，请在 Loong Recall 桌面应用中使用', 'warning');
     } else {
-      showToast('获取 Agent 配置指南失败: ' + errMsg, 'error');
+      showToast('获取 Agent 配置指南失败: ' + humanizeErrorDetail(errMsg), 'error');
     }
   }
 }
@@ -5725,20 +5976,20 @@ async function discoverAllAgents() {
     const maxDisplay = 20;
     const installedFirst = [...knownList].sort((a, b) => (b.installed ? 1 : 0) - (a.installed ? 1 : 0));
     const knownDetails = installedFirst.slice(0, maxDisplay).map(a => {
-      const mark = a.installed ? '✅ 已安装' : '   未安装';
-      return `${mark}  ${a.icon || '🔧'}  ${a.name || a.id || '未知工具'}`;
+      const mark = a.installed ? '[已安装]' : '[未安装]';
+      return `${mark}  ${a.icon || '·'}  ${a.name || a.id || '未知工具'}`;
     }).join('\n');
     const moreHint = knownList.length > maxDisplay ? `\n\n...（仅显示前 ${maxDisplay} 个，还有 ${knownList.length - maxDisplay} 个工具省略）` : '';
 
     // 未知工具提示
     const unknownHint = unknownList.length > 0
-      ? `\n\n🔍 另外发现潜在未知工具 ${unknownList.length} 个：\n` + unknownList.slice(0, 10).map(a => `   · ${a.name || a.id || '未命名'}`).join('\n')
+      ? `\n\n另外发现潜在未知工具 ${unknownList.length} 个：\n` + unknownList.slice(0, 10).map(a => `   · ${a.name || a.id || '未命名'}`).join('\n')
       : '';
 
     const formatDebug = isTuple ? '' : '\n（提示：后端返回格式不是预期的元组）';
     showInfoModal(
       '发现 Agent',
-      `📊 总计：${totalCount} 个支持的工具，已安装 ${totalInstalled} 个\n\n` +
+      `总计：${totalCount} 个支持的工具，已安装 ${totalInstalled} 个\n\n` +
       `═══════ 已知 AI 工具 ═══════\n${knownDetails}${moreHint}` +
       unknownHint +
       formatDebug
@@ -5748,7 +5999,7 @@ async function discoverAllAgents() {
     if (errMsg.includes('非桌面端嵌入模式') || errMsg.includes('无法调用此功能')) {
       showToast('此功能仅在桌面端可用，请在 Loong Recall 桌面应用中使用', 'warning');
     } else {
-      showToast('发现 Agent 失败: ' + errMsg, 'error');
+      showToast('发现 Agent 失败: ' + humanizeErrorDetail(errMsg), 'error');
     }
   }
 }
@@ -6156,11 +6407,14 @@ async function runPrivacyCheck() {
     let trustLabel = '信任';
     let trustColor = 'var(--lrc-玉色-500)';
 
-    if (!dataLocData.ok || !networkData.ok || !integrityData.ok) {
+    // v0.9.0 修复：后端 /v1/trust/* 返回的 JSON 无 `ok` 字段，
+    // 原代码用 dataLocData.ok 判断导致永远为 undefined（误判"异常"）。
+    // 改用 HTTP res.ok 判断请求是否成功。
+    if (!dataLoc.ok || !networkAudit.ok || !auditIntegrity.ok) {
       trustLevel = 'red';
       trustLabel = '异常';
       trustColor = 'var(--lrc-朱砂-500)';
-    } else if (networkData.network_calls && networkData.network_calls.length > 0) {
+    } else if (networkData.requests && networkData.requests.length > 0) {
       trustLevel = 'yellow';
       trustLabel = '注意';
       trustColor = 'var(--lrc-金色-500)';
@@ -6176,15 +6430,15 @@ async function runPrivacyCheck() {
         </div>
         <div class="result-row">
           <span class="result-label">数据存储位置</span>
-          <span class="result-value ${dataLocData.ok ? 'valid' : 'invalid'}">${dataLocData.ok ? (dataLocData.data_path || '本地') : '获取失败'}</span>
+          <span class="result-value ${dataLoc.ok ? 'valid' : 'invalid'}">${dataLoc.ok ? (dataLocData.data_directory || '本地') : '获取失败'}</span>
         </div>
         <div class="result-row">
           <span class="result-label">网络访问记录</span>
-          <span class="result-value ${networkData.ok && (!networkData.network_calls || networkData.network_calls.length === 0) ? 'valid' : 'invalid'}">${networkData.ok ? (networkData.network_calls ? networkData.network_calls.length + ' 次' : '0 次') : '获取失败'}</span>
+          <span class="result-value ${networkAudit.ok && (!networkData.requests || networkData.requests.length === 0) ? 'valid' : 'invalid'}">${networkAudit.ok ? (networkData.requests ? networkData.requests.length + ' 次' : '0 次') : '获取失败'}</span>
         </div>
         <div class="result-row">
           <span class="result-label">审计日志完整性</span>
-          <span class="result-value ${integrityData.ok ? 'valid' : 'invalid'}">${integrityData.ok ? '已验证' : '验证失败'}</span>
+          <span class="result-value ${auditIntegrity.ok ? 'valid' : 'invalid'}">${auditIntegrity.ok ? '已验证' : '验证失败'}</span>
         </div>
         <div class="result-row">
           <span class="result-label">加密状态</span>
@@ -6197,12 +6451,23 @@ async function runPrivacyCheck() {
     console.log(`[LRC v${APP_VERSION}]隐私检查完成，耗时 ${elapsed}ms，信任等级: ${trustLevel}`);
   } catch (err) {
     const elapsed = Date.now() - startTime;
-    resultEl.innerHTML = `
-      <div style="padding:12px;background:var(--lrc-朱砂-50);border-radius:var(--radius-md);color:var(--lrc-朱砂-500);font-size:13px;">
-        <strong>隐私检查失败</strong>（耗时 ${elapsed}ms）：<br>
-        <span style="font-size:12px;">${htmlescape(err.message || String(err))}</span>
-      </div>
-    `;
+    // v0.9.0 修复：lock_busy 时显示友好提示（后台合成中），而非技术性错误文案"lock_busy"
+    const isLockBusy = err && (err.message === 'lock_busy' || (err.message || '').includes('lock_busy') || err.name === 'LOCK_BUSY');
+    if (isLockBusy) {
+      resultEl.innerHTML = `
+        <div style="padding:12px;background:var(--lrc-宣纸-300);border-radius:var(--radius-md);color:var(--lrc-金色-700);font-size:13px;">
+          <strong>后台合成中</strong>（耗时 ${elapsed}ms）<br>
+          <span style="font-size:12px;">记忆系统正在执行后台合成，隐私报告暂时无法生成，请稍后重试。</span>
+        </div>
+      `;
+    } else {
+      resultEl.innerHTML = `
+        <div style="padding:12px;background:var(--lrc-朱砂-50);border-radius:var(--radius-md);color:var(--lrc-朱砂-500);font-size:13px;">
+          <strong>隐私检查失败</strong>（耗时 ${elapsed}ms）：<br>
+          <span style="font-size:12px;">${htmlescape(err.message || String(err))}</span>
+        </div>
+      `;
+    }
     console.error('[LRC v' + APP_VERSION + ']隐私检查失败:', err);
   }
 }
@@ -6881,7 +7146,7 @@ function openMemoryDetail(memoryOrIndex) {
     <div class="memory-detail-actions" style="margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px;">
       <!-- v0.8.3 Step 11：N12 XSS 修复，使用 data-action + data-arg 替代内联 onclick（修复 G001-G003） -->
       <!-- 此前 onclick="correctMemory('${memoryId}')" 存在 XSS 风险（memoryId 含单引号可注入） -->
-      <button class="btn btn-outline" data-action="correctMemory" data-arg="${htmlescape(memoryId)}" ${!memoryId ? 'disabled' : ''}>
+      <button class="btn btn-outline" data-action="correctMemory" data-arg="${htmlescape(memoryId)}" ${!memoryId ? 'disabled' : ''} title="纠正这条记忆的内容偏差，系统会保留历史版本">
         修正记忆
       </button>
       ${isSynthesis ? `<button class="btn btn-outline" data-action="unfoldMemory" data-arg="${htmlescape(memoryId)}" ${!memoryId ? 'disabled' : ''}>拆解合成</button>` : ''}
@@ -6952,8 +7217,10 @@ function closeMemoryDetail() {
  */
 async function correctMemory(memoryId) {
   // v0.8.3 Step 4 批次 1：alert→showToast，prompt→await showPrompt（修复 G001-G003）
+  // P0-1：标记新一次纠错操作开始，清除上一次纠错的残留 toast，避免跨操作串位
+  markOperationStart('memory-correct');
   if (!memoryId) {
-    showToast('✗ 无法修正：记忆 ID 为空', 'error');
+    showToast('✗ 无法修正：记忆 ID 为空', 'error', 3000, 'memory-correct');
     return;
   }
 
@@ -6961,7 +7228,7 @@ async function correctMemory(memoryId) {
   const newContent = await showPrompt('请输入修正后的记忆内容:', '修正记忆');
   if (newContent === null) return; // 用户取消
   if (!newContent || !newContent.trim()) {
-    showToast('修正内容不能为空', 'warning');
+    showToast('修正内容不能为空', 'warning', 3000, 'memory-correct');
     return;
   }
 
@@ -6981,18 +7248,21 @@ async function correctMemory(memoryId) {
     const data = await resp.json();
     if (data.success) {
       showToast('✓ 记忆修正成功，新版本: ' + (data.new_version || '--') +
-                '，历史版本数: ' + (data.history_versions || '--'), 'success');
+                '，历史版本数: ' + (data.history_versions || '--'), 'success', 3000, 'memory-correct');
       closeMemoryDetail();
       // 刷新记忆搜索结果
       if (typeof debouncedMemorySearch === 'function') {
         debouncedMemorySearch();
       }
     } else {
-      showToast('✗ 修正失败: ' + (data.message || data.error || '未知错误'), 'error');
+      showToast('✗ 修正失败: ' + (data.message || data.error || '未知错误'), 'error', 4000, 'memory-correct');
     }
   } catch (e) {
     console.error('[correctMemory] 修正失败:', e);
-    showToast('✗ 修正记忆失败: ' + (e.message || String(e)), 'error');
+    showToast('✗ 修正记忆失败: ' + (e.message || String(e)), 'error', 4000, 'memory-correct');
+  } finally {
+    // v0.9.0 修复 M-4：无论成功/失败都恢复按钮
+    if (correctBtn) correctBtn.disabled = false;
   }
 }
 
@@ -7052,6 +7322,9 @@ async function submitMemoryFeedback(memoryId) {
   } catch (e) {
     console.error('[submitMemoryFeedback] 提交失败:', e);
     showToast('✗ 提交反馈失败: ' + (e.message || String(e)), 'error');
+  } finally {
+    // v0.9.0 修复 M-6：无论成功/失败都恢复按钮
+    if (feedbackBtn) feedbackBtn.disabled = false;
   }
 }
 
@@ -7335,22 +7608,52 @@ function initMemoryFilters() {
 const TOAST_MAX_VISIBLE = 3;
 const _recentToastMessages = new Map();
 const _TOAST_DEDUP_WINDOW = 1500; // 1.5s 去重窗口
+// P0-1：操作级反馈身份（opKey → 代际），用于过期残留 toast 的主动清除
+const _toastOpGenMap = new Map();
+
+/**
+ * P0-1：标记一次新操作开始。
+ * 同一操作上下文（opKey）下，之前代际的残留 toast 会被标记为过期并滑出，
+ * 避免「上一条操作残留反馈」被误判为当前操作结果。
+ * @param {string} opKey - 操作上下文标识（如 'memory-write'、'memory-search'）
+ */
+function markOperationStart(opKey) {
+  if (!opKey) return;
+  const gen = (_toastOpGenMap.get(opKey) || 0) + 1;
+  _toastOpGenMap.set(opKey, gen);
+
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+  container.querySelectorAll('.toast[data-op-key]').forEach((t) => {
+    if (t.getAttribute('data-op-key') !== opKey) return;
+    const tGen = parseInt(t.getAttribute('data-op-gen') || '0', 10);
+    if (tGen < gen) {
+      t.classList.add('toast-leaving');
+      setTimeout(() => {
+        if (t.parentNode) t.parentNode.removeChild(t);
+      }, 200);
+    }
+  });
+}
+window.markOperationStart = markOperationStart;
 
 /**
  * 显示 Toast 通知
  * @param {string} message - 通知内容
  * @param {string} type - 类型：success/error/warning/info
  * @param {number} duration - 显示时长（毫秒），默认 3000
+ * @param {string|null} opKey - 操作上下文标识（可选），用于跨操作去重隔离与过期清除
  */
-function showToast(message, type = 'success', duration = 3000) {
+function showToast(message, type = 'success', duration = 3000, opKey = null) {
   const container = document.getElementById('toast-container');
   if (!container) return;
 
   // G011-1：去重检查（1.5s 内相同消息跳过）
   // v0.8.4 Step 8 / G026 修复：去重检查在显示前，但记录在显示后
   // 避免被上限跳过的消息也记录时间戳，导致后续调用被误去重
+  // P0-1 修复：去重键纳入 opKey 维度，避免「跨操作相同文案」被错误去重
   const now = Date.now();
-  const dedupKey = `${type}:${message}`;
+  const dedupKey = opKey ? `${type}:${opKey}:${message}` : `${type}:${message}`;
   if (_recentToastMessages.has(dedupKey)) {
     const last = _recentToastMessages.get(dedupKey);
     if (now - last < _TOAST_DEDUP_WINDOW) {
@@ -7441,6 +7744,13 @@ function showToast(message, type = 'success', duration = 3000) {
   toast.appendChild(iconWrap);
   toast.appendChild(msgSpan);
 
+  // P0-1：为 toast 绑定操作身份（opKey + 代际），供 markOperationStart 清理过期残留
+  if (opKey) {
+    const gen = _toastOpGenMap.get(opKey) || 1;
+    toast.setAttribute('data-op-key', opKey);
+    toast.setAttribute('data-op-gen', String(gen));
+  }
+
   container.appendChild(toast);
 
   // 3s 后自动滑出消失
@@ -7473,7 +7783,8 @@ const TAB_LOADERS = {
   'trust-center': () => loadTrustCenter(),
   'benchmarks': () => loadBenchmarks(),
   'settings': () => { loadSettings(); loadProjectInfo(); },
-  'system-status': () => loadSysStatusFloat(),
+  // v0.9.0 修复：同时加载浮动窗口 + 系统状态页卡片（此前卡片 -- 占位符无渲染）
+  'system-status': () => { loadSysStatusFloat(); return loadSystemStatusPage(); },
   'project-switch': () => loadProjectInfo()
 };
 
@@ -7670,16 +7981,6 @@ function initMobileTabbar() {
  * 使用 localStorage 持久化"已关闭"状态，避免重复打扰
  * ============================================================ */
 
-// 诗意名言库（每次随机展示一句）
-const WELCOME_POEMS = [
-  '昨日之忆，今日之智',
-  '滴水穿石，结晶有待',
-  '海纳百川，有容乃大',
-  '温故而知新，可以为师矣',
-  '不积跬步，无以至千里',
-  '记忆有道，生生不息',
-];
-
 /**
  * 初始化欢迎区：仅在用户未关闭过时显示
  */
@@ -7728,15 +8029,36 @@ function initWelcomeBanner() {
   const dateEl = document.getElementById('welcome-date');
   if (dateEl) dateEl.textContent = dateStr;
 
-  // 随机选择一句诗意名言
-  const poemEl = document.getElementById('welcome-poem');
-  if (poemEl) {
-    const poem = WELCOME_POEMS[Math.floor(Math.random() * WELCOME_POEMS.length)];
-    poemEl.textContent = poem;
-  }
+  // 引导页重设计：把抽象诗句替换为「记忆库状态摘要」（异步查询，不阻塞主流程）
+  loadWelcomeStatus();
 
   // 显示欢迎区
   banner.hidden = false;
+}
+
+/**
+ * 加载欢迎区状态摘要：查询记忆库总数，填充「已就绪 / 还是空的」文案。
+ * 查询失败时保留默认「记忆库状态加载中…」，不阻塞主流程。
+ */
+async function loadWelcomeStatus() {
+  const statusEl = document.getElementById('welcome-status');
+  if (!statusEl) return;
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/health/system', {}, 5000);
+    if (!res.ok) return;
+    const data = await res.json();
+    const total = (data && data.memory_stats && data.memory_stats.total_memories != null)
+      ? Number(data.memory_stats.total_memories)
+      : null;
+    if (total != null && total > 0) {
+      statusEl.textContent = '记忆库已就绪 · 共 ' + total + ' 条记忆';
+    } else if (total === 0) {
+      statusEl.textContent = '记忆库还是空的 · 花 5 分钟走一遍下方流程，龙忆就记住了你的第一段代码';
+    }
+    // 其余情况（total 为 null）保留默认「记忆库状态加载中…」
+  } catch (_) {
+    // 加载失败，保留默认文案，不阻塞主流程
+  }
 }
 
 /**
@@ -7763,6 +8085,34 @@ function dismissWelcome() {
     localStorage.setItem('lrc_welcome_dismissed', '1');
   } catch (e) {
     console.warn('[Loong Recall] 无法持久化欢迎区关闭状态');
+  }
+}
+
+/**
+ * P2 修复：重新显示新手欢迎引导层（关闭后仍可复现）
+ * 清除 localStorage 中的关闭标记，并重新初始化欢迎区。
+ */
+function reopenWelcome() {
+  try {
+    localStorage.removeItem('lrc_welcome_dismissed');
+  } catch (e) {
+    console.warn('[Loong Recall] 无法清除欢迎区关闭状态');
+  }
+
+  const banner = document.getElementById('welcome-banner');
+  if (banner) {
+    banner.style.transition = '';
+    banner.style.opacity = '';
+    banner.style.transform = '';
+  }
+
+  initWelcomeBanner();
+
+  const visible = banner && !banner.hidden;
+  if (visible) {
+    showToast('已重新显示欢迎引导，可在仪表盘顶部查看', 'success', 3000);
+  } else {
+    showToast('欢迎引导已重置，刷新页面后可见', 'info', 3000);
   }
 }
 
@@ -7800,9 +8150,12 @@ async function loadSysStatusFloat() {
       if (mode === 'ml') {
         mlModelEl.textContent = modelName;
         mlModelEl.className = 'sys-status-value healthy';
+        mlModelEl.title = '已启用语义检索模型';
       } else {
-        mlModelEl.textContent = '统计模式';
+        // P1-1 人话化：技术术语「统计模式」→ 用户语言「基础检索」，附 tooltip 说明
+        mlModelEl.textContent = '基础检索';
         mlModelEl.className = 'sys-status-value warning';
+        mlModelEl.title = '当前为关键词匹配检索。下载语义模型后，可用自然语言搜索，精度更高。';
       }
     }
 
@@ -7812,10 +8165,11 @@ async function loadSysStatusFloat() {
       const mode = encoder.mode || 'unknown';
       const hiddenSize = encoder.hidden_size;
       if (mode === 'ml' && hiddenSize) {
-        encoderTypeEl.textContent = `ML · ${hiddenSize}维`;
+        encoderTypeEl.textContent = `语义向量 · ${hiddenSize}维`;
         encoderTypeEl.className = 'sys-status-value healthy';
       } else if (mode === 'statistical') {
-        encoderTypeEl.textContent = 'TF-IDF';
+        // P1-1 人话化：技术术语「TF-IDF」→ 用户语言「关键词匹配」
+        encoderTypeEl.textContent = '关键词匹配';
         encoderTypeEl.className = 'sys-status-value warning';
       } else {
         encoderTypeEl.textContent = mode;
@@ -7844,13 +8198,14 @@ async function loadSysStatusFloat() {
     const sysModeEl = document.getElementById('float-sys-mode');
     if (sysModeEl) {
       const mode = data.system_mode || 'unknown';
+      // P1-1 人话化：技术术语（degraded/frozen/overloaded）→ 用户语言
       const modeMap = {
         healthy: '正常运行',
-        degraded: '已降级',
+        degraded: '运行中',
         oscillating: '调整中',
-        drifting: '漂移',
-        frozen: '已冻结',
-        overloaded: '过载',
+        drifting: '优化中',
+        frozen: '已暂停',
+        overloaded: '繁忙',
       };
       sysModeEl.textContent = modeMap[mode] || mode;
       if (mode === 'healthy') {
@@ -7867,8 +8222,10 @@ async function loadSysStatusFloat() {
     const qualityFill = document.getElementById('float-quality-fill');
     const qualityScore = encoder.quality_score || 0;
     if (qualityEl) {
-      const percent = (qualityScore * 100).toFixed(0) + '%';
-      qualityEl.textContent = percent;
+      // P1-1 人话化：技术评分「25%」→ 用户语言档位「基础档/标准档/增强档」
+      const tier = qualityScore >= 0.8 ? '增强档' : qualityScore >= 0.4 ? '标准档' : '基础档';
+      qualityEl.textContent = tier;
+      qualityEl.title = '检索能力档位（技术评分 ' + (qualityScore * 100).toFixed(0) + '%）';
       if (qualityScore >= 0.8) {
         qualityEl.className = 'sys-status-value healthy';
       } else if (qualityScore >= 0.4) {
@@ -7904,6 +8261,114 @@ function setDegradedStatusFloat(degradeText) {
   }
   const qualityFill = document.getElementById('float-quality-fill');
   if (qualityFill) qualityFill.style.width = '0%';
+}
+
+/**
+ * v0.9.0 新增：加载系统状态页的卡片数据
+ *
+ * 根因：tab-system-status 页面的"模型与编码"、"系统模式"、"记忆库统计"
+ * 卡片的 id（sys-ml-model / sys-encoder / sys-cache / sys-quality /
+ * sys-mode-name / sys-mode-desc / stat-total-memories 等）此前无任何渲染代码，
+ * 导致永远显示 HTML 静态占位符 "--"。
+ * 本函数从 /v1/health/system 读取数据并填充这些卡片。
+ */
+async function loadSystemStatusPage() {
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/health/system');
+    if (!res.ok) return;
+    const data = await res.json();
+
+    const encoder = data.encoder || {};
+    const memStats = data.memory_stats || {};
+    const daoMetrics = data.dao_metrics || {};
+    const synthesisJournal = data.synthesis_journal || {};
+
+    // 模型与编码卡片
+    const mode = encoder.mode || 'unknown';
+    const mlModelEl = document.getElementById('sys-ml-model');
+    if (mlModelEl) {
+      // P1-1 人话化：技术术语「统计模式」→ 用户语言「基础检索」
+      mlModelEl.textContent = (mode === 'ml') ? (encoder.model_name || '语义模型') : '基础检索';
+    }
+
+    const encoderEl = document.getElementById('sys-encoder');
+    if (encoderEl) {
+      if (mode === 'ml' && encoder.hidden_size) {
+        encoderEl.textContent = `语义向量 · ${encoder.hidden_size}维`;
+      } else if (mode === 'statistical') {
+        // P1-1 人话化：技术术语「TF-IDF」→ 用户语言「关键词匹配」
+        encoderEl.textContent = '关键词匹配';
+      } else {
+        encoderEl.textContent = mode;
+      }
+    }
+
+    const cacheEl = document.getElementById('sys-cache');
+    if (cacheEl) {
+      const totalEncodings = encoder.total_encodings || 0;
+      cacheEl.textContent = totalEncodings === 0 ? '空' : `${totalEncodings} 次`;
+    }
+
+    const qualityEl = document.getElementById('sys-quality');
+    if (qualityEl) {
+      const qualityScore = encoder.quality_score || 0;
+      // P1-1 人话化：技术评分「25%」→ 用户语言档位
+      qualityEl.textContent = qualityScore >= 0.8 ? '增强档' : qualityScore >= 0.4 ? '标准档' : '基础档';
+    }
+
+    // 系统模式卡片
+    const sysModeName = document.getElementById('sys-mode-name');
+    const sysModeDesc = document.getElementById('sys-mode-desc');
+    if (sysModeName) {
+      // P1-1 人话化：技术术语（degraded/frozen/overloaded）→ 用户语言
+      const modeMap = {
+        healthy: '正常运行',
+        degraded: '运行中',
+        oscillating: '调整中',
+        drifting: '优化中',
+        frozen: '已暂停',
+        overloaded: '繁忙',
+      };
+      sysModeName.textContent = modeMap[data.system_mode] || data.system_mode || '未知';
+    }
+    if (sysModeDesc) {
+      sysModeDesc.textContent = data.system_mode_description || '系统运行正常';
+    }
+
+    // v0.9.1 缺口 1：调节器冻结时显示解冻按钮
+    const sysModeCard = document.querySelector('.sys-status-card.mode-card, #sys-mode-card');
+    if (data.system_mode === 'frozen' && sysModeCard) {
+      // 避免重复添加按钮
+      let unfreezeBtn = document.getElementById('btn-unfreeze-regulator');
+      if (!unfreezeBtn) {
+        unfreezeBtn = document.createElement('button');
+        unfreezeBtn.id = 'btn-unfreeze-regulator';
+        unfreezeBtn.className = 'btn btn-sm';
+        unfreezeBtn.style.cssText = 'margin-top:8px;width:100%;';
+        unfreezeBtn.textContent = '解冻调节器';
+        unfreezeBtn.setAttribute('data-action', 'unfreezeRegulator');
+        sysModeCard.appendChild(unfreezeBtn);
+        // 动态新增按钮后重新绑定事件委托
+        if (typeof bindAllActions === 'function') bindAllActions();
+      }
+      unfreezeBtn.style.display = '';
+    } else {
+      const existing = document.getElementById('btn-unfreeze-regulator');
+      if (existing) existing.style.display = 'none';
+    }
+
+    // 记忆库统计卡片
+    const totalEl = document.getElementById('stat-total-memories');
+    const crystEl = document.getElementById('stat-crystallizations');
+    const decayEl = document.getElementById('stat-decays');
+    const synthEl = document.getElementById('stat-syntheses');
+    if (totalEl) totalEl.textContent = (memStats.total_memories != null) ? memStats.total_memories : '--';
+    if (crystEl) crystEl.textContent = (daoMetrics.crystallized_memories != null) ? daoMetrics.crystallized_memories : ((memStats.synthesis_memories != null) ? memStats.synthesis_memories : '--');
+    if (decayEl) decayEl.textContent = (memStats.expired_memories != null) ? memStats.expired_memories : 0;
+    if (synthEl) synthEl.textContent = (daoMetrics.compositions_total != null) ? daoMetrics.compositions_total : ((synthesisJournal.total_synthesis != null) ? synthesisJournal.total_synthesis : 0);
+  } catch (e) {
+    console.warn('[Loong Recall] 系统状态页加载失败:', e.message);
+  }
 }
 
 /**
@@ -8219,8 +8684,12 @@ async function downloadEmbedderModel() {
   const progressEl = document.getElementById('embedder-download-progress');
   const percentEl = document.getElementById('embedder-download-percent');
   const barEl = document.getElementById('embedder-download-bar');
+  // v0.9.0 修复 H-2：下载期间禁用按钮，防止重复点击创建多个 setInterval 轮询
+  const downloadBtn = document.querySelector('[data-action="downloadEmbedderModel"]');
+  const finishDownload = () => { if (downloadBtn) downloadBtn.disabled = false; };
 
   if (progressEl) progressEl.style.display = '';
+  if (downloadBtn) downloadBtn.disabled = true;
 
   try {
     // 调用后端下载 API
@@ -8242,6 +8711,8 @@ async function downloadEmbedderModel() {
 
     // 轮询下载状态
     let pollCount = 0;
+    // v0.9.0 修复：轮询失败计数（此前静默吞异常，用户无法判断是下载中还是卡住）
+    let pollFailCount = 0;
     const pollInterval = setInterval(async () => {
       pollCount++;
       try {
@@ -8255,6 +8726,8 @@ async function downloadEmbedderModel() {
 
           if (statusData.status === 'ready') {
             clearInterval(pollInterval);
+            // v0.9.0 修复 H-2：下载成功后恢复按钮（此前 ready 分支遗漏 finishDownload，导致按钮永久禁用）
+            finishDownload();
             if (percentEl) percentEl.textContent = '100%';
             if (barEl) barEl.style.width = '100%';
             setTimeout(() => {
@@ -8267,17 +8740,23 @@ async function downloadEmbedderModel() {
           // 超时保护（120 秒）
           if (pollCount > 40) {
             clearInterval(pollInterval);
+            finishDownload();
             if (progressEl) progressEl.style.display = 'none';
             showToast('下载超时，请稍后通过「检测状态」查看。模型文件较大时可能需要更长时间。', 'warning');
             checkEmbedderStatus();
           }
         }
       } catch (e) {
-        // 轮询失败，继续重试
+        // v0.9.0 修复：轮询失败计数，连续失败 3 次提示用户（此前静默吞异常）
+        pollFailCount++;
+        if (pollFailCount === 3) {
+          showToast('状态检测连续失败，可能网络不稳定。下载仍在后台进行，请稍后通过「检测状态」查看', 'warning', 5000);
+        }
       }
     }, 3000);
 
   } catch (e) {
+    finishDownload();
     if (progressEl) progressEl.style.display = 'none';
     console.error('[downloadEmbedderModel] 下载失败:', e);
     showToast('下载失败: ' + e.message + '。你也可以通过命令行手动下载：code-memory-server model download ' + modelId, 'error', 8000);
@@ -8303,6 +8782,10 @@ async function applyEmbedderModel() {
     return;
   }
 
+  // v0.9.0 修复 M-2：应用模型期间禁用按钮 + 加载态，防止重复点击
+  const applyBtn = document.querySelector('[data-action="applyEmbedderModel"]');
+  if (applyBtn) setButtonState(applyBtn, 'loading');
+
   try {
     const resp = await fetchWithTimeout(API_BASE + '/api/embedder/apply', {
       method: 'POST',
@@ -8313,6 +8796,7 @@ async function applyEmbedderModel() {
     const data = await resp.json();
 
     if (data.success) {
+      if (applyBtn) setButtonState(applyBtn, 'success');
       showToast(data.message || '模型已设为默认，重启服务后生效', 'success');
       checkEmbedderStatus();
     } else {
@@ -8320,6 +8804,7 @@ async function applyEmbedderModel() {
     }
   } catch (e) {
     console.error('[applyEmbedderModel] 设置失败:', e);
+    if (applyBtn) setButtonState(applyBtn, 'error');
     showToast('设置失败: ' + e.message, 'error');
   }
 }
@@ -8454,6 +8939,10 @@ async function switchProject() {
     return;
   }
 
+  // v0.9.0 修复 M-3：切换项目期间禁用按钮，防止重复触发（120s 长任务）
+  const switchBtn = document.querySelector('[data-action="switchProject"]');
+  if (switchBtn) switchBtn.disabled = true;
+
   // 调用桌面端 switch_project 命令
   // v0.8.15 P0-6 修复：switchProject 120s 等待期间显示进度反馈
   // 避免用户以为卡死
@@ -8517,6 +9006,9 @@ async function switchProject() {
     } else {
       showToast('项目切换失败: ' + errMsg, 'error');
     }
+  } finally {
+    // v0.9.0 修复 M-3：无论成功/失败都恢复切换按钮
+    if (switchBtn) switchBtn.disabled = false;
   }
 }
 
@@ -8645,6 +9137,20 @@ function shouldShowConfirmSkipProjects() {
   }
   return false;
 }
+
+/**
+ * P1-1 修复：AI 工具复选框 change 委托入口（替代内联 onchange，被 CSP 拦截）。
+ * 当用户勾选工具时，复用 onAgentSelected 触发项目目录自动扫描。
+ * @param {Event} ev - change 事件对象
+ */
+function onAgentToolCheckboxChange(ev) {
+  const el = ev.target;
+  const agentId = el.getAttribute('data-agent-id');
+  if (el.checked && typeof onAgentSelected === 'function') {
+    onAgentSelected(agentId, true);
+  }
+}
+window.onAgentToolCheckboxChange = onAgentToolCheckboxChange;
 
 /**
  * v0.8.25 R-08 新增：选中 AI 工具后的回调逻辑
@@ -8776,7 +9282,7 @@ async function simulateAiToolsScan() {
   ensureAiToolsToolbar();
 
   // 显示扫描中状态
-  toolsList.innerHTML = '<p style="color: var(--lrc-墨韵-400); margin: 0;"><span class="loading-spinner"></span> 正在扫描已安装的 IDE & Agent 工具...</p>';
+  toolsList.innerHTML = '<p style="color: var(--lrc-墨韵-400); margin: 0;"><span class="loading-spinner"></span> 正在扫描你电脑上已安装的 IDE 与 Agent 工具…</p>';
   // S-05：如果扫描中，同时让"上次扫描时间"显示「扫描中...」
   updateLastScanTsUi(null, true);
 
@@ -8831,7 +9337,13 @@ async function simulateAiToolsScan() {
     }).filter(t => t.finalInstalled);
 
     if (effectiveTools.length === 0) {
-      toolsList.innerHTML = '<p style="color: var(--lrc-墨韵-400); margin: 0;">未检测到已安装的 IDE 或 Agent 工具</p>';
+      toolsList.innerHTML = `
+        <div style="padding: 24px 16px; text-align: center;">
+          <img src="/assets/icons/icon-empty.svg" alt="" width="40" height="40" style="opacity:0.5; margin-bottom:12px;">
+          <p style="color: var(--lrc-墨韵-500); margin: 0 0 12px 0;">没有检测到已安装的 AI 工具</p>
+          <button class="btn btn-outline" data-action="openManualAddModal">手动添加</button>
+        </div>`;
+      if (typeof bindAllActions === 'function') bindAllActions();
       return;
     }
 
@@ -8840,48 +9352,65 @@ async function simulateAiToolsScan() {
       const agentId = tool.agentId;
       const hasLocalOverride = tool.hasLocalOverride;
       const finalInstalled = tool.finalInstalled;
-      const manualBadgeStyle = hasLocalOverride
-        ? 'display:inline-block; margin-right:6px; font-size:0.75em; padding:1px 5px; border-radius:3px; background:var(--lrc-金色-200); color:var(--lrc-金色-800); border:1px solid var(--lrc-金色-400);'
-        : 'display:none; margin-right:6px; font-size:0.75em; padding:1px 5px; border-radius:3px; background:var(--lrc-金色-200); color:var(--lrc-金色-800); border:1px solid var(--lrc-金色-400);';
-      // 齿轮图标 hover 效果 + 点击菜单
-      const gearBtn = `<button type="button" data-role="tool-gear-btn" 
-        onclick="event.stopPropagation(); event.preventDefault(); showToolGearMenu('${tool.name.replace(/'/g, "\\'")}', ${finalInstalled}, this);"
-        title="检测结果不对？点此手动修正"
-        style="background:none;border:none;cursor:pointer;font-size:1em;padding:2px 4px;border-radius:4px;opacity:0.55;transition:all 0.15s;margin-right:4px;"
-        onmouseover="this.style.opacity='1';this.style.background='var(--lrc-宣纸-500)';"
-        onmouseout="this.style.opacity='0.55';this.style.background='transparent';">⚙️</button>`;
+      const isAutoConfig = !!guide && guide.startsWith('已自动配置');
+      const isManualConfig = !!guide && guide.startsWith('MCP 配置');
+      // 工具图标兜底：CLI/Agent 类用终端，其余用工具箱
+      const toolIcon = toolIconFor(tool.name, tool.type);
+      // 配置徽章：自动配置（玉色）/ 需手动配置（金色）
+      const configBadge = isAutoConfig
+        ? `<span class="lrc-tool-badge lrc-tool-badge-auto"><img src="/assets/icons/icon-plug.svg" alt="" width="12" height="12">已自动配置 MCP</span>`
+        : (isManualConfig
+          ? `<span class="lrc-tool-badge lrc-tool-badge-manual"><img src="/assets/icons/icon-bulb.svg" alt="" width="12" height="12">需手动配置</span>`
+          : '');
+      // 手动添加徽章（替代 🔧 用户指定）
+      const manualBadge = `<span data-role="manual-badge" class="lrc-tool-badge lrc-tool-badge-added" style="display:${hasLocalOverride ? 'inline-flex' : 'none'};">手动添加</span>`;
+      // 更多操作按钮：icon-more（三点），替代齿轮 ⚙️
+      const moreBtn = `<button type="button" data-role="tool-gear-btn"
+        data-tool-name="${htmlescape(tool.name)}"
+        data-tool-installed="${finalInstalled ? 'true' : 'false'}"
+        class="tool-gear-btn"
+        title="更多操作"><img src="/assets/icons/icon-more.svg" alt="" width="16" height="16"></button>`;
       return `
       <div data-agent-id="${htmlescape(agentId)}" style="padding: 12px 0; border-bottom: 1px solid var(--lrc-宣纸-500);">
-        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: ${guide ? '6px' : '0'};">
-          <div style="display: flex; align-items: center; gap: 12px;">
-            <input type="checkbox" ${finalInstalled ? 'checked' : ''} ${!finalInstalled && !hasLocalOverride ? 'disabled' : ''} id="tool-${tool.name.replace(/\s/g, '-')}"
-              data-auto-install-disabled="${!tool.installed ? 'true' : 'false'}"
-              onchange="if(this.checked && typeof onAgentSelected==='function') onAgentSelected('${htmlescape(agentId)}', true);">
+        <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px;">
+          <div style="display: flex; align-items: center; gap: 10px; min-width: 0;">
+            <img src="/assets/icons/${toolIcon}.svg" alt="" width="18" height="18" style="opacity:0.7; flex-shrink:0;">
             <span style="color: var(--lrc-墨韵-700); font-weight: 500;">${htmlescape(tool.name)}</span>
-            <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">(${htmlescape(tool.type || '')})</span>
-            ${tool.version ? '<span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">v' + htmlescape(tool.version) + '</span>' : ''}
+            <span style="font-size: 0.8em; color: var(--lrc-墨韵-300); white-space:nowrap;">(${htmlescape(tool.type || '工具')})</span>
+            ${tool.version ? '<span style="font-size: 0.8em; color: var(--lrc-墨韵-300); white-space:nowrap;">v' + htmlescape(tool.version) + '</span>' : ''}
           </div>
-          <div style="display:flex; align-items:center;">
-            ${gearBtn}
-            <span data-role="manual-override-badge" style="${manualBadgeStyle}" title="用户手动指定，不受自动检测影响">🔧 用户指定</span>
-            <span data-role="tool-status"
-              data-auto-status="${tool.installed ? '已检测到' : '未安装'}"
-              data-auto-status-installed="${tool.installed ? 'true' : 'false'}"
-              data-auto-status-checked="${tool.installed ? 'true' : 'false'}"
-              style="font-size: 0.85em; font-weight: 600; color: var(--lrc-玉色-600);">已检测到</span>
+          <div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">
+            ${configBadge}
+            ${manualBadge}
+            ${moreBtn}
           </div>
         </div>
-        ${guide ? `<div style="font-size: 0.8em; color: var(--lrc-墨韵-500); padding-left: 36px; line-height: 1.5;">💡 ${htmlescape(guide)}</div>` : ''}
+        <div style="display: flex; align-items: center; gap: 8px; margin-top: 8px;">
+          <input type="checkbox" ${finalInstalled ? 'checked' : ''} id="tool-${tool.name.replace(/\s/g, '-')}"
+            data-input-action="onAgentToolCheckboxChange"
+            data-input-event="change"
+            data-pass-event="1"
+            data-agent-id="${htmlescape(agentId)}">
+          <label for="tool-${tool.name.replace(/\s/g, '-')}" style="font-size:0.85em; color:var(--lrc-墨韵-500); cursor:pointer;">启用</label>
+        </div>
+        ${guide ? `<div style="font-size: 0.8em; color: var(--lrc-墨韵-500); padding-left: 28px; margin-top: 6px; line-height: 1.5; display:flex; align-items:flex-start; gap:4px;"><img src="/assets/icons/icon-bulb.svg" alt="" width="12" height="12" style="margin-top:2px; flex-shrink:0;">${htmlescape(guide)}</div>` : ''}
       </div>`;
-    }).join('');
+    }).join('') + `
+      <div style="text-align:center; padding: 12px 0 4px 0;">
+        <button class="btn btn-outline btn-sm" data-action="openManualAddModal">没有找到你的工具？手动添加</button>
+      </div>`;
 
     // 统计已安装数量
     const installedCount = effectiveTools.length;
     // S-05：工具列表渲染完成后，刷新「上次扫描时间」显示
     refreshScanCacheMetadataUi();
+    // P1-1 修复：成功渲染后重新绑定事件（齿轮按钮 + 复选框 data-input-action）
+    if (typeof bindAllActions === 'function') {
+      bindAllActions();
+    }
 
   } catch (e) {
-    toolsList.innerHTML = '<p style="color: var(--lrc-朱砂-500); margin: 0;">检测失败: ' + htmlescape(e.message) + '</p><p style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-top: 8px;">请确保龙忆（LRC）服务正在运行</p><button class="btn btn-accent" style="margin-top: 12px;" data-action="retryToolDetection">重新检测</button>';
+    toolsList.innerHTML = '<p style="color: var(--lrc-朱砂-500); margin: 0;">检测失败: ' + htmlescape(e.message) + '</p><p style="color: var(--lrc-墨韵-400); font-size: 0.85em; margin-top: 8px;">请确认龙忆（LRC）服务正在运行。</p><div style="margin-top:12px; display:flex; gap:8px; justify-content:center;"><button class="btn btn-accent" data-action="retryToolDetection">重新检测</button><button class="btn btn-outline" data-action="openManualAddModal">手动添加</button></div>';
     // S-05：即使失败也刷新「上次扫描时间」（用上次的缓存数据，若有）
     refreshScanCacheMetadataUi();
     // 动态生成的按钮需要重新绑定 data-action
@@ -8895,6 +9424,108 @@ async function simulateAiToolsScan() {
 function retryToolDetection() {
   simulateAiToolsScan();
 }
+
+/**
+ * 打开「手动添加 AI 工具」模态框：展示所有已知但未安装的工具，用户勾选后标记为已安装。
+ * 数据来自 lrc-discover-all-agents（已知工具注册表），只展示未安装项（已安装的已在主列表）。
+ */
+async function openManualAddModal() {
+  // 清理旧模态框，避免重复叠加
+  document.querySelectorAll('.lrc-manual-add-overlay').forEach(m => m.remove());
+
+  const overlay = document.createElement('div');
+  overlay.className = 'lrc-manual-add-overlay';
+
+  const panel = document.createElement('div');
+  panel.className = 'lrc-manual-add-panel';
+  panel.innerHTML = `
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+      <h3 style="margin:0; color:var(--lrc-墨韵-700); font-size:1.1em;">手动添加 AI 工具</h3>
+      <button type="button" class="lrc-manual-add-close" style="background:transparent;border:none;cursor:pointer;padding:4px;" aria-label="关闭"><img src="/assets/icons/icon-close.svg" alt="" width="18" height="18"></button>
+    </div>
+    <p style="color:var(--lrc-墨韵-500); font-size:0.9em; margin:0 0 16px 0;">龙忆支持以下工具，但本次未在你电脑上检测到。勾选你正在使用的工具，龙忆会把它加入列表并给出配置方法。</p>
+    <div class="lrc-manual-add-list" style="margin-bottom:16px;">
+      <p style="color:var(--lrc-墨韵-400); font-size:0.9em; margin:0;"><span class="loading-spinner"></span> 正在加载支持的工具列表…</p>
+    </div>
+    <div style="display:flex; gap:12px; justify-content:flex-end;">
+      <button type="button" class="btn btn-outline lrc-manual-add-cancel">取消</button>
+      <button type="button" class="btn btn-primary lrc-manual-add-save" disabled style="opacity:0.5;">添加并保存</button>
+    </div>
+  `;
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  const close = () => overlay.remove();
+  panel.querySelector('.lrc-manual-add-close').addEventListener('click', close);
+  panel.querySelector('.lrc-manual-add-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  try {
+    const discovered = await postMessageToParent('lrc-discover-all-agents', {}, 30000);
+    let known = [];
+    if (Array.isArray(discovered) && discovered.length === 2 && Array.isArray(discovered[0]) && Array.isArray(discovered[1])) {
+      known = discovered[0];
+    } else if (Array.isArray(discovered)) {
+      known = discovered;
+    }
+
+    // 只展示「未安装」的工具（已安装的已在主列表）
+    const localOverrides = getLocalManualOverrides();
+    const notInstalled = known.filter(a => {
+      const agentId = toolNameToAgentId(a && a.name);
+      const hasOverride = Object.prototype.hasOwnProperty.call(localOverrides, agentId);
+      const installed = hasOverride ? !!localOverrides[agentId] : !!(a && a.installed);
+      return !installed;
+    });
+
+    const listEl = panel.querySelector('.lrc-manual-add-list');
+    if (!notInstalled.length) {
+      listEl.innerHTML = '<p style="color:var(--lrc-墨韵-400); font-size:0.9em; margin:0;">所有支持的工具都已在列表中。</p>';
+      return;
+    }
+
+    listEl.innerHTML = notInstalled.map(a => {
+      const name = a.name || a.id || '未知工具';
+      const icon = toolIconFor(name, a.type);
+      return `
+      <label style="display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px solid var(--lrc-宣纸-500); cursor:pointer;">
+        <input type="checkbox" class="lrc-manual-add-check" data-tool-name="${htmlescape(name)}" style="flex-shrink:0;">
+        <img src="/assets/icons/${icon}.svg" alt="" width="16" height="16" style="opacity:0.7; flex-shrink:0;">
+        <span style="color:var(--lrc-墨韵-700);">${htmlescape(name)}</span>
+        <span style="font-size:0.8em; color:var(--lrc-墨韵-300);">(${htmlescape(a.type || '工具')})</span>
+      </label>`;
+    }).join('');
+
+    // 勾选后启用「添加并保存」
+    const saveBtn = panel.querySelector('.lrc-manual-add-save');
+    const checkboxes = panel.querySelectorAll('.lrc-manual-add-check');
+    checkboxes.forEach(cb => {
+      cb.addEventListener('change', () => {
+        const anyChecked = Array.from(checkboxes).some(c => c.checked);
+        saveBtn.disabled = !anyChecked;
+        saveBtn.style.opacity = anyChecked ? '1' : '0.5';
+      });
+    });
+
+    saveBtn.addEventListener('click', async () => {
+      const selected = Array.from(checkboxes).filter(c => c.checked).map(c => c.getAttribute('data-tool-name'));
+      saveBtn.disabled = true;
+      saveBtn.style.opacity = '0.5';
+      for (const name of selected) {
+        // silent=true 避免逐个 toast 风暴，由下方汇总提示
+        await applyAgentManualOverride(name, true, true);
+      }
+      close();
+      // 重新扫描，让新添加的工具出现在主列表
+      simulateAiToolsScan();
+      showToast('已添加 ' + selected.length + ' 个工具，可在工具列表勾选「启用」', 'success', 4000);
+    });
+  } catch (e) {
+    const listEl = panel.querySelector('.lrc-manual-add-list');
+    listEl.innerHTML = '<p style="color:var(--lrc-朱砂-500); font-size:0.9em; margin:0;">加载失败：' + htmlescape(humanizeErrorDetail(e.message)) + '</p>';
+  }
+}
+window.openManualAddModal = openManualAddModal;
 
 // ============================================================
 // v0.8.31 S-05：扫描缓存 UI 控制（上次扫描时间 + 重新扫描按钮）
@@ -8918,7 +9549,7 @@ function ensureAiToolsToolbar() {
   ].join('');
   toolbar.innerHTML = `
     <div data-role="last-scan-ts" style="display:flex; align-items:center; gap:6px;">
-      <span>📅</span>
+      <img src="/assets/icons/icon-clock.svg" alt="" width="14" height="14" style="opacity:0.7;">
       <span data-role="last-scan-text">上次扫描：</span>
       <span data-role="last-scan-value" style="color: var(--lrc-墨韵-700); font-weight: 500;">加载中...</span>
       <span data-role="last-scan-valid" style="display:none; padding: 1px 6px; border-radius: 3px; font-size: 0.9em; background: var(--lrc-玉色-100); color: var(--lrc-玉色-700); margin-left: 6px;">24h 内有效</span>
@@ -8927,7 +9558,7 @@ function ensureAiToolsToolbar() {
       <button type="button" class="btn" data-action="rescanToolsWithInvalidate"
         title="清空扫描缓存，重新扫描桌面快捷方式和安装目录（检测结果不准确时使用）"
         style="padding: 4px 10px; font-size: 0.85em; border-radius: var(--radius-sm); background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); cursor: pointer; color: var(--lrc-墨韵-700);">
-        🔄 重新扫描（清空缓存）
+        <img src="/assets/icons/icon-refresh.svg" alt="" width="14" height="14" style="vertical-align:middle; margin-right:4px;">重新扫描（清空缓存）
       </button>
     </div>
   `;
@@ -9021,7 +9652,7 @@ async function rescanToolsWithInvalidate() {
   const btn = document.querySelector('[data-action="rescanToolsWithInvalidate"]');
   if (btn) {
     btn.disabled = true;
-    btn.textContent = '⏳ 扫描中...';
+    btn.textContent = '扫描中...';
     btn.style.opacity = '0.6';
     btn.style.cursor = 'not-allowed';
   }
@@ -9044,13 +9675,13 @@ async function rescanToolsWithInvalidate() {
   // 恢复按钮状态
   if (btn) {
     btn.disabled = false;
-    btn.textContent = '🔄 重新扫描（清空缓存）';
+    btn.innerHTML = '<img src="/assets/icons/icon-refresh.svg" alt="" width="14" height="14" style="vertical-align:middle; margin-right:4px;">重新扫描（清空缓存）';
     btn.style.opacity = '';
     btn.style.cursor = '';
   }
 
   if (typeof showToast === 'function') {
-    showToast('重新扫描完成！如结果仍不准确，可点击工具卡片右侧 ⚙️ 齿轮手动修正', 'success', 4500);
+    showToast('重新扫描完成！如结果仍不准确，可点击工具卡片右侧「更多操作」手动修正', 'success', 4500);
   }
 }
 
@@ -9100,6 +9731,16 @@ function toolNameToAgentId(displayName) {
   return TOOL_NAME_TO_AGENT_ID_MAP[trimmed] || trimmed;
 }
 
+/**
+ * 根据工具名/类型判断图标：CLI/Agent 类用终端图标，其余用工具箱图标。
+ * 抽取为单一函数，避免 simulateAiToolsScan 与 openManualAddModal 重复正则。
+ */
+function toolIconFor(name, type) {
+  const cliLike = /CLI|Claude|Gemini|CodeBuddy|Copilot|Agent|Replit|DeepSeek/i;
+  if (cliLike.test(type || '') || cliLike.test(name || '')) return 'icon-terminal';
+  return 'icon-tools';
+}
+
 /** localStorage 次级备份 key（即使后端 IPC 失败，也至少在重启前保持一致） */
 const LS_MANUAL_OVERRIDE_KEY = 'lrc_agent_manual_overrides_v1';
 
@@ -9143,7 +9784,7 @@ function setLocalManualOverride(agentId, overrideInstalled) {
  * @param {string} toolDisplayName - 工具显示名（来自 api/tools/detect 的 name 字段）
  * @param {boolean|null} overrideInstalled - true=强制已安装, false=强制未安装, null=恢复自动检测
  */
-async function applyAgentManualOverride(toolDisplayName, overrideInstalled) {
+async function applyAgentManualOverride(toolDisplayName, overrideInstalled, silent = false) {
   const agentId = toolNameToAgentId(toolDisplayName);
   if (!agentId) {
     showToast('无法识别工具：' + toolDisplayName, 'error', 4000);
@@ -9170,12 +9811,14 @@ async function applyAgentManualOverride(toolDisplayName, overrideInstalled) {
     }
   }
 
-  // ── Step 3：Toast 反馈 ──
-  const actionText = overrideInstalled === true ? '已标记为安装'
-    : overrideInstalled === false ? '已标记为未安装'
-    : '已恢复自动检测';
-  const persistHint = persistOk ? '' : '（本地临时生效，重启后可能丢失）';
-  showToast(`${toolDisplayName}：${actionText}${persistHint}`, persistOk ? 'success' : 'warning', 3500);
+  // ── Step 3：Toast 反馈（批量添加时静默，由调用方统一提示） ──
+  if (!silent) {
+    const actionText = overrideInstalled === true ? '已标记为安装'
+      : overrideInstalled === false ? '已标记为未安装'
+      : '已恢复自动检测';
+    const persistHint = persistOk ? '' : '（本地临时生效，重启后可能丢失）';
+    showToast(`${toolDisplayName}：${actionText}${persistHint}`, persistOk ? 'success' : 'warning', 3500);
+  }
 
   // 变更后重新检查下一步按钮（防止用户取消所有安装后误以为项目已选）
   if (typeof checkNextButton === 'function') checkNextButton();
@@ -9188,42 +9831,27 @@ async function applyAgentManualOverride(toolDisplayName, overrideInstalled) {
  *   - 右侧"已检测到/未安装"文字 + 🔧 用户手动指定标记
  */
 function refreshSingleToolCardUi(agentId, overrideInstalled) {
-  // 找卡片：当前渲染使用 tool.name 替换空格为 - 作为 checkbox id 前缀，
-  // 此处使用 agentId 反查 name，或直接通过 data-agent-id 查找（下面渲染新加入 data-agent-id）
+  // 找卡片：通过 data-agent-id 定位（渲染时写入）
   const cards = document.querySelectorAll('[data-agent-id="' + agentId + '"]');
   cards.forEach(card => {
-    const statusEl = card.querySelector('[data-role="tool-status"]');
     const cb = card.querySelector('input[type="checkbox"]');
-    const manualBadge = card.querySelector('[data-role="manual-override-badge"]');
+    const manualBadge = card.querySelector('[data-role="manual-badge"]');
 
-    // 状态文本 + 颜色
-    if (statusEl) {
-      if (overrideInstalled === null) {
-        // 恢复为自动检测 → 需要重新拉数据，这里只移除手动标记，让用户点重新检测
-        statusEl.textContent = statusEl.dataset.autoStatus || statusEl.textContent;
-        statusEl.style.color = '';
-      } else {
-        statusEl.textContent = overrideInstalled ? '已检测到' : '未安装';
-        statusEl.style.color = overrideInstalled ? 'var(--lrc-玉色-600)' : 'var(--lrc-墨韵-300)';
-      }
-    }
-
-    // checkbox：手动修正为已安装时，用户能勾；手动修正为未安装时，用户应该勾不上
+    // checkbox：手动覆盖时更新勾选状态
     if (cb) {
-      if (overrideInstalled === null) {
-        cb.checked = !!statusEl?.dataset?.autoStatusChecked;
-        cb.disabled = !statusEl?.dataset?.autoStatusInstalled
-          && cb.dataset.autoInstallDisabled !== 'false';
-      } else {
-        cb.checked = !!overrideInstalled;
-        // 手动修正为未安装时仍允许用户勾选（万一用户想先选）
+      if (overrideInstalled === true) {
+        cb.checked = true;
+        cb.disabled = false;
+      } else if (overrideInstalled === false) {
+        cb.checked = false;
         cb.disabled = false;
       }
+      // null（恢复自动检测）不改变 checkbox，等待下一次扫描重新渲染
     }
 
-    // 手动修正小徽章
+    // 手动添加徽章
     if (manualBadge) {
-      manualBadge.style.display = overrideInstalled === null ? 'none' : 'inline-block';
+      manualBadge.style.display = overrideInstalled === null ? 'none' : 'inline-flex';
     }
   });
 }
@@ -9256,15 +9884,17 @@ function showToolGearMenu(toolDisplayName, currentInstalled, anchorEl) {
     font-size:0.9em; color:var(--lrc-墨韵-700);
   `;
   menu.setAttribute('data-tool-name', toolDisplayName);
+  // P1-1 修复：菜单项 hover 改用 CSS class（.lrc-agent-gear-menu-item:hover），
+  //   移除内联 onmouseover/onmouseout（被 CSP 拦截）。disabled 态用 data-disabled 属性。
   menu.innerHTML = `
-    <div data-gear-action="mark-not-installed" style="padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;" onmouseover="this.style.background='var(--lrc-宣纸-400)'" onmouseout="this.style.background='transparent'">
-      <span>🚫</span><span>这不是我用的工具</span>
+    <div data-gear-action="mark-not-installed" class="lrc-agent-gear-menu-item">
+      <span><img src="/assets/icons/icon-close.svg" alt="" width="14" height="14"></span><span>这个工具我没在用</span>
     </div>
-    <div data-gear-action="mark-installed" style="padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;" onmouseover="this.style.background='var(--lrc-宣纸-400)'" onmouseout="this.style.background='transparent'">
-      <span>✅</span><span>改为我正在用的工具</span>
+    <div data-gear-action="mark-installed" class="lrc-agent-gear-menu-item">
+      <span><img src="/assets/icons/icon-check.svg" alt="" width="14" height="14"></span><span>标记为已安装</span>
     </div>
-    <div data-gear-action="reset" ${hasManual ? '' : 'style="opacity:0.4;pointer-events:none"'} style="padding:8px 14px;cursor:pointer;display:flex;align-items:center;gap:8px;border-top:1px solid var(--lrc-宣纸-500);margin-top:4px;padding-top:10px;" onmouseover="this.style.background='var(--lrc-宣纸-400)'" onmouseout="this.style.background='transparent'">
-      <span>♻️</span><span>恢复自动检测</span>
+    <div data-gear-action="reset" class="lrc-agent-gear-menu-item gear-menu-item-reset" ${hasManual ? '' : 'data-disabled="1"'}>
+      <span><img src="/assets/icons/icon-refresh.svg" alt="" width="14" height="14"></span><span>恢复自动检测</span>
     </div>
   `;
 
@@ -9359,10 +9989,10 @@ function addSelectedProject(projectName) {
   projectEl.style.cssText = 'display: flex; align-items: center; justify-content: space-between; padding: 12px; background: var(--lrc-宣纸-400); border-radius: var(--radius-sm); margin-bottom: 8px;';
   projectEl.innerHTML = `
     <div style="display: flex; align-items: center; gap: 10px;">
-      <span>📁</span>
+      <img src="/assets/icons/icon-folder.svg" alt="" width="16" height="16" style="opacity:0.7;">
       <span style="color: var(--lrc-墨韵-700); font-weight: 500;">${projectName}</span>
     </div>
-    <button style="background: none; border: none; color: var(--lrc-朱砂-500); cursor: pointer; font-size: 1.1em;" data-action="removeProjectFromWizard" data-arg-mode="this">✕</button>
+    <button style="background: none; border: none; color: var(--lrc-朱砂-500); cursor: pointer; padding: 2px;" data-action="removeProjectFromWizard" data-arg-mode="this"><img src="/assets/icons/icon-close.svg" alt="" width="14" height="14"></button>
   `;
   projectsContainer.appendChild(projectEl);
   // v0.8.4 Step 9：动态生成的元素需要重新绑定 data-action
@@ -9373,12 +10003,15 @@ function addSelectedProject(projectName) {
   // 启用下一步按钮
   checkNextButton();
 
-  // 如果是快速模式，直接完成
-  const stepsSection = document.getElementById('setup-steps-section');
-  if (!stepsSection || stepsSection.style.display === 'none') {
-    // v0.8.3 Step 4 批次 6：alert→showToast（修复 G001-G003）
-    showToast('项目 ' + projectName + ' 已选择！（演示功能，实际需后端 API 支持重新索引）', 'info');
-  }
+  // P0-1 修复：真正保存项目目录到后端（替代「演示功能，实际需后端 API 支持重新索引」自曝文案）
+  postMessageToParent('lrc-set-project-dir', { projectDir: projectName }, 10000)
+    .then(() => {
+      showToast('已选择项目：' + projectName + '，完成配置后将索引代码', 'success', 3500);
+    })
+    .catch(() => {
+      // 非桌面端或保存失败时，仍提示用户（不暴露「演示功能」）
+      showToast('已选择项目：' + projectName, 'info', 3000);
+    });
 }
 
 /**
@@ -9502,6 +10135,9 @@ async function finishSetup() {
   if (provider && provider !== 'none') {
     const apiKey = document.getElementById('setup-llm-api-key')?.value?.trim();
     if (apiKey && apiKey.length >= 10) {
+      // v0.9.0 修复：保存 LLM 配置期间禁用完成按钮，防止重复提交
+      const finishBtn = document.querySelector('[data-action="finishSetup"]');
+      if (finishBtn) finishBtn.disabled = true;
       try {
         // 保存 LLM 配置到后端，确保用户在向导中输入的配置不会丢失
         const result = await postMessageToParent('lrc-save-llm-config', {
@@ -9516,6 +10152,8 @@ async function finishSetup() {
       } catch (e) {
         // 保存失败不阻塞向导完成，用户可在设置中重新配置
         console.warn('[finishSetup] LLM 配置保存异常，继续完成向导:', e.message);
+      } finally {
+        if (finishBtn) finishBtn.disabled = false;
       }
     }
   }
@@ -9533,9 +10171,36 @@ async function finishSetup() {
 
 // 仪表盘交互
 window.dismissWelcome = dismissWelcome;
+window.reopenWelcome = reopenWelcome;
 window.toggleSidebar = toggleSidebar;
 window.toggleSysStatusFloat = toggleSysStatusFloat;
 window.loadEvolutionTimeline = loadEvolutionTimeline;
+// v0.9.0 修复：暴露信任中心/仪表盘重试函数（此前未暴露导致 HTML onclick 重试按钮 ReferenceError 无响应）
+window.loadTrustCenter = loadTrustCenter;
+window.loadMemoryStats = loadMemoryStats;
+window.retryLoadBenchmarks = retryLoadBenchmarks;
+
+// v0.9.1 缺口 1：调节器手动解冻（补全 RegulatorUnfrozen 审计闭环）
+async function unfreezeRegulator() {
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/regulator/unfreeze', { method: 'POST' }, 10000);
+    if (!res.ok) {
+      showToast('解冻失败：服务暂时不可用，请稍后重试', 'error', 4000);
+      return;
+    }
+    const data = await res.json();
+    if (data.ok) {
+      showToast(data.message || '调节器已解冻', 'success', 3000);
+      // 刷新系统状态页
+      loadSystemStatusPage();
+    } else {
+      showToast(data.message || '解冻失败', 'warning', 4000);
+    }
+  } catch (e) {
+    showToast('解冻请求失败：' + e.message, 'error', 4000);
+  }
+}
+window.unfreezeRegulator = unfreezeRegulator;
 
 // 记忆详情面板
 window.closeMemoryDetail = closeMemoryDetail;
@@ -9658,6 +10323,15 @@ function bindAllActions() {
       // v0.8.2：标记为飞行中
       el.dataset.inFlight = '1';
 
+      // P0-1 修复：新操作开始时，清除上一个操作的残留非 error toast，避免跨操作串位。
+      // 保留 error toast（错误信息重要，不轻易清除）；此刻尚未产生当前操作的 toast，不会误清。
+      try {
+        document.querySelectorAll('#toast-container .toast:not(.toast-leaving):not(.toast-error)').forEach(t => {
+          t.classList.add('toast-leaving');
+          setTimeout(() => { if (t.parentNode) t.parentNode.removeChild(t); }, 200);
+        });
+      } catch (_) { /* toast 清理非关键，静默兜底 */ }
+
       try {
         const argMode = el.getAttribute('data-arg-mode');
         const arg = el.getAttribute('data-arg');
@@ -9680,6 +10354,22 @@ function bindAllActions() {
       } finally {
         // v0.8.2：延迟 500ms 解锁，防止快速连击
         setTimeout(() => { delete el.dataset.inFlight; }, 500);
+      }
+    });
+  });
+
+  // P1-1 修复：齿轮按钮事件委托（替代内联 onclick，修复 CSP 拦截导致菜单失效）
+  // 这些按钮由 simulateAiToolsScan 动态 innerHTML 生成，渲染后会再次调用 bindAllActions。
+  document.querySelectorAll('[data-role="tool-gear-btn"]').forEach(el => {
+    if (el.dataset.bound === '1') return;
+    el.dataset.bound = '1';
+    el.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      const toolName = el.getAttribute('data-tool-name');
+      const installed = el.getAttribute('data-tool-installed') === 'true';
+      if (typeof showToolGearMenu === 'function') {
+        showToolGearMenu(toolName, installed, el);
       }
     });
   });

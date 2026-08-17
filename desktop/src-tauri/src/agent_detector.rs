@@ -71,6 +71,8 @@ pub struct ProjectInfo {
 pub struct RulesStatus {
     /// 工具 ID（如 "trae", "cursor"）
     pub tool_id: String,
+    /// 工具显示名称（如 "Trae", "Cursor"），前端直接使用，避免硬编码映射
+    pub name: String,
     /// 规则文件绝对路径
     pub rules_path: String,
     /// 文件是否存在
@@ -396,7 +398,10 @@ const KNOWN_TOOLS: &[KnownTool] = &[
 /// 用于规则文件的版本化管理和自动升级。
 /// 当此版本号高于规则文件中的版本号时，自动升级规则内容。
 /// 版本号遵循语义化版本规范（major.minor.patch）。
-const LRC_RULES_VERSION: &str = "0.8.0";
+///
+/// v0.9.0 修复：改为从 Cargo.toml 动态读取（env!("CARGO_PKG_VERSION")），
+/// 规则版本号永远与应用版本同步，消除硬编码导致的版本滞后。
+const LRC_RULES_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// v0.8.0 "归一"：从规则文件内容中解析版本号
 ///
@@ -2465,28 +2470,11 @@ impl AgentDetectorRegistry {
         self.configure(&installed_ids, port, project_dir)
     }
 
-    /// v0.8.0 "归一" 新增：获取所有支持规则文件的工具 ID 列表
-    ///
-    /// 用于桌面端 setup() 时自动写入规则，无需依赖 sidecar 启动。
-    /// 返回 KNOWN_TOOLS 中所有定义了 rules_file_template 的工具 ID。
-    pub fn get_all_rules_capable_tool_ids() -> Vec<String> {
-        KNOWN_TOOLS
-            .iter()
-            .filter_map(|t| {
-                if Self::get_rules_file_template(t.id).is_some() {
-                    Some(t.id.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
     /// v0.8.0 "归一" 新增：获取所有工具的规则文件状态
     ///
     /// 用于信任中心展示各 AI 工具的 LRC 规则写入状态。
     /// 检查每个工具的规则文件是否存在、版本是否最新。
-    pub fn get_rules_status() -> Vec<RulesStatus> {
+    pub fn get_rules_status(&self) -> Vec<RulesStatus> {
         let home_dir = match dirs::home_dir() {
             Some(h) => h,
             None => {
@@ -2495,8 +2483,17 @@ impl AgentDetectorRegistry {
             }
         };
 
+        // v0.9.0 修复：只返回已安装工具的规则状态，避免列出用户未安装的一整排工具。
+        // 复用 detect_installed() 的检测逻辑（与配置向导的 AI 工具检测保持一致）。
+        let installed_ids: std::collections::HashSet<String> = self
+            .detect_installed()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+
         KNOWN_TOOLS
             .iter()
+            .filter(|t| installed_ids.contains(t.id))
             .filter_map(|t| {
                 let template = Self::get_rules_file_template(t.id)?;
                 let rules_path = home_dir.join(template);
@@ -2536,6 +2533,7 @@ impl AgentDetectorRegistry {
 
                 Some(RulesStatus {
                     tool_id: t.id.to_string(),
+                    name: t.name.to_string(),
                     rules_path: rules_path.display().to_string(),
                     exists,
                     version,
@@ -2950,9 +2948,9 @@ impl AgentDetectorRegistry {
 
         format!(
             r#"{frontmatter}{header}
-<!-- LRC_RULES_VERSION: 0.8.0 -->
+<!-- LRC_RULES_VERSION: {LRC_RULES_VERSION} -->
 <!-- LRC_RULES_GENERATED: 2026-07-29 -->
-<!-- 本文件由 LRC Desktop v0.8.0 "归一" 自动生成，请勿手动删除 LRC 相关规则 -->
+<!-- 本文件由 LRC Desktop v{LRC_RULES_VERSION} "归一" 自动生成，请勿手动删除 LRC 相关规则 -->
 <!-- 如需自定义规则，请在本文件末尾添加 -->
 
 ## LRC 记忆系统（Loong Recall Code Memory）
@@ -2961,7 +2959,7 @@ impl AgentDetectorRegistry {
 
 ---
 
-### 数据安全承诺（v0.8.0 "归一"）
+### 数据安全承诺（v{LRC_RULES_VERSION} "归一"）
 
 **数据统一存储位置**：`~/.loong-recall/global/data/`（桌面端默认全局模式）
 
@@ -3453,7 +3451,8 @@ mod tests {
 
     #[test]
     fn test_lrc_rules_version_constant() {
-        assert_eq!(LRC_RULES_VERSION, "0.8.0");
+        // v0.9.0：规则版本号改为动态读取 Cargo.toml，测试验证其与包版本一致
+        assert_eq!(LRC_RULES_VERSION, env!("CARGO_PKG_VERSION"));
     }
 
     /// TDD：测试 detect_all 返回所有注册的检测器信息

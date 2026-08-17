@@ -53,7 +53,7 @@ use crate::engine::luoshu_encoder::LuoShuVector;
 use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 use crate::engine::memory_gc::{GcStats, MemoryGarbageCollector, MemoryInfoQuery, MemorySnapshot};
 use crate::engine::mirror_trapezoid::{mirror_project, recursive_unfold, TrapezoidROI};
-use crate::engine::synthesis_engine::{SynthesisConfig, SynthesisEngine};
+use crate::engine::synthesis_engine::{SynthesisConfig, SynthesisEngine, SynthesisPlan};
 use crate::engine::synthesis_journal::SynthesisJournal;
 use crate::engine::user_feedback::{
     AffectedMemoryInfo, ImplicitSignal, MemoryGraphQuery, UserFeedback,
@@ -199,6 +199,19 @@ pub struct RecallResult {
     pub scores: Vec<f32>,
     /// 记忆库总数
     pub total: usize,
+}
+
+/// 合成快照（三阶段锁解耦·Phase 1 读）
+///
+/// 在持锁下快速读取全量记忆 + 合成配置，随后在锁外执行 CPU 密集的聚类计算。
+#[derive(Debug)]
+pub struct SynthesisSnapshot {
+    /// 全量记忆快照（供纯计算使用）
+    pub all: Vec<Memory>,
+    /// 合成引擎配置
+    pub config: SynthesisConfig,
+    /// 信息增量阈值（由 DaoRegulator 动态管理）
+    pub information_gain_threshold: f32,
 }
 
 /// 记忆存储管理器（Aggregate Root）
@@ -435,6 +448,15 @@ impl<P: Persistence> MemoryInfoQuery for MemoryStore<P> {
                 eprintln!("[memory_store] 删除记忆失败 ({}): {}", memory_id, e);
                 false
             });
+        // P2-1 修复：GC 删除记忆时记录审计事件（MemoryDeleted），补全审计追踪覆盖
+        if result {
+            self.record_audit(
+                AuditEventType::MemoryDeleted,
+                format!("GC 删除记忆 {}", memory_id),
+                "自主垃圾回收器删除过期/低质量记忆",
+                vec![memory_id.to_string()],
+            );
+        }
         // v0.5.4 写操作后标记缓存为脏
         self.invalidate_cache();
         result
@@ -806,6 +828,25 @@ impl<P: Persistence> MemoryStore<P> {
         }
     }
 
+    /// v0.9.0 新增：创建带指定编码器的 MemoryStore
+    ///
+    /// 用于 sidecar 启动时根据本地模型检测结果注入 ML 语义编码器。
+    /// 复用 `new()` 的全部初始化逻辑，仅替换洛书编码器，
+    /// 避免复制构造函数导致字段遗漏。
+    pub fn new_with_encoder(persistence: P, luoshu_encoder: HybridLuoShuEncoder) -> Self {
+        let mut store = Self::new(persistence);
+        store.luoshu_encoder = luoshu_encoder;
+        store
+    }
+
+    /// v0.9.0 新增：判断当前编码器是否为 ML 语义模式（而非统计降级模式）
+    ///
+    /// 统计模式下洛书 9 维向量对语义的区分度低，深度检索路径（trapezoid_focus_recall）
+    /// 会把不相关记忆排到前面，稀释字面匹配结果。调用方据此决定是否跳过深度路径。
+    pub fn is_ml_encoder(&self) -> bool {
+        self.luoshu_encoder.get_status().mode.as_str() == "ml"
+    }
+
     /// v0.6.0+ 参赛扩展：设置探索日志记录器
     /// 由 sidecar 启动时根据 `--exploration-log <path>` 参数注入
     /// 未调用此方法时，所有日志调用为空操作（disabled 模式）
@@ -968,6 +1009,82 @@ impl<P: Persistence> MemoryStore<P> {
         result
     }
 
+    /// 合成快照（三阶段锁解耦·Phase 1）：持锁下快速读取全量记忆 + 配置
+    ///
+    /// 仅做磁盘读取，不执行 CPU 密集的聚类计算，锁持有时间极短。
+    pub fn synthesis_snapshot(&self) -> Result<SynthesisSnapshot, PersistenceError> {
+        let all = self.persistence.load_all_memories()?;
+        Ok(SynthesisSnapshot {
+            all,
+            config: SynthesisConfig {
+                min_cluster: self.synthesis_min_cluster,
+                similarity: self.synthesis_similarity,
+            },
+            information_gain_threshold: self.dao_regulator.information_gain_threshold,
+        })
+    }
+
+    /// 应用合成计划（三阶段锁解耦·Phase 3）：持锁下批量写回
+    ///
+    /// 将 Phase 2 无锁计算产出的 SynthesisPlan 写回：磁盘 + 图 + 日志 + 指标 + 审计。
+    /// 返回实际写入的合成记忆数量。
+    pub fn apply_synthesis_plan(&mut self, plan: SynthesisPlan) -> usize {
+        let synthesized = plan.synthesized;
+        if plan.batch.is_empty() {
+            return 0;
+        }
+
+        // 批量写入磁盘（单次序列化）
+        if let Err(e) = self.persistence.save_memories(&plan.batch) {
+            eprintln!("[LRC·合成] 批量写入合成记忆失败: {}", e);
+            return 0;
+        }
+
+        // 图边
+        for (synthesis_id, source_ids, confidence) in &plan.graph_edges {
+            if let Some(ref mut graph) = self.graph_store {
+                for sid in source_ids {
+                    let _ =
+                        graph.add_edge(synthesis_id, sid, EdgeType::SynthesizesFrom, *confidence);
+                }
+            }
+        }
+
+        // 合成日志
+        for entry in &plan.journal_entries {
+            self.synthesis_journal.record_synthesis(
+                entry.synthesis_id.clone(),
+                &entry.trigger_source,
+                &entry.bagua_category,
+                entry.bagua_index,
+                entry.source_ids.clone(),
+                entry.confidence,
+                entry.member_count,
+            );
+        }
+
+        // 指标
+        for _ in 0..synthesized {
+            self.dao_metrics.record_composition();
+        }
+
+        // 审计（系统自主行为，需可回溯）
+        self.record_audit(
+            AuditEventType::SynthesisCreated,
+            format!("合成创建 {} 条合成记忆", synthesized),
+            "三阶段锁解耦：聚类计算在锁外执行，仅写回阶段持锁",
+            plan.batch.iter().map(|m| m.id.clone()).collect(),
+        );
+
+        // v0.5.4 写操作后标记缓存为脏
+        self.invalidate_cache();
+        // v0.9.1 三阶段锁解耦：合成写回完成后清除待合成标记，
+        // 由后台结晶流水线的三阶段合成（而非健康检查）负责消费此标记。
+        self.synthesis_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        synthesized
+    }
+
     /// 洛书驱动递归合成（M.T.R. RecursiveCompose 增强版）
     ///
     /// 与 Jaccard-based try_synthesize 不同，此方法使用洛书向量进行:
@@ -976,87 +1093,49 @@ impl<P: Persistence> MemoryStore<P> {
     /// 3. 生成高置信度的 Synthesis 记忆
     ///
     /// 返回新生成的合成记忆数量。
+    ///
+    /// 三阶段锁解耦（v0.9.1）：此兼容接口内部已拆分为 snapshot → plan → apply，
+    /// 真正的锁外计算由 consolidation / v1_api 的三阶段调用实现。
     pub fn luoshu_synthesize(&mut self) -> Result<usize, PersistenceError> {
-        // v0.6.0+ 参赛扩展：探索日志埋点（synthesize 事件 - 洛书模式）
         let synthesize_start = std::time::Instant::now();
 
-        // 同步引擎配置与存储层设置（确保 consolidation 等外部调用者设置的阈值生效）
+        // 同步引擎配置（确保 consolidation 等外部调用者设置的阈值生效）
         self.synthesis_engine = SynthesisEngine::new(SynthesisConfig {
             min_cluster: self.synthesis_min_cluster,
             similarity: self.synthesis_similarity,
         });
 
-        let luoshu_result = self.synthesis_engine.luoshu_synthesize(
-            &self.persistence,
-            &mut self.graph_store,
-            &mut self.dao_metrics,
-            &self.synthesis_journal,
-            self.dao_regulator.information_gain_threshold, // 质疑一·活性：动态阈值
-        )?;
+        // Phase 1：读快照
+        let snapshot = self.synthesis_snapshot()?;
 
-        // 洛书合成成功，直接返回
-        if luoshu_result > 0 {
-            // v0.6.0+ 参赛扩展：探索日志记录（synthesize 事件 - 洛书模式）
-            self.exploration_logger.log(
-                crate::engine::exploration_log::ExplorationEventType::Synthesize,
-                serde_json::json!({
-                    "engine": "luoshu",
-                    "synthesized_count": luoshu_result,
-                }),
-                Some(crate::engine::exploration_log::Metrics {
-                    latency_ms: Some(synthesize_start.elapsed().as_millis() as u64),
-                    result_count: Some(luoshu_result),
-                    ..Default::default()
-                }),
-            );
-            // 记录审计：结晶流水线合成创建记忆（系统自主行为）
-            self.record_audit(
-                AuditEventType::SynthesisCreated,
-                format!("洛书合成创建 {} 条合成记忆", luoshu_result),
-                "结晶流水线检测到相似记忆簇，自动合成新记忆",
-                Vec::new(),
-            );
-            return Ok(luoshu_result);
-        }
+        // Phase 2：纯计算（洛书优先，失败降级 Jaccard）
+        let engine = SynthesisEngine::new(snapshot.config);
+        let mut plan = engine.plan_luoshu(&snapshot.all, snapshot.information_gain_threshold);
+        let engine_kind = if plan.synthesized > 0 {
+            "luoshu"
+        } else {
+            plan = engine.plan_jaccard(&snapshot.all);
+            "jaccard_fallback"
+        };
 
-        // 降级：当洛书合成因 ML 编码器不可用（bagua 分类不一致）导致 0 结果时，
-        // 回退到 Jaccard 文本相似度合成，确保系统在统计模式下的活性
-        let jaccard_result = self.synthesis_engine.try_synthesize(
-            &self.persistence,
-            &mut self.graph_store,
-            &mut self.dao_metrics,
-        )?;
+        // Phase 3：写回
+        let result = self.apply_synthesis_plan(plan);
 
-        if jaccard_result > 0 {
-            eprintln!(
-                "[LRC] 洛书合成未触发（可能因 ML 编码器降级），回退到 Jaccard 合成：{} 条",
-                jaccard_result
-            );
-            // 记录审计：Jaccard 降级合成创建记忆（系统自主行为）
-            self.record_audit(
-                AuditEventType::SynthesisCreated,
-                format!("Jaccard 降级合成创建 {} 条合成记忆", jaccard_result),
-                "洛书合成未触发（可能因 ML 编码器降级），回退到 Jaccard 文本相似度合成",
-                Vec::new(),
-            );
-        }
-
-        // v0.6.0+ 参赛扩展：探索日志记录（synthesize 事件 - Jaccard 降级模式）
+        // v0.6.0+ 参赛扩展：探索日志记录
         self.exploration_logger.log(
             crate::engine::exploration_log::ExplorationEventType::Synthesize,
             serde_json::json!({
-                "engine": "jaccard_fallback",
-                "luoshu_result": luoshu_result,
-                "jaccard_result": jaccard_result,
+                "engine": engine_kind,
+                "synthesized_count": result,
             }),
             Some(crate::engine::exploration_log::Metrics {
                 latency_ms: Some(synthesize_start.elapsed().as_millis() as u64),
-                result_count: Some(jaccard_result),
+                result_count: Some(result),
                 ..Default::default()
             }),
         );
 
-        Ok(jaccard_result)
+        Ok(result)
     }
 
     /// v0.5.4 运行待处理的合成任务（从关键路径移出，由后台调用）
@@ -1129,6 +1208,10 @@ impl<P: Persistence> MemoryStore<P> {
                 .snapshot(total, crystallized, archived, avg_deviation, &bagua_counts);
         let journal_snapshot = self.synthesis_journal.snapshot();
 
+        // v0.9.1 深度接线：记录调节前的灾难事件数与冻结状态，用于事后对比审计
+        let catastrophic_before = self.dao_regulator.get_catastrophic_events().len();
+        let was_frozen = self.dao_regulator.is_frozen();
+
         // v0.6.0+ 参赛扩展：探索日志埋点（regulate 事件）
         let regulate_start = std::time::Instant::now();
 
@@ -1165,31 +1248,62 @@ impl<P: Persistence> MemoryStore<P> {
             regulate_start.elapsed().as_millis() as u64,
         );
 
-        // 执行调节动作
+        // 执行调节动作（并记录审计：系统自主调节需可回溯）
         match &action {
-            RegulationAction::AdjustDecayRate { new_rate, .. } => {
+            RegulationAction::AdjustDecayRate { new_rate, reason } => {
+                let old_rate = self.decay_config.decay_rate;
                 self.decay_config.decay_rate = *new_rate;
                 eprintln!(
-                    "[LRC·调节] 衰减速率已调整: {:.2} → {:.2}",
-                    self.decay_config.decay_rate, new_rate
+                    "[LRC·调节] 衰减速率已调整: {:.2} → {:.2}（{}）",
+                    old_rate, new_rate, reason
+                );
+                self.record_audit(
+                    AuditEventType::DecayRateChanged,
+                    format!("衰减速率 {:.2} → {:.2}", old_rate, new_rate),
+                    reason.clone(),
+                    Vec::new(),
                 );
             }
             RegulationAction::AdjustSynthesisThreshold {
-                new_min_cluster, ..
+                new_min_cluster,
+                reason,
+                ..
             } => {
+                let old_cluster = self.synthesis_min_cluster;
                 self.synthesis_min_cluster = *new_min_cluster;
                 // 同步更新合成引擎配置
                 self.synthesis_engine = SynthesisEngine::new(SynthesisConfig {
                     min_cluster: *new_min_cluster,
                     similarity: self.synthesis_similarity,
                 });
-                eprintln!("[LRC·调节] 合成最小聚类已调整: → {}", new_min_cluster);
+                eprintln!(
+                    "[LRC·调节] 合成最小聚类已调整: {} → {}（{}）",
+                    old_cluster, new_min_cluster, reason
+                );
+                self.record_audit(
+                    AuditEventType::SynthesisThresholdChanged,
+                    format!("合成最小聚类 {} → {}", old_cluster, new_min_cluster),
+                    reason.clone(),
+                    Vec::new(),
+                );
             }
             RegulationAction::SuggestReencoding { reason, .. } => {
                 eprintln!("[LRC·调节] 建议重新编码: {}", reason);
+                self.record_audit(
+                    AuditEventType::ReencodingSuggested,
+                    "建议重新编码以恢复洛书几何约束",
+                    reason.clone(),
+                    Vec::new(),
+                );
             }
             RegulationAction::AdjustRetrievalWeights { reason, .. } => {
                 eprintln!("[LRC·调节] 建议调整检索权重: {}", reason);
+                self.record_audit(
+                    AuditEventType::RetrievalWeightsAdjusted,
+                    "调整检索权重以平衡八卦分布",
+                    reason.clone(),
+                    Vec::new(),
+                );
             }
             RegulationAction::NoAction => {}
             RegulationAction::AdjustInformationGainThreshold {
@@ -1202,6 +1316,12 @@ impl<P: Persistence> MemoryStore<P> {
                     "[LRC·调节] 信息增量阈值已调整: {:.4} → {:.4}，原因: {}",
                     old, new_threshold, reason
                 );
+                self.record_audit(
+                    AuditEventType::RegulationApplied,
+                    format!("信息增量阈值 {:.4} → {:.4}", old, new_threshold),
+                    reason.clone(),
+                    Vec::new(),
+                );
             }
             RegulationAction::SuggestComprehensiveRebalance {
                 anomaly_description,
@@ -1212,7 +1332,43 @@ impl<P: Persistence> MemoryStore<P> {
                     "[LRC·调节] 综合再平衡建议（耦合指数 {:.2}）: {}",
                     coupling_score, anomaly_description
                 );
+                self.record_audit(
+                    AuditEventType::ComprehensiveRebalance,
+                    format!("综合再平衡建议（耦合指数 {:.2}）", coupling_score),
+                    anomaly_description.clone(),
+                    Vec::new(),
+                );
             }
+        }
+
+        // 灾难性/慢性恶化事件审计（系统自主守护行为的可回溯记录）
+        let catastrophic_events = self.dao_regulator.get_catastrophic_events();
+        for event in catastrophic_events.iter().skip(catastrophic_before) {
+            let is_chronic = event.last_action_before_crash == "chronic_degradation";
+            let event_type = if is_chronic {
+                AuditEventType::ChronicDegradation
+            } else {
+                AuditEventType::CatastrophicEvent
+            };
+            self.record_audit(
+                event_type,
+                format!("[{}] {}", event.severity, event.diagnosis),
+                format!(
+                    "健康评分 {:.2} → {:.2}（下降 {:.2}）",
+                    event.health_before, event.health_after, event.drop_magnitude
+                ),
+                Vec::new(),
+            );
+        }
+
+        // 调节器冻结审计（连续无效调节触发冻结保护）
+        if !was_frozen && self.dao_regulator.is_frozen() {
+            self.record_audit(
+                AuditEventType::RegulatorFrozen,
+                "调节器已冻结（连续无效调节达到阈值）",
+                "防止振荡/漂移进一步恶化，暂停自动调节等待人工介入",
+                Vec::new(),
+            );
         }
 
         // 垃圾回收：在每次调节时顺带清理低质量合成记忆
@@ -1287,6 +1443,7 @@ impl<P: Persistence> MemoryStore<P> {
                 .filter(|m| m.memory_type == MemoryType::Synthesis)
                 .collect();
 
+            let mut flagged_ids: Vec<String> = Vec::new();
             for mem in synth_memories {
                 if self.user_feedback.should_quarantine_by_user(&mem.id) {
                     // 用户多次负面反馈 → 主动标记为低质量
@@ -1298,7 +1455,17 @@ impl<P: Persistence> MemoryStore<P> {
                     self.synthesis_journal.record_hit(&mem.id, 0.05);
                     self.synthesis_journal.record_hit(&mem.id, 0.05);
                     self.synthesis_journal.record_hit(&mem.id, 0.05);
+                    flagged_ids.push(mem.id.clone());
                 }
+            }
+            if !flagged_ids.is_empty() {
+                // 记录审计：用户负面反馈驱动低质量标记（人机协同回路）
+                self.record_audit(
+                    AuditEventType::FeedbackProcessed,
+                    format!("用户负面反馈标记 {} 条合成记忆为低质量", flagged_ids.len()),
+                    "用户多次负面反馈，主动标记低质量以触发隔离",
+                    flagged_ids,
+                );
             }
         }
 
@@ -1355,7 +1522,7 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 用于系统自主行为（GC 清理、合成、调节等）的可回溯审计。
     /// 事件通过哈希链防篡改，并异步持久化到审计日志文件。
-    fn record_audit(
+    pub fn record_audit(
         &mut self,
         event_type: AuditEventType,
         description: impl Into<String>,
@@ -1459,6 +1626,7 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         let mut recovered = 0usize;
+        let mut recovered_ids: Vec<String> = Vec::new();
         let mut remaining: Vec<Memory> = Vec::new();
 
         for mem in archived {
@@ -1468,6 +1636,7 @@ impl<P: Persistence> MemoryStore<P> {
                 restored.last_accessed = chrono::Utc::now();
                 self.persistence.save_memory(&restored)?;
                 recovered += 1;
+                recovered_ids.push(mem.id.clone());
                 eprintln!(
                     "[LRC·恢复] 用户反馈驱动：记忆 {} 已从隔离区恢复到活跃存储",
                     &mem.id[..16.min(mem.id.len())]
@@ -1485,6 +1654,13 @@ impl<P: Persistence> MemoryStore<P> {
             }
             // v0.5.4 写操作后标记缓存为脏
             self.invalidate_cache();
+            // 记录审计：用户反馈驱动隔离恢复（人机协同回路）
+            self.record_audit(
+                AuditEventType::FeedbackProcessed,
+                format!("用户反馈驱动恢复 {} 条被隔离记忆", recovered),
+                "用户标记被误隔离的记忆，系统恢复到活跃存储",
+                recovered_ids,
+            );
         }
 
         Ok(recovered)
@@ -1518,6 +1694,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 加载所有记忆，找出低质量合成记忆
         let all = self.load_cached()?;
         let mut quarantined = 0usize;
+        let mut quarantined_ids: Vec<String> = Vec::new();
         let mut failed = 0usize;
 
         for id in &low_quality_ids {
@@ -1532,6 +1709,7 @@ impl<P: Persistence> MemoryStore<P> {
                         let _ = self.persistence.delete_memory(id);
                         self.synthesis_journal.remove_event(id);
                         quarantined += 1;
+                        quarantined_ids.push(id.clone());
                     }
                     Err(e) => {
                         failed += 1;
@@ -1547,6 +1725,13 @@ impl<P: Persistence> MemoryStore<P> {
         // v0.5.4 写操作后标记缓存为脏
         if quarantined > 0 {
             self.invalidate_cache();
+            // 记录审计：系统自主隔离低质量合成记忆（三阶段渐进式淘汰·阶段 1）
+            self.record_audit(
+                AuditEventType::MemoryIsolated,
+                format!("隔离 {} 条低质量合成记忆", quarantined),
+                "SynthesisJournal 标记为低质量，移入隔离区观察（三阶段渐进式淘汰）",
+                quarantined_ids,
+            );
             eprintln!(
                 "[LRC·清理] 隔离完成: {} 条低质量合成记忆已移入隔离区，{} 条失败",
                 quarantined, failed
@@ -1576,6 +1761,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 隔离保留期限：3 个调节周期（默认 5 分钟/周期 = 15 分钟）
         let retention = chrono::Duration::minutes(15);
         let mut purged = 0usize;
+        let mut purged_ids: Vec<String> = Vec::new();
 
         // 筛选需要保留的归档记忆
         let retained: Vec<Memory> = archived
@@ -1586,6 +1772,7 @@ impl<P: Persistence> MemoryStore<P> {
                     let age = now - m.last_accessed;
                     if age > retention {
                         purged += 1;
+                        purged_ids.push(m.id.clone());
                         false // 过期，淘汰
                     } else {
                         true // 未过期，保留
@@ -1607,6 +1794,13 @@ impl<P: Persistence> MemoryStore<P> {
             }
             // v0.5.4 写操作后标记缓存为脏
             self.invalidate_cache();
+            // 记录审计：隔离期满后永久删除（三阶段渐进式淘汰·阶段 3）
+            self.record_audit(
+                AuditEventType::MemoryDeleted,
+                format!("隔离区淘汰 {} 条过期低质量合成记忆", purged),
+                "隔离保留期（15 分钟）届满，永久删除",
+                purged_ids,
+            );
 
             eprintln!(
                 "[LRC·清理] 隔离区淘汰: {} 条低质量合成记忆已永久删除",
@@ -2545,22 +2739,9 @@ impl<P: Persistence> MemoryStore<P> {
                 .unwrap_or(5),
         );
 
-        // v0.5.4 健康检查时运行待合成的任务（从关键路径移出）
-        // v0.8.48 P0 修复：原子读取，Acquire 语义确保读取到其他线程写入的完整状态
-        if self
-            .synthesis_pending
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            match self.run_pending_synthesis() {
-                Ok(n) if n > 0 => {
-                    eprintln!("[LRC·合成] 后台合成完成: {} 条新合成记忆", n);
-                }
-                Err(e) => {
-                    eprintln!("[LRC·合成] 后台合成失败: {}", e);
-                }
-                _ => {}
-            }
-        }
+        // v0.9.1 三阶段锁解耦：健康检查是读关键路径，绝不再持锁执行合成。
+        // synthesis_pending 标记由后台结晶流水线（consolidation）的三阶段合成消费，
+        // 避免 health/system 接口在持锁时触发数秒~数十秒的聚类计算导致 lock_busy。
 
         // v0.5.5 P1-1：获取 LLM 配置状态，传入健康报告
         let llm_configured = self.is_llm_configured();

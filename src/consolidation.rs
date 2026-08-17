@@ -23,6 +23,8 @@ use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 use crate::engine::llm_translator::{cosine_similarity, LlmApiConfig};
 // v0.6.0 新增：统一 Embedder 抽象（结晶路径支持本地嵌入）
 use crate::engine::embedder::Embedder;
+// v0.9.1 三阶段锁解耦：结晶流水线在锁外执行聚类计算
+use crate::engine::synthesis_engine::SynthesisEngine;
 use crate::memory_store::{ListFilter, MemoryStore};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::Persistence;
@@ -354,44 +356,75 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
             // 3b. 洛书合成（降级路径：仅当 LLM 未配置或失败时执行）
             if !llm_succeeded {
-                // v0.8.22 P0-3 修复 + FIX-007 优化：改为直接异步锁，避免 spawn_blocking 竞争
-                //   原因分析：
-                //     - spawn_blocking + blocking_lock() 组合会耗尽 tokio 阻塞线程池
-                //     - RwLock 支持多个并发读，但写操作仍需序列化
-                //     - luoshu_synthesize() 虽然 CPU 密集，但总持锁时间不长（仅配置修改 + 合成调用）
-                //   修复：使用 tokio::sync::RwLock 的 lock().await，在异步上下文中执行
-                //        这样不会阻塞 tokio worker 线程池的其他任务
                 let store_arc = self.store.clone();
                 let threshold = self.config.synthesis_threshold;
                 let similarity = self.config.synthesis_similarity;
 
-                // FIX-007：改为异步锁，避免 spawn_blocking 阻塞线程池耗尽
-                let mut store = store_arc.lock().await;
-                let old_threshold = store.synthesis_min_cluster;
-                let old_similarity = store.synthesis_similarity;
-                store.synthesis_min_cluster = threshold;
-                store.synthesis_similarity = similarity;
+                // v0.9.1 三阶段锁解耦（根治 lock_busy）：
+                //   Phase 1（持锁读快照，极短）→ Phase 2（锁外 CPU 聚类计算）
+                //   → Phase 3（持锁写回，极短）。
+                //   消除 v0.9.0 中"blocking_lock 持锁执行 luoshu_synthesize
+                //   （含数秒~数十秒的聚类计算）"导致的读接口 lock_busy。
+                let result =
+                    tokio::task::spawn_blocking(move || -> Result<usize, PersistenceError> {
+                        // Phase 1：持锁读快照 + 临时设置阈值（快速）
+                        let (snapshot, old_threshold, old_similarity) = {
+                            let mut store = store_arc.blocking_lock();
+                            let old_threshold = store.synthesis_min_cluster;
+                            let old_similarity = store.synthesis_similarity;
+                            store.synthesis_min_cluster = threshold;
+                            store.synthesis_similarity = similarity;
+                            let snapshot = store.synthesis_snapshot()?;
+                            (snapshot, old_threshold, old_similarity)
+                        }; // 锁在此释放
 
-                let result = store.luoshu_synthesize();
+                        // Phase 2：锁外 CPU 密集计算
+                        let engine = SynthesisEngine::new(snapshot.config);
+                        let mut plan =
+                            engine.plan_luoshu(&snapshot.all, snapshot.information_gain_threshold);
+                        if plan.synthesized == 0 {
+                            plan = engine.plan_jaccard(&snapshot.all);
+                        }
 
-                store.synthesis_min_cluster = old_threshold;
-                store.synthesis_similarity = old_similarity;
-                drop(store); // 显式释放写锁
+                        // Phase 3：持锁写回 + 恢复阈值（快速）
+                        let synthesized = {
+                            let mut store = store_arc.blocking_lock();
+                            store.synthesis_min_cluster = old_threshold;
+                            store.synthesis_similarity = old_similarity;
+                            store.apply_synthesis_plan(plan)
+                        };
+
+                        Ok(synthesized)
+                    })
+                    .await;
 
                 match result {
-                    Ok(n) => {
+                    Ok(Ok(n)) => {
                         stats.synthesized = n;
                         if n > 0 && self.config.verbose >= 1 {
                             eprintln!("[LRC·结晶] 洛书合成完成，生成 {} 条合成记忆", n);
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         if self.config.verbose >= 1 {
                             eprintln!("[LRC·结晶] 合成失败: {}", e);
                         }
                     }
+                    Err(e) => {
+                        eprintln!("[LRC·结晶] 合成任务 panic: {}", e);
+                    }
                 }
             }
+        }
+
+        // v0.9.1 三阶段锁解耦：合成阶段结束后统一重置待合成标记。
+        // 洛书降级路径由 apply_synthesis_plan 重置，此处兜底覆盖 LLM 路径，
+        // 确保无论走哪条合成路径，synthesis_pending 都被正确清除（store(false) 幂等）。
+        {
+            let store = self.store.lock().await;
+            store
+                .synthesis_pending
+                .store(false, std::sync::atomic::Ordering::Release);
         }
 
         // 4. 更新统计

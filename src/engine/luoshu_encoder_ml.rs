@@ -138,15 +138,34 @@ impl LuoShuMlEncoder {
 
         let local_model_name = model_id.replace('/', "--");
 
-        let project_root =
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let local_model_dir = project_root.join("models").join(&local_model_name);
+        // v0.9.0 修复：统一模型目录查找，支持多个候选路径
+        // （cwd/models + exe_dir/models + ~/.loong-recall/models），
+        // 避免 sidecar 运行时 cwd 与模型下载时 cwd 不一致导致找不到模型。
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(cwd) = std::env::current_dir() {
+            candidates.push(cwd.join("models").join(&local_model_name));
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                candidates.push(exe_dir.join("models").join(&local_model_name));
+            }
+        }
+        if let Some(home) = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .ok()
+            .map(std::path::PathBuf::from)
+        {
+            candidates.push(
+                home.join(".loong-recall")
+                    .join("models")
+                    .join(&local_model_name),
+            );
+        }
 
         let mut use_local = false;
         let mut model_dir = std::path::PathBuf::new();
 
-        for dir in [&local_model_dir] {
-            let dir = dir.clone();
+        for dir in candidates {
             if dir.join("config.json").exists()
                 && (dir.join("model.safetensors").exists()
                     || dir.join("pytorch_model.bin").exists())

@@ -2,6 +2,54 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.1] - 2026-08-17
+
+### lock_busy 根因修复：三阶段锁解耦
+
+**根因：** 后台合成（`luoshu_synthesize`）在 `consolidation.rs` 中用 `blocking_lock()` 持锁执行 CPU 密集聚类计算（`recursive_compose` / Jaccard O(n²)），锁持有数秒~数十秒，导致所有读接口 `try_lock` 失败返回 503。
+
+**修复：** 将合成拆成三阶段，计算阶段不再持锁：
+- **Phase 1（持锁读快照，极短）**：`MemoryStore::synthesis_snapshot()` 仅读磁盘+配置
+- **Phase 2（锁外纯计算）**：`SynthesisEngine::plan_luoshu()` / `plan_jaccard()` 产出 `SynthesisPlan`
+- **Phase 3（持锁写回，极短）**：`MemoryStore::apply_synthesis_plan()` 批量写入
+
+**受影响文件：**
+- `src/engine/synthesis_engine.rs`：新增 `cluster_from_all` / `build_synthesis_memory` / `plan_luoshu` / `plan_jaccard` 纯计算方法
+- `src/memory_store.rs`：新增 `synthesis_snapshot` / `apply_synthesis_plan` / `SynthesisSnapshot`，重构 `luoshu_synthesize`
+- `src/consolidation.rs`：合成改为三阶段调用
+- `src/v1_api.rs`：`consolidate` handler 改为三阶段调用
+- `src/memory_store.rs`：移除 `health_report()` 中的持锁合成（读关键路径不再触发合成）
+
+### 审计追踪深度接线（15 类事件全闭环）
+
+**根因：** v0.9.0 仅接入 2 类审计事件，剩余 13 类「已定义但未接线」。
+
+**修复：** 补齐全部 15 类 `AuditEventType` 的生产代码接线：
+- 调节动作：`DecayRateChanged` / `SynthesisThresholdChanged` / `RetrievalWeightsAdjusted` / `ReencodingSuggested` / `RegulationApplied` / `ComprehensiveRebalance`
+- 灾难守护：`CatastrophicEvent` / `ChronicDegradation` / `RegulatorFrozen`
+- 隔离/淘汰：`MemoryIsolated`（隔离低质量）/ `MemoryDeleted`（隔离区淘汰）
+- 用户反馈：`FeedbackProcessed`（隔离恢复 + 负面反馈标记）
+- 调节器解冻：`RegulatorUnfrozen`（新增 `POST /v1/regulator/unfreeze` 端点 + 前端解冻按钮）
+
+### 读接口 503→200 降级一致性
+
+**修复：** 7 个读接口在 lock_busy 时统一返回 200 + 降级数据（而非 503）：
+- `/v1/audit-trail` / `/v1/memories/stats` / `/v1/memories/recent` / `/v1/memories/list`
+- `/v1/trust/data-location`（用全局路径兜底）/ `/v1/trust/audit-integrity` / `/v1/captains-log`
+- 前端 7 个消费点（`loadRecentMemories` / `loadMemoryStats` / `loadAuditLog` / `backupMemories` / `verifyAuditIntegrity` / `generateCaptainLog` / `loadTrustCenter`）成功路径补 `lock_busy` 识别
+
+### 系统状态人话化
+
+- 技术术语→用户语言：「统计模式」→「基础检索」、「TF-IDF」→「关键词匹配」、「degraded」→「运行中」、「frozen」→「已暂停」
+- 质量分 25%→档位制：「基础档/标准档/增强档」，tooltip 显示技术分
+
+### 引导页重设计
+
+- Emoji 全部替换为 SVG 图标（14 个新增）
+- AI 工具列表只展示已安装的，未确认的不展示
+- 生命周期状态机：`applyOnboardingState()` 根据向导完成状态 + 记忆数量动态决定引导内容
+- 移除不必要页面（快速操作区、MCP 配置指南卡片）
+
 ## [0.9.0] - 2026-08-12
 
 ### 前后端数据流断层修复（"龙门"）

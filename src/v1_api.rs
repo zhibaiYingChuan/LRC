@@ -25,6 +25,8 @@ use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
 #[cfg(feature = "ml")]
 use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 use crate::engine::mirror_trapezoid::mirror_project;
+// v0.9.1 三阶段锁解耦：consolidate handler 在锁外执行聚类计算
+use crate::engine::synthesis_engine::SynthesisEngine;
 use crate::engine::user_feedback::{FeedbackTarget, FeedbackType};
 use crate::memory_store::{ListFilter, MemoryStore, RecallFilter};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
@@ -327,6 +329,7 @@ pub fn build_v1_router(
     let correct_store = store.clone();
     let metrics_store = store.clone();
     let unfold_store = store.clone();
+    let regulator_store = store.clone();
 
     // P0-1: 编码器创建一次，所有请求复用（避免每次请求都加载 ML 模型）
     let encode_encoder = std::sync::Arc::new(HybridLuoShuEncoder::default());
@@ -408,17 +411,31 @@ pub fn build_v1_router(
                         }
                     } // 锁释放
 
-                    // Phase 2：spawn_blocking 执行 luoshu_synthesize（CPU 密集，不占 tokio worker）
+                    // Phase 2：三阶段锁解耦（锁外 CPU 聚类计算，根治 lock_busy）
                     let store_arc = store.clone();
-                    let synthesized = match tokio::task::spawn_blocking(move || {
-                        let mut store = store_arc.blocking_lock();
-                        store.luoshu_synthesize()
-                    }).await {
-                        Ok(Ok(n)) => n,
-                        Ok(Err(e)) => {
-                            eprintln!("[v1/consolidate] 合成失败: {}", e);
-                            0
+                    let synthesized = match tokio::task::spawn_blocking(move || -> usize {
+                        // Phase 2a：持锁读快照（极短）
+                        let snapshot = match store_arc.blocking_lock().synthesis_snapshot() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("[v1/consolidate] 合成快照失败: {}", e);
+                                return 0;
+                            }
+                        }; // 锁在此释放
+
+                        // Phase 2b：锁外 CPU 密集计算
+                        let engine = SynthesisEngine::new(snapshot.config);
+                        let mut plan =
+                            engine.plan_luoshu(&snapshot.all, snapshot.information_gain_threshold);
+                        if plan.synthesized == 0 {
+                            plan = engine.plan_jaccard(&snapshot.all);
                         }
+
+                        // Phase 2c：持锁写回（极短）
+                        let mut store = store_arc.blocking_lock();
+                        store.apply_synthesis_plan(plan)
+                    }).await {
+                        Ok(n) => n,
                         Err(e) => {
                             eprintln!("[v1/consolidate] spawn_blocking panic: {}", e);
                             0
@@ -492,10 +509,16 @@ pub fn build_v1_router(
                         top_k: req.top_k * 2,
                         privacy_context: privacy_ctx,
                     };
-                    let deep_result = store.trapezoid_focus_recall(&req.query, &deep_filter, 1).unwrap_or_else(|e| {
-                        eprintln!("[v1/enrich] 深度路径检索失败: {}", e);
+                    // v0.9.0 修复：统计模式（无 ML 模型）下洛书 9 维向量语义不可靠，
+                    // 跳过深度路径，仅用字面匹配（TF-IDF），避免搜"测试"返回不相关记忆
+                    let deep_result = if store.is_ml_encoder() {
+                        store.trapezoid_focus_recall(&req.query, &deep_filter, 1).unwrap_or_else(|e| {
+                            eprintln!("[v1/enrich] 深度路径检索失败: {}", e);
+                            RecallResult { memories: vec![], scores: vec![], total: 0 }
+                        })
+                    } else {
                         RecallResult { memories: vec![], scores: vec![], total: 0 }
-                    });
+                    };
 
                     // RRF 融合 — 使用共享 rrf_fuse
                     let fused = crate::engine::rrf::rrf_fuse(
@@ -1050,6 +1073,7 @@ pub fn build_v1_router(
                             let stats = store.user_feedback.get_stats();
 
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "success": true,
                                 "feedback_id": feedback_id,
                                 "type": match feedback_type {
                                     FeedbackType::Positive => "positive",
@@ -1096,18 +1120,19 @@ pub fn build_v1_router(
                 let store = store.clone();
                 async move {
                     // v0.8.22 HCSE 修复：改用 try_lock，避免 lock_busy 期间超时
+                    // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与 /health/system 一致）
                     let store = match store.try_lock() {
                         Ok(guard) => guard,
                         Err(_) => {
-                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(serde_json::json!({
-                                    "ok": false,
-                                    "error": "lock_busy",
-                                    "lock_busy": true,
-                                    "message": "记忆系统正在执行后台合成，请稍后重试"
-                                })),
-                            ));
+                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "total": 0,
+                                "total_all": 0,
+                                "type_statistics": {},
+                                "events": [],
+                                "lock_busy": true,
+                                "degraded": true,
+                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
+                            })));
                         }
                     };
 
@@ -1166,18 +1191,20 @@ pub fn build_v1_router(
                 let store = store.clone();
                 async move {
                     // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
+                    // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与 /health/system 一致）
                     let store = match store.try_lock() {
                         Ok(guard) => guard,
                         Err(_) => {
-                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(serde_json::json!({
-                                    "ok": false,
-                                    "error": "lock_busy",
-                                    "lock_busy": true,
-                                    "message": "记忆系统正在执行后台合成，请稍后重试"
-                                })),
-                            ));
+                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "total_memories": null,
+                                "expired_count": null,
+                                "storage_size_bytes": null,
+                                "by_type": {},
+                                "by_project": {},
+                                "lock_busy": true,
+                                "degraded": true,
+                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
+                            })));
                         }
                     };
                     match store.stats() {
@@ -1215,18 +1242,18 @@ pub fn build_v1_router(
                     // v0.8.45 修复：改用 try_read，避免 lock_busy 期间挂起超时（与 /memories/stats 一致）
                     //   根因：原实现 lock().await 在结晶持锁时阻塞等待，前端 fetchWithTimeout 8s 超时
                     //         显示"加载失败"，而非 v0.8.45 前端预期的"后台合成中"降级提示
+                    // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与 /health/system 一致）
                     let store = match store.try_lock() {
                         Ok(guard) => guard,
                         Err(_) => {
-                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(serde_json::json!({
-                                    "ok": false,
-                                    "error": "lock_busy",
-                                    "lock_busy": true,
-                                    "message": "记忆系统正在执行后台合成，请稍后重试"
-                                })),
-                            ));
+                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "memories": [],
+                                "total": null,
+                                "returned": 0,
+                                "lock_busy": true,
+                                "degraded": true,
+                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
+                            })));
                         }
                     };
 
@@ -1298,18 +1325,17 @@ pub fn build_v1_router(
                     // 限制最大返回数量，防止内存溢出
                     let limit = params.limit.unwrap_or(10000).clamp(1, 50000);
                     // v0.8.45 修复：改用 try_read，避免 lock_busy 期间挂起超时（与 /memories/recent 一致）
+                    // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与 /health/system 一致）
                     let store = match store.try_lock() {
                         Ok(guard) => guard,
                         Err(_) => {
-                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(serde_json::json!({
-                                    "ok": false,
-                                    "error": "lock_busy",
-                                    "lock_busy": true,
-                                    "message": "记忆系统正在执行后台合成，请稍后重试"
-                                })),
-                            ));
+                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "memories": [],
+                                "total": null,
+                                "lock_busy": true,
+                                "degraded": true,
+                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
+                            })));
                         }
                     };
 
@@ -1466,23 +1492,16 @@ pub fn build_v1_router(
             move || {
                 let store = store.clone();
                 async move {
-                    // v0.8.22 HCSE 修复：改用 try_read，避免 lock_busy 期间超时
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
+                    // v0.9.1 修复：data-location 只读磁盘文件，不依赖内存 store 状态。
+                    // lock_busy 时用全局路径兜底（for_global），不再返回 503。
+                    let data_dir = match store.try_lock() {
+                        Ok(guard) => guard.persistence().data_dir().to_path_buf(),
                         Err(_) => {
-                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(serde_json::json!({
-                                    "ok": false,
-                                    "error": "lock_busy",
-                                    "lock_busy": true,
-                                    "message": "记忆系统正在执行后台合成，请稍后重试"
-                                })),
-                            ));
+                            // 锁被持有时，用全局数据目录兜底（不持锁，仅读静态路径）
+                            crate::data_dir::DataDir::for_global().data_path().to_path_buf()
                         }
-                    };
+                    }; // 锁在此释放，后续不再持锁
                     // 获取记忆文件实际路径
-                    let data_dir = store.persistence().data_dir().to_path_buf();
                     let memory_file = data_dir.join("memories.json");
                     // v0.7.1 P2-1 修复：用 spawn_blocking 包裹同步文件 I/O
                     let memory_file_clone = memory_file.clone();
@@ -1604,19 +1623,31 @@ pub fn build_v1_router(
             move || {
                 let store = store.clone();
                 async move {
-                    // v0.8.22 HCSE 修复：改用 try_read，避免 lock_busy 期间超时
+                    // v0.9.1 修复：lock_busy 时返回 200 降级数据而非 503（与 /health/system 一致）
                     let store = match store.try_lock() {
                         Ok(guard) => guard,
                         Err(_) => {
-                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(serde_json::json!({
-                                    "ok": false,
-                                    "error": "lock_busy",
-                                    "lock_busy": true,
-                                    "message": "记忆系统正在执行后台合成，请稍后重试"
-                                })),
-                            ));
+                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            match store.try_lock() {
+                                Ok(guard) => guard,
+                                Err(_) => {
+                                    return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                        "total_events": null,
+                                        "hash_chain_valid": null,
+                                        "hash_chain_status": "验证延迟 — 后台合成中，稍后自动加载",
+                                        "hash_chain_details": "",
+                                        "anchor_count": null,
+                                        "anchor_chain_valid": null,
+                                        "anchor_chain_status": "验证延迟 — 后台合成中，稍后自动加载",
+                                        "last_anchor_at": null,
+                                        "tamper_proof": null,
+                                        "verification_note": "后台合成中，完整性验证稍后自动加载",
+                                        "lock_busy": true,
+                                        "degraded": true,
+                                        "message": "记忆系统正在执行后台合成，数据稍后自动加载"
+                                    })));
+                                }
+                            }
                         }
                     };
                     let total_events = store.audit_trail.total_count();
@@ -1647,19 +1678,17 @@ pub fn build_v1_router(
                 let store = store.clone();
                 async move {
                     let project_path = params.get("path").cloned().unwrap_or_else(|| ".".to_string());
-                    // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
+                    // v0.9.1 修复：lock_busy 时返回 200 降级数据而非 503（与 /health/system 一致）
                     let mut store = match store.try_lock() {
                         Ok(guard) => guard,
                         Err(_) => {
-                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(serde_json::json!({
-                                    "ok": false,
-                                    "error": "lock_busy",
-                                    "lock_busy": true,
-                                    "message": "记忆系统正在执行后台合成，请稍后重试"
-                                })),
-                            ));
+                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "ok": true,
+                                "lock_busy": true,
+                                "degraded": true,
+                                "report": "⏳ 记忆系统正在执行后台合成，船长日志稍后自动加载...",
+                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
+                            })));
                         }
                     };
 
@@ -1973,6 +2002,56 @@ pub fn build_v1_router(
                     "check_note": "版本检查仅在用户主动触发时发起，不会自动上报任何数据",
                     "download_url": format!("https://github.com/zhibaiYingChuan/LRC/releases/tag/v{}", latest_version),
                 })))
+            }
+        }))
+        // POST /v1/regulator/unfreeze — 手动解冻调节器（补全 RegulatorUnfrozen 审计闭环）
+        //
+        // 当调节器因连续无效调节被冻结后，用户可通过此端点手动解冻。
+        // 解冻后记录 RegulatorUnfrozen 审计事件，恢复自动调节能力。
+        .route("/regulator/unfreeze", post({
+            let store = regulator_store;
+            move || {
+                let store = store.clone();
+                async move {
+                    let mut store = match store.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "error": "lock_busy",
+                                    "lock_busy": true,
+                                    "message": "记忆系统正在执行后台合成，请稍后重试"
+                                })),
+                            ));
+                        }
+                    };
+
+                    let was_frozen = store.dao_regulator.is_frozen();
+                    if was_frozen {
+                        store.dao_regulator.unfreeze();
+                        // 记录审计：调节器手动解冻（用户干预行为的可回溯记录）
+                        store.record_audit(
+                            AuditEventType::RegulatorUnfrozen,
+                            "调节器已手动解冻",
+                            "用户通过 /v1/regulator/unfreeze 端点手动恢复自动调节",
+                            Vec::new(),
+                        );
+                    }
+
+                    let state = store.dao_regulator.get_state();
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                        "ok": true,
+                        "was_frozen": was_frozen,
+                        "is_frozen": state.is_frozen,
+                        "message": if was_frozen {
+                            "调节器已成功解冻，自动调节已恢复"
+                        } else {
+                            "调节器未处于冻结状态，无需解冻"
+                        }
+                    })))
+                }
             }
         }))
         // GET /v1/benchmarks/report — 三层基准测试报告

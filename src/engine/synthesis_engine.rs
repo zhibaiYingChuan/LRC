@@ -45,6 +45,36 @@ impl Default for SynthesisConfig {
     }
 }
 
+/// 合成计划（纯计算结果，不含持久化与内存副作用）
+///
+/// 三阶段锁解耦（v0.9.1）的核心数据结构，消除合成在计算期间长时间持有全局锁：
+///   - Phase 1（持锁读快照）：`MemoryStore::synthesis_snapshot()`
+///   - Phase 2（无锁计算）：`SynthesisEngine::plan_luoshu` / `plan_jaccard` 产出本结构
+///   - Phase 3（持锁写回）：`MemoryStore::apply_synthesis_plan()`
+#[derive(Debug, Default)]
+pub struct SynthesisPlan {
+    /// 待写入的合成记忆
+    pub batch: Vec<Memory>,
+    /// 待写入的图边：(synthesis_id, source_ids, confidence)
+    pub graph_edges: Vec<(String, Vec<String>, f32)>,
+    /// 待记录的合成日志
+    pub journal_entries: Vec<SynthesisJournalEntry>,
+    /// 合成数量
+    pub synthesized: usize,
+}
+
+/// 合成日志条目（延迟到 apply 阶段写入，避免计算阶段持锁）
+#[derive(Debug, Clone)]
+pub struct SynthesisJournalEntry {
+    pub synthesis_id: String,
+    pub trigger_source: String,
+    pub bagua_category: String,
+    pub bagua_index: u8,
+    pub source_ids: Vec<String>,
+    pub confidence: f32,
+    pub member_count: usize,
+}
+
 /// 合成引擎
 ///
 /// 负责记忆的自动合成，支持两种模式：
@@ -110,16 +140,10 @@ impl SynthesisEngine {
         }
     }
 
-    /// 查找相似记忆簇（用于递归合成）
+    /// 从记忆快照中查找相似记忆簇（纯计算，不依赖 persistence）
     ///
-    /// 使用并查集算法，将所有 Jaccard 相似度 ≥ config.similarity 的记忆
-    /// 归入同一簇。返回所有大小 ≥ config.min_cluster 的簇。
-    pub fn find_synthesis_clusters<P: Persistence>(
-        &self,
-        persistence: &P,
-    ) -> Result<Vec<Vec<Memory>>, crate::persistence::PersistenceError> {
-        let all = persistence.load_all_memories()?;
-
+    /// 三阶段锁解耦：此方法仅做 CPU 聚类计算，可在锁外调用。
+    pub fn cluster_from_all(&self, all: &[Memory]) -> Vec<Vec<Memory>> {
         let mut candidates: Vec<&Memory> = all
             .iter()
             .filter(|m| !m.is_expired() && m.memory_type != MemoryType::Synthesis)
@@ -137,7 +161,7 @@ impl SynthesisEngine {
         }
 
         if candidates.len() < self.config.min_cluster {
-            return Ok(Vec::new());
+            return Vec::new();
         }
 
         let n = candidates.len();
@@ -183,13 +207,25 @@ impl SynthesisEngine {
             groups.entry(root).or_default().push(i);
         }
 
-        let clusters: Vec<Vec<Memory>> = groups
+        groups
             .into_values()
             .filter(|indices| indices.len() >= self.config.min_cluster)
             .map(|indices| indices.into_iter().map(|i| candidates[i].clone()).collect())
-            .collect();
+            .collect()
+    }
 
-        Ok(clusters)
+    /// 查找相似记忆簇（用于递归合成）
+    ///
+    /// 使用并查集算法，将所有 Jaccard 相似度 ≥ config.similarity 的记忆
+    /// 归入同一簇。返回所有大小 ≥ config.min_cluster 的簇。
+    ///
+    /// 兼容旧接口：加载全量记忆后委托给纯计算的 cluster_from_all。
+    pub fn find_synthesis_clusters<P: Persistence>(
+        &self,
+        persistence: &P,
+    ) -> Result<Vec<Vec<Memory>>, crate::persistence::PersistenceError> {
+        let all = persistence.load_all_memories()?;
+        Ok(self.cluster_from_all(&all))
     }
 
     /// 道枢映射: 坤卦·地 (☷) — 厚德载物，合成摘要是记忆凝练的土壤
@@ -253,13 +289,10 @@ impl SynthesisEngine {
         summary
     }
 
-    /// 道枢映射: 震卦·雷 (☳) — 震惊百里，合成簇如雷霆之后的新生
-    /// 对单个记忆簇执行递归合成
-    pub fn synthesize_cluster<P: Persistence>(
-        &self,
-        cluster: &[Memory],
-        persistence: &P,
-    ) -> Result<Memory, crate::persistence::PersistenceError> {
+    /// 从簇构建合成记忆（纯计算，不写 persistence）
+    ///
+    /// 三阶段锁解耦：此方法仅构建 Memory 结构，可在锁外调用。
+    pub fn build_synthesis_memory(&self, cluster: &[Memory]) -> Memory {
         let source_ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
 
         let cluster_size = cluster.len() as f32;
@@ -310,29 +343,31 @@ impl SynthesisEngine {
         synthesis.confidence = Some(confidence);
         synthesis.information_gain = Some(avg_similarity); // Jaccard 合成以平均相似度作为信息增量
         synthesis.resolution = "synthesized".to_string(); // 质疑二：标记为合成记忆
+        synthesis
+    }
 
+    /// 道枢映射: 震卦·雷 (☳) — 震惊百里，合成簇如雷霆之后的新生
+    /// 对单个记忆簇执行递归合成
+    pub fn synthesize_cluster<P: Persistence>(
+        &self,
+        cluster: &[Memory],
+        persistence: &P,
+    ) -> Result<Memory, crate::persistence::PersistenceError> {
+        let synthesis = self.build_synthesis_memory(cluster);
         persistence.save_memory(&synthesis)?;
         Ok(synthesis)
     }
 
-    /// 道枢映射: 震卦·雷 (☳) — 万物出乎震，合成如春雷唤醒新生，信息增益阈值是萌发的门槛
+    /// Jaccard 合成纯计算（三阶段锁解耦·Phase 2）
     ///
-    /// 尝试执行 Jaccard 递归合成
-    ///
-    /// 返回本次新生成的合成记忆数量。
-    pub fn try_synthesize<P: Persistence>(
-        &self,
-        persistence: &P,
-        graph_store: &mut Option<GraphMemoryStore>,
-        dao_metrics: &mut DaoMetrics,
-    ) -> Result<usize, crate::persistence::PersistenceError> {
-        let clusters = self.find_synthesis_clusters(persistence)?;
+    /// 接收全量记忆快照，产出 SynthesisPlan（不含持久化）。
+    pub fn plan_jaccard(&self, all: &[Memory]) -> SynthesisPlan {
+        let clusters = self.cluster_from_all(all);
         if clusters.is_empty() {
-            return Ok(0);
+            return SynthesisPlan::default();
         }
 
-        let all_memories = persistence.load_all_memories()?;
-        let existing_sources: std::collections::HashSet<Vec<String>> = all_memories
+        let existing_sources: std::collections::HashSet<Vec<String>> = all
             .iter()
             .filter(|m| m.memory_type == MemoryType::Synthesis && !m.source_ids.is_empty())
             .map(|m| {
@@ -342,7 +377,7 @@ impl SynthesisEngine {
             })
             .collect();
 
-        let mut synthesized = 0usize;
+        let mut plan = SynthesisPlan::default();
 
         for cluster in &clusters {
             let mut cluster_ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
@@ -352,47 +387,60 @@ impl SynthesisEngine {
                 continue;
             }
 
-            match self.synthesize_cluster(cluster, persistence) {
-                Ok(synthesis) => {
-                    if let Some(ref mut graph) = graph_store {
-                        for source_id in &synthesis.source_ids {
-                            let _ = graph.add_edge(
-                                &synthesis.id,
-                                source_id,
-                                EdgeType::SynthesizesFrom,
-                                synthesis.confidence.unwrap_or(0.5),
-                            );
-                        }
-                    }
-                    synthesized += 1;
-                    dao_metrics.record_composition();
-                }
-                Err(e) => {
-                    eprintln!("[LRC] 合成失败: {}（簇大小={}）", e, cluster.len());
-                }
-            }
+            let synthesis = self.build_synthesis_memory(cluster);
+            plan.graph_edges.push((
+                synthesis.id.clone(),
+                synthesis.source_ids.clone(),
+                synthesis.confidence.unwrap_or(0.5),
+            ));
+            plan.batch.push(synthesis);
+            plan.synthesized += 1;
         }
 
-        Ok(synthesized)
+        plan
     }
 
-    /// 洛书驱动递归合成（M.T.R. RecursiveCompose 增强版）
+    /// 道枢映射: 震卦·雷 (☳) — 万物出乎震，合成如春雷唤醒新生，信息增益阈值是萌发的门槛
     ///
-    /// 使用 MirrorProject 分类 + RecursiveCompose 门控融合。
-    /// 返回新生成的合成记忆数量。
+    /// 尝试执行 Jaccard 递归合成（兼容旧接口，内部委托 plan_jaccard）。
     ///
-    /// `information_gain_threshold`：由 DaoRegulator 动态管理的防坍塌阈值（质疑一·活性），
-    /// 替代之前的硬编码常量。当合成产物的信息增量低于此阈值时，阻止合成。
-    pub fn luoshu_synthesize<P: Persistence>(
+    /// 返回本次新生成的合成记忆数量。
+    pub fn try_synthesize<P: Persistence>(
         &self,
         persistence: &P,
         graph_store: &mut Option<GraphMemoryStore>,
         dao_metrics: &mut DaoMetrics,
-        synthesis_journal: &SynthesisJournal,
-        information_gain_threshold: f32,
     ) -> Result<usize, crate::persistence::PersistenceError> {
         let all = persistence.load_all_memories()?;
+        let plan = self.plan_jaccard(&all);
 
+        for memory in &plan.batch {
+            persistence.save_memory(memory)?;
+        }
+        for (synthesis_id, source_ids, confidence) in &plan.graph_edges {
+            if let Some(ref mut graph) = graph_store {
+                for source_id in source_ids {
+                    let _ = graph.add_edge(
+                        synthesis_id,
+                        source_id,
+                        EdgeType::SynthesizesFrom,
+                        *confidence,
+                    );
+                }
+            }
+        }
+        for _ in 0..plan.synthesized {
+            dao_metrics.record_composition();
+        }
+
+        Ok(plan.synthesized)
+    }
+
+    /// 洛书合成纯计算（三阶段锁解耦·Phase 2）
+    ///
+    /// 接收全量记忆快照，产出 SynthesisPlan（不含持久化与内存副作用）。
+    /// 可在锁外调用，避免 CPU 密集的 recursive_compose 持有全局锁。
+    pub fn plan_luoshu(&self, all: &[Memory], information_gain_threshold: f32) -> SynthesisPlan {
         let candidates: Vec<&Memory> = all
             .iter()
             .filter(|m| {
@@ -403,7 +451,7 @@ impl SynthesisEngine {
             .collect();
 
         if candidates.len() < self.config.min_cluster {
-            return Ok(0);
+            return SynthesisPlan::default();
         }
 
         let mut groups: std::collections::HashMap<u8, Vec<&Memory>> =
@@ -413,8 +461,6 @@ impl SynthesisEngine {
                 groups.entry(idx).or_default().push(m);
             }
         }
-
-        let mut synthesized = 0usize;
 
         // 去重集合：提前构建，避免循环内重复构建（性能优化 P1-4）
         let existing_sources: std::collections::HashSet<Vec<String>> = all
@@ -426,6 +472,8 @@ impl SynthesisEngine {
                 ids
             })
             .collect();
+
+        let mut plan = SynthesisPlan::default();
 
         for (bagua_idx, group) in &groups {
             if group.len() < self.config.min_cluster {
@@ -448,11 +496,6 @@ impl SynthesisEngine {
             }
 
             // 质疑二：信息增量阈值检查（防止模式坍塌）
-            // 信息增量过低表示合成只是"压缩冗余"而非"产生新知识"
-            // 此时阻止合成，保持记忆空间的细节多样性
-            //
-            // 质疑一·活性：阈值由 DaoRegulator 动态管理，不再硬编码。
-            // 调节器根据合成产物质量和系统健康指标自动微调此值。
             if result.information_gain < information_gain_threshold {
                 eprintln!(
                     "[LRC·合成·守卫] 阻止八卦类别 {} 的合成：信息增量 {:.4} 低于阈值 {:.4}（疑似空洞抽象）",
@@ -497,43 +540,81 @@ impl SynthesisEngine {
                 None,
             );
             synthesis.source = Some("luoshu_recursive_compose".into());
-            synthesis.source_ids = source_ids;
+            synthesis.source_ids = source_ids.clone();
             synthesis.confidence = Some(result.confidence);
             synthesis.information_gain = Some(result.information_gain);
-            synthesis.resolution = "synthesized".to_string(); // 质疑二：标记为合成记忆
+            synthesis.resolution = "synthesized".to_string();
             synthesis.luoshu_vector = Some(result.vector.values);
 
             let proj = mirror_project(&result.vector);
             synthesis.bagua_index = Some(proj.best_index as u8);
             synthesis.bagua_category = Some(proj.best_category.to_string());
 
-            persistence.save_memory(&synthesis)?;
-
-            if let Some(ref mut graph) = graph_store {
-                for sid in &synthesis.source_ids {
-                    let _ = graph.add_edge(
-                        &synthesis.id,
-                        sid,
-                        EdgeType::SynthesizesFrom,
-                        synthesis.confidence.unwrap_or(0.5),
-                    );
-                }
-            }
-            synthesized += 1;
-            dao_metrics.record_composition();
-
-            synthesis_journal.record_synthesis(
+            plan.graph_edges.push((
                 synthesis.id.clone(),
-                "luoshu_auto",
-                category,
-                *bagua_idx,
-                cluster_ids.clone(),
-                result.confidence,
-                group.len(),
-            );
+                source_ids.clone(),
+                synthesis.confidence.unwrap_or(0.5),
+            ));
+            plan.journal_entries.push(SynthesisJournalEntry {
+                synthesis_id: synthesis.id.clone(),
+                trigger_source: "luoshu_auto".to_string(),
+                bagua_category: category.to_string(),
+                bagua_index: *bagua_idx,
+                source_ids: cluster_ids.clone(),
+                confidence: result.confidence,
+                member_count: group.len(),
+            });
+            plan.batch.push(synthesis);
+            plan.synthesized += 1;
         }
 
-        Ok(synthesized)
+        plan
+    }
+
+    /// 洛书驱动递归合成（M.T.R. RecursiveCompose 增强版）
+    ///
+    /// 兼容旧接口：内部委托给 plan_luoshu 纯计算 + 写回。
+    /// 三阶段解耦后，外部调用者应改用 `MemoryStore::synthesis_snapshot` +
+    /// `plan_luoshu` + `apply_synthesis_plan` 以避免计算阶段持锁。
+    pub fn luoshu_synthesize<P: Persistence>(
+        &self,
+        persistence: &P,
+        graph_store: &mut Option<GraphMemoryStore>,
+        dao_metrics: &mut DaoMetrics,
+        synthesis_journal: &SynthesisJournal,
+        information_gain_threshold: f32,
+    ) -> Result<usize, crate::persistence::PersistenceError> {
+        let all = persistence.load_all_memories()?;
+        let plan = self.plan_luoshu(&all, information_gain_threshold);
+
+        // 批量写入所有合成记忆（单次序列化 + 单次磁盘写入）
+        if !plan.batch.is_empty() {
+            persistence.save_memories(&plan.batch)?;
+        }
+        for (synthesis_id, source_ids, confidence) in &plan.graph_edges {
+            if let Some(ref mut graph) = graph_store {
+                for sid in source_ids {
+                    let _ =
+                        graph.add_edge(synthesis_id, sid, EdgeType::SynthesizesFrom, *confidence);
+                }
+            }
+        }
+        for entry in &plan.journal_entries {
+            synthesis_journal.record_synthesis(
+                entry.synthesis_id.clone(),
+                &entry.trigger_source,
+                &entry.bagua_category,
+                entry.bagua_index,
+                entry.source_ids.clone(),
+                entry.confidence,
+                entry.member_count,
+            );
+        }
+        for _ in 0..plan.synthesized {
+            dao_metrics.record_composition();
+        }
+
+        Ok(plan.synthesized)
     }
 }
 

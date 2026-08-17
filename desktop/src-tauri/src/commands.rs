@@ -632,7 +632,10 @@ pub async fn start_sidecar(
                 let _dev_dd = dev_mode_data_dir();
                 let start_opts = StartOptions {
                     src_dir: effective_src_dir.as_deref(),
-                    port,
+                    // v0.9.0 修复：必须传 dev_mode_port 计算出的端口（dev=3111，stable=3099），
+                    // 而非原始 port（可能为 None）。否则 dev 模式下 spawn 用默认 3099，
+                    // 与稳定版冲突并静默复用稳定版 sidecar（违反开发/稳定隔离）。
+                    port: Some(target_port),
                     multi_window,
                     llm_api: llm_api.as_deref(),
                     cancel_flag: &store.start_cancel_flag,
@@ -836,7 +839,10 @@ pub async fn start_sidecar_for_project(
                 let _dev_dd = dev_mode_data_dir();
                 let start_opts = StartOptions {
                     src_dir: src_dir.as_deref(),
-                    port,
+                    // v0.9.0 修复：与 start_sidecar 一致，必须传 dev_mode_port 计算的端口
+                    // （dev=3111，stable=3099），而非原始 port（可能为 None）。
+                    // 否则 dev 模式下 spawn 用默认 3099，与稳定版冲突并复用稳定版 sidecar。
+                    port: Some(target_port),
                     multi_window,
                     llm_api: llm_api.as_deref(),
                     cancel_flag: &store.start_cancel_flag,
@@ -2182,9 +2188,12 @@ pub async fn switch_project(
             };
 
             let _dev_dd = dev_mode_data_dir();
+            // v0.9.0 修复：切换项目在 dev 模式下也必须用 3111，而非 None→默认 3099，
+            // 否则会复用稳定版 sidecar（违反开发/稳定隔离）。
+            let target_port = dev_mode_port(None);
             let start_opts = StartOptions {
                 src_dir: Some(&project_dir),
-                port: None,
+                port: Some(target_port),
                 multi_window,
                 llm_api: llm_api.as_deref(),
                 cancel_flag: &store.start_cancel_flag,
@@ -2505,9 +2514,10 @@ pub async fn open_data_dir(store: State<'_, AppStore>) -> Result<String, String>
 ///
 /// 此命令不依赖 sidecar，直接读取文件系统，可在 sidecar 未启动时调用。
 #[tauri::command]
-pub async fn get_rules_status() -> Result<Vec<RulesStatus>, String> {
-    let status = AgentDetectorRegistry::get_rules_status();
-    tracing::info!("[v0.8.0] 规则状态查询完成，共 {} 个工具", status.len());
+pub async fn get_rules_status(store: State<'_, AppStore>) -> Result<Vec<RulesStatus>, String> {
+    let registry = store.agent_registry.lock().await;
+    let status = registry.get_rules_status();
+    tracing::info!("[v0.9.0] 规则状态查询完成，共 {} 个已安装工具", status.len());
     Ok(status)
 }
 

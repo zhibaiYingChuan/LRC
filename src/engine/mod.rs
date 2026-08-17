@@ -121,6 +121,22 @@ pub use encoder_codebert::CodeBertEncoder;
 #[cfg(feature = "ml")]
 pub use luoshu_encoder_ml::{HybridLuoShuEncoder, LuoShuMlEncoder};
 
+/// v0.9.1 算法泄露合规：公开层（bin/server.rs）通过此工厂函数创建编码器，
+/// 避免在公开层文件中直接引用受保护的算法类型名。
+#[cfg(feature = "ml")]
+pub fn create_smart_encoder() -> Result<(HybridLuoShuEncoder, bool), String> {
+    match LuoShuMlEncoder::load() {
+        Ok(ml) => Ok((HybridLuoShuEncoder::new_with_ml(ml), true)),
+        Err(e) => Err(e),
+    }
+}
+
+/// v0.9.1 算法泄露合规：统计模式编码器工厂函数
+#[cfg(feature = "ml")]
+pub fn create_statistical_encoder() -> HybridLuoShuEncoder {
+    HybridLuoShuEncoder::new_statistical()
+}
+
 // 核心引擎设计原则：
 // 1. 每个模块设计遵循"内禀调节"原则，从系统动力学自然涌现
 // 2. 所有阈值参数均有严格的数学推导依据

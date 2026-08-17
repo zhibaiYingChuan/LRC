@@ -184,6 +184,48 @@ impl Persistence for JsonPersistence {
         Ok(())
     }
 
+    /// 批量保存记忆（新增或更新）：单次序列化 + 单次磁盘写入
+    ///
+    /// 相比循环 save_memory（每条 O(n) 序列化 + 重写整个文件），
+    /// 此方法将 N 次磁盘 I/O 降为 1 次，用于结晶合成的批量写入。
+    fn save_memories(&self, memories: &[Memory]) -> Result<(), PersistenceError> {
+        if memories.is_empty() {
+            return Ok(());
+        }
+
+        self.ensure_data_dir()?;
+        self.ensure_cache_loaded()?;
+        let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
+        let existing = cache
+            .as_mut()
+            .expect("缓存已通过 ensure_cache_loaded 初始化");
+
+        // 构建 ID → 索引 映射，支持"已存在则更新，不存在则追加"
+        // 使用 String 作为 key（拥有所有权），避免 &str 借用 existing 导致可变借用冲突
+        let mut index_map: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::with_capacity(existing.len() + memories.len());
+        for (i, m) in existing.iter().enumerate() {
+            index_map.insert(m.id.clone(), i);
+        }
+
+        for m in memories {
+            match index_map.get(&m.id) {
+                Some(&idx) => {
+                    existing[idx] = m.clone();
+                }
+                None => {
+                    existing.push(m.clone());
+                    index_map.insert(m.id.clone(), existing.len() - 1);
+                }
+            }
+        }
+
+        let json = serde_json::to_string_pretty(existing)?;
+        drop(cache); // 释放写锁
+        atomic_write(&self.memories_file, &json)?;
+        Ok(())
+    }
+
     fn load_all_memories(&self) -> Result<Vec<Memory>, PersistenceError> {
         // 优先从缓存读取（O(1)），缓存失效时从磁盘加载（O(n)）
         {
@@ -562,5 +604,73 @@ mod tests {
         let loaded = p.load_all_memories().expect("应成功加载");
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].content, "内容1");
+    }
+
+    /// v0.9.0 批量保存：验证批量追加新记忆（合成场景）
+    #[test]
+    fn test_save_memories_batch_append() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = JsonPersistence::new(&data_dir).expect("应成功创建");
+
+        // 批量追加 3 条新记忆
+        let batch = vec![
+            make_test_memory("s1", "合成记忆1"),
+            make_test_memory("s2", "合成记忆2"),
+            make_test_memory("s3", "合成记忆3"),
+        ];
+        p.save_memories(&batch).expect("应成功批量保存");
+
+        let loaded = p.load_all_memories().expect("应成功加载");
+        assert_eq!(loaded.len(), 3, "应批量追加 3 条记忆");
+        assert!(loaded.iter().any(|m| m.id == "s1"));
+        assert!(loaded.iter().any(|m| m.id == "s2"));
+        assert!(loaded.iter().any(|m| m.id == "s3"));
+    }
+
+    /// v0.9.0 批量保存：验证混合更新已有 + 追加新记忆
+    #[test]
+    fn test_save_memories_batch_mixed() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = JsonPersistence::new(&data_dir).expect("应成功创建");
+
+        // 预置 2 条记忆
+        p.save_memory(&make_test_memory("m1", "旧内容1"))
+            .expect("应成功保存");
+        p.save_memory(&make_test_memory("m2", "旧内容2"))
+            .expect("应成功保存");
+
+        // 批量：更新 m1 + 追加 m3
+        let mut updated_m1 = make_test_memory("m1", "新内容1");
+        updated_m1.importance = crate::memory_types::Importance::new(9);
+        let new_m3 = make_test_memory("m3", "新记忆3");
+        p.save_memories(&[updated_m1, new_m3])
+            .expect("应成功批量保存");
+
+        let loaded = p.load_all_memories().expect("应成功加载");
+        assert_eq!(loaded.len(), 3, "应更新 m1 + 追加 m3，共 3 条");
+
+        let m1 = loaded.iter().find(|m| m.id == "m1").expect("应找到 m1");
+        assert_eq!(m1.content, "新内容1");
+        assert_eq!(m1.importance.value(), 9);
+
+        let m2 = loaded.iter().find(|m| m.id == "m2").expect("应找到 m2");
+        assert_eq!(m2.content, "旧内容2", "m2 应保持不变");
+
+        assert!(loaded.iter().any(|m| m.id == "m3"), "应追加 m3");
+    }
+
+    /// v0.9.0 批量保存：验证空列表是 no-op
+    #[test]
+    fn test_save_memories_empty() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = JsonPersistence::new(&data_dir).expect("应成功创建");
+
+        p.save_memories(&[]).expect("空列表应成功");
+
+        let loaded = p.load_all_memories().expect("应成功加载");
+        assert!(loaded.is_empty());
     }
 }

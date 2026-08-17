@@ -319,3 +319,11 @@ docs/*并发安全*.md
 # v0.9.0 发布清理：本地测试/临时目录（不交付用户）
 temp/
 tmp/
+
+# v0.9.1 发布清理：本地开发文档（不交付用户）
+docs/半可用演示态修复方案_*.md
+docs/引导页重设计规范_*.md
+
+# v0.9.1 发布清理：CDP 回归测试脚本与报告（不交付用户）
+tests/frontend/cdp-regression*.js
+tests/frontend/cdp-regression-report.*
