@@ -36,6 +36,9 @@ Thumbs.db
 *.tmp
 *.log
 
+# 调试会话记录（TRAE-debugger 产物，不交付用户）
+debug-*.md
+
 # 内部开发文档（不交付用户）
 docs/evaluation-report-2026-05-31.md
 docs/evaluation-report-*.md

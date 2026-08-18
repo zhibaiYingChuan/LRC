@@ -2,6 +2,34 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.2] - 2026-08-18
+
+### ML 编码器塌缩根因修复（自动结晶恢复工作）
+
+**根因：** `LuoShuMlEncoder::encode_text()` 将 BERT 语义向量投影到洛书 9 维后，直接与
+`LUOSHU_WEIGHTS` 先验做贝叶斯融合。由于随机投影输出的 9 维数值在各维度间差异极小，
+先验权重主导了后验分布，导致不同输入的编码向量高度相似。经幻和归一化后 `mirror_project`
+将 3606/3703 条记忆全部投影到同一八卦类别（坤·地），洛书合成被信息增量守卫
+（信息增量 0.0001 < 阈值 0.0100）全部拦截，稳定版自动结晶长期产出为 0。
+
+**修复：** 在投影（步骤 5）与贝叶斯融合（步骤 6）之间新增对比度增强步骤
+`contrast_normalize`：先中心化消除公共偏置，再用温度调制 softmax（T=0.7）放大维度间
+差异，使不同输入产生可区分的 9 维分布，从而在不同八卦类别间分散，自动结晶恢复工作。
+
+**受影响文件：**
+- `src/engine/luoshu_encoder_ml.rs`：新增 `contrast_normalize` 纯函数并接入 `encode_text`
+- 新增单元测试：对比度增强放大差异 / 均匀退化兜底
+
+### 记忆搜索中文查询崩溃修复
+
+`exploration_log::log_recall` 原使用 `&query[..200]` 按字节截断查询字符串，当中文查询
+第 200 字节落在多字节字符内部时触发 Rust panic，导致 sidecar 进程退出、记忆搜索页显示
+"请求超时"且服务反复关闭。已改为 `query.chars().take(200).collect()` 按字符截断，
+并新增超过 200 个中文字符的回归测试。
+
+### 变更
+- 版本号更新至 0.9.2（10 处同步：Cargo.toml ×2 / Cargo.lock ×2 / tauri.conf.json / package.json / app.js / index.html / CHANGELOG / README）
+
 ## [0.9.1] - 2026-08-17
 
 ### lock_busy 根因修复：三阶段锁解耦
