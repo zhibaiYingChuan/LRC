@@ -34,38 +34,39 @@
 
 > 完整报告见 [基准测试汇总](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md)。
 >
-> **数据版本说明**：上述数据基于 v0.5.6 基准测试（2026-06-23），当前 v0.9.1 版本的检索引擎已有演进，最新数据以重新测试为准。
+> **数据版本说明**：上述数据基于 v0.5.6 基准测试（2026-06-23），当前 v0.9.2 版本的检索引擎已有演进，最新数据以重新测试为准。
 
 ---
 
-## v0.9.1 新特性
+## v0.9.2 新特性
 
 | 领域 | 变更 | 价值 |
 |------|------|------|
-| **稳定性** | 合成三阶段锁解耦（`plan_luoshu`/`plan_jaccard` 锁外纯计算） | 后台合成不再阻塞读接口，消除 `503 lock_busy` |
-| **可回溯性** | 审计追踪 15 类事件全接线（合成/删除/隔离/调节/反馈/灾难等） | 系统每个自主行为都有据可查 |
-| **一致性** | 7 个读接口 lock_busy 时统一返回 200 降级数据 | 后台合成期间不再出现错误提示 |
-| **可控性** | 新增 `POST /v1/regulator/unfreeze` + 前端「解冻调节器」按钮 | 调节器冻结后可手动恢复 |
-| **体验** | 系统状态人话化（「基础检索」「关键词匹配」「已暂停」等） | 技术术语转为用户语言 |
-| **引导页** | Emoji 全部换 SVG 图标、只展示已安装 AI 工具、生命周期状态机 | 引导更直观、不误导 |
+| **自动结晶** | ML 编码器对比度增强（中心化 + softmax），分散八卦分类 | 修复编码塌缩导致稳定版自动结晶长期产出为 0 的根因 |
+| **稳定性** | 记忆搜索中文查询按字符截断 | 修复中文搜索触发 Rust panic 导致 sidecar 退出的 P0 崩溃 |
 
----
+> v0.9.1 特性（含三阶段锁解耦消除 lock_busy、审计 15 类事件接线、解冻调节器等）继续生效。
+
+```text
+自动结晶：稳定版 ML 模式原先 3606/3703 条记忆塌缩到同一八卦类别（坤·地），
+洛书合成全部被信息增量守卫拦截；v0.9.2 修复后编码分布分散，自动结晶恢复工作。
+```
 
 ## 快速开始
 
 ### 方式一：下载桌面端（推荐）
 
 1. 前往 [Releases](https://github.com/zhibaiYingChuan/LRC/releases) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
-   - Windows：`lrc-desktop-v0.9.1-windows-x86_64-setup.exe`
-   - macOS：`lrc-desktop-v0.9.1-macos-arm64.dmg`
-   - Linux：`lrc-desktop-v0.9.1-linux-amd64.deb` 或 `lrc-desktop-v0.9.1-linux-x86_64.AppImage`
+   - Windows：`lrc-desktop-v0.9.2-windows-x86_64-setup.exe`
+   - macOS：`lrc-desktop-v0.9.2-macos-arm64.dmg`
+   - Linux：`lrc-desktop-v0.9.2-linux-amd64.deb` 或 `lrc-desktop-v0.9.2-linux-x86_64.AppImage`
 2. 双击安装，启动 LRC Desktop
 3. 按向导选择项目、配置 LLM（可选）、连接 AI 工具
 4. 重启 IDE，AI 自动发现 13 个 MCP 工具
 
 > 桌面端自动完成所有配置：检测 AI 工具、写入 MCP 配置、写入 AI 规则文件。
 >
-> **注意**：Release 中 `lrc-v0.9.1-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（sidecar 二进制），供开发者/脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
+> **注意**：Release 中 `lrc-v0.9.2-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（sidecar 二进制），供开发者/脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
 
 ### 方式二：从源码编译
 

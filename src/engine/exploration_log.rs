@@ -284,12 +284,9 @@ impl ExplorationLogger {
 
     /// 便捷方法：记录 recall 事件
     pub fn log_recall(&self, query: &str, top_k: usize, result_count: usize, latency_ms: u64) {
-        // 截断 query 防止日志膨胀
-        let truncated_query = if query.len() > 200 {
-            &query[..200]
-        } else {
-            query
-        };
+        // 按字符截断，避免中文等多字节字符被按字节切断导致 panic
+        let truncated_query: String = query.chars().take(200).collect();
+        let truncated_query = truncated_query.as_str();
         self.log(
             ExplorationEventType::Recall,
             serde_json::json!({
@@ -543,6 +540,22 @@ mod tests {
         // query 应被截断到 200 字符
         let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         let query = parsed["payload"]["query"].as_str().unwrap();
-        assert!(query.len() <= 200);
+        assert!(query.chars().count() <= 200);
+    }
+
+    #[test]
+    fn test_long_chinese_query_is_truncated_without_panic() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("trunc-chinese.jsonl");
+        let logger = ExplorationLogger::new(log_path.clone(), "test_trunc_chinese".to_string());
+
+        let long_query = "覆盖".repeat(150);
+        logger.log_recall(&long_query, 5, 1, 50);
+
+        let content = std::fs::read_to_string(&log_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        let query = parsed["payload"]["query"].as_str().unwrap();
+        assert_eq!(query.chars().count(), 200);
+        assert!(query.is_char_boundary(query.len()));
     }
 }

@@ -430,6 +430,35 @@ impl LuoShuMlEncoder {
         proj
     }
 
+    /// v0.9.2 对比度增强（纯函数，可单测）
+    ///
+    /// 对 9 维投影特征做中心化 + 温度调制的 softmax，放大维度间差异，
+    /// 使不同输入的编码向量保持可区分性，防止全部塌缩到同一八卦类别。
+    ///
+    /// 温度越低 softmax 越尖锐，最高维度的权重越突出（增强区分度）；
+    /// 当所有特征相等时退化为均匀分布（1/9），避免数值问题。
+    fn contrast_normalize(features: &[f32; 9], temperature: f32) -> [f32; 9] {
+        let mean = features.iter().sum::<f32>() / 9.0;
+        let mut centered = [0.0f32; 9];
+        for (i, v) in features.iter().enumerate() {
+            centered[i] = v - mean;
+        }
+
+        let max_feat = centered.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let temp = temperature.max(1e-4); // 防除零
+        let exp_sum: f32 = centered.iter().map(|v| ((v - max_feat) / temp).exp()).sum();
+
+        if exp_sum <= 1e-12 || !exp_sum.is_finite() {
+            return [1.0 / 9.0; 9]; // 数值退化时返回均匀分布
+        }
+
+        let mut out = [0.0f32; 9];
+        for (i, v) in centered.iter().enumerate() {
+            out[i] = ((v - max_feat) / temp).exp() / exp_sum;
+        }
+        out
+    }
+
     /// 使用 ML 模型将文本编码为洛书 9 维向量
     pub fn encode_text(&self, text: &str) -> Result<LuoShuVector, String> {
         // 1. Tokenize
@@ -511,11 +540,20 @@ impl LuoShuMlEncoder {
             *rf = sum;
         }
 
-        // 6. 贝叶斯融合：先验（洛书标准权重）× 似然（ML 投影）
+        // 5.5 v0.9.2 对比度增强：中心化 + softmax 放大维度差异，防止编码塌缩
+        // 根因：ML 投影在贝叶斯融合前被 LUOSHU_WEIGHTS 先验主导，不同输入的 9 维
+        // 向量高度相似 → mirror_project 全部落入同一八卦类别 -> 信息增量守卫拦截合成。
+        // 修复：先中心化消除公共偏置，再用温度调制的 softmax 放大输入相关的差异。
+        let enhanced = Self::contrast_normalize(&raw_features, 0.7);
+
+        // 6. v0.9.2 混合融合：输入相关的增强分布（75%）+ 洛书先验（25%）
+        // 根因：原实现 posterior = LUOSHU_WEIGHTS * (1 + likelihood)，likelihood 微弱时
+        // 后验 ≈ LUOSHU_WEIGHTS → mirror_project 全部映射到同一八卦类别（离·火）。
+        // 改为加权混合后，后验由输入特征主导，不同输入的编码向量在八卦类别间分散。
+        const PRIOR_WEIGHT: f32 = 0.25;
         let mut posterior = [0.0f32; 9];
         for i in 0..9 {
-            let likelihood = raw_features[i].max(0.0);
-            posterior[i] = LUOSHU_WEIGHTS[i] * (1.0 + likelihood);
+            posterior[i] = (1.0 - PRIOR_WEIGHT) * enhanced[i] + PRIOR_WEIGHT * LUOSHU_WEIGHTS[i];
         }
 
         // 7. 归一化
@@ -924,6 +962,82 @@ mod tests {
         // 统计模式编码器没有 ML 编码器，降级标记应设置
         // 但由于没有 ML 编码器，is_degraded 取决于 ml_encoder 是否存在
         // 此处重点验证降级逻辑不 panic
+    }
+
+    /// v0.9.2 测试：对比度增强使不同输入产生不同 dominant 维度（防止八卦类别塌缩）
+    #[test]
+    fn test_contrast_normalize_amplifies_differences() {
+        // 两个 dominant 维度不同的投影特征（模拟编码塌缩修复后的场景）
+        let a = [0.3f32, 0.3, 0.9, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3]; // dominant at 2
+        let b = [0.3f32, 0.3, 0.3, 0.3, 0.3, 0.3, 0.9, 0.3, 0.3]; // dominant at 6
+
+        let na = LuoShuMlEncoder::contrast_normalize(&a, 0.7);
+        let nb = LuoShuMlEncoder::contrast_normalize(&b, 0.7);
+
+        // 输出应是概率分布（和为 1）
+        let sum_a: f32 = na.iter().sum();
+        let sum_b: f32 = nb.iter().sum();
+        assert!((sum_a - 1.0).abs() < 1e-3, "a 之和应接近 1，实际 {sum_a}");
+        assert!((sum_b - 1.0).abs() < 1e-3, "b 之和应接近 1，实际 {sum_b}");
+
+        // a 的 dominant 维度应保持为 2，b 的 dominant 维度应保持为 6
+        let argmax_a = na
+            .iter()
+            .enumerate()
+            .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        let argmax_b = nb
+            .iter()
+            .enumerate()
+            .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(argmax_a, 2, "a 的 dominant 维度应为 2，实际 {argmax_a}");
+        assert_eq!(argmax_b, 6, "b 的 dominant 维度应为 6，实际 {argmax_b}");
+    }
+
+    /// v0.9.2 测试：混合融合后不同输入保持可区分（后验不被 LUOSHU_WEIGHTS 主导）
+    #[test]
+    fn test_mixture_fusion_keeps_posterior_derived_from_input() {
+        // 模拟 encode_text 的融合步骤：enhanced 分布（来自对比度增强）与 LUOSHU_WEIGHTS 混合
+        let enhanced_a = [0.05f32, 0.05, 0.45, 0.05, 0.05, 0.05, 0.2, 0.05, 0.05];
+        let enhanced_b = [0.05f32, 0.45, 0.05, 0.05, 0.05, 0.05, 0.05, 0.2, 0.05];
+
+        const PRIOR_WEIGHT: f32 = 0.25;
+        let mut a = [0.0f32; 9];
+        let mut b = [0.0f32; 9];
+        for i in 0..9 {
+            a[i] = (1.0 - PRIOR_WEIGHT) * enhanced_a[i] + PRIOR_WEIGHT * LUOSHU_WEIGHTS[i];
+            b[i] = (1.0 - PRIOR_WEIGHT) * enhanced_b[i] + PRIOR_WEIGHT * LUOSHU_WEIGHTS[i];
+        }
+
+        // 后验的 dominant 维度应由输入（enhanced）决定，而非先验
+        let argmax_a = a
+            .iter()
+            .enumerate()
+            .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        let argmax_b = b
+            .iter()
+            .enumerate()
+            .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(argmax_a, 2, "a 的后验 dominant 维度应为 2，实际 {argmax_a}");
+        assert_eq!(argmax_b, 1, "b 的后验 dominant 维度应为 1，实际 {argmax_b}");
+        assert_ne!(argmax_a, argmax_b, "不同输入应映射到不同八卦类别（防塌缩）");
+    }
+
+    /// v0.9.2 测试：特征全相等时退化为均匀分布（数值安全）
+    #[test]
+    fn test_contrast_normalize_uniform_fallback() {
+        let uniform = [0.5f32; 9];
+        let out = LuoShuMlEncoder::contrast_normalize(&uniform, 0.7);
+        for v in out.iter() {
+            assert!((v - 1.0 / 9.0).abs() < 1e-3, "应退化为均匀分布，实际 {v}");
+        }
     }
 
     /// 测试：恢复阈值设置
