@@ -35,6 +35,23 @@ fn main() {
     );
     fs::write(&guard_rs, code).expect("写入完整性哈希失败");
 
+    // v0.9.1 修复：Windows 平台嵌入应用图标
+    // 根因：sidecar 裸二进制（code-memory-server.exe）无 Windows 图标资源，
+    // 导致下载的 exe 在资源管理器中显示为默认图标
+    #[cfg(windows)]
+    {
+        let icon_path = manifest_dir.join("desktop/src-tauri/icons/icon.ico");
+        if icon_path.exists() {
+            let mut res = winres::WindowsResource::new();
+            // winres 0.1.12 的 set_icon 接受 &str 路径
+            res.set_icon(icon_path.to_str().expect("图标路径含非法 UTF-8"));
+            res.compile().expect("嵌入 Windows 图标失败");
+            println!("cargo:rerun-if-changed=desktop/src-tauri/icons/icon.ico");
+        } else {
+            println!("cargo:warning=未找到图标文件 {icon_path:?}，跳过图标嵌入");
+        }
+    }
+
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=Cargo.toml");
 }

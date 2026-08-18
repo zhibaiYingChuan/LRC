@@ -55,12 +55,17 @@
 
 ### 方式一：下载桌面端（推荐）
 
-1. 前往 [Releases](https://github.com/zhibaiYingChuan/LRC/releases) 下载最新安装包
+1. 前往 [Releases](https://github.com/zhibaiYingChuan/LRC/releases) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
+   - Windows：`lrc-desktop-v0.9.1-windows-x86_64-setup.exe`
+   - macOS：`lrc-desktop-v0.9.1-macos-arm64.dmg`
+   - Linux：`lrc-desktop-v0.9.1-linux-amd64.deb` 或 `lrc-desktop-v0.9.1-linux-x86_64.AppImage`
 2. 双击安装，启动 LRC Desktop
 3. 按向导选择项目、配置 LLM（可选）、连接 AI 工具
 4. 重启 IDE，AI 自动发现 13 个 MCP 工具
 
 > 桌面端自动完成所有配置：检测 AI 工具、写入 MCP 配置、写入 AI 规则文件。
+>
+> **注意**：Release 中 `lrc-v0.9.1-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（sidecar 二进制），供开发者/脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
 
 ### 方式二：从源码编译
 

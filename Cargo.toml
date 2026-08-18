@@ -92,6 +92,12 @@ required-features = ["server"]
 [build-dependencies]
 sha2 = "0.10"
 
+# v0.9.1 修复：Windows 平台嵌入应用图标（winres）
+# 根因：sidecar 裸二进制（code-memory-server.exe）无 Windows 图标资源，
+# 导致下载的 exe 在资源管理器中显示为默认图标
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
 [profile.release]
 opt-level = "z"
 lto = true
