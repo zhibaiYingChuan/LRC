@@ -32,7 +32,7 @@ use crate::memory_store::{ListFilter, MemoryStore, RecallFilter};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::json::JsonPersistence;
 use crate::persistence::Persistence;
-use crate::server::IndexedCodebase;
+use crate::server::{safe_code_search, safe_recent_code_search, IndexedCodebase, SearchError};
 use crate::{LlmApiConfig, RecallResult};
 use axum::{
     extract::Query,
@@ -1807,30 +1807,59 @@ pub fn build_v1_router(
                         .clamp(1, 100);
                     let keywords_str = params.get("keywords").cloned().unwrap_or_default();
 
-                    let manager = manager.lock().await;
-
                     // 如果提供了 keywords 参数，则使用多关键词搜索
-                    let result = if !keywords_str.is_empty() {
-                        let keywords: Vec<String> = keywords_str
+                    let keywords: Vec<String> = if !keywords_str.is_empty() {
+                        keywords_str
                             .split(',')
                             .map(|k| k.trim().to_string())
                             .filter(|k| !k.is_empty())
-                            .collect();
-                        if keywords.is_empty() {
-                            manager.search(&query, top_k)
-                        } else {
-                            manager.multi_keyword_search(&keywords, top_k)
-                        }
+                            .collect()
                     } else if !query.is_empty() {
-                        manager.search(&query, top_k)
+                        vec![query.clone()]
                     } else {
-                        // v0.6.1 P0-2 修复: query 和 keywords 均为空时,回退返回最近 top_k 条
-                        // 修复前: 返回空结果,导致导出代码片段功能在无查询参数时失效
-                        // 修复后: 返回最近索引的 top_k 条代码片段,确保导出功能可用
-                        manager.recent_chunks(top_k)
+                        Vec::new()
                     };
 
-                    let stats = manager.get_stats();
+                    let result = if keywords.is_empty() {
+                        safe_recent_code_search(manager.clone(), top_k)
+                            .await
+                            .map_err(|error| {
+                                let (code, message) = match error {
+                                    SearchError::LockTimeout => ("search_busy", "搜索服务繁忙，请稍后重试"),
+                                    SearchError::ExecutionTimeout => ("search_timeout", "搜索超时，请稍后重试"),
+                                    SearchError::Panic => ("search_internal_error", "搜索内部错误，服务已保持运行"),
+                                };
+                                (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                                    "error": code,
+                                    "message": message,
+                                })))
+                            })?
+                    } else {
+                        safe_code_search(manager.clone(), keywords, top_k)
+                            .await
+                            .map_err(|error| {
+                                let (code, message) = match error {
+                                    SearchError::LockTimeout => ("search_busy", "搜索服务繁忙，请稍后重试"),
+                                    SearchError::ExecutionTimeout => ("search_timeout", "搜索超时，请缩小查询范围后重试"),
+                                    SearchError::Panic => ("search_internal_error", "搜索内部错误，服务已保持运行"),
+                                };
+                                (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                                    "error": code,
+                                    "message": message,
+                                })))
+                            })?
+                    };
+
+                    let stats = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        manager.clone().lock_owned(),
+                    )
+                    .await
+                    .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                        "error": "search_busy",
+                        "message": "搜索服务繁忙，请稍后重试"
+                    }))))?;
+                    let stats = stats.get_stats();
 
                     // 格式化为前端友好的 JSON 结构
                     let results: Vec<serde_json::Value> = result.results.iter().map(|r| {

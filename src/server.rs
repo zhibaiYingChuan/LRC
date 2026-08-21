@@ -23,11 +23,64 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
+
+const SEARCH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const SEARCH_EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+#[derive(Debug)]
+pub enum SearchError {
+    LockTimeout,
+    ExecutionTimeout,
+    Panic,
+}
+
+/// 统一执行代码搜索，隔离锁等待、阻塞计算和搜索 panic。
+pub async fn safe_code_search(
+    manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
+    keywords: Vec<String>,
+    top_k: usize,
+) -> Result<RetrievalResult, SearchError> {
+    safe_code_operation(manager, move |manager| {
+        manager.multi_keyword_search(&keywords, top_k)
+    })
+    .await
+}
+
+/// 统一执行不带查询条件的代码检索，保持与关键词搜索相同的保护边界。
+pub async fn safe_recent_code_search(
+    manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
+    top_k: usize,
+) -> Result<RetrievalResult, SearchError> {
+    safe_code_operation(manager, move |manager| manager.recent_chunks(top_k)).await
+}
+
+async fn safe_code_operation<F>(
+    manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
+    operation: F,
+) -> Result<RetrievalResult, SearchError>
+where
+    F: FnOnce(&dyn IndexedCodebase) -> RetrievalResult + Send + 'static,
+{
+    let guard = tokio::time::timeout(SEARCH_LOCK_TIMEOUT, manager.clone().lock_owned())
+        .await
+        .map_err(|_| SearchError::LockTimeout)?;
+
+    let task = tokio::task::spawn_blocking(move || {
+        std::panic::catch_unwind(AssertUnwindSafe(|| operation(guard.as_ref())))
+            .map_err(|_| SearchError::Panic)
+    });
+
+    tokio::time::timeout(SEARCH_EXECUTION_TIMEOUT, task)
+        .await
+        .map_err(|_| SearchError::ExecutionTimeout)?
+        .map_err(|_| SearchError::Panic)?
+}
 
 // ==================== JSON-RPC 2.0 类型 ====================
 
@@ -1463,8 +1516,18 @@ async fn handle_tools_call(
                 vec![query.to_string()]
             };
 
-            let manager = state.manager.lock().await;
-            let result = manager.multi_keyword_search(&keywords, top_k);
+            let result = match safe_code_search(state.manager.clone(), keywords, top_k).await {
+                Ok(result) => result,
+                Err(SearchError::LockTimeout) => {
+                    return make_error(id, -32001, "搜索服务繁忙，请稍后重试")
+                }
+                Err(SearchError::ExecutionTimeout) => {
+                    return make_error(id, -32002, "搜索超时，请缩小查询范围后重试")
+                }
+                Err(SearchError::Panic) => {
+                    return make_error(id, -32003, "搜索内部错误，服务已保持运行")
+                }
+            };
 
             // 格式化为可读文本
             let mut text = format!(
@@ -1477,7 +1540,15 @@ async fn handle_tools_call(
                 text.push_str(&format!(
                     "提示: 索引库路径为 {}，当前已索引 {} 个文件。",
                     state.src_dir,
-                    manager.get_stats().file_count
+                    match tokio::time::timeout(
+                        SEARCH_LOCK_TIMEOUT,
+                        state.manager.clone().lock_owned(),
+                    )
+                    .await
+                    {
+                        Ok(manager) => manager.get_stats().file_count,
+                        Err(_) => 0,
+                    }
                 ));
             } else {
                 for r in &result.results {
@@ -3475,6 +3546,49 @@ mod tests {
 
     fn to_json(resp: &JsonRpcResponse) -> serde_json::Value {
         serde_json::to_value(resp).unwrap()
+    }
+
+    struct PanicCodebase;
+
+    impl IndexedCodebase for PanicCodebase {
+        fn search(&self, _query: &str, _top_k: usize) -> RetrievalResult {
+            panic!("测试搜索 panic")
+        }
+
+        fn multi_keyword_search(&self, _keywords: &[String], _top_k: usize) -> RetrievalResult {
+            panic!("测试搜索 panic")
+        }
+
+        fn get_stats(&self) -> ChunkStats {
+            ChunkStats {
+                file_count: 0,
+                total_chunks: 0,
+                type_counts: std::collections::HashMap::new(),
+                language_counts: std::collections::HashMap::new(),
+                avg_lines: 0.0,
+            }
+        }
+
+        fn recent_chunks(&self, _top_k: usize) -> RetrievalResult {
+            panic!("测试搜索 panic")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_safe_code_search_converts_panic_to_error() {
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(PanicCodebase)));
+        let result = safe_code_search(manager, vec!["panic".into()], 1).await;
+        assert!(matches!(result, Err(SearchError::Panic)));
+    }
+
+    #[tokio::test]
+    async fn test_safe_code_search_returns_lock_timeout() {
+        let state = test_state();
+        let guard = state.manager.clone().lock_owned().await;
+        let result = safe_code_search(state.manager.clone(), vec!["memory".into()], 1).await;
+        drop(guard);
+        assert!(matches!(result, Err(SearchError::LockTimeout)));
     }
 
     // ---- 初始化与能力协商 ----
