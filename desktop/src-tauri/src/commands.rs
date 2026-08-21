@@ -42,9 +42,7 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
     // v0.9.0 开发模式隔离：开发模式下严禁修改用户的 MCP 配置和 IDE 规则文件
     // 这些操作会触达稳定版用户的全局配置文件，导致端口被意外切换
     if is_dev_mode() {
-        tracing::info!(
-            "[开发模式] 跳过 MCP 自动升级和 IDE 规则写入（避免触碰稳定版用户配置）"
-        );
+        tracing::info!("[开发模式] 跳过 MCP 自动升级和 IDE 规则写入（避免触碰稳定版用户配置）");
         return;
     }
 
@@ -656,10 +654,7 @@ pub async fn start_sidecar(
                     }) => {
                         // v0.8.39 修复：SingletonConflict 且 health check 不可达时，
                         // 强制终止旧进程后重启，而不是让用户手动操作。
-                        tracing::warn!(
-                            "E008: 旧 sidecar (PID={}) 不可达，强制终止后重启",
-                            pid
-                        );
+                        tracing::warn!("E008: 旧 sidecar (PID={}) 不可达，强制终止后重启", pid);
                         if crate::sidecar_manager::kill_process_by_pid(pid) {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             // v0.8.44 R1 修复（HCSE 韧性验证）：二级重试添加 120s 显式超时
@@ -677,7 +672,11 @@ pub async fn start_sidecar(
                             {
                                 Ok(Ok(pair)) => pair,
                                 Ok(Err(e)) => return Err(sidecar_error_to_user_message(&e)),
-                                Err(_) => return Err("启动超时（120s），请检查系统资源后重试。".to_string()),
+                                Err(_) => {
+                                    return Err(
+                                        "启动超时（120s），请检查系统资源后重试。".to_string()
+                                    )
+                                }
                             }
                         } else {
                             // v0.8.43 修复（GAP-L1-08 P0）：三级兜底 — kill 失败后清理锁文件再重试一次
@@ -687,54 +686,18 @@ pub async fn start_sidecar(
                                 "E008 三级兜底：kill_process_by_pid(PID={}) 失败，尝试清理锁文件后重试",
                                 pid
                             );
-                            // 尝试清理锁文件
-                            let lock_dir = {
-                                let home = std::env::var("USERPROFILE")
-                                    .or_else(|_| std::env::var("HOME"))
-                                    .unwrap_or_else(|_| ".".to_string());
-                                std::path::PathBuf::from(home)
-                                    .join(".loong-recall")
-                                    .join("global")
-                                    .join("data")
-                            };
-                            let lock_path = lock_dir.join(".lrc.lock");
-                            if lock_path.exists() {
-                                let _ = std::fs::write(&lock_path, "");
-                                tracing::warn!("E008 三级兜底：已清空锁文件 {}", lock_path.display());
-                            }
-                            // v0.8.44 R1 修复（HCSE 韧性验证）：三级兜底添加 120s 显式超时
-                            //   根因：start_sidecar 的三级兜底无显式超时，与 start_sidecar_for_project 不一致
-                            //   修复：用 tokio::time::timeout(120s) 包裹
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(120),
-                                SidecarManager::spawn_and_wait(
-                                    &binary_path,
-                                    &project_key,
-                                    &start_opts,
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(Ok(pair)) => pair,
-                                Ok(Err(e)) => {
-                                    // 三级兜底也失败，给用户明确的操作指引
-                                    let err_msg = format!(
-                                        "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
-                                         请以管理员身份运行或检查杀毒软件拦截。\
-                                         （错误详情: {}）",
-                                        pid,
-                                        sidecar_error_to_user_message(&e)
-                                    );
-                                    return Err(err_msg);
-                                }
-                                Err(_) => {
-                                    return Err(format!(
-                                        "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
-                                         启动超时（120s），请检查系统资源后重试。",
-                                        pid
-                                    ));
-                                }
-                            }
+                            // 禁止清空共享锁文件：health 不可达不等于实例已死亡。
+                            tracing::error!(
+                                "E008：无法终止不可达的旧 sidecar PID={}，保留锁文件并停止自动重试",
+                                pid
+                            );
+                            return Err(format!(
+                                "检测到正在运行但无法访问的 LRC 实例（PID={}）。为保护数据，未清理锁文件，请先关闭该实例后重试。",
+                                pid
+                            ));
+                            /* v0.8.44 R1 历史三级重试逻辑已删除：不可确认旧实例死亡时，
+                             * 继续启动会破坏共享锁语义，必须由用户先关闭旧实例。 */
+                            // 历史三级重试逻辑已删除：不可确认旧实例死亡时不能继续启动。
                         }
                     }
                     Err(e) => return Err(sidecar_error_to_user_message(&e)),
@@ -870,55 +833,16 @@ pub async fn start_sidecar_for_project(
                             project_key
                         );
                         if !crate::sidecar_manager::kill_process_by_pid(pid) {
-                            // v0.8.43 修复（GAP-L1-08 P0）：三级兜底 — kill 失败后清理锁文件再重试一次
-                            tracing::warn!(
-                                "E008 三级兜底（项目）：kill_process_by_pid(PID={}) 失败，尝试清理锁文件后重试",
+                            // kill 失败时禁止清空共享锁文件：health 不可达不等于实例已死亡。
+                            tracing::error!(
+                                "E008：项目 sidecar PID={} 无法终止，保留锁文件并停止自动重试",
                                 pid
                             );
-                            let lock_dir = {
-                                let home = std::env::var("USERPROFILE")
-                                    .or_else(|_| std::env::var("HOME"))
-                                    .unwrap_or_else(|_| ".".to_string());
-                                std::path::PathBuf::from(home)
-                                    .join(".loong-recall")
-                                    .join("global")
-                                    .join("data")
-                            };
-                            let lock_path = lock_dir.join(".lrc.lock");
-                            if lock_path.exists() {
-                                let _ = std::fs::write(&lock_path, "");
-                                tracing::warn!("E008 三级兜底（项目）：已清空锁文件 {}", lock_path.display());
-                            }
-                            // 最后尝试一次启动（带 120s 超时）
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(120),
-                                SidecarManager::spawn_and_wait(
-                                    &binary_path,
-                                    &project_key,
-                                    &start_opts,
-                                ),
-                            )
-                            .await
-                            {
-                                Ok(Ok(result)) => {
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                    result
-                                }
-                                Ok(Err(e)) => {
-                                    return Err(format!(
-                                        "启动失败: 无法终止旧 sidecar 进程 (PID={})，\
-                                         请手动结束该进程后重试。（错误详情: {}）",
-                                        pid,
-                                        sidecar_error_to_user_message(&e)
-                                    ));
-                                }
-                                Err(_elapsed) => {
-                                    store.start_cancel_flag.store(true, Ordering::SeqCst);
-                                    return Err(user_friendly_error(
-                                        "项目 sidecar 启动超时（120s），请稍后重试或检查 LRC 服务状态",
-                                    ));
-                                }
-                            }
+                            return Err(format!(
+                                "项目 sidecar 实例（PID={}）正在运行但无法访问。为保护数据，未清理锁文件，请先关闭该实例后重试。",
+                                pid
+                            ));
+                            // 不可确认旧实例死亡时不再执行历史重试，避免破坏共享锁语义。
                         } else {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             match tokio::time::timeout(
@@ -932,9 +856,7 @@ pub async fn start_sidecar_for_project(
                             .await
                             {
                                 Ok(Ok(result)) => result,
-                                Ok(Err(e)) => {
-                                    return Err(sidecar_error_to_user_message(&e))
-                                }
+                                Ok(Err(e)) => return Err(sidecar_error_to_user_message(&e)),
                                 Err(_elapsed) => {
                                     store.start_cancel_flag.store(true, Ordering::SeqCst);
                                     return Err(user_friendly_error(
@@ -1038,6 +960,7 @@ pub struct LlmConfigResponse {
     pub configured: bool,
     pub llm_type: String,
     pub model: Option<String>,
+    pub api_key_status: String,
 }
 
 /// 获取 LLM 配置状态
@@ -1046,9 +969,10 @@ pub async fn get_llm_config(store: State<'_, AppStore>) -> Result<LlmConfigRespo
     let wizard = store.wizard.lock().await;
     let config = wizard.config();
     Ok(LlmConfigResponse {
-        configured: config.llm_configured,
+        configured: config.llm_configured && config.api_key_status() != "invalid",
         llm_type: config.llm_type.clone(),
         model: config.llm_model.clone(),
+        api_key_status: config.api_key_status().to_string(),
     })
 }
 
@@ -1073,9 +997,10 @@ pub async fn save_llm_config(
         .map_err(|e| user_friendly_error(&e))?;
     let config = wizard.config();
     let response = LlmConfigResponse {
-        configured: config.llm_configured,
+        configured: config.llm_configured && config.api_key_status() != "invalid",
         llm_type: config.llm_type.clone(),
         model: config.llm_model.clone(),
+        api_key_status: config.api_key_status().to_string(),
     };
     // v0.5.7 二次审计修复：提前克隆 llm_api_str，释放 wizard 锁后再获取 sidecar_port 锁
     let llm_api_str = config.to_llm_api_string();
@@ -1116,6 +1041,7 @@ pub async fn clear_llm_config(store: State<'_, AppStore>) -> Result<LlmConfigRes
         configured: false,
         llm_type: "none".to_string(),
         model: None,
+        api_key_status: "not_configured".to_string(),
     };
 
     // v0.5.4 修复：同步清除到 Sidecar 内存状态
@@ -1378,19 +1304,28 @@ pub async fn detect_agents(store: State<'_, AppStore>) -> Result<Vec<AgentInfo>,
     // v0.5.7 修复：添加后端超时，避免前端超时后后端仍持锁导致死循环
     // detect_all() 内部主要是 Path::exists（轻量），正常 < 1 秒
     // 30 秒超时作为兜底，防止异常情况（如网络盘、杀毒软件扫描）导致卡死
-    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    // 只在构造扫描快照时持有 registry 锁，文件系统检测在锁外执行。
+    let registry_snapshot = {
         let registry = store.agent_registry.lock().await;
-        registry.detect_all()
-    })
+        registry.snapshot_for_scan()
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || registry_snapshot.detect_all()),
+    )
     .await;
 
     match result {
-        Ok(agents) => {
+        Ok(Ok(agents)) => {
             tracing::info!("detect_agents 完成，检测到 {} 个 Agent", agents.len());
             Ok(agents)
         }
+        Ok(Err(error)) => {
+            tracing::error!("detect_agents 后台任务异常终止: {error}");
+            Err(format!("AI 工具检测任务异常终止: {error}"))
+        }
         Err(_) => {
-            tracing::error!("detect_agents 超时（30秒），可能存在锁竞争或文件系统慢");
+            tracing::error!("detect_agents 超时（30秒），可能是网络盘响应慢或杀毒软件扫描");
             Err(
                 "AI 工具检测超时（30秒），可能是杀毒软件扫描或网络盘响应慢，请重启应用后重试"
                     .to_string(),
@@ -1429,10 +1364,14 @@ pub async fn discover_all_agents(
 ) -> Result<(Vec<AgentInfo>, Vec<AgentInfo>), String> {
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         // 锁顺序约束（Level 1 → Level 2）：先取 agent_registry（L1），释放后再取 wizard（L2）
-        let (mut known_list, unknown_list) = {
+        let registry_snapshot = {
             let registry = store.agent_registry.lock().await;
-            registry.discover_all()
-        }; // agent_registry 锁已释放（<1ms）
+            registry.snapshot_for_scan()
+        };
+        let (mut known_list, unknown_list) =
+            tokio::task::spawn_blocking(move || registry_snapshot.discover_all())
+                .await
+                .map_err(|e| format!("AI 工具检测任务异常终止: {}", e))?;
 
         // Level 2：取 wizard 锁读取手动修正
         let overrides = {
@@ -1462,12 +1401,13 @@ pub async fn discover_all_agents(
             }
         }
 
-        (known_list, unknown_list)
+        Ok((known_list, unknown_list))
     })
     .await;
 
     match result {
-        Ok(tuple) => Ok(tuple),
+        Ok(Ok(tuple)) => Ok(tuple),
+        Ok(Err(error)) => Err(error),
         Err(_) => {
             tracing::error!("discover_all_agents 触发 HCSE FM-05 30 秒超时兜底");
             Err("AI 工具检测超时（30 秒）。可能是磁盘响应慢或网络盘扫描卡住，请点击「重新扫描」重试，或关闭杀毒软件后再试。".to_string())
@@ -1558,9 +1498,7 @@ pub async fn configure_agents(
 ) -> Result<Vec<String>, String> {
     // v0.9.0 开发模式隔离：开发模式下禁止修改用户的全局 MCP 配置和 IDE 规则文件
     if is_dev_mode() {
-        tracing::warn!(
-            "[开发模式] configure_agents 被调用但被拒绝（避免触碰稳定版用户配置）"
-        );
+        tracing::warn!("[开发模式] configure_agents 被调用但被拒绝（避免触碰稳定版用户配置）");
         return Err("开发模式下不允许配置 Agent（避免修改稳定版用户的全局 IDE 配置）。请使用稳定版桌面端进行配置。".to_string());
     }
 
@@ -1896,6 +1834,8 @@ pub struct WizardStateResponse {
     pub llm_type: String,
     /// LLM 模型名
     pub llm_model: Option<String>,
+    /// API Key 状态：not_configured/configured/invalid
+    pub api_key_status: String,
     /// 已配置的 Agent 列表
     pub configured_agents: Vec<String>,
     /// Sidecar 是否在运行
@@ -1929,6 +1869,7 @@ pub async fn get_wizard_state(store: State<'_, AppStore>) -> Result<WizardStateR
         llm_configured,
         llm_type,
         llm_model,
+        api_key_status,
         configured_agents,
         corrupted,
     ) = {
@@ -1937,9 +1878,10 @@ pub async fn get_wizard_state(store: State<'_, AppStore>) -> Result<WizardStateR
         (
             config.setup_complete,
             config.project_dir.clone(),
-            config.llm_configured,
+            config.llm_configured && config.api_key_status() != "invalid",
             config.llm_type.clone(),
             config.llm_model.clone(),
+            config.api_key_status().to_string(),
             config.configured_agents.clone(),
             wizard.corrupted_on_load,
         )
@@ -1991,6 +1933,7 @@ pub async fn get_wizard_state(store: State<'_, AppStore>) -> Result<WizardStateR
         llm_configured,
         llm_type,
         llm_model,
+        api_key_status,
         configured_agents,
         sidecar_running,
         sidecar_port,
@@ -2517,7 +2460,10 @@ pub async fn open_data_dir(store: State<'_, AppStore>) -> Result<String, String>
 pub async fn get_rules_status(store: State<'_, AppStore>) -> Result<Vec<RulesStatus>, String> {
     let registry = store.agent_registry.lock().await;
     let status = registry.get_rules_status();
-    tracing::info!("[v0.9.0] 规则状态查询完成，共 {} 个已安装工具", status.len());
+    tracing::info!(
+        "[v0.9.0] 规则状态查询完成，共 {} 个已安装工具",
+        status.len()
+    );
     Ok(status)
 }
 

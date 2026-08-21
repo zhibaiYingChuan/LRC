@@ -1145,8 +1145,7 @@ fn load_llm_from_wizard_json() -> Option<String> {
 /// 不存在则返回 false，直接使用统计编码器（避免联网下载导致启动延迟）。
 #[cfg(feature = "ml")]
 fn local_ml_model_ready() -> bool {
-    let model_id =
-        std::env::var("LRC_LUOSHU_MODEL_ID").unwrap_or_else(|_| "BAAI/bge-small-zh".to_string());
+    let model_id = code_memory::engine::model_resolver::selected_model_id();
     code_memory::engine::model_resolver::check_model_ready(&model_id)
 }
 

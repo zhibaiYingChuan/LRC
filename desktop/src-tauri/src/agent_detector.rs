@@ -2184,6 +2184,14 @@ impl AgentDetectorRegistry {
         self.lrc_binary_path = Some(path);
     }
 
+    /// 创建用于后台扫描的独立注册表快照。
+    /// 注册表中的检测器是无状态策略对象，后台扫描不应长期持有应用状态锁。
+    pub fn snapshot_for_scan(&self) -> Self {
+        let mut snapshot = Self::new();
+        snapshot.lrc_binary_path = self.lrc_binary_path.clone();
+        snapshot
+    }
+
     /// 检测所有已安装的 Agent，返回信息列表
     pub fn detect_all(&self) -> Vec<AgentInfo> {
         // v0.6.0 优化：按 category 优先级排序，IDE 和 Agent 工具优先返回
@@ -2485,11 +2493,8 @@ impl AgentDetectorRegistry {
 
         // v0.9.0 修复：只返回已安装工具的规则状态，避免列出用户未安装的一整排工具。
         // 复用 detect_installed() 的检测逻辑（与配置向导的 AI 工具检测保持一致）。
-        let installed_ids: std::collections::HashSet<String> = self
-            .detect_installed()
-            .into_iter()
-            .map(|a| a.id)
-            .collect();
+        let installed_ids: std::collections::HashSet<String> =
+            self.detect_installed().into_iter().map(|a| a.id).collect();
 
         KNOWN_TOOLS
             .iter()
@@ -3591,10 +3596,7 @@ mod tests {
 
         // 指引内容应包含关键信息
         let guide = get_manual_config_guide("codex-cli").unwrap();
-        assert!(
-            guide.contains("Codex CLI"),
-            "Codex CLI 指引应包含工具名"
-        );
+        assert!(guide.contains("Codex CLI"), "Codex CLI 指引应包含工具名");
         assert!(guide.contains("127.0.0.1:3099"), "指引应包含 LRC 端点");
     }
 

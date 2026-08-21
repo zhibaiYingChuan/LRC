@@ -2,7 +2,7 @@
 
 > **AI 编程助手的记忆与检索插件** — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定。
 >
-> 版本：v0.6.0 | 适用于：Trae / Cursor / VS Code / Claude Desktop 等支持 MCP 协议的 AI 工具
+> 版本：v0.9.3 | 适用于：Trae / Cursor / VS Code / Claude Desktop 等支持 MCP 协议的 AI 工具
 
 ---
 

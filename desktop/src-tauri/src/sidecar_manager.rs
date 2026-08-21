@@ -868,8 +868,8 @@ impl SidecarManager {
                     // 桌面端收到 SingletonConflict 后尝试终止 sidecar 的 PID（已死），
                     // 但锁文件中的残留 PID 永远不会被清理，新 sidecar 重复同一错误。
                     if existing_port.is_none() {
-                        let lock_dir = data_dir.map(std::path::PathBuf::from)
-                            .unwrap_or_else(|| {
+                        let lock_dir =
+                            data_dir.map(std::path::PathBuf::from).unwrap_or_else(|| {
                                 // 默认全局数据目录（与 sidecar --global 一致）
                                 let home = std::env::var("USERPROFILE")
                                     .or_else(|_| std::env::var("HOME"))
@@ -882,7 +882,8 @@ impl SidecarManager {
                         let lock_path = lock_dir.join(".lrc.lock");
                         if lock_path.exists() {
                             if let Ok(content) = std::fs::read_to_string(&lock_path) {
-                                let stale_pids: Vec<&str> = content.split(',')
+                                let stale_pids: Vec<&str> = content
+                                    .split(',')
                                     .map(|s| s.trim())
                                     .filter(|s| !s.is_empty())
                                     .collect();
@@ -892,10 +893,8 @@ impl SidecarManager {
                                     stale_pids.join(",")
                                 );
                             }
-                            // 清空锁文件（删除残留 PID，让新 sidecar 创建新锁）
-                            let _ = std::fs::write(&lock_path, "");
-                            tracing::warn!(
-                                "已清空锁文件 {}，打破 E008 死亡螺旋",
+                            tracing::error!(
+                                "E008：发现不可达实例，保留锁文件 {}，禁止自动清空以保护共享数据",
                                 lock_path.display()
                             );
                         }
@@ -1117,7 +1116,9 @@ impl SidecarManager {
 
             // 端口自适应：从起始端口开始扫描
             for offset in 0..PORT_SCAN_RANGE {
-                let port = start_port + offset;
+                let Some(port) = start_port.checked_add(offset) else {
+                    break;
+                };
                 let health_url = format!("http://127.0.0.1:{port}/health");
 
                 match client.get(&health_url).send().await {
@@ -1143,9 +1144,11 @@ impl SidecarManager {
                 }
             }
 
+            let end_port = start_port
+                .checked_add(PORT_SCAN_RANGE.saturating_sub(1))
+                .unwrap_or(u16::MAX);
             tracing::debug!(
-                "Sidecar 健康检查 第{attempt}/20次: 端口 {start_port}~{} 均不可用",
-                start_port + PORT_SCAN_RANGE - 1
+                "Sidecar 健康检查 第{attempt}/20次: 端口 {start_port}~{end_port} 均不可用"
             );
 
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1170,7 +1173,9 @@ impl SidecarManager {
     ///     桌面端扫描端口寻找已运行的 sidecar 实例以复用
     pub async fn find_healthy_sidecar_port(start_port: u16) -> Option<u16> {
         for offset in 0..10u16 {
-            let port = start_port + offset;
+            let Some(port) = start_port.checked_add(offset) else {
+                break;
+            };
             // 用 200ms 超时包裹 check_sidecar_health（默认 2s 太慢）
             if let Ok(Some(_)) =
                 tokio::time::timeout(Duration::from_millis(200), Self::check_sidecar_health(port))
@@ -1248,7 +1253,9 @@ impl SidecarManager {
         };
 
         let start_port = DEFAULT_SIDECAR_PORT;
-        let end_port = DEFAULT_SIDECAR_PORT + PORT_SCAN_RANGE;
+        let end_port = DEFAULT_SIDECAR_PORT
+            .checked_add(PORT_SCAN_RANGE)
+            .unwrap_or(u16::MAX);
 
         tracing::info!(
             "开始探测外部 sidecar：扫描端口范围 {}-{}",
