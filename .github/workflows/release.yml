@@ -999,12 +999,25 @@ jobs:
           DOC
         shell: bash
 
+      - name: Resolve release tag
+        id: release_version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "TAG=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
       - name: Create Release
+        # v0.9.3 修复：workflow_dispatch 不在 tag ref 上运行，必须显式传入 release tag
+        # 否则 softprops/action-gh-release 会报 GitHub Releases requires a tag
         # v0.8.25 V3-08 修复：添加 SLSA 级别标注
         # 构建来源证明由 attest-build-provenance 生成（SLSA Level 2+）
         # 详情见 https://slsa.dev/spec/v1.0/levels
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
+          tag_name: ${{ steps.release_version.outputs.TAG }}
           files: |
             artifacts/**/*
             install.sh
