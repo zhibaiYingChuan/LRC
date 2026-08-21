@@ -16,6 +16,8 @@ window.__LRC_VERSION__ = APP_VERSION;
  */
 async function fetchBackendVersion() {
   try {
+    // v0.9.3 修复：先确保 API_BASE 已同步，避免发往错误端口
+    await syncSidecarApiBase();
     const res = await fetchWithTimeout(API_BASE + '/v1/health/system', {}, 5000);
     if (!res.ok) return;
     const data = await res.json();
@@ -70,32 +72,61 @@ const META_SIDECAR_PORT = _readSidecarPortFromMeta();
 // v0.9.0 开发模式隔离：开发版默认端口 3111（meta 标签注入），稳定版 3099（release 构建时替换 meta）
 const STABLE_DEFAULT_PORT = 3099;
 
-async function syncSidecarApiBase() {
-  if (!isTauriEnv) return API_BASE;
-  try {
-    const invokeFn = (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)
-      || (window.__TAURI__ && window.__TAURI__.invoke);
-    const instances = invokeFn ? await invokeFn('get_sidecar_status') : [];
-    const runningInstance = Array.isArray(instances)
-      ? instances.find(instance => instance && instance.running && instance.port)
-      : null;
-    if (runningInstance) {
-      API_BASE = `http://127.0.0.1:${runningInstance.port}`;
-      window.API_BASE = API_BASE;
-      const apiDisplay = document.getElementById('api-base-display');
-      if (apiDisplay) apiDisplay.textContent = API_BASE;
-    }
-  } catch (error) {
-    console.warn('[LRC] 同步 sidecar 端口失败:', error.message);
+// v0.9.3 修复：共享同一初始化 Promise，避免多个首屏请求并发触发多次 IPC 同步，
+// 从而消除 API_BASE 在 startup 阶段的竞态（第一批请求可能发往错误端口）
+let _apiBaseSyncSingleton = null;
+function syncSidecarApiBase() {
+  if (!isTauriEnv) return Promise.resolve(API_BASE);
+  // 若已有进行中的同步，复用之（单飞），保证各处拿到一致端口
+  if (!_apiBaseSyncSingleton) {
+    _apiBaseSyncSingleton = (async () => {
+      try {
+        const invokeFn = (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)
+          || (window.__TAURI__ && window.__TAURI__.invoke);
+        const instances = invokeFn ? await invokeFn('get_sidecar_status') : [];
+        const runningInstance = Array.isArray(instances)
+          ? instances.find(instance => instance && instance.running && instance.port)
+          : null;
+        if (runningInstance) {
+          API_BASE = `http://127.0.0.1:${runningInstance.port}`;
+          window.API_BASE = API_BASE;
+          const apiDisplay = document.getElementById('api-base-display');
+          if (apiDisplay) apiDisplay.textContent = API_BASE;
+        }
+      } catch (error) {
+        console.warn('[LRC] 同步 sidecar 端口失败:', error.message);
+      }
+      return API_BASE;
+    })().finally(() => { _apiBaseSyncSingleton = null; });
   }
-  return API_BASE;
+  return _apiBaseSyncSingleton;
 }
 
 const DEFAULT_API_BASE = isTauriEnv
-  ? (META_SIDECAR_PORT ? `http://127.0.0.1:${META_SIDECAR_PORT}` : `http://127.0.0.1:${STABLE_DEFAULT_PORT}`)
-  : (window.location.origin || `http://localhost:${STABLE_DEFAULT_PORT}`);
+    ? (META_SIDECAR_PORT ? `http://127.0.0.1:${META_SIDECAR_PORT}` : `http://127.0.0.1:${STABLE_DEFAULT_PORT}`)
+    : (window.location.origin || `http://localhost:${STABLE_DEFAULT_PORT}`);
 // v0.6.0 P0-1 修复：Tauri 环境下 sidecar 可能端口自适应到非 3099，需改为 let 以便异步更新
-let API_BASE = new URLSearchParams(window.location.search).get('api') || DEFAULT_API_BASE;
+// v0.9.3 修复：校验 ?api= 覆盖，仅允许本机/HTTPS 合法地址，防止被注入到任意服务
+let API_BASE = (() => {
+  const override = new URLSearchParams(window.location.search).get('api');
+  if (override) {
+    try {
+      const u = new URL(override);
+      const allowedScheme = u.protocol === 'http:' || u.protocol === 'https:';
+      const allowedHost = isTauriEnv
+        ? (u.hostname === '127.0.0.1' || u.hostname === 'localhost')
+        : (u.origin === window.location.origin);
+      if (allowedScheme && allowedHost) {
+        // 去掉末尾斜杠，避免拼接出双斜杠
+        return override.replace(/\/+$/, '');
+      }
+      console.warn('[LRC] 已忽略非法 ?api= 覆盖：', override);
+    } catch (e) {
+      console.warn('[LRC] 已忽略无法解析的 ?api= 覆盖：', override);
+    }
+  }
+  return DEFAULT_API_BASE;
+})();
 const REFRESH_INTERVAL = 30000; // 30 秒自动刷新
 let refreshTimer = null;
 let startTime = Date.now();
