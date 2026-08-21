@@ -411,7 +411,7 @@ jobs:
       # 防止 CI 缓存导致"新前端+旧引擎二进制"混合产物
       # 规则：编译产物版本号必须与 Resolve version 结果一致
       - name: Verify binary version matches release version
-        if: always()
+        if: steps.build.outcome == 'success'
         run: |
           VERSION_TAG="${{ steps.version.outputs.VER }}"
           VERSION_TAG="${VERSION_TAG#v}"
