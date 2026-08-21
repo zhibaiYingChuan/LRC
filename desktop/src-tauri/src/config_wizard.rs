@@ -622,10 +622,12 @@ mod tests {
 
     #[test]
     fn test_invalid_api_key_is_not_reported_as_configured() {
-        let mut config = WizardConfig::default();
-        config.llm_type = "openai".into();
-        config.llm_configured = true;
-        config.encrypted_api_key = "不是有效密文".into();
+        let mut config = WizardConfig {
+            llm_type: "openai".into(),
+            llm_configured: true,
+            encrypted_api_key: "不是有效密文".into(),
+            ..WizardConfig::default()
+        };
 
         config.refresh_api_key_status();
 
