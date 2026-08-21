@@ -58,6 +58,27 @@ static BENCHMARK_CACHE: std::sync::LazyLock<
 /// 基准测试缓存有效期：1 小时
 const BENCHMARK_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// 统一 API 错误响应类型
+type ApiError = (StatusCode, Json<serde_json::Value>);
+
+/// 全局 memory_store 锁获取超时。v0.9.3 修复：任何 handler 卡死都不能无限持有
+/// 全局锁阻塞所有其它请求（搜索/健康检查），超时后返回 503。
+async fn lock_store_with_timeout<T>(
+    store: &Arc<Mutex<T>>,
+) -> Result<tokio::sync::MutexGuard<'_, T>, ApiError> {
+    tokio::time::timeout(std::time::Duration::from_secs(2), store.lock())
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "store_busy",
+                    "message": "记忆服务繁忙，请稍后重试"
+                })),
+            )
+        })
+}
+
 // ==================== 请求/响应类型 ====================
 
 /// /v1/encode 请求体
@@ -384,10 +405,10 @@ pub fn build_v1_router(
                     //     Phase 2：释放锁，spawn_blocking 执行 luoshu_synthesize（CPU 密集）
                     //     Phase 3：重新持锁，列出记忆和获取总数（快速操作，<1ms）
 
-                    // Phase 1：持锁写入记忆
+                    // Phase 1：持锁写入记忆（v0.9.3 修复：锁超时保护）
                     let mut stored = 0usize;
                     {
-                        let mut store = store.lock().await;
+                        let mut store = lock_store_with_timeout(&store).await?;
                         for mem in &req.memories {
                             let memory_type = MemoryType::try_parse(&mem.memory_type)
                                 .unwrap_or(MemoryType::Fact);
@@ -444,7 +465,7 @@ pub fn build_v1_router(
 
                     // Phase 3：重新持锁，列出记忆和获取总数（快速操作）
                     let (synthesis_summaries, total) = {
-                        let store = store.lock().await;
+                        let store = lock_store_with_timeout(&store).await?;
                         let filter = ListFilter::new();
                         let all_memories = store.list_memories(&filter).unwrap_or_else(|e| {
                             eprintln!("[v1/consolidate] 列出记忆失败: {}", e);
@@ -606,7 +627,7 @@ pub fn build_v1_router(
             move |Json(req): Json<CorrectRequest>| {
                 let store = store.clone();
                 async move {
-                    let mut store = store.lock().await;
+                    let mut store = lock_store_with_timeout(&store).await?;
                     match store.correct_memory(&req.memory_id, &req.content, req.reason.as_deref()) {
                         Ok(Some(memory)) => {
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(CorrectResponse {
@@ -640,7 +661,7 @@ pub fn build_v1_router(
             move |Json(req): Json<UnfoldRequest>| {
                 let store = store.clone();
                 async move {
-                    let mut store = store.lock().await;
+                    let mut store = lock_store_with_timeout(&store).await?;
                     match store.unfold_memory(&req.memory_id, req.min_activation) {
                         Ok(Some((sub_memories, fidelity))) => {
                             let sub_count = sub_memories.len();
@@ -986,7 +1007,7 @@ pub fn build_v1_router(
                                 }
                             };
 
-                            let store = store.lock().await;
+                            let store = lock_store_with_timeout(&store).await?;
                             match store.user_feedback.confirm_action(assessment_id) {
                                 Ok(memory_ids) => {
                                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
@@ -1021,7 +1042,7 @@ pub fn build_v1_router(
                                 }
                             };
 
-                            let store = store.lock().await;
+                            let store = lock_store_with_timeout(&store).await?;
                             match store.user_feedback.cancel_pending(assessment_id) {
                                 Ok(_) => Ok(Json(serde_json::json!({
                                     "success": true,
@@ -1074,7 +1095,7 @@ pub fn build_v1_router(
                                 ));
                             }
 
-                            let store = store.lock().await;
+                            let store = lock_store_with_timeout(&store).await?;
                             // MemoryStore 需要实现 MemoryGraphQuery trait
                             let assessment = store.user_feedback.request_impact_assessment(
                                 crate::engine::user_feedback::PendingActionType::Isolate,
@@ -1106,7 +1127,7 @@ pub fn build_v1_router(
                             let query = body.get("query").and_then(|v| v.as_str());
                             let note = body.get("note").and_then(|v| v.as_str());
 
-                            let store = store.lock().await;
+                            let store = lock_store_with_timeout(&store).await?;
                             let feedback_id = store.user_feedback.record_feedback(
                                 feedback_type.clone(),
                                 target_type.clone(),
@@ -1434,7 +1455,8 @@ pub fn build_v1_router(
             move |_body: Json<serde_json::Value>| {
                 let store = store.clone();
                 async move {
-                    let store = store.lock().await;
+                    // v0.9.3 修复：锁获取超时保护
+                    let store = lock_store_with_timeout(&store).await?;
 
                     // 通过持久层加载归档记忆
                     match store.persistence().load_archived_memories() {
@@ -1497,7 +1519,8 @@ pub fn build_v1_router(
                     // 解析重要性，限制 1-10
                     let importance = Importance::new(params.importance.unwrap_or(5));
 
-                    let mut store = store.lock().await;
+                    // v0.9.3 修复：锁获取超时保护，避免卡死阻塞全局
+                    let mut store = lock_store_with_timeout(&store).await?;
 
                     // 构造新记忆（project 和 tags 暂为空，ttl 永久）
                     let memory = Memory::new(
