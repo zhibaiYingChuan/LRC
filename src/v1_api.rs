@@ -503,7 +503,7 @@ pub fn build_v1_router(
                 let store = store.clone();
                 async move {
                     let query = req.query;
-                    let top_k = req.top_k;
+                    let top_k = req.top_k.clamp(1, 100);
                     let privacy_ctx = if req.user_id.is_some() {
                         Some((PrivacyLevel::User, req.session_id.clone(), req.user_id.clone()))
                     } else {

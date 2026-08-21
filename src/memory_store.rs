@@ -2181,7 +2181,7 @@ impl<P: Persistence> MemoryStore<P> {
         let recall_start = std::time::Instant::now();
         let recall_top_k = filter.top_k;
 
-        let mut all_memories = self.load_cached()?;
+        let all_memories = self.load_cached()?;
         let total_count = all_memories.iter().filter(|m| !m.is_expired()).count();
 
         // v0.5.4 P1-9 修复：使用智能分词替代 split_whitespace()
@@ -2396,32 +2396,8 @@ impl<P: Persistence> MemoryStore<P> {
         };
         // 块作用域结束，candidates 和 scored 的不可变引用均已释放
 
-        // 收集匹配记忆的 ID（用于标记访问时间）
-        let matched_ids: std::collections::HashSet<String> =
-            memories.iter().map(|m| m.id.clone()).collect();
-
-        // 更新被检索到的记忆的 last_accessed（衰减模型依赖此字段）
-        let mut any_modified = false;
-        for m in &mut all_memories {
-            if matched_ids.contains(&m.id) {
-                m.mark_accessed();
-                any_modified = true;
-            }
-        }
-
-        // v0.5.5 性能修复：将全量重写改为增量批量更新
-        // 原实现：clear_memories() + 循环 save_memory() 全量重写所有记忆，O(N²) 序列化
-        // 新实现：仅更新被检索到的记忆（通常 ≤ top_k=10 条），单次序列化+单次磁盘写入
-        // 性能提升：3633 条记忆场景下，单次 recall 写回从 ~105s 降至毫秒级
-        if any_modified {
-            let modified_memories: Vec<Memory> = all_memories
-                .into_iter()
-                .filter(|m| matched_ids.contains(&m.id))
-                .collect();
-            self.persistence.update_memories(&modified_memories)?;
-            // v0.5.4 写操作后标记缓存为脏
-            self.invalidate_cache();
-        }
+        // 搜索是只读热路径：不在请求内更新 last_accessed 或同步重写记忆文件。
+        // 访问时间由后台维护，避免每次搜索都序列化全量记忆并阻塞全局 store 锁。
 
         // 记录指标：检索 + 1
         self.dao_metrics.record_recall();
@@ -3485,44 +3461,25 @@ mod tests {
     }
 
     #[test]
-    fn test_recall_updates_last_accessed() {
+    fn test_recall_does_not_persist_last_accessed() {
         let (_dir, mut store) = make_store();
 
         let mut m = make_test_memory("测试衰减更新", MemoryType::Fact);
         // 模拟 10 天前的访问
         m.last_accessed = Utc::now() - Duration::days(10);
         let before_access = m.last_accessed;
-        let before_factor = m.decay_factor();
         store.remember(m).expect("应成功记住");
 
-        // 执行 recall，触发 mark_accessed
-        let old_decayed = {
-            let result = store
-                .recall("衰减", &RecallFilter::new())
-                .expect("应成功召回");
-            result.memories[0].decayed_importance()
-        };
+        // recall 是只读热路径，不应触发访问时间更新或持久化写回
+        store
+            .recall("衰减", &RecallFilter::new())
+            .expect("应成功召回");
 
-        // 重新加载记忆，验证 last_accessed 已更新
         let all = store.persistence().load_all_memories().unwrap();
-        let updated = all.first().unwrap();
-        assert!(
-            updated.last_accessed > before_access,
-            "recall 后 last_accessed 应该更新: before={:?}, after={:?}",
-            before_access,
-            updated.last_accessed
-        );
-        assert!(
-            updated.decay_factor() > before_factor,
-            "recall 后衰减因子应回升: before={}, after={}",
-            before_factor,
-            updated.decay_factor()
-        );
-        assert!(
-            updated.decayed_importance() > old_decayed,
-            "recall 后衰减后重要性应提升: old={}, new={}",
-            old_decayed,
-            updated.decayed_importance()
+        let unchanged = all.first().unwrap();
+        assert_eq!(
+            unchanged.last_accessed, before_access,
+            "recall 不应更新已持久化的 last_accessed"
         );
     }
     #[test]
