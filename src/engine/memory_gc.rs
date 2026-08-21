@@ -343,7 +343,7 @@ impl MemoryGarbageCollector {
         let mut to_keep: Vec<GcCandidate> = Vec::new();
 
         // 检查已有候选：过观察期的转为待删除，仍在观察期的保留
-        let existing: Vec<GcCandidate> = self.state.candidates.drain(..).collect();
+        let existing = std::mem::take(&mut self.state.candidates);
         for candidate in existing {
             if now - candidate.marked_at_ms >= observation_period {
                 // 过观察期，在快照中查找该记忆确认仍可删除
