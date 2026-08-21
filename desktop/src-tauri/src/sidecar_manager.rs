@@ -1144,9 +1144,7 @@ impl SidecarManager {
                 }
             }
 
-            let end_port = start_port
-                .checked_add(PORT_SCAN_RANGE.saturating_sub(1))
-                .unwrap_or(u16::MAX);
+            let end_port = start_port.saturating_add(PORT_SCAN_RANGE.saturating_sub(1));
             tracing::debug!(
                 "Sidecar 健康检查 第{attempt}/20次: 端口 {start_port}~{end_port} 均不可用"
             );
@@ -1253,9 +1251,7 @@ impl SidecarManager {
         };
 
         let start_port = DEFAULT_SIDECAR_PORT;
-        let end_port = DEFAULT_SIDECAR_PORT
-            .checked_add(PORT_SCAN_RANGE)
-            .unwrap_or(u16::MAX);
+        let end_port = DEFAULT_SIDECAR_PORT.saturating_add(PORT_SCAN_RANGE);
 
         tracing::info!(
             "开始探测外部 sidecar：扫描端口范围 {}-{}",

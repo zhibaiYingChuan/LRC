@@ -16,6 +16,9 @@ use aes_gcm::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rand::RngCore;
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+static KEY_INIT_LOCK: Mutex<()> = Mutex::new(());
 
 /// 密钥文件路径 — 与密文分离存储，但通过 DPAPI 保护
 ///
@@ -159,6 +162,9 @@ fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
 /// 后续调用从磁盘读取并通过 DPAPI 解密恢复。
 /// 密钥文件即使被复制到其他机器也无法使用。
 fn get_or_create_key() -> Result<[u8; 32], String> {
+    let _lock = KEY_INIT_LOCK
+        .lock()
+        .map_err(|_| "加密密钥锁已损坏".to_string())?;
     let path = key_path()?;
 
     // 尝试读取已有密钥
