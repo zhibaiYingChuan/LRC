@@ -409,11 +409,12 @@ jobs:
 
       # v0.8.39 新增：编译产物版本校验（防御性门禁）
       # 防止 CI 缓存导致"新前端+旧引擎二进制"混合产物
-      # 规则：编译产物版本号必须与 ${GITHUB_REF_NAME#v} 一致
-      - name: Verify binary version matches tag
+      # 规则：编译产物版本号必须与 Resolve version 结果一致
+      - name: Verify binary version matches release version
         if: always()
         run: |
-          VERSION_TAG="${GITHUB_REF_NAME#v}"
+          VERSION_TAG="${{ steps.version.outputs.VER }}"
+          VERSION_TAG="${VERSION_TAG#v}"
           echo "📋 期望版本: ${VERSION_TAG}"
           echo "📋 编译产物: ${BIN_NAME}"
           # 使用 --version 获取编译产物的版本号
@@ -680,9 +681,10 @@ jobs:
         shell: bash
 
       # v0.8.39 新增：编译产物版本校验（Build Desktop 同样执行）
-      - name: Verify sidecar binary version matches tag
+      - name: Verify sidecar binary version matches release version
         run: |
-          VERSION_TAG="${GITHUB_REF_NAME#v}"
+          VERSION_TAG="${{ steps.version.outputs.VER }}"
+          VERSION_TAG="${VERSION_TAG#v}"
           echo "📋 期望版本: ${VERSION_TAG}"
           SIDECAR_BIN="target/${{ matrix.target }}/release/code-memory-server"
           if [ "${{ runner.os }}" = "Windows" ]; then
