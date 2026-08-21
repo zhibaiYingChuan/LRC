@@ -472,86 +472,131 @@ pub fn build_v1_router(
                 }
             }
         }))
-        // POST /v1/memories/enrich — 双路检索增强
+        // POST /v1/memories/enrich — 双路检索增强（v0.9.3 修复：增加超时与 panic 隔离）
+        // v0.9.3 修复：锁获取超时（2s）+ spawn_blocking 执行（15s 超时 + panic 隔离）
+        // 根因：recall() / trapezoid_focus_recall() 在 tokio 异步上下文中同步阻塞，
+        //       无超时保护时若检索卡死，锁永不释放，后续请求全部超时
         .route("/memories/enrich", post({
             let store = enrich_store;
             move |Json(req): Json<EnrichRequest>| {
                 let store = store.clone();
                 async move {
-                    let mut store = store.lock().await;
-                    // v0.5.4 桌面端测试修复：当请求未携带 user_id 时，不设置隐私上下文
-                    // 本地单用户应用场景下，仪表盘检索不应因缺少 user_id 而过滤掉 User 级记忆
-                    // is_visible() 在 privacy_context 为 None 时返回 true（全部可见）
+                    let query = req.query;
+                    let top_k = req.top_k;
                     let privacy_ctx = if req.user_id.is_some() {
                         Some((PrivacyLevel::User, req.session_id.clone(), req.user_id.clone()))
                     } else {
                         None
                     };
 
-                    let fast_filter = RecallFilter {
-                        memory_type: None,
-                        project: None,
-                        tags: vec![],
-                        min_importance: None,
-                        top_k: req.top_k * 2,
-                        privacy_context: privacy_ctx.clone(),
-                    };
-                    let fast_result = store.recall(&req.query, &fast_filter).unwrap_or_else(|e| {
-                        eprintln!("[v1/enrich] 快速路径检索失败: {}", e);
-                        RecallResult { memories: vec![], scores: vec![], total: 0 }
-                    });
+                    // Phase 1：锁获取超时保护（2 秒），避免锁被长期占用时的请求积压
+                    let _guard = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        store.lock(),
+                    ).await.map_err(|_| {
+                        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                            "error": "search_busy",
+                            "message": "搜索服务繁忙，请稍后重试"
+                        })))
+                    })?;
+                    // 立即释放锁，spawn_blocking 中重新获取
+                    drop(_guard);
 
-                    let deep_filter = RecallFilter {
-                        memory_type: None,
-                        project: None,
-                        tags: vec![],
-                        min_importance: None,
-                        top_k: req.top_k * 2,
-                        privacy_context: privacy_ctx,
-                    };
-                    // v0.9.0 修复：统计模式（无 ML 模型）下洛书 9 维向量语义不可靠，
-                    // 跳过深度路径，仅用字面匹配（TF-IDF），避免搜"测试"返回不相关记忆
-                    let deep_result = if store.is_ml_encoder() {
-                        store.trapezoid_focus_recall(&req.query, &deep_filter, 1).unwrap_or_else(|e| {
-                            eprintln!("[v1/enrich] 深度路径检索失败: {}", e);
-                            RecallResult { memories: vec![], scores: vec![], total: 0 }
+                    // Phase 2：spawn_blocking 执行 CPU 密集检索，带超时和 panic 隔离
+                    let store_arc = store.clone();
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(15),
+                        tokio::task::spawn_blocking(move || {
+                            let mut store = store_arc.blocking_lock();
+
+                            let fast_filter = RecallFilter {
+                                memory_type: None,
+                                project: None,
+                                tags: vec![],
+                                min_importance: None,
+                                top_k: top_k * 2,
+                                privacy_context: privacy_ctx.clone(),
+                            };
+                            let fast_result = store.recall(&query, &fast_filter).unwrap_or_else(|e| {
+                                eprintln!("[v1/enrich] 快速路径检索失败: {}", e);
+                                RecallResult { memories: vec![], scores: vec![], total: 0 }
+                            });
+
+                            let deep_filter = RecallFilter {
+                                memory_type: None,
+                                project: None,
+                                tags: vec![],
+                                min_importance: None,
+                                top_k: top_k * 2,
+                                privacy_context: privacy_ctx,
+                            };
+                            // v0.9.0 修复：统计模式（无 ML 模型）下洛书 9 维向量语义不可靠，
+                            // 跳过深度路径，仅用字面匹配（TF-IDF），避免搜"测试"返回不相关记忆
+                            let deep_result = if store.is_ml_encoder() {
+                                store.trapezoid_focus_recall(&query, &deep_filter, 1).unwrap_or_else(|e| {
+                                    eprintln!("[v1/enrich] 深度路径检索失败: {}", e);
+                                    RecallResult { memories: vec![], scores: vec![], total: 0 }
+                                })
+                            } else {
+                                RecallResult { memories: vec![], scores: vec![], total: 0 }
+                            };
+
+                            // RRF 融合 — 使用共享 rrf_fuse
+                            let fused = crate::engine::rrf::rrf_fuse(
+                                &fast_result,
+                                &deep_result,
+                                top_k,
+                                crate::engine::rrf::RRF_DEFAULT_K,
+                            );
+
+                            let total = fused.total_candidates;
+                            let memories: Vec<EnrichedMemory> = fused
+                                .memories
+                                .iter()
+                                .zip(fused.scores.iter())
+                                .map(|(m, &score)| EnrichedMemory {
+                                    id: m.id.clone(),
+                                    content: m.content.clone(),
+                                    memory_type: m.memory_type.as_str().to_string(),
+                                    score,
+                                    bagua_category: m.bagua_category.clone(),
+                                    importance: m.importance.value(),
+                                    topological_depth: m.topological_depth,
+                                    version: m.version,
+                                    created_at: m.created_at.to_rfc3339(),
+                                })
+                                .collect();
+
+                            (memories, fast_result.memories.len(), deep_result.memories.len(), total)
                         })
-                    } else {
-                        RecallResult { memories: vec![], scores: vec![], total: 0 }
-                    };
+                    ).await;
 
-                    // RRF 融合 — 使用共享 rrf_fuse
-                    let fused = crate::engine::rrf::rrf_fuse(
-                        &fast_result,
-                        &deep_result,
-                        req.top_k,
-                        crate::engine::rrf::RRF_DEFAULT_K,
-                    );
-
-                    let total = fused.total_candidates;
-                    let memories: Vec<EnrichedMemory> = fused
-                        .memories
-                        .iter()
-                        .zip(fused.scores.iter())
-                        .map(|(m, &score)| EnrichedMemory {
-                            id: m.id.clone(),
-                            content: m.content.clone(),
-                            memory_type: m.memory_type.as_str().to_string(),
-                            score,
-                            bagua_category: m.bagua_category.clone(),
-                            importance: m.importance.value(),
-                            topological_depth: m.topological_depth,
-                            version: m.version,
-                            created_at: m.created_at.to_rfc3339(),
-                        })
-                        .collect();
-
-                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(EnrichResponse {
-                        memories,
-                        fast_path_hits: fast_result.memories.len(),
-                        deep_path_hits: deep_result.memories.len(),
-                        total,
-                    }))
+                    match result {
+                        Ok(Ok((memories, fast_hits, deep_hits, total))) => {
+                            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(EnrichResponse {
+                                memories,
+                                fast_path_hits: fast_hits,
+                                deep_path_hits: deep_hits,
+                                total,
+                            }))
+                        }
+                        Ok(Err(join_error)) => {
+                            // spawn_blocking 内部 panic 被捕获
+                            eprintln!("[v1/enrich] spawn_blocking 内部 panic: {}", join_error);
+                            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "search_internal_error",
+                                "message": "搜索内部错误，服务已保持运行"
+                            }))))
+                        }
+                        Err(_timeout) => {
+                            // 15 秒超时触发
+                            eprintln!("[v1/enrich] 搜索超时（15s）");
+                            Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                                "error": "search_timeout",
+                                "message": "搜索超时，请稍后重试"
+                            }))))
+                        }
+                    }
                 }
             }
         }))
