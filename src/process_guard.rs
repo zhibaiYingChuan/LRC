@@ -15,6 +15,7 @@
 //   - 锁文件写入 PID，可自检旧进程是否已死（自愈机制）
 
 use std::fmt;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 // ==================== 错误类型 ====================
@@ -154,6 +155,7 @@ impl GuardError {
 #[derive(Debug)]
 pub struct SingletonLock {
     lock_path: PathBuf,
+    guard_path: PathBuf,
     acquired: bool,
 }
 
@@ -179,8 +181,52 @@ impl SingletonLock {
         }
 
         let lock_path = data_dir.join(".lrc.lock");
+        let guard_path = data_dir.join(".lrc.lock.guard");
         let current_pid = std::process::id();
-
+        let guard_file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&guard_path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(e) = write!(file, "{}", current_pid) {
+                    let _ = std::fs::remove_file(&guard_path);
+                    return Err(GuardError::LockAcquireFailed {
+                        path: guard_path,
+                        reason: format!("写入锁守卫 PID 失败: {}", e),
+                    });
+                }
+                file
+            }
+            Err(_) => {
+                let stale_pid = std::fs::read_to_string(&guard_path)
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u32>().ok());
+                if stale_pid.map(|pid| !is_pid_alive(pid)).unwrap_or(false) {
+                    let _ = std::fs::remove_file(&guard_path);
+                    let mut file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&guard_path)
+                        .map_err(|_| GuardError::LockAcquireFailed {
+                            path: guard_path.clone(),
+                            reason: "无法重新获取过期锁守卫，请稍后重试".to_string(),
+                        })?;
+                    use std::io::Write;
+                    write!(file, "{}", current_pid).map_err(|e| GuardError::LockAcquireFailed {
+                        path: guard_path.clone(),
+                        reason: format!("写入锁守卫 PID 失败: {}", e),
+                    })?;
+                    file
+                } else {
+                    return Err(GuardError::LockAcquireFailed {
+                        path: guard_path,
+                        reason: "已有进程正在更新单例锁，请稍后重试".to_string(),
+                    });
+                }
+            }
+        };
         // 读取现有 PIDs 列表，清理已死的进程
         let mut alive_pids: Vec<u32> = Vec::new();
 
@@ -209,6 +255,7 @@ impl SingletonLock {
 
         // 如果锁文件中已有当前 PID → 本进程已持有锁，视为重复启动
         if alive_pids.contains(&current_pid) {
+            let _ = std::fs::remove_file(&guard_path);
             return Err(GuardError::AlreadyRunning {
                 pid: current_pid,
                 data_dir: data_dir.to_path_buf(),
@@ -218,6 +265,7 @@ impl SingletonLock {
 
         // 检查是否已达最大窗口数
         if alive_pids.len() as u32 >= max_windows {
+            let _ = std::fs::remove_file(&guard_path);
             // max_windows == 1 → 多窗口功能未开启，返回 MultiWindowDisabled
             // max_windows > 1  → 已达上限，返回 AlreadyRunning
             return if max_windows <= 1 {
@@ -244,11 +292,13 @@ impl SingletonLock {
             .collect::<Vec<_>>()
             .join(",");
 
-        std::fs::write(&lock_path, &new_content).map_err(|e| GuardError::LockAcquireFailed {
-            path: lock_path.clone(),
-            reason: format!("写入 PID 列表失败: {}", e),
-        })?;
-
+        if let Err(e) = std::fs::write(&lock_path, &new_content) {
+            let _ = std::fs::remove_file(&guard_path);
+            return Err(GuardError::LockAcquireFailed {
+                path: lock_path.clone(),
+                reason: format!("写入锁文件中的 PID 列表失败: {}", e),
+            });
+        }
         if alive_pids.len() > 1 {
             eprintln!(
                 "[进程守护] 多窗口模式：当前 {} 个窗口 (PID: {})，上限 {}",
@@ -258,8 +308,11 @@ impl SingletonLock {
             );
         }
 
+        drop(guard_file);
+        let _ = std::fs::remove_file(&guard_path);
         Ok(Self {
             lock_path,
+            guard_path,
             acquired: true,
         })
     }
@@ -270,8 +323,13 @@ impl Drop for SingletonLock {
         if self.acquired {
             let current_pid_str = std::process::id().to_string();
 
-            // 读取现有锁文件，移除当前 PID
-            if let Ok(content) = std::fs::read_to_string(&self.lock_path) {
+            // 释放时重新获取事务守卫，避免并发启动/退出互相覆盖 PID 列表。
+            if let Ok(_guard_file) = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.guard_path)
+            {
+                let content = std::fs::read_to_string(&self.lock_path).unwrap_or_default();
                 let remaining: Vec<&str> = content
                     .split(',')
                     .map(|s| s.trim())
@@ -279,7 +337,7 @@ impl Drop for SingletonLock {
                     .collect();
 
                 if remaining.is_empty() {
-                    // 无剩余进程 → 删除锁文件
+                    // 已持有事务守卫，删除锁文件不会与新进程创建产生竞态。
                     if let Err(e) = std::fs::remove_file(&self.lock_path) {
                         eprintln!(
                             "[进程守护] 清理锁文件失败 ({}): {}",
@@ -292,6 +350,7 @@ impl Drop for SingletonLock {
                             self.lock_path.display()
                         );
                     }
+                    let _ = std::fs::remove_file(&self.guard_path);
                 } else {
                     // 还有其他进程 → 更新锁文件
                     let new_content = remaining.join(",");
@@ -308,10 +367,13 @@ impl Drop for SingletonLock {
                             remaining.len()
                         );
                     }
+                    let _ = std::fs::remove_file(&self.guard_path);
                 }
             } else {
-                // 无法读取锁文件 → 尝试直接删除
-                let _ = std::fs::remove_file(&self.lock_path);
+                eprintln!(
+                    "[进程守护] 无法获取退出清理守卫，保留锁文件: {}",
+                    self.lock_path.display()
+                );
             }
         }
     }
@@ -490,7 +552,10 @@ pub async fn find_available_port(
     max_attempts: u16,
 ) -> Result<(tokio::net::TcpListener, u16), GuardError> {
     for offset in 0..max_attempts {
-        let port = base_port + offset;
+        let port = match base_port.checked_add(offset) {
+            Some(port) => port,
+            None => break,
+        };
         let addr = format!("{}:{}", host, port);
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => {
@@ -798,6 +863,7 @@ mod tests {
         // 创建锁对象（手动设置，不通过 acquire）
         let lock = SingletonLock {
             lock_path: data_dir.join(".lrc.lock"),
+            guard_path: data_dir.join(".lrc.lock.guard"),
             acquired: true,
         };
 
@@ -812,6 +878,62 @@ mod tests {
 
         // 清理
         let _ = std::fs::remove_file(data_dir.join(".lrc.lock"));
+    }
+
+    /// 测试：并发获取同一数据目录时，事务守卫只允许一个调用成功。
+    #[test]
+    fn test_concurrent_acquire_serializes_guard() {
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
+        let data_dir = Arc::new(tmp.path().join("data"));
+        std::fs::create_dir_all(data_dir.as_ref()).unwrap();
+        let barrier = Arc::new(Barrier::new(4));
+        let results = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+
+        for _ in 0..4 {
+            let data_dir = Arc::clone(&data_dir);
+            let barrier = Arc::clone(&barrier);
+            let results = Arc::clone(&results);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                let result = SingletonLock::acquire(data_dir.as_ref(), 1);
+                results.lock().unwrap().push(result.is_ok());
+                result
+            }));
+        }
+
+        let locks: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(locks.len(), 1, "并发获取必须只有一个成功者");
+        assert_eq!(
+            results
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|success| **success)
+                .count(),
+            1
+        );
+    }
+
+    /// 测试：遗留的死亡守卫可被清理，不会永久阻塞启动。
+    #[test]
+    fn test_stale_guard_is_recovered() {
+        let tmp = tempfile::TempDir::new().expect("创建临时目录失败");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(data_dir.join(".lrc.lock.guard"), "99999").unwrap();
+
+        let lock = SingletonLock::acquire(&data_dir, 1).expect("死亡守卫应可恢复");
+        assert!(data_dir.join(".lrc.lock").exists());
+        drop(lock);
+        assert!(!data_dir.join(".lrc.lock.guard").exists());
     }
 
     /// 测试: is_pid_alive 对当前进程返回 true

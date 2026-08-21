@@ -54,7 +54,11 @@ fn main() {
             format!("{} {}", existing.trim(), cdp_args)
         };
         // 先记录日志（防止后续 move 后无法引用）
-        tracing::info!("[CDP 调试] WebView2 环境变量已设置 (端口: {}): {}", cdp_port, &combined);
+        tracing::info!(
+            "[CDP 调试] WebView2 环境变量已设置 (端口: {}): {}",
+            cdp_port,
+            &combined
+        );
         std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", combined);
     }
 
@@ -186,15 +190,22 @@ fn main() {
             tauri::async_runtime::spawn(async move {
                 tracing::info!("[v0.8.0] 启动时自动写入 AI 规则文件（不依赖 sidecar）");
                 let registry = AgentDetectorRegistry::new();
-                // v0.9.0 修复：只写入已安装工具的规则文件，避免为未安装的 AI 工具
-                // 创建规则文件（用户明明只有 2-3 个工具，却看到一整排"已写入"）。
-                // 复用 detect_installed() 与配置向导一致的检测逻辑。
+                // 只写入已安装工具的规则，并以版本和工具快照判断是否需要重复写入。
                 let tool_ids: Vec<String> = registry
                     .detect_installed()
                     .into_iter()
                     .map(|a| a.id)
                     .collect();
-                tracing::info!("[v0.9.0] 待写入规则的已安装工具数: {}", tool_ids.len());
+                let needs_update = {
+                    let state = rules_handle.state::<AppStore>();
+                    let wizard = state.wizard.lock().await;
+                    wizard.rules_need_update(&tool_ids)
+                };
+                if !needs_update {
+                    tracing::info!("[AI规则] 规则版本和工具列表未变化，跳过启动重复写入");
+                    return;
+                }
+                tracing::info!("[AI规则] 检测到规则版本或工具列表变化，写入 {} 个工具", tool_ids.len());
 
                 match registry.write_rules_for_agents(&tool_ids) {
                     Ok(written) => {
@@ -203,6 +214,13 @@ fn main() {
                             written.len(),
                             written
                         );
+                        {
+                            let state = rules_handle.state::<AppStore>();
+                            let mut wizard = state.wizard.lock().await;
+                            if let Err(e) = wizard.save_rules_state(written.clone()) {
+                                tracing::warn!("[AI规则] 规则状态持久化失败: {}", e);
+                            }
+                        }
                         // 通知前端规则写入成功
                         let _ = rules_handle.emit(
                             "rules-write-completed",

@@ -664,30 +664,23 @@ async fn handle_recall_enhanced(
         })
         .unwrap_or_default();
 
-    let mut store = state.memory_store.lock().await;
-
-    // LLM 记忆翻译：将问题翻译为答案可能包含的关键词，桥接语义鸿沟
-    // v0.5.4 P2-11 修复：添加翻译状态日志，便于调试 LLM 响应问题
-    let enriched_query = if state.llm_api.read().await.is_configured() {
-        let keywords = crate::engine::llm_translator::translate_memory_query(
-            &*state.llm_api.read().await,
-            query,
-        )
-        .await;
+    // 先完成可能发生网络等待的 LLM 翻译，再获取 memory_store 锁。
+    // 这样网络超时不会阻塞其他记忆读写请求。
+    let llm_config = state.llm_api.read().await.clone();
+    let enriched_query = if llm_config.is_configured() {
+        let keywords =
+            crate::engine::llm_translator::translate_memory_query(&llm_config, query).await;
         let translated: String = keywords.join(" ");
         if translated.is_empty() || translated.trim() == query {
-            eprintln!(
-                "[LRC·LLM] 增强检索翻译未产生有效结果，使用原始查询: {}",
-                query
-            );
             query.to_string()
         } else {
-            eprintln!("[LRC·LLM] 增强检索翻译成功: {} → {}", query, translated);
             format!("{} {}", translated, query)
         }
     } else {
         query.to_string()
     };
+
+    let mut store = state.memory_store.lock().await;
 
     // 快速通路：关键词匹配，使用富化查询
     let fast_filter = RecallFilter {
@@ -837,28 +830,23 @@ async fn handle_recall(
         privacy_context: None,
     };
 
-    let mut store = state.memory_store.lock().await;
-
-    // LLM 记忆翻译：将自然语言问题翻译为答案可能包含的关键词
-    // 桥接"问题词与答案词不重叠"的语义鸿沟
-    // v0.5.4 P2-11 修复：添加翻译状态日志，便于调试 LLM 响应问题
-    let enriched_query = if state.llm_api.read().await.is_configured() {
-        let keywords = crate::engine::llm_translator::translate_memory_query(
-            &*state.llm_api.read().await,
-            query,
-        )
-        .await;
+    // 先完成可能发生网络等待的 LLM 翻译，再获取 memory_store 锁。
+    // 这样网络超时不会阻塞其他记忆读写请求。
+    let llm_config = state.llm_api.read().await.clone();
+    let enriched_query = if llm_config.is_configured() {
+        let keywords =
+            crate::engine::llm_translator::translate_memory_query(&llm_config, query).await;
         let translated: String = keywords.join(" ");
         if translated.is_empty() || translated.trim() == query {
-            eprintln!("[LRC·LLM] 记忆翻译未产生有效结果，使用原始查询: {}", query);
             query.to_string()
         } else {
-            eprintln!("[LRC·LLM] 记忆翻译成功: {} → {}", query, translated);
             format!("{} {}", translated, query)
         }
     } else {
         query.to_string()
     };
+
+    let mut store = state.memory_store.lock().await;
 
     // 根据 lrc_mode 选择检索方法（使用富化后的查询）
     let result = if lrc_mode == "deep" {
@@ -1468,9 +1456,9 @@ async fn handle_tools_call(
                 .clamp(1, 100) as usize;
 
             // LLM 查询翻译：如果配置了 LLM API，先将自然语言翻译为关键词
-            let keywords = if state.llm_api.read().await.is_configured() {
-                crate::engine::llm_translator::translate_query(&*state.llm_api.read().await, query)
-                    .await
+            let llm_config = state.llm_api.read().await.clone();
+            let keywords = if llm_config.is_configured() {
+                crate::engine::llm_translator::translate_query(&llm_config, query).await
             } else {
                 vec![query.to_string()]
             };
@@ -1548,7 +1536,19 @@ async fn handle_tools_call(
 
         // === 系统健康监控 ===
         "system_health" => {
-            let store = state.memory_store.lock().await;
+            let store = match state.memory_store.try_lock() {
+                Ok(store) => store,
+                Err(_) => {
+                    return make_response(
+                        id,
+                        serde_json::json!({
+                            "status": "degraded",
+                            "lock_busy": true,
+                            "message": "记忆库正在后台更新，请稍后重试",
+                        }),
+                    );
+                }
+            };
             match store.dao_metrics_snapshot() {
                 Ok(snapshot) => {
                     let mut text = String::from("═══════════════════════════════════\n");
@@ -1698,6 +1698,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
     //   但这是可接受的——/health 的核心职责是存活探测，不是精确统计。
 
     // 获取索引统计信息（try_lock，获取不到返回 None）
+    let mut lock_busy = false;
     let (file_count, total_chunks) = if indexing_complete {
         match state.manager.try_lock() {
             Ok(manager) => {
@@ -1705,7 +1706,8 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
                 (Some(stats.file_count), Some(stats.total_chunks))
             }
             Err(_) => {
-                // 锁被长任务持有，返回 None（不影响存活判定）
+                // manager 锁被长任务持有，返回降级状态而不是伪造正常统计。
+                lock_busy = true;
                 (None, None)
             }
         }
@@ -1715,10 +1717,12 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
     // 获取记忆库统计（try_read，获取不到返回 0）
     // v0.8.21 P0-06：同时检测锁是否被持有，设置 lock_busy 标志
-    let (memory_total, lock_busy) = match state.memory_store.try_lock() {
+    let (memory_total, memory_lock_busy) = match state.memory_store.try_lock() {
         Ok(store) => (store.stats().map(|s| s.total_memories).unwrap_or(0), false),
         Err(_) => (0, true), // 锁被长任务持有，返回 0 + lock_busy=true
     };
+
+    lock_busy |= memory_lock_busy;
 
     // 判断服务阶段
     let status = if indexing_complete {
@@ -2462,8 +2466,8 @@ async fn embedder_status_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     // v0.9.0 修复：使用统一模型目录 ~/.loong-recall/models/（而非相对 cwd）
     let models_dir = crate::engine::model_resolver::default_models_dir();
-    // 默认模型 ID（与 luoshu_encoder_ml.rs 中 detect_default_model 中文分支一致）
-    let default_model_id = "BAAI/bge-small-zh".to_string();
+    // 与实际编码器共用当前生效模型配置，避免设置页与状态接口各自使用固定模型。
+    let default_model_id = crate::engine::model_resolver::selected_model_id();
 
     // 检查是否已下载：本地目录名以 "--" 替换 "/"
     let local_dir = default_model_id.replace('/', "--");

@@ -13,6 +13,7 @@ use crate::crypto; // L1 数据加密模块
 /// 向导配置版本号
 /// 当配置结构发生变化时递增此值，旧版本配置将被自动迁移或重置。
 const CURRENT_CONFIG_VERSION: u32 = 1;
+const CURRENT_RULES_VERSION: u32 = 1;
 
 /// 向导配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,10 +36,19 @@ pub struct WizardConfig {
     pub llm_base_url: Option<String>,
     /// 已配置的 Agent 列表
     pub configured_agents: Vec<String>,
+    /// 已写入规则的版本
+    #[serde(default)]
+    pub rules_version: u32,
+    /// 已写入规则的工具快照
+    #[serde(default)]
+    pub rules_agents: Vec<String>,
     /// API Key 加密存储（Base64 编码的 AES-256-GCM 密文）
     /// 空字符串表示未配置 API Key（Ollama 等不需要 Key 的场景）
     #[serde(default)]
     pub encrypted_api_key: String,
+    /// 运行时状态：已配置的 API Key 无法解密时为 true，不写入磁盘。
+    #[serde(skip)]
+    pub api_key_invalid: bool,
     /// v0.8.31 S-03：AI 工具手动修正（用户点击齿轮时设置）
     /// key = agent_id，value = true 表示强制设为已安装，false 表示强制设为未安装
     /// 优先级：最高（即使自动检测结果相反也以这里为准）
@@ -65,6 +75,7 @@ impl WizardConfig {
     /// API Key 使用 AES-256-GCM 加密后存储（L1-02），
     /// 原始 Key 不会以明文形式写入磁盘。
     pub fn parse_llm_config(&mut self, llm_api: &str) -> Result<(), String> {
+        self.api_key_invalid = false;
         // M-5 修复：优先使用 || 分隔符（支持 API Key 中包含冒号）
         // 向后兼容：若输入不含 ||，回退到旧分隔符 : 并记录警告
         let parts: Vec<&str> = if llm_api.contains("||") {
@@ -81,7 +92,7 @@ impl WizardConfig {
         match parts.first() {
             Some(&"openai") => {
                 self.llm_type = "openai".into();
-                self.llm_configured = true;
+                self.llm_configured = false;
                 // parts: [openai, api_key, model, base_url]
                 if let Some(api_key) = parts.get(1) {
                     if !api_key.is_empty() {
@@ -107,6 +118,7 @@ impl WizardConfig {
                         self.llm_base_url = Some(base_url.to_string());
                     }
                 }
+                self.llm_configured = !self.encrypted_api_key.is_empty();
             }
             Some(&"ollama") => {
                 self.llm_type = "ollama".into();
@@ -145,6 +157,26 @@ impl WizardConfig {
         crypto::decrypt_api_key(&self.encrypted_api_key).ok()
     }
 
+    /// 返回 API Key 是否存在且可解密。
+    pub fn api_key_status(&self) -> &'static str {
+        if self.encrypted_api_key.is_empty() {
+            "not_configured"
+        } else if self.api_key_invalid {
+            "invalid"
+        } else {
+            "configured"
+        }
+    }
+
+    /// 运行时校验加密 API Key，并记录不可用状态。
+    pub fn refresh_api_key_status(&mut self) {
+        self.api_key_invalid = !self.encrypted_api_key.is_empty()
+            && crypto::decrypt_api_key(&self.encrypted_api_key).is_err();
+        if self.api_key_invalid {
+            self.llm_configured = false;
+        }
+    }
+
     /// 检查 API Key 是否已配置（是否有加密存储）
     pub fn has_api_key(&self) -> bool {
         !self.encrypted_api_key.is_empty()
@@ -158,7 +190,7 @@ impl WizardConfig {
     ///
     /// 返回 None 表示 LLM 未配置。
     pub fn to_llm_api_string(&self) -> Option<String> {
-        if !self.llm_configured {
+        if !self.llm_configured || self.api_key_invalid {
             return None;
         }
 
@@ -199,7 +231,10 @@ impl Default for WizardConfig {
             llm_model: None,
             llm_base_url: None,
             configured_agents: Vec::new(),
+            rules_version: 0,
+            rules_agents: Vec::new(),
             encrypted_api_key: String::new(),
+            api_key_invalid: false,
             manual_agent_overrides: std::collections::HashMap::new(),
         }
     }
@@ -244,36 +279,37 @@ impl WizardState {
         let mut corrupted = false;
         // v0.8.21 P0-01：记录 wizard.json 是否存在，供 main.rs 自动启动兜底判断
         let file_existed = config_path.exists();
-        let mut config = if config_path.exists() {
-            match std::fs::read_to_string(&config_path) {
-                Ok(json) => {
-                    match serde_json::from_str::<WizardConfig>(&json) {
-                        Ok(cfg) => cfg,
-                        Err(e) => {
-                            // v0.5.4 修复：JSON 解析失败时记录详细日志
-                            tracing::error!(
-                                "配置文件 {} 解析失败，将使用默认配置。错误：{e}。原始内容（前200字符）：{}",
-                                config_path.display(),
-                                &json[..json.len().min(200)]
-                            );
-                            corrupted = true;
-                            WizardConfig::default()
-                        }
-                    }
-                }
+        let mut config = match std::fs::read_to_string(&config_path) {
+            Ok(json) => match serde_json::from_str::<WizardConfig>(&json) {
+                Ok(cfg) => cfg,
                 Err(e) => {
-                    // v0.5.4 修复：文件读取失败时记录日志
+                    // v0.5.4 修复：JSON 解析失败时记录详细日志
+                    let preview: String = json.chars().take(200).collect();
                     tracing::error!(
-                        "无法读取配置文件 {}，将使用默认配置。错误：{e}",
-                        config_path.display()
+                        "配置文件 {} 解析失败，将使用默认配置。错误：{e}。原始内容（前200字符）：{}",
+                        config_path.display(),
+                        preview
                     );
                     corrupted = true;
                     WizardConfig::default()
                 }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => WizardConfig::default(),
+            Err(e) => {
+                // v0.5.4 修复：文件读取失败时记录日志
+                tracing::error!(
+                    "无法读取配置文件 {}，将使用默认配置。错误：{e}",
+                    config_path.display()
+                );
+                corrupted = true;
+                WizardConfig::default()
             }
-        } else {
-            WizardConfig::default()
         };
+
+        config.refresh_api_key_status();
+        if config.api_key_invalid {
+            tracing::error!("向导配置中的 API Key 无法解密，已标记为无效");
+        }
 
         // ── 版本迁移：旧版本配置 → 重置向导 ──
         if config.config_version < CURRENT_CONFIG_VERSION {
@@ -291,7 +327,9 @@ impl WizardState {
                 if let Some(parent) = config_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let _ = std::fs::write(&config_path, json);
+                let temp_path = config_path.with_extension("json.tmp");
+                let _ = std::fs::write(&temp_path, json)
+                    .and_then(|_| std::fs::rename(&temp_path, &config_path));
             }
         }
 
@@ -304,7 +342,9 @@ impl WizardState {
                 if let Some(parent) = config_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let _ = std::fs::write(&config_path, json);
+                let temp_path = config_path.with_extension("json.tmp");
+                let _ = std::fs::write(&temp_path, json)
+                    .and_then(|_| std::fs::rename(&temp_path, &config_path));
             }
         }
 
@@ -342,6 +382,24 @@ impl WizardState {
     /// 保存已配置的 Agent 列表（P2-05 修复：确保 configured_agents 持久化）
     pub fn save_configured_agents(&mut self, agents: Vec<String>) -> Result<(), String> {
         self.config.configured_agents = agents;
+        self.save()
+    }
+
+    /// 返回当前规则状态是否需要重新写入。
+    pub fn rules_need_update(&self, agents: &[String]) -> bool {
+        let mut current = agents.to_vec();
+        current.sort();
+        let mut saved = self.config.rules_agents.clone();
+        saved.sort();
+        self.config.rules_version != CURRENT_RULES_VERSION || saved != current
+    }
+
+    /// 保存规则写入状态。
+    pub fn save_rules_state(&mut self, agents: Vec<String>) -> Result<(), String> {
+        let mut sorted = agents;
+        sorted.sort();
+        self.config.rules_version = CURRENT_RULES_VERSION;
+        self.config.rules_agents = sorted;
         self.save()
     }
 
@@ -471,7 +529,9 @@ impl WizardState {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let json = serde_json::to_string_pretty(&self.config).map_err(|e| e.to_string())?;
-        std::fs::write(&self.config_path, json).map_err(|e| e.to_string())?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        std::fs::write(&temp_path, json).map_err(|e| e.to_string())?;
+        std::fs::rename(&temp_path, &self.config_path).map_err(|e| e.to_string())?;
         tracing::debug!(
             "配置已保存 (encrypted_api_key={}B)",
             self.config.encrypted_api_key.len()
@@ -558,6 +618,21 @@ mod tests {
         assert_eq!(config2.llm_type, "openai");
         assert_eq!(config2.llm_model, Some("gpt-4o".into()));
         assert_eq!(config2.get_api_key().expect("解密失败"), "sk-test123");
+    }
+
+    #[test]
+    fn test_invalid_api_key_is_not_reported_as_configured() {
+        let mut config = WizardConfig::default();
+        config.llm_type = "openai".into();
+        config.llm_configured = true;
+        config.encrypted_api_key = "不是有效密文".into();
+
+        config.refresh_api_key_status();
+
+        assert!(config.api_key_invalid);
+        assert!(!config.llm_configured);
+        assert_eq!(config.api_key_status(), "invalid");
+        assert!(config.to_llm_api_string().is_none());
     }
 
     #[test]

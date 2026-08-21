@@ -11,6 +11,7 @@ use crate::chunker::{chunk_by_language, is_supported_file, CodeChunk};
 use crate::engine::encoder::{CodeEncoder, EmbeddingVector, FastEncoder};
 use crate::engine::retriever::{CodeRetriever, LocalRetriever, RetrievalResult, ScoredChunk};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -69,9 +70,15 @@ pub struct ChunkStats {
     pub avg_lines: f32,
 }
 
-/// 嵌入向量缓存（保存到磁盘，重启时秒加载）
+/// 嵌入向量缓存（保存到磁盘，重启时快速加载）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EmbeddingCache {
+    /// 缓存格式版本，防止旧结构被静默加载。
+    cache_version: u32,
+    /// 代码片段指纹，源码变化后必须重建缓存。
+    chunks_fingerprint: String,
+    /// 向量维度，模型或编码器变化后必须重建缓存。
+    vector_dim: usize,
     /// 代码片段（chunker 输出是确定性的，同一源码产生相同 chunk）
     chunks: Vec<CodeChunk>,
     /// 对应的嵌入向量
@@ -79,6 +86,27 @@ struct EmbeddingCache {
 }
 
 impl EmbeddingCache {
+    fn fingerprint(chunks: &[CodeChunk]) -> String {
+        let bytes = serde_json::to_vec(chunks).unwrap_or_default();
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn is_valid(&self, expected_dim: usize) -> bool {
+        if self.cache_version != 1
+            || self.chunks.is_empty()
+            || self.vectors.len() != self.chunks.len()
+            || self.chunks_fingerprint != Self::fingerprint(&self.chunks)
+            || self.vector_dim == 0
+            || self
+                .vectors
+                .iter()
+                .any(|values| values.len() != self.vector_dim)
+        {
+            return false;
+        }
+        expected_dim > 0 && self.vector_dim == expected_dim
+    }
+
     /// 缓存文件路径：<data_dir>/../cache/embedding_cache.json
     fn cache_path(data_dir: &str) -> PathBuf {
         Path::new(data_dir)
@@ -804,14 +832,21 @@ impl<E: CodeEncoder> CoreManager<E> {
     /// 缓存文件位于 <data_dir>/../cache/embedding_cache.json
     pub fn save_embedding_cache(&self, data_dir: &str) -> Result<(), String> {
         let chunks = self.retriever.all_chunks().to_vec();
-        let vectors = self
+        let vectors: Vec<Vec<f32>> = self
             .retriever
             .get_vectors()
             .iter()
             .map(|v| v.values.clone())
             .collect();
 
-        let cache = EmbeddingCache { chunks, vectors };
+        let vector_dim = vectors.first().map(Vec::len).unwrap_or(0);
+        let cache = EmbeddingCache {
+            cache_version: 1,
+            chunks_fingerprint: EmbeddingCache::fingerprint(&chunks),
+            vector_dim,
+            chunks,
+            vectors,
+        };
         cache.save(data_dir)
     }
 
@@ -820,16 +855,10 @@ impl<E: CodeEncoder> CoreManager<E> {
     /// 返回加载的片段数量，或 None 表示缓存不存在/无效。
     pub fn load_embedding_cache(&mut self, data_dir: &str) -> Option<usize> {
         let cache = EmbeddingCache::load(data_dir)?;
-        if cache.chunks.is_empty() || cache.vectors.len() != cache.chunks.len() {
+        let expected_dim = self.retriever.encoder_dimension();
+        if !cache.is_valid(expected_dim) {
             return None;
         }
-
-        let dim = self
-            .retriever
-            .get_vectors()
-            .first()
-            .map(|v| v.dim)
-            .unwrap_or(0);
         let vectors: Vec<EmbeddingVector> = cache
             .vectors
             .into_iter()
@@ -841,8 +870,8 @@ impl<E: CodeEncoder> CoreManager<E> {
 
         // 校验维度一致性
         if let Some(first) = vectors.first() {
-            if dim > 0 && first.dim != dim {
-                return None; // 维度不匹配，放弃缓存
+            if expected_dim == 0 || first.dim != expected_dim {
+                return None; // 编码器维度不匹配，放弃缓存并重建
             }
         }
 
@@ -1013,6 +1042,66 @@ class AppConfig:
     fn test_nonexistent_dir() {
         let mut mgr = CoreManager::new();
         assert!(mgr.index_project("/nonexistent/12345").is_err());
+    }
+
+    #[test]
+    fn test_embedding_cache_rejects_changed_chunks() {
+        let chunks = vec![CodeChunk {
+            id: "test.rs:1-1".into(),
+            file_path: "test.rs".into(),
+            language: "rust".into(),
+            chunk_type: "fn".into(),
+            name: "one".into(),
+            content: "fn one() {}".into(),
+            start_line: 1,
+            end_line: 1,
+            signature: "fn one() {}".into(),
+            doc_comment: None,
+        }];
+        let mut changed = chunks.clone();
+        changed[0].name = "two".into();
+        let cache = EmbeddingCache {
+            cache_version: 1,
+            chunks_fingerprint: EmbeddingCache::fingerprint(&chunks),
+            vector_dim: 2,
+            chunks: changed,
+            vectors: vec![vec![0.0, 1.0]],
+        };
+        assert!(!cache.is_valid(2));
+    }
+
+    #[test]
+    fn test_embedding_cache_rejects_version_and_dimension_mismatch() {
+        let chunks = vec![CodeChunk {
+            id: "test.rs:1-1".into(),
+            file_path: "test.rs".into(),
+            language: "rust".into(),
+            chunk_type: "fn".into(),
+            name: "one".into(),
+            content: "fn one() {}".into(),
+            start_line: 1,
+            end_line: 1,
+            signature: "fn one() {}".into(),
+            doc_comment: None,
+        }];
+        let fingerprint = EmbeddingCache::fingerprint(&chunks);
+        let cache = EmbeddingCache {
+            cache_version: 2,
+            chunks_fingerprint: fingerprint.clone(),
+            vector_dim: 2,
+            chunks: chunks.clone(),
+            vectors: vec![vec![0.0, 1.0]],
+        };
+        assert!(!cache.is_valid(2));
+
+        let cache = EmbeddingCache {
+            cache_version: 1,
+            chunks_fingerprint: fingerprint,
+            vector_dim: 2,
+            chunks,
+            vectors: vec![vec![0.0, 1.0]],
+        };
+        assert!(!cache.is_valid(3));
     }
 
     #[test]

@@ -47,6 +47,10 @@ pub struct LocalRetriever<E: CodeEncoder> {
 }
 
 impl<E: CodeEncoder> LocalRetriever<E> {
+    pub fn encoder_dimension(&self) -> usize {
+        self.encoder.dimension()
+    }
+
     pub fn new(encoder: Arc<E>, threshold: f32) -> Self {
         Self {
             encoder,

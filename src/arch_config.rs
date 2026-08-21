@@ -190,7 +190,9 @@ impl ArchConfig {
         let mut config = self.clone();
         config.updated_at = chrono::Utc::now().to_rfc3339();
         let json = serde_json::to_string_pretty(&config).map_err(std::io::Error::other)?;
-        std::fs::write(&path, json)
+        let temp_path = format!("{}.tmp", path);
+        std::fs::write(&temp_path, json)?;
+        std::fs::rename(temp_path, path)
     }
 
     /// 更新衰减配置并保存

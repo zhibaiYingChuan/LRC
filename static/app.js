@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.9.2';
+const APP_VERSION = '0.9.3';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -69,6 +69,28 @@ function _readSidecarPortFromMeta() {
 const META_SIDECAR_PORT = _readSidecarPortFromMeta();
 // v0.9.0 开发模式隔离：开发版默认端口 3111（meta 标签注入），稳定版 3099（release 构建时替换 meta）
 const STABLE_DEFAULT_PORT = 3099;
+
+async function syncSidecarApiBase() {
+  if (!isTauriEnv) return API_BASE;
+  try {
+    const invokeFn = (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)
+      || (window.__TAURI__ && window.__TAURI__.invoke);
+    const instances = invokeFn ? await invokeFn('get_sidecar_status') : [];
+    const runningInstance = Array.isArray(instances)
+      ? instances.find(instance => instance && instance.running && instance.port)
+      : null;
+    if (runningInstance) {
+      API_BASE = `http://127.0.0.1:${runningInstance.port}`;
+      window.API_BASE = API_BASE;
+      const apiDisplay = document.getElementById('api-base-display');
+      if (apiDisplay) apiDisplay.textContent = API_BASE;
+    }
+  } catch (error) {
+    console.warn('[LRC] 同步 sidecar 端口失败:', error.message);
+  }
+  return API_BASE;
+}
+
 const DEFAULT_API_BASE = isTauriEnv
   ? (META_SIDECAR_PORT ? `http://127.0.0.1:${META_SIDECAR_PORT}` : `http://127.0.0.1:${STABLE_DEFAULT_PORT}`)
   : (window.location.origin || `http://localhost:${STABLE_DEFAULT_PORT}`);
@@ -727,6 +749,7 @@ const SidecarHealthMonitor = {
       // v0.8.11 P0-2 修复：改为访问 /health（返回 status 字段），而非 /v1/health/system（返回详细报告，无 status 字段）
       // /health 返回 HealthResponse {status: "running"|"indexing"|"starting", ...}
       // /v1/health/system 返回 health_report()（详细报告，不含 status 字段）
+      await syncSidecarApiBase();
       const res = await fetchWithTimeout(`${API_BASE}/health`, {}, 8000);
       if (res.ok) {
         // v0.8.11 P0-2：解析 status 字段，区分 starting/indexing/running
@@ -1188,6 +1211,7 @@ async function applyOnboardingState() {
 }
 
 async function loadDashboard() {
+  await syncSidecarApiBase();
   const loading = $('dashboard-loading');
   const error = $('dashboard-error');
   if (!loading) return;
@@ -6013,7 +6037,9 @@ async function configureAgents() {
   );
   if (!confirmed) return;
   try {
-    const result = await postMessageToParent('lrc-configure-agents', {}, 60000);
+    await syncSidecarApiBase();
+    const sidecarPort = Number(new URL(API_BASE).port || 3099);
+    const result = await postMessageToParent('lrc-configure-agents', { port: sidecarPort }, 60000);
     if (result && result.success !== false) {
       const configured = result.configured_count || result.count || 0;
       // v0.8.2：用 showInfoModal 替代多行 alert
@@ -8126,6 +8152,7 @@ function reopenWelcome() {
  * 加载系统状态浮窗数据
  */
 async function loadSysStatusFloat() {
+  await syncSidecarApiBase();
   try {
     const res = await fetchWithTimeout(API_BASE + '/v1/health/system');
     if (!res.ok) {
@@ -8273,6 +8300,7 @@ function setDegradedStatusFloat(degradeText) {
  * 本函数从 /v1/health/system 读取数据并填充这些卡片。
  */
 async function loadSystemStatusPage() {
+  await syncSidecarApiBase();
   try {
     const res = await fetchWithTimeout(API_BASE + '/v1/health/system');
     if (!res.ok) return;

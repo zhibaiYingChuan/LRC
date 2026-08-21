@@ -38,6 +38,7 @@ Thumbs.db
 
 # 调试会话记录（TRAE-debugger 产物，不交付用户）
 debug-*.md
+.dbg/
 
 # 内部开发文档（不交付用户）
 docs/evaluation-report-2026-05-31.md
@@ -345,3 +346,33 @@ tests/frontend/playwright.config.js
 /preflight_check.ps1
 /package.json
 /package-lock.json
+
+# 本地回归测试输出与调试残留（不交付用户）
+test-output*.log
+test-results/
+test-results-*/
+tests/frontend/*-report.*
+tests/frontend/screenshots/
+tests/frontend/videos/
+*-test-output.*
+*-test-results.*
+*-regression-report.*
+
+# 本地调试与临时脚本（不交付用户）
+debug_*.ps1
+debug_*.py
+debug_*.js
+scripts/debug_*.ps1
+scripts/debug_*.py
+scripts/debug_*.js
+scripts/local_*.ps1
+scripts/local_*.py
+scripts/local_*.js
+
+# 本地开发过程文档（用户文档除外）
+debug-*.md
+docs/*测试*.md
+docs/*调试*.md
+docs/*开发*.md
+docs/*回归*.md
+docs/*验证*.md

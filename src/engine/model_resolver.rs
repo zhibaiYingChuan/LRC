@@ -9,6 +9,52 @@
 // 提供统一的模型文件检测接口，供启动检查和测试跳过判断使用。
 // 不重复实现下载逻辑（各编码器内部已有），只负责文件存在性检查。
 
+/// 获取当前生效的嵌入模型 ID。
+///
+/// 优先级：环境变量 > ~/.lrc/config.toml > 系统语言默认模型。
+pub fn selected_model_id() -> String {
+    if let Ok(model_id) = std::env::var("LRC_LUOSHU_MODEL_ID") {
+        if !model_id.trim().is_empty() {
+            return model_id.trim().to_string();
+        }
+    }
+
+    if let Some(home) = home_dir() {
+        let config_path = home.join(".lrc").join("config.toml");
+        if let Ok(content) = std::fs::read_to_string(config_path) {
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(value) = line.strip_prefix("model_id") {
+                    let first = value.chars().next();
+                    if !matches!(first, Some(c) if c.is_whitespace() || c == '=') {
+                        continue;
+                    }
+                    if let Some(value) = value.split_once('=') {
+                        let model_id = value.1.trim().trim_matches('"');
+                        if !model_id.is_empty() {
+                            return model_id.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if std::env::var("LANG")
+        .unwrap_or_default()
+        .to_lowercase()
+        .contains("zh")
+        || std::env::var("LC_ALL")
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("zh")
+    {
+        "BAAI/bge-small-zh".to_string()
+    } else {
+        "sentence-transformers/all-MiniLM-L6-v2".to_string()
+    }
+}
+
 /// 检查指定模型是否在本地就绪（models/ 目录或 HuggingFace 缓存）
 ///
 /// 检测顺序：
@@ -50,16 +96,17 @@ pub fn check_model_ready(model_id: &str) -> bool {
     // 3. 检查 HuggingFace 缓存（~/.cache/huggingface/hub/）
     if let Some(cache_dir) = dirs_next::cache_dir() {
         let folder_name = format!("models--{}", local_model_name);
-        let hf_cache = cache_dir
+        let snapshot_dir = cache_dir
             .join("huggingface")
             .join("hub")
             .join(&folder_name)
-            .join("blobs");
-        if hf_cache.exists() {
-            // HF 缓存用 blob 哈希命名，只需检查目录非空
-            if let Ok(entries) = std::fs::read_dir(&hf_cache) {
-                if entries.count() > 0 {
-                    return true;
+            .join("snapshots");
+        if snapshot_dir.exists() {
+            if let Ok(snapshots) = std::fs::read_dir(snapshot_dir) {
+                for snapshot in snapshots.flatten() {
+                    if model_files_exist(&snapshot.path()) {
+                        return true;
+                    }
                 }
             }
         }

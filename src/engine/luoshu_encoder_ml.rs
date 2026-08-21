@@ -46,6 +46,7 @@ use std::sync::{Arc, Mutex};
 /// 道枢映射: 坤卦·地 (☷) — 承载万物，语言检测是模型选择的基础
 /// 检测系统语言环境
 ///
+#[allow(dead_code)]
 /// 返回 BCP-47 风格的语言代码（如 "zh_CN"、"en_US"）。
 /// Windows 用户若未设置环境变量，默认返回 "zh_CN"。
 fn detect_system_lang() -> String {
@@ -77,6 +78,7 @@ fn detect_system_lang() -> String {
 ///
 /// - 中文（zh_*）→ `BAAI/bge-small-zh`（中文 SOTA）
 /// - 其他 → `sentence-transformers/all-MiniLM-L6-v2`（多语言轻量）
+#[allow(dead_code)]
 fn detect_default_model_by_lang(lang: &str) -> &'static str {
     if lang.to_lowercase().starts_with("zh") {
         "BAAI/bge-small-zh"
@@ -126,15 +128,7 @@ impl LuoShuMlEncoder {
 
         // v0.6.0 默认模型选择：环境变量 > 语言检测默认值
         // 优先级：LRC_LUOSHU_MODEL_ID（向后兼容）> 语言检测（中文→BGE，其他→MiniLM）
-        let model_id = std::env::var("LRC_LUOSHU_MODEL_ID").unwrap_or_else(|_| {
-            let lang = detect_system_lang();
-            let default_model = detect_default_model_by_lang(&lang);
-            eprintln!(
-                "[LRC·洛书ML] 系统语言: {} → 默认模型: {}",
-                lang, default_model
-            );
-            default_model.to_string()
-        });
+        let model_id = crate::engine::model_resolver::selected_model_id();
 
         let local_model_name = model_id.replace('/', "--");
 

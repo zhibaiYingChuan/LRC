@@ -17,6 +17,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, bytes).map_err(|e| format!("写入临时配置文件失败: {}", e))?;
+    fs::rename(&temp_path, path).map_err(|e| format!("原子替换配置文件失败: {}", e))
+}
+
 /// LRC 默认 HTTP 端口
 /// 所有模块（server、sidecar、前端）统一的端口默认值
 pub const DEFAULT_PORT: u16 = 3099;
@@ -26,6 +32,9 @@ pub const DEFAULT_PORT: u16 = 3099;
 /// 保存用户所有可配置参数，支持JSON序列化/反序列化。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LrcConfig {
+    /// 配置文件存在但密钥无法解密时为 true，阻止 UI 误报为已配置。
+    #[serde(skip)]
+    pub llm_config_invalid: bool,
     /// 默认端口（HTTP服务）
     pub default_port: u16,
     /// 默认绑定主机
@@ -54,6 +63,7 @@ pub struct LrcConfig {
 impl Default for LrcConfig {
     fn default() -> Self {
         Self {
+            llm_config_invalid: false,
             default_port: DEFAULT_PORT,
             default_host: "127.0.0.1".to_string(),
             llm_api: None,
@@ -121,7 +131,10 @@ impl LrcConfig {
                         eprintln!("[配置] API Key 已从加密存储解密恢复");
                     }
                     Err(e) => {
-                        eprintln!("[配置] 解密 API Key 失败: {}", e);
+                        self.llm_config_invalid = true;
+                        self.llm_api = None;
+                        self.parsed_llm_api = None;
+                        eprintln!("[配置] 解密 API Key 失败，已标记为不可用: {}", e);
                     }
                 }
             }
@@ -151,7 +164,7 @@ impl LrcConfig {
         let json = serde_json::to_string_pretty(&save_config)
             .map_err(|e| format!("序列化配置失败: {}", e))?;
 
-        fs::write(&path, json).map_err(|e| format!("写入配置文件失败: {}", e))?;
+        atomic_write(&path, json.as_bytes())?;
 
         Ok(())
     }
@@ -215,6 +228,10 @@ impl LrcConfig {
     ///
     /// 调用此方法后，结果存入 `parsed_llm_api` 字段。
     pub fn parse_llm_api(&mut self) -> Result<(), String> {
+        if self.llm_config_invalid {
+            self.parsed_llm_api = None;
+            return Err("LLM API 密钥无法解密，请重新配置".to_string());
+        }
         match &self.llm_api {
             Some(raw) => {
                 if raw.trim().is_empty() {

@@ -34,11 +34,11 @@
 
 > 完整报告见 [基准测试汇总](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md)。
 >
-> **数据版本说明**：上述数据基于 v0.5.6 基准测试（2026-06-23），当前 v0.9.2 版本的检索引擎已有演进，最新数据以重新测试为准。
+> **数据版本说明**：上述数据基于 v0.5.6 基准测试（2026-06-23），当前 v0.9.3 版本的检索引擎已有演进，最新数据以重新测试为准。
 
 ---
 
-## v0.9.2 新特性
+## v0.9.3 新特性
 
 | 领域 | 变更 | 价值 |
 |------|------|------|
@@ -49,7 +49,7 @@
 
 ```text
 自动结晶：稳定版 ML 模式原先 3606/3703 条记忆塌缩到同一八卦类别（坤·地），
-洛书合成全部被信息增量守卫拦截；v0.9.2 修复后编码分布分散，自动结晶恢复工作。
+洛书合成全部被信息增量守卫拦截；v0.9.3 修复后编码分布分散，自动结晶恢复工作。
 ```
 
 ## 快速开始
@@ -59,14 +59,14 @@
 1. 前往 [Releases](https://github.com/zhibaiYingChuan/LRC/releases) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
    - Windows：`lrc-desktop-v0.9.2-windows-x86_64-setup.exe`
    - macOS：`lrc-desktop-v0.9.2-macos-arm64.dmg`
-   - Linux：`lrc-desktop-v0.9.2-linux-amd64.deb` 或 `lrc-desktop-v0.9.2-linux-x86_64.AppImage`
+   - Linux：`lrc-desktop-v0.9.3-linux-amd64.deb` 或 `lrc-desktop-v0.9.3-linux-x86_64.AppImage`
 2. 双击安装，启动 LRC Desktop
 3. 按向导选择项目、配置 LLM（可选）、连接 AI 工具
 4. 重启 IDE，AI 自动发现 13 个 MCP 工具
 
 > 桌面端自动完成所有配置：检测 AI 工具、写入 MCP 配置、写入 AI 规则文件。
 >
-> **注意**：Release 中 `lrc-v0.9.2-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（sidecar 二进制），供开发者/脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
+> **注意**：Release 中 `lrc-v0.9.3-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（sidecar 二进制），供开发者/脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
 
 ### 方式二：从源码编译
 
