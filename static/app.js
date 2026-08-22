@@ -957,6 +957,10 @@ const SidecarHealthMonitor = {
       if (online && typeof loadDaoMetrics === 'function') {
         setTimeout(() => loadDaoMetrics(), 800);
       }
+      if (online) {
+        if (typeof loadCrystallizationHistory === 'function') setTimeout(loadCrystallizationHistory, 900);
+        if (typeof loadEvolutionTimeline === 'function') setTimeout(loadEvolutionTimeline, 900);
+      }
       // 3. 发出自定义事件，供其他模块解耦响应
       // v0.8.11 P0-2：事件携带 sidecarStatus，供 loadDaoMetrics 等组件感知索引期
       window.dispatchEvent(new CustomEvent('lrc:sidecar-state-change', {
@@ -6533,43 +6537,51 @@ async function runPrivacyCheck() {
  * v0.6.0 预览：加载结晶历史时间线（v0.8.0 预览）
  * 从审计日志中提取结晶事件并渲染到时间线
  */
+let crystallizationHistoryRequest = null;
+
 async function loadCrystallizationHistory() {
   const timelineEl = document.getElementById('crystallization-timeline');
   if (!timelineEl) return;
+  if (crystallizationHistoryRequest) crystallizationHistoryRequest.abort();
+  crystallizationHistoryRequest = new AbortController();
+  const signal = crystallizationHistoryRequest.signal;
+  timelineEl.innerHTML = '<div class="timeline-loading">正在加载结晶历史...</div>';
 
   try {
-    // v0.8.11：超时从 5s 延长到 10s
-    const res = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, {}, 10000);
+    await syncSidecarApiBase();
+    const res = await fetchWithTimeout(
+      `${window.API_BASE}/v1/audit-trail?event_types=synthesis_created,consolidation_completed&limit=10`,
+      { signal },
+      10000
+    );
     const data = await safeJson(res);
-
-    if (!data.events || data.events.length === 0) {
-      // 保持现有的示例数据（v0.8.0 预览模式）
+    if (data.lock_busy || data.degraded) {
+      throw new Error('后台正在处理记忆，请稍后刷新');
+    }
+    const events = Array.isArray(data.events) ? data.events : [];
+    events.sort((a, b) => Number(b.timestamp_ms || 0) - Number(a.timestamp_ms || 0));
+    if (events.length === 0) {
+      timelineEl.innerHTML = '<div class="timeline-empty">暂无结晶记录，完成一次知识结晶后会显示在这里。</div>';
       return;
     }
-
-    // 过滤出结晶相关事件（v0.9.0 修复：audit-trail 响应字段是 events，非 entries）
-    const crystallizationEvents = data.events.filter(function(e) {
-      return e.event_type && (e.event_type.includes('crystalliz') || e.event_type.includes('synthesi') || e.event_type.includes('consolidat'));
-    });
-
-    if (crystallizationEvents.length === 0) {
-      return;
-    }
-
-    // 渲染真实结晶历史
-    const html = crystallizationEvents.map(function(e) {
-      return `
-        <div class="crystallization-event">
-          <div class="crystallization-event-title">${htmlescape(e.event_type || '结晶事件')}</div>
-          <div class="crystallization-event-time">${htmlescape(e.timestamp_ms || '--')}</div>
-          <div class="crystallization-event-desc">${htmlescape(e.description || e.details || '--')}</div>
-        </div>
-      `;
-    }).join('');
-    timelineEl.innerHTML = html;
+    timelineEl.innerHTML = events.map(e => `
+      <div class="crystallization-event">
+        <div class="crystallization-event-title">${htmlescape(e.event_type || '结晶事件')}</div>
+        <div class="crystallization-event-time">${htmlescape(formatTimelineTime(e.timestamp_ms))}</div>
+        <div class="crystallization-event-desc">${htmlescape(e.description || e.details || '已完成一次知识结晶。')}</div>
+      </div>
+    `).join('');
   } catch (err) {
-    console.warn('[LRC v' + APP_VERSION + ']加载结晶历史失败，使用预览数据:', err.message);
+    if (err?.name === 'AbortError' || signal.aborted) return;
+    timelineEl.innerHTML = `<div class="timeline-error">结晶历史加载失败：${htmlescape(err.message || '服务暂不可用')} <button class="btn btn-ghost" data-action="loadCrystallizationHistory">重试</button></div>`;
   }
+}
+window.loadCrystallizationHistory = loadCrystallizationHistory;
+
+function formatTimelineTime(timestamp) {
+  const value = Number(timestamp);
+  if (!Number.isFinite(value) || value <= 0) return '--';
+  return new Date(value).toLocaleString('zh-CN', { hour12: false });
 }
 
 // 页面加载完成后初始化结晶历史加载
@@ -6697,6 +6709,11 @@ async function loadDaoMetrics() {
     const data = await safeJson(response);
 
     if (data.ok && data.data) {
+      const m = data.data;
+      if (m.lock_busy === true || m.status === 'loading' || data.degraded === true) {
+        _applyDaoMetricsIndexingHint();
+        return;
+      }
       _daoRetryCount = 0; // 成功时重置重试计数器
       // v0.8.11 P0-5：成功时清除"索引中"提示横幅（如果存在）
       const indexingHint = document.querySelector('.dao-indexing-hint');
@@ -6704,33 +6721,41 @@ async function loadDaoMetrics() {
       // v0.8.13 C1: 清除降级横幅（避免与正常数据矛盾显示）
       const fallbackBanner = document.querySelector('.dao-fallback-banner');
       if (fallbackBanner) fallbackBanner.remove();
-      const m = data.data;
-      // v0.8.1：后端已返回 0-100 区间值，前端直接使用
-      // yin_yang_balance: 0-100（阴阳守恒度）
-      // luoshu_deviation: 0-100（洛书偏差，越小越好）
-      // bagua_balance: 0-100（八卦均衡度）
-      // synthesis_ratio: 0-100（合成比率百分比）
-      // 计算综合健康评分（0-100）
-      const score = Math.min(100, Math.max(0, Math.round(
-        (m.yin_yang_balance || 80) * 0.25 +
-        (100 - (m.luoshu_deviation || 20)) * 0.25 +
-        (m.bagua_balance || 75) * 0.25 +
-        Math.min(20, (m.synthesis_ratio || 10) / 5) * 5 * 0.25
-      )));
-
-      drawDaoRing(score);
+      const rawScore = Number(m.dao_isomorphism_score);
+      const score = Number.isFinite(rawScore)
+        ? Math.round(Math.max(0, Math.min(1, rawScore)) * 100)
+        : null;
+      const statusEl = document.getElementById('dao-health-status');
+      const explanationEl = document.getElementById('dao-health-explanation');
+      const status = m.status || (score !== null && score >= 80 ? 'healthy' : 'warning');
+      const statusText = { healthy: '状态稳定', warning: '需要关注', critical: '建议处理' }[status] || '状态评估中';
+      if (statusEl) statusEl.textContent = score === null ? statusText : `${statusText} · ${score}分`;
+      if (explanationEl) {
+        const explanation = score === null
+          ? '当前数据不足以完成可信评估，系统不会自动执行高风险操作。'
+          : status === 'healthy'
+            ? '当前记忆结构稳定，搜索和结晶可以正常使用。系统会继续自动观察变化。'
+            : status === 'warning'
+              ? `当前存在轻微结构偏离（${score}分），通常不会影响基本搜索；系统会优先执行非破坏性检查。`
+              : `当前结构偏离较明显（${score}分），可能影响结晶质量或排序稳定性。原始记忆不会因评分降低而被删除，系统会先进行安全诊断。`;
+        explanationEl.hidden = false;
+        explanationEl.textContent = explanation;
+      }
+      // 后端 dao_isomorphism_score 是唯一主评分源，前端不重复推导评分。
+      // 子指标保留后端真实的 0 值，不使用会覆盖 0 的 || 默认值。
+      drawDaoRing(score ?? 0);
       const scoreEl = document.getElementById('dao-ring-score');
-      if (scoreEl) scoreEl.textContent = score;
+      if (scoreEl) scoreEl.textContent = score ?? '--';
 
       // 更新四个小指标
       const setText = (id, val) => {
         const el = document.getElementById(id);
         if (el) el.textContent = val;
       };
-      setText('dao-yin-yang', ((m.yin_yang_balance || 80) / 100).toFixed(2));
-      setText('dao-luoshu-deviation', (m.luoshu_deviation || 0).toFixed(2));
-      setText('dao-bagua-balance', ((m.bagua_balance || 75) / 100).toFixed(2));
-      setText('dao-synthesis-ratio', (m.synthesis_ratio || 0).toFixed(1) + '%');
+      setText('dao-yin-yang', (Number(m.yin_yang_balance ?? 0) / 100).toFixed(2));
+      setText('dao-luoshu-deviation', Number(m.luoshu_deviation ?? 0).toFixed(2));
+      setText('dao-bagua-balance', (Number(m.bagua_balance ?? 0) / 100).toFixed(2));
+      setText('dao-synthesis-ratio', Number(m.synthesis_ratio ?? 0).toFixed(1) + '%');
 
       console.log(`[LRC v${APP_VERSION}]道同构度加载完成，健康评分: ${score}`);
     } else {
@@ -6917,18 +6942,30 @@ function _applyDaoMetricsFallback(reason) {
  * 从审计日志加载最近 10 条演化事件
  * ============================================================ */
 
+let evolutionTimelineRequest = null;
+
 async function loadEvolutionTimeline() {
   const timelineEl = document.getElementById('evolution-timeline');
   if (!timelineEl) return;
+  if (evolutionTimelineRequest) evolutionTimelineRequest.abort();
+  evolutionTimelineRequest = new AbortController();
+  const signal = evolutionTimelineRequest.signal;
+  timelineEl.innerHTML = '<li class="timeline-loading">正在加载演化事件...</li>';
 
   try {
-    // 从审计日志接口获取演化事件
-    // v0.8.11：超时从 5s 延长到 10s
-    const response = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, {}, 10000);
+    await syncSidecarApiBase();
+    const response = await fetchWithTimeout(`${window.API_BASE}/v1/audit-trail?limit=10`, { signal }, 10000);
     const data = await safeJson(response);
-
-    if (data.events && data.events.length > 0) {
-      const html = data.events.map(event => {
+    if (data.lock_busy || data.degraded) {
+      throw new Error('后台正在处理记忆，请稍后刷新');
+    }
+    const events = Array.isArray(data.events) ? data.events : [];
+    events.sort((a, b) => Number(b.timestamp_ms || 0) - Number(a.timestamp_ms || 0));
+    if (events.length === 0) {
+      timelineEl.innerHTML = '<li class="timeline-empty">暂无演化事件。</li>';
+      return;
+    }
+    const html = events.map(event => {
         // v0.9.0 修复：audit-trail 事件字段是 event_type（snake_case），非 type
         const rawType = event.event_type || 'audit';
         const typeLabelMap = {
@@ -6961,7 +6998,7 @@ async function loadEvolutionTimeline() {
         return `
           <li class="evolution-event ${typeClass}">
             <div class="evolution-event-dot"></div>
-            <div class="evolution-event-time">${event.timestamp_ms || '--'}</div>
+            <div class="evolution-event-time">${htmlescape(formatTimelineTime(event.timestamp_ms))}</div>
             <span class="evolution-event-type">
               <img src="/assets/icons/${iconName}.svg" alt="" width="12" height="12"> ${typeLabel}
             </span>
@@ -6970,14 +7007,13 @@ async function loadEvolutionTimeline() {
         `;
       }).join('');
       timelineEl.innerHTML = html;
-      console.log(`[LRC v${APP_VERSION}]演化时间线加载了 ${data.events.length} 条事件`);
-    }
-    // 如果接口未返回数据，保留默认示例数据
+      console.log(`[LRC v${APP_VERSION}]演化时间线加载了 ${events.length} 条事件`);
   } catch (err) {
-    console.warn('[LRC v' + APP_VERSION + ']演化时间线加载失败，使用示例数据:', err.message);
-    // 保留默认示例数据，不报错
+    if (err?.name === 'AbortError' || signal.aborted) return;
+    timelineEl.innerHTML = `<li class="timeline-error">演化时间线加载失败：${htmlescape(err.message || '服务暂不可用')} <button class="btn btn-ghost" data-action="loadEvolutionTimeline">重试</button></li>`;
   }
 }
+window.loadEvolutionTimeline = loadEvolutionTimeline;
 
 /* ============================================================
  * v0.6.0 记忆搜索页面（设计文档 5.3）

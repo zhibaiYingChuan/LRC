@@ -1225,6 +1225,7 @@ pub fn build_v1_router(
                                 "chronic_degradation" => Some(AuditEventType::ChronicDegradation),
                                 "regulator_frozen" => Some(AuditEventType::RegulatorFrozen),
                                 "regulator_unfrozen" => Some(AuditEventType::RegulatorUnfrozen),
+                                "consolidation_completed" => Some(AuditEventType::SynthesisCreated),
                                 _ => None,
                             })
                             .collect()
