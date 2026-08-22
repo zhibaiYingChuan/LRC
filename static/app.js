@@ -7042,6 +7042,8 @@ async function searchMemories() {
   `;
 
   try {
+    // 搜索前重新确认 Sidecar 实际端口，避免启动竞态导致请求发往旧端口。
+    await syncSidecarApiBase();
     const response = await fetchWithTimeout(`${window.API_BASE}/v1/memories/enrich`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
