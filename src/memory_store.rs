@@ -2125,25 +2125,8 @@ impl<P: Persistence> MemoryStore<P> {
         memories = top_indices.iter().map(|&i| memories[i].clone()).collect();
         scores = top_indices.iter().map(|&i| scores[i]).collect();
 
-        // 8. 更新访问时间
-        let matched_ids: std::collections::HashSet<String> =
-            memories.iter().map(|m| m.id.clone()).collect();
-        let mut all_memories = self.load_cached()?;
-        let mut any_modified = false;
-        for m in &mut all_memories {
-            if matched_ids.contains(&m.id) {
-                m.mark_accessed();
-                any_modified = true;
-            }
-        }
-        if any_modified {
-            self.persistence.clear_memories()?;
-            for m in all_memories {
-                self.persistence.save_memory(&m)?;
-            }
-            // v0.5.4 写操作后标记缓存为脏
-            self.invalidate_cache();
-        }
+        // 8. 深度检索保持只读，不在搜索请求中更新访问时间或写回磁盘。
+        // 这样可避免 ML 模式下全量清空并逐条重写 memories.json 导致请求超时。
 
         self.dao_metrics.record_recall();
 
