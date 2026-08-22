@@ -187,7 +187,7 @@
     <div class="dao-metrics-panel">
       <div class="card-title" style="margin-bottom: var(--space-4);">
         <img src="/assets/icons/icon-health.svg" alt="" width="20" height="20"> 道同构度
-        <span style="margin-left:auto;font-size:11px;color:var(--lrc-墨韵-300);font-weight:normal;">实时健康评分</span>
+        <span id="dao-health-status" style="margin-left:auto;font-size:11px;color:var(--lrc-墨韵-300);font-weight:normal;">实时健康评分</span>
       </div>
       <div class="dao-ring-container">
         <canvas id="dao-ring-canvas" width="200" height="200"></canvas>
@@ -196,6 +196,7 @@
           <div class="dao-ring-label">健康评分</div>
         </div>
       </div>
+      <div id="dao-health-explanation" style="margin:0 0 var(--space-4);font-size:12px;color:var(--lrc-墨韵-500);line-height:1.6;" hidden></div>
       <div class="dao-sub-metrics">
         <div class="dao-sub-metric yin-yang">
           <div class="dao-sub-metric-value" id="dao-yin-yang">--</div>
@@ -282,10 +283,13 @@
     <div class="card">
       <div class="card-title">
         <img src="/assets/icons/icon-crystallization.svg" alt="" width="18" height="18"> 结晶历史时间线
+        <button class="btn btn-ghost" data-action="loadCrystallizationHistory" style="margin-left:auto;font-size:12px;">刷新</button>
       </div>
       <p class="text-sm text-dim mb-4">展示记忆库的成长轨迹——每次结晶都被持久化记录。</p>
-      <div class="crystallization-timeline" id="crystallization-timeline">
-        <div class="crystallization-event">
+      <div class="crystallization-timeline" id="crystallization-timeline" aria-live="polite">
+        <div class="timeline-loading">正在加载结晶历史...</div>
+      </div>
+      <div class="crystallization-event" hidden>
           <div class="crystallization-event-title">首次结晶</div>
           <div class="crystallization-event-time">2026-07-27 09:30</div>
           <div class="crystallization-event-desc">将 5 条相似记忆合成为 1 条知识："项目使用 Rust + Actix-web 框架"</div>
