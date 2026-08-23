@@ -195,12 +195,20 @@ fn sync_sidecar_binary() {
         paths
     };
 
-    // 查找最新的候选源文件
-    let best_source = candidates.iter().filter(|p| p.exists()).max_by_key(|p| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-    });
+    // 当前 profile 只允许使用同 profile 的产物，禁止按修改时间混用 debug/release。
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
+    let best_source = candidates
+        .iter()
+        .filter(|p| p.exists())
+        .filter(|p| {
+            let normalized = p.to_string_lossy().replace('\\', "/");
+            normalized.contains(&format!("/{profile}/"))
+        })
+        .max_by_key(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
 
     let Some(source) = best_source else {
         println!(

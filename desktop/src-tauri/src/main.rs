@@ -317,29 +317,35 @@ fn main() {
                                         "[开发模式] 未找到 3111 端口的开发版 sidecar，跳过探测（禁止回退到稳定版）"
                                     );
                                 }
-                            } else {
-                                // 短暂获取 sidecar_port 锁存储结果
+                            } else if let Some(stable_sidecar) =
+                                probed.iter().find(|p| p.port == crate::sidecar_manager::DEFAULT_SIDECAR_PORT)
+                            {
+                                // 稳定版只允许复用 3099，禁止接管开发版 3111 或其他扫描到的实例。
                                 {
                                     let mut sidecar_port = state.sidecar_port.lock().await;
-                                    *sidecar_port = Some(probed[0].port);
+                                    *sidecar_port = Some(stable_sidecar.port);
                                 }
                                 tracing::info!(
-                                    "启动时探测：检测到外部 sidecar，端口 {}，项目 {}",
-                                    probed[0].port,
-                                    if probed[0].src_dir.is_empty() {
+                                    "启动时探测：检测到稳定版外部 sidecar，端口 {}，项目 {}",
+                                    stable_sidecar.port,
+                                    if stable_sidecar.src_dir.is_empty() {
                                         "unknown"
                                     } else {
-                                        &probed[0].src_dir
+                                        &stable_sidecar.src_dir
                                     }
                                 );
                                 // 通知前端状态已更新（前端可据此刷新向导状态）
                                 let _ = monitor_handle.emit(
                                     "sidecar-detected",
                                     serde_json::json!({
-                                        "port": probed[0].port,
-                                        "src_dir": probed[0].src_dir,
+                                        "port": stable_sidecar.port,
+                                        "src_dir": stable_sidecar.src_dir,
                                         "message": "检测到已运行的 LRC 服务"
                                     }),
+                                );
+                            } else {
+                                tracing::info!(
+                                    "稳定版启动时仅检测到开发或非默认端口 sidecar，忽略并启动 3099"
                                 );
                             }
                         } else {
