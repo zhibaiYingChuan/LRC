@@ -27,10 +27,20 @@ LRC 的核心功能通过 Rust 单元测试、集成测试、前端契约检查�
 
 ---
 
-## v0.9.5 新特性
+## v0.9.6 稳定版特性
+
+- 稳定版 Sidecar 固定使用 `3099`，开发版使用 `3111`，避免两个运行环境互相复用。
+- 修复稳定版错误接管开发版 Sidecar 的问题。
+- 修复 Release 构建混入 Debug Sidecar 的问题。
+- 发布流程增加版本一致性校验、前端资源校验和真实桌面端 CDP 回归门禁。
+- 支持 Windows、macOS 和 Linux 桌面端安装包，以及跨平台 CLI Sidecar。
+
+## v0.9.5 特性
 
 - 全局前端导航与发布资源稳定性修复。
 - 发布前真实 CDP 回归门禁。
+- 结晶历史、演化时间线和道同构度展示闭环。
+- AI 工具扫描、快捷方式识别和规则配置链路增强。
 
 ## v0.9.3 新特性
 
@@ -52,17 +62,19 @@ LRC 的核心功能通过 Rust 单元测试、集成测试、前端契约检查�
 
 ### 方式一：下载桌面端（推荐）
 
-1. 前往 [Releases](https://github.com/zhibaiYingChuan/LRC/releases) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
-   - Windows：`lrc-desktop-v0.9.5-windows-x86_64-setup.exe`
-   - macOS：`lrc-desktop-v0.9.5-macos-arm64.dmg`
-   - Linux：`lrc-desktop-v0.9.5-linux-amd64.deb` 或 `lrc-desktop-v0.9.5-linux-x86_64.AppImage`
+1. 前往 [v0.9.6 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.9.6) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
+   - Windows：`lrc-desktop-v0.9.6-windows-x86_64-setup.exe`
+   - macOS：`lrc-desktop-v0.9.6-macos-arm64.dmg`
+   - Linux：`lrc-desktop-v0.9.6-linux-amd64.deb` 或 `lrc-desktop-v0.9.6-linux-x86_64.AppImage`
 2. 双击安装，启动 LRC Desktop
 3. 按向导选择项目、配置 LLM（可选）、连接 AI 工具
-4. 重启 IDE，AI 自动发现 13 个 MCP 工具
+4. 重启 IDE，AI 通过 MCP 自动发现并使用记忆与代码搜索能力
 
 > 桌面端自动完成所有配置：检测 AI 工具、写入 MCP 配置、写入 AI 规则文件。
 >
-> **注意**：Release 中 `lrc-v0.9.4-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（sidecar 二进制），供开发者/脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
+> **端口说明**：稳定版默认使用 `3099`；本地 Debug 开发版使用 `3111`。稳定版不会复用开发版 Sidecar。
+>
+> **注意**：Release 中 `lrc-v0.9.6-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（Sidecar 二进制），供开发者和脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
 
 ### 方式二：从源码编译
 
@@ -148,7 +160,9 @@ v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计
 
 ---
 
-## 13 个 MCP 工具
+## MCP 工具
+
+桌面端和 CLI 通过 MCP 提供记忆、检索、代码搜索与系统管理能力。当前内置工具数量和名称以运行中的 `tools/list` 返回为准，避免文档与实际版本漂移。
 
 | 类别 | 工具 | 用途 |
 |------|------|------|
@@ -182,7 +196,7 @@ v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计
 | [用户使用说明书](docs/USER_GUIDE.md) | 详细使用指南与 AI 调用规则 |
 | [变更日志](CHANGELOG.md) | 版本变更记录 |
 | [基准测试目录](benchmarks/README.md) | 当前版本基准与外部对比结果 |
-| [v0.9.5 基准测试报告](benchmarks/V0.9.5_BENCHMARK_REPORT.md) | 当前版本可复现基准结果 |
+| [v0.9.6 基准测试报告](benchmarks/V0.9.5_BENCHMARK_REPORT.md) | 当前版本可复现基准结果（报告文件保留历史命名） |
 | [使用场景](docs/USE_CASES.md) | 典型应用场景与最佳实践 |
 | [Smart Match 离线安装](docs/OFFLINE_MODEL_GUIDE.md) | 内网/离线环境模型安装 |
 
