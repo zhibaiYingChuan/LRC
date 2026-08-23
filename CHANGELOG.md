@@ -2764,7 +2764,7 @@ HCSE 五层交互韧性审计（L1-L5）虽然覆盖了状态栏/模态框/卡�
   - v2（`lrc_real_retrieval_eval_v2.py`）：Turn 级注入 + has_answer=8（不公平，对比用）
   - v3（`lrc_fair_eval_v3.py`）：Turn 级注入 + 统一 importance=5（公平，推荐）
 
-- **基准测试报告目录**（`benchmarks/reports/`）：
+- **基准测试报告目录**（历史路径 `benchmarks/reports/`，现已整理至 `benchmarks/comparative/`）：
   - 7 份分项报告 + 1 份汇总对比报告
   - 完整的评估方法、结果、分析和使用建议
 
