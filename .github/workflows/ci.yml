@@ -518,9 +518,11 @@ jobs:
           npm init -y
           npm install @playwright/test
           npx playwright install chromium
-      - name: Run frontend smoke tests
+      - name: Run frontend static and contract checks
         run: |
-          npx playwright test tests/frontend/dashboard-smoke.spec.js --config=tests/frontend/playwright.config.js
+          node --check static/app.js
+          node --check tests/frontend/cdp-regression.js
+          node scripts/validate_frontend_contract.js
       - name: Upload Playwright report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

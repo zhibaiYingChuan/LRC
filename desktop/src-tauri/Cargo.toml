@@ -1,6 +1,6 @@
 [package]
 name = "lrc-desktop"
-version = "0.9.4"
+version = "0.9.5"
 description = "LRC Desktop — 本地优先的 AI 代码记忆桌面应用"
 authors = ["LRC Team"]
 edition = "2021"

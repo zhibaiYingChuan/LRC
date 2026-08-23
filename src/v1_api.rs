@@ -18,7 +18,6 @@
 //   GET  /v1/audit-trail            — 审计追踪（查询系统自主行为日志，质疑五）
 //   GET  /v1/code/search            — 代码库搜索（查询参数: query, top_k, keywords）
 
-use crate::config::DEFAULT_PORT;
 use crate::engine::audit_trail::{AuditEventType, AuditQuery};
 #[cfg(not(feature = "ml"))]
 use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
@@ -1739,14 +1738,13 @@ pub fn build_v1_router(
                 }
             }
         }))
-        // GET /v1/captains-log — 船长日志一键生成演示
-        // 产品化核心端点：输入项目路径，一键生成项目记忆全景报告
+        // GET /v1/captains-log — 生成当前服务项目的船长日志
+        // 当前指标存储绑定到服务启动时的项目，接口不支持按请求参数切换或过滤项目。
         .route("/captains-log", get({
             let store = metrics_store.clone();
-            move |Query(params): Query<std::collections::HashMap<String, String>>| {
+            move || {
                 let store = store.clone();
                 async move {
-                    let project_path = params.get("path").cloned().unwrap_or_else(|| ".".to_string());
                     // v0.9.1 修复：lock_busy 时返回 200 降级数据而非 503（与 /health/system 一致）
                     let mut store = match store.try_lock() {
                         Ok(guard) => guard,
@@ -1755,7 +1753,7 @@ pub fn build_v1_router(
                                 "ok": true,
                                 "lock_busy": true,
                                 "degraded": true,
-                                "report": "⏳ 记忆系统正在执行后台合成，船长日志稍后自动加载...",
+                                "report": "[等待] 记忆系统正在执行后台合成，船长日志稍后自动加载...",
                                 "message": "记忆系统正在执行后台合成，数据稍后自动加载"
                             })));
                         }
@@ -1770,14 +1768,14 @@ pub fn build_v1_router(
                     // 生成船长日志报告
                     let mut report = String::new();
                     report.push_str("═══════════════════════════════════════════\n");
-                    report.push_str("  🏴‍☠️  Loong Recall 船长日志\n");
+                    report.push_str("  Loong Recall 船长日志\n");
                     report.push_str("═══════════════════════════════════════════\n\n");
 
-                    report.push_str(&format!("📂 项目路径: {}\n", project_path));
-                    report.push_str(&format!("🕐 生成时间: {}\n\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")));
+                    report.push_str("项目范围: 当前服务绑定的项目\n");
+                    report.push_str(&format!("生成时间: {}\n\n", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")));
 
                     // 记忆统计
-                    report.push_str("━━━ 📊 记忆统计 ━━━\n");
+                    report.push_str("━━━ 记忆统计 ━━━\n");
                     if let Some(ref s) = stats {
                         report.push_str(&format!("  记忆总数: {} 条\n", s.total_memories));
                         report.push_str(&format!("  已过期: {} 条\n", s.expired_count));
@@ -1791,7 +1789,7 @@ pub fn build_v1_router(
                         report.push_str("  （暂无记忆数据）\n");
                     }
 
-                    report.push_str("\n━━━ 🧘 道同构度 ━━━\n");
+                    report.push_str("\n━━━ 道同构度 ━━━\n");
                     if let Some(ref dao) = dao_snapshot {
                         report.push_str(&format!("  道同构度: {:.1}%\n", dao.dao_isomorphism_score * 100.0));
                         report.push_str(&format!("  八卦分布熵: {:.3}\n", dao.bagua_entropy));
@@ -1802,7 +1800,7 @@ pub fn build_v1_router(
                         report.push_str("  （暂无道同构度数据）\n");
                     }
 
-                    report.push_str("\n━━━ 🏥 系统健康 ━━━\n");
+                    report.push_str("\n━━━ 系统健康 ━━━\n");
                     if let Some(ref h) = health {
                         report.push_str(&format!("  运行模式: {}\n", h.system_mode.as_str()));
                         report.push_str(&format!("  状态描述: {}\n", h.system_mode_description));
@@ -1815,13 +1813,13 @@ pub fn build_v1_router(
                         }
                         // 道同构度摘要
                         if h.dao_metrics.dao_isomorphism_score < 0.5 {
-                            report.push_str("  ⚠ 道同构度偏低，建议检查编码器状态\n");
+                            report.push_str("  [警告] 道同构度偏低，建议检查编码器状态\n");
                         }
                     } else {
                         report.push_str("  （暂无健康数据）\n");
                     }
 
-                    report.push_str("\n━━━ 🔒 审计追踪 ━━━\n");
+                    report.push_str("\n━━━ 审计追踪 ━━━\n");
                     report.push_str(&format!("  审计事件总数: {} 条\n", audit_stats.values().sum::<usize>()));
                     report.push_str("  事件类型分布:\n");
                     let mut audit_types: Vec<_> = audit_stats.iter().collect();
@@ -1830,28 +1828,27 @@ pub fn build_v1_router(
                         report.push_str(&format!("    - {}: {} 条\n", t, c));
                     }
 
-                    report.push_str("\n━━━ 🎯 状态摘要 ━━━\n");
-                    let status_emoji = if let Some(ref h) = health {
+                    report.push_str("\n━━━ 状态摘要 ━━━\n");
+                    let status_text = if let Some(ref h) = health {
                         match h.system_mode {
-                            crate::engine::health_report::SystemMode::Healthy => "✅ 系统运行健康",
-                            crate::engine::health_report::SystemMode::Degraded => "⚠️ 编码器已降级，语义能力降低",
-                            crate::engine::health_report::SystemMode::Oscillating => "🔄 系统参数正在自我调整中",
-                            crate::engine::health_report::SystemMode::Drifting => "📉 检测到参数持续漂移，建议检查",
-                            crate::engine::health_report::SystemMode::Frozen => "🧊 调节器已冻结，需要手动干预",
-                            crate::engine::health_report::SystemMode::Overloaded => "📊 记忆库接近容量上限",
+                            crate::engine::health_report::SystemMode::Healthy => "系统运行健康",
+                            crate::engine::health_report::SystemMode::Degraded => "编码器已降级，语义能力降低",
+                            crate::engine::health_report::SystemMode::Oscillating => "系统参数正在自我调整中",
+                            crate::engine::health_report::SystemMode::Drifting => "检测到参数持续漂移，建议检查",
+                            crate::engine::health_report::SystemMode::Frozen => "调节器已冻结，需要手动干预",
+                            crate::engine::health_report::SystemMode::Overloaded => "记忆库接近容量上限",
                         }
                     } else {
-                        "🔧 系统正在初始化中"
+                        "系统正在初始化中"
                     };
-                    report.push_str(&format!("  {}\n", status_emoji));
+                    report.push_str(&format!("  {}\n", status_text));
 
                     report.push_str("\n═══════════════════════════════════════════\n");
-                    report.push_str("  💡 提示：使用 code-memory-server 启动服务后\n");
-                    report.push_str(&format!("  访问 http://localhost:{}/dashboard 查看可视化仪表盘\n", DEFAULT_PORT));
+                    report.push('\n');
                     report.push_str("═══════════════════════════════════════════\n");
 
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                        "project_path": project_path,
+                        "project_scope": "current_service_project",
                         "report": report,
                         "raw": {
                             "health": health,

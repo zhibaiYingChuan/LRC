@@ -6,7 +6,7 @@
   <!-- 之前完全未配置 CSP，XSS/数据注入防御缺失，HCSE 安全不变量 INV-01 违规 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.openai.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="version" content="0.9.4">
+  <meta name="version" content="0.9.5">
   <!-- v0.9.0 开发模式隔离：注入 sidecar 端口号，前端通过此标签获取正确的 API 端点 -->
   <!-- 开发版默认 3111，稳定版打包时替换为 3099 -->
   <meta name="lrc-sidecar-port" content="3099">
@@ -289,17 +289,6 @@
       <div class="crystallization-timeline" id="crystallization-timeline" aria-live="polite">
         <div class="timeline-loading">正在加载结晶历史...</div>
       </div>
-      <div class="crystallization-event" hidden>
-          <div class="crystallization-event-title">首次结晶</div>
-          <div class="crystallization-event-time">2026-07-27 09:30</div>
-          <div class="crystallization-event-desc">将 5 条相似记忆合成为 1 条知识："项目使用 Rust + Actix-web 框架"</div>
-        </div>
-        <div class="crystallization-event">
-          <div class="crystallization-event-title">二次结晶</div>
-          <div class="crystallization-event-time">2026-07-27 14:15</div>
-          <div class="crystallization-event-desc">将 3 条决策记忆合成为方法论："错误处理优先使用 Result 而非 panic"</div>
-        </div>
-      </div>
     </div>
 
     <!-- 最近记忆 + 项目分布（龙忆设计系统） -->
@@ -511,14 +500,12 @@
         生成一份面向开发者的综合报告。
       </p>
       <div class="input-group">
-        <input type="text" class="input" id="log-project-path"
-          placeholder="例如：C:\Users\MyProject 或 .（当前目录）" value="." maxlength="500">
         <button class="btn btn-primary" id="btn-generate-log" data-action="generateCaptainLog">
           一键生成船长日志
         </button>
       </div>
       <p class="text-sm text-dim" style="margin-top:6px;">
-        输入你想分析的代码项目路径，系统会扫描该目录下的代码并生成记忆健康报告。
+        日志基于当前服务启动时绑定的项目生成；如需分析其他项目，请切换项目后重新生成。
       </p>
 
       <div class="loading-overlay hidden" id="log-loading">
@@ -689,7 +676,7 @@
           </div>
         </div>
         <p class="text-sm text-dim mt-2">
-          规则文件版本 <code id="rules-version-text">v0.9.2</code>。全新安装后首次启动自动写入，无需手动操作。
+          规则文件版本 <code id="rules-version-text">v0.9.5</code>。全新安装后首次启动自动写入，无需手动操作。
         </p>
       </div>
     </div>
@@ -1537,7 +1524,7 @@
               <h4 style="margin: 0; color: var(--lrc-墨韵-700); font-size: 1em;">AI 工具</h4>
               <span style="font-size: 0.8em; color: var(--lrc-墨韵-400);">仅显示已安装的工具 · 已支持 <span class="term-tooltip">MCP<span class="tooltip-content">模型上下文协议（Model Context Protocol），一种让 AI 工具安全访问本地资源的开放协议。龙忆（LRC）通过 MCP 为 IDE 和 Agent 提供代码记忆检索能力。</span></span> 的会自动勾选</span>
             </div>
-            <div id="ai-tools-list" style="background: var(--lrc-宣纸-300); border-radius: var(--radius-md); padding: 20px; text-align: center;">
+            <div id="ai-tools-list" style="background: var(--lrc-宣纸-300); border-radius: var(--radius-md); padding: 20px; text-align: center; max-height: 360px; overflow-y: auto;">
               <p style="color: var(--lrc-墨韵-400); margin: 0;">正在扫描工具...</p>
             </div>
           </div>
@@ -2159,7 +2146,7 @@
 <footer class="status-bar">
   <div class="status-bar-left">
     <span><span class="status-dot unknown" id="status-dot"></span><span id="status-text" class="status-clickable" title="点击启动 LRC 服务">检测中...</span></span>
-    <span>版本 <strong id="status-version">v0.9.2</strong></span>
+    <span>版本 <strong id="status-version">v0.9.5</strong></span>
   </div>
   <div class="status-bar-right">
     <span>数据目录：<code id="status-data-dir" class="status-clickable" title="点击打开数据目录">--</code></span>

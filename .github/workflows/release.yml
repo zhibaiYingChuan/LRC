@@ -89,6 +89,13 @@ jobs:
       - name: Unit tests
         run: cargo test --features server
 
+      # 4.5 前端静态契约与语法门禁
+      - name: Frontend contract checks
+        run: |
+          node --check static/app.js
+          node --check tests/frontend/cdp-regression.js
+          node scripts/validate_frontend_contract.js
+
       # 5. Tauri 配置验证（确保 targets 不是单一平台，防止 macOS/Linux 无 bundle）
       - name: Tauri config lint
         run: |
@@ -184,9 +191,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-    # v0.8.42 修复：Windows runner DNS 不稳定，设置 continue-on-error 不阻塞整体发布
-    #   Linux/macOS 构建必须成功，Windows 构建失败可后续手动重试
-    continue-on-error: ${{ matrix.continue-on-error == true }}
+    # Windows、Linux、macOS 任一构建失败都必须阻止发布，避免生成缺少平台产物的 Release。
     strategy:
       fail-fast: false
       matrix:
@@ -202,7 +207,6 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: lrc-windows-x86_64.exe
-            continue-on-error: true
 
     steps:
       # v0.8.24 修复：Windows runner 网络不稳定导致 git clone 失败，
@@ -462,9 +466,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-    # v0.8.42 修复：Windows runner DNS 不稳定，设置 continue-on-error 不阻塞整体发布
-    #   Linux/macOS 构建必须成功，Windows 构建失败可后续手动重试
-    continue-on-error: ${{ matrix.continue-on-error == true }}
+    # Windows、Linux、macOS 任一构建失败都必须阻止发布，避免生成缺少平台产物的 Release。
     strategy:
       fail-fast: false
       matrix:
@@ -472,7 +474,6 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact-prefix: lrc-desktop-windows
-            continue-on-error: true
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact-prefix: lrc-desktop-macos
@@ -880,12 +881,12 @@ jobs:
   # ════════════════════════════════════════════════════════════
   release:
     name: Create GitHub Release
-    needs: [build-sidecar, build-desktop]
+    needs: [preflight, build-sidecar, build-desktop]
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    # 如果桌面端构建失败，仍然发布 sidecar 二进制
-    if: always() && needs.build-sidecar.result == 'success'
+    # 桌面端或预检失败时禁止发布，避免生成缺少前端验证的半成品 Release。
+    if: needs.preflight.result == 'success' && needs.build-sidecar.result == 'success' && needs.build-desktop.result == 'success'
 
     steps:
       - name: Checkout
@@ -923,15 +924,19 @@ jobs:
 
           VERSION="${1:-latest}"
           BASE_URL="https://github.com/zhibaiYingChuan/LRC/releases/${VERSION}/download"
+          DOWNLOAD_VERSION="${VERSION}"
+          if [ "$VERSION" = "latest" ]; then
+            DOWNLOAD_VERSION=""
+          fi
 
           # Detect OS and architecture
           OS=$(uname -s)
           ARCH=$(uname -m)
 
           if [ "$OS" = "Linux" ]; then
-            BINARY="lrc-${VERSION}-linux-x86_64"
+            BINARY="lrc-${DOWNLOAD_VERSION:+${DOWNLOAD_VERSION}-}linux-x86_64"
           elif [ "$OS" = "Darwin" ]; then
-            BINARY="lrc-${VERSION}-macos-arm64"
+            BINARY="lrc-${DOWNLOAD_VERSION:+${DOWNLOAD_VERSION}-}macos-arm64"
           else
             echo "Unsupported OS: $OS"
             exit 1

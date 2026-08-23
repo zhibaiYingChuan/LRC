@@ -324,12 +324,14 @@ docs/*并发安全*.md
 temp/
 tmp/
 
+# 旧版本运行时与历史 CDP 归档（本地隔离，不参与构建和发布）
+archive/legacy-runtime/
+
 # v0.9.1 发布清理：本地开发文档（不交付用户）
 docs/半可用演示态修复方案_*.md
 docs/引导页重设计规范_*.md
 
-# v0.9.1 发布清理：CDP 回归测试脚本与报告（不交付用户）
-tests/frontend/cdp-regression*.js
+# v0.9.1 发布清理：CDP 回归测试报告（不交付用户）
 tests/frontend/cdp-regression-report.*
 
 # v0.9.1 发布清理：开发/发布流程文档与测试脚本（不交付用户，本地开发自用）
