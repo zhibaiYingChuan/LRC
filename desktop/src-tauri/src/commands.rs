@@ -524,9 +524,9 @@ pub async fn get_sidecar_status(
 /// 开发模式下（npm run tauri dev），使用独立的端口和数据目录，
 /// 避免与稳定版（已安装的桌面端）冲突。
 /// 稳定版端口: 3099, 数据目录: ~/.loong-recall/global/data/
-/// 开发版端口: 3100, 数据目录: ~/.loong-recall/dev/data/
+/// 开发版端口: 3111, 数据目录: ~/.loong-recall/dev/data/
 fn is_dev_mode() -> bool {
-    std::env::var("TAURI_DEV").is_ok() || std::env::var("LRC_DEV_MODE").is_ok()
+    cfg!(debug_assertions)
 }
 
 /// 获取开发模式的端口（如果处于开发模式且未指定端口）

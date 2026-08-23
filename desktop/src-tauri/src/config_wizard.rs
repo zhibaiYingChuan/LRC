@@ -466,7 +466,7 @@ impl WizardState {
     ///
     /// 开发模式下使用独立的配置文件路径，与稳定版完全隔离。
     fn is_dev_mode() -> bool {
-        std::env::var("TAURI_DEV").is_ok() || std::env::var("LRC_DEV_MODE").is_ok()
+        cfg!(debug_assertions)
     }
 
     /// 配置存储路径

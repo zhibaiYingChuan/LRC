@@ -776,7 +776,12 @@ jobs:
           else
             sed -i 's/content="3111"/content="3099"/g' static/index.html
           fi
-          echo "已替换 meta 端口为 3099（稳定版）"
+          if ! grep -q 'name="lrc-sidecar-port" content="3099"' static/index.html; then
+            echo "ERROR: 稳定版前端 meta 端口未固定为 3099"
+            grep 'lrc-sidecar-port' static/index.html || true
+            exit 1
+          fi
+          echo "已替换并校验 meta 端口为 3099（稳定版）"
         shell: bash
 
       # 步骤 4: 构建 Tauri 桌面端安装包

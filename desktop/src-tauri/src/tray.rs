@@ -200,7 +200,7 @@ fn toggle_main_window<R: Runtime>(app: &AppHandle<R>) {
 /// 契约：仪表盘由 sidecar HTTP 服务提供，通过主窗口 iframe 加载。
 pub fn open_dashboard<R: Runtime>(app: &AppHandle<R>) {
     // v0.9.0 开发模式隔离：开发模式默认端口 3111
-    let is_dev = std::env::var("TAURI_DEV").is_ok() || std::env::var("LRC_DEV_MODE").is_ok();
+    let is_dev = cfg!(debug_assertions);
     let dev_default = if is_dev { 3111 } else { 3099 };
     // 获取 sidecar 实际端口
     let port = app

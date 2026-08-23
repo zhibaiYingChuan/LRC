@@ -37,8 +37,8 @@ fn main() {
     // ════════════════════════════════════════════════════════════════
     #[cfg(target_os = "windows")]
     {
-        // 检测是否处于开发模式（TAURI_DEV 由 cargo tauri dev 自动设置，LRC_DEV_MODE 供手动设置）
-        let is_dev = std::env::var("TAURI_DEV").is_ok() || std::env::var("LRC_DEV_MODE").is_ok();
+        // 编译模式决定稳定/开发隔离；Release 不受父进程环境变量污染。
+        let is_dev = cfg!(debug_assertions);
         // v0.9.0 开发模式隔离：开发模式 CDP 端口 9231，稳定版 9230
         let cdp_port = if is_dev { "9231" } else { "9230" };
         // 读取现有环境变量（避免覆盖其他已有参数）
@@ -293,8 +293,7 @@ fn main() {
                         let probed = SidecarManager::probe_existing_sidecar().await;
                         if !probed.is_empty() {
                             // v0.9.0 开发模式隔离：优先选择开发端口 3111，避免意外连接稳定版
-                            let is_dev_mode = std::env::var("TAURI_DEV").is_ok()
-                                || std::env::var("LRC_DEV_MODE").is_ok();
+                            let is_dev_mode = cfg!(debug_assertions);
                             if is_dev_mode {
                                 // 开发模式：优先选 3111（开发端口），找不到则跳过（禁止回退到稳定版 3099）
                                 if let Some(dev_sidecar) = probed.iter().find(|p| p.port == 3111) {
@@ -601,8 +600,7 @@ fn main() {
                                 // v0.8.37 开发模式使用独立数据目录
                                 // v0.9.0 修复：崩溃恢复在 dev 模式下也必须用 3111，
                                 // 而非 None→默认 3099，否则会复用稳定版 sidecar（违反开发/稳定隔离）。
-                                let is_dev = std::env::var("TAURI_DEV").is_ok()
-                                    || std::env::var("LRC_DEV_MODE").is_ok();
+                                let is_dev = cfg!(debug_assertions);
                                 let _dev_dd = if is_dev {
                                     let home = std::env::var("USERPROFILE")
                                         .or_else(|_| std::env::var("HOME"))
