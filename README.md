@@ -181,6 +181,7 @@ v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计
 |------|------|
 | [用户使用说明书](docs/USER_GUIDE.md) | 详细使用指南与 AI 调用规则 |
 | [变更日志](CHANGELOG.md) | 版本变更记录 |
+| [v0.9.5 基准测试报告](benchmarks/V0.9.5_BENCHMARK_REPORT.md) | 当前版本可复现基准结果 |
 | [使用场景](docs/USE_CASES.md) | 典型应用场景与最佳实践 |
 | [Smart Match 离线安装](docs/OFFLINE_MODEL_GUIDE.md) | 内网/离线环境模型安装 |
 
