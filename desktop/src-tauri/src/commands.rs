@@ -20,6 +20,17 @@ use crate::rate_limiter::RateLimiter;
 use crate::sidecar_manager::{SidecarManager, SidecarStartError, StartOptions, StartProgress};
 use crate::tray; // 托盘模块的 open_dashboard 函数
 
+fn apply_agent_overrides(
+    agents: &mut [AgentInfo],
+    overrides: &std::collections::HashMap<String, bool>,
+) {
+    for agent in agents {
+        if let Some(&installed) = overrides.get(&agent.id) {
+            agent.installed = installed;
+        }
+    }
+}
+
 // ── v0.5.1 辅助函数：消除重复代码 ──
 
 /// 从向导配置中获取 LLM API 字符串（消除 3 处重复调用）
@@ -1008,8 +1019,8 @@ pub async fn save_llm_config(
 
     // v0.5.4 修复：保存 LLM 配置后，同步到 Sidecar 的内存状态
     // 否则仪表盘（通过 GET /api/config）仍显示"未配置"
-    let sidecar_port = store.sidecar_port.lock().await;
-    if let Some(port) = *sidecar_port {
+    let sidecar_port = *store.sidecar_port.lock().await;
+    if let Some(port) = sidecar_port {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
@@ -1045,8 +1056,8 @@ pub async fn clear_llm_config(store: State<'_, AppStore>) -> Result<LlmConfigRes
     };
 
     // v0.5.4 修复：同步清除到 Sidecar 内存状态
-    let sidecar_port = store.sidecar_port.lock().await;
-    if let Some(port) = *sidecar_port {
+    let sidecar_port = *store.sidecar_port.lock().await;
+    if let Some(port) = sidecar_port {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
@@ -1309,9 +1320,17 @@ pub async fn detect_agents(store: State<'_, AppStore>) -> Result<Vec<AgentInfo>,
         let registry = store.agent_registry.lock().await;
         registry.snapshot_for_scan()
     };
+    let overrides = {
+        let wizard = store.wizard.lock().await;
+        wizard.get_manual_agent_overrides()
+    };
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || registry_snapshot.detect_all()),
+        tokio::task::spawn_blocking(move || {
+            let mut agents = registry_snapshot.detect_all();
+            apply_agent_overrides(&mut agents, &overrides);
+            agents
+        }),
     )
     .await;
 
@@ -1337,8 +1356,33 @@ pub async fn detect_agents(store: State<'_, AppStore>) -> Result<Vec<AgentInfo>,
 /// 仅返回已安装的 Agent（过滤掉未安装的）
 #[tauri::command]
 pub async fn detect_installed_agents(store: State<'_, AppStore>) -> Result<Vec<AgentInfo>, String> {
-    let registry = store.agent_registry.lock().await;
-    Ok(registry.detect_installed())
+    let registry_snapshot = {
+        let registry = store.agent_registry.lock().await;
+        registry.snapshot_for_scan()
+    };
+    let overrides = {
+        let wizard = store.wizard.lock().await;
+        wizard.get_manual_agent_overrides()
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            let mut agents = registry_snapshot.detect_all();
+            apply_agent_overrides(&mut agents, &overrides);
+            agents.retain(|agent| agent.installed);
+            agents
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(agents)) => Ok(agents),
+        Ok(Err(error)) => Err(format!("AI 工具检测任务异常终止: {error}")),
+        Err(_) => Err(
+            "AI 工具检测超时（30 秒），可能是磁盘或杀毒软件响应较慢，请点击重新扫描重试"
+                .to_string(),
+        ),
+    }
 }
 
 /// v0.6.0 新增：获取工具的手动配置指引
@@ -1368,7 +1412,7 @@ pub async fn discover_all_agents(
             let registry = store.agent_registry.lock().await;
             registry.snapshot_for_scan()
         };
-        let (mut known_list, unknown_list) =
+        let (mut known_list, mut unknown_list) =
             tokio::task::spawn_blocking(move || registry_snapshot.discover_all())
                 .await
                 .map_err(|e| format!("AI 工具检测任务异常终止: {}", e))?;
@@ -1382,7 +1426,7 @@ pub async fn discover_all_agents(
         // 对已知工具列表应用手动覆盖（用户纠正优先级最高，无论自动检测结果如何）
         if !overrides.is_empty() {
             let mut applied = 0usize;
-            for agent in known_list.iter_mut() {
+            for agent in known_list.iter_mut().chain(unknown_list.iter_mut()) {
                 if let Some(&force_installed) = overrides.get(&agent.id) {
                     if agent.installed != force_installed {
                         tracing::info!(
@@ -1537,15 +1581,36 @@ pub async fn configure_agents(
         }
     };
 
-    // 更新 Agent 计数
+    // 仅将实际成功配置的 Agent ID 持久化，失败项和提示项不计入 configured_agents。
+    let configured_ids: Vec<String> = {
+        let registry = store.agent_registry.lock().await;
+        let names: std::collections::HashMap<String, String> = registry
+            .snapshot_for_scan()
+            .detect_all()
+            .into_iter()
+            .map(|agent| (agent.id, agent.name))
+            .collect();
+        agent_ids
+            .iter()
+            .filter(|id| {
+                names.get(*id).is_some_and(|name| {
+                    result.iter().any(|entry| {
+                        entry.starts_with(&format!("{} (全局配置)", name))
+                            || entry.starts_with(&format!("{} — HTTP 端点:", name))
+                    })
+                })
+            })
+            .cloned()
+            .collect()
+    };
+
     let mut count = store.configured_agent_count.lock().await;
-    *count = result.len();
-    // 更新托盘 tooltip
+    *count = configured_ids.len();
     tray::update_tooltip(&app, *count);
-    // 持久化 configured_agents 到 wizard.json（P2-05 修复）
+    drop(count);
     let mut wizard = store.wizard.lock().await;
     wizard
-        .save_configured_agents(agent_ids)
+        .save_configured_agents(configured_ids)
         .map_err(|e| user_friendly_error(&e))?;
     Ok(result)
 }
@@ -1620,7 +1685,7 @@ pub async fn set_agent_manual_override(
     // 参数校验先做（不占限流桶；空输入直接拒）
     let trimmed = agent_id.trim().to_string();
     if trimmed.is_empty() {
-        return Err(user_friendly_error("工具 ID 不能为空"));
+        return Err("工具 ID 不能为空".to_string());
     }
 
     // L3 运行时保护：FM-19 指数退避限流（1s / 2s / 4s / 8s 共 4 次）
@@ -1659,7 +1724,7 @@ pub async fn set_agent_manual_override(
         let mut wizard = store_clone.wizard.lock().await;
         wizard
             .set_agent_manual_override(&trimmed_clone, override_installed)
-            .map_err(|e| user_friendly_error(&e))
+            .map_err(|e| format!("无法保存工具配置：{}", e))
     })
     .await;
 

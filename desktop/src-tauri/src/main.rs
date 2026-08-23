@@ -164,6 +164,7 @@ fn main() {
             commands::open_data_dir, // v0.6.0：右下角"数据目录"点击打开文件夹
             commands::get_rules_status, // v0.8.0：信任中心规则状态查询
             commands::set_agent_manual_override, // v0.8.31 S-03：AI工具手动修正（向导齿轮图标）
+            commands::bulk_apply_agent_overrides, // 批量应用 AI 工具手动修正
             commands::get_scan_cache_metadata,    // v0.8.31 S-05：获取扫描缓存元数据（时间戳+TTL）
             commands::force_invalidate_scan_cache, // v0.8.31 S-05：前端「重新扫描」按钮强制失效缓存
         ])

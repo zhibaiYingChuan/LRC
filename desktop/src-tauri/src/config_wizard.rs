@@ -82,9 +82,7 @@ impl WizardConfig {
             llm_api.splitn(4, "||").collect()
         } else {
             tracing::warn!(
-                "LLM 配置使用旧格式（冒号分隔），建议迁移到新格式（|| 分隔）。\
-                 当 API Key 包含冒号时旧格式会解析错误。输入: {}",
-                llm_api
+                "LLM 配置使用旧格式（冒号分隔），建议迁移到新格式（|| 分隔）；当 API Key 包含冒号时旧格式会解析错误"
             );
             llm_api.splitn(4, ':').collect()
         };
@@ -324,12 +322,7 @@ impl WizardState {
             config.encrypted_api_key = saved_key;
             // 立即持久化新版本配置
             if let Ok(json) = serde_json::to_string_pretty(&config) {
-                if let Some(parent) = config_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let temp_path = config_path.with_extension("json.tmp");
-                let _ = std::fs::write(&temp_path, json)
-                    .and_then(|_| std::fs::rename(&temp_path, &config_path));
+                let _ = atomic_save(&config_path, &json);
             }
         }
 
@@ -339,12 +332,7 @@ impl WizardState {
             config.setup_complete = true;
             // 立即持久化，避免下次启动仍需手动操作
             if let Ok(json) = serde_json::to_string_pretty(&config) {
-                if let Some(parent) = config_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let temp_path = config_path.with_extension("json.tmp");
-                let _ = std::fs::write(&temp_path, json)
-                    .and_then(|_| std::fs::rename(&temp_path, &config_path));
+                let _ = atomic_save(&config_path, &json);
             }
         }
 
@@ -529,15 +517,33 @@ impl WizardState {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let json = serde_json::to_string_pretty(&self.config).map_err(|e| e.to_string())?;
-        let temp_path = self.config_path.with_extension("json.tmp");
-        std::fs::write(&temp_path, json).map_err(|e| e.to_string())?;
-        std::fs::rename(&temp_path, &self.config_path).map_err(|e| e.to_string())?;
-        tracing::debug!(
-            "配置已保存 (encrypted_api_key={}B)",
-            self.config.encrypted_api_key.len()
-        );
-        Ok(())
+        atomic_save(&self.config_path, &json)
     }
+}
+
+/// 在任意路径上以原子方式写入 JSON 配置。
+///
+/// Windows 策略：写临时文件 → copy 覆盖目标 → 删除临时文件。
+/// 其他平台：写临时文件 → rename 覆盖目标。
+fn atomic_save(path: &std::path::Path, json: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
+    }
+    let temp_path = path.with_extension("json.tmp");
+    std::fs::write(&temp_path, json).map_err(|e| format!("写入临时配置文件失败: {}", e))?;
+
+    #[cfg(windows)]
+    {
+        std::fs::copy(&temp_path, path)
+            .map_err(|e| format!("提交配置文件失败（Windows 覆盖配置）: {}", e))?;
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    #[cfg(not(windows))]
+    std::fs::rename(&temp_path, path).map_err(|e| format!("提交配置文件失败: {}", e))?;
+
+    tracing::debug!("配置文件已写入: {}", path.display());
+    Ok(())
 }
 
 #[cfg(test)]

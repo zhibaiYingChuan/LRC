@@ -34,9 +34,14 @@
 
 > 完整报告见 [基准测试汇总](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md)。
 >
-> **数据版本说明**：上述数据基于 v0.5.6 基准测试（2026-06-23），当前 v0.9.4 版本的检索引擎已有演进，最新数据以重新测试为准。
+> **数据版本说明**：上述数据基于 v0.5.6 基准测试（2026-06-23），当前 v0.9.5 版本的检索引擎已有演进，最新数据以重新测试为准。
 
 ---
+
+## v0.9.5 新特性
+
+- 全局前端导航与发布资源稳定性修复。
+- 发布前真实 CDP 回归门禁。
 
 ## v0.9.3 新特性
 
@@ -59,9 +64,9 @@
 ### 方式一：下载桌面端（推荐）
 
 1. 前往 [Releases](https://github.com/zhibaiYingChuan/LRC/releases) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
-   - Windows：`lrc-desktop-v0.9.2-windows-x86_64-setup.exe`
-   - macOS：`lrc-desktop-v0.9.2-macos-arm64.dmg`
-   - Linux：`lrc-desktop-v0.9.4-linux-amd64.deb` 或 `lrc-desktop-v0.9.4-linux-x86_64.AppImage`
+   - Windows：`lrc-desktop-v0.9.5-windows-x86_64-setup.exe`
+   - macOS：`lrc-desktop-v0.9.5-macos-arm64.dmg`
+   - Linux：`lrc-desktop-v0.9.5-linux-amd64.deb` 或 `lrc-desktop-v0.9.5-linux-x86_64.AppImage`
 2. 双击安装，启动 LRC Desktop
 3. 按向导选择项目、配置 LLM（可选）、连接 AI 工具
 4. 重启 IDE，AI 自动发现 13 个 MCP 工具

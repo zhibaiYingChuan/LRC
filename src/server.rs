@@ -25,7 +25,6 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -2516,6 +2515,8 @@ struct ToolDetectItem {
     installed: bool,
     version: Option<String>,
     path: Option<String>,
+    /// 只有快捷方式扫描命中时才允许进入自动展示。
+    shortcut_confirmed: bool,
 }
 
 /// 工具检测响应
@@ -2851,7 +2852,8 @@ async fn embedder_test_handler(
         _ => crate::engine::model_downloader::MirrorSource::HfMirror,
     };
 
-    // 测试 URL：取 config.json（体积小，能反映连通性）
+    // 测试 URL：取 config.json（体积小，能反映连通性）。
+    // 使用 GET 而不是 HEAD，部分镜像对 HEAD 返回 404，但 GET 下载正常。
     let test_url =
         crate::engine::model_downloader::build_download_url(&model_id, "config.json", mirror);
 
@@ -2860,7 +2862,7 @@ async fn embedder_test_handler(
         .timeout(std::time::Duration::from_secs(15))
         .build();
 
-    let resp = match agent.head(&test_url).call() {
+    let resp = match agent.get(&test_url).call() {
         Ok(_) => {
             let latency_ms = start.elapsed().as_millis() as u64;
             EmbedderTestResponse {
@@ -2886,96 +2888,25 @@ async fn embedder_test_handler(
     )
 }
 
-/// GET /api/tools/detect — 检测系统已安装的 IDE 和 Agent 工具
+/// GET /api/tools/detect — 浏览器开发模式的快捷方式候选兼容接口。
 ///
-/// 检测策略（按优先级）：
-/// 1. 扫描桌面快捷方式（`%USERPROFILE%\Desktop\*.lnk`），匹配已知 AI 工具名称
-/// 2. 对于未通过快捷方式检测到的工具，回退到命令行检测 + Windows 安装路径检测
-/// 3. 覆盖市面上主流 AI 编程工具（IDE + Agent + VS Code 扩展）
+/// 桌面端正式检测统一走 Tauri `discover_all_agents`。浏览器模式不再维护第二套
+/// 工具数据库，也不使用 PATH、安装目录、CLI 或扩展推断 AI 工具；只返回快捷方式原名，
+/// 并将其标记为未确认候选，避免把普通快捷方式误报为 AI 工具。
 async fn tools_detect_handler(
     State(_state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // 第一步：扫描桌面快捷方式，获取已安装工具列表
-    let desktop_tools = scan_desktop_shortcuts();
-
-    // 第二步：对所有已知工具进行深度检测（命令行 + 安装路径）
-    let mut tools: Vec<ToolDetectItem> = Vec::new();
-
-    // VS Code 扩展 — 调用一次 code --list-extensions 即可
-    let cline_installed = detect_vscode_extension("saoudrizwan.claude-dev");
-    let continue_installed = detect_vscode_extension("continue.continue");
-    let copilot_installed = detect_vscode_extension("github.copilot");
-
-    // 已知工具完整列表（按分类）
-    // 仅收录大众熟知的主流工具（国内外），冷门工具不在此列。
-    // IDE 类
-    for tool in &[
-        ("VS Code", "code"),
-        ("Cursor", "cursor"),
-        ("Trae", "trae"),
-        ("Trae CN", "trae"),
-        ("Windsurf", "windsurf"),
-        ("CodeBuddy CN", "codebuddy"),
-        ("CodeBuddy", "codebuddy"),
-        ("Qoder", "qoder"),
-        ("JetBrains Toolbox", "jetbrains-toolbox"),
-        ("Zed", "zed"),
-    ] {
-        let mut item = detect_command_tool(tool.0, tool.1, &["--version"], "ide");
-        // 如果命令行检测失败，尝试安装路径检测
-        if !item.installed {
-            if let Some(path) = check_windows_install_path(tool.0) {
-                item.installed = true;
-                item.path = Some(path);
-            }
-        }
-        // 如果桌面快捷方式已检测到但上述方法未命中，强制标记为已安装
-        if !item.installed && desktop_tools.iter().any(|t| t == tool.0) {
-            item.installed = true;
-        }
-        tools.push(item);
-    }
-
-    // Agent 类工具（仅保留大众熟知的 CLI Agent）
-    let agent_name = "Claude Code";
-    let mut item = detect_command_tool(agent_name, "claude", &["--version"], "agent");
-    if !item.installed {
-        if let Some(path) = check_windows_install_path(agent_name) {
-            item.installed = true;
-            item.path = Some(path);
-        }
-    }
-    if !item.installed && desktop_tools.iter().any(|t| t == agent_name) {
-        item.installed = true;
-    }
-    tools.push(item);
-
-    // VS Code 扩展类
-    tools.push(ToolDetectItem {
-        name: "Cline".to_string(),
-        tool_type: "extension".to_string(),
-        installed: cline_installed,
-        version: None,
-        path: None,
-    });
-    tools.push(ToolDetectItem {
-        name: "Continue".to_string(),
-        tool_type: "extension".to_string(),
-        installed: continue_installed,
-        version: None,
-        path: None,
-    });
-    tools.push(ToolDetectItem {
-        name: "GitHub Copilot".to_string(),
-        tool_type: "extension".to_string(),
-        installed: copilot_installed,
-        version: None,
-        path: None,
-    });
-
-    // 去重：同名工具只保留第一个（优先级最高的检测结果）
-    let mut seen = std::collections::HashSet::new();
-    tools.retain(|t| seen.insert(t.name.clone()));
+    let tools = scan_desktop_shortcuts()
+        .into_iter()
+        .map(|name| ToolDetectItem {
+            name,
+            tool_type: "shortcut-candidate".to_string(),
+            installed: false,
+            version: None,
+            path: None,
+            shortcut_confirmed: false,
+        })
+        .collect::<Vec<_>>();
 
     let resp = ToolsDetectResponse { tools };
     (
@@ -2984,143 +2915,58 @@ async fn tools_detect_handler(
     )
 }
 
-/// 匹配快捷方式名称对应的规范工具名
+/// 扫描桌面和开始菜单快捷方式，返回原始快捷方式名称。
 ///
-/// 采用"整词边界 + 最长优先"策略，杜绝短词误检：
-/// - 要求工具别名作为完整单词出现（被空格/开头/结尾包围），
-///   避免 "CodeBuddy CN" 误匹配 "Code"（VS Code）、"Trae CN" 误匹配 "Trae"。
-/// - 多个别名命中时取最长者（"Trae CN" 优先于 "Trae"），避免子串重叠歧义。
-/// - 返回规范工具名（与工具检测列表一致），未命中返回 None。
-fn match_tool_alias(name: &str, known_tools: &[(&str, &str)]) -> Option<String> {
-    let mut best: Option<(&str, usize)> = None;
-    for (alias, canonical) in known_tools {
-        let is_word_match = name.eq_ignore_ascii_case(alias)
-            || name.starts_with(&format!("{} ", alias))
-            || name.ends_with(&format!(" {}", alias))
-            || name.contains(&format!(" {} ", alias));
-        if is_word_match && best.map_or(true, |(_, blen)| alias.len() > blen) {
-            best = Some((canonical, alias.len()));
-        }
-    }
-    best.map(|(c, _)| c.to_string())
-}
-
-/// 扫描桌面快捷方式，识别已安装的 AI 工具
-///
-/// 读取 `%USERPROFILE%\Desktop\*.lnk` 及开始菜单快捷方式，
-/// 匹配已知 AI 工具名称列表。返回匹配到的工具名称列表。
+/// 这里只收集事实，不判断它是否属于 AI 工具；判断和确认交给桌面端注册表
+/// 与用户主动选择，避免维护第二套硬编码工具名单。
 fn scan_desktop_shortcuts() -> Vec<String> {
-    let mut result = Vec::new();
+    let mut result: Vec<String> = Vec::new();
+    let mut dirs = Vec::new();
 
-    // 已知 AI 工具名称（别名 → 规范名），用于匹配快捷方式文件名。
-    // 仅收录大众熟知的工具，采用整词边界 + 最长优先匹配。
-    let known_tools: &[(&str, &str)] = &[
-        ("Visual Studio Code", "VS Code"),
-        ("VS Code", "VS Code"),
-        ("Cursor", "Cursor"),
-        ("Trae CN", "Trae CN"),
-        ("Trae", "Trae"),
-        ("Windsurf", "Windsurf"),
-        ("CodeBuddy CN", "CodeBuddy CN"),
-        ("CodeBuddy", "CodeBuddy"),
-        ("Qoder", "Qoder"),
-        ("Claude Code", "Claude Code"),
-        ("Claude", "Claude Code"),
-        ("Zed", "Zed"),
-        ("JetBrains Toolbox", "JetBrains Toolbox"),
-        ("IntelliJ IDEA", "IntelliJ IDEA"),
-        ("PyCharm", "PyCharm"),
-        ("WebStorm", "WebStorm"),
-        ("GoLand", "GoLand"),
-    ];
+    if let Ok(user_profile) = std::env::var("USERPROFILE") {
+        let home = PathBuf::from(user_profile);
+        dirs.push(home.join("Desktop"));
+        dirs.push(home.join("AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs"));
+    }
+    if let Ok(program_data) = std::env::var("PROGRAMDATA") {
+        dirs.push(PathBuf::from(program_data).join("Microsoft\\Windows\\Start Menu\\Programs"));
+    }
 
-    // Windows 桌面路径
-    let desktop_path = if cfg!(windows) {
-        std::env::var("USERPROFILE")
-            .ok()
-            .map(|p| PathBuf::from(p).join("Desktop"))
-    } else {
-        None
-    };
-
-    let desktop_path = match desktop_path {
-        Some(p) if p.exists() => p,
-        _ => return result,
-    };
-
-    // 读取桌面目录，查找 .lnk 文件
-    if let Ok(entries) = std::fs::read_dir(&desktop_path) {
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("lnk") {
-                continue;
-            }
-            // 从文件名中去除 .lnk 扩展名
-            let file_stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
-
-            // 匹配已知工具名称（整词边界 + 最长优先）
-            if let Some(canonical) = match_tool_alias(&file_stem, known_tools) {
-                if !result.contains(&canonical) {
-                    result.push(canonical);
-                }
-            }
-        }
-    }
-
-    // 额外检查开始菜单和任务栏快捷方式（常见安装位置）
-    let extra_paths = vec![
-        std::env::var("PROGRAMDATA")
-            .ok()
-            .map(|p| PathBuf::from(p).join("Microsoft\\Windows\\Start Menu\\Programs")),
-        std::env::var("APPDATA")
-            .ok()
-            .map(|p| PathBuf::from(p).join("Microsoft\\Windows\\Start Menu\\Programs")),
-    ];
-    for extra in extra_paths.into_iter().flatten() {
-        if !extra.exists() {
-            continue;
-        }
-        if let Ok(entries) = std::fs::read_dir(&extra) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let is_lnk = path.extension().and_then(|e| e.to_str()) == Some("lnk");
-                let is_dir = path.is_dir();
-                if !is_lnk && !is_dir {
-                    continue;
-                }
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                // 如果是目录，也检查目录名
-                let name_to_check = if is_dir {
-                    path.file_name()
-                        .and_then(|s| s.to_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_default()
-                } else {
-                    name.clone()
-                };
-                // 匹配已知工具名称（整词边界 + 最长优先）
-                if let Some(canonical) = match_tool_alias(&name_to_check, known_tools) {
-                    if !result.contains(&canonical) {
-                        result.push(canonical);
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
+            {
+                if let Some(name) = path.file_stem().and_then(|value| value.to_str()) {
+                    let name = name.trim();
+                    if !name.is_empty()
+                        && !result.iter().any(|item| item.eq_ignore_ascii_case(name))
+                    {
+                        result.push(name.to_string());
                     }
                 }
             }
         }
     }
 
+    result.sort_by_key(|name| name.to_lowercase());
     result
 }
 
 // ---------- 工具检测辅助函数 ----------
 
+/*
+旧版 PATH、安装目录和扩展检测已移除。
+浏览器端兼容接口只返回快捷方式原始候选；正式检测统一由桌面端 AgentDetector 负责。
+*/
+
+/*
 /// 检测命令行工具是否安装，并解析版本号
 ///
 /// 优先通过 PATH 执行命令；失败时回退到检查 Windows 常见安装路径。
@@ -3143,6 +2989,7 @@ fn detect_command_tool(name: &str, cmd: &str, args: &[&str], tool_type: &str) ->
                 installed: true,
                 version,
                 path,
+                shortcut_confirmed: false,
             };
         }
     }
@@ -3155,6 +3002,7 @@ fn detect_command_tool(name: &str, cmd: &str, args: &[&str], tool_type: &str) ->
             installed: true,
             version: None,
             path: Some(path),
+            shortcut_confirmed: false,
         };
     }
 
@@ -3164,6 +3012,7 @@ fn detect_command_tool(name: &str, cmd: &str, args: &[&str], tool_type: &str) ->
         installed: false,
         version: None,
         path: None,
+        shortcut_confirmed: false,
     }
 }
 
@@ -3277,6 +3126,7 @@ fn detect_vscode_extension(extension_id: &str) -> bool {
     list.lines()
         .any(|line| line.trim().eq_ignore_ascii_case(extension_id))
 }
+*/
 
 // ==================== Stdio 传输层（标准 MCP） ====================
 
