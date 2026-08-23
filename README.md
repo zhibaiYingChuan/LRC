@@ -19,22 +19,11 @@
 
 ---
 
-## 基准测试评分
+## 质量与验证
 
-6 次标准基准测试，对比 BM25 基线：
+LRC 的核心功能通过 Rust 单元测试、集成测试、前端契约检查和桌面端 CDP 回归门禁持续验证。
 
-| 基准测试 | 评估目标 | TF-IDF MRR@10 | LLM 增强 MRR@10 | vs BM25 |
-|:--------:|:--------:|:-------------:|:----------------:|:-------:|
-| [MS MARCO](benchmarks/reports/LRC_MSMARCO_REPORT.md) | 关键词检索 | 0.7749 | **0.8895** | +383% |
-| [Natural Questions](benchmarks/reports/LRC_NQ_REPORT.md) | 自然语言问题 | 0.5389 | **0.8016** | +163% |
-| [HotpotQA](benchmarks/reports/LRC_HOTPOTQA_REPORT.md) | 多跳推理 | 0.7964 | **0.9383** | +48% |
-| [FiQA](benchmarks/reports/LRC_FIQA_REPORT.md) | 金融领域 | 0.2729 | **0.4453** | +89% |
-| [LRC 原生基准](benchmarks/reports/LRC_NATIVE_BENCHMARK_TFIDF.md) | 综合记忆能力 | **11/11 PASS** (评分 0.94) | [9/11 PASS](benchmarks/reports/LRC_NATIVE_BENCHMARK_LLM.md) (评分 0.79) | — |
-| [LongMemEval](benchmarks/reports/LRC_LONGMEMEVAL_REPORT.md) | 长时记忆 | Session Recall@10 = **85.74%** | Turn Recall@10 = **61.70%** | — |
-
-> 完整报告见 [基准测试汇总](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md)。
->
-> **数据版本说明**：上述数据基于 v0.5.6 基准测试（2026-06-23），当前 v0.9.5 版本的检索引擎已有演进，最新数据以重新测试为准。
+> 性能数据会随版本、硬件和配置变化，发布前以当前版本的 CI 结果为准。
 
 ---
 
@@ -171,9 +160,7 @@ v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计
 
 ## 性能
 
-基于 BEIR 标准基准测试（500 文档 / 100 查询），TF-IDF 模式平均检索延迟 13-21ms，LLM 增强模式平均 1.0-1.3s（含 LLM API 调用）。LongMemEval（470 实例）Session Recall@10 = 85.74%。
-
-> 上述数据来自 v0.5.6 基准测试（2026-06-23），基于 Fast Match 模式（纯 Rust，零外部依赖），消费级 CPU，未使用 GPU。详见 [基准测试汇总](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md)。
+性能表现取决于硬件、数据规模和运行模式。请以当前版本的实际测试结果为准。
 
 ---
 
@@ -194,8 +181,6 @@ v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计
 |------|------|
 | [用户使用说明书](docs/USER_GUIDE.md) | 详细使用指南与 AI 调用规则 |
 | [变更日志](CHANGELOG.md) | 版本变更记录 |
-| [基准测试汇总](benchmarks/reports/LRC_BENCHMARK_SUMMARY.md) | 6 次基准测试完整报告 |
-| [性能测试指南](docs/BENCHMARK.md) | 如何复现性能测试 |
 | [使用场景](docs/USE_CASES.md) | 典型应用场景与最佳实践 |
 | [Smart Match 离线安装](docs/OFFLINE_MODEL_GUIDE.md) | 内网/离线环境模型安装 |
 
