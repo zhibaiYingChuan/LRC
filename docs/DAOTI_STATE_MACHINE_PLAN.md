@@ -1,8 +1,8 @@
 # 道体状态机接入 LRC 记忆系统 · 推进计划
 
-> 版本：v1.3（2026-09-08）
-> 状态：P0、P1、P2 核心已完成（P2.6-P2.8 发布项待执行），P3 待执行
-> 最近进度：P0 50304ef/26dbb66；P1 faa4cae；P2 fe4342d；均未推送
+> 版本：v1.4（2026-09-08）
+> 状态：P0-P3 判据+接入已完成（P3.5 实验待执行），P4 待执行
+> 最近进度：P0 50304ef/26dbb66；P1 faa4cae；P2 fe4342d；P3 64f93b9；均未推送
 > 前置文档：`daoti/PREREG_NAV.md`、`daoti/PREREG_FAIR_STATE_MACHINE.md`
 > 许可约束：道体引擎与卦词典属研究资产（DaoTi Research License v1.0），产品侧只消费信号、不内置引擎
 
@@ -150,23 +150,29 @@ LRC sidecar /v1/associations/explore
 
 **端口约定**：daoti_daemon 固定 `127.0.0.1:3222`（避开 sidecar 3099/3111、桌面 dev 1420），环境变量 `DAOTI_SERVICE_URL` 可覆盖。
 
-### P3 联想中心接入导航 + 预注册实验（先写判据，后接数据）
+### P3 联想中心接入导航 + 预注册实验（判据+接入已完成，2026-09-08，提交 64f93b9；实验待执行）
 
-| 任务 | 内容 | 涉及文件 |
-|------|------|---------|
-| P3.1 | **预注册判据文档先行**（见第四节），写入 `daoti/PREREG_ASSOC_NAV.md`，数据产生前锁定 | 新文档 |
-| P3.2 | `/v1/associations/explore` 增加 `navigation` 消费：有信号 → `navigated_deep_recall` 产生的候选进入根节点门禁双通路（词面+语义旁路）；无信号 → 现状 `explore_pure` 逐字节一致 | `src/v1_api.rs` |
-| P3.3 | 导航候选仍受 CodeContext 过滤与泛指 bigram 过滤约束（复用现有防线） | `src/v1_api.rs` |
-| P3.4 | 时间预算：daoti 往返 + 多视图检索合计 ≤10s，超时收敛返回部分结果 | `src/v1_api.rs` |
-| P3.5 | 实验执行：按预注册语料（100 记忆 + 30 查询）跑三臂对照 | `daoti/` 评测脚本 |
+| 任务 | 内容 | 涉及文件 | 状态 |
+|------|------|---------|------|
+| P3.1 | **预注册判据文档先行**（见第四节），写入 `daoti/PREREG_ASSOC_NAV.md`，数据产生前锁定 | `daoti/PREREG_ASSOC_NAV.md` | ✅ 完成（诚实引用 PREREG_NAV 先验：召回增益 NO-GO，G5 体验护栏为决定性判据） |
+| P3.2 | `/v1/associations/explore` 增加 `navigation` 消费：有信号 → `navigated_deep_recall` 产生的候选进入根节点门禁双通路（词面+语义旁路）；无信号 → 现状 `explore_pure` 逐字节一致 | `src/v1_api.rs`（`run_association_explore` 增 `navigation` 参数 + root 候选池切换） | ✅ 完成（2 个契约测试） |
+| P3.3 | 导航候选仍受 CodeContext 过滤与泛指 bigram 过滤约束（复用现有防线） | `src/v1_api.rs` | ✅ 完成（导航候选走同一门禁路径，CodeContext 过滤测试验证） |
+| P3.4 | 时间预算：daoti 往返 + 多视图检索合计 ≤10s，超时收敛返回部分结果 | `src/v1_api.rs` | ✅ 完成（复用 `ASSOCIATION_EXPLORE_TIME_BUDGET` 10s + fetch 2s 超时） |
+| P3.5 | 实验执行：按预注册语料（100 记忆 + 30 查询）跑三臂对照 | `daoti/` 评测脚本 | ⏳ 待执行（判据已锁定，需 daemon + 语料） |
 
-**预注册判据**（在 P3.1 中写死，全部满足才 go，任一不满足即 no-go 并诚实收场）：
+**P3 执行记录（重要）**：
+- **预注册判据**（`daoti/PREREG_ASSOC_NAV.md`）：G1-G5 判据在实验数据产生前写死。诚实声明 `PREREG_NAV.md` 先验（导航召回增益 NO-GO +1~2pp），将 G5 体验护栏定位为决定性判据，G1/G2 为强门槛，并预设"判定矩阵"（部分有效/NO-GO 的诚实收场路径）。
+- **修复真实缺陷**：`navigated_deep_recall` 返回 `Some(空候选)` 时，explore 原逻辑用空候选池导致 root=None（导航"变了候选但捞空"产生空起点）。已修复：导航候选为空时回退单查询基线召回。
+- **导航不豁免防线**：P3.2-1 契约测试验证导航信号下 CodeContext 代码块仍被过滤、生活记忆经词面门禁上位；P3.2-2 验证空 palaces（无有效方向）时诚实回退基线。
+- **License 合规**：`fetch_daoti_navigation` 提为 `pub(crate)` 供联想中心消费，仍只消费 JSON 信号、不内置引擎；泄露检测通过。
 
-- **G1 互补性**：基线臂 top1 错误的查询子集上，导航臂把 hop≥2 同链记忆拉进 top-5 比例 ≥30%
-- **G2 净增量**：导航臂 hop3-5 recall@10 − 基线 ≥8pp，且 hop1-2 recall@3 下降 ≤2pp
-- **G3 显著性**：按查询 bootstrap 重采样 2000 次，P(G2 增益 ≥8pp) ≥0.95
+**预注册判据**（G1-G5 详见 `daoti/PREREG_ASSOC_NAV.md`，判据在实验前锁定）：
+
+- **G1 互补性**：基线 top1 错误子集上，导航臂把 hop≥2 同链记忆拉进 top-5 比例 ≥30%
+- **G2 净增量**：导航臂 hop3-5 recall@10 − 基线 ≥8pp，且 hop1-2 recall@3 下降 ≤2pp（强门槛，历史 NO-GO 先验）
+- **G3 显著性**：bootstrap 2000 次 P(G2 增益 ≥8pp) ≥0.95
 - **G4 噪声护栏**：导航臂 top10 异链噪声率不高于基线 +3pp
-- **G5 体验护栏**：生活类查询（今晚吃什么）CDP 实测无代码噪声回潮；"量子物理是什么"仍为诚实空态
+- **G5 体验护栏（决定性）**：生活类查询 CDP 实测无代码噪声回潮；"量子物理是什么"仍为诚实空态
 
 **No-go 收场**（预注册纪律）：导航信号退回"用户确认联想时作为元数据记录"（同 PREREG_FAIR 的收场规则），联想中心保持 CHAIN1+词面校验现状——该现状已通过 7 项 CDP 专项与 88 交互口回归门禁。
 
@@ -261,7 +267,7 @@ Remove-Item -LiteralPath $versionFile -ErrorAction SilentlyContinue
 P0 止血（已完成：50304ef 本地提交，泄露检测通过，未推送）  ✅
 P1 调节器心跳（已完成：faa4cae 本地提交 + 运行时验证通过）  ✅
 P2 daoti_daemon 常驻进程（核心完成：fe4342d；P2.6-2.8 发布项待执行）  ✅
-P3 预注册判据 → 联想中心接入 → 三臂实验         ← 下一步（含 P2.8 四级校准）
-P4 道体状态级回归校验（第四证据位）             ← 实验通过后叠加
+P3 联想中心接入导航（判据+接入完成：64f93b9；P3.5 实验待执行）  ✅
+P4 道体状态级回归校验（第四证据位）             ← 下一步（实验通过后叠加）
 P5 打包发布（MSI 重打包 + 全量回归）           ← 收口（含 P2.6-2.7 桌面端/打包）
 ```
