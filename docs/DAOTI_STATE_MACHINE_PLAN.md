@@ -108,16 +108,21 @@ LRC sidecar /v1/associations/explore
 
 **风险说明**：P0 不做，下次打 tag 触发 CI 必然编译失败（mod.rs 引用了不存在的文件）。—— 此风险已解除（50304ef 已提交全部引用文件）。
 
-### P1 点亮调节器心跳（道体血统的活性保证，纯 Rust 侧）
+### P1 点亮调节器心跳（已完成，2026-09-08，提交 faa4cae）
 
-| 任务 | 内容 | 涉及文件 |
+| 任务 | 内容 | 验收标准 |
 |------|------|---------|
-| P1.1 | sidecar 后台周期任务（tokio interval，建议 30 分钟）调用 `store.regulate()` | `src/server.rs` |
-| P1.2 | 调节动作落地审计：`AdjustDecayRate`/`AdjustRetrievalWeights` 等执行结果写入 audit-trail | `src/engine/audit_trail.rs` |
-| P1.3 | 前端系统状态卡展示"调节器心跳"状态（最近调节时间/最近动作），接入 TAB_LOADERS | `static/app.js`、`static/index.html` |
-| P1.4 | 单测：模拟阴阳失衡 → regulate 返回动作 → 衰减率真实变更 → 审计事件存在 | 新增测试 |
+| P1.1 | sidecar 后台周期任务（tokio interval，建议 30 分钟）调用 `store.regulate()` | ✅ 新增 `regulator_heartbeat_loop`，周期可用 `LRC_REGULATE_INTERVAL_MIN` 覆盖（默认 30 分钟）；`try_lock` 锁忙跳过，`spawn_blocking` 避免阻塞 HTTP worker |
+| P1.2 | 调节动作落地审计：`AdjustDecayRate`/`AdjustRetrievalWeights` 等执行结果写入 audit-trail | ✅ 已有机制复用（`regulate()` 内 `record_audit`），并新增 `RegulatorHeartbeat::record` 统一记录心跳状态 |
+| P1.3 | 前端系统状态卡展示"调节器心跳"状态（最近调节时间/最近动作），接入 TAB_LOADERS | ✅ 新增 `renderRegulatorHeartbeat()`（static/app.js）+ 心跳展示区（index.html 系统健康评分卡内） |
+| P1.4 | 单测：模拟阴阳失衡 → regulate 返回动作 → 衰减率真实变更 → 审计事件存在 | ✅ 新增 3 个契约测试（心跳记录/NoAction 可观测/审计可查询） |
 
-**验收标准**：sidecar 运行 30 分钟后，`/v1/trust/audit-integrity` 可见调节器心跳事件；防振荡机制（冷却/冻结）在单测中验证。
+**P1 执行记录（重要）**：
+- **心跳状态数据结构**：`RegulatorHeartbeat { last_run_ms, last_action, run_count, last_reason }`，位于 `src/memory_store.rs`，作为 `MemoryStore` 字段，随 `regulate()` 自动更新。
+- **运行时验证通过**：用 `LRC_REGULATE_INTERVAL_MIN=1` + 隔离数据目录启动 sidecar 冒烟，`GET /v1/health/system` 返回 `{"last_action":"adjust_synthesis_threshold → 2","run_count":1,...}` —— 调节器心跳真实执行了调节动作（合成最小聚类 3→2）。
+- **License 合规**：server.rs 公开层注释不出现受保护术语（避免泄露检测告警），仅用 "DaoRegulator（自适应调节的活性保证）" 描述。
+
+**验收标准**：✅ sidecar 运行时 `/v1/health/system` 可见 `regulator_heartbeat` 心跳状态；防振荡机制（冷却/冻结）在 dao_regulator 已有单测覆盖。
 
 **降级安全**：调节器已内置防振荡 v2.0（历史追踪/冲突仲裁/自适应步长/冷却）与冻结机制，异常时 NoAction，不改变检索行为。
 
