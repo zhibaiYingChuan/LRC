@@ -8064,6 +8064,46 @@ let daoAbortController = null;
 window.daoAbortController = null;
 
 /**
+ * P1 调节器心跳渲染：展示 DaoRegulator 后台周期任务的活性状态。
+ * @param {object|null} hb 后端注入的 regulator_heartbeat 对象
+ *   { last_run_ms, last_action, run_count, last_reason }
+ */
+function renderRegulatorHeartbeat(hb) {
+  const dot = document.getElementById('heartbeat-dot');
+  const infoEl = document.getElementById('regulator-heartbeat-info');
+  const detailEl = document.getElementById('regulator-heartbeat-detail');
+  if (!infoEl) return; // 系统健康评分卡片可能尚未挂载
+
+  if (!hb || !hb.last_run_ms) {
+    // 心跳尚未触发：诚实展示"等待首次运行"
+    if (dot) dot.style.background = 'var(--lrc-墨韵-300)';
+    infoEl.textContent = '等待首次运行...';
+    if (detailEl) detailEl.textContent = '后台周期任务将在服务启动后一个周期内自动触发调节器。';
+    return;
+  }
+
+  // 心跳已运行：绿点 + 最近运行时间 + 动作摘要
+  if (dot) dot.style.background = 'var(--lrc-琥珀-500, #d9a441)';
+  const elapsedMin = Math.max(0, Math.round((Date.now() - (hb.last_run_ms || 0)) / 60000));
+  const timeText = elapsedMin < 1 ? '刚刚' : `${elapsedMin} 分钟前`;
+  const actionMap = {
+    no_action: '无需调节',
+    adjust_decay_rate: '调整衰减速率',
+    adjust_synthesis_threshold: '调整合成阈值',
+    suggest_reencoding: '建议重新编码',
+    adjust_retrieval_weights: '调整检索权重',
+    adjust_information_gain_threshold: '调整信息增益阈值',
+    suggest_comprehensive_rebalance: '建议综合再平衡',
+  };
+  infoEl.textContent = `最近运行 ${timeText}`;
+  if (detailEl) {
+    const actionName = actionMap[hb.last_action] || hb.last_action || 'unknown';
+    const reason = hb.last_reason ? `（${hb.last_reason}）` : '';
+    detailEl.textContent = `累计心跳 ${hb.run_count || 0} 次 · 最近动作：${actionName}${reason}`;
+  }
+}
+
+/**
  * 加载道同构度数据并渲染
  * v0.8.11：超时从 5s 延长到 10s + 自动重试退避（sidecar 索引期间 dao_metrics 响应慢）
  */
@@ -8134,6 +8174,10 @@ async function loadDaoMetrics() {
       setText('dao-luoshu-deviation', Number(m.luoshu_deviation ?? 0).toFixed(2));
       setText('dao-bagua-balance', (Number(m.bagua_balance ?? 0) / 100).toFixed(2));
       setText('dao-synthesis-ratio', Number(m.synthesis_ratio ?? 0).toFixed(1) + '%');
+
+      // P1 调节器心跳：渲染 DaoRegulator 后台周期任务的活性状态。
+      // 数据源为 /v1/health/system 的 dao_metrics（后端注入 regulator_heartbeat）。
+      renderRegulatorHeartbeat(m.regulator_heartbeat);
 
       console.log(`[LRC v${APP_VERSION}]道同构度加载完成，健康评分: ${score}`);
     } else {

@@ -340,6 +340,15 @@
           <div class="dao-sub-metric-desc">结晶记忆占比</div>
         </div>
       </div>
+      <!-- P1 调节器心跳：道同构度调节器（DaoRegulator）的运行时活性状态 -->
+      <div class="regulator-heartbeat" style="margin-top:var(--space-4);padding-top:var(--space-3);border-top:1px dashed var(--lrc-墨韵-200);font-size:12px;color:var(--lrc-墨韵-600);">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+          <span class="status-dot" id="heartbeat-dot" style="width:8px;height:8px;background:var(--lrc-墨韵-300);"></span>
+          <span style="font-weight:600;">调节器心跳</span>
+          <span id="regulator-heartbeat-info" style="margin-left:auto;color:var(--lrc-墨韵-400);">等待首次运行...</span>
+        </div>
+        <div id="regulator-heartbeat-detail" style="line-height:1.7;color:var(--lrc-墨韵-500);">后台周期任务尚未触发。首次调节将在启动后一个周期自动执行。</div>
+      </div>
       </div>
     </div>
 
