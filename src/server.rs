@@ -999,7 +999,8 @@ async fn fetch_daoti_navigation_with_base(
 }
 
 /// fetch_daoti_navigation 的生产入口（base_url 走环境变量/默认端口）。
-async fn fetch_daoti_navigation(
+/// `pub(crate)`：联想中心（v1_api.rs）P3.2 也消费该信号。
+pub(crate) async fn fetch_daoti_navigation(
     query: &str,
 ) -> Option<crate::engine::navigation::NavigationSignal> {
     fetch_daoti_navigation_with_base(query, None).await
