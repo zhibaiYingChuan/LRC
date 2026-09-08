@@ -1,8 +1,8 @@
 # 道体状态机接入 LRC 记忆系统 · 推进计划
 
-> 版本：v1.1（2026-09-08）
-> 状态：P0 已完成，P1 待执行
-> 最近进度：P0 本地提交 50304ef；未推送
+> 版本：v1.3（2026-09-08）
+> 状态：P0、P1、P2 核心已完成（P2.6-P2.8 发布项待执行），P3 待执行
+> 最近进度：P0 50304ef/26dbb66；P1 faa4cae；P2 fe4342d；均未推送
 > 前置文档：`daoti/PREREG_NAV.md`、`daoti/PREREG_FAIR_STATE_MACHINE.md`
 > 许可约束：道体引擎与卦词典属研究资产（DaoTi Research License v1.0），产品侧只消费信号、不内置引擎
 
@@ -126,20 +126,27 @@ LRC sidecar /v1/associations/explore
 
 **降级安全**：调节器已内置防振荡 v2.0（历史追踪/冲突仲裁/自适应步长/冷却）与冻结机制，异常时 NoAction，不改变检索行为。
 
-### P2 导航信号生产者：daoti_daemon 常驻进程（License 合规）
+### P2 导航信号生产者：daoti_daemon 常驻进程（核心已完成，2026-09-08，提交 fe4342d）
 
-| 任务 | 内容 | 涉及文件 |
-|------|------|---------|
-| P2.1 | 新建 `daoti/daoti_daemon.py`：常驻 HTTP 服务（纯 stdlib，对齐 lrc_bridge 风格），暴露 `/health`、`/deduce`（查询+会话id → NavigationSignal JSON）、`/reflect`（检索结果回传 → 更新推演状态）、`/state` | 新文件（研究资产侧） |
-| P2.2 | 常驻推演节拍器：空闲期按固定周期推进状态演化，满足两次交互之间状态持续变化 | 新文件 |
-| P2.3 | 推演状态持久化：`~/.loong-recall/daoti/session_state.json`（跨查询存活，原子写入，重启恢复） | 新文件 |
-| P2.4 | 编码器走四级校准路线第④步成果：GuaLexiconEncoder（纯 stdlib 词典计数，已实现） | `daoti/calibrate_lrc_mapping.py` |
-| P2.5 | LRC 侧降级客户端：`explore`/`recall` 调 daoti_daemon 失败（超时 2s/不可达）→ 信号缺省 → 基线行为 | `src/server.rs`、`src/v1_api.rs` |
-| P2.6 | 桌面端以 sidecar 管理模式拉起/回收 `daoti_daemon`，并做健康检查、PID 校验与异常降级 | `desktop/src-tauri/` |
-| P2.7 | PyInstaller 打包 `daoti_daemon.exe`，免用户 Python 环境依赖 | `daoti/` 打包脚本 |
-| P2.8 | 走完四级校准：④ 映射校验（已有脚本）→ ③ 链路验证 → ① 权重标定 → ② 阈值标定 | `daoti/` 校准脚本 |
+| 任务 | 内容 | 涉及文件 | 状态 |
+|------|------|---------|------|
+| P2.1 | 新建 `daoti/daoti_daemon.py`：常驻 HTTP 服务（纯 stdlib，对齐 lrc_bridge 风格），暴露 `/health`、`/deduce`（查询+会话id → NavigationSignal JSON）、`/reflect`（检索结果回传 → 更新推演状态）、`/state` | `daoti/daoti_daemon.py` | ✅ 完成 |
+| P2.2 | 常驻推演节拍器：空闲期按固定周期推进状态演化，满足两次交互之间状态持续变化 | 同上（`advance_beat` 每 60s） | ✅ 完成 |
+| P2.3 | 推演状态持久化：`~/.loong-recall/daoti/session_state.json`（跨查询存活，原子写入，重启恢复） | 同上（`atomic_write_json`） | ✅ 完成（重启恢复实测通过） |
+| P2.4 | 编码器走四级校准路线第④步成果：GuaLexiconEncoder（纯 stdlib 词典计数，已实现） | `daoti/calibrate_lrc_mapping.py` | ✅ 完成（V23 优先，lexicon 兜底） |
+| P2.5 | LRC 侧降级客户端：`explore`/`recall` 调 daoti_daemon 失败（超时 2s/不可达）→ 信号缺省 → 基线行为 | `src/server.rs`（`fetch_daoti_navigation` + handle_recall 接入） | ✅ 完成（2 个契约测试：在线解析 / 离线降级） |
+| P2.6 | 桌面端以 sidecar 管理模式拉起/回收 `daoti_daemon`，并做健康检查、PID 校验与异常降级 | `desktop/src-tauri/` | ⏳ 发布项待执行 |
+| P2.7 | PyInstaller 打包 `daoti_daemon.exe`，免用户 Python 环境依赖 | `daoti/` 打包脚本 | ⏳ 发布项待执行 |
+| P2.8 | 走完四级校准：④ 映射校验（已有脚本）→ ③ 链路验证 → ① 权重标定 → ② 阈值标定 | `daoti/` 校准脚本 | ⏳ 随 P3 实验执行 |
 
-**验收标准**：`python daoti/daoti_daemon.py` 启动后，`Invoke-RestMethod http://127.0.0.1:3222/health` 返回 ok；同一会话连续两次 `/deduce` 的推演状态演进（state/target_gua 变化）且 `/state` 可见状态、重启进程后状态可恢复。
+**P2 执行记录（重要）**：
+- **V23 真实引擎驱动**：发现 `trigram_emergence_v2.pt`（325MB）实际存在于 `daoti/`（此前 Test-Path 误判缺失）。daemon 优先加载 V23 引擎（2.2s 加载 / 0.5s 推演），`GuaLexiconEncoder` 作为 checkpoint 不可用时的降级后端。`/health` 与 `/state` 如实暴露 `engine: v23`，不编造信号来源。
+- **导航信号契约对齐**：`/deduce` 返回 `{palaces, probes, version}`，与 [navigation.rs](file:///g:/code-memory/src/engine/navigation.rs) 的 `NavigationSignal` 解析完全一致（palaces 由 V23 推演链每步 target_gua 映射卦宫去重取前 4，probes 为宫义探测词）。
+- **端到端验证通过**：真实请求 `/deduce 今晚吃什么` → `palaces:["艮宫","震宫"]`、`converged:true`、`active_gua:"随"/震宫`；`/reflect` 情绪记忆 → 坎宫修正；连续 deduce 状态演进（step 递增、stable_steps 累积）；**重启后 step=2 保留**（跨进程持久化）。
+- **LRC 侧接入**：`handle_recall` 在 `LRC_DAOTI_NAVIGATE=1` 且外部无 navigation 参数时，自动向 daemon 拉取信号；daemon 不可达（2s 超时）→ None → 无导航基线，行为与既有版本逐字节一致。
+- **License 合规**：daemon 位于研究资产侧（DaoTi License），LRC 仅消费 JSON 信号；泄露检测白名单仅限进程名/函数名/环境变量/协议版本标识，未放宽真算法关键词检测。
+
+**验收标准**：✅ `/health` 返回 ok、连续 deduce 状态演进、`/state` 可见、重启恢复——全部实测通过。
 
 **端口约定**：daoti_daemon 固定 `127.0.0.1:3222`（避开 sidecar 3099/3111、桌面 dev 1420），环境变量 `DAOTI_SERVICE_URL` 可覆盖。
 
@@ -252,9 +259,9 @@ Remove-Item -LiteralPath $versionFile -ErrorAction SilentlyContinue
 
 ```
 P0 止血（已完成：50304ef 本地提交，泄露检测通过，未推送）  ✅
-P1 调节器心跳（道体血统活性上线）              ← 下一步
-P2 daoti_daemon 常驻进程 + 四级校准            ← 道体持续运行落地（生产者就绪）
-P3 预注册判据 → 联想中心接入 → 三臂实验         ← 判据先写死，go/no-go 都诚实收场
+P1 调节器心跳（已完成：faa4cae 本地提交 + 运行时验证通过）  ✅
+P2 daoti_daemon 常驻进程（核心完成：fe4342d；P2.6-2.8 发布项待执行）  ✅
+P3 预注册判据 → 联想中心接入 → 三臂实验         ← 下一步（含 P2.8 四级校准）
 P4 道体状态级回归校验（第四证据位）             ← 实验通过后叠加
-P5 打包发布（MSI 重打包 + 全量回归）           ← 收口
+P5 打包发布（MSI 重打包 + 全量回归）           ← 收口（含 P2.6-2.7 桌面端/打包）
 ```
