@@ -661,6 +661,9 @@ pub struct DaoMetricsData {
     pub active_memories: usize,
     pub crystallized_memories: usize,
     pub status: String,
+    /// P1 调节器心跳：最近一次 regulate() 的执行状态（None 表示尚未触发）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regulator_heartbeat: Option<crate::memory_store::RegulatorHeartbeat>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1800,6 +1803,8 @@ pub fn build_v1_router(
                                     active_memories: snapshot.active_memories,
                                     crystallized_memories: snapshot.crystallized_memories,
                                     status: status.to_string(),
+                                    // P1 调节器心跳：随 dao 指标一起暴露（前端 loadDaoMetrics 直接读取）
+                                    regulator_heartbeat: Some(store.regulator_heartbeat.clone()),
                                 },
                                 raw: DaoMetricsRaw {
                                     bagua_entropy: snapshot.bagua_entropy,
@@ -1917,6 +1922,13 @@ pub fn build_v1_router(
                                 obj.insert("data_directory".to_string(), serde_json::Value::String(
                                     store.persistence().data_dir().to_string_lossy().to_string()
                                 ));
+                                // P1 调节器心跳：暴露最近一次 regulate() 的执行状态，
+                                // 前端系统状态卡据此展示"调节器心跳"（最近运行时间/最近动作）
+                                obj.insert(
+                                    "regulator_heartbeat".to_string(),
+                                    serde_json::to_value(&store.regulator_heartbeat)
+                                        .unwrap_or_else(|_| serde_json::json!({})),
+                                );
                             }
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(json))
                         }
@@ -4210,6 +4222,7 @@ mod api_contracts_tests {
                 active_memories: 100,
                 crystallized_memories: 30,
                 status: "healthy".to_string(),
+                regulator_heartbeat: None,
             },
             raw: DaoMetricsRaw {
                 bagua_entropy: 2.1,

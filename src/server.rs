@@ -3731,7 +3731,7 @@ pub async fn serve_on_listener(
     port: u16,
     listener: tokio::net::TcpListener,
 ) -> std::io::Result<()> {
-    let app = build_mcp_router(state);
+    let app = build_mcp_router(state.clone());
 
     let addr = format!("{}:{}", host, port);
     println!("Loong Recall (L-RC) 代码搜索 + 记忆服务");
@@ -3758,7 +3758,52 @@ pub async fn serve_on_listener(
         }
     });
 
+    // P1 调节器心跳：点亮 DaoRegulator（自适应调节的活性保证）。
+    // 后台周期任务定期调用 MemoryStore::regulate()，并记录调节器心跳状态，
+    // 供 /v1/health/system 与前端系统状态卡展示。无异常路径会改变检索行为。
+    tokio::spawn(regulator_heartbeat_loop(state.clone()));
+
     axum::serve(listener, app).await
+}
+
+/// P1 调节器心跳后台循环。
+///
+/// 周期由环境变量 `LRC_REGULATE_INTERVAL_MIN` 控制（默认 30 分钟，便于测试缩短）。
+/// 每次 tick：
+///   1. 尝试 `try_lock` 获取 MemoryStore（锁忙时跳过本轮，不阻塞 HTTP worker）；
+///   2. 在 `spawn_blocking` 中调用 `regulate()`（同步且可能涉及 IO，避免占用 async worker）；
+///   3. `regulate()` 内部已记录心跳（RegulatorHeartbeat）与审计事件，此处仅输出日志。
+async fn regulator_heartbeat_loop(state: Arc<AppState>) {
+    let interval_min = std::env::var("LRC_REGULATE_INTERVAL_MIN")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30)
+        .max(1);
+    eprintln!(
+        "[LRC·心跳] 调节器心跳已上线，周期 {} 分钟（LRC_REGULATE_INTERVAL_MIN 可调）",
+        interval_min
+    );
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_min * 60));
+    loop {
+        ticker.tick().await;
+        let store = state.memory_store.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let mut guard = match store.try_lock() {
+                Ok(g) => g,
+                Err(_) => return "locked", // 其他线程持锁（如后台合成），本轮跳过
+            };
+            match guard.regulate() {
+                Some(_) => "regulated",
+                None => "no_action",
+            }
+        })
+        .await
+        .unwrap_or("panic");
+        // 心跳状态与审计已在 regulate() 内记录，此处仅输出调试日志
+        if outcome != "no_action" {
+            eprintln!("[LRC·心跳] 调节器本轮结果: {outcome}");
+        }
+    }
 }
 
 // ==================== MCP 协议单元测试 ====================
