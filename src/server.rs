@@ -963,6 +963,48 @@ async fn handle_recall_enhanced(
     make_response(id, to_json_value_safe(&call_result))
 }
 
+/// 从 daoti_daemon 获取导航信号（P2.5：LRC 侧降级客户端）。
+///
+/// 向 daemon 的 POST /deduce 发送查询，解析 NavigationSignal JSON。
+/// daemon 不可达 / 超时 / 解析失败 → 返回 None → 调用方保持无导航基线
+/// （行为与既有版本逐字节一致，navigation.rs 契约保证）。
+///
+/// base_url 参数用于测试注入 mock；为 None 时取环境变量 DAOTI_SERVICE_URL，
+/// 缺省回退 http://127.0.0.1:3222。
+async fn fetch_daoti_navigation_with_base(
+    query: &str,
+    base: Option<&str>,
+) -> Option<crate::engine::navigation::NavigationSignal> {
+    // 端口约定：daoti_daemon 固定 127.0.0.1:3222，环境变量 DAOTI_SERVICE_URL 可覆盖
+    let base = match base {
+        Some(b) => b.to_string(),
+        None => std::env::var("DAOTI_SERVICE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3222".to_string()),
+    };
+    let url = format!("{}/deduce", base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        // 连接 + 读超时 2s：daemon 挂起时不拖慢检索主链路
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .ok()?;
+    let body = serde_json::json!({"query": query, "session_id": "lrc-recall"});
+    let resp = client.post(&url).json(&body).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let value: serde_json::Value = resp.json().await.ok()?;
+    // 信号中携带 palaces/probes/version；缺字段或全部无效 → None（无导航）
+    crate::engine::navigation::NavigationSignal::from_json(&value)
+}
+
+/// fetch_daoti_navigation 的生产入口（base_url 走环境变量/默认端口）。
+async fn fetch_daoti_navigation(
+    query: &str,
+) -> Option<crate::engine::navigation::NavigationSignal> {
+    fetch_daoti_navigation_with_base(query, None).await
+}
+
 /// 处理 recall 工具调用 — 关键词匹配 / 深度语义检索
 ///
 /// 支持 lrc_mode: "fast"（关键词匹配，默认）或 "deep"（深度语义检索）
@@ -1031,9 +1073,10 @@ async fn handle_recall(
 
     // v0.9.7 导航层（预注册实验证实：导航改变候选集 > 随机方向扩展，
     // 配对 bootstrap P=96.3%）。门控 LRC_DAOTI_NAVIGATE=1 默认关闭 →
-    // 行为与既有版本逐字节一致。信号由 daoti pilot 在查询时推演产出、
-    // 经 recall 的 navigation 参数注入；产品侧只消费不计算（DaoTi License）。
-    let nav_signal = if std::env::var("LRC_DAOTI_NAVIGATE")
+    // 行为与既有版本逐字节一致。信号由 daoti 研究资产推演产出、经 recall
+    // 的 navigation 参数注入（显式携带优先）；P2.5 起支持自动向 daoti_daemon
+    // 拉取信号（daemon 不可达 → None → 无导航基线）。
+    let mut nav_signal = if std::env::var("LRC_DAOTI_NAVIGATE")
         .map(|v| v == "1")
         .unwrap_or(false)
     {
@@ -1043,6 +1086,14 @@ async fn handle_recall(
     } else {
         None
     };
+    // P2.5：显式信号缺省且门控开启时，尝试从常驻 daemon 获取（失败降级 None）
+    if nav_signal.is_none()
+        && std::env::var("LRC_DAOTI_NAVIGATE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        nav_signal = fetch_daoti_navigation(query).await;
+    }
 
     // 先完成可能发生网络等待的 LLM 翻译，再获取 memory_store 锁。
     // 这样网络超时不会阻塞其他记忆读写请求。
@@ -3812,6 +3863,59 @@ async fn regulator_heartbeat_loop(state: Arc<AppState>) {
 mod tests {
     use super::*;
     use crate::CodeMemoryManager;
+
+    /// P2.5-1：fetch_daoti_navigation 在 daemon 在线时解析 NavigationSignal。
+    /// 用本地 mock HTTP 服务模拟 daemon 的 /deduce 响应（不依赖外部进程）。
+    #[tokio::test]
+    async fn test_fetch_daoti_navigation_online() {
+        // 起一个仅监听回环的 mock daemon
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                // 仅响应 POST /deduce
+                if req.starts_with("POST /deduce") {
+                    let body = "{\"ok\":true,\"palaces\":[\"艮宫\",\"震宫\"],\"probes\":[[\"艮\",\"艮\"],[\"震\",\"震\"]],\"version\":\"daoti-lexicon-v1\"}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                } else {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                }
+            }
+        });
+
+        // 通过注入 base_url 指向 mock（不依赖全局环境变量，避免测试并行竞态）
+        let sig =
+            fetch_daoti_navigation_with_base("今晚吃什么", Some(&format!("http://{}", addr))).await;
+        mock.abort();
+
+        let sig = sig.expect("daemon 在线时应返回导航信号");
+        assert_eq!(sig.palaces, vec!["艮宫".to_string(), "震宫".to_string()]);
+        assert_eq!(sig.source_version.as_deref(), Some("daoti-lexicon-v1"));
+    }
+
+    /// P2.5-2：daemon 不可达时降级返回 None（行为与无导航基线一致）。
+    #[tokio::test]
+    async fn test_fetch_daoti_navigation_offline_degrades() {
+        // 使用一个必然无人监听的本地端口（回环 + 端口 0 已释放）
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // 立刻释放 → 连接被拒绝 → 超时降级
+        let sig =
+            fetch_daoti_navigation_with_base("今晚吃什么", Some(&format!("http://{}", addr))).await;
+        assert!(sig.is_none(), "daemon 不可达时应返回 None（降级基线）");
+    }
 
     /// 构建测试用 AppState（带已索引的 manager 和记忆存储）
     fn test_state() -> Arc<AppState> {
