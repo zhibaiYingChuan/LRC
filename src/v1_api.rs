@@ -389,6 +389,9 @@ fn run_association_explore(
     max_depth: u8,
     width: usize,
     cancel: &AtomicBool,
+    // P3.2 导航信号（daoti_daemon 产出）。None = 无导航 → 现状 explore_pure 逐字节一致；
+    // Some = 导航候选进入根节点门禁双通路（词面 + 语义旁路），CodeContext 过滤不豁免。
+    navigation: Option<&crate::engine::navigation::NavigationSignal>,
 ) -> AssociationExploreResponse {
     use std::collections::{HashSet, VecDeque};
 
@@ -442,7 +445,26 @@ fn run_association_explore(
             // 只看 top-2/3 时，真正相关的记忆可能排在噪声之后没被看到。
             let mut root_filter = filter.clone();
             root_filter.top_k = ASSOCIATION_ROOT_POOL_TOPK;
-            let result = store.recall(text, &root_filter).ok()?;
+            // P3.2 导航候选池：有导航信号且为 query 起点时，用多视图检索
+            // （navigated_deep_recall，改变候选集）替代单查询召回——导航视图
+            // 内已含基线视图，信号无有效方向或召回为空（返回 None/空结果）
+            // 时回退单查询，绝不因"导航变了候选但捞空"产生空起点。
+            // 导航只改变"候选从哪来"，不豁免后续词面/泛指/CodeContext 门禁。
+            let result = match navigation {
+                Some(sig) if !text.trim().is_empty() => {
+                    match crate::engine::navigation::navigated_deep_recall(
+                        store,
+                        text,
+                        &root_filter,
+                        1,
+                        sig,
+                    ) {
+                        Some(rr) if !rr.memories.is_empty() => rr,
+                        _ => store.recall(text, &root_filter).ok()?,
+                    }
+                }
+                _ => store.recall(text, &root_filter).ok()?,
+            };
             let query_tokens = crate::memory_store::tokenize_query(text);
             // v0.9.7 泛指 bigram 过滤：「是什/什么/怎么」等问句功能组合
             // 不计入实质共鸣——"量子物理是什么"曾因「是什」「什么」两个
@@ -1458,6 +1480,23 @@ pub fn build_v1_router(
                     let cancellation_for_task = cancellation.clone();
                     let query = req.query.clone();
                     let memory_id = req.memory_id.clone();
+                    // P3.2 联想中心接入导航：门控开启且 query 起点时，向 daoti_daemon
+                    // 拉取导航信号（缺省/不可达 → None → 现状 explore_pure 逐字节一致）。
+                    // 信号获取放在 spawn_blocking 之前（异步网络等待不占用锁）。
+                    let nav_signal = if req.query.is_some()
+                        && std::env::var("LRC_DAOTI_NAVIGATE")
+                            .map(|v| v == "1")
+                            .unwrap_or(false)
+                    {
+                        let trimmed = req.query.as_deref().map(|q| q.trim()).unwrap_or("");
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            crate::server::fetch_daoti_navigation(trimmed).await
+                        }
+                    } else {
+                        None
+                    };
                     let result = tokio::time::timeout(
                         Duration::from_secs(15),
                         tokio::task::spawn_blocking(move || -> Result<AssociationExploreResponse, &'static str> {
@@ -1486,6 +1525,7 @@ pub fn build_v1_router(
                                 depth,
                                 width,
                                 &cancellation_for_task,
+                                nav_signal.as_ref(),
                             ))
                         }),
                     ).await;
@@ -4733,6 +4773,7 @@ mod api_contracts_tests {
             3, // 最多 3 层
             2, // 每层最多 2 个方向
             &cancel,
+            None,
         );
 
         assert!(resp.root.is_some(), "应找到起点记忆");
@@ -4788,8 +4829,15 @@ mod api_contracts_tests {
         let dir_str = dir.to_str().unwrap().to_string();
         let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
         let cancel = AtomicBool::new(false);
-        let resp =
-            run_association_explore(&mut store, None, Some("mem-does-not-exist"), 2, 1, &cancel);
+        let resp = run_association_explore(
+            &mut store,
+            None,
+            Some("mem-does-not-exist"),
+            2,
+            1,
+            &cancel,
+            None,
+        );
         assert!(resp.root.is_none(), "不存在的记忆 ID 不应产生根节点");
         assert!(resp.nodes.is_empty());
         assert!(resp.edges.is_empty());
@@ -4839,6 +4887,7 @@ mod api_contracts_tests {
             3, // 允许 3 层，确保会走到深层扩散
             2,
             &cancel,
+            None,
         );
 
         assert!(resp.root.is_some(), "应找到起点记忆");
@@ -4899,7 +4948,8 @@ mod api_contracts_tests {
         }
 
         let cancel = AtomicBool::new(false);
-        let resp = run_association_explore(&mut store, Some("今晚吃什么"), None, 2, 2, &cancel);
+        let resp =
+            run_association_explore(&mut store, Some("今晚吃什么"), None, 2, 2, &cancel, None);
 
         assert!(resp.root.is_some(), "应存在实质共鸣的起点记忆");
         let root_node = resp
@@ -4951,7 +5001,8 @@ mod api_contracts_tests {
         store.remember(memory).unwrap();
 
         let cancel = AtomicBool::new(false);
-        let resp = run_association_explore(&mut store, Some("今晚吃什么"), None, 2, 2, &cancel);
+        let resp =
+            run_association_explore(&mut store, Some("今晚吃什么"), None, 2, 2, &cancel, None);
 
         assert!(resp.root.is_none(), "泛指词重叠的无关记忆不应成为起点");
         assert!(resp.nodes.is_empty(), "弱匹配时不应产生任何节点");
@@ -4993,7 +5044,15 @@ mod api_contracts_tests {
 
         // 查询 1：库里没有量子物理相关内容 → 不硬凑代码起点，诚实空态
         let cancel = AtomicBool::new(false);
-        let resp = run_association_explore(&mut store, Some("量子物理是什么"), None, 2, 2, &cancel);
+        let resp = run_association_explore(
+            &mut store,
+            Some("量子物理是什么"),
+            None,
+            2,
+            2,
+            &cancel,
+            None,
+        );
         assert!(
             resp.root.is_none() && resp.weak_match,
             "泛指 bigram 组合不应让代码记忆虚假上位: root={:?}",
@@ -5002,8 +5061,15 @@ mod api_contracts_tests {
 
         // 查询 2（对照）：实义 bigram（数据库/据库/缓存）命中时正常上位，
         // 证明过滤只剔除泛指组合，不伤害实义共鸣。
-        let resp2 =
-            run_association_explore(&mut store, Some("数据库和缓存架构"), None, 2, 2, &cancel);
+        let resp2 = run_association_explore(
+            &mut store,
+            Some("数据库和缓存架构"),
+            None,
+            2,
+            2,
+            &cancel,
+            None,
+        );
         assert!(
             resp2.root.is_some() && !resp2.weak_match,
             "实义 token 重叠的代码记忆应正常成为起点"
@@ -5154,6 +5220,7 @@ mod api_contracts_tests {
             2,
             2,
             &cancel,
+            None,
         );
 
         assert!(!resp.weak_match, "语义强相关的纪念日记忆不应被误判为弱匹配");
@@ -5219,7 +5286,8 @@ mod api_contracts_tests {
         }
 
         let cancel = AtomicBool::new(false);
-        let resp = run_association_explore(&mut store, Some("周末去哪儿玩"), None, 2, 2, &cancel);
+        let resp =
+            run_association_explore(&mut store, Some("周末去哪儿玩"), None, 2, 2, &cancel, None);
 
         assert!(resp.root.is_some(), "起点应通过词面实质共鸣门禁");
         assert!(
@@ -5234,6 +5302,170 @@ mod api_contracts_tests {
                 .iter()
                 .any(|node| node.content.contains("白云山徒步记得带水")),
             "真实发散记忆应正常出现"
+        );
+    }
+
+    /// P3.2-1：导航信号在场时，根候选经 navigated_deep_recall 多视图召回，
+    /// 且词面实质共鸣门禁 + CodeContext 过滤仍生效（导航不豁免防线）。
+    #[test]
+    fn test_run_association_explore_with_navigation_signal() {
+        use crate::engine::navigation::NavigationSignal;
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_nav_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut store = new_statistical_store(&dir_str);
+
+        // 生活记忆：词面与"今晚吃什么"实质共鸣（今晚/吃 均重叠）
+        let life = Memory::new(
+            "今晚吃番茄炒蛋，记得先买番茄".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(7),
+            None,
+        );
+        store.remember(life).unwrap();
+        // 代码噪声：含"今晚"但为代码块，任何路径都不应混入
+        let code = Memory::new(
+            "fn 今晚执行() { run_test_suite(); } // 编译入口".to_string(),
+            MemoryType::CodeContext,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        store.remember(code).unwrap();
+
+        // 构造导航信号：艮宫 + 与生活记忆词面一致的探测词"番茄"
+        // （探测词是导航"值得探测的方向"，本用例验证导航候选进入门禁）
+        let nav = NavigationSignal {
+            palaces: vec!["艮".to_string(), "坤".to_string()],
+            probes: Some(vec![
+                vec!["番茄".to_string(), "吃".to_string()],
+                vec!["家".to_string(), "厨房".to_string()],
+            ]),
+            source_version: Some("daoti-lexicon-v1".to_string()),
+        };
+
+        let cancel = AtomicBool::new(false);
+        let resp = run_association_explore(
+            &mut store,
+            Some("今晚吃什么"),
+            None,
+            2,
+            2,
+            &cancel,
+            Some(&nav),
+        );
+
+        // 导航候选 + 词面门禁 → 生活记忆上位为起点
+        // 先验证 navigated_deep_recall 本身是否召回了生活记忆（探针，测试失败时可见）
+        {
+            use crate::memory_store::RecallFilter;
+            let nav_filter = RecallFilter::new().with_top_k(ASSOCIATION_ROOT_POOL_TOPK);
+            let nav_result = crate::engine::navigation::navigated_deep_recall(
+                &mut store,
+                "今晚吃什么",
+                &nav_filter,
+                1,
+                &nav,
+            );
+            eprintln!(
+                "[P3.2探针] navigated_deep_recall = {}",
+                match &nav_result {
+                    Some(r) => format!(
+                        "Some({} memories: {:?})",
+                        r.memories.len(),
+                        r.memories.iter().map(|m| &m.content).collect::<Vec<_>>()
+                    ),
+                    None => "None".to_string(),
+                }
+            );
+        }
+        assert!(resp.root.is_some(), "导航信号应帮助生活记忆成为起点");
+        let root_node = resp
+            .nodes
+            .iter()
+            .find(|n| resp.root.as_deref() == Some(n.id.as_str()));
+        assert!(
+            root_node.is_some_and(|n| n.content.contains("番茄炒蛋")),
+            "起点应为生活记忆而非代码: {:?}",
+            root_node.map(|n| &n.content)
+        );
+        // CodeContext 过滤仍生效：代码块不进入联想链
+        assert!(
+            resp.nodes
+                .iter()
+                .all(|node| !node.content.contains("run_test_suite")),
+            "导航不得豁免 CodeContext 过滤: {:?}",
+            resp.nodes.iter().map(|n| &n.content).collect::<Vec<_>>()
+        );
+        assert!(!resp.weak_match, "存在实质起点时不应标记弱匹配");
+    }
+
+    /// P3.2-2：导航信号全无效（palaces 空 → from_json 返回 None）时，
+    /// 行为与无导航基线逐字节一致（诚实降级）。
+    #[test]
+    fn test_run_association_explore_navigation_invalid_degrades() {
+        use crate::engine::navigation::NavigationSignal;
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_nav_invalid_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut store = new_statistical_store(&dir_str);
+
+        let life = Memory::new(
+            "今晚吃番茄炒蛋，记得先买番茄".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(7),
+            None,
+        );
+        store.remember(life).unwrap();
+
+        // palaces 为空 → navigated_deep_recall 返回 None → 回退单查询 recall
+        let nav = NavigationSignal {
+            palaces: vec![],
+            probes: None,
+            source_version: Some("daoti-lexicon-v1".to_string()),
+        };
+
+        let cancel = AtomicBool::new(false);
+        let resp = run_association_explore(
+            &mut store,
+            Some("今晚吃什么"),
+            None,
+            2,
+            2,
+            &cancel,
+            Some(&nav),
+        );
+
+        // 无有效导航方向时仍能正常找到生活起点（与无导航基线一致）
+        assert!(resp.root.is_some(), "空导航应回退基线召回");
+        let root_node = resp
+            .nodes
+            .iter()
+            .find(|n| resp.root.as_deref() == Some(n.id.as_str()));
+        assert!(
+            root_node.is_some_and(|n| n.content.contains("番茄炒蛋")),
+            "回退基线仍应由词面门禁选出生活记忆"
         );
     }
 }
