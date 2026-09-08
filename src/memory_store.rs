@@ -3156,7 +3156,7 @@ impl<P: Persistence> MemoryStore<P> {
                         .iter()
                         .filter(|t| original_tokens.iter().any(|w| t.to_lowercase().contains(w)))
                         .count();
-                    let verdict = regression_recheck(original_overlap, bridge_hits, tag_hits);
+                    let verdict = regression_recheck(original_overlap, bridge_hits, tag_hits, None);
                     if verdict.keep {
                         evidence_by_idx.insert(i, verdict.evidence.to_string());
                     } else {
@@ -3706,7 +3706,8 @@ impl<P: Persistence> MemoryStore<P> {
                                     .any(|w| t.to_lowercase().contains(w))
                             })
                             .count();
-                        let verdict = regression_recheck(original_overlap, bridge_hits, tag_hits);
+                        let verdict =
+                            regression_recheck(original_overlap, bridge_hits, tag_hits, None);
                         if verdict.keep {
                             // 记录证据标签：联想桥强关联是联想导航的产物，
                             // 标注它让调用方看到"这条记忆为何被联想回来"

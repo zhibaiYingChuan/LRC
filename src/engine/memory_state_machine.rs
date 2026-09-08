@@ -251,9 +251,16 @@ pub fn regression_filter(
 /// 1. **原查询词面命中**：候选直接包含原查询词 → 与查询直接相关；
 /// 2. **联想桥强关联**：候选命中 ≥2 个活跃记忆专属联想桥词 → 真联想边，
 ///    非单个泛词误撞；
-/// 3. **标签共鸣**：候选标签与原查询词共享 → 用户主动标注的语义证据。
+/// 3. **标签共鸣**：候选标签与原查询词共享 → 用户主动标注的语义证据；
+/// 4. **原意图回应度**（P4 第四证据位）：daemon /reflect 的意图相关分 ≥0.5 →
+///    词面零重叠但语义回应原意图的候选凭此保留（道体状态级校验）。
 ///
-/// 若三种证据皆无 → 判定为"发散噪声"，剔除。
+/// `intent_score` 语义：
+///   - `Some(score)` 且 `score >= 0.5` → 判定"回应原意图"，保留（第四证据生效）
+///   - `Some(score)` 且 `score < 0.5` → 第四证据不通过，回退三证据裁决
+///   - `None`（daemon 离线/未接入）→ 第四证据缺省跳过，行为与三证据现状逐字节一致
+///
+/// 若三种词面证据皆无且第四证据缺席/未过 → 判定为"发散噪声"，剔除。
 /// 返回保留/剔除判定及证据标签（供联想链输出可观测）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegressionVerdict {
@@ -261,10 +268,16 @@ pub struct RegressionVerdict {
     pub evidence: &'static str,
 }
 
+/// 第四证据位（原意图回应度）的判定阈值：daemon /reflect 意图相关分 ≥ 0.5
+/// 视为"回应原意图"（与计划文档 P4.1 一致）。
+pub const ASSOCIATION_INTENT_RESPONSE_THRESHOLD: f32 = 0.5;
+
 pub fn regression_recheck(
     original_overlap: usize,
     bridge_hits: usize,
     tag_hits: usize,
+    // P4 第四证据位：daemon 返回的意图相关分（None = daemon 离线，跳过）
+    intent_score: Option<f32>,
 ) -> RegressionVerdict {
     if original_overlap > 0 {
         RegressionVerdict {
@@ -280,6 +293,12 @@ pub fn regression_recheck(
         RegressionVerdict {
             keep: true,
             evidence: "标签共鸣",
+        }
+    } else if intent_score.is_some_and(|s| s >= ASSOCIATION_INTENT_RESPONSE_THRESHOLD) {
+        // P4 第四证据：道体状态级——词面全空但语义回应原意图
+        RegressionVerdict {
+            keep: true,
+            evidence: "原意图回应度",
         }
     } else {
         RegressionVerdict {
@@ -348,14 +367,14 @@ mod tests {
 
     #[test]
     fn 道体再次校验原查询直接命中保留() {
-        let verdict = regression_recheck(2, 0, 0);
+        let verdict = regression_recheck(2, 0, 0, None);
         assert!(verdict.keep);
         assert_eq!(verdict.evidence, "原查询词面命中");
     }
 
     #[test]
     fn 道体再次校验联想桥强关联保留() {
-        let verdict = regression_recheck(0, 3, 0);
+        let verdict = regression_recheck(0, 3, 0, None);
         assert!(verdict.keep);
         assert_eq!(verdict.evidence, "联想桥强关联");
     }
@@ -363,15 +382,50 @@ mod tests {
     #[test]
     fn 道体再次校验单泛词不通过() {
         // 仅 1 个联想桥词命中、原查询零重叠、无标签 → 发散噪声，剔除
-        let verdict = regression_recheck(0, 1, 0);
+        let verdict = regression_recheck(0, 1, 0, None);
         assert!(!verdict.keep);
         assert_eq!(verdict.evidence, "无共鸣信号·发散噪声");
     }
 
     #[test]
     fn 道体再次校验标签共鸣兜底() {
-        let verdict = regression_recheck(0, 0, 1);
+        let verdict = regression_recheck(0, 0, 1, None);
         assert!(verdict.keep);
         assert_eq!(verdict.evidence, "标签共鸣");
+    }
+
+    // === P4：第四证据位（原意图回应度）契约测试 ===
+
+    /// P4.1-1：词面全空但意图相关分 ≥0.5 → 保留，证据"原意图回应度"
+    #[test]
+    fn 第四证据意图回应度高分保留() {
+        let verdict = regression_recheck(0, 0, 0, Some(0.7));
+        assert!(verdict.keep, "intent_score ≥0.5 时应凭第四证据保留");
+        assert_eq!(verdict.evidence, "原意图回应度");
+    }
+
+    /// P4.1-2：意图相关分 <0.5 → 第四证据不通过，回退三证据裁决（此处全空 → 剔除）
+    #[test]
+    fn 第四证据低分不通过回退三证据() {
+        let verdict = regression_recheck(0, 0, 0, Some(0.3));
+        assert!(!verdict.keep, "intent_score <0.5 且词面全空时应仍剔除");
+        assert_eq!(verdict.evidence, "无共鸣信号·发散噪声");
+    }
+
+    /// P4.1-3：意图分数在场且词面证据存在时，词面证据优先（不掩盖原证据）
+    #[test]
+    fn 第四证据不与词面证据冲突() {
+        let verdict = regression_recheck(2, 0, 0, Some(0.1));
+        assert!(verdict.keep);
+        assert_eq!(verdict.evidence, "原查询词面命中", "词面证据优先于第四证据");
+    }
+
+    /// P4.1-4：daemon 离线（None）时第四证据缺省跳过，行为与三证据现状逐字节一致
+    #[test]
+    fn 第四证据离线缺省跳过() {
+        // 词面全空 + intent=None → 与"未接入 P4 前"的现状一致（剔除）
+        let verdict = regression_recheck(0, 0, 0, None);
+        assert!(!verdict.keep);
+        assert_eq!(verdict.evidence, "无共鸣信号·发散噪声");
     }
 }
