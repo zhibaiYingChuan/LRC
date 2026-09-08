@@ -98,6 +98,12 @@ def scan_file(filepath: Path, verbose: bool = False) -> list[dict]:
         # 跳过 License 边界门控注释与信号消费声明（产品侧只消费信号、不内置算法）
         if re.search(r'(产品侧只消费不计算|DaoTi License|LRC_DAOTI_NAVIGATE|daoti\s+pilot)', line, re.IGNORECASE):
             continue
+        # 跳过 P2.5 常驻导航生产者（daoti_daemon）的进程名/函数名/环境变量引用。
+        # daoti_daemon 是独立研究资产进程，LRC 仅消费其 JSON 信号，不内置算法；
+        # 与 LRC_DAOTI_NAVIGATE 门控、daoti_preview 字段同属"契约/集成引用"白名单
+        # daoti-lexicon-v1 是信号协议版本标识（navigation.rs 的 source_version 协商值）
+        if re.search(r'(daoti_daemon|DAOTI_SERVICE_URL|fetch_daoti_navigation|from daoti|daoti-lexicon-v1|daoti 研究资产)', line, re.IGNORECASE):
+            continue
         # 跳过 API schema 中 daoti_preview 字段的 description 描述文本
         # （如 "道体写入时预判的六十四卦名称"）—— 契约字段含义，非算法
         if re.search(r'"(daoti_preview_\w+)"|道体写入时预判', line, re.IGNORECASE):
