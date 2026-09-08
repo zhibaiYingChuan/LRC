@@ -9,7 +9,14 @@ use tauri::Emitter;
 use tauri::Manager; // Manager trait 提供 get_webview_window 等方法
 use tauri::State; // v0.5.5 P1-2：Emitter trait 提供 emit 方法（open_settings 命令使用）
                   // v0.5.4 修复：移除未使用的 Emitter import（emit 已从 detect_agents 中移除）
-use tokio::sync::Mutex; // 使用 tokio::sync::Mutex 以支持跨 await 持有
+use std::sync::LazyLock;
+use tokio::sync::{Mutex, Semaphore}; // 使用异步锁与并发信号量保护 IPC
+
+const MAX_PROVIDER_LEN: usize = 32;
+const MAX_BASE_URL_LEN: usize = 2048;
+const MAX_API_KEY_LEN: usize = 4096;
+const MAX_MODEL_LEN: usize = 256;
+static LLM_TEST_CONCURRENCY: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(1));
 
 use crate::agent_detector::{
     get_scan_cache_timestamp_ms, invalidate_scan_cache, AgentDetectorRegistry, AgentInfo,
@@ -17,7 +24,9 @@ use crate::agent_detector::{
 };
 use crate::config_wizard::WizardState;
 use crate::rate_limiter::RateLimiter;
-use crate::sidecar_manager::{SidecarManager, SidecarStartError, StartOptions, StartProgress};
+use crate::sidecar_manager::{
+    sidecar_identity_matches, SidecarManager, SidecarStartError, StartOptions, StartProgress,
+};
 use crate::tray; // 托盘模块的 open_dashboard 函数
 
 fn apply_agent_overrides(
@@ -207,7 +216,7 @@ fn sidecar_error_to_user_message(e: &SidecarStartError) -> String {
         SidecarStartError::UserCancelled => "启动已取消。".to_string(),
         SidecarStartError::PortConflict { port, .. } => {
             format!(
-                "端口 {} 已被其他 LRC 服务占用，请先停止现有服务再启动。",
+                "端口 {} 已被其他程序占用（非当前项目的 LRC 服务），请释放该端口后重试。",
                 port
             )
         }
@@ -429,6 +438,8 @@ pub struct AppStore {
     pub configured_agent_count: Mutex<usize>,
     /// 启动取消标志（v0.8.9 G-001：前端 abort 时通知后端终止启动）
     pub start_cancel_flag: Arc<AtomicBool>,
+    /// 串行化启动与项目切换，避免共享取消标志互相干扰
+    pub start_operation_lock: Mutex<()>,
 }
 
 // ── Sidecar 管理命令 ──
@@ -530,21 +541,46 @@ fn is_dev_mode() -> bool {
 }
 
 /// 获取开发模式的端口（如果处于开发模式且未指定端口）
-fn dev_mode_port(requested_port: Option<u16>) -> u16 {
-    if is_dev_mode() && requested_port.is_none() {
-        3111
-    } else {
-        requested_port.unwrap_or(crate::sidecar_manager::DEFAULT_SIDECAR_PORT)
+fn validate_requested_port(requested_port: Option<u16>) -> Result<(), String> {
+    if let Some(port) = requested_port {
+        if is_dev_mode() && port == crate::sidecar_manager::DEFAULT_SIDECAR_PORT {
+            return Err("开发模式禁止使用稳定版端口 3099，请使用 3111 或留空自动选择".to_string());
+        }
+        if !is_dev_mode() && port == 3111 {
+            return Err("稳定模式禁止使用开发版端口 3111，请使用 3099 或留空自动选择".to_string());
+        }
     }
+    Ok(())
 }
 
-/// 仅在开发版扫描并复用端口范围内的 sidecar，稳定版禁止接管开发实例。
-async fn find_reusable_sidecar_port(start_port: u16) -> Option<u16> {
-    if is_dev_mode() {
-        SidecarManager::find_healthy_sidecar_port(start_port).await
+fn dev_mode_port(requested_port: Option<u16>) -> u16 {
+    requested_port.unwrap_or(if is_dev_mode() {
+        3111
     } else {
-        None
+        crate::sidecar_manager::DEFAULT_SIDECAR_PORT
+    })
+}
+
+/// 仅复用身份完全匹配的外部 sidecar，稳定版禁止扫描接管其他实例。
+async fn find_reusable_sidecar_port(
+    start_port: u16,
+    src_dir: Option<&str>,
+    data_dir: Option<&str>,
+) -> Option<u16> {
+    if !is_dev_mode() {
+        return None;
     }
+    for offset in 0..10u16 {
+        let Some(port) = start_port.checked_add(offset) else {
+            break;
+        };
+        if let Some(probed) = SidecarManager::check_sidecar_health(port).await {
+            if sidecar_identity_matches(&probed, src_dir, data_dir) {
+                return Some(port);
+            }
+        }
+    }
+    None
 }
 
 /// 获取开发模式的数据目录（如果处于开发模式）
@@ -568,6 +604,10 @@ pub async fn start_sidecar(
     port: Option<u16>,
     multi_window: Option<u32>,
 ) -> Result<u16, String> {
+    let _start_operation_guard = store
+        .start_operation_lock
+        .try_lock()
+        .map_err(|_| user_friendly_error("已有 sidecar 启动或项目切换正在进行，请稍后重试"))?;
     // L3 运行时保护：速率限制检查
     {
         let mut limiter = store.rate_limiter.lock().await;
@@ -578,6 +618,9 @@ pub async fn start_sidecar(
 
     // v0.8.9 G-001：重置取消标志，允许新的启动请求
     store.start_cancel_flag.store(false, Ordering::SeqCst);
+
+    // v0.9.0 P1 修复：开发/稳定模式端口隔离 — 显式传入对方模式的端口直接拒绝
+    validate_requested_port(port)?;
 
     // v0.8.9 G-003：创建进度通道，spawn 转发任务将进度事件推送到前端
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<StartProgress>(32);
@@ -620,19 +663,36 @@ pub async fn start_sidecar(
             // 场景：桌面端崩溃后重启，旧 sidecar 仍在端口上运行。
             // 复用现有 sidecar，避免 spawn 重复进程（孤儿进程问题）。
             let target_port = dev_mode_port(port);
-            if let Some(probed) = SidecarManager::check_sidecar_health(target_port).await {
+            let expected_data_dir = dev_mode_data_dir();
+            let probed = SidecarManager::check_sidecar_health(target_port)
+                .await
+                .filter(|p| {
+                    sidecar_identity_matches(
+                        p,
+                        effective_src_dir.as_deref(),
+                        expected_data_dir.as_deref(),
+                    )
+                });
+            if let Some(probed) = probed {
                 tracing::info!(
-                    "G-002：端口 {} 已有健康 sidecar（src_dir: {}, uptime: {}s），复用现有实例",
+                    "G-002：端口 {} 已有匹配项目的健康 sidecar（src_dir: {}, uptime: {}s），复用现有实例",
                     target_port,
                     probed.src_dir,
                     probed.uptime_seconds
                 );
-                // 复用现有 sidecar，不执行 Phase 2/3
                 target_port
-            } else if let Some(found) = find_reusable_sidecar_port(target_port).await {
-
-                // 开发版允许在开发端口范围内复用已有 sidecar；稳定版禁止扫描回退。
-                tracing::info!("G-002：开发端口区间发现健康 sidecar 在端口 {}，复用现有实例", found);
+            } else if let Some(found) = find_reusable_sidecar_port(
+                target_port,
+                effective_src_dir.as_deref(),
+                expected_data_dir.as_deref(),
+            )
+            .await
+            {
+                // v0.9.0 P1 修复：仅在 src_dir/data_dir 身份完全匹配时复用，防止误连对方模式实例
+                tracing::info!(
+                    "G-002：端口区间发现身份匹配的健康 sidecar 在端口 {}，复用现有实例",
+                    found
+                );
                 found
             } else {
                 // Phase 2: 启动子进程 + 健康检查（不持锁，I/O，最多 40s）
@@ -654,18 +714,27 @@ pub async fn start_sidecar(
                     progress_tx: Some(&progress_tx),
                     data_dir: _dev_dd.as_deref(),
                 };
-                let (child, port) = match SidecarManager::spawn_and_wait(
-                    &binary_path,
-                    &project_key,
-                    &start_opts,
+                // v0.9.7 审查修复（HCSE 超时机制验证）：首跳此前无外层超时，
+                // 与二级重试/for_project/switch_project 的 120s 不一致。
+                // 超时 drop future 时由 ChildCleanupGuard 回收已 spawn 的子进程。
+                let (child, port) = match tokio::time::timeout(
+                    std::time::Duration::from_secs(120),
+                    SidecarManager::spawn_and_wait(
+                        &binary_path,
+                        &project_key,
+                        &start_opts,
+                    ),
                 )
                 .await
                 {
-                    Ok(pair) => pair,
-                    Err(crate::sidecar_manager::SidecarStartError::SingletonConflict {
+                    Err(_elapsed) => {
+                        tracing::error!("start_sidecar: spawn_and_wait 超出 120s 总预算，已取消");
+                        return Err("启动超时（120s），请检查系统资源后重试。".to_string());
+                    }
+                    Ok(Err(crate::sidecar_manager::SidecarStartError::SingletonConflict {
                         pid,
                         existing_port: None,
-                    }) => {
+                    })) => {
                         // v0.8.39 修复：SingletonConflict 且 health check 不可达时，
                         // 强制终止旧进程后重启，而不是让用户手动操作。
                         tracing::warn!("E008: 旧 sidecar (PID={}) 不可达，强制终止后重启", pid);
@@ -714,7 +783,8 @@ pub async fn start_sidecar(
                             // 历史三级重试逻辑已删除：不可确认旧实例死亡时不能继续启动。
                         }
                     }
-                    Err(e) => return Err(sidecar_error_to_user_message(&e)),
+                    Ok(Err(e)) => return Err(sidecar_error_to_user_message(&e)),
+                    Ok(Ok(pair)) => pair,
                 };
 
                 // Phase 3: 插入实例（重新获取锁，无 I/O，<1ms）
@@ -762,8 +832,15 @@ pub async fn start_sidecar_for_project(
     port: Option<u16>,
     multi_window: Option<u32>,
 ) -> Result<u16, String> {
+    let _start_operation_guard = store
+        .start_operation_lock
+        .try_lock()
+        .map_err(|_| user_friendly_error("已有 sidecar 启动或项目切换正在进行，请稍后重试"))?;
     // v0.8.9 G-001：重置取消标志，允许新的启动请求
     store.start_cancel_flag.store(false, Ordering::SeqCst);
+
+    // v0.9.0 P1 修复：开发/稳定模式端口隔离 — 显式传入对方模式的端口直接拒绝
+    validate_requested_port(port)?;
 
     // v0.8.9 G-003：创建进度通道
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<StartProgress>(32);
@@ -789,15 +866,31 @@ pub async fn start_sidecar_for_project(
         crate::sidecar_manager::PrepareResult::NeedStart => {
             // v0.8.9 G-002：Phase 1.5 — 检测端口是否被外部 sidecar 占用
             let target_port = dev_mode_port(port);
-            if let Some(probed) = SidecarManager::check_sidecar_health(target_port).await {
+            let expected_data_dir = dev_mode_data_dir();
+            if let Some(probed) = SidecarManager::check_sidecar_health(target_port)
+                .await
+                .filter(|probed| {
+                    sidecar_identity_matches(
+                        probed,
+                        src_dir.as_deref(),
+                        expected_data_dir.as_deref(),
+                    )
+                })
+            {
                 tracing::info!(
-                    "G-002：端口 {} 已有健康 sidecar（src_dir: {}），复用现有实例（项目: {}）",
+                    "G-002：端口 {} 已有身份匹配的健康 sidecar（src_dir: {}），复用现有实例（项目: {}）",
                     target_port,
                     probed.src_dir,
                     project_key
                 );
                 target_port
-            } else if let Some(found) = find_reusable_sidecar_port(target_port).await {
+            } else if let Some(found) = find_reusable_sidecar_port(
+                target_port,
+                src_dir.as_deref(),
+                expected_data_dir.as_deref(),
+            )
+            .await
+            {
                 // v0.8.38 新增：扫描端口区间（3099-3119）寻找健康 sidecar
                 tracing::info!(
                     "G-002：端口区间扫描发现健康 sidecar 在端口 {}，复用现有实例（项目: {}）",
@@ -939,11 +1032,16 @@ pub async fn stop_sidecar_for_project(
     store: State<'_, AppStore>,
     project_key: String,
 ) -> Result<(), String> {
-    let mut sidecar = store.sidecar.lock().await;
-    sidecar
-        .stop_project(&project_key)
-        .await
-        .map_err(|e| user_friendly_error(&e))
+    let child = {
+        let mut sidecar = store.sidecar.lock().await;
+        sidecar.take_project_child(&project_key)
+    };
+    if let Some(child) = child {
+        SidecarManager::stop_child(child, &project_key)
+            .await
+            .map_err(|e| user_friendly_error(&e))?;
+    }
+    Ok(())
 }
 
 /// 停止 sidecar 进程
@@ -952,10 +1050,15 @@ pub async fn stop_sidecar_for_project(
 #[tauri::command]
 pub async fn stop_sidecar(store: State<'_, AppStore>) -> Result<(), String> {
     // v0.5.7：先持有 sidecar 锁执行 stop()，释放后再获取 sidecar_port 锁
-    {
+    let children = {
         let mut sidecar = store.sidecar.lock().await;
-        sidecar.stop().await.map_err(|e| user_friendly_error(&e))?;
-    } // sidecar 锁在此释放
+        sidecar.take_all_children()
+    }; // sidecar 锁在此释放
+    for (project_key, child) in children {
+        SidecarManager::stop_child(child, &project_key)
+            .await
+            .map_err(|e| user_friendly_error(&e))?;
+    }
 
     // 清除端口记录（单独获取 sidecar_port 锁，避免锁嵌套）
     {
@@ -1095,6 +1198,30 @@ fn clean_api_key(raw: &str) -> String {
         .collect()
 }
 
+/// 校验 test_llm_connection 的输入参数（纯函数，便于单元测试）
+///
+/// P1/P2 审查修复：
+/// 1. provider 白名单：仅允许 openai/ollama（与 config_wizard 支持的类型一致）
+/// 2. 输入长度上限：provider/base_url/model/api_key（清洗后）均有约束，
+///    防止恶意超长输入造成日志/内存滥用
+fn validate_test_llm_input(
+    provider: &str,
+    api_key: &str,
+    base_url: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    if provider.len() > MAX_PROVIDER_LEN || !matches!(provider, "openai" | "ollama") {
+        return Err("不支持的 LLM 提供商".to_string());
+    }
+    if base_url.len() > MAX_BASE_URL_LEN || api_key.len() > MAX_API_KEY_LEN {
+        return Err("输入长度超过限制".to_string());
+    }
+    if model.is_some_and(|value| value.len() > MAX_MODEL_LEN) {
+        return Err("模型名称长度超过限制".to_string());
+    }
+    Ok(())
+}
+
 /// 测试 LLM API 连接（由 Rust 后端代理，避免浏览器 CSP 限制）
 ///
 /// 前端直接向 LLM 提供商发请求会被 CSP 拦截，
@@ -1102,15 +1229,50 @@ fn clean_api_key(raw: &str) -> String {
 /// v0.5.4 修复：API Key 输入清洗，trim + 过滤不可见字符
 #[tauri::command]
 pub async fn test_llm_connection(
+    store: State<'_, AppStore>,
     provider: String,
     api_key: String,
     base_url: String,
     model: Option<String>,
 ) -> Result<LlmTestResult, String> {
+    validate_test_llm_input(&provider, &api_key, &base_url, model.as_deref())?;
+    {
+        let mut limiter = store.rate_limiter.lock().await;
+        if limiter.should_throttle("cmd:test_llm_connection") {
+            return Err("请求过于频繁，请稍后重试".to_string());
+        }
+    }
+    let _permit = LLM_TEST_CONCURRENCY
+        .try_acquire()
+        .map_err(|_| "已有连接测试正在进行，请稍后重试".to_string())?;
     // v0.5.4 修复：清洗 API Key — trim 空白 + 过滤 \r\n 等控制字符
     let api_key = clean_api_key(&api_key);
+    if api_key.len() > MAX_API_KEY_LEN {
+        return Err("API Key 长度超过限制".to_string());
+    }
+    // SSRF 防护：校验 base_url（拒绝云 metadata/链路本地/userinfo；回环与私网放行）
+    if let Err(e) = crate::url_safety::validate_http_url(&base_url) {
+        return Err(format!("API 地址校验失败: {e}"));
+    }
+    // SSRF 防护：解析并固定本次连接目标，保留原 URL 的 Host/SNI。
+    let resolved_ips = crate::url_safety::resolve_and_check_dns(&base_url)
+        .await
+        .map_err(|e| format!("API 地址校验失败: {e}"))?;
+    let endpoint_url = url::Url::parse(&base_url).map_err(|_| "API 地址格式无效".to_string())?;
+    let endpoint_host = endpoint_url
+        .host_str()
+        .ok_or_else(|| "API 地址缺少主机".to_string())?;
+    let endpoint_port = endpoint_url
+        .port_or_known_default()
+        .ok_or_else(|| "API 地址端口无效".to_string())?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .resolve(
+            endpoint_host,
+            std::net::SocketAddr::new(resolved_ips[0], endpoint_port),
+        )
+        // SSRF 防护：禁止自动重定向（防 302 跳转至内网/metadata）
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
 
@@ -1145,7 +1307,7 @@ pub async fn test_llm_connection(
                 } else if e.is_connect() {
                     format!("无法连接 Ollama 服务（{}），请确认 Ollama 是否在运行", base)
                 } else {
-                    format!("Ollama 连接失败：{e}")
+                    "Ollama 连接失败，请检查服务状态和网络连接".to_string()
                 };
                 Ok(LlmTestResult {
                     success: false,
@@ -1219,7 +1381,7 @@ pub async fn test_llm_connection(
                 } else if e.is_connect() {
                     format!("网络不通：无法连接到 {base}，请检查网络连接和 API 地址是否正确")
                 } else {
-                    format!("网络请求失败：{e}")
+                    "网络请求失败，请检查网络连接和 API 地址".to_string()
                 };
                 Ok(LlmTestResult {
                     success: false,
@@ -1295,7 +1457,7 @@ pub async fn test_llm_connection(
                         } else if e.is_connect() {
                             "网络不通：无法建立连接，请检查网络和 API 地址".to_string()
                         } else {
-                            format!("网络请求失败：{e}")
+                            "网络请求失败，请检查网络连接和 API 地址".to_string()
                         };
                         Ok(LlmTestResult {
                             success: false,
@@ -2086,6 +2248,10 @@ pub async fn switch_project(
     project_dir: String,
     multi_window: Option<u32>,
 ) -> Result<SwitchProjectResponse, String> {
+    let _start_operation_guard = store
+        .start_operation_lock
+        .try_lock()
+        .map_err(|_| user_friendly_error("已有 sidecar 启动或项目切换正在进行，请稍后重试"))?;
     // L3 运行时保护：速率限制检查
     {
         let mut limiter = store.rate_limiter.lock().await;
@@ -2365,10 +2531,10 @@ pub async fn verify_setup(store: State<'_, AppStore>) -> Result<VerifySetupResul
                     result.sidecar_message =
                         format!("服务响应异常（HTTP {}）", resp.status().as_u16());
                 }
-                Err(e) => {
+                Err(_e) => {
                     result.all_ok = false;
                     result.sidecar_running = false;
-                    result.sidecar_message = format!("服务未响应：{}", e);
+                    result.sidecar_message = "服务未响应，请检查后台服务状态".to_string();
                 }
             }
         } else {
@@ -2577,5 +2743,58 @@ mod tests {
             "中文超时应匹配到友好提示，实际: {}",
             friendly
         );
+    }
+
+    // ── test_llm_connection 输入校验（P1/P2 审查修复回归测试）──
+
+    #[test]
+    fn test_validate_llm_input_accepts_supported_providers() {
+        assert!(
+            validate_test_llm_input("openai", "sk-x", "https://api.openai.com/v1", None).is_ok()
+        );
+        assert!(
+            validate_test_llm_input("ollama", "", "http://localhost:11434", Some("llama3")).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_llm_input_rejects_unknown_provider() {
+        // 白名单之外（如任意 SSH 内网探测目标/自制 provider）一律拒绝
+        assert!(validate_test_llm_input("ssh", "", "http://10.0.0.1:22", None).is_err());
+        assert!(validate_test_llm_input("custom", "", "https://example.com", None).is_err());
+        assert!(validate_test_llm_input("OpenAI", "", "https://api.openai.com/v1", None).is_err());
+        assert!(validate_test_llm_input("", "", "https://example.com", None).is_err());
+    }
+
+    #[test]
+    fn test_validate_llm_input_length_limits() {
+        let long_url = "https://example.com/".to_string() + &"a".repeat(MAX_BASE_URL_LEN);
+        assert!(
+            validate_test_llm_input("openai", "sk-x", &long_url, None).is_err(),
+            "超长 base_url 应被拒绝"
+        );
+        let long_key = "s".repeat(MAX_API_KEY_LEN + 1);
+        assert!(
+            validate_test_llm_input("openai", &long_key, "https://api.openai.com/v1", None)
+                .is_err(),
+            "超长 api_key 应被拒绝"
+        );
+        let long_model = "m".repeat(MAX_MODEL_LEN + 1);
+        assert!(
+            validate_test_llm_input(
+                "openai",
+                "sk-x",
+                "https://api.openai.com/v1",
+                Some(&long_model)
+            )
+            .is_err(),
+            "超长 model 应被拒绝"
+        );
+        let long_provider = "p".repeat(MAX_PROVIDER_LEN + 1);
+        assert!(validate_test_llm_input(&long_provider, "", "", None).is_err());
+        // 各字段恰好等于上限时应放行
+        let exact_url = "https://example.com/".to_string()
+            + &"a".repeat(MAX_BASE_URL_LEN - "https://example.com/".len());
+        assert!(validate_test_llm_input("openai", "sk-x", &exact_url, None).is_ok());
     }
 }

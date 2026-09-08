@@ -398,12 +398,19 @@ async fn try_run() -> Result<(), String> {
             if let Some(ref saved_llm) = saved_config.llm_api {
                 if !saved_llm.is_empty() {
                     llm_api_raw = Some(saved_llm.clone());
-                    eprintln!(
-                        "[配置] 从全局配置加载 LLM API: {}...",
-                        &saved_llm[..saved_llm.len().min(30)]
-                    );
+                    eprintln!("[配置] 从全局配置加载 LLM API（凭据已隐藏）");
                 }
             }
+        }
+    }
+
+    // HTTP 服务仅允许绑定本机地址，避免 --host 或配置文件意外暴露服务。
+    if host != "localhost" {
+        let ip = host
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| format!("错误: --host 仅支持 localhost 或回环 IP，收到: {host}"))?;
+        if !ip.is_loopback() {
+            return Err(format!("错误: --host 必须是回环地址，拒绝绑定: {host}"));
         }
     }
 
@@ -416,10 +423,7 @@ async fn try_run() -> Result<(), String> {
     if llm_api_raw.is_none() {
         if let Ok(env_llm) = std::env::var("LRC_LLM_API") {
             if !env_llm.is_empty() {
-                eprintln!(
-                    "[配置] 从环境变量 LRC_LLM_API 加载 LLM API: {}...",
-                    &env_llm[..env_llm.len().min(30)]
-                );
+                eprintln!("[配置] 从环境变量 LRC_LLM_API 加载 LLM API（凭据已隐藏）");
                 llm_api_raw = Some(env_llm);
             }
         }
@@ -432,10 +436,7 @@ async fn try_run() -> Result<(), String> {
         if let Some(ref saved_llm) = saved_config.llm_api {
             if !saved_llm.is_empty() {
                 llm_api_raw = Some(saved_llm.clone());
-                eprintln!(
-                    "[配置] daemon 模式从全局配置后备加载 LLM API: {}...",
-                    &saved_llm[..saved_llm.len().min(30)]
-                );
+                eprintln!("[配置] daemon 模式从全局配置后备加载 LLM API（凭据已隐藏）");
             }
         }
     }
@@ -448,10 +449,7 @@ async fn try_run() -> Result<(), String> {
     if daemon_mode && llm_api_raw.is_none() {
         if let Some(wizard_llm) = load_llm_from_wizard_json() {
             llm_api_raw = Some(wizard_llm.clone());
-            eprintln!(
-                "[配置] daemon 模式从 wizard.json 后备加载 LLM API: {}...",
-                &wizard_llm[..wizard_llm.len().min(30)]
-            );
+            eprintln!("[配置] daemon 模式从 wizard.json 后备加载 LLM API（凭据已隐藏）");
         }
     }
 
@@ -712,7 +710,18 @@ async fn try_run() -> Result<(), String> {
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }));
             // 记录 sidecar 启动事件
-            logger.log_sidecar_started(0, &args.join(" "));
+            let safe_args: Vec<String> = args
+                .iter()
+                .enumerate()
+                .map(|(index, arg)| {
+                    if index > 0 && args.get(index - 1).map(String::as_str) == Some("--llm-api") {
+                        "[已隐藏]".to_string()
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect();
+            logger.log_sidecar_started(0, &safe_args.join(" "));
             store.set_exploration_logger(logger);
             log(&format!("   探索日志: 已启用 → {log_path}"));
         }
@@ -735,6 +744,24 @@ async fn try_run() -> Result<(), String> {
         if disable_memory {
             std::env::set_var("LRC_DISABLE_MEMORY", "1");
             log("   ⚠ 记忆系统: 已禁用（基线 A：zero_memory）");
+        }
+
+        // 阶段D：检索链路审计落盘（JSONL，重启不丢失）
+        // 与记忆数据同目录存储，初始化失败时降级为内存审计模式
+        let audit_path = format!("{}/audit.jsonl", data_dir);
+        match store.audit_trail.set_persist_path(&audit_path) {
+            Ok(()) => log(&format!("   检索审计落盘: 已启用 → {audit_path}")),
+            Err(e) => log(&format!(
+                "   ⚠ 检索审计落盘初始化失败（继续内存审计模式）: {e}"
+            )),
+        }
+
+        // 阶段D：联想级反馈落盘（JSONL，重启不丢失）
+        // 与记忆数据同目录存储，初始化失败时降级为纯内存模式
+        let feedback_path = format!("{}/feedback.jsonl", data_dir);
+        match store.user_feedback.set_persist_path(&feedback_path) {
+            Ok(()) => log(&format!("   反馈落盘: 已启用 → {feedback_path}")),
+            Err(e) => log(&format!("   ⚠ 反馈落盘初始化失败（继续纯内存模式）: {e}")),
         }
     }
 
@@ -824,6 +851,8 @@ async fn try_run() -> Result<(), String> {
         manager: Arc::new(Mutex::new(Box::new(mgr))),
         memory_store: memory_store.clone(),
         src_dir: src_dir.clone(),
+        // v0.9.6 P0 修复：/health 需暴露 data_dir 供桌面端身份校验
+        data_dir: data_dir.clone(),
         llm_api: Arc::new(tokio::sync::RwLock::new(llm_api.clone())),
         // v0.8.22 P0-1 修复：LLM 配置状态无锁缓存，避免 /health 阻塞
         llm_configured_atomic: Arc::new(std::sync::atomic::AtomicBool::new(
@@ -1742,7 +1771,21 @@ fn handle_model_list() {
 ///
 /// 使用 ModelDownloader 下载模型文件到 models/ 目录。
 /// 需要启用 ml feature（默认未启用，需用 `cargo build --features server,ml` 编译）。
+fn validate_model_id(model_id: &str) -> Result<(), String> {
+    if model_id.is_empty()
+        || model_id.contains(['\\', ':'])
+        || model_id
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || model_id.starts_with('/')
+    {
+        return Err(format!("错误: 无效的模型 ID: {model_id}"));
+    }
+    Ok(())
+}
+
 fn handle_model_download(model_id: &str) -> Result<(), String> {
+    validate_model_id(model_id)?;
     #[cfg(not(feature = "ml"))]
     {
         Err(format!(
@@ -1875,6 +1918,7 @@ fn handle_model_download(model_id: &str) -> Result<(), String> {
 /// 设置默认嵌入模型。当前通过环境变量配置（变量名见 `EMBEDDER_MODEL_ENV_VAR` 常量）。
 /// 未来版本将支持持久化到配置文件。
 fn handle_model_use(model_id: &str) -> Result<(), String> {
+    validate_model_id(model_id)?;
     // 从 engine 层获取环境变量名（避免公开层直接出现受保护术语）
     let env_var = code_memory::engine::embedder::EMBEDDER_MODEL_ENV_VAR;
     println!("═══════════════════════════════════════════");
@@ -1937,6 +1981,7 @@ fn handle_model_use(model_id: &str) -> Result<(), String> {
 ///
 /// 删除指定模型的本地文件。需要用户确认。
 fn handle_model_remove(model_id: &str) -> Result<(), String> {
+    validate_model_id(model_id)?;
     println!("═══════════════════════════════════════════");
     println!("  LRC 删除模型");
     println!("═══════════════════════════════════════════");

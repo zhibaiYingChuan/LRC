@@ -110,13 +110,19 @@ impl GraphMemoryStore {
 
     /// 从文件加载已有边
     pub fn load(&mut self) -> Result<(), PersistenceError> {
-        if let Ok(content) = std::fs::read_to_string(&self.edges_file) {
-            if !content.trim().is_empty() {
-                self.edges =
-                    serde_json::from_str(&content).map_err(PersistenceError::Serialization)?;
+        // 文件不存在（首次运行）→ 正常空状态
+        // 文件存在但读取/解析失败 → 必须返回错误，防止后续 add_edge 用空状态覆盖原图数据
+        match std::fs::read_to_string(&self.edges_file) {
+            Ok(content) => {
+                if !content.trim().is_empty() {
+                    self.edges =
+                        serde_json::from_str(&content).map_err(PersistenceError::Serialization)?;
+                }
+                Ok(())
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(PersistenceError::Io(e)),
         }
-        Ok(())
     }
 
     /// 持久化边到文件

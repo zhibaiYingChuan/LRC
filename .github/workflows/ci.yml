@@ -399,8 +399,19 @@ jobs:
             target/
           key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-build-
-      - name: cargo check (server feature)
-        run: cargo check --features server
+      - name: cargo check (feature matrix)
+        run: |
+          cargo check --no-default-features
+          cargo check --features server
+          cargo check --all-features
+          cargo check --features server,ml
+          cargo check --features server,postgres
+          cargo check --features server,qdrant
+          cargo check --features server,neo4j
+      - name: Explicit binary checks
+        run: |
+          cargo check --bin code-memory-server --features server
+          cargo check --bin code-memory-benchmark --features server
 
       # v0.8.8 新增：桌面端跨平台编译验证（防止 macOS/Linux 桌面端 CI 失败）
       # v0.8.23 CI 修复：禁用 apt 镜像列表探测（避免 harden-runner 阻断未知镜像域名导致挂起），
@@ -460,11 +471,21 @@ jobs:
   # 使用 Playwright 对仪表盘做真实浏览器交互测试
   # ════════════════════════════════════════════════════════════
   frontend-test:
-    name: Frontend Smoke Test
+    name: Frontend Browser Regression
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # v0.8.26 HCSE 发布合规修复：github.event.head_commit 在 push 事件中可能为 null，
     # 添加 null 保护避免表达式求值时报错
-    if: github.event_name == 'pull_request' || (github.event.head_commit != null && contains(join(github.event.head_commit.modified, ' '), 'static/'))
+    # v0.9.7 审查修复：新增文件在 head_commit.added（不在 modified），
+    # 纯新增 static/tests 文件的 commit 也必须触发本门禁
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'push' && github.event.head_commit != null &&
+      (contains(join(github.event.head_commit.modified, ' '), 'static/') ||
+      contains(join(github.event.head_commit.modified, ' '), 'tests/frontend/') ||
+      contains(join(github.event.head_commit.added, ' '), 'static/') ||
+      contains(join(github.event.head_commit.added, ' '), 'tests/frontend/') ||
+      contains(join(github.event.head_commit.modified, ' '), '.github/workflows/ci.yml')))
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -472,6 +493,9 @@ jobs:
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
           egress-policy: block
+          # v0.9.7 审查修复：本 Job 需要 npm 安装 playwright（registry.npmjs.org）
+          # 与 --with-deps 的 apt 系统依赖（archive/security.ubuntu.com），
+          # 此前白名单缺失这两组域名，egress block 下门禁必挂
           allowed-endpoints: >
             github.com:443
             api.github.com:443
@@ -481,8 +505,16 @@ jobs:
             rustup.rs:443
             static.rust-lang.org:443
             index.crates.io:443
+            registry.npmjs.org:443
+            nodejs.org:443
             playwright.azureedge.net:443
             cdn.playwright.dev:443
+            archive.ubuntu.com:443
+            archive.ubuntu.com:80
+            security.ubuntu.com:443
+            security.ubuntu.com:80
+            old-releases.ubuntu.com:443
+            old-releases.ubuntu.com:80
             unpkg.com:443
             cdn.jsdelivr.net:443
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -501,14 +533,20 @@ jobs:
         run: cargo build --release --features server
       - name: Start sidecar in background
         run: |
-          nohup ./target/release/code-memory-server --src-dir . --port 3099 > sidecar.log 2>&1 &
+          nohup ./target/release/code-memory-server --src-dir . --port 3111 > sidecar.log 2>&1 &
           echo "Sidecar PID: $!"
-          sleep 5
-          if ! pgrep -f "code-memory-server"; then
-            echo "ERROR: sidecar 启动失败"
-            cat sidecar.log
-            exit 1
-          fi
+          for i in $(seq 1 30); do
+            if curl --fail --silent --show-error http://127.0.0.1:3111/health > /dev/null; then
+              echo "sidecar 已在 3111 就绪"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "ERROR: sidecar 在 30 秒内未就绪"
+              cat sidecar.log
+              exit 1
+            fi
+            sleep 1
+          done
       - name: Setup Node.js
         uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4
         with:
@@ -516,19 +554,26 @@ jobs:
       - name: Install Playwright
         run: |
           npm init -y
-          npm install @playwright/test
-          npx playwright install chromium
+          npm install playwright
+          npx playwright install --with-deps chromium
       - name: Run frontend static and contract checks
         run: |
           node --check static/app.js
           node --check tests/frontend/cdp-regression.js
+          node --check tests/frontend/playwright-smoke.js
           node scripts/validate_frontend_contract.js
-      - name: Upload Playwright report
+      - name: Run Chromium browser regression
+        env:
+          LRC_BROWSER_BASE_URL: http://127.0.0.1:3111
+          LRC_BROWSER_ARTIFACT_DIR: ${{ github.workspace }}/playwright-artifacts
+        run: node tests/frontend/playwright-smoke.js
+      - name: Upload browser regression evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: playwright-report
-          path: playwright-report/
+          name: browser-regression-evidence
+          path: playwright-artifacts/
+          if-no-files-found: warn
           retention-days: 7
       - name: Stop sidecar
         if: always()

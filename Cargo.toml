@@ -4,7 +4,7 @@ exclude = ["desktop/src-tauri"]
 
 [package]
 name = "code-memory"
-version = "0.9.6"
+version = "0.9.7"
 edition = "2021"
 # v0.7.1 P2-5：声明最低支持 Rust 版本（MSRV）
 # v0.8.8：提升到 1.80（std::sync::LazyLock 需要 1.80+）
@@ -25,13 +25,20 @@ default = ["server"]
 ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub", "ureq"]
 # 启用 MCP HTTP 服务（axum + tokio）
 # v0.6.0+：ureq 用于嵌入模型管理 API 的镜像源连通性测试 + model_downloader 模块
-server = ["axum", "tokio", "tower", "tower-http", "reqwest", "webbrowser", "ureq", "socket2"]
+server = [
+    "axum",
+    "tower",
+    "tower-http",
+    "webbrowser",
+    "ureq",
+    "socket2",
+]
 # PostgreSQL 持久化后端（需运行中的 PostgreSQL 服务）
-postgres = ["sqlx", "tokio"]
+postgres = ["sqlx"]
 # Qdrant 向量存储后端（通过 HTTP API，无需额外依赖）
-qdrant = ["reqwest", "tokio"]
+qdrant = []
 # Neo4j 图存储后端（通过 HTTP API，无需额外依赖）
-neo4j = ["reqwest", "tokio"]
+neo4j = []
 # 桌面仪表盘 feature — 启用浏览器自动打开 + 内置 HTTP 仪表盘
 dashboard = ["webbrowser", "server"]
 
@@ -69,10 +76,11 @@ ureq = { version = "2", optional = true }
 # MCP HTTP 服务依赖（optional，server feature 启用）
 # v0.7.1 P2-4：axum 0.7 → 0.8 升级，tower-http 0.5 → 0.6
 axum = { version = "0.8", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "io-std", "signal"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "io-util", "io-std", "signal", "net"] }
 tower = { version = "0.5", features = ["limit"], optional = true }
 tower-http = { version = "0.6", features = ["cors", "timeout"], optional = true }
-reqwest = { version = "0.12", features = ["json"], optional = true }
+reqwest = { version = "0.12", features = ["json"] }
+url = "2"
 # v0.8.1：TCP keepalive 配置（防止 sidecar 连接池泄漏）
 socket2 = { version = "0.6", optional = true }
 

@@ -1,6 +1,6 @@
 [package]
 name = "lrc-desktop"
-version = "0.9.6"
+version = "0.9.7"
 description = "LRC Desktop — 本地优先的 AI 代码记忆桌面应用"
 authors = ["LRC Team"]
 edition = "2021"
@@ -15,6 +15,10 @@ crate-type = ["lib", "cdylib", "staticlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 sha2 = "0.10"           # SHA-256 哈希（v0.5.1: build.rs 二进制验证）
+
+[features]
+default = ["server"]
+server = []
 
 [dependencies]
 # Tauri 桌面框架（tray-icon feature 内置系统托盘支持）
@@ -43,6 +47,7 @@ rfd = "0.15"
 dirs = "5"
 # HTTP 客户端（sidecar 健康检查）
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+url = "2"
 # time crate 版本约束（兼容 0.3.x 系列，避免与 tauri-utils 冲突）
 time = "0.3.36"
 # v0.5.12 新增：递归扫描目录（SpaceSniffer 式项目索引）

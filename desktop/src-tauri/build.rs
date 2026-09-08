@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 fn main() {
+    // 资源清理必须先于 Tauri 构建，确保错误平台 sidecar 不会进入资源清单。
+    cleanup_sidecar_artifacts(&PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     // Tauri 构建基础配置
     tauri_build::build();
 
@@ -235,6 +237,15 @@ fn sync_sidecar_binary() {
 
     let src_size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
 
+    // v0.9.6 修复（六钥匙·反向推导）：tauri dev 运行时，桌面端 exe 位于
+    // target/{profile}/，main.rs 从 exe 同目录加载 lrc-sidecar.exe。
+    // 若只同步到 src-tauri/（供打包），target/{profile}/ 里残留的历史副本
+    // 会被误加载，形成"新桌面端 + 旧 sidecar"混合产物（P0 data_dir 契约断裂的根因）。
+    // 因此先把最新 sidecar 同步到 source 同级目录（即当前 profile 的 target 目录）。
+    // 此步骤必须在下方「src-tauri 目标是否需更新」的早退检查之前执行，
+    // 否则 src-tauri 副本已是最新时会直接 return，运行副本永远得不到刷新。
+    sync_runtime_sidecar(source, dest_name, &dest_path);
+
     // 检查目标文件是否需要更新
     if dest_path.exists() {
         let dest_size = std::fs::metadata(&dest_path).map(|m| m.len()).unwrap_or(0);
@@ -363,6 +374,49 @@ fn sync_sidecar_binary() {
     }
 }
 
+/// 同步 sidecar 运行副本到当前 profile 的 target 目录
+///
+/// tauri dev 启动的桌面端 exe 位于 `target/{profile}/`，而 `main.rs` 固定从
+/// exe 同目录加载 `lrc-sidecar.exe`。`sync_sidecar_binary` 的常规目标 `dest_path`
+/// 是 `desktop/src-tauri/`（供 tauri build 打包 resources 使用），两者目录不同。
+/// 若不同步运行副本，target 目录里残留的历史 sidecar 会被 dev 实例误加载，
+/// 造成"新桌面端 + 旧 sidecar"混合产物。此函数把最新编译产物刷入运行目录。
+fn sync_runtime_sidecar(source: &Path, dest_name: &str, packaging_dest: &Path) {
+    let Some(src_parent) = source.parent() else { return };
+    let runtime_dest = src_parent.join(dest_name);
+    // 运行目录与打包目标相同（默认 target-dir 布局下的极端情况）则无需二次复制
+    if runtime_dest == packaging_dest {
+        return;
+    }
+    // 内容一致则跳过（哈希比对，避免无谓写盘与文件锁）
+    let need_copy = match (compute_sha256(&runtime_dest), compute_sha256(source)) {
+        (Some(a), Some(b)) => a != b,
+        _ => true,
+    };
+    if !need_copy {
+        println!("cargo:info=Sidecar 运行副本已是最新: {}", runtime_dest.display());
+        return;
+    }
+    // 运行时副本可能正被上一次 dev 会话占用：锁定则提示并跳过，不阻断构建
+    match std::fs::copy(source, &runtime_dest) {
+        Ok(bytes) => println!(
+            "cargo:info=Sidecar 运行副本已同步: {} → {} ({:.1} MB)",
+            source.display(),
+            runtime_dest.display(),
+            bytes as f64 / 1_048_576.0
+        ),
+        Err(e) if e.raw_os_error() == Some(32) || e.raw_os_error() == Some(5) => println!(
+            "cargo:warning=Sidecar 运行副本被占用，跳过同步（请关闭上一次 dev 实例后重启）: {}",
+            runtime_dest.display()
+        ),
+        Err(e) => println!(
+            "cargo:warning=Sidecar 运行副本同步失败: {} ({})",
+            runtime_dest.display(),
+            e
+        ),
+    }
+}
+
 /// 向上查找 workspace 根目录（包含 workspace Cargo.toml）
 fn find_workspace_root(start: &Path) -> Option<PathBuf> {
     let mut current = start.to_path_buf();
@@ -389,8 +443,12 @@ fn find_workspace_root(start: &Path) -> Option<PathBuf> {
 /// 会误匹配到运行时产生的 lrc-sidecar.log 等文件，需在打包前清理。
 /// 只保留 lrc-sidecar.exe（Windows）或 lrc-sidecar（Linux/macOS）二进制文件。
 fn cleanup_sidecar_artifacts(dest_dir: &Path) {
-    // 允许的 sidecar 文件名列表
-    let allowed_names = ["lrc-sidecar.exe", "lrc-sidecar"];
+    // 仅允许当前目标平台的 sidecar 文件名，避免跨平台产物污染资源目录。
+    let allowed_name = if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        "lrc-sidecar.exe"
+    } else {
+        "lrc-sidecar"
+    };
 
     if let Ok(entries) = std::fs::read_dir(dest_dir) {
         for entry in entries.flatten() {
@@ -398,7 +456,7 @@ fn cleanup_sidecar_artifacts(dest_dir: &Path) {
             let name_str = file_name.to_string_lossy();
 
             // 匹配 lrc-sidecar 前缀但不在允许列表中的文件
-            if name_str.starts_with("lrc-sidecar") && !allowed_names.contains(&name_str.as_ref()) {
+            if name_str.starts_with("lrc-sidecar") && name_str != allowed_name {
                 if let Err(e) = std::fs::remove_file(entry.path()) {
                     println!(
                         "cargo:warning=无法删除 sidecar 残留文件 {}: {}",

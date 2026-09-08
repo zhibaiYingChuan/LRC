@@ -125,6 +125,7 @@ fn main() {
         sidecar_port: Mutex::new(None),
         configured_agent_count: Mutex::new(0),
         start_cancel_flag: Arc::new(AtomicBool::new(false)),
+        start_operation_lock: Mutex::new(()),
     };
 
     tauri::Builder::default()
@@ -294,9 +295,24 @@ fn main() {
                         if !probed.is_empty() {
                             // v0.9.0 开发模式隔离：优先选择开发端口 3111，避免意外连接稳定版
                             let is_dev_mode = cfg!(debug_assertions);
+                            let expected_data_dir = if is_dev_mode {
+                                std::env::var("USERPROFILE")
+                                    .or_else(|_| std::env::var("HOME"))
+                                    .ok()
+                                    .map(|home| format!("{home}/.loong-recall/dev/data"))
+                            } else {
+                                None
+                            };
                             if is_dev_mode {
-                                // 开发模式：优先选 3111（开发端口），找不到则跳过（禁止回退到稳定版 3099）
-                                if let Some(dev_sidecar) = probed.iter().find(|p| p.port == 3111) {
+                                // 开发模式：优先选 3111（开发端口），且必须匹配开发数据目录。
+                                if let Some(dev_sidecar) = probed.iter().find(|p| {
+                                    p.port == 3111
+                                        && sidecar_manager::sidecar_identity_matches(
+                                            p,
+                                            None,
+                                            expected_data_dir.as_deref(),
+                                        )
+                                }) {
                                     let mut sidecar_port = state.sidecar_port.lock().await;
                                     *sidecar_port = Some(dev_sidecar.port);
                                     tracing::info!(
@@ -751,7 +767,10 @@ fn main() {
             Ok(())
         })
         .run(tauri::generate_context!())
-        .expect("启动 LRC Desktop 失败");
+        .unwrap_or_else(|e| {
+            tracing::error!("启动 LRC Desktop 失败: {e}");
+            std::process::exit(1);
+        });
 }
 
 /// v0.5.1 新增：日志系统初始化

@@ -460,6 +460,49 @@ impl Persistence for PostgresPersistence {
         })
     }
 
+    fn replace_all_memories(&self, memories: &[Memory]) -> Result<(), PersistenceError> {
+        let pool = self.pool.clone();
+        let table = format!("{}memories", self.table_prefix);
+        let rows: Vec<_> = memories.iter().map(Self::memory_to_row).collect();
+
+        self.block_on_async(async move {
+            let mut tx = pool.begin().await.map_err(|e| PersistenceError::Other(format!("开始 PostgreSQL 全量替换事务失败: {}", e)))?;
+            sqlx::query(&format!("DELETE FROM {}", table)).execute(&mut *tx).await
+                .map_err(|e| PersistenceError::Other(format!("事务内清空记忆失败: {}", e)))?;
+            for row in rows {
+                sqlx::query(&format!(
+                    "INSERT INTO {} (id, content, memory_type, project, tags, importance, version, created_at, updated_at, last_accessed, ttl_days, luoshu_vector, bagua_index, bagua_category, topological_depth, privacy_level, session_id, user_id, source, source_ids, confidence, version_history) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)", table
+                ))
+                .bind(row["id"].as_str().unwrap_or(""))
+                .bind(row["content"].as_str().unwrap_or(""))
+                .bind(row["memory_type"].as_str().unwrap_or("fact"))
+                .bind(row["project"].as_str())
+                .bind(serde_json::to_string(&row["tags"]).unwrap_or_default())
+                .bind(row["importance"].as_i64().unwrap_or(5) as i16)
+                .bind(row["version"].as_i64().unwrap_or(1) as i32)
+                .bind(row["created_at"].as_str().map(str::to_owned))
+                .bind(row["updated_at"].as_str().map(str::to_owned))
+                .bind(row["last_accessed"].as_str().map(str::to_owned))
+                .bind(row["ttl_days"].as_i64().map(|v| v as i32))
+                .bind(serde_json::to_string(&row["luoshu_vector"]).unwrap_or_default())
+                .bind(row["bagua_index"].as_i64().map(|v| v as i16))
+                .bind(row["bagua_category"].as_str().map(str::to_owned))
+                .bind(row["topological_depth"].as_f64().unwrap_or(0.5) as f32)
+                .bind(row["privacy_level"].as_str().unwrap_or("user"))
+                .bind(row["session_id"].as_str().map(str::to_owned))
+                .bind(row["user_id"].as_str().map(str::to_owned))
+                .bind(row["source"].as_str().map(str::to_owned))
+                .bind(serde_json::to_string(&row["source_ids"]).unwrap_or_default())
+                .bind(row["confidence"].as_f64().map(|v| v as f32))
+                .bind(serde_json::to_string(&row["version_history"]).unwrap_or_default())
+                .execute(&mut *tx).await
+                .map_err(|e| PersistenceError::Other(format!("事务内写入记忆失败: {}", e)))?;
+            }
+            tx.commit().await.map_err(|e| PersistenceError::Other(format!("提交 PostgreSQL 全量替换事务失败: {}", e)))?;
+            Ok(())
+        })
+    }
+
     fn clear_memories(&self) -> Result<(), PersistenceError> {
         let pool = self.pool.clone();
         let table = format!("{}memories", self.table_prefix);
@@ -501,23 +544,41 @@ impl Persistence for PostgresPersistence {
     }
 
     fn size_bytes(&self) -> Result<u64, PersistenceError> {
-        Ok(0) // PG 存储大小需要单独查询
+        let pool = self.pool.clone();
+        self.block_on_async(async move {
+            let size: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())")
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| {
+                    PersistenceError::Other(format!("查询 PostgreSQL 数据库大小失败: {}", e))
+                })?;
+            u64::try_from(size)
+                .map_err(|_| PersistenceError::Other("PostgreSQL 返回了负的数据库大小".to_string()))
+        })
     }
 
     fn load_archived_memories(&self) -> Result<Vec<Memory>, PersistenceError> {
-        Ok(Vec::new()) // 归档通过 expires_at 字段在查询中过滤
+        Err(PersistenceError::Other(
+            "PostgreSQL 后端不支持归档记忆接口".to_string(),
+        ))
     }
 
     fn save_archived_memories(&self, _memories: &[Memory]) -> Result<(), PersistenceError> {
-        Ok(())
+        Err(PersistenceError::Other(
+            "PostgreSQL 后端不支持归档记忆接口".to_string(),
+        ))
     }
 
     fn add_to_archive(&self, _memories: &[Memory]) -> Result<(), PersistenceError> {
-        Ok(())
+        Err(PersistenceError::Other(
+            "PostgreSQL 后端不支持归档记忆接口".to_string(),
+        ))
     }
 
     fn delete_from_archive(&self, _id: &str) -> Result<bool, PersistenceError> {
-        Ok(false)
+        Err(PersistenceError::Other(
+            "PostgreSQL 后端不支持归档记忆接口".to_string(),
+        ))
     }
 }
 

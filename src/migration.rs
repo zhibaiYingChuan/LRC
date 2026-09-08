@@ -256,6 +256,7 @@ pub fn execute_migration() -> MigrationReport {
                     backed_up: false,
                     status: format!("读取失败: {}", e),
                 });
+                return report;
             }
         }
     }
@@ -270,6 +271,18 @@ pub fn execute_migration() -> MigrationReport {
 
     report.global_after = merged.len();
     report.memories_added = report.global_after.saturating_sub(report.global_before);
+
+    // 预检迁移源备份目标，避免写入 global 后才发现无法完成迁移。
+    for source in &sources {
+        if !source.is_global {
+            let memory_file = source.data_dir.join("memories.json");
+            let bak_file = memory_file.with_extension("json.bak");
+            if memory_file.exists() && bak_file.exists() {
+                report.error = Some(format!("迁移源备份目标已存在: {}", bak_file.display()));
+                return report;
+            }
+        }
+    }
 
     // 写入 global 目录
     let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
@@ -287,12 +300,19 @@ pub fn execute_migration() -> MigrationReport {
             return report;
         }
     };
-    if let Err(e) = std::fs::write(&global_file, merged_json) {
+    let temp_file = global_file.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&temp_file, merged_json) {
+        let _ = std::fs::remove_file(&temp_file);
         report.error = Some(format!("写入 global memories.json 失败: {}", e));
         return report;
     }
+    if let Err(e) = std::fs::rename(&temp_file, &global_file) {
+        let _ = std::fs::remove_file(&temp_file);
+        report.error = Some(format!("替换 global memories.json 失败: {}", e));
+        return report;
+    }
 
-    // 非 global 源文件重命名 .bak
+    // 非 global 源文件重命名 .bak；备份失败明确阻断迁移成功。
     for source in &sources {
         if source.is_global {
             continue;
@@ -314,11 +334,13 @@ pub fn execute_migration() -> MigrationReport {
                 }
             }
             Err(e) => {
+                report.error = Some(format!("备份迁移源失败: {}", e));
                 for s in &mut report.sources {
                     if s.data_dir == source.data_dir.to_string_lossy() {
                         s.status = format!("备份失败: {}", e);
                     }
                 }
+                return report;
             }
         }
     }

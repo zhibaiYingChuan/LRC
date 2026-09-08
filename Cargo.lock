@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "code-memory"
-version = "0.9.6"
+version = "0.9.7"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -401,6 +401,7 @@ dependencies = [
  "tower",
  "tower-http",
  "ureq",
+ "url",
  "uuid",
  "walkdir",
  "webbrowser",

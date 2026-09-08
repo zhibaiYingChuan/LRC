@@ -378,3 +378,39 @@ docs/*调试*.md
 docs/*开发*.md
 docs/*回归*.md
 docs/*验证*.md
+
+# v0.9.6 道体-LRC 检索/消融实验中间产物（clean_v*.json、v8_retrieval_*.json 为一次性实验数据，不交付用户）
+clean_v*.json
+v8_retrieval_*.json
+
+# 道体本地运行时、模型和 Python 缓存（源码脚本仍可按需单独纳入版本控制）
+daoti/*.pt
+daoti/__pycache__/
+daoti/**/*.pyc
+
+# 道体实验本地凭据与验证运行时数据（禁止入库）
+daoti/api_key.txt
+daoti/.t3-verify/
+daoti/**/*.jsonl
+technical_*materials*.jsonl
+semantic_quality_*.json
+verify_*_2026*.json
+
+# v0.9.7 发布准备（用户要求：本地测试文件/开发文件/文档不入库）
+# 根目录审查残留
+.review_diff.txt
+.review_*.txt
+# 道体实验目录整体为本地研究资产（脚本+实验数据），不随产品发布
+daoti/
+# Playwright 运行产物（截图/DOM dump/日志）
+playwright-artifacts/
+# 本地开发流程脚本（归档工具、镜像连通性测试）
+scripts/archive_legacy_runtime.ps1
+scripts/test_external_model_mirrors.ps1
+# 中文开发过程文档（设计/审计/跟踪类，不交付用户）
+docs/仪表盘页面重构方案.md
+docs/道体-LRC*.md
+# v0.9.7 基准评测临时产物（本地开发/评测用，不入库）
+src/bin/persistence_eval.rs
+data_eval_v3*/
+benchmarks/*_raw_*.json
