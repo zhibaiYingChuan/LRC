@@ -9,6 +9,7 @@
 // 默认实现为 JSON 文件存储，后续可扩展 SQLite/Redis 等后端。
 
 use crate::chunker::CodeChunk;
+use crate::engine::memory_state_machine::MemoryState;
 use crate::memory_types::Memory;
 use std::error::Error;
 use std::fmt;
@@ -73,6 +74,18 @@ pub trait Persistence: Send + Sync {
     /// 保存一条记忆（新增或更新）
     fn save_memory(&self, memory: &Memory) -> Result<(), PersistenceError>;
 
+    /// 加载 LRC 内置道体状态机的持久化快照。
+    /// 未实现的后端返回空状态，保证旧后端兼容。
+    fn load_memory_state(&self) -> Result<MemoryState, PersistenceError> {
+        Ok(MemoryState::default())
+    }
+
+    /// 保存 LRC 内置道体状态机的持久化快照。
+    /// 未实现的后端默认忽略，具体后端可提供原子持久化。
+    fn save_memory_state(&self, _state: &MemoryState) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+
     /// 批量更新记忆（仅更新指定的记忆，不触碰其他记忆）
     ///
     /// 默认实现：循环调用 `save_memory`（每条都会触发一次全量序列化+磁盘写入）。
@@ -99,6 +112,20 @@ pub trait Persistence: Send + Sync {
             self.save_memory(m)?;
         }
         Ok(())
+    }
+
+    /// 全量替换所有记忆（原子语义）。
+    ///
+    /// 用于归档/修正等需要"仅保留指定集合"的场景——旧实现用
+    /// `clear_memories` + 循环 `save_memory` 两端点，clear 成功后任一写入
+    /// 失败/崩溃都会导致磁盘上的活跃记忆丢失（C05 全库丢失窗口）。
+    ///
+    /// 默认实现：明确拒绝全量替换，避免用非原子 clear+save 冒充原子语义。
+    /// 后端必须自行实现事务/原子替换后才能支持此操作。
+    fn replace_all_memories(&self, _memories: &[Memory]) -> Result<(), PersistenceError> {
+        Err(PersistenceError::Other(
+            "当前持久化后端不支持原子全量替换".to_string(),
+        ))
     }
 
     /// 加载所有记忆

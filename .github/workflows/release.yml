@@ -9,6 +9,7 @@ on:
       version:
         description: 'Release version (e.g. v0.2.0)'
         required: true
+        type: string
 
 # v0.8.23 S1-SEC-01：最小权限原则 — 每个 job 显式声明所需权限
 # 只有 release job 需要 contents: write，其他 job 只需要 contents: read
@@ -71,6 +72,18 @@ jobs:
       - name: Force clean target/ (defense-in-depth against stale cache)
         run: cargo clean
 
+      # 0. 发布版本必须来自环境变量，并严格符合 SemVer（tag 与手动触发统一）
+      - name: Validate release version
+        env:
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          VERSION="$RELEASE_VERSION"
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "ERROR: 发布版本必须是 v<SemVer>，实际为: $VERSION"
+            exit 1
+          fi
+          echo "发布版本校验通过: $VERSION"
+
       # 1. 代码格式检查（与 CI Rustfmt job 对齐）
       - name: Format check
         run: cargo fmt --all -- --check
@@ -81,19 +94,39 @@ jobs:
       - name: Clippy check (all targets)
         run: cargo clippy --all-targets -- -D warnings
 
-      # 3. 编译检查
-      - name: Compile check
-        run: cargo check --features server
+      # 3. 编译检查：默认、无默认、全 feature 以及发布使用的 server+ml 必须一致
+      - name: Compile feature matrix
+        run: |
+          cargo check --no-default-features
+          cargo check --features server
+          cargo check --all-features
+          cargo check --features server,ml
 
-      # 4. 单元测试
+      # 4. 显式验证所有发布 bin（required-features 不能掩盖漏编译）
+      - name: Build all binaries
+        run: |
+          cargo check --bin code-memory-server --features server
+          cargo check --bin code-memory-benchmark --features server
+
+      # 5. 关键持久化后端编译矩阵
+      - name: Compile persistence backends
+        run: |
+          cargo check --features server,postgres
+          cargo check --features server,qdrant
+          cargo check --features server,neo4j
+
+      # 6. 单元测试
       - name: Unit tests
         run: cargo test --features server
 
       # 4.5 前端静态契约与语法门禁
+      # v0.9.7 审查修复：补齐 ci.yml 已有的两个测试脚本语法检查，口径一致
       - name: Frontend contract checks
         run: |
           node --check static/app.js
           node --check tests/frontend/cdp-regression.js
+          node --check tests/frontend/playwright-smoke.js
+          node --check tests/frontend/association-dashboard-cdp.js
           node scripts/validate_frontend_contract.js
 
       # 5. Tauri 配置验证（确保 targets 不是单一平台，防止 macOS/Linux 无 bundle）
@@ -330,10 +363,17 @@ jobs:
         id: version
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "VER=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            VERSION="$RELEASE_VERSION"
           else
-            echo "VER=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            VERSION="$GITHUB_REF_NAME"
           fi
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: 版本号格式无效"
+            exit 1
+          fi
+          echo "VER=$VERSION" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
         shell: bash
 
       - name: Install Rust toolchain
@@ -402,12 +442,15 @@ jobs:
             echo "已禁用 SSL 证书吊销检查 (CARGO_HTTP_CHECK_REVOKE=false)"
           fi
 
-          cargo build --release --features server,ml --target ${{ matrix.target }}
+          cargo build --release --bin code-memory-server --features server,ml --target ${{ matrix.target }}
+          cargo build --release --bin code-memory-benchmark --features server,ml --target ${{ matrix.target }}
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp target/${{ matrix.target }}/release/code-memory-server.exe "${BIN_NAME}"
           else
             cp target/${{ matrix.target }}/release/code-memory-server "${BIN_NAME}"
           fi
+          test -s "${BIN_NAME}"
+          test -s "${BIN_NAME}.sha256" 2>/dev/null || true
           echo "Built: ${BIN_NAME}"
         shell: bash
 
@@ -618,10 +661,17 @@ jobs:
         id: version
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "VER=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            VERSION="$RELEASE_VERSION"
           else
-            echo "VER=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            VERSION="$GITHUB_REF_NAME"
           fi
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: 版本号格式无效"
+            exit 1
+          fi
+          echo "VER=$VERSION" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.version }}
         shell: bash
 
       - name: Install Rust toolchain
@@ -677,8 +727,9 @@ jobs:
             export CARGO_HTTP_CHECK_REVOKE=false
             echo "已禁用 SSL 证书吊销检查 (CARGO_HTTP_CHECK_REVOKE=false)"
           fi
-          cargo build --release --features server,ml --target ${{ matrix.target }}
-          echo "Sidecar binary built at target/${{ matrix.target }}/release/"
+          cargo build --release --bin code-memory-server --features server,ml --target ${{ matrix.target }}
+          cargo build --release --bin code-memory-benchmark --features server,ml --target ${{ matrix.target }}
+          echo "Sidecar binaries built at target/${{ matrix.target }}/release/"
         shell: bash
 
       # v0.8.39 新增：编译产物版本校验（Build Desktop 同样执行）
@@ -717,6 +768,11 @@ jobs:
             echo "Sidecar synced to desktop/src-tauri/lrc-sidecar"
             ls -la desktop/src-tauri/lrc-sidecar
           fi
+          test -s desktop/src-tauri/lrc-sidecar${{ runner.os == 'Windows' && '.exe' || '' }}
+          case "${{ runner.os }}" in
+            Windows) test -f desktop/src-tauri/lrc-sidecar.exe ;;
+            *) test -x desktop/src-tauri/lrc-sidecar ;;
+          esac
         shell: bash
 
       # 步骤 3: 安装 Tauri CLI v2
@@ -1013,10 +1069,17 @@ jobs:
         id: release_version
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "TAG=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+            TAG="$RELEASE_VERSION"
           else
-            echo "TAG=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            TAG="$GITHUB_REF_NAME"
           fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "ERROR: 发布标签格式无效"
+            exit 1
+          fi
+          echo "TAG=$TAG" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_VERSION: ${{ github.event.inputs.version }}
         shell: bash
 
       - name: Create Release

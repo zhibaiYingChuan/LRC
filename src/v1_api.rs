@@ -18,17 +18,39 @@
 //   GET  /v1/audit-trail            — 审计追踪（查询系统自主行为日志，质疑五）
 //   GET  /v1/code/search            — 代码库搜索（查询参数: query, top_k, keywords）
 
-use crate::engine::audit_trail::{AuditEventType, AuditQuery};
+use crate::engine::audit_trail::{AuditEvent, AuditEventType, AuditQuery};
 #[cfg(not(feature = "ml"))]
 use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
 #[cfg(feature = "ml")]
 use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 use crate::engine::mirror_trapezoid::mirror_project;
+use std::time::Duration;
 // v0.9.1 三阶段锁解耦：consolidate handler 在锁外执行聚类计算
 use crate::engine::synthesis_engine::SynthesisEngine;
 use crate::engine::user_feedback::{FeedbackTarget, FeedbackType};
 use crate::memory_store::{ListFilter, MemoryStore, RecallFilter};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
+
+type EnrichBlockingResult = (
+    Vec<EnrichedMemory>,
+    Vec<EnrichExplanationItem>,
+    f32,
+    f32,
+    usize,
+    usize,
+    usize,
+    usize,
+    Vec<crate::engine::memory_state_machine::AssociationStep>,
+    HashMap<String, String>,
+);
+
+struct CancellationFlag(Arc<AtomicBool>);
+
+impl Drop for CancellationFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
 use crate::persistence::json::JsonPersistence;
 use crate::persistence::Persistence;
 use crate::server::{safe_code_search, safe_recent_code_search, IndexedCodebase, SearchError};
@@ -37,7 +59,7 @@ use axum::{
     extract::Query,
     http::StatusCode,
     response::Json,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -157,6 +179,91 @@ pub struct EnrichRequest {
     pub top_k: usize,
     pub session_id: Option<String>,
     pub user_id: Option<String>,
+    pub project: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// 联想中心探索请求：从查询或指定记忆开始，执行有界多跳扩散。
+#[derive(Debug, Deserialize)]
+pub struct AssociationExploreRequest {
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub memory_id: Option<String>,
+    #[serde(default = "default_association_depth")]
+    pub depth: u8,
+    #[serde(default = "default_association_width")]
+    pub width: usize,
+    pub project: Option<String>,
+}
+
+fn default_association_depth() -> u8 {
+    4
+}
+
+fn default_association_width() -> usize {
+    3
+}
+
+/// 联想确认请求（v0.9.7：用户在联想探索中点击"就是这个"）。
+/// 确认后该记忆以最高激活强度写回道体状态机活跃锚点。
+#[derive(Debug, Deserialize)]
+pub struct ConfirmAssociationRequest {
+    pub memory_id: String,
+    #[serde(default)]
+    pub query: Option<String>,
+}
+
+/// 联想探索响应：从起点开始的多跳联想树（有界 BFS）。
+#[derive(Debug, Serialize)]
+pub struct AssociationExploreResponse {
+    /// 起点记忆 ID（无则从查询召回第一条）
+    pub root: Option<String>,
+    /// 实际执行的联想层数
+    pub depth: u8,
+    /// 每层方向数上限
+    pub width: usize,
+    /// 探索到的节点（按发现顺序）
+    pub nodes: Vec<ExploreNode>,
+    /// 节点间的联想边
+    pub edges: Vec<ExploreEdge>,
+    /// 状态机联想链（与 /v1/memories/enrich 同源）
+    pub trail: Vec<crate::engine::memory_state_machine::AssociationStep>,
+    /// 总共展开的召回次数（含起点）
+    pub total_expanded: usize,
+    /// 是否因超时/取消而提前中断
+    pub interrupted: bool,
+    /// 弱匹配标记（v0.9.7 精确度修复）：
+    /// true 表示探索没有找到任何与查询实质共鸣的记忆（连起点都没有）——
+    /// 记忆库里没有与查询真正相关的内容。前端应显示诚实空态，
+    /// 而不是把无关记忆硬凑成"联想结果"。
+    /// false 时 nodes 至少包含起点（起点已通过实质共鸣门禁）。
+    pub weak_match: bool,
+}
+
+/// 联想探索节点
+#[derive(Debug, Serialize)]
+pub struct ExploreNode {
+    pub id: String,
+    pub content: String,
+    /// 所处的联想层（起点为 0）
+    pub depth: u8,
+    pub score: f32,
+    /// 节点来源：root（起点）/ expanded（发散）
+    pub source: String,
+    /// 道体再次校验·保留证据（无则为空）
+    pub evidence: Option<String>,
+}
+
+/// 联想探索边
+#[derive(Debug, Serialize)]
+pub struct ExploreEdge {
+    pub from: String,
+    pub to: String,
+    pub score: f32,
+    /// 从父节点联想到子节点的回归证据
+    pub evidence: Option<String>,
 }
 
 fn default_top_k() -> usize {
@@ -170,6 +277,65 @@ pub struct EnrichResponse {
     pub fast_path_hits: usize,
     pub deep_path_hits: usize,
     pub total: usize,
+    /// 本次联想的状态机轨迹。
+    pub trail: Vec<crate::engine::memory_state_machine::AssociationStep>,
+    /// 每条结果通过道体再次校验的证据。
+    pub regression_evidence: HashMap<String, String>,
+    /// 被回归校验剔除的候选数量。
+    pub filtered_count: usize,
+    /// 联想模式，供桌面端解释当前过程。
+    pub association_mode: String,
+    /// 阶段D 联想解释块（只观测，不参与排序决策）
+    pub explanation: EnrichExplanation,
+}
+
+/// 联想解释块：面向用户解释"为什么联想这条"（阶段D 可观测性）。
+///
+/// 约定：该块仅暴露观测数据（两路权重、候选规模、每条的通路贡献），
+/// 不接入默认排序决策，符合"预判元数据只做观测"的产品约束。
+#[derive(Debug, Serialize)]
+pub struct EnrichExplanation {
+    /// 触发联想的查询原文
+    pub query: String,
+    /// RRF 两路检索权重
+    pub weights: ExplanationWeights,
+    /// RRF 常数 k
+    pub rrf_k: f32,
+    /// 快速路径候选数
+    pub fast_path_hits: usize,
+    /// 深度路径候选数
+    pub deep_path_hits: usize,
+    /// 融合后唯一候选桶数（与响应体 total 一致）
+    pub total_candidates: usize,
+    /// 每条结果的通路贡献明细（与 memories 平行）
+    pub items: Vec<EnrichExplanationItem>,
+}
+
+/// RRF 两路检索权重
+#[derive(Debug, Serialize)]
+pub struct ExplanationWeights {
+    pub fast: f32,
+    pub deep: f32,
+}
+
+/// 单条联想结果的通路贡献明细
+#[derive(Debug, Serialize)]
+pub struct EnrichExplanationItem {
+    pub id: String,
+    /// 融合结果中的排名（1 起）
+    pub rank: usize,
+    /// 展示分（与 EnrichedMemory.score 一致）
+    pub score: f32,
+    /// 真实融合贡献分 = fast_contrib + deep_contrib
+    pub fused_contrib: f32,
+    pub fast_contrib: f32,
+    pub deep_contrib: f32,
+    /// 在快速路径结果中的排名（未命中为 None）
+    pub fast_rank: Option<usize>,
+    /// 在深度路径结果中的排名（未命中为 None）
+    pub deep_rank: Option<usize>,
+    /// 命中的检索通路，如 ["fast"] / ["deep"] / ["fast","deep"]
+    pub hit_paths: Vec<&'static str>,
 }
 
 /// 增强记忆条目
@@ -180,10 +346,283 @@ pub struct EnrichedMemory {
     pub memory_type: String,
     pub score: f32,
     pub bagua_category: Option<String>,
+    pub daoti_preview_gua: Option<String>,
+    pub daoti_preview_bagua: Option<String>,
+    pub daoti_preview_version: Option<String>,
     pub importance: u8,
     pub topological_depth: f32,
     pub version: u32,
     pub created_at: String,
+}
+
+/// 联想探索·根节点最小实质重叠 token 数（v0.9.7 精确度门禁）。
+///
+/// 起点记忆必须与查询至少共享这么多个分词 token（bigram），防止只靠
+/// 单个泛指词（如"什么"）重叠的无关记忆（如恰好提到"什么"的代码笔记）
+/// 上位当起点。上限按查询长度收缩：短查询（如"失眠"只有 1 个 bigram）
+/// 不会因凑不满 2 个 token 被误杀——门禁要求是 min(本值, 查询 token 数)。
+const ASSOCIATION_ROOT_MIN_OVERLAP: usize = 2;
+
+/// 联想探索·根节点候选池大小。根门禁要从候选中"挑"出实质共鸣的起点，
+/// 池子必须比扩散宽度宽——只看 top-2/3 时，真正相关的记忆可能排在
+/// 噪声之后而根本没被门禁看到。
+const ASSOCIATION_ROOT_POOL_TOPK: usize = 8;
+
+/// 联想探索·根节点语义旁路阈值（bge 完整句向量余弦，0-1）。
+///
+/// 词面重叠门禁挡得住"泛指词偶然命中"，但挡不住语义强相关、词面
+/// 零重叠的真实召回（如查询"我以前记过什么重要日子" ↔ 记忆
+/// "和爸妈去了杭州西湖"——分词后几乎无共享 token）。语义旁路仅在
+/// 词面门禁无人通过时惰性启用（避免常规热路径的 ML 编码开销），
+/// 用 bge 句向量余弦判断实质相关；ML 编码器不可用时相似度恒为
+/// None，旁路自动失效，门禁退化为纯词面通路，绝不放宽标准。
+const ASSOCIATION_ROOT_MIN_SEMANTIC_SIM: f32 = 0.55;
+
+/// 执行一次有界联想探索。
+///
+/// 探索本身复用 LRC 的 recall 入口，因此每一跳都会经过内置道体状态机、
+/// 联想导航和回归校验，而不是在 API 层另造一套排序逻辑。
+fn run_association_explore(
+    store: &mut MemoryStore<JsonPersistence>,
+    query: Option<&str>,
+    memory_id: Option<&str>,
+    max_depth: u8,
+    width: usize,
+    cancel: &AtomicBool,
+) -> AssociationExploreResponse {
+    use std::collections::{HashSet, VecDeque};
+
+    let max_depth = max_depth.clamp(1, 4);
+    let width = width.clamp(1, 3);
+    // v0.9.7 精确度修复：探索是用户主动发起的联想，语义必须由查询本身主导。
+    // explore_pure 关闭联想导航的查询扩展与活性偏置，避免"近期活跃记忆"
+    //（可能是某个领域的旧内容）把任意查询的结果牵引到固定的一批记忆上。
+    let mut filter = RecallFilter {
+        memory_type: None,
+        project: None,
+        tags: Vec::new(),
+        min_importance: None,
+        top_k: width,
+        privacy_context: None,
+        explore_pure: true,
+        regression_query: None,
+    };
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::new();
+    let mut total_expanded = 0usize;
+    let mut interrupted = false;
+    // v0.9.7 韧性修复：探索耗时预算从函数入口起算——root 召回（含语义
+    // 旁路的并行编码）与 BFS 扩散共享同一预算，确保任何路径下探索都
+    // 在外层 15s 超时之前优雅收敛，用户看到部分结果或诚实空态而非 503。
+    const ASSOCIATION_EXPLORE_TIME_BUDGET: Duration = Duration::from_secs(10);
+    const ASSOCIATION_SEMANTIC_BYPASS_BUDGET: Duration = Duration::from_secs(6);
+    let explore_started = std::time::Instant::now();
+
+    let root_memory = if let Some(id) = memory_id {
+        store
+            .list_memories(&ListFilter {
+                limit: usize::MAX,
+                ..ListFilter::new()
+            })
+            .ok()
+            .and_then(|(all, _)| all.into_iter().find(|memory| memory.id == id))
+            .map(|memory| (memory, 1.0f32, "root".to_string(), None))
+    } else {
+        query.and_then(|text| {
+            // v0.9.7 精确度修复（根节点主导性门禁）：起点是整条联想链
+            // 的锚，"词面命中过一次"不够——含泛指词（如"什么"）的查询
+            // 会让恰好提到该词的无关记忆靠单 token 重叠上位。起点必须
+            // 与查询实质共鸣：至少命中 min(ASSOCIATION_ROOT_MIN_OVERLAP,
+            // 查询 token 数) 个 token；没有合格候选则诚实标记弱匹配，
+            // 绝不硬凑一个错误起点把整条联想链带偏。
+            //
+            // 门禁是"从候选池里挑"，池子必须够宽（ROOT_POOL_TOPK）：
+            // 只看 top-2/3 时，真正相关的记忆可能排在噪声之后没被看到。
+            let mut root_filter = filter.clone();
+            root_filter.top_k = ASSOCIATION_ROOT_POOL_TOPK;
+            let result = store.recall(text, &root_filter).ok()?;
+            let query_tokens = crate::memory_store::tokenize_query(text);
+            // v0.9.7 泛指 bigram 过滤：「是什/什么/怎么」等问句功能组合
+            // 不计入实质共鸣——"量子物理是什么"曾因「是什」「什么」两个
+            // 泛指 bigram 与含测试文本"是什么"的代码 chunk 虚假共鸣，
+            // 让代码 chunk 抢走生活查询的起点，进而把整条联想链拖进
+            // 代码 chunk 邻域造成 15s 扩散超时。过滤后门禁只看实义
+            // token（量子/物理/今晚/吃什 等）的重叠。
+            let substantive_tokens: Vec<String> = query_tokens
+                .iter()
+                .filter(|t| !crate::memory_store::is_generic_bigram(t))
+                .cloned()
+                .collect();
+            let min_required = substantive_tokens
+                .len()
+                .clamp(1, ASSOCIATION_ROOT_MIN_OVERLAP);
+            // 双通路门禁（先词面后语义，惰性）：词面通路要求实质重叠
+            // ≥ min_required 个 token；无人通过时才启用语义旁路——用
+            // bge 句向量余弦（阈值 ASSOCIATION_ROOT_MIN_SEMANTIC_SIM）
+            // 挽救"重要日子 ↔ 结婚纪念日"类语义强相关但词面零重叠的
+            // 真实召回。ML 未加载时旁路自动失效，诚实弱匹配。
+            let candidates: Vec<(crate::memory_types::Memory, f32)> =
+                result.memories.into_iter().zip(result.scores).collect();
+            let mut passing: Vec<(crate::memory_types::Memory, f32)> = candidates
+                .iter()
+                .filter(|(memory, _)| {
+                    store.query_overlap_count(memory, &substantive_tokens) >= min_required
+                })
+                .cloned()
+                .collect();
+            if passing.is_empty() && explore_started.elapsed() < ASSOCIATION_SEMANTIC_BYPASS_BUDGET
+            {
+                // 旁路硬时限：并行编码仍超预算时放弃旁路（诚实空态），
+                // 不允许 root 阶段吃掉 BFS 扩散的全部预算
+                let mem_refs: Vec<&crate::memory_types::Memory> =
+                    candidates.iter().map(|(m, _)| m).collect();
+                let sims = store.semantic_similarities(text, &mem_refs);
+                for ((memory, score), sim) in candidates.iter().zip(sims) {
+                    // v0.9.7 精确度修复：语义旁路不放行代码记忆。旁路只在
+                    // 词面零命中时触发，此时若救回的是代码 chunk，几乎都
+                    // 是 bge 对长文本的向量居中假象（"量子物理是什么"曾
+                    // 因此被 memory_store.rs 的代码块当起点，整条联想链
+                    // 全是代码）。代码查询词面命中率高（标识符/函数名
+                    // 天然是实义 token），不需要旁路。
+                    if memory.memory_type == crate::memory_types::MemoryType::CodeContext {
+                        continue;
+                    }
+                    if sim.is_some_and(|s| s >= ASSOCIATION_ROOT_MIN_SEMANTIC_SIM) {
+                        passing.push((memory.clone(), *score));
+                    }
+                }
+            }
+            // 开发上下文块（6000+ 条代码 chunk 在语义空间里无处不在）
+            // 只在没有更贴合的生活记忆通过门禁时才允许充当起点，防止
+            // 代码记忆抢走生活查询的锚。代码查询下所有通过门禁的候选
+            // 都是代码块时，照常以代码为起点，联想链保持在开发语境。
+            let picked = passing
+                .iter()
+                .find(|(memory, _)| {
+                    memory.memory_type != crate::memory_types::MemoryType::CodeContext
+                })
+                .or_else(|| passing.first())
+                .cloned()?;
+            let (memory, score) = picked;
+            let evidence = result.regression_evidence.get(&memory.id).cloned();
+            Some((memory, score, "root".to_string(), evidence))
+        })
+    };
+
+    let Some((root_memory, root_score, source, evidence)) = root_memory else {
+        return AssociationExploreResponse {
+            root: None,
+            depth: max_depth,
+            width,
+            nodes,
+            edges,
+            trail: store.memory_state_machine.snapshot().trail,
+            total_expanded,
+            interrupted,
+            // 连起点都召不回（召回为空，或没有候选通过根节点实质共鸣门禁），
+            // 必然是弱匹配：记忆库里没有与查询实质相关的内容
+            weak_match: true,
+        };
+    };
+
+    let root_id = root_memory.id.clone();
+    let root: Option<String> = Some(root_id.clone());
+    visited.insert(root_id.clone());
+    nodes.push(ExploreNode {
+        id: root_id.clone(),
+        content: root_memory.content.clone(),
+        depth: 0,
+        score: root_score,
+        source,
+        evidence,
+    });
+    // v0.9.7 精确度修复：多跳扩散的回归校验锚定到起点记忆主题。
+    // 每一跳以父记忆内容为查询逐层扩散，但校验一律对齐起点——
+    // 保证展示给用户的每个节点都"收束回联想主题"，杜绝深层
+    // 语义漂移（食物 → 代码噪声）。
+    filter.regression_query = Some(root_memory.content.clone());
+    // 非代码起点的联想链不混入开发上下文块：6000+ 代码 chunk 在
+    // 语义空间里无处不在，会把"周末去哪儿玩"的发散拉向 src/
+    // benchmark 之类的实现细节。代码起点不受影响——开发查询的
+    // 联想链本来就应该是代码。
+    let root_is_code = root_memory.memory_type == crate::memory_types::MemoryType::CodeContext;
+    // BFS 扩散与 root 召回共享 explore_started 预算（见函数入口），
+    // 超预算即优雅收敛：返回已找到的部分 + interrupted=true。
+    queue.push_back((root_id, root_memory.content, 0u8));
+
+    while let Some((from_id, from_content, current_depth)) = queue.pop_front() {
+        if current_depth >= max_depth {
+            continue;
+        }
+        if cancel.load(Ordering::Acquire) {
+            interrupted = true;
+            break;
+        }
+        if explore_started.elapsed() >= ASSOCIATION_EXPLORE_TIME_BUDGET {
+            interrupted = true;
+            break;
+        }
+        total_expanded += 1;
+        let result = match store.recall(
+            &from_content,
+            &RecallFilter {
+                top_k: width.saturating_add(2),
+                ..filter.clone()
+            },
+        ) {
+            Ok(result) => result,
+            Err(_) => continue,
+        };
+        let next_depth = current_depth + 1;
+        let mut added = 0usize;
+        for (memory, score) in result.memories.into_iter().zip(result.scores) {
+            if !root_is_code && memory.memory_type == crate::memory_types::MemoryType::CodeContext {
+                continue;
+            }
+            if added >= width || visited.contains(&memory.id) {
+                continue;
+            }
+            let evidence = result.regression_evidence.get(&memory.id).cloned();
+            let child_id = memory.id.clone();
+            visited.insert(child_id.clone());
+            edges.push(ExploreEdge {
+                from: from_id.clone(),
+                to: child_id.clone(),
+                score,
+                evidence: evidence.clone(),
+            });
+            nodes.push(ExploreNode {
+                id: child_id.clone(),
+                content: memory.content.clone(),
+                depth: next_depth,
+                score,
+                source: "expanded".to_string(),
+                evidence,
+            });
+            queue.push_back((child_id, memory.content, next_depth));
+            added += 1;
+        }
+    }
+
+    // v0.9.7 精确度修复：弱匹配 = 没有任何与查询实质相关的内容可展示。
+    // 起点都没找到（nodes 为空）时必然弱匹配，前端显示诚实空态；
+    // 找到起点时，起点本身就是实质共鸣的相关内容——"没有更多发散"
+    // 不算弱匹配，照常展示起点与确认按钮，绝不把有效结果整个隐藏。
+    let weak_match = nodes.is_empty();
+
+    AssociationExploreResponse {
+        root,
+        depth: max_depth,
+        width,
+        nodes,
+        edges,
+        trail: store.memory_state_machine.snapshot().trail,
+        total_expanded,
+        interrupted,
+        weak_match,
+    }
 }
 
 /// /v1/memories/correct 请求体
@@ -291,6 +730,11 @@ pub struct RecentMemoriesParams {
 pub struct MemoryListRequest {
     /// 返回的记忆数量（默认 10000，最大 50000）
     pub limit: Option<usize>,
+    /// 按项目过滤
+    pub project: Option<String>,
+    /// 按标签过滤（任一标签匹配）
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// v0.6.0 新增：/v1/memories/remember 请求体
@@ -304,6 +748,20 @@ pub struct MemoryRememberRequest {
     pub memory_type: String,
     /// 重要性 1-10（默认 5）
     pub importance: Option<u8>,
+    /// 关联项目名称
+    pub project: Option<String>,
+    /// 按标签过滤
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// /v1/memories/forget 请求体
+///
+/// 前端删除单条记忆时调用，memory_id 必填。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ForgetRequest {
+    /// 待删除的记忆 ID（必填）
+    pub memory_id: String,
 }
 
 /// v0.8.1 新增：/v1/config/llm/test 请求体
@@ -332,6 +790,116 @@ pub struct LlmTestResponse {
 
 // ==================== 路由构建 ====================
 
+/// 构建结晶历史时间线（v0.9.6 修复：数据源从审计事件改为合成记忆本身）。
+///
+/// 结晶的持久化产物就是 Synthesis 类型记忆，其 created_at 即结晶完成时间。
+/// 原实现从审计事件（synthesis_created）提取，但历史合成未落审计事件
+/// （如批量导入/早期版本），导致时间线永远显示"暂无结晶记录"。
+/// 修复：直接过滤 Synthesis 记忆并按创建时间倒序返回，即"每次结晶被持久化记录"。
+/// 抽为纯函数以便单元测试覆盖字段名与排序逻辑。
+fn build_synthesis_timeline(memories: &[Memory], limit: usize) -> serde_json::Value {
+    let limit = limit.clamp(1, 50);
+    let mut sorted: Vec<&Memory> = memories
+        .iter()
+        .filter(|m| m.memory_type == MemoryType::Synthesis)
+        .collect();
+    // 防御性排序：不依赖调用方传入顺序，保证时间线倒序契约
+    sorted.sort_by_key(|m| std::cmp::Reverse(m.created_at));
+    let items: Vec<serde_json::Value> = sorted
+        .iter()
+        .take(limit)
+        .map(|m| {
+            // v0.9.6 P1-1：补充来源记忆数/置信度/信息增量，支撑"结晶成长链路"展示
+            serde_json::json!({
+                "id": m.id,
+                "content": m.content,
+                "memory_type": m.memory_type.as_str(),
+                "project": m.project,
+                "created_at_ms": m.created_at.timestamp_millis(),
+                "importance": m.importance.value(),
+                "source_count": m.source_ids.len(),
+                "confidence": m.confidence,
+                "information_gain": m.information_gain,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "items": items,
+        "total": sorted.len(),
+    })
+}
+
+/// 聚合 RetrievalExecuted 审计事件为联想执行活动指标（v0.9.6 首屏仪表盘）。
+///
+/// 抽为纯函数以便单元测试覆盖字段名与计算逻辑，防止前后端契约漂移
+/// （与 audit-trail/trust 端点字段名错误同源的历史教训）。
+/// 输入为 `audit_trail.query` 返回的引用切片（最新在前）。
+fn aggregate_association_activity(events: &[&AuditEvent]) -> serde_json::Value {
+    let mut fast_only = 0u64;
+    let mut deep_only = 0u64;
+    let mut both = 0u64;
+    let mut cand_sum: u64 = 0;
+    let mut cand_n: u64 = 0;
+    let mut last_ms: Option<u64> = None;
+
+    for ev in events.iter() {
+        let md = &ev.metadata;
+        let fh = md.get("fast_hits").and_then(|v| v.parse::<u64>().ok());
+        let dh = md.get("deep_hits").and_then(|v| v.parse::<u64>().ok());
+        if let (Some(f), Some(d)) = (fh, dh) {
+            if f > 0 && d > 0 {
+                both += 1;
+            } else if f > 0 {
+                fast_only += 1;
+            } else if d > 0 {
+                deep_only += 1;
+            }
+        }
+        if let Some(c) = md
+            .get("total_candidates")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            cand_sum += c;
+            cand_n += 1;
+        }
+        if ev.timestamp_ms > last_ms.unwrap_or(0) {
+            last_ms = Some(ev.timestamp_ms);
+        }
+    }
+
+    // 最近 10 次执行明细（audit_trail 事件为最新在前，直接 take）
+    let recent: Vec<serde_json::Value> = events
+        .iter()
+        .take(10)
+        .map(|ev| {
+            let md = &ev.metadata;
+            serde_json::json!({
+                "timestamp_ms": ev.timestamp_ms,
+                "fast_hits": md.get("fast_hits").and_then(|v| v.parse::<u64>().ok()),
+                "deep_hits": md.get("deep_hits").and_then(|v| v.parse::<u64>().ok()),
+                "total_candidates": md.get("total_candidates").and_then(|v| v.parse::<u64>().ok()),
+                "query_length": md.get("query_length").and_then(|v| v.parse::<u64>().ok()),
+            })
+        })
+        .collect();
+
+    let avg_candidates = if cand_n > 0 {
+        cand_sum as f64 / cand_n as f64
+    } else {
+        0.0
+    };
+
+    serde_json::json!({
+        "total_executions": events.len(),
+        "avg_candidates": avg_candidates,
+        "fast_only_count": fast_only,
+        "deep_only_count": deep_only,
+        "both_count": both,
+        "last_execution_ms": last_ms,
+        "recent": recent,
+    })
+}
+
 /// 创建 v1 REST API 路由（状态类型为 ()，以便与主路由合并）
 ///
 /// 通过闭包捕获 memory_store 和 codebase_manager，无需使用 axum State。
@@ -347,9 +915,13 @@ pub fn build_v1_router(
     let consolidate_store = store.clone();
     let enrich_store = store.clone();
     let correct_store = store.clone();
+    let explore_store = store.clone();
+    let confirm_store = store.clone();
     let metrics_store = store.clone();
     let unfold_store = store.clone();
     let regulator_store = store.clone();
+    // v0.9.7 审查修复：备份恢复需持 store 锁防止并发写竞态，并失效缓存
+    let restore_store = store.clone();
 
     // P0-1: 编码器创建一次，所有请求复用（避免每次请求都加载 ML 模型）
     let encode_encoder = std::sync::Arc::new(HybridLuoShuEncoder::default());
@@ -404,11 +976,26 @@ pub fn build_v1_router(
                     //     Phase 2：释放锁，spawn_blocking 执行 luoshu_synthesize（CPU 密集）
                     //     Phase 3：重新持锁，列出记忆和获取总数（快速操作，<1ms）
 
-                    // Phase 1：持锁写入记忆（v0.9.3 修复：锁超时保护）
-                    let mut stored = 0usize;
-                    {
-                        let mut store = lock_store_with_timeout(&store).await?;
-                        for mem in &req.memories {
+                    // Phase 1：持锁写入记忆。
+                    // v0.9.6 P1 修复：整体移入 spawn_blocking，避免守卫自旋占死 worker。
+                    let mem_inputs = req.memories;
+                    let phase1_store = store.clone();
+                    let stored = tokio::task::spawn_blocking(move || -> Option<usize> {
+                        // 有界 try_lock 轮询（2s），与 remember 一致：
+                        // 在阻塞线程中自旋，不饥饿 HTTP worker，也不无限占用阻塞线程
+                        let lock_deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        let mut store = loop {
+                            match phase1_store.try_lock() {
+                                Ok(guard) => break guard,
+                                Err(_) if std::time::Instant::now() < lock_deadline => {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                                Err(_) => return None,
+                            }
+                        };
+                        let mut stored = 0usize;
+                        for mem in &mem_inputs {
                             let memory_type = MemoryType::try_parse(&mem.memory_type)
                                 .unwrap_or(MemoryType::Fact);
                             let privacy_level = PrivacyLevel::try_parse(&mem.privacy_level)
@@ -429,36 +1016,48 @@ pub fn build_v1_router(
                                 Err(e) => eprintln!("[v1/consolidate] 写入失败: {}", e),
                             }
                         }
-                    } // 锁释放
+                        Some(stored)
+                    })
+                    .await
+                    .unwrap_or(None)
+                    .ok_or((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({
+                            "error": "store_busy",
+                            "message": "记忆服务繁忙，请稍后重试"
+                        })),
+                    ))?;
 
-                    // Phase 2：三阶段锁解耦（锁外 CPU 聚类计算，根治 lock_busy）
-                    let store_arc = store.clone();
-                    let synthesized = match tokio::task::spawn_blocking(move || -> usize {
-                        // Phase 2a：持锁读快照（极短）
-                        let snapshot = match store_arc.blocking_lock().synthesis_snapshot() {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("[v1/consolidate] 合成快照失败: {}", e);
-                                return 0;
-                            }
-                        }; // 锁在此释放
-
-                        // Phase 2b：锁外 CPU 密集计算
+                    // Phase 2：异步超时获取快照，锁外执行 CPU 聚类计算。
+                    let snapshot = {
+                        let store = lock_store_with_timeout(&store).await?;
+                        store
+                            .synthesis_snapshot()
+                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "consolidation_failed",
+                                "message": format!("合成快照失败: {}", e)
+                            }))))?
+                    };
+                    let synthesized_plan = tokio::task::spawn_blocking(move || {
                         let engine = SynthesisEngine::new(snapshot.config);
                         let mut plan =
                             engine.plan_luoshu(&snapshot.all, snapshot.information_gain_threshold);
                         if plan.synthesized == 0 {
                             plan = engine.plan_jaccard(&snapshot.all);
                         }
-
-                        // Phase 2c：持锁写回（极短）
-                        let mut store = store_arc.blocking_lock();
-                        store.apply_synthesis_plan(plan)
-                    }).await {
-                        Ok(n) => n,
+                        plan
+                    }).await;
+                    let synthesized = match synthesized_plan {
+                        Ok(plan) => {
+                            let mut store = lock_store_with_timeout(&store).await?;
+                            store.apply_synthesis_plan(plan)
+                        }
                         Err(e) => {
                             eprintln!("[v1/consolidate] spawn_blocking panic: {}", e);
-                            0
+                            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "consolidation_internal_error",
+                                "message": "合成任务执行失败，服务已保持运行"
+                            }))));
                         }
                     };
 
@@ -466,20 +1065,24 @@ pub fn build_v1_router(
                     let (synthesis_summaries, total) = {
                         let store = lock_store_with_timeout(&store).await?;
                         let filter = ListFilter::new();
-                        let all_memories = store.list_memories(&filter).unwrap_or_else(|e| {
-                            eprintln!("[v1/consolidate] 列出记忆失败: {}", e);
-                            Default::default()
-                        });
+                        let all_memories = store.list_memories(&filter).map_err(|e| {
+                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "list_memories_failed",
+                                "message": format!("列出记忆失败: {}", e)
+                            })))
+                        })?;
                         let synthesis_summaries: Vec<String> = all_memories.0
                             .iter()
                             .filter(|m| m.memory_type == MemoryType::Synthesis)
                             .map(|m| m.summary())
                             .collect();
 
-                        let total = store.total_count().unwrap_or_else(|e| {
-                            eprintln!("[v1/consolidate] 获取总数失败: {}", e);
-                            0
-                        });
+                        let total = store.total_count().map_err(|e| {
+                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "total_count_failed",
+                                "message": format!("获取记忆总数失败: {}", e)
+                            })))
+                        })?;
                         (synthesis_summaries, total)
                     }; // 锁释放
 
@@ -493,7 +1096,8 @@ pub fn build_v1_router(
             }
         }))
         // POST /v1/memories/enrich — 双路检索增强（v0.9.3 修复：增加超时与 panic 隔离）
-        // v0.9.3 修复：锁获取超时（2s）+ spawn_blocking 执行（15s 超时 + panic 隔离）
+        // v0.9.3 修复：锁获取 + CPU 检索统一放入 spawn_blocking（blocking_lock），
+        //       外层 15s timeout 兜底（覆盖锁等待与检索执行两个阶段）。
         // 根因：recall() / trapezoid_focus_recall() 在 tokio 异步上下文中同步阻塞，
         //       无超时保护时若检索卡死，锁永不释放，后续请求全部超时
         .route("/memories/enrich", post({
@@ -502,6 +1106,8 @@ pub fn build_v1_router(
                 let store = store.clone();
                 async move {
                     let query = req.query;
+                    // 联想解释块需要保留查询原文（query 将被 move 进 spawn_blocking 闭包）
+                    let query_text = query.clone();
                     let top_k = req.top_k.clamp(1, 100);
                     let privacy_ctx = if req.user_id.is_some() {
                         Some((PrivacyLevel::User, req.session_id.clone(), req.user_id.clone()))
@@ -509,96 +1115,292 @@ pub fn build_v1_router(
                         None
                     };
 
-                    // Phase 1：锁获取超时保护（2 秒），避免锁被长期占用时的请求积压
-                    let _guard = tokio::time::timeout(
-                        std::time::Duration::from_secs(2),
-                        store.lock(),
-                    ).await.map_err(|_| {
-                        (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-                            "error": "search_busy",
-                            "message": "搜索服务繁忙，请稍后重试"
-                        })))
-                    })?;
-                    // 立即释放锁，spawn_blocking 中重新获取
-                    drop(_guard);
-
-                    // Phase 2：spawn_blocking 执行 CPU 密集检索，带超时和 panic 隔离
-                    let store_arc = store.clone();
+                    // Phase 1+2：锁获取与 CPU 密集检索统一放入 spawn_blocking（阻塞上下文）。
+                    // 锁获取采用"有界 try_lock 轮询"（2 秒截止）——若锁被长期占用，
+                    // 阻塞线程自行放弃并返回 search_busy，不会无限阻塞线程池。
+                    // 外部 15s timeout 对"检索执行"阶段兜底（请求等待超时）。
+                    let cancellation = Arc::new(AtomicBool::new(false));
+                    let cancellation_for_task = cancellation.clone();
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(15),
-                        tokio::task::spawn_blocking(move || {
-                            let mut store = store_arc.blocking_lock();
+                        tokio::task::spawn_blocking(move || -> Result<EnrichBlockingResult, &'static str> {
+                            let _cancellation_guard = CancellationFlag(cancellation_for_task.clone());
+                            // 有界锁获取：轮询 try_lock，2 秒未获得则放弃
+                            let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                            let mut store = loop {
+                                match store.try_lock() {
+                                    Ok(guard) => break guard,
+                                    Err(_) if std::time::Instant::now() < lock_deadline => {
+                                        if cancellation_for_task.load(Ordering::Acquire) {
+                                            return Err("cancelled");
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(10));
+                                    }
+                                    Err(_) => {
+                                        eprintln!("[v1/enrich] 锁获取超时（2s），返回 search_busy");
+                                        return Err("search_busy");
+                                    }
+                                }
+                            };
 
                             let fast_filter = RecallFilter {
                                 memory_type: None,
-                                project: None,
-                                tags: vec![],
+                                project: req.project.clone(),
+                                tags: req.tags.clone(),
                                 min_importance: None,
                                 top_k: top_k * 2,
                                 privacy_context: privacy_ctx.clone(),
+                                explore_pure: false,
+                                regression_query: None,
                             };
-                            let fast_result = store.recall(&query, &fast_filter).unwrap_or_else(|e| {
-                                eprintln!("[v1/enrich] 快速路径检索失败: {}", e);
-                                RecallResult { memories: vec![], scores: vec![], total: 0 }
-                            });
+                            let mut internal_error = false;
+                            let fast_result = match store.recall_with_cancel(
+                                &query,
+                                &fast_filter,
+                                Some(&cancellation_for_task),
+                            ) {
+                                Ok(result) => result,
+                                Err(e) if e.to_string() == "enrich_cancelled" => {
+                                    return Err("cancelled");
+                                }
+                                Err(_e) => {
+                                    eprintln!("[v1/enrich] 快速路径检索失败，已降级为空结果");
+                                    internal_error = true;
+                                    RecallResult::basic(vec![], vec![], 0)
+                                }
+                            };
 
                             let deep_filter = RecallFilter {
                                 memory_type: None,
-                                project: None,
-                                tags: vec![],
+                                project: req.project.clone(),
+                                tags: req.tags.clone(),
                                 min_importance: None,
                                 top_k: top_k * 2,
                                 privacy_context: privacy_ctx,
+                                explore_pure: false,
+                                regression_query: None,
                             };
-                            // v0.9.0 修复：统计模式（无 ML 模型）下洛书 9 维向量语义不可靠，
-                            // 跳过深度路径，仅用字面匹配（TF-IDF），避免搜"测试"返回不相关记忆
-                            let deep_result = if store.is_ml_encoder() {
-                                store.trapezoid_focus_recall(&query, &deep_filter, 1).unwrap_or_else(|e| {
-                                    eprintln!("[v1/enrich] 深度路径检索失败: {}", e);
-                                    RecallResult { memories: vec![], scores: vec![], total: 0 }
-                                })
-                            } else {
-                                RecallResult { memories: vec![], scores: vec![], total: 0 }
+                            // 深度路径始终执行：查询意图权重会在 RRF 阶段抑制泛化词污染，
+                            // 同时保留无 ML 模式下的真实结果，便于评估与后续升级编码器。
+                            let deep_result = match store.trapezoid_focus_recall_with_cancel(
+                                &query,
+                                &deep_filter,
+                                1,
+                                Some(&cancellation_for_task),
+                            ) {
+                                Ok(result) => result,
+                                Err(e) if e.to_string() == "enrich_cancelled" => {
+                                    return Err("cancelled");
+                                }
+                                Err(_e) => {
+                                    eprintln!("[v1/enrich] 深度路径检索失败，已降级为空结果");
+                                    internal_error = true;
+                                    RecallResult::basic(vec![], vec![], 0)
+                                }
                             };
 
-                            // RRF 融合 — 使用共享 rrf_fuse
-                            let fused = crate::engine::rrf::rrf_fuse(
+                            // RRF 融合：具体错误查询提高 Deep 路径权重。
+                            let (fast_weight, deep_weight) =
+                                crate::engine::rrf::query_path_weights(&query);
+                            let fused = crate::engine::rrf::rrf_fuse_weighted(
                                 &fast_result,
                                 &deep_result,
                                 top_k,
                                 crate::engine::rrf::RRF_DEFAULT_K,
+                                fast_weight,
+                                deep_weight,
                             );
 
+                            // 阶段D 可观测性：LRC_RRF_TRACE=1 输出融合审计行（默认关闭）
+                            if std::env::var("LRC_RRF_TRACE").map(|v| v == "1").unwrap_or(false) {
+                                let ft = fast_result.memories.first();
+                                let dt = deep_result.memories.first();
+                                let mt = fused.memories.first();
+                                eprintln!("[LRC-RRF-TRACE] {}", serde_json::json!({
+                                    "query_length": query.chars().count(),
+                                    "weights": { "fast": fast_weight, "deep": deep_weight },
+                                    "fast_top1": ft.map(|m| serde_json::json!({
+                                        "source": m.source, "project": m.project,
+                                        "bagua": m.bagua_index, "score": fast_result.scores.first().copied().unwrap_or(0.0),
+                                        "preview": m.content.chars().take(60).collect::<String>(),
+                                    })),
+                                    "deep_top1": dt.map(|m| serde_json::json!({
+                                        "source": m.source, "project": m.project,
+                                        "bagua": m.bagua_index, "score": deep_result.scores.first().copied().unwrap_or(0.0),
+                                        "preview": m.content.chars().take(60).collect::<String>(),
+                                    })),
+                                    "fused_top1": mt.map(|m| serde_json::json!({
+                                        "source": m.source, "project": m.project,
+                                        "bagua": m.bagua_index, "score": fused.scores.first().copied().unwrap_or(0.0),
+                                        "preview": m.content.chars().take(60).collect::<String>(),
+                                    })),
+                                }));
+                            }
+
+                            if internal_error && fused.memories.is_empty() {
+                                return Err("search_internal_error");
+                            }
                             let total = fused.total_candidates;
-                            let memories: Vec<EnrichedMemory> = fused
+                            let fast_hits = fast_result.memories.len();
+                            let deep_hits = deep_result.memories.len();
+                            let mut memories: Vec<EnrichedMemory> = Vec::with_capacity(fused.memories.len());
+                            let mut explanation_items: Vec<EnrichExplanationItem> =
+                                Vec::with_capacity(fused.memories.len());
+                            for (i, (m, (&score, contrib))) in fused
                                 .memories
                                 .iter()
-                                .zip(fused.scores.iter())
-                                .map(|(m, &score)| EnrichedMemory {
+                                .zip(fused.scores.iter().zip(fused.contributions.iter()))
+                                .enumerate()
+                            {
+                                memories.push(EnrichedMemory {
                                     id: m.id.clone(),
                                     content: m.content.clone(),
                                     memory_type: m.memory_type.as_str().to_string(),
                                     score,
                                     bagua_category: m.bagua_category.clone(),
+                                    daoti_preview_gua: m.daoti_preview_gua.clone(),
+                                    daoti_preview_bagua: m.daoti_preview_bagua.clone(),
+                                    daoti_preview_version: m.daoti_preview_version.clone(),
                                     importance: m.importance.value(),
                                     topological_depth: m.topological_depth,
                                     version: m.version,
                                     created_at: m.created_at.to_rfc3339(),
-                                })
-                                .collect();
+                                });
+                                // 阶段D：每条的路径贡献明细（只观测，不参与排序）
+                                explanation_items.push(EnrichExplanationItem {
+                                    id: m.id.clone(),
+                                    rank: i + 1,
+                                    score,
+                                    fused_contrib: contrib.fused_contrib(),
+                                    fast_contrib: contrib.fast_contrib,
+                                    deep_contrib: contrib.deep_contrib,
+                                    fast_rank: contrib.fast_rank,
+                                    deep_rank: contrib.deep_rank,
+                                    hit_paths: contrib.hit_paths(),
+                                });
+                            }
 
-                            (memories, fast_result.memories.len(), deep_result.memories.len(), total)
+                            // 阶段D：检索链路结构化审计（只观测，不参与排序决策）
+                            // 记录两路权重、候选规模与每条结果的通路贡献分解，
+                            // 供 /v1/audit-trail 查询与后续反馈回流观测使用。
+                            let mut audit_meta = std::collections::HashMap::new();
+                            audit_meta.insert(
+                                "query_length".to_string(),
+                                query.chars().count().to_string(),
+                            );
+                            audit_meta.insert("fast_weight".to_string(), fast_weight.to_string());
+                            audit_meta.insert("deep_weight".to_string(), deep_weight.to_string());
+                            audit_meta.insert("fast_hits".to_string(), fast_hits.to_string());
+                            audit_meta.insert("deep_hits".to_string(), deep_hits.to_string());
+                            audit_meta.insert("total_candidates".to_string(), total.to_string());
+                            let items_json = serde_json::json!(explanation_items
+                                .iter()
+                                .map(|item| {
+                                    serde_json::json!({
+                                        "rank": item.rank,
+                                        "id": item.id,
+                                        "fused_contrib": item.fused_contrib,
+                                        "fast_contrib": item.fast_contrib,
+                                        "deep_contrib": item.deep_contrib,
+                                        "fast_rank": item.fast_rank,
+                                        "deep_rank": item.deep_rank,
+                                        "hit_paths": item.hit_paths,
+                                    })
+                                })
+                                .collect::<Vec<_>>());
+                            audit_meta.insert("items".to_string(), items_json.to_string());
+                            let state_snapshot = store.memory_state_machine.snapshot();
+                            let mut regression_evidence = fast_result.regression_evidence.clone();
+                            for (id, evidence) in &deep_result.regression_evidence {
+                                regression_evidence.insert(id.clone(), evidence.clone());
+                            }
+                            let filtered_count = fast_hits
+                                .saturating_add(deep_hits)
+                                .saturating_sub(total);
+                            let affected_ids =
+                                explanation_items.iter().map(|item| item.id.clone()).collect();
+                            let evidence_json = serde_json::to_string(&regression_evidence)
+                                .unwrap_or_else(|_| "{}".to_string());
+                            audit_meta.insert("filtered_count".to_string(), filtered_count.to_string());
+                            audit_meta.insert("regression_evidence".to_string(), evidence_json);
+                            audit_meta.insert(
+                                "trail".to_string(),
+                                serde_json::to_string(&state_snapshot.trail)
+                                    .unwrap_or_else(|_| "[]".to_string()),
+                            );
+                            store.audit_trail.record(
+                                AuditEventType::RetrievalExecuted,
+                                format!(
+                                    "联想检索执行：查询「{}」，融合 {} 条候选（fast={}，deep={}）",
+                                    query.chars().take(40).collect::<String>(),
+                                    total,
+                                    fast_hits,
+                                    deep_hits
+                                ),
+                                "阶段D 联想解释观测：记录检索链路权重与每条结果的通路贡献分解，供结构化审计，不参与排序".to_string(),
+                                affected_ids,
+                                audit_meta,
+                            );
+
+                            Ok((
+                                memories,
+                                explanation_items,
+                                fast_weight,
+                                deep_weight,
+                                fast_hits,
+                                deep_hits,
+                                total,
+                                filtered_count,
+                                state_snapshot.trail,
+                                regression_evidence,
+                            ))
                         })
                     ).await;
 
                     match result {
-                        Ok(Ok((memories, fast_hits, deep_hits, total))) => {
+                        Ok(Ok(Ok((memories, explanation_items, fast_weight, deep_weight, fast_hits, deep_hits, total, filtered_count, trail, regression_evidence)))) => {
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(EnrichResponse {
                                 memories,
                                 fast_path_hits: fast_hits,
                                 deep_path_hits: deep_hits,
                                 total,
+                                trail,
+                                regression_evidence,
+                                filtered_count,
+                                association_mode: "state_machine_navigation".to_string(),
+                                explanation: EnrichExplanation {
+                                    query: query_text,
+                                    weights: ExplanationWeights {
+                                        fast: fast_weight,
+                                        deep: deep_weight,
+                                    },
+                                    rrf_k: crate::engine::rrf::RRF_DEFAULT_K,
+                                    fast_path_hits: fast_hits,
+                                    deep_path_hits: deep_hits,
+                                    total_candidates: total,
+                                    items: explanation_items,
+                                },
                             }))
+                        }
+                        Ok(Ok(Err("search_internal_error"))) => {
+                            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "search_internal_error",
+                                "message": "搜索内部错误，请稍后重试"
+                            }))))
+                        }
+                        Ok(Ok(Err("cancelled"))) => {
+                            eprintln!("[v1/enrich] 检索任务已取消，后台 blocking 任务已退出");
+                            Err((StatusCode::REQUEST_TIMEOUT, Json(serde_json::json!({
+                                "error": "search_cancelled",
+                                "message": "搜索已取消"
+                            }))))
+                        }
+                        Ok(Ok(Err("search_busy"))) => {
+                            // 有界锁获取超时（2s）：返回与既有 lock_busy 一致的口径
+                            Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                                "error": "search_busy",
+                                "message": "搜索服务繁忙，请稍后重试"
+                            }))))
                         }
                         Ok(Err(join_error)) => {
                             // spawn_blocking 内部 panic 被捕获
@@ -610,10 +1412,170 @@ pub fn build_v1_router(
                         }
                         Err(_timeout) => {
                             // 15 秒超时触发
-                            eprintln!("[v1/enrich] 搜索超时（15s）");
+                            // v0.9.7 审查修复（HCSE-P1）：CancellationFlag 的 Drop
+                            // 只在闭包结束时触发，超时分支若不显式置位，失控任务会
+                            // 继续持锁跑完整轮检索，让后续请求在窗口期内全部 busy。
+                            // 置位后任务会在下一个 token 检查点退出并释放锁。
+                            cancellation.store(true, Ordering::Release);
+                            eprintln!("[v1/enrich] 搜索超时（15s），已置取消标志令后台任务提前退出");
                             Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
                                 "error": "search_timeout",
                                 "message": "搜索超时，请稍后重试"
+                            }))))
+                        }
+                        Ok(Ok(Err(other))) => {
+                            // 兜底：未知锁错误分支（当前仅 search_busy 一种）
+                            eprintln!("[v1/enrich] 未知检索错误: {}", other);
+                            Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                                "error": "search_unavailable",
+                                "message": "搜索暂不可用，请稍后重试"
+                            }))))
+                        }
+                    }
+                }
+            }
+        }))
+        // POST /v1/associations/explore — 联想中心多跳探索（有界 BFS）
+        .route("/associations/explore", post({
+            let store = explore_store;
+            move |Json(req): Json<AssociationExploreRequest>| {
+                let store = store.clone();
+                async move {
+                    let depth = req.depth.clamp(1, 4);
+                    let width = req.width.clamp(1, 3);
+                    if req.query.as_deref().map(|q| q.trim()).unwrap_or("").is_empty()
+                        && req.memory_id.as_deref().map(|id| id.trim()).unwrap_or("").is_empty()
+                    {
+                        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                            "error": "missing_start",
+                            "message": "必须提供 query 或 memory_id 作为联想起点"
+                        }))));
+                    }
+                    let cancellation = Arc::new(AtomicBool::new(false));
+                    let cancellation_for_task = cancellation.clone();
+                    let query = req.query.clone();
+                    let memory_id = req.memory_id.clone();
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(15),
+                        tokio::task::spawn_blocking(move || -> Result<AssociationExploreResponse, &'static str> {
+                            let _guard = CancellationFlag(cancellation_for_task.clone());
+                            let mut store = loop {
+                                match store.try_lock() {
+                                    Ok(guard) => break guard,
+                                    Err(_) => {
+                                        if cancellation_for_task.load(Ordering::Acquire) {
+                                            return Err("search_busy");
+                                        }
+                                        std::thread::sleep(Duration::from_millis(50));
+                                    }
+                                }
+                            };
+                            Ok(run_association_explore(
+                                &mut store,
+                                query.as_deref().and_then(|q| {
+                                    let t = q.trim();
+                                    if t.is_empty() { None } else { Some(t) }
+                                }),
+                                memory_id.as_deref().and_then(|id| {
+                                    let t = id.trim();
+                                    if t.is_empty() { None } else { Some(t) }
+                                }),
+                                depth,
+                                width,
+                                &cancellation_for_task,
+                            ))
+                        }),
+                    ).await;
+
+                    match result {
+                        Ok(Ok(Ok(response))) => Ok(Json(response)),
+                        Ok(Ok(Err(_))) => Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                            "error": "search_busy",
+                            "message": "记忆系统正在执行后台任务，请稍后重试"
+                        })))),
+                        Ok(Err(join_error)) => {
+                            eprintln!("[v1/associations/explore] spawn_blocking panic: {}", join_error);
+                            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "explore_internal_error",
+                                "message": "探索内部错误，服务已保持运行"
+                            }))))
+                        }
+                        Err(_timeout) => {
+                            cancellation.store(true, Ordering::Release);
+                            eprintln!("[v1/associations/explore] 探索超时（15s），已置取消标志");
+                            Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                                "error": "explore_timeout",
+                                "message": "联想探索超时，请降低联想层数后重试"
+                            }))))
+                        }
+                    }
+                }
+            }
+        }))
+        // POST /v1/associations/confirm — 用户确认一条联想（"就是这个"）。
+        // 确认 = 该记忆以最高激活强度写回道体状态机活跃锚点并持久化。
+        .route("/associations/confirm", post({
+            let store = confirm_store;
+            move |Json(req): Json<ConfirmAssociationRequest>| {
+                let store = store.clone();
+                async move {
+                    let memory_id = req.memory_id.trim().to_string();
+                    if memory_id.is_empty() {
+                        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                            "error": "missing_memory_id",
+                            "message": "必须提供 memory_id"
+                        }))));
+                    }
+                    let query = req.query.clone();
+                    // 克隆后移入阻塞任务，避免外层后续审计与响应无法使用
+                    let blocking_store = store.clone();
+                    let confirm_id = memory_id.clone();
+                    let result = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+                        let mut guard = loop {
+                            match blocking_store.try_lock() {
+                                Ok(g) => break g,
+                                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                            }
+                        };
+                        guard.confirm_memory(&confirm_id).map_err(|e| e.to_string())
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Ok(true)) => {
+                            // 结构化审计：记录用户确认行为（可观测，不参与排序）
+                            if let Ok(mut guard) = store.try_lock() {
+                                let mut meta = std::collections::HashMap::new();
+                                meta.insert(
+                                    "query".to_string(),
+                                    query.unwrap_or_default(),
+                                );
+                                guard.audit_trail.record(
+                                    AuditEventType::AssociationConfirmed,
+                                    format!("用户确认联想：「{}」", memory_id),
+                                    "用户在联想探索中确认该记忆与意图相关，写入活跃锚点".to_string(),
+                                    vec![memory_id.clone()],
+                                    meta,
+                                );
+                            }
+                            Ok(Json(serde_json::json!({
+                                "confirmed": true,
+                                "memory_id": memory_id
+                            })))
+                        }
+                        Ok(Ok(false)) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+                            "error": "memory_not_found",
+                            "message": "该记忆不存在或已过期"
+                        })))),
+                        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                            "error": "confirm_failed",
+                            "message": e
+                        })))),
+                        Err(join_error) => {
+                            eprintln!("[v1/associations/confirm] spawn_blocking panic: {}", join_error);
+                            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                "error": "confirm_internal_error",
+                                "message": "确认操作内部错误，服务已保持运行"
                             }))))
                         }
                     }
@@ -626,30 +1588,65 @@ pub fn build_v1_router(
             move |Json(req): Json<CorrectRequest>| {
                 let store = store.clone();
                 async move {
-                    let mut store = lock_store_with_timeout(&store).await?;
-                    match store.correct_memory(&req.memory_id, &req.content, req.reason.as_deref()) {
-                        Ok(Some(memory)) => {
+                    // v0.9.6 P1 修复：correct_memory 走跨进程写守卫，移入 spawn_blocking
+                    // 避免守卫自旋占死 HTTP worker。
+                    let memory_id = req.memory_id.clone();
+                    let memory_id_for_task = memory_id.clone();
+                    let outcome = tokio::task::spawn_blocking(move || match store.try_lock() {
+                        Ok(mut store) => {
+                            match store.correct_memory(&memory_id_for_task, &req.content, req.reason.as_deref()) {
+                                Ok(Some(memory)) => Ok((memory.id, memory.version, memory.version_history.len())),
+                                Ok(None) => Err("not_found"),
+                                Err(e) => {
+                                    eprintln!("[v1/correct] 修正失败: {}", e);
+                                    Err("write_failed")
+                                }
+                            }
+                        }
+                        Err(_) => Err("store_busy"),
+                    })
+                    .await;
+
+                    match outcome {
+                        Ok(Ok((id, version, history))) => {
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(CorrectResponse {
                                 success: true,
-                                memory_id: memory.id,
-                                new_version: memory.version,
-                                history_versions: memory.version_history.len(),
+                                memory_id: id,
+                                new_version: version,
+                                history_versions: history,
                             }))
                         }
-                        Ok(None) => Err((
+                        Ok(Err("not_found")) => Err((
                             StatusCode::NOT_FOUND,
                             Json(serde_json::json!({
                                 "error": "memory_not_found",
-                                "message": format!("未找到记忆: {}", req.memory_id)
+                                "message": format!("未找到记忆: {}", memory_id)
                             })),
                         )),
-                        Err(e) => Err((
+                        Ok(Err("store_busy")) => Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "store_busy",
+                                "message": "记忆服务繁忙，请稍后重试"
+                            })),
+                        )),
+                        Ok(Err(_)) => Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({
                                 "error": "correction_failed",
-                                "message": format!("修正失败: {}", e)
+                                "message": "修正失败，请稍后重试"
                             })),
                         )),
+                        Err(join_error) => {
+                            eprintln!("[v1/correct] spawn_blocking panic: {}", join_error);
+                            Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "correction_failed",
+                                    "message": "修正任务异常终止"
+                                })),
+                            ))
+                        }
                     }
                 }
             }
@@ -660,41 +1657,75 @@ pub fn build_v1_router(
             move |Json(req): Json<UnfoldRequest>| {
                 let store = store.clone();
                 async move {
-                    let mut store = lock_store_with_timeout(&store).await?;
-                    match store.unfold_memory(&req.memory_id, req.min_activation) {
-                        Ok(Some((sub_memories, fidelity))) => {
-                            let sub_count = sub_memories.len();
-                            let unfolded: Vec<UnfoldedSubMemory> = sub_memories
-                                .into_iter()
-                                .map(|m| UnfoldedSubMemory {
-                                    id: m.id,
-                                    content: m.content,
-                                    bagua_category: m.bagua_category.unwrap_or_else(|| "未知".into()),
-                                    weight: 1.0 / sub_count.max(1) as f32,
-                                })
-                                .collect();
+                    // v0.9.6 P1 修复：unfold_memory 走跨进程写守卫，移入 spawn_blocking
+                    let memory_id = req.memory_id;
+                    let memory_id_for_task = memory_id.clone();
+                    let outcome = tokio::task::spawn_blocking(move || match store.try_lock() {
+                        Ok(mut store) => match store.unfold_memory(&memory_id_for_task, req.min_activation) {
+                            Ok(Some((sub_memories, fidelity))) => {
+                                let sub_count = sub_memories.len();
+                                let unfolded: Vec<UnfoldedSubMemory> = sub_memories
+                                    .into_iter()
+                                    .map(|m| UnfoldedSubMemory {
+                                        id: m.id,
+                                        content: m.content,
+                                        bagua_category: m.bagua_category.unwrap_or_else(|| "未知".into()),
+                                        weight: 1.0 / sub_count.max(1) as f32,
+                                    })
+                                    .collect();
+                                Ok((unfolded, fidelity, sub_count))
+                            }
+                            Ok(None) => Err("not_found"),
+                            Err(e) => {
+                                eprintln!("[v1/unfold] 拆解失败: {}", e);
+                                Err("write_failed")
+                            }
+                        },
+                        Err(_) => Err("store_busy"),
+                    })
+                    .await;
+
+                    match outcome {
+                        Ok(Ok((unfolded, fidelity, sub_count))) => {
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(UnfoldResponse {
                                 success: true,
-                                source_memory_id: req.memory_id,
+                                source_memory_id: memory_id,
                                 sub_vectors_count: sub_count,
                                 fidelity,
                                 sub_memories: unfolded,
                             }))
                         }
-                        Ok(None) => Err((
+                        Ok(Err("not_found")) => Err((
                             StatusCode::NOT_FOUND,
                             Json(serde_json::json!({
                                 "error": "unfold_failed",
-                                "message": format!("无法拆解记忆: {} (可能不是合成类型或无洛书向量)", req.memory_id)
+                                "message": format!("无法拆解记忆: {} (可能不是合成类型或无洛书向量)", memory_id)
                             })),
                         )),
-                        Err(e) => Err((
+                        Ok(Err("store_busy")) => Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "store_busy",
+                                "message": "记忆服务繁忙，请稍后重试"
+                            })),
+                        )),
+                        Ok(Err(_)) => Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({
                                 "error": "unfold_error",
-                                "message": format!("拆解失败: {}", e)
+                                "message": "拆解失败，请稍后重试"
                             })),
                         )),
+                        Err(join_error) => {
+                            eprintln!("[v1/unfold] spawn_blocking panic: {}", join_error);
+                            Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "unfold_error",
+                                    "message": "拆解任务异常终止"
+                                })),
+                            ))
+                        }
                     }
                 }
             }
@@ -881,6 +1912,11 @@ pub fn build_v1_router(
                                     "status": "active",
                                     "supported": true
                                 }));
+                                // v0.9.6：新增 data_directory（前端仪表盘据此显示真实数据目录，
+                                // 替换此前硬编码的全局路径，避免项目指纹模式下误导用户）
+                                obj.insert("data_directory".to_string(), serde_json::Value::String(
+                                    store.persistence().data_dir().to_string_lossy().to_string()
+                                ));
                             }
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(json))
                         }
@@ -986,6 +2022,7 @@ pub fn build_v1_router(
                         Some("isolate") => FeedbackTarget::IsolateMemory,
                         Some("confirm_action") => FeedbackTarget::ConfirmAction,
                         Some("cancel_action") => FeedbackTarget::CancelAction,
+                        Some("association") => FeedbackTarget::AssociationRelevance,
                         _ => FeedbackTarget::RetrievalResult,
                     };
 
@@ -1109,7 +2146,7 @@ pub fn build_v1_router(
                             })))
                         }
                         _ => {
-                            // 普通反馈记录（retrieval, synthesis, quarantine_override）
+                            // 普通反馈记录（retrieval, synthesis, quarantine_override, association）
                             let memory_id = match body.get("memory_id").and_then(|v| v.as_str()) {
                                 Some(id) => id.to_string(),
                                 None => {
@@ -1127,13 +2164,37 @@ pub fn build_v1_router(
                             let note = body.get("note").and_then(|v| v.as_str());
 
                             let store = lock_store_with_timeout(&store).await?;
-                            let feedback_id = store.user_feedback.record_feedback(
-                                feedback_type.clone(),
-                                target_type.clone(),
-                                &memory_id,
-                                query,
-                                note,
-                            );
+
+                            // 阶段D：联想级反馈——解析联想上下文（排名、命中的检索通路）
+                            let feedback_id = if target_type == FeedbackTarget::AssociationRelevance {
+                                let rank = body.get("rank").and_then(|v| v.as_u64()).map(|r| r as usize);
+                                let hit_paths: Vec<String> = body
+                                    .get("hit_paths")
+                                    .and_then(|v| v.as_array())
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str())
+                                            .map(|s| s.to_string())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                store.user_feedback.record_association_feedback(
+                                    feedback_type.clone(),
+                                    &memory_id,
+                                    query,
+                                    rank,
+                                    hit_paths,
+                                    note,
+                                )
+                            } else {
+                                store.user_feedback.record_feedback(
+                                    feedback_type.clone(),
+                                    target_type.clone(),
+                                    &memory_id,
+                                    query,
+                                    note,
+                                )
+                            };
 
                             let stats = store.user_feedback.get_stats();
 
@@ -1152,6 +2213,7 @@ pub fn build_v1_router(
                                     FeedbackTarget::IsolateMemory => "isolate",
                                     FeedbackTarget::ConfirmAction => "confirm_action",
                                     FeedbackTarget::CancelAction => "cancel_action",
+                                    FeedbackTarget::AssociationRelevance => "association",
                                 },
                                 "memory_id": memory_id,
                                 "stats": {
@@ -1160,12 +2222,157 @@ pub fn build_v1_router(
                                 },
                                 "message": if target_type == FeedbackTarget::QuarantineOverride {
                                     "隔离恢复请求已记录，将在下一个调节周期中处理"
+                                } else if target_type == FeedbackTarget::AssociationRelevance {
+                                    "联想结果反馈已记录（仅观测，不影响当前排序）"
                                 } else {
                                     "反馈已记录，感谢您的参与"
                                 },
                             })))
                         }
                     }
+                }
+            }
+        }))
+        // GET /v1/feedback/association-stats — 联想级反馈聚合（阶段D：反馈回流闭环）
+        //
+        // 按记忆聚合联想级反馈（AssociationRelevance），返回建议性质量分。
+        // 约束：仅观测/建议，不接入默认排序决策。
+        .route("/feedback/association-stats", get({
+            let store = metrics_store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    let store = match store.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "total": 0,
+                                "stats": [],
+                                "lock_busy": true,
+                                "degraded": true,
+                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
+                            })));
+                        }
+                    };
+
+                    let stats = store.user_feedback.get_association_stats();
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                        "total": stats.len(),
+                        "stats": stats,
+                    })))
+                }
+            }
+        }))
+        // GET /v1/feedback/association-activity — 联想执行活动聚合（v0.9.6 首屏仪表盘）
+        //
+        // 聚合 RetrievalExecuted 审计事件，返回真实的联想检索执行情况：
+        // 执行次数、平均候选规模、通路命中分布、最近执行时间。
+        // 与 association-stats（反馈统计）互补：反馈需用户评价才有数据，
+        // 而执行活动只要发生过 enrich 就有数据，确保首屏"记忆联想执行"
+        // 仪表盘不再长期显示空白。仅观测，不参与检索排序。
+        .route("/feedback/association-activity", get({
+            let store = metrics_store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    let store = match store.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "total_executions": 0,
+                                "lock_busy": true,
+                                "degraded": true,
+                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
+                            })));
+                        }
+                    };
+
+                    let q = AuditQuery {
+                        from_ms: None,
+                        to_ms: None,
+                        event_types: Some(vec![AuditEventType::RetrievalExecuted]),
+                        memory_id: None,
+                        limit: Some(1000),
+                    };
+                    let events = store.audit_trail.query(&q);
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                        aggregate_association_activity(&events),
+                    ))
+                }
+            }
+        }))
+        // GET /v1/associations/records — 联想中心本地过程记录。
+        // 仅读取本机审计链，不上传查询原文；客户端可选择隐藏原文。
+        .route("/associations/records", get({
+            let store = metrics_store.clone();
+            move |Query(params): Query<HashMap<String, String>>| {
+                let store = store.clone();
+                async move {
+                    let store = match store.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "records": [], "total": 0, "lock_busy": true, "degraded": true,
+                                "message": "记忆系统正在执行后台任务，记录稍后自动加载"
+                            })));
+                        }
+                    };
+                    let from_ms = params.get("from_ms").and_then(|v| v.parse::<u64>().ok());
+                    let to_ms = params.get("to_ms").and_then(|v| v.parse::<u64>().ok());
+                    let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50).clamp(1, 100);
+                    let offset = params.get("offset").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+                    let multi_hop = params.get("multi_hop").map(|v| v == "1" || v == "true").unwrap_or(false);
+                    let evidence_only = params.get("evidence_only").map(|v| v == "1" || v == "true").unwrap_or(false);
+                    let query = AuditQuery {
+                        from_ms, to_ms,
+                        event_types: Some(vec![AuditEventType::RetrievalExecuted]),
+                        memory_id: None, limit: Some(1000),
+                    };
+                    let events = store.audit_trail.query(&query);
+                    let filtered: Vec<&AuditEvent> = events.into_iter().filter(|event| {
+                        let trail_len = event.metadata.get("trail").and_then(|v| serde_json::from_str::<Vec<serde_json::Value>>(v).ok()).map(|v| v.len()).unwrap_or(0);
+                        let has_evidence = event.metadata.get("regression_evidence").map(|v| v != "{}" && v != "null").unwrap_or(false);
+                        (!multi_hop || trail_len > 1) && (!evidence_only || has_evidence)
+                    }).collect();
+                    let total = filtered.len();
+                    let records: Vec<serde_json::Value> = filtered.into_iter().skip(offset).take(limit).map(|event| {
+                        let md = &event.metadata;
+                        serde_json::json!({
+                            "id": event.id,
+                            "timestamp_ms": event.timestamp_ms,
+                            "query_length": md.get("query_length").and_then(|v| v.parse::<u64>().ok()),
+                            "fast_hits": md.get("fast_hits").and_then(|v| v.parse::<u64>().ok()),
+                            "deep_hits": md.get("deep_hits").and_then(|v| v.parse::<u64>().ok()),
+                            "total_candidates": md.get("total_candidates").and_then(|v| v.parse::<u64>().ok()),
+                            "filtered_count": md.get("filtered_count").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+                            "trail": md.get("trail").and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()).unwrap_or_else(|| serde_json::json!([])),
+                            "regression_evidence": md.get("regression_evidence").and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()).unwrap_or_else(|| serde_json::json!({})),
+                            "affected_memory_ids": event.affected_memory_ids,
+                            "description": event.description,
+                        })
+                    }).collect();
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                        "records": records, "total": total, "offset": offset, "limit": limit
+                    })))
+                }
+            }
+        }))
+        // DELETE /v1/associations/records — 清除本机联想过程记录。
+        .route("/associations/records", delete({
+            let store = metrics_store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    let mut store = match store.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => return Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                            "error": "store_busy", "message": "记忆服务繁忙，请稍后重试"
+                        })))),
+                    };
+                    let cleared = store.audit_trail.clear_matching(|event| event.event_type == AuditEventType::RetrievalExecuted);
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                        "success": true, "cleared": cleared, "message": "联想记录已在本机清除"
+                    })))
                 }
             }
         }))
@@ -1225,6 +2432,8 @@ pub fn build_v1_router(
                                 "regulator_frozen" => Some(AuditEventType::RegulatorFrozen),
                                 "regulator_unfrozen" => Some(AuditEventType::RegulatorUnfrozen),
                                 "consolidation_completed" => Some(AuditEventType::SynthesisCreated),
+                                "retrieval_executed" => Some(AuditEventType::RetrievalExecuted),
+                                "association_confirmed" => Some(AuditEventType::AssociationConfirmed),
                                 _ => None,
                             })
                             .collect()
@@ -1278,6 +2487,7 @@ pub fn build_v1_router(
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                                 "total_memories": stats.total_memories,
                                 "expired_count": stats.expired_count,
+                                "recent_added": stats.recent_added,
                                 "storage_size_bytes": stats.storage_size_bytes,
                                 "by_type": stats.by_type,
                                 "by_project": stats.by_project,
@@ -1354,6 +2564,12 @@ pub fn build_v1_router(
                                         "created_at_ms": m.created_at.timestamp_millis(),
                                         "importance": m.importance.value(),
                                         "tags": m.tags,
+                                        "bagua_category": m.bagua_category,
+                                        "daoti_preview_gua": m.daoti_preview_gua,
+                                        "daoti_preview_bagua": m.daoti_preview_bagua,
+                                        "daoti_preview_version": m.daoti_preview_version,
+                                        "luoshu_vector": m.luoshu_vector,
+                                        "topological_depth": m.topological_depth,
                                     })
                                 })
                                 .collect();
@@ -1406,6 +2622,8 @@ pub fn build_v1_router(
                     };
 
                     let filter = crate::memory_store::ListFilter {
+                        project: params.project.clone(),
+                        tags: params.tags.clone(),
                         limit,
                         offset: 0,
                         sort_by: crate::memory_store::SortBy::CreatedAt,
@@ -1426,6 +2644,10 @@ pub fn build_v1_router(
                                         "created_at_ms": m.created_at.timestamp_millis(),
                                         "importance": m.importance.value(),
                                         "tags": m.tags,
+                                        "bagua_category": m.bagua_category,
+                                        "daoti_preview_gua": m.daoti_preview_gua,
+                                        "daoti_preview_bagua": m.daoti_preview_bagua,
+                                        "daoti_preview_version": m.daoti_preview_version,
                                     })
                                 })
                                 .collect();
@@ -1440,6 +2662,63 @@ pub fn build_v1_router(
                             Json(serde_json::json!({
                                 "error": "list_memories_failed",
                                 "message": format!("记忆列表获取失败: {}", e)
+                            })),
+                        )),
+                    }
+                }
+            }
+        }))
+        //
+        // v0.9.6 修复：GET /v1/memories/synthesis-timeline — 结晶历史时间线
+        //
+        // 结晶的持久化产物是 Synthesis 类型记忆。原实现从审计事件
+        // （synthesis_created）提取，但历史合成未落审计事件导致时间线永远空白。
+        // 修复：直接按创建时间倒序返回合成记忆，即"每次结晶被持久化记录"。
+        // 查询参数：limit（默认 10，最大 50）
+        .route("/memories/synthesis-timeline", get({
+            let store = metrics_store.clone();
+            move |Query(params): Query<HashMap<String, String>>| {
+                let store = store.clone();
+                async move {
+                    let limit = params
+                        .get("limit")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(10);
+
+                    // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与其他端点一致）
+                    let store = match store.try_lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                                "items": [],
+                                "total": null,
+                                "lock_busy": true,
+                                "degraded": true,
+                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
+                            })));
+                        }
+                    };
+
+                    // 只在存储层过滤 Synthesis，减少传输量；纯函数内二次过滤保证契约
+                    let filter = crate::memory_store::ListFilter {
+                        memory_type: Some(MemoryType::Synthesis),
+                        limit: 50,
+                        sort_by: crate::memory_store::SortBy::CreatedAt,
+                        order: crate::memory_store::SortOrder::Desc,
+                        ..Default::default()
+                    };
+
+                    match store.list_memories(&filter) {
+                        Ok((memories, _total)) => {
+                            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                                build_synthesis_timeline(&memories, limit),
+                            ))
+                        }
+                        Err(e) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "synthesis_timeline_failed",
+                                "message": format!("结晶时间线获取失败: {}", e)
                             })),
                         )),
                     }
@@ -1472,6 +2751,10 @@ pub fn build_v1_router(
                                         "created_at_ms": m.created_at.timestamp_millis(),
                                         "importance": m.importance.value(),
                                         "tags": m.tags,
+                                        "bagua_category": m.bagua_category,
+                                        "daoti_preview_gua": m.daoti_preview_gua,
+                                        "daoti_preview_bagua": m.daoti_preview_bagua,
+                                        "daoti_preview_version": m.daoti_preview_version,
                                     })
                                 })
                                 .collect();
@@ -1519,33 +2802,148 @@ pub fn build_v1_router(
                     // 解析重要性，限制 1-10
                     let importance = Importance::new(params.importance.unwrap_or(5));
 
-                    // v0.9.3 修复：锁获取超时保护，避免卡死阻塞全局
-                    let mut store = lock_store_with_timeout(&store).await?;
+                    // v0.9.6 P1 修复：锁获取 + 写入统一放入 spawn_blocking（blocking_lock）。
+                    // 根因：store.remember() 内部会走跨进程写守卫 acquire_process_write_guard，
+                    //   该守卫在被占用时用 std::thread::sleep 自旋最长 5s。若在 async handler
+                    //   中同步调用，会占死 tokio worker 线程，连带拖慢 /health（实测 5.4s），
+                    //   并使 2s async 锁超时失效（被阻塞 worker 无法被轮询）。
+                    // 修复：移入 spawn_blocking 阻塞线程，用 blocking_lock 有界等待，
+                    //   守卫自旋只占用阻塞线程池，不再饥饿 HTTP worker。
+                    let blocking = tokio::task::spawn_blocking(move || {
+                        let lock_deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        let mut store = loop {
+                            match store.try_lock() {
+                                Ok(guard) => break guard,
+                                Err(_) if std::time::Instant::now() < lock_deadline => {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                                Err(_) => return Err("store_busy"),
+                            }
+                        };
+                        let memory = Memory::new(
+                            params.content,
+                            memory_type,
+                            params.project,
+                            params.tags,
+                            importance,
+                            None,
+                        );
+                        match store.remember(memory) {
+                            Ok(saved) => Ok(saved.id),
+                            Err(e) => {
+                                eprintln!("[v1/remember] 记忆写入失败: {}", e);
+                                Err("remember_failed")
+                            }
+                        }
+                    })
+                    .await;
 
-                    // 构造新记忆（project 和 tags 暂为空，ttl 永久）
-                    let memory = Memory::new(
-                        params.content,
-                        memory_type,
-                        None,
-                        Vec::new(),
-                        importance,
-                        None,
-                    );
-
-                    match store.remember(memory) {
-                        Ok(id) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+                    match blocking {
+                        Ok(Ok(memory_id)) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(
                             Json(serde_json::json!({
                                 "success": true,
-                                "memory_id": id,
+                                "memory_id": memory_id,
                             }))
                         ),
-                        Err(e) => Err((
+                        Ok(Err("store_busy")) => Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "store_busy",
+                                "message": "记忆服务繁忙，请稍后重试"
+                            })),
+                        )),
+                        Ok(Err(_)) => Err((
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({
                                 "error": "remember_failed",
-                                "message": format!("记忆写入失败: {}", e)
+                                "message": "记忆写入失败，请稍后重试"
                             })),
                         )),
+                        Err(join_error) => {
+                            eprintln!("[v1/remember] spawn_blocking panic: {}", join_error);
+                            Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "remember_failed",
+                                    "message": "记忆写入任务异常终止"
+                                })),
+                            ))
+                        }
+                    }
+                }
+            }
+        }))
+        // POST /v1/memories/forget — 删除单条记忆（前端删除按钮调用）
+        .route("/memories/forget", post({
+            let store = metrics_store.clone();
+            move |Json(req): Json<ForgetRequest>| {
+                let store = store.clone();
+                async move {
+                    // v0.9.6 P1 修复：forget 走跨进程写守卫（acquire_process_write_guard），
+                    // 移入 spawn_blocking 避免守卫自旋占死 HTTP worker（与 remember/correct 同模式）。
+                    let memory_id = req.memory_id;
+                    let memory_id_for_task = memory_id.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                        let mut store = loop {
+                            match store.try_lock() {
+                                Ok(guard) => break guard,
+                                Err(_) if std::time::Instant::now() < deadline => {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                                Err(_) => return Err("store_busy"),
+                            }
+                        };
+                        match store.forget(&memory_id_for_task) {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Err("not_found"),
+                            Err(e) => {
+                                eprintln!("[v1/forget] 删除记忆失败: {}", e);
+                                Err("forget_failed")
+                            }
+                        }
+                    })
+                    .await;
+
+                    match outcome {
+                        Ok(Ok(())) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                            serde_json::json!({
+                                "success": true,
+                                "memory_id": memory_id,
+                            })
+                        )),
+                        Ok(Err("not_found")) => Err((
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({
+                                "error": "memory_not_found",
+                                "message": format!("未找到记忆: {}", memory_id)
+                            })),
+                        )),
+                        Ok(Err("store_busy")) => Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "store_busy",
+                                "message": "记忆服务繁忙，请稍后重试"
+                            })),
+                        )),
+                        Ok(Err(_)) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "forget_failed",
+                                "message": "删除失败，请稍后重试"
+                            })),
+                        )),
+                        Err(join_error) => {
+                            eprintln!("[v1/forget] spawn_blocking panic: {}", join_error);
+                            Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "forget_failed",
+                                    "message": "删除任务异常终止"
+                                })),
+                            ))
+                        }
                     }
                 }
             }
@@ -2302,6 +3700,53 @@ pub fn build_v1_router(
                 serde_json::json!({"success": false, "error": "序列化备份报告失败"})
             })))
         }))
+        // POST /v1/backup/restore — 从快照恢复全部运行时文件
+        // v0.9.7 审查修复（HCSE-P0）：
+        //   1) 恢复前以有界轮询获取 store 锁并全程持有，防止与并发 remember/save
+        //      互写数据文件（半新半旧混合状态）；拿不到锁返回 409 而非硬闯。
+        //   2) 恢复成功后立即失效内存缓存，否则后续读取仍返回恢复前数据。
+        //   3) 失败返回 500（此前返回 200 + success:false，前端按状态码会误判）。
+        //   4) 快照路径必须位于 backups_dir 内（backup::restore_backup 内强制校验）。
+        .route("/backup/restore", post({
+            let restore_store = restore_store.clone();
+            move |body: Json<serde_json::Value>| async move {
+            let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            // 有界获取 store 锁（最多等待 5s）
+            let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let guard = loop {
+                match restore_store.try_lock() {
+                    Ok(g) => break g,
+                    Err(_) if std::time::Instant::now() < lock_deadline => {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(_) => {
+                        return Err((StatusCode::CONFLICT, Json(serde_json::json!({
+                            "success": false,
+                            "error": "restore_busy",
+                            "message": "记忆系统正忙（合成/写入中），请稍后重试恢复"
+                        }))));
+                    }
+                }
+            };
+            let result = tokio::task::spawn_blocking(move || crate::backup::restore_backup(std::path::Path::new(&path))).await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"success": false, "error": e.to_string()}))))?;
+            match result {
+                Ok(()) => {
+                    // 失效缓存并立即从磁盘重载，保证后续读取看到恢复后的数据
+                    guard.invalidate_cache_after_external_restore();
+                    let restored_count = guard.total_count().unwrap_or(0);
+                    drop(guard);
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                        "success": true,
+                        "restored_memories": restored_count
+                    })))
+                }
+                Err(e) => {
+                    drop(guard);
+                    Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"success": false, "error": e}))))
+                }
+            }
+        }}))
         // GET /v1/backups — v0.8.0 "归一"：列出所有备份文件
         .route("/backups", get(|| async move {
             let backups = tokio::task::spawn_blocking(|| {
@@ -2366,26 +3811,50 @@ pub fn build_v1_router(
                         ));
                     }
 
-                    // 校验 endpoint 是合法 HTTP/HTTPS URL，并拼接 /models 路径（OpenAI 兼容）
-                    let test_url = format!("{}/models", req.endpoint.trim_end_matches('/'));
-                    if !test_url.starts_with("https://") && !test_url.starts_with("http://") {
+                    // SSRF 防护：字面量校验（scheme/userinfo/host 网段检查）
+                    if let Err(e) = crate::url_safety::validate_http_url(&req.endpoint) {
                         return Err((
                             StatusCode::BAD_REQUEST,
                             Json(serde_json::json!({
                                 "ok": false,
                                 "status": 0,
-                                "message": "endpoint 必须以 http:// 或 https:// 开头",
+                                "message": format!("endpoint 校验失败: {}", e),
                                 "latency_ms": 0
                             })),
                         ));
                     }
+                    // SSRF 防护：解析并固定本次连接目标，保留原 URL 的 Host/SNI。
+                    let resolved_ips = match crate::url_safety::resolve_and_check_dns(&req.endpoint).await {
+                        Ok(ips) => ips,
+                        Err(e) => {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "ok": false,
+                                    "status": 0,
+                                    "message": format!("endpoint 校验失败: {}", e),
+                                    "latency_ms": 0
+                                })),
+                            ));
+                        }
+                    };
+
+                    // 校验 endpoint 是合法 HTTP/HTTPS URL，并拼接 /models 路径（OpenAI 兼容）
+                    let test_url = format!("{}/models", req.endpoint.trim_end_matches('/'));
 
                     let start = std::time::Instant::now();
 
-                    // 构造 HTTP 客户端（带 10 秒超时）
+                    // 构造 HTTP 客户端（带 10 秒超时）。resolve 将连接固定到刚才校验的 IP，
+                    // URL 仍使用原域名，因此 HTTPS 的 Host 与 SNI 不变。
+                    let endpoint_url = url::Url::parse(&req.endpoint).expect("已完成 URL 校验");
+                    let endpoint_host = endpoint_url.host_str().expect("已完成主机校验");
+                    let endpoint_port = endpoint_url.port_or_known_default().expect("HTTP(S) 默认端口");
                     let client = match reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(10))
+                        .resolve(endpoint_host, std::net::SocketAddr::new(resolved_ips[0], endpoint_port))
                         .user_agent("loong-recall-llm-test")
+                        // SSRF 防护：禁止自动重定向（防 302 跳转至内网/metadata）
+                        .redirect(reqwest::redirect::Policy::none())
                         .build()
                     {
                         Ok(c) => c,
@@ -2447,7 +3916,7 @@ pub fn build_v1_router(
                             Ok(Json(serde_json::json!({
                                 "ok": false,
                                 "status": 0,
-                                "message": format!("{}: {}", err_msg, e),
+                                "message": err_msg,
                                 "latency_ms": latency_ms
                             })))
                         }
@@ -2664,6 +4133,22 @@ mod api_contracts_tests {
     }
 
     #[test]
+    fn test_forget_request_serde() {
+        // 最小请求体：仅提供 memory_id
+        let json = r#"{"memory_id":"mem-001"}"#;
+        let req: ForgetRequest = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(req.memory_id, "mem-001");
+    }
+
+    #[test]
+    fn test_forget_request_requires_memory_id() {
+        // memory_id 是必填字段，缺失应反序列化失败
+        let json = r#"{}"#;
+        let result: Result<ForgetRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "缺失 memory_id 字段应反序列化失败");
+    }
+
+    #[test]
     fn test_encode_request_required_fields() {
         // text 是必填字段，缺失应反序列化失败
         let json = r#"{}"#;
@@ -2807,6 +4292,9 @@ mod api_contracts_tests {
             memory_type: "fact".to_string(),
             score: 0.85,
             bagua_category: Some("震".to_string()),
+            daoti_preview_gua: None,
+            daoti_preview_bagua: None,
+            daoti_preview_version: None,
             importance: 7,
             topological_depth: 0.5,
             version: 1,
@@ -2823,5 +4311,916 @@ mod api_contracts_tests {
         assert_eq!(json["bagua_category"], "震");
         assert_eq!(json["importance"], 7);
         assert_eq!(json["version"], 1);
+    }
+
+    /// 阶段D：EnrichResponse 联想解释块字段契约（只观测，不参与排序）。
+    #[test]
+    fn test_enrich_explanation_block_fields() {
+        let resp = EnrichResponse {
+            memories: vec![],
+            fast_path_hits: 6,
+            deep_path_hits: 4,
+            total: 3,
+            trail: vec![],
+            regression_evidence: HashMap::new(),
+            filtered_count: 0,
+            association_mode: "state_machine_navigation".to_string(),
+            explanation: EnrichExplanation {
+                query: "Rust 编译失败 ModuleNotFoundError 怎么排查".to_string(),
+                weights: ExplanationWeights {
+                    fast: 1.0,
+                    deep: 1.8,
+                },
+                rrf_k: 60.0,
+                fast_path_hits: 6,
+                deep_path_hits: 4,
+                total_candidates: 3,
+                items: vec![EnrichExplanationItem {
+                    id: "mem-001".to_string(),
+                    rank: 1,
+                    score: 1.0,
+                    fused_contrib: 0.0311,
+                    fast_contrib: 0.0164,
+                    deep_contrib: 0.0147,
+                    fast_rank: Some(1),
+                    deep_rank: Some(3),
+                    hit_paths: vec!["fast", "deep"],
+                }],
+            },
+        };
+        let json = serde_json::to_value(&resp).expect("序列化失败");
+        let exp = &json["explanation"];
+        assert_eq!(exp["query"], "Rust 编译失败 ModuleNotFoundError 怎么排查");
+        assert!((exp["weights"]["fast"].as_f64().unwrap() - 1.0).abs() < 1e-5);
+        assert!((exp["weights"]["deep"].as_f64().unwrap() - 1.8).abs() < 1e-5);
+        assert!((exp["rrf_k"].as_f64().unwrap() - 60.0).abs() < 1e-5);
+        assert_eq!(exp["fast_path_hits"], 6);
+        assert_eq!(exp["deep_path_hits"], 4);
+        assert_eq!(exp["total_candidates"], 3);
+        let item = &exp["items"][0];
+        assert_eq!(item["id"], "mem-001");
+        assert_eq!(item["rank"], 1);
+        assert_eq!(item["fast_rank"], 1);
+        assert_eq!(item["deep_rank"], 3);
+        assert_eq!(item["hit_paths"], serde_json::json!(["fast", "deep"]));
+        assert!((item["fast_contrib"].as_f64().unwrap() - 0.0164).abs() < 1e-5);
+        assert!((item["deep_contrib"].as_f64().unwrap() - 0.0147).abs() < 1e-5);
+        // 顶层与解释块保持一致
+        assert_eq!(json["total"], 3);
+    }
+
+    /// 阶段D：单路命中的解释条目 hit_paths 只含命中的通路。
+    #[test]
+    fn test_enrich_explanation_item_single_path() {
+        let resp = EnrichResponse {
+            memories: vec![],
+            fast_path_hits: 1,
+            deep_path_hits: 0,
+            total: 1,
+            trail: vec![],
+            regression_evidence: HashMap::new(),
+            filtered_count: 0,
+            association_mode: "state_machine_navigation".to_string(),
+            explanation: EnrichExplanation {
+                query: "仅快速命中".to_string(),
+                weights: ExplanationWeights {
+                    fast: 1.0,
+                    deep: 1.0,
+                },
+                rrf_k: 60.0,
+                fast_path_hits: 1,
+                deep_path_hits: 0,
+                total_candidates: 1,
+                items: vec![EnrichExplanationItem {
+                    id: "mem-002".to_string(),
+                    rank: 1,
+                    score: 1.0,
+                    fused_contrib: 0.0164,
+                    fast_contrib: 0.0164,
+                    deep_contrib: 0.0,
+                    fast_rank: Some(1),
+                    deep_rank: None,
+                    hit_paths: vec!["fast"],
+                }],
+            },
+        };
+        let json = serde_json::to_value(&resp).expect("序列化失败");
+        let item = &json["explanation"]["items"][0];
+        assert_eq!(item["deep_rank"], serde_json::Value::Null);
+        assert_eq!(item["hit_paths"], serde_json::json!(["fast"]));
+    }
+
+    // ===== 4. 联想执行活动聚合纯函数测试（v0.9.6 首屏仪表盘契约） =====
+
+    /// 构造一条 RetrievalExecuted 审计事件（metadata 为字符串映射，模拟真实落盘格式）
+    fn retrieval_event(ts: u64, fast: &str, deep: &str, total: &str) -> AuditEvent {
+        let mut md = std::collections::HashMap::new();
+        md.insert("fast_hits".to_string(), fast.to_string());
+        md.insert("deep_hits".to_string(), deep.to_string());
+        md.insert("total_candidates".to_string(), total.to_string());
+        AuditEvent {
+            id: format!("audit-{ts}"),
+            timestamp_ms: ts,
+            event_type: AuditEventType::RetrievalExecuted,
+            description: String::new(),
+            reason: String::new(),
+            affected_memory_ids: vec![],
+            metadata: md,
+            previous_hash: String::new(),
+            event_hash: String::new(),
+            hash_format: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_association_activity_field_names_and_aggregation() {
+        // 双通路命中 2 条 + 仅快速 1 条 + 仅深度 1 条，候选 10/20/30/40
+        let e1 = retrieval_event(100, "5", "5", "10");
+        let e2 = retrieval_event(300, "3", "3", "20");
+        let e3 = retrieval_event(200, "4", "0", "30");
+        let e4 = retrieval_event(50, "0", "2", "40");
+        let refs: Vec<&AuditEvent> = vec![&e1, &e2, &e3, &e4];
+        let agg = aggregate_association_activity(&refs);
+
+        // 字段名契约（前端消费依赖这些 snake_case 键）
+        for key in [
+            "total_executions",
+            "avg_candidates",
+            "fast_only_count",
+            "deep_only_count",
+            "both_count",
+            "last_execution_ms",
+            "recent",
+        ] {
+            assert!(agg.get(key).is_some(), "缺少字段: {key}");
+        }
+
+        assert_eq!(agg["total_executions"], 4);
+        assert_eq!(agg["both_count"], 2);
+        assert_eq!(agg["fast_only_count"], 1);
+        assert_eq!(agg["deep_only_count"], 1);
+        // 平均候选 = (10+20+30+40)/4 = 25
+        assert_eq!(agg["avg_candidates"], 25.0);
+        // last_execution_ms 取最大时间戳（非数组末位），验证乱序鲁棒
+        assert_eq!(agg["last_execution_ms"], 300);
+        // recent 最多 10 条，此处 4 条全含
+        assert_eq!(agg["recent"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_association_activity_empty_is_safe() {
+        // 空事件集不得 panic，且各计数为 0、avg 为 0、last 为 null
+        let agg = aggregate_association_activity(&[]);
+        assert_eq!(agg["total_executions"], 0);
+        assert_eq!(agg["avg_candidates"], 0.0);
+        assert!(agg["last_execution_ms"].is_null());
+        assert!(agg["recent"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_association_activity_ignores_unparseable_metadata() {
+        // metadata 缺字段或非数字时按未命中处理，不污染统计
+        let mut md = std::collections::HashMap::new();
+        md.insert("fast_hits".to_string(), "abc".to_string()); // 不可解析
+        let ev = AuditEvent {
+            id: "x".into(),
+            timestamp_ms: 10,
+            event_type: AuditEventType::RetrievalExecuted,
+            description: String::new(),
+            reason: String::new(),
+            affected_memory_ids: vec![],
+            metadata: md,
+            previous_hash: String::new(),
+            event_hash: String::new(),
+            hash_format: String::new(),
+        };
+        let refs: Vec<&AuditEvent> = vec![&ev];
+        let agg = aggregate_association_activity(&refs);
+        assert_eq!(agg["total_executions"], 1);
+        assert_eq!(agg["both_count"], 0);
+        assert_eq!(agg["fast_only_count"], 0);
+        assert_eq!(agg["avg_candidates"], 0.0);
+    }
+
+    // ===== 5. 结晶历史时间线纯函数测试（v0.9.6 首屏时间线契约） =====
+
+    /// 构造一条指定创建时间的记忆（Synthesis 或对照类型），覆盖默认随机时间
+    fn timed_memory(id: &str, ts_ms: u64, content: &str, mtype: MemoryType) -> Memory {
+        let mut m = Memory::new(
+            content.to_string(),
+            mtype,
+            Some("test".to_string()),
+            vec![],
+            Importance::default(),
+            None,
+        );
+        m.id = id.to_string();
+        let ts = chrono::DateTime::from_timestamp_millis(ts_ms as i64).unwrap();
+        m.created_at = ts;
+        m.updated_at = ts;
+        m.last_accessed = ts;
+        m
+    }
+
+    #[test]
+    fn test_synthesis_timeline_field_names_and_order() {
+        let m1 = timed_memory("a", 100, "第一次结晶", MemoryType::Synthesis);
+        let m2 = timed_memory("b", 300, "第二次结晶", MemoryType::Synthesis);
+        // 非合成记忆必须被过滤，即使创建时间更晚
+        let fact = timed_memory("c", 999, "普通记忆", MemoryType::Fact);
+        // 故意乱序传入，验证防御性倒序排序
+        let agg = build_synthesis_timeline(&[m1, fact, m2], 10);
+
+        // 顶层字段契约（前端消费依赖这些 snake_case 键）
+        for key in ["items", "total"] {
+            assert!(agg.get(key).is_some(), "缺少字段: {key}");
+        }
+        assert_eq!(agg["total"], 2, "应只统计 Synthesis 记忆");
+        let items = agg["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        // 倒序契约：b(300) 在 a(100) 前
+        assert_eq!(items[0]["id"], "b");
+        assert_eq!(items[1]["id"], "a");
+        // 条目字段契约
+        for key in [
+            "id",
+            "content",
+            "memory_type",
+            "project",
+            "created_at_ms",
+            "importance",
+            // v0.9.6 P1-1：结晶成长链路字段
+            "source_count",
+            "confidence",
+            "information_gain",
+        ] {
+            assert!(items[0].get(key).is_some(), "条目缺少字段: {key}");
+        }
+        assert_eq!(items[0]["source_count"], 0, "默认记忆无来源应记 0");
+        assert_eq!(items[0]["memory_type"], "synthesis");
+        assert_eq!(items[0]["created_at_ms"], 300);
+    }
+
+    #[test]
+    fn test_synthesis_timeline_limit_and_empty() {
+        // limit 截断契约
+        let mems: Vec<Memory> = (0..20)
+            .map(|i| {
+                timed_memory(
+                    &format!("m{i}"),
+                    i as u64,
+                    &format!("结晶{i}"),
+                    MemoryType::Synthesis,
+                )
+            })
+            .collect();
+        let agg = build_synthesis_timeline(&mems, 5);
+        assert_eq!(agg["total"], 20);
+        assert_eq!(agg["items"].as_array().unwrap().len(), 5);
+        // 空输入安全
+        let empty = build_synthesis_timeline(&[], 10);
+        assert_eq!(empty["total"], 0);
+        assert!(empty["items"].as_array().unwrap().is_empty());
+    }
+
+    // ===== 6. 联想中心探索契约测试（v0.9.7 产品化） =====
+
+    #[test]
+    fn test_association_explore_request_defaults() {
+        // 不传 depth/width 时使用默认：4 层、3 分支
+        let req: AssociationExploreRequest =
+            serde_json::from_value(serde_json::json!({ "query": "今晚吃什么" })).unwrap();
+        assert_eq!(req.depth, 4);
+        assert_eq!(req.width, 3);
+        assert_eq!(req.query.as_deref(), Some("今晚吃什么"));
+
+        // query 与 memory_id 均可作为起点
+        let req2: AssociationExploreRequest = serde_json::from_value(
+            serde_json::json!({ "memory_id": "mem-001", "depth": 2, "width": 1 }),
+        )
+        .unwrap();
+        assert_eq!(req2.query, None);
+        assert_eq!(req2.memory_id.as_deref(), Some("mem-001"));
+        assert_eq!(req2.depth, 2);
+        assert_eq!(req2.width, 1);
+
+        // depth 越界时在 handler 入口被 clamp 到 1..=4、width clamp 到 1..=3
+        let req3: AssociationExploreRequest =
+            serde_json::from_value(serde_json::json!({ "query": "x", "depth": 99, "width": 99 }))
+                .unwrap();
+        assert_eq!(req3.depth.clamp(1, 4), 4);
+        assert_eq!(req3.width.clamp(1, 3), 3);
+    }
+
+    #[test]
+    fn test_association_explore_response_field_names() {
+        use crate::engine::memory_state_machine::AssociationStep;
+        let resp = AssociationExploreResponse {
+            root: Some("mem-root".to_string()),
+            depth: 2,
+            width: 2,
+            nodes: vec![
+                ExploreNode {
+                    id: "mem-root".into(),
+                    content: "起点记忆".into(),
+                    depth: 0,
+                    score: 1.0,
+                    source: "root".into(),
+                    evidence: None,
+                },
+                ExploreNode {
+                    id: "mem-child".into(),
+                    content: "联想记忆".into(),
+                    depth: 1,
+                    score: 0.7,
+                    source: "expanded".into(),
+                    evidence: Some("联想桥强关联".into()),
+                },
+            ],
+            edges: vec![ExploreEdge {
+                from: "mem-root".into(),
+                to: "mem-child".into(),
+                score: 0.7,
+                evidence: Some("联想桥强关联".into()),
+            }],
+            trail: vec![AssociationStep {
+                from_id: Some("mem-root".into()),
+                to_id: "mem-child".into(),
+                score: 0.7,
+                depth: 1,
+            }],
+            total_expanded: 2,
+            interrupted: false,
+            // 存在通过校验的扩展节点 → 非弱匹配
+            weak_match: false,
+        };
+        let json = serde_json::to_value(&resp).expect("序列化失败");
+        assert_eq!(json["root"], "mem-root");
+        assert_eq!(json["depth"], 2);
+        assert_eq!(json["width"], 2);
+        assert_eq!(json["interrupted"], false);
+        // v0.9.7：weak_match 契约——有扩展节点时必须为 false
+        assert_eq!(json["weak_match"], false);
+        for key in ["nodes", "edges", "trail"] {
+            assert!(json[key].is_array(), "缺少数组字段: {key}");
+        }
+        let node = &json["nodes"][1];
+        for key in ["id", "content", "depth", "score", "source", "evidence"] {
+            assert!(node.get(key).is_some(), "节点缺少字段: {key}");
+        }
+        assert_eq!(node["source"], "expanded");
+        assert_eq!(node["evidence"], "联想桥强关联");
+        let edge = &json["edges"][0];
+        for key in ["from", "to", "score", "evidence"] {
+            assert!(edge.get(key).is_some(), "边缺少字段: {key}");
+        }
+    }
+
+    /// 探索集成测试：BFS 有界性、visited 去重、节点深度合法。
+    #[test]
+    fn test_run_association_explore_bfs_bounds() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_bfs_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+
+        // 写入一组生活联想链相关记忆：食物、餐馆、和谁吃、在哪吃
+        for content in [
+            "今晚吃什么好呢",
+            "潮汕牛肉火锅和粤式烧腊都是不错的选项",
+            "楼下新开的粤菜餐馆珠江新城店环境很好",
+            "和小王一起去吃火锅很开心",
+            "中山路的老字号肠粉店排队很久",
+            "周末和老婆去郊外野餐带了三明治",
+            "完全无关的记忆：绿萝每周换一次盆土",
+        ] {
+            let memory = Memory::new(
+                content.to_string(),
+                MemoryType::Conversation,
+                None,
+                vec![],
+                Importance::new(5),
+                None,
+            );
+            store.remember(memory).unwrap();
+        }
+
+        let cancel = AtomicBool::new(false);
+        let resp = run_association_explore(
+            &mut store,
+            Some("今晚吃什么"),
+            None,
+            3, // 最多 3 层
+            2, // 每层最多 2 个方向
+            &cancel,
+        );
+
+        assert!(resp.root.is_some(), "应找到起点记忆");
+        assert!(!resp.nodes.is_empty(), "应至少返回起点节点");
+        // 深度合法性：节点 depth 不超过 3
+        for node in &resp.nodes {
+            assert!(node.depth <= 3, "节点深度越界: {}", node.depth);
+            if node.depth == 0 {
+                assert_eq!(node.source, "root", "起点节点来源应为 root");
+            } else {
+                assert_eq!(node.source, "expanded", "发散节点来源应为 expanded");
+            }
+        }
+        // visited 去重：节点 id 不得重复
+        let mut ids = std::collections::HashSet::new();
+        for node in &resp.nodes {
+            assert!(
+                ids.insert(node.id.clone()),
+                "探索出现重复节点 id: {}",
+                node.id
+            );
+        }
+        // 边端点必须都出现在节点集合中
+        for edge in &resp.edges {
+            assert!(
+                ids.contains(&edge.from),
+                "边起点不在节点集合: {}",
+                edge.from
+            );
+            assert!(ids.contains(&edge.to), "边终点不在节点集合: {}", edge.to);
+        }
+        // 有界性：每层分支 <= width（2），总节点数 <= 1 + 2 + 4 + 8 = 15
+        assert!(
+            resp.nodes.len() <= 15,
+            "探索节点数量超过有界上限: {}",
+            resp.nodes.len()
+        );
+        assert!(!resp.interrupted, "小规模探索不应中断");
+    }
+
+    /// 探索集成测试：从记忆 ID 出发且目标不存在时安全返回空树。
+    #[test]
+    fn test_run_association_explore_missing_memory_id_safe() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_missing_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let cancel = AtomicBool::new(false);
+        let resp =
+            run_association_explore(&mut store, None, Some("mem-does-not-exist"), 2, 1, &cancel);
+        assert!(resp.root.is_none(), "不存在的记忆 ID 不应产生根节点");
+        assert!(resp.nodes.is_empty());
+        assert!(resp.edges.is_empty());
+    }
+
+    /// v0.9.7 精确度修复：多跳扩散的回归校验必须锚定起点主题。
+    /// 深层记忆与"漂移陷阱"（与 hop1 共享词、但与起点主题无关）不得出现。
+    #[test]
+    fn test_run_association_explore_anchored_regression_no_drift() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_anchor_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+
+        // 食物主题链 + 漂移陷阱：
+        // 陷阱与 hop1 记忆共享"浇水"，但与起点"今晚吃番茄炒蛋"主题无关。
+        // 若回归校验随父内容漂移（旧行为），深层会把陷阱拉进结果。
+        for content in [
+            "今晚吃番茄炒蛋，简单好吃",
+            "番茄苗要每日浇水补光才能长好",
+            "浇水的计算机程序实现细节与源码",
+        ] {
+            let memory = Memory::new(
+                content.to_string(),
+                MemoryType::Conversation,
+                None,
+                vec![],
+                Importance::new(5),
+                None,
+            );
+            store.remember(memory).unwrap();
+        }
+
+        let cancel = AtomicBool::new(false);
+        let resp = run_association_explore(
+            &mut store,
+            Some("今晚吃什么"),
+            None,
+            3, // 允许 3 层，确保会走到深层扩散
+            2,
+            &cancel,
+        );
+
+        assert!(resp.root.is_some(), "应找到起点记忆");
+        // 锚定校验：任何层级的节点都不得包含漂移陷阱内容
+        for node in &resp.nodes {
+            assert!(
+                !node.content.contains("计算机"),
+                "深层联想漂移：无关记忆混入联想结果: {}",
+                node.content
+            );
+        }
+        // hop1 的主题内记忆（番茄苗）应被保留——锚定只杀漂移，不杀主题
+        assert!(
+            resp.nodes
+                .iter()
+                .any(|node| node.content.contains("番茄苗")),
+            "锚定校验不应误杀主题内记忆"
+        );
+        assert!(!resp.weak_match, "存在主题内扩展节点时不应标记弱匹配");
+    }
+
+    /// v0.9.7 精确度修复：根节点主导性门禁。
+    /// 仅凭单个泛指词（"什么"）重叠的代码记忆不得上位当起点，
+    /// 实质共鸣（≥2 个 token）的主题记忆必须胜出。
+    #[test]
+    fn test_run_association_explore_root_dominance_gate() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_root_gate_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+
+        // 干扰记忆：与"今晚吃什么"只共享泛指 bigram「什么」1 个 token；
+        // 主题记忆：命中「今晚」「晚吃」2 个 token，实质共鸣；
+        // 扩展记忆：与起点"今晚吃火锅还是点外卖"共鸣（火锅），供发散层使用。
+        // 旧行为（无条件取 top1）在分数接近时会把代码记忆当起点。
+        for content in [
+            "这个报错是什么意思",
+            "今晚吃火锅还是点外卖",
+            "周末和朋友也想吃火锅，虾滑必点",
+        ] {
+            let memory = Memory::new(
+                content.to_string(),
+                MemoryType::Conversation,
+                None,
+                vec![],
+                Importance::new(5),
+                None,
+            );
+            store.remember(memory).unwrap();
+        }
+
+        let cancel = AtomicBool::new(false);
+        let resp = run_association_explore(&mut store, Some("今晚吃什么"), None, 2, 2, &cancel);
+
+        assert!(resp.root.is_some(), "应存在实质共鸣的起点记忆");
+        let root_node = resp
+            .nodes
+            .iter()
+            .find(|node| node.depth == 0)
+            .expect("起点节点必须存在");
+        assert!(
+            root_node.content.contains("火锅"),
+            "起点应为食物主题记忆，而不是泛指词重叠的无关记忆: {}",
+            root_node.content
+        );
+        // 干扰记忆不得以任何身份（起点或发散）出现在联想结果里
+        assert!(
+            resp.nodes.iter().all(|node| !node.content.contains("报错")),
+            "泛指词重叠的无关记忆混入联想结果"
+        );
+        assert!(!resp.weak_match, "存在主题记忆与扩展节点时不应标记弱匹配");
+    }
+
+    /// 根节点门禁的诚实空态：记忆库里只有泛指词重叠的无关记忆时，
+    /// 不硬凑起点，直接标记 weak_match。
+    #[test]
+    fn test_run_association_explore_root_gate_weak_match() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_root_weak_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        // 统计模式确定性构造：语义旁路在本用例中必须保持失效，
+        // 泛指词重叠的无关记忆无论是否装有 ML 模型都不应上位
+        let mut store = new_statistical_store(&dir_str);
+
+        // 只有与查询共享单个泛指词的记忆——旧行为会把它硬凑成起点
+        let memory = Memory::new(
+            "这个报错是什么意思".to_string(),
+            MemoryType::Conversation,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        store.remember(memory).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let resp = run_association_explore(&mut store, Some("今晚吃什么"), None, 2, 2, &cancel);
+
+        assert!(resp.root.is_none(), "泛指词重叠的无关记忆不应成为起点");
+        assert!(resp.nodes.is_empty(), "弱匹配时不应产生任何节点");
+        assert!(resp.weak_match, "无实质共鸣候选时应标记弱匹配");
+    }
+
+    /// 泛指 bigram 组合不得虚假共鸣（v0.9.7 CDP 回归发现的真实缺陷）：
+    /// "量子物理是什么"与含测试文本"是什么"的代码 chunk 共享「是什」
+    /// 「什么」两个泛指 bigram——修复前刚好凑满 min_required=2，代码
+    /// chunk 抢走起点并让整条联想链陷入代码邻域（depth=4 扩散超时 503）。
+    /// 修复后：泛指 bigram 不计入门禁，实义 token（量子/物理）零重叠
+    /// → 诚实空态。对照查询验证实义 bigram 不被误伤。
+    #[test]
+    fn test_run_association_explore_generic_bigram_gate() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_generic_gate_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        // 统计模式（确定性）：不依赖 ML 是否可用
+        let mut store = new_statistical_store(&dir_str);
+
+        // 干扰记忆：含"是什么"字样的代码记忆（模拟代码 chunk 里的测试文本）
+        let noisy = Memory::new(
+            "来源：src/lib.rs:1-10；主题：rs。项目的数据库和缓存架构是什么".to_string(),
+            MemoryType::CodeContext,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        store.remember(noisy).unwrap();
+
+        // 查询 1：库里没有量子物理相关内容 → 不硬凑代码起点，诚实空态
+        let cancel = AtomicBool::new(false);
+        let resp = run_association_explore(&mut store, Some("量子物理是什么"), None, 2, 2, &cancel);
+        assert!(
+            resp.root.is_none() && resp.weak_match,
+            "泛指 bigram 组合不应让代码记忆虚假上位: root={:?}",
+            resp.root
+        );
+
+        // 查询 2（对照）：实义 bigram（数据库/据库/缓存）命中时正常上位，
+        // 证明过滤只剔除泛指组合，不伤害实义共鸣。
+        let resp2 =
+            run_association_explore(&mut store, Some("数据库和缓存架构"), None, 2, 2, &cancel);
+        assert!(
+            resp2.root.is_some() && !resp2.weak_match,
+            "实义 token 重叠的代码记忆应正常成为起点"
+        );
+    }
+
+    /// 构造统计模式（确定性）记忆库：ML 模型存在与否不影响测试预期。
+    /// 本机装有 bge 模型时，`MemoryStore::new` 会加载 ML 编码器并激活
+    /// 语义旁路；需要验证"纯词面门禁"的测试必须显式固定为统计模式。
+    fn new_statistical_store(dir_str: &str) -> MemoryStore<JsonPersistence> {
+        #[cfg(feature = "ml")]
+        {
+            MemoryStore::new_with_encoder(
+                JsonPersistence::new(dir_str).unwrap(),
+                crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder::new_statistical(),
+            )
+        }
+        #[cfg(not(feature = "ml"))]
+        {
+            // 非 ml 构建本身就是统计编码器
+            MemoryStore::new(JsonPersistence::new(dir_str).unwrap())
+        }
+    }
+
+    /// 构造 ML 能力记忆库（镜像 bin/server.rs 的启动链路：
+    /// LuoShuMlEncoder::load → new_with_ml）。模型不可用时返回 None，
+    /// 调用方跳过用例——语义旁路只能在真实 ML 环境验证。
+    #[cfg(feature = "ml")]
+    fn new_ml_capable_store(dir_str: &str) -> Option<MemoryStore<JsonPersistence>> {
+        let ml = crate::engine::luoshu_encoder_ml::LuoShuMlEncoder::load().ok()?;
+        Some(MemoryStore::new_with_encoder(
+            JsonPersistence::new(dir_str).unwrap(),
+            crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder::new_with_ml(ml),
+        ))
+    }
+
+    /// 语义旁路阈值标定（仅 ml 构建且模型可用时执行）：
+    /// 断言"语义强相关对"的余弦显著高于"泛指结构相似对"，
+    /// 保证 ASSOCIATION_ROOT_MIN_SEMANTIC_SIM 存在可分离的取值区间，
+    /// 并打印具体数值供阈值调整参考。
+    #[test]
+    #[cfg(feature = "ml")]
+    fn test_semantic_similarity_threshold_calibration() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_sem_calib_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        // 显式加载 ML 编码器（默认构造恒为统计模式，不会加载模型）
+        let Some(store) = new_ml_capable_store(&dir_str) else {
+            eprintln!("[标定] ML 编码器不可用，跳过语义阈值标定");
+            return;
+        };
+
+        let anniversary = Memory::new(
+            "结婚纪念日是 10 月 20 号，每年都要一起吃顿好的。".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(9),
+            None,
+        );
+        let decoy = Memory::new(
+            "这个报错是什么意思".to_string(),
+            MemoryType::Conversation,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        let hiking = Memory::new(
+            "周末去白云山徒步，山顶风景很好。".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(6),
+            None,
+        );
+
+        let pairs = [
+            ("我以前记过什么重要日子？", &anniversary),
+            ("今晚吃什么", &decoy),
+            ("周末去哪儿玩", &hiking),
+        ];
+        let sims = pairs
+            .iter()
+            .map(|(q, m)| store.semantic_similarities(q, &[m])[0].unwrap_or(f32::NAN));
+        let (sim_days, sim_decoy, sim_hiking) = {
+            let v: Vec<f32> = sims.collect();
+            (v[0], v[1], v[2])
+        };
+        eprintln!(
+            "[标定] 重要日子↔结婚纪念日 = {sim_days:.4}；今晚吃什么↔报错 = {sim_decoy:.4}；周末去哪儿玩↔白云山 = {sim_hiking:.4}；当前阈值 = {ASSOCIATION_ROOT_MIN_SEMANTIC_SIM}"
+        );
+        // 相关对必须与泛指结构对可分离，阈值才有存在意义
+        assert!(
+            sim_days > sim_decoy,
+            "语义强相关对的余弦必须高于泛指结构对：{sim_days} vs {sim_decoy}"
+        );
+        assert!(
+            sim_hiking > sim_decoy,
+            "语义强相关对的余弦必须高于泛指结构对：{sim_hiking} vs {sim_decoy}"
+        );
+    }
+
+    /// 语义旁路行为：查询"重要日子"与"结婚纪念日"记忆词面零重叠，
+    /// 纯词面门禁下必然弱匹配；ML 编码器可用时语义旁路应挽救该起点。
+    #[test]
+    #[cfg(feature = "ml")]
+    fn test_run_association_explore_semantic_bypass_life_days() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_sem_bypass_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        // 显式加载 ML 编码器（默认构造恒为统计模式，不会加载模型）
+        let Some(mut store) = new_ml_capable_store(&dir_str) else {
+            eprintln!("[语义旁路] ML 编码器不可用，本用例仅在 ml 环境执行");
+            return;
+        };
+
+        let memory = Memory::new(
+            "结婚纪念日是 10 月 20 号，每年都要一起吃顿好的。".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(9),
+            None,
+        );
+        store.remember(memory).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let resp = run_association_explore(
+            &mut store,
+            Some("我以前记过什么重要日子？"),
+            None,
+            2,
+            2,
+            &cancel,
+        );
+
+        assert!(!resp.weak_match, "语义强相关的纪念日记忆不应被误判为弱匹配");
+        let root_node = resp
+            .nodes
+            .iter()
+            .find(|node| node.depth == 0)
+            .expect("起点节点必须存在");
+        assert!(
+            root_node.content.contains("结婚纪念日"),
+            "语义旁路应召回结婚纪念日记忆: {}",
+            root_node.content
+        );
+    }
+
+    /// 开发上下文噪声过滤：非代码起点的联想链不得混入 code_context
+    /// 代码块（用户视角的"src/benchmark"噪声）。词面构造保证起点
+    /// 稳定通过门禁，两种 feature 配置下行为一致。
+    #[test]
+    fn test_run_association_explore_skips_code_children_for_life_root() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_code_noise_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut store = new_statistical_store(&dir_str);
+
+        // 起点：与查询共享 周末/去哪/哪儿 多个 token，稳定通过词面门禁
+        let root = Memory::new(
+            "周末去哪儿玩都可以，我去白云山徒步看风景。".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(6),
+            None,
+        );
+        // 真实发散：与起点共享 白云山/徒步 token
+        let real_child = Memory::new(
+            "白云山徒步记得带水，南门上山比较轻松。".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        // 代码噪声：内容刻意包含"白云山"以挤进扩散候选，但类型是代码块
+        let code_noise = Memory::new(
+            "来源：src/benchmark.rs；主题：rs。白云山景区人流量数据统计实现。".to_string(),
+            MemoryType::CodeContext,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        for memory in [root, real_child, code_noise] {
+            store.remember(memory).unwrap();
+        }
+
+        let cancel = AtomicBool::new(false);
+        let resp = run_association_explore(&mut store, Some("周末去哪儿玩"), None, 2, 2, &cancel);
+
+        assert!(resp.root.is_some(), "起点应通过词面实质共鸣门禁");
+        assert!(
+            resp.nodes
+                .iter()
+                .all(|node| !node.content.contains("src/benchmark")),
+            "代码块不得混入生活起点的联想链: {:?}",
+            resp.nodes.iter().map(|n| &n.content).collect::<Vec<_>>()
+        );
+        assert!(
+            resp.nodes
+                .iter()
+                .any(|node| node.content.contains("白云山徒步记得带水")),
+            "真实发散记忆应正常出现"
+        );
     }
 }

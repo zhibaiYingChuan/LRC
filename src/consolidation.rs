@@ -33,7 +33,30 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, timeout, Duration};
+
+const LOCK_DEADLINE: Duration = Duration::from_secs(2);
+const EMBEDDING_TIMEOUT: Duration = Duration::from_secs(60);
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(60);
+const CYCLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn try_lock_with_deadline<P: Persistence>(
+    store: &Arc<Mutex<MemoryStore<P>>>,
+) -> Result<tokio::sync::MutexGuard<'_, MemoryStore<P>>, PersistenceError> {
+    let deadline = std::time::Instant::now() + LOCK_DEADLINE;
+    loop {
+        match store.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(_) if std::time::Instant::now() >= deadline => {
+                return Err(PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "获取结晶存储锁超时，待处理状态保留以便重试",
+                )))
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+}
 
 // ==================== 配置类型 ====================
 
@@ -260,6 +283,19 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         &mut self,
         source: &dyn SurfaceMemorySource,
     ) -> Result<CycleStats, PersistenceError> {
+        match timeout(CYCLE_TIMEOUT, self.run_cycle_inner(source)).await {
+            Ok(result) => result,
+            Err(_) => Err(PersistenceError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "结晶周期超时，待处理状态保留以便重试",
+            ))),
+        }
+    }
+
+    async fn run_cycle_inner(
+        &mut self,
+        source: &dyn SurfaceMemorySource,
+    ) -> Result<CycleStats, PersistenceError> {
         let cycle_start = std::time::Instant::now();
         let mut stats = CycleStats::default();
 
@@ -331,12 +367,14 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         } // 自动释放锁
 
         // 3. 合成阶段
+        let mut synthesis_completed = !self.config.auto_synthesize;
         if self.config.auto_synthesize {
             // 3a. v0.5.18 LLM embedding 合成路径（优先）
             // 遵循三阶段锁安全模式：Phase 1 持锁加载 → Phase 2 无锁 LLM 调用 → Phase 3 持锁写入
             let llm_succeeded: bool = if let Some(ref llm_config) = self.llm_config {
                 match self.llm_synthesize_cycle(llm_config).await {
                     Ok(n) => {
+                        synthesis_completed = true;
                         stats.synthesized = n;
                         if n > 0 && self.config.verbose >= 1 {
                             eprintln!("[LRC·结晶] LLM 合成完成，生成 {} 条合成记忆", n);
@@ -369,7 +407,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                     tokio::task::spawn_blocking(move || -> Result<usize, PersistenceError> {
                         // Phase 1：持锁读快照 + 临时设置阈值（快速）
                         let (snapshot, old_threshold, old_similarity) = {
-                            let mut store = store_arc.blocking_lock();
+                            let mut store = try_lock_with_deadline(&store_arc)?;
                             let old_threshold = store.synthesis_min_cluster;
                             let old_similarity = store.synthesis_similarity;
                             store.synthesis_min_cluster = threshold;
@@ -387,12 +425,26 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                         }
 
                         // Phase 3：持锁写回 + 恢复阈值（快速）
-                        let synthesized = {
-                            let mut store = store_arc.blocking_lock();
-                            store.synthesis_min_cluster = old_threshold;
-                            store.synthesis_similarity = old_similarity;
-                            store.apply_synthesis_plan(plan)
-                        };
+                        // v0.9.7 审查修复（HCSE-P0）：写回锁获取失败时绝不能直接
+                        // `?` 返回——否则 Phase 1 设置的临时阈值永不恢复，且下一轮
+                        // Phase 1 会把临时值当作 old_threshold 捕获，污染被永久固化。
+                        // 失败时降级为 blocking_lock 仅做恢复（该操作为纯内存赋值，毫秒级）。
+                        let synthesized = match try_lock_with_deadline(&store_arc) {
+                            Ok(mut store) => {
+                                store.synthesis_min_cluster = old_threshold;
+                                store.synthesis_similarity = old_similarity;
+                                Ok(store.apply_synthesis_plan(plan))
+                            }
+                            Err(e) => {
+                                // 恢复阈值是无毒化 Mutex 的纯内存赋值，blocking_lock
+                                // 仅可能因持锁者 panic 而阻塞（此处持锁方均正常释放）
+                                let mut store = store_arc.blocking_lock();
+                                store.synthesis_min_cluster = old_threshold;
+                                store.synthesis_similarity = old_similarity;
+                                drop(store);
+                                Err(e)
+                            }
+                        }?;
 
                         Ok(synthesized)
                     })
@@ -400,6 +452,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
                 match result {
                     Ok(Ok(n)) => {
+                        synthesis_completed = true;
                         stats.synthesized = n;
                         if n > 0 && self.config.verbose >= 1 {
                             eprintln!("[LRC·结晶] 洛书合成完成，生成 {} 条合成记忆", n);
@@ -417,10 +470,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             }
         }
 
-        // v0.9.1 三阶段锁解耦：合成阶段结束后统一重置待合成标记。
-        // 洛书降级路径由 apply_synthesis_plan 重置，此处兜底覆盖 LLM 路径，
-        // 确保无论走哪条合成路径，synthesis_pending 都被正确清除（store(false) 幂等）。
-        {
+        // 仅在完整成功时清除待合成标记；超时或失败必须保留以便下轮重试。
+        if synthesis_completed {
             let store = self.store.lock().await;
             store
                 .synthesis_pending
@@ -498,9 +549,9 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
         // ===== Phase 2：无锁，LLM embedding + 聚类 + 总结 =====
         let texts: Vec<&str> = candidates.iter().map(|(_, c)| c.as_str()).collect();
-        let embeddings = llm_config
-            .embed_texts(&texts)
+        let embeddings = timeout(EMBEDDING_TIMEOUT, llm_config.embed_texts(&texts))
             .await
+            .map_err(|_| "LLM embedding 调用超时（60 秒）".to_string())?
             .map_err(|e| format!("LLM embedding 调用失败: {}", e))?;
 
         if embeddings.len() != candidates.len() {
@@ -547,10 +598,13 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 .collect();
 
             // 调用 LLM chat API 生成合成内容
-            let summary = llm_config
-                .summarize_memories(&cluster_memories)
-                .await
-                .map_err(|e| format!("LLM 合成总结失败: {}", e))?;
+            let summary = timeout(
+                SUMMARY_TIMEOUT,
+                llm_config.summarize_memories(&cluster_memories),
+            )
+            .await
+            .map_err(|_| "LLM 合成总结超时（60 秒）".to_string())?
+            .map_err(|e| format!("LLM 合成总结失败: {}", e))?;
 
             // 收集源记忆 ID
             let source_ids: Vec<String> = cluster_indices
@@ -674,9 +728,9 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
         // ===== Phase 2：无锁，embedding + 聚类 + 总结 =====
         let texts: Vec<&str> = candidates.iter().map(|(_, c)| c.as_str()).collect();
-        let embeddings = embedder
-            .embed(&texts)
+        let embeddings = timeout(EMBEDDING_TIMEOUT, embedder.embed(&texts))
             .await
+            .map_err(|_| "Embedding 调用超时（60 秒）".to_string())?
             .map_err(|e| format!("Embedding 调用失败: {}", e))?;
 
         if embeddings.len() != candidates.len() {
@@ -724,8 +778,9 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
             // 总结：有 LLM 用 LLM，否则用本地拼接降级
             let summary = if let Some(llm) = summarizer {
-                llm.summarize_memories(&cluster_memories)
+                timeout(SUMMARY_TIMEOUT, llm.summarize_memories(&cluster_memories))
                     .await
+                    .map_err(|_| "LLM 合成总结超时（60 秒）".to_string())?
                     .map_err(|e| format!("LLM 合成总结失败: {}", e))?
             } else {
                 self.local_summarize(&cluster_memories)

@@ -386,7 +386,7 @@ impl Drop for SingletonLock {
 ///
 /// v0.8.41 修复：Windows 上增加了进程名验证，防止 PID 被其他进程重用时
 /// 误判为"sidecar 仍在运行"（这是 E008:noport 频繁出现的根因）。
-fn is_pid_alive(pid: u32) -> bool {
+pub(crate) fn is_pid_alive(pid: u32) -> bool {
     #[cfg(target_os = "windows")]
     {
         // 使用最小权限查询进程状态，不触发 UAC

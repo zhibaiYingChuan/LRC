@@ -63,6 +63,11 @@ impl LlmApiConfig {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
+                // SSRF 防护：配置入口统一字面量校验（拒绝 metadata/链路本地/未指定等）
+                if let Err(e) = crate::url_safety::validate_http_url(&endpoint) {
+                    return Err(format!("openai endpoint 地址校验失败: {}", e));
+                }
+
                 Ok(LlmApiConfig::OpenAI {
                     api_key,
                     model,
@@ -80,6 +85,17 @@ impl LlmApiConfig {
                     .filter(|s| !s.is_empty())
                     .ok_or("ollama 模式需要模型名: ollama:localhost:llama3")?
                     .to_string();
+
+                // SSRF 防护：Ollama host 构造 http://host 统一校验
+                // host 可能为 "localhost"、"192.168.1.109"、"192.168.1.109:11434"
+                let target = if host.starts_with("http://") || host.starts_with("https://") {
+                    host.clone()
+                } else {
+                    format!("http://{}", host)
+                };
+                if let Err(e) = crate::url_safety::validate_http_url(&target) {
+                    return Err(format!("ollama host 地址校验失败: {}", e));
+                }
 
                 Ok(LlmApiConfig::Ollama { host, model })
             }
@@ -283,8 +299,9 @@ async fn summarize_ollama(host: &str, model: &str, prompt: &str) -> Result<Strin
 
     let body: OllamaChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
-            "[LRC·合成] Ollama 响应 JSON 解析失败: {} (原始响应: {:.200})",
-            e, raw_body
+            "[LRC·合成] Ollama 响应 JSON 解析失败: {} ({})",
+            e,
+            response_log_summary(&raw_body)
         );
         format!("解析 Ollama 合成响应失败: {}", e)
     })?;
@@ -406,6 +423,22 @@ fn parse_keywords(response: &str) -> Vec<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+fn response_log_summary(body: &str) -> String {
+    format!("响应体已脱敏（{} 字节）", body.len())
+}
+
+#[cfg(test)]
+mod response_log_tests {
+    use super::response_log_summary;
+
+    #[test]
+    fn response_log_summary_does_not_include_response_body() {
+        let summary = response_log_summary("secret-api-error");
+        assert!(!summary.contains("secret-api-error"));
+        assert!(summary.contains("脱敏"));
+    }
 }
 
 // ==================== 核心翻译函数 ====================
@@ -622,8 +655,9 @@ async fn translate_ollama(
 
     let body: OllamaChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
-            "[LRC·LLM] Ollama 响应 JSON 解析失败: {} (原始响应: {:.200})",
-            e, raw_body
+            "[LRC·LLM] Ollama 响应 JSON 解析失败: {} ({})",
+            e,
+            response_log_summary(&raw_body)
         );
         format!("解析 Ollama 响应失败: {}", e)
     })?;
@@ -709,8 +743,9 @@ async fn embed_openai(
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         eprintln!(
-            "[LRC·Embedding] OpenAI API 返回错误状态: {} (响应: {:.200})",
-            status, body
+            "[LRC·Embedding] OpenAI API 返回错误状态: {} ({})",
+            status,
+            response_log_summary(&body)
         );
         return Err(format!("Embedding API 返回错误: {}", status));
     }
@@ -722,8 +757,9 @@ async fn embed_openai(
 
     let body: OpenAiEmbeddingResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
-            "[LRC·Embedding] OpenAI 响应 JSON 解析失败: {} (原始响应: {:.200})",
-            e, raw_body
+            "[LRC·Embedding] OpenAI 响应 JSON 解析失败: {} ({})",
+            e,
+            response_log_summary(&raw_body)
         );
         format!("解析 Embedding 响应失败: {}", e)
     })?;
@@ -790,8 +826,9 @@ async fn embed_openai_batch(
 
         let body: OpenAiEmbeddingResponse = serde_json::from_str(&raw_body).map_err(|e| {
             eprintln!(
-                "[LRC·Embedding] 批量响应 JSON 解析失败: {} (原始响应: {:.200})",
-                e, raw_body
+                "[LRC·Embedding] 批量响应 JSON 解析失败: {} ({})",
+                e,
+                response_log_summary(&raw_body)
             );
             format!("解析批量 Embedding 响应失败: {}", e)
         })?;
@@ -843,8 +880,9 @@ async fn embed_ollama(host: &str, model: &str, text: &str) -> Result<Vec<f32>, S
 
     let body: OllamaEmbeddingResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
-            "[LRC·Embedding] Ollama 响应 JSON 解析失败: {} (原始响应: {:.200})",
-            e, raw_body
+            "[LRC·Embedding] Ollama 响应 JSON 解析失败: {} ({})",
+            e,
+            response_log_summary(&raw_body)
         );
         format!("解析 Ollama Embedding 响应失败: {}", e)
     })?;

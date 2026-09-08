@@ -53,6 +53,12 @@ pub enum FeedbackTarget {
     ConfirmAction,
     /// 取消待确认操作
     CancelAction,
+    /// 对联想检索结果的反馈（阶段D：结构化联想级评价，只观测不排序）
+    ///
+    /// 用户针对 enrich 联想结果中的某条记忆给出正/负/中立评价，
+    /// 携带联想上下文（查询、在结果中的排名、命中的检索通路），
+    /// 供反馈回流聚合观测，不直接修改排序权重。
+    AssociationRelevance,
 }
 
 /// 待确认操作的种类
@@ -157,6 +163,12 @@ pub struct FeedbackRecord {
     pub timestamp_ms: u64,
     /// 反馈是否已被系统处理
     pub processed: bool,
+    /// 联想上下文：该记忆在 enrich 联想结果中的排名（1 起，阶段D）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association_rank: Option<usize>,
+    /// 联想上下文：命中的检索通路（["fast"] / ["deep"] / ["fast","deep"]，阶段D）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub association_hit_paths: Vec<String>,
 }
 
 /// 用户反馈统计
@@ -179,6 +191,25 @@ pub struct FeedbackStats {
     /// 知情同意状态（质疑二·终极）
     /// None = 未选择, Some(true) = 已同意, Some(false) = 已拒绝
     pub consent_granted: Option<bool>,
+}
+
+/// 按记忆聚合的联想级反馈统计（阶段D：反馈回流闭环，只观测不排序）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssociationFeedbackStats {
+    /// 记忆 ID
+    pub memory_id: String,
+    /// 正面反馈数
+    pub positive_count: usize,
+    /// 负面反馈数
+    pub negative_count: usize,
+    /// 中立反馈数
+    pub neutral_count: usize,
+    /// 总反馈数
+    pub total_count: usize,
+    /// 建议性质量分：`(正 - 负) / (正 + 负 + 中立)`，范围 [-1, 1]
+    ///
+    /// 仅供观测/建议，不接入默认排序决策。
+    pub suggested_quality: f32,
 }
 
 /// 记忆关系查询器 trait
@@ -213,12 +244,20 @@ pub trait MemoryGraphQuery {
 pub struct UserFeedback {
     /// 反馈历史（FIFO，最多 500 条）
     records: Mutex<VecDeque<FeedbackRecord>>,
+    /// 全量反馈总数（含已溢出 FIFO 的历史，与 JSONL 全量口径一致）
+    ///
+    /// 阶段D 修复：`total_feedback` 统计口径统一为全量计数（落盘 JSONL 的所有记录），
+    /// 避免 FIFO 500 窗口淘汰后，`positive_count` 等计数器大于 `total_feedback`
+    /// 导致 `positive_ratio > 1` 或与全量 JSONL 自相矛盾。
+    total_count: Mutex<usize>,
     /// 正面反馈计数
     positive_count: Mutex<usize>,
     /// 负面反馈计数
     negative_count: Mutex<usize>,
     /// 隔离恢复计数
     quarantine_override_count: Mutex<usize>,
+    /// 合成质量反馈计数（全量，含已溢出 FIFO 的历史）
+    synthesis_feedback_count: Mutex<usize>,
     /// 反馈 ID 计数器
     id_counter: Mutex<u64>,
     /// 待确认操作映射（assessment_id → PendingConfirmation）
@@ -233,6 +272,16 @@ pub struct UserFeedback {
     /// - Some(true): 用户已明确同意
     /// - Some(false): 用户已明确拒绝
     consent_granted: Mutex<Option<bool>>,
+    /// JSONL 持久化路径（阶段D：反馈落盘，重启不丢失）
+    ///
+    /// 设置后，每次记录反馈会追加写入一行 JSON 到该文件；
+    /// 启动时 set_persist_path 会加载历史反馈到内存。
+    persist_path: Mutex<Option<String>>,
+    /// JSONL 文件写互斥锁（阶段D 并发修复）
+    ///
+    /// `persist_append`（追加写）与 `persist_processed_state`（整文件覆写）
+    /// 都必须先获取此锁，避免"读-改-写"覆写并发时静默丢弃同时刻追加的新行。
+    persist_file_lock: Mutex<()>,
 }
 
 impl UserFeedback {
@@ -240,14 +289,18 @@ impl UserFeedback {
     pub fn new() -> Self {
         Self {
             records: Mutex::new(VecDeque::with_capacity(500)),
+            total_count: Mutex::new(0),
             positive_count: Mutex::new(0),
             negative_count: Mutex::new(0),
             quarantine_override_count: Mutex::new(0),
+            synthesis_feedback_count: Mutex::new(0),
             id_counter: Mutex::new(0),
             pending_confirmations: Mutex::new(HashMap::new()),
             assessment_counter: Mutex::new(0),
             implicit_feedback_enabled: Mutex::new(true), // 质疑二·隐私：默认启用隐式反馈
             consent_granted: Mutex::new(None),           // 质疑二·终极：用户尚未做出知情选择
+            persist_path: Mutex::new(None), // 阶段D：默认纯内存，由 set_persist_path 开启
+            persist_file_lock: Mutex::new(()), // 阶段D 并发修复：文件写互斥
         }
     }
 
@@ -294,10 +347,64 @@ impl UserFeedback {
             note: note.map(|s| s.to_string()),
             timestamp_ms: now,
             processed: false,
+            association_rank: None,
+            association_hit_paths: Vec::new(),
         };
 
-        // 更新统计
-        match &feedback_type {
+        self.push_record(record);
+
+        id
+    }
+
+    /// 联想级反馈入口（阶段D：结构化联想级评价，只观测不排序）
+    ///
+    /// 用户针对 enrich 联想结果中的某条记忆给出正/负/中立评价，
+    /// 携带联想上下文（查询、在结果中的排名、命中的检索通路），
+    /// 供反馈回流聚合观测。该数据不参与默认排序决策。
+    pub fn record_association_feedback(
+        &self,
+        feedback_type: FeedbackType,
+        memory_id: &str,
+        query: Option<&str>,
+        rank: Option<usize>,
+        hit_paths: Vec<String>,
+        note: Option<&str>,
+    ) -> String {
+        let id = self.next_id();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let record = FeedbackRecord {
+            id: id.clone(),
+            feedback_type,
+            target_type: FeedbackTarget::AssociationRelevance,
+            memory_id: memory_id.to_string(),
+            query: query.map(|s| s.to_string()),
+            note: note.map(|s| s.to_string()),
+            timestamp_ms: now,
+            processed: false,
+            association_rank: rank,
+            association_hit_paths: hit_paths,
+        };
+
+        self.push_record(record);
+
+        id
+    }
+
+    /// 内部：统一入队 + 统计 + 落盘
+    ///
+    /// 阶段D：当设置了持久化路径时，追加写入 JSONL 文件，
+    /// 保证反馈在服务重启后不丢失。
+    fn push_record(&self, record: FeedbackRecord) {
+        // 更新全量统计（与 JSONL 全量口径一致，FIFO 淘汰不影响历史计数）
+        {
+            let mut total = self.total_count.lock().unwrap_or_else(|e| e.into_inner());
+            *total += 1;
+        }
+        match &record.feedback_type {
             FeedbackType::Positive => {
                 let mut count = self
                     .positive_count
@@ -315,7 +422,15 @@ impl UserFeedback {
             FeedbackType::Neutral => {}
         }
 
-        if target_type == FeedbackTarget::QuarantineOverride {
+        if record.target_type == FeedbackTarget::SynthesisQuality {
+            let mut count = self
+                .synthesis_feedback_count
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *count += 1;
+        }
+
+        if record.target_type == FeedbackTarget::QuarantineOverride {
             let mut count = self
                 .quarantine_override_count
                 .lock()
@@ -323,13 +438,119 @@ impl UserFeedback {
             *count += 1;
         }
 
+        // 阶段D：持久化落盘（追加 JSONL 行）
+        self.persist_append(&record);
+
         let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         if records.len() >= 500 {
             records.pop_front();
         }
         records.push_back(record);
+    }
 
-        id
+    /// 设置 JSONL 持久化路径（阶段D：反馈落盘，重启不丢失）
+    ///
+    /// 若文件已存在，加载历史反馈到内存（恢复记录与 ID 计数器），
+    /// 保证服务重启后反馈数据连续、ID 不重复。
+    pub fn set_persist_path(&self, path: &str) -> std::io::Result<()> {
+        // 加载历史反馈
+        if std::path::Path::new(path).exists() {
+            let content = std::fs::read_to_string(path)?;
+            let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+            let mut counter = self.id_counter.lock().unwrap_or_else(|e| e.into_inner());
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(record) = serde_json::from_str::<FeedbackRecord>(line) {
+                    // 恢复全量统计计数，保证重启后总览与聚合一致
+                    // （total_count 反映 JSONL 全量，与 FIFO 窗口无关）
+                    *self.total_count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    match record.feedback_type {
+                        FeedbackType::Positive => {
+                            *self
+                                .positive_count
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) += 1;
+                        }
+                        FeedbackType::Negative => {
+                            *self
+                                .negative_count
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) += 1;
+                        }
+                        FeedbackType::Neutral => {}
+                    }
+                    if record.target_type == FeedbackTarget::SynthesisQuality {
+                        *self
+                            .synthesis_feedback_count
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) += 1;
+                    }
+                    if record.target_type == FeedbackTarget::QuarantineOverride {
+                        *self
+                            .quarantine_override_count
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) += 1;
+                    }
+                    // 恢复 ID 计数器，避免重启后 ID 重复
+                    if let Some(num) = record.id.strip_prefix("feedback_") {
+                        if let Ok(n) = num.parse::<u64>() {
+                            if n > *counter {
+                                *counter = n;
+                            }
+                        }
+                    }
+                    records.push_back(record);
+                }
+            }
+            // 限制内存保留最近 500 条
+            while records.len() > 500 {
+                records.pop_front();
+            }
+        }
+
+        *self.persist_path.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_string());
+        Ok(())
+    }
+
+    /// 追加一行反馈记录到 JSONL 文件（阶段D）
+    ///
+    /// 忽略单次写入失败（持久化是尽力而为，不阻塞主流程）。
+    fn persist_append(&self, record: &FeedbackRecord) {
+        let path = match self
+            .persist_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            Some(p) => p,
+            None => return,
+        };
+        if let Ok(json) = serde_json::to_string(record) {
+            use std::io::Write;
+            // 文件写互斥：与 persist_processed_state 串行，防止覆写丢行
+            let _guard = self
+                .persist_file_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(file, "{}", json);
+            }
+        }
+    }
+
+    /// 检查是否启用了反馈持久化（阶段D）
+    pub fn has_persistence(&self) -> bool {
+        self.persist_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     // ============================================================
@@ -746,34 +967,172 @@ impl UserFeedback {
         negative >= 2 && positive < negative
     }
 
-    /// 获取待处理的隔离恢复请求
+    /// 获取待处理的隔离恢复请求（返回记忆 ID 去重列表，兼容旧调用方）
     pub fn get_quarantine_override_ids(&self) -> Vec<String> {
-        let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        let mut ids: Vec<String> = records
-            .iter()
-            .filter(|r| r.target_type == FeedbackTarget::QuarantineOverride && !r.processed)
-            .map(|r| r.memory_id.clone())
-            .collect();
-        ids.sort();
-        ids.dedup();
-        ids
+        self.get_quarantine_override_snapshot()
+            .into_iter()
+            .map(|(memory_id, _)| memory_id)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect()
     }
 
-    /// 标记反馈为已处理
+    /// 获取待处理的隔离恢复请求精确快照（memory_id, record_id）。
+    ///
+    /// 2026-09-01 P1 修复：TOCTOU 防护不再依赖墙上时钟（系统时钟回拨会导致
+    /// 已恢复反馈永久无法标记而重复重试），改为按"快照中的 record_id"精确标记：
+    ///   1. 快照时刻收集 (memory_id, record_id) 对；
+    ///   2. 恢复成功后只标记快照内的 record_id；
+    ///   3. 快照后新到达的恢复请求（不在快照内）保持未处理，下一周期再处理。
+    pub fn get_quarantine_override_snapshot(&self) -> Vec<(String, String)> {
+        let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot: Vec<(String, String)> = records
+            .iter()
+            .filter(|r| r.target_type == FeedbackTarget::QuarantineOverride && !r.processed)
+            .map(|r| (r.memory_id.clone(), r.id.clone()))
+            .collect();
+        snapshot.sort();
+        snapshot.dedup();
+        snapshot
+    }
+
+    /// 标记反馈为已处理（同步将 processed 状态回写 JSONL）
+    ///
+    /// 修复：仅修改内存会在重启后丢失 processed 状态（JSONL 仍为 false）。
+    /// 通过目标行重写保持文件与内存一致，且不影响 FIFO 已淘汰的其它历史记录。
     pub fn mark_processed(&self, feedback_id: &str) {
-        let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        for record in records.iter_mut() {
-            if record.id == feedback_id {
-                record.processed = true;
-                return;
+        let changed = {
+            let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+            let mut changed = false;
+            for record in records.iter_mut() {
+                if record.id == feedback_id {
+                    if !record.processed {
+                        record.processed = true;
+                        changed = true;
+                    }
+                    break;
+                }
             }
+            changed
+        };
+        // 记录可能已被 FIFO 淘汰但仍存在于 JSONL，因此持久化开启时始终尝试回写
+        if changed || self.has_persistence() {
+            let _ = self.persist_processed_state(&[feedback_id.to_string()]);
         }
+    }
+
+    /// 业务标记：按精确 record_id 列表标记隔离恢复请求为已处理并持久化。
+    ///
+    /// 2026-09-01 P1 修复：TOCTOU 防护改为"快照 record_id 精确标记"——
+    /// 不再使用墙上时钟 as_of（系统时钟回拨会导致已恢复记录永久无法标记、
+    /// 每轮重复重试）。调用方流程：
+    ///   1. `get_quarantine_override_snapshot()` 取 (memory_id, record_id) 快照；
+    ///   2. 对快照中的 memory_id 执行隔离恢复；
+    ///   3. 成功后调用本方法，只标记快照内 record_id 对应的记录。
+    ///      快照后新到达的恢复请求不在快照内 → 保持未处理，下一周期再处理。
+    pub fn mark_override_processed_by_records(&self, record_ids: &[String]) {
+        let mark_set: std::collections::HashSet<&String> = record_ids.iter().collect();
+        let changed = {
+            let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+            let mut changed = false;
+            for record in records.iter_mut() {
+                if record.target_type == FeedbackTarget::QuarantineOverride
+                    && !record.processed
+                    && mark_set.contains(&record.id)
+                {
+                    record.processed = true;
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if !changed && !self.has_persistence() {
+            return;
+        }
+        // 记录可能已被 FIFO 淘汰但仍存在于 JSONL，因此持久化开启时始终尝试回写
+        let _ = self.persist_processed_state(record_ids);
+    }
+
+    /// 兼容旧调用方：按记忆 ID 标记（保留时钟截止语义，避免行为突变）。
+    ///
+    /// 新调用方应优先使用 [Self::mark_override_processed_by_records]。
+    /// 注：`as_of_ms` 保留仅用于兼容，不再作为 TOCTOU 依据。
+    pub fn mark_override_processed(&self, memory_id: &str, _as_of_ms: u64) {
+        let ids: Vec<String> = {
+            let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+            records
+                .iter_mut()
+                .filter(|r| {
+                    r.target_type == FeedbackTarget::QuarantineOverride
+                        && r.memory_id == memory_id
+                        && !r.processed
+                })
+                .map(|r| {
+                    r.processed = true;
+                    r.id.clone()
+                })
+                .collect()
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let _ = self.persist_processed_state(&ids);
+    }
+
+    /// 将 processed=true 状态回写 JSONL（整文件重写，仅更新目标行）
+    ///
+    /// 保留文件中全部历史记录（含内存 FIFO 已淘汰的），
+    /// 单行反序列化后修正 processed 字段再写回。
+    fn persist_processed_state(&self, ids: &[String]) -> std::io::Result<()> {
+        let path = match self
+            .persist_path
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        // 文件写互斥：与 persist_append 串行，防止读-改-写覆写
+        // 把并发追加的新行（尚未包含在已读内容中）静默丢弃。
+        let _guard = self
+            .persist_file_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        let mut out = String::new();
+        let mut updated = 0usize;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(mut record) = serde_json::from_str::<FeedbackRecord>(trimmed) {
+                if ids.iter().any(|id| id == &record.id) && !record.processed {
+                    record.processed = true;
+                    updated += 1;
+                    if let Ok(json) = serde_json::to_string(&record) {
+                        out.push_str(&json);
+                        out.push('\n');
+                        continue;
+                    }
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if updated > 0 {
+            std::fs::write(&path, out)?;
+        }
+        Ok(())
     }
 
     /// 获取反馈统计
     pub fn get_stats(&self) -> FeedbackStats {
-        let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        let total = records.len();
+        let total = *self.total_count.lock().unwrap_or_else(|e| e.into_inner());
         let positive = *self
             .positive_count
             .lock()
@@ -782,10 +1141,10 @@ impl UserFeedback {
             .negative_count
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let synthesis_feedback = records
-            .iter()
-            .filter(|r| r.target_type == FeedbackTarget::SynthesisQuality)
-            .count();
+        let synthesis_feedback = *self
+            .synthesis_feedback_count
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let quarantine_overrides = *self
             .quarantine_override_count
             .lock()
@@ -793,7 +1152,7 @@ impl UserFeedback {
         let positive_ratio = if total > 0 {
             positive as f32 / total as f32
         } else {
-            0.5
+            0.0
         };
 
         FeedbackStats {
@@ -812,6 +1171,59 @@ impl UserFeedback {
     pub fn get_recent(&self, n: usize) -> Vec<FeedbackRecord> {
         let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
         records.iter().rev().take(n).cloned().collect()
+    }
+
+    // ============================================================
+    // 阶段D：反馈回流闭环 — 联想级反馈聚合（只观测，不参与排序）
+    // ============================================================
+
+    /// 按记忆聚合联想级反馈（阶段D：反馈回流闭环）
+    ///
+    /// 统计每条记忆收到的 AssociationRelevance 反馈（正/负/中立），
+    /// 并计算建议性质量分：`(正 - 负) / (正 + 负 + 中立)`，范围 [-1, 1]。
+    /// 正分表示整体评价正向，负分表示整体评价负面。
+    ///
+    /// 约束：该聚合仅用于观测与建议（返回给调用方评估），
+    /// **不接入默认排序**，符合"预判元数据只做观测"的产品决策。
+    pub fn get_association_stats(&self) -> Vec<AssociationFeedbackStats> {
+        let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stats: HashMap<String, (usize, usize, usize)> = HashMap::new();
+
+        for record in records.iter() {
+            if record.target_type != FeedbackTarget::AssociationRelevance {
+                continue;
+            }
+            let entry = stats.entry(record.memory_id.clone()).or_insert((0, 0, 0));
+            match record.feedback_type {
+                FeedbackType::Positive => entry.0 += 1,
+                FeedbackType::Negative => entry.1 += 1,
+                FeedbackType::Neutral => entry.2 += 1,
+            }
+        }
+
+        let mut result: Vec<AssociationFeedbackStats> = stats
+            .into_iter()
+            .map(|(memory_id, (positive, negative, neutral))| {
+                let total = positive + negative + neutral;
+                let suggested_quality = if total == 0 {
+                    0.0
+                } else {
+                    (positive as f32 - negative as f32) / total as f32
+                };
+                AssociationFeedbackStats {
+                    memory_id,
+                    positive_count: positive,
+                    negative_count: negative,
+                    neutral_count: neutral,
+                    total_count: total,
+                    suggested_quality,
+                }
+            })
+            .collect();
+
+        // 按总反馈数降序排列，让反馈最多的记忆排在前面
+        result.sort_by_key(|b| std::cmp::Reverse(b.total_count));
+        result
     }
 
     // ============================================================
@@ -1069,41 +1481,11 @@ impl UserFeedback {
     }
 
     /// 获取反馈统计（质疑五·健康报告）
+    ///
+    /// 与 `get_stats()` 共享同一实现（全量计数器口径），
+    /// 避免两个统计入口的口径漂移导致 FIFO/全量 JSONL 自相矛盾。
     pub fn stats(&self) -> FeedbackStats {
-        let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
-        let total = records.len();
-        let positive = *self
-            .positive_count
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let negative = *self
-            .negative_count
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let overrides = *self
-            .quarantine_override_count
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let synthesis_feedback = records
-            .iter()
-            .filter(|r| matches!(r.target_type, FeedbackTarget::SynthesisQuality))
-            .count();
-        let ratio = if total > 0 {
-            positive as f32 / total as f32
-        } else {
-            0.0
-        };
-
-        FeedbackStats {
-            total_feedback: total,
-            positive_count: positive,
-            negative_count: negative,
-            synthesis_feedback_count: synthesis_feedback,
-            quarantine_overrides: overrides,
-            positive_ratio: ratio,
-            implicit_feedback_enabled: self.is_implicit_feedback_enabled(),
-            consent_granted: self.is_consent_granted(),
-        }
+        self.get_stats()
     }
 }
 
@@ -1624,5 +2006,433 @@ mod tests {
         assert!(narrative.contains("core"), "叙事应包含目标记忆");
         assert!(narrative.contains("synth_A"), "叙事应包含直接合成记忆");
         assert!(narrative.contains("second-order"), "叙事应提及二阶影响");
+    }
+
+    // ============================================================
+    // 阶段D：联想级反馈与 JSONL 持久化测试
+    // ============================================================
+
+    /// 阶段D：联想级反馈记录携带联想上下文（排名、命中的通路），
+    /// 且不改变现有检索/合成反馈行为。
+    #[test]
+    fn test_association_relevance_feedback() {
+        let feedback = UserFeedback::new();
+        let id = feedback.record_association_feedback(
+            FeedbackType::Positive,
+            "mem_101",
+            Some("Rust 编译失败怎么排查"),
+            Some(1),
+            vec!["fast".to_string(), "deep".to_string()],
+            Some("联想结果第三条非常相关"),
+        );
+        assert!(id.starts_with("feedback_"));
+
+        // 联想级反馈应计入总反馈与正反馈统计
+        let stats = feedback.get_stats();
+        assert_eq!(stats.total_feedback, 1);
+        assert_eq!(stats.positive_count, 1);
+
+        // 记录应包含联想上下文
+        let recent = feedback.get_recent(1);
+        assert_eq!(recent.len(), 1);
+        let rec = &recent[0];
+        assert_eq!(rec.target_type, FeedbackTarget::AssociationRelevance);
+        assert_eq!(rec.association_rank, Some(1));
+        assert_eq!(
+            rec.association_hit_paths,
+            vec!["fast".to_string(), "deep".to_string()]
+        );
+        assert_eq!(rec.query.as_deref(), Some("Rust 编译失败怎么排查"));
+
+        // 无联想上下文时字段为空（兼容既有反馈记录）
+        let id2 = feedback.record_feedback(
+            FeedbackType::Negative,
+            FeedbackTarget::RetrievalResult,
+            "mem_102",
+            Some("数据库优化"),
+            None,
+        );
+        assert!(id2.starts_with("feedback_"));
+        let recent = feedback.get_recent(1);
+        let rec2 = &recent[0];
+        assert_eq!(rec2.association_rank, None);
+        assert!(rec2.association_hit_paths.is_empty());
+    }
+
+    /// 阶段D：JSONL 持久化 — 反馈落盘后可重新加载，ID 不重复。
+    #[test]
+    fn test_jsonl_persistence_roundtrip() {
+        let tmp_dir = std::env::temp_dir();
+        let file_path = tmp_dir
+            .join("lrc_feedback_test.jsonl")
+            .to_string_lossy()
+            .to_string();
+
+        let _ = std::fs::remove_file(&file_path);
+
+        // 写入侧：启用持久化
+        let feedback = UserFeedback::new();
+        feedback.set_persist_path(&file_path).unwrap();
+        assert!(feedback.has_persistence());
+        feedback.record_association_feedback(
+            FeedbackType::Positive,
+            "mem_200",
+            Some("超时排查"),
+            Some(2),
+            vec!["deep".to_string()],
+            None,
+        );
+        feedback.record_feedback(
+            FeedbackType::Negative,
+            FeedbackTarget::SynthesisQuality,
+            "mem_201",
+            None,
+            None,
+        );
+
+        // 文件应存在且含 2 行
+        let content = std::fs::read_to_string(&file_path).expect("读取反馈文件失败");
+        assert_eq!(content.lines().filter(|l| !l.trim().is_empty()).count(), 2);
+
+        // 加载侧：从文件恢复，联想上下文保持
+        let feedback2 = UserFeedback::new();
+        feedback2.set_persist_path(&file_path).unwrap();
+        let restored_stats = feedback2.get_stats();
+        assert_eq!(restored_stats.total_feedback, 2);
+        assert_eq!(restored_stats.positive_count, 1);
+        assert_eq!(restored_stats.negative_count, 1);
+        let recent = feedback2.get_recent(2);
+        assert_eq!(recent.len(), 2);
+        let assoc = recent
+            .iter()
+            .find(|r| r.target_type == FeedbackTarget::AssociationRelevance)
+            .expect("联想级反馈应被恢复");
+        assert_eq!(assoc.association_rank, Some(2));
+        assert_eq!(assoc.association_hit_paths, vec!["deep".to_string()]);
+        assert_eq!(assoc.query.as_deref(), Some("超时排查"));
+
+        // 恢复后新记录的 ID 不与历史重复
+        let new_id = feedback2.record_feedback(
+            FeedbackType::Neutral,
+            FeedbackTarget::RetrievalResult,
+            "mem_202",
+            None,
+            None,
+        );
+        let latest = feedback2.get_recent(1);
+        assert_eq!(latest[0].id, new_id);
+        assert_ne!(latest[0].id, assoc.id, "新记录 ID 不应与历史重复");
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    /// 阶段D：未启用持久化时不写文件、无副作用。
+    #[test]
+    fn test_no_persistence_path() {
+        let feedback = UserFeedback::new();
+        assert!(!feedback.has_persistence());
+        feedback.record_association_feedback(
+            FeedbackType::Negative,
+            "mem_300",
+            None,
+            None,
+            vec![],
+            None,
+        );
+        // 不产生文件，仅内存记录
+        assert_eq!(feedback.get_stats().total_feedback, 1);
+        assert_eq!(feedback.get_stats().negative_count, 1);
+    }
+
+    /// 阶段D：联想级反馈聚合 — 建议性质量分与分记忆统计，只观测不排序。
+    #[test]
+    fn test_association_stats_aggregation() {
+        let feedback = UserFeedback::new();
+
+        // mem_a：2 正 + 1 负 → 质量分 (2-1)/3 = 0.333
+        for _ in 0..2 {
+            feedback.record_association_feedback(
+                FeedbackType::Positive,
+                "mem_a",
+                Some("查询A"),
+                Some(1),
+                vec!["fast".to_string()],
+                None,
+            );
+        }
+        feedback.record_association_feedback(
+            FeedbackType::Negative,
+            "mem_a",
+            Some("查询A"),
+            Some(2),
+            vec!["deep".to_string()],
+            None,
+        );
+
+        // mem_b：1 负 → 质量分 (0-1)/1 = -1.0
+        feedback.record_association_feedback(
+            FeedbackType::Negative,
+            "mem_b",
+            Some("查询B"),
+            Some(1),
+            vec!["fast".to_string(), "deep".to_string()],
+            None,
+        );
+
+        // 非联想级反馈不应计入聚合
+        feedback.record_feedback(
+            FeedbackType::Positive,
+            FeedbackTarget::SynthesisQuality,
+            "mem_c",
+            None,
+            None,
+        );
+
+        let stats = feedback.get_association_stats();
+        assert_eq!(stats.len(), 2, "仅统计联想级反馈，mem_c 不应出现");
+
+        // 按总反馈数降序：mem_a(3) 在前
+        let a = stats.iter().find(|s| s.memory_id == "mem_a").unwrap();
+        assert_eq!(a.positive_count, 2);
+        assert_eq!(a.negative_count, 1);
+        assert_eq!(a.neutral_count, 0);
+        assert_eq!(a.total_count, 3);
+        assert!(
+            (a.suggested_quality - 1.0 / 3.0).abs() < 1e-5,
+            "质量分应为 1/3"
+        );
+
+        let b = stats.iter().find(|s| s.memory_id == "mem_b").unwrap();
+        assert_eq!(b.total_count, 1);
+        assert!(
+            (b.suggested_quality - (-1.0)).abs() < 1e-5,
+            "质量分应为 -1.0"
+        );
+
+        // 无联想反馈时返回空列表
+        let empty = UserFeedback::new();
+        assert!(empty.get_association_stats().is_empty());
+    }
+
+    // ============================================================
+    // 回归修复：统计口径统一（FIFO500 vs 全量 JSONL）
+    // ============================================================
+
+    /// 回归：FIFO 500 窗口淘汰后，全量计数（total/positive/negative）
+    /// 必须与"已记录的反馈总数"一致，不得因窗口截断而自相矛盾
+    /// （旧实现：total 取 FIFO 长度，positive 取全量计数器，导致
+    ///  positive_count > total_feedback、positive_ratio > 1）。
+    #[test]
+    fn test_stats_full_history_consistency() {
+        let feedback = UserFeedback::new();
+        // 记录 510 条正面反馈，超过 FIFO 500 上限
+        for i in 0..510 {
+            feedback.record_feedback(
+                FeedbackType::Positive,
+                FeedbackTarget::SynthesisQuality,
+                &format!("synth_{}", i),
+                None,
+                None,
+            );
+        }
+
+        // get_stats() 与 stats() 必须完全一致（统一口径）
+        let stats = feedback.get_stats();
+        let stats2 = feedback.stats();
+        assert_eq!(stats.total_feedback, stats2.total_feedback);
+        assert_eq!(stats.positive_count, stats2.positive_count);
+        assert_eq!(stats.negative_count, stats2.negative_count);
+        assert_eq!(stats.quarantine_overrides, stats2.quarantine_overrides);
+        assert_eq!(
+            stats.synthesis_feedback_count,
+            stats2.synthesis_feedback_count
+        );
+
+        // 全量口径：total 反映 510 条历史，而非 FIFO 窗口的 500
+        assert_eq!(stats.total_feedback, 510, "total_feedback 应为全量历史数");
+        assert_eq!(stats.positive_count, 510, "positive_count 应为全量历史数");
+        assert_eq!(stats.synthesis_feedback_count, 510);
+        assert!(
+            (stats.positive_ratio - 1.0).abs() < 1e-6,
+            "positive_ratio 应 = positive/total = 1.0（不因窗口截断 > 1）"
+        );
+
+        // 窗口接口只保留最近 500 条
+        let recent = feedback.get_recent(600);
+        assert_eq!(recent.len(), 500, "FIFO 应只保留最近 500 条");
+    }
+
+    /// 回归：混合类型与隔离恢复全量统计一致性
+    #[test]
+    fn test_stats_mixed_full_history() {
+        let feedback = UserFeedback::new();
+        // 505 正面（合成质量）+ 5 负面（检索）+ 2 隔离恢复 + 3 联想
+        for i in 0..505 {
+            feedback.record_feedback(
+                FeedbackType::Positive,
+                FeedbackTarget::SynthesisQuality,
+                &format!("synth_{}", i),
+                None,
+                None,
+            );
+        }
+        for i in 0..5 {
+            feedback.record_feedback(
+                FeedbackType::Negative,
+                FeedbackTarget::RetrievalResult,
+                &format!("mem_{}", i),
+                None,
+                None,
+            );
+        }
+        for i in 0..2 {
+            feedback.record_feedback(
+                FeedbackType::Positive,
+                FeedbackTarget::QuarantineOverride,
+                &format!("q_{}", i),
+                None,
+                None,
+            );
+        }
+        for _ in 0..3 {
+            feedback.record_association_feedback(
+                FeedbackType::Neutral,
+                "assoc_mem",
+                None,
+                None,
+                vec![],
+                None,
+            );
+        }
+
+        let stats = feedback.get_stats();
+        assert_eq!(stats.total_feedback, 515, "全量总数 = 505+5+2+3");
+        assert_eq!(stats.positive_count, 507, "正面 = 505 + 2 隔离恢复");
+        assert_eq!(stats.negative_count, 5);
+        assert_eq!(stats.synthesis_feedback_count, 505);
+        assert_eq!(stats.quarantine_overrides, 2);
+        // 隔离恢复在 FIFO 淘汰后计数不丢失（501 条正面最旧的已被淘汰）
+        assert_eq!(feedback.get_recent(600).len(), 500);
+
+        // 与 stats() 一致性
+        let via_stats = feedback.stats();
+        assert_eq!(via_stats.total_feedback, stats.total_feedback);
+        assert_eq!(via_stats.quarantine_overrides, stats.quarantine_overrides);
+    }
+
+    // ============================================================
+    // 回归修复：QuarantineOverride processed 业务标记与持久化
+    // ============================================================
+
+    /// 回归：`mark_override_processed` 后隔离恢复请求从待处理列表消失，
+    /// 且重启（重新 set_persist_path）后 processed 状态仍保留。
+    #[test]
+    fn test_quarantine_override_processed_persisted() {
+        let tmp_dir = std::env::temp_dir();
+        let file_path = tmp_dir
+            .join("lrc_feedback_override_persist_test.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&file_path);
+
+        // 写入侧
+        let feedback = UserFeedback::new();
+        feedback.set_persist_path(&file_path).unwrap();
+        feedback.record_feedback(
+            FeedbackType::Positive,
+            FeedbackTarget::QuarantineOverride,
+            "quarantine_mem_1",
+            None,
+            Some("这条记忆被误隔离，应该恢复"),
+        );
+        assert_eq!(
+            feedback.get_quarantine_override_ids(),
+            vec!["quarantine_mem_1".to_string()]
+        );
+
+        // 业务标记：隔离恢复处理完成后置 processed（传入快照时刻，含刚记录的时间）
+        let as_of_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        feedback.mark_override_processed("quarantine_mem_1", as_of_ms);
+        assert!(
+            feedback.get_quarantine_override_ids().is_empty(),
+            "处理后不应再返回待恢复请求"
+        );
+
+        // 重启加载：processed 状态必须从 JSONL 恢复
+        let feedback2 = UserFeedback::new();
+        feedback2.set_persist_path(&file_path).unwrap();
+        assert!(
+            feedback2.get_quarantine_override_ids().is_empty(),
+            "processed 状态必须跨重启持久化"
+        );
+        let recent = feedback2.get_recent(1);
+        assert!(recent[0].processed, "恢复的记录 processed 应为 true");
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    /// 回归（P1）：隔离恢复标记不依赖墙上时钟——快照精确标记方案下，
+    /// 即使系统时钟回拨导致"记录时间戳 > 当前时间"，已恢复的请求仍可被标记，
+    /// 不会永久重复重试。
+    #[test]
+    fn test_override_mark_ignores_clock_rollback() {
+        let feedback = UserFeedback::new();
+        feedback.record_feedback(
+            FeedbackType::Positive,
+            FeedbackTarget::QuarantineOverride,
+            "q_mem_rollback",
+            None,
+            Some("模拟时钟回拨场景"),
+        );
+
+        // 取快照（不依赖当前时间）
+        let snapshot = feedback.get_quarantine_override_snapshot();
+        assert_eq!(snapshot.len(), 1, "应有 1 条待恢复快照");
+        let record_ids: Vec<String> = snapshot.into_iter().map(|(_, id)| id).collect();
+
+        // 模拟时钟回拨场景：旧方案依赖 as_of（当前时钟），回拨会导致
+        // 截止不满足而跳过标记；新方案基于快照 record_id，与时钟无关。
+        feedback.mark_override_processed_by_records(&record_ids);
+        assert!(
+            feedback.get_quarantine_override_ids().is_empty(),
+            "时钟回拨下基于快照的精确标记仍应生效，不会重复重试"
+        );
+    }
+
+    /// 回归：`mark_processed` 按反馈 ID 置位并持久化到 JSONL。
+    #[test]
+    fn test_mark_processed_persisted() {
+        let tmp_dir = std::env::temp_dir();
+        let file_path = tmp_dir
+            .join("lrc_feedback_mark_processed_test.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&file_path);
+
+        let feedback = UserFeedback::new();
+        feedback.set_persist_path(&file_path).unwrap();
+        let id = feedback.record_feedback(
+            FeedbackType::Negative,
+            FeedbackTarget::SynthesisQuality,
+            "synth_x",
+            None,
+            None,
+        );
+        assert!(!feedback.get_recent(1)[0].processed);
+
+        feedback.mark_processed(&id);
+        assert!(feedback.get_recent(1)[0].processed);
+
+        // 重启后 processed 状态保留
+        let feedback2 = UserFeedback::new();
+        feedback2.set_persist_path(&file_path).unwrap();
+        let recent = feedback2.get_recent(1);
+        assert!(recent[0].processed, "mark_processed 状态应持久化");
+        assert_eq!(recent[0].id, id);
+
+        let _ = std::fs::remove_file(&file_path);
     }
 }

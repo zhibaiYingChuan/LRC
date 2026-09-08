@@ -16,7 +16,8 @@ use crate::{
 };
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Json},
     routing::{get, post},
     serve::ListenerExt,
@@ -255,6 +256,10 @@ struct HealthResponse {
     memory: MemoryBrief,
     /// 源码目录
     src_dir: String,
+    /// 记忆数据目录（供桌面端 sidecar 身份校验使用）
+    /// v0.9.6 修复 P0 契约断裂：桌面端 check_sidecar_health 读取此字段做
+    /// 数据目录身份匹配，缺失会导致开发模式身份校验恒失败、误报端口占用。
+    data_dir: String,
     /// LLM 是否已配置
     llm_configured: bool,
     /// v0.8.21 P0-06：memory_store 锁是否被持有（后台合成中）
@@ -287,6 +292,8 @@ pub struct AppState {
     pub manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
     pub memory_store: Arc<Mutex<MemoryStore<JsonPersistence>>>,
     pub src_dir: String,
+    /// 记忆数据目录（供 /health 暴露给桌面端做身份校验）
+    pub data_dir: String,
     /// LLM API 配置（运行时可变，通过 /api/config/llm 动态更新）
     pub llm_api: Arc<RwLock<LlmApiConfig>>,
     /// v0.8.22 P0-1 修复（hcse-resilience-validator Round3）：
@@ -390,6 +397,18 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                     "user_id": {
                         "type": "string",
                         "description": "用户 ID（privacy_level=user 时使用）"
+                    },
+                    "daoti_preview_gua": {
+                        "type": "string",
+                        "description": "可选：道体写入时预判的六十四卦名称"
+                    },
+                    "daoti_preview_bagua": {
+                        "type": "string",
+                        "description": "可选：道体写入时预判的主导八卦名称"
+                    },
+                    "daoti_preview_version": {
+                        "type": "string",
+                        "description": "可选：道体预判编码版本"
                     }
                 }),
                 required: vec!["content".into()],
@@ -479,6 +498,23 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                     "min_importance": {
                         "type": "integer",
                         "description": "最低重要性阈值（0-10）"
+                    },
+                    "navigation": {
+                        "type": "object",
+                        "description": "道体导航信号（可选，需服务端 LRC_DAOTI_NAVIGATE=1）。由道体状态机在查询推演产出的检索方向：{\"palaces\":[\"兑\",\"坤\"],\"probes\":[[\"吃\",\"餐厅\"],[\"出行\",\"徒步\"]],\"version\":\"daoti-v23-pilot\"}。probes 可选（与 palaces 同序的探测词组，缺省回退卦宫宫义）。仅 deep 模式生效，改变检索候选集而非重排；缺省行为与既有版本一致",
+                        "properties": {
+                            "palaces": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "轨迹卦宫名序列（最多 4 个，如 乾/兑/坤/艮/震/巽/坎/离）"
+                            },
+                            "probes": {
+                                "type": "array",
+                                "items": { "type": "array", "items": { "type": "string" } },
+                                "description": "每个卦宫的探测词组（与 palaces 同序，可选）"
+                            },
+                            "version": { "type": "string", "description": "推演版本标识" }
+                        }
                     }
                 }),
                 required: vec!["query".into()],
@@ -732,52 +768,112 @@ async fn handle_recall_enhanced(
         query.to_string()
     };
 
-    let mut store = state.memory_store.lock().await;
+    // 双路检索 + RRF 融合移入 spawn_blocking，避免持锁阻塞 Tokio worker；
+    // 锁获取采用有界 try_lock 轮询（2 秒），锁被长期占用时快速返回忙态，
+    // 不再让 async 上下文无限等待全局 Store 锁。
+    // RRF 权重不依赖锁，提前在闭包外计算。
+    let (fast_weight, deep_weight) = crate::engine::rrf::query_path_weights(query);
+    let store_arc = state.memory_store.clone();
+    let enrich_query = enriched_query.clone();
+    let mem_type = memory_type.clone();
+    let proj = project.clone();
+    let tag_list = tags.clone();
+    let retrieval_result = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        tokio::task::spawn_blocking(move || {
+            // 有界锁获取：轮询 try_lock，2 秒未获得则放弃
+            let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut store = loop {
+                match store_arc.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(_) if std::time::Instant::now() < lock_deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => {
+                        eprintln!("[recall_enhanced] 锁获取超时（2s），返回忙态");
+                        return None;
+                    }
+                }
+            };
 
-    // 快速通路：关键词匹配，使用富化查询
-    let fast_filter = RecallFilter {
-        memory_type: memory_type.clone(),
-        project: project.clone(),
-        tags: tags.clone(),
-        min_importance: None,
-        top_k: top_k * 2,
-        privacy_context: None,
-    };
-    let fast_result = store
-        .recall(&enriched_query, &fast_filter)
-        .unwrap_or(RecallResult {
-            memories: vec![],
-            scores: vec![],
-            total: 0,
-        });
+            // 快速通路：关键词匹配，使用富化查询
+            let fast_filter = RecallFilter {
+                memory_type: mem_type.clone(),
+                project: proj.clone(),
+                tags: tag_list.clone(),
+                min_importance: None,
+                top_k: top_k * 2,
+                privacy_context: None,
+                explore_pure: false,
+                regression_query: None,
+            };
+            let fast_result = store
+                .recall(&enrich_query, &fast_filter)
+                .unwrap_or(RecallResult::basic(vec![], vec![], 0));
 
-    // 深度通路：深度语义检索，使用富化查询
-    let deep_filter = RecallFilter {
-        memory_type,
-        project,
-        tags,
-        min_importance: None,
-        top_k: top_k * 2,
-        privacy_context: None,
-    };
-    let deep_result = store
-        .trapezoid_focus_recall(&enriched_query, &deep_filter, 1)
-        .unwrap_or(RecallResult {
-            memories: vec![],
-            scores: vec![],
-            total: 0,
-        });
+            // 深度通路：深度语义检索，使用富化查询
+            let deep_filter = RecallFilter {
+                memory_type: mem_type,
+                project: proj,
+                tags: tag_list,
+                min_importance: None,
+                top_k: top_k * 2,
+                privacy_context: None,
+                explore_pure: false,
+                regression_query: None,
+            };
+            let deep_result = store
+                .trapezoid_focus_recall(&enrich_query, &deep_filter, 1)
+                .unwrap_or(RecallResult::basic(vec![], vec![], 0));
 
-    // 倒数排名融合 (RRF, Reciprocal Rank Fusion) — 使用共享 rrf_fuse
-    let fused = crate::engine::rrf::rrf_fuse(
-        &fast_result,
-        &deep_result,
-        top_k,
-        crate::engine::rrf::RRF_DEFAULT_K,
-    );
-    let result_memories = fused.memories;
-    let result_scores = fused.scores;
-    let total = fused.total_candidates;
+            // 倒数排名融合 (RRF, Reciprocal Rank Fusion) — 使用共享 rrf_fuse
+            let fused = crate::engine::rrf::rrf_fuse_weighted(
+                &fast_result,
+                &deep_result,
+                top_k,
+                crate::engine::rrf::RRF_DEFAULT_K,
+                fast_weight,
+                deep_weight,
+            );
+
+            // LRC 内置道体状态机·联想链（在锁内取快照，随结果一起返回）
+            let state_snapshot = store.memory_state_machine.snapshot();
+            // 合并 fast+deep 两路的回归证据（保留融合后仍在结果中的记忆）
+            let mut merged_evidence = fast_result.regression_evidence;
+            for (id, ev) in deep_result.regression_evidence {
+                merged_evidence.insert(id, ev);
+            }
+            Some((
+                fused.memories,
+                fused.scores,
+                fused.total_candidates,
+                state_snapshot,
+                merged_evidence,
+            ))
+        }),
+    )
+    .await;
+
+    let (result_memories, result_scores, total, state_snapshot, merged_evidence) =
+        match retrieval_result {
+            Ok(Ok(Some(ok))) => ok,
+            Ok(Ok(None)) => {
+                // 锁获取超时：返回忙态错误，提示稍后重试
+                return make_error(id.clone(), -32000, "搜索服务繁忙，请稍后重试");
+            }
+            Ok(Err(join_error)) => {
+                // spawn_blocking 内部 panic 被捕获
+                eprintln!(
+                    "[recall_enhanced] spawn_blocking 内部 panic: {}",
+                    join_error
+                );
+                return make_error(id.clone(), -32603, "搜索内部错误，服务已保持运行");
+            }
+            Err(_) => {
+                // 15s 超时：返回超时错误
+                return make_error(id.clone(), -32001, "搜索超时，请稍后重试");
+            }
+        };
 
     let mut text = format!(
         "双路检索增强结果 (共 {} 条候选，返回 {} 条)\n\
@@ -807,6 +903,55 @@ async fn handle_recall_enhanced(
             text.push_str(&format!("ID: `{}`\n\n", m.id));
         }
         text.push_str("💡 双路检索融合了快速关键词匹配和深度语义定位，兼顾了召回率和精度。\n");
+    }
+
+    // LRC 内置道体状态机·联想链输出（与标准 recall 一致）
+    if state_snapshot.trail.len() >= 2 {
+        text.push_str("\n═══ 联想链（状态机轨迹）═══\n");
+        for step in &state_snapshot.trail {
+            let from = step.from_id.as_deref().unwrap_or("查询起点");
+            text.push_str(&format!(
+                "  {} ──(深度 {})──▶ {}\n",
+                from.chars().take(24).collect::<String>(),
+                step.depth,
+                step.to_id.chars().take(24).collect::<String>(),
+            ));
+        }
+        text.push_str(
+            "💡 联想链展示记忆如何由一件事发散到相关记忆；活性状态已持久化，下次检索会感知近期语境。\n",
+        );
+    } else if !state_snapshot.active.is_empty() {
+        let active_note: Vec<String> = state_snapshot
+            .active
+            .iter()
+            .take(3)
+            .map(|a| {
+                format!(
+                    "{} (强度 {:.2})",
+                    a.memory_id.chars().take(16).collect::<String>(),
+                    a.activation
+                )
+            })
+            .collect();
+        text.push_str(&format!("\n🧠 当前活跃记忆: {}\n", active_note.join(", ")));
+    }
+
+    // LRC 内置道体状态机·回归证据（道体再次校验）
+    if !merged_evidence.is_empty() {
+        text.push_str("\n🔍 回归校验证据（道体再次校验）\n");
+        for m in &result_memories {
+            if let Some(evidence) = merged_evidence.get(&m.id) {
+                text.push_str(&format!(
+                    "  #{} [{}] {}\n",
+                    m.id.chars().take(12).collect::<String>(),
+                    evidence,
+                    m.content.chars().take(28).collect::<String>(),
+                ));
+            }
+        }
+        text.push_str(
+            "💡 回归校验确认联想扩散的记忆确实回应了原始查询；无共鸣信号的记忆已被剔除。\n",
+        );
     }
 
     let call_result = ToolCallResult {
@@ -880,6 +1025,23 @@ async fn handle_recall(
         min_importance,
         top_k,
         privacy_context: None,
+        explore_pure: false,
+        regression_query: None,
+    };
+
+    // v0.9.7 导航层（预注册实验证实：导航改变候选集 > 随机方向扩展，
+    // 配对 bootstrap P=96.3%）。门控 LRC_DAOTI_NAVIGATE=1 默认关闭 →
+    // 行为与既有版本逐字节一致。信号由 daoti pilot 在查询时推演产出、
+    // 经 recall 的 navigation 参数注入；产品侧只消费不计算（DaoTi License）。
+    let nav_signal = if std::env::var("LRC_DAOTI_NAVIGATE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        arguments
+            .get("navigation")
+            .and_then(crate::engine::navigation::NavigationSignal::from_json)
+    } else {
+        None
     };
 
     // 先完成可能发生网络等待的 LLM 翻译，再获取 memory_store 锁。
@@ -902,7 +1064,23 @@ async fn handle_recall(
 
     // 根据 lrc_mode 选择检索方法（使用富化后的查询）
     let result = if lrc_mode == "deep" {
-        store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth)
+        // 导航信号在场时：多视图 deep 检索 + N 路 RRF（改变候选集，非重排）；
+        // 导航内部已含基线视图，返回 None（信号无有效方向）时回退单查询 deep。
+        match nav_signal {
+            Some(sig) => {
+                match crate::engine::navigation::navigated_deep_recall(
+                    &mut store,
+                    &enriched_query,
+                    &filter,
+                    focus_depth,
+                    &sig,
+                ) {
+                    Some(rr) => Ok(rr),
+                    None => store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth),
+                }
+            }
+            None => store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth),
+        }
     } else {
         store.recall(&enriched_query, &filter)
     };
@@ -945,9 +1123,72 @@ async fn handle_recall(
                     if let Some(ref proj) = m.project {
                         text.push_str(&format!(" | 项目: {}", proj));
                     }
+                    if let Some(ref preview_gua) = m.daoti_preview_gua {
+                        text.push_str(&format!(" | 道体预判卦: {}", preview_gua));
+                    }
+                    if let Some(ref preview_bagua) = m.daoti_preview_bagua {
+                        text.push_str(&format!(" | 道体预判八卦: {}", preview_bagua));
+                    }
+                    if let Some(ref preview_version) = m.daoti_preview_version {
+                        text.push_str(&format!(" | 道体预判版本: {}", preview_version));
+                    }
                     text.push_str(&format!("\nID: `{}`\n\n", m.id));
                 }
                 text.push_str("💡 在回复中引用记忆时，请使用「（根据记忆 #N）」的格式标注来源，让用户能看见和信任记忆的存在。\n");
+            }
+
+            // LRC 内置道体状态机·联想链输出：
+            // 将本次检索激活的记忆及联想轨迹直接暴露给调用方，
+            // 让"如何从一件事联想到另一件事"可观测、可审计。
+            let state_snapshot = store.memory_state_machine.snapshot();
+            if state_snapshot.trail.len() >= 2 {
+                text.push_str("\n═══ 联想链（状态机轨迹）═══\n");
+                for step in &state_snapshot.trail {
+                    let from = step.from_id.as_deref().unwrap_or("查询起点");
+                    text.push_str(&format!(
+                        "  {} ──(深度 {})──▶ {}\n",
+                        from.chars().take(24).collect::<String>(),
+                        step.depth,
+                        step.to_id.chars().take(24).collect::<String>(),
+                    ));
+                }
+                text.push_str(
+                    "💡 联想链展示记忆如何由一件事发散到相关记忆；活性状态已持久化，下次检索会感知近期语境。\n",
+                );
+            } else if !state_snapshot.active.is_empty() {
+                let active_note: Vec<String> = state_snapshot
+                    .active
+                    .iter()
+                    .take(3)
+                    .map(|a| {
+                        format!(
+                            "{} (强度 {:.2})",
+                            a.memory_id.chars().take(16).collect::<String>(),
+                            a.activation
+                        )
+                    })
+                    .collect();
+                text.push_str(&format!("\n🧠 当前活跃记忆: {}\n", active_note.join(", ")));
+            }
+
+            // LRC 内置道体状态机·回归证据（道体再次校验）：
+            // 展示联想扩散保留每条记忆的判定证据——"为什么这条被联想回来"，
+            // 让发散-回归闭环对调用方完全可审计。
+            if !result.regression_evidence.is_empty() {
+                text.push_str("\n🔍 回归校验证据（道体再次校验）\n");
+                for m in &result.memories {
+                    if let Some(evidence) = result.regression_evidence.get(&m.id) {
+                        text.push_str(&format!(
+                            "  #{} [{}] {}\n",
+                            m.id.chars().take(12).collect::<String>(),
+                            evidence,
+                            m.content.chars().take(28).collect::<String>(),
+                        ));
+                    }
+                }
+                text.push_str(
+                    "💡 回归校验确认联想扩散的记忆确实回应了原始查询；无共鸣信号的记忆已被剔除。\n",
+                );
             }
 
             let call_result = ToolCallResult {
@@ -1179,6 +1420,15 @@ async fn handle_list_memories(
                     if !m.tags.is_empty() {
                         text.push_str(&format!("标签: {}\n", m.tags.join(", ")));
                     }
+                    if let Some(ref preview_gua) = m.daoti_preview_gua {
+                        text.push_str(&format!("道体预判卦: {}\n", preview_gua));
+                    }
+                    if let Some(ref preview_bagua) = m.daoti_preview_bagua {
+                        text.push_str(&format!("道体预判八卦: {}\n", preview_bagua));
+                    }
+                    if let Some(ref preview_version) = m.daoti_preview_version {
+                        text.push_str(&format!("道体预判版本: {}\n", preview_version));
+                    }
                     text.push('\n');
                 }
             }
@@ -1257,6 +1507,19 @@ async fn handle_remember(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    let preview_gua = arguments
+        .get("daoti_preview_gua")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let preview_bagua = arguments
+        .get("daoti_preview_bagua")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let preview_version = arguments
+        .get("daoti_preview_version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let memory = Memory::new(
         content.to_string(),
         memory_type,
@@ -1266,6 +1529,11 @@ async fn handle_remember(
         ttl_days,
     )
     .with_privacy(privacy_level, session_id, user_id);
+
+    let mut memory = memory;
+    memory.daoti_preview_gua = preview_gua;
+    memory.daoti_preview_bagua = preview_bagua;
+    memory.daoti_preview_version = preview_version;
 
     let mut store = state.memory_store.lock().await;
     match store.remember(memory) {
@@ -1826,6 +2094,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
             total: memory_total,
         },
         src_dir: state.src_dir.clone(),
+        data_dir: state.data_dir.clone(),
         llm_configured,
         lock_busy,
     };
@@ -1994,6 +2263,22 @@ async fn icon_asset_handler(
     const POWER_BALANCE: &str = include_str!("../static/assets/icons/power-balance.svg");
     const POWER_GROWTH: &str = include_str!("../static/assets/icons/power-growth.svg");
     const POWER_SHIELD: &str = include_str!("../static/assets/icons/power-shield.svg");
+    // v0.9.7：emoji→SVG 图标体系迁移新增 15 个图标嵌入
+    const ICON_BULB: &str = include_str!("../static/assets/icons/icon-bulb.svg");
+    const ICON_CHECK_CIRCLE: &str = include_str!("../static/assets/icons/icon-check-circle.svg");
+    const ICON_CLOCK: &str = include_str!("../static/assets/icons/icon-clock.svg");
+    const ICON_CLOSE: &str = include_str!("../static/assets/icons/icon-close.svg");
+    const ICON_DOCUMENT: &str = include_str!("../static/assets/icons/icon-document.svg");
+    const ICON_EMPTY: &str = include_str!("../static/assets/icons/icon-empty.svg");
+    const ICON_ERROR_CIRCLE: &str = include_str!("../static/assets/icons/icon-error-circle.svg");
+    const ICON_MENU: &str = include_str!("../static/assets/icons/icon-menu.svg");
+    const ICON_MORE: &str = include_str!("../static/assets/icons/icon-more.svg");
+    const ICON_PLUG: &str = include_str!("../static/assets/icons/icon-plug.svg");
+    const ICON_REFRESH: &str = include_str!("../static/assets/icons/icon-refresh.svg");
+    const ICON_SPARKLE: &str = include_str!("../static/assets/icons/icon-sparkle.svg");
+    const ICON_STAR: &str = include_str!("../static/assets/icons/icon-star.svg");
+    const ICON_STAR_EMPTY: &str = include_str!("../static/assets/icons/icon-star-empty.svg");
+    const ICON_TOOLS: &str = include_str!("../static/assets/icons/icon-tools.svg");
 
     let content = match filename.as_str() {
         "icon-dashboard.svg" => Some(ICON_DASHBOARD),
@@ -2037,6 +2322,22 @@ async fn icon_asset_handler(
         "power-balance.svg" => Some(POWER_BALANCE),
         "power-growth.svg" => Some(POWER_GROWTH),
         "power-shield.svg" => Some(POWER_SHIELD),
+        // v0.9.7：emoji→SVG 图标体系迁移新增 15 个图标路由
+        "icon-bulb.svg" => Some(ICON_BULB),
+        "icon-check-circle.svg" => Some(ICON_CHECK_CIRCLE),
+        "icon-clock.svg" => Some(ICON_CLOCK),
+        "icon-close.svg" => Some(ICON_CLOSE),
+        "icon-document.svg" => Some(ICON_DOCUMENT),
+        "icon-empty.svg" => Some(ICON_EMPTY),
+        "icon-error-circle.svg" => Some(ICON_ERROR_CIRCLE),
+        "icon-menu.svg" => Some(ICON_MENU),
+        "icon-more.svg" => Some(ICON_MORE),
+        "icon-plug.svg" => Some(ICON_PLUG),
+        "icon-refresh.svg" => Some(ICON_REFRESH),
+        "icon-sparkle.svg" => Some(ICON_SPARKLE),
+        "icon-star.svg" => Some(ICON_STAR),
+        "icon-star-empty.svg" => Some(ICON_STAR_EMPTY),
+        "icon-tools.svg" => Some(ICON_TOOLS),
         _ => None,
     };
     match content {
@@ -2241,6 +2542,40 @@ pub async fn update_llm_config(
     // 解析配置
     match LlmApiConfig::parse(&llm_str) {
         Ok(config) => {
+            // SSRF 防护：校验配置中的目标地址（持久化前拒绝 metadata/链路本地等）
+            let target = match &config {
+                LlmApiConfig::OpenAI { endpoint, .. } => endpoint.clone(),
+                LlmApiConfig::Ollama { host, .. } => {
+                    // Ollama host 可能为 host 或 host:port，构造 http URL 校验
+                    if host.starts_with("http://") || host.starts_with("https://") {
+                        host.clone()
+                    } else {
+                        format!("http://{}", host)
+                    }
+                }
+                LlmApiConfig::None => String::new(),
+            };
+            if !target.is_empty() {
+                if let Err(e) = crate::url_safety::validate_http_url(&target) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "message": format!("目标地址校验失败: {}", e)
+                        })),
+                    );
+                }
+                // SSRF 防护：DNS 解析复核（防 DNS rebinding）
+                if let Err(e) = crate::url_safety::check_dns_safety(&target).await {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "message": format!("目标地址校验失败: {}", e)
+                        })),
+                    );
+                }
+            }
             // v0.5.4 修复：unreachable!() 替换为安全的错误返回
             // parse() 方法理论上不会返回 None，但防御性编程应处理所有情况
             let (llm_type, model) = match &config {
@@ -2635,76 +2970,90 @@ async fn embedder_download_handler(
         );
     }
 
-    // 后台线程执行下载
+    // 后台线程执行下载（fire-and-forget：JoinHandle 有意丢弃，生命周期由
+    // EMBEDDER_DOWNLOADING 原子标志管理，前端轮询 /api/embedder/status）。
+    // r4 修复：用 catch_unwind 包裹线程主体——若下载逻辑 panic，也能重置
+    // EMBEDDER_DOWNLOADING 并记录日志，避免状态永久卡在"下载中"导致后续
+    // 下载永远返回 409 CONFLICT。
     let model_id_clone = model_id.clone();
     std::thread::spawn(move || {
-        use crate::engine::model_downloader::{
-            build_download_url, ConsoleProgress, ModelDownloader,
-        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            use crate::engine::model_downloader::{
+                build_download_url, ConsoleProgress, ModelDownloader,
+            };
 
-        let downloader = ModelDownloader::with_defaults();
-        let progress = ConsoleProgress::new();
+            let downloader = ModelDownloader::with_defaults();
+            let progress = ConsoleProgress::new();
 
-        // 模型所需核心文件（按依赖顺序）
-        // v0.9.0 修复：权重文件支持 safetensors / pytorch_model.bin 双格式 fallback。
-        // bge-small-zh 等部分模型只有 pytorch_model.bin（无 model.safetensors），
-        // 若只下载 model.safetensors 必然失败，导致模型不完整、始终降级。
-        let config_files = ["config.json", "tokenizer.json"];
-        let local_dir = model_id_clone.replace('/', "--");
-        // v0.9.0 修复：下载到统一模型目录 ~/.loong-recall/models/
-        let base_dir = crate::engine::model_resolver::default_models_dir().join(&local_dir);
-        if let Err(e) = std::fs::create_dir_all(&base_dir) {
-            eprintln!("[LRC·嵌入] 创建模型目录失败 {}: {}", base_dir.display(), e);
-            EMBEDDER_DOWNLOADING.store(false, Ordering::SeqCst);
-            return;
-        }
-
-        // 1. 下载必需的配置文件（config.json + tokenizer.json）
-        for file in &config_files {
-            let url = build_download_url(&model_id_clone, file, mirror);
-            let dest = base_dir.join(file);
-            eprintln!("[LRC·嵌入] 下载 {}: {}", file, url);
-            if let Err(e) = downloader.download_with_retry(&url, &dest, &progress) {
-                eprintln!("[LRC·嵌入] 下载 {} 失败: {}", file, e);
-                EMBEDDER_DOWNLOADING.store(false, Ordering::SeqCst);
+            // 模型所需核心文件（按依赖顺序）
+            // v0.9.0 修复：权重文件支持 safetensors / pytorch_model.bin 双格式 fallback。
+            // bge-small-zh 等部分模型只有 pytorch_model.bin（无 model.safetensors），
+            // 若只下载 model.safetensors 必然失败，导致模型不完整、始终降级。
+            let config_files = ["config.json", "tokenizer.json"];
+            let local_dir = model_id_clone.replace('/', "--");
+            // v0.9.0 修复：下载到统一模型目录 ~/.loong-recall/models/
+            let base_dir = crate::engine::model_resolver::default_models_dir().join(&local_dir);
+            if let Err(e) = std::fs::create_dir_all(&base_dir) {
+                eprintln!("[LRC·嵌入] 创建模型目录失败 {}: {}", base_dir.display(), e);
                 return;
             }
-        }
 
-        // 2. 下载权重文件：safetensors 优先，失败则 fallback 到 pytorch_model.bin
-        let weights_ok = {
-            let url = build_download_url(&model_id_clone, "model.safetensors", mirror);
-            let dest = base_dir.join("model.safetensors");
-            eprintln!("[LRC·嵌入] 下载 model.safetensors: {}", url);
-            match downloader.download_with_retry(&url, &dest, &progress) {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!(
-                        "[LRC·嵌入] model.safetensors 下载失败: {}，尝试 pytorch_model.bin",
-                        e
-                    );
-                    let alt_url = build_download_url(&model_id_clone, "pytorch_model.bin", mirror);
-                    let alt_dest = base_dir.join("pytorch_model.bin");
-                    eprintln!("[LRC·嵌入] 下载 pytorch_model.bin: {}", alt_url);
-                    match downloader.download_with_retry(&alt_url, &alt_dest, &progress) {
-                        Ok(()) => true,
-                        Err(e2) => {
-                            eprintln!("[LRC·嵌入] pytorch_model.bin 下载也失败: {}", e2);
-                            false
+            // 1. 下载必需的配置文件（config.json + tokenizer.json）
+            for file in &config_files {
+                let url = build_download_url(&model_id_clone, file, mirror);
+                let dest = base_dir.join(file);
+                eprintln!("[LRC·嵌入] 下载 {}: {}", file, url);
+                if let Err(e) = downloader.download_with_retry(&url, &dest, &progress) {
+                    eprintln!("[LRC·嵌入] 下载 {} 失败: {}", file, e);
+                    return;
+                }
+            }
+
+            // 2. 下载权重文件：safetensors 优先，失败则 fallback 到 pytorch_model.bin
+            let weights_ok = {
+                let url = build_download_url(&model_id_clone, "model.safetensors", mirror);
+                let dest = base_dir.join("model.safetensors");
+                eprintln!("[LRC·嵌入] 下载 model.safetensors: {}", url);
+                match downloader.download_with_retry(&url, &dest, &progress) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!(
+                            "[LRC·嵌入] model.safetensors 下载失败: {}，尝试 pytorch_model.bin",
+                            e
+                        );
+                        let alt_url =
+                            build_download_url(&model_id_clone, "pytorch_model.bin", mirror);
+                        let alt_dest = base_dir.join("pytorch_model.bin");
+                        eprintln!("[LRC·嵌入] 下载 pytorch_model.bin: {}", alt_url);
+                        match downloader.download_with_retry(&alt_url, &alt_dest, &progress) {
+                            Ok(()) => true,
+                            Err(e2) => {
+                                eprintln!("[LRC·嵌入] pytorch_model.bin 下载也失败: {}", e2);
+                                false
+                            }
                         }
                     }
                 }
+            };
+
+            if !weights_ok {
+                eprintln!("[LRC·嵌入] 模型 {} 权重文件下载失败", model_id_clone);
+                return;
             }
-        };
 
-        if !weights_ok {
-            eprintln!("[LRC·嵌入] 模型 {} 权重文件下载失败", model_id_clone);
-            EMBEDDER_DOWNLOADING.store(false, Ordering::SeqCst);
-            return;
-        }
+            eprintln!("[LRC·嵌入] 模型 {} 下载完成", model_id_clone);
+        }));
 
-        eprintln!("[LRC·嵌入] 模型 {} 下载完成", model_id_clone);
+        // 无论成功/失败/panic，最终都重置下载标志，保证状态机可恢复
         EMBEDDER_DOWNLOADING.store(false, Ordering::SeqCst);
+        if let Err(panic_payload) = result {
+            let msg = panic_payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "未知 panic 载荷".to_string());
+            eprintln!("[LRC·嵌入] 下载线程 panic: {}", msg);
+        }
     });
 
     let resp = EmbedderDownloadResponse {
@@ -2858,8 +3207,14 @@ async fn embedder_test_handler(
         crate::engine::model_downloader::build_download_url(&model_id, "config.json", mirror);
 
     let start = std::time::Instant::now();
+    // v0.9.6 修复（六钥匙·反向推导）：超时预算必须"后端 < 前端"。
+    // 前端 fetchWithTimeout 预算为 10s，此前后端总超时 15s，镜像不可达时
+    // 后端 21s 才返回，前端已提前抛 SidecarTimeoutError，用户看到误导性文案
+    // （"请检查 LRC 服务是否正常运行"），而真实原因是外网镜像不可达。
+    // 连接超时 4s + 总超时 8s，确保镜像不可达时后端先于前端返回真实失败原因。
     let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(15))
+        .timeout_connect(std::time::Duration::from_secs(4))
+        .timeout(std::time::Duration::from_secs(8))
         .build();
 
     let resp = match agent.get(&test_url).call() {
@@ -3215,6 +3570,44 @@ pub async fn run_stdio(state: Arc<AppState>) {
 
 // ==================== 路由构建 ====================
 
+/// 本地 API 认证中间件（安全加固：/v1、/mcp 等端点默认未认证）。
+///
+/// 兼容设计：仅当环境变量 LRC_API_TOKEN 非空且非空字符串时启用
+/// Bearer Token 校验；未配置 token 时跳过认证，保持既有本地开发、
+/// 仪表盘与桥接客户端行为完全不变。认证失败返回 401 Unauthorized。
+async fn local_api_auth(
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    match std::env::var("LRC_API_TOKEN") {
+        // 未配置 token：跳过认证（兼容本地开发模式）
+        Err(_) => Ok(next.run(req).await),
+        // token 为空字符串：同样视为未配置
+        Ok(token) if token.trim().is_empty() => Ok(next.run(req).await),
+        Ok(expected) => {
+            let authorized = req
+                .headers()
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "))
+                .map(|token| token.trim())
+                .map(|token| token == expected.trim())
+                .unwrap_or(false);
+            if authorized {
+                Ok(next.run(req).await)
+            } else {
+                Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "unauthorized",
+                        "message": "缺少或无效的 API Token，请携带 Authorization: Bearer <LRC_API_TOKEN>"
+                    })),
+                ))
+            }
+        }
+    }
+}
+
 /// 创建 MCP 服务的 axum Router（合并 v1 REST API 端点 + 仪表盘）
 ///
 /// 可嵌入到已有 axum 应用中，将 MCP 路由挂载到子路径。
@@ -3229,17 +3622,11 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
     )
     .into_service();
 
-    Router::new()
+    // 受保护路由：/v1 API、/mcp 与仪表盘数据 API 需要 Bearer Token 认证。
+    // 注意：使用 route_layer 而非 layer——layer 会改变 Request body 泛型，
+    // 导致后续 merge 出现类型不匹配；route_layer 保持泛型不变，可安全合并。
+    let protected_routes = Router::new()
         .route("/mcp", post(mcp_handler))
-        .route("/health", get(health_handler))
-        .route("/app.js", get(app_js_handler))
-        .route("/app.css", get(app_css_handler))
-        // v0.6.0 龙忆设计系统：设计系统 CSS 资源
-        .route("/colors_and_type.css", get(colors_and_type_css_handler))
-        .route("/components.css", get(components_css_handler))
-        // v0.6.0 龙忆设计系统：Logo 与图标 SVG 资源
-        .route("/assets/logo/{filename}", get(logo_asset_handler))
-        .route("/assets/icons/{filename}", get(icon_asset_handler))
         .nest_service("/v1", v1_service) // 将 v1 API 嵌套在 /v1 路径下
         // 仪表盘路由：静态文件 + 重定向
         .route("/dashboard", get(dashboard_handler))
@@ -3261,6 +3648,24 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         .route("/api/embedder/test", post(embedder_test_handler))
         // v0.6.0+：IDE / Agent 工具检测
         .route("/api/tools/detect", get(tools_detect_handler))
+        .route_layer(middleware::from_fn(local_api_auth));
+
+    // 公开路由：健康检查与静态资源（不涉及敏感数据，无需认证）
+    let public_routes = Router::new()
+        .route("/health", get(health_handler))
+        .route("/app.js", get(app_js_handler))
+        .route("/app.css", get(app_css_handler))
+        // v0.6.0 龙忆设计系统：设计系统 CSS 资源
+        .route("/colors_and_type.css", get(colors_and_type_css_handler))
+        .route("/components.css", get(components_css_handler))
+        // v0.6.0 龙忆设计系统：Logo 与图标 SVG 资源
+        .route("/assets/logo/{filename}", get(logo_asset_handler))
+        .route("/assets/icons/{filename}", get(icon_asset_handler));
+
+    // 合并公开与受保护路由，再应用跨域/超时/并发限制
+    Router::new()
+        .merge(public_routes)
+        .merge(protected_routes)
         // v0.6.0 安全加固：CORS 从 permissive 收紧为显式白名单
         // 允许本地开发服务器和桌面端访问，拒绝任意来源
         .layer(
@@ -3386,6 +3791,7 @@ mod tests {
             manager: Arc::new(Mutex::new(Box::new(manager))),
             memory_store,
             src_dir: "fixture/src".into(),
+            data_dir: data_dir.clone(),
             llm_api: Arc::new(RwLock::new(LlmApiConfig::None)),
             llm_configured_atomic: Arc::new(AtomicBool::new(false)), // v0.8.22 P0-1: 无锁缓存
             indexing_complete: Arc::new(AtomicBool::new(true)),      // 测试环境默认索引已完成
@@ -3396,6 +3802,39 @@ mod tests {
 
     fn to_json(resp: &JsonRpcResponse) -> serde_json::Value {
         serde_json::to_value(resp).unwrap()
+    }
+
+    /// v0.9.6 P0 契约测试：/health 响应必须暴露非空 data_dir，
+    /// 否则桌面端 sidecar_identity_matches 恒失败、开发模式复用路径失效。
+    /// 该测试直接序列化 HealthResponse，堵住"手工构造 DTO 绕过真实序列化"的假绿。
+    #[test]
+    fn health_response_must_expose_nonempty_data_dir() {
+        let state = test_state();
+        let response = HealthResponse {
+            status: "running",
+            service: "loong-recall",
+            version: env!("CARGO_PKG_VERSION"),
+            uptime_seconds: 1,
+            indexing: IndexingStatus {
+                complete: true,
+                file_count: Some(0),
+                total_chunks: Some(0),
+            },
+            memory: MemoryBrief { total: 0 },
+            src_dir: state.src_dir.clone(),
+            data_dir: state.data_dir.clone(),
+            llm_configured: false,
+            lock_busy: false,
+        };
+        let json = serde_json::to_value(&response).expect("HealthResponse 应可序列化");
+        assert!(
+            json.get("data_dir").is_some(),
+            "契约断裂：/health 未序列化 data_dir，桌面端身份校验将恒失败"
+        );
+        assert!(
+            !json["data_dir"].as_str().unwrap_or("").is_empty(),
+            "data_dir 不得为空串，否则开发模式身份匹配恒失败"
+        );
     }
 
     struct PanicCodebase;

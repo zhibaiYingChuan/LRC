@@ -19,9 +19,23 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+static BACKUP_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// 备份保留份数（超出此数量的最旧备份将被删除）
 const MAX_BACKUPS: usize = 4;
+const SNAPSHOT_FILES: [&str; 7] = [
+    "memories.json",
+    "chunks.json",
+    "archive.json",
+    "audit.jsonl",
+    "audit.jsonl.seal",
+    "audit.jsonl.anchors.jsonl",
+    "feedback.jsonl",
+];
+static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// 备份结果报告
 #[derive(Debug, Clone, serde::Serialize)]
@@ -57,7 +71,12 @@ fn global_data_dir() -> PathBuf {
 /// 生成带时间戳的备份文件名
 fn backup_filename() -> String {
     let now = chrono::Local::now();
-    format!("memories_{}.json", now.format("%Y%m%d_%H%M%S"))
+    format!(
+        "memories_{}_{}_{}.json",
+        now.format("%Y%m%d_%H%M%S"),
+        now.timestamp_subsec_nanos(),
+        BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    )
 }
 
 /// 创建备份
@@ -67,6 +86,10 @@ fn backup_filename() -> String {
 ///
 /// 自动清理超过 MAX_BACKUPS 份数的旧备份。
 pub fn create_backup() -> BackupReport {
+    let _operation_guard = BACKUP_OPERATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let mut report = BackupReport {
         success: false,
         backup_path: None,
@@ -76,33 +99,44 @@ pub fn create_backup() -> BackupReport {
         total_backups: 0,
         error: None,
     };
-
     let data_dir = global_data_dir();
-    let memory_file = data_dir.join("memories.json");
-
-    // 检查源文件是否存在
-    if !memory_file.exists() {
-        report.error = Some(format!("记忆文件不存在: {}", memory_file.display()));
+    if !data_dir.join("memories.json").exists() {
+        report.error = Some(format!(
+            "记忆文件不存在: {}",
+            data_dir.join("memories.json").display()
+        ));
         return report;
     }
-
-    // 确保备份目录存在
-    let backups_dir = backups_dir();
-    if let Err(e) = fs::create_dir_all(&backups_dir) {
+    let root = backups_dir();
+    if let Err(e) = fs::create_dir_all(&root) {
         report.error = Some(format!("创建备份目录失败: {}", e));
         return report;
     }
-
-    // 生成备份文件路径
-    let backup_file = backups_dir.join(backup_filename());
-
-    // 复制文件
-    if let Err(e) = fs::copy(&memory_file, &backup_file) {
-        report.error = Some(format!("复制文件失败: {}", e));
+    let name = backup_filename().trim_end_matches(".json").to_string() + ".snapshot";
+    let final_dir = root.join(name);
+    let temp_dir = root.join(format!(
+        ".{}.tmp",
+        BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<(), String> {
+        fs::create_dir(&temp_dir).map_err(|e| format!("创建临时快照失败: {}", e))?;
+        for file in SNAPSHOT_FILES {
+            let source = data_dir.join(file);
+            let target = temp_dir.join(file);
+            if source.exists() {
+                fs::copy(&source, &target).map_err(|e| format!("备份 {} 失败: {}", file, e))?;
+            } else {
+                fs::write(&target, b"").map_err(|e| format!("创建空文件 {} 失败: {}", file, e))?;
+            }
+        }
+        fs::rename(&temp_dir, &final_dir).map_err(|e| format!("提交快照失败: {}", e))
+    })();
+    if let Err(e) = result {
+        let _ = fs::remove_dir_all(&temp_dir);
+        report.error = Some(e);
         return report;
     }
-
-    // 获取备份文件大小
+    let backup_file = final_dir.join("memories.json");
     report.backup_size = fs::metadata(&backup_file).map(|m| m.len()).unwrap_or(0);
 
     // 统计记忆数
@@ -121,13 +155,13 @@ pub fn create_backup() -> BackupReport {
         }
     }
 
-    report.backup_path = Some(backup_file.to_string_lossy().to_string());
+    report.backup_path = Some(final_dir.to_string_lossy().to_string());
 
     // 清理旧备份
-    report.old_backups_removed = cleanup_old_backups(&backups_dir);
+    report.old_backups_removed = cleanup_old_backups(&root);
 
     // 统计当前备份总数
-    report.total_backups = count_backups(&backups_dir);
+    report.total_backups = count_backups(&root);
 
     report.success = true;
 
@@ -155,7 +189,9 @@ fn cleanup_old_backups(backups_dir: &Path) -> usize {
             let path = entry.path();
             // 只处理 memories_*.json 文件
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("memories_") && name.ends_with(".json") {
+                if (name.starts_with("memories_") && name.ends_with(".json"))
+                    || name.ends_with(".snapshot")
+                {
                     if let Ok(meta) = entry.metadata() {
                         if let Ok(modified) = meta.modified() {
                             backups.push((path, modified));
@@ -176,7 +212,12 @@ fn cleanup_old_backups(backups_dir: &Path) -> usize {
     // 删除超出部分
     let mut removed = 0;
     for (path, _) in backups.iter().skip(MAX_BACKUPS) {
-        if fs::remove_file(path).is_ok() {
+        let result = if path.is_dir() {
+            fs::remove_dir_all(path)
+        } else {
+            fs::remove_file(path)
+        };
+        if result.is_ok() {
             removed += 1;
         }
     }
@@ -190,13 +231,111 @@ fn count_backups(backups_dir: &Path) -> usize {
     if let Ok(entries) = fs::read_dir(backups_dir) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with("memories_") && name.ends_with(".json") {
+                if (name.starts_with("memories_") && name.ends_with(".json"))
+                    || name.ends_with(".snapshot")
+                {
                     count += 1;
                 }
             }
         }
     }
     count
+}
+
+/// 从快照恢复全部运行时文件。
+pub fn restore_backup(snapshot_path: &Path) -> Result<(), String> {
+    let _operation_guard = BACKUP_OPERATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    // v0.9.7 审查修复（HCSE-P0 安全）：快照目录必须位于本工具的备份目录内。
+    // 端点默认无 token 保护，若不约束路径，本机任意进程可把任意目录内容
+    // （SNAPSHOT_FILES 同名文件）覆盖进全局数据目录，属路径穿越/越权写。
+    let allowed_root = backups_dir();
+    let canonical_snapshot = snapshot_path
+        .canonicalize()
+        .map_err(|e| format!("快照路径无法解析: {} ({})", snapshot_path.display(), e))?;
+    let canonical_root = match allowed_root.canonicalize() {
+        Ok(root) => root,
+        // 备份目录尚不存在时不可能有合法快照，直接拒绝
+        Err(_) => return Err(format!("备份目录不存在: {}", allowed_root.display())),
+    };
+    if !canonical_snapshot.starts_with(&canonical_root) {
+        return Err(format!(
+            "拒绝恢复：快照目录 {} 不在备份目录 {} 内",
+            canonical_snapshot.display(),
+            canonical_root.display()
+        ));
+    }
+    if !canonical_snapshot.is_dir() {
+        return Err(format!("快照目录不存在: {}", snapshot_path.display()));
+    }
+    let required_memory_file = canonical_snapshot.join("memories.json");
+    if !required_memory_file.is_file() {
+        return Err(format!(
+            "快照缺少有效的 memories.json: {}",
+            required_memory_file.display()
+        ));
+    }
+    let snapshot_path = canonical_snapshot.as_path();
+    let data_dir = global_data_dir();
+    fs::create_dir_all(&data_dir).map_err(|e| format!("创建数据目录失败: {}", e))?;
+    let temp = data_dir.join(format!(
+        ".restore-{}.tmp",
+        BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&temp).map_err(|e| format!("创建恢复临时目录失败: {}", e))?;
+    let result = (|| -> Result<(), String> {
+        for file in SNAPSHOT_FILES {
+            let source = snapshot_path.join(file);
+            if source.exists() {
+                fs::copy(&source, temp.join(file))
+                    .map_err(|e| format!("恢复 {} 失败: {}", file, e))?;
+            } else {
+                fs::write(temp.join(file), b"")
+                    .map_err(|e| format!("恢复空文件 {} 失败: {}", file, e))?;
+            }
+        }
+        let rollback = data_dir.join(format!(
+            ".restore-{}-rollback",
+            BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&rollback).map_err(|e| format!("创建恢复回滚目录失败: {}", e))?;
+        let mut originals = Vec::new();
+        let mut committed = Vec::new();
+        let commit_result = (|| -> Result<(), String> {
+            for file in SNAPSHOT_FILES {
+                let target = data_dir.join(file);
+                if target.exists() {
+                    let saved = rollback.join(file);
+                    fs::rename(&target, &saved)
+                        .map_err(|e| format!("保存原始 {} 失败: {}", file, e))?;
+                    originals.push((target.clone(), saved));
+                }
+                fs::rename(temp.join(file), &target)
+                    .map_err(|e| format!("提交 {} 失败: {}", file, e))?;
+                committed.push(target);
+            }
+            Ok(())
+        })();
+        if let Err(error) = commit_result {
+            for target in committed.iter().rev() {
+                let _ = if target.is_dir() {
+                    fs::remove_dir_all(target)
+                } else {
+                    fs::remove_file(target)
+                };
+            }
+            for (target, saved) in originals.iter().rev() {
+                let _ = fs::rename(saved, target);
+            }
+            return Err(format!("{}；已尝试回滚恢复文件", error));
+        }
+        fs::remove_dir_all(&rollback).map_err(|e| format!("清理恢复回滚目录失败: {}", e))?;
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&temp);
+    result
 }
 
 /// 列出所有备份文件信息（按时间降序）
@@ -221,7 +360,7 @@ pub fn list_backups() -> Vec<BackupInfo> {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if !(name.starts_with("memories_") && name.ends_with(".json")) {
+                if !name.ends_with(".snapshot") {
                     continue;
                 }
                 if let Ok(meta) = entry.metadata() {
@@ -266,8 +405,15 @@ mod tests {
         let name = backup_filename();
         assert!(name.starts_with("memories_"));
         assert!(name.ends_with(".json"));
-        // 格式：memories_YYYYMMDD_HHMMSS.json
-        assert_eq!(name.len(), "memories_YYYYMMDD_HHMMSS.json".len());
+        // 格式：memories_YYYYMMDD_HHMMSS_纳秒_进程号.json
+        assert!(name.len() > "memories_YYYYMMDD_HHMMSS.json".len());
+    }
+
+    #[test]
+    fn test_backup_filenames_are_unique_within_same_second() {
+        let first = backup_filename();
+        let second = backup_filename();
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -315,6 +461,26 @@ mod tests {
 
         let remaining = count_backups(&temp);
         assert_eq!(remaining, MAX_BACKUPS, "应保留 {} 个备份", MAX_BACKUPS);
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_cleanup_removes_snapshot_directories() {
+        let temp = std::env::temp_dir().join("lrc_backup_test_snapshot_dirs");
+        let _ = fs::remove_dir_all(&temp);
+        fs::create_dir_all(&temp).unwrap();
+
+        for i in 0..6 {
+            let snapshot = temp.join(format!("memories_2026010{}.snapshot", i));
+            fs::create_dir(&snapshot).unwrap();
+            fs::write(snapshot.join("memories.json"), "[]").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let removed = cleanup_old_backups(&temp);
+        assert_eq!(removed, 2, "应删除 2 个最旧快照目录");
+        assert_eq!(count_backups(&temp), MAX_BACKUPS);
 
         let _ = fs::remove_dir_all(&temp);
     }

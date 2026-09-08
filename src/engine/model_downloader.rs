@@ -261,7 +261,21 @@ pub enum DownloadError {
 impl std::fmt::Display for DownloadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Network(msg) => write!(f, "网络错误: {}", msg),
+            Self::Network(msg) => {
+                let lower = msg.to_ascii_lowercase();
+                if lower.contains("timed out") || lower.contains("timeout") || msg.contains("超时")
+                {
+                    write!(f, "网络超时: 镜像源响应超过配置时限，请检查代理、防火墙或切换 ModelScope 镜像。详情: {}", msg)
+                } else if lower.contains("dns") || lower.contains("resolve") {
+                    write!(
+                        f,
+                        "网络解析失败: 无法解析镜像源域名，请检查 DNS 或代理。详情: {}",
+                        msg
+                    )
+                } else {
+                    write!(f, "网络错误: {}", msg)
+                }
+            }
             Self::Http(code, msg) => write!(f, "HTTP 错误 {}: {}", code, msg),
             Self::Io(e) => write!(f, "文件系统错误: {}", e),
             Self::RetriesExhausted {
@@ -653,8 +667,12 @@ mod tests {
     #[test]
     fn test_download_error_display() {
         let err = DownloadError::Network("连接超时".to_string());
-        assert!(format!("{}", err).contains("网络错误"));
+        assert!(format!("{}", err).contains("网络超时"));
+        assert!(format!("{}", err).contains("切换 ModelScope"));
         assert!(format!("{}", err).contains("连接超时"));
+
+        let err = DownloadError::Network("request timed out".to_string());
+        assert!(format!("{}", err).contains("检查代理"));
 
         let err = DownloadError::Http(404, "Not Found".to_string());
         assert!(format!("{}", err).contains("HTTP 错误 404"));

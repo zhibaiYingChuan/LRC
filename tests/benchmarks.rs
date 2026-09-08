@@ -505,6 +505,10 @@ fn benchmark_yin_yang_balance_stability() {
 #[test]
 fn benchmark_anti_pollution_capability() {
     let (_dir, mut store) = make_store();
+    // 该基准测"检索质量抗污染"（静态一致性）：关闭联想导航（活性偏置），
+    // 否则 recall 循环内活跃状态演化会改变排序，污染一致性度量。
+    let prev_bias = std::env::var_os("LRC_STATE_BIAS");
+    std::env::set_var("LRC_STATE_BIAS", "0");
 
     // 写入 80 条核心事实记忆
     let core_facts = generate_test_memories(80, "core", Importance::new(8));
@@ -562,6 +566,12 @@ fn benchmark_anti_pollution_capability() {
                 "[测试警告] 前 5 条结果中噪声记忆 {noise_in_top5} 条（建议 ≤3），统计编码器区分能力有限，建议启用 ml feature 提升检索质量"
             );
         }
+    }
+
+    // 恢复 LRC_STATE_BIAS 环境变量
+    match prev_bias {
+        Some(value) => std::env::set_var("LRC_STATE_BIAS", value),
+        None => std::env::remove_var("LRC_STATE_BIAS"),
     }
 }
 

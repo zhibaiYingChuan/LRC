@@ -11,6 +11,41 @@
 /// 默认端口：3099（与 sidecar 默认值一致）。
 /// 注意：不要传 0，因为 0 会导致 sidecar 尝试绑定特权端口（<1024）而失败。
 pub const DEFAULT_SIDECAR_PORT: u16 = 3099;
+
+fn same_path(left: &str, right: &str) -> bool {
+    std::path::Path::new(left)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .eq_ignore_ascii_case(
+            std::path::Path::new(right)
+                .to_string_lossy()
+                .replace('\\', "/")
+                .trim_end_matches('/'),
+        )
+}
+
+pub fn sidecar_identity_matches(
+    probed: &ProbedSidecar,
+    src_dir: Option<&str>,
+    data_dir: Option<&str>,
+) -> bool {
+    let src_matches = match src_dir {
+        Some(expected) => !probed.src_dir.is_empty() && same_path(&probed.src_dir, expected),
+        // v0.9.7 审查修复（HCSE-P0 回归）：全局模式调用方传 None，而 sidecar 的
+        // /health 永远上报非空 src_dir（启动 cwd 的 canonicalize，见 server.rs
+        // "src_dir 为空时回填 canonicalize('.')"），旧实现要求"对方 src 为空"
+        // 恒为 false → 桌面端重开后外部 sidecar 复用路径整体断裂，误入 spawn →
+        // PortConflict 死胡同。全局模式身份由 data_dir 承担；data_dir 也未指定时
+        // 退回健康检查语义（与 v0.5.14"关桌面端 sidecar 后台续跑"设计一致）。
+        None => true,
+    };
+    let data_matches = match data_dir {
+        Some(expected) => !probed.data_dir.is_empty() && same_path(&probed.data_dir, expected),
+        None => true,
+    };
+    src_matches && data_matches
+}
 /// 端口扫描范围：实际端口 = 起始端口 + 0..PORT_SCAN_RANGE
 /// 与 server.rs 中 find_available_port 的 scan_range(100) 保持一致
 const PORT_SCAN_RANGE: u16 = 100;
@@ -90,6 +125,8 @@ pub struct ProbedSidecar {
     pub port: u16,
     /// 服务源码目录（从 /health 响应中获取）
     pub src_dir: String,
+    /// 数据目录（从 /health 响应中获取）
+    pub data_dir: String,
     /// 已运行秒数
     pub uptime_seconds: i64,
 }
@@ -445,6 +482,20 @@ pub struct DeadInstanceInfo {
 }
 
 /// Sidecar 进程管理器（支持多项目）
+struct ChildCleanupGuard<'a> {
+    child: &'a mut Child,
+    armed: bool,
+}
+
+impl Drop for ChildCleanupGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 pub struct SidecarManager {
     /// 所有运行中的 sidecar 实例，按项目路径索引
     instances: HashMap<String, SidecarHandle>,
@@ -952,30 +1003,38 @@ impl SidecarManager {
             ));
         }
 
-        // 等待健康检查通过
-        // v0.8.9 修复 G-010：健康检查失败时显式 kill 子进程，防止孤儿进程
-        // std::process::Child 的 Drop 不会 kill 子进程，必须显式 kill + wait
-        let port =
-            match Self::wait_for_health_static(&mut child, actual_port, cancel_flag, progress_tx)
-                .await
-            {
-                Ok(port) => port,
-                Err(e) => {
-                    tracing::warn!("健康检查失败，正在清理子进程 (pid: {:?}): {}", pid, e);
-                    // v0.8.10 L5-03：kill/wait 错误不再静默吞掉，记录日志便于排查
-                    if let Err(kill_err) = child.kill() {
-                        tracing::error!(
-                            "清理子进程失败 (pid: {:?}): kill 返回错误: {}",
-                            pid,
-                            kill_err
-                        );
-                    }
-                    if let Err(wait_err) = child.wait() {
-                        tracing::warn!("等待子进程退出失败 (pid: {:?}): {}", pid, wait_err);
-                    }
-                    return Err(e);
-                }
+        // 等待健康检查通过；外层 timeout 取消 future 时由守卫回收子进程。
+        let port_result = {
+            let mut cleanup = ChildCleanupGuard {
+                child: &mut child,
+                armed: true,
             };
+            let result =
+                Self::wait_for_health_static(cleanup.child, actual_port, cancel_flag, progress_tx)
+                    .await;
+            if result.is_ok() {
+                cleanup.armed = false;
+            }
+            result
+        };
+        let port = match port_result {
+            Ok(port) => port,
+            Err(e) => {
+                tracing::warn!("健康检查失败，正在清理子进程 (pid: {:?}): {}", pid, e);
+                // v0.8.10 L5-03：kill/wait 错误不再静默吞掉，记录日志便于排查
+                if let Err(kill_err) = child.kill() {
+                    tracing::error!(
+                        "清理子进程失败 (pid: {:?}): kill 返回错误: {}",
+                        pid,
+                        kill_err
+                    );
+                }
+                if let Err(wait_err) = child.wait() {
+                    tracing::warn!("等待子进程退出失败 (pid: {:?}): {}", pid, wait_err);
+                }
+                return Err(e);
+            }
+        };
 
         // G-003：发送"服务已就绪"进度
         if let Some(tx) = progress_tx {
@@ -1027,8 +1086,12 @@ impl SidecarManager {
     /// 端口自适应扫描：sidecar 可能因端口冲突而绑定到不同端口，
     /// 因此从起始端口开始扫描 PORT_SCAN_RANGE 个端口，找到实际绑定的端口。
     ///
-    /// 每 500ms 检查一次，最多尝试 20 次（10 秒）。
-    /// 注意：单端口 HTTP 超时为 2 秒，最坏情况下 20 × 2 = 40 秒。
+    /// 每 500ms 检查一次，最多尝试 20 次。
+    /// v0.9.7 审查修复（HCSE 超时机制验证）：旧注释宣称"最坏 20×2=40s"是错的——
+    /// 每轮 attempt 会串行扫描 PORT_SCAN_RANGE(100) 个端口、单请求超时 2s，
+    /// Windows Hyper-V 动态端口保留或"接受 TCP 但不回 HTTP"的服务会把单轮放大到
+    /// ~200s。现加总预算 40s 的共享 deadline，并在端口循环内每 10 个端口检查一次
+    /// 取消标志，保证"取消"和"超时"都真正生效。
     async fn wait_for_health_static(
         child: &mut Child,
         start_port: u16,
@@ -1036,6 +1099,7 @@ impl SidecarManager {
         progress_tx: Option<&tokio::sync::mpsc::Sender<StartProgress>>,
     ) -> Result<u16, SidecarStartError> {
         let pid = child.id();
+        let health_deadline = tokio::time::Instant::now() + Duration::from_secs(40);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
@@ -1047,6 +1111,14 @@ impl SidecarManager {
             // v0.8.9 G-001：检查取消标志，前端 abort 时终止等待
             if cancel_flag.load(Ordering::SeqCst) {
                 return Err(SidecarStartError::UserCancelled);
+            }
+            // v0.9.7：总预算 40s，超时立即收敛为 HealthCheckTimeout
+            if tokio::time::Instant::now() >= health_deadline {
+                tracing::error!("Sidecar 健康检查超出总预算 40s（第{attempt}轮），PID={pid} 仍在运行但不可达");
+                return Err(SidecarStartError::HealthCheckTimeout {
+                    port: start_port,
+                    attempts: attempt,
+                });
             }
 
             // G-003：发送进度事件
@@ -1119,6 +1191,16 @@ impl SidecarManager {
                 let Some(port) = start_port.checked_add(offset) else {
                     break;
                 };
+                // v0.9.7：细粒度取消/超时检查（每 10 个端口一次，开销可忽略），
+                // 避免单个 attempt 内 100 端口串行扫描拖到分钟级
+                if offset % 10 == 9 {
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        return Err(SidecarStartError::UserCancelled);
+                    }
+                    if tokio::time::Instant::now() >= health_deadline {
+                        break;
+                    }
+                }
                 let health_url = format!("http://127.0.0.1:{port}/health");
 
                 match client.get(&health_url).send().await {
@@ -1217,6 +1299,11 @@ impl SidecarManager {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
+            data_dir: body
+                .get("data_dir")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             uptime_seconds: body
                 .get("uptime_seconds")
                 .and_then(|v| v.as_i64())
@@ -1278,6 +1365,11 @@ impl SidecarManager {
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
+                                    let data_dir = body
+                                        .get("data_dir")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
                                     let uptime_seconds = body
                                         .get("uptime_seconds")
                                         .and_then(|v| v.as_i64())
@@ -1285,6 +1377,7 @@ impl SidecarManager {
                                     Some(ProbedSidecar {
                                         port,
                                         src_dir,
+                                        data_dir,
                                         uptime_seconds,
                                     })
                                 } else {
@@ -1394,8 +1487,9 @@ impl SidecarManager {
             PrepareResult::NeedStart => {}
         }
 
-        // Phase 2: 启动子进程 + 健康检查（I/O，关联函数）
-        let (child, port) = Self::spawn_and_wait(&self.binary_path, project_key, opts).await?;
+        // Phase 2: 启动子进程 + 健康检查（I/O，释放管理器锁）
+        let binary_path = self.binary_path.clone();
+        let (child, port) = Self::spawn_and_wait(&binary_path, project_key, opts).await?;
 
         // Phase 3: 插入实例（无 I/O）
         // insert_handle 需要 Option<String>（拥有），从 &str 转换
@@ -1418,36 +1512,77 @@ impl SidecarManager {
 
     /// 停止所有项目的 sidecar 进程
     pub async fn stop_all(&mut self) -> Result<(), String> {
-        let project_keys: Vec<String> = self.instances.keys().cloned().collect();
-        for key in project_keys {
-            let _ = self.stop_project(&key).await;
+        let children = self.take_all_children();
+        for (key, child) in children {
+            Self::stop_child(child, &key).await?;
         }
         Ok(())
     }
 
+    pub fn take_all_children(&mut self) -> Vec<(String, Child)> {
+        self.instances
+            .drain()
+            .map(|(key, handle)| (key, handle.child))
+            .collect()
+    }
+
     /// 停止指定项目的 sidecar 进程
     pub async fn stop_project(&mut self, project_key: &str) -> Result<(), String> {
-        if let Some(mut handle) = self.instances.remove(project_key) {
-            let pid = handle.child.id();
-            // 先尝试优雅终止
-            let _ = handle.child.kill();
-            // 等待进程退出（最多 5 秒）
-            let wait_result = tokio::time::timeout(
-                Duration::from_secs(5),
-                tokio::task::spawn_blocking(move || handle.child.wait()),
-            )
-            .await
-            .map_err(|_| format!("等待 sidecar 退出超时 (项目: {project_key})"))?
-            .map_err(|e| format!("等待 sidecar 退出失败: {e}"))?;
-
-            tracing::info!(
-                "Sidecar 已停止: 项目={}, PID={}: {:?}",
-                project_key,
-                pid,
-                wait_result
-            );
+        if let Some(handle) = self.instances.remove(project_key) {
+            Self::stop_child(handle.child, project_key).await?;
         }
         Ok(())
+    }
+
+    /// 在释放管理器锁后停止已移出的子进程。
+    pub async fn stop_child(mut child: Child, project_key: &str) -> Result<(), String> {
+        let pid = child.id();
+        let _ = child.kill();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(result)) => {
+                    tracing::info!(
+                        "Sidecar 已停止: 项目={}, PID={}: {:?}",
+                        project_key,
+                        pid,
+                        result
+                    );
+                    return Ok(());
+                }
+                Ok(None) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    tracing::error!(
+                        "等待 sidecar 退出超时: 项目={}, PID={}; 继续等待回收子进程",
+                        project_key,
+                        pid
+                    );
+                    // 超时不能直接丢弃 Child：必须 wait 回收，避免产生脱管进程。
+                    match child.wait() {
+                        Ok(result) => {
+                            tracing::info!(
+                                "Sidecar 超时后已强制回收: 项目={}, PID={}: {:?}",
+                                project_key,
+                                pid,
+                                result
+                            );
+                            return Err(format!("等待 sidecar 退出超时 (项目: {project_key})"));
+                        }
+                        Err(e) => return Err(format!("等待 sidecar 退出失败: {e}")),
+                    }
+                }
+                Err(e) => return Err(format!("等待 sidecar 退出失败: {e}")),
+            }
+        }
+    }
+
+    pub fn take_project_child(&mut self, project_key: &str) -> Option<Child> {
+        self.instances
+            .remove(project_key)
+            .map(|handle| handle.child)
     }
 
     /// v0.5.1 新增：崩溃恢复 — 检测并自动重启已死亡的 sidecar 实例
@@ -1569,7 +1704,59 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
-    /// TDD：测试初始状态无运行实例
+    #[test]
+    fn test_sidecar_identity_mismatch_is_rejected() {
+        let probed = ProbedSidecar {
+            port: 3099,
+            src_dir: "C:/project-a".into(),
+            data_dir: "C:/data-a".into(),
+            uptime_seconds: 1,
+        };
+        assert!(sidecar_identity_matches(
+            &probed,
+            Some("c:\\project-a"),
+            Some("c:\\data-a")
+        ));
+        assert!(!sidecar_identity_matches(
+            &probed,
+            Some("C:/project-b"),
+            Some("C:/data-a")
+        ));
+        assert!(!sidecar_identity_matches(
+            &probed,
+            Some("C:/project-a"),
+            Some("C:/data-b")
+        ));
+    }
+
+    /// v0.9.7 审查修复回归：全局模式调用方 src_dir=None，但 sidecar /health
+    /// 永远上报非空 src_dir（启动 cwd canonicalize）。旧实现要求"对方 src 为空"
+    /// 恒 false → 桌面端重开后外部 sidecar 复用断裂。身份应由 data_dir 判定。
+    #[test]
+    fn test_global_mode_none_src_matches_by_data_dir() {
+        let probed = ProbedSidecar {
+            port: 3111,
+            src_dir: "C:/Users/dev/.loong-recall".into(), // 非空 cwd 回填
+            data_dir: "C:/Users/dev/.loong-recall/dev/data".into(),
+            uptime_seconds: 1,
+        };
+        // src=None（全局模式）+ data 匹配 → 应复用
+        assert!(sidecar_identity_matches(
+            &probed,
+            None,
+            Some("c:\\users\\dev\\.loong-recall\\dev\\data")
+        ));
+        // src=None + data 不匹配 → 拒绝（防串库）
+        assert!(!sidecar_identity_matches(
+            &probed,
+            None,
+            Some("C:/other/data")
+        ));
+        // src=None + data=None → 退回健康检查语义（放行）
+        assert!(sidecar_identity_matches(&probed, None, None));
+    }
+
+    /// 测试初始状态无运行实例
     #[test]
     fn test_initial_state_is_stopped() {
         let manager = SidecarManager::for_testing("test-server.exe".into());

@@ -567,6 +567,11 @@ impl LuoShuMlEncoder {
 
     /// 道枢映射: 洛书·九宫 — 将语义向量映射到洛书九宫格，实现数与义的统一
     /// 获取底层 BERT 编码器的句嵌入（未经投影，用于其他语义场景）
+    ///
+    /// 池化方式必须是 CLS（首位 token 隐层）：bge 系列模型以 CLS +
+    /// 归一化对比学习训练，这是其官方检索用法。均值池化会让 BERT 族
+    /// 句向量呈各向异性——实测任意中文短句对的余弦都挤在 ≈0.65，
+    /// 语义相关对与无关对完全不可分（v0.9.7 联想探索标定结论）。
     pub fn encode_embedding(&self, text: &str) -> Result<Vec<f32>, String> {
         let encoding = self
             .tokenizer
@@ -600,23 +605,18 @@ impl LuoShuMlEncoder {
             .forward(&input_ids, &token_type_ids, Some(&attention_tensor))
             .map_err(|e| format!("forward: {}", e))?;
 
-        let mask = attention_tensor
-            .unsqueeze(2)
-            .map_err(|e| format!("mask unsqueeze: {}", e))?;
-        let masked = output
-            .broadcast_mul(&mask)
-            .map_err(|e| format!("masked mul: {}", e))?;
-        let sum = masked.sum(1).map_err(|e| format!("sum: {}", e))?;
-        let mask_sum = mask.sum(1).map_err(|e| format!("mask_sum: {}", e))?;
-        let pooled = sum
-            .broadcast_div(&mask_sum)
-            .map_err(|e| format!("div: {}", e))?;
-
-        pooled
+        // CLS 池化：取序列首位 token 的隐层向量（[batch, seq, hidden] → [hidden]）
+        let cls = output
+            .narrow(1, 0, 1)
+            .map_err(|e| format!("cls narrow: {}", e))?
+            .squeeze(1)
+            .map_err(|e| format!("cls squeeze: {}", e))?;
+        let vec = cls
             .flatten_all()
-            .map_err(|e| format!("flatten: {}", e))?
+            .map_err(|e| format!("cls flatten: {}", e))?
             .to_vec1()
-            .map_err(|e| format!("to_vec1: {}", e))
+            .map_err(|e| format!("cls to_vec1: {}", e))?;
+        Ok(vec)
     }
 
     /// 返回模型的隐藏层维度（v0.6.0 新增）
@@ -846,6 +846,16 @@ impl HybridLuoShuEncoder {
     /// 检查是否使用 ML 模式
     pub fn is_ml_mode(&self) -> bool {
         self.ml_encoder.is_some()
+    }
+
+    /// 获取底层 ML 编码器的完整语义句向量（bge 隐层均值池化，未经洛书投影）。
+    ///
+    /// 9 维洛书投影粒度太粗，承担不了"重要日子 ↔ 结婚纪念日"这类
+    /// 语义强相关、词面零重叠的判断；完整句向量（384/768 维）才能。
+    /// ML 编码器未加载或编码失败时返回 None——调用方据此退回词面
+    /// 通路，绝不放宽标准。
+    pub fn encode_embedding(&self, text: &str) -> Option<Vec<f32>> {
+        self.ml_encoder.as_ref()?.encode_embedding(text).ok()
     }
 
     /// 检查是否处于降级状态（质疑一：监控用）

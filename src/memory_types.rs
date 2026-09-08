@@ -279,9 +279,18 @@ pub struct Memory {
     /// 先天八卦分类索引（0-7，由 MirrorProject 自动判定）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bagua_index: Option<u8>,
-    /// 先天八卦分类名称
+    /// 八卦分类名称
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bagua_category: Option<String>,
+    /// 道体写入时预判的六十四卦名称（pilot，独立于 LRC 分类）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daoti_preview_gua: Option<String>,
+    /// 道体写入时预判的主导八卦名称（pilot）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daoti_preview_bagua: Option<String>,
+    /// 道体预判所使用的编码版本（pilot）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daoti_preview_version: Option<String>,
     /// 隐私权限级别（Session/User/Global，默认 User）
     #[serde(default)]
     pub privacy_level: PrivacyLevel,
@@ -355,6 +364,9 @@ impl Memory {
             luoshu_vector: None,
             bagua_index: None,
             bagua_category: None,
+            daoti_preview_gua: None,
+            daoti_preview_bagua: None,
+            daoti_preview_version: None,
             privacy_level: PrivacyLevel::default(),
             session_id: None,
             user_id: None,

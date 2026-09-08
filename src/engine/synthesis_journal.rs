@@ -129,7 +129,7 @@ impl SynthesisJournal {
                 event.avg_relevance = (total + relevance) / event.hit_count as f32;
 
                 // 连续多次命中但相关性低 → 标记为低质量
-                if event.hit_count >= 3 && event.avg_relevance < 0.3 {
+                if event.hit_count >= 3 && event.avg_relevance < 0.3 && !event.low_quality {
                     event.low_quality = true;
                     let mut lq = self
                         .low_quality_count
@@ -139,6 +139,52 @@ impl SynthesisJournal {
                 }
                 return;
             }
+        }
+    }
+
+    /// 显式标记一条合成记忆为低质量（用户负面反馈驱动）
+    ///
+    /// 不伪造检索命中，直接置位 low_quality，避免污染检索统计。
+    pub fn mark_low_quality(&self, synthesis_id: &str) {
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
+        for event in events.iter_mut() {
+            if event.synthesis_id == synthesis_id {
+                if !event.low_quality {
+                    event.low_quality = true;
+                    changed = true;
+                }
+                break;
+            }
+        }
+        if changed {
+            let mut lq = self
+                .low_quality_count
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *lq += 1;
+        }
+    }
+
+    /// 显式撤销一条合成记忆的低质量标记（用户正面反馈驱动）
+    ///
+    /// 不伪造检索命中，直接清除 low_quality，避免污染检索统计。
+    pub fn clear_low_quality(&self, synthesis_id: &str) {
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut changed = false;
+        for event in events.iter_mut() {
+            if event.synthesis_id == synthesis_id && event.low_quality {
+                event.low_quality = false;
+                changed = true;
+                break;
+            }
+        }
+        if changed {
+            let mut lq = self
+                .low_quality_count
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *lq = lq.saturating_sub(1);
         }
     }
 
@@ -184,7 +230,19 @@ impl SynthesisJournal {
     /// 清除指定合成事件的跟踪记录（记忆被清理后调用）
     pub fn remove_event(&self, synthesis_id: &str) {
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let removed_low_quality = events
+            .iter()
+            .any(|e| e.synthesis_id == synthesis_id && e.low_quality);
         events.retain(|e| e.synthesis_id != synthesis_id);
+        // 口径一致：被删除的事件若为低质量，同步递减累计计数，
+        // 避免 remove_event/窗口淘汰后 low_quality_count 与窗口内容漂移。
+        if removed_low_quality {
+            let mut count = self
+                .low_quality_count
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *count = count.saturating_sub(1);
+        }
     }
 }
 
@@ -306,5 +364,52 @@ mod tests {
         assert_eq!(snapshot.total_synthesis, 2);
         assert_eq!(snapshot.recent_events.len(), 2);
         assert_eq!(snapshot.success_rate, 1.0);
+    }
+
+    /// 回归：连续低相关性命中触发 low_quality 标记后，
+    /// 低质量计数只应自增一次（旧实现：每命中一次都自增，产生重复计数）。
+    #[test]
+    fn test_low_quality_no_duplicate_counting() {
+        let journal = SynthesisJournal::new();
+
+        journal.record_synthesis(
+            "synth_bad".into(),
+            "recall",
+            "坎",
+            7,
+            vec!["m1".into()],
+            0.2,
+            1,
+        );
+
+        // 连续 6 次低相关性命中（超过触发阈值 3 次）
+        for _ in 0..6 {
+            journal.record_hit("synth_bad", 0.1);
+        }
+
+        let snapshot = journal.snapshot();
+        assert_eq!(
+            snapshot.low_quality_count, 1,
+            "低质量计数不应随后续命中重复累加"
+        );
+        assert_eq!(snapshot.total_synthesis, 1, "总合成次数不受命中影响");
+
+        let events = journal.get_events();
+        assert!(events[0].low_quality);
+        assert_eq!(events[0].hit_count, 6);
+
+        // 先经 record_hit 置为低质量后，再显式 mark_low_quality 不应重复计数
+        journal.mark_low_quality("synth_bad");
+        let snapshot2 = journal.snapshot();
+        assert_eq!(
+            snapshot2.low_quality_count, 1,
+            "显式标记已是低质量的条目不应重复计数"
+        );
+
+        // 撤销低质量后再标记，计数恢复后再 +1
+        journal.clear_low_quality("synth_bad");
+        assert_eq!(journal.snapshot().low_quality_count, 0);
+        journal.mark_low_quality("synth_bad");
+        assert_eq!(journal.snapshot().low_quality_count, 1);
     }
 }

@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.9.6';
+const APP_VERSION = '0.9.7';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -84,10 +84,17 @@ function syncSidecarApiBase() {
         const invokeFn = (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)
           || (window.__TAURI__ && window.__TAURI__.invoke);
         const instances = invokeFn ? await invokeFn('get_sidecar_status') : [];
-        const runningInstance = Array.isArray(instances)
-          ? instances.find(instance => instance && instance.running && instance.port)
-          : null;
-        if (runningInstance) {
+        const runningInstance = META_SIDECAR_PORT
+          ? null
+          : (Array.isArray(instances)
+            ? instances.find(instance => instance && instance.running && instance.port)
+            : null);
+        if (META_SIDECAR_PORT) {
+          API_BASE = `http://127.0.0.1:${META_SIDECAR_PORT}`;
+          window.API_BASE = API_BASE;
+          const apiDisplay = document.getElementById('api-base-display');
+          if (apiDisplay) apiDisplay.textContent = API_BASE;
+        } else if (runningInstance) {
           API_BASE = `http://127.0.0.1:${runningInstance.port}`;
           window.API_BASE = API_BASE;
           const apiDisplay = document.getElementById('api-base-display');
@@ -101,6 +108,9 @@ function syncSidecarApiBase() {
   }
   return _apiBaseSyncSingleton;
 }
+// 暴露给 IIFE 外部的首屏版本探针，避免跨作用域调用时报“未定义”。
+// 该桥接只暴露既有函数，不改变 API_BASE 同步逻辑和单飞语义。
+window.syncSidecarApiBase = syncSidecarApiBase;
 
 const DEFAULT_API_BASE = isTauriEnv
     ? (META_SIDECAR_PORT ? `http://127.0.0.1:${META_SIDECAR_PORT}` : `http://127.0.0.1:${STABLE_DEFAULT_PORT}`)
@@ -213,7 +223,7 @@ function setButtonState(btn, state, originalText) {
       btn.disabled = false;
       btn.style.opacity = '';
       btn.style.cursor = '';
-      btn.textContent = '✓ 成功';
+      btn.textContent = '成功';
       // v0.8.26 UX-01 修复：恢复时间从 1.5s 统一为 3s，与 testModel 边框恢复时间一致
       setTimeout(() => {
         btn.textContent = stateInfo.originalText;
@@ -223,7 +233,7 @@ function setButtonState(btn, state, originalText) {
       btn.disabled = false;
       btn.style.opacity = '';
       btn.style.cursor = '';
-      btn.textContent = '✗ 失败';
+      btn.textContent = '失败';
       // v0.8.26 UX-01 修复：恢复时间从 1.5s 统一为 3s，与 testModel 边框恢复时间一致
       setTimeout(() => {
         btn.textContent = stateInfo.originalText;
@@ -334,6 +344,10 @@ async function fetchWithTimeout(url, options = {}, timeout = 10000) {
   // 若 options.signal 已 abort，立即抛出 AbortError（避免无谓的网络请求）
   // 若 options.signal 在请求过程中 abort，同步触发 controller.abort()
   const externalSignal = options.signal;
+  // f2 修复：监听器保存为具名引用（onExternalAbort），便于在 finally 中显式
+  // removeEventListener。原匿名箭头函数 + { once: true } 仅在 abort 触发时移除，
+  // 对长生命周期的 externalSignal（页面级 AbortController）会不断累积监听器。
+  let onExternalAbort = null;
   if (externalSignal) {
     if (externalSignal.aborted) {
       clearTimeout(timer);
@@ -341,7 +355,8 @@ async function fetchWithTimeout(url, options = {}, timeout = 10000) {
       err.name = 'AbortError';
       throw err;
     }
-    externalSignal.addEventListener('abort', () => controller.abort(), { once: true });
+    onExternalAbort = () => controller.abort();
+    externalSignal.addEventListener('abort', onExternalAbort, { once: true });
   }
 
   // v0.8.2：增加进行中请求计数
@@ -399,6 +414,10 @@ async function fetchWithTimeout(url, options = {}, timeout = 10000) {
     throw e;
   } finally {
     clearTimeout(timer);
+    // f2 修复：请求结束后移除外部 abort 监听器，避免长生命周期 signal 累积
+    if (externalSignal && onExternalAbort) {
+      externalSignal.removeEventListener('abort', onExternalAbort);
+    }
     // v0.8.2：减少进行中请求计数
     pendingRequestCount--;
   }
@@ -459,11 +478,62 @@ function humanizeErrorDetail(errorDetail) {
   if (lower.includes('embedding') && (lower.includes('not ready') || lower.includes('loading'))) {
     return '本地模型尚未就绪，请稍后再试';
   }
+  // v0.9.6 P2：跨进程写守卫超时（原始串为中文技术描述）
+  if (raw.includes('写入锁') || lower.includes('write guard')) {
+    return '记忆库正被其他 LRC 窗口写入，请稍候重试';
+  }
+  // v0.9.6 P2：搜索被取消（客户端断开触发 408 search_cancelled）
+  if (lower.includes('search_cancelled') || lower.includes('enrich_cancelled')) {
+    return '搜索已取消，可换个关键词重试';
+  }
+  // v0.9.6 P2：搜索执行超时（15s 兜底触发 503 search_timeout）
+  if (lower.includes('search_timeout') || lower.includes('search_internal_error')) {
+    return '搜索耗时过长已中止，请缩小范围后重试';
+  }
   // 原始错误本身已经是中文或较短，直接透传
   return raw;
 }
 // 暴露到 window 供测试与后续调用点复用
 window.humanizeErrorDetail = humanizeErrorDetail;
+
+/**
+ * v0.8.x 回归修复（P1/P2）：可取消的退避等待。
+ * - P1：退避 Promise 正常完成时移除 abort 监听器，避免长生命周期
+ *   signal（页面级 AbortController）不断累积监听器导致内存泄漏。
+ * - P2：signal 已 aborted 时立即失败；并在 addEventListener 后复查一次，
+ *   消除"检查→注册监听器"窗口内被 abort 的竞态，避免退避仍完整跑完。
+ * 无 DOM 依赖的独立函数，便于在 Node 环境下做最小可执行测试。
+ * @param {number} ms - 退避毫秒数
+ * @param {AbortSignal|null|undefined} [signal] - 可选取消信号
+ * @returns {Promise<void>} 正常完成 resolve；被取消时 reject(AbortError)
+ */
+function waitForBackoff(ms, signal) {
+  if (signal && signal.aborted) {
+    // P2：signal 已在退避开始前被取消，直接失败，不再启动计时器
+    return Promise.reject(new DOMException('退避延迟被取消', 'AbortError'));
+  }
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const onAbort = () => {
+      if (timer) clearTimeout(timer);
+      // P1：取消路径也显式移除监听器，避免双路径残留
+      if (signal) signal.removeEventListener('abort', onAbort);
+      reject(new DOMException('退避延迟被取消', 'AbortError'));
+    };
+    timer = setTimeout(() => {
+      // P1：退避正常完成时移除 abort 监听器，避免长生命周期 signal 累积
+      if (signal) signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (signal) {
+      signal.addEventListener('abort', onAbort, { once: true });
+      // P2：注册后再复查一次，消除检查与注册之间的竞态窗口
+      if (signal.aborted) onAbort();
+    }
+  });
+}
+// 暴露到 window 供测试与退避逻辑复用
+window.waitForBackoff = waitForBackoff;
 
 async function handleHttpError(response, context = '操作', retryContext = null) {
   const status = response.status;
@@ -478,6 +548,10 @@ async function handleHttpError(response, context = '操作', retryContext = null
       errorDetail = `HTTP ${status}`;
     }
   }
+  // 后端可能返回对象等非字符串错误详情，统一转为字符串后再处理
+  if (errorDetail !== null && errorDetail !== undefined && typeof errorDetail !== 'string') {
+    errorDetail = String(errorDetail);
+  }
   // 限制错误详情长度，避免 Toast 过长
   if (errorDetail.length > 200) errorDetail = errorDetail.substring(0, 200) + '...';
 
@@ -490,7 +564,7 @@ async function handleHttpError(response, context = '操作', retryContext = null
     errorDetail.toLowerCase().includes(kw.toLowerCase())
   );
   if (isDiskSpaceError) {
-    showToast('⚠️ 磁盘空间不足，请清理磁盘后重试', 'error', 8000);
+    showToast('磁盘空间不足，请清理磁盘后重试', 'error', 8000);
     console.warn('[handleHttpError] 检测到磁盘空间不足错误:', errorDetail);
     return { action: 'cancel', status, errorDetail: '磁盘空间不足' };
   }
@@ -554,11 +628,19 @@ async function handleHttpError(response, context = '操作', retryContext = null
       if (signal) {
         try {
           await new Promise((resolve, reject) => {
-            const timer = setTimeout(resolve, backoff);
+            let timer = null;
             const onAbort = () => {
-              clearTimeout(timer);
+              if (timer) clearTimeout(timer);
+              // f2 修复：abort 触发时也显式移除监听器（避免双路径残留）
+              signal.removeEventListener('abort', onAbort);
               reject(new DOMException('退避延迟被取消', 'AbortError'));
             };
+            timer = setTimeout(() => {
+              // f2 修复：退避正常完成时移除 abort 监听器，避免长生命周期
+              // signal（页面级 AbortController）不断累积监听器
+              signal.removeEventListener('abort', onAbort);
+              resolve();
+            }, backoff);
             signal.addEventListener('abort', onAbort, { once: true });
           });
         } catch (e) {
@@ -630,26 +712,17 @@ async function handleHttpError(response, context = '操作', retryContext = null
     }
 
     // 支持 signal 取消退避（标签页切换）
+    // v0.8.x P1/P2 修复：复用 waitForBackoff 统一处理
+    //   监听器清理（正常完成时移除 abort 监听器）与已 aborted 竞态
     const signal = retryContext?.signal;
-    if (signal) {
-      try {
-        await new Promise((resolve, reject) => {
-          const timer = setTimeout(resolve, backoff);
-          const onAbort = () => {
-            clearTimeout(timer);
-            reject(new DOMException('退避延迟被取消', 'AbortError'));
-          };
-          signal.addEventListener('abort', onAbort, { once: true });
-        });
-      } catch (e) {
-        if (e.name === 'AbortError') {
-          console.log(`[handleHttpError] ${status} 退避延迟被取消，放弃重试`);
-          return { action: 'cancel', status, errorDetail };
-        }
-        throw e;
+    try {
+      await waitForBackoff(backoff, signal);
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        console.log(`[handleHttpError] ${status} 退避延迟被取消，放弃重试`);
+        return { action: 'cancel', status, errorDetail };
       }
-    } else {
-      await new Promise(r => setTimeout(r, backoff));
+      throw e;
     }
     return { action: 'retry', status, errorDetail };
   } else if (status === 429) {
@@ -666,6 +739,11 @@ async function handleHttpError(response, context = '操作', retryContext = null
     // 鉴权失败
     showToast(`${context}失败：权限不足，请检查 API 密钥配置`, 'error', 4000);
     return { action: 'cancel', status, errorDetail };
+  } else if (status === 408) {
+    // v0.9.6 P2：408 search_cancelled 是客户端主动断开触发的取消，
+    // 不是系统故障——静默返回，不弹红色 toast，避免"取消被当成报错"。
+    console.log(`[handleHttpError] 408 请求已取消（${context}），静默处理`);
+    return { action: 'cancel', status, errorDetail: 'search_cancelled' };
   } else {
     // 其他非 2xx 错误
     // P0-2：通过人话化映射层翻译技术术语，避免 raw errorDetail 直接上屏
@@ -710,12 +788,14 @@ const SidecarHealthMonitor = {
   _lockBusy: false,
   // v0.8.22 GAP-11：时间偏差警告标志（每次启动只提示一次）
   _timeSkewWarned: false,
+  _running: false,
 
   /**
    * 启动健康监测
    */
   start() {
-    if (this._pollTimer) return;
+    if (this._pollTimer || this._running) return;
+    this._running = true;
     // v0.8.19 P0-3 修复（GAP-P0-01）：初始不可达时立即显示 banner
     // 根因：_setReachable 的"状态未变直接返回"优化（第522行）导致初始 _isReachable=false 时，
     //   第一次健康检查失败调用 _setReachable(false) 时 wasReachable===reachable===false，
@@ -741,8 +821,11 @@ const SidecarHealthMonitor = {
       ? this._pollInterval
       : Math.min(this._pollInterval * Math.pow(2, this._backoffStep), this._MAX_BACKOFF);
     this._pollTimer = setTimeout(() => {
-      this.check();
-      this._scheduleNextCheck();
+      this._pollTimer = null;
+      if (!this._running) return;
+      this.check().finally(() => {
+        if (this._running) this._scheduleNextCheck();
+      });
     }, interval);
   },
 
@@ -750,6 +833,7 @@ const SidecarHealthMonitor = {
    * 停止健康监测
    */
   stop() {
+    this._running = false;
     if (this._pollTimer) {
       clearTimeout(this._pollTimer); // v0.8.13 E1: setInterval → setTimeout，需用 clearTimeout
       this._pollTimer = null;
@@ -805,9 +889,9 @@ const SidecarHealthMonitor = {
             this._broadcastSidecarStateChange(true);
           }
         } catch (jsonErr) {
-          // JSON 解析失败但 HTTP 200，视为就绪
-          this._sidecarStatus = 'running';
-          this._lockBusy = false;
+          // HTTP 200 但响应不是合法 JSON 时，不能伪装为健康状态。
+          console.error('[SidecarHealthMonitor] 健康响应解析失败:', jsonErr);
+          return this._handleCheckFailure();
         }
         // 可达：重置失败计数
         this._failCount = 0;
@@ -1017,7 +1101,7 @@ const SidecarHealthMonitor = {
         if (isIndexingHint) {
           const bannerText = banner.querySelector('.banner-text');
           if (bannerText) {
-            bannerText.textContent = '⏳ LRC 服务正在索引代码库，请稍候...';
+            bannerText.textContent = 'LRC 服务正在索引代码库，请稍候...';
           }
           // 索引期不禁用 API 按钮（服务实际在运行，只是响应慢）
           console.log('[LRC v' + APP_VERSION + ']Sidecar 索引期不可达，显示"索引中..."提示，保留 API 按钮可用');
@@ -1108,6 +1192,17 @@ function htmlescape(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+/**
+ * 截断文本为指定最大长度（超长追加省略号），用于列表摘要展示
+ * @param {string} text - 原始文本
+ * @param {number} max - 最大字符数
+ */
+function truncateText(text, max) {
+  const s = String(text == null ? '' : text);
+  if (s.length <= max) return s;
+  return s.slice(0, max) + '…';
 }
 
 /**
@@ -1385,7 +1480,7 @@ async function loadDashboard() {
     if (e.name === 'SidecarTimeoutError') {
       if (loading) loading.classList.add('hidden');
       if (error) {
-        error.innerHTML = '⏱️ 请求超时，请检查网络连接后重试<br>'
+        error.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">请求超时，请检查网络连接后重试<br>'
           + '<button data-action="manualRefreshDashboard" style="margin-top:8px;padding:6px 16px;background:#4a90d9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;">重试</button>';
         error.classList.add('show');
       }
@@ -1404,7 +1499,7 @@ async function loadDashboard() {
       if (_lockBusyCooldown) {
         console.log('[loadDashboard] lock_busy 冷却期内，跳过自动重试');
         if (error) {
-          error.innerHTML = '⏳ 后台合成中，请等待 <span id="lockbusy-countdown">30</span> 秒后自动重试...';
+          error.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">后台合成中，请等待 <span id="lockbusy-countdown">30</span> 秒后自动重试...';
           error.classList.add('show');
         }
         // 启动倒计时更新（如果尚未启动）
@@ -1428,7 +1523,7 @@ async function loadDashboard() {
         const retryDelay = 2000 * Math.pow(2, _dashboardRetryCount - 1); // 2s/4s/8s
         console.log('[loadDashboard] lock_busy（后台合成中，可能由 503 或 200+降级触发），' + retryDelay + 'ms 后自动重试 (' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')');
         if (error) {
-          error.innerHTML = '⏳ 记忆系统正在执行后台合成，数据稍后自动加载... <span style="opacity:0.7;font-size:0.9em">(' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')</span>';
+          error.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">记忆系统正在执行后台合成，数据稍后自动加载... <span style="opacity:0.7;font-size:0.9em">(' + _dashboardRetryCount + '/' + _DASHBOARD_MAX_RETRIES + ')</span>';
           error.classList.add('show');
         }
         _dashboardRetryTimer = setTimeout(() => {
@@ -1463,7 +1558,7 @@ async function loadDashboard() {
           console.log('[loadDashboard] lock_busy 冷却期结束，恢复自动重试');
         }, 30000);
         if (error) {
-          error.innerHTML = '⏳ 后台合成耗时较长，建议稍后手动刷新<br>'
+          error.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">后台合成耗时较长，建议稍后手动刷新<br>'
             + '<button id="btn-manual-refresh" data-action="manualRefreshDashboard" style="margin-top:8px;padding:6px 16px;background:#4a90d9;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;">立即刷新</button>'
             + '<button data-action="closeParentError" style="margin-top:8px;margin-left:8px;padding:6px 16px;background:#666;color:white;border:none;border-radius:4px;cursor:pointer;font-size:13px;">关闭</button>';
           error.classList.add('show');
@@ -1506,14 +1601,14 @@ async function loadDashboard() {
       // v0.8.15 P0-5 修复：sidecar 已知可达时（索引期），显示"索引中"提示而非"无法连接"
       // 避免与状态栏"运行中"矛盾
       if (sidecarKnownReachable) {
-        error.textContent = '⏳ LRC 服务正在索引代码库，数据稍后自动加载...';
+        error.textContent = 'LRC 服务正在索引代码库，数据稍后自动加载...';
       } else {
         // v0.8.44 GAP-L1-01 修复：仪表盘 API 全失败时添加重试按钮
         //   根因：审计报告指出仪表盘 API 全部失败时，error 遮罩无重试按钮，
         //         用户只能刷新页面，体验差。
         //   修复：添加"立即刷新"按钮，复用 manualRefreshDashboard 机制
         //   （manualRefreshDashboard 会重置计数器并重新加载仪表盘）
-        error.innerHTML = '⚠️ ' + htmlescape(e.message)
+        error.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">' + htmlescape(e.message)
           + '<br><button id="btn-dashboard-retry" data-action="manualRefreshDashboard" '
           + 'style="margin-top:8px;padding:6px 16px;background:#4a90d9;color:white;border:none;'
           + 'border-radius:4px;cursor:pointer;font-size:13px;">立即刷新</button>'
@@ -1522,11 +1617,8 @@ async function loadDashboard() {
           + 'border:none;border-radius:4px;cursor:pointer;font-size:13px;">关闭</button>';
       }
       error.classList.add('show');
-      // v0.9.0 修复：全部失败时更新统计卡片为"不可用"，避免残留 "--"
-      ['stat-total', 'stat-active', 'stat-crystallized', 'stat-today'].forEach(function(id) {
-        var el = document.getElementById(id);
-        if (el) el.textContent = '不可用';
-      });
+      // v0.9.7 首页重构：仪表盘统计卡片组（stat-total/stat-today 等）已移出首屏，
+      // 价值卡 M1 有独立的"暂时读不到数据 + 重试"态，此处不再回写占位
     }
     // v0.8.12：仅在 sidecar 确实不可达时才更新状态栏为"已停止"
     // 避免 sidecar 已启动但数据加载失败时覆盖"运行中"状态
@@ -1735,25 +1827,12 @@ function renderDashboard(system, detailed, dao) {
     const badge = document.querySelector('.dao-degraded-badge');
     if (badge) badge.remove();
   }
-  // --- v0.5.4 P1-7 修复：用户友好的记忆统计卡片 ---
-  const memStats = system?.memory_stats || {};
+  // --- v0.5.4 P1-7 修复：用户友好的记忆统计（供降级判断与系统信息使用） ---
   // v0.9.0 修复：dao_metrics 降级路径字段层级对齐
   // （system 端点失败时 dao 是 {ok, data:{...}, raw:{...}}，需取 dao.data 而非 dao 本身）
   const daoMetrics = system?.dao_metrics || (dao && dao.data) || {};
-
-  // 记忆总数 = 活跃 + 结晶 + 归档
-  const totalMemories = memStats.total_memories
-    || (daoMetrics.active_memories || 0) + (daoMetrics.crystallized_memories || 0) + (daoMetrics.archived_memories || 0);
-
-  const statTotal = $('stat-total');
-  const statActive = $('stat-active');
-  const statCrystallized = $('stat-crystallized');
-  const statToday = $('stat-today');
-  if (statTotal) statTotal.textContent = num(totalMemories);
-  if (statActive) statActive.textContent = num(memStats.active_memories || daoMetrics.active_memories);
-  if (statCrystallized) statCrystallized.textContent = num(memStats.synthesis_memories || daoMetrics.crystallized_memories);
-  // 今日新增：使用编码次数作为近似值（无专门的"今日"字段）
-  if (statToday) statToday.textContent = num(daoMetrics.encodings_total || 0);
+  // v0.9.7 首页重构：仪表盘统计卡片组（stat-total / stat-today / stat-active /
+  // stat-crystallized）已从 DOM 移除，对应回写逻辑一并清理，避免残留无效引用
 
   // --- v0.5.4 P1-7 修复：系统信息卡片（用户友好） ---
   const sysHealthStatus = $('sys-health-status');
@@ -1769,32 +1848,36 @@ function renderDashboard(system, detailed, dao) {
   const daoScore = health.dao ? (daoMetrics.dao_isomorphism_score ?? 0) : null;
   if (sysHealthStatus) {
     if (daoScore === null) {
-      sysHealthStatus.innerHTML = '<span class="badge warning">⚠ 部分数据暂不可用</span>';
+      sysHealthStatus.innerHTML = '<span class="badge warning"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">部分数据暂不可用</span>';
     } else if (daoScore >= 0.5) {
-      sysHealthStatus.innerHTML = '<span class="badge healthy">✓ 正常运行</span>';
+      sysHealthStatus.innerHTML = '<span class="badge healthy"><img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">正常运行</span>';
     } else if (daoScore >= 0.3) {
-      sysHealthStatus.innerHTML = '<span class="badge warning">⚠ 需关注</span>';
+      sysHealthStatus.innerHTML = '<span class="badge warning"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">需关注</span>';
     } else {
-      sysHealthStatus.innerHTML = '<span class="badge critical">⚠ 待优化</span>';
+      sysHealthStatus.innerHTML = '<span class="badge critical"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">待优化</span>';
     }
   }
 
   // v0.9.0 修复：数据目录改为 v0.8.0+ 全局模式真实路径（曾硬编码旧版 .loong-recall/data/）
-  if (sysDataDir) sysDataDir.textContent = '~/.loong-recall/global/data/';
-  if (sysDataDirSettings) sysDataDirSettings.textContent = '~/.loong-recall/global/data/';
+  // v0.9.6 修复：优先使用后端返回的真实 data_directory（项目指纹/全局/自定义模式一致），
+  //             后端未返回时回退全局模式路径（仅展示兜底）
+  if (sysDataDir) sysDataDir.textContent = system?.data_directory || '~/.loong-recall/global/data/';
+  if (sysDataDirSettings) sysDataDirSettings.textContent = system?.data_directory || '~/.loong-recall/global/data/';
   if (sysMode) sysMode.innerHTML = statusBadge(system?.system_mode || 'unknown');
 
   // --- v0.5.4 P1-7 修复：并行加载最近记忆、项目分布、活动日志 ---
   loadRecentMemories();
   loadMemoryStats();
   loadAuditLog();
+  loadAssociationStats();
 }
 
 // ============================================================
 // v0.5.4 P1-7 新增：加载最近记忆（用户友好）
 // ============================================================
 async function loadRecentMemories() {
-  const container = $('recent-memories-list');
+  // v0.9.7 首页重构：「最近记忆」卡已并入 M2，容器缺席属预期，用原生查询避免告警
+  const container = document.getElementById('recent-memories-list');
   if (!container) return;
   container.innerHTML = '<div class="text-center text-dim" style="padding:20px;">加载中...</div>';
 
@@ -1808,9 +1891,10 @@ async function loadRecentMemories() {
       try {
         const errBody = await res.json();
         if (errBody && errBody.lock_busy === true) {
+          renderOverviewUnavailable('记忆正在后台整理中，已有数据仍可查看。');
           container.innerHTML = `
             <div class="empty-state">
-              <div class="empty-icon">⏳</div>
+              <div class="empty-icon"><img src="/assets/icons/icon-clock.svg" width="32" height="32" alt=""></div>
               <div class="empty-text">后台合成中</div>
               <div class="empty-hint">记忆系统正在执行后台合成，最近记忆稍后自动加载</div>
             </div>`;
@@ -1824,7 +1908,7 @@ async function loadRecentMemories() {
     if (data.lock_busy === true) {
       container.innerHTML = `
         <div class="empty-state">
-          <div class="empty-icon">⏳</div>
+          <div class="empty-icon"><img src="/assets/icons/icon-clock.svg" width="32" height="32" alt=""></div>
           <div class="empty-text">后台合成中</div>
           <div class="empty-hint">记忆系统正在执行后台合成，最近记忆稍后自动加载</div>
         </div>`;
@@ -1835,7 +1919,7 @@ async function loadRecentMemories() {
     if (memories.length === 0) {
       container.innerHTML = `
         <div class="empty-state">
-          <div class="empty-icon">📝</div>
+          <div class="empty-icon"><img src="/assets/icons/icon-memory.svg" width="32" height="32" alt=""></div>
           <div class="empty-text">暂无记忆</div>
           <div class="empty-hint">使用上方的"5分钟快速体验"向导写入第一条记忆</div>
         </div>`;
@@ -1877,7 +1961,10 @@ async function loadRecentMemories() {
       const projectTooltip = projectPath ? ` title="${htmlescape(projectPath)}"` : '';
       const importance = m.importance || 0;
       // 重要性星级（1-5星，基于 1-10 分）
-      const stars = '★'.repeat(Math.ceil(importance / 2)) + '☆'.repeat(5 - Math.ceil(importance / 2));
+      // f1 修复：对 importance 做 [1,10]→[1,5] 收敛钳制，避免异常数据（如
+      // importance>10 或负值）导致 repeat 负长度触发 RangeError 整页崩溃。
+      const filledStars = Math.max(0, Math.min(5, Math.ceil(importance / 2)));
+      const stars = '<img class="inline-icon" src="/assets/icons/icon-star.svg" width="12" height="12" alt="">'.repeat(filledStars) + '<img class="inline-icon" src="/assets/icons/icon-star-empty.svg" width="12" height="12" alt="">'.repeat(5 - filledStars);
       return `
         <div class="recent-memory-item">
           <div class="recent-memory-header">
@@ -1886,7 +1973,7 @@ async function loadRecentMemories() {
           </div>
           <div class="recent-memory-content">${htmlescape(m.content_preview)}</div>
           <div class="recent-memory-meta">
-            <span class="recent-memory-project"${projectTooltip}>📂 ${htmlescape(project)}</span>
+            <span class="recent-memory-project"${projectTooltip}><img class="inline-icon" src="/assets/icons/icon-folder.svg" width="14" height="14" alt="">${htmlescape(project)}</span>
             <span class="recent-memory-importance" title="重要性 ${importance}/10">${stars}</span>
           </div>
         </div>`;
@@ -1902,14 +1989,15 @@ async function loadRecentMemories() {
     if (isLockBusy) {
       container.innerHTML = `
         <div class="empty-state">
-          <div class="empty-icon">⏳</div>
+          <div class="empty-icon"><img src="/assets/icons/icon-clock.svg" width="32" height="32" alt=""></div>
           <div class="empty-text">后台合成中</div>
           <div class="empty-hint">记忆系统正在执行后台合成，最近记忆稍后自动加载</div>
         </div>`;
     } else {
+      renderOverviewUnavailable('记忆库统计暂时不可用，请稍后重试。');
       container.innerHTML = `
         <div class="empty-state">
-          <div class="empty-icon">⚠️</div>
+          <div class="empty-icon"><img src="/assets/icons/icon-warning.svg" width="32" height="32" alt=""></div>
           <div class="empty-text">加载失败</div>
           <div class="empty-hint">${htmlescape(e.message)}</div>
         </div>`;
@@ -1920,13 +2008,70 @@ async function loadRecentMemories() {
 // ============================================================
 // v0.5.4 P1-7 新增：加载记忆统计（项目分布）
 // ============================================================
-async function loadMemoryStats() {
+const MEMORY_CATEGORY_LABELS = {
+  fact: { label: '事实', desc: '客观稳定的信息', icon: 'icon-memory.svg' },
+  preference: { label: '偏好', desc: '习惯与倾向', icon: 'icon-user.svg' },
+  decision: { label: '决策', desc: '已做的选择与原因', icon: 'icon-check.svg' },
+  code_context: { label: '代码上下文', desc: '从代码库提取的结构', icon: 'icon-document.svg' },
+  conversation: { label: '对话要点', desc: '对话中提炼的信息', icon: 'icon-users.svg' },
+  synthesis: { label: '结晶知识', desc: '多条记忆归纳的知识', icon: 'icon-crystallization.svg' },
+};
+
+function renderMemoryOverview(data) {
+  const byType = data.by_type || {};
+  const total = Number(data.total_memories || 0);
+  const crystallized = Number(byType.synthesis || 0);
+  const recentAdded = Number(data.recent_added || 0);
+  const summary = $('memory-summary-main');
+  const detail = $('memory-summary-detail');
+  const status = $('memory-overview-status');
+  const grid = $('memory-category-grid');
+
+  if (summary) summary.textContent = total
+    ? `你的记忆库有 ${num(total)} 条记忆，其中 ${num(crystallized)} 条已经结晶。`
+    : '你的记忆库还没有内容。';
+  if (detail) detail.textContent = total
+    ? `近 7 天新增 ${num(recentAdded)} 条。系统会把相关记忆整理为更容易调用的结晶知识。`
+    : '记录一条知识后，它会出现在这里，并逐步形成可复用的结晶知识。';
+  if (status) status.textContent = '数据已更新';
+  if (!grid) return;
+
+  const entries = Object.entries(MEMORY_CATEGORY_LABELS);
+  grid.innerHTML = entries.map(([type, meta]) => `
+    <button class="memory-category-card" data-action="filterMemoriesByType" data-type="${type}" title="查看${meta.label}">
+      <img src="/assets/icons/${meta.icon}" alt="" width="18" height="18">
+      <span class="memory-category-name">${meta.label}</span>
+      <strong class="memory-category-count">${num(byType[type] || 0)}</strong>
+      <span class="memory-category-desc">${meta.desc}</span>
+    </button>
+  `).join('');
+  bindAllActions();
+}
+
+function renderOverviewUnavailable(message) {
+  const status = $('memory-overview-status');
+  const summary = $('memory-summary-main');
+  if (status) status.textContent = '暂时无法读取';
+  if (summary) summary.textContent = message || '记忆库数据暂时不可用，请稍后重试。';
+}
+
+async function loadMemoryStats(retryLeft = 8) {
+  // v0.9.7 首页重构：原「项目分布」卡（#project-distribution）已并入 M4b「谁在用」，
+  // 容器不存在时本函数仍负责记忆总览与系统信息，不再提前 return
   const container = $('project-distribution');
+  const setContainer = (html) => { if (container) container.innerHTML = html; };
   const sysStorageSize = $('sys-storage-size');
   const sysTypeCount = $('sys-type-count');
   const sysProjectCount = $('sys-project-count');
-  if (!container) return;
-  container.innerHTML = '<div class="text-center text-dim" style="padding:20px;">加载中...</div>';
+  setContainer('<div class="text-center text-dim" style="padding:20px;">加载中...</div>');
+
+  // v0.9.6 G3：冷启动降级重试——sidecar 持锁加载记忆库时返回 lock_busy，
+  // 每 2s 重试一次（最多 8 次/16s 窗口，实测 dev 库锁释放约 8s），
+  // 避免首屏长期停留在"后台整理中"。与 loadHomeData 保持一致口径。
+  const scheduleRetry = () => {
+    if (retryLeft <= 0) return;
+    setTimeout(() => loadMemoryStats(retryLeft - 1), 2000);
+  };
 
   try {
     const res = await fetchWithTimeout(API_BASE + '/v1/memories/stats');
@@ -1935,12 +2080,13 @@ async function loadMemoryStats() {
       try {
         const errBody = await res.json();
         if (errBody && errBody.lock_busy === true) {
-          container.innerHTML = `
+          setContainer(`
             <div class="empty-state">
-              <div class="empty-icon">⏳</div>
+              <div class="empty-icon"><img src="/assets/icons/icon-clock.svg" width="32" height="32" alt=""></div>
               <div class="empty-text">后台合成中</div>
               <div class="empty-hint">记忆系统正在执行后台合成，项目分布稍后自动加载</div>
-            </div>`;
+            </div>`);
+          scheduleRetry();
           return;
         }
       } catch (_) { /* 解析失败，降级到默认错误处理 */ }
@@ -1949,14 +2095,23 @@ async function loadMemoryStats() {
     const data = await res.json();
     // v0.9.1 修复：后端 lock_busy 时返回 200 + 降级数据（非 503），成功路径也需识别
     if (data.lock_busy === true) {
-      container.innerHTML = `
+      renderOverviewUnavailable('记忆正在后台整理中，已有数据仍可查看。');
+      setContainer(`
         <div class="empty-state">
-          <div class="empty-icon">⏳</div>
+          <div class="empty-icon"><img src="/assets/icons/icon-clock.svg" width="32" height="32" alt=""></div>
           <div class="empty-text">后台合成中</div>
           <div class="empty-hint">记忆系统正在执行后台合成，项目分布稍后自动加载</div>
-        </div>`;
+        </div>`);
+      scheduleRetry();
       return;
     }
+
+    // v0.9.7 M5 整合：记忆总览区（你的记忆库/记忆分类）与 M1/M4a 重复已删除；
+    // renderMemoryOverview 各容器均有 null 守卫，此处调用对缺席容器为无害空操作
+    renderMemoryOverview(data);
+
+    // v0.9.7 首页重构：近 7 天新增改由 M1 价值卡 / M4c 成长趋势直接读取 statsData.recent_added，
+    // 不再回写已删除的 stat-today
 
     // 更新系统信息卡片
     if (sysStorageSize) {
@@ -1972,24 +2127,26 @@ async function loadMemoryStats() {
     if (sysTypeCount) sysTypeCount.textContent = Object.keys(data.by_type || {}).length;
     if (sysProjectCount) sysProjectCount.textContent = Object.keys(data.by_project || {}).length;
 
-    // 渲染项目分布
+    // 渲染项目分布（v0.9.7：容器已并入 M4b 时不再渲染，保留函数供其他入口复用）
     const byProject = data.by_project || {};
     const projectEntries = Object.entries(byProject).sort((a, b) => b[1] - a[1]);
 
+    if (!container) return;
+
     if (projectEntries.length === 0) {
-      container.innerHTML = `
+      setContainer(`
         <div class="empty-state">
-          <div class="empty-icon">📂</div>
+          <div class="empty-icon"><img src="/assets/icons/icon-folder.svg" width="32" height="32" alt=""></div>
           <div class="empty-text">暂无项目数据</div>
           <div class="empty-hint">写入记忆后将自动统计项目分布</div>
-        </div>`;
+        </div>`);
       return;
     }
 
     const total = projectEntries.reduce((sum, [_, count]) => sum + count, 0);
     const maxCount = projectEntries[0][1];
 
-    container.innerHTML = projectEntries.slice(0, 8).map(([project, count]) => {
+    setContainer(projectEntries.slice(0, 8).map(([project, count]) => {
       const displayName = getProjectDisplayName(project);
       const percentage = total > 0 ? (count / total * 100).toFixed(1) : '0.0';
       const barWidth = maxCount > 0 ? (count / maxCount * 100).toFixed(1) : '0.0';
@@ -1999,14 +2156,14 @@ async function loadMemoryStats() {
       return `
         <div class="project-dist-item">
           <div class="project-dist-header">
-            <span class="project-dist-name"${tooltipAttr}>📂 ${htmlescape(displayName)}</span>
+            <span class="project-dist-name"${tooltipAttr}><img class="inline-icon" src="/assets/icons/icon-folder.svg" width="14" height="14" alt="">${htmlescape(displayName)}</span>
             <span class="project-dist-count">${num(count)} 条 (${percentage}%)</span>
           </div>
           <div class="progress-bar" style="margin-top:4px;">
             <div class="progress-fill jade" style="width:${barWidth}%"></div>
           </div>
         </div>`;
-    }).join('');
+    }).join(''));
 
     if (projectEntries.length > 8) {
       container.innerHTML += `<div class="text-center text-dim" style="margin-top:8px;font-size:11px;">还有 ${projectEntries.length - 8} 个项目未显示</div>`;
@@ -2019,20 +2176,21 @@ async function loadMemoryStats() {
       e.message.includes('Service Unavailable')
     );
     if (isLockBusy) {
-      container.innerHTML = `
+      setContainer(`
         <div class="empty-state">
-          <div class="empty-icon">⏳</div>
+          <div class="empty-icon"><img src="/assets/icons/icon-clock.svg" width="32" height="32" alt=""></div>
           <div class="empty-text">后台合成中</div>
           <div class="empty-hint">记忆系统正在执行后台合成，项目分布稍后自动加载</div>
-        </div>`;
+        </div>`);
     } else {
-      container.innerHTML = `
+      setContainer(`
         <div class="empty-state">
-          <div class="empty-icon">⚠️</div>
+          <div class="empty-icon"><img src="/assets/icons/icon-warning.svg" width="32" height="32" alt=""></div>
           <div class="empty-text">加载失败</div>
           <div class="empty-hint">${htmlescape(e.message)}</div>
           <button class="btn btn-secondary btn-sm" style="margin-top:8px;" data-action="loadMemoryStats">重试</button>
-        </div>`;
+        </div>`);
+      if (typeof bindAllActions === 'function') bindAllActions();
     }
   }
 }
@@ -2041,8 +2199,51 @@ async function loadMemoryStats() {
 // v0.5.4 P1-7 新增：切换标签页（供快速操作区域使用）
 // ============================================================
 function switchToTab(tabName) {
+  // 快捷入口不依赖已收敛的顶部导航，统一走主导航切换逻辑。
+  if (typeof switchTab === 'function') {
+    switchTab(tabName);
+    return;
+  }
   const btn = document.querySelector(`.navbar-nav button[data-tab="${tabName}"]`);
   if (btn) btn.click();
+}
+
+// 从首页分类卡进入记忆搜索，并复用现有筛选器状态
+function filterMemoriesByType(type) {
+  const filterTag = document.querySelector(`.memory-filter-tag[data-filter-type="${type}"]`);
+  if (filterTag) {
+    filterTag.click();
+  } else {
+    memorySearchFilters.type = type;
+    debouncedMemorySearch();
+  }
+  switchTab('memory-search');
+}
+
+// v0.9.6 G6 修复：关闭仪表盘错误提示（此前按钮未定义导致失效）
+function closeParentError() {
+  const error = document.getElementById('dashboard-error');
+  if (error) {
+    error.classList.remove('show');
+    error.innerHTML = '';
+  }
+}
+
+// v0.9.6 G6 修复：首页关联卡点击 → 打开记忆详情（而非把 uuid 当关键词搜索）
+function openHomeMemory(memoryId) {
+  switchTab('memory-search');
+  const id = String(memoryId);
+  const memory = (window._homeAssociationMemories || [])
+    .find(m => String(m.id) === id);
+  if (memory) {
+    openMemoryDetail(memory);
+    return;
+  }
+  if (typeof showToast === 'function') {
+    showToast('未找到该记忆，请使用搜索查找', 'warning');
+  }
+  const input = document.getElementById('memory-search-input');
+  if (input) setTimeout(() => input.focus(), 60);
 }
 
 // ============================================================
@@ -2058,7 +2259,7 @@ async function loadAuditLog() {
       try {
         const errBody = await res.json();
         if (errBody && errBody.lock_busy === true) {
-          tbody.innerHTML = '<tr><td colspan="3" class="text-center text-dim">⏳ 后台合成中，日志稍后自动加载</td></tr>';
+          tbody.innerHTML = '<tr><td colspan="3" class="text-center text-dim"><img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">后台合成中，日志稍后自动加载</td></tr>';
           return;
         }
       } catch (_) { /* 解析失败，降级到默认错误处理 */ }
@@ -2067,7 +2268,7 @@ async function loadAuditLog() {
     const data = await res.json();
     // v0.9.1 修复：后端 lock_busy 时返回 200 + 降级数据（非 503），成功路径也需识别
     if (data.lock_busy === true) {
-      tbody.innerHTML = '<tr><td colspan="3" class="text-center text-dim">⏳ 后台合成中，日志稍后自动加载</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="3" class="text-center text-dim"><img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">后台合成中，日志稍后自动加载</td></tr>';
       return;
     }
     const events = data.events || [];
@@ -2089,6 +2290,7 @@ async function loadAuditLog() {
       regulator_unfrozen: '调节器解冻', trust_anchor_created: '锚点创建',
       trust_anchor_published: '锚点发布', dual_confirmation_requested: '双人确认请求',
       dual_confirmation_granted: '双人确认通过', dual_confirmation_denied: '双人确认拒绝',
+      retrieval_executed: '联想检索',
     };
 
     tbody.innerHTML = events.map(e => {
@@ -2110,7 +2312,7 @@ async function loadAuditLog() {
       e.message.includes('Service Unavailable')
     );
     tbody.innerHTML = isLockBusy
-      ? '<tr><td colspan="3" class="text-center text-dim">⏳ 后台合成中，日志稍后自动加载</td></tr>'
+      ? '<tr><td colspan="3" class="text-center text-dim"><img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">后台合成中，日志稍后自动加载</td></tr>'
       : '<tr><td colspan="3" class="text-center text-dim">审计日志加载失败</td></tr>';
   }
 }
@@ -2298,6 +2500,8 @@ function postMessageToParent(type, extra = {}, timeoutMs = 30000, externalSignal
       const cmdName = POST_MESSAGE_TO_INVOKE[type];
       if (invokeFn && cmdName) {
         let timeoutId = null;
+        // f2 修复：abort 监听器引用提升到 try/catch 之外，保证 catch 路径也可清理
+        let onExternalAbort = null;
         try {
           // v0.8.9 修复：Tauri 分支加 setTimeout 硬超时
           // 之前 timeoutMs 参数在 Tauri 分支被完全忽略（只有 iframe 模式有超时）
@@ -2313,20 +2517,30 @@ function postMessageToParent(type, extra = {}, timeoutMs = 30000, externalSignal
 
           // 构建竞争 Promise 列表：invoke + 超时 + abort（如有）
           const racers = [invokePromise, timeoutPromise];
+          // f2 修复：abort 监听器保存为具名引用，Promise.race 结束后显式移除，
+          // 避免每次调用都在长生命周期 externalSignal 上累积匿名监听器
           if (externalSignal) {
             // v0.8.6：abort Promise，监听外部取消信号
             const abortPromise = new Promise((_, rejectAbort) => {
-              externalSignal.addEventListener('abort', () => {
+              onExternalAbort = () => {
                 rejectAbort(new DOMException('Aborted', 'AbortError'));
-              }, { once: true });
+              };
+              externalSignal.addEventListener('abort', onExternalAbort, { once: true });
             });
             racers.push(abortPromise);
           }
           const result = await Promise.race(racers);
           clearTimeout(timeoutId);
+          if (onExternalAbort) {
+            externalSignal.removeEventListener('abort', onExternalAbort);
+          }
           resolve(result);
         } catch (e) {
           clearTimeout(timeoutId);
+          // f2 修复：catch 路径同样清理外部 abort 监听器（Promise.race 已结束）
+          if (onExternalAbort) {
+            externalSignal.removeEventListener('abort', onExternalAbort);
+          }
           if (e && e.name === 'AbortError') {
             reject(new DOMException('用户取消操作', 'AbortError'));
           } else {
@@ -2348,6 +2562,11 @@ function postMessageToParent(type, extra = {}, timeoutMs = 30000, externalSignal
     const reqId = ++postMessageReqId;
     const timer = setTimeout(() => {
       if (pendingPostMessageRequests.has(reqId)) {
+        const pendingReq = pendingPostMessageRequests.get(reqId);
+        // f2 修复：超时路径同样移除 abort 监听器，避免残留
+        if (pendingReq && pendingReq.abortHandler && pendingReq.externalSignal) {
+          pendingReq.externalSignal.removeEventListener('abort', pendingReq.abortHandler);
+        }
         pendingPostMessageRequests.delete(reqId);
         reject(new Error('请求超时，请稍后重试'));
       }
@@ -2366,7 +2585,9 @@ function postMessageToParent(type, extra = {}, timeoutMs = 30000, externalSignal
       externalSignal.addEventListener('abort', abortHandler, { once: true });
     }
 
-    pendingPostMessageRequests.set(reqId, { resolve, reject, timer });
+    // f2 修复：把 abortHandler 与 externalSignal 一并存入 pending，
+    // 供消息回复/超时/发送失败三个完成路径统一清理监听器
+    pendingPostMessageRequests.set(reqId, { resolve, reject, timer, abortHandler, externalSignal });
 
     try {
       window.parent.postMessage({
@@ -2376,6 +2597,11 @@ function postMessageToParent(type, extra = {}, timeoutMs = 30000, externalSignal
       }, '*');
     } catch (e) {
       clearTimeout(timer);
+      const pendingReq = pendingPostMessageRequests.get(reqId);
+      // f2 修复：发送失败路径移除 abort 监听器
+      if (pendingReq && pendingReq.abortHandler && pendingReq.externalSignal) {
+        pendingReq.externalSignal.removeEventListener('abort', pendingReq.abortHandler);
+      }
       pendingPostMessageRequests.delete(reqId);
       reject(new Error('发送请求失败: ' + e.message));
     }
@@ -2396,6 +2622,10 @@ window.addEventListener('message', (event) => {
   if (!pending) return;
 
   clearTimeout(pending.timer);
+  // f2 修复：回复到达时移除 abort 监听器，避免残留
+  if (pending.abortHandler && pending.externalSignal) {
+    pending.externalSignal.removeEventListener('abort', pending.abortHandler);
+  }
   pendingPostMessageRequests.delete(reqId);
 
   if (data.success) {
@@ -2462,6 +2692,15 @@ function closeStartServiceModal() {
   if (startServiceAbortController) {
     startServiceAbortController.abort();
     startServiceAbortController = null;
+    // v0.9.6 P1 修复：仅前端 abort 无法中断后端 spawn_and_wait——
+    // sidecar 会在后台继续启动并绑定端口，导致"取消→再启动→端口占用"死循环。
+    // 必须调用后端 cancel_start_sidecar，让健康检查循环下一迭代中断并回收子进程。
+    const cancelInvokeFn = (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke)
+      || (window.__TAURI__ && window.__TAURI__.invoke);
+    if (cancelInvokeFn) {
+      invokeWithTimeout(cancelInvokeFn, 'cancel_start_sidecar', undefined, 3000)
+        .catch(() => { /* 取消指令失败不阻塞关闭流程，后端仍有 120s 超时兜底 */ });
+    }
     // v0.8.13 A3: 取消/关闭时重置 sidecar 状态，避免误触发"索引完成"刷新
     if (typeof SidecarHealthMonitor !== 'undefined' && SidecarHealthMonitor) {
       SidecarHealthMonitor._sidecarStatus = 'unknown';
@@ -2901,14 +3140,19 @@ document.addEventListener('DOMContentLoaded', () => {
 // ============================================================
 // 船长日志生成
 // ============================================================
+// v0.9.6 修复：函数级防重复锁（长耗时入口不依赖 bindAllActions 的 500ms inFlight）
+let _captainLogBusy = false;
 async function generateCaptainLog() {
+  // v0.9.6 修复：函数级防重复，长耗时期间重复触发直接忽略
+  if (_captainLogBusy) return;
+  _captainLogBusy = true;
   const btn = $('btn-generate-log');
   const maxLockBusyRetries = 3;
   const lockBusyRetryDelayMs = 1000;
   const loading = $('log-loading');
   const error = $('log-error');
   const result = $('log-result');
-  if (!btn || !result) return;
+  if (!btn || !result) { _captainLogBusy = false; return; }
 
   btn.disabled = true;
   loading.classList.remove('hidden');
@@ -3112,6 +3356,7 @@ async function generateCaptainLog() {
   } finally {
     if (btn) btn.disabled = false;
     if (loading) loading.classList.add('hidden');
+    _captainLogBusy = false;
   }
 }
 
@@ -3129,19 +3374,10 @@ let trustAbortController = null;
 
 // v0.8.22 修复：将缓存的信任中心数据应用到 UI
 function _applyTrustCenterData(data) {
-  const feedback = data.feedback_stats || {};
-  const fbEnabled = feedback.implicit_feedback_enabled;
   const fbText = $('feedback-status-text');
   const fbCard = $('feedback-status-card');
   if (fbText) {
-    if (fbEnabled) {
-      fbText.innerHTML = '状态：<span class="badge healthy">已启用</span>';
-      fbText.innerHTML += '<br>正面反馈率：' + pct(feedback.positive_ratio || 0);
-      fbText.innerHTML += '<br>总反馈数：' + num(feedback.total_feedback || 0);
-    } else {
-      fbText.innerHTML = '状态：<span class="badge info">未启用</span>';
-      fbText.innerHTML += '<br>隐式反馈当前未激活，系统使用默认排序策略。';
-    }
+    fbText.textContent = '本地工具不会收集用户行为或评价埋点。';
   }
   const auditText = $('audit-integrity-text');
   const auditCard = $('audit-integrity-card');
@@ -3182,21 +3418,12 @@ async function loadTrustCenter() {
     if (!res.ok) throw new Error('API 不可达');
     const data = await res.json();
 
-    // 隐式反馈状态
-    const feedback = data.feedback_stats || {};
-    const fbEnabled = feedback.implicit_feedback_enabled;
+    // 本地数据边界：不读取用户反馈埋点状态。
     const fbText = $('feedback-status-text');
     const fbCard = $('feedback-status-card');
 
     if (fbText) {
-      if (fbEnabled) {
-        fbText.innerHTML = '状态：<span class="badge healthy">已启用</span>';
-        fbText.innerHTML += '<br>正面反馈率：' + pct(feedback.positive_ratio || 0);
-        fbText.innerHTML += '<br>总反馈数：' + num(feedback.total_feedback || 0);
-      } else {
-        fbText.innerHTML = '状态：<span class="badge info">未启用</span>';
-        fbText.innerHTML += '<br>隐式反馈当前未激活，系统使用默认排序策略。';
-      }
+      fbText.textContent = '本地工具不会收集用户行为或评价埋点。';
     }
 
     // 审计日志完整性
@@ -3210,12 +3437,16 @@ async function loadTrustCenter() {
           const auditData = await auditRes.json();
           auditText.innerHTML = '状态：<span class="badge healthy">完整</span>';
           auditText.innerHTML += '<br>总事件数：' + num(auditData.total_all || 0);
-          auditText.innerHTML += '<br>哈希链：已验证 ✓';
+          auditText.innerHTML += '<br>哈希链：已验证 <img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">';
           if (auditCard) auditCard.style.borderLeftColor = 'var(--jade)';
         } else {
           throw new Error('审计 API 不可用');
         }
-      } catch (_) {
+      } catch (auditError) {
+        // 标签切换触发的操作级取消不是审计服务故障，不应覆盖当前页面状态。
+        if (auditError.name === 'AbortError' && currentSignal.aborted) {
+          return;
+        }
         auditText.innerHTML = '状态：<span class="badge warning">不可用</span>';
         auditText.innerHTML += '<br>审计 API 端点未响应';
         if (auditCard) auditCard.style.borderLeftColor = 'var(--gold)';
@@ -3227,7 +3458,7 @@ async function loadTrustCenter() {
 
   } catch (e) {
     // v0.8.23 修复（OBS-01）：AbortError 静默处理，不显示错误 UI
-    if (e.name === 'AbortError') {
+    if (e.name === 'AbortError' && typeof currentSignal !== 'undefined' && currentSignal?.aborted) {
       console.log('[loadTrustCenter] 请求被取消（标签页切换）');
       return;
     }
@@ -3263,10 +3494,17 @@ async function loadTrustCenter() {
 // ============================================================
 
 /** 验证数据存储位置 */
+// v0.9.6 修复：函数级防重复锁（长耗时入口不依赖 bindAllActions 的 500ms inFlight）
+let _verifyDataLocationBusy = false;
 async function verifyDataLocation() {
+  if (_verifyDataLocationBusy) return;
+  _verifyDataLocationBusy = true;
   const result = $('data-location-result');
   const loading = $('data-location-loading');
-  if (!result) return;
+  // v0.9.6 修复：操作期间禁用按钮，失败/超时后恢复
+  const btn = document.querySelector('[data-action="verifyDataLocation"]');
+  if (!result) { _verifyDataLocationBusy = false; return; }
+  if (btn) btn.disabled = true;
   if (loading) loading.classList.remove('hidden');
   result.classList.remove('show');
 
@@ -3283,32 +3521,41 @@ async function verifyDataLocation() {
     result.innerHTML = `
       <div class="result-row"><span class="result-label">数据目录</span><span class="result-value">${htmlescape(data.data_directory)}</span></div>
       <div class="result-row"><span class="result-label">记忆文件</span><span class="result-value">${htmlescape(data.memory_file)}</span></div>
-      <div class="result-row"><span class="result-label">文件存在</span><span class="result-value ${validCls}">${data.file_exists ? '✅ 是' : '❌ 否'}</span></div>
+      <div class="result-row"><span class="result-label">文件存在</span><span class="result-value ${validCls}">${data.file_exists ? '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt=""> 是' : '<img class="inline-icon" src="/assets/icons/icon-error-circle.svg" width="14" height="14" alt=""> 否'}</span></div>
       <div class="result-row"><span class="result-label">文件大小</span><span class="result-value">${htmlescape(data.file_size_human)} (${num(data.file_size_bytes)} 字节)</span></div>
       <div class="result-row"><span class="result-label">记忆总数</span><span class="result-value ${validCls}">${num(data.memory_count)} 条</span></div>
       <div class="result-row"><span class="result-label">最后备份</span><span class="result-value">${htmlescape(backupTimeStr)}</span></div>
       <div class="result-row"><span class="result-label">存储后端</span><span class="result-value">${htmlescape(data.storage_backend)}</span></div>
-      <div class="result-row"><span class="result-label">完全本地</span><span class="result-value valid">✅ 是</span></div>
+      <div class="result-row"><span class="result-label">完全本地</span><span class="result-value valid"><img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">是</span></div>
       <div class="result-row" style="margin-top: 8px;">
         <button class="btn btn-outline btn-sm" data-action="handleOpenDataDirClick">
-          📁 打开数据文件夹
+          <img class="inline-icon" src="/assets/icons/icon-folder.svg" width="14" height="14" alt="">打开数据文件夹
         </button>
       </div>
     `;
     result.classList.add('show');
   } catch (e) {
-    result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)">⚠️ ' + htmlescape(e.message) + '</span></div>';
+    result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">' + htmlescape(e.message) + '</span></div>';
     result.classList.add('show');
   } finally {
     if (loading) loading.classList.add('hidden');
+    if (btn) btn.disabled = false;
+    _verifyDataLocationBusy = false;
   }
 }
 
 /** 验证网络活动 */
+// v0.9.6 修复：函数级防重复锁（长耗时入口不依赖 bindAllActions 的 500ms inFlight）
+let _verifyNetworkAuditBusy = false;
 async function verifyNetworkAudit() {
+  if (_verifyNetworkAuditBusy) return;
+  _verifyNetworkAuditBusy = true;
   const result = $('network-audit-result');
   const loading = $('network-audit-loading');
-  if (!result) return;
+  // v0.9.6 修复：操作期间禁用按钮，失败/超时后恢复
+  const btn = document.querySelector('[data-action="verifyNetworkAudit"]');
+  if (!result) { _verifyNetworkAuditBusy = false; return; }
+  if (btn) btn.disabled = true;
   if (loading) loading.classList.remove('hidden');
   result.classList.remove('show');
 
@@ -3320,8 +3567,8 @@ async function verifyNetworkAudit() {
     let html = `
       <div class="result-row"><span class="result-label">网络请求总数</span><span class="result-value">${num(data.total_network_requests)}</span></div>
       <div class="result-row"><span class="result-label">网络策略</span><span class="result-value">${htmlescape(data.network_policy)}</span></div>
-      <div class="result-row"><span class="result-label">无遥测</span><span class="result-value valid">✅ ${data.no_telemetry ? '确认' : '未能确认'}</span></div>
-      <div class="result-row"><span class="result-label">无分析</span><span class="result-value valid">✅ ${data.no_analytics ? '确认' : '未能确认'}</span></div>
+      <div class="result-row"><span class="result-label">无遥测</span><span class="result-value valid"><img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">${data.no_telemetry ? '确认' : '未能确认'}</span></div>
+      <div class="result-row"><span class="result-label">无分析</span><span class="result-value valid"><img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">${data.no_analytics ? '确认' : '未能确认'}</span></div>
     `;
 
     // v0.9.0 修复：requests 空值保护（与 runPrivacyCheck 一致）
@@ -3330,25 +3577,34 @@ async function verifyNetworkAudit() {
       html += data.requests.map(r => '<div>' + htmlescape(r) + '</div>').join('');
       html += '</span></div>';
     } else {
-      html += '<div class="result-row"><span class="result-label">网络活动</span><span class="result-value valid">✅ 无网络请求记录</span></div>';
+      html += '<div class="result-row"><span class="result-label">网络活动</span><span class="result-value valid"><img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">无网络请求记录</span></div>';
     }
 
     result.innerHTML = html;
     result.classList.add('show');
   } catch (e) {
-    result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)">⚠️ ' + htmlescape(e.message) + '</span></div>';
+    result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">' + htmlescape(e.message) + '</span></div>';
     result.classList.add('show');
   } finally {
     if (loading) loading.classList.add('hidden');
+    if (btn) btn.disabled = false;
+    _verifyNetworkAuditBusy = false;
   }
 }
 
 /** 验证审计完整性 */
+// v0.9.6 修复：函数级防重复锁（长耗时入口不依赖 bindAllActions 的 500ms inFlight）
+let _verifyAuditIntegrityBusy = false;
 async function verifyAuditIntegrity() {
+  if (_verifyAuditIntegrityBusy) return;
+  _verifyAuditIntegrityBusy = true;
   const result = $('audit-integrity-result');
   const loading = $('audit-integrity-loading');
   const auditCard = $('audit-integrity-card');
-  if (!result) return;
+  // v0.9.6 修复：操作期间禁用按钮，失败/超时后恢复
+  const btn = document.querySelector('[data-action="verifyAuditIntegrity"]');
+  if (!result) { _verifyAuditIntegrityBusy = false; return; }
+  if (btn) btn.disabled = true;
   if (loading) loading.classList.remove('hidden');
   result.classList.remove('show');
 
@@ -3359,7 +3615,7 @@ async function verifyAuditIntegrity() {
 
     // v0.9.1 修复：后端 lock_busy 时返回 200 降级数据（非 503），成功路径需识别
     if (data.lock_busy === true) {
-      result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--ink)">⏳ 后台合成中，完整性验证稍后自动加载</span></div>';
+      result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--ink)"><img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">后台合成中，完整性验证稍后自动加载</span></div>';
       result.classList.add('show');
       const auditText = $('audit-integrity-text');
       if (auditText) {
@@ -3386,7 +3642,7 @@ async function verifyAuditIntegrity() {
       <div class="result-row"><span class="result-label">锚点数量</span><span class="result-value">${num(data.anchor_count)}</span></div>
       <div class="result-row"><span class="result-label">锚点链状态</span><span class="result-value ${anchorCls}">${htmlescape(data.anchor_chain_status)}</span></div>
       <div class="result-row"><span class="result-label">最后锚点时间</span><span class="result-value">${htmlescape(lastAnchor)}</span></div>
-      <div class="result-row"><span class="result-label">防篡改状态</span><span class="result-value ${tamperCls}">${data.tamper_proof ? '✅ 通过' : '❌ 失败'}</span></div>
+      <div class="result-row"><span class="result-label">防篡改状态</span><span class="result-value ${tamperCls}">${data.tamper_proof ? '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt=""> 通过' : '<img class="inline-icon" src="/assets/icons/icon-error-circle.svg" width="14" height="14" alt=""> 失败'}</span></div>
     `;
     result.classList.add('show');
 
@@ -3395,18 +3651,20 @@ async function verifyAuditIntegrity() {
     if (auditText) {
       auditText.innerHTML = '状态：<span class="badge ' + (data.tamper_proof ? 'healthy' : 'critical') + '">' + (data.tamper_proof ? '完整' : '异常') + '</span>';
       auditText.innerHTML += '<br>总事件数：' + num(data.total_events);
-      auditText.innerHTML += '<br>哈希链：' + (data.hash_chain_valid ? '已验证 ✓' : '断裂 ✗');
-      auditText.innerHTML += '<br>锚点链：' + (data.anchor_chain_valid ? '已验证 ✓' : '异常 ✗');
+      auditText.innerHTML += '<br>哈希链：' + (data.hash_chain_valid ? '已验证 <img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">' : '断裂 <img class="inline-icon" src="/assets/icons/icon-error-circle.svg" width="14" height="14" alt="">');
+      auditText.innerHTML += '<br>锚点链：' + (data.anchor_chain_valid ? '已验证 <img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">' : '异常 <img class="inline-icon" src="/assets/icons/icon-error-circle.svg" width="14" height="14" alt="">');
     }
   } catch (e) {
     // v0.8.2：sidecar 不可达时给出明确提示，不产生 console error
     const msg = (e.name === 'SidecarUnreachableError' || e.name === 'SidecarTimeoutError')
-      ? '⚠️ LRC 服务未运行，请先启动服务后再验证完整性'
-      : '⚠️ ' + htmlescape(e.message);
+      ? '<img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">LRC 服务未运行，请先启动服务后再验证完整性'
+      : '<img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">' + htmlescape(e.message);
     result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)">' + msg + '</span></div>';
     result.classList.add('show');
   } finally {
     if (loading) loading.classList.add('hidden');
+    if (btn) btn.disabled = false;
+    _verifyAuditIntegrityBusy = false;
   }
 }
 
@@ -3437,7 +3695,7 @@ async function wizardStep1Search() {
     const data = await res.json();
 
     if (data.results && data.results.length > 0) {
-      let html = '✅ 搜索成功！在 ' + num(data.total_indexed) + ' 个代码片段中找到 ' + num(data.returned) + ' 条结果：<br>';
+      let html = '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">搜索成功！在 ' + num(data.total_indexed) + ' 个代码片段中找到 ' + num(data.returned) + ' 条结果：<br>';
       for (const r of data.results) {
         const codeContent = r.content || '';
         const codePreview = codeContent.length > 80 ? codeContent.slice(0, 80) + '...' : codeContent;
@@ -3450,12 +3708,12 @@ async function wizardStep1Search() {
       }
       result.innerHTML = html;
     } else {
-      result.innerHTML = '✅ 搜索完成，在 ' + num(data.total_indexed) + ' 个代码片段中未找到匹配结果。<br>' +
+      result.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">搜索完成，在 ' + num(data.total_indexed) + ' 个代码片段中未找到匹配结果。<br>' +
         '<span style="color:#888">提示：尝试搜索 "struct"、"fn"、"impl" 或具体函数名</span>';
     }
     if (step) step.classList.add('completed');
   } catch (e) {
-    result.innerHTML = '⚠️ ' + htmlescape(e.message);
+    result.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">' + htmlescape(e.message);
   }
 }
 
@@ -3492,10 +3750,10 @@ async function wizardStep2Write() {
     if (!res.ok) throw new Error('写入失败，请确认服务已启动');
     const data = await res.json();
 
-    result.innerHTML = '✅ 写入成功！已存储 ' + htmlescape(String(data.stored)) + ' 条记忆，当前共 ' + num(data.total_memories) + ' 条记忆';
+    result.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">写入成功！已存储 ' + htmlescape(String(data.stored)) + ' 条记忆，当前共 ' + num(data.total_memories) + ' 条记忆';
     if (step) step.classList.add('completed');
   } catch (e) {
-    result.innerHTML = '⚠️ ' + htmlescape(e.message);
+    result.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">' + htmlescape(e.message);
   }
 }
 
@@ -3530,16 +3788,16 @@ async function wizardStep3Search() {
     if (data.memories && data.memories.length > 0) {
       const items = data.memories.slice(0, 3).map(m => {
         const memContent = m.content || '';
-        return '📝 ' + htmlescape(memContent.length > 60 ? memContent.slice(0, 60) + '...' : memContent) +
+        return '<img class="inline-icon" src="/assets/icons/icon-memory.svg" width="14" height="14" alt="">' + htmlescape(memContent.length > 60 ? memContent.slice(0, 60) + '...' : memContent) +
         ' (' + ((m.score || 0) * 100).toFixed(0) + '%)'
       }).join('<br>');
-      result.innerHTML = '✅ 检索成功！找到 ' + htmlescape(String(data.total)) + ' 条相关记忆：<br>' + items;
+      result.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">检索成功！找到 ' + htmlescape(String(data.total)) + ' 条相关记忆：<br>' + items;
     } else {
-      result.innerHTML = '✅ 检索完成，但未找到相关记忆。请先完成步骤二写入记忆。';
+      result.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">检索完成，但未找到相关记忆。请先完成步骤二写入记忆。';
     }
     if (step) step.classList.add('completed');
   } catch (e) {
-    result.innerHTML = '⚠️ ' + htmlescape(e.message);
+    result.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">' + htmlescape(e.message);
   }
 }
 
@@ -4139,6 +4397,10 @@ async function loadProjectInfo() {
 async function backupMemories() {
   // v0.9.0 修复 H-1：HTML 中该按钮无 id（仅 data-action），原 $('btn-backup-memories') 恒为 null，
   // 导致防重复提交是死代码。改为查询所有触发按钮并统一禁用。
+  // v0.9.x 修复：backupSignal 此前未声明（引用未定义变量），改为函数内 AbortController，
+  // 并将 signal 接入全部四个备份请求，保证中断/重试时整体取消。
+  const backupController = new AbortController();
+  const backupSignal = backupController.signal;
   const btns = document.querySelectorAll('[data-action="backupMemories"]');
   // v0.8.0：同时更新设置页 backup-result 和信任中心 trust-backup-result
   const resultEls = [$('backup-result'), $('trust-backup-result')].filter(Boolean);
@@ -4151,7 +4413,7 @@ async function backupMemories() {
   };
   btns.forEach(b => b.disabled = true);
   if (resultEls.length > 0) {
-    updateResult('⏳ 正在准备备份文件...');
+    updateResult('正在准备备份文件...');
   }
 
   try {
@@ -4160,15 +4422,17 @@ async function backupMemories() {
       fetchWithTimeout(API_BASE + '/v1/memories/list', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ limit: 10000 })
+        body: JSON.stringify({ limit: 10000 }),
+        signal: backupSignal
       }, 60000),
-      fetchWithTimeout(API_BASE + '/v1/code/search?query=&top_k=10000', {}, 60000),
+      fetchWithTimeout(API_BASE + '/v1/code/search?query=&top_k=100', { signal: backupSignal }, 60000),
       fetchWithTimeout(API_BASE + '/v1/memories/archive', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({})
+        body: JSON.stringify({}),
+        signal: backupSignal
       }, 60000),
-      fetchWithTimeout(API_BASE + '/api/project/info'),
+      fetchWithTimeout(API_BASE + '/api/project/info', { signal: backupSignal }, 30000),
     ]);
 
     // 构建导出数据
@@ -4198,7 +4462,7 @@ async function backupMemories() {
       const memoriesData = await memoriesRes.value.json();
       // v0.9.1 修复：后端 lock_busy 时返回 200 + 降级数据（非 503），避免导出空备份
       if (memoriesData.lock_busy === true) {
-        updateResult('⏳ 后台合成中，请稍后再导出备份', 'form-result form-result-warning');
+        updateResult('后台合成中，请稍后再导出备份', 'form-result form-result-warning');
         showToast('记忆系统正在后台合成，请稍后再导出备份', 'warning', 5000);
         return;
       }
@@ -4236,14 +4500,14 @@ async function backupMemories() {
     if (archiveRes.status === 'rejected') failedParts.push('归档数据不可用');
     if (projectRes.status === 'rejected') failedParts.push('项目信息不可用');
 
-    let successMsg = '✅ 备份已下载！文件包含 ' +
+    let successMsg = '备份已下载！文件包含 ' +
       (Array.isArray(exportData.memories) ? exportData.memories.length : 0) + ' 条记忆';
     if (failedParts.length > 0) {
       successMsg += '（部分数据不可用：' + failedParts.join('，') + '）';
       // v0.8.25 UX-05 修复：部分失败时同时显示 Toast 通知，确保用户感知
       showToast('备份部分完成：' + failedParts.join('，'), 'warning', 5000);
     } else {
-      showToast('✅ 备份完成，共 ' + (Array.isArray(exportData.memories) ? exportData.memories.length : 0) + ' 条记忆', 'success', 3000);
+      showToast('备份完成，共 ' + (Array.isArray(exportData.memories) ? exportData.memories.length : 0) + ' 条记忆', 'success', 3000);
     }
 
     if (resultEls.length > 0) {
@@ -4251,7 +4515,7 @@ async function backupMemories() {
     }
   } catch (e) {
     if (resultEls.length > 0) {
-      updateResult('⚠️ 备份失败: ' + htmlescape(e.message), 'form-result form-result-error');
+      updateResult('备份失败: ' + htmlescape(e.message), 'form-result form-result-error');
     }
   } finally {
     btns.forEach(b => b.disabled = false);
@@ -4275,7 +4539,7 @@ async function importMemories(event) {
     });
   };
   if (resultEls.length > 0) {
-    updateResult('⏳ 正在验证并导入记忆数据...');
+    updateResult('正在验证并导入记忆数据...');
   }
 
   try {
@@ -4372,7 +4636,7 @@ async function importMemories(event) {
           imported++;
           // 每 50 条更新一次进度
           if (imported % 50 === 0 && resultEls.length > 0) {
-            updateResult('⏳ 导入中... ' + imported + '/' + memoryCount + ' 条');
+            updateResult('导入中... ' + imported + '/' + memoryCount + ' 条');
           }
         } catch (e) {
           failed++;
@@ -4380,14 +4644,14 @@ async function importMemories(event) {
         }
       }
       if (resultEls.length > 0) {
-        const msg = '✅ 导入完成！成功 ' + imported + ' 条' +
+        const msg = '导入完成！成功 ' + imported + ' 条' +
                     (failed > 0 ? '，失败 ' + failed + ' 条' : '');
         updateResult(msg, 'form-result form-result-success');
       }
     }
   } catch (e) {
     if (resultEls.length > 0) {
-      updateResult('⚠️ 导入失败: ' + htmlescape(e.message), 'form-result form-result-error');
+      updateResult('导入失败: ' + htmlescape(e.message), 'form-result form-result-error');
     }
   } finally {
     // 清除文件选择以便重复选择同一文件
@@ -4399,34 +4663,39 @@ async function importMemories(event) {
 // v0.8.0 "归一"：数据迁移与合并（调用 POST /v1/migrate）
 // 扫描所有已知老路径，按 memory.id 去重合并到 global 目录
 // ============================================================
+// v0.9.6 修复：函数级防重复锁（长耗时入口不依赖 bindAllActions 的 500ms inFlight）
+let _migrateDataBusy = false;
 async function migrateData() {
+  // v0.9.6 修复：函数级防重复锁（长耗时入口不依赖 bindAllActions 的 500ms inFlight）
+  if (_migrateDataBusy) return;
+  _migrateDataBusy = true;
   const result = $('migration-result');
-  if (!result) return;
-  // v0.8.3 Step 4 批次 5：confirm→await showConfirm（修复 G001-G003）
-  const migrateConfirmed = await showConfirm(
-    '即将执行数据迁移与合并：\n\n' +
-    '  1. 扫描所有已知历史数据路径\n' +
-    '  2. 按 memory.id 去重合并到全局目录\n' +
-    '  3. 原文件将重命名为 .bak 备份\n\n' +
-    '此操作不可逆（但原文件会保留 .bak 备份）。确认继续？',
-    '确认迁移'
-  );
-  if (!migrateConfirmed) {
-    result.textContent = '已取消迁移';
-    result.className = 'form-result';
-    result.style.display = '';
-    return;
-  }
-
-  // v0.9.0 修复 M-1：迁移期间禁用按钮，防止重复触发 POST /v1/migrate
+  // v0.9.6 修复：确认弹窗阶段即禁用按钮，避免连点弹出多个确认框
   const migrateBtn = document.querySelector('[data-action="migrateData"]');
+  if (!result) { _migrateDataBusy = false; return; }
   if (migrateBtn) migrateBtn.disabled = true;
 
-  result.style.display = '';
-  result.textContent = '⏳ 正在扫描并迁移数据...';
-  result.className = 'form-result';
-
   try {
+    // v0.8.3 Step 4 批次 5：confirm→await showConfirm（修复 G001-G003）
+    const migrateConfirmed = await showConfirm(
+      '即将执行数据迁移与合并：\n\n' +
+      '  1. 扫描所有已知历史数据路径\n' +
+      '  2. 按 memory.id 去重合并到全局目录\n' +
+      '  3. 原文件将重命名为 .bak 备份\n\n' +
+      '此操作不可逆（但原文件会保留 .bak 备份）。确认继续？',
+      '确认迁移'
+    );
+    if (!migrateConfirmed) {
+      result.textContent = '已取消迁移';
+      result.className = 'form-result';
+      result.style.display = '';
+      return;
+    }
+
+    result.style.display = '';
+    result.textContent = '正在扫描并迁移数据...';
+    result.className = 'form-result';
+
     const res = await fetchWithTimeout(API_BASE + '/v1/migrate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -4446,7 +4715,7 @@ async function migrateData() {
     const backups = data.files_backed_up || 0;
 
     result.innerHTML =
-      '✅ 迁移完成！<br>' +
+      '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">迁移完成！<br>' +
       '<small style="display:block; margin-top:6px;">' +
       '  扫描源：' + sources + ' 处<br>' +
       '  发现记忆：' + totalFound + ' 条<br>' +
@@ -4460,11 +4729,12 @@ async function migrateData() {
       setTimeout(verifyDataLocation, 500);
     }
   } catch (e) {
-    result.textContent = '⚠️ 迁移失败: ' + htmlescape(e.message);
+    result.textContent = '迁移失败: ' + htmlescape(e.message);
     result.className = 'form-result form-result-error';
   } finally {
-    // v0.9.0 修复 M-1：无论成功/失败都恢复迁移按钮
+    // v0.9.0 修复 M-1 / v0.9.6 修复：无论成功/失败/取消都恢复迁移按钮与锁
     if (migrateBtn) migrateBtn.disabled = false;
+    _migrateDataBusy = false;
   }
 }
 
@@ -4472,16 +4742,19 @@ async function migrateData() {
 // v0.8.0 "归一"：手动创建备份（调用 POST /v1/backup）
 // 将当前记忆库复制到 ~/.loong-recall/backups/ 目录
 // ============================================================
+// v0.9.6 修复：函数级防重复锁（长耗时入口不依赖 bindAllActions 的 500ms inFlight）
+let _createBackupBusy = false;
 async function createBackup() {
+  if (_createBackupBusy) return;
+  _createBackupBusy = true;
   const result = $('backup-result-trust');
-  if (!result) return;
-
   // v0.9.0 修复 L-1：备份期间禁用按钮，防止重复触发 POST /v1/backup
   const backupBtn = document.querySelector('[data-action="createBackup"]');
+  if (!result) { _createBackupBusy = false; return; }
   if (backupBtn) backupBtn.disabled = true;
 
   result.style.display = '';
-  result.textContent = '⏳ 正在创建备份...';
+  result.textContent = '正在创建备份...';
   result.className = 'form-result';
 
   try {
@@ -4497,7 +4770,7 @@ async function createBackup() {
     }
 
     result.innerHTML =
-      '✅ 备份成功！<br>' +
+      '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">备份成功！<br>' +
       '<small style="display:block; margin-top:6px;">' +
       '  记忆数：' + (data.memory_count || 0) + ' 条<br>' +
       '  文件大小：' + (data.backup_size || 0) + ' 字节<br>' +
@@ -4511,11 +4784,12 @@ async function createBackup() {
       setTimeout(verifyDataLocation, 500);
     }
   } catch (e) {
-    result.textContent = '⚠️ 备份失败: ' + htmlescape(e.message);
+    result.textContent = '备份失败: ' + htmlescape(e.message);
     result.className = 'form-result form-result-error';
   } finally {
-    // v0.9.0 修复 L-1：无论成功/失败都恢复备份按钮
+    // v0.9.0 修复 L-1 / v0.9.6 修复：无论成功/失败都恢复备份按钮与锁
     if (backupBtn) backupBtn.disabled = false;
+    _createBackupBusy = false;
   }
 }
 
@@ -4523,10 +4797,17 @@ async function createBackup() {
 // v0.8.0 "归一"：数据操作日志（调用 GET /v1/data-logs）
 // 显示最近 10 条数据操作记录
 // ============================================================
+// v0.9.6 修复：函数级防重复锁（长耗时入口不依赖 bindAllActions 的 500ms inFlight）
+let _loadDataLogsBusy = false;
 async function loadDataLogs() {
+  if (_loadDataLogsBusy) return;
+  _loadDataLogsBusy = true;
   const result = $('data-logs-result');
   const loading = $('data-logs-loading');
-  if (!result) return;
+  // v0.9.6 修复：操作期间禁用按钮，失败/超时后恢复
+  const logsBtn = document.querySelector('[data-action="loadDataLogs"]');
+  if (!result) { _loadDataLogsBusy = false; return; }
+  if (logsBtn) logsBtn.disabled = true;
   if (loading) loading.classList.remove('hidden');
   result.classList.remove('show');
 
@@ -4561,10 +4842,12 @@ async function loadDataLogs() {
     result.classList.add('show');
   } catch (e) {
     // v0.8.43 修复：添加重试按钮（GAP-L6-03 P3）
-    result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)">⚠️ ' + htmlescape(e.message) + '</span></div><div class="result-row"><button class="btn btn-primary btn-sm" data-action="loadDataLogs" style="margin-top:4px">重试</button></div>';
+    result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">' + htmlescape(e.message) + '</span></div><div class="result-row"><button class="btn btn-primary btn-sm" data-action="loadDataLogs" style="margin-top:4px">重试</button></div>';
     result.classList.add('show');
   } finally {
     if (loading) loading.classList.add('hidden');
+    if (logsBtn) logsBtn.disabled = false;
+    _loadDataLogsBusy = false;
   }
 }
 
@@ -4626,11 +4909,11 @@ async function loadRulesStatus() {
       renderRulesStatus(result, statusList);
     } else {
       // 非 Tauri 环境不支持
-      result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)">⚠️ 规则状态查询仅在桌面端可用</span></div>';
+      result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">规则状态查询仅在桌面端可用</span></div>';
     }
     result.classList.add('show');
   } catch (e) {
-    result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)">⚠️ ' + htmlescape(e.message || String(e)) + '</span></div>';
+    result.innerHTML = '<div class="result-row"><span class="result-label" style="color:var(--cinnabar)"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">' + htmlescape(e.message || String(e)) + '</span></div>';
     result.classList.add('show');
   } finally {
     if (loading) loading.classList.add('hidden');
@@ -4682,7 +4965,7 @@ function renderRulesStatus(container, statusList) {
         '<span class="result-label" style="font-weight:600;">' + htmlescape(name) + '</span>' +
         '<span class="result-value" style="color:' + statusColor + ';white-space:nowrap;">' + statusBadge + '</span>' +
       '</div>' +
-      '<div class="result-label text-sm text-dim" style="font-size:11px;word-break:break-all;white-space:normal;line-height:1.5;padding-left:0;" title="' + htmlescape(fullPath) + '">📄 ' + htmlescape(fullPath) + '</div>' +
+      '<div class="result-label text-sm text-dim" style="font-size:11px;word-break:break-all;white-space:normal;line-height:1.5;padding-left:0;" title="' + htmlescape(fullPath) + '"><img class="inline-icon" src="/assets/icons/icon-document.svg" width="14" height="14" alt="">' + htmlescape(fullPath) + '</div>' +
       '</div>';
   });
 
@@ -4735,7 +5018,9 @@ async function loadBenchmarks() {
   const summaryBar = $('benchmark-summary-bar');
   if (!container) return;
   try {
-    const resp = await fetchWithTimeout(API_BASE + '/v1/benchmarks/report');
+    // v0.9.6 修复：基准报告为冷启动重端点（首次运行全套基准 ~10s+，之后走缓存）。
+    // 默认 10s 超时预算会在冷启动时误报超时，给该端点单独放宽到 30s。
+    const resp = await fetchWithTimeout(API_BASE + '/v1/benchmarks/report', {}, 30000);
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
 
@@ -4819,7 +5104,7 @@ function renderBenchmarkLayer(idx) {
     '<p class="layer-desc">' + htmlescape(layer.description) + '</p>';
   for (const test of layer.tests) {
     const statusClass = test.status === 'PASS' ? 'pass' : 'fail';
-    const statusIcon = test.status === 'PASS' ? '✓' : '✗';
+    const statusIcon = test.status === 'PASS' ? '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">' : '<img class="inline-icon" src="/assets/icons/icon-error-circle.svg" width="14" height="14" alt="">';
     html += '<div class="benchmark-test">' +
       '<div class="test-status ' + statusClass + '">' + statusIcon + '</div>' +
       '<div class="test-info">' +
@@ -4858,7 +5143,7 @@ function copyReproCmd() {
         const btn = document.querySelector('.copy-btn');
         if (!btn) return;
         const original = btn.textContent;
-        btn.textContent = '✓ 已复制';
+        btn.textContent = '已复制';
         btn.style.background = '#2a5a3a';
         setTimeout(() => {
             btn.textContent = original;
@@ -5094,7 +5379,7 @@ function showConfigSection(configured, type, model) {
     content.innerHTML =
       '<p><strong>提供商:</strong> ' + htmlescape(type) + '</p>' +
       '<p><strong>模型:</strong> ' + htmlescape(model || '--') + '</p>' +
-      '<p style="color: var(--jade); font-size: 13px; margin-top: 8px;">✅ LLM 查询翻译已启用，搜索时会自动将自然语言翻译为精准关键词。</p>';
+      '<p style="color: var(--jade); font-size: 13px; margin-top: 8px;"><img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">LLM 查询翻译已启用，搜索时会自动将自然语言翻译为精准关键词。</p>';
   } else {
     section.style.display = 'none';
   }
@@ -5157,7 +5442,7 @@ async function saveLlmConfig() {
   if (!resultEl) return;
   resultEl.style.display = '';
   resultEl.className = 'form-result';
-  resultEl.textContent = '⏳ 正在保存...';
+  resultEl.textContent = '正在保存...';
   if (btnSave) btnSave.disabled = true;
 
   try {
@@ -5189,7 +5474,7 @@ async function saveLlmConfig() {
     const data = await resp.json();
     if (data.success) {
       resultEl.className = 'form-result success';
-      resultEl.textContent = '✅ ' + data.message + '。配置已保存并立即生效，无需重启。';
+      resultEl.textContent = '' + data.message + '。配置已保存并立即生效，无需重启。';
       // 更新状态徽章
       const providerName = LLM_PROVIDERS[provider]?.name || provider;
       updateLlmStatusBadge(true, providerName);
@@ -5201,8 +5486,8 @@ async function saveLlmConfig() {
   } catch (e) {
     // v0.8.2：sidecar 不可达时给出明确提示
     const msg = (e.name === 'SidecarUnreachableError' || e.name === 'SidecarTimeoutError')
-      ? '❌ LRC 服务未运行，请先启动服务'
-      : '❌ ' + e.message;
+      ? 'LRC 服务未运行，请先启动服务'
+      : e.message;
     resultEl.className = 'form-result error';
     resultEl.textContent = msg;
   } finally {
@@ -5211,61 +5496,102 @@ async function saveLlmConfig() {
 }
 
 /**
- * v0.8.2：异步确认对话框（增强版）
+ * v0.9.x：统一弹窗队列（confirm / prompt / info / note 共用一套队列）
  *
- * v0.8.1 基础上新增：
- *   - data-autotest 属性，便于自动化测试脚本识别按钮
- *   - ESC 键关闭（对应审计 G012）
- *   - 焦点自动聚焦到确认按钮（对应审计 G013 焦点陷阱前置准备）
- *   - 超时自动取消（30 秒，避免测试卡死）
+ * 此前实现缺陷（本次统一修复）：
+ *   - showConfirm 使用独立 confirmModalQueue，而 showPrompt / showLocalNoteForm
+ *     直接操作 #confirm-modal DOM 而不入队；当 confirm 正在显示时调用 showPrompt，
+ *     prompt 会覆盖正在等待的 confirm 内容，导致 confirm 的 Promise 悬挂；
+ *     反之 confirm 渲染时也会覆盖 prompt 的输入框，导致 prompt Promise 永久 pending。
+ *   - showInfoModal 使用独立 #info-panel，与 confirm/prompt 交错时视觉叠加，
+ *     且旧的 onEsc / onClose 监听器未及时移除，存在监听器泄漏。
  *
- * v0.8.3 Step 7 新增：队列机制（修复 N03）
- *   - 同时调用 showConfirm 两次时，第二次排队等待第一次完成
- *   - 队列上限 5 个，超过时拒绝新调用（返回 false）
- *   - 避免单例 modal 文案被覆盖导致第一个 Promise 永不 resolve
+ * 本次统一：
+ *   - 所有弹窗任务进入同一队列 modalQueue，同一时刻只渲染一个任务，
+ *     任务 resolve 后才处理下一个，互不覆盖 DOM。
+ *   - 每个任务都有明确结束路径：按钮 / ESC / 遮罩 / 超时（confirm 默认 60s），
+ *     不会因交错调用而永久 pending。
+ *   - 保留各弹窗原有行为：confirm 确认/取消/遮罩/ESC/超时/Tab 焦点陷阱；
+ *     prompt 输入框+Enter 提交+ESC 取消+输入选中；info 关闭/ESC；note 分类+备注。
  *
  * @param {string} message - 确认提示文案
  * @param {string} [title='确认操作'] - 对话框标题
- * @param {number} [timeoutMs=0] - 超时毫秒（0 表示不超时）
+ * @param {number} [timeoutMs=60000] - 超时毫秒（0 表示不超时）
  * @returns {Promise<boolean>} 用户点击"确认"返回 true，"取消"返回 false
  */
-// v0.8.3 Step 7：confirm-modal 队列状态（修复 N03 单例冲突）
-const confirmModalQueue = [];
-let confirmModalActive = false;
-// 暴露队列长度查询接口便于测试
-window.__getConfirmQueueLength = () => confirmModalQueue.length;
+
+// 统一弹窗队列状态（替代 confirmModalQueue / confirmModalActive）
+const modalQueue = [];
+let modalActive = false;
+// 兼容旧测试接口：返回等待中的弹窗任务数
+window.__getConfirmQueueLength = () => modalQueue.length;
 
 function showConfirm(message, title = '确认操作', timeoutMs = 60000) {
-  // v0.8.3 Step 7：队列上限检查
-  if (confirmModalQueue.length >= 5) {
+  // 队列上限检查，防止弹窗无限堆积
+  if (modalQueue.length >= 5) {
     console.warn('[showConfirm] 队列已满（5 个等待中），拒绝新调用');
     return Promise.resolve(false);
   }
 
   return new Promise((resolve) => {
     // 入队等待
-    confirmModalQueue.push({ message, title, timeoutMs, resolve });
+    modalQueue.push({ type: 'confirm', message, title, timeoutMs, resolve });
     // 尝试处理队列
-    processConfirmQueue();
+    processModalQueue();
   });
 }
 
-// v0.8.4 Step 2：暴露 showConfirm 到 window（修复 G018 + CDP 测试 #7）
-// 之前遗漏此暴露语句，导致 typeof window.showConfirm === 'function' 返回 false
+// 暴露 showConfirm 到 window（修复 G018 + CDP 测试 #7）
 window.showConfirm = showConfirm;
 
 /**
- * v0.8.3 Step 7：处理 confirm-modal 队列（修复 N03）
- * 同一时刻只显示一个 confirm-modal，避免单例冲突
+ * 处理统一弹窗队列：同一时刻仅渲染一个任务
+ * 任务 resolve 后才继续下一个，避免交错调用互相覆盖 DOM
  */
+function processModalQueue() {
+  if (modalActive || modalQueue.length === 0) return;
+  modalActive = true;
+
+  const task = modalQueue.shift();
+  // 动态 z-index：后弹出的弹窗在上层（继承 GAP-03 层级管理）
+  const zIndex = String(10010 + modalQueue.length + 1);
+
+  switch (task.type) {
+    case 'confirm': renderConfirmTask(task, zIndex); break;
+    case 'prompt':  renderPromptTask(task, zIndex); break;
+    case 'info':    renderInfoTask(task, zIndex); break;
+    case 'note':    renderNoteTask(task, zIndex); break;
+    default:
+      console.error('[modalQueue] 未知任务类型:', task.type);
+      finishModalTask(task, undefined);
+  }
+}
+
+/**
+ * 完成当前弹窗任务：释放队列锁、resolve 任务 Promise、继续处理下一个任务
+ * @param {object} task - 队列任务（含 resolve 回调）
+ * @param {*} value - 传给任务 Promise 的 resolve 值
+ */
+// 兼容旧入口：确认队列现已统一处理所有弹窗类型
 function processConfirmQueue() {
-  if (confirmModalActive || confirmModalQueue.length === 0) return;
-  confirmModalActive = true;
+  processModalQueue();
+}
 
-  const task = confirmModalQueue.shift();
-  // v0.8.4 Step 3：扩展解构，支持 isInfoOnly 标记（修复 G022 队列死锁）
-  const { message, title, timeoutMs, resolve, isInfoOnly = false } = task;
+function finishModalTask(task, value) {
+  modalActive = false;
+  task.resolve(value);
+  // 异步调用避免递归栈溢出
+  if (modalQueue.length > 0) setTimeout(processModalQueue, 0);
+}
 
+/**
+ * 渲染 confirm 确认对话框任务
+ * 保留：确认/取消按钮、遮罩点击取消、ESC、超时自动取消、自动聚焦、Tab 焦点陷阱
+ * @param {object} task - { type:'confirm', message, title, timeoutMs, resolve }
+ * @param {string} zIndex - 动态层级
+ */
+function renderConfirmTask(task, zIndex) {
+  const { message, title, timeoutMs } = task;
   const modal = $('confirm-modal');
   const titleEl = $('confirm-modal-title');
   const msgEl = $('confirm-modal-message');
@@ -5273,60 +5599,35 @@ function processConfirmQueue() {
   const cancelBtn = $('confirm-modal-cancel');
 
   if (!modal || !okBtn || !cancelBtn) {
-    // 降级：DOM 不存在时回退到 console.error + 返回 false（Step 11 统一处理降级）
+    // 降级：DOM 不存在时回退 console.error + false，避免 Promise 悬挂
     console.error('[showConfirm] confirm-modal DOM 不存在，降级返回 false');
-    // v0.8.4 Step 3：isInfoOnly 时 resolve(undefined) 而非 false
-    resolve(isInfoOnly ? undefined : false);
-    confirmModalActive = false;
-    // 处理队列中下一个
-    if (confirmModalQueue.length > 0) processConfirmQueue();
+    finishModalTask(task, false);
     return;
   }
 
-  // 设置文案
+  // 设置文案（textContent 覆盖，同时清掉上次 prompt/note 动态生成的输入框）
   if (titleEl) titleEl.textContent = title;
-  if (msgEl) {
-    // v0.8.4 Step 3：isInfoMode 时保留换行（showInfoModal 需要 \n → <br>）
-    if (isInfoOnly && typeof htmlescape === 'function') {
-      msgEl.innerHTML = htmlescape(message).replace(/\n/g, '<br>');
-    } else {
-      msgEl.textContent = message;
-    }
-  }
+  if (msgEl) msgEl.textContent = message;
 
-  // v0.8.4 Step 3：根据 isInfoOnly 标记处理按钮显示（修复 G022）
-  // showInfoModal 入队后，隐藏取消按钮，仅显示"知道了"
-  if (isInfoOnly) {
-    cancelBtn.style.display = 'none';
-    okBtn.textContent = '知道了';
-  } else {
-    cancelBtn.style.display = '';
-    okBtn.textContent = '确认';
-  }
-
-  // 显示 modal（使用 hidden 属性，与现有 modal 模式一致）
-  // v0.8.22 GAP-03 修复（interaction-resilience-auditor Round4）：
-  //   根因：嵌套弹窗无 Z-index 栈管理，3 层以上可能视觉错乱
-  //   修复：动态递增 z-index，确保后弹出的 modal 在上层
-  const _baseZIndex = 10010;
-  const _stackDepth = confirmModalQueue.length + 1;
-  modal.style.zIndex = String(_baseZIndex + _stackDepth);
+  // 确保按钮处于确认态（prompt/note 可能修改过文案）
+  cancelBtn.style.display = '';
+  okBtn.textContent = '确认';
+  modal.style.zIndex = zIndex;
   modal.hidden = false;
 
   // 自动聚焦到确认按钮，便于键盘操作和自动化测试
   setTimeout(() => okBtn.focus(), 50);
 
-  // 超时自动取消（仅当指定 timeoutMs > 0 时，showInfoModal 不超时）
+  // 超时自动取消（仅当指定 timeoutMs > 0 时生效）
   let timeoutId = null;
   if (timeoutMs > 0) {
     timeoutId = setTimeout(() => {
       cleanup();
-      // v0.8.4 Step 3：isInfoOnly 时 resolve(undefined)
-      resolve(isInfoOnly ? undefined : false);
+      finishModalTask(task, false);
     }, timeoutMs);
   }
 
-  // 清理函数：移除事件监听并隐藏 modal，处理队列下一个
+  // 清理函数：移除事件监听并隐藏 modal，然后由 finishModalTask 处理下一个任务
   const cleanup = () => {
     if (timeoutId) clearTimeout(timeoutId);
     modal.hidden = true;
@@ -5334,32 +5635,20 @@ function processConfirmQueue() {
     cancelBtn.removeEventListener('click', onCancel);
     modal.removeEventListener('click', onOverlay);
     document.removeEventListener('keydown', onEsc);
-    // v0.8.3 Step 12 / G013：移除 Tab 焦点陷阱监听
     modal.removeEventListener('keydown', onTabTrap);
-    // 恢复取消按钮显示和确认按钮文案（showInfoModal 可能修改了它们）
-    if (cancelBtn) cancelBtn.style.display = '';
-    if (okBtn) okBtn.textContent = '确认';
-    // v0.8.3 Step 7：释放队列锁，处理下一个任务
-    confirmModalActive = false;
-    if (confirmModalQueue.length > 0) {
-      // 异步调用避免栈溢出
-      setTimeout(processConfirmQueue, 0);
-    }
   };
 
-  // v0.8.4 Step 3：isInfoOnly 时 onOk resolve(undefined)，onCancel/onOverlay/onEsc 同样
-  const onOk = () => { cleanup(); resolve(isInfoOnly ? undefined : true); };
-  const onCancel = () => { cleanup(); resolve(isInfoOnly ? undefined : false); };
+  const onOk = () => { cleanup(); finishModalTask(task, true); };
+  const onCancel = () => { cleanup(); finishModalTask(task, false); };
   const onOverlay = (ev) => {
     // 点击遮罩层（非内容区域）视为取消
-    if (ev.target === modal) { cleanup(); resolve(isInfoOnly ? undefined : false); }
+    if (ev.target === modal) { cleanup(); finishModalTask(task, false); }
   };
   // ESC 键关闭（对应审计 G012）
   const onEsc = (ev) => {
-    if (ev.key === 'Escape') { cleanup(); resolve(isInfoOnly ? undefined : false); }
+    if (ev.key === 'Escape') { cleanup(); finishModalTask(task, false); }
   };
-  // v0.8.3 Step 12 / G013：Tab 焦点陷阱（限制焦点在 modal 内循环）
-  // 设计原则：仅在 modal 可见时生效，不影响其他按键
+  // Tab 焦点陷阱（限制焦点在 modal 内循环，仅 modal 可见时生效）
   const onTabTrap = (ev) => {
     if (ev.key !== 'Tab') return;
     const focusable = modal.querySelectorAll('button:not([disabled]):not([style*="display: none"]), input:not([disabled]), [tabindex]:not([tabindex="-1"])');
@@ -5385,23 +5674,19 @@ function processConfirmQueue() {
   cancelBtn.addEventListener('click', onCancel);
   modal.addEventListener('click', onOverlay);
   document.addEventListener('keydown', onEsc);
-  // v0.8.3 Step 12 / G013：注册 Tab 焦点陷阱
   modal.addEventListener('keydown', onTabTrap);
 }
 
 /**
- * P1-2 修复：信息展示面板（只读/查询结果展示）。
- * 改用独立的 #info-panel（非 #confirm-modal），避免纯信息弹窗被测试误判为 confirmOpen，
- * 也不再占用 confirmModalQueue / confirmModalActive（解除与 showConfirm 的单例耦合）。
- * 语义：非阻塞展示，用户点击「关闭」或按 ESC 后 resolve；若被新调用覆盖，旧的 Promise 立即 resolve。
+ * 信息展示面板（只读/查询结果展示），使用独立 #info-panel（与 confirm-modal 隔离）。
+ * 统一入队：与 confirm/prompt/note 交错调用时排队展示，不覆盖 DOM、不悬挂 Promise。
+ * 语义：非阻塞展示，用户点击「关闭」或按 ESC 后 resolve。
  * @param {string} title - 标题
  * @param {string} content - 内容（支持换行 \n，通过 CSS white-space:pre-wrap 保留）
  * @returns {Promise<undefined>} 用户关闭面板后 resolve
  */
-let _infoPanelResolve = null;
 function showInfoModal(title, content) {
   const panel = $('info-panel');
-  const titleEl = $('info-panel-title');
   const msgEl = $('info-panel-message');
   const closeBtn = $('info-panel-close');
 
@@ -5412,114 +5697,261 @@ function showInfoModal(title, content) {
     return Promise.resolve(undefined);
   }
 
-  // 若上一次信息面板尚未关闭，先 resolve 上一次，避免 Promise 悬挂
-  if (_infoPanelResolve) {
-    const prev = _infoPanelResolve;
-    _infoPanelResolve = null;
-    prev(undefined);
+  // 队列上限检查，防止弹窗无限堆积
+  if (modalQueue.length >= 5) {
+    console.warn('[showInfoModal] 队列已满（5 个等待中），拒绝新调用');
+    return Promise.resolve(undefined);
+  }
+
+  return new Promise((resolve) => {
+    modalQueue.push({ type: 'info', title, content, resolve });
+    processModalQueue();
+  });
+}
+
+/**
+ * 渲染 info 信息展示面板任务
+ * 保留：关闭按钮、ESC 关闭、自动聚焦关闭按钮
+ * @param {object} task - { type:'info', title, content, resolve }
+ * @param {string} zIndex - 动态层级
+ */
+function renderInfoTask(task, zIndex) {
+  const { title, content } = task;
+  const panel = $('info-panel');
+  const titleEl = $('info-panel-title');
+  const msgEl = $('info-panel-message');
+  const closeBtn = $('info-panel-close');
+
+  if (!panel || !msgEl || !closeBtn) {
+    // 降级：DOM 不存在时回退到 Toast
+    console.warn('[showInfoModal] info-panel DOM 不存在，降级为 Toast');
+    showToast(content, 'info', 5000);
+    finishModalTask(task, undefined);
+    return;
   }
 
   if (titleEl) titleEl.textContent = title;
   // 使用 textContent + CSS white-space:pre-wrap，保留换行且规避 XSS
   msgEl.textContent = content;
 
-  return new Promise((resolve) => {
-    _infoPanelResolve = resolve;
+  panel.style.zIndex = zIndex;
+  panel.hidden = false;
+  setTimeout(() => closeBtn.focus(), 50);
 
-    const onClose = () => {
-      panel.hidden = true;
-      closeBtn.removeEventListener('click', onClose);
-      document.removeEventListener('keydown', onEsc);
-      if (_infoPanelResolve === resolve) {
-        _infoPanelResolve = null;
-        resolve(undefined);
-      }
-    };
-    const onEsc = (ev) => {
-      if (ev.key === 'Escape') onClose();
-    };
+  // 清理函数：移除事件监听并隐藏面板，然后由 finishModalTask 处理下一个任务
+  const cleanup = () => {
+    panel.hidden = true;
+    closeBtn.removeEventListener('click', onClose);
+    document.removeEventListener('keydown', onEsc);
+  };
 
-    closeBtn.addEventListener('click', onClose);
-    document.addEventListener('keydown', onEsc);
+  const onClose = () => { cleanup(); finishModalTask(task, undefined); };
+  const onEsc = (ev) => {
+    if (ev.key === 'Escape') onClose();
+  };
 
-    panel.hidden = false;
-    setTimeout(() => closeBtn.focus(), 50);
-  });
+  closeBtn.addEventListener('click', onClose);
+  document.addEventListener('keydown', onEsc);
 }
 
 /**
- * v0.8.2：异步输入对话框（替代同步 prompt）
+ * 异步输入对话框（替代同步 prompt），统一入队串行展示
  * @param {string} message - 提示文案
  * @param {string} [title='请输入'] - 标题
  * @param {string} [defaultValue=''] - 默认值
  * @returns {Promise<string|null>} 用户输入的值，取消返回 null
  */
 function showPrompt(message, title = '请输入', defaultValue = '') {
+  // 队列上限检查，防止弹窗无限堆积
+  if (modalQueue.length >= 5) {
+    console.warn('[showPrompt] 队列已满（5 个等待中），拒绝新调用');
+    return Promise.resolve(null);
+  }
+
   return new Promise((resolve) => {
-    const modal = $('confirm-modal');
-    const titleEl = $('confirm-modal-title');
-    const msgEl = $('confirm-modal-message');
-    const okBtn = $('confirm-modal-ok');
-    const cancelBtn = $('confirm-modal-cancel');
-
-    if (!modal || !okBtn || !cancelBtn) {
-      // v0.8.3 Step 11：N11 降级路径不阻塞 JS 线程（修复 G001-G003）
-      // 此前用 prompt(message, defaultValue)，现改为 console.error + showToast + resolve(null)
-      console.error('[showPrompt] confirm-modal DOM 不存在，降级返回 null');
-      showToast('输入对话框不可用：' + message, 'error');
-      resolve(null);
-      return;
-    }
-
-    if (titleEl) titleEl.textContent = title;
-    // 构造输入框
-    if (msgEl) {
-      msgEl.innerHTML = '';
-      const label = document.createElement('div');
-      label.textContent = message;
-      label.style.marginBottom = '8px';
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.value = defaultValue;
-      input.style.width = '100%';
-      input.style.padding = '6px 8px';
-      input.style.boxSizing = 'border-box';
-      input.dataset.autotest = 'prompt-input';
-      input.setAttribute('maxlength', '500');  // v0.8.6 Step 9 / N009：限制输入长度
-      msgEl.appendChild(label);
-      msgEl.appendChild(input);
-    }
-
-    modal.hidden = false;
-    setTimeout(() => {
-      const input = msgEl?.querySelector('input');
-      if (input) { input.focus(); input.select(); }
-    }, 50);
-
-    const cleanup = () => {
-      modal.hidden = true;
-      okBtn.removeEventListener('click', onOk);
-      cancelBtn.removeEventListener('click', onCancel);
-      document.removeEventListener('keydown', onKey);
-    };
-
-    const getValue = () => {
-      const input = msgEl?.querySelector('input');
-      return input ? input.value : '';
-    };
-
-    const onOk = () => { const v = getValue(); cleanup(); resolve(v); };
-    const onCancel = () => { cleanup(); resolve(null); };
-    // v0.8.2：Enter 提交、ESC 取消
-    const onKey = (ev) => {
-      if (ev.key === 'Escape') { cleanup(); resolve(null); }
-      if (ev.key === 'Enter') { const v = getValue(); cleanup(); resolve(v); }
-    };
-
-    okBtn.addEventListener('click', onOk);
-    cancelBtn.addEventListener('click', onCancel);
-    document.addEventListener('keydown', onKey);
+    modalQueue.push({ type: 'prompt', message, title, defaultValue, resolve });
+    processModalQueue();
   });
+}
+
+/**
+ * 渲染 prompt 输入对话框任务
+ * 保留：动态输入框、Enter 提交、ESC 取消、自动聚焦并选中输入
+ * @param {object} task - { type:'prompt', message, title, defaultValue, resolve }
+ * @param {string} zIndex - 动态层级
+ */
+function renderPromptTask(task, zIndex) {
+  const { message, title, defaultValue } = task;
+  const modal = $('confirm-modal');
+  const titleEl = $('confirm-modal-title');
+  const msgEl = $('confirm-modal-message');
+  const okBtn = $('confirm-modal-ok');
+  const cancelBtn = $('confirm-modal-cancel');
+
+  if (!modal || !okBtn || !cancelBtn) {
+    // 降级：DOM 不存在时回退 console.error + showToast + null，不阻塞 JS 线程
+    console.error('[showPrompt] confirm-modal DOM 不存在，降级返回 null');
+    showToast('输入对话框不可用：' + message, 'error');
+    finishModalTask(task, null);
+    return;
+  }
+
+  if (titleEl) titleEl.textContent = title;
+  // 构造输入框（先清空残留内容，防止上次 note/confirm 的内容残留）
+  if (msgEl) {
+    msgEl.innerHTML = '';
+    const label = document.createElement('div');
+    label.textContent = message;
+    label.style.marginBottom = '8px';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = defaultValue;
+    input.style.width = '100%';
+    input.style.padding = '6px 8px';
+    input.style.boxSizing = 'border-box';
+    input.dataset.autotest = 'prompt-input';
+    input.setAttribute('maxlength', '500');  // 限制输入长度
+    msgEl.appendChild(label);
+    msgEl.appendChild(input);
+  }
+
+  // 确保按钮处于确认态（note 可能修改过文案）
+  cancelBtn.style.display = '';
+  okBtn.textContent = '确认';
+  modal.style.zIndex = zIndex;
+  modal.hidden = false;
+  setTimeout(() => {
+    const input = msgEl?.querySelector('input');
+    if (input) { input.focus(); input.select(); }
+  }, 50);
+
+  // 清理函数：移除事件监听、隐藏 modal、清空动态输入框
+  const cleanup = () => {
+    modal.hidden = true;
+    okBtn.removeEventListener('click', onOk);
+    cancelBtn.removeEventListener('click', onCancel);
+    document.removeEventListener('keydown', onKey);
+    if (msgEl) msgEl.innerHTML = '';
+  };
+
+  const getValue = () => {
+    const input = msgEl?.querySelector('input');
+    return input ? input.value : '';
+  };
+
+  const onOk = () => { const v = getValue(); cleanup(); finishModalTask(task, v); };
+  const onCancel = () => { cleanup(); finishModalTask(task, null); };
+  // Enter 提交、ESC 取消
+  const onKey = (ev) => {
+    if (ev.key === 'Escape') { cleanup(); finishModalTask(task, null); }
+    if (ev.key === 'Enter') { const v = getValue(); cleanup(); finishModalTask(task, v); }
+  };
+
+  okBtn.addEventListener('click', onOk);
+  cancelBtn.addEventListener('click', onCancel);
+  document.addEventListener('keydown', onKey);
+}
+
+/**
+ * 渲染本地质量备注表单任务
+ * 保留：类别选择、备注输入、保存/取消、ESC、自动聚焦
+ * @param {object} task - { type:'note', options, resolve }
+ * @param {string} zIndex - 动态层级
+ */
+function renderNoteTask(task, zIndex) {
+  const { options } = task;
+  const modal = $('confirm-modal');
+  const titleEl = $('confirm-modal-title');
+  const msgEl = $('confirm-modal-message');
+  const okBtn = $('confirm-modal-ok');
+  const cancelBtn = $('confirm-modal-cancel');
+
+  if (!modal || !okBtn || !cancelBtn) {
+    console.error('[showLocalNoteForm] confirm-modal DOM 不存在，降级返回 null');
+    showToast('备注表单不可用', 'error');
+    finishModalTask(task, null);
+    return;
+  }
+
+  const categories = Array.isArray(options?.categories) ? options.categories : [];
+  let selected = options?.defaultCategory || (categories[0] && categories[0].value) || '';
+  let activeBtn = null;
+
+  if (titleEl) titleEl.textContent = options?.title || '质量备注';
+  if (msgEl) {
+    msgEl.innerHTML = '';
+    const hint = document.createElement('div');
+    hint.className = 'text-sm text-dim';
+    hint.style.marginBottom = '10px';
+    hint.textContent = options?.hint || '备注仅保存在本机，不会上传，也不会影响任何排序结果。';
+    msgEl.appendChild(hint);
+
+    const catRow = document.createElement('div');
+    catRow.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px;';
+    categories.forEach(cat => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = cat.label;
+      b.className = 'btn btn-sm ' + (cat.value === selected ? 'btn-accent' : 'btn-outline');
+      b.dataset.autotest = 'local-note-category';
+      b.addEventListener('click', () => {
+        selected = cat.value;
+        if (activeBtn) activeBtn.className = 'btn btn-sm btn-outline';
+        b.className = 'btn btn-sm btn-accent';
+        activeBtn = b;
+      });
+      if (cat.value === selected) activeBtn = b;
+      catRow.appendChild(b);
+    });
+    msgEl.appendChild(catRow);
+
+    const noteLabel = document.createElement('div');
+    noteLabel.textContent = '备注（可选，最多 500 字）：';
+    noteLabel.style.marginBottom = '4px';
+    const noteInput = document.createElement('textarea');
+    noteInput.rows = 3;
+    noteInput.maxLength = 500;
+    noteInput.style.cssText = 'width:100%;box-sizing:border-box;padding:6px 8px;resize:vertical;';
+    noteInput.dataset.autotest = 'local-note-input';
+    msgEl.appendChild(noteLabel);
+    msgEl.appendChild(noteInput);
+    setTimeout(() => noteInput.focus(), 50);
+  }
+
+  okBtn.textContent = '保存备注';
+  cancelBtn.textContent = '取消';
+  modal.style.zIndex = zIndex;
+  modal.hidden = false;
+
+  const cleanup = () => {
+    modal.hidden = true;
+    okBtn.textContent = '确认';
+    cancelBtn.textContent = '取消';
+    okBtn.removeEventListener('click', onOk);
+    cancelBtn.removeEventListener('click', onCancel);
+    document.removeEventListener('keydown', onKey);
+    if (msgEl) msgEl.innerHTML = '';
+  };
+
+  const getNote = () => {
+    const ta = msgEl?.querySelector('textarea[data-autotest="local-note-input"]');
+    return ta ? ta.value.trim() : '';
+  };
+
+  const onOk = () => {
+    const note = getNote();
+    cleanup();
+    finishModalTask(task, { type: selected, note });
+  };
+  const onCancel = () => { cleanup(); finishModalTask(task, null); };
+  // Enter 在 textarea 内换行，不触发提交；ESC 取消
+  const onKey = (ev) => {
+    if (ev.key === 'Escape') { cleanup(); finishModalTask(task, null); }
+  };
+
+  okBtn.addEventListener('click', onOk);
+  cancelBtn.addEventListener('click', onCancel);
+  document.addEventListener('keydown', onKey);
 }
 
 // 暴露到全局
@@ -5540,7 +5972,7 @@ async function clearLlmConfig() {
 
   resultEl.style.display = '';
   resultEl.className = 'form-result';
-  resultEl.textContent = '⏳ 正在清除...';
+  resultEl.textContent = '正在清除...';
 
   // v0.9.0 修复：清除期间禁用按钮，防止重复触发 POST /v1/config/llm
   const clearBtn = document.querySelector('[data-action="clearLlmConfig"]');
@@ -5556,7 +5988,7 @@ async function clearLlmConfig() {
     const data = await resp.json();
     if (data.success) {
       resultEl.className = 'form-result success';
-      resultEl.textContent = '✅ LLM 配置已清除。';
+      resultEl.textContent = 'LLM 配置已清除。';
       // v0.8.2：补充 Toast 反馈（对应审计 G018 成功视觉反馈）
       if (typeof showToast === 'function') {
         showToast('LLM 配置已清除', 'success');
@@ -5575,7 +6007,7 @@ async function clearLlmConfig() {
     }
   } catch (e) {
     resultEl.className = 'form-result error';
-    resultEl.textContent = '❌ ' + e.message;
+    resultEl.textContent = e.message;
   } finally {
     if (clearBtn) clearBtn.disabled = false;
   }
@@ -6192,10 +6624,10 @@ async function verifySetup() {
     if (result) {
       const lines = [
         '安装验证结果:',
-        '• sidecar 二进制: ' + (result.sidecar_binary ? '✓' : '✗'),
-        '• 配置文件: ' + (result.config_file ? '✓' : '✗'),
-        '• LLM 配置: ' + (result.llm_configured ? '✓' : '✗'),
-        '• Agent 配置: ' + (result.agent_configured ? '✓' : '✗'),
+        '• sidecar 二进制: ' + (result.sidecar_binary ? '是' : '否'),
+        '• 配置文件: ' + (result.config_file ? '是' : '否'),
+        '• LLM 配置: ' + (result.llm_configured ? '是' : '否'),
+        '• Agent 配置: ' + (result.agent_configured ? '是' : '否'),
       ];
       if (result.issues && result.issues.length > 0) {
         lines.push('\n存在的问题:');
@@ -6318,6 +6750,115 @@ window.toggleAdvancedManagement = toggleAdvancedManagement;
 // v0.7.0 孤儿路由修复：记忆详情面板操作函数导出（修复 onclick 调用失败问题）
 window.correctMemory = correctMemory;
 window.submitMemoryFeedback = submitMemoryFeedback;
+window.submitAssociationFeedback = submitAssociationFeedback;
+// v0.9.7：移除联想反馈统计读取（本地工具不收集用户反馈埋点，前端不再调用 /v1/feedback 系列统计接口）
+
+// v0.9.6：加载并渲染联想执行仪表盘（仅本机执行活动观测，不参与排序、不含用户埋点）
+// 数据源：/v1/feedback/association-activity — 联想执行活动（enrich 审计聚合，有检索即有数据）
+// v0.9.6 修复：sidecar 启动初期持锁加载记忆库，请求会返回 lock_busy/degraded，
+// 之前不重试导致首屏长期停留在无数据状态（30s 轮询才恢复），现降级时 2s 后重试最多 3 次。
+async function loadAssociationStats(retryLeft = 3) {
+  const statusEl = document.getElementById('association-dashboard-status');
+  const detailEl = document.getElementById('association-dashboard-detail');
+  const setStatus = (status, detail) => {
+    if (statusEl) statusEl.textContent = status;
+    if (detailEl) detailEl.textContent = detail;
+  };
+  const setValue = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  };
+
+  // v0.9.6 P1-2：将每次联想的通路命中翻译成人话
+  // fast 快速关键词检索 / deep 深度语义检索；双通路命中说明被两种方式同时找到，可信度更高
+  const recentListEl = document.getElementById('association-recent-list');
+  const renderAssociationRecent = (recent) => {
+    if (!recentListEl) return;
+    const list = Array.isArray(recent) ? recent.slice(0, 5) : [];
+    if (list.length === 0) {
+      recentListEl.innerHTML = '';
+      return;
+    }
+    recentListEl.innerHTML = `
+      <div class="association-recent-title">最近联想：为什么会找到这些记忆</div>
+      ${list.map(item => {
+        const fast = Number(item.fast_hits || 0);
+        const deep = Number(item.deep_hits || 0);
+        const cands = Number(item.total_candidates || 0);
+        let reason;
+        if (fast > 0 && deep > 0) {
+          reason = '同时被关键词和语义两种方式找到，可信度最高';
+        } else if (fast > 0) {
+          reason = '被关键词快速检索命中';
+        } else if (deep > 0) {
+          reason = '被语义相似度检索找到';
+        } else {
+          reason = '检索执行完成，未找到强匹配记忆';
+        }
+        const when = item.timestamp_ms ? formatTimelineTime(item.timestamp_ms) : '';
+        return `
+          <div class="association-recent-item">
+            <span class="association-recent-when">${htmlescape(when)}</span>
+            <span class="association-recent-reason">${htmlescape(reason)}</span>
+            <span class="association-recent-cands">融合候选 ${num(cands)} 条</span>
+          </div>
+        `;
+      }).join('')}
+    `;
+  };
+  try {
+    await syncSidecarApiBase();
+    // 本地工具仅读取本机“联想执行活动”，不再读取任何用户反馈统计（不上传、不埋点）。
+    const actResp = await fetchWithTimeout(API_BASE + '/v1/feedback/association-activity', {
+      headers: { 'Accept': 'application/json' }
+    }, 10000).then(r => r.json().catch(() => null)).catch(() => null);
+
+    // --- 执行活动轨道（本机统计，非用户埋点） ---
+    let activityOk = false;
+    if (actResp && !actResp.lock_busy && !actResp.degraded) {
+      const execCount = Number(actResp.total_executions || 0);
+      const avgCand = Number(actResp.avg_candidates || 0);
+      const both = Number(actResp.both_count || 0);
+      const totalExec = execCount || 1;
+      setValue('association-execution-count', String(execCount));
+      setValue('association-avg-candidates', execCount ? avgCand.toFixed(1) : '--');
+      setValue('association-dual-path-rate', execCount ? ((both / totalExec) * 100).toFixed(0) + '%' : '--');
+      const lastMs = actResp.last_execution_ms ? Number(actResp.last_execution_ms) : null;
+      setValue('association-last-execution', lastMs ? formatTimelineTime(lastMs) : '--');
+      activityOk = execCount > 0;
+      // v0.9.6 P1-2：渲染最近联想命中原因（人话解释）
+      renderAssociationRecent(actResp.recent);
+    } else if (recentListEl && !recentListEl.children.length) {
+      // 降级刷新时保留已渲染的旧列表（"已有数据照常可看"），仅空列表才写空
+      recentListEl.innerHTML = '';
+    }
+
+    if (!activityOk) {
+      const degraded = actResp && (actResp.lock_busy || actResp.degraded);
+      if (degraded) {
+        // sidecar 启动/合成持锁是暂时状态，2s 后重试，避免首屏长期停留在 "--"
+        setStatus('后台更新中', '记忆系统正在加载或后台合成，稍后自动刷新');
+        if (retryLeft > 0) {
+          setTimeout(() => loadAssociationStats(retryLeft - 1), 2000);
+        }
+        return;
+      }
+      if (!actResp) {
+        setStatus('暂不可用', '联想执行状态暂不可用，请确认 LRC 服务运行后重试');
+        return;
+      }
+      setStatus('等待执行', '在「全部记忆」中检索一次后，这里会显示联想执行情况。');
+      return;
+    }
+    setStatus('实时观测', '已加载联想执行活动');
+    if (detailEl) detailEl.textContent = '联想执行活动为观测指标，不改变默认检索排序。';
+  } catch (error) {
+    console.error('[loadAssociationStats] 加载失败:', error);
+    // v0.9.6 P2：稳定版用户看到"开发服务"字样会困惑，改用中性文案
+    setStatus('暂不可用', '联想统计暂不可用，请确认 LRC 服务运行后点击刷新重试');
+  }
+}
+window.loadAssociationStats = loadAssociationStats;
 // v0.7.0 孤儿路由修复 Step 3-D：洛书向量编码器
 window.encodeTextToLuoshu = encodeTextToLuoshu;
 // v0.7.0 孤儿路由修复 Step 3-E：合成记忆拆解
@@ -6433,9 +6974,17 @@ function resetScenarioRestore() {
  * 100ms 内返回报告：存储位置、大小、网络访问、加密状态
  * 三色信任指示器（绿/黄/红）
  */
+// v0.9.6 修复：函数级防重复锁（长耗时入口不依赖 bindAllActions 的 500ms inFlight）
+let _runPrivacyCheckBusy = false;
 async function runPrivacyCheck() {
+  // v0.9.6 修复：函数级防重复锁（长耗时入口不依赖 bindAllActions 的 500ms inFlight）
+  if (_runPrivacyCheckBusy) return;
+  _runPrivacyCheckBusy = true;
   const resultEl = document.getElementById('privacy-check-result');
-  if (!resultEl) return;
+  // v0.9.6 修复：检查期间禁用按钮，失败/超时后恢复
+  const privacyBtn = document.querySelector('[data-action="runPrivacyCheck"]');
+  if (!resultEl) { _runPrivacyCheckBusy = false; return; }
+  if (privacyBtn) privacyBtn.disabled = true;
 
   // 显示加载状态
   resultEl.classList.add('show');
@@ -6524,13 +7073,833 @@ async function runPrivacyCheck() {
       `;
     }
     console.error('[LRC v' + APP_VERSION + ']隐私检查失败:', err);
+  } finally {
+    // v0.9.6 修复：无论成功/失败/超时都恢复按钮与锁
+    if (privacyBtn) privacyBtn.disabled = false;
+    _runPrivacyCheckBusy = false;
   }
 }
 
 /**
- * v0.6.0 预览：加载结晶历史时间线（v0.8.0 预览）
- * 从审计日志中提取结晶事件并渲染到时间线
+ * v0.9.7 首页重构（《LRC 仪表盘首页设计规范 v1.0》）：
+ * M0 搜索/记一笔 → M1 价值陈述卡 → M2 当前记忆 → M3 系统替你做的事
+ * → M4 记忆资产 → M5 技术细节（折叠）
+ * 数据全部复用现有本机接口，不新增存储、不上传。
  */
+let homeDataRequest = null;
+
+const HOME_TYPE_LABELS = {
+  fact: '事实',
+  preference: '偏好',
+  decision: '决策',
+  code_context: '代码',
+  conversation: '对话',
+  synthesis: '结晶',
+};
+
+// M4a 条形标签：沿用 HOME_TYPE_LABELS，但结晶类对用户说全称更直观
+const HOME_ASSET_TYPE_LABELS = Object.assign({}, HOME_TYPE_LABELS, {
+  synthesis: '结晶知识',
+});
+
+// 折叠态 3 条、展开 8 条（设计规范 M2 渲染规范）
+const HOME_CM_COLLAPSED = 3;
+const HOME_CM_EXPANDED = 8;
+
+/**
+ * 相对时间（设计规范 M2）：
+ * 今天 → HH:MM；1 天内 → N 分钟前 / N 小时前；更早 → N 天前
+ */
+function formatRelativeTime(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  const now = Date.now();
+  const diff = now - value;
+  if (diff < 0) return '刚刚';
+  const min = Math.floor(diff / 60000);
+  if (min < 1) return '刚刚';
+  if (min < 60) return `${min}分钟前`;
+  // 同一自然日内一律显示时钟时间
+  const date = new Date(value);
+  const today = new Date();
+  const sameDay = date.getFullYear() === today.getFullYear()
+    && date.getMonth() === today.getMonth()
+    && date.getDate() === today.getDate();
+  if (sameDay) {
+    return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+  }
+  // 跨天但不足 24 小时用"小时前"，避免出现"今天 00:57"这类歧义
+  const hour = Math.floor(min / 60);
+  if (hour < 24) return `${hour}小时前`;
+  const dayMs = 24 * 60 * 60 * 1000;
+  // 跨自然日按"天前"计，最少 1 天前
+  const days = Math.max(1, Math.floor(diff / dayMs));
+  return `${days}天前`;
+}
+
+/** 时钟时间 HH:MM（用于 M2 标题行"更新于"） */
+function formatClockTime(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return '--';
+  const d = new Date(value);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+/** 重要性点条：10 个点，前 importance 个点亮 */
+function renderImportanceDots(importance) {
+  const n = Math.max(0, Math.min(10, Number(importance) || 0));
+  let html = '';
+  for (let i = 0; i < 10; i++) {
+    html += `<span class="cm-dot ${i < n ? 'on' : 'off'}"></span>`;
+  }
+  return `<span class="cm-dots" title="重要性 ${n}/10">${html}</span>`;
+}
+
+/* ============================================================
+ * M1 价值陈述卡：三态渲染（骨架 / 后台整理中 / 读取失败）
+ * 冷启动重试统一由 loadHomeData 的整体自愈机制驱动（见 _homeDataRetry*），
+ * 本模块不再单独发起重试，避免 M1 恢复而 M2/M3/M4 滞留旧态。
+ * ============================================================ */
+let _homeDataRetryCount = 0;
+let _homeDataRetryTimer = null;
+const HOME_DATA_MAX_RETRIES = 24;
+/** 自愈重试退避：前 10 次每 2s（快速收敛），之后每 5s（降低后端压力），总计约 90s */
+function _homeDataRetryDelay() {
+  return _homeDataRetryCount <= 10 ? 2000 : 5000;
+}
+
+/** 价值卡骨架态（首屏初始 / 重新加载时） */
+function renderValueHeroSkeleton() {
+  const body = document.getElementById('value-hero-content');
+  if (!body) return;
+  body.innerHTML = `
+    <p class="vh-sentence" id="value-hero-sentence"><span class="vh-skeleton vh-skeleton-line"></span></p>
+    <div class="vh-kpis">
+      <div class="vh-skeleton vh-skeleton-kpi"></div>
+      <div class="vh-skeleton vh-skeleton-kpi"></div>
+      <div class="vh-skeleton vh-skeleton-kpi"></div>
+    </div>`;
+}
+
+/** 价值卡"后台整理中"态（展示重试进度；实际重试由 loadHomeData 整体调度） */
+function renderValueHeroBusy() {
+  const body = document.getElementById('value-hero-content');
+  if (!body) return;
+  body.innerHTML = `
+    <div class="vh-state">
+      <img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">
+      记忆正在后台整理中，已有数据照常可看
+      <span class="vh-state-count">(${_homeDataRetryCount}/${HOME_DATA_MAX_RETRIES})</span>
+    </div>`;
+}
+
+/** 价值卡失败态：明确文案 + 重试按钮（重试走整页数据加载） */
+function renderValueHeroError() {
+  const body = document.getElementById('value-hero-content');
+  if (!body) return;
+  body.innerHTML = `
+    <div class="vh-state">
+      <img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">
+      暂时读不到数据
+      <button class="btn btn-ghost btn-sm" data-action="loadHomeData" style="margin-left:8px;">重试</button>
+    </div>`;
+  if (typeof bindAllActions === 'function') bindAllActions();
+}
+
+/**
+ * M1 渲染入口：数据齐全时输出价值陈述句 + 三个 KPI
+ * @param {object|null} stats  /v1/memories/stats
+ * @param {object|null} act    /v1/feedback/association-activity
+ * @param {object|null} synth  /v1/memories/synthesis-timeline
+ */
+function renderValueHero(stats, act, synth) {
+  const body = document.getElementById('value-hero-content');
+  if (!body) return;
+  if (stats && (stats.lock_busy || stats.degraded)) {
+    renderValueHeroBusy();
+    return;
+  }
+  if (!stats) {
+    renderValueHeroError();
+    return;
+  }
+
+  const total = Number(stats.total_memories || 0);
+  const recentAdded = Number(stats.recent_added || 0);
+  const exec = Number((act && !act.lock_busy && !act.degraded ? act.total_executions : 0) || 0);
+  const synthCount = Number(
+    (stats.by_type && stats.by_type.synthesis)
+    ?? (synth && synth.total)
+    ?? 0
+  );
+  const lastMs = Number(act?.last_execution_ms || 0);
+
+  const second = exec > 0
+    ? `被 AI 工具检索使用了 <strong class="vh-num">${num(exec)}</strong> 次，`
+    : '等待你的 AI 工具第一次来查询，';
+  const sentence = `它已替你存下 <strong class="vh-num">${num(total)}</strong> 条记忆，`
+    + second
+    + `并自动沉淀出 <strong class="vh-num">${num(synthCount)}</strong> 条结晶知识。`;
+
+  const kpi2Sub = lastMs > 0 ? `最近 ${formatRelativeTime(lastMs)}` : '还没被用到过';
+
+  body.innerHTML = `
+    <p class="vh-sentence" id="value-hero-sentence">${sentence}</p>
+    <div class="vh-kpis">
+      <div class="vh-kpi">
+        <div class="vh-kpi-value">${num(total)}</div>
+        <div class="vh-kpi-label">条记忆</div>
+        <div class="vh-kpi-note">+${num(recentAdded)} 近7天</div>
+      </div>
+      <div class="vh-kpi">
+        <div class="vh-kpi-value">${num(exec)}</div>
+        <div class="vh-kpi-label">次被AI使用</div>
+        <div class="vh-kpi-note">${htmlescape(kpi2Sub)}</div>
+      </div>
+      <div class="vh-kpi">
+        <div class="vh-kpi-value">${num(synthCount)}</div>
+        <div class="vh-kpi-label">条结晶知识</div>
+        <div class="vh-kpi-note">由碎片自动归纳</div>
+      </div>
+    </div>`;
+}
+
+/* ============================================================
+ * M2 当前记忆：三要素列表（类型徽章 / 摘要 / meta）
+ * ============================================================ */
+function renderHomeAssociationItems(memories, full) {
+  const assocList = document.getElementById('home-association-list');
+  const toggleBtn = document.querySelector('[data-action="toggleHomeAssociations"]');
+  if (!assocList) return;
+  const all = Array.isArray(memories) ? memories : [];
+  const shown = full ? all.slice(0, HOME_CM_EXPANDED) : all.slice(0, HOME_CM_COLLAPSED);
+  if (shown.length === 0) {
+    assocList.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-icon"><img src="/assets/icons/icon-memory.svg" width="32" height="32" alt=""></div>
+        <div class="empty-text">还没有记忆</div>
+        <div class="empty-hint">点右上角「记一笔」，或直接在 AI 工具里让它记下来——它会出现在这里。</div>
+      </div>`;
+  } else {
+    assocList.innerHTML = shown.map(m => {
+      const typeLabel = HOME_TYPE_LABELS[m.memory_type] || m.memory_type || '记忆';
+      const project = m.project ? getProjectDisplayName(m.project) : '全局记忆';
+      const when = formatRelativeTime(m.created_at_ms);
+      // 摘要不再做 JS 截断，交由 CSS 两行裁剪
+      const summary = m.content_preview || m.content || '';
+      return `
+        <div class="cm-item" role="button" tabindex="0"
+             data-action="openHomeMemory" data-arg="${htmlescape(String(m.id || ''))}">
+          <span class="cm-type">${htmlescape(typeLabel)}</span>
+          <div class="cm-main">
+            <div class="cm-summary">${htmlescape(summary)}</div>
+            <div class="cm-meta">
+              <span class="cm-project">${htmlescape(project)}</span>
+              <span class="cm-sep">·</span>
+              <span>${htmlescape(when || '--')}</span>
+              <span class="cm-sep">·</span>
+              <span class="cm-imp">重要性</span>${renderImportanceDots(m.importance)}
+            </div>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+  // 折叠/展开按钮：≤3 条隐藏
+  if (toggleBtn) {
+    if (all.length <= HOME_CM_COLLAPSED) {
+      toggleBtn.hidden = true;
+    } else {
+      toggleBtn.hidden = false;
+      const rest = Math.max(0, Math.min(all.length, HOME_CM_EXPANDED) - HOME_CM_COLLAPSED);
+      toggleBtn.textContent = full
+        ? '收起 ↑'
+        : `展开其余 ${num(rest)} 条 ↓`;
+    }
+  }
+  // 动态渲染的元素需要重新绑定 data-action（openHomeMemory 详情点击）
+  if (typeof bindAllActions === 'function') bindAllActions();
+}
+
+// M2 展开/收起：在首页卡片内完成，不跳转"全部记忆"页
+function toggleHomeAssociations() {
+  const memories = window._homeAssociationMemories || [];
+  const full = !window._homeAssociationsExpanded;
+  if (full && memories.length <= HOME_CM_COLLAPSED) {
+    if (typeof showToast === 'function') showToast('当前记忆已全部展示', 'info');
+    return;
+  }
+  window._homeAssociationsExpanded = full;
+  renderHomeAssociationItems(memories, full);
+}
+
+/* ============================================================
+ * M3 系统替你做的事：检索 / 结晶 / 新增 三类事件合并流水
+ * ============================================================ */
+function loadActivityFeed(actData, synthItems, memories) {
+  const feedEl = document.getElementById('activity-feed');
+  if (!feedEl) return;
+  const events = [];
+  const dayKey = (ms) => {
+    const d = new Date(ms);
+    return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+  };
+
+  // a) 检索事件：接口未回传 query 文本，按自然日聚合成"查找了 n 次"口径。
+  // recent 明细最多 10 条，若明细数小于总执行数则退化为"总数口径"单条事件
+  const totalExec = Number((actData && !actData.lock_busy && !actData.degraded
+    ? actData.total_executions : 0) || 0);
+  const lastExecMs = Number((actData && actData.last_execution_ms) || 0);
+  const searchByDay = new Map();
+  if (actData && !actData.lock_busy && !actData.degraded && Array.isArray(actData.recent)) {
+    actData.recent.forEach(item => {
+      const ts = Number(item.timestamp_ms || 0);
+      if (!ts) return;
+      const key = dayKey(ts);
+      const bucket = searchByDay.get(key) || { time: ts, times: 0, hits: 0 };
+      bucket.times += 1;
+      bucket.hits += Number(item.fast_hits || 0) + Number(item.deep_hits || 0);
+      bucket.time = Math.max(bucket.time, ts);
+      searchByDay.set(key, bucket);
+    });
+  }
+  const detailTimes = [...searchByDay.values()].reduce((sum, b) => sum + b.times, 0);
+  const detailHits = [...searchByDay.values()].reduce((sum, b) => sum + b.hits, 0);
+  if (totalExec > 0 && (detailTimes === 0 || totalExec > detailTimes)) {
+    events.push({
+      time: lastExecMs || 0,
+      icon: 'icon-search-lrc',
+      text: `AI 查找了记忆 ${num(totalExec)} 次，共找到 ${num(detailHits)} 条相关内容`,
+    });
+  } else {
+    searchByDay.forEach(bucket => {
+      events.push({
+        time: bucket.time,
+        icon: 'icon-search-lrc',
+        text: `AI 查找了记忆 ${num(bucket.times)} 次，共找到 ${num(bucket.hits)} 条相关内容`,
+      });
+    });
+  }
+
+  // b) 结晶事件：碎片自动归纳为结晶知识
+  (Array.isArray(synthItems) ? synthItems : []).forEach(s => {
+    const src = Number(s.source_count || 0);
+    events.push({
+      time: Number(s.created_at_ms) || 0,
+      icon: 'icon-sparkle',
+      text: src > 0
+        ? `把 ${num(src)} 条相关记忆，归纳成 1 条结晶知识`
+        : '沉淀出 1 条结晶知识',
+    });
+  });
+
+  // c) 新增事件：按项目 + 自然日聚合
+  const addByProjectDay = new Map();
+  (Array.isArray(memories) ? memories : []).forEach(m => {
+    const ts = Number(m.created_at_ms || 0);
+    if (!ts) return;
+    const project = m.project ? getProjectDisplayName(m.project) : '全局记忆';
+    const key = `${project}|${dayKey(ts)}`;
+    const bucket = addByProjectDay.get(key) || { time: ts, count: 0, project };
+    bucket.count += 1;
+    bucket.time = Math.max(bucket.time, ts);
+    addByProjectDay.set(key, bucket);
+  });
+  addByProjectDay.forEach(bucket => {
+    events.push({
+      time: bucket.time,
+      icon: 'icon-memory',
+      text: `${bucket.project} 新写入了 ${num(bucket.count)} 条记忆`,
+    });
+  });
+
+  events.sort((a, b) => b.time - a.time);
+  const shown = events.slice(0, 5);
+  if (shown.length === 0) {
+    feedEl.innerHTML = '<div class="af-empty">系统在等待第一条记忆</div>';
+    return;
+  }
+  feedEl.innerHTML = shown.map(ev => `
+    <div class="af-item">
+      <img class="inline-icon af-icon" src="/assets/icons/${ev.icon}.svg" width="14" height="14" alt="">
+      <span class="af-text">${htmlescape(ev.text)}</span>
+      <span class="af-time">${htmlescape(formatRelativeTime(ev.time) || '--')}</span>
+    </div>
+  `).join('');
+}
+
+/* ============================================================
+ * M4 我的记忆资产：构成 / 谁在用 / 成长趋势 / 结晶成果
+ * ============================================================ */
+function renderMemoryAssets(statsData, synthData) {
+  const busy = !!(statsData && (statsData.lock_busy || statsData.degraded));
+  const stats = (statsData && !busy) ? statsData : null;
+
+  // --- 4a 记忆构成（六类水平条形，点击跳转全部记忆并筛选） ---
+  const barsEl = document.getElementById('memory-type-bars-list');
+  if (barsEl) {
+    if (!stats) {
+      barsEl.innerHTML = `<div class="text-center text-dim" style="padding:12px;">${busy ? '记忆正在后台整理中，已有数据照常可看' : '暂时读不到构成数据'}</div>`;
+    } else {
+      const byType = stats.by_type || {};
+      const rows = Object.keys(HOME_ASSET_TYPE_LABELS).map(type => ({
+        type,
+        label: HOME_ASSET_TYPE_LABELS[type],
+        count: Number(byType[type] || 0),
+      }));
+      const max = rows.reduce((m, r) => Math.max(m, r.count), 0);
+      if (max === 0) {
+        barsEl.innerHTML = '<div class="text-center text-dim" style="padding:12px;">还没有记忆，记一笔就有构成图了</div>';
+      } else {
+        barsEl.innerHTML = rows.map(r => {
+          const width = r.count > 0 ? Math.max(3, Math.round(r.count / max * 100)) : 0;
+          return `
+            <div class="bar-row" role="button" tabindex="0"
+                 data-action="filterMemoriesByType" data-type="${r.type}" title="查看全部${r.label}">
+              <span class="bar-label">${htmlescape(r.label)}</span>
+              <span class="bar-track"><span class="bar-fill" style="width:${width}%"></span></span>
+              <span class="bar-value">${num(r.count)}</span>
+            </div>`;
+        }).join('');
+      }
+    }
+  }
+
+  // --- 4b 谁在用（项目 Top5，其余合并） ---
+  const projEl = document.getElementById('memory-project-top-list');
+  if (projEl) {
+    if (!stats) {
+      projEl.innerHTML = `<div class="text-center text-dim" style="padding:12px;">${busy ? '记忆正在后台整理中，已有数据照常可看' : '暂时读不到项目分布'}</div>`;
+    } else {
+      const entries = Object.entries(stats.by_project || {}).sort((a, b) => b[1] - a[1]);
+      const real = entries.filter(([p]) => p && p !== '_global_');
+      if (entries.length > 0 && real.length === 0) {
+        projEl.innerHTML = '<div class="pt-global">全局模式：所有工具共享一份记忆库</div>';
+      } else if (real.length === 0) {
+        projEl.innerHTML = '<div class="text-center text-dim" style="padding:12px;">还没有项目写入记忆</div>';
+      } else {
+        const top = real.slice(0, 5);
+        const max = Number(top[0][1] || 0);
+        let html = top.map(([project, count], idx) => {
+          const width = count > 0 ? Math.max(3, Math.round(count / max * 100)) : 0;
+          const name = getProjectDisplayName(project);
+          return `
+            <div class="bar-row" title="${htmlescape(getProjectCanonicalPath(project) || name)}">
+              <span class="pt-rank">${idx + 1}</span>
+              <span class="pt-name">${htmlescape(name)}</span>
+              <span class="bar-track"><span class="bar-fill" style="width:${width}%"></span></span>
+              <span class="bar-value">${num(count)}</span>
+            </div>`;
+        }).join('');
+        const rest = real.slice(5);
+        if (rest.length > 0) {
+          const restCount = rest.reduce((sum, [, c]) => sum + Number(c || 0), 0);
+          html += `<div class="pt-rest">其他 ${num(rest.length)} 个 · 共 ${num(restCount)} 条</div>`;
+        }
+        projEl.innerHTML = html;
+      }
+    }
+  }
+
+  // --- 4c 成长趋势（P0 降级：大字 + 可选 sparkline） ---
+  renderMemoryGrowth(stats);
+
+  // --- 4d 结晶成果（最近 3 条 + 置信环） ---
+  const crystalEl = document.getElementById('crystal-highlights-list');
+  if (crystalEl) {
+    const items = Array.isArray(synthData?.items) ? synthData.items : [];
+    const total = Number(synthData?.total || 0);
+    if (!synthData || synthData.lock_busy || synthData.degraded) {
+      crystalEl.innerHTML = `<div class="text-center text-dim" style="padding:12px;">${busy ? '记忆正在后台整理中，已有数据照常可看' : '暂时读不到结晶成果'}</div>`;
+    } else if (items.length === 0) {
+      crystalEl.innerHTML = `<div class="ch-empty">${total === 0 ? '记忆积累够了会自动结晶' : '暂时还没有结晶记录'}</div>`;
+    } else {
+      crystalEl.innerHTML = items.slice(0, 3).map(it => {
+        const conf = Math.max(0, Math.min(1, Number(it.confidence || 0)));
+        const deg = Math.round(conf * 360);
+        const src = Number(it.source_count || 0);
+        return `
+          <div class="ch-card">
+            <div class="ch-body">
+              <div class="ch-title" title="${htmlescape(it.content || '')}">${htmlescape(truncateText(it.content, 40))}</div>
+              <div class="ch-meta">${src > 0 ? `由 ${num(src)} 条记忆归纳` : '由碎片记忆归纳'} · ${htmlescape(formatRelativeTime(it.created_at_ms) || '--')}</div>
+            </div>
+            <span class="crystal-ring" style="--deg:${deg}deg" title="置信度 ${Math.round(conf * 100)}%"><span class="crystal-ring-text">${Math.round(conf * 100)}</span></span>
+          </div>`;
+      }).join('');
+    }
+  }
+
+  if (typeof bindAllActions === 'function') bindAllActions();
+}
+
+/**
+ * M4c 数据准备：把 /v1/memories/list 的结果按本地自然日聚合成
+ * window._homeMemoryBucket = [{ day, ts, count }]（时间正序），供 sparkline 使用
+ */
+function buildHomeMemoryBucket(listData) {
+  window._homeMemoryBucket = [];
+  if (!listData || listData.lock_busy || listData.degraded) return;
+  const memories = Array.isArray(listData.memories) ? listData.memories : [];
+  if (memories.length === 0) return;
+  const byDay = new Map();
+  memories.forEach(m => {
+    const ts = Number(m.created_at_ms || 0);
+    if (!ts) return;
+    const d = new Date(ts);
+    const key = `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`;
+    const bucket = byDay.get(key) || { ts, count: 0 };
+    bucket.count += 1;
+    bucket.ts = Math.min(bucket.ts, ts);
+    byDay.set(key, bucket);
+  });
+  window._homeMemoryBucket = [...byDay.values()].sort((a, b) => a.ts - b.ts);
+}
+
+/**
+ * 4c 成长趋势：近 7 天新增大字为主，
+ * window._homeMemoryBucket（按 created_at_ms 本地自然日分桶，时间正序）≥3 天时叠加 sparkline
+ */
+function renderMemoryGrowth(stats) {
+  const body = document.getElementById('memory-growth-body');
+  if (!body) return;
+  // stats 不可用时不写 0，避免"近 7 天新增 0 条"的误导结论
+  const addedText = stats ? num(Number(stats.recent_added || 0)) : '--';
+  let html = `<div class="mg-big">近 7 天新增 <span class="vh-num">${addedText}</span> 条</div>`;
+  const bucket = stats && Array.isArray(window._homeMemoryBucket) ? window._homeMemoryBucket : [];
+  if (bucket.length >= 3) {
+    const max = bucket.reduce((m, b) => Math.max(m, Number(b.count || 0)), 0) || 1;
+    const step = bucket.length > 1 ? 100 / (bucket.length - 1) : 100;
+    const pts = bucket.map((b, i) => {
+      const x = Number((i * step).toFixed(2));
+      const y = Number((28 - (Number(b.count || 0) / max) * 26).toFixed(2));
+      return `${x},${y}`;
+    });
+    const line = pts.join(' ');
+    const area = `0,30 ${line} 100,30`;
+    html += `
+      <svg class="mg-spark" viewBox="0 0 100 30" preserveAspectRatio="none" aria-hidden="true">
+        <polygon points="${area}"></polygon>
+        <polyline points="${line}"></polyline>
+      </svg>
+      <div class="mg-note">共 ${num(bucket.length)} 天有新增</div>`;
+  } else {
+    html += '<div class="mg-note">再多记几条，这里就会出现成长曲线</div>';
+  }
+  body.innerHTML = html;
+}
+
+/* ============================================================
+ * 首页数据加载：一次并行拉取，依次喂给 M1-M4
+ * ============================================================ */
+/**
+ * 首页数据加载：一次并行拉取，依次喂给 M1-M4
+ * @param {boolean} [isRetry] 由整页自愈定时器触发时为 true；
+ *   手动/周期性加载（首屏、切页、点重试按钮）会重置自愈预算，
+ *   保证预算耗尽后用户仍可通过再次进入或刷新恢复，而非永久滞留。
+ */
+async function loadHomeData(isRetry) {
+  const assocList = document.getElementById('home-association-list');
+  const projectEl = document.getElementById('home-association-project');
+  if (!assocList) return;
+  if (!isRetry) {
+    _homeDataRetryCount = 0;
+    if (_homeDataRetryTimer) {
+      clearTimeout(_homeDataRetryTimer);
+      _homeDataRetryTimer = null;
+    }
+  }
+
+  if (homeDataRequest) homeDataRequest.abort();
+  homeDataRequest = new AbortController();
+  const signal = homeDataRequest.signal;
+
+  // 重新加载时先回到骨架态，避免旧数据与新数据交替闪烁
+  renderValueHeroSkeleton();
+  try {
+    await syncSidecarApiBase();
+    // v0.9.7 根因修复（六钥匙·简化）：stats/recent/synth/list 共用同一 store 互斥锁，
+    // 后端用 try_lock() 即时降级。此前 5 路 Promise.allSettled 并发，兄弟请求互相抢锁
+    // 失败 → 制造"伪 lock_busy"，且每轮自愈重试仍并发 → 永远自锁 → 仪表盘长期卡
+    // "后台整理中"。实测：顺序请求三端点全部 busy=false，并发则 recent 立即 busy。
+    // 故改为顺序拉取（每个约 10ms，总延迟仍可忽略），彻底消除自相争用；
+    // 真正因后台合成持锁的降级仍会被如实感知并重试。
+    const getJson = async (url, opt) => {
+      try {
+        const resp = await fetchWithTimeout(url, opt, 10000);
+        if (!resp.ok) return null;
+        return await resp.json();
+      } catch (_) {
+        return null;
+      }
+    };
+    const recentData = await getJson(`${window.API_BASE}/v1/memories/recent?limit=8`, { signal });
+    const statsData = await getJson(`${window.API_BASE}/v1/memories/stats`, { signal });
+    const actData = await getJson(`${window.API_BASE}/v1/feedback/association-activity`, { signal });
+    const synthData = await getJson(`${window.API_BASE}/v1/memories/synthesis-timeline?limit=6`, { signal });
+    const listData = await getJson(`${window.API_BASE}/v1/memories/list`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ limit: 500 }),
+      signal,
+    });
+    const synthItems = (synthData && !synthData.lock_busy && Array.isArray(synthData.items))
+      ? synthData.items : [];
+
+    // v0.9.7 修复（六钥匙·简化）：冷启动索引期 sidecar 对 stats/recent 等端点返回
+    // lock_busy，属暂时状态。策略：每个模块都基于"当前拿到的数据"即时渲染
+    // （renderValueHero / renderHomeAssociationItems / renderMemoryAssets 内部各自
+    // 处理 busy/null 态），只要还有关键端点 busy 就调度整页重试，让所有模块
+    // 一起收敛到真实数据（退避见 _homeDataRetryDelay，总预算约 90s）。
+    // 避免旧方案"只补 M1、M2/M3/M4 永久滞留"。
+    const homeBusy = [recentData, statsData, actData, synthData]
+      .some(d => d && (d.lock_busy || d.degraded));
+
+    // --- M1 价值陈述卡（stats 为 lock_busy 判据，act/synth 为辅助口径） ---
+    renderValueHero(statsData, actData, synthData);
+
+    // --- M2 当前记忆：最近写入的记忆（本机真实数据，非联想结果） ---
+    const recentBusy = !!recentData && (recentData.lock_busy || recentData.degraded);
+    const memories = (recentData && !recentBusy
+      && Array.isArray(recentData.memories)) ? recentData.memories : [];
+    window._homeAssociationMemories = memories;
+    window._homeAssociationsExpanded = false;
+    if (projectEl) {
+      if (!recentData) {
+        projectEl.textContent = '暂时读不到数据';
+      } else if (recentBusy) {
+        projectEl.textContent = '记忆正在后台整理中';
+      } else if (memories.length > 0) {
+        const latest = memories.reduce((max, m) => Math.max(max, Number(m.created_at_ms || 0)), 0);
+        projectEl.textContent = `共 ${num(memories.length)} 条 · 更新于 ${formatClockTime(latest)}`;
+      } else {
+        projectEl.textContent = '暂无记忆';
+      }
+    }
+    // busy 时列表体也显示"整理中"占位，避免误导成"还没有记忆"（整页重试会再次渲染真实列表）
+    if (recentBusy) {
+      assocList.innerHTML = '<div class="text-center text-dim" style="padding:16px;">记忆正在后台整理中，稍后自动刷新</div>';
+    } else {
+      renderHomeAssociationItems(memories, false);
+    }
+
+    // --- M3 系统替你做的事 ---
+    loadActivityFeed(actData, synthItems, memories);
+
+    // --- M4c 成长趋势分桶（list limit 500，按 created_at_ms 本地自然日聚合，时间正序） ---
+    buildHomeMemoryBucket(listData);
+
+    // --- M4 记忆资产（成长趋势的 sparkline 依赖 list 分桶，单独容错拉取） ---
+    renderMemoryAssets(statsData, synthData);
+
+    // 所有模块基于当前数据即时渲染后，若仍有核心端点 busy，则调度整页重试收敛
+    if (homeBusy) {
+      // 后台整理中：每次调度都刷新 M1/M2 占位，让重试进度可见
+      renderValueHeroBusy();
+      if (_homeDataRetryCount < HOME_DATA_MAX_RETRIES && !_homeDataRetryTimer) {
+        _homeDataRetryCount++;
+        _homeDataRetryTimer = setTimeout(() => {
+          _homeDataRetryTimer = null;
+          loadHomeData(true);
+        }, _homeDataRetryDelay());
+      }
+    } else {
+      _homeDataRetryCount = 0;
+      if (_homeDataRetryTimer) {
+        clearTimeout(_homeDataRetryTimer);
+        _homeDataRetryTimer = null;
+      }
+    }
+  } catch (err) {
+    if (err?.name === 'AbortError' || signal.aborted) return;
+    console.error('[loadHomeData] 首页数据加载失败:', err);
+    if (assocList) {
+      assocList.innerHTML = '<div class="text-center text-dim" style="padding:16px;">首页数据暂时不可用，请稍后刷新。</div>';
+    }
+    if (projectEl) projectEl.textContent = '暂时读不到数据';
+    renderValueHeroError();
+    const feedEl = document.getElementById('activity-feed');
+    if (feedEl) feedEl.innerHTML = '<div class="af-empty">暂时读不到系统动态</div>';
+    renderMemoryAssets(null, null);
+  }
+}
+window.loadHomeData = loadHomeData;
+// M1-M4 新增导出（data-action 集中绑定通过 window 解析）
+window.renderValueHero = renderValueHero;
+window.loadActivityFeed = loadActivityFeed;
+window.renderMemoryAssets = renderMemoryAssets;
+window.buildHomeMemoryBucket = buildHomeMemoryBucket;
+window.formatRelativeTime = formatRelativeTime;
+// M2 展开/收起按钮导出
+window.toggleHomeAssociations = toggleHomeAssociations;
+window.renderHomeAssociationItems = renderHomeAssociationItems;
+
+// 首页搜索框回车 → 携带关键词跳转记忆搜索
+function homeSearchSubmit() {
+  const input = document.getElementById('home-search-input');
+  const keyword = (input?.value || '').trim();
+  gotoMemorySearch(keyword);
+  return false;
+}
+
+// 跳转记忆列表，并可携带用户输入的关键词作为筛选条件。
+function gotoMemorySearch(keyword) {
+  switchTab('memory-search');
+  const input = document.getElementById('memory-search-input');
+  if (input && keyword) {
+    input.value = String(keyword);
+    debouncedMemorySearch();
+  }
+  if (input) {
+    setTimeout(() => input.focus(), 60);
+  }
+}
+
+// 记一笔：打开新增记忆弹窗（P0：快速写入）
+function openQuickAdd() {
+  const modal = document.getElementById('quick-add-modal');
+  if (!modal) return;
+  // 重置表单为默认值（类型 fact、重要性 5）
+  const typeSel = document.getElementById('quick-add-type');
+  const impSel = document.getElementById('quick-add-importance');
+  const contentEl = document.getElementById('quick-add-content');
+  const tagsEl = document.getElementById('quick-add-tags');
+  const projectEl = document.getElementById('quick-add-project');
+  const errEl = document.getElementById('quick-add-error');
+  if (typeSel) typeSel.value = 'fact';
+  if (impSel) impSel.value = '5';
+  if (contentEl) contentEl.value = '';
+  if (tagsEl) tagsEl.value = '';
+  if (projectEl) projectEl.value = '';
+  if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+  modal.hidden = false;
+  if (contentEl) setTimeout(() => contentEl.focus(), 60);
+}
+
+// 关闭新增记忆弹窗
+function closeQuickAddModal() {
+  const modal = document.getElementById('quick-add-modal');
+  if (modal) modal.hidden = true;
+}
+
+// 提交新增记忆：调用 POST /v1/memories/remember，成功关闭弹窗并刷新首页/列表/统计，失败保留输入
+async function submitQuickAddMemory() {
+  const contentEl = document.getElementById('quick-add-content');
+  const typeSel = document.getElementById('quick-add-type');
+  const impSel = document.getElementById('quick-add-importance');
+  const tagsEl = document.getElementById('quick-add-tags');
+  const projectEl = document.getElementById('quick-add-project');
+  const errEl = document.getElementById('quick-add-error');
+  const saveBtn = document.getElementById('quick-add-save-btn');
+  if (!contentEl || !typeSel) return;
+
+  const content = contentEl.value.trim();
+  // 内容必填校验
+  if (!content) {
+    if (errEl) { errEl.style.display = 'block'; errEl.textContent = '内容不能为空'; }
+    contentEl.focus();
+    return;
+  }
+  // 重要性解析（1-10，默认 5）
+  let importance = parseInt(impSel ? impSel.value : '5', 10);
+  if (isNaN(importance) || importance < 1 || importance > 10) importance = 5;
+  // 标签解析（逗号/顿号/空格分隔）
+  const tags = (tagsEl && tagsEl.value.trim())
+    ? tagsEl.value.split(/[,，、\s]+/).map(s => s.trim()).filter(Boolean)
+    : [];
+  // 项目（可选）
+  const project = (projectEl && projectEl.value.trim()) ? projectEl.value.trim() : null;
+
+  // 进入加载态，防止重复提交
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '保存中…'; }
+  if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+
+  try {
+    await syncSidecarApiBase();
+    const res = await fetchWithTimeout(window.API_BASE + '/v1/memories/remember', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content,
+        memory_type: typeSel.value || 'fact',
+        importance,
+        tags,
+        project,
+      }),
+    }, 15000);
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => null);
+      throw new Error((errBody && errBody.message) || ('记忆写入失败（HTTP ' + res.status + '）'));
+    }
+    // 成功：关闭弹窗、刷新首页/列表/统计、Toast 提示
+    closeQuickAddModal();
+    refreshAfterMemoryWrite();
+    if (typeof showToast === 'function') showToast('记忆已保存', 'success');
+  } catch (e) {
+    // 失败：保留用户已填写内容，仅提示错误，不关闭弹窗
+    if (errEl) {
+      errEl.style.display = 'block';
+      errEl.textContent = '保存失败：' + (e.message || String(e));
+    }
+    console.error('[submitQuickAddMemory] 保存失败:', e);
+  } finally {
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '保存'; }
+  }
+}
+
+// 记忆写入/删除成功后刷新首页、全部记忆列表、统计
+function refreshAfterMemoryWrite() {
+  // 首页（当前上下文、最近沉淀、记忆总览）
+  if (typeof loadHomeData === 'function') loadHomeData();
+  // 全部记忆列表（若当前处于搜索页会立即重新加载）
+  if (typeof debouncedMemorySearch === 'function') debouncedMemorySearch();
+  // 统计（项目分布等）
+  if (typeof loadMemoryStats === 'function') loadMemoryStats();
+}
+
+// 查看结晶历史：v0.9.7 首页重构后结晶成果在 M4d，定位到该卡并保留折叠区内的历史加载
+function gotoSynthesisHistory() {
+  switchTab('dashboard');
+  const target = document.getElementById('crystal-highlights');
+  if (target && typeof target.scrollIntoView === 'function') {
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+  const morePanel = document.getElementById('home-advanced-details');
+  if (morePanel) morePanel.open = true;
+  setTimeout(() => {
+    if (typeof loadCrystallizationHistory === 'function') loadCrystallizationHistory();
+  }, 100);
+}
+
+// data-action 集中绑定通过 window[action] 解析，需显式导出
+window.gotoMemorySearch = gotoMemorySearch;
+window.openQuickAdd = openQuickAdd;
+window.closeQuickAddModal = closeQuickAddModal;
+window.submitQuickAddMemory = submitQuickAddMemory;
+window.forgetMemory = forgetMemory;
+window.gotoSynthesisHistory = gotoSynthesisHistory;
+window.homeSearchSubmit = homeSearchSubmit;
+// v0.9.6 G6 修复：此前已定义但未导出，首页分类卡点击失效
+window.filterMemoriesByType = filterMemoriesByType;
+window.closeParentError = closeParentError;
+window.openHomeMemory = openHomeMemory;
+
+// 首页搜索框回车事件
+document.addEventListener('DOMContentLoaded', function() {
+  const homeSearch = document.getElementById('home-search-input');
+  if (homeSearch) {
+    homeSearch.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') {
+        ev.preventDefault();
+        homeSearchSubmit();
+      }
+    });
+  }
+  // 首页数据延迟加载，避免阻塞首屏渲染
+  setTimeout(loadHomeData, 1200);
+});
+
+
 let crystallizationHistoryRequest = null;
 
 async function loadCrystallizationHistory() {
@@ -6543,8 +7912,12 @@ async function loadCrystallizationHistory() {
 
   try {
     await syncSidecarApiBase();
+    // v0.9.6 修复：数据源从审计事件改为合成记忆本身。
+    // 结晶的持久化产物就是 Synthesis 类型记忆（created_at 即结晶完成时间）。
+    // 原实现从 audit-trail 提取 synthesis_created 事件，但历史合成未落审计
+    // 事件（批量导入/早期版本），导致时间线永远显示"暂无结晶记录"。
     const res = await fetchWithTimeout(
-      `${window.API_BASE}/v1/audit-trail?event_types=synthesis_created,consolidation_completed&limit=10`,
+      `${window.API_BASE}/v1/memories/synthesis-timeline?limit=10`,
       { signal },
       10000
     );
@@ -6552,19 +7925,28 @@ async function loadCrystallizationHistory() {
     if (data.lock_busy || data.degraded) {
       throw new Error('后台正在处理记忆，请稍后刷新');
     }
-    const events = Array.isArray(data.events) ? data.events : [];
-    events.sort((a, b) => Number(b.timestamp_ms || 0) - Number(a.timestamp_ms || 0));
-    if (events.length === 0) {
+    const items = Array.isArray(data.items) ? data.items : [];
+    if (items.length === 0) {
       timelineEl.innerHTML = '<div class="timeline-empty">暂无结晶记录，完成一次知识结晶后会显示在这里。</div>';
       return;
     }
-    timelineEl.innerHTML = events.map(e => `
+    // v0.9.6 P1-1：展示来源记忆数/置信度，体现"记忆→结晶"成长链路
+    timelineEl.innerHTML = items.map(it => {
+      const sourceText = Number(it.source_count) > 0
+        ? `由 ${num(it.source_count)} 条相关记忆结晶而成`
+        : '';
+      const confText = Number(it.confidence) > 0
+        ? `置信度 ${(Number(it.confidence) * 100).toFixed(0)}%`
+        : '';
+      return `
       <div class="crystallization-event">
-        <div class="crystallization-event-title">${htmlescape(e.event_type || '结晶事件')}</div>
-        <div class="crystallization-event-time">${htmlescape(formatTimelineTime(e.timestamp_ms))}</div>
-        <div class="crystallization-event-desc">${htmlescape(e.description || e.details || '已完成一次知识结晶。')}</div>
+        <div class="crystallization-event-title">${htmlescape(truncateText(it.content, 24))}</div>
+        <div class="crystallization-event-time">${htmlescape(formatTimelineTime(it.created_at_ms))}</div>
+        <div class="crystallization-event-desc">${htmlescape(truncateText(it.content, 96))}${it.project ? `<span class="crystallization-event-project"> · ${htmlescape(truncateText(it.project, 24))}</span>` : ''}</div>
+        ${(sourceText || confText) ? `<div class="crystallization-event-meta">${sourceText}${sourceText && confText ? ' · ' : ''}${confText}</div>` : ''}
       </div>
-    `).join('');
+    `;
+    }).join('');
   } catch (err) {
     if (err?.name === 'AbortError' || signal.aborted) return;
     timelineEl.innerHTML = `<div class="timeline-error">结晶历史加载失败：${htmlescape(err.message || '服务暂不可用')} <button class="btn btn-ghost" data-action="loadCrystallizationHistory">重试</button></div>`;
@@ -6584,12 +7966,14 @@ document.addEventListener('DOMContentLoaded', function() {
   setTimeout(loadCrystallizationHistory, 1500);
   // 初始化道同构度仪表盘
   setTimeout(loadDaoMetrics, 800);
-  // 初始化演化时间线
-  setTimeout(loadEvolutionTimeline, 1200);
+  // v0.9.7 首页重构：演化时间线不再即时加载，改为 M5 折叠区首次展开时懒加载
+  bindAdvancedPanelLazyLoad();
   // 初始化侧边栏导航
   initSidebarNav();
   // 初始化手机端底部标签栏
   initMobileTabbar();
+  // 初始化联想中心三视图
+  initAssociationCenter();
   // 初始化记忆搜索筛选器
   initMemoryFilters();
   // 初始化欢迎区（设计文档 5.2.1：仅首次使用时显示）
@@ -6892,7 +8276,7 @@ function _applyDaoMetricsFallback(reason) {
       banner.style.cssText = 'background:rgba(255,193,7,0.15);color:#856404;padding:8px 12px;border-radius:4px;margin-bottom:8px;font-size:13px;display:flex;align-items:center;gap:8px;';
       panel.insertBefore(banner, panel.firstChild);
     }
-    banner.textContent = '⚠ 道同构度数据加载失败：' + reason;
+    banner.textContent = '道同构度数据加载失败：' + reason;
 
     // 添加重试按钮（如尚未添加）
     if (!banner.querySelector('.dao-retry-btn')) {
@@ -6973,6 +8357,7 @@ async function loadEvolutionTimeline() {
           comprehensive_rebalance: '综合再平衡',
           catastrophic_event: '灾难检测',
           chronic_degradation: '慢性恶化',
+          retrieval_executed: '联想检索',
         };
         const typeLabel = typeLabelMap[rawType] || rawType;
         const iconMap = {
@@ -7009,6 +8394,28 @@ async function loadEvolutionTimeline() {
 }
 window.loadEvolutionTimeline = loadEvolutionTimeline;
 
+/**
+ * v0.9.7 首页重构：M5「技术细节」折叠区懒加载绑定
+ * 演化时间线只在折叠区第一次展开时才请求（面板内"刷新"按钮仍可手动重载）
+ */
+let _advancedPanelLoaded = false;
+function bindAdvancedPanelLazyLoad() {
+  const panel = document.getElementById('home-advanced-details');
+  if (!panel) return;
+  panel.addEventListener('toggle', () => {
+    if (!panel.open || _advancedPanelLoaded) return;
+    _advancedPanelLoaded = true;
+    if (typeof loadEvolutionTimeline === 'function') loadEvolutionTimeline();
+  });
+}
+
+/** 演化时间线是否需要刷新：M5 折叠区处于展开态才刷新，避免首屏多余请求 */
+function isAdvancedPanelOpen() {
+  const panel = document.getElementById('home-advanced-details');
+  return !!(panel && panel.open);
+}
+window.isAdvancedPanelOpen = isAdvancedPanelOpen;
+
 /* ============================================================
  * v0.6.0 记忆搜索页面（设计文档 5.3）
  * 防抖搜索 + 筛选 + 卡片流 + 右侧详情面板
@@ -7043,14 +8450,67 @@ async function searchMemories() {
   if (!input || !resultsEl) return;
 
   const query = input.value.trim();
+
+  // v0.9.6 G6 修复：空查询 = 浏览全部记忆（搜索退化为筛选），调用 /v1/memories/list
+  // 根因：此前空 query 直接渲染空态提示，用户打开"全部记忆"看不到任何数据
   if (!query) {
+    if (searchAbortController) {
+      searchAbortController.abort();
+    }
+    searchAbortController = new AbortController();
+    const listSignal = searchAbortController.signal;
     resultsEl.innerHTML = `
-      <div class="memory-search-empty">
-        <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
-        <div class="empty-poem">寻而未得，或待他时</div>
-        <p class="text-sm text-dim">输入关键词开始搜索记忆</p>
-      </div>
+      <div class="skeleton skeleton-text title" style="margin-bottom: 8px;"></div>
+      <div class="skeleton skeleton-text" style="margin-bottom: 8px;"></div>
+      <div class="skeleton skeleton-text short" style="margin-bottom: 16px;"></div>
     `;
+    try {
+      await syncSidecarApiBase();
+      // v0.9.6 G6：list 接口返回全量记忆（限制 500 条避免页面过载），created_at_ms → ISO 供筛选复用
+      const response = await fetchWithTimeout(`${window.API_BASE}/v1/memories/list`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ limit: 50000 }),
+        signal: listSignal
+      }, 10000);
+      if (listSignal.aborted) {
+        console.log('[searchMemories] 全部记忆请求被 abort，静默退出');
+        return;
+      }
+      const data = await safeJson(response);
+      if (data.lock_busy === true || data.degraded === true) {
+        resultsEl.innerHTML = `
+          <div class="memory-search-empty">
+            <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
+            <div class="empty-poem">记忆正在后台整理中</div>
+            <p class="text-sm text-dim">记忆系统正在执行后台合成，全部记忆稍后自动加载</p>
+          </div>`;
+        return;
+      }
+      const memories = (data.memories || []).map(m => {
+        if (m.created_at_ms && !m.created_at) {
+          m.created_at = new Date(m.created_at_ms).toISOString();
+        }
+        return m;
+      });
+      renderMemoryResults(memories, new Map());
+    } catch (err) {
+      if (err.name === 'AbortError' && listSignal.aborted) {
+        console.log('[searchMemories] 全部记忆请求被 abort（正常行为）');
+        return;
+      }
+      resultsEl.innerHTML = `
+        <div class="memory-search-empty">
+          <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
+          <div class="empty-poem">加载失败</div>
+          <p class="text-sm text-dim">${htmlescape(err.message || String(err))}</p>
+        </div>`;
+      console.error('[LRC v' + APP_VERSION + ']全部记忆加载失败:', err);
+    } finally {
+      if (searchAbortController && searchAbortController.signal === listSignal) {
+        searchAbortController = null;
+      }
+    }
     return;
   }
 
@@ -7095,57 +8555,18 @@ async function searchMemories() {
 
     // v0.6.0 适配 /v1/memories/enrich 响应格式（memories 数组）
     const results = data.memories || data.results || [];
+    // 阶段D：保存结构化联想解释，供结果卡片与详情面板使用
+    const explanationItems = (data.explanation && Array.isArray(data.explanation.items))
+      ? data.explanation.items : [];
+    const explanationById = new Map(explanationItems.map(item => [item.id, item]));
+    results.forEach(memory => {
+      memory._associationExplanation = explanationById.get(memory.id) || null;
+      memory._associationQuery = data.explanation && data.explanation.query
+        ? data.explanation.query : query;
+    });
     if (results.length > 0) {
-      // 应用筛选器
-      let filtered = results;
-      if (memorySearchFilters.type !== 'all') {
-        filtered = filtered.filter(m => m.memory_type === memorySearchFilters.type);
-      }
-      if (memorySearchFilters.importance !== 'all') {
-        const ranges = { high: [8, 10], medium: [5, 7], low: [1, 4] };
-        const [min, max] = ranges[memorySearchFilters.importance];
-        filtered = filtered.filter(m => (m.importance || 5) >= min && (m.importance || 5) <= max);
-      }
-
-      if (filtered.length === 0) {
-        resultsEl.innerHTML = `
-          <div class="memory-search-empty">
-            <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
-            <div class="empty-poem">寻而未得，或待他时</div>
-            <p class="text-sm text-dim">未找到匹配的记忆，尝试调整搜索条件</p>
-          </div>
-        `;
-        return;
-      }
-
-      const html = filtered.map((memory, idx) => {
-        // v0.8.4 Step 9 / G040 修复：白名单校验 memory_type，防止 XSS
-        const safeType = sanitizeMemoryType(memory.memory_type || 'conversation');
-        const typeClass = `card-memory-${safeType}`;
-        const preview = (memory.content || '').substring(0, 200);
-        const time = memory.created_at || memory.timestamp || '--';
-        const importance = memory.importance || 5;
-        // v0.8.4 Step 9 / G025 修复：移除内联 onclick，改用 data-action + data-arg（索引）
-        // v0.8.4 Step 9 / G032 修复：data-action 走 bindAllActions 防抖，避免绕过
-        return `
-          <div class="memory-card-item ${typeClass}" data-action="openMemoryDetail" data-arg="${idx}">
-            <div class="memory-card-preview">${htmlescape(preview)}</div>
-            <div class="memory-card-meta">
-              <span><img src="/assets/icons/icon-memory.svg" alt="" width="12" height="12"> ${htmlescape(memory.memory_type || '未分类')}</span>
-              <span>重要性: ${htmlescape(String(importance))}</span>
-              <span>${htmlescape(time)}</span>
-            </div>
-          </div>
-        `;
-      }).join('');
-      // v0.8.4 Step 9：存储搜索结果到全局缓存，供 openMemoryDetail 按索引查找
-      window._memorySearchResults = filtered;
-      resultsEl.innerHTML = html;
-      // v0.8.4 Step 9：动态生成的元素需要重新绑定 data-action
-      if (typeof bindAllActions === 'function') {
-        bindAllActions();
-      }
-      console.log(`[LRC v${APP_VERSION}]记忆搜索完成，返回 ${filtered.length} 条结果`);
+      // v0.9.6 G6：统一渲染（筛选 + 卡片 + 缓存），list 分支共用
+      renderMemoryResults(results, explanationById);
     } else {
       resultsEl.innerHTML = `
         <div class="memory-search-empty">
@@ -7178,6 +8599,104 @@ async function searchMemories() {
 }
 
 /**
+ * v0.9.6 G6 新增：统一渲染记忆结果（enrich 搜索与 list 全部记忆共用）
+ * 应用类型/重要性/时间筛选，生成卡片流并更新全局缓存供详情面板按索引查找。
+ * @param {Array} memories - 记忆数组
+ * @param {Map} explanationById - 联想解释映射（list 模式传空 Map）
+ */
+function renderMemoryResults(memories, explanationById) {
+  const resultsEl = document.getElementById('memory-search-results');
+  if (!resultsEl) return;
+
+  const summaryEl = document.getElementById('memory-list-summary');
+  if (!Array.isArray(memories) || memories.length === 0) {
+    if (summaryEl) summaryEl.textContent = '记忆库暂无内容';
+    resultsEl.innerHTML = `
+      <div class="memory-search-empty">
+        <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
+        <div class="empty-poem">暂无记忆</div>
+        <p class="text-sm text-dim">这里将展示全部记忆，暂无内容可浏览。</p>
+      </div>
+    `;
+    return;
+  }
+  if (summaryEl) summaryEl.textContent = `共 ${num(memories.length)} 条，当前显示 ${num(memories.length)} 条`;
+
+  // 应用筛选器
+  let filtered = memories;
+  if (memorySearchFilters.type !== 'all') {
+    filtered = filtered.filter(m => m.memory_type === memorySearchFilters.type);
+  }
+  if (memorySearchFilters.importance !== 'all') {
+    const ranges = { high: [8, 10], medium: [5, 7], low: [1, 4] };
+    const [min, max] = ranges[memorySearchFilters.importance];
+    filtered = filtered.filter(m => (m.importance || 5) >= min && (m.importance || 5) <= max);
+  }
+  // v0.9.6 修复：时间筛选器补齐逻辑（此前只有 UI 无过滤，用户操作被忽略）
+  if (memorySearchFilters.time !== 'all') {
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    const startOfWeek = startOfToday - (now.getDay() === 0 ? 6 : now.getDay() - 1) * 86400000;
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+    const cutoff = { today: startOfToday, week: startOfWeek, month: startOfMonth }[memorySearchFilters.time];
+    filtered = filtered.filter(m => {
+      const ts = Date.parse(m.created_at || m.timestamp || '');
+      return !isNaN(ts) && ts >= cutoff;
+    });
+  }
+
+  if (summaryEl) {
+    summaryEl.textContent = `共 ${num(memories.length)} 条，当前显示 ${num(filtered.length)} 条`;
+  }
+  if (filtered.length === 0) {
+    resultsEl.innerHTML = `
+      <div class="memory-search-empty">
+        <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
+        <div class="empty-poem">寻而未得，或待他时</div>
+        <p class="text-sm text-dim">未找到匹配的记忆，尝试调整筛选条件</p>
+      </div>
+    `;
+    return;
+  }
+
+  const html = filtered.map((memory) => {
+    // v0.8.4 Step 9 / G040 修复：白名单校验 memory_type，防止 XSS
+    const safeType = sanitizeMemoryType(memory.memory_type || 'conversation');
+    const typeClass = `card-memory-${safeType}`;
+    const preview = (memory.content || '').substring(0, 200);
+    const time = memory.created_at || memory.timestamp || '--';
+    const importance = memory.importance || 5;
+    const association = memory._associationExplanation;
+    const pathLabel = association && Array.isArray(association.hit_paths)
+      ? association.hit_paths.map(path => path === 'fast' ? '快速' : '深度').join(' + ')
+      : '';
+    const associationHint = association
+      ? `<span title="联想路径：${htmlescape(pathLabel || '未知')}">联想：${htmlescape(pathLabel || '未知')} · 贡献 ${Number(association.fused_contrib || 0).toFixed(4)}</span>`
+      : '';
+    // v0.8.4 Step 9 / G025 修复：移除内联 onclick，改用 data-action + data-arg（索引）
+    return `
+      <div class="memory-card-item ${typeClass}" data-action="openMemoryDetail" data-memory-id="${htmlescape(String(memory.id || ''))}">
+        <div class="memory-card-preview">${htmlescape(preview)}</div>
+        <div class="memory-card-meta">
+          <span><img src="/assets/icons/icon-memory.svg" alt="" width="12" height="12"> ${htmlescape(memory.memory_type || '未分类')}</span>
+          <span>重要性: ${htmlescape(String(importance))}</span>
+          ${associationHint}
+          <span>${htmlescape(time)}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+  // v0.8.4 Step 9：存储搜索结果到全局缓存，供 openMemoryDetail 按索引查找
+  window._memorySearchResults = filtered;
+  resultsEl.innerHTML = html;
+  // v0.8.4 Step 9：动态生成的元素需要重新绑定 data-action
+  if (typeof bindAllActions === 'function') {
+    bindAllActions();
+  }
+  console.log(`[LRC v${APP_VERSION}]记忆渲染完成，返回 ${filtered.length} 条结果`);
+}
+
+/**
  * 打开记忆详情面板（右侧滑出 40% 宽度）
  * v0.8.4 Step 9 / G025 修复：支持接收索引参数，从全局缓存查找 memory 对象
  * @param {number|object} memoryOrIndex - memory 对象或在搜索结果中的索引
@@ -7193,22 +8712,33 @@ function openMemoryDetail(memoryOrIndex) {
       return;
     }
     memory = cache[memoryOrIndex];
-    if (!memory) {
-      console.warn('[openMemoryDetail] 缓存中未找到记忆:', memoryOrIndex);
-      showToast('记忆详情加载失败：数据不存在', 'error');
-      return;
-    }
+  } else if (typeof memoryOrIndex === 'string') {
+    const cache = [...(window._memorySearchResults || []), ...(window._homeAssociationMemories || [])];
+    memory = cache.find(item => String(item.id) === memoryOrIndex);
   }
-  // 兼容直接传入 memory 对象的场景
-  if (!memory || typeof memory !== 'object') {
-    console.warn('[openMemoryDetail] 无效的 memory 参数:', memoryOrIndex);
+  if (!memory) {
+    console.warn('[openMemoryDetail] 缓存中未找到记忆:', memoryOrIndex);
+    showToast('记忆详情加载失败：数据不存在', 'error');
     return;
   }
-
   const panel = document.getElementById('memory-detail-panel');
   const backdrop = document.getElementById('memory-detail-backdrop');
   const content = document.getElementById('memory-detail-content');
   if (!panel || !content) return;
+
+  // 无有效上下文时也打开详情面板，明确说明修正/拆解不可用，避免点击后无反馈。
+  if (!memory || typeof memory !== 'object') {
+    console.warn('[openMemoryDetail] 无效的 memory 参数:', memoryOrIndex);
+    content.innerHTML = `
+      <div class="memory-detail-empty" style="padding:24px 12px;text-align:center;">
+        <div class="empty-poem">暂无记忆详情</div>
+        <p class="text-sm text-dim" style="margin-top:8px;">当前没有可操作的记忆上下文，请返回搜索结果后重新选择一条记忆。</p>
+        <p class="text-sm text-dim" style="margin-top:4px;">修正记忆和拆解合成需要有效的记忆 ID。</p>
+      </div>`;
+    panel.classList.add('open');
+    if (backdrop) backdrop.classList.add('open');
+    return;
+  }
 
   // v0.7.0 修复: 存储当前查看的记忆到全局变量，供修正/拆解/反馈按钮使用
   window._currentDetailMemory = memory;
@@ -7216,6 +8746,61 @@ function openMemoryDetail(memoryOrIndex) {
   const memoryId = memory.id || '';
   const memoryType = memory.memory_type || '';
   const isSynthesis = memoryType === 'synthesis';
+  const association = memory._associationExplanation;
+  const associationQuery = memory._associationQuery || '';
+  // v0.9.6：联想解释自然语言化——不再暴露卦象与技术数值，而是讲清
+  // 「你的查询想找什么 → 联想到了什么方向 → 为什么被排在前面」。
+  const associationPaths = association && Array.isArray(association.hit_paths)
+    ? association.hit_paths.map(path => path === 'fast' ? '关键词匹配' : '语义相关').join('、')
+    : '';
+  const associationHtml = association ? (() => {
+    // 自然语言解释：根据命中通路与排名生成
+    const reasonParts = [];
+    if (association.hit_paths && association.hit_paths.length === 2) {
+      reasonParts.push('这条记忆既与查询有关键词重合，也在语义方向上相似');
+    } else if (association.hit_paths && association.hit_paths.includes('deep')) {
+      reasonParts.push('这条记忆在语义方向上与你的查询相关');
+    } else {
+      reasonParts.push('这条记忆与你的查询存在关键词重合');
+    }
+    if (association.rank && association.rank <= 3) {
+      reasonParts.push('，所以被排在了联想结果的前列');
+    } else {
+      reasonParts.push('，因此被联想到');
+    }
+    const natural = reasonParts.join('');
+    // v0.9.x 修复：评价痕迹改为本地备注语义（仅本机保存，不上传，不改变排序）
+    let feedbackBadge = '';
+    try {
+      const saved = JSON.parse(localStorage.getItem('lrc_association_feedback') || '{}')[memoryId];
+      if (saved && saved.type) {
+        const labelMap = { positive: '相关', negative: '不相关', neutral: '部分相关' };
+        const when = new Date(saved.ts).toLocaleDateString('zh-CN');
+        feedbackBadge = `
+          <div class="association-feedback-badge" style="margin-top:6px;font-size:12px;color:var(--color-success,#2e7d32);" title="仅本机保存，不上传，不影响排序">
+            <img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">本地备注已保存：${htmlescape(labelMap[saved.type] || saved.type)}（${htmlescape(when)}）${saved.note ? ' · ' + htmlescape(saved.note) : ''}
+          </div>`;
+      }
+    } catch (_) { /* localStorage 不可用时忽略痕迹回显 */ }
+    // 技术明细折叠展示（仅供开发者调试，不干扰普通用户）
+    const technical = `
+      <details style="margin-top:6px;">
+        <summary class="text-dim" style="cursor:pointer;font-size:12px;">技术详情（联通路与贡献分）</summary>
+        <div class="text-sm text-dim" style="margin-top:4px;">
+          命中通路：${htmlescape(associationPaths || '未知')} · 结果排名：${htmlescape(String(association.rank || '--'))}<br>
+          快速贡献 ${Number(association.fast_contrib || 0).toFixed(4)} · 深度贡献 ${Number(association.deep_contrib || 0).toFixed(4)}<br>
+          融合贡献 ${Number(association.fused_contrib || 0).toFixed(4)}（仅观测，不影响排序）
+        </div>
+      </details>`;
+    return `
+    <div class="memory-detail-association" style="margin-top: 12px; padding: 10px; border: 1px solid var(--border-color, #ddd); border-radius: 6px;">
+      <strong>为什么联想这条</strong>
+      <div class="text-sm" style="margin-top: 6px;">${htmlescape(associationQuery ? '你的查询：「' + associationQuery + '」' : '')}</div>
+      <div class="text-sm" style="margin-top: 4px;">${htmlescape(natural)}</div>
+      ${feedbackBadge}
+      ${technical}
+    </div>`;
+  })() : '';
 
   content.innerHTML = `
     <h3>${htmlescape(memory.content ? memory.content.substring(0, 50) + '...' : '记忆详情')}</h3>
@@ -7232,6 +8817,8 @@ function openMemoryDetail(memoryOrIndex) {
       <span class="label">标签</span>
       <span class="value">${htmlescape((memory.tags || []).join(', ') || '--')}</span>
     </div>
+    ${associationHtml}
+    ${!memoryId ? '<p class="text-sm text-dim" style="margin-top:8px;">该记忆无有效 ID，以下操作不可用</p>' : ''}
     <div class="memory-detail-actions" style="margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px;">
       <!-- v0.8.3 Step 11：N12 XSS 修复，使用 data-action + data-arg 替代内联 onclick（修复 G001-G003） -->
       <!-- 此前 onclick="correctMemory('${memoryId}')" 存在 XSS 风险（memoryId 含单引号可注入） -->
@@ -7239,8 +8826,8 @@ function openMemoryDetail(memoryOrIndex) {
         修正记忆
       </button>
       ${isSynthesis ? `<button class="btn btn-outline" data-action="unfoldMemory" data-arg="${htmlescape(memoryId)}" ${!memoryId ? 'disabled' : ''}>拆解合成</button>` : ''}
-      <button class="btn btn-outline" data-action="submitMemoryFeedback" data-arg="${htmlescape(memoryId)}" ${!memoryId ? 'disabled' : ''}>
-        反馈
+      <button class="btn btn-outline" style="color:var(--lrc-朱砂-500,#C0392B);border-color:var(--lrc-朱砂-300,#E6B0AA);" data-action="forgetMemory" data-arg="${htmlescape(memoryId)}" ${!memoryId ? 'disabled' : ''} title="永久删除这条记忆，不可恢复">
+        永久删除
       </button>
     </div>
   `;
@@ -7254,6 +8841,12 @@ function openMemoryDetail(memoryOrIndex) {
     btn.dataset.bound = '1';
     btn.addEventListener('click', async (ev) => {
       // 复用 bindAllActions 的事件处理逻辑
+      // v0.9.x 修复：动态详情按钮同样拦截 btn-disabled-api（离线/服务未运行时禁用触发）
+      if (btn.classList.contains('btn-disabled-api')) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+      }
       if (btn.dataset.inFlight === '1') {
         ev.preventDefault();
         ev.stopPropagation();
@@ -7295,6 +8888,48 @@ function closeMemoryDetail() {
   if (backdrop) backdrop.classList.remove('open');
 }
 
+/**
+ * 永久删除记忆：调用 POST /v1/memories/forget
+ * 需 showConfirm 二次确认；删除期间按钮进入加载态，失败时恢复按钮状态。
+ * @param {string} memoryId - 记忆 ID
+ */
+async function forgetMemory(memoryId) {
+  const id = String(memoryId || '').trim();
+  if (!id) {
+    if (typeof showToast === 'function') showToast('缺少记忆 ID，无法删除', 'warning');
+    return;
+  }
+  // 二次确认（复用全局 showConfirm）
+  const confirmed = await showConfirm('确定要永久删除这条记忆吗？此操作不可恢复。', '永久删除');
+  if (!confirmed) return;
+
+  // 进入加载态：禁用删除按钮，防止重复提交
+  const delBtn = document.querySelector('#memory-detail-panel [data-action="forgetMemory"]');
+  if (delBtn) { delBtn.disabled = true; delBtn.textContent = '删除中…'; }
+
+  try {
+    await syncSidecarApiBase();
+    const res = await fetchWithTimeout(window.API_BASE + '/v1/memories/forget', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memory_id: id }),
+    }, 15000);
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => null);
+      throw new Error((errBody && errBody.message) || ('删除失败（HTTP ' + res.status + '）'));
+    }
+    // 成功：关闭详情面板、刷新首页/列表/统计、Toast 提示
+    closeMemoryDetail();
+    refreshAfterMemoryWrite();
+    if (typeof showToast === 'function') showToast('记忆已删除', 'success');
+  } catch (e) {
+    // 失败：恢复按钮状态，保留详情面板，便于用户重试
+    if (delBtn) { delBtn.disabled = false; delBtn.textContent = '永久删除'; }
+    console.error('[forgetMemory] 删除失败:', e);
+    if (typeof showToast === 'function') showToast('删除失败：' + (e.message || String(e)), 'error');
+  }
+}
+
 // ============================================================
 // v0.7.0 修复: 孤儿路由前端入口实现
 // 6 个后端孤儿路由的前端调用逻辑
@@ -7309,7 +8944,7 @@ async function correctMemory(memoryId) {
   // P0-1：标记新一次纠错操作开始，清除上一次纠错的残留 toast，避免跨操作串位
   markOperationStart('memory-correct');
   if (!memoryId) {
-    showToast('✗ 无法修正：记忆 ID 为空', 'error', 3000, 'memory-correct');
+    showToast('无法修正：记忆 ID 为空', 'error', 3000, 'memory-correct');
     return;
   }
 
@@ -7336,7 +8971,7 @@ async function correctMemory(memoryId) {
 
     const data = await resp.json();
     if (data.success) {
-      showToast('✓ 记忆修正成功，新版本: ' + (data.new_version || '--') +
+      showToast('记忆修正成功，新版本: ' + (data.new_version || '--') +
                 '，历史版本数: ' + (data.history_versions || '--'), 'success', 3000, 'memory-correct');
       closeMemoryDetail();
       // 刷新记忆搜索结果
@@ -7344,76 +8979,113 @@ async function correctMemory(memoryId) {
         debouncedMemorySearch();
       }
     } else {
-      showToast('✗ 修正失败: ' + (data.message || data.error || '未知错误'), 'error', 4000, 'memory-correct');
+      showToast('修正失败: ' + (data.message || data.error || '未知错误'), 'error', 4000, 'memory-correct');
     }
   } catch (e) {
     console.error('[correctMemory] 修正失败:', e);
-    showToast('✗ 修正记忆失败: ' + (e.message || String(e)), 'error', 4000, 'memory-correct');
+    showToast('修正记忆失败: ' + (e.message || String(e)), 'error', 4000, 'memory-correct');
   } finally {
     // v0.9.0 修复 M-4：无论成功/失败都恢复按钮
+    // v0.9.x 修复：correctBtn 此前未声明（引用未定义变量），改为按 data-action 查询真实按钮
+    const correctBtn = document.querySelector('#memory-detail-panel [data-action="correctMemory"]');
     if (correctBtn) correctBtn.disabled = false;
   }
 }
 
 /**
- * v0.7.0 修复: 提交记忆反馈（调用 POST /v1/feedback）
- * 支持检索质量、合成质量等多种反馈类型
+ * v0.9.x 修复：本地质量备注表单（可视按钮选择类别 + 文本备注）
+ * 仅保存在本机 localStorage，不上传后端，不改变任何排序结果。
+ * 替代此前"输入数字"式 showPrompt，避免把反馈/评价流程暴露给普通用户主流程。
+ * @param {object} options
+ * @param {string} options.title - 弹窗标题
+ * @param {string} options.hint - 说明文案（明确仅本机保存、不上传、不改变排序）
+ * @param {Array<{value:string,label:string}>} options.categories - 可视按钮类别
+ * @param {string} [options.defaultCategory] - 默认选中类别的 value
+ * @returns {Promise<{type:string, note:string}|null>} 用户取消返回 null
+ */
+function showLocalNoteForm(options) {
+  if (modalQueue.length >= 5) {
+    console.warn('[showLocalNoteForm] 队列已满（5 个等待中），拒绝新调用');
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    modalQueue.push({ type: 'note', options, resolve });
+    processModalQueue();
+  });
+}
+window.showLocalNoteForm = showLocalNoteForm;
+
+/**
+ * v0.9.x 修复：联想质量备注（本地保存）
+ * 不再调用 POST /v1/feedback 上传后端；改为可视按钮 + 文本备注，
+ * 仅存本机 localStorage，不上传，不改变排序。
+ * @param {string} memoryId - 记忆 ID
+ */
+async function submitAssociationFeedback(memoryId) {
+  const memory = window._currentDetailMemory;
+  const association = memory && memory._associationExplanation;
+  if (!memoryId || !association) {
+    showToast('当前记忆没有可备注的联想上下文', 'warning');
+    return;
+  }
+
+  const result = await showLocalNoteForm({
+    title: '联想质量备注',
+    hint: '备注仅保存在本机，不会上传，也不会影响任何排序结果。',
+    categories: [
+      { value: 'positive', label: '相关' },
+      { value: 'negative', label: '不相关' },
+      { value: 'neutral', label: '部分相关' },
+    ],
+    defaultCategory: 'positive',
+  });
+  if (!result) return; // 用户取消
+
+  try {
+    const key = 'lrc_association_feedback';
+    const existing = JSON.parse(localStorage.getItem(key) || '{}');
+    existing[memoryId] = { type: result.type, ts: Date.now(), note: result.note };
+    localStorage.setItem(key, JSON.stringify(existing));
+    showToast('本地联想质量备注已保存（仅本机，不上传，不影响排序）', 'success');
+  } catch (e) {
+    console.error('[submitAssociationFeedback] 本地备注保存失败:', e);
+    showToast('本地备注保存失败: ' + (e.message || String(e)), 'error');
+  }
+}
+
+/**
+ * v0.9.x 修复：本地质量备注（本地保存）
+ * 移除「反馈类型：检索质量/合成质量/恢复隔离/两阶段确认」数字 prompt，
+ * 改为可视按钮 + 文本备注表单；仅存本机 localStorage，不上传，不改变排序。
  * @param {string} memoryId - 记忆 ID
  */
 async function submitMemoryFeedback(memoryId) {
-  // v0.8.3 Step 4 批次 2：alert→showToast，prompt→await showPrompt（修复 G001-G003）
   if (!memoryId) {
-    showToast('✗ 无法反馈：记忆 ID 为空', 'error');
+    showToast('无法备注：记忆 ID 为空', 'error');
     return;
   }
 
-  const feedbackType = await showPrompt(
-    '请选择反馈类型（输入数字）：1.检索质量 2.合成质量 3.恢复隔离 4.两阶段确认 5.其他',
-    '反馈类型',
-    '1'
-  );
-  if (feedbackType === null) return; // 用户取消
-  if (!feedbackType) return;
-
-  const typeMap = {
-    '1': 'retrieval_quality',
-    '2': 'synthesis_quality',
-    '3': 'recover_isolated',
-    '4': 'two_phase_confirm',
-    '5': 'general',
-  };
-  const fbType = typeMap[feedbackType.trim()] || 'general';
-
-  const feedbackContent = (await showPrompt('请输入反馈内容:', '反馈内容')) || '';
-  if (!feedbackContent.trim()) {
-    showToast('✗ 反馈内容不能为空', 'warning');
-    return;
-  }
+  const result = await showLocalNoteForm({
+    title: '本地质量备注',
+    hint: '备注仅保存在本机，不会上传，也不会影响任何排序结果。',
+    categories: [
+      { value: 'good', label: '质量好' },
+      { value: 'bad', label: '质量差' },
+      { value: 'general', label: '一般' },
+    ],
+    defaultCategory: 'general',
+  });
+  if (!result) return; // 用户取消
 
   try {
-    const resp = await fetchWithTimeout(API_BASE + '/v1/feedback', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: fbType,
-        memory_id: memoryId,
-        content: feedbackContent.trim(),
-        timestamp: new Date().toISOString(),
-      })
-    }, 30000);
-
-    const data = await resp.json();
-    if (data.success || data.status === 'ok' || resp.ok) {
-      showToast('✓ 反馈已提交：' + (data.message || '感谢您的反馈！'), 'success');
-    } else {
-      showToast('✗ 反馈提交失败: ' + (data.message || data.error || '未知错误'), 'error');
-    }
+    const key = 'lrc_memory_feedback';
+    const existing = JSON.parse(localStorage.getItem(key) || '{}');
+    existing[memoryId] = { type: result.type, note: result.note, ts: Date.now() };
+    localStorage.setItem(key, JSON.stringify(existing));
+    showToast('本地质量备注已保存（仅本机，不上传，不影响排序）', 'success');
   } catch (e) {
-    console.error('[submitMemoryFeedback] 提交失败:', e);
-    showToast('✗ 提交反馈失败: ' + (e.message || String(e)), 'error');
-  } finally {
-    // v0.9.0 修复 M-6：无论成功/失败都恢复按钮
-    if (feedbackBtn) feedbackBtn.disabled = false;
+    console.error('[submitMemoryFeedback] 本地备注保存失败:', e);
+    showToast('本地备注保存失败: ' + (e.message || String(e)), 'error');
   }
 }
 
@@ -7432,7 +9104,7 @@ async function encodeTextToLuoshu() {
 
   const text = input.value.trim();
   if (!text) {
-    errorBox.textContent = '✗ 请输入要编码的文本';
+    errorBox.textContent = '请输入要编码的文本';
     errorBox.style.display = 'block';
     resultBox.style.display = 'none';
     return;
@@ -7488,7 +9160,7 @@ async function encodeTextToLuoshu() {
 
     resultBox.style.display = 'block';
   } catch (e) {
-    errorBox.textContent = '✗ 编码失败: ' + (e.message || String(e));
+    errorBox.textContent = '编码失败: ' + (e.message || String(e));
     errorBox.style.display = 'block';
     resultBox.style.display = 'none';
   } finally {
@@ -7505,13 +9177,13 @@ async function encodeTextToLuoshu() {
 async function unfoldMemory(memoryId) {
   // v0.8.3 Step 4 批次 3：alert→showToast（修复 G001-G003）
   if (!memoryId) {
-    showToast('✗ 无法拆解：记忆 ID 为空', 'error');
+    showToast('无法拆解：记忆 ID 为空', 'error');
     return;
   }
 
   const content = document.getElementById('memory-detail-content');
   if (!content) {
-    showToast('✗ 记忆详情面板未打开', 'error');
+    showToast('记忆详情面板未打开', 'error');
     return;
   }
 
@@ -7525,7 +9197,7 @@ async function unfoldMemory(memoryId) {
   }
 
   // 进入加载态
-  resultArea.innerHTML = '<div style="color:var(--lrc-墨韵-300,#888);font-size:13px;">⏳ 正在拆解合成记忆...</div>';
+  resultArea.innerHTML = '<div style="color:var(--lrc-墨韵-300,#888);font-size:13px;"><img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">正在拆解合成记忆...</div>';
 
   try {
     const resp = await fetchWithTimeout(API_BASE + '/v1/memories/unfold', {
@@ -7549,7 +9221,7 @@ async function unfoldMemory(memoryId) {
     const fidelity = (typeof data.fidelity === 'number') ? data.fidelity.toFixed(4) : '--';
 
     let html = '<div style="margin-bottom:10px;">';
-    html += '<div style="font-size:13px;color:var(--lrc-玉色-400,#4a9d8e);font-weight:600;margin-bottom:4px;">✓ 拆解成功</div>';
+    html += '<div style="font-size:13px;color:var(--lrc-玉色-400,#4a9d8e);font-weight:600;margin-bottom:4px;"><img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">拆解成功</div>';
     html += '<div style="font-size:12px;color:var(--lrc-墨韵-300,#888);">子记忆数：' + subCount + ' · 保真度：' + fidelity + '</div>';
     html += '</div>';
 
@@ -7574,7 +9246,7 @@ async function unfoldMemory(memoryId) {
 
     resultArea.innerHTML = html;
   } catch (e) {
-    resultArea.innerHTML = '<div style="color:var(--lrc-朱砂-400,#c04851);font-size:13px;">✗ 拆解失败: ' + htmlescape(e.message || String(e)) + '</div>';
+    resultArea.innerHTML = '<div style="color:var(--lrc-朱砂-400,#c04851);font-size:13px;"><img class="inline-icon" src="/assets/icons/icon-error-circle.svg" width="14" height="14" alt="">拆解失败: ' + htmlescape(e.message || String(e)) + '</div>';
   }
 }
 
@@ -7592,7 +9264,7 @@ async function checkVersionUpdate() {
   btn.disabled = true;
   btn.textContent = '检查中...';
   resultBox.style.display = 'block';
-  resultBox.innerHTML = '<div style="color:var(--lrc-墨韵-300,#888);font-size:13px;">⏳ 正在连接 GitHub 检查最新版本...</div>';
+  resultBox.innerHTML = '<div style="color:var(--lrc-墨韵-300,#888);font-size:13px;"><img class="inline-icon" src="/assets/icons/icon-clock.svg" width="14" height="14" alt="">正在连接 GitHub 检查最新版本...</div>';
 
   try {
     const resp = await fetchWithTimeout(API_BASE + '/v1/version/check', {
@@ -7608,7 +9280,7 @@ async function checkVersionUpdate() {
 
     // 处理检查错误
     if (data.check_error) {
-      resultBox.innerHTML = '<div style="color:var(--lrc-朱砂-400,#c04851);font-size:13px;">✗ 检查失败: ' +
+      resultBox.innerHTML = '<div style="color:var(--lrc-朱砂-400,#c04851);font-size:13px;"><img class="inline-icon" src="/assets/icons/icon-error-circle.svg" width="14" height="14" alt="">检查失败: ' +
         htmlescape(data.check_error) + '</div>' +
         '<div style="color:var(--lrc-墨韵-300,#888);font-size:12px;margin-top:4px;">当前版本：v' + htmlescape(data.current_version || '--') + '</div>';
       return;
@@ -7626,7 +9298,7 @@ async function checkVersionUpdate() {
     if (updateAvailable) {
       // 有新版本可用
       html += '<div style="padding:12px;border-radius:8px;background:rgba(212,168,67,0.08);border:1px solid var(--lrc-金色-300,#d4a843);margin-bottom:8px;">';
-      html += '<div style="font-size:14px;color:var(--lrc-金色-400,#d4a843);font-weight:600;margin-bottom:6px;">✨ 发现新版本</div>';
+      html += '<div style="font-size:14px;color:var(--lrc-金色-400,#d4a843);font-weight:600;margin-bottom:6px;"><img class="inline-icon" src="/assets/icons/icon-sparkle.svg" width="14" height="14" alt="">发现新版本</div>';
       html += '<div style="font-size:13px;color:var(--lrc-墨韵-100,#eee);">当前版本：<strong>v' + htmlescape(current) + '</strong> → 最新版本：<strong>v' + htmlescape(latest) + '</strong></div>';
       if (updateUrl) {
         html += '<div style="margin-top:8px;"><a href="' + htmlescape(updateUrl) + '" target="_blank" rel="noopener" style="color:var(--lrc-玉色-400,#4a9d8e);font-size:13px;text-decoration:underline;">查看发布说明 →</a></div>';
@@ -7638,7 +9310,7 @@ async function checkVersionUpdate() {
     } else {
       // 已是最新版本
       html += '<div style="padding:12px;border-radius:8px;background:rgba(76,164,156,0.08);border:1px solid var(--lrc-玉色-400,#4a9d8e);margin-bottom:8px;">';
-      html += '<div style="font-size:14px;color:var(--lrc-玉色-400,#4a9d8e);font-weight:600;margin-bottom:6px;">✓ 已是最新版本</div>';
+      html += '<div style="font-size:14px;color:var(--lrc-玉色-400,#4a9d8e);font-weight:600;margin-bottom:6px;"><img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">已是最新版本</div>';
       html += '<div style="font-size:13px;color:var(--lrc-墨韵-100,#eee);">当前版本：<strong>v' + htmlescape(current) + '</strong>（最新版本：v' + htmlescape(latest) + '）</div>';
       html += '</div>';
     }
@@ -7652,7 +9324,7 @@ async function checkVersionUpdate() {
 
     resultBox.innerHTML = html;
   } catch (e) {
-    resultBox.innerHTML = '<div style="color:var(--lrc-朱砂-400,#c04851);font-size:13px;">✗ 检查更新失败: ' + htmlescape(e.message || String(e)) + '</div>';
+    resultBox.innerHTML = '<div style="color:var(--lrc-朱砂-400,#c04851);font-size:13px;"><img class="inline-icon" src="/assets/icons/icon-error-circle.svg" width="14" height="14" alt="">检查更新失败: ' + htmlescape(e.message || String(e)) + '</div>';
   } finally {
     btn.disabled = false;
     btn.textContent = '检查更新';
@@ -7662,6 +9334,18 @@ async function checkVersionUpdate() {
 /**
  * 初始化记忆搜索筛选器
  */
+function resetMemoryFilters() {
+  memorySearchFilters = { type: 'all', importance: 'all', time: 'all' };
+  document.querySelectorAll('.memory-filter-tag').forEach(tag => {
+    const isDefault = tag.dataset.filterType === 'all'
+      || tag.dataset.filterImportance === 'all'
+      || tag.dataset.filterTime === 'all';
+    tag.classList.toggle('active', isDefault);
+  });
+  searchMemories();
+}
+window.resetMemoryFilters = resetMemoryFilters;
+
 function initMemoryFilters() {
   document.querySelectorAll('.memory-filter-tag').forEach(tag => {
     tag.addEventListener('click', function() {
@@ -7864,14 +9548,288 @@ function showToast(message, type = 'success', duration = 3000, opKey = null) {
 //   3. 保留降级路径作为兜底（target 不存在时不报错）
 //   4. 暴露到 window 便于 CDP 测试与外部调用
 // 注意：未在 TAB_LOADERS 中列出的标签页仅切换 DOM 不报错
+async function loadAssociationRecords() {
+  const container = document.getElementById('association-records');
+  if (!container) return;
+  const multiHop = document.getElementById('association-record-multi-hop')?.checked;
+  const evidenceOnly = document.getElementById('association-record-evidence')?.checked;
+  container.innerHTML = '<div class="association-empty">正在加载本机联想记录…</div>';
+  try {
+    const params = new URLSearchParams({ limit: '50' });
+    if (multiHop) params.set('multi_hop', '1');
+    if (evidenceOnly) params.set('evidence_only', '1');
+    const response = await fetchWithTimeout(`${API_BASE}/v1/associations/records?${params}`, {}, 8000);
+    if (!response.ok) throw new Error(`加载失败（${response.status}）`);
+    const data = await response.json();
+    const records = Array.isArray(data.records) ? data.records : [];
+    if (!records.length) {
+      container.innerHTML = '<div class="association-empty">还没有联想记录。开始一次探索或使用记忆搜索后，过程会保存在这里。</div>';
+      return;
+    }
+    container.innerHTML = records.map(record => {
+      const trail = Array.isArray(record.trail) ? record.trail : [];
+      const evidence = record.regression_evidence && typeof record.regression_evidence === 'object' ? record.regression_evidence : {};
+      const evidenceText = Object.values(evidence).slice(0, 4).join('、') || '暂无回归证据';
+      return `<details class="association-record-item"><summary><span>${htmlescape(formatTimelineTime(record.timestamp_ms))}</span><strong>${trail.length > 1 ? `多跳 ${trail.length} 步` : '单次联想'}</strong><span>保留 ${Object.keys(evidence).length} 条</span><span>剔除 ${Number(record.filtered_count || 0)} 条</span></summary><div class="association-record-detail"><div>过程：${trail.length ? trail.map(step => `${htmlescape(String(step.from_id || '查询起点'))} → ${htmlescape(String(step.to_id || ''))}`).join(' · ') : '暂无轨迹'}</div><div>回归：${htmlescape(evidenceText)}</div><div>结果：${Number(record.total_candidates || 0)} 条候选</div></div></details>`;
+    }).join('');
+  } catch (error) {
+    console.error('[association] 记录加载失败:', error);
+    container.innerHTML = `<div class="association-error">联想记录加载失败：${htmlescape(error.message || '服务暂不可用')} <button class="btn btn-ghost btn-sm" data-action="loadAssociationRecords">重试</button></div>`;
+    bindAllActions();
+  }
+}
+
+async function clearAssociationRecords() {
+  if (!window.confirm('确认清除本机保存的全部联想过程记录吗？这不会删除记忆内容。')) return;
+  try {
+    const response = await fetchWithTimeout(`${API_BASE}/v1/associations/records`, { method: 'DELETE' }, 8000);
+    if (!response.ok) throw new Error(`清除失败（${response.status}）`);
+    await loadAssociationRecords();
+    showToast('联想记录已在本机清除', 'success');
+  } catch (error) {
+    console.error('[association] 记录清除失败:', error);
+    showToast(error.message || '联想记录清除失败', 'error');
+  }
+}
+
+async function startAssociationExplore() {
+  const input = document.getElementById('association-query');
+  const status = document.getElementById('association-explore-status');
+  const resultCard = document.getElementById('association-explore-result');
+  const conclusionEl = document.getElementById('association-conclusion');
+  const storyEl = document.getElementById('association-story');
+  const trailEl = document.getElementById('association-trail');
+  const evidenceEl = document.getElementById('association-evidence');
+  const query = input?.value.trim();
+  if (!query) { status.textContent = '先输入一句话，例如：今晚吃什么？'; input?.focus(); return; }
+  // 深度与方向交给系统自动决定；隐藏参数保留默认值，仅供技术详情使用
+  const body = {
+    query,
+    depth: Number(document.getElementById('association-depth')?.value || 4) || 4,
+    width: Number(document.getElementById('association-width')?.value || 3) || 3
+  };
+  status.textContent = '正在翻你的记忆…';
+  if (resultCard) resultCard.hidden = false;
+  if (conclusionEl) conclusionEl.innerHTML = '<span class="association-loading">正在回想…</span>';
+  if (storyEl) storyEl.innerHTML = '';
+  if (trailEl) trailEl.innerHTML = '<div class="association-loading">正在展开联想路径…</div>';
+  if (evidenceEl) evidenceEl.innerHTML = '<div class="association-loading">整理保留理由…</div>';
+  try {
+    const response = await fetchWithTimeout(`${API_BASE}/v1/associations/explore`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }, 15000);
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.message || `联想失败（${response.status}）`);
+    }
+    const data = await response.json();
+    const nodes = Array.isArray(data.nodes) ? data.nodes : [];
+    const edges = Array.isArray(data.edges) ? data.edges : [];
+    const trail = Array.isArray(data.trail) ? data.trail : [];
+    const evidenceMap = {};
+    nodes.forEach(node => { if (node.evidence) evidenceMap[node.id] = node.evidence; });
+    if (data.interrupted && status) status.textContent = '想得有点远，已展示完成的部分，可以换个问题再试。';
+    // v0.9.7 精确度修复：weak_match 表示记忆库里没有与查询真正相关的内容
+    // （起点召回失败，或没有任何通过校验的发散节点）。此时显示诚实空态，
+    // 而不是把无关记忆硬凑成"联想结果"。
+    if (data.weak_match) {
+      if (conclusionEl) {
+        conclusionEl.innerHTML = `你的记忆库里还没有和「${htmlescape(query)}」相关的内容。`;
+      }
+      if (storyEl) {
+        storyEl.innerHTML = `<div class="association-empty">这次没有想起相关的念头——不是联想坏了，是记忆里还没有记过这类事情。<br>先用「记一条」把相关的事存进来，下次联想就能想起它。</div>`;
+      }
+      if (trailEl) trailEl.innerHTML = '<div class="association-empty">没有可展示的联想路径。</div>';
+      if (evidenceEl) evidenceEl.innerHTML = '<div class="association-empty">本次联想没有保留理由。</div>';
+      if (status) status.textContent = '记忆库里暂无相关内容，先记录再联想效果更好。';
+      return;
+    }
+    // 通俗结论
+    if (conclusionEl) {
+      conclusionEl.innerHTML = nodes.length
+        ? `从「${htmlescape(query)}」出发，一共想起了 <strong>${nodes.length}</strong> 个念头${edges.length ? `，${edges.length} 条线索把它们串在了一起` : ''}。想到哪个就说一声，我会更记得它。`
+        : '没有从记忆里找到和它有关系的念头，换个说法试试？';
+    }
+    if (storyEl) {
+      if (!nodes.length) {
+        storyEl.innerHTML = '<div class="association-empty">你的记忆库还没有和这句相关的内容。</div>';
+      } else {
+        // 把证据标签翻译成普通人能看懂的话
+        const plain = reason => {
+          const map = {
+            '原查询词面命中': '字面上和你问得很接近',
+            '联想桥强关联': '顺着上一个念头自然带了出来',
+            '标签共鸣': '和你反复出现的主题相关',
+            '活跃锚点': '是你最近常想起的记忆',
+            '无共鸣信号·发散噪声': '离得太远，已略过'
+          };
+          return map[reason] || reason || '和你记下的内容有关';
+        };
+        // 按深度分组：0 最贴合查询的起点，1 直接想起，2 再往前一步，3+ 更远一步
+        const byDepth = {};
+        nodes.forEach(node => { (byDepth[node.depth] = byDepth[node.depth] || []).push(node); });
+        const groupTitle = {
+          0: '最贴合你问的',
+          1: '直接联想',
+          2: '再往前一步',
+          3: '更远一步',
+          4: '更远一步'
+        };
+        // v0.9.7：直接联想优先展示；更远的联想默认折叠，减少视觉噪声——
+        // 用户主要关心"直接想到什么"，深层发散按需展开。
+        // v0.9.7 精确度修复：起点记忆（depth 0）在最前面照常展示——
+        // 查询模式下它就是"最贴合查询的那条记忆"，藏着不展示会让用户
+        // 看不到最好的联想结果；同时它也带"就是这个"确认按钮。
+        const nearDepths = Object.keys(byDepth).sort((a, b) => Number(a) - Number(b)).filter(d => Number(d) >= 0 && Number(d) <= 1);
+        const farDepths = Object.keys(byDepth).sort((a, b) => Number(a) - Number(b)).filter(d => Number(d) >= 2);
+        const renderGroup = d => {
+          const list = byDepth[d].map(node => {
+            const reason = evidenceMap[node.id] ? ` · ${htmlescape(String(plain(evidenceMap[node.id])))}` : '';
+            // v0.9.7：确认按钮——用户点击"就是这个"后，该记忆以最高激活强度
+            // 写回道体状态机活跃锚点，之后的联想会优先想起它。
+            // data-arg-mode="this" 让集中分发器把元素自身传入处理函数。
+            const confirmBtn = `<button type="button" class="btn btn-sm association-confirm-btn" data-action="confirmAssociation" data-arg-mode="this" data-memory-id="${htmlescape(node.id)}" data-query="${htmlescape(query)}">就是这个</button>`;
+            return `<div class="association-story-node"><span class="association-branch-dot"></span><div><strong>${htmlescape(node.content)}</strong><div class="text-sm text-dim">${reason || '和你问的主题有关'}</div></div>${confirmBtn}</div>`;
+          }).join('');
+          return `<div class="association-story-group"><div class="association-subtitle">${d === '1' ? '直接联想' : groupTitle[d]}</div>${list}</div>`;
+        };
+        const farCount = farDepths.reduce((sum, d) => sum + byDepth[d].length, 0);
+        const farBlock = farCount
+          ? `<details class="association-far-details"><summary>更远的联想（${farCount} 条）</summary>${farDepths.map(renderGroup).join('')}</details>`
+          : '';
+        const html = nearDepths.map(renderGroup).join('') + farBlock;
+        storyEl.innerHTML = html || '<div class="association-empty">没有可展示的联想。</div>';
+      }
+    }
+    // 技术细节：联想路径与保留理由（默认折叠）
+    if (trailEl) {
+      trailEl.innerHTML = nodes.length
+        ? nodes.slice(0, 40).map(node => {
+            const depthLabel = node.depth === 0 ? '起点' : `第 ${node.depth} 层`;
+            const reason = evidenceMap[node.id] ? `<span class="evidence-tag">${htmlescape(String(evidenceMap[node.id]))}</span>` : '';
+            return `<div class="association-trail-step"><span class="association-depth-badge">${depthLabel}</span><strong>${htmlescape(node.content)}</strong>${reason}</div>`;
+          }).join('')
+        : '<div class="association-empty">没有找到可联想的起点记忆。</div>';
+    }
+    if (evidenceEl) {
+      const evidenceList = Object.entries(evidenceMap);
+      evidenceEl.innerHTML = evidenceList.length
+        ? evidenceList.map(([id, reason]) => `<div class="association-evidence-item"><span class="evidence-tag">${htmlescape(String(reason))}</span><span>${htmlescape(id)}</span></div>`).join('')
+        : '<div class="association-empty">本次联想没有额外保留理由，结果由直接相关记忆构成。</div>';
+    }
+    if (!data.interrupted && status) {
+      status.textContent = `联想完成：${nodes.length} 个念头，${edges.length} 条线索，${trail.length} 步联想轨迹。`;
+    }
+    // 动态创建的"就是这个"按钮需要重新绑定 data-action
+    if (typeof bindAllActions === 'function') bindAllActions();
+  } catch (error) {
+    console.error('[association] 联想失败:', error);
+    if (status) status.textContent = `联想失败：${error.message || '服务暂不可用'}`;
+    if (trailEl) trailEl.innerHTML = '<div class="association-error">请检查 LRC 服务状态后重试。</div>';
+    if (storyEl) storyEl.innerHTML = '<div class="association-empty">暂无结果。</div>';
+  }
+}
+
+// v0.9.7 联想确认：用户点击"就是这个"表示该记忆与当前意图真正相关。
+// 后端将该记忆以最高激活强度（1.0）写回道体状态机活跃锚点并持久化，
+// 后续联想会优先想起被确认的内容；同时记录 AssociationConfirmed 审计事件。
+async function confirmAssociation(button) {
+  const memoryId = button?.dataset?.memoryId;
+  const query = button?.dataset?.query || '';
+  if (!memoryId) return;
+  // 已确认的按钮不再响应（集中分发器的 inFlight 防抖负责连击保护）
+  if (button.classList.contains('association-confirmed')) return;
+  const originalText = button.textContent;
+  button.textContent = '记下了…';
+  try {
+    const response = await fetchWithTimeout(`${API_BASE}/v1/associations/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memory_id: memoryId, query: query || null })
+    }, 8000);
+    if (response.status === 404) {
+      showToast('这条记忆已经被清理了，无法确认', 'warning');
+      button.textContent = originalText;
+      return;
+    }
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.message || `确认失败（${response.status}）`);
+    }
+    // 成功：按钮进入已确认态，明确告知用户后续效果
+    button.textContent = '已确认';
+    button.classList.add('association-confirmed');
+    showToast('已记下：下次联想会优先想起它', 'success');
+  } catch (error) {
+    console.error('[association] 联想确认失败:', error);
+    button.textContent = originalText;
+    showToast(error.message || '确认失败，请稍后重试', 'error');
+  }
+}
+window.confirmAssociation = confirmAssociation;
+
+function initAssociationCenter() {
+  document.querySelectorAll('[data-association-view]').forEach(button => {
+    if (button.dataset.associationBound === '1') return;
+    button.dataset.associationBound = '1';
+    button.addEventListener('click', () => {
+      const view = button.dataset.associationView;
+      document.querySelectorAll('[data-association-view]').forEach(item => item.classList.toggle('active', item === button));
+      document.querySelectorAll('.association-view').forEach(panel => { panel.hidden = panel.id !== `association-view-${view}`; panel.classList.toggle('active', panel.id === `association-view-${view}`); });
+      if (view === 'records') loadAssociationRecords();
+      if (view === 'observe') loadAssociationCenterObservation();
+    });
+  });
+  ['association-record-multi-hop', 'association-record-evidence'].forEach(id => document.getElementById(id)?.addEventListener('change', loadAssociationRecords));
+  // 一键示例：点击后填入输入框并直接开始联想（面向普通用户）
+  document.querySelectorAll('[data-explore-preset]').forEach(chip => {
+    if (chip.dataset.presetBound === '1') return;
+    chip.dataset.presetBound = '1';
+    chip.addEventListener('click', () => {
+      const input = document.getElementById('association-query');
+      if (input) input.value = chip.dataset.explorePreset || '';
+      startAssociationExplore();
+    });
+  });
+}
+
+async function loadAssociationCenterObservation() {
+  const setVal = (id, value) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+  try {
+    const response = await fetchWithTimeout(`${API_BASE}/v1/feedback/association-activity`, {}, 8000);
+    if (!response.ok) throw new Error('统计暂不可用');
+    const data = await response.json();
+    setVal('association-center-count', String(data.total_executions || 0));
+    setVal('association-center-avg', Number(data.avg_candidates || 0).toFixed(1));
+    const total = Number(data.total_executions || 0);
+    setVal('association-center-dual', total ? `${Math.round((Number(data.both_count || 0) / total) * 100)}%` : '--');
+    setVal('association-center-filtered', String((data.recent || []).reduce((sum, item) => sum + Number(item.filtered_count || 0), 0)));
+    const recent = document.getElementById('association-center-recent');
+    if (recent) recent.innerHTML = (data.recent || []).length ? data.recent.map(item => `<div class="association-record-item"><span>${htmlescape(formatTimelineTime(item.timestamp_ms))}</span><span>fast ${Number(item.fast_hits || 0)} · deep ${Number(item.deep_hits || 0)} · 候选 ${Number(item.total_candidates || 0)}</span></div>`).join('') : '<div class="association-empty">暂无联想执行。</div>';
+  } catch (error) { console.error('[association] 观测加载失败:', error); }
+}
+
+window.startAssociationExplore = startAssociationExplore;
+window.loadAssociationRecords = loadAssociationRecords;
+window.clearAssociationRecords = clearAssociationRecords;
+// 首页联想卡摘要入口：跳转到联想中心
+window.gotoAssociationCenter = async () => { await switchTab('association-center'); };
+
 const TAB_LOADERS = {
   // v0.8.15 P0-2 修复：dashboard 加载后同时刷新道同构度，避免切换标签页后数据陈旧
   'dashboard': () => loadDashboard().then(() => {
     if (typeof loadDaoMetrics === 'function') return loadDaoMetrics();
+  }).then(() => {
+    // v0.9.6 G1：切换回首页时刷新用户视角三模块
+    if (typeof loadHomeData === 'function') return loadHomeData();
   }),
   'trust-center': () => loadTrustCenter(),
   'benchmarks': () => loadBenchmarks(),
   'settings': () => { loadSettings(); loadProjectInfo(); },
+  // v0.9.6 G6：进入“全部记忆”默认浏览全量列表，搜索框仅作为筛选条件。
+  'memory-search': () => searchMemories(),
+  'association-center': () => { initAssociationCenter(); loadAssociationCenterObservation(); loadAssociationRecords(); },
   // v0.9.0 修复：同时加载浮动窗口 + 系统状态页卡片（此前卡片 -- 占位符无渲染）
   'system-status': () => { loadSysStatusFloat(); return loadSystemStatusPage(); },
   'project-switch': () => loadProjectInfo()
@@ -7901,17 +9859,19 @@ async function switchTab(tabName) {
     _dashboardRetryCount = 0;
   }
 
+  // v0.9.6 修复：先校验目标面板是否存在，不存在则保持当前状态，避免移除全部 active 后空白
+  const target = document.getElementById(`tab-${tabName}`);
+  if (!target) {
+    console.warn(`[switchTab] 标签页 tab-${tabName} 不存在，忽略切换`);
+    return false;
+  }
+
   // 1. 移除所有标签页与导航项的 active 类
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.app-sidebar .nav-item').forEach(n => n.classList.remove('active'));
   document.querySelectorAll('.navbar-nav button').forEach(b => b.classList.remove('active'));
 
   // 2. 激活目标标签页内容
-  const target = document.getElementById(`tab-${tabName}`);
-  if (!target) {
-    console.warn(`[switchTab] 标签页 tab-${tabName} 不存在，仅切换导航状态`);
-    return;
-  }
   target.classList.add('active');
 
   // 3. 同步激活对应的侧边栏导航项（data-tab 属性匹配）
@@ -7983,6 +9943,12 @@ function _abortActiveTabRequests(excludeTab) {
     daoAbortController = null;
     window.daoAbortController = null; // v0.8.22 HCSE Round2 修复：同步到 window，避免 CDP 测试读到旧引用
     console.log('[IA-01] 道同构度旧请求已取消（切换离开 dashboard）');
+  }
+  // 信任中心请求属于信任中心/设置操作，离开这两个页面时取消大请求。
+  if (excludeTab !== 'trust-center' && excludeTab !== 'settings' && trustAbortController) {
+    trustAbortController.abort();
+    trustAbortController = null;
+    console.log('[trust] 标签页切换，信任中心请求已取消');
   }
   // v0.8.4 Step 7 / G021：不再无条件 abort dashboardAbortController
   // dashboard 的请求取消由 loadDashboard 自身管理（第 396-398 行）
@@ -8623,7 +10589,7 @@ async function testLlmConfig() {
 
   resultEl.style.display = '';
   resultEl.className = 'form-result';
-  resultEl.textContent = '🔍 正在测试连接...';
+  resultEl.textContent = '正在测试连接...';
   if (btnTest) btnTest.disabled = true;
 
   try {
@@ -8649,15 +10615,15 @@ async function testLlmConfig() {
     const data = await resp.json();
     if (data.ok) {
       resultEl.className = 'form-result success';
-      resultEl.textContent = `✅ 连接成功！延迟 ${data.latency_ms}ms`;
+      resultEl.textContent = `连接成功！延迟 ${data.latency_ms}ms`;
     } else {
       throw new Error(data.message || `连接失败 (HTTP ${data.status})`);
     }
   } catch (e) {
     // v0.8.2：sidecar 不可达时给出明确提示
     const msg = (e.name === 'SidecarUnreachableError' || e.name === 'SidecarTimeoutError')
-      ? '❌ LRC 服务未运行，请先启动服务'
-      : '❌ ' + e.message;
+      ? 'LRC 服务未运行，请先启动服务'
+      : e.message;
     resultEl.className = 'form-result error';
     resultEl.textContent = msg;
   } finally {
@@ -8927,14 +10893,20 @@ async function testEmbedderConnection() {
     const data = await resp.json();
 
     if (data.success) {
-      showToast('✅ 连接成功！镜像源: ' + mirrorNames[mirror] + '，模型: ' + modelId + '，延迟: ' + (data.latency_ms || '?') + 'ms', 'success');
+      showToast('连接成功！镜像源: ' + mirrorNames[mirror] + '，模型: ' + modelId + '，延迟: ' + (data.latency_ms || '?') + 'ms', 'success');
       if (btn) setButtonState(btn, 'success', originalText);
     } else {
-      throw new Error(data.message || '连接失败');
+      // v0.9.6 修复：镜像不可达是后端返回的结构化业务结果（success:false），
+      // 属于「预期内的连通性失败」，应以 warning 提示用户，而非 error 级日志。
+      // 此前 throw 后统一走 catch 记 console.error，会在离线/无外网环境下
+      // 污染 CDP 回归门禁（误判为前端异常），掩盖真实缺陷。
+      showToast('镜像源不可达: ' + (data.message || '连接失败') + '。可尝试切换其他镜像源', 'warning');
+      if (btn) setButtonState(btn, 'error', originalText);
     }
   } catch (e) {
+    // 仅传输层异常（超时/网络中断/解析失败）才记 error 级日志
     console.error('[testEmbedderConnection] 连接失败:', e);
-    showToast('❌ 连接失败: ' + e.message + '。请检查网络或尝试其他镜像源', 'error');
+    showToast('连接失败: ' + e.message + '。请检查网络或尝试其他镜像源', 'error');
     if (btn) setButtonState(btn, 'error', originalText);
   } finally {
     if (btn) {
@@ -8970,7 +10942,7 @@ async function testModel() {
     const data = await resp.json();
 
     if (data.ok) {
-      showToast('✅ 模型测试通过！维度: ' + data.vector_dim + '，耗时: ' + data.elapsed_ms + 'ms', 'success', 5000);
+      showToast('模型测试通过！维度: ' + data.vector_dim + '，耗时: ' + data.elapsed_ms + 'ms', 'success', 5000);
       setButtonState(btn, 'success', originalText);
       btn.style.borderColor = 'var(--lrc-玉色-600)';
     } else {
@@ -8978,7 +10950,7 @@ async function testModel() {
     }
   } catch (e) {
     console.error('[testModel] 模型测试失败:', e);
-    showToast('❌ 模型测试失败: ' + e.message + '。请确认模型已下载并应用', 'error', 5000);
+    showToast('模型测试失败: ' + e.message + '。请确认模型已下载并应用', 'error', 5000);
     setButtonState(btn, 'error', originalText);
     btn.style.borderColor = 'var(--lrc-朱砂-500)';
   } finally {
@@ -9159,6 +11131,7 @@ function getUserCancelledAllProjectsFlag() {
  * 4. 若本次是"勾选上" → 标志位 = false（用户又选回来了，不应该打扰）
  */
 function onWizardProjectCheckboxChanged(checkboxEl) {
+  checkboxEl = checkboxEl?.target || checkboxEl;
   const allChecked = _countAllWizardProjectCheckedBoxes();
   const justChecked = checkboxEl && checkboxEl.checked;
   if (justChecked) {
@@ -9276,13 +11249,13 @@ async function onAgentSelected(agentId, selected) {
               : '';
             const highlightBadge = isFirst
               ? `<div data-role="auto-selected-badge" style="margin-left:28px;margin-top:4px;font-size:0.78em;color:var(--lrc-玉色-700);font-weight:500;line-height:1.4;">
-                   ✨ 已自动选择为索引目录（如需修改可取消勾选或选择其他项目）
+                   <img class="inline-icon" src="/assets/icons/icon-sparkle.svg" width="14" height="14" alt="">已自动选择为索引目录（如需修改可取消勾选或选择其他项目）
                  </div>`
               : '';
             const highlightClass = isFirst ? ' auto-selected-highlight' : '';
             return `
               <div class="project-item${highlightClass}" data-path="${htmlescape(p.path || p)}" data-auto="${isFirst ? '1' : '0'}" style="${highlightStyle}">
-                <input type="checkbox" checked data-action="toggleProject" onchange="onWizardProjectCheckboxChanged(this);">
+                <input type="checkbox" checked data-input-action="onWizardProjectCheckboxChanged" data-input-event="change" data-pass-event="1">
                 <span class="project-name">${htmlescape(p.name || p)}</span>
                 <span class="project-path">${htmlescape(p.path || '')}</span>
                 ${highlightBadge}
@@ -10434,6 +12407,7 @@ function bindAllActions() {
       try {
         const argMode = el.getAttribute('data-arg-mode');
         const arg = el.getAttribute('data-arg');
+        const dataType = el.getAttribute('data-type');
 
         if (argMode === 'this') {
           // selectPresetScenario(this) 等场景，传入元素自身
@@ -10442,6 +12416,12 @@ function bindAllActions() {
           // 自动判断数字/字符串
           const parsed = /^\d+$/.test(arg) ? parseInt(arg, 10) : arg;
           await fn(parsed);
+        } else if (el.hasAttribute('data-memory-id')) {
+          // 记忆卡片使用稳定 ID，避免列表刷新后索引错位。
+          await fn(el.getAttribute('data-memory-id'));
+        } else if (dataType !== null) {
+          // v0.9.7 修复：分类卡等通过 data-type 传递类型参数（此前仅解析 data-arg 导致类型丢失）
+          await fn(dataType);
         } else if (action === 'triggerFileInput') {
           // 触发隐藏文件输入框
           triggerFileInput(el);
@@ -10512,8 +12492,8 @@ function bindAllActions() {
   // 3. v0.8.2 新增：处理 data-input-action（替代内联 onchange/oninput）
   // 支持 change/input/blur 等事件类型，通过 data-input-event 指定
   document.querySelectorAll('[data-input-action]').forEach(el => {
-    if (el.dataset.bound === '1') return;
-    el.dataset.bound = '1';
+    if (el.dataset.boundInput === '1') return;
+    el.dataset.boundInput = '1';
     const action = el.getAttribute('data-input-action');
     const eventType = el.getAttribute('data-input-event') || 'change';
     const passEvent = el.getAttribute('data-pass-event') === '1';
@@ -10540,10 +12520,30 @@ function bindAllActions() {
   console.log('[LRC v' + APP_VERSION + ']集中事件绑定完成，共绑定', actionEls.length, '个元素');
 }
 
+function bindImageFallbacks() {
+  document.querySelectorAll('[data-image-fallback]').forEach((image) => {
+    image.addEventListener('error', () => {
+      if (image.dataset.imageFallback === 'sidebar-logo') {
+        const fallback = document.createElement('span');
+        fallback.className = 'sidebar-logo-fallback';
+        fallback.textContent = '龙忆';
+        fallback.style.cssText = 'font-size:1.2em;font-weight:600;color:var(--lrc-墨韵-700);padding:12px;';
+        image.replaceWith(fallback);
+      } else if (image.dataset.imageFallback === 'navbar-logo') {
+        image.style.display = 'none';
+      }
+    }, { once: true });
+  });
+}
+
 // DOMContentLoaded 后执行绑定；若 DOM 已加载（动态注入场景）则立即执行
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', bindAllActions);
+  document.addEventListener('DOMContentLoaded', () => {
+    bindImageFallbacks();
+    bindAllActions();
+  });
 } else {
+  bindImageFallbacks();
   bindAllActions();
 }
 // v0.8.4 Step 14 / G004：暴露 bindAllActions 到 window 供 CDP 测试检测

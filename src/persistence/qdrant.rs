@@ -93,16 +93,11 @@ struct QdrantVectorConfig {
     distance: String,
 }
 
-/// Qdrant 搜索结果
-#[derive(Debug, Deserialize)]
-struct QdrantSearchResult {
-    #[serde(default)]
-    result: Vec<QdrantScoredPoint>,
-}
-
 #[derive(Debug, Deserialize)]
 struct QdrantScoredPoint {
     id: serde_json::Value,
+    #[serde(default)]
+    #[allow(dead_code)]
     score: f32,
     #[serde(default)]
     payload: Option<serde_json::Value>,
@@ -159,10 +154,10 @@ impl QdrantPersistence {
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
             .map_err(|e| {
-                PersistenceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("创建 HTTP 客户端失败: {}", e),
-                ))
+                PersistenceError::Io(std::io::Error::other(format!(
+                    "创建 HTTP 客户端失败: {}",
+                    e
+                )))
             })?;
 
         let this = Self {
@@ -380,6 +375,18 @@ impl QdrantPersistence {
                 .get("bagua_category")
                 .and_then(|v| v.as_str())
                 .map(String::from),
+            daoti_preview_gua: payload
+                .get("daoti_preview_gua")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            daoti_preview_bagua: payload
+                .get("daoti_preview_bagua")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            daoti_preview_version: payload
+                .get("daoti_preview_version")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             privacy_level,
             session_id: None,
             user_id: None,
@@ -408,10 +415,9 @@ impl Persistence for QdrantPersistence {
         }
 
         // 如果有洛书向量，写入 Qdrant
-        if let Some(lv) = memory.luoshu_vector {
+        if let Some(lv) = memory.luoshu_vector.as_ref() {
             let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-                PersistenceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                PersistenceError::Io(std::io::Error::other(
                     "QdrantPersistence 需要在 tokio 运行时上下文中使用",
                 ))
             })?;
@@ -463,8 +469,7 @@ impl Persistence for QdrantPersistence {
     fn load_all_memories(&self) -> Result<Vec<Memory>, PersistenceError> {
         // 从 Qdrant 滚动查询所有记忆（修复：重启后数据可恢复）
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            PersistenceError::Io(std::io::Error::other(
                 "QdrantPersistence 需要在 tokio 运行时上下文中使用",
             ))
         })?;
@@ -500,19 +505,16 @@ impl Persistence for QdrantPersistence {
     }
 
     fn delete_memory(&self, id: &str) -> Result<bool, PersistenceError> {
-        // 从本地兜底删除
-        let mut found = false;
-        if let Ok(mut guard) = self.fallback_memories.lock() {
-            if let Some(idx) = guard.iter().position(|m| m.id == id) {
-                guard.remove(idx);
-                found = true;
-            }
-        }
+        // 先从 Qdrant 删除，成功后再更新本地兜底
+        let found = self
+            .fallback_memories
+            .lock()
+            .map(|guard| guard.iter().any(|m| m.id == id))
+            .unwrap_or(false);
 
         // 从 Qdrant 删除
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            PersistenceError::Io(std::io::Error::other(
                 "QdrantPersistence 需要在 tokio 运行时上下文中使用",
             ))
         })?;
@@ -524,14 +526,29 @@ impl Persistence for QdrantPersistence {
 
         let client = self.client.clone();
         let id_owned = id.to_string();
-        let _ = handle.block_on(async move {
-            let body = serde_json::json!({
-                "points": [id_owned],
-            });
-            client.post(&url).json(&body).send().await
-        });
-
+        let response = handle
+            .block_on(async move {
+                let body = serde_json::json!({ "points": [id_owned] });
+                client.post(&url).json(&body).send().await
+            })
+            .map_err(|e| PersistenceError::Other(format!("Qdrant 删除请求失败: {e}")))?;
+        if !response.status().is_success() {
+            return Err(PersistenceError::Other(format!(
+                "Qdrant 删除失败: HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        if let Ok(mut guard) = self.fallback_memories.lock() {
+            guard.retain(|m| m.id != id);
+        }
         Ok(found)
+    }
+
+    fn replace_all_memories(&self, _memories: &[Memory]) -> Result<(), PersistenceError> {
+        Err(PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Qdrant 后端无法保证全量替换的原子语义",
+        )))
     }
 
     fn clear_memories(&self) -> Result<(), PersistenceError> {
@@ -539,15 +556,10 @@ impl Persistence for QdrantPersistence {
         // 此前仅清除本地兜底缓存，远程 Qdrant 数据未删除，导致数据不一致
         // 用户调用"清除记忆"后期望所有数据都被删除
 
-        // 1. 清除本地兜底缓存
-        if let Ok(mut guard) = self.fallback_memories.lock() {
-            guard.clear();
-        }
-
-        // 2. 清除 Qdrant 远程集合中的所有向量点
+        // 远程删除成功后再清除本地兜底缓存，失败时保留可恢复数据。
+        // 清除 Qdrant 远程集合中的所有向量点
         let handle = tokio::runtime::Handle::try_current().map_err(|_| {
-            PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            PersistenceError::Io(std::io::Error::other(
                 "QdrantPersistence 需要在 tokio 运行时上下文中使用",
             ))
         })?;
@@ -574,6 +586,9 @@ impl Persistence for QdrantPersistence {
                 response.status().as_u16(),
                 response.status().canonical_reason().unwrap_or("未知错误")
             )));
+        }
+        if let Ok(mut guard) = self.fallback_memories.lock() {
+            guard.clear();
         }
 
         Ok(())

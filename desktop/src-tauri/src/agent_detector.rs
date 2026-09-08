@@ -368,7 +368,13 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
-        exe_names: &["deepseek", "deepseek-coder", "deepseek.exe", "dsh", "dsh.exe"],
+        exe_names: &[
+            "deepseek",
+            "deepseek-coder",
+            "deepseek.exe",
+            "dsh",
+            "dsh.exe",
+        ],
     },
     // Qoder — AI 编程 IDE（字节跳动海外版），支持 MCP 全局配置
     // 官方文档：user 级配置写入 ~/.qoder/settings.json，project 级写入 .qoder/settings.local.json
@@ -2498,7 +2504,11 @@ impl AgentDetectorRegistry {
                     // v0.6.0 优化：为不支持 MCP 的工具提供手动配置指引
                     let guide = get_manual_config_guide(&info.id)
                         .unwrap_or("该工具暂不支持 MCP 协议，无配置指引可用。");
-                    tracing::info!("[MCP配置] {} — 不支持 MCP 自动配置，未计入成功列表。指引：{}", info.name, guide);
+                    tracing::info!(
+                        "[MCP配置] {} — 不支持 MCP 自动配置，未计入成功列表。指引：{}",
+                        info.name,
+                        guide
+                    );
                     continue;
                 }
 

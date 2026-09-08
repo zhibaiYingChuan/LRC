@@ -19,6 +19,7 @@
 
 use async_trait::async_trait;
 use std::fmt;
+#[cfg(any(feature = "ml", feature = "server"))]
 use std::sync::Arc;
 
 // v0.6.0 本地 BERT 嵌入器依赖 LuoShuMlEncoder（ml feature 启用）

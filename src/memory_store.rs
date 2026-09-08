@@ -42,6 +42,19 @@
 
 use crate::engine::audit_trail::{AuditEventType, AuditTrail};
 use crate::engine::complexity_budget::ComplexityBudget;
+
+fn emit_remember_profile(line: String) {
+    eprintln!("{line}");
+    if let Some(path) = std::env::var_os("LRC_PROFILE_REMEMBER_FILE") {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes());
+        }
+    }
+}
 use crate::engine::dao_metrics::DaoMetrics;
 use crate::engine::dao_regulator::{DaoRegulator, RegulationAction};
 use crate::engine::health_report::HintEscalationTracker;
@@ -52,7 +65,10 @@ use crate::engine::luoshu_encoder::LuoShuVector;
 #[cfg(feature = "ml")]
 use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 use crate::engine::memory_gc::{GcStats, MemoryGarbageCollector, MemoryInfoQuery, MemorySnapshot};
-use crate::engine::mirror_trapezoid::{mirror_project, recursive_unfold, TrapezoidROI};
+use crate::engine::memory_state_machine::MemoryStateMachine;
+use crate::engine::mirror_trapezoid::{
+    bagua_name_to_index, mirror_project, recursive_unfold, TrapezoidROI,
+};
 use crate::engine::synthesis_engine::{SynthesisConfig, SynthesisEngine, SynthesisPlan};
 use crate::engine::synthesis_journal::SynthesisJournal;
 use crate::engine::user_feedback::{
@@ -62,6 +78,21 @@ use crate::graph_store::{EdgeType, GraphMemoryStore};
 use crate::memory_types::{DecayConfig, Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::{Persistence, PersistenceError};
 use serde::Serialize;
+
+/// BM25 检索评分参数（v0.8.50 检索质量修复）：
+/// 替代朴素 TF-IDF 的线性文档长度归一，抑制长文档（如大段源码/文档节选种子记忆）
+/// 被过度稀释的问题。k1 控制词频饱和、b 控制长度归一强度，取 Lucene/ES 常用默认值。
+const BM25_K1: f32 = 1.2;
+const BM25_B: f32 = 0.75;
+
+/// 语义向量域过滤权重（v0.8.52）：
+/// deep 路洛书向量是纯字符位置统计特征（density/entropy/position_weight），不含词义，
+/// 短 query 与无关长记忆的余弦区分度低，实测 dev 库 32 组 query 中 deep top1 与 query
+/// 零词面重合 23/32。在余弦之外叠加词面域重合分（候选池内平滑 IDF 加权），
+/// final = 余弦 + LEX_DOMAIN_WEIGHT * (词面域分 / 域内最大值)，
+/// 域外高余弦记忆无词面加分自然沉底。词面域是内容锚，不涉及八卦元数据，遵循方案 §3.5。
+/// 权重可通过环境变量 LRC_DEEP_LEX_DOMAIN_WEIGHT 覆盖（阶段 B scale 消融用），默认 0.25。
+const LEX_DOMAIN_WEIGHT: f32 = 0.25;
 
 /// 记忆召回过滤条件
 #[derive(Debug, Clone, Default)]
@@ -79,6 +110,17 @@ pub struct RecallFilter {
     /// 隐私上下文：按隐私级别过滤（Session/User/Global）
     /// 传入 (PrivacyLevel, session_id, user_id) 三元组
     pub privacy_context: Option<(PrivacyLevel, Option<String>, Option<String>)>,
+    /// 纯净查询模式（联想探索专用，v0.9.7 精确度修复）：
+    /// 跳过联想导航的查询扩展与活性偏置加分——用户主动发起探索时，
+    /// 语义必须完全由查询本身主导，不得被"近期活跃记忆"（可能全是
+    /// 某个领域的旧内容）牵引。回归校验退化为纯原查询词面/标签共鸣。
+    pub explore_pure: bool,
+    /// 回归校验锚定查询（联想探索专用，v0.9.7 精确度修复）：
+    /// 设置后，道体再次校验以此查询（而非当前 recall 查询）判定候选
+    /// 是否与主题相关。探索的多跳 BFS 以父记忆内容为查询逐层扩散，
+    /// 若每跳独立校验，语义会随深度漂移（父内容 → 无关领域噪声）。
+    /// 锚定到起点记忆主题可保证每一跳结果都必须"收束回联想主题"。
+    pub regression_query: Option<String>,
 }
 
 impl RecallFilter {
@@ -91,6 +133,8 @@ impl RecallFilter {
             min_importance: None,
             top_k: 5,
             privacy_context: None,
+            explore_pure: false,
+            regression_query: None,
         }
     }
 
@@ -186,6 +230,8 @@ pub struct MemoryStats {
     pub by_project: std::collections::HashMap<String, usize>,
     /// 过期记忆数
     pub expired_count: usize,
+    /// 近 7 天新增记忆数（v0.9.6：仪表盘"最近新增"真实时间口径，替代累计编码次数近似）
+    pub recent_added: usize,
     /// 存储文件大小（字节）
     pub storage_size_bytes: u64,
 }
@@ -199,6 +245,21 @@ pub struct RecallResult {
     pub scores: Vec<f32>,
     /// 记忆库总数
     pub total: usize,
+    /// 道体再次校验·回归证据标签（memory_id → 证据，如"联想桥强关联"）。
+    /// 联想导航未开启或未执行校验时为空，旧行为零影响。
+    pub regression_evidence: std::collections::HashMap<String, String>,
+}
+
+impl RecallResult {
+    /// 构造无回归证据的结果（兼容旧调用点）
+    pub fn basic(memories: Vec<Memory>, scores: Vec<f32>, total: usize) -> Self {
+        Self {
+            memories,
+            scores,
+            total,
+            regression_evidence: std::collections::HashMap::new(),
+        }
+    }
 }
 
 /// 合成快照（三阶段锁解耦·Phase 1 读）
@@ -218,6 +279,11 @@ pub struct SynthesisSnapshot {
 ///
 /// 聚合所有记忆的 CRUD 操作。
 /// 通过 `Persistence` trait 抽象存储后端。
+struct RecallDocument {
+    normalized_content: String,
+    token_count: usize,
+}
+
 pub struct MemoryStore<P: Persistence> {
     persistence: P,
     /// 冲突检测相似度阈值（0.0 ~ 1.0），默认 0.5
@@ -241,6 +307,8 @@ pub struct MemoryStore<P: Persistence> {
     pub decay_config: DecayConfig,
     /// 可选图存储（用于自动建立冲突/演进关系边）
     graph_store: Option<GraphMemoryStore>,
+    /// LRC 内置道体状态机：跟踪当前活跃记忆与联想转移
+    pub memory_state_machine: MemoryStateMachine,
     /// 用户反馈回路：将人类判断力注入系统演化（解决质疑四）
     pub user_feedback: UserFeedback,
     /// 自主记忆垃圾回收器：定期清理低质量、长期未用的记忆
@@ -265,6 +333,13 @@ pub struct MemoryStore<P: Persistence> {
     memory_cache: std::cell::RefCell<Vec<Memory>>,
     /// 缓存脏标记：任何写操作（保存/删除）后设为 true，读操作前检查
     cache_dirty: std::cell::Cell<bool>,
+    /// 稳定 Memory ID 候选索引（pilot 默认关闭，最终仍由 Jaccard 判定）
+    bigram_index:
+        std::cell::RefCell<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    /// 候选索引脏标记
+    bigram_index_dirty: std::cell::Cell<bool>,
+    /// recall 文本特征缓存，按 Memory ID 复用规范化正文和文档长度
+    recall_documents: std::cell::RefCell<std::collections::HashMap<String, RecallDocument>>,
     /// v0.5.5 P1-1：LLM 是否已配置
     /// LLM 配置后替代本地 ML 模型提供语义理解能力，编码器不再视为"降级"
     /// 通过 set_llm_configured() 在 sidecar 启动后设置
@@ -509,7 +584,10 @@ fn cjk_ratio(text: &str) -> f32 {
 /// let tokens = tokenize_query("database connection");
 /// assert!(tokens.contains(&"database".to_string()));
 /// ```
-fn tokenize_query(text: &str) -> Vec<String> {
+///
+/// v0.9.7：开放为 pub——联想探索 API 层（v1_api）需要用同一套分词
+/// 口径实现"根节点实质共鸣门禁"，避免分词逻辑被复制产生漂移。
+pub fn tokenize_query(text: &str) -> Vec<String> {
     let lower = text.to_lowercase();
 
     // CJK 比例 ≥ 30% 使用 bigram 分词
@@ -525,10 +603,38 @@ fn tokenize_query(text: &str) -> Vec<String> {
     }
 }
 
-/// CJK 字符级 bigram 分词
+/// 判断一个分词 token 是否为"泛指 bigram"——两个字符都属于问句
+/// 功能字/高频虚词的组合（如「是什」「什么」「怎么」「这个」）。
+///
+/// v0.9.7 联想根门禁专用：泛指 bigram 的命中不代表主题相关——
+/// "量子物理是什么"会因「是什」「什么」两个泛指 bigram，与恰好
+/// 含测试文本"是什么"的代码 chunk 虚假共鸣并抢走起点。过滤后
+/// 门禁只统计实义 token（量子/物理/今晚/吃什 等）的重叠。
+pub fn is_generic_bigram(token: &str) -> bool {
+    const GENERIC_CJK_CHARS: &[char] = &[
+        '是', '什', '么', '吗', '呢', '吧', '啊', '怎', '样', '办', '的', '了', '这', '那', '个',
+    ];
+    let mut chars = token.chars();
+    let (Some(first), Some(second), None) = (chars.next(), chars.next(), chars.next()) else {
+        return false;
+    };
+    GENERIC_CJK_CHARS.contains(&first) && GENERIC_CJK_CHARS.contains(&second)
+}
+
+/// CJK 字符级 bigram 分词（含混合语言兜底）
 ///
 /// 将中文文本拆分为相邻字符对（bigram），例如 "数据库" → ["数据", "据库"]。
 /// 对于长度 < 2 的文本，返回单字符 token。
+///
+/// v8 检索质量修复（混合语言兜底）：当文本为 "CJK + 英文/数字" 混合时（如
+/// "所有try_lock()读操作改为try_read()"），连续 ASCII 字母/数字/下划线/连字符段
+/// 被保留为独立 token（如 try_read、try_lock），而非按 bigram 切成 2 字符碎片，
+/// 使 `contains_word` 能对这类标识符做整词边界匹配（词边界判定对长度 ≥ 3 的
+/// ASCII 词生效）。中文部分仍按 bigram 切分，标点/符号作为分隔符。
+///
+/// 修复前引入的缺陷：混合文本被整体按字符切 bigram，英文标识符被切碎
+/// （try_read → tr/ry/y_/_r/re/ea/ad），`contains_word` 对 2 字符英文仅做
+/// 子串匹配，DF 高、IDF 低，正确记忆与大量无关文档同分甚至落榜。
 fn tokenize_cjk(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
 
@@ -540,10 +646,52 @@ fn tokenize_cjk(text: &str) -> Vec<String> {
         return vec![chars[0].to_string()];
     }
 
-    chars
-        .windows(2)
-        .map(|w| format!("{}{}", w[0], w[1]))
-        .collect()
+    let mut result = Vec::new();
+    // 连续 ASCII 字母/数字/下划线/连字符段（保留整词）
+    let mut ascii_run = String::new();
+    // CJK 等非 ASCII 字母段（按 bigram 切分）
+    let mut cjk_run: Vec<char> = Vec::new();
+
+    // 将 CJK 段按字符 bigram 产出 token
+    let flush_cjk = |run: &mut Vec<char>, out: &mut Vec<String>| {
+        if run.is_empty() {
+            return;
+        }
+        if run.len() == 1 {
+            out.push(run[0].to_string());
+        } else {
+            for pair in run.windows(2) {
+                out.push(format!("{}{}", pair[0], pair[1]));
+            }
+        }
+        run.clear();
+    };
+
+    for &c in &chars {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            // ASCII 字母/数字/下划线/连字符：刷新 CJK 段后累积到整词段
+            flush_cjk(&mut cjk_run, &mut result);
+            ascii_run.push(c);
+        } else if c.is_alphabetic() && !c.is_ascii() {
+            // CJK 等非 ASCII 字母：刷新英文段后累积到 CJK 段
+            if !ascii_run.is_empty() {
+                result.push(std::mem::take(&mut ascii_run));
+            }
+            cjk_run.push(c);
+        } else {
+            // 标点/符号：作为分隔符，刷新两侧段
+            if !ascii_run.is_empty() {
+                result.push(std::mem::take(&mut ascii_run));
+            }
+            flush_cjk(&mut cjk_run, &mut result);
+        }
+    }
+    if !ascii_run.is_empty() {
+        result.push(std::mem::take(&mut ascii_run));
+    }
+    flush_cjk(&mut cjk_run, &mut result);
+
+    result
 }
 
 /// v0.5.4 P1-9 修复：计算文档长度（token 数量）
@@ -633,7 +781,12 @@ fn contains_word(content: &str, word: &str) -> bool {
             }
 
             // 继续查找下一个匹配位置
-            start = match_start + 1;
+            // 按完整字符推进，避免多字节词的下一次切片落在 UTF-8 字符内部
+            let next_char_len = content[match_start..]
+                .chars()
+                .next()
+                .map_or(word_len, char::len_utf8);
+            start = match_start + next_char_len;
         } else {
             break;
         }
@@ -696,7 +849,12 @@ fn count_word_occurrences(content: &str, word: &str) -> usize {
                 count += 1;
             }
 
-            start = match_start + 1;
+            // 按完整字符推进，避免多字节词的下一次切片落在 UTF-8 字符内部
+            let next_char_len = content[match_start..]
+                .chars()
+                .next()
+                .map_or(word_len, char::len_utf8);
+            start = match_start + next_char_len;
         } else {
             break;
         }
@@ -743,6 +901,7 @@ fn is_visible(
 impl<P: Persistence> MemoryStore<P> {
     /// 创建新的记忆存储器（默认相似度阈值 0.5）
     pub fn new(persistence: P) -> Self {
+        let memory_state = persistence.load_memory_state().unwrap_or_default();
         // 质疑二·终极：启动时打印完整的隐私清单，而非一闪而过的日志
         eprintln!(
             "{}",
@@ -764,6 +923,7 @@ impl<P: Persistence> MemoryStore<P> {
             }),
             decay_config: DecayConfig::default(),
             graph_store: None,
+            memory_state_machine: MemoryStateMachine::from_state(memory_state),
             user_feedback: UserFeedback::new(),
             memory_gc: MemoryGarbageCollector::default(),
             gc_pending: std::sync::atomic::AtomicBool::new(false),
@@ -780,6 +940,9 @@ impl<P: Persistence> MemoryStore<P> {
             // v0.5.4 增量缓存初始化
             memory_cache: std::cell::RefCell::new(Vec::new()),
             cache_dirty: std::cell::Cell::new(true), // 初始为脏，首次读取时加载
+            bigram_index: std::cell::RefCell::new(std::collections::HashMap::new()),
+            bigram_index_dirty: std::cell::Cell::new(true),
+            recall_documents: std::cell::RefCell::new(std::collections::HashMap::new()),
             // v0.5.5 P1-1：LLM 默认未配置，由 sidecar 启动后通过 set_llm_configured() 设置
             llm_configured: std::sync::atomic::AtomicBool::new(false),
             // v0.6.0+ 参赛扩展：探索日志默认禁用
@@ -807,6 +970,7 @@ impl<P: Persistence> MemoryStore<P> {
             }),
             decay_config: DecayConfig::default(),
             graph_store: None,
+            memory_state_machine: MemoryStateMachine::new(),
             user_feedback: UserFeedback::new(),
             memory_gc: MemoryGarbageCollector::default(),
             gc_pending: std::sync::atomic::AtomicBool::new(false),
@@ -821,6 +985,9 @@ impl<P: Persistence> MemoryStore<P> {
             // v0.5.4 增量缓存初始化
             memory_cache: std::cell::RefCell::new(Vec::new()),
             cache_dirty: std::cell::Cell::new(true), // 初始为脏，首次读取时加载
+            bigram_index: std::cell::RefCell::new(std::collections::HashMap::new()),
+            bigram_index_dirty: std::cell::Cell::new(true),
+            recall_documents: std::cell::RefCell::new(std::collections::HashMap::new()),
             // v0.5.5 P1-1：LLM 默认未配置
             llm_configured: std::sync::atomic::AtomicBool::new(false),
             // v0.6.0+ 参赛扩展：探索日志默认禁用
@@ -845,6 +1012,74 @@ impl<P: Persistence> MemoryStore<P> {
     /// 会把不相关记忆排到前面，稀释字面匹配结果。调用方据此决定是否跳过深度路径。
     pub fn is_ml_encoder(&self) -> bool {
         self.luoshu_encoder.get_status().mode.as_str() == "ml"
+    }
+
+    /// v0.9.7 联想探索·真实语义相似度（bge 完整句向量余弦，0-1）。
+    ///
+    /// 9 维洛书投影粒度太粗，承担不了"重要日子 ↔ 结婚纪念日"这类
+    /// 语义强相关、词面零重叠的判断；本方法用底层 BERT 句向量直接
+    /// 计算余弦。ML 编码器不可用（未加载/未启用 ml feature）时全部
+    /// 返回 None，调用方退回纯词面通路——绝不放宽标准。
+    ///
+    /// 查询向量只编码一次，候选并行编码（见下）。调用方应惰性使用：
+    /// 仅在词面门禁无人通过时调用，避免给常规检索热路径增加 ML 开销。
+    #[cfg(feature = "ml")]
+    pub fn semantic_similarities(&self, query: &str, memories: &[&Memory]) -> Vec<Option<f32>> {
+        fn l2_norm(v: &[f32]) -> f32 {
+            v.iter().map(|x| x * x).sum::<f32>().sqrt()
+        }
+        fn dot(a: &[f32], b: &[f32]) -> f32 {
+            a.iter().zip(b).map(|(x, y)| x * y).sum()
+        }
+        // bge-zh 官方用法：短查询侧需加检索指令前缀，文档侧不加。
+        // 缺省前缀时句向量各向异性严重（实测相关对与无关对差距仅 ~0.01）。
+        const BGE_QUERY_INSTRUCTION: &str = "为这个句子生成表示以用于检索相关文章：";
+        let instructed_query = format!("{BGE_QUERY_INSTRUCTION}{query}");
+        let Some(q) = self.luoshu_encoder.encode_embedding(&instructed_query) else {
+            return vec![None; memories.len()];
+        };
+        let q_norm = l2_norm(&q);
+        if !q_norm.is_finite() || q_norm <= 0.0 {
+            return vec![None; memories.len()];
+        }
+        // v0.9.7 性能修复：候选并行编码。语义旁路只在词面零命中时触发，
+        // 候选逐条串行前向（每条 ~2s）会在 root 召回阶段耗尽外层 15s
+        // 超时，把"诚实空态"变成 503 错误。std::thread::scope 并发前向，
+        // 墙钟时间压缩到单条耗时量级。
+        // 注意：MemoryStore 因持久化缓存字段含 RefCell 而 !Sync，跨线程
+        // 只共享编码器字段（HybridLuoShuEncoder 本身 Sync）。
+        let encoder = &self.luoshu_encoder;
+        let vectors: Vec<Option<Vec<f32>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = memories
+                .iter()
+                .map(|m| {
+                    let content = m.content.clone();
+                    scope.spawn(move || encoder.encode_embedding(&content))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or(None))
+                .collect()
+        });
+        memories
+            .iter()
+            .zip(vectors)
+            .map(|(_, v)| {
+                let v = v?;
+                let n = l2_norm(&v);
+                if !n.is_finite() || n <= 0.0 || v.len() != q.len() {
+                    return None;
+                }
+                Some((dot(&q, &v) / (q_norm * n)).clamp(0.0, 1.0))
+            })
+            .collect()
+    }
+
+    /// 非 ml 构建：语义相似度恒不可用（返回全 None），词面通路独自生效。
+    #[cfg(not(feature = "ml"))]
+    pub fn semantic_similarities(&self, _query: &str, memories: &[&Memory]) -> Vec<Option<f32>> {
+        vec![None; memories.len()]
     }
 
     /// v0.6.0+ 参赛扩展：设置探索日志记录器
@@ -901,18 +1136,84 @@ impl<P: Persistence> MemoryStore<P> {
     /// 使用 RefCell 实现内部可变性，支持 &self 方法调用
     /// 首次调用或缓存脏时从持久层加载，后续调用直接返回缓存副本
     fn load_cached(&self) -> Result<Vec<Memory>, PersistenceError> {
-        if self.cache_dirty.get() {
+        let load_start = std::time::Instant::now();
+        let cache_was_dirty = self.cache_dirty.get();
+        if cache_was_dirty {
             let mut cache = self.memory_cache.borrow_mut();
             *cache = self.persistence.load_all_memories()?;
             self.cache_dirty.set(false);
         }
-        Ok(self.memory_cache.borrow().clone())
+        let result = self.memory_cache.borrow().clone();
+        if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
+            eprintln!(
+                "[LRC_PROFILING] load_cached_ms={:.3} cache_reload={} memory_count={}",
+                load_start.elapsed().as_secs_f64() * 1000.0,
+                cache_was_dirty,
+                result.len()
+            );
+        }
+        Ok(result)
     }
 
     /// 标记缓存为脏：任何写操作（保存/删除/修改）后调用
     /// 下次 load_cached 时会重新从持久层加载
     fn invalidate_cache(&self) {
         self.cache_dirty.set(true);
+        self.bigram_index_dirty.set(true);
+        self.recall_documents.borrow_mut().clear();
+    }
+
+    /// v0.9.7 审查修复：外部替换数据文件（如备份恢复）后强制失效内存缓存，
+    /// 否则后续读取仍返回恢复前的旧缓存数据
+    pub fn invalidate_cache_after_external_restore(&self) {
+        self.invalidate_cache();
+    }
+
+    fn mark_cache_dirty_preserving_index(&self) {
+        self.cache_dirty.set(true);
+        self.recall_documents.borrow_mut().clear();
+    }
+
+    fn recall_document(&self, memory: &Memory) -> RecallDocument {
+        let mut documents = self.recall_documents.borrow_mut();
+        if let Some(document) = documents.get(&memory.id) {
+            return RecallDocument {
+                normalized_content: document.normalized_content.clone(),
+                token_count: document.token_count,
+            };
+        }
+        let normalized_content = memory.content.to_lowercase();
+        let token_count = doc_token_count(&normalized_content);
+        let document = RecallDocument {
+            normalized_content,
+            token_count,
+        };
+        documents.insert(
+            memory.id.clone(),
+            RecallDocument {
+                normalized_content: document.normalized_content.clone(),
+                token_count: document.token_count,
+            },
+        );
+        document
+    }
+
+    /// 统计一条记忆与查询的词面实质重叠 token 数（v0.9.7 精确度门禁信号源）。
+    ///
+    /// 复用 recall 内部的规范化文档缓存与词边界匹配逻辑，保证与评分口径
+    /// 完全一致。调用方（联想探索 API）用它实现"根节点必须与查询实质
+    /// 共鸣"的门禁：仅凭单个泛指词（如"什么"）重叠的无关记忆不得上位。
+    ///
+    /// # 参数
+    /// - `memory`：待统计的候选记忆
+    /// - `query_tokens`：调用方预先用 [`tokenize_query`] 分好的查询 token
+    ///   （避免对同一查询的 N 条候选重复分词）
+    pub fn query_overlap_count(&self, memory: &Memory, query_tokens: &[String]) -> usize {
+        let content_lower = self.recall_document(memory).normalized_content;
+        query_tokens
+            .iter()
+            .filter(|token| contains_word(&content_lower, token))
+            .count()
     }
 
     /// 设置冲突检测的相似度阈值
@@ -954,23 +1255,380 @@ impl<P: Persistence> MemoryStore<P> {
         self.synthesis_engine.compute_jaccard(a, b)
     }
 
-    /// 查找与给定内容高度相似的已有记忆
-    ///
-    /// 返回第一条相似度超过阈值的记忆。
-    /// 如果无相似记忆则返回 None。
-    pub fn find_similar(&self, content: &str) -> Result<Option<Memory>, PersistenceError> {
-        let all = self.load_cached()?;
+    fn content_bigrams(content: &str) -> std::collections::HashSet<String> {
+        content
+            .to_lowercase()
+            .chars()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| format!("{}{}", w[0], w[1]))
+            .collect()
+    }
 
-        for m in &all {
+    /// 域候选索引的 term 提取：与评分侧 `tokenize_query` 保持一致。
+    ///
+    /// v8 检索质量修复：原先"含任一 CJK 即整体 bigram 切分"会把混合文本中的
+    /// 英文标识符切碎（try_read → 2 字符碎片），导致索引 term 与评分 token
+    /// 分叉、候选剪枝漏召回正确记忆。现直接复用 `tokenize_query`（混合语言下
+    /// 保留英文/数字整词 + 中文 bigram），保证候选索引与 TF-IDF 评分口径统一。
+    fn content_index_terms(content: &str) -> std::collections::HashSet<String> {
+        tokenize_query(content).into_iter().collect()
+    }
+
+    /// 域候选索引开关：默认启用 NOLANG（项目优先、无语言剪枝），
+    /// 对应决策记忆 914a95dd（§5.11 方向 a 线上 A/B 验收通过后默认启用）。
+    ///
+    /// - `LRC_DOMAIN_CANDIDATE_INDEX_OFF=1`：逃生开关，完全关闭域候选索引，
+    ///   回退到旧的全量/大词索引路径（与默认启用前行为一致）。
+    /// - `LRC_DOMAIN_CANDIDATE_INDEX=1`（未设 NOLANG）：显式退回"项目+语言域"
+    ///   带语言剪枝的普通 domain 模式。
+    /// - `LRC_DOMAIN_CANDIDATE_INDEX_NOLANG=1`：显式启用 NOLANG（与默认同语义）。
+    fn domain_index_enabled() -> bool {
+        !std::env::var_os("LRC_DOMAIN_CANDIDATE_INDEX_OFF").is_some()
+    }
+
+    /// NOLANG 子模式：默认启用；仅当显式设置 LRC_DOMAIN_CANDIDATE_INDEX
+    /// 而未设置 LRC_DOMAIN_CANDIDATE_INDEX_NOLANG 时，退回带语言剪枝的
+    /// 普通 domain 模式（历史兼容语义）。
+    fn domain_index_nolang_enabled() -> bool {
+        if !Self::domain_index_enabled() {
+            return false;
+        }
+        if std::env::var_os("LRC_DOMAIN_CANDIDATE_INDEX").is_some()
+            && std::env::var_os("LRC_DOMAIN_CANDIDATE_INDEX_NOLANG").is_none()
+        {
+            return false;
+        }
+        true
+    }
+
+    fn index_terms_for_memory(memory: &Memory) -> std::collections::HashSet<String> {
+        if Self::domain_index_enabled() {
+            Self::content_index_terms(&memory.content)
+        } else if memory.content.chars().any(|c| {
+            let code = c as u32;
+            (0x4E00..=0x9FFF).contains(&code)
+        }) {
+            Self::content_bigrams(&memory.content)
+        } else {
+            std::collections::HashSet::new()
+        }
+    }
+
+    fn add_memory_to_index(&self, memory: &Memory) {
+        if self.bigram_index_dirty.get() {
+            return;
+        }
+        let mut index = self.bigram_index.borrow_mut();
+        for term in Self::index_terms_for_memory(memory) {
+            index.entry(term).or_default().insert(memory.id.clone());
+        }
+    }
+
+    fn remove_memory_from_index(&self, memory: &Memory) {
+        if self.bigram_index_dirty.get() {
+            return;
+        }
+        let mut index = self.bigram_index.borrow_mut();
+        for term in Self::index_terms_for_memory(memory) {
+            if let Some(ids) = index.get_mut(&term) {
+                ids.remove(&memory.id);
+                if ids.is_empty() {
+                    index.remove(&term);
+                }
+            }
+        }
+    }
+
+    fn replace_memory_in_index(&self, old: &Memory, new: &Memory) {
+        if self.bigram_index_dirty.get() {
+            return;
+        }
+        self.remove_memory_from_index(old);
+        self.add_memory_to_index(new);
+    }
+
+    fn verify_candidate_equivalence(
+        &self,
+        all: &[Memory],
+        candidate_positions: &[usize],
+        content: &str,
+    ) -> (usize, usize) {
+        let exact_matches = all
+            .iter()
+            .filter(|memory| {
+                self.compute_jaccard(content, &memory.content) >= self.similarity_threshold
+            })
+            .map(|memory| memory.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let candidate_ids = candidate_positions
+            .iter()
+            .map(|position| all[*position].id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let indexed_exact_matches = candidate_positions
+            .iter()
+            .filter(|position| {
+                self.compute_jaccard(content, &all[**position].content) >= self.similarity_threshold
+            })
+            .map(|position| all[*position].id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let missing = exact_matches.difference(&indexed_exact_matches).count();
+        let extra = candidate_ids.difference(&exact_matches).count();
+        (missing, extra)
+    }
+
+    fn rebuild_bigram_index(&self, all: &[Memory]) {
+        let index_start = std::time::Instant::now();
+        let mut index = self.bigram_index.borrow_mut();
+        index.clear();
+        let use_domain_index = Self::domain_index_enabled();
+        for memory in all {
+            let terms = if use_domain_index {
+                Self::content_index_terms(&memory.content)
+            } else {
+                if !memory.content.chars().any(|c| {
+                    let code = c as u32;
+                    (0x4E00..=0x9FFF).contains(&code)
+                }) {
+                    continue;
+                }
+                Self::content_bigrams(&memory.content)
+            };
+            for term in terms {
+                index.entry(term).or_default().insert(memory.id.clone());
+            }
+        }
+        self.bigram_index_dirty.set(false);
+        if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
+            emit_remember_profile(format!(
+                "[LRC_PROFILING] rebuild_index_ms={:.3} index_terms={} memory_count={}",
+                index_start.elapsed().as_secs_f64() * 1000.0,
+                index.len(),
+                all.len()
+            ));
+        }
+    }
+
+    /// 查找与给定内容高度相似的已有记忆。
+    pub fn find_similar(&self, content: &str) -> Result<Option<Memory>, PersistenceError> {
+        self.find_similar_scoped_with_privacy(content, None, &None)
+    }
+
+    /// 按项目和语言域优先查找相似记忆，未命中时受控扩大候选范围。
+    /// 仅测试使用（生产路径经 [Self::find_similar_scoped_with_privacy]）。
+    #[cfg(test)]
+    fn find_similar_scoped(
+        &self,
+        content: &str,
+        scope: Option<&Memory>,
+    ) -> Result<Option<Memory>, PersistenceError> {
+        self.find_similar_scoped_with_privacy(content, scope, &None)
+    }
+
+    /// 按项目和语言域优先查找相似记忆（带隐私可见性过滤）。
+    ///
+    /// 2026-09-01 隐私隔离修复：评估循环中对每个候选调用 `is_visible`
+    /// 过滤——只有对调用方隐私上下文可见的记忆才参与相似合并，避免
+    /// `remember` 把其他 session/user 的私有记忆误合并进当前上下文。
+    fn find_similar_scoped_with_privacy(
+        &self,
+        content: &str,
+        scope: Option<&Memory>,
+        privacy_context: &Option<(PrivacyLevel, Option<String>, Option<String>)>,
+    ) -> Result<Option<Memory>, PersistenceError> {
+        let all = self.load_cached()?;
+        let candidate_start = std::time::Instant::now();
+        let use_index = std::env::var_os("LRC_BIGRAM_CANDIDATE_INDEX").is_some();
+        let use_rare_index = std::env::var_os("LRC_RARE_BIGRAM_CANDIDATE_INDEX").is_some();
+        let use_domain_index = Self::domain_index_enabled();
+        let use_domain_index_nolang = Self::domain_index_nolang_enabled();
+        let index_mode = if use_domain_index && use_domain_index_nolang {
+            "domain-nolang"
+        } else if use_domain_index {
+            "domain"
+        } else if use_rare_index {
+            "rare"
+        } else if use_index {
+            "all"
+        } else {
+            "off"
+        };
+        let mut primary_candidates = Vec::new();
+        let mut same_language_candidates = Vec::new();
+        let fallback_candidates: Vec<usize> = (0..all.len()).collect();
+        let mut candidate_positions = Vec::new();
+        let mut indexed_position_count = 0usize;
+        let mut fallback_triggered = false;
+        let mut same_project_count = 0usize;
+
+        let content_is_cjk = content.chars().any(|c| {
+            let code = c as u32;
+            (0x4E00..=0x9FFF).contains(&code)
+        });
+        let index_enabled = use_index || use_rare_index || (use_domain_index && scope.is_some());
+        let query_terms = if use_domain_index {
+            Self::content_index_terms(content)
+        } else {
+            Self::content_bigrams(content)
+        };
+        if index_enabled && (!query_terms.is_empty()) && (content_is_cjk || use_domain_index) {
+            if self.bigram_index_dirty.get() {
+                self.rebuild_bigram_index(&all);
+            }
+            let index = self.bigram_index.borrow();
+            let selected_bigrams = if use_rare_index && content_is_cjk {
+                let mut ranked = query_terms
+                    .iter()
+                    .map(|bigram| {
+                        (
+                            bigram,
+                            index.get(bigram).map_or(0, std::collections::HashSet::len),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                ranked.sort_unstable_by_key(|(_, frequency)| *frequency);
+                ranked
+                    .into_iter()
+                    .take(4)
+                    .map(|(bigram, _)| bigram.as_str())
+                    .collect::<Vec<_>>()
+            } else {
+                query_terms.iter().map(String::as_str).collect()
+            };
+            let mut candidate_ids = std::collections::HashSet::new();
+            for bigram in selected_bigrams {
+                if let Some(found) = index.get(bigram) {
+                    candidate_ids.extend(found.iter().cloned());
+                }
+            }
+            let positions_by_id = all
+                .iter()
+                .enumerate()
+                .map(|(position, memory)| (memory.id.as_str(), position))
+                .collect::<std::collections::HashMap<_, _>>();
+            let positions = candidate_ids
+                .iter()
+                .filter_map(|id| positions_by_id.get(id.as_str()).copied())
+                .collect::<std::collections::HashSet<_>>();
+            indexed_position_count = positions.len();
+            let scope_is_cjk = scope
+                .map(|memory| {
+                    memory.content.chars().any(|c| {
+                        let code = c as u32;
+                        (0x4E00..=0x9FFF).contains(&code)
+                    })
+                })
+                .unwrap_or(content_is_cjk);
+            let scope_project = scope.and_then(|memory| memory.project.as_deref());
+            let same_project = |memory: &Memory| memory.project.as_deref() == scope_project;
+            for position in positions {
+                let memory = &all[position];
+                if use_domain_index && same_project(memory) {
+                    // 项目优先桶：同项目即入（NOLANG 模式不按语言剪枝，
+                    // 普通 domain 模式仍要求语言一致，见下方同语言并入条件）。
+                    primary_candidates.push(position);
+                } else if !use_domain_index || use_domain_index_nolang || {
+                    let memory_is_cjk = memory.content.chars().any(|c| {
+                        let code = c as u32;
+                        (0x4E00..=0x9FFF).contains(&code)
+                    });
+                    memory_is_cjk == scope_is_cjk
+                } {
+                    same_language_candidates.push(position);
+                }
+            }
+            primary_candidates.sort_unstable();
+            same_language_candidates.sort_unstable();
+            same_project_count = primary_candidates.len();
+            candidate_positions.extend(&primary_candidates);
+            candidate_positions.extend(&same_language_candidates);
+            candidate_positions.sort_unstable();
+            candidate_positions.dedup();
+        }
+        if !index_enabled {
+            candidate_positions = fallback_candidates.clone();
+        } else if candidate_positions.is_empty() {
+            fallback_triggered = true;
+            candidate_positions = fallback_candidates.clone();
+        }
+
+        if std::env::var_os("LRC_CANDIDATE_INDEX_VERIFY").is_some() && index_enabled {
+            let (missing, extra) =
+                self.verify_candidate_equivalence(&all, &candidate_positions, content);
+            eprintln!(
+                "[LRC_VERIFY] index_mode={} candidates={} missing_exact_matches={} extra_candidates={}",
+                index_mode,
+                candidate_positions.len(),
+                missing,
+                extra
+            );
+        }
+
+        let candidate_count = candidate_positions.len();
+        let candidate_build_ms = candidate_start.elapsed().as_secs_f64() * 1000.0;
+        let primary_candidate_count = primary_candidates.len();
+        let same_language_count = same_language_candidates.len();
+        let fallback_candidate_count = if fallback_triggered {
+            fallback_candidates.len()
+        } else {
+            0
+        };
+        let mut comparisons = 0usize;
+        let similarity_start = std::time::Instant::now();
+        for position in &candidate_positions {
+            let m = &all[*position];
             if m.is_expired() {
                 continue;
             }
+            // 隐私隔离：跳过对调用方不可见的记忆（不参与相似合并）
+            if !is_visible(m, privacy_context) {
+                continue;
+            }
+            comparisons += 1;
             let sim = self.compute_jaccard(content, &m.content);
             if sim >= self.similarity_threshold {
+                if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
+                    emit_remember_profile(format!(
+                        "[LRC_PROFILING] remember candidates={} indexed_positions={} primary_candidates={} same_language_candidates={} fallback_candidates={} fallback_triggered={} fallback_comparisons={} same_project={} jaccard_comparisons={} index_mode={} query_is_cjk={} scope_project={:?} candidate_build_ms={:.3} similarity_ms={:.3} hit=true",
+                        candidate_count,
+                        indexed_position_count,
+                        primary_candidate_count,
+                        same_language_count,
+                        fallback_candidate_count,
+                        fallback_triggered,
+                        if fallback_triggered { comparisons } else { 0 },
+                        same_project_count,
+                        comparisons,
+                        index_mode,
+                        content_is_cjk,
+                        scope.and_then(|memory| memory.project.as_deref()),
+                        candidate_build_ms,
+                        similarity_start.elapsed().as_secs_f64() * 1000.0
+                    ));
+                }
                 return Ok(Some(m.clone()));
             }
         }
 
+        if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
+            emit_remember_profile(format!(
+                "[LRC_PROFILING] remember candidates={} indexed_positions={} primary_candidates={} same_language_candidates={} fallback_candidates={} fallback_triggered={} fallback_comparisons={} same_project={} jaccard_comparisons={} index_mode={} query_is_cjk={} scope_project={:?} candidate_build_ms={:.3} similarity_ms={:.3}",
+                candidate_count,
+                indexed_position_count,
+                primary_candidate_count,
+                same_language_count,
+                fallback_candidate_count,
+                fallback_triggered,
+                if fallback_triggered { comparisons } else { 0 },
+                same_project_count,
+                comparisons,
+                index_mode,
+                content_is_cjk,
+                scope.and_then(|memory| memory.project.as_deref()),
+                candidate_build_ms,
+                similarity_start.elapsed().as_secs_f64() * 1000.0
+            ));
+        }
         Ok(None)
     }
 
@@ -1414,14 +2072,30 @@ impl<P: Persistence> MemoryStore<P> {
     /// 将人的判断力注入到系统的自主演化中，形成人机协同。
     fn process_user_feedback(&mut self) {
         // 1. 处理隔离恢复请求（用户标记被误隔离的记忆）
-        let override_ids = self.user_feedback.get_quarantine_override_ids();
-        if !override_ids.is_empty() {
-            match self.recover_from_quarantine(&override_ids) {
+        // TOCTOU 防护（2026-09-01 改进）：基于"快照 record_id 精确标记"，
+        // 不依赖墙上时钟（系统时钟回拨不会导致已恢复反馈永久无法标记）。
+        // 先取 (memory_id, record_id) 精确快照，恢复成功后只标记快照内的记录；
+        // 快照后新到的恢复请求不在快照内，保持未处理，下一周期再处理。
+        let override_snapshot = self.user_feedback.get_quarantine_override_snapshot();
+        if !override_snapshot.is_empty() {
+            let override_memory_ids: Vec<String> = override_snapshot
+                .iter()
+                .map(|(memory_id, _)| memory_id.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            match self.recover_from_quarantine(&override_memory_ids) {
                 Ok(recovered) if recovered > 0 => {
                     eprintln!(
                         "[LRC·反馈] 用户反馈回路：恢复了 {} 条被误隔离的记忆",
                         recovered
                     );
+                    // 按快照 record_id 精确标记已处理（含持久化），
+                    // 避免下一调节周期重复恢复；快照后新到的记录不受影响。
+                    let record_ids: Vec<String> =
+                        override_snapshot.into_iter().map(|(_, id)| id).collect();
+                    self.user_feedback
+                        .mark_override_processed_by_records(&record_ids);
                 }
                 Err(e) => {
                     eprintln!("[LRC·反馈] 隔离恢复失败: {}", e);
@@ -1451,10 +2125,8 @@ impl<P: Persistence> MemoryStore<P> {
                         "[LRC·反馈] 用户负面反馈触发：合成记忆 {} 将被标记为低质量",
                         &mem.id[..16.min(mem.id.len())]
                     );
-                    // 主动记录低质量命中触发合成日志的标记机制
-                    self.synthesis_journal.record_hit(&mem.id, 0.05);
-                    self.synthesis_journal.record_hit(&mem.id, 0.05);
-                    self.synthesis_journal.record_hit(&mem.id, 0.05);
+                    // 显式标记低质量（不伪造检索命中，避免污染检索统计）
+                    self.synthesis_journal.mark_low_quality(&mem.id);
                     flagged_ids.push(mem.id.clone());
                 }
             }
@@ -1490,9 +2162,8 @@ impl<P: Persistence> MemoryStore<P> {
                             "[LRC·反馈] 用户正面反馈保护：合成记忆 {} 的低质量标记已撤销",
                             &mem.id[..16.min(mem.id.len())]
                         );
-                        // 通过模拟高质量命中来撤销低质量标记
-                        self.synthesis_journal.record_hit(&mem.id, 0.85);
-                        self.synthesis_journal.record_hit(&mem.id, 0.9);
+                        // 显式撤销低质量标记（不伪造检索命中，避免污染检索统计）
+                        self.synthesis_journal.clear_low_quality(&mem.id);
                     }
                 }
             }
@@ -1823,7 +2494,8 @@ impl<P: Persistence> MemoryStore<P> {
     /// 写入后自动：
     /// 1. 洛书编码：将记忆内容编码为 9 维洛书向量
     /// 2. MirrorProject 分类：自动判定记忆的先天八卦类别
-    /// 3. 递归合成：若记忆库中相似记忆数 ≥ 3 条，则自动生成合成记忆
+    /// 3. 可选道体预判：仅在 pilot 开关开启时附加独立的卦类元数据
+    /// 4. 递归合成：若记忆库中相似记忆数 ≥ 3 条，则自动生成合成记忆
     pub fn remember(&mut self, memory: Memory) -> Result<Memory, PersistenceError> {
         // v0.6.0+ 参赛扩展：探索日志埋点（remember 事件）
         let remember_start = std::time::Instant::now();
@@ -1848,7 +2520,38 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         // 检查是否有相似记忆
-        let mut result = if let Some(existing) = self.find_similar(&memory.content)? {
+        let similarity_start = std::time::Instant::now();
+        // 隐私隔离：从待写入记忆自身派生隐私上下文，相似检查只合并
+        // 对当前上下文可见的记忆，避免跨 session/user 污染。
+        // 注意：仅当记忆携带真实归属标识（session_id/user_id）时才启用过滤——
+        // 无标识的匿名记忆（含默认 User 级但未设 user_id）保持既有合并行为，
+        // 避免默认配置下自动合并功能被隐私过滤意外禁用（回归）。
+        let remember_privacy = if memory.session_id.is_none() && memory.user_id.is_none() {
+            None
+        } else {
+            Some((
+                memory.privacy_level,
+                memory.session_id.clone(),
+                memory.user_id.clone(),
+            ))
+        };
+        let similar = if Self::domain_index_enabled() {
+            self.find_similar_scoped_with_privacy(
+                &memory.content,
+                Some(&memory),
+                &remember_privacy,
+            )?
+        } else {
+            self.find_similar_scoped_with_privacy(&memory.content, None, &remember_privacy)?
+        };
+        if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
+            eprintln!(
+                "[LRC_PROFILING] remember similarity_lookup_ms={:.3} found={}",
+                similarity_start.elapsed().as_secs_f64() * 1000.0,
+                similar.is_some()
+            );
+        }
+        let mut result = if let Some(existing) = similar.as_ref() {
             // 合并标签（去重）
             let mut merged_tags = existing.tags.clone();
             for tag in &memory.tags {
@@ -1862,6 +2565,9 @@ impl<P: Persistence> MemoryStore<P> {
             let old_content = merged.content.clone();
             merged.content = memory.content;
             merged.tags = merged_tags;
+            merged.daoti_preview_gua = memory.daoti_preview_gua;
+            merged.daoti_preview_bagua = memory.daoti_preview_bagua;
+            merged.daoti_preview_version = memory.daoti_preview_version;
             merged.touch();
 
             // 如果新记忆的重要性更高，则提升
@@ -1888,12 +2594,9 @@ impl<P: Persistence> MemoryStore<P> {
                 }
             }
 
-            // 更新持久化
-            self.persistence.save_memory(&merged)?;
             merged
         } else {
             // 无冲突，正常写入
-            self.persistence.save_memory(&memory)?;
             memory
         };
 
@@ -1910,9 +2613,14 @@ impl<P: Persistence> MemoryStore<P> {
             // topological_depth = 1.0 - center_value（归一化到 0.0~1.0）
             let center_val = luoshu_vec.center_value();
             result.topological_depth = (1.0 - center_val).clamp(0.0, 1.0);
+        }
 
-            // 更新持久化（写入编码后的元数据）
-            self.persistence.save_memory(&result)?;
+        // 统一在编码和分类完成后持久化一次，避免单条写入重复重写整个 JSON。
+        self.persistence.save_memory(&result)?;
+        if let Some(existing) = similar.as_ref() {
+            self.replace_memory_in_index(existing, &result);
+        } else {
+            self.add_memory_to_index(&result);
         }
 
         // 记录指标：编码 + 1
@@ -1924,8 +2632,8 @@ impl<P: Persistence> MemoryStore<P> {
         self.synthesis_pending
             .store(true, std::sync::atomic::Ordering::Release);
 
-        // v0.5.4 写操作后标记缓存为脏
-        self.invalidate_cache();
+        // 写入后仅刷新记忆快照，保留已完成的增量索引。
+        self.mark_cache_dirty_preserving_index();
 
         // v0.6.0+ 参赛扩展：探索日志记录（remember 事件）
         self.exploration_logger.log_remember(
@@ -1934,6 +2642,16 @@ impl<P: Persistence> MemoryStore<P> {
             &mem_tags,
             remember_start.elapsed().as_millis() as u64,
         );
+
+        // LRC 内置道体状态机：新写入的记忆代表"当前语境"，以重要性激活，
+        // 让后续检索能感知"用户刚刚在记什么"，形成跨调用的话题延续。
+        self.memory_state_machine.activate(
+            &result.id,
+            (result.importance.value() as f32 / 10.0).clamp(0.0, 1.0),
+        );
+        let _ = self
+            .persistence
+            .save_memory_state(&self.memory_state_machine.snapshot());
 
         Ok(result)
     }
@@ -1974,10 +2692,15 @@ impl<P: Persistence> MemoryStore<P> {
             let center_val = luoshu_vec.center_value();
             result.topological_depth = (1.0 - center_val).clamp(0.0, 1.0);
 
-            // 直接追加写入（不触发 clear+re-save）
-            self.persistence.save_memory(&result)?;
+            // 先完成整批编码，持久化统一在循环结束后执行。
             results.push(result);
             self.dao_metrics.record_encoding();
+        }
+
+        // 批量写入只执行一次全量序列化和磁盘写入。
+        self.persistence.save_memories(&results)?;
+        for result in &results {
+            self.add_memory_to_index(result);
         }
 
         // 注意：此处不在关键路径内执行合成（luoshu_synthesize），因为：
@@ -1991,8 +2714,8 @@ impl<P: Persistence> MemoryStore<P> {
         self.synthesis_pending
             .store(true, std::sync::atomic::Ordering::Release);
 
-        // v0.5.4 写操作后标记缓存为脏
-        self.invalidate_cache();
+        // 批量写入后仅刷新记忆快照，保留已完成的增量索引。
+        self.mark_cache_dirty_preserving_index();
 
         Ok(results)
     }
@@ -2017,12 +2740,37 @@ impl<P: Persistence> MemoryStore<P> {
         filter: &RecallFilter,
         depth: u32,
     ) -> Result<RecallResult, PersistenceError> {
+        self.trapezoid_focus_recall_with_cancel(query, filter, depth, None)
+    }
+
+    pub fn trapezoid_focus_recall_with_cancel(
+        &mut self,
+        query: &str,
+        filter: &RecallFilter,
+        depth: u32,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<RecallResult, PersistenceError> {
+        // 阶段D 可观测性：LRC_DEEP_TRACE=1 时输出审计行（候选/八卦剪除/词面域/top1 来源；默认关闭零开销）
+        let deep_trace = std::env::var("LRC_DEEP_TRACE")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let mut trace_lex_max = 0.0f32;
+        let mut trace_lex_fallback = false;
+
         // 1. 编码查询文本
         let query_vec = self.luoshu_encoder.encode_text(query);
 
         // 2. MirrorProject 分类查询向量（用于八卦预过滤）
         let query_proj = mirror_project(&query_vec);
         let query_bagua = query_proj.best_index as u8;
+
+        // 阶段三 b2：预判元数据参与候选剪枝（默认开启）。
+        // LRC_DAOTI_PREVIEW_PRUNE=0 / =false 时关闭，退化为仅 LRC 自分类卦硬剪除
+        // （保持 v0.8.50 回滚后的行为）。
+        let daoti_prune_enabled = !matches!(
+            std::env::var("LRC_DAOTI_PREVIEW_PRUNE").as_deref(),
+            Ok("0") | Ok("false")
+        );
 
         // 3. 以查询向量重心为中心创建 ROI
         let center = query_vec
@@ -2036,6 +2784,26 @@ impl<P: Persistence> MemoryStore<P> {
 
         let all_memories = self.load_cached()?;
         let total_count = all_memories.iter().filter(|m| !m.is_expired()).count();
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(PersistenceError::Other("enrich_cancelled".to_string()));
+        }
+
+        // LRC 内置道体状态机·联想导航（deep 候选白名单）：
+        // 活跃记忆无论卦象一律进入候选——它们代表"近期在想什么"，
+        // 是联想扩散的锚点，不能被八卦硬剪除误丢（记忆丢失的深层原因）。
+        let active_whitelist: std::collections::HashSet<String> =
+            if crate::engine::memory_state_machine::state_bias_enabled() {
+                self.memory_state_machine
+                    .active_ids(16)
+                    .into_iter()
+                    .collect()
+            } else {
+                std::collections::HashSet::new()
+            };
+        // 道体再次校验·回归证据收集（deep）：索引 → 证据标签，
+        // 由下方校验段填充，随 RecallResult 返回供联想链输出可观测。
+        let mut deep_evidence: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         // 4. 构建 (索引, 洛书向量) 对 — 增加八卦预过滤
         let indexed: Vec<(usize, LuoShuVector)> = all_memories
@@ -2066,18 +2834,55 @@ impl<P: Persistence> MemoryStore<P> {
                 if !is_visible(m, &filter.privacy_context) {
                     return false;
                 }
-                // 八卦预过滤：同卦优先，相邻卦次之，跨卦降权
-                if let Some(mem_bagua) = m.bagua_index {
-                    let bagua_diff = (mem_bagua as i8 - query_bagua as i8).abs();
-                    // 只保留同卦（diff=0）或相邻卦（diff=1 或 7）
-                    if bagua_diff > 1 && bagua_diff < 7 {
-                        return false;
+                // 活跃记忆白名单：无论卦象一律保留（联想导航锚点，防记忆丢失）
+                if active_whitelist.contains(&m.id) {
+                    return m.luoshu_vector.is_some();
+                }
+                // v0.8.50 检索质量修复 A/B（3111 旧 vs 3122 BM25+八卦降权）后回滚：
+                // 八卦降权（0.6~1.0 惩罚）对 deep 命中零改进（top1 2/32 持平），
+                // 且把卦近/跨卦的无关全局记忆顶上 top1、污染 RRF top1 命中
+                // （model_file_missing/orig、port_binding/rewrite 各退回 1 处）。
+                // 按方案 §3.5「预判元数据只做观测、不接入默认排序」，恢复原硬剪除：
+                // 仅保留同卦或相邻卦候选，其余剪除。
+                // 阶段三 b2：接入道体预判卦（daoti_preview_bagua）作为候选保留的
+                // 第二证据——LRC 自分类与道体预判不一致（跨域）时，任一证据命中
+                // 即保留，修正跨域污染误剪；仅影响召回候选、不改 RRF 评分权重。
+                m.luoshu_vector.is_some() && {
+                    // 证据1：LRC 自分类卦（环形距离 ≤1 保留）
+                    let lrc_keep = match m.bagua_index {
+                        Some(mem_bagua) => {
+                            let diff = (mem_bagua as i8 - query_bagua as i8).abs();
+                            // 八卦环形距离：diff 与 8-diff 取小者；≤1（同卦/相邻卦）保留
+                            let ring_dist = diff.min(8 - diff);
+                            ring_dist <= 1
+                        }
+                        None => true,
+                    };
+                    if lrc_keep {
+                        true
+                    } else if daoti_prune_enabled {
+                        // 证据2：道体预判卦（按名称映射，修正跨域污染）
+                        match m
+                            .daoti_preview_bagua
+                            .as_deref()
+                            .and_then(bagua_name_to_index)
+                        {
+                            Some(daoti_bagua) => {
+                                let diff = (daoti_bagua as i8 - query_bagua as i8).abs();
+                                let ring_dist = diff.min(8 - diff);
+                                ring_dist <= 1
+                            }
+                            None => false,
+                        }
+                    } else {
+                        false
                     }
                 }
-                m.luoshu_vector.is_some()
             })
             .filter_map(|(i, m)| m.luoshu_vector.map(|v| (i, LuoShuVector { values: v })))
             .collect();
+        // 阶段D 审计：八卦硬剪除后的候选规模
+        let trace_candidates = indexed.len();
 
         // 4. 执行梯形聚焦检索
         let vec_refs: Vec<(usize, &LuoShuVector)> = indexed.iter().map(|(i, v)| (*i, v)).collect();
@@ -2090,8 +2895,10 @@ impl<P: Persistence> MemoryStore<P> {
             .iter()
             .filter_map(|&idx| all.get(idx).cloned())
             .collect();
+        // 阶段D 审计：ROI 聚焦原始召回数（词面域过滤前）
+        let trace_roi = memories.len();
 
-        // 6. 计算分数（基于洛书向量与查询向量的余弦相似度）
+        // 6. 计算分数（纯洛书向量余弦相似度；八卦已在候选阶段硬剪除，评分不再降权）
         let mut scores: Vec<f32> = memories
             .iter()
             .map(|m| {
@@ -2104,9 +2911,186 @@ impl<P: Persistence> MemoryStore<P> {
             })
             .collect();
 
+        // ========== 语义向量域过滤（词面域融合评分，v0.8.52） ==========
+        // 洛书向量无词义：短 query 的余弦前排被与查询无关的长记忆抢占。
+        // 以查询词面为语义域锚点：对候选池统计查询 token 的平滑 IDF，
+        // 词面域重合分 = 命中 token 的 IDF 加权和，融合 final = 余弦 + 权重×(分/域内最大)；
+        // 域外记忆（零重合）不加分，域内记忆按词面相关度提升，域排序由余弦主导。
+        // 环境变量 LRC_DEEP_LEX_DOMAIN=0 可关闭本过滤（A/B 对照与回归用）；
+        // LRC_DEEP_LEX_DOMAIN_WEIGHT 可覆盖权重（阶段 B scale 消融，默认 0.25）。
+        let lex_domain_enabled = std::env::var("LRC_DEEP_LEX_DOMAIN")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let lex_domain_weight: f32 = std::env::var("LRC_DEEP_LEX_DOMAIN_WEIGHT")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(LEX_DOMAIN_WEIGHT);
+        if lex_domain_enabled {
+            let mut query_tokens = tokenize_query(query);
+            // LRC 内置道体状态机·联想导航（deep 词面域锚点扩展）：
+            // 把活跃记忆内容中的联想桥词并入词面域锚点，让"近期在想什么"
+            // 的内容也能获得词面域加分——与 fast 路径的查询扩展对齐。
+            if crate::engine::memory_state_machine::state_bias_enabled()
+                && !active_whitelist.is_empty()
+            {
+                let all = self.load_cached().unwrap_or_default();
+                let mut bridge_text = String::new();
+                for m in &all {
+                    if active_whitelist.contains(&m.id) {
+                        bridge_text.push_str(&m.content);
+                        bridge_text.push(' ');
+                    }
+                }
+                let mut seen: std::collections::HashSet<String> =
+                    query_tokens.iter().cloned().collect();
+                for w in tokenize_query(&bridge_text) {
+                    if seen.insert(w.clone()) {
+                        query_tokens.push(w);
+                    }
+                }
+                if query_tokens.len() > 32 {
+                    query_tokens.truncate(32);
+                }
+            }
+            if !query_tokens.is_empty() && !memories.is_empty() {
+                // 候选池内 DF：查询 token 在多少候选 content 中出现（词边界匹配，与 fast 路一致）
+                let mut doc_freq: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for w in &query_tokens {
+                    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)) {
+                        return Err(PersistenceError::Other("enrich_cancelled".to_string()));
+                    }
+                    for m in &memories {
+                        if contains_word(&m.content.to_lowercase(), w) {
+                            *doc_freq.entry(w.as_str()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let n_docs = memories.len() as f32;
+                // 词面域重合分：命中 token 的平滑 IDF 累加
+                let lex_domain: Vec<f32> = memories
+                    .iter()
+                    .map(|m| {
+                        let lower = m.content.to_lowercase();
+                        query_tokens
+                            .iter()
+                            .map(|w| {
+                                if contains_word(&lower, w) {
+                                    let df = *doc_freq.get(w.as_str()).unwrap_or(&0) as f32;
+                                    ((n_docs + 1.0) / (df + 1.0)).ln()
+                                } else {
+                                    0.0
+                                }
+                            })
+                            .sum()
+                    })
+                    .collect();
+                let lex_max = lex_domain.iter().copied().fold(0.0f32, f32::max);
+                // 阶段D 审计：词面域是否回退纯余弦
+                trace_lex_max = lex_max;
+                // 融合：仅在有词面重合时生效；候选池与查询零重合（如纯英文 query 对中文库）回退纯余弦
+                if lex_max > 0.0 {
+                    for (s, lex) in scores.iter_mut().zip(lex_domain.iter()) {
+                        *s += lex_domain_weight * (lex / lex_max);
+                    }
+                } else {
+                    trace_lex_fallback = true;
+                }
+            }
+        }
+
+        // LRC 内置道体状态机·活性偏置（与 fast 路径一致）：
+        // 即便查询措辞与活跃记忆无词面重叠，也按激活强度给加分，
+        // 让"近期在想什么"对 deep 检索同样生效，保持双路径行为一致。
+        if crate::engine::memory_state_machine::state_bias_enabled() && !memories.is_empty() {
+            let active_map: std::collections::HashMap<String, f32> = self
+                .memory_state_machine
+                .active_context(usize::MAX)
+                .into_iter()
+                .collect();
+            for (m, s) in memories.iter().zip(scores.iter_mut()) {
+                let activation = active_map.get(&m.id).copied().unwrap_or(0.0);
+                if activation > 0.0 {
+                    *s += (activation * 0.25).min(0.25);
+                }
+            }
+        }
+
         // 7. 按分数排序并截取 top_k
         let mut scored: Vec<(usize, f32)> = (0..memories.len()).map(|i| (i, scores[i])).collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // LRC 内置道体状态机·道体再次校验（deep 回归验证层）：
+        // 与 fast 路径同语义——联想扩散（词面域锚点扩展）拉进候选的记忆，
+        // 必须在输出前验证与原查询的共鸣。活跃记忆白名单是联想锚点本身，
+        // 不参与校验（它们代表近期语境，保留是设计意图）。
+        if !active_whitelist.is_empty() {
+            let original_tokens = tokenize_query(query);
+            let bridge_words: Vec<String> = {
+                let all = self.load_cached().unwrap_or_default();
+                let mut bridge_text = String::new();
+                for m in &all {
+                    if active_whitelist.contains(&m.id) {
+                        bridge_text.push_str(&m.content);
+                        bridge_text.push(' ');
+                    }
+                }
+                tokenize_query(&bridge_text)
+            };
+            let mut rejected: usize = 0;
+            // 收集回归证据：索引 → 证据标签（供联想链输出可观测）
+            let mut evidence_by_idx: std::collections::HashMap<usize, String> =
+                std::collections::HashMap::new();
+            let kept_indices: Vec<usize> = scored
+                .iter()
+                .map(|(i, _)| *i)
+                .filter(|&i| {
+                    use crate::engine::memory_state_machine::regression_recheck;
+                    let m = &memories[i];
+                    // 白名单活跃记忆：联想锚点，直接保留
+                    if active_whitelist.contains(&m.id) {
+                        evidence_by_idx.insert(i, "活跃锚点".to_string());
+                        return true;
+                    }
+                    let content_lower = m.content.to_lowercase();
+                    let original_overlap = original_tokens
+                        .iter()
+                        .filter(|w| contains_word(&content_lower, w))
+                        .count();
+                    let bridge_hits = bridge_words
+                        .iter()
+                        .filter(|w| contains_word(&content_lower, w))
+                        .count();
+                    let tag_hits = m
+                        .tags
+                        .iter()
+                        .filter(|t| original_tokens.iter().any(|w| t.to_lowercase().contains(w)))
+                        .count();
+                    let verdict = regression_recheck(original_overlap, bridge_hits, tag_hits);
+                    if verdict.keep {
+                        evidence_by_idx.insert(i, verdict.evidence.to_string());
+                    } else {
+                        rejected += 1;
+                    }
+                    verdict.keep
+                })
+                .collect();
+            if rejected > 0 {
+                eprintln!("[LRC-STATE] deep 道体再次校验剔除 {} 条发散噪声", rejected);
+            }
+            // 用校验后的索引重建 scored
+            let kept: std::collections::HashSet<usize> = kept_indices.iter().copied().collect();
+            scored.retain(|(i, _)| kept.contains(i));
+            // 将证据映射到最终输出的记忆 id
+            deep_evidence = kept_indices
+                .iter()
+                .filter_map(|&i| {
+                    evidence_by_idx
+                        .get(&i)
+                        .map(|e| (memories[i].id.clone(), e.clone()))
+                })
+                .collect();
+        }
 
         // v0.5.4 P2-12 修复：按 content 哈希去重，保留匹配度最高的那条
         // 在排序后、截取 top_k 前进行去重，确保深度检索结果中不会出现内容相同的记忆
@@ -2128,6 +3112,38 @@ impl<P: Persistence> MemoryStore<P> {
         // 8. 深度检索保持只读，不在搜索请求中更新访问时间或写回磁盘。
         // 这样可避免 ML 模式下全量清空并逐条重写 memories.json 导致请求超时。
 
+        // 阶段D 可观测性：LRC_DEEP_TRACE=1 输出审计行（默认关闭，生产零开销）
+        if deep_trace {
+            let top1 = memories.first();
+            eprintln!(
+                "[LRC-DEEP-TRACE] {}",
+                serde_json::json!({
+                    "query": query.chars().take(60).collect::<String>(),
+                    "query_bagua": query_bagua,
+                    "depth": depth,
+                    "top_k": filter.top_k,
+                    "recall": {
+                        "bagua_pruned_candidates": trace_candidates,
+                        "roi_matched": trace_roi,
+                        "lex_max": trace_lex_max,
+                        "lex_fallback": trace_lex_fallback,
+                        "lex_weight": lex_domain_weight,
+                    },
+                    "top1": top1.map(|m| {
+                        serde_json::json!({
+                            "id": m.id,
+                            "source": m.source,
+                            "project": m.project,
+                            "bagua": m.bagua_index,
+                            "preview_gua": m.daoti_preview_gua,
+                            "score": scores.first().copied().unwrap_or(0.0),
+                            "preview": m.content.chars().take(80).collect::<String>(),
+                        })
+                    }),
+                })
+            );
+        }
+
         self.dao_metrics.record_recall();
 
         // 质量反馈闭环：记录合成记忆被检索命中的相关性
@@ -2136,6 +3152,10 @@ impl<P: Persistence> MemoryStore<P> {
                 self.synthesis_journal.record_hit(&mem.id, *score);
             }
         }
+
+        // LRC 内置道体状态机：激活本次召回的记忆、记录联想轨迹并持久化。
+        // 这样下一次检索可感知"近期在想什么"，让信息从"查询依赖"变为"上下文依赖"。
+        self.bake_activation(&memories, &scores);
 
         // v0.5.4 检索后合成标记移出关键路径：由后台运行
         if memories.len() >= self.synthesis_min_cluster {
@@ -2148,8 +3168,60 @@ impl<P: Persistence> MemoryStore<P> {
             memories,
             scores,
             total: total_count,
+            regression_evidence: deep_evidence,
         })
     }
+    /// 将召回结果写入内置道体状态机的活性与联想轨迹。
+    fn populate_state(
+        &mut self,
+        memories: &[Memory],
+        scores: &[f32],
+    ) -> Result<(), PersistenceError> {
+        let mut previous = None;
+        for (memory, score) in memories.iter().zip(scores.iter()) {
+            self.memory_state_machine
+                .transition(previous, &memory.id, *score, 1);
+            previous = Some(memory.id.as_str());
+        }
+        self.persistence
+            .save_memory_state(&self.memory_state_machine.snapshot())
+    }
+
+    /// LRC 内置道体状态机·激活快照：
+    /// 激活本次召回的记忆、记录联想轨迹并持久化。
+    /// 快照写入失败不阻塞检索："记忆活性"是增强项，不应影响主路径。
+    fn bake_activation(&mut self, memories: &[Memory], scores: &[f32]) {
+        for (mem, score) in memories.iter().zip(scores.iter()) {
+            self.memory_state_machine.activate(&mem.id, *score);
+        }
+        if !memories.is_empty() {
+            let _ = self.populate_state(memories, scores);
+        }
+    }
+
+    /// 联想确认（v0.9.7：用户在联想探索中点击"就是这个"）。
+    ///
+    /// 用户确认某条记忆与当前意图相关：以最高激活强度（1.0）写入道体
+    /// 状态机活跃锚点并持久化，下次联想/检索时该记忆优先呈现。
+    /// 返回 Ok(true) 表示记忆存在且已确认；Ok(false) 表示记忆不存在。
+    pub fn confirm_memory(&mut self, memory_id: &str) -> Result<bool, PersistenceError> {
+        let exists = self
+            .load_cached()?
+            .iter()
+            .any(|m| m.id == memory_id && !m.is_expired());
+        if !exists {
+            return Ok(false);
+        }
+        // 用户显式确认 = 最高激活强度；轨迹记录一次确认转移并持久化快照
+        self.memory_state_machine.activate(memory_id, 1.0);
+        self.memory_state_machine
+            .transition(None, memory_id, 1.0, 1);
+        let _ = self
+            .persistence
+            .save_memory_state(&self.memory_state_machine.snapshot());
+        Ok(true)
+    }
+
     /// 道枢映射: 道枢·检索 — 记忆召回是系统的核心能力，如道枢之"环中"应对无穷
     /// 语义搜索记忆
     ///
@@ -2160,22 +3232,94 @@ impl<P: Persistence> MemoryStore<P> {
         query: &str,
         filter: &RecallFilter,
     ) -> Result<RecallResult, PersistenceError> {
+        self.recall_with_cancel(query, filter, None)
+    }
+
+    pub fn recall_with_cancel(
+        &mut self,
+        query: &str,
+        filter: &RecallFilter,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<RecallResult, PersistenceError> {
         // v0.6.0+ 参赛扩展：探索日志埋点（recall 事件）
         let recall_start = std::time::Instant::now();
         let recall_top_k = filter.top_k;
 
         let all_memories = self.load_cached()?;
         let total_count = all_memories.iter().filter(|m| !m.is_expired()).count();
+        if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(PersistenceError::Other("enrich_cancelled".to_string()));
+        }
 
         // v0.5.4 P1-9 修复：使用智能分词替代 split_whitespace()
         // 对中文文本使用 bigram 分词，解决中文检索精度问题
         let query_lower = query.to_lowercase();
         let query_words: Vec<String> = tokenize_query(query);
-        let query_word_refs: Vec<&str> = query_words.iter().map(|s| s.as_str()).collect();
 
-        // 分两阶段处理以避免借用冲突：
-        // 阶段 1: 用不可变引用评分和排序
-        // 阶段 2: 修改匹配记忆的 last_accessed 并写回持久化
+        // LRC 内置道体状态机·联想导航（查询扩展）：
+        // 把"近期活跃记忆"的内容作为联想桥并入查询词。这样即使本次查询与
+        // 目标记忆无词面重叠（如"今天晚饭吃什么" vs "粤菜餐厅牛肉丸"），
+        // 活跃记忆中的高频实词也能把相关记忆拉回候选——解决"记忆丢失"。
+        // 回归约束：扩展词仅在候选与原查询零词重叠时以封顶加分生效，
+        // 且权重低于原查询词，避免发散跑偏。开关 LRC_STATE_BIAS=0 关闭。
+        // v0.9.7 精确度修复：explore_pure（联想探索）模式下不做查询扩展，
+        // 探索语义完全由原查询主导。
+        let (query_words, expansion_boost) =
+            if crate::engine::memory_state_machine::state_bias_enabled() && !filter.explore_pure {
+                let active_ids = self.memory_state_machine.active_ids(8);
+                if active_ids.is_empty() {
+                    (query_words, Vec::<(String, f32)>::new())
+                } else {
+                    // 从活跃记忆内容抽取联想桥词（复用全库缓存，避免额外 I/O）
+                    let all = self.load_cached().unwrap_or_default();
+                    let id_set: std::collections::HashSet<&str> =
+                        active_ids.iter().map(|s| s.as_str()).collect();
+                    let mut bridge_text = String::new();
+                    for m in &all {
+                        if id_set.contains(m.id.as_str()) {
+                            bridge_text.push_str(&m.content);
+                            bridge_text.push(' ');
+                        }
+                    }
+                    let bridge_words: Vec<String> = tokenize_query(&bridge_text);
+                    // 扩展词去重（排除已属于原查询的词）
+                    let mut seen: std::collections::HashSet<String> =
+                        query_words.iter().cloned().collect();
+                    let mut expansion_boost: Vec<(String, f32)> = Vec::new();
+                    for w in bridge_words {
+                        if seen.insert(w.clone()) {
+                            expansion_boost.push((w, 0.20));
+                        }
+                    }
+                    // 联想桥词上限：防长活跃记忆稀释原查询主导地位
+                    if expansion_boost.len() > 16 {
+                        expansion_boost.truncate(16);
+                    }
+                    let mut merged = query_words;
+                    merged.extend(expansion_boost.iter().map(|(w, _)| w.clone()));
+                    (merged, expansion_boost)
+                }
+            } else {
+                (query_words, Vec::<(String, f32)>::new())
+            };
+        let query_word_refs: Vec<&str> = query_words.iter().map(|s| s.as_str()).collect();
+        // 原查询词（不含联想桥扩展词）——用于"零词重叠"判断：只有与原查询
+        // 完全无重叠的记忆才有资格获得联想桥扩展分，否则仍以原查询分主导。
+        // v0.9.7：联想探索设置 regression_query 后，回归校验锚定到该查询
+        //（起点记忆主题）而非当前 recall 查询（父记忆内容），
+        // 防止多跳扩散的语义随父内容漂移到无关领域。
+        let recheck_query: &str = filter.regression_query.as_deref().unwrap_or(query);
+        let original_query_words: Vec<String> = tokenize_query(recheck_query);
+        let original_query_refs: Vec<&str> =
+            original_query_words.iter().map(|s| s.as_str()).collect();
+
+        // 道体再次校验·回归证据收集（memory_id → 证据标签）：
+        // 函数级声明，由 scored 块内校验段填充，随 RecallResult 返回
+        // 供联想链输出可观测。
+        let mut regression_evidence: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+
+        // 用不可变引用评分和排序（只读：不在热路径更新 last_accessed 或同步重写文件）
         let (memories, scores) = {
             // 过滤记忆
             let privacy_ctx = filter.privacy_context.clone();
@@ -2224,8 +3368,11 @@ impl<P: Persistence> MemoryStore<P> {
                 let mut doc_freq: std::collections::HashMap<&str, usize> =
                     std::collections::HashMap::new();
                 for word in &query_word_refs {
+                    if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                        return Err(PersistenceError::Other("enrich_cancelled".to_string()));
+                    }
                     for m in &candidates {
-                        let content_lower = m.content.to_lowercase();
+                        let content_lower = self.recall_document(m).normalized_content;
                         // v0.5.5 修复二：词边界匹配替代子串匹配
                         if contains_word(&content_lower, word) {
                             *doc_freq.entry(word).or_insert(0) += 1;
@@ -2245,17 +3392,41 @@ impl<P: Persistence> MemoryStore<P> {
                     })
                     .collect();
 
+                // v0.8.50 BM25 检索质量修复：计算候选集合平均文档长度（token 数），
+                // 供 BM25 饱和归一使用。候选集即过滤后的全部未过期记忆。
+                let avgdl: f32 = {
+                    let mut total_tokens: usize = 0;
+                    for m in &candidates {
+                        total_tokens += self.recall_document(m).token_count;
+                    }
+                    total_tokens as f32 / candidates.len().max(1) as f32
+                };
+
+                // LRC 内置道体状态机·活性偏置：
+                // 将"近期活跃记忆"预构建为 id->激活强度 映射，供后续逐候选 O(1) 查询，
+                // 避免在 N×M 打分循环中反复构造活跃列表。
+                let active_map: std::collections::HashMap<String, f32> = self
+                    .memory_state_machine
+                    .active_context(usize::MAX)
+                    .into_iter()
+                    .collect();
+
                 candidates
                     .iter()
                     .map(|m| {
-                        let content_lower = m.content.to_lowercase();
+                        if cancel
+                            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                        {
+                            return (0.0, *m);
+                        }
+                        let document = self.recall_document(m);
+                        let content_lower = &document.normalized_content;
                         let mut score: f32 = 0.0;
 
                         // 完全匹配加分（精确匹配整句查询时额外加分）
                         if content_lower.contains(&query_lower) {
                             score += 0.4;
                         }
-
                         // TF-IDF 词匹配加分（替代原 0.1/词的固定权重）
                         // 对每个查询词，计算其在当前记忆中的词频（TF），乘以 IDF
                         // 归一化 TF：除以文档长度（token 数），避免长文本获得不合理的
@@ -2264,15 +3435,36 @@ impl<P: Persistence> MemoryStore<P> {
                         // 对 CJK 文本基于 bigram 数量计算文档长度
                         // v0.5.5 修复二：使用 contains_word + count_word_occurrences
                         // 替代 contains + matches().count()，避免子串误匹配
-                        let doc_len = doc_token_count(&content_lower) as f32;
+                        let doc_len = document.token_count as f32;
+                        // 原查询词重叠计数：>0 表示该记忆本就与查询直接相关，
+                        // 此时扩展词不应加分（原查询主导，防发散稀释）。
+                        let original_overlap: usize = original_query_refs
+                            .iter()
+                            .filter(|word| contains_word(content_lower, word))
+                            .count();
                         for word in &query_word_refs {
-                            if contains_word(&content_lower, word) {
+                            if contains_word(content_lower, word) {
+                                // 联想桥扩展词的权重（0.20）；原查询词权重为 1.0。
+                                // 回归约束：仅当该记忆与原查询零重叠时才给扩展分——
+                                // 扩展词只负责把"孤立但相关"的记忆拉进候选，
+                                // 已经与原查询直接匹配的记忆不需要联想桥。
+                                let expansion_weight = expansion_boost
+                                    .iter()
+                                    .find(|(w, _)| w.as_str() == *word)
+                                    .map(|(_, w)| *w)
+                                    .unwrap_or(1.0);
+                                if expansion_weight < 1.0 && original_overlap > 0 {
+                                    continue;
+                                }
                                 // 计算词频（TF）: 该词在记忆内容中以整词形式出现的次数
-                                let tf = count_word_occurrences(&content_lower, word) as f32;
+                                let tf = count_word_occurrences(content_lower, word) as f32;
                                 let idf_val = idf.get(word).copied().unwrap_or(1.0);
-                                // 归一化 TF-IDF 得分: (词频/文档长度) × 逆文档频率
-                                // 长文档中的高频常见词不再获得不合理的高分
-                                score += (tf / doc_len) * idf_val;
+                                // v0.8.50 BM25 检索质量修复：以 BM25 TF 饱和项替代线性
+                                // (词频/文档长度) 归一。长文档不再因 doc_len 线性放大而稀释
+                                // 精确短语命中，短文档关键词密度收益保留；参数取 Lucene/ES
+                                // 默认 k1=1.2、b=0.75。
+                                score += expansion_weight * idf_val * tf * (BM25_K1 + 1.0)
+                                    / (tf + BM25_K1 * (1.0 - BM25_B + BM25_B * doc_len / avgdl));
                             }
                         }
 
@@ -2288,6 +3480,24 @@ impl<P: Persistence> MemoryStore<P> {
 
                         // 重要性加权（含衰减因子，使用可配置衰减曲线）
                         score += m.decayed_importance_with_config(&self.decay_config) * 0.01;
+
+                        // LRC 内置道体状态机·活性偏置：
+                        // 仅当该记忆当前处于活跃状态（近期被召回）时，才依据其
+                        // 激活强度加一小分。这样"近期在想什么"能温和地影响下一次
+                        // 检索，但不会把不相关的高活性记忆顶到前面（因为基础分
+                        // 仍是内容匹配主导）。默认开关 LRC_STATE_BIAS=1 启用，
+                        // 设 0 可精确回退到旧行为。
+                        // v0.9.7：explore_pure（联想探索）模式下跳过，探索排序
+                        // 不受"近期语境"牵引。
+                        if crate::engine::memory_state_machine::state_bias_enabled()
+                            && !filter.explore_pure
+                        {
+                            let activation = active_map.get(&m.id).copied().unwrap_or(0.0);
+                            if activation > 0.0 {
+                                // 活性偏置上限 0.25，避免盖过内容匹配主导地位。
+                                score += (activation * 0.25).min(0.25);
+                            }
+                        }
 
                         // 类型匹配加权
                         if (query_lower.contains("偏好") || query_lower.contains("prefer"))
@@ -2357,6 +3567,77 @@ impl<P: Persistence> MemoryStore<P> {
             // 按分数降序排序
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
+            // LRC 内置道体状态机·道体再次校验（回归验证层）：
+            // 联想扩散把候选拉进 top_k 后，必须在输出前验证它是否真的回应了
+            // 原始查询——"发散之后能否收束回主题"，防止碰巧共享联想桥词的
+            // 噪声混入结果。判定信号：
+            //   1. 原查询词面命中（直接相关）
+            //   2. 联想桥强关联（≥2 个活跃记忆专属词命中 → 真联想边）
+            //   3. 标签共鸣（用户主动标注的语义证据）
+            // 三种证据皆无 → 判定为发散噪声，剔除。
+            // 仅当联想导航开启且存在联想桥词时执行；否则跳过（旧行为零影响）。
+            // v0.9.7：explore_pure（联想探索）模式下的处理分两级——
+            //   · 扩散跳（regression_query=Some）：必须校验，且锚定起点主题，
+            //     防止多跳扩散随父内容漂移；
+            //   · 根节点召回（regression_query=None）：不得在此词面预筛——
+            //     词面零重叠但语义强相关的候选（如"重要日子"↔"结婚纪念日"）
+            //     会在这里被提前剔除，根门禁的语义旁路就永远看不到它们。
+            //     起点是否实质共鸣交给 API 层根门禁（词面重叠 + 语义余弦）裁决。
+            let skip_pure_recheck = filter.explore_pure && filter.regression_query.is_none();
+            if !expansion_boost.is_empty() || (filter.explore_pure && !skip_pure_recheck) {
+                let bridge_words: Vec<&str> =
+                    expansion_boost.iter().map(|(w, _)| w.as_str()).collect();
+                let mut rejected: usize = 0;
+                // 收集回归证据：memory_id → 证据标签（供联想链输出可观测）
+                let mut evidence: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                scored = scored
+                    .into_iter()
+                    .filter(|(_, m)| {
+                        use crate::engine::memory_state_machine::regression_recheck;
+                        let content_lower = self.recall_document(m).normalized_content;
+                        // 证据1：原查询词面命中数
+                        let original_overlap = original_query_refs
+                            .iter()
+                            .filter(|w| contains_word(&content_lower, w))
+                            .count();
+                        // 证据2：联想桥词命中数（活跃记忆专属词）
+                        let bridge_hits = bridge_words
+                            .iter()
+                            .filter(|w| contains_word(&content_lower, w))
+                            .count();
+                        // 证据3：标签与原查询词共鸣
+                        let tag_hits = m
+                            .tags
+                            .iter()
+                            .filter(|t| {
+                                original_query_refs
+                                    .iter()
+                                    .any(|w| t.to_lowercase().contains(w))
+                            })
+                            .count();
+                        let verdict = regression_recheck(original_overlap, bridge_hits, tag_hits);
+                        if verdict.keep {
+                            // 记录证据标签：联想桥强关联是联想导航的产物，
+                            // 标注它让调用方看到"这条记忆为何被联想回来"
+                            evidence.insert(m.id.clone(), verdict.evidence.to_string());
+                        } else {
+                            rejected += 1;
+                        }
+                        verdict.keep
+                    })
+                    .collect::<Vec<_>>();
+                if rejected > 0 {
+                    eprintln!(
+                        "[LRC-STATE] 道体再次校验剔除 {} 条发散噪声（联想桥拉回但无共鸣信号）",
+                        rejected
+                    );
+                }
+                // 校验证据随结果返回（仅保留 top_k 截取前的证据即可，
+                // 去重/截取不会改变记忆 id 集合）
+                regression_evidence = evidence;
+            }
+
             // v0.5.4 P2-12 修复：按 content 哈希去重，保留匹配度最高的那条
             // 在排序后、截取 top_k 前进行去重，确保结果中不会出现内容相同的记忆
             // 使用规范化内容（trim + lowercase）作为去重键，捕获大小写/空白差异的重复
@@ -2372,6 +3653,9 @@ impl<P: Persistence> MemoryStore<P> {
                 .take(top_k)
                 .collect();
 
+            if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                return Err(PersistenceError::Other("enrich_cancelled".to_string()));
+            }
             let memories: Vec<Memory> = scored.iter().map(|(_, m)| (*m).clone()).collect();
             let scores: Vec<f32> = scored.iter().map(|(s, _)| *s).collect();
 
@@ -2394,24 +3678,41 @@ impl<P: Persistence> MemoryStore<P> {
             recall_start.elapsed().as_millis() as u64,
         );
 
+        // LRC 内置道体状态机：激活本次召回的记忆、记录联想轨迹并持久化。
+        // 与 deep 路径 (trapezoid_focus_recall) 保持一致。
+        self.bake_activation(&memories, &scores);
+
         Ok(RecallResult {
             memories,
             scores,
             total: total_count,
+            regression_evidence,
         })
     }
 
     /// 删除一条记忆
     pub fn forget(&mut self, id: &str) -> Result<bool, PersistenceError> {
+        let old = self
+            .load_cached()?
+            .into_iter()
+            .find(|memory| memory.id == id);
         let result = self.persistence.delete_memory(id)?;
-        // v0.5.4 写操作后标记缓存为脏
-        self.invalidate_cache();
+        if result {
+            if let Some(old) = old.as_ref() {
+                self.remove_memory_from_index(old);
+            }
+            self.mark_cache_dirty_preserving_index();
+        }
         Ok(result)
     }
 
     /// 更新记忆内容
     ///
     /// 如果记忆存在则更新并返回旧版本，否则返回 None。
+    ///
+    /// 写盘走 `update_memories` 单端点（单次序列化 + tmp+rename 原子写），
+    /// 不再使用 clear_memories + save_memories 两端点——避免 clear 成功、
+    /// save 前崩溃导致磁盘全库丢失的间隙窗口（持久化评估 C05）。
     pub fn update_memory(
         &mut self,
         id: &str,
@@ -2438,13 +3739,16 @@ impl<P: Persistence> MemoryStore<P> {
             })
             .collect();
 
-        // 重新写入所有记忆（更新后的列表）
-        self.persistence.clear_memories()?;
-        for m in updated {
-            self.persistence.save_memory(&m)?;
+        // 单端点原子写全量：update_memories 内部单次序列化 + tmp+rename，
+        // 消除旧 clear_memories+save_memories 两端点在 save 前崩溃丢全库的窗口（C05）。
+        self.persistence.update_memories(&updated)?;
+        if let Some(new_memory) = updated.iter().find(|memory| memory.id == id) {
+            if let Some(old_memory) = found.as_ref() {
+                self.replace_memory_in_index(old_memory, new_memory);
+            }
         }
-        // v0.5.4 写操作后标记缓存为脏
-        self.invalidate_cache();
+        // 更新后仅刷新记忆快照，保留已完成的增量索引。
+        self.mark_cache_dirty_preserving_index();
 
         Ok(found)
     }
@@ -2512,6 +3816,9 @@ impl<P: Persistence> MemoryStore<P> {
             ..Default::default()
         };
 
+        // v0.9.6：近 7 天新增按创建时间真实统计（替代"今日新增=累计编码次数"的误导口径）
+        let recent_cutoff = chrono::Utc::now() - chrono::Duration::days(7);
+
         for m in &all {
             *stats
                 .by_type
@@ -2523,6 +3830,10 @@ impl<P: Persistence> MemoryStore<P> {
 
             if m.is_expired() {
                 stats.expired_count += 1;
+            }
+
+            if m.created_at >= recent_cutoff {
+                stats.recent_added += 1;
             }
         }
 
@@ -2561,10 +3872,9 @@ impl<P: Persistence> MemoryStore<P> {
         self.persistence.add_to_archive(&expired)?;
 
         // 从活跃存储中重建（仅保留活跃记忆）
-        self.persistence.clear_memories()?;
-        for m in active {
-            self.persistence.save_memory(&m)?;
-        }
+        // 2026-09-01 C05 修复：改用 replace_all_memories 单端点原子写，
+        // 消除旧 clear_memories+save_memory 两端点在重建中途崩溃丢全库的窗口。
+        self.persistence.replace_all_memories(&active)?;
         // v0.5.4 写操作后标记缓存为脏
         self.invalidate_cache();
 
@@ -2862,10 +4172,9 @@ impl<P: Persistence> MemoryStore<P> {
             .collect();
 
         // 重新写入
-        self.persistence.clear_memories()?;
-        for m in updated {
-            self.persistence.save_memory(&m)?;
-        }
+        // 2026-09-01 C05 修复：改用 replace_all_memories 单端点原子写，
+        // 消除旧 clear_memories+save_memory 两端点在重写中途崩溃丢全库的窗口。
+        self.persistence.replace_all_memories(&updated)?;
         // v0.5.4 写操作后标记缓存为脏
         self.invalidate_cache();
 
@@ -3077,6 +4386,33 @@ mod tests {
     }
 
     #[test]
+    fn test_recall_with_cancel_stops_before_work() {
+        let (_dir, mut store) = make_store();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let result = store.recall_with_cancel("取消查询", &RecallFilter::new(), Some(&cancel));
+        assert!(matches!(
+            result,
+            Err(PersistenceError::Other(message)) if message == "enrich_cancelled"
+        ));
+    }
+
+    #[test]
+    fn test_trapezoid_recall_with_cancel_stops_before_work() {
+        let (_dir, mut store) = make_store();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let result = store.trapezoid_focus_recall_with_cancel(
+            "取消查询",
+            &RecallFilter::new(),
+            1,
+            Some(&cancel),
+        );
+        assert!(matches!(
+            result,
+            Err(PersistenceError::Other(message)) if message == "enrich_cancelled"
+        ));
+    }
+
+    #[test]
     fn test_remember_and_recall() {
         let (_dir, mut store) = make_store();
 
@@ -3089,6 +4425,351 @@ mod tests {
             .expect("应成功召回");
         assert!(!result.memories.is_empty());
         assert!(result.memories[0].content.contains("pnpm"));
+    }
+
+    /// v8 检索质量修复：混合语言文本中英文标识符保留整词（混合语言兜底）
+    #[test]
+    fn test_tokenize_cjk_keeps_ascii_identifiers() {
+        let tokens = tokenize_cjk(&"所有try_lock()读操作改为try_read()".to_lowercase());
+        // 英文标识符整词保留，不被切碎
+        assert!(
+            tokens.contains(&"try_lock".to_string()),
+            "应保留 try_lock 整词，实际: {:?}",
+            tokens
+        );
+        assert!(
+            tokens.contains(&"try_read".to_string()),
+            "应保留 try_read 整词，实际: {:?}",
+            tokens
+        );
+        // 中文部分仍按 bigram 切分
+        assert!(tokens.contains(&"所有".to_string()));
+        assert!(tokens.contains(&"读操".to_string()));
+        assert!(tokens.contains(&"操作".to_string()));
+        assert!(tokens.contains(&"改为".to_string()));
+        // 下标/括号不再产生跨语言碎片（修复前会产生 "有t"/"d(" 等）
+        assert!(!tokens.contains(&"有t".to_string()));
+        assert!(!tokens.contains(&"d(".to_string()));
+    }
+
+    /// v8 检索质量修复：`contains_word` 对混合文本中的英文标识符整词命中
+    #[test]
+    fn test_contains_word_mixed_language_identifier() {
+        let content = "所有try_lock()读操作改为try_read()";
+        assert!(contains_word(content, "try_read"), "应整词命中 try_read");
+        assert!(contains_word(content, "try_lock"), "应整词命中 try_lock");
+        // 长度 < 3 的 ASCII 词仍按既有逻辑走子串匹配（兼容 CJK bigram 碎片）
+        assert!(contains_word(content, "tr"));
+    }
+
+    /// v8 检索质量修复：混合语言 query 能整词匹配英文标识符，top1 返回正确记忆
+    #[test]
+    fn test_recall_mixed_language_identifier_top1() {
+        let (_dir, mut store) = make_store();
+        store
+            .remember(make_test_memory(
+                "所有try_lock()读操作改为try_read()（rwlock 并发保护）",
+                MemoryType::CodeContext,
+            ))
+            .expect("应成功记住");
+        let result = store
+            .recall(
+                "lock_busy 期间改用 try_read 避免挂起超时",
+                &RecallFilter::new().with_top_k(3),
+            )
+            .expect("应成功召回");
+        assert!(
+            !result.memories.is_empty(),
+            "应有召回结果（修复前 lock_busy 类混合 query 常漏召回正确记忆）"
+        );
+        assert!(
+            result.memories[0].content.contains("try_read"),
+            "top1 应命中含 try_read 的正确记忆，实际: {}",
+            result.memories[0].content
+        );
+    }
+
+    /// v0.8.50 检索质量修复：BM25 词频饱和替代线性文档长度归一
+    ///
+    /// 场景还原（df：大段节选的种子记忆被旧线性归一稀释）：
+    /// - 长文档完整命中全部查询词（tf=1 × 4 词），但 doc_len 大；
+    /// - 短文档仅片面命中单一查询词（tf=1 × 1 词），doc_len 极小。
+    ///   旧逻辑 score += (tf/doc_len)*idf → 短文档 1/5 > 长文档 4/45，错误地排在前面；
+    ///   新逻辑 BM25 饱和项按 avgdl 归一，长文档精确短语命中不再被稀释。
+    #[test]
+    fn test_recall_bm25_prefers_dense_short_match() {
+        let (_dir, mut store) = make_store();
+        // 长文档：完整命中查询词（"数据/据库/库连/连接" 各 1 次），但被大量无关节选文本稀释
+        store
+            .remember(make_test_memory(
+                "数据库连接 配置说明摘自大型运行文档，程序用于记录系统运行日志与监控指标并按期清理过期条目保障服务稳定可靠，\
+                 同时在多实例环境部署时需关注集群负载均衡策略并定期执行备份恢复演练。",
+                MemoryType::CodeContext,
+            ))
+            .expect("应成功记住");
+        // 短文档：仅片面命中"数据"一词，旧线性归一因 doc_len 极小反占优势
+        store
+            .remember(make_test_memory("数据统计报表", MemoryType::Fact))
+            .expect("应成功记住");
+
+        let result = store
+            .recall("数据库连接", &RecallFilter::new().with_top_k(3))
+            .expect("应成功召回");
+        assert!(
+            result.memories[0].content.contains("数据库连接"),
+            "top1 应为完整命中查询词的记忆（旧线性归一被短文档片面命中反超，BM25 修复），实际: {}",
+            result.memories[0].content
+        );
+    }
+
+    /// v0.8.50 检索质量修复（A/B 后回滚）：deep 路恢复八卦硬剪除
+    ///
+    /// 场景还原（t7 A/B：3111 旧 vs 3122 BM25+八卦降权，deep top1 均 2/32）：
+    /// 八卦降权对 deep 命中零改进，且把卦近/跨卦无关记忆顶上 top1、污染 RRF，
+    /// 故按方案 §3.5 恢复原硬剪除（仅保留同卦/相邻卦候选）。
+    /// 本测试验证：跨卦记忆（环形距离 3）被剪除、相邻卦（距离 1）保留、同卦优先。
+    #[test]
+    fn test_trapezoid_recall_prunes_cross_bagua_candidates() {
+        let (_dir, mut store) = make_store();
+        // 确定查询向量的天然八卦分类
+        let qv = store.luoshu_encoder.encode_text("数据库连接池参数调优");
+        let qproj = mirror_project(&qv);
+        let qbagua = qproj.best_index as u8;
+
+        // 三条记忆的洛书向量均指向查询方向（基础余弦相同），仅八卦分类不同：
+        // - 跨卦记忆 A：环形距离 3，预期被硬剪除
+        // - 相邻卦记忆 C：环形距离 1（相邻卦），预期保留
+        // - 同卦记忆 B：bagua_index = qbagua，预期保留且优先
+        let mut ma = make_test_memory("跨卦候选记忆：数据库连接池参数调优经验", MemoryType::Fact);
+        ma.luoshu_vector = Some(qv.values);
+        ma.bagua_index = Some((qbagua + 3) % 8);
+        store
+            .persistence
+            .save_memory(&ma)
+            .expect("应能保存跨卦记忆");
+        store.add_memory_to_index(&ma);
+
+        let mut mb = make_test_memory("同卦候选记忆：数据库连接池参数调优经验", MemoryType::Fact);
+        mb.luoshu_vector = Some(qv.values);
+        mb.bagua_index = Some(qbagua);
+        store
+            .persistence
+            .save_memory(&mb)
+            .expect("应能保存同卦记忆");
+        store.add_memory_to_index(&mb);
+
+        let mut mc = make_test_memory("相邻卦候选记忆：数据库连接池参数调优经验", MemoryType::Fact);
+        mc.luoshu_vector = Some(qv.values);
+        mc.bagua_index = Some((qbagua + 1) % 8);
+        store
+            .persistence
+            .save_memory(&mc)
+            .expect("应能保存相邻卦记忆");
+        store.add_memory_to_index(&mc);
+
+        store.mark_cache_dirty_preserving_index();
+
+        let result = store
+            .trapezoid_focus_recall(
+                "数据库连接池参数调优",
+                &RecallFilter::new().with_top_k(5),
+                1,
+            )
+            .expect("应成功检索");
+
+        // 1) 跨卦记忆（环形距离 3）被硬剪除，不应出现在结果中
+        assert!(
+            !result
+                .memories
+                .iter()
+                .any(|m| m.content.contains("跨卦候选")),
+            "跨卦记忆应被硬剪除（A/B 证实降权仅引入 RRF 污染）: {:?}",
+            result
+                .memories
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        // 2) 同卦与相邻卦均保留，且同卦排第一（基础余弦相同）
+        let idx_b = result
+            .memories
+            .iter()
+            .position(|m| m.content.contains("同卦候选"))
+            .expect("同卦记忆应在结果中");
+        let idx_c = result
+            .memories
+            .iter()
+            .position(|m| m.content.contains("相邻卦候选"))
+            .expect("相邻卦记忆应在结果中");
+        assert_eq!(idx_b, 0, "同卦记忆应排第一");
+        // 3) 同卦与相邻卦基础余弦相同 → 分数应相等（不再降权）
+        assert!(
+            (result.scores[idx_b] - result.scores[idx_c]).abs() < 1e-6,
+            "同卦与相邻卦不应有评分差异（已恢复纯余弦），B={} C={}",
+            result.scores[idx_b],
+            result.scores[idx_c]
+        );
+    }
+
+    /// 阶段三 b2：预判元数据接入候选剪枝（默认开启，LRC_DAOTI_PREVIEW_PRUNE=0 关闭）
+    ///
+    /// 场景还原（跨域污染）：LRC 自分类卦（bagua_index）与道体预判卦
+    /// （daoti_preview_bagua）不一致时，若仅按 LRC 自分类硬剪除，
+    /// 道体预判更准的候选会被误剪；b2 将道体预判作为第二证据，
+    /// 任一证据命中（环形距离 ≤1）即保留——仅影响召回候选、不改 RRF 评分权重。
+    /// 本测试验证：
+    /// 1) 跨域候选 A（自分类跨卦 + 道体预判同卦）默认开启时被保留（污染被修正）
+    /// 2) 跨卦且无预判元数据的候选 B 仍被剪除（剪枝未被放松）
+    /// 3) LRC_DAOTI_PREVIEW_PRUNE=0 时 A 退化为被剪除（逃生开关生效）
+    #[test]
+    fn test_trapezoid_recall_daoti_preview_keeps_cross_domain_candidate() {
+        use crate::engine::mirror_trapezoid::BAGUA_NAMES;
+        let (_dir, mut store) = make_store();
+        // 本测试聚焦八卦剪除语义：关闭联想导航（活性偏置），
+        // 否则活跃记忆白名单会豁免跨卦候选，干扰剪除断言。
+        let prev_bias = std::env::var_os("LRC_STATE_BIAS");
+        std::env::set_var("LRC_STATE_BIAS", "0");
+        let qv = store.luoshu_encoder.encode_text("数据库连接池参数调优");
+        let qproj = mirror_project(&qv);
+        let qbagua = qproj.best_index as u8;
+        // 道体预判卦名（单字，如 "乾"），取 BAGUA_NAMES 对应索引的首段
+        let daoti_q_name: String = BAGUA_NAMES[qbagua as usize]
+            .split('·')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // 记忆 A：LRC 自分类跨卦（环形距离 3，证据1 会剪除），
+        // 但 daoti_preview_bagua 与查询同卦（证据2 命中）→ 应保留
+        let mut ma = make_test_memory(
+            "预判跨域候选记忆：数据库连接池参数调优经验",
+            MemoryType::Fact,
+        );
+        ma.luoshu_vector = Some(qv.values);
+        ma.bagua_index = Some((qbagua + 3) % 8);
+        ma.daoti_preview_bagua = Some(daoti_q_name.clone());
+        store
+            .persistence
+            .save_memory(&ma)
+            .expect("应能保存跨域候选");
+        store.add_memory_to_index(&ma);
+
+        // 记忆 B：LRC 自分类跨卦且无预判元数据（证据1、2 均不命中）→ 应剪除
+        let mut mb = make_test_memory(
+            "无预判跨卦候选记忆：数据库连接池参数调优经验",
+            MemoryType::Fact,
+        );
+        mb.luoshu_vector = Some(qv.values);
+        mb.bagua_index = Some((qbagua + 3) % 8);
+        store
+            .persistence
+            .save_memory(&mb)
+            .expect("应能保存跨卦候选");
+        store.add_memory_to_index(&mb);
+
+        // 对照组 C：同卦记忆（证据1 命中）→ 无论开关与否均应保留
+        let mut mc = make_test_memory("同卦对照记忆：数据库连接池参数调优经验", MemoryType::Fact);
+        mc.luoshu_vector = Some(qv.values);
+        mc.bagua_index = Some(qbagua);
+        store
+            .persistence
+            .save_memory(&mc)
+            .expect("应能保存同卦记忆");
+        store.add_memory_to_index(&mc);
+
+        store.mark_cache_dirty_preserving_index();
+
+        let previous = std::env::var_os("LRC_DAOTI_PREVIEW_PRUNE");
+
+        // ---------- 默认开启：A 保留（跨域污染被修正），B 剪除 ----------
+        std::env::remove_var("LRC_DAOTI_PREVIEW_PRUNE");
+        let result = store
+            .trapezoid_focus_recall(
+                "数据库连接池参数调优",
+                &RecallFilter::new().with_top_k(5),
+                1,
+            )
+            .expect("应成功检索");
+        let got = |needle: &str| result.memories.iter().any(|m| m.content.contains(needle));
+        assert!(
+            got("预判跨域候选"),
+            "跨域候选 A 应因道体预判同卦被保留: {:?}",
+            result
+                .memories
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !got("无预判跨卦"),
+            "跨卦且无预判证据的 B 应被剪除: {:?}",
+            result
+                .memories
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // ---------- 逃生开关 LRC_DAOTI_PREVIEW_PRUNE=0：退化为原行为，A 被剪除 ----------
+        std::env::set_var("LRC_DAOTI_PREVIEW_PRUNE", "0");
+        let result_off = store
+            .trapezoid_focus_recall(
+                "数据库连接池参数调优",
+                &RecallFilter::new().with_top_k(5),
+                1,
+            )
+            .expect("应成功检索");
+        let got_off = |needle: &str| {
+            result_off
+                .memories
+                .iter()
+                .any(|m| m.content.contains(needle))
+        };
+        assert!(
+            !got_off("预判跨域候选"),
+            "逃生开关关闭时 A 应退化为被剪除: {:?}",
+            result_off
+                .memories
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(got_off("同卦对照"), "同卦对照组 C 应始终保留");
+
+        match previous {
+            Some(value) => std::env::set_var("LRC_DAOTI_PREVIEW_PRUNE", value),
+            None => std::env::remove_var("LRC_DAOTI_PREVIEW_PRUNE"),
+        }
+        match prev_bias {
+            Some(value) => std::env::set_var("LRC_STATE_BIAS", value),
+            None => std::env::remove_var("LRC_STATE_BIAS"),
+        }
+    }
+
+    /// 阶段三 b2 补充：bagua_name_to_index 必须按名称映射而非按位置。
+    /// daoti GUA_LEXICON 字典顺序（乾,兑,坤,艮,震,巽,坎,离）与
+    /// BAGUA_NAMES 顺序（乾,兑,离,震,巽,坎,艮,坤）不同——按位置会错位
+    /// 导致跨域污染（如 daoti "坤" 若按位置会被误判为 "离"）。
+    #[test]
+    fn test_bagua_name_to_index_maps_by_name_not_position() {
+        use crate::engine::mirror_trapezoid::{bagua_name_to_index, BAGUA_NAMES};
+        // 全量 8 卦逐一按名称映射，应命中各自正确索引
+        for (index, canonical) in BAGUA_NAMES.iter().enumerate() {
+            let single = canonical.split('·').next().unwrap();
+            assert_eq!(
+                bagua_name_to_index(single),
+                Some(index as u8),
+                "单字 {single} 应映射到索引 {index}"
+            );
+            assert_eq!(bagua_name_to_index(canonical), Some(index as u8));
+        }
+        // 跨域污染关键：daoti 词典中 "坤"（索引 7）若按位置映射会被误认为
+        // BAGUA_NAMES[2]="离·火"，按名称映射必须命中 "坤·地"(7)
+        assert_eq!(bagua_name_to_index("坤"), Some(7));
+        assert_eq!(bagua_name_to_index("兑"), Some(1));
+        // 未知/空名称应返回 None
+        assert_eq!(bagua_name_to_index(""), None);
+        assert_eq!(bagua_name_to_index("不存在"), None);
     }
 
     /// v0.5.4 P1-9 新增：验证中文检索精度修复
@@ -3194,6 +4875,10 @@ mod tests {
             contains_word("cat and cat again", "cat"),
             "应匹配多次出现的 'cat'"
         );
+        assert!(
+            contains_word("═══ ═══", "═══"),
+            "重复的多字节符号词应安全匹配"
+        );
     }
 
     /// v0.5.5 修复二：验证 CJK bigram 保留子串匹配
@@ -3260,6 +4945,13 @@ mod tests {
             count_word_occurrences("数据库连接数据库", "据库"),
             2,
             "CJK bigram '据库' 应子串计数 2 次"
+        );
+
+        // 非 CJK 多字节词重复出现时，统计过程不得因字节索引落在字符内部而崩溃
+        assert_eq!(
+            count_word_occurrences("═══ ═══", "═══"),
+            2,
+            "重复的多字节符号词应安全统计"
         );
     }
 
@@ -3360,6 +5052,54 @@ mod tests {
     }
 
     #[test]
+    fn test_update_memory_preserves_other_entries_on_disk() {
+        // C05 回归：update_memory 必须走单端点原子写，clear+save 间隙
+        // 不得存在——更新后磁盘需完整保留全部条目（未更新条目原样落盘）。
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let (s1_id, s2_id) = {
+            let p = create_json_persistence(&data_dir).expect("应成功创建");
+            let mut store = MemoryStore::new(p);
+            let s1 = store
+                .remember(make_test_memory("第一条内容", MemoryType::Fact))
+                .expect("应成功记住");
+            let s2 = store
+                .remember(make_test_memory("第二条内容", MemoryType::Fact))
+                .expect("应成功记住");
+            let old = store
+                .update_memory(&s1.id, "第一条已更新", None)
+                .expect("应成功更新");
+            assert_eq!(old.as_ref().map(|m| m.content.as_str()), Some("第一条内容"));
+            (s1.id, s2.id)
+        }; // store 与 persistence 随作用域释放
+
+        // 直接读磁盘文件：2 条都在，更新生效——无 clear 中间态清空痕迹
+        let on_disk: Vec<Memory> = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("memories.json")).expect("磁盘文件应存在"),
+        )
+        .expect("磁盘 JSON 应可解析");
+        assert_eq!(on_disk.len(), 2, "update 后磁盘必须保留 2 条，不得清空");
+        assert_eq!(
+            on_disk.iter().find(|m| m.id == s1_id).unwrap().content,
+            "第一条已更新",
+            "被更新条目应已落盘"
+        );
+        assert_eq!(
+            on_disk.iter().find(|m| m.id == s2_id).unwrap().content,
+            "第二条内容",
+            "未更新条目应原样保留"
+        );
+
+        // 同一 data_dir 新建实例重载：磁盘=缓存一致
+        let p2 = create_json_persistence(&data_dir).expect("应成功创建");
+        let store2 = MemoryStore::new(p2);
+        let (all, _) = store2
+            .list_memories(&ListFilter::new())
+            .expect("应能列出全部记忆");
+        assert_eq!(all.len(), 2, "重载后应仍为 2 条");
+    }
+
+    #[test]
     fn test_list_memories() {
         let (_dir, mut store) = make_store();
 
@@ -3418,6 +5158,22 @@ mod tests {
         assert_eq!(stats.total_memories, 2);
         assert_eq!(stats.by_type.get("fact"), Some(&1));
         assert_eq!(stats.by_type.get("preference"), Some(&1));
+        assert_eq!(stats.recent_added, 2, "刚写入的记忆应计入近7天新增");
+    }
+
+    #[test]
+    fn test_stats_recent_added_excludes_old_memories() {
+        let (_dir, mut store) = make_store();
+        let mut old = make_test_memory("历史记忆", MemoryType::Fact);
+        old.created_at = Utc::now() - Duration::days(8);
+        store.remember(old).expect("应成功记住历史记忆");
+        store
+            .remember(make_test_memory("近期记忆", MemoryType::Fact))
+            .expect("应成功记住近期记忆");
+
+        let stats = store.stats().expect("应获取统计");
+        assert_eq!(stats.total_memories, 2);
+        assert_eq!(stats.recent_added, 1, "8天前记忆不得计入近7天新增");
     }
 
     #[test]
@@ -3568,6 +5324,25 @@ mod tests {
     }
 
     #[test]
+    fn test_recall_document_reuses_and_invalidates_content_features() {
+        let (_dir, mut store) = make_store();
+        let mut memory = make_test_memory("Feature cache original", MemoryType::Fact);
+        let saved = store.remember(memory.clone()).expect("写入应成功");
+
+        let first = store.recall_document(&saved);
+        let second = store.recall_document(&saved);
+        assert_eq!(first.normalized_content, second.normalized_content);
+        assert_eq!(first.token_count, second.token_count);
+
+        memory.id = saved.id;
+        memory.content = "Feature cache updated".into();
+        store.persistence.save_memory(&memory).expect("更新应成功");
+        store.invalidate_cache();
+        let updated = store.recall_document(&memory);
+        assert_eq!(updated.normalized_content, "feature cache updated");
+    }
+
+    #[test]
     fn test_remember_auto_merge_similar() {
         let (_dir, mut store) = make_store();
 
@@ -3598,6 +5373,114 @@ mod tests {
     }
 
     #[test]
+    fn test_domain_candidate_index_finds_same_project_language_candidate() {
+        let (_dir, mut store) = make_store();
+        let previous = std::env::var_os("LRC_DOMAIN_CANDIDATE_INDEX");
+        std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX", "1");
+
+        let mut first = make_test_memory("域索引测试：项目缓存超时处理", MemoryType::Fact);
+        first.project = Some("domain-index-project-a".into());
+        store.remember(first).expect("首次写入应成功");
+
+        let mut duplicate = make_test_memory("域索引测试：项目缓存超时处理", MemoryType::Fact);
+        duplicate.project = Some("domain-index-project-a".into());
+        let matched = store
+            .find_similar_scoped(&duplicate.content, Some(&duplicate))
+            .expect("域候选检索应成功")
+            .expect("同项目同语言内容应命中");
+
+        assert_eq!(matched.project.as_deref(), Some("domain-index-project-a"));
+        match previous {
+            Some(value) => std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX", value),
+            None => std::env::remove_var("LRC_DOMAIN_CANDIDATE_INDEX"),
+        }
+    }
+
+    #[test]
+    fn test_domain_candidate_index_fallback_matches_full_scan() {
+        let (_dir, mut store) = make_store();
+        store
+            .remember(make_test_memory(
+                "唯一回退候选：数据库连接超时",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        store
+            .remember(make_test_memory(
+                "完全不同的主题：天气预报",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+
+        let previous = std::env::var_os("LRC_DOMAIN_CANDIDATE_INDEX");
+        std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX", "1");
+        let query = "唯一回退候选：数据库连接超时";
+        let indexed = store
+            .find_similar_scoped(query, Some(&make_test_memory(query, MemoryType::Fact)))
+            .expect("索引检索应成功")
+            .map(|memory| memory.content);
+        std::env::remove_var("LRC_DOMAIN_CANDIDATE_INDEX");
+        let full_scan = store
+            .find_similar(query)
+            .expect("全量检索应成功")
+            .map(|memory| memory.content);
+        match previous {
+            Some(value) => std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX", value),
+            None => std::env::remove_var("LRC_DOMAIN_CANDIDATE_INDEX"),
+        }
+        assert_eq!(indexed, full_scan);
+    }
+
+    #[test]
+    fn test_domain_candidate_index_nolang_recovers_cross_bucket_exact_match() {
+        // 复现 §5.11 真实库漏检模式：中文 query（is_cjk=true）+ 同项目纯英文记忆
+        // （is_cjk=false）。两者通过 'of'/'on' 等两字母词 term 进入同一倒排并集，
+        // 但普通 domain 分桶用 memory_is_cjk == scope_is_cjk 把它们剪掉导致漏检。
+        // NOLANG（无语言剪枝）开关下同项目记忆直接进入 primary，应恢复精确召回。
+        let (_dir, mut store) = make_store();
+        let previous = std::env::var_os("LRC_DOMAIN_CANDIDATE_INDEX_NOLANG");
+        std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX_NOLANG", "1");
+
+        // 同项目英文记忆（纯英文，索引走空格分词，含 'of'/'on' 两字母词）
+        let mut en = make_test_memory(
+            "[assistant]: Sure, here are the revised versions of the research questions that focus on the core ideas",
+            MemoryType::Fact,
+        );
+        en.project = Some("nolang-cross-a".into());
+        store.remember(en).expect("英文记忆写入应成功");
+
+        // 干扰记忆（不同项目但同为中文）：保证候选非空，否则 domain 模式会走
+        // fallback 全量而无意间找回目标记忆，掩盖分桶漏检。
+        let mut other = make_test_memory(
+            "完全不同的中文主题内容：天气预报与气候模型",
+            MemoryType::Fact,
+        );
+        other.project = Some("nolang-cross-b".into());
+        store.remember(other).expect("干扰记忆写入应成功");
+
+        // 中文 query（is_cjk=true），与英文记忆共享字符 bigram（如 'of'、'on'）
+        let mut query_mem = make_test_memory(
+            "对话整理：[assistant]: Sure, here are the revised versions of the research questions that focus on the core ideas 是核心内容",
+            MemoryType::Fact,
+        );
+        query_mem.project = Some("nolang-cross-a".into());
+        let matched = store
+            .find_similar_scoped(&query_mem.content, Some(&query_mem))
+            .expect("NOLANG 候选检索应成功")
+            .expect("跨语言桶精确匹配应被召回（不丢合并）");
+        assert!(
+            matched.content.contains("revised versions"),
+            "应命中同项目英文记忆，实际命中: {}",
+            matched.content
+        );
+
+        match previous {
+            Some(value) => std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX_NOLANG", value),
+            None => std::env::remove_var("LRC_DOMAIN_CANDIDATE_INDEX_NOLANG"),
+        }
+    }
+
+    #[test]
     fn test_remember_no_merge_dissimilar() {
         let (_dir, mut store) = make_store();
 
@@ -3618,6 +5501,38 @@ mod tests {
 
         let count = store.total_count().expect("应获取总数");
         assert_eq!(count, 2, "不相似的内容应分别存储");
+    }
+
+    #[test]
+    fn test_remember_merge_updates_daoti_preview_metadata() {
+        let (_dir, mut store) = make_store();
+        let mut first = make_test_memory("预判元数据测试内容", MemoryType::Fact);
+        first.daoti_preview_gua = Some("乾为天".into());
+        first.daoti_preview_bagua = Some("乾".into());
+        first.daoti_preview_version = Some("pilot-v1".into());
+        let saved = store.remember(first).expect("首次写入应成功");
+
+        let mut second = make_test_memory("预判元数据测试内容", MemoryType::Fact);
+        second.daoti_preview_gua = Some("坎为水".into());
+        second.daoti_preview_bagua = Some("坎".into());
+        second.daoti_preview_version = Some("pilot-v2".into());
+        let merged = store.remember(second).expect("重复写入应合并");
+
+        assert_eq!(merged.id, saved.id);
+        assert_eq!(merged.daoti_preview_gua.as_deref(), Some("坎为水"));
+        assert_eq!(merged.daoti_preview_bagua.as_deref(), Some("坎"));
+        assert_eq!(merged.daoti_preview_version.as_deref(), Some("pilot-v2"));
+    }
+
+    #[test]
+    fn test_memory_without_daoti_preview_remains_compatible() {
+        let (_dir, mut store) = make_store();
+        let saved = store
+            .remember(make_test_memory("无预判字段的旧记忆", MemoryType::Fact))
+            .expect("旧格式记忆应成功写入");
+        assert!(saved.daoti_preview_gua.is_none());
+        assert!(saved.daoti_preview_bagua.is_none());
+        assert!(saved.daoti_preview_version.is_none());
     }
 
     #[test]

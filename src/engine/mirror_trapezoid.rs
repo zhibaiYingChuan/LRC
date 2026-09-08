@@ -105,6 +105,22 @@ pub const BAGUA_NAMES: [&str; 8] = [
     "乾·天", "兑·泽", "离·火", "震·雷", "巽·风", "坎·水", "艮·山", "坤·地",
 ];
 
+/// 将 8 母卦名（如道体 `daoti_preview_bagua` 写入的单字 "乾"/"坎"）
+/// 映射到 MirrorProject 八卦索引（0-7）。
+///
+/// 必须按名称映射而非按位置：道体 GUA_LEXICON 字典顺序
+/// （乾,兑,坤,艮,震,巽,坎,离）与 `BAGUA_NAMES` 顺序
+/// （乾,兑,离,震,巽,坎,艮,坤）不同——按位置映射会错位导致跨域污染。
+///
+/// 匹配规则：取名称首字符与 BAGUA_NAMES 首字符相同者（"乾·天".starts_with("乾")）。
+pub fn bagua_name_to_index(name: &str) -> Option<u8> {
+    let first_char = name.trim().chars().next()?;
+    BAGUA_NAMES
+        .iter()
+        .position(|canonical| canonical.starts_with(first_char))
+        .map(|index| index as u8)
+}
+
 /// 八卦的先天类别含义（用于记忆分类）
 pub const BAGUA_CATEGORIES: [&str; 8] = [
     "刚性法则", // 乾 — 核心规则、架构约束
@@ -202,6 +218,7 @@ impl TrapezoidROI {
     ///
     /// 梯形顶点从该位置向外扩展 1 格
     pub fn centered(center: usize, depth: u32) -> Self {
+        let center = center.min(8);
         let row = center / 3;
         let col = center % 3;
 
@@ -224,6 +241,9 @@ impl TrapezoidROI {
 
     /// 判断一个九宫格位置是否落在 ROI 内
     pub fn contains_position(&self, pos: usize) -> bool {
+        if pos >= 9 || self.vertices.iter().any(|&v| v >= 9) {
+            return false;
+        }
         let row = pos / 3;
         let col = pos % 3;
 
@@ -240,6 +260,9 @@ impl TrapezoidROI {
     ///
     /// 重心位置 = argmax(values)，即向量中最大分量对应的九宫格位置
     pub fn contains_vector(&self, vector: &LuoShuVector) -> bool {
+        if vector.values.iter().any(|value| !value.is_finite()) {
+            return false;
+        }
         let center = vector
             .values
             .iter()
@@ -285,8 +308,15 @@ impl TrapezoidROI {
             return vec![self.clone()];
         }
 
-        // 计算每层细分因子
-        let sub_divisions = 2usize.pow(self.depth);
+        // 计算每层细分因子，避免幂运算溢出。
+        let Some(sub_divisions) = 2usize.checked_pow(self.depth) else {
+            return vec![self.clone()];
+        };
+        // 2026-09-01 修复(P1)：细分存在物理上限——9 宫格单维最多 3 格，
+        // 深度超过网格分辨率后继续细分只是重复切到单格，无新信息。
+        // 将 sub_divisions 钳制到单维格子数（≤3），使双层循环规模恒 ≤ 9，
+        // 杜绝 depth=63（2^63）时进入 2^126 次迭代的不可执行循环（DoS 卡死）。
+        let sub_divisions = sub_divisions.min(rows.max(cols).max(1));
         let sub_rows = (rows as f32 / sub_divisions as f32).ceil() as usize;
         let sub_cols = (cols as f32 / sub_divisions as f32).ceil() as usize;
 
@@ -656,6 +686,36 @@ mod tests {
         assert!(roi.contains_position(4), "ROI 应包含中心");
         assert!(roi.contains_position(0), "ROI 应包含左上角");
         assert!(roi.contains_position(8), "ROI 应包含右下角");
+    }
+
+    #[test]
+    fn test_roi_rejects_invalid_positions_and_nan_vectors() {
+        let roi = TrapezoidROI::full(0);
+        assert!(!roi.contains_position(9));
+        let mut vector = LuoShuVector::zeros();
+        vector.values[0] = f32::NAN;
+        assert!(!roi.contains_vector(&vector));
+    }
+
+    #[test]
+    fn test_roi_center_clamps_invalid_center() {
+        assert_eq!(
+            TrapezoidROI::centered(usize::MAX, 0).vertices,
+            TrapezoidROI::centered(8, 0).vertices
+        );
+    }
+
+    #[test]
+    fn test_roi_extreme_depth_does_not_hang() {
+        // 回归：depth=u32::MAX 此前会进入 2^126 次迭代的不可执行循环（DoS 卡死）。
+        // 修复后 sub_divisions 被钳制到单维格子数（≤3），子区域总数恒 ≤ 9。
+        let roi = TrapezoidROI::full(u32::MAX);
+        let regions = roi.subdivide();
+        assert!(
+            regions.len() <= 9,
+            "极端 depth 子区域数应受网格分辨率钳制，实际 {}",
+            regions.len()
+        );
     }
 
     #[test]

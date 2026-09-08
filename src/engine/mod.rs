@@ -42,6 +42,7 @@ pub mod exploration_log;
 // ──────────────────────────────────────────────
 pub mod luoshu_encoder; // 洛书编码器 — 乾卦·天 (☰)
 pub mod mirror_trapezoid; // 镜像梯形 — 中宫 (五)
+pub mod navigation; // 道体导航信号 — 检索前方向注入（多视图 deep + N 路 RRF）
 
 #[cfg(feature = "ml")]
 pub mod luoshu_encoder_ml; // 洛书编码器 ML 模式 — 艮卦·山 (☶)
@@ -54,6 +55,7 @@ pub mod dao_metrics; // 道同构度 — 巽卦·风 (☴)
 pub mod dao_regulator; // 道调节器 — 震卦·雷 (☳)
 pub mod health_report; // 健康报告 — 乾卦·天 (☰)
 pub mod memory_gc; // 记忆回收 — 坎卦·水 (☵)
+pub mod memory_state_machine; // 内置记忆联想状态机：活性、转移与回归校验
 pub mod synthesis_engine; // 合成引擎 — 离卦·火 (☲)
 pub mod synthesis_journal; // 合成日志 — 兑卦·泽 (☱)
 pub mod user_feedback; // 用户反馈 — 坤卦·地 (☷) // 道枢演化 — 中宫 (五)

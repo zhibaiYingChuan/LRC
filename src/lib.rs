@@ -50,6 +50,9 @@ pub mod dashboard;
 /// 配置持久化模块：保存端口、LLM API、源码目录等
 pub mod config;
 
+/// URL 安全校验模块：集中式 SSRF 防护（云 metadata/链路本地/未指定地址拒绝）
+pub mod url_safety;
+
 /// L1 数据加密模块：API Key 安全存储（与桌面端共享密钥文件）
 pub mod crypto;
 
