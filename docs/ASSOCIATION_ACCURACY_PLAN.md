@@ -1,7 +1,7 @@
 # 联想记忆精度提升计划 · 分析与分期（P7，2026-09-09）
 
-> 版本：v1.7（2026-09-09）
-> 状态：P7 全阶段完结（P7.2/P7.3 完成、P7.4 分层评测 NO-GO，门控默认关）。**P8 root 语义召回已立项（前置可行性收尾：归因完成、ml 构建可行、bge 权重网络隔离不可获取 → P8.3 外部阻塞；P8.2c 旁路活性自检落地并经 HTTP 层实证，判据 H1-H4 锁定待用，详见第十节）**
+> 版本：v1.8（2026-09-09）
+> 状态：P7 全阶段完结（P7.2/P7.3 完成、P7.4 分层评测 NO-GO，门控默认关）。**P8 root 语义召回已立项（前置可行性收尾：归因完成、ml 构建可行、bge 权重网络隔离不可获取 → P8.3 外部阻塞；P8.2c 旁路活性自检落地+HTTP 实证+评测脚本化，判据 H1-H4 锁定待用，详见第十节）**
 > 前置结论：道体导航三模式（PREREG_NAV / PREREG_ASSOC_NAV / PREREG_CLOSED_LOOP）
 > 已一致否证"64 维卦象信号在 768 维 BGE 之上产生召回增益"，本计划不再投入
 > 道体信号方向，聚焦可解释的关系检索与用户反馈闭环。
@@ -458,6 +458,25 @@ P8 结论：语义旁路实验必须使用 bge-small-zh 权重，代码模型即
 获得端到端实证，与 10.2 的代码推断一致；（2）ml 二进制在无 ml 参数时正确回退
 统计模式（bge 缺失 → local_ml_model_ready=false），不会误启用旁路；（3）词面
 通过查询的 root 不受新字段影响（行为零变化）。
+
+**评测脚本级自检（P8.2e，2026-09-09）**：把 10.5 的"前置纪律"从文档要求固化为
+评测脚本能力——`daoti/_assoc_accuracy_eval.py` 更新后：
+- `record_metrics` 采集 `semantic_bypass`；
+- `summarize` 输出 `weak_queries` 与 `weak_bypass_distribution`（弱匹配查询的
+  applied/unavailable 计数）；
+- `evaluate` 输出 `bypass_active_probe`（applied>0 → `APPLIED`；否则
+  `ABSENT（旁路缺席：判定 H1 不可执行）`）。
+
+**复测（三臂，结果文件 `daoti/assoc_accuracy_results_v2.json`）**：用更新后的脚本
+在真实 sidecar 上重跑 P7.4 全量：A/P/E 三臂指标与 P7.4 原结果**逐项完全一致**
+（root_recall 46.7%、root 正确 14、同链率 53.3%、noise 32.3%、空态 100%），确认
+P8.2c 字段零行为影响且 P7.4 结论可复现；三臂 `weak_bypass_distribution` 均为
+`{"unavailable": 16}`，`bypass_active_probe = ABSENT`——**16 个弱匹配查询在全量
+评测上全部确认旁路缺席**。
+
+**关键收益**：bge 权重就绪后，用**同一脚本同一命令**重跑即可——`weak_bypass_distribution`
+自动出现 `applied` 计数、`bypass_active_probe` 自动翻转为 `APPLIED`，H1 才可执行；
+无需改写任何评测逻辑。当前 16/16 `unavailable` 明确标识"不能判定旁路有效性"。
 
 **P8.3 前置纪律（追加）**：评测脚本必须对每个弱匹配查询断言
 `semantic_bypass == "applied"`，才允许计入 H1 救回率分母；任何 `unavailable`
