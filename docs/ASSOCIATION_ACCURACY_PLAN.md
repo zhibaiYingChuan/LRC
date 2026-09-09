@@ -1,7 +1,7 @@
 # 联想记忆精度提升计划 · 分析与分期（P7，2026-09-09）
 
-> 版本：v1.6（2026-09-09）
-> 状态：P7 全阶段完结（P7.2/P7.3 完成、P7.4 分层评测 NO-GO，门控默认关）。**P8 root 语义召回已立项（前置可行性收尾：归因完成、ml 构建可行、bge 权重网络隔离不可获取 → P8.3 外部阻塞；P8.2c 旁路活性自检已落地，判据 H1-H4 锁定待用，详见第十节）**
+> 版本：v1.7（2026-09-09）
+> 状态：P7 全阶段完结（P7.2/P7.3 完成、P7.4 分层评测 NO-GO，门控默认关）。**P8 root 语义召回已立项（前置可行性收尾：归因完成、ml 构建可行、bge 权重网络隔离不可获取 → P8.3 外部阻塞；P8.2c 旁路活性自检落地并经 HTTP 层实证，判据 H1-H4 锁定待用，详见第十节）**
 > 前置结论：道体导航三模式（PREREG_NAV / PREREG_ASSOC_NAV / PREREG_CLOSED_LOOP）
 > 已一致否证"64 维卦象信号在 768 维 BGE 之上产生召回增益"，本计划不再投入
 > 道体信号方向，聚焦可解释的关系检索与用户反馈闭环。
@@ -443,6 +443,21 @@ P8 结论：语义旁路实验必须使用 bge-small-zh 权重，代码模型即
 **验收**：`test_assoc_explore_semantic_bypass_activity_probe`（统计模式弱匹配
 查询 → unavailable 且诚实空态；词面通过查询 → unused）+ 字段名序列化断言；
 全量 lib 625 / 全测试集 **657 passed / 0 failed**，qdrant check 通过。
+
+**HTTP 层实证（P8.2d，2026-09-09）**：用当前 debug 二进制（ml feature 构建，
+默认不加 `--mode smart`/模型参数）启动真实 sidecar，写入公平语料后发代表性查询，
+实测 `semantic_bypass` 在 HTTP 响应中的输出：
+
+| 查询类型 | 示例 | weak_match | semantic_bypass |
+|---|---|---|---|
+| 弱桥（P7.4 归因 shared=1） | 今晚吃什么好呢 / 周末爬山安排得怎么样了 / 猫咪不吃饭这事后来怎么样 | true | `unavailable` |
+| 词面通过 | 孩子下周三期末考试怎么备战 | false（root=应用题记忆） | `unused` |
+| 无关联 | 量子物理是什么 / 今天股市行情怎么样 | true | `unavailable` |
+
+**点评**：（1）P7.4 报告的弱桥查询在 HTTP 层确认为 `unavailable`——"旁路缺席"
+获得端到端实证，与 10.2 的代码推断一致；（2）ml 二进制在无 ml 参数时正确回退
+统计模式（bge 缺失 → local_ml_model_ready=false），不会误启用旁路；（3）词面
+通过查询的 root 不受新字段影响（行为零变化）。
 
 **P8.3 前置纪律（追加）**：评测脚本必须对每个弱匹配查询断言
 `semantic_bypass == "applied"`，才允许计入 H1 救回率分母；任何 `unavailable`
