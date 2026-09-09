@@ -169,6 +169,13 @@ pub struct FeedbackRecord {
     /// 联想上下文：命中的检索通路（["fast"] / ["deep"] / ["fast","deep"]，阶段D）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub association_hit_paths: Vec<String>,
+    /// 联想边上下文：起点记忆 ID（from→to 边，P7.2 联想边反馈闭环）
+    ///
+    /// 用户确认/拒绝"从该起点出发联想到本记忆"时记录，供探索排序
+    /// 消费（门控 `LRC_ASSOC_EDGE_FEEDBACK=1` 时启用）。serde default
+    /// 保证旧 JSONL 记录（无此字段）加载兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub association_from_id: Option<String>,
 }
 
 /// 用户反馈统计
@@ -349,6 +356,7 @@ impl UserFeedback {
             processed: false,
             association_rank: None,
             association_hit_paths: Vec::new(),
+            association_from_id: None,
         };
 
         self.push_record(record);
@@ -387,6 +395,45 @@ impl UserFeedback {
             processed: false,
             association_rank: rank,
             association_hit_paths: hit_paths,
+            association_from_id: None,
+        };
+
+        self.push_record(record);
+
+        id
+    }
+
+    /// 联想边反馈入口（P7.2：联想边反馈闭环）
+    ///
+    /// 用户确认/拒绝"从起点记忆 from_id 联想到本记忆（to_id）"时记录，
+    /// 携带 from→to 边的方向信息，供探索排序消费
+    /// （门控 `LRC_ASSOC_EDGE_FEEDBACK=1` 时启用；默认关，零影响）。
+    pub fn record_association_edge_feedback(
+        &self,
+        feedback_type: FeedbackType,
+        from_id: &str,
+        to_id: &str,
+        query: Option<&str>,
+        note: Option<&str>,
+    ) -> String {
+        let id = self.next_id();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let record = FeedbackRecord {
+            id: id.clone(),
+            feedback_type,
+            target_type: FeedbackTarget::AssociationRelevance,
+            memory_id: to_id.to_string(),
+            query: query.map(|s| s.to_string()),
+            note: note.map(|s| s.to_string()),
+            timestamp_ms: now,
+            processed: false,
+            association_rank: None,
+            association_hit_paths: Vec::new(),
+            association_from_id: Some(from_id.to_string()),
         };
 
         self.push_record(record);
@@ -1224,6 +1271,45 @@ impl UserFeedback {
         // 按总反馈数降序排列，让反馈最多的记忆排在前面
         result.sort_by_key(|b| std::cmp::Reverse(b.total_count));
         result
+    }
+
+    /// 联想边净调整（P7.2：联想边反馈闭环）
+    ///
+    /// 按 (from_id → to_id) 聚合 AssociationRelevance 边反馈：
+    /// positive +1 / negative −1 / neutral 0，再用 `v / (|v| + 1)` 平滑
+    /// 归一化到 [-1, 1]（反馈越多越接近 ±1，但永不饱和），返回净调整表。
+    ///
+    /// 由联想探索排序消费（门控 `LRC_ASSOC_EDGE_FEEDBACK=1` 时启用），
+    /// 关闭时调用方得到空表，探索行为与现状逐字节一致。
+    pub fn get_edge_adjustments(&self) -> HashMap<(String, String), f32> {
+        let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        let mut net: HashMap<(String, String), i32> = HashMap::new();
+        for record in records.iter() {
+            if record.target_type != FeedbackTarget::AssociationRelevance {
+                continue;
+            }
+            let Some(from) = record.association_from_id.as_deref() else {
+                continue;
+            };
+            if from.is_empty() {
+                continue;
+            }
+            let delta = match record.feedback_type {
+                FeedbackType::Positive => 1,
+                FeedbackType::Negative => -1,
+                FeedbackType::Neutral => 0,
+            };
+            *net.entry((from.to_string(), record.memory_id.clone()))
+                .or_insert(0) += delta;
+        }
+        net.into_iter()
+            .map(|((from, to), v)| {
+                (
+                    (from, to),
+                    (v as f32 / (v.abs() + 1) as f32).clamp(-1.0, 1.0),
+                )
+            })
+            .collect()
     }
 
     // ============================================================
@@ -2212,6 +2298,146 @@ mod tests {
         // 无联想反馈时返回空列表
         let empty = UserFeedback::new();
         assert!(empty.get_association_stats().is_empty());
+    }
+
+    // ============================================================
+    // P7.2：联想边反馈闭环 — 边记录 / 聚合 / 持久化 / 旧记录兼容
+    // ============================================================
+
+    /// P7.2：边反馈记录携带 from→to 方向，统计计入全量口径。
+    #[test]
+    fn test_association_edge_feedback_record() {
+        let feedback = UserFeedback::new();
+        let id = feedback.record_association_edge_feedback(
+            FeedbackType::Positive,
+            "mem_from",
+            "mem_to",
+            Some("今晚吃什么"),
+            Some("用户确认了这条联想边"),
+        );
+        assert!(id.starts_with("feedback_"));
+
+        let stats = feedback.get_stats();
+        assert_eq!(stats.total_feedback, 1);
+        assert_eq!(stats.positive_count, 1);
+
+        let recent = feedback.get_recent(1);
+        let rec = &recent[0];
+        assert_eq!(rec.target_type, FeedbackTarget::AssociationRelevance);
+        assert_eq!(rec.memory_id, "mem_to", "目标记忆为边终点");
+        assert_eq!(
+            rec.association_from_id.as_deref(),
+            Some("mem_from"),
+            "应记录边起点"
+        );
+    }
+
+    /// P7.2：边净调整聚合 — 正/负/中立按 (from→to) 归并，平滑归一化。
+    #[test]
+    fn test_edge_adjustments_aggregation() {
+        let feedback = UserFeedback::new();
+        // (a→b)：2 正 + 1 负 → net=1 → 平滑 1/2 = 0.5
+        for _ in 0..2 {
+            feedback.record_association_edge_feedback(FeedbackType::Positive, "a", "b", None, None);
+        }
+        feedback.record_association_edge_feedback(FeedbackType::Negative, "a", "b", None, None);
+        // (a→c)：1 负 → net=-1 → -1/2 = -0.5
+        feedback.record_association_edge_feedback(FeedbackType::Negative, "a", "c", None, None);
+        // (x→y)：1 正 1 负 → net=0 → 0
+        feedback.record_association_edge_feedback(FeedbackType::Positive, "x", "y", None, None);
+        feedback.record_association_edge_feedback(FeedbackType::Negative, "x", "y", None, None);
+        // 无 from_id 的联想级反馈不参与边聚合
+        feedback.record_association_feedback(FeedbackType::Positive, "z", None, None, vec![], None);
+
+        let adj = feedback.get_edge_adjustments();
+        assert_eq!(adj.len(), 3, "仅 3 条 from 明确的边参与聚合，z 不应出现");
+        assert!(
+            (adj[&("a".into(), "b".into())] - 0.5).abs() < 1e-5,
+            "net=1 平滑后应为 0.5"
+        );
+        assert!(
+            (adj[&("a".into(), "c".into())] - (-0.5)).abs() < 1e-5,
+            "net=-1 平滑后应为 -0.5"
+        );
+        assert!(adj[&("x".into(), "y".into())].abs() < 1e-5, "net=0 应为 0");
+        // 空库返回空表
+        assert!(UserFeedback::new().get_edge_adjustments().is_empty());
+    }
+
+    /// P7.2：边反馈持久化 — 重启后 from→to 方向不丢失，ID 不重复。
+    #[test]
+    fn test_edge_feedback_persistence_roundtrip() {
+        let tmp_dir = std::env::temp_dir();
+        let file_path = tmp_dir
+            .join("lrc_feedback_edge_persist_test.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&file_path);
+
+        let feedback = UserFeedback::new();
+        feedback.set_persist_path(&file_path).unwrap();
+        feedback.record_association_edge_feedback(
+            FeedbackType::Positive,
+            "mem_from_p",
+            "mem_to_p",
+            Some("联想测试"),
+            None,
+        );
+
+        // 重启加载：边方向恢复，ID 计数器续接
+        let feedback2 = UserFeedback::new();
+        feedback2.set_persist_path(&file_path).unwrap();
+        let recent = feedback2.get_recent(1);
+        assert_eq!(
+            recent[0].association_from_id.as_deref(),
+            Some("mem_from_p"),
+            "重启后边起点应恢复"
+        );
+        assert_eq!(recent[0].memory_id, "mem_to_p");
+        assert_eq!(recent[0].query.as_deref(), Some("联想测试"));
+        let adj = feedback2.get_edge_adjustments();
+        assert!((adj[&("mem_from_p".into(), "mem_to_p".into())] - 0.5).abs() < 1e-5);
+
+        let new_id = feedback2.record_association_edge_feedback(
+            FeedbackType::Negative,
+            "mem_from_p",
+            "mem_other",
+            None,
+            None,
+        );
+        assert_ne!(new_id, recent[0].id, "新记录 ID 不应与历史重复");
+
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    /// P7.2：旧 JSONL 记录（无 association_from_id）加载兼容，边聚合跳过它们。
+    #[test]
+    fn test_edge_feedback_old_record_compat() {
+        let tmp_dir = std::env::temp_dir();
+        let file_path = tmp_dir
+            .join("lrc_feedback_edge_old_compat_test.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let _ = std::fs::remove_file(&file_path);
+
+        // 手工写入一条无 association_from_id 的旧格式记录
+        let old_line = r#"{"id":"feedback_000001","feedback_type":"Positive","target_type":"AssociationRelevance","memory_id":"old_mem","query":"旧查询","note":null,"timestamp_ms":1700000000000,"processed":false,"association_rank":1,"association_hit_paths":["fast"]}"#;
+        std::fs::write(&file_path, format!("{}\n", old_line)).unwrap();
+
+        let feedback = UserFeedback::new();
+        feedback.set_persist_path(&file_path).unwrap();
+        assert_eq!(feedback.get_stats().total_feedback, 1, "旧记录应被加载");
+        assert_eq!(
+            feedback.get_recent(1)[0].association_from_id,
+            None,
+            "旧记录无 from 字段"
+        );
+        assert!(
+            feedback.get_edge_adjustments().is_empty(),
+            "无 from 的旧记录不参与边聚合，不报错"
+        );
+
+        let _ = std::fs::remove_file(&file_path);
     }
 
     // ============================================================
