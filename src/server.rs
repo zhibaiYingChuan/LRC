@@ -971,8 +971,11 @@ async fn handle_recall_enhanced(
 ///
 /// base_url 参数用于测试注入 mock；为 None 时取环境变量 DAOTI_SERVICE_URL，
 /// 缺省回退 http://127.0.0.1:3222。
+/// session_id：daoti_daemon 会话标识（P6/CL2 前提②闭环要求 deduce 与 reflect
+/// 同会话，状态演化才能累积历史上下文）。
 async fn fetch_daoti_navigation_with_base(
     query: &str,
+    session_id: &str,
     base: Option<&str>,
 ) -> Option<crate::engine::navigation::NavigationSignal> {
     // 端口约定：daoti_daemon 固定 127.0.0.1:3222，环境变量 DAOTI_SERVICE_URL 可覆盖
@@ -988,7 +991,7 @@ async fn fetch_daoti_navigation_with_base(
         .timeout(std::time::Duration::from_secs(2))
         .build()
         .ok()?;
-    let body = serde_json::json!({"query": query, "session_id": "lrc-recall"});
+    let body = serde_json::json!({"query": query, "session_id": session_id});
     let resp = client.post(&url).json(&body).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -1003,7 +1006,63 @@ async fn fetch_daoti_navigation_with_base(
 pub(crate) async fn fetch_daoti_navigation(
     query: &str,
 ) -> Option<crate::engine::navigation::NavigationSignal> {
-    fetch_daoti_navigation_with_base(query, None).await
+    fetch_daoti_navigation_with_base(query, "lrc-recall", None).await
+}
+
+/// fetch_daoti_navigation 的会话感知入口（P6/CL2：联想中心闭环使用，
+/// deduce 与后续 reflect 绑定同一 session_id，状态跨查询累积）。
+pub(crate) async fn fetch_daoti_navigation_for_session(
+    query: &str,
+    session_id: &str,
+) -> Option<crate::engine::navigation::NavigationSignal> {
+    fetch_daoti_navigation_with_base(query, session_id, None).await
+}
+
+/// 向 daoti_daemon 回传检索结果（P6/CL2 前提②：reflect 闭环接入运行时）。
+///
+/// explore 成功后把结果摘要 POST 到 daemon /reflect，daemon 用结果修正
+/// 主导宫 → 下次 /deduce 方向随之演化（闭环的 daoti_daemon 侧半环）。复用
+/// fetch_daoti_navigation 的客户端模式：2s 超时、DAOTI_SERVICE_URL 可覆盖；
+/// 失败静默返回 false（闭环任何环节失败 → 调用方行为不变，navigation.rs
+/// 契约）。调用方以 tokio::spawn fire-and-forget，不阻塞检索响应。
+///
+/// 返回 true 表示 daemon 确认应用（响应 {"applied": true}）。
+async fn post_daoti_reflect_with_base(
+    memories: &[String],
+    session_id: &str,
+    base: Option<&str>,
+) -> bool {
+    if memories.is_empty() {
+        return false;
+    }
+    let base = match base {
+        Some(b) => b.to_string(),
+        None => std::env::var("DAOTI_SERVICE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3222".to_string()),
+    };
+    let url = format!("{}/reflect", base.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let body = serde_json::json!({"memories": memories, "session_id": session_id});
+    match client.post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => v.get("applied").and_then(|a| a.as_bool()).unwrap_or(false),
+            Err(_) => false,
+        },
+        _ => false,
+    }
+}
+
+/// post_daoti_reflect 的生产入口（base_url 走环境变量/默认端口）。
+/// `pub(crate)`：联想中心（v1_api.rs）CL2 在 explore 成功后 fire-and-forget 回传。
+pub(crate) async fn post_daoti_reflect(memories: &[String], session_id: &str) -> bool {
+    post_daoti_reflect_with_base(memories, session_id, None).await
 }
 
 /// 处理 recall 工具调用 — 关键词匹配 / 深度语义检索
@@ -3897,8 +3956,12 @@ mod tests {
         });
 
         // 通过注入 base_url 指向 mock（不依赖全局环境变量，避免测试并行竞态）
-        let sig =
-            fetch_daoti_navigation_with_base("今晚吃什么", Some(&format!("http://{}", addr))).await;
+        let sig = fetch_daoti_navigation_with_base(
+            "今晚吃什么",
+            "lrc-recall",
+            Some(&format!("http://{}", addr)),
+        )
+        .await;
         mock.abort();
 
         let sig = sig.expect("daemon 在线时应返回导航信号");
@@ -3913,9 +3976,90 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener); // 立刻释放 → 连接被拒绝 → 超时降级
-        let sig =
-            fetch_daoti_navigation_with_base("今晚吃什么", Some(&format!("http://{}", addr))).await;
+        let sig = fetch_daoti_navigation_with_base(
+            "今晚吃什么",
+            "lrc-recall",
+            Some(&format!("http://{}", addr)),
+        )
+        .await;
         assert!(sig.is_none(), "daemon 不可达时应返回 None（降级基线）");
+    }
+
+    /// P6/CL2-1：post_daoti_reflect 在 daemon 在线时回传结果摘要并解析 applied。
+    /// 同时校验请求体携带 memories 与 session_id（闭环契约：deduce/reflect 同会话）。
+    #[tokio::test]
+    async fn test_post_daoti_reflect_online() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                // 仅响应 POST /reflect，并校验闭环请求体契约
+                if req.starts_with("POST /reflect") {
+                    assert!(
+                        req.contains("\"memories\""),
+                        "reflect 请求必须携带 memories 结果摘要"
+                    );
+                    assert!(
+                        req.contains("\"session_id\":\"lrc-explore\""),
+                        "reflect 请求必须携带 session_id（与 deduce 同会话）"
+                    );
+                    let body =
+                        "{\"applied\":true,\"reflection\":{\"reflected_gua\":\"兑\",\"palace\":\"兑宫\"}}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                } else {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                }
+            }
+        });
+
+        let memories = vec![
+            "火锅店在老街尽头".to_string(),
+            "上周聚餐去了那家川菜馆".to_string(),
+        ];
+        let applied = post_daoti_reflect_with_base(
+            &memories,
+            "lrc-explore",
+            Some(&format!("http://{}", addr)),
+        )
+        .await;
+        mock.abort();
+        assert!(applied, "daemon 在线且结果非空时应返回 applied=true");
+    }
+
+    /// P6/CL2-2：reflect 空结果不发请求；daemon 不可达时静默降级返回 false
+    /// （闭环任何环节失败 → 调用方行为不变）。
+    #[tokio::test]
+    async fn test_post_daoti_reflect_empty_and_offline_degrade() {
+        // 空结果：直接 false，不发起任何请求
+        assert!(
+            !post_daoti_reflect_with_base(&[], "lrc-explore", Some("http://127.0.0.1:1")).await
+        );
+        // 不可达端口：连接拒绝 → 静默降级 false
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let memories = vec!["任意内容".to_string()];
+        assert!(
+            !post_daoti_reflect_with_base(
+                &memories,
+                "lrc-explore",
+                Some(&format!("http://{}", addr))
+            )
+            .await,
+            "daemon 不可达时应静默降级返回 false"
+        );
     }
 
     /// 构建测试用 AppState（带已索引的 manager 和记忆存储）

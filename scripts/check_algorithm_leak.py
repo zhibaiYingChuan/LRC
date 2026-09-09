@@ -102,7 +102,9 @@ def scan_file(filepath: Path, verbose: bool = False) -> list[dict]:
         # daoti_daemon 是独立研究资产进程，LRC 仅消费其 JSON 信号，不内置算法；
         # 与 LRC_DAOTI_NAVIGATE 门控、daoti_preview 字段同属"契约/集成引用"白名单
         # daoti-lexicon-v1 是信号协议版本标识（navigation.rs 的 source_version 协商值）
-        if re.search(r'(daoti_daemon|DAOTI_SERVICE_URL|fetch_daoti_navigation|from daoti|daoti-lexicon-v1|daoti 研究资产)', line, re.IGNORECASE):
+        # P6/CL2 新增同类消费侧契约引用：post_daoti_reflect（explore 后回传 /reflect
+        # 的客户端函数）、LRC_DAOTI_REFLECT（回传门控环境变量）——均只消费 JSON 信号
+        if re.search(r'(daoti_daemon|DAOTI_SERVICE_URL|fetch_daoti_navigation|post_daoti_reflect|LRC_DAOTI_REFLECT|from daoti|daoti-lexicon-v1|daoti 研究资产)', line, re.IGNORECASE):
             continue
         # 跳过 API schema 中 daoti_preview 字段的 description 描述文本
         # （如 "道体写入时预判的六十四卦名称"）—— 契约字段含义，非算法

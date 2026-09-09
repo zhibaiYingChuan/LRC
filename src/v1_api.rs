@@ -196,6 +196,10 @@ pub struct AssociationExploreRequest {
     #[serde(default = "default_association_width")]
     pub width: usize,
     pub project: Option<String>,
+    /// P6/CL2：道体会话标识（deduce 与 reflect 绑定同会话，状态跨查询累积）。
+    /// 缺省 "lrc-explore"。
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 fn default_association_depth() -> u8 {
@@ -1480,6 +1484,13 @@ pub fn build_v1_router(
                     let cancellation_for_task = cancellation.clone();
                     let query = req.query.clone();
                     let memory_id = req.memory_id.clone();
+                    // P6/CL2：道体会话标识 —— deduce 与 reflect 绑定同会话，
+                    // daemon 状态才能跨查询累积历史上下文（闭环的价值来源）。
+                    let daoti_session = req
+                        .session_id
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "lrc-explore".to_string());
                     // P3.2 联想中心接入导航：门控开启且 query 起点时，向 daoti_daemon
                     // 拉取导航信号（缺省/不可达 → None → 现状 explore_pure 逐字节一致）。
                     // 信号获取放在 spawn_blocking 之前（异步网络等待不占用锁）。
@@ -1492,7 +1503,11 @@ pub fn build_v1_router(
                         if trimmed.is_empty() {
                             None
                         } else {
-                            crate::server::fetch_daoti_navigation(trimmed).await
+                            crate::server::fetch_daoti_navigation_for_session(
+                                trimmed,
+                                &daoti_session,
+                            )
+                            .await
                         }
                     } else {
                         None
@@ -1531,7 +1546,34 @@ pub fn build_v1_router(
                     ).await;
 
                     match result {
-                        Ok(Ok(Ok(response))) => Ok(Json(response)),
+                        Ok(Ok(Ok(response))) => {
+                            // P6/CL2 前提②：reflect 闭环 —— explore 成功后把结果摘要
+                            // 回传 daemon 修正主导宫，下次 /deduce 方向随之演化。
+                            // 门控 LRC_DAOTI_REFLECT=1（默认关 → 行为与现状逐字节一致）；
+                            // fire-and-forget 不阻塞响应；失败静默降级（navigation.rs 契约）。
+                            if std::env::var("LRC_DAOTI_REFLECT")
+                                .map(|v| v == "1")
+                                .unwrap_or(false)
+                                && !response.nodes.is_empty()
+                            {
+                                // 有界回传：发现序前 10 条（root 优先），限制载荷规模
+                                let reflect_memories: Vec<String> = response
+                                    .nodes
+                                    .iter()
+                                    .take(10)
+                                    .map(|n| n.content.clone())
+                                    .collect();
+                                let reflect_session = daoti_session;
+                                tokio::spawn(async move {
+                                    crate::server::post_daoti_reflect(
+                                        &reflect_memories,
+                                        &reflect_session,
+                                    )
+                                    .await;
+                                });
+                            }
+                            Ok(Json(response))
+                        }
                         Ok(Ok(Err(_))) => Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
                             "error": "search_busy",
                             "message": "记忆系统正在执行后台任务，请稍后重试"
