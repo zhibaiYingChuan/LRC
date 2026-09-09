@@ -1,7 +1,7 @@
 # 联想记忆精度提升计划 · 分析与分期（P7，2026-09-09）
 
-> 版本：v1.8（2026-09-09）
-> 状态：P7 全阶段完结（P7.2/P7.3 完成、P7.4 分层评测 NO-GO，门控默认关）。**P8 root 语义召回已立项（前置可行性收尾：归因完成、ml 构建可行、bge 权重网络隔离不可获取 → P8.3 外部阻塞；P8.2c 旁路活性自检落地+HTTP 实证+评测脚本化，判据 H1-H4 锁定待用，详见第十节）**
+> 版本：v1.9（2026-09-09）
+> 状态：P7 全阶段完结（P7.2/P7.3 完成、P7.4 分层评测 NO-GO，门控默认关）。**P8 root 语义召回已立项（前置可行性收尾：归因完成、ml 构建可行、bge 权重网络隔离不可获取 → P8.3 外部阻塞；P8.2c 旁路活性自检落地+HTTP 实证+评测脚本化，P8.3 判据 H1-H4 已脚本化待 B 臂接入，判据锁定待用，详见第十节）**
 > 前置结论：道体导航三模式（PREREG_NAV / PREREG_ASSOC_NAV / PREREG_CLOSED_LOOP）
 > 已一致否证"64 维卦象信号在 768 维 BGE 之上产生召回增益"，本计划不再投入
 > 道体信号方向，聚焦可解释的关系检索与用户反馈闭环。
@@ -477,6 +477,25 @@ P8.2c 字段零行为影响且 P7.4 结论可复现；三臂 `weak_bypass_distri
 **关键收益**：bge 权重就绪后，用**同一脚本同一命令**重跑即可——`weak_bypass_distribution`
 自动出现 `applied` 计数、`bypass_active_probe` 自动翻转为 `APPLIED`，H1 才可执行；
 无需改写任何评测逻辑。当前 16/16 `unavailable` 明确标识"不能判定旁路有效性"。
+
+**P8.3 判据脚本化（P8.2f，2026-09-09）**：把 10.4 的 H1-H4 判定也固化为脚本——
+`daoti/_assoc_accuracy_eval.py` 新增：
+- `--base-b <url>` 旁路臂 B（ml 构建 + bge 权重 + `--mode smart` 启动的第 4 个
+  sidecar，可选）；
+- `evaluate_h()`：H1（A 臂 miss 查询中 B 臂救回 ≥10）、H2（A 臂 root 正确查询在
+  B 不退化 + 无关联查询仍诚实空态）、H3（阈值 0.55 引擎固定，脚本不做调整）、
+  H4 判定；**前置**：B 臂弱匹配查询须至少一个 `semantic_bypass == "applied"`，
+  否则返回 `BLOCKED`（10.5 纪律）；
+- 输出 `criteria_h`（无 B 臂时 `NOT_RUN`）。
+
+**回归验证**：三臂复测（结果 `daoti/assoc_accuracy_results_v3.json`）——G1-G5 与
+P7.4/P8.2e **逐项完全一致**（行为零破坏），`criteria_h = NOT_RUN（未提供 --base-b）`
+并按预期给出续跑指引。
+
+**一键执行（bge 权重就绪后）**：放入 `models/BAAI--bge-small-zh/model.safetensors`
+→ 以 `--mode smart` 启动第 4 个 sidecar（隔离 db-path/端口）→ 评测命令追加
+`--base-b http://127.0.0.1:<port>` → 脚本自动输出 `criteria_h` 的 H1-H4 判定。
+**无需改写任何脚本**；当前已实现全部判据逻辑并回归验证。
 
 **P8.3 前置纪律（追加）**：评测脚本必须对每个弱匹配查询断言
 `semantic_bypass == "applied"`，才允许计入 H1 救回率分母；任何 `unavailable`
