@@ -249,6 +249,13 @@ pub struct AssociationExploreResponse {
     /// 而不是把无关记忆硬凑成"联想结果"。
     /// false 时 nodes 至少包含起点（起点已通过实质共鸣门禁）。
     pub weak_match: bool,
+    /// 语义旁路状态（P8.2c 活性观测，零行为影响）：
+    /// - "unused"：词面起点门禁已有人通过，未触发语义旁路
+    /// - "applied"：旁路触发且编码器产出向量参与判定（ML 编码器可用）
+    /// - "unavailable"：旁路触发但编码器无向量（统计模式/模型缺失）→ 旁路实际未参与。
+    ///   这是 P7.4 教训的代码防呆：先在评测中断言本字段 == "applied"，再判定
+    ///   旁路有效性，避免把"旁路缺席"误读为"旁路无效"。
+    pub semantic_bypass: String,
 }
 
 /// 联想探索节点
@@ -444,6 +451,9 @@ fn run_association_explore(
         explore_pure: true,
         regression_query: None,
     };
+    // P8.2c：语义旁路活性观测状态（unused / applied / unavailable），
+    // 随响应暴露，供评测断言旁路是否真实参与（避免 P7.4 的误读教训）。
+    let mut semantic_bypass = "unused".to_string();
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut visited = HashSet::new();
@@ -535,6 +545,14 @@ fn run_association_explore(
                 let mem_refs: Vec<&crate::memory_types::Memory> =
                     candidates.iter().map(|(m, _)| m).collect();
                 let sims = store.semantic_similarities(text, &mem_refs);
+                // P8.2c：记录旁路活性——编码器是否产出向量参与判定。
+                // 统计模式/模型缺失时 sims 全 None → "unavailable"（旁路实际未参与），
+                // 与"applied（旁路真实判定）"区分，供评测自检。
+                semantic_bypass = if sims.iter().any(|s| s.is_some()) {
+                    "applied".to_string()
+                } else {
+                    "unavailable".to_string()
+                };
                 for ((memory, score), sim) in candidates.iter().zip(sims) {
                     // v0.9.7 精确度修复：语义旁路不放行代码记忆。旁路只在
                     // 词面零命中时触发，此时若救回的是代码 chunk，几乎都
@@ -580,6 +598,7 @@ fn run_association_explore(
             // 连起点都召不回（召回为空，或没有候选通过根节点实质共鸣门禁），
             // 必然是弱匹配：记忆库里没有与查询实质相关的内容
             weak_match: true,
+            semantic_bypass: semantic_bypass.clone(),
         };
     };
 
@@ -741,6 +760,7 @@ fn run_association_explore(
         total_expanded,
         interrupted,
         weak_match,
+        semantic_bypass,
     }
 }
 
@@ -4875,6 +4895,8 @@ mod api_contracts_tests {
             interrupted: false,
             // 存在通过校验的扩展节点 → 非弱匹配
             weak_match: false,
+            // 测试用例：词面门禁通过，语义旁路未触发
+            semantic_bypass: "unused".to_string(),
         };
         let json = serde_json::to_value(&resp).expect("序列化失败");
         assert_eq!(json["root"], "mem-root");
@@ -4883,6 +4905,8 @@ mod api_contracts_tests {
         assert_eq!(json["interrupted"], false);
         // v0.9.7：weak_match 契约——有扩展节点时必须为 false
         assert_eq!(json["weak_match"], false);
+        // P8.2c：语义旁路活性字段可序列化
+        assert_eq!(json["semantic_bypass"], "unused");
         for key in ["nodes", "edges", "trail"] {
             assert!(json[key].is_array(), "缺少数组字段: {key}");
         }
@@ -5176,6 +5200,80 @@ mod api_contracts_tests {
         assert!(resp.root.is_none(), "泛指词重叠的无关记忆不应成为起点");
         assert!(resp.nodes.is_empty(), "弱匹配时不应产生任何节点");
         assert!(resp.weak_match, "无实质共鸣候选时应标记弱匹配");
+    }
+
+    /// P8.2c：语义旁路活性观测——统计模式（默认构建）下，词面无通过者的
+    /// 查询会触发旁路但编码器无向量 → semantic_bypass="unavailable"（旁路实际
+    /// 未参与）；词面通过者 → "unused"（旁路未触发）。供评测自检，避免把
+    /// "旁路缺席"误读为"旁路无效"（P7.4 教训的代码防呆）。
+    #[test]
+    fn test_assoc_explore_semantic_bypass_activity_probe() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_bypass_probe_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+
+        // 用例1：词面无通过候选的查询 → 触发旁路，但统计模式无向量 → unavailable
+        let _ = store.remember(Memory::new(
+            "周末想去看红叶，香山那边全红了".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        ));
+        let cancel = AtomicBool::new(false);
+        let resp1 = run_association_explore(
+            &mut store,
+            Some("量子物理是什么"),
+            None,
+            2,
+            2,
+            &cancel,
+            None,
+        );
+        assert_eq!(
+            resp1.semantic_bypass, "unavailable",
+            "统计模式下旁路触发但编码器无向量应标记 unavailable（weak={}）",
+            resp1.weak_match
+        );
+        assert!(resp1.weak_match, "无关联查询应诚实空态");
+
+        // 用例2：词面通过候选的查询 → 旁路未触发 → unused
+        let _ = store.remember(Memory::new(
+            "Rust 借用检查器报 E0597 时先检查所有权转移位置".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        ));
+        let resp2 = run_association_explore(
+            &mut store,
+            Some("Rust 借用检查器"),
+            None,
+            2,
+            2,
+            &cancel,
+            None,
+        );
+        assert_eq!(
+            resp2.semantic_bypass,
+            "unused",
+            "词面通过者不应触发旁路: {:?}",
+            resp2.nodes.iter().map(|n| &n.content).collect::<Vec<_>>()
+        );
+        assert!(!resp2.weak_match, "词面命中的代码查询不应空态");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 泛指 bigram 组合不得虚假共鸣（v0.9.7 CDP 回归发现的真实缺陷）：
