@@ -378,7 +378,7 @@ P5 打包发布（MSI 重打包 + 全量回归；闭环判定 GO 前不含默认
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | CL1 | 前提①：daemon 状态参与 deduce（状态宫偏置进推演输入等） | ✅ 完成（2026-09-09：`StateBiasEncoder` 状态偏置注入编码，消融验收 6/6 对 100% 不同，门槛 50%，PASS） |
-| CL2 | 前提②：LRC explore 运行时自动回传 /reflect（fire-and-forget 不阻塞） | ⏳ 待执行 |
+| CL2 | 前提②：LRC explore 运行时自动回传 /reflect（fire-and-forget 不阻塞） | ✅ 完成（2026-09-09：`post_daoti_reflect` 客户端 + explore 成功后 `tokio::spawn` 回传发现序前 10 条节点；门控 `LRC_DAOTI_REFLECT=1` 默认关，与 `LRC_DAOTI_NAVIGATE` 独立（支撑 L-off 消融臂）；`session_id` 贯通 deduce/reflect 同会话。单测 2 项（在线 applied / 离线静默降级）+ 运行时观测 PASS：daemon step 4→5→7（query1 空结果仅 deduce +1，query2 deduce+reflect +2）、palace 兑宫→艮宫→坤宫随检索结果修正、explore 耗时 0.36/0.51s 未被回传阻塞） |
 | CL3 | 前提③：daemon 接入探索进程，漂移量可观测 | ⏳ 待执行 |
 | CL4 | 前提④：会话级三臂实验 + 判定 + 回写 | ⏳ 待执行（前提①②③验收全过才允许采数） |
 
