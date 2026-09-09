@@ -280,7 +280,7 @@ P1 调节器心跳（已完成：faa4cae 本地提交 + 运行时验证通过）
 P2 daoti_daemon 常驻进程（核心完成：fe4342d；P2.6-2.8 发布项待执行）  ✅
 P3 联想中心接入导航（判据+接入完成：64f93b9；P3.5 实验 NO-GO，2026-09-09）  ✅
 P4 第四证据位（基础设施完成：c9921cb；运行时接线已冻结）  ✅
-P6 完全体闭环（立项 + 判据锁定：acc9bb7 后续提交；CL1-CL4 实现待执行）  ← 当前
+P6 完全体闭环（立项 + 判据锁定：acc9bb7 后续提交；CL1 前提① / CL2 前提② / CL3 前提③ 已完成，CL4 三臂实验待执行）  ← 当前
 P5 打包发布（MSI 重打包 + 全量回归；闭环判定 GO 前不含默认开启行为）  待执行
 ```
 
@@ -379,7 +379,7 @@ P5 打包发布（MSI 重打包 + 全量回归；闭环判定 GO 前不含默认
 |---|---|---|
 | CL1 | 前提①：daemon 状态参与 deduce（状态宫偏置进推演输入等） | ✅ 完成（2026-09-09：`StateBiasEncoder` 状态偏置注入编码，消融验收 6/6 对 100% 不同，门槛 50%，PASS） |
 | CL2 | 前提②：LRC explore 运行时自动回传 /reflect（fire-and-forget 不阻塞） | ✅ 完成（2026-09-09：`post_daoti_reflect` 客户端 + explore 成功后 `tokio::spawn` 回传发现序前 10 条节点；门控 `LRC_DAOTI_REFLECT=1` 默认关，与 `LRC_DAOTI_NAVIGATE` 独立（支撑 L-off 消融臂）；`session_id` 贯通 deduce/reflect 同会话。单测 2 项（在线 applied / 离线静默降级）+ 运行时观测 PASS：daemon step 4→5→7（query1 空结果仅 deduce +1，query2 deduce+reflect +2）、palace 兑宫→艮宫→坤宫随检索结果修正、explore 耗时 0.36/0.51s 未被回传阻塞） |
-| CL3 | 前提③：daemon 接入探索进程，漂移量可观测 | ⏳ 待执行 |
+| CL3 | 前提③：daemon 接入探索进程，漂移量可观测 | ✅ 完成（2026-09-09：轻量 beat 演化——`explore_step` 每拍以主导卦为扰动源（冷启动八卦轮转），主导宫 +lr(0.002，对齐 V23 exploration_lr)、生宫 +0.5lr、克宫 -0.3lr、随机微扰+遗忘(×0.995)+clamp(±0.5)；`apply_explore_bias` 与状态偏置组合为 `apply_all_biases` 统一注入 V23/lexicon 两条 deduce 路径；`explore_beats`/`drift_total`/`last_explore_gua` 进 /state 并持久化，`DAOTI_BEAT_SECONDS` 可加速节拍。验收：离线 `_cl3_explore_drift_test.py` 22/22 PASS（含行为消融——NO_HIT 查询零场 miss→探索场独立成信号）；运行时观测（v23 引擎，3s 节拍）5/5 PASS——beats 2→4、drift 0.0137→0.0275 持续累积、deduce 正常） |
 | CL4 | 前提④：会话级三臂实验 + 判定 + 回写 | ⏳ 待执行（前提①②③验收全过才允许采数） |
 
 执行纪律：每阶段本地提交 + 回写本档；前提验收失败即暂停修复，不得带病实验；
