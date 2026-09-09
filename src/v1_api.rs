@@ -217,6 +217,11 @@ pub struct ConfirmAssociationRequest {
     pub memory_id: String,
     #[serde(default)]
     pub query: Option<String>,
+    /// 联想边起点（P7.2）：确认"从该起点出发联想到 memory_id"的边为正例。
+    /// 可选；缺省时仅激活记忆（与现状逐字节一致），携带时在门控
+    /// `LRC_ASSOC_EDGE_FEEDBACK=1` 下额外记录 (from→to) 正边。
+    #[serde(default)]
+    pub from_id: Option<String>,
 }
 
 /// 联想探索响应：从起点开始的多跳联想树（有界 BFS）。
@@ -381,6 +386,17 @@ const ASSOCIATION_ROOT_POOL_TOPK: usize = 8;
 /// 用 bge 句向量余弦判断实质相关；ML 编码器不可用时相似度恒为
 /// None，旁路自动失效，门禁退化为纯词面通路，绝不放宽标准。
 const ASSOCIATION_ROOT_MIN_SEMANTIC_SIM: f32 = 0.55;
+
+/// P7.2 联想边反馈：用户确认边（positive）对候选分的最大抬升幅度。
+/// 与联想桥扩展词权重（0.20）同量级但略高——边反馈是强用户信号。
+const ASSOC_EDGE_ADJUST_SCALE: f32 = 0.30;
+
+/// P7.2 联想边反馈门控：`LRC_ASSOC_EDGE_FEEDBACK=1` 启用探索排序消费
+/// 用户确认/拒绝的 (from→to) 边；默认关 → 探索行为与现状逐字节一致
+/// （零影响承诺，与 P3.5 的降级契约精神一致）。
+fn assoc_edge_feedback_enabled() -> bool {
+    std::env::var_os("LRC_ASSOC_EDGE_FEEDBACK").is_some()
+}
 
 /// 执行一次有界联想探索。
 ///
@@ -577,6 +593,14 @@ fn run_association_explore(
     // BFS 扩散与 root 召回共享 explore_started 预算（见函数入口），
     // 超预算即优雅收敛：返回已找到的部分 + interrupted=true。
     queue.push_back((root_id, root_memory.content, 0u8));
+    // P7.2 联想边反馈：门控开启时构建 (from→to) 净调整表供 BFS 排序消费；
+    // 关闭时为空表，候选顺序与现状逐字节一致（零影响承诺）。
+    let edge_adjust: std::collections::HashMap<(String, String), f32> =
+        if assoc_edge_feedback_enabled() {
+            store.user_feedback.get_edge_adjustments()
+        } else {
+            std::collections::HashMap::new()
+        };
 
     while let Some((from_id, from_content, current_depth)) = queue.pop_front() {
         if current_depth >= max_depth {
@@ -603,7 +627,24 @@ fn run_association_explore(
         };
         let next_depth = current_depth + 1;
         let mut added = 0usize;
-        for (memory, score) in result.memories.into_iter().zip(result.scores) {
+        // P7.2 联想边反馈：对召回候选施加 (from→to) 边净调整后稳定降序重排。
+        // 边调整只改变"候选之间的相对顺序"（确认边前置/拒绝边后置），
+        // 不豁免任何既有防线（CodeContext 过滤 / 回归校验 / width 上限）。
+        // 门控关闭时 adj=0，稳定排序保持 recall 原序 → 与现状逐字节一致。
+        let mut ranked: Vec<(f32, crate::memory_types::Memory)> = result
+            .memories
+            .into_iter()
+            .zip(result.scores)
+            .map(|(memory, score)| {
+                let adj = edge_adjust
+                    .get(&(from_id.clone(), memory.id.clone()))
+                    .copied()
+                    .unwrap_or(0.0);
+                (score + adj * ASSOC_EDGE_ADJUST_SCALE, memory)
+            })
+            .collect();
+        ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (child_score, memory) in ranked {
             if !root_is_code && memory.memory_type == crate::memory_types::MemoryType::CodeContext {
                 continue;
             }
@@ -616,14 +657,14 @@ fn run_association_explore(
             edges.push(ExploreEdge {
                 from: from_id.clone(),
                 to: child_id.clone(),
-                score,
+                score: child_score,
                 evidence: evidence.clone(),
             });
             nodes.push(ExploreNode {
                 id: child_id.clone(),
                 content: memory.content.clone(),
                 depth: next_depth,
-                score,
+                score: child_score,
                 source: "expanded".to_string(),
                 evidence,
             });
@@ -1643,6 +1684,22 @@ pub fn build_v1_router(
                                     meta,
                                 );
                             }
+                            // P7.2 联想边反馈：确认携带 from_id（联想起点）且门控开启时，
+                            // 记录 (from → memory_id) 正边供后续探索排序消费；缺省或
+                            // 门控关闭时行为与现状逐字节一致（仅激活记忆，零影响）。
+                            if let Some(from) = req.from_id.as_deref() {
+                                if !from.trim().is_empty() && assoc_edge_feedback_enabled() {
+                                    if let Ok(guard) = store.try_lock() {
+                                        guard.user_feedback.record_association_edge_feedback(
+                                            FeedbackType::Positive,
+                                            from.trim(),
+                                            &memory_id,
+                                            req.query.as_deref(),
+                                            Some("[联想边] 用户确认此联想"),
+                                        );
+                                    }
+                                }
+                            }
                             Ok(Json(serde_json::json!({
                                 "confirmed": true,
                                 "memory_id": memory_id
@@ -2260,6 +2317,7 @@ pub fn build_v1_router(
                             let store = lock_store_with_timeout(&store).await?;
 
                             // 阶段D：联想级反馈——解析联想上下文（排名、命中的检索通路）
+                            // P7.2：新增 from_id（联想起点，可选）——携带时记录 (from→to) 边反馈
                             let feedback_id = if target_type == FeedbackTarget::AssociationRelevance {
                                 let rank = body.get("rank").and_then(|v| v.as_u64()).map(|r| r as usize);
                                 let hit_paths: Vec<String> = body
@@ -2272,14 +2330,31 @@ pub fn build_v1_router(
                                             .collect()
                                     })
                                     .unwrap_or_default();
-                                store.user_feedback.record_association_feedback(
-                                    feedback_type.clone(),
-                                    &memory_id,
-                                    query,
-                                    rank,
-                                    hit_paths,
-                                    note,
-                                )
+                                let from_id = body
+                                    .get("from_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.trim().to_string());
+                                match from_id {
+                                    // 边级反馈：携带联想起点（P7.2 联想边反馈闭环）
+                                    Some(from) if !from.is_empty() => {
+                                        store.user_feedback.record_association_edge_feedback(
+                                            feedback_type.clone(),
+                                            &from,
+                                            &memory_id,
+                                            query,
+                                            note,
+                                        )
+                                    }
+                                    // 兼容旧调用：无起点 → 仍按记忆级联想反馈记录（只观测）
+                                    _ => store.user_feedback.record_association_feedback(
+                                        feedback_type.clone(),
+                                        &memory_id,
+                                        query,
+                                        rank,
+                                        hit_paths,
+                                        note,
+                                    ),
+                                }
                             } else {
                                 store.user_feedback.record_feedback(
                                     feedback_type.clone(),
@@ -5276,6 +5351,137 @@ mod api_contracts_tests {
             "语义旁路应召回结婚纪念日记忆: {}",
             root_node.content
         );
+    }
+
+    /// P7.2：联想边反馈闭环——用户确认 (root→child_b) 边后，门控开启时
+    /// explore BFS 使 child_b 前置（稳定排序按边净调整翻转）；门控关闭时
+    /// 顺序与无反馈基线逐字节一致（零影响承诺消融对照）。
+    ///
+    /// 语料设计：root 与 child_a/child_b 词面共享完全相同（平分秋色），
+    /// 基线稳定排序按 id 字典序 child_a 在前；确认边 +0.30×0.5 分打破平局，
+    /// 使 child_b 前置——证明差异来自边反馈而非词面。
+    #[test]
+    fn test_assoc_edge_feedback_rerank_in_explore() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_edge_rerank_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+
+        // root：查询起点记忆（查询与自身完全匹配 → 自身成为起点）
+        let root = Memory::new(
+            "今晚吃什么好呢".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        store.remember(root.clone()).unwrap();
+        // child_a / child_b：与 root 词面共享完全相同（各共享「今晚」「晚吃」
+        // 两个 bigram → BM25 同分），但彼此差异大（Jaccard≈0.15 < 合并阈值 0.5，
+        // 避免 remember 相似合并吃掉独立 id）；基线同分按写入序 a 在前。
+        let child_a = Memory::new(
+            "今晚吃啥 家常小炒".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        store.remember(child_a.clone()).unwrap();
+        let child_b = Memory::new(
+            "今晚吃水饺 北方风味".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        store.remember(child_b.clone()).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let depth1_ids = |resp: &AssociationExploreResponse| -> Vec<String> {
+            resp.nodes
+                .iter()
+                .filter(|n| n.depth == 1)
+                .map(|n| n.id.clone())
+                .collect()
+        };
+
+        // 基线（门控默认关）：child_a 在前
+        let base = run_association_explore(
+            &mut store,
+            Some("今晚吃什么好呢"),
+            None,
+            2,
+            1,
+            &cancel,
+            None,
+        );
+        assert!(base.root.is_some(), "root 记忆应成为起点");
+        let base_children = depth1_ids(&base);
+        assert_eq!(
+            base_children,
+            vec![child_a.id.clone()],
+            "基线 width=1 时应取同分稳定的 child_a: {:?}",
+            base_children
+        );
+
+        // 记录确认边：root → child_b（用户确认"从今晚吃什么好呢联想到今晚吃面"）
+        store.user_feedback.record_association_edge_feedback(
+            FeedbackType::Positive,
+            &root.id,
+            &child_b.id,
+            Some("今晚吃什么好呢"),
+            None,
+        );
+
+        // 门控开启：确认边打破平局，child_b 前置
+        std::env::set_var("LRC_ASSOC_EDGE_FEEDBACK", "1");
+        let rerank = run_association_explore(
+            &mut store,
+            Some("今晚吃什么好呢"),
+            None,
+            2,
+            1,
+            &cancel,
+            None,
+        );
+        std::env::remove_var("LRC_ASSOC_EDGE_FEEDBACK");
+        let rerank_children = depth1_ids(&rerank);
+        assert_eq!(
+            rerank_children,
+            vec![child_b.id.clone()],
+            "确认边应使 child_b 前置: baseline={:?} rerank={:?}",
+            base_children,
+            rerank_children
+        );
+
+        // 门控恢复关闭：回到基线顺序（零影响承诺）
+        let restore = run_association_explore(
+            &mut store,
+            Some("今晚吃什么好呢"),
+            None,
+            2,
+            1,
+            &cancel,
+            None,
+        );
+        assert_eq!(
+            depth1_ids(&restore),
+            vec![child_a.id.clone()],
+            "门控关闭后应回到基线顺序（零影响）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 开发上下文噪声过滤：非代码起点的联想链不得混入 code_context
