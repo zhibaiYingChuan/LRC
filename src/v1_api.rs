@@ -398,6 +398,20 @@ fn assoc_edge_feedback_enabled() -> bool {
     std::env::var_os("LRC_ASSOC_EDGE_FEEDBACK").is_some()
 }
 
+/// P7.3 路径级评分：候选与 root 主题实义词共享 ≥2 时的小幅加成。
+/// 与联想桥扩展词权重（0.20）同量级但更温和——主题加成只做排序区分，
+/// 不改变候选集合。
+const ASSOC_PATH_TOPIC_BONUS: f32 = 0.10;
+/// P7.3 路径级评分：候选与 root 主题零实义词共享时的漂移惩罚。
+/// 只降权不硬删——通过回归硬门禁的候选仍可展示，但排序后置，
+/// 避免多跳扩散沿父记忆的非主题面漂移。
+const ASSOC_PATH_DRIFT_PENALTY: f32 = 0.20;
+/// P7.3 路径级评分门控：`LRC_ASSOC_PATH_SCORE=1` 启用 root 主题一致性
+/// 软评分层；默认关 → 探索行为与现状逐字节一致（零影响承诺）。
+fn assoc_path_score_enabled() -> bool {
+    std::env::var_os("LRC_ASSOC_PATH_SCORE").is_some()
+}
+
 /// 执行一次有界联想探索。
 ///
 /// 探索本身复用 LRC 的 recall 入口，因此每一跳都会经过内置道体状态机、
@@ -592,6 +606,8 @@ fn run_association_explore(
     let root_is_code = root_memory.memory_type == crate::memory_types::MemoryType::CodeContext;
     // BFS 扩散与 root 召回共享 explore_started 预算（见函数入口），
     // 超预算即优雅收敛：返回已找到的部分 + interrupted=true。
+    // P7.3 路径级评分：克隆 root 内容供主题一致性计算（content 随后被移入队列）。
+    let root_path_content = root_memory.content.clone();
     queue.push_back((root_id, root_memory.content, 0u8));
     // P7.2 联想边反馈：门控开启时构建 (from→to) 净调整表供 BFS 排序消费；
     // 关闭时为空表，候选顺序与现状逐字节一致（零影响承诺）。
@@ -601,6 +617,14 @@ fn run_association_explore(
         } else {
             std::collections::HashMap::new()
         };
+    // P7.3 路径级评分：root 主题实义 token（过滤泛指 bigram）与门控快照。
+    // 与回归校验共用同一 root 锚——校验是硬过滤（剔证据缺失），此处是软排序
+    // 信号（只降权不杀）。
+    let root_path_tokens: Vec<String> = crate::memory_store::tokenize_query(&root_path_content)
+        .into_iter()
+        .filter(|t| !crate::memory_store::is_generic_bigram(t))
+        .collect();
+    let path_score_on = assoc_path_score_enabled();
 
     while let Some((from_id, from_content, current_depth)) = queue.pop_front() {
         if current_depth >= max_depth {
@@ -627,20 +651,48 @@ fn run_association_explore(
         };
         let next_depth = current_depth + 1;
         let mut added = 0usize;
-        // P7.2 联想边反馈：对召回候选施加 (from→to) 边净调整后稳定降序重排。
-        // 边调整只改变"候选之间的相对顺序"（确认边前置/拒绝边后置），
-        // 不豁免任何既有防线（CodeContext 过滤 / 回归校验 / width 上限）。
-        // 门控关闭时 adj=0，稳定排序保持 recall 原序 → 与现状逐字节一致。
+        // P7.3 路径级评分：预计算每个候选与 root 主题的实义词重叠数
+        //（只读计算，避免在 ranked 闭包内与 store 可变借用冲突）。
+        let path_hits: std::collections::HashMap<String, usize> = if path_score_on {
+            result
+                .memories
+                .iter()
+                .map(|m| {
+                    (
+                        m.id.clone(),
+                        store.query_overlap_count(m, &root_path_tokens),
+                    )
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
+        // P7.2 联想边反馈 + P7.3 路径级评分：对召回候选施加边净调整与
+        // root 主题一致性调整后稳定降序重排。两者只改变"候选之间的相对
+        // 顺序"（确认边前置/拒绝边后置 / 主题近前置/漂移后置），不豁免
+        // 任何既有防线（CodeContext 过滤 / 回归校验 / width 上限）。
+        // 门控关闭时 adj=0 且 path=0，稳定排序保持 recall 原序 → 现状逐字节一致。
         let mut ranked: Vec<(f32, crate::memory_types::Memory)> = result
             .memories
             .into_iter()
             .zip(result.scores)
             .map(|(memory, score)| {
+                let mut adjusted = score;
+                if path_score_on {
+                    let hits = path_hits.get(&memory.id).copied().unwrap_or(0);
+                    adjusted += if hits >= 2 {
+                        ASSOC_PATH_TOPIC_BONUS
+                    } else if hits == 0 {
+                        -ASSOC_PATH_DRIFT_PENALTY
+                    } else {
+                        0.0
+                    };
+                }
                 let adj = edge_adjust
                     .get(&(from_id.clone(), memory.id.clone()))
                     .copied()
                     .unwrap_or(0.0);
-                (score + adj * ASSOC_EDGE_ADJUST_SCALE, memory)
+                (adjusted + adj * ASSOC_EDGE_ADJUST_SCALE, memory)
             })
             .collect();
         ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -5479,6 +5531,156 @@ mod api_contracts_tests {
             depth1_ids(&restore),
             vec![child_a.id.clone()],
             "门控关闭后应回到基线顺序（零影响）"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P7.3：路径级评分——门控开启时，候选节点分数相对基线发生三档偏移：
+    /// 与 root 主题实义词共享 ≥2 的 +TOPIC_BONUS、=1 的无偏移、=0 的
+    /// −DRIFT_PENALTY（差分断言，容差 1e-3）；门控关闭/还原后与基线
+    /// 逐字节一致（F1 生效 + F2 消融对照）。
+    #[test]
+    fn test_assoc_path_score_topic_rerank_in_explore() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_path_score_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+
+        // root：查询起点记忆（查询与自身完全匹配 → 自身成为起点）
+        let root = Memory::new(
+            "今晚吃什么好呢".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        store.remember(root.clone()).unwrap();
+        // mem_a：与 root 共享 2 个实义 bigram（今晚/晚吃）→ 主题强，+BONUS
+        let mem_a = Memory::new(
+            "今晚吃啥 家常小炒".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        store.remember(mem_a.clone()).unwrap();
+        // mem_b：与 root 共享 1 个实义 bigram（今晚）→ 主题中，无偏移
+        let mem_b = Memory::new(
+            "今晚家常面".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        store.remember(mem_b.clone()).unwrap();
+        // mem_c：与 root 内容零共享，但带标签"今晚"通过回归校验（边缘样本）
+        // → 主题漂移，−DRIFT_PENALTY
+        let mem_c = Memory::new(
+            "周末爬山 户外装备清单".to_string(),
+            MemoryType::Fact,
+            None,
+            vec!["今晚".to_string()],
+            Importance::new(5),
+            None,
+        );
+        store.remember(mem_c.clone()).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let depth1_score = |resp: &AssociationExploreResponse, id: &str| -> f32 {
+            resp.nodes
+                .iter()
+                .find(|n| n.depth == 1 && n.id == id)
+                .map(|n| n.score)
+                .unwrap_or(f32::NAN)
+        };
+
+        // 基线（门控默认关）：三候选均进入联想链（回归校验后仍保留，width=3）
+        let base = run_association_explore(
+            &mut store,
+            Some("今晚吃什么好呢"),
+            None,
+            2,
+            3,
+            &cancel,
+            None,
+        );
+        assert!(base.root.is_some(), "root 记忆应成为起点");
+        let sa0 = depth1_score(&base, &mem_a.id);
+        let sb0 = depth1_score(&base, &mem_b.id);
+        let sc0 = depth1_score(&base, &mem_c.id);
+        assert!(
+            !sa0.is_nan() && !sb0.is_nan() && !sc0.is_nan(),
+            "三候选都应通过回归校验进入联想链: a={sa0:.3} b={sb0:.3} c={sc0:.3}"
+        );
+
+        // 门控开启：三档偏移
+        std::env::set_var("LRC_ASSOC_PATH_SCORE", "1");
+        let on = run_association_explore(
+            &mut store,
+            Some("今晚吃什么好呢"),
+            None,
+            2,
+            3,
+            &cancel,
+            None,
+        );
+        std::env::remove_var("LRC_ASSOC_PATH_SCORE");
+        let sa1 = depth1_score(&on, &mem_a.id);
+        let sb1 = depth1_score(&on, &mem_b.id);
+        let sc1 = depth1_score(&on, &mem_c.id);
+        assert!(
+            (sa1 - sa0 - ASSOC_PATH_TOPIC_BONUS).abs() < 1e-3,
+            "a 偏移应 +{}，实际 {:.4}（{:.4} → {:.4}）",
+            ASSOC_PATH_TOPIC_BONUS,
+            sa1 - sa0,
+            sa0,
+            sa1
+        );
+        assert!(
+            (sb1 - sb0).abs() < 1e-3,
+            "b 偏移应为 0，实际 {:.4}（{:.4} → {:.4}）",
+            sb1 - sb0,
+            sb0,
+            sb1
+        );
+        assert!(
+            (sc1 - sc0 + ASSOC_PATH_DRIFT_PENALTY).abs() < 1e-3,
+            "c 偏移应 −{}，实际 {:.4}（{:.4} → {:.4}）",
+            ASSOC_PATH_DRIFT_PENALTY,
+            sc1 - sc0,
+            sc0,
+            sc1
+        );
+
+        // 门控还原：回到基线（零影响承诺）
+        let restore = run_association_explore(
+            &mut store,
+            Some("今晚吃什么好呢"),
+            None,
+            2,
+            3,
+            &cancel,
+            None,
+        );
+        assert!(
+            (depth1_score(&restore, &mem_a.id) - sa0).abs() < 1e-3,
+            "门控还原后 a 应回到基线"
+        );
+        assert!(
+            (depth1_score(&restore, &mem_b.id) - sb0).abs() < 1e-3,
+            "门控还原后 b 应回到基线"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

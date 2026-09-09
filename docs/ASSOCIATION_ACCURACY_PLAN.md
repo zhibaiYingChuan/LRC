@@ -1,7 +1,7 @@
 # 联想记忆精度提升计划 · 分析与分期（P7，2026-09-09）
 
-> 版本：v1.1（2026-09-09）
-> 状态：现状分析与诊断完成；**P7.2 联想边反馈闭环已完成（四条判据 E1-E4 验收通过）**；P7.3/P7.4 待执行
+> 版本：v1.2（2026-09-09）
+> 状态：现状分析与诊断完成；**P7.2 联想边反馈闭环已完成（E1-E4 验收通过）**；**P7.3 路径级评分已完成（F1-F4 验收通过）**；P7.4 待执行
 > 前置结论：道体导航三模式（PREREG_NAV / PREREG_ASSOC_NAV / PREREG_CLOSED_LOOP）
 > 已一致否证"64 维卦象信号在 768 维 BGE 之上产生召回增益"，本计划不再投入
 > 道体信号方向，聚焦可解释的关系检索与用户反馈闭环。
@@ -108,7 +108,7 @@ root 门禁三层：
 |---|---|---|---|
 | P7.1 | 本分析文档 + 判据锁定（见第六节） | `docs/ASSOCIATION_ACCURACY_PLAN.md` | ✅ 本文件 |
 | **P7.2** | **联想边反馈闭环**：数据层边记录 + confirm/feedback 记边 + explore 排序消费 | user_feedback.rs + v1_api.rs + 单元测试 | ✅ 已完成（2026-09-09，判据 E1-E4 全过，详细见第七节） |
-| P7.3 | 路径级评分（root/edge/child 分离，软评分替代部分硬过滤） | v1_api.rs explore 重构 + 评测 | 待执行 |
+| P7.3 | 路径级评分（root 主题一致性软评分层，门控 `LRC_ASSOC_PATH_SCORE` 默认关） | v1_api.rs explore 排序增强 + 单元测试 | ✅ 已完成（2026-09-09，判据 F1-F4 全过，详细见第八节） |
 | P7.4 | 分层评测集与指标脚本（复用 `_fair_corpus.py`） | daoti/ 评测脚本 | 待执行 |
 
 执行纪律：
@@ -132,6 +132,27 @@ root 门禁三层：
   `cargo check --features qdrant` 通过。
 - **E4 不回归护栏**：边调整只改变候选**顺序**，不豁免 CodeContext 过滤、泛指
   bigram 过滤、root 主导性门禁、时间预算（继承全部既有防线）。
+
+---
+
+## 六B、P7.3 判据（数据产生前锁定，2026-09-09）
+
+**目标**：路径级评分——联想探索对每个候选施加"root 主题一致性"软评分
+（与 root 实义词共享 ≥2 加成 / =1 无调整 / =0 漂移惩罚），把多跳扩散的
+主题漂移从"仅靠回归硬门禁"升级为"硬门禁 + 软排序"双保险，且零负向。
+
+设计边界（逆向推导）：现有回归校验（regression_recheck）已把"与 root 零共享"
+的候选硬剔除，因此软评分的作用域是**通过硬门禁的候选**（original_overlap ≥1），
+对零共享候选的惩罚仅影响"带标签共鸣等证据通过门禁"的边缘样本。
+
+- **F1 软评分生效**：门控 `LRC_ASSOC_PATH_SCORE=1` 开启时，同一候选的节点分数
+  相对基线发生三档偏移——root 实义词共享 ≥2 的候选 +ASSOC_PATH_TOPIC_BONUS、
+  =1 的无偏移、=0 的 −ASSOC_PATH_DRIFT_PENALTY（差分断言，容差 1e-3）。
+- **F2 消融对照**：门控关闭（默认）时 explore 输出与现状逐字节一致；开启后
+  还原门控，输出回到基线（零影响承诺）。
+- **F3 兼容与回归**：全量测试 0 失败；`cargo check --features qdrant` 通过。
+- **F4 不豁免护栏**：路径评分只调候选**分数/顺序**，不豁免 CodeContext 过滤、
+  回归硬门禁、root 门禁、width 与时间预算；对零共享候选不重新放行。
 
 ---
 
@@ -183,3 +204,53 @@ P7.3 继续处理路径级评分（root / edge / child 分离与漂移惩罚）�
 | 代码验证 | ✅ 编译、P7.2 专项测试、全量回归均通过 |
 | 提交 | 待本地提交 |
 | 记忆同步 | 待提交完成后记录本次 P7.2 架构变更 |
+
+---
+
+## 八、结果回写（2026-09-09，P7.3 完成）
+
+### 8.1 实现结果
+
+| 项 | 结果 |
+|---|---|
+| P7.3 状态 | ✅ 完成 |
+| 路径主题 token | [v1_api.rs](file:///G:/code-memory/src/v1_api.rs#L388-L425)：新增 `ASSOC_PATH_TOPIC_BONUS=0.10`、`ASSOC_PATH_DRIFT_PENALTY=0.20` 与 `LRC_ASSOC_PATH_SCORE` 门控；root 内容提取实义 bigram，过滤泛指 bigram |
+| 候选路径评分 | [v1_api.rs](file:///G:/code-memory/src/v1_api.rs#L605-L700)：每轮 BFS 预计算候选与 root 的主题重叠数；≥2 加成、=1 不调整、=0 惩罚，再与 P7.2 边反馈叠加后稳定重排 |
+| 设计边界 | 仅改变候选分数/顺序，不重新放行零证据候选；CodeContext 过滤、root 门禁、回归硬校验、width 与时间预算均保留 |
+| 默认行为 | `LRC_ASSOC_PATH_SCORE` 默认关闭；关闭时 path adjustment 为 0，现有 explore 行为保持不变 |
+
+### 8.2 判据验收
+
+| 判据 | 验收证据 | 判定 |
+|---|---|---|
+| F1 软评分生效 | `test_assoc_path_score_topic_rerank_in_explore` 验证三档差分：共享 ≥2 为 +0.10、共享 1 为 0、共享 0 为 −0.20 | ✅ PASS |
+| F2 消融对照 | 测试在关闭/开启/恢复关闭三个状态运行；恢复后节点分数回到基线 | ✅ PASS |
+| F3 兼容与回归 | `cargo check --offline --features qdrant` 通过；全量测试无失败 | ✅ PASS |
+| F4 不豁免护栏 | 路径评分只在候选重排层生效，未修改 root/CodeContext/回归校验硬门禁 | ✅ PASS |
+
+### 8.3 测试结果
+
+| 测试集 | 结果 |
+|---|---|
+| P7.3 专项测试 | 1 passed / 0 failed |
+| lib 单元测试 | 624 passed / 0 failed |
+| benchmarks | 11 passed / 0 failed |
+| luoshu invariants | 13 passed / 0 failed |
+| memory state machine e2e | 8 passed / 0 failed |
+| 合计 | **656 passed / 0 failed**（另有 8 ignored） |
+| qdrant 特性编译 | `cargo check --offline --features qdrant` ✅ |
+
+### 8.4 结论与后续
+
+P7.3 已完成，但它是**默认关闭的可选排序实验能力**，不是默认产品行为。当前
+路径评分的主要效果是将 root 主题一致性显式化为可观测的软分，不会绕过已有护栏，
+也没有证明最终召回率已经提升。是否开启必须由 P7.4 分层评测结果决定。
+
+P7.4 将建立分层评测集与指标脚本，分别测量 root、edge、child、深度、噪声和空态
+准确性；在 P7.4 证明净收益前，不默认开启 `LRC_ASSOC_PATH_SCORE`。
+
+| 项 | 值 |
+|---|---|
+| 代码验证 | ✅ P7.3 专项、全量回归、qdrant check 均通过 |
+| 提交 | 本轮 P7.3 变更已本地提交 |
+| 记忆同步 | 待提交完成后记录 P7.3 路径级评分架构变更 |
