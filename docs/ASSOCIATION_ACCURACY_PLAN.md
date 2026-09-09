@@ -1,7 +1,7 @@
 # 联想记忆精度提升计划 · 分析与分期（P7，2026-09-09）
 
-> 版本：v1.9（2026-09-09）
-> 状态：P7 全阶段完结（P7.2/P7.3 完成、P7.4 分层评测 NO-GO，门控默认关）。**P8 root 语义召回已立项（前置可行性收尾：归因完成、ml 构建可行、bge 权重网络隔离不可获取 → P8.3 外部阻塞；P8.2c 旁路活性自检落地+HTTP 实证+评测脚本化，P8.3 判据 H1-H4 已脚本化待 B 臂接入，判据锁定待用，详见第十节）**
+> 版本：v1.10（2026-09-09）
+> 状态：P7 全阶段完结（P7.2/P7.3 完成、P7.4 分层评测 NO-GO，门控默认关）。**P8 root 语义召回已立项（前置可行性收尾：归因完成、ml 构建可行、bge 权重全盘深度搜寻确认不可获取 → P8.3 外部阻塞；旁路活性自检落地+HTTP 实证+评测脚本化，H1-H4 判据脚本化待 B 臂接入，判据锁定待用，详见第十节）**
 > 前置结论：道体导航三模式（PREREG_NAV / PREREG_ASSOC_NAV / PREREG_CLOSED_LOOP）
 > 已一致否证"64 维卦象信号在 768 维 BGE 之上产生召回增益"，本计划不再投入
 > 道体信号方向，聚焦可解释的关系检索与用户反馈闭环。
@@ -404,7 +404,7 @@ P7.2 已证明用户确认边可以在 opt-in 模式下改变候选顺序；P7.3
 | 前置 | 状态 | 实测证据 |
 |---|---|---|
 | `ml` feature 构建 | ✅ **可行** | 本地 cargo 缓存含 candle-core/nn/transformers、tokenizers、hf-hub 全部依赖；`cargo build --offline --features server,ml --bin code-memory-server` 54.3s 构建成功（仅无害 LNK4098 链接警告） |
-| bge-small-zh 模型权重 | ❌ **缺失且当前环境不可获取** | hf-mirror 与 huggingface.co 的 model.safetensors HEAD 请求双超时；`curl.exe` 直接请求 exit 28（超时）→ 网络隔离确认；G:/D: 浅层搜索无 bge safetensors 备份；本地 HF 缓存目录不存在 |
+| bge-small-zh 模型权重 | ❌ **缺失且当前环境不可获取（全盘深度搜寻最终确认，P8.2g）** | 网络隔离：hf-mirror 与 huggingface.co 的 model.safetensors HEAD 双超时、`curl.exe` exit 28；**全盘搜寻（2026-09-09）**：G:\ 深度 3 与 G:\Yl 完整递归的 `*bge*` 文件名仅编译产物误匹配、D:\ 深度 3 与 G:\ 的所有 `model.safetensors`/`pytorch_model.bin`/`*.onnx` 仅发现 graphcodebert（623MB 代码模型）；本地 HF 缓存目录不存在。**结论：本机任意位置、任意格式均无 bge 权重** |
 | 旁路救回率实测（P8.3） | ⏸ 待 bge 权重就绪 | 对 14 弱桥 + 2 孤儿查询测 bge 余弦 ≥0.55 的可救回数 |
 
 **备选模型探针（已弃用，如实记录）**：曾尝试以本地唯一完整模型
