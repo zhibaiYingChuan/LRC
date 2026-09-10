@@ -394,6 +394,88 @@ const ASSOCIATION_ROOT_POOL_TOPK: usize = 8;
 /// None，旁路自动失效，门禁退化为纯词面通路，绝不放宽标准。
 const ASSOCIATION_ROOT_MIN_SEMANTIC_SIM: f32 = 0.55;
 
+/// P8.2i 自适应语义门槛：池内相对突出度所需的最小间隔（Top-1 − Top-2）。
+///
+/// 设计动机：P8.2h 实测证明固定绝对阈值在 bge-base-zh 的句向量各向异性下不可
+/// 分离——无关联查询（"量子物理是什么"）的全库最高余弦达 0.64–0.71，普遍高于
+/// 0.55，导致旁路把"人人都像"的噪声记忆放行成 root，H2 失败。故尝试不看
+/// "绝对相似度够不够"，改看 best 候选在候选池内是否显著突出。
+///
+/// **实测结论（P8.2i，2026-09-10）：本假设已被否证。** 以 `LRC_ASSOC_SEMANTIC_DIAG`
+/// 采集的池内间隔在相关查询（0.0037–0.1239）与无关查询（0.0109–0.0398）之间
+/// **完全重叠**，不存在可行切分点：门槛取 0.03 时「量子物理是什么」仍以 0.0398
+/// 越过（H2 未修复），同时误杀 6 条真实相关查询（H1 由 12/16 跌至 5/16）。
+/// 根因是 Top-1/Top-2 间隔只刻画池内名次差、不刻画绝对相关性，且召回池由
+/// BM25 预筛后语义同质性高，间隔分布与相关性无关。
+///
+/// 该常量与下方自适应通路作为**可门控实验通路**保留（与 `LRC_ASSOC_PATH_SCORE` /
+/// `LRC_ASSOC_EDGE_FEEDBACK` 同一纪律，默认关，生产路径零影响），供后续算法
+/// （查询内 z-score / 链级共识 / 向量去中心化）复用同一门控与诊断骨架。
+/// `ASSOCIATION_ROOT_MIN_SEMANTIC_SIM` 始终作为安全下限（H3 判据维持 0.55 不变）。
+const ASSOC_SEMANTIC_ADAPTIVE_MARGIN: f32 = 0.03;
+
+/// P8.2i 自适应语义门槛门控：`LRC_ASSOC_ADAPTIVE_THRESHOLD=1` 启用池内
+/// 相对突出度判定；默认关 → 旁路行为与 P8.2h 现状逐字节一致（零影响承诺，
+/// 与 `LRC_ASSOC_EDGE_FEEDBACK` / `LRC_ASSOC_PATH_SCORE` 同一纪律）。
+fn assoc_adaptive_threshold_enabled() -> bool {
+    std::env::var_os("LRC_ASSOC_ADAPTIVE_THRESHOLD").is_some()
+}
+
+/// P8.2i 语义旁路诊断开关：`LRC_ASSOC_SEMANTIC_DIAG=1` 时在旁路触发点打印
+/// 合格候选的池内余弦分布（Top-3 + Top-1/Top-2 间隔 + 放行结论），供离线
+/// 标定间隔阈值，避免"靠猜调参"。默认关 → 生产路径零额外输出与零额外计算。
+fn assoc_semantic_diag_enabled() -> bool {
+    std::env::var_os("LRC_ASSOC_SEMANTIC_DIAG").is_some()
+}
+
+/// P8.2j 向量去中心化门控：`LRC_ASSOC_DEBIAS=1` 时，root 语义旁路改用
+/// **候选池均值双侧对称去中心化**后的余弦（见
+/// [`MemoryStore::semantic_similarities_debiased`]）。
+///
+/// 设计动机：P8.2h/P8.2i 实测证明 bge-zh 句向量各向异性严重——无关内容的绝对
+/// 余弦与池内间隔都无法与真实相关分离（H2 失败）。去中心化把句向量挤向公共
+/// 方向的分量剪掉，是各向异性问题的标准对策，且以候选池均值估计公共分量属
+/// **零额外编码开销**（池向量本就要编码），满足旁路 6s 硬时限。
+///
+/// 默认关 → 旁路仍走 [`MemoryStore::semantic_similarities`]，与 P8.2h 现状
+/// 逐字节一致（零影响承诺，与 `LRC_ASSOC_SEMANTIC_DIAG` / `LRC_ASSOC_EDGE_FEEDBACK`
+/// / `LRC_ASSOC_PATH_SCORE` 同一纪律）。`ASSOCIATION_ROOT_MIN_SEMANTIC_SIM`
+/// 始终作为安全下限（H3 判据维持 0.55 不变）。
+fn assoc_debias_enabled() -> bool {
+    std::env::var_os("LRC_ASSOC_DEBIAS").is_some()
+}
+
+/// P8.2k 去中心化空间的**重标定**语义下限（仅 `LRC_ASSOC_DEBIAS` 开启时生效）。
+///
+/// 标定依据（P8.2j 实测，2026-09-10）：去中心化把句向量的公共分量剪除后，
+/// 余弦量纲整体下移——固定阈值 0.55 在去中心化空间**完全失配**（16 条相关
+/// 查询池内 Top-1 全部落在 `[0.0844, 0.5192]`，无一越 0.55），导致 H1 归零
+/// 0/16。以 P8.2j 诊断日志（`docs/_p82j_diag.err.log`，18 条池内 Top-1）离线扫描：
+/// - 无关查询上界 0.1496（「量子物理是什么」），下界 0.0807；
+/// - 相关查询 Top-1 中位 0.2394（q25 0.2031 / q75 0.2955 / max 0.5192）。
+///
+/// 故 H1≥10/16 与 H2 零噪声的**可行阈值区间为 `(0.1496, 0.2188]`**，本常量
+/// 取该区间**中点 0.18**（对两侧边界的裕度最大：距无关上界 +0.030、
+/// 距第 10 条相关查询 −0.039）。
+///
+/// **口径诚实声明**：H2 证据仅来自 **2 条**无关查询（公平语料设计如此），
+/// 阈值选择因此**证据强度有限**；本常量作可门控实验参数记录，不作生产默认值。
+/// 非去中心化路径**始终**使用 [`ASSOCIATION_ROOT_MIN_SEMANTIC_SIM`]（0.55），
+/// 本常量不进入任何默认通路（零影响承诺，与 `LRC_ASSOC_SEMANTIC_DIAG` /
+/// `LRC_ASSOC_EDGE_FEEDBACK` / `LRC_ASSOC_PATH_SCORE` 同一纪律）。
+const ASSOC_DEBIAS_MIN_SEMANTIC_SIM: f32 = 0.18;
+
+/// 旁路实际生效的余弦下限：去中心化门控开启时用重标定值
+/// （[`ASSOC_DEBIAS_MIN_SEMANTIC_SIM`]），否则为历史安全下限
+/// （[`ASSOCIATION_ROOT_MIN_SEMANTIC_SIM`]=0.55）——门控关闭时与 P8.2h 逐字节一致。
+fn assoc_bypass_min_sim() -> f32 {
+    if assoc_debias_enabled() {
+        ASSOC_DEBIAS_MIN_SEMANTIC_SIM
+    } else {
+        ASSOCIATION_ROOT_MIN_SEMANTIC_SIM
+    }
+}
+
 /// P7.2 联想边反馈：用户确认边（positive）对候选分的最大抬升幅度。
 /// 与联想桥扩展词权重（0.20）同量级但略高——边反馈是强用户信号。
 const ASSOC_EDGE_ADJUST_SCALE: f32 = 0.30;
@@ -544,7 +626,13 @@ fn run_association_explore(
                 // 不允许 root 阶段吃掉 BFS 扩散的全部预算
                 let mem_refs: Vec<&crate::memory_types::Memory> =
                     candidates.iter().map(|(m, _)| m).collect();
-                let sims = store.semantic_similarities(text, &mem_refs);
+                // P8.2j 去中心化门控（默认关）：开启时以候选池均值剪掉句向量的
+                // 公共分量再算余弦，对抗 bge-zh 各向异性；关闭时与 P8.2h 逐字节一致。
+                let sims = if assoc_debias_enabled() {
+                    store.semantic_similarities_debiased(text, &mem_refs)
+                } else {
+                    store.semantic_similarities(text, &mem_refs)
+                };
                 // P8.2c：记录旁路活性——编码器是否产出向量参与判定。
                 // 统计模式/模型缺失时 sims 全 None → "unavailable"（旁路实际未参与），
                 // 与"applied（旁路真实判定）"区分，供评测自检。
@@ -553,18 +641,91 @@ fn run_association_explore(
                 } else {
                     "unavailable".to_string()
                 };
-                for ((memory, score), sim) in candidates.iter().zip(sims) {
-                    // v0.9.7 精确度修复：语义旁路不放行代码记忆。旁路只在
-                    // 词面零命中时触发，此时若救回的是代码 chunk，几乎都
-                    // 是 bge 对长文本的向量居中假象（"量子物理是什么"曾
-                    // 因此被 memory_store.rs 的代码块当起点，整条联想链
-                    // 全是代码）。代码查询词面命中率高（标识符/函数名
-                    // 天然是实义 token），不需要旁路。
-                    if memory.memory_type == crate::memory_types::MemoryType::CodeContext {
-                        continue;
+                // P8.2i 池内余弦诊断：仅在编码器真实产出向量时打印（统计
+                // 模式全 None 时静默），暴露候选池的余弦分布与 Top-1/Top-2
+                // 间隔，供离线标定自适应间隔阈值——不靠猜调参。
+                if assoc_semantic_diag_enabled() && sims.iter().any(|s| s.is_some()) {
+                    let mut scored: Vec<(f32, usize)> = sims
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, sim)| {
+                            let memory = &candidates[idx].0;
+                            if memory.memory_type == crate::memory_types::MemoryType::CodeContext {
+                                return None;
+                            }
+                            (*sim).map(|s| (s, idx))
+                        })
+                        .collect();
+                    scored
+                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    let best = scored.first().map(|(s, _)| *s).unwrap_or(0.0);
+                    let second = scored.get(1).map(|(s, _)| *s).unwrap_or(0.0);
+                    let top3: Vec<(f32, String)> = scored
+                        .iter()
+                        .take(3)
+                        .map(|(s, idx)| (*s, candidates[*idx].0.content.chars().take(24).collect()))
+                        .collect();
+                    eprintln!(
+                        "[P8.2i][旁路诊断] 「{text}」非代码候选 {} 条，Top-3 {top3:?}；\
+                         Top1-Top2 间隔={:.4}（自适应门槛={}，去中心化={}，生效阈值={:.2}）",
+                        scored.len(),
+                        best - second,
+                        assoc_adaptive_threshold_enabled(),
+                        assoc_debias_enabled(),
+                        assoc_bypass_min_sim()
+                    );
+                }
+                // P8.2i 自适应门槛（默认关，零影响承诺）：开启时用池内相对
+                // 突出度替代固定绝对阈值；关闭时保持 P8.2h 逐字节一致的
+                // 固定阈值通路。绝对下限始终生效 → H3 判据（0.55）不变。
+                //
+                // ⚠ 实测否证（2026-09-10）：该假设不成立——间隔在相关/无关
+                // 查询间完全重叠（见常量注释与文档 §10.8），开启会使 H1 由
+                // 12/16 跌至 5/16 且 H2 仍 FAIL。故本通路仅为后续算法预留的
+                // 门控实验骨架，生产默认关闭。
+                if assoc_adaptive_threshold_enabled() {
+                    // 候选判据：best 需同时满足绝对下限与池内间隔。
+                    // 仅放行 best 一条，避免平坦池里"矮子里拔将军"式批量放行。
+                    let mut scored: Vec<(f32, usize)> = sims
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, sim)| {
+                            let memory = &candidates[idx].0;
+                            if memory.memory_type == crate::memory_types::MemoryType::CodeContext {
+                                return None;
+                            }
+                            (*sim).map(|s| (s, idx))
+                        })
+                        .collect();
+                    scored
+                        .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    if let Some((best, best_idx)) = scored.first().copied() {
+                        let second = scored.get(1).map(|(s, _)| *s).unwrap_or(0.0);
+                        if best >= ASSOCIATION_ROOT_MIN_SEMANTIC_SIM
+                            && best - second >= ASSOC_SEMANTIC_ADAPTIVE_MARGIN
+                        {
+                            passing.push((candidates[best_idx].0.clone(), candidates[best_idx].1));
+                        }
                     }
-                    if sim.is_some_and(|s| s >= ASSOCIATION_ROOT_MIN_SEMANTIC_SIM) {
-                        passing.push((memory.clone(), *score));
+                } else {
+                    // v0.9.7 通路（逐字节保留）：语义旁路不放行代码记忆。
+                    // 旁路只在词面零命中时触发，此时若救回的是代码 chunk，
+                    // 几乎都是 bge 对长文本的向量居中假象（"量子物理是什么"
+                    // 曾因此被 memory_store.rs 的代码块当起点，整条联想链全
+                    // 是代码）。代码查询词面命中率高（标识符/函数名天然是
+                    // 实义 token），不需要旁路。
+                    //
+                    // P8.2k 阈值重标定（默认关，零影响承诺）：门控关闭时
+                    // `assoc_bypass_min_sim()` 恒返回 0.55（历史路径逐字节一致）；
+                    // 去中心化门控开启时才返回针对新量纲标定的 0.18（见常量注释）。
+                    let min_sim = assoc_bypass_min_sim();
+                    for ((memory, score), sim) in candidates.iter().zip(sims) {
+                        if memory.memory_type == crate::memory_types::MemoryType::CodeContext {
+                            continue;
+                        }
+                        if sim.is_some_and(|s| s >= min_sim) {
+                            passing.push((memory.clone(), *score));
+                        }
                     }
                 }
             }
@@ -5501,6 +5662,1079 @@ mod api_contracts_tests {
             "语义旁路应召回结婚纪念日记忆: {}",
             root_node.content
         );
+    }
+
+    // ============================================================
+    // P8.2h：离线 bge 批量编码 —— root 语义旁路救回率实测（H1-H4）
+    //
+    // 方案 A：直接调用真实 run_association_explore（零镜像口径）。
+    // 语料 / 查询 / 判定口径逐字对齐 daoti/_fair_corpus.py 与
+    // daoti/_assoc_accuracy_eval.py；A 臂（统计编码器）复现 P7.4 基线，
+    // B 臂（ML 编码器 + 真实 bge 权重）实测语义旁路救回。
+    //
+    // 运行（需本地 bge 权重，如 ~/.loong-recall/models/BAAI--bge-base-zh）：
+    //   $env:LRC_LUOSHU_MODEL_ID='BAAI/bge-base-zh'
+    //   cargo test --offline --features ml --lib test_assoc_p82h -- --nocapture
+    // ============================================================
+
+    /// 公平语料·联想链（6 链 × 16 条，逐字对齐 _fair_corpus.py::CHAINS）
+    #[cfg(feature = "ml")]
+    const P82H_CHAINS: &[(&str, &[(u8, &str)])] = &[
+        (
+            "dinner",
+            &[
+                (1, "今晚想吃火锅，上次念叨的那家海底捞一直还没去"),
+                (1, "冰箱里有半盒鸡蛋两个西红柿，实在不行就下碗面"),
+                (2, "室友小周不吃香菜，点锅底要提前跟她说"),
+                (2, "楼下新开那家日料周三前会员打八折"),
+                (2, "外卖起送要三十，满四十五才减八块"),
+                (2, "这个月外食预算只剩三百出头"),
+                (3, "上回吃太辣第二天胃不舒服，买了盒达喜"),
+                (3, "商场停车两小时后每小时六块，饭点地库排队"),
+                (3, "她收藏了一家深夜食堂风格的居酒屋在老仓库那边"),
+                (3, "周末在家包了次饺子，饺子皮是菜场买的"),
+                (4, "老仓库那家店老板说翻台慢建议工作日来"),
+                (4, "体检报告说要少油少盐，外卖备注清淡"),
+                (4, "家里那口炒锅涂层花了，炒菜总粘底"),
+                (4, "她生日那顿说好吃的话下次带爸妈来"),
+                (5, "从小家里晚饭都固定一荤一汤，习惯了"),
+                (5, "吃完晚饭轮流水池，周五轮到她洗"),
+            ],
+        ),
+        (
+            "hike",
+            &[
+                (1, "周末想去香山看红叶，听说这周全红了"),
+                (1, "约了老陈一家周六上午西山绿道徒步"),
+                (2, "预报周六多云十八度，傍晚起风"),
+                (2, "绿道后山出口有条野路通到停车场"),
+                (2, "老陈家娃五岁，走快了要抱"),
+                (2, "徒步群里说东门外拼车AA每人十五"),
+                (3, "去年爬香山东门堵了一个半小时没上去"),
+                (3, "山上小卖部矿泉水八块，泡面十五"),
+                (3, "她新买的登山杖是碳纤维的要显摆"),
+                (3, "看红叶最佳时段是十点半前和四点半后"),
+                (4, "野路出来那段碎石坡容易打滑"),
+                (4, "山顶信号差，约定失联就在观景台等"),
+                (4, "老陈上次扭过脚腕，护踝让他戴上"),
+                (4, "回程顺路能到那个大集，收摊早"),
+                (5, "家里规矩是户外活动前夜必须早睡"),
+                (5, "她背包里永远有一块压缩饼干应急"),
+            ],
+        ),
+        (
+            "wedding",
+            &[
+                (1, "下周六小赵结婚，请柬写的是香格里宴会厅"),
+                (1, "随份子群里接龙统一六百"),
+                (2, "婚礼要求正装出席，男士深色西装"),
+                (2, "午宴一点半入场，合影在仪式后"),
+                (2, "部门五个人拼一辆七座商务车"),
+                (2, "她让我帮忙带个礼物盒包装"),
+                (3, "上次婚宴那家酒店海鲜不新鲜有人拉肚子"),
+                (3, "宴会厅在城东，早高峰地铁更稳"),
+                (3, "司仪要随机采访同事讲新人故事"),
+                (3, "小赵说过敬酒环节他替新娘挡酒"),
+                (4, "婚礼车库限高一点八米，底盘低别下"),
+                (4, "份子钱让财务统一转，微信别单独发"),
+                (4, "上次酒桌游戏输了被起哄唱了一首"),
+                (4, "她西装是去年买的裤脚短了一截"),
+                (5, "家里长辈要求红白喜事必须到场"),
+                (5, "每次参加婚礼她都要记人家的礼服穿法"),
+            ],
+        ),
+        (
+            "cat",
+            &[
+                (1, "猫这两天不吃东西老趴着，得带去看医生"),
+                (1, "家附近评价最好的是爱康宠物医院"),
+                (2, "它体检疫苗本和驱虫记录在一个袋里"),
+                (2, "航空箱在阳台储物柜，钥匙挂门后"),
+                (2, "周五它吐了一次毛球样的东西"),
+                (2, "医生说换粮要七天渐进掺着换"),
+                (3, "上回打疫苗它应激，回家躲沙发底一天"),
+                (3, "宠物医院节假日加收三十块急诊费"),
+                (3, "它以前最爱钻快递纸箱，见箱就进"),
+                (3, "猫砂快见底了，囤的那袋是豆腐砂"),
+                (4, "医生说过舔毛过猛可能是皮肤过敏信号"),
+                (4, "医院用的猫条零食是某牌子，家里没有了"),
+                (4, "她妈对猫毛过敏，过年不能带它回老家"),
+                (4, "上次输液留置针挂了三天，伊丽莎白圈要戴"),
+                (5, "从小家里养猫，看病先翻旧病历的习惯随家里"),
+                (5, "它一听到开罐头声就从任何角落出现"),
+            ],
+        ),
+        (
+            "car",
+            &[
+                (1, "这辆车的年检到期了，得赶这个月办完"),
+                (1, "朋友推荐一家检测站能预约不用排队"),
+                (2, "交强险和车船税一起续，保单在抽屉"),
+                (2, "行驶证副本上写着注册日期是月底"),
+                (2, "上次有个未处理违停要先缴掉"),
+                (2, "尾气复检要空滤干净，四万八该换的了"),
+                (3, "检测站门口那条路单行，绕辅路进"),
+                (3, "验车师傅说灯光改装过要还原才能过线"),
+                (3, "她练车那会儿最怕灯光检测那一项"),
+                (3, "去年检完贴的合格标在挡风玻璃右上角"),
+                (4, "检测排队时引擎别熄火，怠速也要测"),
+                (4, "车内三角警示牌过期了，顺手换新的"),
+                (4, "保险过户后第一年就少了两次免费道路救援"),
+                (4, "那家老检测站后来被查到出具虚假报告关了"),
+                (5, "家里买车惯例是提前两个月开始张罗年检"),
+                (5, "每次办手续他都要把单据按日期排好夹起来"),
+            ],
+        ),
+        (
+            "exam",
+            &[
+                (1, "孩子下周三期末考，数学应用题是他的坎"),
+                (1, "老师说考前把错题本重新过一遍就行"),
+                (2, "她每晚八点陪读一小时，雷打不动"),
+                (2, "语文古诗默写还差两首长的没背熟"),
+                (2, "考试要带的两B铅笔和尺子放笔袋了"),
+                (2, "学校通知周四下午提前放学"),
+                (3, "上次他紧张把计算器忘家里，半路回去取"),
+                (3, "他同桌考前发烧没考好，全班都知道了"),
+                (3, "家里那盏护眼台灯是买给他写作业的"),
+                (3, "班主任群里说这次成绩家长不排名"),
+                (4, "她一考试前就失眠，安眠药是老毛病了"),
+                (4, "爷爷那辈人信奉考前别吃太饱，七分饱"),
+                (4, "他房间朝西，下午晒得书桌滚烫"),
+                (4, "去年暑假班老师留了套压轴题卷一直没做"),
+                (5, "家里惯例考完试周六全家去放风放松"),
+                (5, "她妈当年考前要亲手包一顿馄饨图吉利"),
+            ],
+        ),
+    ];
+
+    /// 公平语料·干扰池（8 技术 + 2 生活噪声，逐字对齐 _fair_corpus.py::DISTRACTORS）
+    #[cfg(feature = "ml")]
+    const P82H_DISTRACTORS: &[(u8, &str)] = &[
+        (9, "Rust 借用检查器报 E0597 时先检查所有权转移位置"),
+        (9, "数据库慢查询先跑 EXPLAIN 看是否走了索引"),
+        (9, "CI 流水线 YAML 锚点可以复用公共步骤定义"),
+        (9, "前端大列表渲染要用虚拟滚动避免 DOM 节点过多"),
+        (9, "Docker 镜像分层缓存能显著缩短构建时间"),
+        (9, "Kubernetes 就绪探针配置不当会造成滚动发布卡死"),
+        (9, "Nginx 反向代理超时默认六十秒要显式配置"),
+        (9, "SQL 注入防护必须参数化查询不能拼字符串"),
+        (9, "阳台绿萝养了两年长得特别疯要修剪"),
+        (9, "双十一囤的洗衣液还有两大桶没用完"),
+    ];
+
+    /// 30 个查询（逐字对齐 _fair_corpus.py::QUERIES）
+    #[cfg(feature = "ml")]
+    const P82H_QUERIES: &[(&str, &str)] = &[
+        ("dinner", "今晚吃什么好呢"),
+        ("dinner", "晚饭怎么解决"),
+        ("dinner", "肚子饿了晚上吃点啥"),
+        ("dinner", "今晚的饭有谱了吗"),
+        ("dinner", "晚饭后去哪吃比较好"),
+        ("hike", "周末爬山安排得怎么样了"),
+        ("hike", "这周六出去走走怎么计划"),
+        ("hike", "想去看红叶什么时候去合适"),
+        ("hike", "周末徒步那次都约了谁怎么过去"),
+        ("hike", "爬山那天都注意点啥"),
+        ("wedding", "下周六小赵的婚礼怎么办"),
+        ("wedding", "同事结婚我要准备些什么"),
+        ("wedding", "婚礼那天流程是啥样的"),
+        ("wedding", "参加婚礼有什么讲究来着"),
+        ("wedding", "份子钱和车那事都齐了吗"),
+        ("cat", "猫这两天不对劲怎么办"),
+        ("cat", "要带猫去看医生得准备啥"),
+        ("cat", "猫咪不吃饭这事后来怎么样"),
+        ("cat", "宠物医院那趟有什么要注意的"),
+        ("cat", "猫生病家里还缺什么物资"),
+        ("car", "车的年检这个月能办完吗"),
+        ("car", "去检测站要带什么东西"),
+        ("car", "年检前车辆还要弄哪些"),
+        ("car", "验车那次有什么坑"),
+        ("car", "保险和年检怎么一起搞"),
+        ("exam", "孩子下周三期末考试怎么备战"),
+        ("exam", "期末考前家里要配合什么"),
+        ("exam", "考试那几天有什么要准备的"),
+        ("exam", "孩子数学应用题那关怎么过"),
+        ("exam", "考前孩子状态不对怎么办"),
+    ];
+
+    /// 无关联查询（对齐 _assoc_accuracy_eval.py::UNRELATED_QUERIES）
+    /// P8.2l 扩容复测：2 → 22 条，覆盖天体物理/历史/气象/医疗/体育/数学/化学/
+    /// 法律/生物/艺术/影视/环保/宗教/棋类/语言文字/地质/音乐/考古/贸易等跨域语义；
+    /// 逐条避开公平语料的 6 大生活链（dinner/hike/wedding/cat/car/exam）与
+    /// 10 条干扰语义；保留原有 2 条以维持与 P8.2h–P8.2k 的可比性。
+    #[cfg(feature = "ml")]
+    const P82H_UNRELATED: &[&str] = &[
+        "量子物理是什么",
+        "今天股市行情怎么样",
+        "黑洞是怎么形成的",
+        "明朝灭亡的原因是什么",
+        "台风路径是怎么预测的",
+        "心脏搭桥手术恢复要多久",
+        "马拉松训练计划怎么安排",
+        "三角函数公式怎么推导",
+        "化学反应放热如何判断",
+        "合同法里的违约责任怎么算",
+        "光合作用的过程是怎样的",
+        "水墨画的皴法有哪些讲究",
+        "电影分级制度是怎么规定的",
+        "大气污染治理有哪些手段",
+        "佛教禅宗的核心思想是什么",
+        "围棋的胜负怎么判定",
+        "糖尿病早期症状有哪些",
+        "汉字简化是什么时候开始的",
+        "地震预警系统是怎么工作的",
+        "交响乐团的编制是怎样的",
+        "考古地层学的基本原理",
+        "跨境电商的关税怎么计算",
+    ];
+
+    /// P7.4 A 臂（统计模式）实测的 16 个 MISS 查询（对齐 assoc_accuracy_results.json）
+    #[cfg(feature = "ml")]
+    const P82H_DOC_MISS: &[&str] = &[
+        "今晚吃什么好呢",
+        "晚饭怎么解决",
+        "肚子饿了晚上吃点啥",
+        "今晚的饭有谱了吗",
+        "晚饭后去哪吃比较好",
+        "周末爬山安排得怎么样了",
+        "这周六出去走走怎么计划",
+        "爬山那天都注意点啥",
+        "同事结婚我要准备些什么",
+        "婚礼那天流程是啥样的",
+        "猫咪不吃饭这事后来怎么样",
+        "猫生病家里还缺什么物资",
+        "年检前车辆还要弄哪些",
+        "验车那次有什么坑",
+        "考试那几天有什么要准备的",
+        "考前孩子状态不对怎么办",
+    ];
+
+    /// 全语料（6 链 × 16 + 10 干扰 = 106 条，对齐 _fair_corpus.py::all_memories）
+    #[cfg(feature = "ml")]
+    fn p82h_all_memories() -> Vec<(&'static str, u8, &'static str)> {
+        let mut out = Vec::new();
+        for (chain, items) in P82H_CHAINS {
+            for (hop, content) in items.iter() {
+                out.push((*chain, *hop, *content));
+            }
+        }
+        for (hop, content) in P82H_DISTRACTORS {
+            out.push(("none", *hop, *content));
+        }
+        out
+    }
+
+    /// 内容 → (链, hop)，逐字对齐 _assoc_accuracy_eval.py::classify
+    /// （完全相等或前 12 个字符前缀命中；未命中归入 "none"/9）
+    #[cfg(feature = "ml")]
+    fn p82h_classify(content: &str) -> (&'static str, u8) {
+        for (chain, items) in P82H_CHAINS {
+            for (hop, text) in items.iter() {
+                let prefix: String = text.chars().take(12).collect();
+                if content == *text || (!prefix.is_empty() && content.starts_with(&prefix)) {
+                    return (*chain, *hop);
+                }
+            }
+        }
+        ("none", 9)
+    }
+
+    /// 单臂评测记录
+    #[cfg(feature = "ml")]
+    struct P82hRecord {
+        query: &'static str,
+        root_chain: &'static str,
+        root_correct: bool,
+        weak_match: bool,
+        semantic_bypass: String,
+    }
+
+    /// 写入公平语料（对齐 _assoc_accuracy_eval.py::seed 的字段口径）
+    #[cfg(feature = "ml")]
+    fn p82h_seed(store: &mut MemoryStore<JsonPersistence>) {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        for &(chain, hop, content) in p82h_all_memories().iter() {
+            let memory = Memory::new(
+                content.to_string(),
+                MemoryType::Fact,
+                Some("p7-4-association-accuracy".to_string()),
+                vec![format!("chain:{chain}"), format!("hop:{hop}")],
+                Importance::new(if hop <= 2 { 7 } else { 5 }),
+                None,
+            );
+            store.remember(memory).expect("公平语料写入失败");
+        }
+    }
+
+    /// 单臂跑完全部 30 查询（depth=4 / width=3，对齐评测脚本常量）
+    #[cfg(feature = "ml")]
+    fn p82h_run_all(store: &mut MemoryStore<JsonPersistence>) -> Vec<P82hRecord> {
+        use std::sync::atomic::AtomicBool;
+        let mut records = Vec::new();
+        for &(gold, query) in P82H_QUERIES {
+            let cancel = AtomicBool::new(false);
+            let resp = run_association_explore(store, Some(query), None, 4, 3, &cancel, None);
+            let root_chain = resp
+                .nodes
+                .iter()
+                .find(|node| node.depth == 0)
+                .map(|node| p82h_classify(&node.content).0)
+                .unwrap_or("none");
+            records.push(P82hRecord {
+                query,
+                root_chain,
+                root_correct: root_chain == gold,
+                weak_match: resp.weak_match,
+                semantic_bypass: resp.semantic_bypass.clone(),
+            });
+        }
+        records
+    }
+
+    /// 无关联查询的诚实空态探测（返回 (查询, 是否诚实空态, 旁路状态, 被拉入的 root 内容)）
+    #[cfg(feature = "ml")]
+    fn p82h_probe_unrelated(
+        store: &mut MemoryStore<JsonPersistence>,
+    ) -> Vec<(&'static str, bool, String, String)> {
+        use std::sync::atomic::AtomicBool;
+        let mut out = Vec::new();
+        for query in P82H_UNRELATED {
+            let cancel = AtomicBool::new(false);
+            let resp = run_association_explore(store, Some(*query), None, 4, 3, &cancel, None);
+            // 误召回根因：旁路放行后 depth==0 的起点内容（诚实空态时应为空）
+            let root_content = resp
+                .nodes
+                .iter()
+                .find(|node| node.depth == 0)
+                .map(|node| node.content.clone())
+                .unwrap_or_default();
+            out.push((
+                *query,
+                resp.weak_match && resp.nodes.is_empty(),
+                resp.semantic_bypass.clone(),
+                root_content,
+            ));
+        }
+        out
+    }
+
+    /// P8.2h 根因探针：对给定查询，打印全库余弦 Top-3（判定 H2 FAIL 是
+    /// "阈值标定"还是"机制失效"——误召回余弦若仅略高于 0.55 属标定问题）。
+    #[cfg(feature = "ml")]
+    fn p82h_cosine_probe(store: &MemoryStore<JsonPersistence>, query: &str) -> Vec<(f32, String)> {
+        let filter = crate::memory_store::ListFilter {
+            limit: 1000,
+            ..Default::default()
+        };
+        let Ok((memories, _)) = store.list_memories(&filter) else {
+            return Vec::new();
+        };
+        let refs: Vec<&crate::memory_types::Memory> = memories.iter().collect();
+        let sims = store.semantic_similarities(query, &refs);
+        let mut scored: Vec<(f32, String)> = sims
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|v| (v, memories[i].content.clone())))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(3);
+        scored
+    }
+
+    /// P8.2j 探针：与 `p82h_cosine_probe` 同口径，但走**去中心化**余弦
+    /// （候选池均值双侧对称去中心化），用于对照观察 H2 FAIL 是否被修复。
+    #[cfg(feature = "ml")]
+    fn p82j_cosine_probe(store: &MemoryStore<JsonPersistence>, query: &str) -> Vec<(f32, String)> {
+        let filter = crate::memory_store::ListFilter {
+            limit: 1000,
+            ..Default::default()
+        };
+        let Ok((memories, _)) = store.list_memories(&filter) else {
+            return Vec::new();
+        };
+        let refs: Vec<&crate::memory_types::Memory> = memories.iter().collect();
+        let sims = store.semantic_similarities_debiased(query, &refs);
+        let mut scored: Vec<(f32, String)> = sims
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|v| (v, memories[i].content.clone())))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(3);
+        scored
+    }
+
+    /// P8.2h：离线 bge 批量编码验证 root 语义旁路救回率。
+    ///
+    /// 同进程内跑两臂（同一语料、同一代码路径）：
+    /// - A 臂：统计编码器（旁路必然 unavailable）→ 复现 P7.4 基线；
+    /// - B 臂：ML 编码器（bge 真实参与旁路）→ 实测救回率。
+    /// 判据计算逐条对齐 _assoc_accuracy_eval.py::evaluate_h（H1-H4）。
+    #[test]
+    #[cfg(feature = "ml")]
+    fn test_assoc_p82h_offline_bge_rescue_rates() {
+        use std::collections::{BTreeMap, HashMap, HashSet};
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        // P8.2j 复测口径标注：本用例复用 P8.2h 骨架，靠门控切换实现通路。
+        // 门控开启时输出 P8.2j 去中心化实测；关闭时即为 P8.2h 基线复现。
+        eprintln!(
+            "[P8.2j] 去中心化门控 LRC_ASSOC_DEBIAS={}（开启=候选池均值双侧对称去中心化）",
+            if assoc_debias_enabled() {
+                "ON"
+            } else {
+                "OFF（P8.2h 基线）"
+            }
+        );
+        // P8.2k 阈值重标定：去中心化门控开启时生效阈值为 0.18（去中心化空间
+        // 标定值），关闭时恒为 0.55（历史安全下限）——H3 判据据此修正为
+        // "阈值须与所用向量空间一致"，而非"阈值恒等于 0.55"。
+        eprintln!(
+            "[P8.2k] 旁路生效阈值 assoc_bypass_min_sim()={:.2}（去中心化重标定值 {:.2}；历史下限 {:.2}）",
+            assoc_bypass_min_sim(),
+            ASSOC_DEBIAS_MIN_SEMANTIC_SIM,
+            ASSOCIATION_ROOT_MIN_SEMANTIC_SIM
+        );
+
+        // ---------- A 臂：统计编码器（旁路缺席，复现 P7.4 基线）----------
+        let dir_a = std::env::temp_dir().join(format!("lrc_p82h_a_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir_a);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        let dir_a_str = dir_a.to_str().unwrap().to_string();
+        let mut store_a = new_statistical_store(&dir_a_str);
+        let t_seed_a = Instant::now();
+        p82h_seed(&mut store_a);
+        let t_a = Instant::now();
+        let arm_a = p82h_run_all(&mut store_a);
+        let a_elapsed = t_a.elapsed();
+        let unrelated_a = p82h_probe_unrelated(&mut store_a);
+        let a_correct = arm_a.iter().filter(|r| r.root_correct).count();
+        let a_miss: Vec<&str> = arm_a
+            .iter()
+            .filter(|r| !r.root_correct)
+            .map(|r| r.query)
+            .collect();
+        eprintln!(
+            "[P8.2h][A 臂·统计] 写入 {} 条（{:.1}s）→ 30 查询耗时 {:.1}s；root 正确 {}/30，MISS {}",
+            p82h_all_memories().len(),
+            t_seed_a.elapsed().as_secs_f32(),
+            a_elapsed.as_secs_f32(),
+            a_correct,
+            a_miss.len()
+        );
+        let set_a: HashSet<&str> = a_miss.iter().copied().collect();
+        let set_doc: HashSet<&str> = P82H_DOC_MISS.iter().copied().collect();
+        if set_a != set_doc {
+            let extra: Vec<&&str> = set_a.difference(&set_doc).collect();
+            let missing: Vec<&&str> = set_doc.difference(&set_a).collect();
+            eprintln!(
+                "[P8.2h][A 臂·统计] ⚠ MISS 集合与 P7.4 文档不一致：多出 {extra:?}，缺失 {missing:?}"
+            );
+        }
+
+        // ---------- B 臂：ML 编码器（bge 真实参与语义旁路）----------
+        let dir_b = std::env::temp_dir().join(format!("lrc_p82h_b_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir_b);
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let dir_b_str = dir_b.to_str().unwrap().to_string();
+        let Some(mut store_b) = new_ml_capable_store(&dir_b_str) else {
+            eprintln!(
+                "[P8.2h] ML 编码器不可用（bge 权重缺失或环境未设 LRC_LUOSHU_MODEL_ID）\
+                 ——本用例仅在 ml 环境执行；请设置 LRC_LUOSHU_MODEL_ID=BAAI/bge-base-zh"
+            );
+            return;
+        };
+        let t_seed_b = Instant::now();
+        p82h_seed(&mut store_b);
+        let t_b = Instant::now();
+        let arm_b = p82h_run_all(&mut store_b);
+        let b_elapsed = t_b.elapsed();
+        let unrelated_b = p82h_probe_unrelated(&mut store_b);
+        let b_correct = arm_b.iter().filter(|r| r.root_correct).count();
+        // 根因探针：无关联查询的全库余弦 Top-3（判定 H2 FAIL 属"阈值标定"还是"机制失效"）
+        // P8.2j：同时打印去中心化余弦，形成同库同查询的原始/去中心化对照。
+        for query in P82H_UNRELATED {
+            let top = p82h_cosine_probe(&store_b, query);
+            eprintln!("[P8.2h][B 臂·余弦] 「{query}」全库 Top-3：");
+            for (sim, content) in &top {
+                eprintln!("  · 余弦={sim:.4} 内容={content}");
+            }
+            let top_j = p82j_cosine_probe(&store_b, query);
+            eprintln!("[P8.2j][B 臂·去中心化余弦] 「{query}」全库 Top-3：");
+            for (sim, content) in &top_j {
+                eprintln!("  · 余弦={sim:.4} 内容={content}");
+            }
+        }
+        eprintln!(
+            "[P8.2h][B 臂·ml ] 写入 {} 条（{:.1}s）→ 30 查询耗时 {:.1}s；root 正确 {}/30",
+            p82h_all_memories().len(),
+            t_seed_b.elapsed().as_secs_f32(),
+            b_elapsed.as_secs_f32(),
+            b_correct
+        );
+
+        // ---------- 判据计算（对齐 evaluate_h：H1-H4）----------
+        let b_by_query: HashMap<&str, &P82hRecord> = arm_b.iter().map(|r| (r.query, r)).collect();
+
+        // H1：P7.4 文档 16 个 MISS 查询中，B 臂救回（root 正确）且旁路真实 applied 的数量
+        let mut miss_bypass: BTreeMap<String, usize> = BTreeMap::new();
+        let mut saved: Vec<&str> = Vec::new();
+        let mut saved_applied: Vec<&str> = Vec::new();
+        eprintln!("[P8.2h] 16 个 MISS 查询在 B 臂的逐条结果：");
+        for &query in P82H_DOC_MISS {
+            let Some(record) = b_by_query.get(query) else {
+                continue;
+            };
+            *miss_bypass
+                .entry(record.semantic_bypass.clone())
+                .or_insert(0) += 1;
+            if record.root_correct {
+                saved.push(query);
+                if record.semantic_bypass == "applied" {
+                    saved_applied.push(query);
+                }
+            }
+            eprintln!(
+                "  · {query:<16} root_chain={:<8} correct={:<5} weak={:<5} bypass={}",
+                record.root_chain, record.root_correct, record.weak_match, record.semantic_bypass
+            );
+        }
+        let h1 = saved_applied.len() >= 10;
+        eprintln!(
+            "[P8.2h] H1 救回率：{} / 16（其中旁路 applied {} / 16，阈值 ≥10）→ {}；\
+             MISS 旁路分布 {miss_bypass:?}",
+            saved.len(),
+            saved_applied.len(),
+            if h1 { "PASS" } else { "FAIL" }
+        );
+
+        // H2：A 臂 root 正确的查询在 B 臂不得退化；无关联查询两臂均须诚实空态
+        let regressed: Vec<&str> = arm_a
+            .iter()
+            .filter(|r| r.root_correct && !b_by_query[r.query].root_correct)
+            .map(|r| r.query)
+            .collect();
+        let b_unrelated_ok = unrelated_b.iter().all(|(_, honest, _, _)| *honest);
+        let a_unrelated_ok = unrelated_a.iter().all(|(_, honest, _, _)| *honest);
+        let h2 = regressed.is_empty() && b_unrelated_ok;
+        eprintln!(
+            "[P8.2h] H2 无新增噪声：退化查询 {regressed:?}；无关联空态 A 臂={a_unrelated_ok} \
+             B 臂={b_unrelated_ok}（条目 {unrelated_b:?}）→ {}",
+            if h2 { "PASS" } else { "FAIL" }
+        );
+
+        // H3（P8.2k 修正）：判据由"余弦阈值维持 0.55"改为
+        // **"生效阈值须与所用向量空间一致"**——修正理由见文档 §10.4'（P8.2j 已识别
+        // 的结构性冲突：去中心化改变余弦量纲，若仍锁死 0.55 则机制有效也永远不通过）。
+        // 双条件：①历史安全下限常量必须恒为 0.55（不得因追求召回而下调）；
+        //         ②门控开启时生效阈值 = 去中心化空间标定值 0.18；关闭时 = 0.55。
+        let base_ok = (ASSOCIATION_ROOT_MIN_SEMANTIC_SIM - 0.55).abs() < 1e-6;
+        let effective_ok = if assoc_debias_enabled() {
+            (assoc_bypass_min_sim() - ASSOC_DEBIAS_MIN_SEMANTIC_SIM).abs() < 1e-6
+        } else {
+            (assoc_bypass_min_sim() - ASSOCIATION_ROOT_MIN_SEMANTIC_SIM).abs() < 1e-6
+        };
+        let h3 = base_ok && effective_ok;
+        eprintln!(
+            "[P8.2h] H3 门槛一致（P8.2k 修正）：历史下限 ASSOCIATION_ROOT_MIN_SEMANTIC_SIM \
+             = {}（应 0.55，未下调={base_ok}）；生效阈值 = {}（去中心化={}，应 {}）→ {}",
+            ASSOCIATION_ROOT_MIN_SEMANTIC_SIM,
+            assoc_bypass_min_sim(),
+            assoc_debias_enabled(),
+            if assoc_debias_enabled() {
+                ASSOC_DEBIAS_MIN_SEMANTIC_SIM
+            } else {
+                ASSOCIATION_ROOT_MIN_SEMANTIC_SIM
+            },
+            if h3 { "PASS" } else { "FAIL" }
+        );
+
+        let h4 = h1 && h2 && h3;
+        eprintln!(
+            "[P8.2h] H4 判定：H1={h1} H2={h2} H3={h3} → {}",
+            if h4 {
+                "PASS（旁路救回达标，可进入默认开启评审）"
+            } else {
+                "FAIL（如实记录救回率不足，维持诚实空态）"
+            }
+        );
+
+        // ---------- 不变量断言（保留已打印的实测数据前提下，锁死可确证契约）----------
+        assert_eq!(
+            a_correct, 14,
+            "A 臂（统计模式）应复现 P7.4 基线的 14 条 root 正确；实测 {a_correct}"
+        );
+        assert!(
+            miss_bypass.contains_key("applied"),
+            "B 臂（ml）在弱匹配查询上旁路必须 applied（bge 真实产出向量），实测分布 {miss_bypass:?}"
+        );
+    }
+
+    /// P8.2k 分位数（最近秩法：升序第 ceil(q×n) 个，取 1-based 秩）
+    #[cfg(feature = "ml")]
+    fn p82k_percentile(samples: &mut [f64], q: f64) -> f64 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = samples.len();
+        let rank = ((q * n as f64).ceil() as usize).clamp(1, n);
+        samples[rank - 1]
+    }
+
+    /// /associations/explore 不触碰代码库，此桩仅满足 build_v1_router 的构造签名
+    /// （刻意不 panic：HTTP 抽样链路里任何代码库调用都属意外，应显式暴露为 0 结果）。
+    #[cfg(feature = "ml")]
+    struct IdleCodebase;
+
+    #[cfg(feature = "ml")]
+    impl IndexedCodebase for IdleCodebase {
+        fn search(&self, query: &str, _top_k: usize) -> crate::RetrievalResult {
+            crate::RetrievalResult {
+                query: query.to_string(),
+                returned: 0,
+                total_indexed: 0,
+                results: Vec::new(),
+            }
+        }
+
+        fn multi_keyword_search(
+            &self,
+            _keywords: &[String],
+            _top_k: usize,
+        ) -> crate::RetrievalResult {
+            crate::RetrievalResult {
+                query: String::new(),
+                returned: 0,
+                total_indexed: 0,
+                results: Vec::new(),
+            }
+        }
+
+        fn get_stats(&self) -> crate::ChunkStats {
+            crate::ChunkStats {
+                file_count: 0,
+                total_chunks: 0,
+                type_counts: std::collections::HashMap::new(),
+                language_counts: std::collections::HashMap::new(),
+                avg_lines: 0.0,
+            }
+        }
+
+        fn recent_chunks(&self, _top_k: usize) -> crate::RetrievalResult {
+            crate::RetrievalResult {
+                query: String::new(),
+                returned: 0,
+                total_indexed: 0,
+                results: Vec::new(),
+            }
+        }
+    }
+
+    /// P8.2k 在线链路时延实测（§10.13 锁定项 1）：把语义旁路放回完整 BFS 多跳
+    /// 路径，测端到端分位数（P50/P95/max）而非单点均值。
+    ///
+    /// 立项口径（用户确认）：30 查询 × 5 轮 = 150 次调用/臂；A/B 双臂同测——
+    /// - A 臂（统计编码器）：旁路必然 unavailable，即"词面通路"成本基线；
+    /// - B 臂（ML 编码器 bge）：旁路真实参与，即"旁路净增量"。
+    ///
+    /// 为什么必须分位数 + 双峰分解：旁路只在 root 起点门禁零命中时惰性触发一次
+    /// （BFS 扩散循环内不再触发），单查询时延因此呈双峰；把两峰混成一个均值会
+    /// 重演 P7.4 的误读教训。故按响应 `semantic_bypass` 归组统计，并单列
+    /// `unavailable` 计数以证明 A 臂旁路确实缺席（而非未触发）。
+    #[test]
+    #[cfg(feature = "ml")]
+    fn test_assoc_p82k_explore_latency_p95() {
+        use std::collections::BTreeMap;
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+        /// 采样轮数（立项口径 5 轮）
+        const ROUNDS: usize = 5;
+        /// 单次探索的总预算（对齐 run_association_explore 内 ASSOCIATION_EXPLORE_TIME_BUDGET）
+        const EXPLORE_BUDGET_SECS: f64 = 10.0;
+        /// 外层 HTTP 超时（对齐 explore handler 的 Duration::from_secs(15)）
+        const HTTP_TIMEOUT_SECS: f64 = 15.0;
+
+        /// 单臂采样结果
+        struct ArmSample {
+            name: &'static str,
+            /// 逐轮 P50（秒）——用于暴露首轮冷启动效应
+            per_round_p50: Vec<f64>,
+            /// 全部调用：(单次耗时秒, semantic_bypass)
+            all: Vec<(f64, String)>,
+        }
+
+        /// 跑完一条臂的 ROUNDS 轮 × 30 查询，逐次计时
+        fn sample_arm(
+            name: &'static str,
+            store: &mut MemoryStore<JsonPersistence>,
+            rounds: usize,
+        ) -> ArmSample {
+            use std::sync::atomic::AtomicBool;
+            let mut per_round_p50 = Vec::with_capacity(rounds);
+            let mut all: Vec<(f64, String)> = Vec::with_capacity(P82H_QUERIES.len() * rounds);
+            for _round in 0..rounds {
+                let mut round_lat: Vec<f64> = Vec::with_capacity(P82H_QUERIES.len());
+                for &(_gold, query) in P82H_QUERIES {
+                    let cancel = AtomicBool::new(false);
+                    let started = Instant::now();
+                    let resp =
+                        run_association_explore(store, Some(query), None, 4, 3, &cancel, None);
+                    let elapsed = started.elapsed().as_secs_f64();
+                    round_lat.push(elapsed);
+                    all.push((elapsed, resp.semantic_bypass.clone()));
+                }
+                per_round_p50.push(p82k_percentile(&mut round_lat, 0.50));
+            }
+            ArmSample {
+                name,
+                per_round_p50,
+                all,
+            }
+        }
+
+        /// 打印一条臂的分位数报告（整体 + 双峰分解）
+        fn report(arm: &ArmSample, budget: f64) {
+            let mut lat: Vec<f64> = arm.all.iter().map(|(secs, _)| *secs).collect();
+            let p50 = p82k_percentile(&mut lat, 0.50);
+            let p95 = p82k_percentile(&mut lat, 0.95);
+            let max = lat.last().copied().unwrap_or(0.0);
+            let mut dist: BTreeMap<String, usize> = BTreeMap::new();
+            for (_, bypass) in &arm.all {
+                *dist.entry(bypass.clone()).or_insert(0) += 1;
+            }
+            eprintln!(
+                "[P8.2k][时延·{}] n={} P50={:.3}s P95={:.3}s max={:.3}s（P95 占 {:.0}s 预算 {:.1}%）",
+                arm.name,
+                arm.all.len(),
+                p50,
+                p95,
+                max,
+                budget,
+                p95 / budget * 100.0
+            );
+            eprintln!(
+                "[P8.2k][时延·{}] 逐轮 P50（ms）：{:?}",
+                arm.name,
+                arm.per_round_p50
+                    .iter()
+                    .map(|secs| (secs * 1000.0).round() as u64)
+                    .collect::<Vec<u64>>()
+            );
+            eprintln!("[P8.2k][时延·{}] 旁路分布：{:?}", arm.name, dist);
+
+            let mut applied: Vec<f64> = arm
+                .all
+                .iter()
+                .filter(|(_, bypass)| bypass == "applied")
+                .map(|(secs, _)| *secs)
+                .collect();
+            let mut non_applied: Vec<f64> = arm
+                .all
+                .iter()
+                .filter(|(_, bypass)| bypass != "applied")
+                .map(|(secs, _)| *secs)
+                .collect();
+            if !applied.is_empty() {
+                let a50 = p82k_percentile(&mut applied, 0.50);
+                let a95 = p82k_percentile(&mut applied, 0.95);
+                eprintln!(
+                    "[P8.2k][时延·{}] applied 峰 n={} P50={:.3}s P95={:.3}s max={:.3}s",
+                    arm.name,
+                    applied.len(),
+                    a50,
+                    a95,
+                    applied.last().copied().unwrap_or(0.0)
+                );
+            }
+            if !non_applied.is_empty() {
+                let n50 = p82k_percentile(&mut non_applied, 0.50);
+                let n95 = p82k_percentile(&mut non_applied, 0.95);
+                eprintln!(
+                    "[P8.2k][时延·{}] 非 applied 峰 n={} P50={:.3}s P95={:.3}s max={:.3}s",
+                    arm.name,
+                    non_applied.len(),
+                    n50,
+                    n95,
+                    non_applied.last().copied().unwrap_or(0.0)
+                );
+            }
+        }
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        // ---------- A 臂：统计编码器（旁路缺席，代表词面通路基线）----------
+        let dir_a = std::env::temp_dir().join(format!("lrc_p82k_lat_a_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir_a);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        let dir_a_str = dir_a.to_str().unwrap().to_string();
+        let mut store_a = new_statistical_store(&dir_a_str);
+        p82h_seed(&mut store_a);
+        let arm_a = sample_arm("A·统计", &mut store_a, ROUNDS);
+
+        // ---------- B 臂：ML 编码器（bge 真实参与旁路）----------
+        let dir_b = std::env::temp_dir().join(format!("lrc_p82k_lat_b_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir_b);
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let dir_b_str = dir_b.to_str().unwrap().to_string();
+        let Some(mut store_b) = new_ml_capable_store(&dir_b_str) else {
+            eprintln!(
+                "[P8.2k][时延] ML 编码器不可用（bge 权重缺失或环境未设 LRC_LUOSHU_MODEL_ID）\
+                 ——本用例仅在 ml 环境执行；请设置 LRC_LUOSHU_MODEL_ID=BAAI/bge-base-zh"
+            );
+            return;
+        };
+        p82h_seed(&mut store_b);
+        let arm_b = sample_arm("B·ml  ", &mut store_b, ROUNDS);
+
+        // ---------- 分位数报告 ----------
+        report(&arm_a, EXPLORE_BUDGET_SECS);
+        report(&arm_b, EXPLORE_BUDGET_SECS);
+
+        // ---------- 旁路净增量：两臂"旁路触发峰"的 P50 之差 ----------
+        let mut a_trig: Vec<f64> = arm_a
+            .all
+            .iter()
+            .filter(|(_, bypass)| bypass != "unused")
+            .map(|(secs, _)| *secs)
+            .collect();
+        let mut b_trig: Vec<f64> = arm_b
+            .all
+            .iter()
+            .filter(|(_, bypass)| bypass != "unused")
+            .map(|(secs, _)| *secs)
+            .collect();
+        if !a_trig.is_empty() && !b_trig.is_empty() {
+            let a_p50 = p82k_percentile(&mut a_trig, 0.50);
+            let b_p50 = p82k_percentile(&mut b_trig, 0.50);
+            eprintln!(
+                "[P8.2k][净增量] 旁路触发峰 P50：A(统计·unavailable)={:.3}s（n={}）→ B(ml·applied)={:.3}s（n={}）；\
+                 单查询净增量 {:.3}s",
+                a_p50,
+                a_trig.len(),
+                b_p50,
+                b_trig.len(),
+                b_p50 - a_p50
+            );
+        }
+
+        // ---------- 不变量断言（与机器绝对性能无关的可确证契约）----------
+        assert_eq!(
+            arm_a.all.len(),
+            P82H_QUERIES.len() * ROUNDS,
+            "A 臂采样数应为 30×5"
+        );
+        assert_eq!(
+            arm_b.all.len(),
+            P82H_QUERIES.len() * ROUNDS,
+            "B 臂采样数应为 30×5"
+        );
+        let stat_applied = arm_a
+            .all
+            .iter()
+            .filter(|(_, bypass)| bypass == "applied")
+            .count();
+        let stat_unavailable = arm_a
+            .all
+            .iter()
+            .filter(|(_, bypass)| bypass == "unavailable")
+            .count();
+        assert_eq!(
+            stat_applied, 0,
+            "A 臂为统计编码器，语义旁路不可能 applied（实测 {stat_applied}）"
+        );
+        assert!(
+            stat_unavailable > 0,
+            "A 臂应出现 unavailable——证明旁路被触发但编码器缺席（≠未触发）；实测 {stat_unavailable}"
+        );
+        let ml_applied = arm_b
+            .all
+            .iter()
+            .filter(|(_, bypass)| bypass == "applied")
+            .count();
+        assert!(
+            ml_applied > 0,
+            "B 臂 ml 编码器必须在弱匹配查询上真实参与旁路（applied）；实测 {ml_applied}"
+        );
+        // 在线链路可用性底线：任何单次探索都必须在外层 HTTP 15s 超时内返回
+        let max_a = arm_a
+            .all
+            .iter()
+            .map(|(secs, _)| *secs)
+            .fold(0.0f64, f64::max);
+        let max_b = arm_b
+            .all
+            .iter()
+            .map(|(secs, _)| *secs)
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_a < HTTP_TIMEOUT_SECS && max_b < HTTP_TIMEOUT_SECS,
+            "单次探索必须在外层 {HTTP_TIMEOUT_SECS}s HTTP 超时内返回：A max={max_a:.3}s B max={max_b:.3}s"
+        );
+    }
+
+    /// P8.2k HTTP 层端到端抽样对照（§10.13 锁定项 1 的 B 抽样）：同一 ML 记忆库、
+    /// 同一批查询，比较「函数直接调用」与「经 build_v1_router 的完整 HTTP 链路
+    /// （axum 路由 + spawn_blocking + JSON 编解码）」的 P50，量化框架开销占比。
+    ///
+    /// 抽样量刻意远小于函数层（5 查询 × 2 轮 = 10 次/层）：HTTP 层只为给函数层
+    /// 主力数据做"框架开销上限"的旁证，不重复 BFS 全量成本。
+    #[tokio::test]
+    #[cfg(feature = "ml")]
+    async fn test_assoc_p82k_http_latency_overhead() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool as StdAtomicBool;
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        /// 抽样查询数（取 P82H_QUERIES 前 N 条）
+        const SAMPLE_QUERIES: usize = 5;
+        /// 抽样轮数
+        const SAMPLE_ROUNDS: usize = 2;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_p82k_http_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let mut store = match new_ml_capable_store(&dir_str) {
+            Some(store) => store,
+            None => {
+                eprintln!(
+                    "[P8.2k][HTTP] ML 编码器不可用（bge 权重缺失或环境未设 LRC_LUOSHU_MODEL_ID）\
+                     ——本用例仅在 ml 环境执行；请设置 LRC_LUOSHU_MODEL_ID=BAAI/bge-base-zh"
+                );
+                return;
+            }
+        };
+        p82h_seed(&mut store);
+
+        let queries: Vec<&'static str> = P82H_QUERIES
+            .iter()
+            .take(SAMPLE_QUERIES)
+            .map(|(_gold, query)| *query)
+            .collect();
+
+        // ---------- 函数层基准 ----------
+        let mut fn_lat: Vec<f64> = Vec::with_capacity(SAMPLE_QUERIES * SAMPLE_ROUNDS);
+        let mut fn_root: Vec<String> = Vec::with_capacity(SAMPLE_QUERIES * SAMPLE_ROUNDS);
+        for _round in 0..SAMPLE_ROUNDS {
+            for &query in &queries {
+                let cancel = StdAtomicBool::new(false);
+                let started = Instant::now();
+                let resp =
+                    run_association_explore(&mut store, Some(query), None, 4, 3, &cancel, None);
+                fn_lat.push(started.elapsed().as_secs_f64());
+                fn_root.push(resp.root.unwrap_or_default());
+            }
+        }
+
+        // ---------- HTTP 层：与生产链路同构（build_v1_router → Service → oneshot）----------
+        let shared = Arc::new(Mutex::new(store));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(IdleCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        // 路由内注册路径为 /associations/explore（/v1 前缀由生产侧 nest_service 追加）
+        let app = build_v1_router(shared, manager, llm_api, llm_ready, false);
+
+        let mut http_lat: Vec<f64> = Vec::with_capacity(SAMPLE_QUERIES * SAMPLE_ROUNDS);
+        let mut http_root: Vec<String> = Vec::with_capacity(SAMPLE_QUERIES * SAMPLE_ROUNDS);
+        for _round in 0..SAMPLE_ROUNDS {
+            for &query in &queries {
+                let payload = serde_json::json!({
+                    "query": query,
+                    "depth": 4,
+                    "width": 3,
+                })
+                .to_string();
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/associations/explore")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload))
+                    .unwrap();
+                let started = Instant::now();
+                let response = app
+                    .clone()
+                    .into_service()
+                    .oneshot(request)
+                    .await
+                    .expect("HTTP 层调用失败");
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("读取响应体失败");
+                http_lat.push(started.elapsed().as_secs_f64());
+                assert_eq!(status, StatusCode::OK, "HTTP 层应返回 200，实测 {status}");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("响应体应为合法 JSON");
+                assert!(
+                    body.get("semantic_bypass").is_some(),
+                    "响应必须携带 semantic_bypass 活性字段"
+                );
+                http_root.push(
+                    body.get("root")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+
+        // ---------- 对照报告 ----------
+        let mut fn_sorted = fn_lat.clone();
+        let mut http_sorted = http_lat.clone();
+        let fn_p50 = p82k_percentile(&mut fn_sorted, 0.50);
+        let http_p50 = p82k_percentile(&mut http_sorted, 0.50);
+        let overhead_percent = if fn_p50 > 0.0 {
+            (http_p50 / fn_p50 - 1.0) * 100.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[P8.2k][HTTP] 函数层 n={} P50={:.3}s max={:.3}s；HTTP 层 n={} P50={:.3}s max={:.3}s；\
+             框架开销 {:.1}%（绝对值 {:.3}s）",
+            fn_lat.len(),
+            fn_p50,
+            fn_sorted.last().copied().unwrap_or(0.0),
+            http_lat.len(),
+            http_p50,
+            http_sorted.last().copied().unwrap_or(0.0),
+            overhead_percent,
+            http_p50 - fn_p50
+        );
+
+        // ---------- 不变量断言 ----------
+        assert_eq!(
+            fn_lat.len(),
+            SAMPLE_QUERIES * SAMPLE_ROUNDS,
+            "函数层抽样数应为 5×2"
+        );
+        assert_eq!(
+            http_lat.len(),
+            SAMPLE_QUERIES * SAMPLE_ROUNDS,
+            "HTTP 层抽样数应为 5×2"
+        );
+        for (index, (fn_value, http_value)) in fn_root.iter().zip(http_root.iter()).enumerate() {
+            assert_eq!(
+                fn_value, http_value,
+                "第 {index} 次抽样：HTTP 层与函数层 root 起点必须一致（{fn_value} vs {http_value}）"
+            );
+        }
     }
 
     /// P7.2：联想边反馈闭环——用户确认 (root→child_b) 边后，门控开启时
