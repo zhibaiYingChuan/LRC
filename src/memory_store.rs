@@ -1111,6 +1111,40 @@ impl<P: Persistence> MemoryStore<P> {
     /// 仅在词面门禁无人通过时调用，避免给常规检索热路径增加 ML 开销。
     #[cfg(feature = "ml")]
     pub fn semantic_similarities(&self, query: &str, memories: &[&Memory]) -> Vec<Option<f32>> {
+        self.semantic_similarities_impl(query, memories, false)
+    }
+
+    /// v0.9.7 联想探索·去中心化语义相似度（P8.2j 实验通路，默认关）。
+    ///
+    /// 与 [`Self::semantic_similarities`] 的唯一差别：算余弦前，以**候选池自身的
+    /// 均值向量**估计句向量的公共分量，并从查询/文档两侧同时减去（mean-centering）。
+    /// 动机：bge-zh 句向量各向异性严重——全库向量挤在一个公共方向附近，使无关内容
+    /// 的绝对余弦也被抬到 0.6+，任何绝对/相对标量阈值都难分离（P8.2h/P8.2i 已实测）。
+    ///
+    /// 用候选池均值而非全库均值，是因为全库均值需常驻全库向量（P8.2j 行动前侦查已证
+    /// 仓库既有缓存为 2026-06-03 旧语料 208 维、不可复用，全库重编码叠加 10.8 的编码
+    /// 吞吐风险）；而候选池向量本就要编码，属**零额外编码开销**，可满足旁路 6s 硬时限。
+    ///
+    /// 本方法仅在门控 `LRC_ASSOC_DEBIAS` 开启时被调用；关闭时生产路径仍走
+    /// [`Self::semantic_similarities`]，与 P8.2h 逐字节一致（零影响承诺）。
+    #[cfg(feature = "ml")]
+    pub fn semantic_similarities_debiased(
+        &self,
+        query: &str,
+        memories: &[&Memory],
+    ) -> Vec<Option<f32>> {
+        self.semantic_similarities_impl(query, memories, true)
+    }
+
+    /// 语义相似度公共实现。`decenter=false` 时与历史实现逐字节一致；
+    /// `decenter=true` 时追加"候选池均值去中心化"步骤（P8.2j）。
+    #[cfg(feature = "ml")]
+    fn semantic_similarities_impl(
+        &self,
+        query: &str,
+        memories: &[&Memory],
+        decenter: bool,
+    ) -> Vec<Option<f32>> {
         fn l2_norm(v: &[f32]) -> f32 {
             v.iter().map(|x| x * x).sum::<f32>().sqrt()
         }
@@ -1124,8 +1158,9 @@ impl<P: Persistence> MemoryStore<P> {
         let Some(q) = self.luoshu_encoder.encode_embedding(&instructed_query) else {
             return vec![None; memories.len()];
         };
-        let q_norm = l2_norm(&q);
-        if !q_norm.is_finite() || q_norm <= 0.0 {
+        let mut q = q;
+        let q_norm_pre = l2_norm(&q);
+        if !q_norm_pre.is_finite() || q_norm_pre <= 0.0 {
             return vec![None; memories.len()];
         }
         // v0.9.7 性能修复：候选并行编码。语义旁路只在词面零命中时触发，
@@ -1148,16 +1183,63 @@ impl<P: Persistence> MemoryStore<P> {
                 .map(|h| h.join().unwrap_or(None))
                 .collect()
         });
+        if !decenter {
+            // 历史路径（逐字节保留）：直接以原始句向量算余弦。
+            return memories
+                .iter()
+                .zip(vectors)
+                .map(|(_, v)| {
+                    let v = v?;
+                    let n = l2_norm(&v);
+                    if !n.is_finite() || n <= 0.0 || v.len() != q.len() {
+                        return None;
+                    }
+                    Some((dot(&q, &v) / (q_norm_pre * n)).clamp(0.0, 1.0))
+                })
+                .collect();
+        }
+        // P8.2j 去中心化：以候选池内"维度合法"的向量估计公共分量（均值向量），
+        // 查询与文档两侧同时减去后再算余弦。池内向量本就要编码，零额外编码开销。
+        let mut mean = vec![0.0f32; q.len()];
+        let mut counted = 0usize;
+        for v in vectors.iter().flatten() {
+            if v.len() != q.len() {
+                continue;
+            }
+            for (acc, x) in mean.iter_mut().zip(v.iter()) {
+                *acc += *x;
+            }
+            counted += 1;
+        }
+        if counted == 0 {
+            return vec![None; memories.len()];
+        }
+        let inv = 1.0f32 / counted as f32;
+        for acc in mean.iter_mut() {
+            *acc *= inv;
+        }
+        // 公共分量同时从查询侧与文档侧减去（对称去中心化），保持余弦可比性。
+        for (x, m) in q.iter_mut().zip(mean.iter()) {
+            *x -= *m;
+        }
+        let q_norm = l2_norm(&q);
+        if !q_norm.is_finite() || q_norm <= 0.0 {
+            return vec![None; memories.len()];
+        }
         memories
             .iter()
             .zip(vectors)
             .map(|(_, v)| {
                 let v = v?;
-                let n = l2_norm(&v);
-                if !n.is_finite() || n <= 0.0 || v.len() != q.len() {
+                if v.len() != q.len() {
                     return None;
                 }
-                Some((dot(&q, &v) / (q_norm * n)).clamp(0.0, 1.0))
+                let centered: Vec<f32> = v.iter().zip(mean.iter()).map(|(x, m)| *x - *m).collect();
+                let n = l2_norm(&centered);
+                if !n.is_finite() || n <= 0.0 {
+                    return None;
+                }
+                Some((dot(&q, &centered) / (q_norm * n)).clamp(0.0, 1.0))
             })
             .collect()
     }
@@ -1165,6 +1247,16 @@ impl<P: Persistence> MemoryStore<P> {
     /// 非 ml 构建：语义相似度恒不可用（返回全 None），词面通路独自生效。
     #[cfg(not(feature = "ml"))]
     pub fn semantic_similarities(&self, _query: &str, memories: &[&Memory]) -> Vec<Option<f32>> {
+        vec![None; memories.len()]
+    }
+
+    /// 非 ml 构建：去中心化语义相似度同样恒不可用（门控开启也不改变行为）。
+    #[cfg(not(feature = "ml"))]
+    pub fn semantic_similarities_debiased(
+        &self,
+        _query: &str,
+        memories: &[&Memory],
+    ) -> Vec<Option<f32>> {
         vec![None; memories.len()]
     }
 
