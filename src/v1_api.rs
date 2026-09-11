@@ -7202,6 +7202,285 @@ mod api_contracts_tests {
         );
     }
 
+    /// P8.2o 状态化压制方案可行性评估探针（承接文档 §10.17.9 锁定项 2，纯观测零回归）。
+    ///
+    /// **问题**：§10.17 已否证三种"无状态代理"（去中心化空间 κ、原始空间 τ、模长 L2）；
+    /// §10.18 进一步证明绝对阈值族无空间（极值交叉）。路线仅剩"状态化方案"——
+    /// 即为 `Memory` 增加**跨查询命中/访问统计**字段（真实跨会话频次），用频次折扣
+    /// 压制"语义吸铁石"。本探针在**不改动任何数据结构**的前提下，以进程内 `BTreeMap`
+    /// 等价模拟该持久化字段，先回答**算法价值问题**：频次信息能否同时改善 H1 与 H2？
+    /// （工程代价评估为文档 §10.19 的静态部分，不含在代码内）
+    ///
+    /// **口径设计（避免循环论证）**：真实系统的压制只能用**历史**频次。故探针采用
+    /// **留一法（leave-one-out）**：压制查询 q 时，频次取"其余 n−1 个查询"的累计
+    /// 命中次数，排除 q 自身贡献。否则用全量频次会把当前查询的 Top-1 直接压掉，
+    /// H2 改善沦为自证。
+    ///
+    /// **命中频次定义**：某条目在其余查询的**候选池内出现的次数**（跨查询文档频率 df），
+    /// 与锁定项 2 措辞"跨查询命中统计"精确对应，且无需定义并列规则。折扣形式
+    /// `s' = s − λ·留一命中率`（命中率量纲 0-1，与去中心化余弦同尺度；不额外 clamp，
+    /// 以免截断行为对 H2 产生人为偏利）。
+    ///
+    /// **核心风险假设**：霸榜者（如「孩子下周三期末考…」）本身是某些查询的 gold
+    /// （exam 链），压制它必然连带压制那些查询的 gold ⇒ H1 恶化。探针以 λ 扫描给出
+    /// (H1, H2) 联合曲线，并附**频次判别力 AUC**（无关 Top-1 的留一频次 vs
+    /// MISS gold 的留一频次，期望前者高、后者低）——AUC≈0.5 即频次无判别力。
+    #[test]
+    #[cfg(feature = "ml")]
+    fn test_assoc_p82o_frequency_suppress_probe() {
+        use std::collections::BTreeMap;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_p82o_freq_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(mut store) = new_ml_capable_store(dir.to_str().unwrap()) else {
+            eprintln!(
+                "[P8.2o][频次压制] ML 编码器不可用（bge 权重缺失或未设 LRC_LUOSHU_MODEL_ID），跳过状态化可行性探针"
+            );
+            return;
+        };
+        p82h_seed(&mut store);
+
+        /// 单查询池内缓存（第一遍采集；λ 扫描阶段纯数值重算，免重复编码）
+        struct P82oQueryCache {
+            is_related: bool,
+            is_miss: bool,
+            /// (候选内容, 去中心化余弦, 是否属查询 gold 链)
+            hits: Vec<(String, f32, bool)>,
+        }
+
+        /// 池内 argmax（可选仅看 gold 候选）
+        fn p82o_argmax(c: &P82oQueryCache, only_gold: bool) -> Option<&(String, f32, bool)> {
+            c.hits
+                .iter()
+                .filter(|(_, _, g)| !only_gold || *g)
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+        }
+
+        let miss_set: std::collections::HashSet<&str> = P82H_DOC_MISS.iter().copied().collect();
+        let mut caches: Vec<P82oQueryCache> = Vec::new();
+
+        // ---------- 第一遍：逐查询采集池内 (内容, 去中心化余弦, 是否 gold) ----------
+        // 口径与 §10.18 探针逐字一致（p82m_root_pool + 去中心化余弦），保证 λ=0 行
+        // 可直接与 §10.18 的基线数值对照。压制阶段纯数值重算，不重复编码。
+        for &(gold, query) in P82H_QUERIES {
+            let pool = p82m_root_pool(&mut store, query);
+            if pool.is_empty() {
+                continue;
+            }
+            let refs: Vec<&crate::memory_types::Memory> = pool.iter().collect();
+            let dec = store.semantic_similarities_debiased(query, &refs, assoc_suppress_lambda());
+            let mut hits: Vec<(String, f32, bool)> = Vec::new();
+            for (i, memory) in pool.iter().enumerate() {
+                if let Some(s) = dec[i] {
+                    let is_gold = p82h_classify(&memory.content).0 == gold;
+                    hits.push((memory.content.clone(), s, is_gold));
+                }
+            }
+            caches.push(P82oQueryCache {
+                is_related: true,
+                is_miss: miss_set.contains(query),
+                hits,
+            });
+        }
+        for &query in P82H_UNRELATED {
+            let pool = p82m_root_pool(&mut store, query);
+            if pool.is_empty() {
+                continue;
+            }
+            let refs: Vec<&crate::memory_types::Memory> = pool.iter().collect();
+            let dec = store.semantic_similarities_debiased(query, &refs, assoc_suppress_lambda());
+            let mut hits: Vec<(String, f32, bool)> = Vec::new();
+            for (i, memory) in pool.iter().enumerate() {
+                if let Some(s) = dec[i] {
+                    // 无关查询无 gold 链（H2 只看"是否有候选越过阈值"），故一律标 false
+                    hits.push((memory.content.clone(), s, false));
+                }
+            }
+            caches.push(P82oQueryCache {
+                is_related: false,
+                is_miss: false,
+                hits,
+            });
+        }
+
+        // ---------- 跨查询文档频率 df（按"出现的查询数"计数，池内不重复） ----------
+        let mut df: BTreeMap<String, usize> = BTreeMap::new();
+        for c in caches.iter() {
+            for (content, _, _) in c.hits.iter() {
+                *df.entry(content.clone()).or_insert(0) += 1;
+            }
+        }
+        let n_queries = caches.len();
+        let n_miss = caches.iter().filter(|c| c.is_miss).count();
+        let n_unrel = caches.iter().filter(|c| !c.is_related).count();
+
+        // 留一命中率：rate(c|q) = (df(c) − 1_{c ∈ q 池}) / (n_queries − 1)
+        // 分母取全体查询数 −1，使"跨查询"语义完整（含无关查询的池），且排除 q 自身贡献。
+        let others = n_queries.saturating_sub(1).max(1);
+        let l1_rate = |q: &P82oQueryCache, content: &str| -> f32 {
+            let total = *df.get(content).unwrap_or(&0);
+            let self_hit = usize::from(q.hits.iter().any(|(c, _, _)| c == content));
+            total.saturating_sub(self_hit) as f32 / others as f32
+        };
+
+        // 集中度诊断：df 最高的条目即"跨查询语义吸铁石"候选
+        let mut df_sorted: Vec<(String, usize)> = df.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        df_sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let df_max = df_sorted.first().map(|(_, v)| *v).unwrap_or(0);
+        let df_ge_mean: f32 = if df.is_empty() {
+            0.0
+        } else {
+            df.values().sum::<usize>() as f32 / df.len() as f32
+        };
+        eprintln!(
+            "[P8.2o][频次] 池内候选去重后 {} 条，覆盖查询 {}（关联 {} / 无关 {}，其中 MISS {}）；\
+             池内 df 均值={df_ge_mean:.2} 最大={df_max}",
+            df.len(),
+            n_queries,
+            n_queries - n_unrel,
+            n_unrel,
+            n_miss
+        );
+        eprintln!("[P8.2o][频次][吸铁石候选] 池内 df Top-5（跨查询出现次数）：");
+        for (content, freq) in df_sorted.iter().take(5) {
+            eprintln!("  · df={freq}/{n_queries}  {content}");
+        }
+
+        // ---------- 频次判别力 AUC（无状态代理 τ 的对照项） ----------
+        // 正类 = 无关查询池内 Top-1 的留一命中率（期望高：吸铁石）；
+        // 负类 = MISS 查询池内 gold 最高分条目的留一命中率（期望低：真 gold 应专指）。
+        // AUC 由 p82n_auc 的 Mann-Whitney 口径给出；≈0.5 即频次不携带类别信息。
+        let mut pos_freq: Vec<f32> = Vec::new();
+        let mut neg_freq: Vec<f32> = Vec::new();
+        for c in caches.iter() {
+            if c.is_related {
+                if !c.is_miss {
+                    continue;
+                }
+                if let Some((content, _, _)) = p82o_argmax(c, true) {
+                    neg_freq.push(l1_rate(c, content));
+                }
+            } else if let Some((content, _, _)) = p82o_argmax(c, false) {
+                pos_freq.push(l1_rate(c, content));
+            }
+        }
+        let mut freq_samples: Vec<(f32, bool)> = Vec::new();
+        freq_samples.extend(pos_freq.iter().map(|v| (*v, true)));
+        freq_samples.extend(neg_freq.iter().map(|v| (*v, false)));
+        let freq_auc = p82n_auc(&freq_samples);
+        let freq_ovl = p82n_ovl(&pos_freq, &neg_freq, 10);
+        eprintln!(
+            "[P8.2o][频次][判别力] 留一命中率：无关 Top-1 均值={:.4}（n={}） vs MISS gold 均值={:.4}（n={}）；\
+             OVL(10箱)={freq_ovl:.3}",
+            {
+                let s: f32 = pos_freq.iter().sum();
+                if pos_freq.is_empty() { 0.0 } else { s / pos_freq.len() as f32 }
+            },
+            pos_freq.len(),
+            {
+                let s: f32 = neg_freq.iter().sum();
+                if neg_freq.is_empty() { 0.0 } else { s / neg_freq.len() as f32 }
+            },
+            neg_freq.len()
+        );
+        if let Some((auc, np, nn)) = freq_auc {
+            eprintln!(
+                "[P8.2o][频次][判别力] AUC(无关Top-1 高频 vs MISS-gold 低频)={auc:.3}（正 {np} / 负 {nn}；≈0.5 即无判别力）"
+            );
+        } else {
+            eprintln!("[P8.2o][频次][判别力] AUC 不可计算（某一侧样本为空）");
+        }
+
+        // ---------- λ 扫描：(H1 救回, H2 误放行) 联合曲线 ----------
+        // 阈值固定为去中心化空间标定值 0.18（§10.18/P8.2k 同源），避免"压制改变量纲后
+        // 再动阈值"引入额外自由度；λ=0 行即当前 P8.2m 基线。
+        const P82O_THRESHOLD: f32 = 0.18;
+        let lambdas: [f32; 6] = [0.0, 0.25, 0.5, 1.0, 2.0, 4.0];
+        let mut curve: Vec<(f32, usize, usize)> = Vec::new();
+        for &lam in lambdas.iter() {
+            let mut h1_saved = 0usize;
+            let mut h2_pass = 0usize;
+            for c in caches.iter() {
+                if c.is_related {
+                    if !c.is_miss {
+                        continue;
+                    }
+                    // H1 口径同 §10.18：MISS 关心 gold 候选本身能否越过阈值
+                    let best = c
+                        .hits
+                        .iter()
+                        .filter(|(_, _, g)| *g)
+                        .map(|(content, s, _)| *s - lam * l1_rate(c, content))
+                        .reduce(f32::max);
+                    if best.is_some_and(|v| v >= P82O_THRESHOLD) {
+                        h1_saved += 1;
+                    }
+                } else {
+                    let top1 = c
+                        .hits
+                        .iter()
+                        .map(|(content, s, _)| *s - lam * l1_rate(c, content))
+                        .reduce(f32::max);
+                    if top1.is_some_and(|v| v >= P82O_THRESHOLD) {
+                        h2_pass += 1;
+                    }
+                }
+            }
+            curve.push((lam, h1_saved, h2_pass));
+        }
+        eprintln!(
+            "[P8.2o][压制][λ扫描] 阈值 t={P82O_THRESHOLD}（去中心化空间）；λ=0 行应与 §10.18 基线一致："
+        );
+        for (lam, h1, h2) in curve.iter() {
+            eprintln!(
+                "  · λ={lam:<4} H1 救回 {h1}/{n_miss}（阈值 ≥10）  H2 无关放行 {h2}/{n_unrel}（阈值 =0）"
+            );
+        }
+
+        // ---------- 判读：算法价值是否存在 ----------
+        // 有价值 ⇔ 存在 λ 使 H2 放行 0 且 H1 ≥10（两者同时成立，即无需任何结构变更
+        // 也能扩大可行域）；若无 λ 能达到，则状态化路线在"算法层"即被否证。
+        let feasible = curve
+            .iter()
+            .filter(|(_, _, h2)| *h2 == 0)
+            .map(|(lam, h1, _)| (*lam, *h1))
+            .max_by(|a, b| a.1.cmp(&b.1));
+        let base_h1 = curve.first().map(|(_, h1, _)| *h1).unwrap_or(0);
+        let last_h1 = curve.last().map(|(_, h1, _)| *h1).unwrap_or(0);
+        let verdict = match feasible {
+            Some((lam, h1)) if h1 >= 10 => format!(
+                "λ={lam} 时 H2 放行 0 且 H1 救回 {h1}/{n_miss} ⇒ 频次压制可同时满足 H1/H2，\
+                 状态化方案具算法价值，建议进入工程代价评审"
+            ),
+            Some((lam, h1)) => format!(
+                "存在 λ={lam} 使 H2 放行 0，但 H1 仅 {h1}/{n_miss}（基线 {base_h1}）⇒ 频次压制\
+                 能改善 H2 却无法使 H1 达标，状态化方案算法价值不足"
+            ),
+            None if last_h1 >= base_h1 => format!(
+                "无任何 λ 能使无关侧零放行（H2 不可达）；但 H1 由 {base_h1} 增至 {last_h1} ⇒ \
+                 压制方向与 gold 一致，瓶颈在频次不可分而非压制形式"
+            ),
+            None => format!(
+                "无任何 λ 能使无关侧零放行（H2 不可达），且 H1 由 {base_h1} 恶化至 {last_h1} ⇒ \
+                 压制连带杀伤 gold，状态化方案在算法层被否证"
+            ),
+        };
+        let auc_txt = freq_auc
+            .map(|(a, _, _)| format!("{a:.3}"))
+            .unwrap_or_else(|| "N/A".to_string());
+        eprintln!(
+            "[P8.2o][压制][判读] 频次判别力 AUC={auc_txt}；H1 基线(λ=0)={base_h1}/{n_miss} → 最大 λ 时 {last_h1}/{n_miss}；结论：{verdict}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// P8.2k 分位数（最近秩法：升序第 ceil(q×n) 个，取 1-based 秩）
     #[cfg(feature = "ml")]
     fn p82k_percentile(samples: &mut [f64], q: f64) -> f64 {
