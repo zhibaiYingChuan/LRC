@@ -6042,27 +6042,216 @@ mod api_contracts_tests {
         scored
     }
 
-    /// P8.2j 探针：与 `p82h_cosine_probe` 同口径，但走**去中心化**余弦
-    /// （候选池均值双侧对称去中心化），用于对照观察 H2 FAIL 是否被修复。
+    /// P8.2m 单口径分布统计（去中心化余弦）：Top-3 + 均值 + 标准差 + 有效条数。
     #[cfg(feature = "ml")]
-    fn p82j_cosine_probe(store: &MemoryStore<JsonPersistence>, query: &str) -> Vec<(f32, String)> {
+    struct P82mDistribution {
+        /// Top-3（(余弦, 内容前 24 字)），按余弦降序
+        top3: Vec<(f32, String)>,
+        /// 该口径下有效候选的余弦均值
+        mean: f32,
+        /// 该口径下有效候选的余弦总体标准差
+        std: f32,
+        /// 该口径下有效候选条数（编码成功者）
+        count: usize,
+    }
+
+    /// P8.2m：由余弦序列与对应内容构造分布统计（Top-3 + 均值 + 标准差）。
+    #[cfg(feature = "ml")]
+    fn p82m_distribution(sims: &[Option<f32>], contents: &[String]) -> P82mDistribution {
+        let values: Vec<f32> = sims.iter().filter_map(|s| *s).collect();
+        let count = values.len();
+        let mean = if count == 0 {
+            0.0
+        } else {
+            values.iter().sum::<f32>() / count as f32
+        };
+        let std = if count == 0 {
+            0.0
+        } else {
+            (values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / count as f32).sqrt()
+        };
+        let mut top3: Vec<(f32, String)> = sims
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|v| (v, contents[i].chars().take(24).collect::<String>())))
+            .collect();
+        top3.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        top3.truncate(3);
+        P82mDistribution {
+            top3,
+            mean,
+            std,
+            count,
+        }
+    }
+
+    /// P8.2m：构造与生产 root 分支逐字一致的候选池（`top_k=ASSOCIATION_ROOT_POOL_TOPK`
+    /// ＋ `explore_pure`）——作为"池内均值"口径的候选来源，与旁路实际传入
+    /// `semantic_similarities_debiased` 的 `mem_refs`（`candidates`）同源。
+    #[cfg(feature = "ml")]
+    fn p82m_root_pool(
+        store: &mut MemoryStore<JsonPersistence>,
+        query: &str,
+    ) -> Vec<crate::memory_types::Memory> {
+        let filter = crate::memory_store::RecallFilter {
+            memory_type: None,
+            project: None,
+            tags: Vec::new(),
+            min_importance: None,
+            top_k: ASSOCIATION_ROOT_POOL_TOPK,
+            privacy_context: None,
+            explore_pure: true,
+            regression_query: None,
+        };
+        store
+            .recall(query, &filter)
+            .map(|result| result.memories)
+            .unwrap_or_default()
+    }
+
+    /// P8.2m 口径对照探针（承接文档 §10.15 锁定项 2）：对**同一 store、同一查询**，
+    /// 分别以「全库 106 条」与「候选池 8 条」为 `memories` 调用**去中心化**余弦，
+    /// 得到两口径各自的 Top-3 与均值/标准差——单变量对照（唯一变量 = 均值基准池）。
+    ///
+    /// 均值基准即调用方传入的 `memories`（`semantic_similarities_impl` 内 `mean`
+    /// 完全由 `memories` 的编码结果累积求得），故本对照**无需改动 `memory_store.rs`**。
+    /// 返回 `(全库分布, 池内分布)`；同时保留 P8.2j 的全库去中心化 Top-3 语义
+    /// （与旧 `p82j_cosine_probe` 同源同值），不破坏既有诊断口径。
+    #[cfg(feature = "ml")]
+    fn p82m_pool_vs_global_probe(
+        store: &mut MemoryStore<JsonPersistence>,
+        query: &str,
+    ) -> (P82mDistribution, P82mDistribution) {
+        // ① 全库口径：106 条语料（6 链 × 16 + 10 干扰），均值基准 = 全库
         let filter = crate::memory_store::ListFilter {
             limit: 1000,
             ..Default::default()
         };
-        let Ok((memories, _)) = store.list_memories(&filter) else {
-            return Vec::new();
+        let global_dist = match store.list_memories(&filter) {
+            Ok((memories, _)) => {
+                let refs: Vec<&crate::memory_types::Memory> = memories.iter().collect();
+                let sims = store.semantic_similarities_debiased(query, &refs);
+                let contents: Vec<String> = memories.iter().map(|m| m.content.clone()).collect();
+                p82m_distribution(&sims, &contents)
+            }
+            Err(_) => P82mDistribution {
+                top3: Vec::new(),
+                mean: 0.0,
+                std: 0.0,
+                count: 0,
+            },
         };
-        let refs: Vec<&crate::memory_types::Memory> = memories.iter().collect();
+        // ② 池内口径：与生产旁路同源的候选池（recall top_k=8），均值基准 = 池内
+        let pool = p82m_root_pool(store, query);
+        let pool_refs: Vec<&crate::memory_types::Memory> = pool.iter().collect();
+        let pool_sims = store.semantic_similarities_debiased(query, &pool_refs);
+        let pool_contents: Vec<String> = pool.iter().map(|m| m.content.clone()).collect();
+        let pool_dist = p82m_distribution(&pool_sims, &pool_contents);
+        (global_dist, pool_dist)
+    }
+
+    /// P8.2m：单一"池内口径"分布（承接 §10.15 锁定项 1 的池级判据数据采集）。
+    ///
+    /// 与 `p82m_pool_vs_global_probe` 的 ② 口径逐字一致（`recall top_k=ASSOCIATION_ROOT_POOL_TOPK`
+    /// ＋ 去中心化余弦），单独抽出以便对**关联查询侧**（30 条 `P82H_QUERIES`）复用。
+    #[cfg(feature = "ml")]
+    fn p82m_pool_dist(store: &mut MemoryStore<JsonPersistence>, query: &str) -> P82mDistribution {
+        let pool = p82m_root_pool(store, query);
+        let pool_refs: Vec<&crate::memory_types::Memory> = pool.iter().collect();
+        let sims = store.semantic_similarities_debiased(query, &pool_refs);
+        let contents: Vec<String> = pool.iter().map(|m| m.content.clone()).collect();
+        p82m_distribution(&sims, &contents)
+    }
+
+    /// P8.2m：池内分布派生标量——Top-1 / Top-2 / 间隔 / z 分数。
+    ///
+    /// `z = (Top-1 − 池内均值) / 池内标准差`，刻画"Top-1 相对池内分布中心的偏离度"，
+    /// 是**池级/分布判据**的候选形式（据 §10.8 已排除"池内单条余弦绝对排序"族）。
+    #[cfg(feature = "ml")]
+    struct P82mPoolStats {
+        top1: f32,
+        top2: f32,
+        gap: f32,
+        mean: f32,
+        std: f32,
+        z: f32,
+        count: usize,
+        top1_content: String,
+    }
+
+    #[cfg(feature = "ml")]
+    fn p82m_pool_stats(dist: &P82mDistribution) -> P82mPoolStats {
+        let top1 = dist.top3.first().map(|(v, _)| *v).unwrap_or(0.0);
+        let top2 = dist.top3.get(1).map(|(v, _)| *v).unwrap_or(0.0);
+        let top1_content = dist
+            .top3
+            .first()
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default();
+        let z = if dist.std > 0.0 {
+            (top1 - dist.mean) / dist.std
+        } else {
+            0.0
+        };
+        P82mPoolStats {
+            top1,
+            top2,
+            gap: top1 - top2,
+            mean: dist.mean,
+            std: dist.std,
+            z,
+            count: dist.count,
+            top1_content,
+        }
+    }
+
+    /// P8.2m：按池内去中心化余弦降序的完整排名（承接 §10.15 锁定项 1 的"链级共识"形式）。
+    ///
+    /// 与 `p82m_pool_dist` 同口径（`recall top_k=ASSOCIATION_ROOT_POOL_TOPK` ＋ 去中心化余弦），
+    /// 但保留**完整内容**与链分类，供"Top-K 同链共识票数"与"跨查询高频 Top-1 条目"统计复用。
+    #[cfg(feature = "ml")]
+    fn p82m_pool_ranked(
+        store: &mut MemoryStore<JsonPersistence>,
+        query: &str,
+    ) -> Vec<(&'static str, f32, String)> {
+        let pool = p82m_root_pool(store, query);
+        let refs: Vec<&crate::memory_types::Memory> = pool.iter().collect();
         let sims = store.semantic_similarities_debiased(query, &refs);
-        let mut scored: Vec<(f32, String)> = sims
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.map(|v| (v, memories[i].content.clone())))
+        let mut ranked: Vec<(&'static str, f32, String)> = pool
+            .iter()
+            .zip(sims.iter())
+            .filter_map(|(m, s)| s.map(|v| (p82h_classify(&m.content).0, v, m.content.clone())))
             .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(3);
-        scored
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked
+    }
+
+    /// P8.2m：池内 Top-K 中"同一链"的最大票数（排除 none）——链级共识判据的候选标量。
+    #[cfg(feature = "ml")]
+    fn p82m_best_chain_votes(ranked: &[(&'static str, f32, String)], k: usize) -> usize {
+        let mut counts: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        for (chain, _, _) in ranked.iter().take(k) {
+            if *chain != "none" {
+                *counts.entry(*chain).or_insert(0) += 1;
+            }
+        }
+        counts.values().copied().max().unwrap_or(0)
+    }
+
+    /// P8.2m：单查询的链级共识采集记录（承接 §10.15 锁定项 1）。
+    #[cfg(feature = "ml")]
+    struct P82mChainStats {
+        gold: &'static str,
+        query: &'static str,
+        /// Top-3 中最大非 none 同链票数（1..=3）
+        c3: usize,
+        /// 全池（8 条）中最大非 none 同链票数（1..=8）
+        c8: usize,
+        /// Top-1 所属链（未命中语料为 "none"）
+        top1_chain: &'static str,
+        /// Top-1 内容前 24 字（供跨查询霸榜统计，避免重复编码）
+        top1_content: String,
     }
 
     /// P8.2h：离线 bge 批量编码验证 root 语义旁路救回率。
@@ -6157,18 +6346,42 @@ mod api_contracts_tests {
         let unrelated_b = p82h_probe_unrelated(&mut store_b);
         let b_correct = arm_b.iter().filter(|r| r.root_correct).count();
         // 根因探针：无关联查询的全库余弦 Top-3（判定 H2 FAIL 属"阈值标定"还是"机制失效"）
-        // P8.2j：同时打印去中心化余弦，形成同库同查询的原始/去中心化对照。
+        // P8.2j：同时打印去中心化余弦（全库均值口径）。
+        // P8.2m：再叠加"池内均值"口径，形成同库同查询的【全库均值 vs 池内均值】单变量对照
+        //        （承接 §10.15 锁定项 2；两口径唯一差异 = 去中心化均值基准所用候选集）。
         for query in P82H_UNRELATED {
             let top = p82h_cosine_probe(&store_b, query);
             eprintln!("[P8.2h][B 臂·余弦] 「{query}」全库 Top-3：");
             for (sim, content) in &top {
                 eprintln!("  · 余弦={sim:.4} 内容={content}");
             }
-            let top_j = p82j_cosine_probe(&store_b, query);
-            eprintln!("[P8.2j][B 臂·去中心化余弦] 「{query}」全库 Top-3：");
-            for (sim, content) in &top_j {
+            let (global_dist, pool_dist) = p82m_pool_vs_global_probe(&mut store_b, query);
+            eprintln!(
+                "[P8.2m][全库口径] 「{query}」n={} 均值={:.4} 标准差={:.4} Top-3：",
+                global_dist.count, global_dist.mean, global_dist.std
+            );
+            for (sim, content) in &global_dist.top3 {
                 eprintln!("  · 余弦={sim:.4} 内容={content}");
             }
+            eprintln!(
+                "[P8.2m][池内口径] 「{query}」n={} 均值={:.4} 标准差={:.4} Top-3：",
+                pool_dist.count, pool_dist.mean, pool_dist.std
+            );
+            for (sim, content) in &pool_dist.top3 {
+                eprintln!("  · 余弦={sim:.4} 内容={content}");
+            }
+            // 口径对照：池内 Top-1 与全库 Top-1 的差值（>0 表示池内口径放大，<0 表示池内口径收紧）
+            let g_top1 = global_dist.top3.first().map(|(v, _)| *v).unwrap_or(0.0);
+            let p_top1 = pool_dist.top3.first().map(|(v, _)| *v).unwrap_or(0.0);
+            eprintln!(
+                "[P8.2m][口径差] 池内 Top-1 − 全库 Top-1 = {:.4}（池内 {:.4} / 全库 {:.4}；\
+                 池内标准差 {:.4} / 全库标准差 {:.4}）",
+                p_top1 - g_top1,
+                p_top1,
+                g_top1,
+                pool_dist.std,
+                global_dist.std
+            );
         }
         eprintln!(
             "[P8.2h][B 臂·ml ] 写入 {} 条（{:.1}s）→ 30 查询耗时 {:.1}s；root 正确 {}/30",
@@ -6177,6 +6390,206 @@ mod api_contracts_tests {
             b_elapsed.as_secs_f32(),
             b_correct
         );
+
+        // ---------- P8.2m 池级/分布判据（承接 §10.15 锁定项 1）----------
+        // 双侧同口径采集：关联侧（30 条 P82H_QUERIES）+ 无关侧（22 条 P82H_UNRELATED），
+        // 口径与生产旁路逐字一致（recall top_k=ASSOCIATION_ROOT_POOL_TOPK ＋ 去中心化余弦）。
+        // 候选判据 z = (Top-1 − 池内均值) / 池内标准差（§10.8 已排除"池内单条余弦排序"族）。
+        let mut related_stats: Vec<(&'static str, P82mPoolStats)> = Vec::new();
+        for &(gold, query) in P82H_QUERIES {
+            let dist = p82m_pool_dist(&mut store_b, query);
+            let stats = p82m_pool_stats(&dist);
+            eprintln!(
+                "[P8.2m][池级·关联侧] 「{query}」gold={gold} n={} Top-1={:.4} Top-2={:.4} \
+                 间隔={:.4} 均值={:.4} 标准差={:.4} z={:.3} Top-1内容={}",
+                stats.count,
+                stats.top1,
+                stats.top2,
+                stats.gap,
+                stats.mean,
+                stats.std,
+                stats.z,
+                stats.top1_content
+            );
+            related_stats.push((query, stats));
+        }
+        let mut unrelated_stats: Vec<(&'static str, P82mPoolStats)> = Vec::new();
+        for &query in P82H_UNRELATED {
+            let dist = p82m_pool_dist(&mut store_b, query);
+            let stats = p82m_pool_stats(&dist);
+            eprintln!(
+                "[P8.2m][池级·无关侧] 「{query}」n={} Top-1={:.4} 间隔={:.4} 均值={:.4} \
+                 标准差={:.4} z={:.3} Top-1内容={}",
+                stats.count,
+                stats.top1,
+                stats.gap,
+                stats.mean,
+                stats.std,
+                stats.z,
+                stats.top1_content
+            );
+            unrelated_stats.push((query, stats));
+        }
+        // 阈值扫描：目标 = 无关侧放行 0 条且关联侧 MISS 救回最大。
+        // 因判据为 z ≥ t，t 必须严格大于无关侧 z 上界；可行域内取"救回最多"的最小 t。
+        let miss_set: HashSet<&str> = P82H_DOC_MISS.iter().copied().collect();
+        let unrel_z_max = unrelated_stats
+            .iter()
+            .map(|(_, s)| s.z)
+            .fold(f32::MIN, f32::max);
+        let mut rel_miss_z: Vec<f32> = related_stats
+            .iter()
+            .filter(|(q, _)| miss_set.contains(*q))
+            .map(|(_, s)| s.z)
+            .collect();
+        rel_miss_z.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut best_t = f32::INFINITY;
+        let mut best_miss_pass = 0usize;
+        for t in rel_miss_z.iter().copied() {
+            if unrelated_stats.iter().filter(|(_, s)| s.z >= t).count() > 0 {
+                continue;
+            }
+            let miss_pass = rel_miss_z.iter().filter(|z| **z >= t).count();
+            if miss_pass > best_miss_pass {
+                best_miss_pass = miss_pass;
+                best_t = t;
+            }
+        }
+        eprintln!(
+            "[P8.2m][池级判据] 无关侧 z 上界={:.3}（22 条）；关联侧 MISS(16) z 最小={:.3} \
+             中位={:.3} 最大={:.3}",
+            unrel_z_max,
+            rel_miss_z.first().copied().unwrap_or(0.0),
+            rel_miss_z.get(rel_miss_z.len() / 2).copied().unwrap_or(0.0),
+            rel_miss_z.last().copied().unwrap_or(0.0)
+        );
+        let unrel_top1_max = unrelated_stats
+            .iter()
+            .map(|(_, s)| s.top1)
+            .fold(f32::MIN, f32::max);
+        let miss_top1_min = related_stats
+            .iter()
+            .filter(|(q, _)| miss_set.contains(*q))
+            .map(|(_, s)| s.top1)
+            .fold(f32::MAX, f32::min);
+        eprintln!(
+            "[P8.2m][池级判据] 阈值扫描：可行最优 t={:.3}（须 > 无关上界 {:.3}）→ 无关放行 0，\
+             MISS 救回 {}/16 → {}",
+            best_t,
+            unrel_z_max,
+            best_miss_pass,
+            if best_miss_pass >= 10 { "PASS" } else { "FAIL" }
+        );
+        eprintln!(
+            "[P8.2m][池级判据·对照] 固定阈值族（Top-1 绝对值）：无关侧上界={:.4}，\
+             关联 MISS 下界={:.4} → 可分离={}",
+            unrel_top1_max,
+            miss_top1_min,
+            unrel_top1_max < miss_top1_min
+        );
+
+        // ---------- P8.2m 链级共识判据（锁定项 1 剩余候选形式）----------
+        // 候选标量：Top-K 内"同一链"的最大票数（Top-3 / 全池 8 两条口径）。
+        // 采样对象与生产旁路逐字同口径（含代码类候选），不额外过滤。
+        let mut chain_all: Vec<P82mChainStats> = Vec::new();
+        for &(gold, query) in P82H_QUERIES {
+            let ranked = p82m_pool_ranked(&mut store_b, query);
+            let top1_chain = ranked.first().map(|(c, _, _)| *c).unwrap_or("none");
+            let top1_content: String = ranked
+                .first()
+                .map(|(_, _, c)| c.chars().take(24).collect())
+                .unwrap_or_default();
+            chain_all.push(P82mChainStats {
+                gold,
+                query,
+                c3: p82m_best_chain_votes(&ranked, 3),
+                c8: p82m_best_chain_votes(&ranked, 8),
+                top1_chain,
+                top1_content,
+            });
+        }
+        for &query in P82H_UNRELATED {
+            let ranked = p82m_pool_ranked(&mut store_b, query);
+            let top1_chain = ranked.first().map(|(c, _, _)| *c).unwrap_or("none");
+            let top1_content: String = ranked
+                .first()
+                .map(|(_, _, c)| c.chars().take(24).collect())
+                .unwrap_or_default();
+            chain_all.push(P82mChainStats {
+                gold: "none",
+                query,
+                c3: p82m_best_chain_votes(&ranked, 3),
+                c8: p82m_best_chain_votes(&ranked, 8),
+                top1_chain,
+                top1_content,
+            });
+        }
+        for s in chain_all.iter() {
+            eprintln!(
+                "[P8.2m][链级共识] 「{}」gold={} Top-3 同链最大票={} 全池同链最大票={} Top-1链={}",
+                s.query, s.gold, s.c3, s.c8, s.top1_chain
+            );
+        }
+        // 阈值扫描（c3）：目标 = 无关侧放行 0 且关联 MISS 救回最大（判据 c3 ≥ t）。
+        let related_chain: Vec<&P82mChainStats> =
+            chain_all.iter().filter(|s| s.gold != "none").collect();
+        let unrelated_chain: Vec<&P82mChainStats> =
+            chain_all.iter().filter(|s| s.gold == "none").collect();
+        for (label, pick) in [
+            (
+                "Top-3",
+                (|s: &P82mChainStats| s.c3) as fn(&P82mChainStats) -> usize,
+            ),
+            (
+                "全池8",
+                (|s: &P82mChainStats| s.c8) as fn(&P82mChainStats) -> usize,
+            ),
+        ] {
+            let unrel_max = unrelated_chain.iter().map(|s| pick(s)).max().unwrap_or(0);
+            let mut miss_votes: Vec<usize> = related_chain
+                .iter()
+                .filter(|s| miss_set.contains(s.query))
+                .map(|s| pick(s))
+                .collect();
+            miss_votes.sort_unstable();
+            let mut best_t = usize::MAX;
+            let mut best_pass = 0usize;
+            for &t in miss_votes.iter().rev() {
+                if t <= unrel_max || t == 0 {
+                    continue;
+                }
+                let pass = miss_votes.iter().filter(|v| **v >= t).count();
+                if pass > best_pass {
+                    best_pass = pass;
+                    best_t = t;
+                }
+            }
+            eprintln!(
+                "[P8.2m][链级共识判据·{label}] 无关侧上界={unrel_max}（22 条）；\
+                 关联 MISS(16) 票分布={miss_votes:?} → 可行最优 t={} → 无关放行 0，\
+                 MISS 救回 {best_pass}/16 → {}",
+                if best_t == usize::MAX {
+                    "不可行".to_string()
+                } else {
+                    best_t.to_string()
+                },
+                if best_pass >= 10 { "PASS" } else { "FAIL" }
+            );
+        }
+        // 跨查询高频 Top-1 条目（承接锁定项 3 的"全局霸榜条目"观察）。
+        let mut top1_freq: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for s in chain_all.iter() {
+            if !s.top1_content.is_empty() {
+                *top1_freq.entry(s.top1_content.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut freq_sorted: Vec<(String, usize)> = top1_freq.into_iter().collect();
+        freq_sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        eprintln!("[P8.2m][霸榜条目·池内口径] 跨 52 查询（30 关联 + 22 无关）Top-1 频次 Top-5：");
+        for (content, freq) in freq_sorted.iter().take(5) {
+            eprintln!("  · {freq}/52 次  {content}");
+        }
 
         // ---------- 判据计算（对齐 evaluate_h：H1-H4）----------
         let b_by_query: HashMap<&str, &P82hRecord> = arm_b.iter().map(|r| (r.query, r)).collect();
