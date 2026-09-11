@@ -1111,7 +1111,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 仅在词面门禁无人通过时调用，避免给常规检索热路径增加 ML 开销。
     #[cfg(feature = "ml")]
     pub fn semantic_similarities(&self, query: &str, memories: &[&Memory]) -> Vec<Option<f32>> {
-        self.semantic_similarities_impl(query, memories, false)
+        self.semantic_similarities_impl(query, memories, false, None)
     }
 
     /// v0.9.7 联想探索·去中心化语义相似度（P8.2j 实验通路，默认关）。
@@ -1127,23 +1127,32 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 本方法仅在门控 `LRC_ASSOC_DEBIAS` 开启时被调用；关闭时生产路径仍走
     /// [`Self::semantic_similarities`]，与 P8.2h 逐字节一致（零影响承诺）。
+    ///
+    /// `suppress`（P8.2n）为可选的**池内中心度压制强度 λ**：`None` = 不压制，
+    /// 与 P8.2m 逐字节一致；`Some(λ)` = 对显著超出池内中位中心度的候选按
+    /// `s' = s − λ·max(0, κ − median(κ))` 扣减余弦（κ = 候选与同池其他候选的
+    /// 平均去中心化余弦）。压制**以去中心化池内口径为界**——调用方须同时开启
+    /// `LRC_ASSOC_DEBIAS`，否则本参数不生效（原始空间无中心度语义）。
     #[cfg(feature = "ml")]
     pub fn semantic_similarities_debiased(
         &self,
         query: &str,
         memories: &[&Memory],
+        suppress: Option<f32>,
     ) -> Vec<Option<f32>> {
-        self.semantic_similarities_impl(query, memories, true)
+        self.semantic_similarities_impl(query, memories, true, suppress)
     }
 
     /// 语义相似度公共实现。`decenter=false` 时与历史实现逐字节一致；
-    /// `decenter=true` 时追加"候选池均值去中心化"步骤（P8.2j）。
+    /// `decenter=true` 时追加"候选池均值去中心化"步骤（P8.2j）；
+    /// `suppress=Some(λ)` 时在去中心化余弦上追加"池内中心度去偏"（P8.2n）。
     #[cfg(feature = "ml")]
     fn semantic_similarities_impl(
         &self,
         query: &str,
         memories: &[&Memory],
         decenter: bool,
+        suppress: Option<f32>,
     ) -> Vec<Option<f32>> {
         fn l2_norm(v: &[f32]) -> f32 {
             v.iter().map(|x| x * x).sum::<f32>().sqrt()
@@ -1226,22 +1235,91 @@ impl<P: Persistence> MemoryStore<P> {
         if !q_norm.is_finite() || q_norm <= 0.0 {
             return vec![None; memories.len()];
         }
-        memories
+        // 第一遍：算各候选的去中心化余弦。`suppress=None` 时下面的返回值与
+        // P8.2m 逐字节一致（同一表达式、同一顺序）。
+        let mut sims: Vec<Option<f32>> = Vec::with_capacity(memories.len());
+        for v in &vectors {
+            let Some(v) = v.as_ref() else {
+                sims.push(None);
+                continue;
+            };
+            if v.len() != q.len() {
+                sims.push(None);
+                continue;
+            }
+            let centered: Vec<f32> = v.iter().zip(mean.iter()).map(|(x, m)| *x - *m).collect();
+            let n = l2_norm(&centered);
+            if !n.is_finite() || n <= 0.0 {
+                sims.push(None);
+                continue;
+            }
+            sims.push(Some((dot(&q, &centered) / (q_norm * n)).clamp(0.0, 1.0)));
+        }
+        let Some(lambda) = suppress else {
+            return sims;
+        };
+        if !lambda.is_finite() || lambda <= 0.0 {
+            return sims;
+        }
+        // P8.2n 池内中心度去偏：霸榜条目的本质是"语义吸铁石"——它与池内**多数
+        // 不同主题**条目都保持中等相似。以 τ_i = 候选 i 与同池其他候选的平均
+        // **原始句向量**余弦作为"跨查询频次"的无状态代理（Memory 无频次字段，
+        // 无法跨查询计数），对显著超出池内中位水平者等量扣减：
+        // s'_i = clamp(s_i − λ·max(0, τ_i − median(τ)))。
+        // 该量与旁路判据同池，故压制天然"以所用口径为界"。
+        //
+        // 关键：代理必须在**原始空间**估计，不可用去中心化向量。去中心化空间满足
+        // 零和约束 Σ_j c_j = 0，故 Σ_{j≠i} dot(c_i, c_j) = −‖c_i‖²，两两余弦均值
+        // 退化为 κ_i ≈ −‖c_i‖/((n−1)·const)，即 κ 仅随去中心化模长单调递减。
+        // 霸榜条目恰是模长最大者 ⇒ κ 最负 ⇒ excess=0 ⇒ **永不被压**，而被压的反是
+        // 模长小的平庸候选（含正确召回）。λ=10 档实测已证伪：放大 10 倍后 5 条误召回
+        // 中 4 条 Top-1 逐字不变，H1 反由 13/16 降至 9/16。故此处刻意用原始 `vectors`。
+        let valid_idx: Vec<usize> = vectors
             .iter()
-            .zip(vectors)
-            .map(|(_, v)| {
-                let v = v?;
-                if v.len() != q.len() {
-                    return None;
-                }
-                let centered: Vec<f32> = v.iter().zip(mean.iter()).map(|(x, m)| *x - *m).collect();
-                let n = l2_norm(&centered);
-                if !n.is_finite() || n <= 0.0 {
-                    return None;
-                }
-                Some((dot(&q, &centered) / (q_norm * n)).clamp(0.0, 1.0))
+            .enumerate()
+            .filter_map(|(i, v)| {
+                let v = v.as_ref()?;
+                let n = l2_norm(v);
+                (v.len() == q.len() && n.is_finite() && n > 0.0).then_some(i)
             })
-            .collect()
+            .collect();
+        let norms: Vec<f32> = vectors
+            .iter()
+            .map(|v| v.as_ref().map_or(0.0, |v| l2_norm(v)))
+            .collect();
+        let mut tau = vec![0.0f32; memories.len()];
+        for &i in &valid_idx {
+            let vi = vectors[i].as_ref().expect("已过滤为有效候选");
+            let ni = norms[i];
+            let mut acc = 0.0f32;
+            let mut cnt = 0usize;
+            for &j in &valid_idx {
+                if j == i || norms[j] <= 0.0 {
+                    continue;
+                }
+                let vj = vectors[j].as_ref().expect("已过滤为有效候选");
+                acc += (dot(vi, vj) / (ni * norms[j])).clamp(0.0, 1.0);
+                cnt += 1;
+            }
+            tau[i] = if cnt > 0 { acc / cnt as f32 } else { 0.0 };
+        }
+        let mut taus: Vec<f32> = valid_idx.iter().map(|&i| tau[i]).collect();
+        taus.sort_by(f32::total_cmp);
+        let median = if taus.is_empty() {
+            0.0
+        } else if taus.len() % 2 == 1 {
+            taus[taus.len() / 2]
+        } else {
+            (taus[taus.len() / 2 - 1] + taus[taus.len() / 2]) / 2.0
+        };
+        for (i, s) in sims.iter_mut().enumerate() {
+            let Some(s) = s else { continue };
+            let excess = (tau[i] - median).max(0.0);
+            if excess > 0.0 {
+                *s = (*s - lambda * excess).clamp(0.0, 1.0);
+            }
+        }
+        sims
     }
 
     /// 非 ml 构建：语义相似度恒不可用（返回全 None），词面通路独自生效。
@@ -1251,11 +1329,13 @@ impl<P: Persistence> MemoryStore<P> {
     }
 
     /// 非 ml 构建：去中心化语义相似度同样恒不可用（门控开启也不改变行为）。
+    /// P8.2n 压制参数在非 ml 下无编码器可依，同样静默忽略。
     #[cfg(not(feature = "ml"))]
     pub fn semantic_similarities_debiased(
         &self,
         _query: &str,
         memories: &[&Memory],
+        _suppress: Option<f32>,
     ) -> Vec<Option<f32>> {
         vec![None; memories.len()]
     }
