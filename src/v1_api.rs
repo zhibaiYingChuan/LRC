@@ -8018,6 +8018,427 @@ mod api_contracts_tests {
         }
     }
 
+    /// P8.2p 池规模扩展语料的无关填充条（与六链 30 条查询保持零词面重叠）。
+    ///
+    /// 仅用于抬高"全库词面扫描"成本，不参与命中关系判定：话题词与考试/宠物/
+    /// 旅行/车辆/健康/家居六链完全无关，确保扩展后 root 起点仍由原 106 条语料
+    /// 决定——即"唯一变量 = 候选池规模"。
+    #[cfg(feature = "ml")]
+    fn p82p_filler_memories(scale: usize) -> Vec<crate::memory_types::Memory> {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        const TOPICS: [&str; 12] = [
+            "木工榫卯",
+            "矿石化验",
+            "陶笛吹奏",
+            "版画拓印",
+            "茶道点茶",
+            "集邮册整理",
+            "帆船索具",
+            "天文观测",
+            "篆刻边款",
+            "织染扎染",
+            "皮划艇划桨",
+            "气象云图",
+        ];
+        let base = p82h_all_memories().len();
+        let extra = base.saturating_mul(scale.saturating_sub(1));
+        let mut out = Vec::with_capacity(extra);
+        for index in 0..extra {
+            let topic = TOPICS[index % TOPICS.len()];
+            let content = format!(
+                "{topic}札记第 {} 则：本条为语料规模填充样本（编号 p82p-filler-{index}），\
+                 内容与联想精度评测的六条语义链均无关联。",
+                index + 1
+            );
+            out.push(Memory::new(
+                content,
+                MemoryType::Fact,
+                Some("p82p-pool-scale-filler".to_string()),
+                vec!["chain:none".to_string(), "hop:9".to_string()],
+                Importance::new(3),
+                None,
+            ));
+        }
+        out
+    }
+
+    /// P8.2p 候选池规模扩展复测（计划文档 §10.17.9 锁定项 4 前半，承接未决风险 6+7）。
+    ///
+    /// 立项口径原文（§10.14 锁定项 1）：
+    /// "将『触发查询 P50 0.723s』置于 N 条并发 × 更大候选池下复测，确认是否仍落在 10s 预算内。"
+    ///
+    /// 本用例只取"更大候选池"这一半（并发的另一半见
+    /// `test_assoc_p82p_concurrency_pressure`）：同一批 30 条触发查询，分别在原池
+    /// 106 条与扩展池 ≈1060 条上跑同一口径，测 P50/P95/max 与净增量。
+    /// 两臂各自独立建库，防止 `assoc_frequency` 跨查询状态串扰对照。
+    ///
+    /// 判据性质声明：本用例为**时延实测报表 + 预算契约断言**，不对精度判据
+    /// （H1–H4）重复断言——池规模扩展意在压低精度基线，故只逐字复述既有
+    /// root 起点口径用于观测，不新增精度判据。
+    #[test]
+    #[cfg(feature = "ml")]
+    fn test_assoc_p82p_pool_scale_latency() {
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+        /// 池规模扩展倍率（106 → 106×10 ≈ 1060 条）
+        const POOL_SCALE: usize = 10;
+        /// 单次探索内部预算（对齐 run_association_explore 的 ASSOCIATION_EXPLORE_TIME_BUDGET）
+        const EXPLORE_BUDGET_SECS: f64 = 10.0;
+        /// 外层 HTTP 超时（对齐 explore handler 的 Duration::from_secs(15)）
+        const HTTP_TIMEOUT_SECS: f64 = 15.0;
+
+        /// 跑完一条臂的 30 条触发查询，逐次计时（返回 (耗时秒, semantic_bypass)）
+        fn sample_arm(store: &mut MemoryStore<JsonPersistence>) -> Vec<(f64, String)> {
+            use std::sync::atomic::AtomicBool;
+            let mut all: Vec<(f64, String)> = Vec::with_capacity(P82H_QUERIES.len());
+            for &(_gold, query) in P82H_QUERIES {
+                let cancel = AtomicBool::new(false);
+                let started = Instant::now();
+                let resp = run_association_explore(store, Some(query), None, 4, 3, &cancel, None);
+                all.push((
+                    started.elapsed().as_secs_f64(),
+                    resp.semantic_bypass.clone(),
+                ));
+            }
+            all
+        }
+
+        /// 打印一条臂的分位数报告，返回 (P50, P95, max)
+        fn report(name: &str, samples: &[(f64, String)], budget: f64) -> (f64, f64, f64) {
+            let mut lat: Vec<f64> = samples.iter().map(|(secs, _)| *secs).collect();
+            let p50 = p82k_percentile(&mut lat, 0.50);
+            let p95 = p82k_percentile(&mut lat, 0.95);
+            let max = lat.last().copied().unwrap_or(0.0);
+            let applied = samples
+                .iter()
+                .filter(|(_, bypass)| bypass == "applied")
+                .count();
+            let n = samples.len();
+            let pct = p95 / budget * 100.0;
+            eprintln!(
+                "[P8.2p][池规模·{name}] n={n} P50={p50:.3}s P95={p95:.3}s max={max:.3}s\
+                 （P95 占 {budget:.0}s 预算 {pct:.1}%）；旁路 applied={applied}"
+            );
+            (p50, p95, max)
+        }
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        // ---------- 基准臂：原池 106 条 ----------
+        let base_dir = std::env::temp_dir().join(format!("lrc_p82p_pool_base_{ts}"));
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let Some(mut store_base) = new_ml_capable_store(base_dir.to_str().unwrap()) else {
+            eprintln!(
+                "[P8.2p][池规模] ML 编码器不可用（bge 权重缺失或环境未设 LRC_LUOSHU_MODEL_ID）\
+                 ——本用例仅在 ml 环境执行；请设置 LRC_LUOSHU_MODEL_ID=BAAI/bge-base-zh"
+            );
+            return;
+        };
+        p82h_seed(&mut store_base);
+
+        // ---------- 扩展臂：原池 + 填充语料 ≈ ×POOL_SCALE ----------
+        let scaled_dir = std::env::temp_dir().join(format!("lrc_p82p_pool_scaled_{ts}"));
+        let _ = std::fs::remove_dir_all(&scaled_dir);
+        std::fs::create_dir_all(&scaled_dir).unwrap();
+        let mut store_scaled = new_ml_capable_store(scaled_dir.to_str().unwrap())
+            .expect("扩展臂 ML 编码器二次加载失败——若失败则规模对照不成立，不得静默跳过");
+        p82h_seed(&mut store_scaled);
+        let fillers = p82p_filler_memories(POOL_SCALE);
+        let filler_count = fillers.len();
+        store_scaled
+            .remember_batch(fillers)
+            .expect("扩展语料批量注入失败");
+
+        let base_samples = sample_arm(&mut store_base);
+        let scaled_samples = sample_arm(&mut store_scaled);
+
+        let pool_base = p82h_all_memories().len();
+        let pool_scaled = pool_base + filler_count;
+        eprintln!(
+            "[P8.2p][池规模] 基准池 {pool_base} 条 → 扩展池 {pool_scaled} 条（+{filler_count} 条无关填充）"
+        );
+        let (b50, b95, bmax) = report("基准池", &base_samples, EXPLORE_BUDGET_SECS);
+        let (s50, s95, smax) = report("扩展池", &scaled_samples, EXPLORE_BUDGET_SECS);
+        eprintln!(
+            "[P8.2p][池规模] 规模 ×{POOL_SCALE} 净增量：P50 {:+.3}s P95 {:+.3}s max {:+.3}s",
+            s50 - b50,
+            s95 - b95,
+            smax - bmax
+        );
+
+        // ---------- 预算契约断言 ----------
+        assert_eq!(
+            base_samples.len(),
+            P82H_QUERIES.len(),
+            "基准臂采样数应为 30"
+        );
+        assert_eq!(
+            scaled_samples.len(),
+            P82H_QUERIES.len(),
+            "扩展臂采样数应为 30"
+        );
+        assert!(
+            s95 < EXPLORE_BUDGET_SECS,
+            "扩展池下 P95 必须仍落 {EXPLORE_BUDGET_SECS}s 内部预算内：实测 {s95:.3}s"
+        );
+        assert!(
+            smax < HTTP_TIMEOUT_SECS,
+            "扩展池下 max 必须仍落 {HTTP_TIMEOUT_SECS}s 外层 HTTP 超时内：实测 {smax:.3}s"
+        );
+
+        let _ = std::fs::remove_dir_all(&base_dir);
+        let _ = std::fs::remove_dir_all(&scaled_dir);
+    }
+
+    /// P8.2p 并发压力复测（计划文档 §10.17.9 锁定项 4 后半，承接未决风险 6）。
+    ///
+    /// 与 `test_assoc_p82p_pool_scale_latency` 配对：那条量化"更大池"，这条量化
+    /// "N 条并发"。以生产同构链路（`build_v1_router` → `oneshot`）发起 N 条并发
+    /// POST /associations/explore，逐请求记录状态码与墙钟。
+    ///
+    /// 为什么预期会看到兜底：`MemoryStore` 含 `RefCell`（持久化缓存）而为 `!Sync`，
+    /// 生产 handler 用 `Arc<Mutex<..>>` + `try_lock` 50ms 轮询取锁，故并发探索被
+    /// **全局串行化**——后到者在锁外排队，一旦排队超过外层 15s，`timeout` 会置取消
+    /// 标志并返回 503 `explore_timeout`。本用例的契约不是"必须全部 200"，而是
+    /// **每个请求都必须在有限时间内拿到 200 或 503 的明确应答（无挂死）**。
+    ///
+    /// 用例分两段：
+    /// 1. **并发批**（N=8 真实并发）——量化排队现象，但 200/503 的分布依赖机器性能，
+    ///    本机实测 200=8/503=0（未触发兜底）；
+    /// 2. **确定性兜底段**——主动在外部独占 `shared` 的 tokio Mutex 直到底层 15s
+    ///    `timeout` 触发，**不依赖机器性能**地硬验证 503 `explore_timeout` 兜底路径
+    ///    （覆盖 HCSE"异常路径必须覆盖"要求）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[cfg(feature = "ml")]
+    async fn test_assoc_p82p_concurrency_pressure() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool as StdAtomicBool;
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+        use tokio::task::JoinSet;
+        use tower::ServiceExt;
+
+        /// 单批并发请求数（每请求对应一条互不相同的触发查询）
+        const CONCURRENT_REQUESTS: usize = 8;
+        /// 池规模扩展倍率（与池规模用例同口径）
+        const POOL_SCALE: usize = 10;
+        /// 外层 HTTP 超时（对齐 explore handler 的 Duration::from_secs(15)）
+        const HTTP_TIMEOUT_SECS: f64 = 15.0;
+        /// 超时兜底的调度容差：timeout 触发到状态码返回之间的实测延迟
+        const TIMEOUT_TOLERANCE_SECS: f64 = 3.0;
+
+        /// 单请求采样
+        struct Sample {
+            status: u16,
+            secs: f64,
+            bypass: Option<String>,
+        }
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_p82p_conc_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut store = new_ml_capable_store(dir.to_str().unwrap())
+            .expect("并发臂 ML 编码器加载失败——若失败则并发结论不成立，不得静默跳过");
+        p82h_seed(&mut store);
+        store
+            .remember_batch(p82p_filler_memories(POOL_SCALE))
+            .expect("并发臂扩展语料注入失败");
+
+        let shared = Arc::new(Mutex::new(store));
+        // 保留一份锁句柄用于第 2 段的确定性兜底验证（build_v1_router 会 move 走 shared）
+        let probe_store = shared.clone();
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(IdleCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(StdAtomicBool::new(false));
+        // 路由内注册路径为 /associations/explore（/v1 前缀由生产侧 nest_service 追加）
+        let app = build_v1_router(shared, manager, llm_api, llm_ready, false);
+
+        let queries: Vec<&'static str> = P82H_QUERIES
+            .iter()
+            .take(CONCURRENT_REQUESTS)
+            .map(|(_gold, query)| *query)
+            .collect();
+        assert_eq!(
+            queries.len(),
+            CONCURRENT_REQUESTS,
+            "触发查询池不足 {CONCURRENT_REQUESTS} 条"
+        );
+
+        let wall_started = Instant::now();
+        let mut tasks: JoinSet<Sample> = JoinSet::new();
+        for &query in &queries {
+            let app = app.clone();
+            tasks.spawn(async move {
+                let payload = serde_json::json!({
+                    "query": query,
+                    "depth": 4,
+                    "width": 3,
+                })
+                .to_string();
+                let request = Request::builder()
+                    .method("POST")
+                    .uri("/associations/explore")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload))
+                    .expect("请求构造失败");
+                let started = Instant::now();
+                let response = app
+                    .into_service()
+                    .oneshot(request)
+                    .await
+                    .expect("HTTP 层调用失败");
+                let status = response.status().as_u16();
+                let bytes = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("读取响应体失败");
+                let bypass = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|body| {
+                        body.get("semantic_bypass")
+                            .and_then(|value| value.as_str())
+                            .map(|value| value.to_string())
+                    });
+                Sample {
+                    status,
+                    secs: started.elapsed().as_secs_f64(),
+                    bypass,
+                }
+            });
+        }
+
+        let mut samples: Vec<Sample> = Vec::with_capacity(CONCURRENT_REQUESTS);
+        while let Some(joined) = tasks.join_next().await {
+            samples.push(joined.expect("并发任务 panic"));
+        }
+        let wall = wall_started.elapsed().as_secs_f64();
+
+        // ---------- 并发报表 ----------
+        let mut ok: Vec<f64> = samples
+            .iter()
+            .filter(|sample| sample.status == 200)
+            .map(|sample| sample.secs)
+            .collect();
+        let busy = samples.iter().filter(|sample| sample.status == 503).count();
+        let ok_count = ok.len();
+        let ok_p50 = p82k_percentile(&mut ok, 0.50);
+        let ok_max = ok.last().copied().unwrap_or(0.0);
+        let applied = samples
+            .iter()
+            .filter(|sample| sample.bypass.as_deref() == Some("applied"))
+            .count();
+        eprintln!(
+            "[P8.2p][并发] N={CONCURRENT_REQUESTS} 并发（池 ×{POOL_SCALE}）：200={ok_count} 503={busy}；\
+             墙钟 {wall:.3}s；成功请求 P50={ok_p50:.3}s max={ok_max:.3}s；applied={applied}"
+        );
+        let serial_sum: f64 = samples
+            .iter()
+            .filter(|sample| sample.status == 200)
+            .map(|sample| sample.secs)
+            .sum();
+        eprintln!(
+            "[P8.2p][并发] 串行化证据：成功请求耗时之和 {serial_sum:.3}s vs 墙钟 {wall:.3}s\
+             （MemoryStore 为 !Sync，探索被全局 Mutex 串行化；判据：比值 ≈N（={CONCURRENT_REQUESTS}）\
+             为真并行，≈(N+1)/2（={:.1}）即锁排队主导）",
+            (CONCURRENT_REQUESTS as f64 + 1.0) / 2.0
+        );
+
+        // ---------- 韧性契约断言 ----------
+        assert_eq!(
+            samples.len(),
+            CONCURRENT_REQUESTS,
+            "并发采样数应为 {CONCURRENT_REQUESTS}"
+        );
+        for (index, sample) in samples.iter().enumerate() {
+            assert!(
+                sample.status == 200 || sample.status == 503,
+                "第 {index} 个请求状态码须为 200 或 503（忙/超时兜底），实测 {}",
+                sample.status
+            );
+            assert!(
+                sample.secs <= HTTP_TIMEOUT_SECS + TIMEOUT_TOLERANCE_SECS,
+                "第 {index} 个请求须在 {HTTP_TIMEOUT_SECS}s 外层超时（+{TIMEOUT_TOLERANCE_SECS}s 容差）内返回，\
+                 实测 {:.3}s——超出即无兜底（挂死）",
+                sample.secs
+            );
+        }
+        assert!(
+            ok_count > 0,
+            "并发下至少一个请求须成功：全 503 意味着兜底把正常负载也拒了"
+        );
+
+        // ---------- 确定性兜底段：外部独占锁 → 硬验证 503 explore_timeout ----------
+        // 第 1 段的 200/503 分布依赖机器性能（本机 503=0，兜底路径未被走过）。
+        // 这里主动在外部持锁：handler 的 try_lock 50ms 轮询会一直失败，
+        // 直到外层 15s timeout 触发并置取消标志 → 必然返回 503 explore_timeout。
+        // 该段不依赖机器性能，确定性覆盖 HCSE 要求的"超时/卡死异常路径"。
+        let guard = probe_store.lock().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/associations/explore")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "query": queries[0],
+                    "depth": 4,
+                    "width": 3,
+                })
+                .to_string(),
+            ))
+            .expect("兜底段请求构造失败");
+        let started = Instant::now();
+        let response = app
+            .clone()
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("兜底段 HTTP 层调用失败");
+        let fallback_secs = started.elapsed().as_secs_f64();
+        let fallback_status = response.status().as_u16();
+        let fallback_body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("兜底段读取响应体失败");
+        let fallback_error = serde_json::from_slice::<serde_json::Value>(&fallback_body)
+            .ok()
+            .and_then(|body| {
+                body.get("error")
+                    .and_then(|value| value.as_str())
+                    .map(|value| value.to_string())
+            })
+            .unwrap_or_default();
+        drop(guard);
+
+        eprintln!(
+            "[P8.2p][并发][兜底] 外部独占锁下：status={fallback_status} error={fallback_error} \
+             耗时 {fallback_secs:.3}s（预期 503 explore_timeout，耗时贴近 15s 外层超时）"
+        );
+        assert_eq!(
+            fallback_status, 503,
+            "外部独占锁时须返回 503（探索超时兜底），实测 {fallback_status}"
+        );
+        assert_eq!(
+            fallback_error, "explore_timeout",
+            "外部独占锁须走 15s 外层超时分支返回 explore_timeout，实测 {fallback_error}"
+        );
+        assert!(
+            fallback_secs >= HTTP_TIMEOUT_SECS - 1.0
+                && fallback_secs <= HTTP_TIMEOUT_SECS + TIMEOUT_TOLERANCE_SECS,
+            "兜底段耗时须贴近 {HTTP_TIMEOUT_SECS}s 外层超时（容差 -1.0/+{TIMEOUT_TOLERANCE_SECS}s），\
+             实测 {fallback_secs:.3}s"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// P7.2：联想边反馈闭环——用户确认 (root→child_b) 边后，门控开启时
     /// explore BFS 使 child_b 前置（稳定排序按边净调整翻转）；门控关闭时
     /// 顺序与无反馈基线逐字节一致（零影响承诺消融对照）。
