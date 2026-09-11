@@ -6844,6 +6844,364 @@ mod api_contracts_tests {
         }
     }
 
+    /// P8.2n+ 可分性统计：Mann-Whitney AUC（并列取平均秩）。
+    ///
+    /// 输入 `(标量, 是否正类)`；返回 `(AUC, 正类数, 负类数)`，任一类别为空返回
+    /// `None`。AUC 等价于 `P(随机正类分数 > 随机负类分数)`——AUC=0.5 表示该标量
+    /// **不携带任何类别信息**，任何基于它的阈值/排序判据都不可能工作。
+    #[cfg(feature = "ml")]
+    fn p82n_auc(samples: &[(f32, bool)]) -> Option<(f32, usize, usize)> {
+        let n_pos = samples.iter().filter(|(_, p)| *p).count();
+        let n_neg = samples.len().saturating_sub(n_pos);
+        if n_pos == 0 || n_neg == 0 {
+            return None;
+        }
+        let mut sorted: Vec<(f32, bool)> = samples.to_vec();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // 并列组取平均秩（1-based）
+        let mut ranks = vec![0.0f64; sorted.len()];
+        let mut i = 0usize;
+        while i < sorted.len() {
+            let mut j = i + 1;
+            while j < sorted.len()
+                && sorted[j].0.total_cmp(&sorted[i].0) == std::cmp::Ordering::Equal
+            {
+                j += 1;
+            }
+            let avg = (i + 1 + j) as f64 / 2.0;
+            for r in ranks[i..j].iter_mut() {
+                *r = avg;
+            }
+            i = j;
+        }
+        let rank_sum_pos: f64 = ranks
+            .iter()
+            .zip(sorted.iter())
+            .filter(|(_, entry)| entry.1)
+            .map(|(r, _)| *r)
+            .sum();
+        let auc = (rank_sum_pos - (n_pos * (n_pos + 1)) as f64 / 2.0) / (n_pos * n_neg) as f64;
+        Some((auc as f32, n_pos, n_neg))
+    }
+
+    /// P8.2n+ 可分性统计：10 箱重叠面积系数（OVL）。
+    ///
+    /// 两经验分布在同一箱区间上的 `Σ min(p_i, q_i)`；1.0 = 完全重叠（不可分），
+    /// 0.0 = 完全不重叠。小样本下噪声较大，仅作 AUC 的辅助印证。
+    #[cfg(feature = "ml")]
+    fn p82n_ovl(pos: &[f32], neg: &[f32], bins: usize) -> f32 {
+        if pos.is_empty() || neg.is_empty() || bins == 0 {
+            return f32::NAN;
+        }
+        let lo = pos
+            .iter()
+            .chain(neg.iter())
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        let hi = pos
+            .iter()
+            .chain(neg.iter())
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        if hi <= lo {
+            return 1.0;
+        }
+        let w = (hi - lo) / bins as f32;
+        let mut ovl = 0.0f32;
+        for b in 0..bins {
+            let l = lo + w * b as f32;
+            // 末箱上界取闭区间，避免丢掉样本最大值
+            let h = if b + 1 == bins {
+                hi + 1e-6
+            } else {
+                lo + w * (b + 1) as f32
+            };
+            let p = pos.iter().filter(|s| **s >= l && **s < h).count() as f32 / pos.len() as f32;
+            let q = neg.iter().filter(|s| **s >= l && **s < h).count() as f32 / neg.len() as f32;
+            ovl += p.min(q);
+        }
+        ovl
+    }
+
+    /// P8.2n+ 候选池语义可分性确认探针（承接文档 §10.17.9 锁定项 1，纯观测零回归）。
+    ///
+    /// 以**不依赖具体判据形式**的秩统计（AUC / 秩分布 / 重叠面积）定量回答：
+    /// 候选池内"关联候选（属查询 gold 链）vs 其余候选"是否可分。分两层定位根因：
+    /// - **查询内**：同一查询池内 gold 与噪声在去中心化/原始余弦上是否分开
+    ///   —— 决定"池内阈值/相对排序"族判据是否还有空间；
+    /// - **查询间**：关联查询的池内 Top-1 与无关查询的池内 Top-1 是否分开
+    ///   —— 决定 H2（无关侧零放行）能否靠绝对阈值满足。
+    ///
+    /// 结论分岔：查询内可分而查询间不可分 ⇒ 根因 = 跨查询尺度不可比（仍有新判据
+    /// 空间）；两层皆不可分 ⇒ 根因 = 池组成语义混杂（只能走状态化或池重构）。
+    ///
+    /// 本探针只读语料常量、只调用生产相似度函数与既有候选池构造，不进入任何
+    /// 判据路径（零回归）。
+    #[test]
+    #[cfg(feature = "ml")]
+    fn test_assoc_p82n_pool_separability_probe() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_p82n_sep_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let Some(mut store) = new_ml_capable_store(dir.to_str().unwrap()) else {
+            eprintln!(
+                "[P8.2n+][可分性] ML 编码器不可用（bge 权重缺失或未设 LRC_LUOSHU_MODEL_ID），跳过可分性探针"
+            );
+            return;
+        };
+        p82h_seed(&mut store);
+
+        // 预注册判定阈值（避免事后调参）：AUROC 不低于 0.75 判可分，不高于 0.60 判不可分
+        const SEPARABLE_AUC: f32 = 0.75;
+        const INSEPARABLE_AUC: f32 = 0.60;
+
+        let mut within_auc_dec: Vec<f32> = Vec::new();
+        let mut within_auc_raw: Vec<f32> = Vec::new();
+        let mut within_ovl_dec: Vec<f32> = Vec::new();
+        let mut gold_best_rank: Vec<f32> = Vec::new();
+        let mut pool_sizes: Vec<usize> = Vec::new();
+        let mut gold_present = 0usize;
+        let mut merged_dec: Vec<(f32, bool)> = Vec::new();
+        let mut merged_raw: Vec<(f32, bool)> = Vec::new();
+        let mut top1_related: Vec<f32> = Vec::new();
+        // §10.18 关键补测：H1 只关心 16 条 MISS，故单独采集其池内 Top-1，
+        // 用于检验"是否存在同时满足 H1（≥10/16）与 H2（无关零放行）的绝对阈值"。
+        let mut miss_top1: Vec<f32> = Vec::new();
+        let miss_set: std::collections::HashSet<&str> = P82H_DOC_MISS.iter().copied().collect();
+
+        for &(gold, query) in P82H_QUERIES {
+            let pool = p82m_root_pool(&mut store, query);
+            if pool.is_empty() {
+                continue;
+            }
+            let refs: Vec<&crate::memory_types::Memory> = pool.iter().collect();
+            let dec = store.semantic_similarities_debiased(query, &refs, assoc_suppress_lambda());
+            let raw = store.semantic_similarities(query, &refs);
+            let mut samples_dec: Vec<(f32, bool)> = Vec::new();
+            let mut samples_raw: Vec<(f32, bool)> = Vec::new();
+            let mut pos_dec: Vec<f32> = Vec::new();
+            let mut neg_dec: Vec<f32> = Vec::new();
+            let mut has_gold = false;
+            for (i, memory) in pool.iter().enumerate() {
+                let is_gold = p82h_classify(&memory.content).0 == gold;
+                has_gold |= is_gold;
+                if let Some(s) = dec[i] {
+                    samples_dec.push((s, is_gold));
+                    if is_gold {
+                        pos_dec.push(s);
+                    } else {
+                        neg_dec.push(s);
+                    }
+                }
+                if let Some(s) = raw[i] {
+                    samples_raw.push((s, is_gold));
+                }
+            }
+            pool_sizes.push(pool.len());
+            if has_gold {
+                gold_present += 1;
+            }
+            if let Some((auc, _, _)) = p82n_auc(&samples_dec) {
+                within_auc_dec.push(auc);
+                within_ovl_dec.push(p82n_ovl(&pos_dec, &neg_dec, 10));
+            }
+            if let Some((auc, _, _)) = p82n_auc(&samples_raw) {
+                within_auc_raw.push(auc);
+            }
+            // gold 在池内去中心化降序中的最佳秩（纯秩方法，不依赖阈值）
+            let mut ranked = samples_dec.clone();
+            ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+            if let Some(pos) = ranked.iter().position(|(_, g)| *g) {
+                gold_best_rank.push((pos + 1) as f32);
+            }
+            merged_dec.extend(samples_dec.iter().copied());
+            merged_raw.extend(samples_raw.iter().copied());
+            if let Some(max) = samples_dec.iter().map(|(s, _)| *s).reduce(f32::max) {
+                top1_related.push(max);
+            }
+            // H1 口径：MISS 查询关心的是 **gold 候选本身**能否越过阈值（决定该查询能否
+            // 被救回），故单独记录其池内最高分，而非池内全局 Top-1（可能仍被噪声霸占）。
+            if miss_set.contains(query) {
+                if let Some(gold_max) = pos_dec.iter().copied().reduce(f32::max) {
+                    miss_top1.push(gold_max);
+                }
+            }
+        }
+
+        // 无关侧：池内 Top-1（同口径），用于查询间对照
+        let mut top1_unrelated: Vec<f32> = Vec::new();
+        for &query in P82H_UNRELATED {
+            let pool = p82m_root_pool(&mut store, query);
+            if pool.is_empty() {
+                continue;
+            }
+            let refs: Vec<&crate::memory_types::Memory> = pool.iter().collect();
+            let dec = store.semantic_similarities_debiased(query, &refs, assoc_suppress_lambda());
+            if let Some(max) = dec.iter().flatten().copied().reduce(f32::max) {
+                top1_unrelated.push(max);
+            }
+        }
+
+        let mean = |v: &[f32]| -> f32 {
+            if v.is_empty() {
+                0.0
+            } else {
+                v.iter().sum::<f32>() / v.len() as f32
+            }
+        };
+        let median = |v: &[f32]| -> f32 {
+            if v.is_empty() {
+                return 0.0;
+            }
+            let mut s = v.to_vec();
+            s.sort_by(f32::total_cmp);
+            s[s.len() / 2]
+        };
+        let over = |v: &[f32], t: f32| v.iter().filter(|x| **x >= t).count();
+        let sizes_f32: Vec<f32> = pool_sizes.iter().map(|n| *n as f32).collect();
+
+        eprintln!(
+            "[P8.2n+][可分性] 关联查询 {} 条，池非空 {} 条，池内 gold 存在 {} 条；池规模均值={:.2}",
+            P82H_QUERIES.len(),
+            pool_sizes.len(),
+            gold_present,
+            mean(&sizes_f32)
+        );
+        eprintln!(
+            "[P8.2n+][可分性][查询内] AUC(去中心化余弦) n={} 均值={:.3} 中位={:.3} 最小={:.3} 最大={:.3}；\
+             >0.5 者 {}/{}；不低于 0.75 者 {}/{}",
+            within_auc_dec.len(),
+            mean(&within_auc_dec),
+            median(&within_auc_dec),
+            within_auc_dec.iter().copied().fold(f32::INFINITY, f32::min),
+            within_auc_dec
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max),
+            over(&within_auc_dec, 0.5001),
+            within_auc_dec.len(),
+            over(&within_auc_dec, SEPARABLE_AUC),
+            within_auc_dec.len()
+        );
+        eprintln!(
+            "[P8.2n+][可分性][查询内] AUC(原始余弦)   n={} 均值={:.3} 中位={:.3}；不低于 0.75 者 {}/{}",
+            within_auc_raw.len(),
+            mean(&within_auc_raw),
+            median(&within_auc_raw),
+            over(&within_auc_raw, SEPARABLE_AUC),
+            within_auc_raw.len()
+        );
+        eprintln!(
+            "[P8.2n+][可分性][查询内] OVL(去中心化余弦,10箱) 均值={:.3} 中位={:.3}（1.0=完全重叠）",
+            mean(&within_ovl_dec),
+            median(&within_ovl_dec)
+        );
+        eprintln!(
+            "[P8.2n+][可分性][查询内] gold 最佳秩 n={} 均值={:.2} 中位={:.2}；秩=1 者 {}/{}（随机期望约为池半宽）",
+            gold_best_rank.len(),
+            mean(&gold_best_rank),
+            median(&gold_best_rank),
+            gold_best_rank
+                .iter()
+                .filter(|r| (**r - 1.0).abs() < 1e-6)
+                .count(),
+            gold_best_rank.len()
+        );
+
+        if let Some((auc, np, nn)) = p82n_auc(&merged_dec) {
+            eprintln!("[P8.2n+][可分性][合并] AUC(去中心化余弦)={auc:.3}（正 {np} / 负 {nn}）");
+        }
+        if let Some((auc, np, nn)) = p82n_auc(&merged_raw) {
+            eprintln!("[P8.2n+][可分性][合并] AUC(原始余弦)={auc:.3}（正 {np} / 负 {nn}）");
+        }
+
+        // ---------- 查询间对照：关联查询池内 Top-1 vs 无关查询池内 Top-1 ----------
+        // 判据 H2（无关侧零放行）能否靠绝对阈值满足，取决于这两组 Top-1 是否可分。
+        let mut cross: Vec<(f32, bool)> = Vec::new();
+        cross.extend(top1_related.iter().map(|s| (*s, true)));
+        cross.extend(top1_unrelated.iter().map(|s| (*s, false)));
+        let ovl_cross = p82n_ovl(&top1_related, &top1_unrelated, 10);
+        let rel_min = top1_related.iter().copied().fold(f32::INFINITY, f32::min);
+        let unrel_max = top1_unrelated
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        eprintln!(
+            "[P8.2n+][可分性][查询间] 关联 Top-1 n={} 均值={:.3} 中位={:.3} 最小={:.3}；无关 Top-1 n={} 均值={:.3} 中位={:.3} 最大={:.3}",
+            top1_related.len(),
+            mean(&top1_related),
+            median(&top1_related),
+            rel_min,
+            top1_unrelated.len(),
+            mean(&top1_unrelated),
+            median(&top1_unrelated),
+            unrel_max
+        );
+        eprintln!(
+            "[P8.2n+][可分性][查询间] OVL(10箱)={ovl_cross:.3}；关联最小 Top-1={rel_min:.3} vs 无关最大 Top-1={unrel_max:.3}（若前者 <= 后者则不存在可行绝对阈值）"
+        );
+        if let Some((auc, np, nn)) = p82n_auc(&cross) {
+            eprintln!(
+                "[P8.2n+][可分性][查询间] AUC(关联 vs 无关 Top-1)={auc:.3}（正 {np} / 负 {nn}）"
+            );
+        }
+
+        // ---------- 关键补测：H1 口径的可行绝对阈值区间 ----------
+        // H1（16 条 MISS 救回 ≥10）要求 MISS 的 gold 分越过阈值 t；
+        // H2（无关侧零放行）要求 t 严格大于无关侧池内 Top-1 上界。
+        // 两者同时可满足 ⇔ 存在 t 使 ≥10 条 miss_top1 ≥ t > unrel_top1_max。
+        let unrel_top1_max = top1_unrelated
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut miss_sorted: Vec<f32> = miss_top1.clone();
+        miss_sorted.sort_by(|a, b| b.total_cmp(a));
+        let miss_10th = miss_sorted.get(9).copied();
+        let feasible = miss_10th.is_some_and(|m| m > unrel_top1_max);
+        eprintln!(
+            "[P8.2n+][可分性][阈值可行性] MISS gold 分 n={} 降序前 12={:?}",
+            miss_sorted.len(),
+            miss_sorted.iter().take(12).copied().collect::<Vec<_>>()
+        );
+        eprintln!(
+            "[P8.2n+][可分性][阈值可行性] MISS 第 10 高={:?} vs 无关池内 Top-1 上界={:.4} ⇒ 可行阈值区间{}",
+            miss_10th,
+            unrel_top1_max,
+            if feasible {
+                "非空（H1/H2 可同时满足）"
+            } else {
+                "为空（极值交叉，绝对阈值不可能同时满足 H1 与 H2）"
+            }
+        );
+
+        // ---------- 预注册判读（不做事后调参）----------
+        let within_mean = mean(&within_auc_dec);
+        let within_sep = within_mean >= SEPARABLE_AUC;
+        let within_insep = within_mean <= INSEPARABLE_AUC;
+        let cross_auc = p82n_auc(&cross).map(|(a, _, _)| a).unwrap_or(f32::NAN);
+        let cross_insep = cross_auc <= INSEPARABLE_AUC;
+        // 判读改为"排序可分性（AUC）× 范围可分性（可行阈值区间）"二维：
+        // 仅当两者皆成立，绝对阈值族判据才可能同时满足 H1 与 H2。
+        let verdict = if within_sep && feasible {
+            "两层排序可分且可行阈值区间非空 ⇒ 绝对阈值族判据在原理上可同时满足 H1/H2，需回到判据形式/阈值寻址"
+        } else if within_sep && !feasible {
+            "排序可分（AUC 高）但极值交叉 ⇒ 可行阈值区间为空：**排序可分不等于阈值可行**，\
+             根因=跨查询尺度不可比（池内相对排序族无空间，须状态化或池组成重构）"
+        } else if within_insep && cross_insep {
+            "两层皆不可分 ⇒ 根因=池组成语义混杂，只能走状态化或池组成重构"
+        } else {
+            "混合信号 ⇒ 需结合逐查询池内细节定位（与 H1 否证方向一致）"
+        };
+        eprintln!(
+            "[P8.2n+][可分性][判读] 查询内 AUC 均值={within_mean:.3}（阈值 >=0.75 可分 / <=0.60 不可分）；查询间 AUC={cross_auc:.3}；可行阈值区间非空={feasible}；结论：{verdict}"
+        );
+    }
+
     /// P8.2k 分位数（最近秩法：升序第 ceil(q×n) 个，取 1-based 秩）
     #[cfg(feature = "ml")]
     fn p82k_percentile(samples: &mut [f64], q: f64) -> f64 {
