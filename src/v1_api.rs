@@ -501,6 +501,44 @@ fn assoc_path_score_enabled() -> bool {
     std::env::var_os("LRC_ASSOC_PATH_SCORE").is_some()
 }
 
+/// P8.2n 霸榜条目压制的默认强度 λ（`LRC_ASSOC_SUPPRESS` 未给数值时使用）。
+///
+/// 设计定稿（六钥匙，承接 §10.16.5 结论 4「判据路线须转向**压制**而非分离」）：
+/// 霸榜条目（如「孩子下周三期末考…」52 查询中 11 次池内 Top-1）的本质是
+/// "语义吸铁石"——它与池内**多数异主题**条目都保持中等相似，故在所有查询上
+/// 都易被顶到前列。`Memory` 无频次/访问计数字段，无法跨查询计数，因此用
+/// 「候选与同池其他候选的平均去中心化余弦」κ 作为**跨查询频次的无状态代理**
+/// （小池上的局部 IDF）。对显著超出池内中位水平者等量扣减：
+/// `s' = clamp(s − λ·max(0, κ − median(κ)))`。
+///
+/// 该量与被压制对象**同池同空间**（去中心化池内口径），天然满足 §10.16.8
+/// 锁定项 1 的"压制须以所用口径为界"约束：池内压制生活条目，全库口径不参与
+/// 旁路判据故无需压制。λ 取 1.0 = 全额扣减"超出中位的那部分中心度"；
+/// 因 κ 本身是 0-1 余弦均值、且只扣**超出中位**的增量，故仍属温和调整
+/// （H1 硬门 `min_sim` 不变，必要时由 λ 扫描回调力度）。
+const ASSOC_SUPPRESS_LAMBDA: f32 = 1.0;
+
+/// P8.2n 压制强度解析：门控 `LRC_ASSOC_SUPPRESS` 未开启、或去中心化门控
+/// `LRC_ASSOC_DEBIAS` 未开启时返回 `None`（→ 调用方行为与 P8.2m 逐字节一致，
+/// 零影响承诺）；开启时返回 `Some(λ)`，λ 可用 `LRC_ASSOC_SUPPRESS=<数值>` 覆盖
+/// （便于离线 λ 扫描，无需重编译）。
+///
+/// **口径约束**：压制只在去中心化池内空间有语义（原始空间各向异性会把所有
+/// 余弦抬到 0.6+，无中心度语义），故本函数内联 `LRC_ASSOC_DEBIAS` 前置判据，
+/// 使"压制以所用口径为界"成为**单一实现点**，生产路径与离线探针共用同一取值。
+fn assoc_suppress_lambda() -> Option<f32> {
+    if !assoc_debias_enabled() {
+        return None;
+    }
+    let raw = std::env::var("LRC_ASSOC_SUPPRESS").ok()?;
+    let lambda = raw.trim().parse::<f32>().unwrap_or(ASSOC_SUPPRESS_LAMBDA);
+    if lambda.is_finite() && lambda > 0.0 {
+        Some(lambda)
+    } else {
+        None
+    }
+}
+
 /// 执行一次有界联想探索。
 ///
 /// 探索本身复用 LRC 的 recall 入口，因此每一跳都会经过内置道体状态机、
@@ -628,8 +666,11 @@ fn run_association_explore(
                     candidates.iter().map(|(m, _)| m).collect();
                 // P8.2j 去中心化门控（默认关）：开启时以候选池均值剪掉句向量的
                 // 公共分量再算余弦，对抗 bge-zh 各向异性；关闭时与 P8.2h 逐字节一致。
+                // P8.2n 霸榜压制（默认关）：与去中心化同口径，压制后仍走
+                // 原 `min_sim` 硬门（H3 判据阈值不变），仅使"语义吸铁石"
+                // 条目更难越线——不新增放行分支，避免改变通路形状。
                 let sims = if assoc_debias_enabled() {
-                    store.semantic_similarities_debiased(text, &mem_refs)
+                    store.semantic_similarities_debiased(text, &mem_refs, assoc_suppress_lambda())
                 } else {
                     store.semantic_similarities(text, &mem_refs)
                 };
@@ -6130,7 +6171,8 @@ mod api_contracts_tests {
         let global_dist = match store.list_memories(&filter) {
             Ok((memories, _)) => {
                 let refs: Vec<&crate::memory_types::Memory> = memories.iter().collect();
-                let sims = store.semantic_similarities_debiased(query, &refs);
+                let sims =
+                    store.semantic_similarities_debiased(query, &refs, assoc_suppress_lambda());
                 let contents: Vec<String> = memories.iter().map(|m| m.content.clone()).collect();
                 p82m_distribution(&sims, &contents)
             }
@@ -6144,7 +6186,8 @@ mod api_contracts_tests {
         // ② 池内口径：与生产旁路同源的候选池（recall top_k=8），均值基准 = 池内
         let pool = p82m_root_pool(store, query);
         let pool_refs: Vec<&crate::memory_types::Memory> = pool.iter().collect();
-        let pool_sims = store.semantic_similarities_debiased(query, &pool_refs);
+        let pool_sims =
+            store.semantic_similarities_debiased(query, &pool_refs, assoc_suppress_lambda());
         let pool_contents: Vec<String> = pool.iter().map(|m| m.content.clone()).collect();
         let pool_dist = p82m_distribution(&pool_sims, &pool_contents);
         (global_dist, pool_dist)
@@ -6158,7 +6201,7 @@ mod api_contracts_tests {
     fn p82m_pool_dist(store: &mut MemoryStore<JsonPersistence>, query: &str) -> P82mDistribution {
         let pool = p82m_root_pool(store, query);
         let pool_refs: Vec<&crate::memory_types::Memory> = pool.iter().collect();
-        let sims = store.semantic_similarities_debiased(query, &pool_refs);
+        let sims = store.semantic_similarities_debiased(query, &pool_refs, assoc_suppress_lambda());
         let contents: Vec<String> = pool.iter().map(|m| m.content.clone()).collect();
         p82m_distribution(&sims, &contents)
     }
@@ -6216,7 +6259,7 @@ mod api_contracts_tests {
     ) -> Vec<(&'static str, f32, String)> {
         let pool = p82m_root_pool(store, query);
         let refs: Vec<&crate::memory_types::Memory> = pool.iter().collect();
-        let sims = store.semantic_similarities_debiased(query, &refs);
+        let sims = store.semantic_similarities_debiased(query, &refs, assoc_suppress_lambda());
         let mut ranked: Vec<(&'static str, f32, String)> = pool
             .iter()
             .zip(sims.iter())
@@ -6259,6 +6302,7 @@ mod api_contracts_tests {
     /// 同进程内跑两臂（同一语料、同一代码路径）：
     /// - A 臂：统计编码器（旁路必然 unavailable）→ 复现 P7.4 基线；
     /// - B 臂：ML 编码器（bge 真实参与旁路）→ 实测救回率。
+    ///
     /// 判据计算逐条对齐 _assoc_accuracy_eval.py::evaluate_h（H1-H4）。
     #[test]
     #[cfg(feature = "ml")]
@@ -6686,6 +6730,118 @@ mod api_contracts_tests {
             miss_bypass.contains_key("applied"),
             "B 臂（ml）在弱匹配查询上旁路必须 applied（bge 真实产出向量），实测分布 {miss_bypass:?}"
         );
+    }
+
+    /// P8.2n：模长类代理（L2 范数）形式覆盖检查——关闭"无状态代理压制"路线的
+    /// 最后一个理论候选。
+    ///
+    /// 背景（承接 §10.16.8 锁定项 1）：压制路线已试过两种"无状态中心度代理"，
+    /// 均同族失效：
+    ///
+    /// 1. 去中心化空间 κ——受零和约束 `Σ_j c_j = 0` 支配，两两余弦均值退化为
+    ///    去中心化模长的单调递减函数，即"模长最大者 κ 最负 ⇒ excess=0 ⇒
+    ///    永不被压"，方向系统性反向（λ=10 档实测 H1 崩至 9/16 已证伪）；
+    /// 2. 原始空间 τ——λ=10 修正版实测 H1 由 13/16 崩至 10/16，霸榜条目
+    ///    （exam，52 查询 11 次池内 Top-1）反升至 12 次，仅台风 1 条误召回
+    ///    被压过阈值 ⇒ 代理无判别力，放大只带来附带损伤。
+    ///
+    /// 最后一个候选是**模长类代理**：直接以 `‖v_i‖` 作为压制信号。因
+    /// `encode_embedding` 返回**未归一化**的 CLS 向量，全库模长各异，故该代理
+    /// 不被恒等退化排除，必须实测而非解析论证。判定标准：
+    ///
+    /// - 若霸榜条目即模长极值 ⇒ 模长代理与 κ 同型退化（"模长最大者永不被压"），
+    ///   "无状态代理压制"路线**整体否证**，须转向口径重构或状态化方案；
+    /// - 若霸榜条目并非模长极值 ⇒ 仍有新代理空间。
+    ///
+    /// 本探针为**纯观测**：只读语料常量、只调用 `encode_embedding`，
+    /// 不进入任何判据路径（零回归）。
+    #[test]
+    #[cfg(feature = "ml")]
+    fn test_assoc_p82n_l2_norm_probe() {
+        let Ok(ml) = crate::engine::luoshu_encoder_ml::LuoShuMlEncoder::load() else {
+            eprintln!("[P8.2n][模长代理] ML 编码器不可用，跳过模长探针");
+            return;
+        };
+        let encoder = crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder::new_with_ml(ml);
+        let corpus = p82h_all_memories();
+        // 并行编码（编码器 Sync）——串行 106 条会显著拉长用例时长。
+        let vectors: Vec<Option<Vec<f32>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = corpus
+                .iter()
+                .map(|(_, _, content)| {
+                    let encoder = &encoder;
+                    scope.spawn(move || encoder.encode_embedding(content))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or(None))
+                .collect()
+        });
+        let norms: Vec<f32> = vectors
+            .iter()
+            .map(|v| {
+                v.as_ref()
+                    .map_or(0.0, |v| v.iter().map(|x| x * x).sum::<f32>().sqrt())
+            })
+            .collect();
+        let mut sorted: Vec<f32> = norms.iter().copied().filter(|n| *n > 0.0).collect();
+        if sorted.is_empty() {
+            eprintln!("[P8.2n][模长代理] 全部编码失败，跳过模长探针");
+            return;
+        }
+        sorted.sort_by(f32::total_cmp);
+        let n = sorted.len();
+        let pick = |q: f64| sorted[((q * n as f64).ceil() as usize).clamp(1, n) - 1];
+        let mean = sorted.iter().sum::<f32>() / n as f32;
+        eprintln!(
+            "[P8.2n][模长代理] 语料 n={n}/{}（有效）L2 范数：min={:.3} p25={:.3} 中位={:.3} p75={:.3} max={:.3} 均值={:.3}",
+            corpus.len(),
+            sorted[0],
+            pick(0.25),
+            pick(0.5),
+            pick(0.75),
+            sorted[n - 1],
+            mean
+        );
+
+        // 待检验条目：霸榜条目 + 3 条池内误召回 Top-1 的常客。
+        const WATCH: &[&str] = &[
+            "孩子下周三期末考，数学应用题是他的坎", // 霸榜（52 查询 11 次池内 Top-1）
+            "预报周六多云十八度，傍晚起风",         // 台风查询误召回 Top-1（λ=10 被压至 0.1796）
+            "交强险和车船税一起续，保单在抽屉",     // 合同法/跨境电商误召回 Top-1
+            "部门五个人拼一辆七座商务车",           // 交响乐团误召回 Top-1
+        ];
+        let median = pick(0.5);
+        for content in WATCH {
+            let Some(pos) = corpus.iter().position(|(_, _, c)| *c == *content) else {
+                continue;
+            };
+            let norm = norms[pos];
+            let rank = sorted.iter().filter(|x| **x > norm).count() + 1;
+            eprintln!(
+                "[P8.2n][模长代理] 秩 {rank}/{n}（1=最大）模长={norm:.3} 相对中位={:.3}×  {content}",
+                if median > 0.0 { norm / median } else { 0.0 }
+            );
+        }
+
+        // 模长极值对照：判定"霸榜条目是否即模长最大者"。
+        let mut idx: Vec<usize> = (0..corpus.len()).filter(|&i| norms[i] > 0.0).collect();
+        idx.sort_by(|&a, &b| norms[b].total_cmp(&norms[a]));
+        eprintln!("[P8.2n][模长代理] 模长 Top-5：");
+        for &i in idx.iter().take(5) {
+            eprintln!(
+                "  · 模长={:.3} 链={} 内容={}",
+                norms[i], corpus[i].0, corpus[i].2
+            );
+        }
+        eprintln!("[P8.2n][模长代理] 模长 Bottom-5：");
+        for &i in idx.iter().rev().take(5) {
+            eprintln!(
+                "  · 模长={:.3} 链={} 内容={}",
+                norms[i], corpus[i].0, corpus[i].2
+            );
+        }
     }
 
     /// P8.2k 分位数（最近秩法：升序第 ceil(q×n) 个，取 1-based 秩）
