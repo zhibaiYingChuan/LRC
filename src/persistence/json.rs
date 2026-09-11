@@ -9,7 +9,7 @@
 // 适用于轻量级部署（记忆数量 < 10,000 条）。
 // 大数据量场景建议使用 SQLite 后端（P1 计划）。
 
-use super::{Persistence, PersistenceError};
+use super::{AssocFrequency, Persistence, PersistenceError};
 use crate::chunker::CodeChunk;
 use crate::engine::memory_state_machine::MemoryState;
 use crate::memory_types::Memory;
@@ -188,6 +188,26 @@ impl Persistence for JsonPersistence {
     fn save_memory_state(&self, state: &MemoryState) -> Result<(), PersistenceError> {
         self.ensure_data_dir()?;
         let path = self.data_dir.join("memory_state.json");
+        let json = serde_json::to_string_pretty(state)?;
+        atomic_write(&path, &json)?;
+        Ok(())
+    }
+
+    fn load_assoc_frequency(&self) -> Result<AssocFrequency, PersistenceError> {
+        let path = self.data_dir.join("assoc_frequency.json");
+        if !path.exists() {
+            return Ok(AssocFrequency::default());
+        }
+        let content = fs::read_to_string(path)?;
+        if content.trim().is_empty() {
+            return Ok(AssocFrequency::default());
+        }
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    fn save_assoc_frequency(&self, state: &AssocFrequency) -> Result<(), PersistenceError> {
+        self.ensure_data_dir()?;
+        let path = self.data_dir.join("assoc_frequency.json");
         let json = serde_json::to_string_pretty(state)?;
         atomic_write(&path, &json)?;
         Ok(())

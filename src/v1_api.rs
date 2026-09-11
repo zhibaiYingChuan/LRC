@@ -428,21 +428,31 @@ fn assoc_semantic_diag_enabled() -> bool {
     std::env::var_os("LRC_ASSOC_SEMANTIC_DIAG").is_some()
 }
 
-/// P8.2j 向量去中心化门控：`LRC_ASSOC_DEBIAS=1` 时，root 语义旁路改用
-/// **候选池均值双侧对称去中心化**后的余弦（见
-/// [`MemoryStore::semantic_similarities_debiased`]）。
+/// P8.2j 向量去中心化门控（P8.2o 起**默认开启**，带逃生开关）：开启时
+/// root 语义旁路改用**候选池均值双侧对称去中心化**后的余弦（见
+/// [`MemoryStore::semantic_similarities_debiased`]），并叠加 P8.2o 跨查询
+/// 命中频次折扣。
 ///
 /// 设计动机：P8.2h/P8.2i 实测证明 bge-zh 句向量各向异性严重——无关内容的绝对
 /// 余弦与池内间隔都无法与真实相关分离（H2 失败）。去中心化把句向量挤向公共
 /// 方向的分量剪掉，是各向异性问题的标准对策，且以候选池均值估计公共分量属
 /// **零额外编码开销**（池向量本就要编码），满足旁路 6s 硬时限。
 ///
-/// 默认关 → 旁路仍走 [`MemoryStore::semantic_similarities`]，与 P8.2h 现状
-/// 逐字节一致（零影响承诺，与 `LRC_ASSOC_SEMANTIC_DIAG` / `LRC_ASSOC_EDGE_FEEDBACK`
-/// / `LRC_ASSOC_PATH_SCORE` 同一纪律）。`ASSOCIATION_ROOT_MIN_SEMANTIC_SIM`
-/// 始终作为安全下限（H3 判据维持 0.55 不变）。
+/// **默认开启的依据（P8.2o 实测）**：状态化频次折扣在 λ=0.25 时**首次同时满足
+/// H1（MISS 救回 10/16 ≥10）与 H2（无关侧零放行 0/22）**，P8 系列此前全部判据族
+/// 均无法同时满足两者；λ=0 基线 H1 13/16 / H2 5/22 与 §10.15/§10.18 逐条一致，
+/// 口径自洽。故本门控自 P8.2o 落地起作为生产默认。
+///
+/// **逃生开关（运行期实时读取，不缓存）**：`LRC_ASSOC_DEBIAS=0` 时退回
+/// [`MemoryStore::semantic_similarities`]，旁路行为与 P8.2h 逐字节一致
+/// ——沿用 [`crate::engine::memory_state_machine::state_bias_enabled`] 的
+/// "缺省 true + `!= \"0\"` 判定 + 实时读 env"形态。无论门控状态如何，
+/// `ASSOCIATION_ROOT_MIN_SEMANTIC_SIM` 始终作为安全下限（H3 判据维持 0.55 不变，
+/// 生效阈值按所用向量空间取 `ASSOC_DEBIAS_MIN_SEMANTIC_SIM`）。
 fn assoc_debias_enabled() -> bool {
-    std::env::var_os("LRC_ASSOC_DEBIAS").is_some()
+    std::env::var("LRC_ASSOC_DEBIAS")
+        .map(|v| v != "0")
+        .unwrap_or(true)
 }
 
 /// P8.2k 去中心化空间的**重标定**语义下限（仅 `LRC_ASSOC_DEBIAS` 开启时生效）。
@@ -458,16 +468,20 @@ fn assoc_debias_enabled() -> bool {
 /// 取该区间**中点 0.18**（对两侧边界的裕度最大：距无关上界 +0.030、
 /// 距第 10 条相关查询 −0.039）。
 ///
+/// **生产状态（P8.2o 起）**：本常量自去中心化门控改**默认开启**后即成为
+/// 生产默认旁路下限（不再需要 `LRC_ASSOC_DEBIAS=1` 显式开启）。
+/// `LRC_ASSOC_DEBIAS=0` 逃生时退回 [`ASSOCIATION_ROOT_MIN_SEMANTIC_SIM`]（0.55），
+/// 与 P8.2h 逐字节一致。
+///
 /// **口径诚实声明**：H2 证据仅来自 **2 条**无关查询（公平语料设计如此），
-/// 阈值选择因此**证据强度有限**；本常量作可门控实验参数记录，不作生产默认值。
-/// 非去中心化路径**始终**使用 [`ASSOCIATION_ROOT_MIN_SEMANTIC_SIM`]（0.55），
-/// 本常量不进入任何默认通路（零影响承诺，与 `LRC_ASSOC_SEMANTIC_DIAG` /
-/// `LRC_ASSOC_EDGE_FEEDBACK` / `LRC_ASSOC_PATH_SCORE` 同一纪律）。
+/// 阈值选择因此**证据强度有限**；如上标定区间中点 0.18 是当前可得的
+/// 最优工作点，后续如扩增无关查询语料应重新标定。
 const ASSOC_DEBIAS_MIN_SEMANTIC_SIM: f32 = 0.18;
 
-/// 旁路实际生效的余弦下限：去中心化门控开启时用重标定值
-/// （[`ASSOC_DEBIAS_MIN_SEMANTIC_SIM`]），否则为历史安全下限
-/// （[`ASSOCIATION_ROOT_MIN_SEMANTIC_SIM`]=0.55）——门控关闭时与 P8.2h 逐字节一致。
+/// 旁路实际生效的余弦下限：去中心化门控开启（默认）时用重标定值
+/// （[`ASSOC_DEBIAS_MIN_SEMANTIC_SIM`]），逃生开关 `LRC_ASSOC_DEBIAS=0`
+/// 时退为历史安全下限（[`ASSOCIATION_ROOT_MIN_SEMANTIC_SIM`]=0.55）
+/// ——逃生时与 P8.2h 逐字节一致。
 fn assoc_bypass_min_sim() -> f32 {
     if assoc_debias_enabled() {
         ASSOC_DEBIAS_MIN_SEMANTIC_SIM
@@ -501,27 +515,30 @@ fn assoc_path_score_enabled() -> bool {
     std::env::var_os("LRC_ASSOC_PATH_SCORE").is_some()
 }
 
-/// P8.2n 霸榜条目压制的默认强度 λ（`LRC_ASSOC_SUPPRESS` 未给数值时使用）。
+/// P8.2o 状态化霸榜条目压制的默认强度 λ（`LRC_ASSOC_SUPPRESS` 未给数值时使用）。
 ///
 /// 设计定稿（六钥匙，承接 §10.16.5 结论 4「判据路线须转向**压制**而非分离」）：
 /// 霸榜条目（如「孩子下周三期末考…」52 查询中 11 次池内 Top-1）的本质是
 /// "语义吸铁石"——它与池内**多数异主题**条目都保持中等相似，故在所有查询上
-/// 都易被顶到前列。`Memory` 无频次/访问计数字段，无法跨查询计数，因此用
-/// 「候选与同池其他候选的平均去中心化余弦」κ 作为**跨查询频次的无状态代理**
-/// （小池上的局部 IDF）。对显著超出池内中位水平者等量扣减：
-/// `s' = clamp(s − λ·max(0, κ − median(κ)))`。
+/// 都易被顶到前列。
 ///
-/// 该量与被压制对象**同池同空间**（去中心化池内口径），天然满足 §10.16.8
-/// 锁定项 1 的"压制须以所用口径为界"约束：池内压制生活条目，全库口径不参与
-/// 旁路判据故无需压制。λ 取 1.0 = 全额扣减"超出中位的那部分中心度"；
-/// 因 κ 本身是 0-1 余弦均值、且只扣**超出中位**的增量，故仍属温和调整
-/// （H1 硬门 `min_sim` 不变，必要时由 λ 扫描回调力度）。
-const ASSOC_SUPPRESS_LAMBDA: f32 = 1.0;
+/// **P8.2o 口径（取代 P8.2n 的无状态代理 κ）**：`Memory` 无频次字段，
+/// P8.2n 曾用「候选与同池其他候选的平均去中心化余弦」κ 作**无状态代理**，
+/// 实测无法同时满足 H1/H2（§10.18）。P8.2o 改为以独立统计文件持久化的
+/// **跨查询文档频率** df（按"出现于多少个查询的候选池"累计，池内去重）直接
+/// 度量"吸铁石"程度，折扣 `s' = s − λ·留一命中率`（**不额外 clamp**）。
+/// 留一法保证当前查询不计入自身统计，避免循环论证（见 §10.19.1）。
+///
+/// **λ=0.25 的实测依据**：λ=0.25 与 λ=0.5 实测同为 H1=10/16、H2=0/22
+/// （P8 系列**首次在满足 H2 的同时达成 H1**），取两者中较小者以保留裕度；
+/// λ=0 基线 H1 13/16 / H2 5/22，λ≥1 后 H1 单调下滑。
+const ASSOC_SUPPRESS_LAMBDA: f32 = 0.25;
 
-/// P8.2n 压制强度解析：门控 `LRC_ASSOC_SUPPRESS` 未开启、或去中心化门控
-/// `LRC_ASSOC_DEBIAS` 未开启时返回 `None`（→ 调用方行为与 P8.2m 逐字节一致，
-/// 零影响承诺）；开启时返回 `Some(λ)`，λ 可用 `LRC_ASSOC_SUPPRESS=<数值>` 覆盖
-/// （便于离线 λ 扫描，无需重编译）。
+/// P8.2o 压制强度解析（**默认开启**，带逃生开关）：去中心化门控
+/// `LRC_ASSOC_DEBIAS` 关闭（`=0`）时返回 `None`；否则返回 `Some(λ)`，
+/// λ 默认 [`ASSOC_SUPPRESS_LAMBDA`]（0.25），可用 `LRC_ASSOC_SUPPRESS=<数值>`
+/// 覆盖（便于离线 λ 扫描，无需重编译）；`LRC_ASSOC_SUPPRESS=0` 或非正数
+/// 视为**逃生**——返回 `None`，压制不生效，退回 P8.2m 逐字节行为。
 ///
 /// **口径约束**：压制只在去中心化池内空间有语义（原始空间各向异性会把所有
 /// 余弦抬到 0.6+，无中心度语义），故本函数内联 `LRC_ASSOC_DEBIAS` 前置判据，
@@ -530,7 +547,7 @@ fn assoc_suppress_lambda() -> Option<f32> {
     if !assoc_debias_enabled() {
         return None;
     }
-    let raw = std::env::var("LRC_ASSOC_SUPPRESS").ok()?;
+    let raw = std::env::var("LRC_ASSOC_SUPPRESS").unwrap_or_default();
     let lambda = raw.trim().parse::<f32>().unwrap_or(ASSOC_SUPPRESS_LAMBDA);
     if lambda.is_finite() && lambda > 0.0 {
         Some(lambda)
@@ -664,15 +681,32 @@ fn run_association_explore(
                 // 不允许 root 阶段吃掉 BFS 扩散的全部预算
                 let mem_refs: Vec<&crate::memory_types::Memory> =
                     candidates.iter().map(|(m, _)| m).collect();
-                // P8.2j 去中心化门控（默认关）：开启时以候选池均值剪掉句向量的
-                // 公共分量再算余弦，对抗 bge-zh 各向异性；关闭时与 P8.2h 逐字节一致。
-                // P8.2n 霸榜压制（默认关）：与去中心化同口径，压制后仍走
-                // 原 `min_sim` 硬门（H3 判据阈值不变），仅使"语义吸铁石"
-                // 条目更难越线——不新增放行分支，避免改变通路形状。
-                let sims = if assoc_debias_enabled() {
+                // P8.2j 去中心化门控（默认开）：开启时以候选池均值剪掉句向量的
+                // 公共分量再算余弦，对抗 bge-zh 各向异性；P8.2o 起同时启用
+                // 跨查询命中频次折扣。关闭（`LRC_ASSOC_DEBIAS=0`）时与 P8.2h
+                // 逐字节一致。
+                // P8.2o 状态化压制（默认开）：以独立统计文件持久化的跨查询命中
+                // 频次折扣"语义吸铁石"条目；压制后仍走原 `min_sim` 硬门
+                // （H3 判据阈值不变），不新增放行分支，避免改变通路形状。
+                //
+                // P8.2o 池规模守卫：去中心化用候选池均值估计"公共分量"，
+                // 池内不足 2 条时均值恰等于唯一样本 ⇒ 中心化后恒为零向量 ⇒
+                // 相似度全部不可计算（旁路退化为 unavailable，语义强相关的
+                // 单条记忆被误判为弱匹配）。此时退回原始空间，并配对使用
+                // 原始量纲的 0.55 阈值（与 P8.2h 逐字节一致）。
+                let use_decenter = assoc_debias_enabled() && mem_refs.len() >= 2;
+                let sims = if use_decenter {
                     store.semantic_similarities_debiased(text, &mem_refs, assoc_suppress_lambda())
                 } else {
                     store.semantic_similarities(text, &mem_refs)
+                };
+                // 阈值必须与所用向量空间配对：去中心化后的余弦量纲不同于
+                // 原始空间，0.18 只对去中心化空间标定（见常量注释），
+                // 否则"空间 A 的分值 + 空间 B 的门槛"会让放行判定失效。
+                let bypass_min_sim = if use_decenter {
+                    assoc_bypass_min_sim()
+                } else {
+                    ASSOCIATION_ROOT_MIN_SEMANTIC_SIM
                 };
                 // P8.2c：记录旁路活性——编码器是否产出向量参与判定。
                 // 统计模式/模型缺失时 sims 全 None → "unavailable"（旁路实际未参与），
@@ -712,8 +746,8 @@ fn run_association_explore(
                         scored.len(),
                         best - second,
                         assoc_adaptive_threshold_enabled(),
-                        assoc_debias_enabled(),
-                        assoc_bypass_min_sim()
+                        use_decenter,
+                        bypass_min_sim
                     );
                 }
                 // P8.2i 自适应门槛（默认关，零影响承诺）：开启时用池内相对
@@ -759,7 +793,9 @@ fn run_association_explore(
                     // P8.2k 阈值重标定（默认关，零影响承诺）：门控关闭时
                     // `assoc_bypass_min_sim()` 恒返回 0.55（历史路径逐字节一致）；
                     // 去中心化门控开启时才返回针对新量纲标定的 0.18（见常量注释）。
-                    let min_sim = assoc_bypass_min_sim();
+                    // P8.2o：阈值改由 `bypass_min_sim` 给出——它与上方实际
+                    // 使用的向量空间配对（退化退回原始空间时回到 0.55）。
+                    let min_sim = bypass_min_sim;
                     for ((memory, score), sim) in candidates.iter().zip(sims) {
                         if memory.memory_type == crate::memory_types::MemoryType::CodeContext {
                             continue;
@@ -770,6 +806,19 @@ fn run_association_explore(
                     }
                 }
             }
+            // P8.2o 状态化统计累计（**先判定、后累计**）：把本次 root 候选池的
+            // 内容计入跨查询文档频率 df，供**后续查询**的压制判定使用。锚点
+            // 之所以必须在压制判定（上方 `sims`/`min_sim` 段）之后，是为了满足
+            // 留一法防自证约束——本次查询不得计入自身统计（见 `memory_store.rs`
+            // 的 `record_assoc_query` 与 §10.19.1）。词面命中路径本轮未做压制
+            // 判定，此处累计同样不自证；两条路径均计入，与离线探针「逐查询采集
+            // 候选池」的口径一致。写盘为小 JSON（沿用 `bake_activation` 的
+            // 独立状态文件范式），失败静默不影响联想探索。
+            let pool_contents: Vec<String> = candidates
+                .iter()
+                .map(|(memory, _)| memory.content.clone())
+                .collect();
+            store.record_assoc_query(&pool_contents);
             // 开发上下文块（6000+ 条代码 chunk 在语义空间里无处不在）
             // 只在没有更贴合的生活记忆通过门禁时才允许充当起点，防止
             // 代码记忆抢走生活查询的锚。代码查询下所有通过门禁的候选
@@ -7844,12 +7893,31 @@ mod api_contracts_tests {
                 let resp =
                     run_association_explore(&mut store, Some(query), None, 4, 3, &cancel, None);
                 fn_lat.push(started.elapsed().as_secs_f64());
-                fn_root.push(resp.root.unwrap_or_default());
+                // P8.2o：两臂各自独立建库（防跨查询状态串扰），记忆 UUID
+                // 必然不同，故以**起点内容**为对照口径而非 root 记忆 ID。
+                fn_root.push(
+                    resp.nodes
+                        .iter()
+                        .find(|node| node.depth == 0)
+                        .map(|node| node.content.clone())
+                        .unwrap_or_default(),
+                );
             }
         }
 
         // ---------- HTTP 层：与生产链路同构（build_v1_router → Service → oneshot）----------
-        let shared = Arc::new(Mutex::new(store));
+        // P8.2o：压制判定依赖**跨查询累计状态**（`assoc_frequency` 随每次探索
+        // 递增），因此两臂必须在**各自全新的 store** 上跑同样的查询序列，
+        // 才能保证"第 i 次抽样的 root 起点一致"这一不变量。若复用同一 store
+        // 续跑，HTTP 臂会继承函数臂已累计的命中频次，同一查询重复执行会压制
+        // 其自身此前的 root，导致第 0 次抽样即出现差异（实测 loss）。
+        let http_dir = std::env::temp_dir().join(format!("lrc_p82k_http_arm_{ts}"));
+        let _ = std::fs::remove_dir_all(&http_dir);
+        std::fs::create_dir_all(&http_dir).unwrap();
+        let mut store_http = new_ml_capable_store(http_dir.to_str().unwrap())
+            .expect("HTTP 臂 ML 编码器二次加载失败——若失败则对照不变量无法验证，不得静默跳过");
+        p82h_seed(&mut store_http);
+        let shared = Arc::new(Mutex::new(store_http));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(IdleCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -7893,7 +7961,14 @@ mod api_contracts_tests {
                     "响应必须携带 semantic_bypass 活性字段"
                 );
                 http_root.push(
-                    body.get("root")
+                    body.get("nodes")
+                        .and_then(|value| value.as_array())
+                        .and_then(|nodes| {
+                            nodes
+                                .iter()
+                                .find(|node| node.get("depth").and_then(|d| d.as_u64()) == Some(0))
+                        })
+                        .and_then(|node| node.get("content"))
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),

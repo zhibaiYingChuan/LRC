@@ -11,6 +11,8 @@
 use crate::chunker::CodeChunk;
 use crate::engine::memory_state_machine::MemoryState;
 use crate::memory_types::Memory;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -66,6 +68,78 @@ impl From<serde_json::Error> for PersistenceError {
     }
 }
 
+/// 关联召回的跨查询命中频次统计（P8.2o 状态化方案的持久化载体）。
+///
+/// 语义：`hit_counts[content]` 记录该内容在历史查询的根候选池中**出现过多少次**
+/// （按"出现的查询数"计数，同一查询的池内不重复）；`total_queries` 为已累计的
+/// 查询总数。二者共同支撑"留一命中率"：`l1_rate(c) = df(c) / max(total, 1)`。
+///
+/// 该口径与 P8.2o 离线探针逐字等价：探针写为
+/// `(df_all − 1_{c ∈ q 池}) / (n_queries − 1)`，其中 `df_all = df + 1`、
+/// `n_queries = total + 1`，两者恒等；而在线增量累计天然使当前查询不计入自身
+/// 统计，从机制上排除了循环论证。
+///
+/// 以独立文件承载，`Memory` 无需新增字段；Postgres/Qdrant 后端通过 trait 默认
+/// 方法自动忽略。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AssocFrequency {
+    /// 内容 → 跨查询文档频率（df，按出现的查询数计，池内不重复）
+    pub hit_counts: BTreeMap<String, u32>,
+    /// 已累计的查询总数
+    pub total_queries: u64,
+    /// 结构版本号，便于后续格式演进
+    pub version: u32,
+}
+
+impl Default for AssocFrequency {
+    fn default() -> Self {
+        Self {
+            hit_counts: BTreeMap::new(),
+            total_queries: 0,
+            version: 1,
+        }
+    }
+}
+
+impl AssocFrequency {
+    /// 留一命中率 `l1_rate(c) = df(c) / max(total_queries, 1)`，值域 `[0, 1]`。
+    ///
+    /// 在线增量口径下当前查询尚未计入自身统计，故无需再减 1（与 P8.2o 探针
+    /// 的 `(df_all − 1)/(n_queries − 1)` 恒等）。分母用 `max(…, 1)` 防除零。
+    pub fn leave_one_rate(&self, content: &str) -> f32 {
+        let df = self.hit_counts.get(content).copied().unwrap_or(0);
+        if df == 0 {
+            return 0.0;
+        }
+        let denom = self.total_queries.max(1) as f32;
+        (df as f32 / denom).clamp(0.0, 1.0)
+    }
+
+    /// 累计一次查询的命中：对池内去重后的每个内容 `+1`，并将查询总数 `+1`。
+    ///
+    /// 去重语义与 P8.2o 探针的 df 构造一致（同一查询的池内不重复计数）。
+    pub fn record_query<I, S>(&mut self, pool_contents: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        // 先物化为 owned 字符串：`seen` 需要跨迭代持有借用，若直接借用迭代器
+        // 产出的临时值会触发 E0597（borrowed value does not live long enough）。
+        let pool: Vec<String> = pool_contents
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for content in &pool {
+            if !seen.insert(content.as_str()) {
+                continue;
+            }
+            *self.hit_counts.entry(content.clone()).or_insert(0) += 1;
+        }
+        self.total_queries = self.total_queries.saturating_add(1);
+    }
+}
+
 /// 持久化存储抽象 trait
 ///
 /// 定义记忆和代码片段的 CRUD 操作接口。
@@ -83,6 +157,18 @@ pub trait Persistence: Send + Sync {
     /// 保存 LRC 内置道体状态机的持久化快照。
     /// 未实现的后端默认忽略，具体后端可提供原子持久化。
     fn save_memory_state(&self, _state: &MemoryState) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+
+    /// 加载跨查询命中频次统计（P8.2o 状态化方案）。
+    /// 未实现的后端返回空统计，保证旧后端兼容。
+    fn load_assoc_frequency(&self) -> Result<AssocFrequency, PersistenceError> {
+        Ok(AssocFrequency::default())
+    }
+
+    /// 保存跨查询命中频次统计（P8.2o 状态化方案）。
+    /// 未实现的后端默认忽略，具体后端可提供原子持久化。
+    fn save_assoc_frequency(&self, _state: &AssocFrequency) -> Result<(), PersistenceError> {
         Ok(())
     }
 

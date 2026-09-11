@@ -76,7 +76,7 @@ use crate::engine::user_feedback::{
 };
 use crate::graph_store::{EdgeType, GraphMemoryStore};
 use crate::memory_types::{DecayConfig, Importance, Memory, MemoryType, PrivacyLevel};
-use crate::persistence::{Persistence, PersistenceError};
+use crate::persistence::{AssocFrequency, Persistence, PersistenceError};
 use serde::{Deserialize, Serialize};
 
 /// BM25 检索评分参数（v0.8.50 检索质量修复）：
@@ -424,6 +424,10 @@ pub struct MemoryStore<P: Persistence> {
     bigram_index_dirty: std::cell::Cell<bool>,
     /// recall 文本特征缓存，按 Memory ID 复用规范化正文和文档长度
     recall_documents: std::cell::RefCell<std::collections::HashMap<String, RecallDocument>>,
+    /// P8.2o 状态化方案：跨查询命中频次统计（独立文件持久化，`Memory` 零改动）
+    /// 用于把"霸榜条目"的跨查询频次从无状态代理升级为真实计数，
+    /// 支撑压制项 `s' = s − λ·留一命中率`。同样以 RefCell 支持 &self 内部可变。
+    assoc_frequency: std::cell::RefCell<AssocFrequency>,
     /// v0.5.5 P1-1：LLM 是否已配置
     /// LLM 配置后替代本地 ML 模型提供语义理解能力，编码器不再视为"降级"
     /// 通过 set_llm_configured() 在 sidecar 启动后设置
@@ -986,6 +990,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 创建新的记忆存储器（默认相似度阈值 0.5）
     pub fn new(persistence: P) -> Self {
         let memory_state = persistence.load_memory_state().unwrap_or_default();
+        let assoc_frequency = persistence.load_assoc_frequency().unwrap_or_default();
         // 质疑二·终极：启动时打印完整的隐私清单，而非一闪而过的日志
         eprintln!(
             "{}",
@@ -1028,6 +1033,7 @@ impl<P: Persistence> MemoryStore<P> {
             bigram_index: std::cell::RefCell::new(std::collections::HashMap::new()),
             bigram_index_dirty: std::cell::Cell::new(true),
             recall_documents: std::cell::RefCell::new(std::collections::HashMap::new()),
+            assoc_frequency: std::cell::RefCell::new(assoc_frequency),
             // v0.5.5 P1-1：LLM 默认未配置，由 sidecar 启动后通过 set_llm_configured() 设置
             llm_configured: std::sync::atomic::AtomicBool::new(false),
             // v0.6.0+ 参赛扩展：探索日志默认禁用
@@ -1074,6 +1080,8 @@ impl<P: Persistence> MemoryStore<P> {
             bigram_index: std::cell::RefCell::new(std::collections::HashMap::new()),
             bigram_index_dirty: std::cell::Cell::new(true),
             recall_documents: std::cell::RefCell::new(std::collections::HashMap::new()),
+            // P8.2o 状态化方案：统计模式构造点不加载磁盘统计，以空统计起步
+            assoc_frequency: std::cell::RefCell::new(AssocFrequency::default()),
             // v0.5.5 P1-1：LLM 默认未配置
             llm_configured: std::sync::atomic::AtomicBool::new(false),
             // v0.6.0+ 参赛扩展：探索日志默认禁用
@@ -1261,64 +1269,31 @@ impl<P: Persistence> MemoryStore<P> {
         if !lambda.is_finite() || lambda <= 0.0 {
             return sims;
         }
-        // P8.2n 池内中心度去偏：霸榜条目的本质是"语义吸铁石"——它与池内**多数
-        // 不同主题**条目都保持中等相似。以 τ_i = 候选 i 与同池其他候选的平均
-        // **原始句向量**余弦作为"跨查询频次"的无状态代理（Memory 无频次字段，
-        // 无法跨查询计数），对显著超出池内中位水平者等量扣减：
-        // s'_i = clamp(s_i − λ·max(0, τ_i − median(τ)))。
-        // 该量与旁路判据同池，故压制天然"以所用口径为界"。
+        // P8.2o 状态化压制（跨查询命中频次折扣）：以**独立统计文件**持久化的
+        // 跨查询文档频率 df(content) 计算留一命中率
+        //   l1_rate(c) = df(c) / max(total_queries, 1)
+        // 作为"语义吸铁石"的真实度量，替代 P8.2n 的池内中心度**无状态代理**
+        // （该代理在 §10.17 实测证伪：κ 仅随去中心化模长单调递减，霸榜者恰是
+        // 模长最大者 ⇒ excess=0 ⇒ 永不被压，反杀平庸正确召回）。折扣形式
+        //   s' = s − λ·l1_rate(c)，**不额外 clamp**
+        // 与 §10.19 探针口径逐字一致（对 H2 不施加人为偏利）。
         //
-        // 关键：代理必须在**原始空间**估计，不可用去中心化向量。去中心化空间满足
-        // 零和约束 Σ_j c_j = 0，故 Σ_{j≠i} dot(c_i, c_j) = −‖c_i‖²，两两余弦均值
-        // 退化为 κ_i ≈ −‖c_i‖/((n−1)·const)，即 κ 仅随去中心化模长单调递减。
-        // 霸榜条目恰是模长最大者 ⇒ κ 最负 ⇒ excess=0 ⇒ **永不被压**，而被压的反是
-        // 模长小的平庸候选（含正确召回）。λ=10 档实测已证伪：放大 10 倍后 5 条误召回
-        // 中 4 条 Top-1 逐字不变，H1 反由 13/16 降至 9/16。故此处刻意用原始 `vectors`。
-        let valid_idx: Vec<usize> = vectors
-            .iter()
-            .enumerate()
-            .filter_map(|(i, v)| {
-                let v = v.as_ref()?;
-                let n = l2_norm(v);
-                (v.len() == q.len() && n.is_finite() && n > 0.0).then_some(i)
-            })
-            .collect();
-        let norms: Vec<f32> = vectors
-            .iter()
-            .map(|v| v.as_ref().map_or(0.0, |v| l2_norm(v)))
-            .collect();
-        let mut tau = vec![0.0f32; memories.len()];
-        for &i in &valid_idx {
-            let vi = vectors[i].as_ref().expect("已过滤为有效候选");
-            let ni = norms[i];
-            let mut acc = 0.0f32;
-            let mut cnt = 0usize;
-            for &j in &valid_idx {
-                if j == i || norms[j] <= 0.0 {
-                    continue;
-                }
-                let vj = vectors[j].as_ref().expect("已过滤为有效候选");
-                acc += (dot(vi, vj) / (ni * norms[j])).clamp(0.0, 1.0);
-                cnt += 1;
-            }
-            tau[i] = if cnt > 0 { acc / cnt as f32 } else { 0.0 };
-        }
-        let mut taus: Vec<f32> = valid_idx.iter().map(|&i| tau[i]).collect();
-        taus.sort_by(f32::total_cmp);
-        let median = if taus.is_empty() {
-            0.0
-        } else if taus.len() % 2 == 1 {
-            taus[taus.len() / 2]
-        } else {
-            (taus[taus.len() / 2 - 1] + taus[taus.len() / 2]) / 2.0
-        };
-        for (i, s) in sims.iter_mut().enumerate() {
+        // 留一法保证：调用方（`run_association_explore`）必须在**完成本次压制判定
+        // 之后**才调用 `record_assoc_query` 累计本查询的池，故当前查询不计入自身
+        // 贡献——在线增量口径 (df+1)/(n+1) 与离线探针 (df_all−1)/(n_all−1) 恒等
+        // （df_all = df+1、n_all = n+1），满足 §10.19.1 的防自证要求。
+        //
+        // 该量以"跨查询出现次数"为统计口径，是**跨查询原生可比的状态量**——正落在
+        // §10.18 否证边界（查询内、无状态标量阈值族）之外（见 §10.19.4）。
+        let freq = self.assoc_frequency.borrow();
+        for (memory, s) in memories.iter().zip(sims.iter_mut()) {
             let Some(s) = s else { continue };
-            let excess = (tau[i] - median).max(0.0);
-            if excess > 0.0 {
-                *s = (*s - lambda * excess).clamp(0.0, 1.0);
+            let rate = freq.leave_one_rate(&memory.content);
+            if rate > 0.0 {
+                *s -= lambda * rate;
             }
         }
+        drop(freq);
         sims
     }
 
@@ -1329,7 +1304,7 @@ impl<P: Persistence> MemoryStore<P> {
     }
 
     /// 非 ml 构建：去中心化语义相似度同样恒不可用（门控开启也不改变行为）。
-    /// P8.2n 压制参数在非 ml 下无编码器可依，同样静默忽略。
+    /// P8.2n/P8.2o 压制参数在非 ml 下无编码器可依，同样静默忽略。
     #[cfg(not(feature = "ml"))]
     pub fn semantic_similarities_debiased(
         &self,
@@ -1338,6 +1313,29 @@ impl<P: Persistence> MemoryStore<P> {
         _suppress: Option<f32>,
     ) -> Vec<Option<f32>> {
         vec![None; memories.len()]
+    }
+
+    /// P8.2o 状态化方案：累计一次查询的根候选池命中频次，并持久化统计快照。
+    ///
+    /// **留一法调用约束（强）**：调用方必须在**完成本次压制判定之后**才调用本方法。
+    /// 判定读取的是"本次查询尚未计入"的历史统计，故当前查询不计入自身贡献；
+    /// 在线增量口径 `df(c)/max(total,1)` 与离线探针
+    /// `(df_all − 1_{c∈q池})/(n_all − 1)` 恒等（df_all = df+1、n_all = n+1），
+    /// 满足防自证要求（口径推导见 [`Self::semantic_similarities_impl`] 内注释）。
+    ///
+    /// 持久化失败不阻塞检索/探索——跨查询统计是增强项，与 `bake_activation`
+    /// 对 `save_memory_state` 的容错同一范式（`let _ =`）。
+    pub fn record_assoc_query(&mut self, pool_contents: &[String]) {
+        if pool_contents.is_empty() {
+            // 与离线探针口径一致：空池不计数（探针见空池直接 continue）
+            return;
+        }
+        {
+            let mut freq = self.assoc_frequency.borrow_mut();
+            freq.record_query(pool_contents.iter().map(|s| s.as_str()));
+        }
+        let snapshot = self.assoc_frequency.borrow().clone();
+        let _ = self.persistence.save_assoc_frequency(&snapshot);
     }
 
     /// v0.6.0+ 参赛扩展：设置探索日志记录器
