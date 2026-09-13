@@ -282,7 +282,10 @@ async function detectProxyConfiguration() {
       const invokeFn = (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke) ||
                        (window.__TAURI__ && window.__TAURI__.invoke);
       if (invokeFn) {
-        const proxyInfo = await invokeFn('get_proxy_configuration');
+        // v0.9.7 修复（审查报告 P1）：后端此前未定义/未注册该命令，
+        // 异常被静默吞掉导致"系统代理检测"完全失效；现已在桌面端补齐。
+        // 同时补 3s 超时兜底，避免 IPC 异常时阻塞 banner 更新（HCSE 韧性要求）。
+        const proxyInfo = await invokeWithTimeout(invokeFn, 'get_proxy_configuration', undefined, 3000);
         if (proxyInfo && proxyInfo.proxy_url) {
           result.likelyProxy = true;
           result.reason = `检测到系统代理: ${proxyInfo.proxy_url}`;
@@ -291,7 +294,7 @@ async function detectProxyConfiguration() {
         }
       }
     } catch (e) {
-      // Tauri IPC 调用失败，静默处理（可能是旧版本 sidecar 不支持此命令）
+      // Tauri IPC 调用失败不阻断主流程，仅记录并降级到其他检测手段
       console.log('[detectProxy] Tauri IPC 获取代理信息失败:', e.message);
       result.details.push('Tauri IPC 获取代理信息失败（可忽略）');
     }
@@ -1429,6 +1432,16 @@ async function loadDashboard() {
     }
 
     if (!systemData && !daoData) {
+      // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT 8.6「前端超时路径」+ HCSE_RESILIENCE_AUDIT 1.3）：
+      //   根因：Promise.allSettled 会抹平 rejection 的 reason，此处此前无条件抛"无法连接到 API 服务"，
+      //         导致下方 catch 中的 `e.name === 'SidecarTimeoutError'` 分支（渲染"请求超时"+重试按钮）
+      //         成为不可达死代码——用户遇到超时却被误导为"服务未启动"，且拿不到超时专属恢复入口。
+      //   修复：仅在无任何数据可用时，优先还原超时语义再抛出。
+      //   边界：不改变"何时进入错误态"的判定（仍以 !systemData && !daoData 为准），只改变错误类型。
+      const timeoutRejection = [systemRes, detailedRes, daoRes].find(
+        (result) => result.status === 'rejected' && result.reason && result.reason.name === 'SidecarTimeoutError'
+      );
+      if (timeoutRejection) throw timeoutRejection.reason;
       throw new Error('无法连接到 API 服务，请确认 Loong Recall 服务已启动 (' + API_BASE + ')');
     }
 
@@ -7289,7 +7302,8 @@ function renderHomeAssociationItems(memories, full) {
       const summary = m.content_preview || m.content || '';
       return `
         <div class="cm-item" role="button" tabindex="0"
-             data-action="openHomeMemory" data-arg="${htmlescape(String(m.id || ''))}">
+             data-action="openHomeMemory" data-arg="${htmlescape(String(m.id || ''))}"
+             aria-label="查看当前记忆：${htmlescape(summary)}">
           <span class="cm-type">${htmlescape(typeLabel)}</span>
           <div class="cm-main">
             <div class="cm-summary">${htmlescape(summary)}</div>
@@ -7455,7 +7469,8 @@ function renderMemoryAssets(statsData, synthData) {
           const width = r.count > 0 ? Math.max(3, Math.round(r.count / max * 100)) : 0;
           return `
             <div class="bar-row" role="button" tabindex="0"
-                 data-action="filterMemoriesByType" data-type="${r.type}" title="查看全部${r.label}">
+                 data-action="filterMemoriesByType" data-type="${r.type}" title="查看全部${r.label}"
+                 aria-label="查看全部${r.label}（${r.count} 条）">
               <span class="bar-label">${htmlescape(r.label)}</span>
               <span class="bar-track"><span class="bar-fill" style="width:${width}%"></span></span>
               <span class="bar-value">${num(r.count)}</span>
@@ -8718,8 +8733,9 @@ function renderMemoryResults(memories, explanationById) {
       ? `<span title="联想路径：${htmlescape(pathLabel || '未知')}">联想：${htmlescape(pathLabel || '未知')} · 贡献 ${Number(association.fused_contrib || 0).toFixed(4)}</span>`
       : '';
     // v0.8.4 Step 9 / G025 修复：移除内联 onclick，改用 data-action + data-arg（索引）
+    // v0.9.7 无障碍修复（D-9）：补 role/tabindex/aria-label，使记忆卡可键盘聚焦并被读屏播报
     return `
-      <div class="memory-card-item ${typeClass}" data-action="openMemoryDetail" data-memory-id="${htmlescape(String(memory.id || ''))}">
+      <div class="memory-card-item ${typeClass}" data-action="openMemoryDetail" data-memory-id="${htmlescape(String(memory.id || ''))}" role="button" tabindex="0" aria-label="查看记忆详情：${htmlescape(preview)}">
         <div class="memory-card-preview">${htmlescape(preview)}</div>
         <div class="memory-card-meta">
           <span><img src="/assets/icons/icon-memory.svg" alt="" width="12" height="12"> ${htmlescape(memory.memory_type || '未分类')}</span>
@@ -11477,7 +11493,7 @@ async function simulateAiToolsScan() {
         data-tool-name="${htmlescape(tool.name)}"
         data-tool-installed="${finalInstalled ? 'true' : 'false'}"
         class="tool-gear-btn"
-        title="更多操作"><img src="/assets/icons/icon-more.svg" alt="" width="16" height="16"></button>`;
+        title="更多操作" aria-label="更多操作：${htmlescape(tool.name)}"><img src="/assets/icons/icon-more.svg" alt="" width="16" height="16"></button>`;
       return `
       <div data-agent-id="${htmlescape(agentId)}" style="padding: 12px 0; border-bottom: 1px solid var(--lrc-宣纸-500);">
         <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px;">
@@ -12110,7 +12126,7 @@ function addSelectedProject(projectName) {
       <img src="/assets/icons/icon-folder.svg" alt="" width="16" height="16" style="opacity:0.7;">
       <span style="color: var(--lrc-墨韵-700); font-weight: 500;">${projectName}</span>
     </div>
-    <button style="background: none; border: none; color: var(--lrc-朱砂-500); cursor: pointer; padding: 2px;" data-action="removeProjectFromWizard" data-arg-mode="this"><img src="/assets/icons/icon-close.svg" alt="" width="14" height="14"></button>
+    <button style="background: none; border: none; color: var(--lrc-朱砂-500); cursor: pointer; padding: 2px;" data-action="removeProjectFromWizard" data-arg-mode="this" aria-label="从配置中移除项目：${htmlescape(projectName)}"><img src="/assets/icons/icon-close.svg" alt="" width="14" height="14"></button>
   `;
   projectsContainer.appendChild(projectEl);
   // v0.8.4 Step 9：动态生成的元素需要重新绑定 data-action

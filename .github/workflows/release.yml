@@ -127,6 +127,8 @@ jobs:
           node --check tests/frontend/cdp-regression.js
           node --check tests/frontend/playwright-smoke.js
           node --check tests/frontend/association-dashboard-cdp.js
+          node --check tests/frontend/association-desktop-cdp.js
+          node --check tests/frontend/association-user-view-check.js
           node scripts/validate_frontend_contract.js
 
       # 5. Tauri 配置验证（确保 targets 不是单一平台，防止 macOS/Linux 无 bundle）

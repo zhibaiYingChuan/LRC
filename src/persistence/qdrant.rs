@@ -13,6 +13,10 @@
 // 无需额外的 gRPC 依赖。
 
 use crate::chunker::CodeChunk;
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：payload 反序列化路径的签名由
+// 不可判别的 `Result<_, String>` 收敛为 [`crate::errors::LrcResult`]。
+// 该函数当前无错误构造点（失败项静默跳过），故无 ErrorKind 归属。
+use crate::errors::LrcResult;
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::{Persistence, PersistenceError};
 use chrono::Utc;
@@ -96,8 +100,12 @@ struct QdrantVectorConfig {
 #[derive(Debug, Deserialize)]
 struct QdrantScoredPoint {
     id: serde_json::Value,
-    #[serde(default)]
+    /// 相似度分值（Qdrant 返回，用于排序参考）
+    ///
+    /// v0.9.7 核实：移除实验（`cargo check --features qdrant`）证明该 allow 非冗余
+    /// （仍报 `field 'score' is never read`），予以保留。
     #[allow(dead_code)]
+    #[serde(default)]
     score: f32,
     #[serde(default)]
     payload: Option<serde_json::Value>,
@@ -302,7 +310,7 @@ impl QdrantPersistence {
     fn payload_to_memory(
         point: &QdrantScoredPoint,
         payload: &serde_json::Value,
-    ) -> Result<Memory, String> {
+    ) -> LrcResult<Memory> {
         let id = match &point.id {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Number(n) => n.to_string(),

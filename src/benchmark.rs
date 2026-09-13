@@ -1,12 +1,12 @@
-// ============================================================
-// Loong Recall 基准测试库模块
-// ============================================================
-//
-// 提供三层基准测试的核心逻辑，可供 CLI 工具、仪表盘 API、
-// 和 CI/CD 流水线复用。
-//
-// 道枢映射：中宫（五）— 统摄八方，基准测试如中宫之统摄
-// ============================================================
+//! ============================================================
+//! Loong Recall 基准测试库模块
+//! ============================================================
+//!
+//! 提供三层基准测试的核心逻辑，可供 CLI 工具、仪表盘 API、
+//! 和 CI/CD 流水线复用。
+//!
+//! 道枢映射：中宫（五）— 统摄八方，基准测试如中宫之统摄
+//! ============================================================
 
 use std::time::Instant;
 use tempfile::TempDir;
@@ -22,13 +22,15 @@ use crate::persistence::Persistence;
 // 测试辅助函数
 // ════════════════════════════════════════════════════════════
 
-fn make_store() -> (TempDir, MemoryStore<JsonPersistence>) {
-    let dir = TempDir::new().expect("创建临时目录失败");
-    let persistence =
-        create_json_persistence(&dir.path().to_string_lossy()).expect("创建持久化层失败");
+/// 基准测试的错误类型：统一为持久化层错误，避免在库路径 panic
+pub type BenchmarkError = crate::persistence::PersistenceError;
+
+fn make_store() -> Result<(TempDir, MemoryStore<JsonPersistence>), BenchmarkError> {
+    let dir = TempDir::new()?;
+    let persistence = create_json_persistence(&dir.path().to_string_lossy())?;
     // 使用统计编码器跳过 ML 模型下载，加速基准测试
     let store = MemoryStore::new_statistical(persistence);
-    (dir, store)
+    Ok((dir, store))
 }
 
 fn generate_test_memories(count: usize, prefix: &str, importance: Importance) -> Vec<Memory> {
@@ -160,12 +162,12 @@ pub struct LayerReport {
 // 第一层：通用记忆检索基准
 // ════════════════════════════════════════════════════════════
 
-pub fn run_benchmark_l1_retrieval_latency() -> BenchmarkResult {
+pub fn run_benchmark_l1_retrieval_latency() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store();
+    let (_dir, mut store) = make_store()?;
     let memories = generate_test_memories(1000, "latency", Importance::new(5));
     for m in &memories {
-        store.remember(m.clone()).expect("写入记忆失败");
+        store.remember(m.clone())?;
     }
     let filter = RecallFilter::new().with_top_k(10);
     let mut latencies = Vec::with_capacity(100);
@@ -184,7 +186,7 @@ pub fn run_benchmark_l1_retrieval_latency() -> BenchmarkResult {
         (500_000.0 / p50.max(1.0)).min(1.0) * 0.8
     };
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_retrieval_latency_scalability".into(),
         layer: 1,
         description: "大规模记忆检索延迟（1K 规模 P50/P95）".into(),
@@ -193,12 +195,12 @@ pub fn run_benchmark_l1_retrieval_latency() -> BenchmarkResult {
         score,
         details: format!("P50: {:.0}μs, P95: {:.0}μs", p50, p95),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
-pub fn run_benchmark_l1_recall_precision() -> BenchmarkResult {
+pub fn run_benchmark_l1_recall_precision() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store();
+    let (_dir, mut store) = make_store()?;
     let mut golden = Memory::new(
         "项目 Loong Recall 使用 Rust 编写，记忆核心基于洛书编码器的 9 维向量空间".to_string(),
         MemoryType::Fact,
@@ -209,12 +211,10 @@ pub fn run_benchmark_l1_recall_precision() -> BenchmarkResult {
     );
     golden.id = "golden-001".to_string();
     golden.privacy_level = PrivacyLevel::Global;
-    store.remember(golden).expect("写入黄金记忆失败");
+    store.remember(golden)?;
 
     let filter = RecallFilter::new().with_top_k(5);
-    let result = store
-        .recall("Loong Recall Rust 洛书编码器", &filter)
-        .expect("检索失败");
+    let result = store.recall("Loong Recall Rust 洛书编码器", &filter)?;
     let passed = !result.memories.is_empty();
     let top_content = result
         .memories
@@ -228,7 +228,7 @@ pub fn run_benchmark_l1_recall_precision() -> BenchmarkResult {
         0.3
     };
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_retrieval_recall_precision".into(),
         layer: 1,
         description: "检索召回率 — 精确匹配".into(),
@@ -237,12 +237,12 @@ pub fn run_benchmark_l1_recall_precision() -> BenchmarkResult {
         score,
         details: format!("返回 {} 条结果", result.memories.len()),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
-pub fn run_benchmark_l1_session_recall() -> BenchmarkResult {
+pub fn run_benchmark_l1_session_recall() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store();
+    let (_dir, mut store) = make_store()?;
     let conversations = vec![
         ("用户: 我叫张三，目前在北京工作", "fact", "high"),
         ("用户: 我使用 Python 和 Rust 进行开发", "fact", "high"),
@@ -283,13 +283,13 @@ pub fn run_benchmark_l1_session_recall() -> BenchmarkResult {
         );
         mem.id = format!("session-{}", content.len());
         mem.privacy_level = PrivacyLevel::Global;
-        store.remember(mem).expect("写入对话记忆失败");
+        store.remember(mem)?;
     }
     let queries = vec!["张三", "Rust", "Loong", "PostgreSQL", "pnpm", "北京"];
     let filter = RecallFilter::new().with_top_k(3);
     let mut recalled = 0;
     for query in &queries {
-        let result = store.recall(query, &filter).expect("检索失败");
+        let result = store.recall(query, &filter)?;
         if !result.memories.is_empty() {
             let combined: String = result
                 .memories
@@ -306,7 +306,7 @@ pub fn run_benchmark_l1_session_recall() -> BenchmarkResult {
     let passed = recall_rate >= 0.5;
     let score = recall_rate;
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_session_recall_accuracy".into(),
         layer: 1,
         description: "Session Recall — 长对话上下文事实提取".into(),
@@ -320,26 +320,26 @@ pub fn run_benchmark_l1_session_recall() -> BenchmarkResult {
             queries.len()
         ),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
 // ════════════════════════════════════════════════════════════
 // 第二层：高级记忆能力基准（公平版：测能力，不测架构）
 // ════════════════════════════════════════════════════════════
 
-pub fn run_benchmark_l2_decay() -> BenchmarkResult {
+pub fn run_benchmark_l2_decay() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store();
+    let (_dir, mut store) = make_store()?;
     let high = generate_test_memories(50, "high", Importance::new(8));
     let low = generate_test_memories(50, "low", Importance::new(2));
     for m in &high {
-        store.remember(m.clone()).expect("写入失败");
+        store.remember(m.clone())?;
     }
     for m in &low {
-        store.remember(m.clone()).expect("写入失败");
+        store.remember(m.clone())?;
     }
     let filter = RecallFilter::new().with_top_k(20);
-    let result = store.recall("测试记忆内容", &filter).expect("检索失败");
+    let result = store.recall("测试记忆内容", &filter)?;
     let mut high_count = 0;
     let mut low_count = 0;
     for mem in &result.memories {
@@ -349,14 +349,15 @@ pub fn run_benchmark_l2_decay() -> BenchmarkResult {
             low_count += 1;
         }
     }
-    let passed = high_count >= 0;
+    // 断言检索确实返回了候选集（否则衰减效果无从谈起）
+    let passed = high_count + low_count > 0;
     let score = if high_count + low_count > 0 {
         high_count as f64 / (high_count + low_count) as f64
     } else {
         0.5
     };
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_memory_decay_effectiveness".into(),
         layer: 2,
         description: "记忆衰减有效性 — 高重要性记忆优先检索".into(),
@@ -365,20 +366,20 @@ pub fn run_benchmark_l2_decay() -> BenchmarkResult {
         score,
         details: format!("前20条中：高重要性={}, 低重要性={}", high_count, low_count),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
-pub fn run_benchmark_l2_synthesis() -> BenchmarkResult {
+pub fn run_benchmark_l2_synthesis() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store();
+    let (_dir, mut store) = make_store()?;
     // 写入相似的数据库连接故障记忆，测试合成引擎是否能自动提炼规律
     let db_memories = generate_db_connection_memories(10);
     for m in &db_memories {
-        store.remember(m.clone()).expect("写入失败");
+        store.remember(m.clone())?;
     }
 
     // 验证合成前记忆数（写入 + 初始种子记忆）
-    let all_before = store.persistence().load_all_memories().expect("加载失败");
+    let all_before = store.persistence().load_all_memories()?;
     let count_before = all_before.len();
 
     // 计算前两条记忆的 Jaccard 相似度（验证它们确实相似）
@@ -387,16 +388,15 @@ pub fn run_benchmark_l2_synthesis() -> BenchmarkResult {
         .compute_jaccard(&db_memories[0].content, &db_memories[1].content);
 
     // 实际触发洛书合成（核心测试：碎片信息自动提炼为标准方案）
+    // 注：合成失败时降级为 0，由下方的 passed 条件判定为该项 FAIL，而非中断整个报告
     let synthesized = store.luoshu_synthesize().unwrap_or(0);
 
     // 验证合成后记忆数增加
-    let all_after = store.persistence().load_all_memories().expect("加载失败");
+    let all_after = store.persistence().load_all_memories()?;
 
     // 检索验证：合成后应该能搜到数据库排查相关内容
     let filter = RecallFilter::new().with_top_k(5);
-    let result = store
-        .recall("排查数据库超时的标准步骤", &filter)
-        .expect("检索失败");
+    let result = store.recall("排查数据库超时的标准步骤", &filter)?;
     let combined: String = result
         .memories
         .iter()
@@ -418,7 +418,7 @@ pub fn run_benchmark_l2_synthesis() -> BenchmarkResult {
         0.3
     };
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_synthesis_trigger_and_quality".into(),
         layer: 2,
         description: "合成触发与质量 — 碎片信息自动提炼".into(),
@@ -434,17 +434,17 @@ pub fn run_benchmark_l2_synthesis() -> BenchmarkResult {
             has_keywords
         ),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
-pub fn run_benchmark_l2_yin_yang() -> BenchmarkResult {
+pub fn run_benchmark_l2_yin_yang() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store();
+    let (_dir, mut store) = make_store()?;
     let mut snapshots: Vec<DaoMetricsSnapshot> = Vec::new();
     for batch in 0..5 {
         let memories = generate_test_memories(100, &format!("batch-{}", batch), Importance::new(5));
         for m in &memories {
-            store.remember(m.clone()).expect("写入失败");
+            store.remember(m.clone())?;
         }
         let snapshot = store
             .dao_metrics
@@ -462,7 +462,7 @@ pub fn run_benchmark_l2_yin_yang() -> BenchmarkResult {
         .sum::<f64>()
         / snapshots.len() as f64;
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_yin_yang_balance_stability".into(),
         layer: 2,
         description: "阴阳守恒稳定性 — 记忆增长中道同构度保持".into(),
@@ -474,24 +474,24 @@ pub fn run_benchmark_l2_yin_yang() -> BenchmarkResult {
             avg_score, all_entropy_ok
         ),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
-pub fn run_benchmark_l2_anti_pollution() -> BenchmarkResult {
+pub fn run_benchmark_l2_anti_pollution() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store();
+    let (_dir, mut store) = make_store()?;
     let core = generate_test_memories(80, "core", Importance::new(8));
     let noise = generate_noise_memories(20);
     for m in &core {
-        store.remember(m.clone()).expect("写入失败");
+        store.remember(m.clone())?;
     }
     for m in &noise {
-        store.remember(m.clone()).expect("写入失败");
+        store.remember(m.clone())?;
     }
     let filter = RecallFilter::new().with_top_k(10);
     let mut top_ids: Vec<Vec<String>> = Vec::new();
     for _ in 0..5 {
-        let result = store.recall("测试记忆内容", &filter).expect("检索失败");
+        let result = store.recall("测试记忆内容", &filter)?;
         top_ids.push(result.memories.iter().map(|m| m.id.clone()).collect());
     }
     let mut consistency = 0;
@@ -513,7 +513,7 @@ pub fn run_benchmark_l2_anti_pollution() -> BenchmarkResult {
     let passed = consistency >= 3 && no_noise_in_top5;
     let score = consistency as f64 / 5.0;
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_anti_pollution_capability".into(),
         layer: 2,
         description: "抗污染能力 — 20% 噪声下的检索一致性".into(),
@@ -525,16 +525,16 @@ pub fn run_benchmark_l2_anti_pollution() -> BenchmarkResult {
             consistency, no_noise_in_top5
         ),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
 // ════════════════════════════════════════════════════════════
 // 第三层：综合能力与信任基准（公平版：测能力，不测架构）
 // ════════════════════════════════════════════════════════════
 
-pub fn run_benchmark_l3_data_localization() -> BenchmarkResult {
+pub fn run_benchmark_l3_data_localization() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (dir, mut store) = make_store();
+    let (dir, mut store) = make_store()?;
     let mut sensitive = Memory::new(
         "用户隐私数据：身份证号 110101199001011234".to_string(),
         MemoryType::Fact,
@@ -545,7 +545,7 @@ pub fn run_benchmark_l3_data_localization() -> BenchmarkResult {
     );
     sensitive.privacy_level = PrivacyLevel::User;
     sensitive.user_id = Some("user-a".to_string());
-    store.remember(sensitive).expect("写入失败");
+    store.remember(sensitive)?;
     let data_path = dir.path().join("memories.json");
     let exists = data_path.exists();
     let content_ok = if exists {
@@ -558,7 +558,7 @@ pub fn run_benchmark_l3_data_localization() -> BenchmarkResult {
     let passed = exists && content_ok;
     let score = if passed { 1.0 } else { 0.0 };
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_data_localization".into(),
         layer: 3,
         description: "数据本地化验证 — 所有数据仅存本地".into(),
@@ -567,12 +567,12 @@ pub fn run_benchmark_l3_data_localization() -> BenchmarkResult {
         score,
         details: format!("数据文件存在: {}, 内容完整: {}", exists, content_ok),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
-pub fn run_benchmark_l3_audit_tamper() -> BenchmarkResult {
+pub fn run_benchmark_l3_audit_tamper() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store();
+    let (_dir, mut store) = make_store()?;
     let mut m1 = Memory::new(
         "测试记忆 1".to_string(),
         MemoryType::Fact,
@@ -591,8 +591,8 @@ pub fn run_benchmark_l3_audit_tamper() -> BenchmarkResult {
         None,
     );
     m2.privacy_level = PrivacyLevel::Global;
-    store.remember(m1).expect("写入失败");
-    store.remember(m2).expect("写入失败");
+    store.remember(m1)?;
+    store.remember(m2)?;
     let total = store.audit_trail.total_count();
     let integrity = store.audit_trail.verify_integrity();
     let anchors = store.audit_trail.get_anchors();
@@ -604,7 +604,7 @@ pub fn run_benchmark_l3_audit_tamper() -> BenchmarkResult {
     let passed = integrity.is_valid && anchor_valid;
     let score = if passed { 1.0 } else { 0.5 };
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_audit_tamper_proof".into(),
         layer: 3,
         description: "审计防篡改验证 — 哈希链+信任锚点完整性".into(),
@@ -618,12 +618,12 @@ pub fn run_benchmark_l3_audit_tamper() -> BenchmarkResult {
             anchors.len()
         ),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
-pub fn run_benchmark_l3_privacy_isolation() -> BenchmarkResult {
+pub fn run_benchmark_l3_privacy_isolation() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store();
+    let (_dir, mut store) = make_store()?;
     let mut session_mem = Memory::new(
         "会话私有记忆".to_string(),
         MemoryType::Fact,
@@ -656,16 +656,16 @@ pub fn run_benchmark_l3_privacy_isolation() -> BenchmarkResult {
     );
     global_mem.id = "global-1".to_string();
     global_mem.privacy_level = PrivacyLevel::Global;
-    store.remember(session_mem).expect("写入失败");
-    store.remember(user_mem).expect("写入失败");
-    store.remember(global_mem).expect("写入失败");
+    store.remember(session_mem)?;
+    store.remember(user_mem)?;
+    store.remember(global_mem)?;
 
     let session_filter = RecallFilter::new().with_top_k(10).with_privacy(
         PrivacyLevel::Session,
         Some("session-a".to_string()),
         None,
     );
-    let session_results = store.recall("记忆", &session_filter).expect("检索失败");
+    let session_results = store.recall("记忆", &session_filter)?;
     let session_ok = session_results
         .memories
         .iter()
@@ -676,7 +676,7 @@ pub fn run_benchmark_l3_privacy_isolation() -> BenchmarkResult {
         None,
         Some("user-a".to_string()),
     );
-    let user_results = store.recall("记忆", &user_filter).expect("检索失败");
+    let user_results = store.recall("记忆", &user_filter)?;
     let user_ok = user_results
         .memories
         .iter()
@@ -685,7 +685,7 @@ pub fn run_benchmark_l3_privacy_isolation() -> BenchmarkResult {
     let passed = session_ok && user_ok;
     let score = if passed { 1.0 } else { 0.5 };
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_privacy_level_isolation".into(),
         layer: 3,
         description: "隐私级别隔离 — Session/User/Global 正确隔离".into(),
@@ -694,12 +694,12 @@ pub fn run_benchmark_l3_privacy_isolation() -> BenchmarkResult {
         score,
         details: format!("Session隔离: {}, User隔离: {}", session_ok, user_ok),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
-pub fn run_benchmark_l3_complexity_redline() -> BenchmarkResult {
+pub fn run_benchmark_l3_complexity_redline() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store();
+    let (_dir, mut store) = make_store()?;
     for i in 0..5 {
         let mut mem = Memory::new(
             format!("红线测试记忆 {}", i),
@@ -710,13 +710,13 @@ pub fn run_benchmark_l3_complexity_redline() -> BenchmarkResult {
             None,
         );
         mem.privacy_level = PrivacyLevel::Global;
-        store.remember(mem).expect("写入失败");
+        store.remember(mem)?;
     }
     let redline = store.complexity_budget.red_line_check();
     let score = store.complexity_budget.maintainability_score();
     let passed = redline.passed && score >= 0.3;
 
-    BenchmarkResult {
+    Ok(BenchmarkResult {
         name: "benchmark_complexity_red_line_self_check".into(),
         layer: 3,
         description: "复杂度预算红线自检 — 健康系统通过CI拦截".into(),
@@ -725,7 +725,7 @@ pub fn run_benchmark_l3_complexity_redline() -> BenchmarkResult {
         score: score.min(1.0),
         details: format!("红线检查: {}, 可维护性: {:.3}", redline.passed, score),
         duration_ms: start.elapsed().as_millis() as u64,
-    }
+    })
 }
 
 // ════════════════════════════════════════════════════════════
@@ -733,10 +733,17 @@ pub fn run_benchmark_l3_complexity_redline() -> BenchmarkResult {
 // ════════════════════════════════════════════════════════════
 
 /// 基准测试条目类型：(层级, 编号, 测试函数)
-type BenchmarkEntry = (u8, &'static str, fn() -> BenchmarkResult);
+type BenchmarkEntry = (
+    u8,
+    &'static str,
+    fn() -> Result<BenchmarkResult, BenchmarkError>,
+);
 
 /// 运行所有基准测试，返回完整报告
-pub fn run_all_benchmarks(target_layer: Option<u8>) -> BenchmarkReport {
+///
+/// 任一基准测试在初始化或读写持久化层时失败，会将错误向上传播，
+/// 由调用方决定降级策略（CLI 退出 / API 返回 5xx），避免库路径 panic。
+pub fn run_all_benchmarks(target_layer: Option<u8>) -> Result<BenchmarkReport, BenchmarkError> {
     // 定义所有基准测试（按层分组）
     let all_benchmarks: Vec<BenchmarkEntry> = vec![
         (1, "L1-1", run_benchmark_l1_retrieval_latency),
@@ -760,7 +767,7 @@ pub fn run_all_benchmarks(target_layer: Option<u8>) -> BenchmarkReport {
                 continue;
             }
         }
-        results.push(runner());
+        results.push(runner()?);
     }
 
     let passed = results.iter().filter(|r| r.passed).count();
@@ -802,7 +809,7 @@ pub fn run_all_benchmarks(target_layer: Option<u8>) -> BenchmarkReport {
         },
     ];
 
-    BenchmarkReport {
+    Ok(BenchmarkReport {
         version: "1.0".into(),
         generated_at: chrono::Utc::now().to_rfc3339(),
         total: results.len(),
@@ -811,7 +818,7 @@ pub fn run_all_benchmarks(target_layer: Option<u8>) -> BenchmarkReport {
         layers,
         results,
         radar_scores,
-    }
+    })
 }
 
 fn build_radar_scores(results: &[BenchmarkResult]) -> serde_json::Value {

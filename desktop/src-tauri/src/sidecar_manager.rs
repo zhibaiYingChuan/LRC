@@ -5,7 +5,7 @@
 ///
 /// 生命周期保证：
 ///   - Drop 时自动 kill 所有子进程（防止僵尸进程）
-///   - 启动时等待健康检查通过（最多 10 秒）
+///   - 启动时等待健康检查通过（总预算最多 40 秒，见 HEALTH_CHECK_TOTAL_BUDGET_SECS）
 ///   - 端口自适应：每个 sidecar 自动扫描可用端口
 ///
 /// 默认端口：3099（与 sidecar 默认值一致）。
@@ -49,6 +49,22 @@ pub fn sidecar_identity_matches(
 /// 端口扫描范围：实际端口 = 起始端口 + 0..PORT_SCAN_RANGE
 /// 与 server.rs 中 find_available_port 的 scan_range(100) 保持一致
 const PORT_SCAN_RANGE: u16 = 100;
+
+// ── v0.9.7 审查修复（P1-1）：健康检查超时口径三者统一 ─────────────────────────
+// 此前注释称"最多 10 秒"、实现实为"20 轮 × 500ms + 每轮 100 端口串行扫描"、
+// 日志又称"20次/10秒"，三者互相矛盾且均低估真实耗时。现集中定义常量，
+// 注释/实现/日志一律引用它们，杜绝再次漂移。
+/// 健康检查最大轮次（每轮扫描全部端口后 sleep 一次）
+const HEALTH_CHECK_MAX_ATTEMPTS: u32 = 20;
+/// 每轮之间的间隔
+const HEALTH_CHECK_INTERVAL_MS: u64 = 500;
+/// 单次 /health 请求超时
+const HEALTH_CHECK_REQUEST_TIMEOUT_SECS: u64 = 2;
+/// 健康检查总预算（硬上限）：无论轮次与端口扫描如何放大，超过即收敛为 E003。
+/// 取 40s 是为兼容"每轮 100 端口 × 2s 串行"的最坏路径，同时避免拖到分钟级。
+const HEALTH_CHECK_TOTAL_BUDGET_SECS: u64 = 40;
+/// 端口扫描循环内检查取消/超时的粒度（每 N 个端口一次，开销可忽略）
+const HEALTH_CHECK_CANCEL_CHECK_STRIDE: u16 = 10;
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1086,12 +1102,16 @@ impl SidecarManager {
     /// 端口自适应扫描：sidecar 可能因端口冲突而绑定到不同端口，
     /// 因此从起始端口开始扫描 PORT_SCAN_RANGE 个端口，找到实际绑定的端口。
     ///
-    /// 每 500ms 检查一次，最多尝试 20 次。
-    /// v0.9.7 审查修复（HCSE 超时机制验证）：旧注释宣称"最坏 20×2=40s"是错的——
-    /// 每轮 attempt 会串行扫描 PORT_SCAN_RANGE(100) 个端口、单请求超时 2s，
+    /// 超时语义（三者统一，常量见模块头部）：
+    ///   - 轮次：最多 HEALTH_CHECK_MAX_ATTEMPTS(20) 轮，每轮间隔 HEALTH_CHECK_INTERVAL_MS(500ms)；
+    ///   - 单请求：HEALTH_CHECK_REQUEST_TIMEOUT_SECS(2s)；
+    ///   - 总预算：HEALTH_CHECK_TOTAL_BUDGET_SECS(40s) 的共享 deadline 为硬上限，
+    ///     一旦超出立即收敛为 E003（不等待剩余轮次）。
+    /// v0.9.7 审查修复（P1-1）：旧注释宣称"每 500ms 检查一次，最多尝试 20 次 / 最多 10 秒"，
+    /// 但每轮 attempt 会串行扫描 PORT_SCAN_RANGE(100) 个端口、单请求超时 2s，
     /// Windows Hyper-V 动态端口保留或"接受 TCP 但不回 HTTP"的服务会把单轮放大到
-    /// ~200s。现加总预算 40s 的共享 deadline，并在端口循环内每 10 个端口检查一次
-    /// 取消标志，保证"取消"和"超时"都真正生效。
+    /// ~200s。现以共享 deadline 约束真实上限，并在端口循环内按
+    /// HEALTH_CHECK_CANCEL_CHECK_STRIDE 检查取消标志，保证"取消"和"超时"都真正生效。
     async fn wait_for_health_static(
         child: &mut Child,
         start_port: u16,
@@ -1099,22 +1119,26 @@ impl SidecarManager {
         progress_tx: Option<&tokio::sync::mpsc::Sender<StartProgress>>,
     ) -> Result<u16, SidecarStartError> {
         let pid = child.id();
-        let health_deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+        let health_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(HEALTH_CHECK_TOTAL_BUDGET_SECS);
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(HEALTH_CHECK_REQUEST_TIMEOUT_SECS))
             .build()
             .map_err(|e| SidecarStartError::HttpClientError {
                 reason: e.to_string(),
             })?;
 
-        for attempt in 1..=20 {
+        for attempt in 1..=HEALTH_CHECK_MAX_ATTEMPTS {
             // v0.8.9 G-001：检查取消标志，前端 abort 时终止等待
             if cancel_flag.load(Ordering::SeqCst) {
                 return Err(SidecarStartError::UserCancelled);
             }
-            // v0.9.7：总预算 40s，超时立即收敛为 HealthCheckTimeout
+            // v0.9.7：总预算超限时立即收敛为 HealthCheckTimeout
             if tokio::time::Instant::now() >= health_deadline {
-                tracing::error!("Sidecar 健康检查超出总预算 40s（第{attempt}轮），PID={pid} 仍在运行但不可达");
+                tracing::error!(
+                    "Sidecar 健康检查超出总预算 {}s（第{attempt}轮），PID={pid} 仍在运行但不可达",
+                    HEALTH_CHECK_TOTAL_BUDGET_SECS
+                );
                 return Err(SidecarStartError::HealthCheckTimeout {
                     port: start_port,
                     attempts: attempt,
@@ -1126,7 +1150,7 @@ impl SidecarManager {
                 let _ = tx.try_send(StartProgress::new(
                     "health_check",
                     (attempt as u8 * 5).min(95),
-                    format!("健康检查第 {attempt}/20 次"),
+                    format!("健康检查第 {attempt}/{HEALTH_CHECK_MAX_ATTEMPTS} 次"),
                 ));
             }
 
@@ -1191,9 +1215,9 @@ impl SidecarManager {
                 let Some(port) = start_port.checked_add(offset) else {
                     break;
                 };
-                // v0.9.7：细粒度取消/超时检查（每 10 个端口一次，开销可忽略），
-                // 避免单个 attempt 内 100 端口串行扫描拖到分钟级
-                if offset % 10 == 9 {
+                // v0.9.7：细粒度取消/超时检查（按 HEALTH_CHECK_CANCEL_CHECK_STRIDE 个端口一次，
+                // 开销可忽略），避免单个 attempt 内 100 端口串行扫描拖到分钟级
+                if offset % HEALTH_CHECK_CANCEL_CHECK_STRIDE == HEALTH_CHECK_CANCEL_CHECK_STRIDE - 1 {
                     if cancel_flag.load(Ordering::SeqCst) {
                         return Err(SidecarStartError::UserCancelled);
                     }
@@ -1216,7 +1240,7 @@ impl SidecarManager {
                     }
                     Ok(resp) => {
                         tracing::debug!(
-                            "Sidecar 健康检查 port={port} 第{attempt}/20次: HTTP {}",
+                            "Sidecar 健康检查 port={port} 第{attempt}/{HEALTH_CHECK_MAX_ATTEMPTS}次: HTTP {}",
                             resp.status()
                         );
                     }
@@ -1228,16 +1252,21 @@ impl SidecarManager {
 
             let end_port = start_port.saturating_add(PORT_SCAN_RANGE.saturating_sub(1));
             tracing::debug!(
-                "Sidecar 健康检查 第{attempt}/20次: 端口 {start_port}~{end_port} 均不可用"
+                "Sidecar 健康检查 第{attempt}/{HEALTH_CHECK_MAX_ATTEMPTS}次: 端口 {start_port}~{end_port} 均不可用"
             );
 
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(HEALTH_CHECK_INTERVAL_MS)).await;
         }
 
-        tracing::error!("Sidecar 健康检查超时（20次/10秒），进程 PID={pid} 仍在运行但不可达");
+        tracing::error!(
+            "Sidecar 健康检查超时（{}轮/间隔{}ms/总预算{}s），进程 PID={pid} 仍在运行但不可达",
+            HEALTH_CHECK_MAX_ATTEMPTS,
+            HEALTH_CHECK_INTERVAL_MS,
+            HEALTH_CHECK_TOTAL_BUDGET_SECS
+        );
         Err(SidecarStartError::HealthCheckTimeout {
             port: start_port,
-            attempts: 20,
+            attempts: HEALTH_CHECK_MAX_ATTEMPTS,
         })
     }
 
@@ -1438,72 +1467,17 @@ impl SidecarManager {
         }
     }
 
-    /// 启动 sidecar 进程（兼容旧接口，使用默认项目标识）
-    /// 返回实际使用的端口号
-    pub async fn start(
-        &mut self,
-        src_dir: Option<String>,
-        port: Option<u16>,
-        multi_window: Option<u32>,
-        llm_api: Option<String>,
-        cancel_flag: &AtomicBool,
-        progress_tx: Option<&tokio::sync::mpsc::Sender<StartProgress>>,
-    ) -> Result<u16, String> {
-        // 使用项目路径作为默认标识，若未指定则使用 "default"
-        let project_key = src_dir.clone().unwrap_or_else(|| "default".to_string());
-        // 构造启动参数集合（v0.8.9：统一使用 StartOptions）
-        let opts = StartOptions {
-            src_dir: src_dir.as_deref(),
-            port,
-            multi_window,
-            llm_api: llm_api.as_deref(),
-            cancel_flag,
-            progress_tx,
-            data_dir: None,
-        };
-        self.start_for_project(&project_key, &opts).await
-    }
-
-    /// 为指定项目启动 sidecar 进程（内部使用三阶段方法）
-    ///
-    /// 每个项目可以有独立的 sidecar，绑定不同端口。
-    /// 如果该项目的 sidecar 已在运行，直接返回端口。
-    /// 返回实际使用的端口号。
-    ///
-    /// **注意**：此方法内部顺序调用 Phase 1→2→3，虽然 Phase 2 使用关联函数，
-    /// 但调用方仍持有 `&mut self`（即 sidecar 锁），因此在 Phase 2 期间锁不会被释放。
-    /// 如需避免锁竞争，调用方应直接使用三阶段编排：
-    ///   1. `prepare_start()`（持锁）→ 释放锁
-    ///   2. `SidecarManager::spawn_and_wait()`（不持锁）
-    ///   3. `insert_handle()`（重新获取锁）
-    pub async fn start_for_project(
-        &mut self,
-        project_key: &str,
-        opts: &StartOptions<'_>,
-    ) -> Result<u16, String> {
-        // Phase 1: 检查是否已运行（无 I/O）
-        match self.prepare_start(project_key) {
-            PrepareResult::AlreadyRunning(port) => return Ok(port),
-            PrepareResult::NeedStart => {}
-        }
-
-        // Phase 2: 启动子进程 + 健康检查（I/O，释放管理器锁）
-        let binary_path = self.binary_path.clone();
-        let (child, port) = Self::spawn_and_wait(&binary_path, project_key, opts).await?;
-
-        // Phase 3: 插入实例（无 I/O）
-        // insert_handle 需要 Option<String>（拥有），从 &str 转换
-        self.insert_handle(
-            project_key,
-            child,
-            port,
-            opts.src_dir.map(|s| s.to_string()),
-            opts.multi_window,
-            opts.llm_api.map(|s| s.to_string()),
-        );
-
-        Ok(port)
-    }
+    // v0.9.7 结构清理（GLOBAL_CODE_REVIEW_REPORT P2-2「SidecarManager 持锁跨 Phase」）：
+    //   此前存在 `start()` / `start_for_project()` / `restart_project()` 三个**兼容旧接口**，
+    //   它们接收 `&mut self`（即调用方必须已持有 sidecar 锁），内部顺序调用
+    //   Phase 1→2→3——**Phase 2 的健康检查（最多 40s）在持锁状态下执行**，
+    //   构成报告指出的锁竞争风险。
+    //   经取证：`commands.rs` / `main.rs` 的生产路径**已全部改用三阶段编排**
+    //   （`prepare_start` 持锁 → `SidecarManager::spawn_and_wait` 不持锁 →
+    //   `insert_handle` 重新持锁），上述三个方法**无任何调用方**。
+    //   故本处删除它们，使"持锁跨 Phase 2"在类型层面不可达——
+    //   调用方只能通过 `prepare_start` / `spawn_and_wait` / `insert_handle` 组合，
+    //   而这三个方法本身不持有 `&mut self` 跨 I/O。
 
     /// 停止 sidecar 进程（兼容旧接口，停止所有实例）
     pub async fn stop(&mut self) -> Result<(), String> {
@@ -1683,15 +1657,11 @@ impl SidecarManager {
         recovered
     }
 
-    /// 重启指定项目的 sidecar
-    pub async fn restart_project(
-        &mut self,
-        project_key: &str,
-        opts: &StartOptions<'_>,
-    ) -> Result<u16, String> {
-        self.stop_project(project_key).await?;
-        self.start_for_project(project_key, opts).await
-    }
+    // v0.9.7 结构清理（GLOBAL_CODE_REVIEW_REPORT P2-2）：
+    //   `restart_project()` 同样接收 `&mut self` 并在内部调用已删除的
+    //   `start_for_project()`，会在持锁状态下执行 Phase 2 健康检查。
+    //   经取证其**无任何调用方**（`commands.rs` 的 switch_project 已改用
+    //   三阶段编排），故一并删除，彻底消除该 footgun。
 
     // v0.5.17: 旧的 wait_for_health(&self, ...) 已被 wait_for_health_static 替代。
     // 新方法是关联函数，不需要 &self，可在不持有 sidecar 锁的情况下调用。

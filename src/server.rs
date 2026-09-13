@@ -1,12 +1,12 @@
-// 许可证: Apache 2.0
-//
-// MCP 协议服务端
-// ===============
-// 实现 Model Context Protocol (MCP) 服务端，通过 HTTP + JSON-RPC 2.0 暴露代码检索工具。
-// IDE 可通过 MCP 协议调用 search_code 工具，自动获取项目代码上下文。
-//
-// 协议参考: https://spec.modelcontextprotocol.io/
-// 当前暴露 search_code + codebase_stats 两个工具
+//! 许可证: Apache 2.0
+//!
+//! MCP 协议服务端
+//! ===============
+//! 实现 Model Context Protocol (MCP) 服务端，通过 HTTP + JSON-RPC 2.0 暴露代码检索工具。
+//! IDE 可通过 MCP 协议调用 search_code 工具，自动获取项目代码上下文。
+//!
+//! 协议参考: <https://spec.modelcontextprotocol.io/>
+//! 当前暴露 search_code + codebase_stats 两个工具
 
 use crate::memory_store::{ListFilter, MemoryStore, RecallFilter, SortBy, SortOrder};
 use crate::persistence::json::JsonPersistence;
@@ -14,6 +14,10 @@ use crate::{
     ChunkStats, CodeMemoryManager, Importance, LlmApiConfig, Memory, MemoryType, PrivacyLevel,
     RecallResult, RetrievalResult,
 };
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：wizard.json 同步路径错误由不可判别的
+// `String` 收敛为带域分类的 [`crate::errors::LrcError`]（io / parse / config / crypto）。
+// `Display` 仅输出 message，故前端/日志文案**零漂移**。
+use crate::errors::{LrcError, LrcResult};
 use axum::{
     extract::State,
     http::{Request, StatusCode},
@@ -35,10 +39,37 @@ const SEARCH_EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 #[derive(Debug)]
 pub enum SearchError {
+    /// 等待检索锁超时（其他请求长时间占用）
     LockTimeout,
+    /// 检索执行超时（阻塞任务超过上限）
     ExecutionTimeout,
+    /// 检索过程 panic（已由 catch_unwind 隔离）
     Panic,
 }
+
+// v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P1-6「错误处理不统一」）：
+//   SearchError 此前仅 derive(Debug)，未实现 Display / std::error::Error，
+//   导致调用方无法用 `?` 融入 `Box<dyn Error>` 生态，也无法打印人类可读原因。
+//   此处补齐两个 trait，使其与 GuardError / EmbedError / DownloadError 口径一致。
+impl std::fmt::Display for SearchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LockTimeout => write!(
+                f,
+                "获取检索锁超时（等待超过 {}s）",
+                SEARCH_LOCK_TIMEOUT.as_secs()
+            ),
+            Self::ExecutionTimeout => write!(
+                f,
+                "代码检索执行超时（超过 {}s），底层任务可能仍在占用线程",
+                SEARCH_EXECUTION_TIMEOUT.as_secs()
+            ),
+            Self::Panic => write!(f, "代码检索过程发生 panic（已被隔离，服务继续可用）"),
+        }
+    }
+}
+
+impl std::error::Error for SearchError {}
 
 /// 统一执行代码搜索，隔离锁等待、阻塞计算和搜索 panic。
 pub async fn safe_code_search(
@@ -86,6 +117,11 @@ where
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
+    /// JSON-RPC 协议版本字段（恒为 "2.0"）。
+    ///
+    /// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `field 'jsonrpc' is never read`）。
+    /// 保留原因：该字段是 JSON-RPC 2.0 报文的一部分，`serde` 需能解析它，
+    /// 但当前服务端不校验版本值，故读取方为零——属协议兼容字段而非死代码。
     #[allow(dead_code)]
     jsonrpc: String,
     #[serde(default)]
@@ -130,6 +166,23 @@ pub enum ApiError {
     /// 服务不可用（503）
     ServiceUnavailable(String),
 }
+
+// v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P1-6「错误处理不统一」）：
+//   ApiError 此前只实现 IntoResponse（面向 HTTP 响应），未实现 Display / Error，
+//   故无法作为 `Box<dyn Error>` 传播，也无法在日志中直接打印原因。
+//   补齐后它与全仓其余错误类型口径一致；HTTP 响应路径保持不变。
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadRequest(msg) => write!(f, "请求参数错误(400): {}", msg),
+            Self::NotFound(msg) => write!(f, "资源未找到(404): {}", msg),
+            Self::Internal(msg) => write!(f, "内部服务器错误(500): {}", msg),
+            Self::ServiceUnavailable(msg) => write!(f, "服务不可用(503): {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
@@ -2766,9 +2819,11 @@ async fn config_llm_handler(
 }
 
 /// 保存 LLM API 配置到全局配置文件
-fn save_llm_to_config(llm_api: Option<&str>) -> Result<(), String> {
+fn save_llm_to_config(llm_api: Option<&str>) -> crate::errors::LrcResult<()> {
     let mut cfg = crate::config::LrcConfig::load();
     cfg.llm_api = llm_api.map(|s| s.to_string());
+    // v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：LrcConfig::save 已返回 LrcError，
+    // 此处直接上浮，不再降级为 String。
     cfg.save()
 }
 
@@ -2789,13 +2844,14 @@ fn wizard_json_path() -> Option<std::path::PathBuf> {
 
 /// 仪表盘修改 LLM 配置后，同步到 wizard.json，确保桌面端和仪表盘配置一致。
 /// API Key 使用 AES-256-GCM 加密存储（与桌面端一致）。
-fn save_llm_to_wizard_json(llm_api: &str) -> Result<(), String> {
-    let wizard_path = wizard_json_path().ok_or_else(|| "读取 APPDATA 环境变量失败".to_string())?;
+fn save_llm_to_wizard_json(llm_api: &str) -> LrcResult<()> {
+    let wizard_path =
+        wizard_json_path().ok_or_else(|| LrcError::config("读取 APPDATA 环境变量失败"))?;
 
     // 读取现有 wizard.json（如果存在），保留非 LLM 字段
     let mut wizard: serde_json::Value = if wizard_path.exists() {
         let content = std::fs::read_to_string(&wizard_path)
-            .map_err(|e| format!("读取 wizard.json 失败: {}", e))?;
+            .map_err(|e| LrcError::io(format!("读取 wizard.json 失败: {}", e)))?;
         serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
     } else {
         serde_json::json!({})
@@ -2819,7 +2875,7 @@ fn save_llm_to_wizard_json(llm_api: &str) -> Result<(), String> {
                     .collect();
                 if !cleaned_key.is_empty() {
                     let encrypted = crate::crypto::encrypt_api_key(&cleaned_key)
-                        .map_err(|e| format!("加密 API Key 失败: {}", e))?;
+                        .map_err(|e| LrcError::crypto(format!("加密 API Key 失败: {}", e)))?;
                     wizard["encrypted_api_key"] = serde_json::json!(encrypted);
                 }
             }
@@ -2859,13 +2915,15 @@ fn save_llm_to_wizard_json(llm_api: &str) -> Result<(), String> {
 
     // 确保目录存在
     if let Some(parent) = wizard_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建 wizard.json 目录失败: {}", e))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| LrcError::io(format!("创建 wizard.json 目录失败: {}", e)))?;
     }
 
     // 写入 wizard.json
     let json_str = serde_json::to_string_pretty(&wizard)
-        .map_err(|e| format!("序列化 wizard.json 失败: {}", e))?;
-    std::fs::write(&wizard_path, json_str).map_err(|e| format!("写入 wizard.json 失败: {}", e))?;
+        .map_err(|e| LrcError::parse(format!("序列化 wizard.json 失败: {}", e)))?;
+    std::fs::write(&wizard_path, json_str)
+        .map_err(|e| LrcError::io(format!("写入 wizard.json 失败: {}", e)))?;
 
     eprintln!(
         "[配置] LLM 配置已同步到 wizard.json: {}",
@@ -2884,12 +2942,19 @@ fn save_llm_to_wizard_json(llm_api: &str) -> Result<(), String> {
 static EMBEDDER_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
 /// 可用的嵌入模型白名单
-const AVAILABLE_EMBEDDER_MODELS: &[&str] = &[
-    "BAAI/bge-small-zh",
-    "sentence-transformers/all-MiniLM-L6-v2",
-    "intfloat/multilingual-e5-small",
-    "BAAI/bge-base-zh",
-];
+///
+/// v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P3 质量「模型 ID 常量重复」）：
+///   根因：模型 ID 此前在 4 处独立硬编码（本处白名单、`bin/server.rs` 的 `RECOMMENDED_MODELS`、
+///         `engine/model_resolver.rs::selected_model_id`、`engine/luoshu_encoder_ml.rs::detect_default_model_by_lang`），
+///         且存在**值不一致**——本白名单要求 `intfloat/multilingual-e5-small`，
+///         而 `bin/server.rs` 的 `model list` 展示 `multilingual-e5-small`（无 org 前缀），
+///         用户照展示值调用会被白名单直接拒绝。
+///   修复：收敛到 Layer 1 中立模块 [`crate::model_ids`]（无 feature 门控，
+///         Layer 2 引擎亦可引用，避免 Layer 2 反向依赖本模块造成 feature 耦合）。
+pub use crate::model_ids::{
+    AVAILABLE_EMBEDDER_MODELS, MODEL_ALL_MINILM_L6_V2, MODEL_BGE_BASE_ZH, MODEL_BGE_SMALL_ZH,
+    MODEL_MULTILINGUAL_E5_SMALL,
+};
 
 // ---------- 请求 / 响应结构体 ----------
 
@@ -3425,175 +3490,6 @@ fn scan_desktop_shortcuts() -> Vec<String> {
     result
 }
 
-// ---------- 工具检测辅助函数 ----------
-
-/*
-旧版 PATH、安装目录和扩展检测已移除。
-浏览器端兼容接口只返回快捷方式原始候选；正式检测统一由桌面端 AgentDetector 负责。
-*/
-
-/*
-/// 检测命令行工具是否安装，并解析版本号
-///
-/// 优先通过 PATH 执行命令；失败时回退到检查 Windows 常见安装路径。
-/// `tool_type` 参数指定工具类型："ide"、"agent" 或 "extension"
-fn detect_command_tool(name: &str, cmd: &str, args: &[&str], tool_type: &str) -> ToolDetectItem {
-    // 优先：通过 PATH 执行命令
-    if let Ok(output) = Command::new(cmd).args(args).output() {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            // 多数 CLI 工具的版本号在第一行
-            let version = stdout
-                .lines()
-                .next()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let path = which_path(cmd);
-            return ToolDetectItem {
-                name: name.to_string(),
-                tool_type: tool_type.to_string(),
-                installed: true,
-                version,
-                path,
-                shortcut_confirmed: false,
-            };
-        }
-    }
-
-    // 回退：检查 Windows 常见安装路径
-    if let Some(path) = check_windows_install_path(name) {
-        return ToolDetectItem {
-            name: name.to_string(),
-            tool_type: tool_type.to_string(),
-            installed: true,
-            version: None,
-            path: Some(path),
-            shortcut_confirmed: false,
-        };
-    }
-
-    ToolDetectItem {
-        name: name.to_string(),
-        tool_type: tool_type.to_string(),
-        installed: false,
-        version: None,
-        path: None,
-        shortcut_confirmed: false,
-    }
-}
-
-/// 通过 `where`（Windows）/ `which`（Unix）查询可执行文件路径
-fn which_path(cmd: &str) -> Option<String> {
-    let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
-        ("where.exe", vec![cmd])
-    } else {
-        ("which", vec![cmd])
-    };
-    Command::new(program)
-        .args(&args)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                let s = String::from_utf8_lossy(&o.stdout);
-                s.lines().next().map(|l| l.trim().to_string())
-            } else {
-                None
-            }
-        })
-}
-
-/// 检查 Windows 下的常见安装路径
-///
-/// 仅 Windows 调用，其他平台返回 None。
-fn check_windows_install_path(name: &str) -> Option<String> {
-    let local_appdata = std::env::var("LOCALAPPDATA").ok()?;
-    let candidates: Vec<PathBuf> = match name {
-        "VS Code" => vec![
-            PathBuf::from(&local_appdata)
-                .join("Programs")
-                .join("Microsoft VS Code")
-                .join("bin"),
-            PathBuf::from("C:\\Program Files")
-                .join("Microsoft VS Code")
-                .join("bin"),
-        ],
-        "Cursor" => vec![PathBuf::from(&local_appdata)
-            .join("Programs")
-            .join("cursor")],
-        // 注意：Trae 与 Trae CN 路径严格分离，避免一个安装目录触发两个工具误检。
-        // Trae CN 常装在自定义盘符（如 D:\Trae CN），由快捷方式检测兜底。
-        "Trae" => vec![PathBuf::from(&local_appdata).join("Programs").join("Trae")],
-        "Trae CN" => vec![PathBuf::from(&local_appdata)
-            .join("Programs")
-            .join("Trae CN")],
-        "Windsurf" => vec![PathBuf::from(&local_appdata)
-            .join("Programs")
-            .join("windsurf")],
-        "CodeBuddy" => vec![
-            PathBuf::from(&local_appdata)
-                .join("Programs")
-                .join("CodeBuddy"),
-            PathBuf::from("C:\\Program Files").join("CodeBuddy"),
-        ],
-        // CodeBuddy CN（腾讯中文版）：安装目录常为自定义盘符（如 H:\CodeBuddy CN），
-        // 由快捷方式检测兜底；此处补充常见程序目录。
-        "CodeBuddy CN" => vec![
-            PathBuf::from(&local_appdata)
-                .join("Programs")
-                .join("CodeBuddy CN"),
-            PathBuf::from("C:\\Program Files").join("CodeBuddy CN"),
-        ],
-        "Qoder" => vec![
-            PathBuf::from(&local_appdata).join("Programs").join("Qoder"),
-            PathBuf::from("C:\\Program Files").join("Qoder"),
-        ],
-        "GitHub Copilot" => vec![
-            PathBuf::from(&local_appdata)
-                .join("Programs")
-                .join("GitHub Copilot"),
-            PathBuf::from(&local_appdata).join("GitHub Copilot"),
-        ],
-        "JetBrains Toolbox" => vec![
-            PathBuf::from(&local_appdata)
-                .join("JetBrains")
-                .join("Toolbox"),
-            PathBuf::from("C:\\Program Files")
-                .join("JetBrains")
-                .join("JetBrains Toolbox"),
-        ],
-        "Zed" => vec![PathBuf::from(&local_appdata).join("Programs").join("Zed")],
-        "Claude Code" => vec![PathBuf::from(&local_appdata)
-            .join("Programs")
-            .join("Claude Code")],
-        _ => return None,
-    };
-
-    for dir in candidates {
-        if dir.exists() {
-            return Some(dir.to_string_lossy().to_string());
-        }
-    }
-    None
-}
-
-/// 检测 VS Code 扩展是否已安装
-///
-/// 通过执行 `code --list-extensions` 检查指定扩展 ID 是否存在。
-fn detect_vscode_extension(extension_id: &str) -> bool {
-    let output = match Command::new("code").arg("--list-extensions").output() {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let list = String::from_utf8_lossy(&output.stdout);
-    list.lines()
-        .any(|line| line.trim().eq_ignore_ascii_case(extension_id))
-}
-*/
-
 // ==================== Stdio 传输层（标准 MCP） ====================
 
 /// MCP 请求分发结果
@@ -3686,6 +3582,22 @@ pub async fn run_stdio(state: Arc<AppState>) {
 /// 兼容设计：仅当环境变量 LRC_API_TOKEN 非空且非空字符串时启用
 /// Bearer Token 校验；未配置 token 时跳过认证，保持既有本地开发、
 /// 仪表盘与桥接客户端行为完全不变。认证失败返回 401 Unauthorized。
+///
+/// # 认证默认策略（v0.9.7 明确化，GLOBAL_CODE_REVIEW_REPORT P1 安全「认证默认策略」）
+///
+/// **默认无认证**这一行为是**有意设计**，其安全边界如下，部署者须自行评估：
+///
+/// 1. **威胁模型假设**：进程绑定 `127.0.0.1`（回环），仅本机可访问；同机其它进程
+///    与恶意软件本就可读取用户目录下的记忆数据，故"同机无认证"不额外扩大暴露面。
+/// 2. **风险场景**：若将服务**绑定到非回环地址**（`--host 0.0.0.0`）却未设置
+///    `LRC_API_TOKEN`，则**局域网内任意主机可读写全部记忆**（含明文与归档）。
+///    此场景下必须显式设置 token。
+/// 3. **强制保护手段**：设置 `LRC_API_TOKEN=<强随机串>` 即启用 Bearer 校验；
+///    客户端须携带 `Authorization: Bearer <token>`。
+/// 4. **比较方式**：token 比对使用 [`constant_time_eq`]（常量时间），
+///    防止通过响应耗时逐字节推断 token。
+/// 5. **未做之事**：不提供速率限制以外的暴力破解防护、不做 token 轮换。
+///    面向不可信网络的部署应在反向代理层叠加 TLS 与访问控制。
 async fn local_api_auth(
     req: Request<axum::body::Body>,
     next: Next,
@@ -3701,8 +3613,7 @@ async fn local_api_auth(
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.strip_prefix("Bearer "))
-                .map(|token| token.trim())
-                .map(|token| token == expected.trim())
+                .map(|token| constant_time_eq(token.trim().as_bytes(), expected.trim().as_bytes()))
                 .unwrap_or(false);
             if authorized {
                 Ok(next.run(req).await)
@@ -3717,6 +3628,57 @@ async fn local_api_auth(
             }
         }
     }
+}
+
+/// 非回环绑定且未设 Token 时的启动告警
+///
+/// v0.9.7 新增（GLOBAL_CODE_REVIEW_REPORT P1 安全「认证默认策略」）：
+///   该函数把"默认无认证仅在回环下安全"这一文档约定，转为**启动期的可见告警**。
+///   判定逻辑刻意保守（宁可误报不可漏报）：
+///     - `host` 为 `127.0.0.1` / `::1` / `localhost` → 视为回环，不告警；
+///     - 其余（含 `0.0.0.0`、`::`、具体内网/公网 IP、主机名）→ 视为对外可达，
+///       若此时 `LRC_API_TOKEN` 未设置或为空，则打印多行醒目告警。
+///   仅告警、不阻断启动：强制手段是在环境变量中设置 `LRC_API_TOKEN`。
+fn warn_if_unauthenticated_non_loopback(host: &str) {
+    let is_loopback = matches!(
+        host.trim().trim_start_matches('[').trim_end_matches(']'),
+        "127.0.0.1" | "::1" | "localhost"
+    );
+    if is_loopback {
+        return;
+    }
+    let token_missing = std::env::var("LRC_API_TOKEN")
+        .map(|t| t.trim().is_empty())
+        .unwrap_or(true);
+    if !token_missing {
+        return;
+    }
+    eprintln!("================================================================");
+    eprintln!("[安全告警] 服务绑定到非回环地址 '{host}'，且未设置 LRC_API_TOKEN。");
+    eprintln!("          当前状态下，能访问该地址的任意主机均可读写全部记忆数据。");
+    eprintln!("          若仅本机使用，请改绑 127.0.0.1；");
+    eprintln!("          若确需对外提供服务，请设置 LRC_API_TOKEN=<强随机串> 后再启动。");
+    eprintln!("================================================================");
+}
+
+/// 常量时间字节串比较（防时序侧信道）
+/// v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P2 安全「Token 非常量时间比较 @server.rs:3705」）：
+///   根因：原实现用 `token == expected`（`str` 的 `PartialEq`）——比较在首个不同字节处提前返回，
+///         攻击者可通过统计响应耗时逐字节推断 Token。
+///   实现要点：
+///     - 长度不同立即返回 false（长度差异本身不是秘密，Token 长度固定）；
+///     - 逐字节累积 XOR 差异，**不使用短路**，使耗时与"首个不同字节的位置"无关；
+///     - `black_box` 防止优化器把循环改回短路比较。
+///   注：不引入 `subtle` crate，避免为单点需求新增供应链依赖。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 /// 创建 MCP 服务的 axum Router（合并 v1 REST API 端点 + 仪表盘）
@@ -3851,6 +3813,13 @@ pub async fn serve_on_listener(
     println!("   船长日志: GET  http://{}/v1/captains-log", addr);
     println!("   MCP 协议: POST http://{}/mcp", addr);
     println!("   状态检查: GET  http://{}/health", addr);
+
+    // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P1 安全「认证默认策略」——强制保护）：
+    //   默认无认证仅在"绑定回环"时安全（见 local_api_auth 文档）。一旦绑定到非回环
+    //   地址（0.0.0.0 / :: / 局域网 IP）且未设置 LRC_API_TOKEN，则局域网内任意主机
+    //   可读写全部记忆。此处把该风险从"文档约定"升级为"启动即告警"，越明显越好。
+    //   注：告警而非拒绝启动——避免破坏既有内网自用部署；强制手段仍是设 token。
+    warn_if_unauthenticated_non_loopback(host);
 
     // v0.8.1：连接池与超时优化（修复 Bug #7：sidecar API 间歇性超时）
     //

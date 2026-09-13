@@ -8,6 +8,12 @@ const baseUrl = process.env.LRC_BROWSER_BASE_URL || 'http://127.0.0.1:1420';
 const artifactDir = path.join(process.cwd(), 'playwright-artifacts');
 const consoleErrors = [];
 
+// P1-7 修复：本脚本此前只打印采集结果、不做任何断言，联想链路整体失败时仍以退出码 0 通过。
+// 现补齐硬断言，使"用户视角可见的联想结果"成为可阻断的质量门禁。
+function assert(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
 async function main() {
   fs.mkdirSync(artifactDir, { recursive: true });
   const browser = await chromium.launch({ headless: true });
@@ -43,6 +49,15 @@ async function main() {
     });
 
     await page.screenshot({ path: path.join(artifactDir, 'association-user-view.png'), fullPage: true });
+
+    // 断言：查询词回填、结论渲染出"N 个念头"、故事节点/证据条目非空、无 emoji、无控制台错误
+    assert(result.q.trim() === '今晚吃什么？', `联想查询词未回填: "${result.q}"`);
+    assert(result.conclusion.includes('个念头'), `联想结论未渲染念头数: "${result.conclusion}"`);
+    assert(result.storyNodes > 0, '联想叙事链未渲染任何节点');
+    assert(result.evidenceItems > 0, '联想证据列表为空');
+    assert(!result.hasEmoji, '联想结果区仍含 emoji 图标（应使用 SVG 体系）');
+    assert(consoleErrors.length === 0, `控制台存在错误: ${consoleErrors.slice(0, 3).join(' | ')}`);
+
     console.log(JSON.stringify({ ok: true, baseUrl, consoleErrors, result }, null, 2));
   } catch (error) {
     console.error(`[user-view] FAIL: ${error.message}`);

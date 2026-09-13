@@ -2,7 +2,7 @@
 
 > **AI 编程助手的记忆与检索插件** — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定。
 >
-> 版本：v0.9.5 | 适用于：Trae / Cursor / VS Code / Claude Desktop 等支持 MCP 协议的 AI 工具
+> 版本：v0.9.7 | 适用于：Trae / Cursor / VS Code / Claude Desktop 等支持 MCP 协议的 AI 工具
 
 ---
 
@@ -586,8 +586,8 @@ LLM 增强模式的原理是：把你的自然语言查询发送给 LLM，翻译
 
 ### 安全配置变更
 
-v0.6.0 起，CORS 策略从 `permissive`（完全宽松）收紧为显式白名单：
-- 允许来源：`localhost` / `127.0.0.1` / `0.0.0.0` 任意端口，以及 `tauri://` 协议
+v0.6.0 起，CORS 策略从 `permissive`（完全宽松）收紧为显式白名单（v0.7.1 起进一步移除 `0.0.0.0`）：
+- 允许来源：`http(s)://localhost:任意端口` / `http://127.0.0.1:任意端口`，以及 `tauri://` 协议与 `tauri.localhost`（Tauri 2.x WebView 源）
 - 允许方法：GET、POST、OPTIONS
 - 允许头：Content-Type、Authorization
 - 不允许凭证（credentials: false）
@@ -800,7 +800,7 @@ v0.6.0 起，点击状态栏的"已停止 / 不可达"文本会弹出启动服�
 ### v0.5.1 (2026-06-18)
 
 **新增功能**
-- 前端版本号一致性（统一从 Cargo.toml 读取）
+- 前端版本号一致性（`static/app.js` 内置 `APP_VERSION` fallback，启动时经 `/v1/health/system` 返回的 `CARGO_PKG_VERSION` 异步校正）
 - 前端 CSS 内联 1260 行提取到 app.css
 - 前端 app.js 全局变量污染（IIFE 隔离）
 - server.rs 巨型函数拆分（964行 → 5个函数）

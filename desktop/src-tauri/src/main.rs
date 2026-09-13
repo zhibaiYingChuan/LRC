@@ -154,6 +154,20 @@ fn main() {
             commands::set_project_dir,
             commands::pick_project_dir,
             commands::get_wizard_state,
+            // v0.9.7 归属标注（GLOBAL_CODE_REVIEW_REPORT「Tauri 命令归属不明」）：
+            //   以下 4 个命令**已注册但 static/ 前端零 invoke 调用**（实测：
+            //   前端 33 个 invoke 目标 vs 后端 37 个注册命令，差集即此 4 个）。
+            //   保留原因（非死代码）：
+            //     1. `open_dashboard_window` / `navigate_main_to_dashboard`
+            //        ——统一的"在主窗口内显示仪表盘"入口，是**对外 IPC 契约**；
+            //        当前桌面端内部改由 `show_dashboard_in_main_window` 直接调用，
+            //        但保留命令使外部/未来前端可复用。
+            //     2. `update_tray_tooltip` ——托盘 tooltip 刷新入口；桌面端内部已在
+            //        `commands.rs` 的 Agent 配置完成后直接调 `tray::update_tooltip`。
+            //     3. `bulk_apply_agent_overrides` ——批量手动修正（含 HCSE FM-09
+            //        10 秒超时 + 指数退避限流），供跨端同步/恢复场景使用。
+            //   处置：**不删除**（删除会缩小对外接口面，属产品决策）；
+            //   改为在注册处显式标注归属，消除"归属不明"。
             commands::open_dashboard_window,
             commands::navigate_main_to_dashboard,
             commands::open_settings, // v0.5.5 P1-2：从仪表盘打开桌面端设置
@@ -168,6 +182,7 @@ fn main() {
             commands::bulk_apply_agent_overrides, // 批量应用 AI 工具手动修正
             commands::get_scan_cache_metadata,    // v0.8.31 S-05：获取扫描缓存元数据（时间戳+TTL）
             commands::force_invalidate_scan_cache, // v0.8.31 S-05：前端「重新扫描」按钮强制失效缓存
+            commands::get_proxy_configuration, // v0.9.7 修复：前端代理检测（app.js:285）此前调用未注册命令
         ])
         .manage(app_store)
         // v0.5.4 P2-16 调试：页面加载事件追踪

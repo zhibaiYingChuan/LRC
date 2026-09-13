@@ -20,6 +20,10 @@
 //   -[:RELATED_TO]-> (:Memory)
 
 use crate::graph_store::{EdgeType, GraphMemoryStore, GraphQueryResult};
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：Neo4j 配置与 HTTP 调用错误由不可判别的
+// `String` 收敛为带域分类的 [`crate::errors::LrcError`]（config / network / parse）。
+// `Display` 仅输出 message，故调用方/log 文案**零漂移**。
+use crate::errors::{LrcError, LrcResult};
 use crate::persistence::PersistenceError;
 use serde::{Deserialize, Serialize};
 
@@ -59,14 +63,18 @@ impl Neo4jConfig {
     /// - `LRC_NEO4J_USER`：用户名
     /// - `LRC_NEO4J_PASS`：密码（**必须设置**，v0.5.4 起不再使用硬编码默认值）
     /// - `LRC_NEO4J_DB`：数据库名
-    pub fn from_env() -> Result<Self, String> {
+    pub fn from_env() -> LrcResult<Self> {
         let endpoint =
             std::env::var("LRC_NEO4J_URL").unwrap_or_else(|_| "http://localhost:7474".to_string());
         let username = std::env::var("LRC_NEO4J_USER").unwrap_or_else(|_| "neo4j".to_string());
         // v0.5.4 修复：密码必须从环境变量读取，不使用硬编码默认值
         let password = match std::env::var("LRC_NEO4J_PASS") {
             Ok(p) if !p.is_empty() => p,
-            _ => return Err("LRC_NEO4J_PASS 环境变量未设置或为空，请设置 Neo4j 密码".to_string()),
+            _ => {
+                return Err(LrcError::config(
+                    "LRC_NEO4J_PASS 环境变量未设置或为空，请设置 Neo4j 密码",
+                ))
+            }
         };
         let database = std::env::var("LRC_NEO4J_DB").unwrap_or_else(|_| "neo4j".to_string());
 
@@ -167,7 +175,7 @@ impl Neo4jGraphStore {
     }
 
     /// 验证连接
-    async fn ping(&self) -> Result<(), String> {
+    async fn ping(&self) -> LrcResult<()> {
         let url = format!(
             "{}/db/{}/tx/commit",
             self.config.endpoint, self.config.database
@@ -189,19 +197,22 @@ impl Neo4jGraphStore {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("HTTP 请求失败: {}", e))?;
+            .map_err(|e| LrcError::network(format!("HTTP 请求失败: {}", e)))?;
 
         if !response.status().is_success() {
-            return Err(format!("HTTP {}", response.status()));
+            return Err(LrcError::network(format!("HTTP {}", response.status())));
         }
 
         let tx_response: Neo4jTransactionResponse = response
             .json()
             .await
-            .map_err(|e| format!("解析响应失败: {}", e))?;
+            .map_err(|e| LrcError::parse(format!("解析响应失败: {}", e)))?;
 
         if !tx_response.errors.is_empty() {
-            return Err(format!("Cypher 错误: {}", tx_response.errors[0].message));
+            return Err(LrcError::network(format!(
+                "Cypher 错误: {}",
+                tx_response.errors[0].message
+            )));
         }
 
         eprintln!("[LRC·Neo4j] 连接验证成功");

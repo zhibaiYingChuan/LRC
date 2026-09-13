@@ -1,22 +1,28 @@
-// Loong Recall (LRC) — 通用语义记忆引擎
-// ================================================
-//
-// 为 AI 助手提供跨项目、跨语言的永久记忆能力。
-// 支持多语言代码和通用文档的自动切分与检索。
-//
-// 分层开源架构:
-//   Layer 1 (Public)  — chunker.rs, server.rs, bin/server.rs → Apache 2.0
-//   Layer 2 (Protected) — engine/ 子模块 → 专有研究许可
-//   Layer 3 (Binary)  — 编译产物 → 二进制分发，Rust 编译天然混淆
-//
-// 架构: Chunker（多语言切分）→ Encoder（语义编码）→ Retriever（向量检索）→ Manager（编排）
-// 可选: Server（MCP HTTP/Stdio 服务）→ IDE 直接调用
-// 可选: CodeBERT（ml feature）→ 高精度语义编码
+//! Loong Recall (LRC) — 通用语义记忆引擎
+//! ================================================
+//!
+//! 为 AI 助手提供跨项目、跨语言的永久记忆能力。
+//! 支持多语言代码和通用文档的自动切分与检索。
+//!
+//! 分层开源架构:
+//!   Layer 1 (Public)  — chunker.rs, server.rs, bin/server.rs → Apache 2.0
+//!   Layer 2 (Protected) — engine/ 子模块 → 专有研究许可
+//!   Layer 3 (Binary)  — 编译产物 → 二进制分发，Rust 编译天然混淆
+//!
+//! 架构: Chunker（多语言切分）→ Encoder（语义编码）→ Retriever（向量检索）→ Manager（编排）
+//! 可选: Server（MCP HTTP/Stdio 服务）→ IDE 直接调用
+//! 可选: CodeBERT（ml feature）→ 高精度语义编码
 
 // === Layer 1: 公开层 (Apache 2.0) ===
 pub mod chunker;
+/// 统一错误契约（v0.9.7，GLOBAL_CODE_REVIEW_REPORT P1-6）
+pub mod errors;
 pub mod graph_store;
 pub mod memory_store;
+/// 记忆存储缓存子系统（v0.9.7：从 memory_store.rs 外提，P2-2 God Object 拆分）
+pub mod memory_store_cache;
+/// 记忆存储数据契约类型（v0.9.7：从 memory_store.rs 外提，P2-2 God Object 拆分）
+pub mod memory_store_types;
 pub mod memory_types;
 pub mod persistence;
 
@@ -68,6 +74,27 @@ pub mod ab_test;
 
 /// 架构记忆配置（算子参数、衰减曲线、权限策略持久化）
 pub mod arch_config;
+
+/// 嵌入模型 ID 单一真源（Layer 1 中立，无 feature 门控，供 Layer 1/Layer 2 共用）
+pub mod model_ids;
+
+/// 原子文件写入工具（Layer 1 公共设施）
+///
+/// v0.9.7 新增（GLOBAL_CODE_REVIEW_REPORT P3-3「原子写入逻辑重复 4 处」）：
+///   收敛 `arch_config.rs` / `config.rs` / `data_dir.rs` / `engine/audit_trail.rs`
+///   四处各自手写的"临时文件 + rename"实现为唯一实现。
+pub mod atomic_file;
+
+/// 记忆联想状态机（Layer 1）
+///
+/// v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P0-2「依赖倒置 Layer 1 → Layer 2」）：
+///   根因：本模块原位于 `engine/memory_state_machine.rs`（Layer 2，DaoTi 研究许可），
+///         但其自身**文件头声明为 Apache 2.0 且零 crate 内部依赖**（仅 serde/std）——
+///         属**许可层错位**。由于 Layer 1 的 `persistence/` 需要其中 `MemoryState`
+///         作为持久化载体，形成 Layer 1 → Layer 2 的反向依赖。
+///   修复：上提至 Layer 1 顶层。为不破坏既有 `crate::engine::memory_state_machine::*`
+///         路径（36 处引用），`engine/mod.rs` 保留 `pub use` 再导出。
+pub mod memory_state_machine;
 
 /// 三层基准测试框架（可被 CLI、仪表盘 API、CI/CD 复用）
 pub mod benchmark;

@@ -1,18 +1,18 @@
-// ============================================================
-// 许可证: Apache 2.0
-// 本文件实现 A/B 测试框架与 MRR 评估，属于公开层 (Layer 1)。
-// ============================================================
-//
-// A/B 测试框架（AB Test Framework）
-//
-// 对比"带幻和约束的九宫格检索"与"纯向量检索"的 MRR（平均倒数排名）。
-//
-// 核心组件：
-//   1. SearchEngine trait — 检索引擎抽象
-//   2. LuoshuSearchEngine — 基于洛书幻和约束的检索（实验组）
-//   3. PlainVectorSearchEngine — 纯向量检索（对照组）
-//   4. ABTestRunner — 协调实验运行和结果统计
-//   5. mrr_evaluate — MRR 计算函数
+//! ============================================================
+//! 许可证: Apache 2.0
+//! 本文件实现 A/B 测试框架与 MRR 评估，属于公开层 (Layer 1)。
+//! ============================================================
+//!
+//! A/B 测试框架（AB Test Framework）
+//!
+//! 对比"带幻和约束的九宫格检索"与"纯向量检索"的 MRR（平均倒数排名）。
+//!
+//! 核心组件：
+//!   1. SearchEngine trait — 检索引擎抽象
+//!   2. LuoshuSearchEngine — 基于洛书幻和约束的检索（实验组）
+//!   3. PlainVectorSearchEngine — 纯向量检索（对照组）
+//!   4. ABTestRunner — 协调实验运行和结果统计
+//!   5. mrr_evaluate — MRR 计算函数
 
 #[cfg(not(feature = "ml"))]
 use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;

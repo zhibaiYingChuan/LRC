@@ -29,6 +29,11 @@ use tokio::sync::Mutex;
 use code_memory::process_guard::{self, SingletonLock};
 // 配置持久化：桌面端agent配置保存与加载
 use code_memory::config::{LrcConfig, DEFAULT_PORT};
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：本入口各错误路径由不可判别的
+// `String` 收敛为带域分类的 [`code_memory::errors::LrcError`]（config / invalid_input /
+// io / parse / network / not_found / unsupported / internal）。
+// `Display` 仅输出 message，故 CLI 打印文案**零漂移**。
+use code_memory::errors::{LrcError, LrcResult};
 // V2 模块：项目指纹、统一数据目录
 // v0.8.0：migration 模块改为通过 API（POST /v1/migrate）调用，不在启动时自动执行
 use code_memory::data_dir::DataDir;
@@ -70,7 +75,9 @@ async fn main() {
 
     // 核心逻辑放入 try_run()，确保所有 Drop 析构函数执行完毕后再 exit
     // 这解决了此前 std::process::exit 跳过 SingletonLock Drop 导致僵尸锁残留的问题
-    let exit_code = match try_run().await {
+    // 注：CLI 顶层保留 String 打印契约，故在此做一次 LrcError → String 转换
+    // （Display 仅输出 message，文案与改造前逐字一致）
+    let exit_code = match try_run().await.map_err(|e| e.to_string()) {
         Ok(()) => 0,
         Err(msg) => {
             eprintln!("{msg}");
@@ -87,7 +94,7 @@ async fn main() {
 
 /// 主运行逻辑，返回 Result 以避免 std::process::exit 跳过 Drop 析构
 #[allow(unused_assignments)]
-async fn try_run() -> Result<(), String> {
+async fn try_run() -> LrcResult<()> {
     let args: Vec<String> = std::env::args().collect();
 
     let mut src_dir = String::new();
@@ -179,9 +186,10 @@ async fn try_run() -> Result<(), String> {
                 if i < args.len() {
                     data_dir = Some(args[i].clone());
                 } else {
-                    return Err("错误: --data-dir 需要指定路径\n\
-                         用法: code-memory-server --data-dir ~/my-lrc-data"
-                        .to_string());
+                    return Err(LrcError::invalid_input(
+                        "错误: --data-dir 需要指定路径\n\
+                         用法: code-memory-server --data-dir ~/my-lrc-data",
+                    ));
                 }
             }
             "--dev" => {
@@ -210,10 +218,11 @@ async fn try_run() -> Result<(), String> {
                 if i < args.len() {
                     install_ide = Some(args[i].clone());
                 } else {
-                    return Err("错误: --install-ide 需要指定 IDE 名称\n\
+                    return Err(LrcError::invalid_input(
+                        "错误: --install-ide 需要指定 IDE 名称\n\
                          用法: code-memory-server --install-ide <trae|cursor|vscode|windsurf>\n\
-                         多 IDE 用逗号分隔: code-memory-server --install-ide trae,cursor,vscode"
-                        .to_string());
+                         多 IDE 用逗号分隔: code-memory-server --install-ide trae,cursor,vscode",
+                    ));
                 }
             }
             "--list-ides" => {
@@ -224,9 +233,10 @@ async fn try_run() -> Result<(), String> {
             "model" => {
                 // 解析子命令
                 if i + 1 >= args.len() {
-                    return Err("错误: model 子命令需要指定操作\n\
-                         用法: code-memory-server model <list|download|use|remove> [args]"
-                        .to_string());
+                    return Err(LrcError::invalid_input(
+                        "错误: model 子命令需要指定操作\n\
+                         用法: code-memory-server model <list|download|use|remove> [args]",
+                    ));
                 }
                 let subcommand = args[i + 1].clone();
                 let sub_args = &args[i + 2..];
@@ -236,37 +246,40 @@ async fn try_run() -> Result<(), String> {
                     "list" => handle_model_list(),
                     "download" => {
                         if sub_args.is_empty() {
-                            return Err("错误: model download 需要指定模型 ID\n\
+                            return Err(LrcError::invalid_input(
+                                "错误: model download 需要指定模型 ID\n\
                                  用法: code-memory-server model download <model_id>\n\
-                                 示例: code-memory-server model download BAAI/bge-small-zh"
-                                .to_string());
+                                 示例: code-memory-server model download BAAI/bge-small-zh",
+                            ));
                         }
                         handle_model_download(&sub_args[0])?
                     }
                     "use" => {
                         if sub_args.is_empty() {
-                            return Err("错误: model use 需要指定模型 ID\n\
+                            return Err(LrcError::invalid_input(
+                                "错误: model use 需要指定模型 ID\n\
                                  用法: code-memory-server model use <model_id>\n\
-                                 示例: code-memory-server model use BAAI/bge-small-zh"
-                                .to_string());
+                                 示例: code-memory-server model use BAAI/bge-small-zh",
+                            ));
                         }
                         handle_model_use(&sub_args[0])?
                     }
                     "remove" => {
                         if sub_args.is_empty() {
-                            return Err("错误: model remove 需要指定模型 ID\n\
+                            return Err(LrcError::invalid_input(
+                                "错误: model remove 需要指定模型 ID\n\
                                  用法: code-memory-server model remove <model_id>\n\
-                                 示例: code-memory-server model remove BAAI/bge-small-zh"
-                                .to_string());
+                                 示例: code-memory-server model remove BAAI/bge-small-zh",
+                            ));
                         }
                         handle_model_remove(&sub_args[0])?
                     }
                     _ => {
-                        return Err(format!(
+                        return Err(LrcError::invalid_input(format!(
                             "错误: 未知的 model 子命令 '{}'\n\
                              可用子命令: list, download, use, remove",
                             subcommand
-                        ));
+                        )));
                     }
                 }
                 return Ok(());
@@ -332,9 +345,10 @@ async fn try_run() -> Result<(), String> {
                 if i < args.len() {
                     export_path = Some(args[i].clone());
                 } else {
-                    return Err("错误: --export 需要指定输出文件路径\n\
-                         用法: code-memory-server --export ~/backup/lrc-export.json"
-                        .to_string());
+                    return Err(LrcError::invalid_input(
+                        "错误: --export 需要指定输出文件路径\n\
+                         用法: code-memory-server --export ~/backup/lrc-export.json",
+                    ));
                 }
             }
             "--import" => {
@@ -342,9 +356,10 @@ async fn try_run() -> Result<(), String> {
                 if i < args.len() {
                     import_path = Some(args[i].clone());
                 } else {
-                    return Err("错误: --import 需要指定导入文件路径\n\
-                         用法: code-memory-server --import ~/backup/lrc-export.json"
-                        .to_string());
+                    return Err(LrcError::invalid_input(
+                        "错误: --import 需要指定导入文件路径\n\
+                         用法: code-memory-server --import ~/backup/lrc-export.json",
+                    ));
                 }
             }
             // v0.6.0+ 参赛扩展：参照系实验参数
@@ -362,13 +377,17 @@ async fn try_run() -> Result<(), String> {
                 if i < args.len() {
                     exploration_log_path = Some(args[i].clone());
                 } else {
-                    return Err("错误: --exploration-log 需要指定日志文件路径\n\
-                         用法: code-memory-server --exploration-log ./exploration.jsonl"
-                        .to_string());
+                    return Err(LrcError::invalid_input(
+                        "错误: --exploration-log 需要指定日志文件路径\n\
+                         用法: code-memory-server --exploration-log ./exploration.jsonl",
+                    ));
                 }
             }
             _ => {
-                return Err(format!("未知参数: {}\n请使用 --help 查看可用选项", args[i]));
+                return Err(LrcError::invalid_input(format!(
+                    "未知参数: {}\n请使用 --help 查看可用选项",
+                    args[i]
+                )));
             }
         }
         i += 1;
@@ -406,11 +425,15 @@ async fn try_run() -> Result<(), String> {
 
     // HTTP 服务仅允许绑定本机地址，避免 --host 或配置文件意外暴露服务。
     if host != "localhost" {
-        let ip = host
-            .parse::<std::net::IpAddr>()
-            .map_err(|_| format!("错误: --host 仅支持 localhost 或回环 IP，收到: {host}"))?;
+        let ip = host.parse::<std::net::IpAddr>().map_err(|_| {
+            LrcError::invalid_input(format!(
+                "错误: --host 仅支持 localhost 或回环 IP，收到: {host}"
+            ))
+        })?;
         if !ip.is_loopback() {
-            return Err(format!("错误: --host 必须是回环地址，拒绝绑定: {host}"));
+            return Err(LrcError::invalid_input(format!(
+                "错误: --host 必须是回环地址，拒绝绑定: {host}"
+            )));
         }
     }
 
@@ -465,7 +488,7 @@ async fn try_run() -> Result<(), String> {
     if let Some(ref ide) = install_ide {
         if dev_mode {
             eprintln!("[开发模式] --install-ide 被拒绝：开发模式下禁止修改全局 IDE 配置。请使用稳定版二进制执行此操作。");
-            return Err("开发模式下不允许安装 IDE 配置（避免修改稳定版用户的全局 IDE 配置）。请使用稳定版二进制执行 --install-ide。".to_string());
+            return Err(LrcError::invalid_input("开发模式下不允许安装 IDE 配置（避免修改稳定版用户的全局 IDE 配置）。请使用稳定版二进制执行 --install-ide。"));
         }
         let ides: Vec<&str> = ide
             .split(',')
@@ -473,7 +496,9 @@ async fn try_run() -> Result<(), String> {
             .filter(|s| !s.is_empty())
             .collect();
         if ides.is_empty() {
-            return Err("错误: --install-ide 需要至少指定一个有效的 IDE 名称".to_string());
+            return Err(LrcError::invalid_input(
+                "错误: --install-ide 需要至少指定一个有效的 IDE 名称",
+            ));
         }
         for single_ide in &ides {
             install_ide_config(single_ide);
@@ -515,6 +540,8 @@ async fn try_run() -> Result<(), String> {
             }
             Err(e) => {
                 eprintln!("导出失败: {e}");
+                // export::export_memories 已返回 LrcError（P1-6）；本入口同为 LrcResult，
+                // 直接上浮（Display 仅输出 message，输出文案不变）。
                 return Err(e);
             }
         }
@@ -540,6 +567,7 @@ async fn try_run() -> Result<(), String> {
             }
             Err(e) => {
                 eprintln!("导入失败: {e}");
+                // 同上：本入口同为 LrcResult，直接上浮
                 return Err(e);
             }
         }
@@ -624,7 +652,7 @@ async fn try_run() -> Result<(), String> {
     let _singleton_lock = SingletonLock::acquire(std::path::Path::new(&data_dir), multi_window)
         .map_err(|e| {
             EXIT_CODE.store(e.exit_code(), std::sync::atomic::Ordering::SeqCst);
-            e.to_string()
+            LrcError::internal(e.to_string())
         })?;
     log(&format!(
         "   进程锁: 已获取 (PID: {}, 窗口上限: {})",
@@ -635,19 +663,21 @@ async fn try_run() -> Result<(), String> {
     // 前置验证：源码目录必须存在且为目录
     let src_path = std::path::Path::new(&src_dir);
     if !src_path.exists() {
-        return Err(format!(
+        return Err(LrcError::not_found(format!(
             "错误: 源码目录不存在: {src_dir}\n提示: 请使用 --src-dir 指定正确的项目路径"
-        ));
+        )));
     }
     if !src_path.is_dir() {
-        return Err(format!("错误: 指定路径不是目录: {src_dir}"));
+        return Err(LrcError::invalid_input(format!(
+            "错误: 指定路径不是目录: {src_dir}"
+        )));
     }
 
     // 创建持久化后端
     let persistence = JsonPersistence::new(&data_dir).map_err(|e| {
-        format!(
+        LrcError::io(format!(
             "致命错误: 无法创建数据目录或初始化持久化后端\n  路径: {data_dir}\n  原因: {e}\n  建议: 检查磁盘空间和目录写入权限"
-        )
+        ))
     })?;
 
     // v0.9.0 修复：根据 mode 加载编码器
@@ -812,7 +842,7 @@ async fn try_run() -> Result<(), String> {
     // 解析 LLM API 配置
     let llm_api = match llm_api_raw {
         Some(ref raw) => LlmApiConfig::parse(raw).map_err(|e| {
-            format!("错误: LLM API 配置解析失败: {e}\n提示: 格式为 openai:sk-xxx:model 或 ollama:host:model")
+            LrcError::config(format!("错误: LLM API 配置解析失败: {e}\n提示: 格式为 openai:sk-xxx:model 或 ollama:host:model"))
         })?,
         None => LlmApiConfig::None,
     };
@@ -974,7 +1004,9 @@ async fn try_run() -> Result<(), String> {
         let (listener, actual_port) = process_guard::find_available_port(&host, port, 100)
             .await
             .map_err(|e| {
-                format!("{e}\n提示: 请关闭占用端口的程序后重试，或使用 --port 指定其他起始端口")
+                LrcError::network(format!(
+                    "{e}\n提示: 请关闭占用端口的程序后重试，或使用 --port 指定其他起始端口"
+                ))
             })?;
 
         log(&format!(
@@ -1042,7 +1074,7 @@ async fn try_run() -> Result<(), String> {
         // tokio::select! 实现优雅关闭 — _singleton_lock 的 Drop 自动清理锁文件
         tokio::select! {
             result = server::serve_on_listener(state, &host, actual_port, listener) => {
-                result.map_err(|e| format!("服务启动失败: {e}"))?;
+                result.map_err(|e| LrcError::network(format!("服务启动失败: {e}")))?;
             }
             _ = process_guard::wait_for_shutdown_signal() => {
                 log("\n收到关闭信号，正在优雅退出...");
@@ -1219,12 +1251,14 @@ fn ask_user_confirmation(prompt: &str) -> bool {
 }
 
 /// 索引项目并输出统计信息，失败时返回错误而非杀死进程
+///
+/// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `never used`）。
 #[allow(dead_code)]
 fn index_and_report<E: code_memory::engine::encoder::CodeEncoder>(
     mgr: &mut CodeMemoryManager<E>,
     src_dir: &str,
     log: &impl Fn(&str),
-) -> Result<(), String> {
+) -> LrcResult<()> {
     match mgr.index_project(src_dir) {
         Ok(_count) => {
             let stats = mgr.get_stats();
@@ -1246,7 +1280,7 @@ fn index_and_report<E: code_memory::engine::encoder::CodeEncoder>(
         Err(e) => {
             let msg = format!("   索引失败: {e} (请检查 --src-dir 路径是否正确)");
             log(&msg);
-            Err(msg)
+            Err(LrcError::io(msg))
         }
     }
 }
@@ -1534,7 +1568,13 @@ fn run_benchmark_mode(json_output: bool) {
     use std::time::Instant;
 
     let total_start = Instant::now();
-    let report = code_memory::benchmark::run_all_benchmarks(None);
+    let report = match code_memory::benchmark::run_all_benchmarks(None) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("  ✗ 基准测试运行失败: {e}");
+            std::process::exit(1);
+        }
+    };
     let total_ms = u64::try_from(total_start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     if json_output {
@@ -1630,15 +1670,26 @@ fn run_benchmark_mode(json_output: bool) {
 // ════════════════════════════════════════════════════════════
 
 /// 推荐模型列表（用于 model list 输出参考）
+///
+/// v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P3 质量「模型 ID 常量重复」）：
+///   根因：本列表第 4 项原为 `"multilingual-e5-small"`（缺 `intfloat/` 前缀），
+///         与服务端白名单 `server::AVAILABLE_EMBEDDER_MODELS` 中的
+///         `"intfloat/multilingual-e5-small"` **值不一致**——用户照本列表展示值
+///         复制粘贴去下载，会被白名单直接拒绝（"不支持的 model_id"）。
+///   修复：改为引用 `server` 模块的单一真源常量，消除展示值与白名单分歧。
 const RECOMMENDED_MODELS: &[(&str, &str, &str)] = &[
-    ("BAAI/bge-small-zh", "512", "中文默认（~100MB）"),
-    ("BAAI/bge-base-zh", "768", "中文高精度（~400MB）"),
+    (server::MODEL_BGE_SMALL_ZH, "512", "中文默认（~100MB）"),
+    (server::MODEL_BGE_BASE_ZH, "768", "中文高精度（~400MB）"),
     (
-        "sentence-transformers/all-MiniLM-L6-v2",
+        server::MODEL_ALL_MINILM_L6_V2,
         "384",
         "英文/多语言轻量（~80MB）",
     ),
-    ("multilingual-e5-small", "384", "多语言通用（~120MB）"),
+    (
+        server::MODEL_MULTILINGUAL_E5_SMALL,
+        "384",
+        "多语言通用（~120MB）",
+    ),
     (
         "microsoft/graphcodebert-base",
         "768",
@@ -1771,7 +1822,7 @@ fn handle_model_list() {
 ///
 /// 使用 ModelDownloader 下载模型文件到 models/ 目录。
 /// 需要启用 ml feature（默认未启用，需用 `cargo build --features server,ml` 编译）。
-fn validate_model_id(model_id: &str) -> Result<(), String> {
+fn validate_model_id(model_id: &str) -> LrcResult<()> {
     if model_id.is_empty()
         || model_id.contains(['\\', ':'])
         || model_id
@@ -1779,16 +1830,18 @@ fn validate_model_id(model_id: &str) -> Result<(), String> {
             .any(|part| part.is_empty() || part == "." || part == "..")
         || model_id.starts_with('/')
     {
-        return Err(format!("错误: 无效的模型 ID: {model_id}"));
+        return Err(LrcError::invalid_input(format!(
+            "错误: 无效的模型 ID: {model_id}"
+        )));
     }
     Ok(())
 }
 
-fn handle_model_download(model_id: &str) -> Result<(), String> {
+fn handle_model_download(model_id: &str) -> LrcResult<()> {
     validate_model_id(model_id)?;
     #[cfg(not(feature = "ml"))]
     {
-        Err(format!(
+        Err(LrcError::unsupported(format!(
             "错误: 模型下载功能需要启用 ml feature\n\
              当前编译未启用 ml feature，请使用以下命令重新编译：\n\
              cargo build --features server,ml\n\
@@ -1801,7 +1854,7 @@ fn handle_model_download(model_id: &str) -> Result<(), String> {
             model_id,
             model_id,
             model_id.replace('/', "--")
-        ))
+        )))
     }
 
     #[cfg(feature = "ml")]
@@ -1906,7 +1959,10 @@ fn handle_model_download(model_id: &str) -> Result<(), String> {
             println!("═══════════════════════════════════════════");
             println!();
             println!("{}", manual_download_guide(model_id));
-            return Err(format!("下载失败，{} 个文件未成功下载", failed_files.len()));
+            return Err(LrcError::network(format!(
+                "下载失败，{} 个文件未成功下载",
+                failed_files.len()
+            )));
         }
 
         Ok(())
@@ -1917,7 +1973,7 @@ fn handle_model_download(model_id: &str) -> Result<(), String> {
 ///
 /// 设置默认嵌入模型。当前通过环境变量配置（变量名见 `EMBEDDER_MODEL_ENV_VAR` 常量）。
 /// 未来版本将支持持久化到配置文件。
-fn handle_model_use(model_id: &str) -> Result<(), String> {
+fn handle_model_use(model_id: &str) -> LrcResult<()> {
     validate_model_id(model_id)?;
     // 从 engine 层获取环境变量名（避免公开层直接出现受保护术语）
     let env_var = code_memory::engine::embedder::EMBEDDER_MODEL_ENV_VAR;
@@ -1936,13 +1992,13 @@ fn handle_model_use(model_id: &str) -> Result<(), String> {
         println!();
         println!("  ⚠ 该模型尚未下载");
         println!("  请先下载: code-memory-server model download {}", model_id);
-        return Err(format!("模型 {} 未下载", model_id));
+        return Err(LrcError::not_found(format!("模型 {} 未下载", model_id)));
     }
 
     if !model_dir.join("config.json").exists() {
         println!();
         println!("  ⚠ 模型目录不完整（缺少 config.json）");
-        return Err(format!("模型 {} 文件不完整", model_id));
+        return Err(LrcError::not_found(format!("模型 {} 文件不完整", model_id)));
     }
 
     println!();
@@ -1980,7 +2036,7 @@ fn handle_model_use(model_id: &str) -> Result<(), String> {
 /// 处理 `model remove <model_id>` 子命令
 ///
 /// 删除指定模型的本地文件。需要用户确认。
-fn handle_model_remove(model_id: &str) -> Result<(), String> {
+fn handle_model_remove(model_id: &str) -> LrcResult<()> {
     validate_model_id(model_id)?;
     println!("═══════════════════════════════════════════");
     println!("  LRC 删除模型");
@@ -1995,7 +2051,10 @@ fn handle_model_remove(model_id: &str) -> Result<(), String> {
     if !model_dir.exists() {
         println!();
         println!("  ⚠ 模型目录不存在: {}", model_dir.display());
-        return Err(format!("模型 {} 未下载，无需删除", model_id));
+        return Err(LrcError::not_found(format!(
+            "模型 {} 未下载，无需删除",
+            model_id
+        )));
     }
 
     // 计算目录大小
@@ -2022,7 +2081,7 @@ fn handle_model_remove(model_id: &str) -> Result<(), String> {
             println!("  已释放空间: {}", size_str);
             Ok(())
         }
-        Err(e) => Err(format!("删除失败: {}", e)),
+        Err(e) => Err(LrcError::io(format!("删除失败: {}", e))),
     }
 }
 

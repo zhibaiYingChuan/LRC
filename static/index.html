@@ -22,7 +22,9 @@
 <body>
 
 <!-- ==================== Toast 通知条容器（设计文档 3.10） ==================== -->
-<div class="toast-container" id="toast-container"></div>
+<!-- v0.9.7 无障碍修复（D-9）：声明 live region，使 60+ 处 showToast 动态插入的通知
+     能被屏幕阅读器自动播报；aria-live=polite 避免打断用户当前朗读。 -->
+<div class="toast-container" id="toast-container" role="status" aria-live="polite" aria-atomic="false"></div>
 
 <!-- v0.8.2：Sidecar 未运行横幅（对应审计 G005） -->
 <div id="sidecar-down-banner" class="sidecar-down-banner" hidden>
@@ -110,7 +112,7 @@
     <div class="home-hero">
       <div class="home-search-box">
         <img src="/assets/icons/icon-search-lrc.svg" alt="" width="18" height="18">
-        <input type="text" id="home-search-input" class="input" placeholder="想找什么，直接问…（回车搜索）" maxlength="200" autocomplete="off">
+        <input type="text" id="home-search-input" class="input" placeholder="想找什么，直接问…（回车搜索）" maxlength="200" autocomplete="off" aria-label="主页搜索：输入想找的内容，回车搜索">
       </div>
       <button class="btn btn-accent" data-action="openQuickAdd" id="home-quick-add-btn">＋ 记一笔</button>
     </div>
@@ -141,7 +143,7 @@
             <span class="wizard-check"><img src="/assets/icons/icon-check.svg" width="12" height="12" alt=""></span>
           </div>
           <div class="wizard-step-desc">输入函数名、结构体名或一个关键词，龙忆会从你项目的代码里返回最相关的片段，并标出它在哪个文件、第几行。</div>
-          <input type="text" class="input" id="wizard-search-path" placeholder="输入关键词，如 struct、fn、MemoryStore" value="struct" required maxlength="200">
+          <input type="text" class="input" id="wizard-search-path" placeholder="输入关键词，如 struct、fn、MemoryStore" value="struct" required maxlength="200" aria-label="代码检索关键词">
           <button class="btn btn-accent" data-action="wizardStep1Search">搜索代码</button>
           <div class="wizard-result" id="wizard-step1-result"></div>
         </div>
@@ -155,7 +157,7 @@
           </div>
           <div class="wizard-step-desc">把一段对项目有用的知识记进龙忆。写进去之后，你可以用自然语言把它找回来，而不是死记关键词。</div>
           <input type="text" class="input" id="wizard-memory-content"
-            value="项目使用 Rust 语言开发，采用 Actix-web 框架" placeholder="记忆内容..." required maxlength="2000">
+            value="项目使用 Rust 语言开发，采用 Actix-web 框架" placeholder="记忆内容..." required maxlength="2000" aria-label="要写入的记忆内容">
           <button class="btn btn-accent" data-action="wizardStep2Write">写入记忆</button>
           <div class="wizard-result" id="wizard-step2-result"></div>
         </div>
@@ -169,7 +171,7 @@
           </div>
           <div class="wizard-step-desc">用一句人话提问（不用写关键词），龙忆会把你刚才写入的那条记忆找回来——看到它，就说明记忆真的生效了。</div>
           <input type="text" class="input" id="wizard-search-query"
-            value="这个项目用什么语言开发" placeholder="用自然语言提问，如「这个项目用什么语言开发」" required maxlength="200">
+            value="这个项目用什么语言开发" placeholder="用自然语言提问，如「这个项目用什么语言开发」" required maxlength="200" aria-label="记忆检索问题">
           <button class="btn btn-accent" data-action="wizardStep3Search">检索记忆</button>
           <div class="wizard-result" id="wizard-step3-result"></div>
         </div>
@@ -374,19 +376,19 @@
       </div>
       <p class="text-sm text-dim mb-4">一键启用场景模板，无需手动设计记忆类型与标签体系。</p>
       <div class="preset-scenario-grid" id="preset-scenario-grid">
-        <div class="preset-scenario-card" data-scenario="personal-notes" data-action="selectPresetScenario" data-arg-mode="this">
+        <div class="preset-scenario-card" data-scenario="personal-notes" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="启用预设场景：个人笔记">
           <div class="preset-scenario-title">个人笔记</div>
           <div class="preset-scenario-desc">灵感、日记、个人知识沉淀</div>
         </div>
-        <div class="preset-scenario-card" data-scenario="project-management" data-action="selectPresetScenario" data-arg-mode="this">
+        <div class="preset-scenario-card" data-scenario="project-management" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="启用预设场景：项目管理">
           <div class="preset-scenario-title">项目管理</div>
           <div class="preset-scenario-desc">决策、会议纪要、任务跟踪</div>
         </div>
-        <div class="preset-scenario-card" data-scenario="learning-assistant" data-action="selectPresetScenario" data-arg-mode="this">
+        <div class="preset-scenario-card" data-scenario="learning-assistant" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="启用预设场景：学习助手">
           <div class="preset-scenario-title">学习助手</div>
           <div class="preset-scenario-desc">知识点、问答、学科分类</div>
         </div>
-        <div class="preset-scenario-card selected" data-scenario="coding-helper" data-action="selectPresetScenario" data-arg-mode="this">
+        <div class="preset-scenario-card selected" data-scenario="coding-helper" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="启用预设场景：编程助手（默认）">
           <div class="preset-scenario-title">编程助手</div>
           <div class="preset-scenario-desc">代码决策、偏好、约定（默认）</div>
         </div>
@@ -405,7 +407,7 @@
       <p class="text-sm text-dim mb-4">输入任意文本，实时查看其洛书 9 维向量表示、八卦归属与拓扑深度。</p>
       <div class="luoshu-encoder-input" style="display:flex;gap:8px;margin-bottom:12px;">
         <input type="text" class="input" id="luoshu-encode-input"
-          placeholder="请输入要编码的文本（例如：用户认证逻辑）" style="flex:1;" maxlength="500">
+          placeholder="请输入要编码的文本（例如：用户认证逻辑）" style="flex:1;" maxlength="500" aria-label="要编码为洛书向量的文本">
         <button class="btn btn-primary" id="btn-luoshu-encode" data-action="encodeTextToLuoshu">编码</button>
       </div>
       <div class="luoshu-encode-error" id="luoshu-encode-error" style="display:none;color:var(--lrc-朱砂-400,#c04851);font-size:12px;margin-bottom:8px;"></div>
@@ -490,7 +492,7 @@
       <div class="memory-search-bar">
         <img class="search-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
         <input type="text" class="input" id="memory-search-input"
-          placeholder="搜索记忆内容、标签或关键词..." data-input-action="debouncedMemorySearch" data-input-event="input" maxlength="200">
+          placeholder="搜索记忆内容、标签或关键词..." data-input-action="debouncedMemorySearch" data-input-event="input" maxlength="200" aria-label="搜索记忆内容、标签或关键词">
       </div>
 
       <!-- 搜索布局：左侧筛选 + 右侧卡片流 -->
@@ -539,9 +541,9 @@
     </div>
 
     <!-- 右侧滑出详情面板（设计文档 5.3：40% 宽度） -->
-    <div class="memory-detail-panel-backdrop" id="memory-detail-backdrop" data-action="closeMemoryDetail"></div>
+    <div class="memory-detail-panel-backdrop" id="memory-detail-backdrop" data-action="closeMemoryDetail" role="button" tabindex="0" aria-label="关闭记忆详情"></div>
     <aside class="memory-detail-panel" id="memory-detail-panel">
-      <button class="memory-detail-close" data-action="closeMemoryDetail">×</button>
+      <button class="memory-detail-close" data-action="closeMemoryDetail" aria-label="关闭记忆详情">×</button>
       <div class="memory-detail-content" id="memory-detail-content">
         <!-- 详情内容动态填充 -->
       </div>
@@ -574,7 +576,7 @@
             <button type="button" class="association-preset-chip" data-explore-preset="我以前记过什么重要日子？">我以前记过什么重要日子？</button>
           </div>
           <div class="association-ask-row">
-            <input id="association-query" class="input association-ask-input" maxlength="200" placeholder="输入一句话，例如：今晚吃什么？">
+            <input id="association-query" class="input association-ask-input" maxlength="200" placeholder="输入一句话，例如：今晚吃什么？" aria-label="记忆联想提问">
             <button class="btn btn-accent association-start-btn" data-action="startAssociationExplore">开始联想</button>
           </div>
           <!-- 联想的深度与方向由系统自动决定；此处保留旧契约默认值，供技术详情使用 -->
@@ -1570,7 +1572,7 @@
     <div class="section">
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 32px;">
         <!-- 路径 1：完整配置 -->
-        <div class="narrative-card" style="cursor: pointer; border: 2px solid var(--lrc-宣纸-500); transition: all 0.3s ease;" data-action="startFullSetup" data-hover-border="var(--lrc-金色-400)" data-default-border="var(--lrc-宣纸-500)">
+        <div class="narrative-card" style="cursor: pointer; border: 2px solid var(--lrc-宣纸-500); transition: all 0.3s ease;" data-action="startFullSetup" data-hover-border="var(--lrc-金色-400)" data-default-border="var(--lrc-宣纸-500)" role="button" tabindex="0" aria-label="完整配置：约 30 秒，推荐首次使用">
           <div style="text-align: center; padding: 24px;">
             <div style="display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, var(--lrc-金色-400), var(--lrc-金色-600)); color: white; font-weight: 700; font-size: 1.2em; margin-bottom: 16px;">
               <img src="/assets/icons/icon-settings.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
@@ -1586,7 +1588,7 @@
         </div>
 
         <!-- 路径 2：快速上手 -->
-        <div class="narrative-card" style="cursor: pointer; border: 2px solid var(--lrc-宣纸-500); transition: all 0.3s ease;" data-action="startQuickSetup" data-hover-border="var(--lrc-玉色-400)" data-default-border="var(--lrc-宣纸-500)">
+        <div class="narrative-card" style="cursor: pointer; border: 2px solid var(--lrc-宣纸-500); transition: all 0.3s ease;" data-action="startQuickSetup" data-hover-border="var(--lrc-玉色-400)" data-default-border="var(--lrc-宣纸-500)" role="button" tabindex="0" aria-label="快速上手：更快完成配置">
           <div style="text-align: center; padding: 24px;">
             <div style="display: inline-flex; align-items: center; justify-content: center; width: 48px; height: 48px; border-radius: 50%; background: linear-gradient(135deg, var(--lrc-玉色-400), var(--lrc-玉色-600)); color: white; font-weight: 700; font-size: 1.2em; margin-bottom: 16px;">
               <img src="/assets/icons/icon-lightning.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
@@ -1947,26 +1949,26 @@
           <!-- 隐藏输入，存储当前选中的模型 ID，供 testEmbedderConnection 等函数读取 -->
           <input type="hidden" id="embedder-model" value="BAAI/bge-small-zh">
           <div class="provider-grid">
-            <div class="provider-card active" data-embedder="bge-small-zh" data-action="selectEmbedderModel" data-arg="BAAI/bge-small-zh">
+            <div class="provider-card active" data-embedder="bge-small-zh" data-action="selectEmbedderModel" data-arg="BAAI/bge-small-zh" role="button" tabindex="0" aria-label="选择嵌入模型：BGE-small-zh（中文首选）">
               <div class="provider-card-header">
                 <span class="provider-name">BGE-small-zh</span>
                 <span class="provider-recommended">中文首选</span>
               </div>
               <p class="provider-card-desc">中文通用，512维，~100MB，精度高速度快</p>
             </div>
-            <div class="provider-card" data-embedder="minilm-l6" data-action="selectEmbedderModel" data-arg="sentence-transformers/all-MiniLM-L6-v2">
+            <div class="provider-card" data-embedder="minilm-l6" data-action="selectEmbedderModel" data-arg="sentence-transformers/all-MiniLM-L6-v2" role="button" tabindex="0" aria-label="选择嵌入模型：MiniLM-L6-v2">
               <div class="provider-card-header">
                 <span class="provider-name">MiniLM-L6-v2</span>
               </div>
               <p class="provider-card-desc">英文通用，384维，~80MB，轻量快速</p>
             </div>
-            <div class="provider-card" data-embedder="multilingual-e5" data-action="selectEmbedderModel" data-arg="intfloat/multilingual-e5-small">
+            <div class="provider-card" data-embedder="multilingual-e5" data-action="selectEmbedderModel" data-arg="intfloat/multilingual-e5-small" role="button" tabindex="0" aria-label="选择嵌入模型：multilingual-e5">
               <div class="provider-card-header">
                 <span class="provider-name">multilingual-e5</span>
               </div>
               <p class="provider-card-desc">多语言，384维，~120MB，支持100+语言</p>
             </div>
-            <div class="provider-card" data-embedder="bge-base-zh" data-action="selectEmbedderModel" data-arg="BAAI/bge-base-zh">
+            <div class="provider-card" data-embedder="bge-base-zh" data-action="selectEmbedderModel" data-arg="BAAI/bge-base-zh" role="button" tabindex="0" aria-label="选择嵌入模型：BGE-base-zh（高精度）">
               <div class="provider-card-header">
                 <span class="provider-name">BGE-base-zh</span>
                 <span style="font-size: 0.75em; padding: 2px 8px; background: var(--lrc-宣纸-500); border-radius: 12px; color: var(--lrc-墨韵-500);">高精度</span>
@@ -2064,56 +2066,56 @@
 
         <!-- 提供商卡片网格 -->
         <div class="provider-grid" id="provider-grid-cloud">
-          <div class="provider-card active" data-provider="deepseek" data-action="selectProvider" data-arg="deepseek">
+          <div class="provider-card active" data-provider="deepseek" data-action="selectProvider" data-arg="deepseek" role="button" tabindex="0" aria-label="选择 LLM 提供商：DeepSeek（推荐）">
             <div class="provider-card-header">
               <span class="provider-name">DeepSeek</span>
               <span class="provider-recommended">推荐</span>
             </div>
             <p class="provider-card-desc">国产性价比之王，代码能力极强</p>
           </div>
-          <div class="provider-card" data-provider="qwen" data-action="selectProvider" data-arg="qwen">
+          <div class="provider-card" data-provider="qwen" data-action="selectProvider" data-arg="qwen" role="button" tabindex="0" aria-label="选择 LLM 提供商：通义千问">
             <div class="provider-card-header">
               <span class="provider-name">通义千问</span>
             </div>
             <p class="provider-card-desc">阿里云出品，中文理解出色</p>
           </div>
-          <div class="provider-card" data-provider="zhipu" data-action="selectProvider" data-arg="zhipu">
+          <div class="provider-card" data-provider="zhipu" data-action="selectProvider" data-arg="zhipu" role="button" tabindex="0" aria-label="选择 LLM 提供商：智谱 GLM">
             <div class="provider-card-header">
               <span class="provider-name">智谱 GLM</span>
             </div>
             <p class="provider-card-desc">清华系，GLM 系列模型</p>
           </div>
-          <div class="provider-card" data-provider="minimax" data-action="selectProvider" data-arg="minimax">
+          <div class="provider-card" data-provider="minimax" data-action="selectProvider" data-arg="minimax" role="button" tabindex="0" aria-label="选择 LLM 提供商：MiniMax 海螺">
             <div class="provider-card-header">
               <span class="provider-name">MiniMax 海螺</span>
             </div>
             <p class="provider-card-desc">长文本支持好，性价比高</p>
           </div>
-          <div class="provider-card" data-provider="moonshot" data-action="selectProvider" data-arg="moonshot">
+          <div class="provider-card" data-provider="moonshot" data-action="selectProvider" data-arg="moonshot" role="button" tabindex="0" aria-label="选择 LLM 提供商：Kimi 月之暗面">
             <div class="provider-card-header">
               <span class="provider-name">Kimi 月之暗面</span>
             </div>
             <p class="provider-card-desc">超长上下文，阅读能力强</p>
           </div>
-          <div class="provider-card" data-provider="stepfun" data-action="selectProvider" data-arg="stepfun">
+          <div class="provider-card" data-provider="stepfun" data-action="selectProvider" data-arg="stepfun" role="button" tabindex="0" aria-label="选择 LLM 提供商：阶跃星辰">
             <div class="provider-card-header">
               <span class="provider-name">阶跃星辰</span>
             </div>
             <p class="provider-card-desc">多模态能力强，图像理解出色</p>
           </div>
-          <div class="provider-card" data-provider="baichuan" data-action="selectProvider" data-arg="baichuan">
+          <div class="provider-card" data-provider="baichuan" data-action="selectProvider" data-arg="baichuan" role="button" tabindex="0" aria-label="选择 LLM 提供商：百川智能">
             <div class="provider-card-header">
               <span class="provider-name">百川智能</span>
             </div>
             <p class="provider-card-desc">垂直领域优化，性价比高</p>
           </div>
-          <div class="provider-card" data-provider="xunfei" data-action="selectProvider" data-arg="xunfei">
+          <div class="provider-card" data-provider="xunfei" data-action="selectProvider" data-arg="xunfei" role="button" tabindex="0" aria-label="选择 LLM 提供商：讯飞星火">
             <div class="provider-card-header">
               <span class="provider-name">讯飞星火</span>
             </div>
             <p class="provider-card-desc">科大讯飞出品，语音能力强</p>
           </div>
-          <div class="provider-card" data-provider="hunyuan" data-action="selectProvider" data-arg="hunyuan">
+          <div class="provider-card" data-provider="hunyuan" data-action="selectProvider" data-arg="hunyuan" role="button" tabindex="0" aria-label="选择 LLM 提供商：腾讯混元">
             <div class="provider-card-header">
               <span class="provider-name">腾讯混元</span>
             </div>
@@ -2122,7 +2124,7 @@
         </div>
 
         <div class="provider-grid" id="provider-grid-custom" style="display:none;">
-          <div class="provider-card" data-provider="custom" data-action="selectProvider" data-arg="custom">
+          <div class="provider-card" data-provider="custom" data-action="selectProvider" data-arg="custom" role="button" tabindex="0" aria-label="选择 LLM 提供商：自定义 API">
             <div class="provider-card-header">
               <span class="provider-name">自定义 API</span>
             </div>

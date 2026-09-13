@@ -39,6 +39,9 @@ jobs:
       checks: write
     # 定时触发的扫描即使发现漏洞也不阻塞（仅报告），PR 触发的阻塞
     continue-on-error: ${{ github.event_name == 'schedule' }}
+    # v0.9.7 审查修复（P2-1）：本 Job 需下载 RustSec Advisory DB（网络依赖），
+    #   此前无超时保护，网络挂起时会拖到 GitHub 默认 6 小时上限。
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -69,7 +72,11 @@ jobs:
   license-check:
     name: License Check
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # v0.9.7 审查修复（P2-5）：此前本 Job 标注 continue-on-error: true，
+    #   门禁状态恒为 success —— GPL/AGPL/LGPL 传染性许可证即使检出也永不阻断，
+    #   属"声明式门禁、实际零约束"，与三层开源架构（Layer 1 Apache 2.0）的
+    #   合规承诺冲突。现改为真实阻断，并补齐超时保护（P2-1）。
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -100,12 +107,17 @@ jobs:
 
       - name: Check dependency licenses
         # 列出所有依赖的许可证，标记非宽松许可证
+        # v0.9.7 审查修复（P2-5）：检出传染性许可证时由"仅警告"改为硬失败，
+        #   否则本门禁与 continue-on-error 叠加后完全失效。
         run: |
           echo "=== 依赖许可证清单 ==="
           cargo license --avoid-dev --avoid-build-scripts 2>&1 | tee licenses.txt
           # 检查是否有传染性许可证（GPL, AGPL, LGPL）
           if grep -iE 'GPL|AGPL|LGPL' licenses.txt; then
-            echo "WARNING: 检测到传染性许可证依赖，请人工审核"
+            echo "::error::检测到传染性许可证依赖，违反 Layer 1 Apache 2.0 许可边界"
+            echo "处理方式：替换该依赖；若确认属合法使用（如仅构建期工具），"
+            echo "须在本步骤添加带理由的行级豁免注释后重新提交。"
+            exit 1
           else
             echo "OK: 未检测到传染性许可证"
           fi

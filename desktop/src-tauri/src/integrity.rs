@@ -54,6 +54,11 @@ impl std::fmt::Display for IntegrityError {
 /// L2 完整性校验器
 pub struct IntegrityChecker;
 
+// v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P1-6「错误处理不统一」）：
+//   IntegrityError 此前只实现 Display，未实现 std::error::Error，
+//   与同仓 SidecarStartError 口径不一致（后者两者皆有）。此处补齐。
+impl std::error::Error for IntegrityError {}
+
 impl IntegrityChecker {
     /// 启动时执行完整性校验
     /// 调用时机：main() 的第一行（在所有初始化之前）

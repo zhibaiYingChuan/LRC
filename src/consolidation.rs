@@ -1,19 +1,19 @@
-// ============================================================
-// 许可证: Apache 2.0
-// 本文件实现后台结晶流水线，属于公开层 (Layer 1)。
-// ============================================================
-//
-// 后台结晶流水线（Background Consolidation Pipeline）
-//
-// 后台结晶流水线：
-//   定时从表层记忆系统拉取新记忆，
-//   经由洛书编码 → 八卦分类 → 递归合成，将表层记忆结晶为永久记忆。
-//
-// 核心组件：
-//   1. ConsolidationPipeline — 主流水线，协调编码→分类→合成全流程
-//   2. ConsolidationConfig — 可配置的流水线参数（轮询间隔、合成阈值等）
-//   3. SurfaceMemorySource — 表层记忆数据源 trait（可对接任意表层记忆系统）
-//   4. run_consolidation_loop — 后台 tokio 任务入口
+//! ============================================================
+//! 许可证: Apache 2.0
+//! 本文件实现后台结晶流水线，属于公开层 (Layer 1)。
+//! ============================================================
+//!
+//! 后台结晶流水线（Background Consolidation Pipeline）
+//!
+//! 后台结晶流水线：
+//!   定时从表层记忆系统拉取新记忆，
+//!   经由洛书编码 → 八卦分类 → 递归合成，将表层记忆结晶为永久记忆。
+//!
+//! 核心组件：
+//!   1. ConsolidationPipeline — 主流水线，协调编码→分类→合成全流程
+//!   2. ConsolidationConfig — 可配置的流水线参数（轮询间隔、合成阈值等）
+//!   3. SurfaceMemorySource — 表层记忆数据源 trait（可对接任意表层记忆系统）
+//!   4. run_consolidation_loop — 后台 tokio 任务入口
 
 #[cfg(not(feature = "ml"))]
 use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
@@ -29,8 +29,13 @@ use crate::memory_store::{ListFilter, MemoryStore};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::Persistence;
 use crate::persistence::PersistenceError;
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：本模块的 Synthetic 数据源契约与
+// LLM 合成路径错误由不可判别的 `String` 收敛为带域分类的 [`crate::errors::LrcError`]。
+// `Display` 仅输出 message，故所有调用方/日志文案**零漂移**。
+use crate::errors::{LrcError, LrcResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{interval, timeout, Duration};
@@ -142,7 +147,7 @@ pub trait SurfaceMemorySource: Send + Sync {
         &self,
         since: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<SurfaceMemory>, String>;
+    ) -> LrcResult<Vec<SurfaceMemory>>;
 
     /// 获取数据源名称（用于日志和指标）
     fn source_name(&self) -> &str;
@@ -154,6 +159,11 @@ pub trait SurfaceMemorySource: Send + Sync {
 pub struct InMemorySource {
     name: String,
     memories: Vec<SurfaceMemory>,
+    /// 读取游标：保留供流式/分批拉取使用
+    ///
+    /// v0.9.7 核实（GLOBAL_CODE_REVIEW_REPORT P2 质量「过时 #[allow(dead_code)]」）：
+    ///   报告称此 allow 已过时，经**移除实验**（删掉后 `cargo check --all-targets`）
+    ///   实测仍报 `field 'cursor' is never read`，故该 allow **并非冗余**，予以保留。
     #[allow(dead_code)]
     cursor: usize,
 }
@@ -175,7 +185,7 @@ impl SurfaceMemorySource for InMemorySource {
         &self,
         since: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<SurfaceMemory>, String> {
+    ) -> LrcResult<Vec<SurfaceMemory>> {
         let filtered: Vec<SurfaceMemory> = self
             .memories
             .iter()
@@ -227,6 +237,8 @@ pub struct ConsolidationPipeline<P: Persistence> {
     /// FIX-007：改用 RwLock 避免 spawn_blocking + blocking_lock 竞争
     store: Arc<Mutex<MemoryStore<P>>>,
     /// 洛书编码器（保留供未来直接编码使用）
+    ///
+    /// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `field 'luoshu_encoder' is never read`）。
     #[allow(dead_code)]
     luoshu_encoder: HybridLuoShuEncoder,
     /// v0.5.18 新增：LLM 配置（用于结晶时的高维 embedding 合成）
@@ -283,18 +295,29 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         &mut self,
         source: &dyn SurfaceMemorySource,
     ) -> Result<CycleStats, PersistenceError> {
-        match timeout(CYCLE_TIMEOUT, self.run_cycle_inner(source)).await {
+        // 协作式取消标志（v0.9.7，GLOBAL_CODE_REVIEW_REPORT P1-3）：
+        // `spawn_blocking` 提交的任务无法被 tokio 强杀，`timeout` 到点后该任务
+        // 仍会在阻塞线程上跑满 O(n²) 聚类。此处把标志交给 `run_cycle_inner`，
+        // 超时分支置位后，任务内的周期性自查会提前返回（补偿路径）。
+        // 每轮新建标志，避免跨周期残留导致下一轮被误取消。
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_for_timeout = cancel.clone();
+        match timeout(CYCLE_TIMEOUT, self.run_cycle_inner(source, cancel)).await {
             Ok(result) => result,
-            Err(_) => Err(PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "结晶周期超时，待处理状态保留以便重试",
-            ))),
+            Err(_) => {
+                cancel_for_timeout.store(true, Ordering::Release);
+                Err(PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "结晶周期超时，待处理状态保留以便重试",
+                )))
+            }
         }
     }
 
     async fn run_cycle_inner(
         &mut self,
         source: &dyn SurfaceMemorySource,
+        cancel: Arc<AtomicBool>,
     ) -> Result<CycleStats, PersistenceError> {
         let cycle_start = std::time::Instant::now();
         let mut stats = CycleStats::default();
@@ -397,6 +420,9 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 let store_arc = self.store.clone();
                 let threshold = self.config.synthesis_threshold;
                 let similarity = self.config.synthesis_similarity;
+                // 把取消标志带进阻塞线程（v0.9.7 P1-3 补偿路径）。
+                // 计算方在循环内周期性自查该标志，超时后提前返回，不再跑满整个 O(n²)。
+                let cancel_for_task = cancel.clone();
 
                 // v0.9.1 三阶段锁解耦（根治 lock_busy）：
                 //   Phase 1（持锁读快照，极短）→ Phase 2（锁外 CPU 聚类计算）
@@ -416,12 +442,21 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                             (snapshot, old_threshold, old_similarity)
                         }; // 锁在此释放
 
-                        // Phase 2：锁外 CPU 密集计算
+                        // Phase 2：锁外 CPU 密集计算（可取消）
                         let engine = SynthesisEngine::new(snapshot.config);
-                        let mut plan =
-                            engine.plan_luoshu(&snapshot.all, snapshot.information_gain_threshold);
-                        if plan.synthesized == 0 {
-                            plan = engine.plan_jaccard(&snapshot.all);
+                        let (mut plan, mut cancelled) = engine.plan_luoshu_cancellable(
+                            &snapshot.all,
+                            snapshot.information_gain_threshold,
+                            Some(cancel_for_task.as_ref()),
+                        );
+                        if !cancelled && plan.synthesized == 0 {
+                            let (jaccard_plan, jaccard_cancelled) = engine
+                                .plan_jaccard_cancellable(
+                                    &snapshot.all,
+                                    Some(cancel_for_task.as_ref()),
+                                );
+                            plan = jaccard_plan;
+                            cancelled = jaccard_cancelled;
                         }
 
                         // Phase 3：持锁写回 + 恢复阈值（快速）
@@ -433,7 +468,18 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                             Ok(mut store) => {
                                 store.synthesis_min_cluster = old_threshold;
                                 store.synthesis_similarity = old_similarity;
-                                Ok(store.apply_synthesis_plan(plan))
+                                if cancelled {
+                                    // 取消路径：阈值已恢复，丢弃**不完整计划**，
+                                    // 且返回 TimedOut 而非 Ok(0)——调用方的 Ok 分支会清除
+                                    // `synthesis_pending`，而"被取消"意味着本轮未完成，
+                                    // 必须保留待重试标记交由下轮重跑。
+                                    Err(PersistenceError::Io(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "合成计算被协作式取消，待处理状态保留以便重试",
+                                    )))
+                                } else {
+                                    Ok(store.apply_synthesis_plan(plan))
+                                }
                             }
                             Err(e) => {
                                 // 恢复阈值是无毒化 Mutex 的纯内存赋值，blocking_lock
@@ -512,7 +558,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     /// - Phase 3：持锁写入合成记忆，释放锁（<1ms）
     ///
     /// 失败时返回 Err，调用方应降级到洛书合成。
-    async fn llm_synthesize_cycle(&self, llm_config: &LlmApiConfig) -> Result<usize, String> {
+    async fn llm_synthesize_cycle(&self, llm_config: &LlmApiConfig) -> LrcResult<usize> {
         // ===== Phase 1：持锁加载记忆列表 =====
         let candidates: Vec<(String, String)> = {
             let store = self.store.lock().await;
@@ -522,7 +568,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             };
             let (all, _) = store
                 .list_memories(&filter)
-                .map_err(|e| format!("加载记忆列表失败: {}", e))?;
+                .map_err(|e| LrcError::io(format!("加载记忆列表失败: {}", e)))?;
             all.into_iter()
                 .filter(|m| m.memory_type != MemoryType::Synthesis)
                 .map(|m| (m.id, m.content))
@@ -551,15 +597,15 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         let texts: Vec<&str> = candidates.iter().map(|(_, c)| c.as_str()).collect();
         let embeddings = timeout(EMBEDDING_TIMEOUT, llm_config.embed_texts(&texts))
             .await
-            .map_err(|_| "LLM embedding 调用超时（60 秒）".to_string())?
-            .map_err(|e| format!("LLM embedding 调用失败: {}", e))?;
+            .map_err(|_| LrcError::timeout("LLM embedding 调用超时（60 秒）"))?
+            .map_err(|e| LrcError::network(format!("LLM embedding 调用失败: {}", e)))?;
 
         if embeddings.len() != candidates.len() {
-            return Err(format!(
+            return Err(LrcError::internal(format!(
                 "Embedding 数量不匹配：期望 {}，实际 {}",
                 candidates.len(),
                 embeddings.len()
-            ));
+            )));
         }
 
         // 基于余弦相似度聚类（贪心法）
@@ -603,8 +649,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 llm_config.summarize_memories(&cluster_memories),
             )
             .await
-            .map_err(|_| "LLM 合成总结超时（60 秒）".to_string())?
-            .map_err(|e| format!("LLM 合成总结失败: {}", e))?;
+            .map_err(|_| LrcError::timeout("LLM 合成总结超时（60 秒）"))?
+            .map_err(|e| LrcError::network(format!("LLM 合成总结失败: {}", e)))?;
 
             // 收集源记忆 ID
             let source_ids: Vec<String> = cluster_indices
@@ -684,12 +730,14 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     /// - `summarizer`：可选的 LLM 总结器（有则用 LLM 生成总结，无则用本地拼接）
     ///
     /// 注：此方法已实现并测试通过，等待集成到 run_cycle 主流程（功能 4.2.3 后续步骤）。
+    ///
+    /// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `never used`）。
     #[allow(dead_code)]
     async fn embedding_synthesize_cycle(
         &self,
         embedder: &dyn Embedder,
         summarizer: Option<&LlmApiConfig>,
-    ) -> Result<usize, String> {
+    ) -> LrcResult<usize> {
         // ===== Phase 1：持锁加载记忆列表 =====
         let candidates: Vec<(String, String)> = {
             let store = self.store.lock().await;
@@ -699,7 +747,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             };
             let (all, _) = store
                 .list_memories(&filter)
-                .map_err(|e| format!("加载记忆列表失败: {}", e))?;
+                .map_err(|e| LrcError::io(format!("加载记忆列表失败: {}", e)))?;
             all.into_iter()
                 .filter(|m| m.memory_type != MemoryType::Synthesis)
                 .map(|m| (m.id, m.content))
@@ -730,15 +778,15 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         let texts: Vec<&str> = candidates.iter().map(|(_, c)| c.as_str()).collect();
         let embeddings = timeout(EMBEDDING_TIMEOUT, embedder.embed(&texts))
             .await
-            .map_err(|_| "Embedding 调用超时（60 秒）".to_string())?
-            .map_err(|e| format!("Embedding 调用失败: {}", e))?;
+            .map_err(|_| LrcError::timeout("Embedding 调用超时（60 秒）"))?
+            .map_err(|e| LrcError::network(format!("Embedding 调用失败: {}", e)))?;
 
         if embeddings.len() != candidates.len() {
-            return Err(format!(
+            return Err(LrcError::internal(format!(
                 "Embedding 数量不匹配：期望 {}，实际 {}",
                 candidates.len(),
                 embeddings.len()
-            ));
+            )));
         }
 
         // 基于余弦相似度聚类（贪心法，复用现有算法）
@@ -780,8 +828,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             let summary = if let Some(llm) = summarizer {
                 timeout(SUMMARY_TIMEOUT, llm.summarize_memories(&cluster_memories))
                     .await
-                    .map_err(|_| "LLM 合成总结超时（60 秒）".to_string())?
-                    .map_err(|e| format!("LLM 合成总结失败: {}", e))?
+                    .map_err(|_| LrcError::timeout("LLM 合成总结超时（60 秒）"))?
+                    .map_err(|e| LrcError::network(format!("LLM 合成总结失败: {}", e)))?
             } else {
                 self.local_summarize(&cluster_memories)
             };
@@ -865,6 +913,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     /// 虽然质量不如 LLM 总结，但能保留簇内记忆的关键信息。
     ///
     /// 注：此方法由 `embedding_synthesize_cycle` 调用，等待集成到主流程。
+    ///
+    /// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `never used`）。
     #[allow(dead_code)]
     fn local_summarize(&self, memories: &[String]) -> String {
         if memories.is_empty() {

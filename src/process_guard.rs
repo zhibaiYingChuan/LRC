@@ -1,18 +1,18 @@
-// 许可证: Apache 2.0
-//
-// 进程守护模块 — 保障 LRC 服务端单一实例、端口自适应、优雅关闭
-// ==============================================================
-//
-// 核心能力:
-//   1. SingletonLock  — 文件锁单例，防止同一数据目录下多实例同时运行
-//   2. find_available_port — 端口自适应，默认端口被占用时自动尝试下一个
-//   3. graceful_shutdown — 信号处理，捕获 SIGINT/SIGTERM 并清理锁文件
-//   4. derive_defaults — 零配置默认值推导
-//
-// 设计原则:
-//   - 零外部依赖，仅使用标准库 + tokio
-//   - 跨平台兼容（Windows/Linux/macOS）
-//   - 锁文件写入 PID，可自检旧进程是否已死（自愈机制）
+//! 许可证: Apache 2.0
+//!
+//! 进程守护模块 — 保障 LRC 服务端单一实例、端口自适应、优雅关闭
+//! ==============================================================
+//!
+//! 核心能力:
+//!   1. SingletonLock  — 文件锁单例，防止同一数据目录下多实例同时运行
+//!   2. find_available_port — 端口自适应，默认端口被占用时自动尝试下一个
+//!   3. graceful_shutdown — 信号处理，捕获 SIGINT/SIGTERM 并清理锁文件
+//!   4. derive_defaults — 零配置默认值推导
+//!
+//! 设计原则:
+//!   - 零外部依赖，仅使用标准库 + tokio
+//!   - 跨平台兼容（Windows/Linux/macOS）
+//!   - 锁文件写入 PID，可自检旧进程是否已死（自愈机制）
 
 use std::fmt;
 use std::fs::OpenOptions;
@@ -625,8 +625,31 @@ pub async fn wait_for_shutdown_signal() {
     #[cfg(not(target_os = "windows"))]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut sigint = signal(SignalKind::interrupt()).expect("无法注册 SIGINT 处理器");
-        let mut sigterm = signal(SignalKind::terminate()).expect("无法注册 SIGTERM 处理器");
+        // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT 第五节第 5 项「收敛生产路径 expect」）：
+        //   根因：原实现用 `.expect("无法注册 SIGINT/SIGTERM 处理器")`——在信号处理器
+        //         配额耗尽或运行时受限环境（容器、受限 seccomp）下会直接 panic，
+        //         使服务无法启动，且该路径属生产代码（非测试）。
+        //   修复：注册失败时打印告警并**挂起等待**（与上方 Windows 分支
+        //         "ctrl_c 失败则 pending" 的处理保持一致），让 server 继续正常运行，
+        //         仅在真正收到信号时才退出，避免"注册不了信号就崩溃"。
+        let sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[进程守护] 无法注册 SIGINT 处理器（{e}），降级为不可中断运行（依赖 SIGKILL 结束）");
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        let sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[进程守护] 无法注册 SIGTERM 处理器（{e}），降级为不可中断运行（依赖 SIGKILL 结束）");
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        let mut sigint = sigint;
+        let mut sigterm = sigterm;
 
         tokio::select! {
             _ = sigint.recv() => {
