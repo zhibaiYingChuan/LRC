@@ -360,6 +360,16 @@ tests/frontend/playwright.config.js
 # 本地回归测试输出与调试残留（不交付用户）
 test-output*.log
 test-results/
+
+# v0.9.7 发布清理（2026-09-14）：内部研发/审计过程文档（不交付用户）
+# 依据：以下文档均为**内部过程产物**（代码审查报告、算法实验计划、状态机设计、
+#       模型评测报告），面向维护者而非用户；经全仓引用反向扫描确认**零引用**
+#       （README / CI / release.yml / 源码均不引用），属"本地开发测试文档"。
+# 边界：Cargo 打包走 Cargo.toml 的 include/exclude，与本文件无关。
+docs/GLOBAL_CODE_REVIEW_REPORT.md
+docs/ASSOCIATION_ACCURACY_PLAN.md
+docs/DAOTI_STATE_MACHINE_PLAN.md
+docs/MODEL_EVALUATION.md
 test-results-*/
 tests/frontend/*-report.*
 tests/frontend/screenshots/
@@ -423,14 +433,12 @@ src/bin/persistence_eval.rs
 data_eval_v3*/
 benchmarks/*_raw_*.json
 
-# v0.9.7 例外：HCSE 回写检查清单解除忽略（须随克隆交付，供后续会话/维护者复用）
-# 背景：上述 :317/:318/:339 的 HCSE 规则由 local-dev 于 v0.9.1 归入"本地开发自用"，
-#       导致回写清单物理存在却无法随克隆交付（与 D-11「钩子不可分发」同源缺陷）。
-# 边界：Cargo 打包走 Cargo.toml 的 include/exclude，与本文件无关；
-#       本例外仅使两文档可提交，不会使其进入 crate/Tauri 发布产物。
-# 顺序约束：负向规则必须置于其对应忽略规则之后，故集中于此，勿上移。
-!docs/HCSE_RELEASE_PROTOCOL.md
-!docs/HCSE_RESILIENCE_AUDIT.md
+# v0.9.7 修订（2026-09-14）：撤回 HCSE 清单的交付豁免
+# 背景：上轮（r10）曾以"回写清单须随克隆交付"为由解除忽略（原为两条 ! 负向规则）。
+#       后续判定：两份 HCSE 清单是**内部发布/韧性审计过程文档**，全仓零引用
+#       （README 不引用、CI 不依赖），属"本地开发测试文档"，不应随产品仓库交付。
+# 处置：移除负向规则，回落到下方 :325 / :347 的既有忽略规则；文档保留在本地磁盘。
+# 说明：若将来需要交付，重新加回负向规则即可（须置于对应忽略规则之后）。
 
 # v0.9.7 例外：本地开发链路脚本解除忽略（被已跟踪测试文件引用，须随克隆交付）
 # 背景：下列 :303-305 的规则由 local-dev 于 v0.8.45 归入"本地开发运行目录（非交付内容）"，
