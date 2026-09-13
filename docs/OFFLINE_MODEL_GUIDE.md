@@ -211,4 +211,4 @@ export LRC_MODEL_ID=microsoft/codebert-base-mlm
 
 ### Q：模型文件太大，有更小的替代吗？
 
-目前 GraphCodeBERT 是最小可用的代码语义模型。我们正在评估更轻量的替代方案（如 MiniLM），详见 [模型评估报告](MODEL_EVALUATION.md)。
+目前 GraphCodeBERT 是最小可用的代码语义模型。我们正在评估更轻量的替代方案（如 MiniLM）。
