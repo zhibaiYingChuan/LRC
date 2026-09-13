@@ -3497,8 +3497,15 @@ mod api_contracts_tests {
         let http_dir = std::env::temp_dir().join(format!("lrc_p82k_http_arm_{ts}"));
         let _ = std::fs::remove_dir_all(&http_dir);
         std::fs::create_dir_all(&http_dir).unwrap();
-        let mut store_http = new_ml_capable_store(http_dir.to_str().unwrap())
-            .expect("HTTP 臂 ML 编码器二次加载失败——若失败则对照不变量无法验证，不得静默跳过");
+        // v0.9.7 审查修复（消除同族隐患）：与 test_assoc_p82p_concurrency_pressure
+        // 同字面文案的 expect。本处当前**不可达**（上方 L3451 已在模型缺失时 return），
+        // 但属同类隐患——若将来上方守卫被移动，此处会重新变成 CI 硬失败点。
+        // 统一改为同族跳过守卫，保证"ml 用例在无模型环境一律优雅跳过"这一契约
+        // 不依赖"守卫恰好在其上方"这一脆弱假设。
+        let Some(mut store_http) = new_ml_capable_store(http_dir.to_str().unwrap()) else {
+            eprintln!("[P8.2k][HTTP] HTTP 臂 ML 编码器二次加载失败——本用例仅在 ml 环境执行，跳过");
+            return;
+        };
         p82h_seed(&mut store_http);
         let shared = Arc::new(Mutex::new(store_http));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
@@ -3727,8 +3734,13 @@ mod api_contracts_tests {
         let scaled_dir = std::env::temp_dir().join(format!("lrc_p82p_pool_scaled_{ts}"));
         let _ = std::fs::remove_dir_all(&scaled_dir);
         std::fs::create_dir_all(&scaled_dir).unwrap();
-        let mut store_scaled = new_ml_capable_store(scaled_dir.to_str().unwrap())
-            .expect("扩展臂 ML 编码器二次加载失败——若失败则规模对照不成立，不得静默跳过");
+        // v0.9.7 审查修复（消除同族隐患，同 L3501）：当前**不可达**
+        // （上方 L3724 已在模型缺失时 return），但属同类隐患——统一改为跳过守卫，
+        // 使"ml 用例在无模型环境一律优雅跳过"契约不依赖"守卫恰好在其上方"。
+        let Some(mut store_scaled) = new_ml_capable_store(scaled_dir.to_str().unwrap()) else {
+            eprintln!("[P8.2p][池规模] 扩展臂 ML 编码器二次加载失败——本用例仅在 ml 环境执行，跳过");
+            return;
+        };
         p82h_seed(&mut store_scaled);
         let fillers = p82p_filler_memories(POOL_SCALE);
         let filler_count = fillers.len();
@@ -3829,8 +3841,24 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let mut store = new_ml_capable_store(dir.to_str().unwrap())
-            .expect("并发臂 ML 编码器加载失败——若失败则并发结论不成立，不得静默跳过");
+        // v0.9.7 审查修复（P0 CI 平台/环境缺陷）：此前此处为
+        //   `.expect("并发臂 ML 编码器加载失败——若失败则并发结论不成立，不得静默跳过")`
+        // 其意图是"防止静默跳过掩盖结论"，但实现后果与 CI 契约直接冲突：
+        //   CI 的 `cargo test --features server,ml` 运行在**无 bge 模型权重**的环境，
+        //   该步骤的既有约定是"ml 用例均带模型缺失即跳过守卫"（同文件其余 7 处
+        //   均用 `let Some(..) else { eprintln!; return }`）。本处用 expect 硬失败，
+        //   使 CI 必然红——实测 ubuntu 报 `panicked at src/v1_api_tests.rs:3833`
+        //   （`option::expect_failed`，前一行日志 `[LRC·洛书ML] 3s 快速检测超时`）。
+        // 正确做法：**跳过时必须显式留痕**（eprintln 说明原因与环境要求），
+        // 既满足 CI 契约，又不掩盖"本机未验证"这一事实——这与既有守卫一致。
+        let Some(mut store) = new_ml_capable_store(dir.to_str().unwrap()) else {
+            eprintln!(
+                "[P8.2p][并发] ML 编码器不可用（bge 权重缺失或未设 LRC_LUOSHU_MODEL_ID）\
+                 ——本用例仅在 ml 环境执行；请设置 LRC_LUOSHU_MODEL_ID=BAAI/bge-base-zh。\
+                 注意：本用例结论（并发无挂死）在无模型环境下**未获验证**，须在本地 ml 环境复跑。"
+            );
+            return;
+        };
         p82h_seed(&mut store);
         store
             .remember_batch(p82p_filler_memories(POOL_SCALE))
