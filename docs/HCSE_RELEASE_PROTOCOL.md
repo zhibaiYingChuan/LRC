@@ -213,9 +213,15 @@ $trackedFiles | Where-Object -FilterScript {
 
 ### 4.3 已知未闭环缺口
 
-- 上述 **16 个未跟踪交付物均未 `git add`**。发布前须全部提交，否则：
-  - **8 个 `src/*.rs` 源文件**（`model_ids.rs` / `atomic_file.rs` / `v1_api_tests.rs` / `memory_store_tests.rs` / `memory_state_machine.rs` / `errors.rs` / `memory_store_types.rs` / `memory_store_cache.rs`）缺失 → **克隆后编译失败**（`mod` 声明找不到文件）。**这是本轮最高优先级的交付项**；
-  - 其余缺失 → 本地开发链路、质量门禁、审查记录不可用。
+- **✅ 已闭环（2026-09-13）**：上述 **16 个未跟踪交付物已全部 `git add` 并提交**——
+  提交 `b284ca2`（分支 `fix/code-review-8rounds`）。其中 **8 个 `src/*.rs` 源文件**
+  （`model_ids.rs` / `atomic_file.rs` / `v1_api_tests.rs` / `memory_store_tests.rs` /
+  `memory_state_machine.rs` / `errors.rs` / `memory_store_types.rs` /
+  `memory_store_cache.rs`）若缺失会导致克隆后编译失败，本次**已优先纳入同一提交**。
+  复核命令 `git ls-files --others --exclude-standard` 现返回**空**；
+  提交亦经**预提交钩子 5 项检查全部通过**（fmt + clippy + check + test + 泄露检测）。
+- **剩余跟踪项（非缺陷）**：本地提交尚未推送（`git branch -vv` 显示分支无 upstream）。
+  这是**有意为之**——推送属对外可见操作，建议先复核 diff 再决定。
 - `temp/` 目录下的第六~八轮取证脚本（`b8a-check.ps1`、`b8d-*.ps1`、`b8f-regression.ps1`、`b9-*.ps1`、**`c2-*.ps1`、`c5-regression.ps1`、`c6-errsigs.ps1`** 等）
   属过程产物，`temp/` 整体被 `.gitignore:324` 忽略（不随克隆交付），**无需手动清理**；
   对应 `.txt` evidence 保留供复核。
