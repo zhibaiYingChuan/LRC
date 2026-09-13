@@ -414,3 +414,28 @@ docs/道体-LRC*.md
 src/bin/persistence_eval.rs
 data_eval_v3*/
 benchmarks/*_raw_*.json
+
+# v0.9.7 例外：HCSE 回写检查清单解除忽略（须随克隆交付，供后续会话/维护者复用）
+# 背景：上述 :317/:318/:339 的 HCSE 规则由 local-dev 于 v0.9.1 归入"本地开发自用"，
+#       导致回写清单物理存在却无法随克隆交付（与 D-11「钩子不可分发」同源缺陷）。
+# 边界：Cargo 打包走 Cargo.toml 的 include/exclude，与本文件无关；
+#       本例外仅使两文档可提交，不会使其进入 crate/Tauri 发布产物。
+# 顺序约束：负向规则必须置于其对应忽略规则之后，故集中于此，勿上移。
+!docs/HCSE_RELEASE_PROTOCOL.md
+!docs/HCSE_RESILIENCE_AUDIT.md
+
+# v0.9.7 例外：本地开发链路脚本解除忽略（被已跟踪测试文件引用，须随克隆交付）
+# 背景：下列 :303-305 的规则由 local-dev 于 v0.8.45 归入"本地开发运行目录（非交付内容）"，
+#       但 3 个【已跟踪】测试文件依赖它们——"引用即契约"，被忽略即等同于克隆后必然失效：
+#         tests/frontend/cdp-regression.js          （dev-proxy 探测/降级）
+#         tests/frontend/association-dashboard-cdp.js（dev-proxy 优先，打包副本回退）
+#         tests/frontend/association-desktop-cdp.js （dev-proxy 探测/降级）
+#       且两份文档（HCSE_RELEASE_PROTOCOL 检查项 3）均无"如何获取"说明。
+# 安全性：三脚本均无硬编码绝对路径（分别用相对路径 / Get-Location / %~dp0..），
+#         无 token/secret 等敏感内容，dev-proxy 仅绑定本地回环用途。
+# 边界：Cargo 打包走 Cargo.toml 的 include/exclude，与本文件无关；
+#       本例外仅使三脚本可提交，不会使其进入 crate/Tauri 发布产物。
+# 顺序约束：负向规则必须置于其对应忽略规则之后，故集中于此，勿上移。
+!scripts/dev-proxy.py
+!scripts/run-dev.ps1
+!scripts/run-dev.bat

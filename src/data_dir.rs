@@ -1,31 +1,31 @@
-// ============================================================
-// 许可证: Apache 2.0
-// 本文件实现统一数据目录管理，属于公开层 (Layer 1)。
-// ============================================================
-//
-// 统一数据目录管理模块 — 管理 LRC 记忆数据目录的标准化路径
-//
-// 数据目录结构（V2）：
-//   ~/.loong-recall/
-//   ├── projects/
-//   │   ├── {sha256_fingerprint}/    # 项目A
-//   │   │   └── data/
-//   │   │       ├── memories.json
-//   │   │       ├── chunks.json
-//   │   │       └── archive.json
-//   │   └── {sha256_fingerprint}/    # 项目B
-//   │       └── data/
-//   ├── global/                      # --global 模式
-//   │   └── data/
-//   ├── config.json                  # 全局配置
-//   ├── exports/                     # 导出文件存放
-//   └── .lrc.lock                    # 全局服务锁（V2 移至根目录）
-//
-// 核心能力:
-//   1. 获取 LRC 根目录 (~/.loong-recall/)
-//   2. 根据项目指纹计算数据目录
-//   3. 支持 --global 模式、--data-dir 覆盖、--db-path 兼容
-//   4. 自动创建必要的子目录
+//! ============================================================
+//! 许可证: Apache 2.0
+//! 本文件实现统一数据目录管理，属于公开层 (Layer 1)。
+//! ============================================================
+//!
+//! 统一数据目录管理模块 — 管理 LRC 记忆数据目录的标准化路径
+//!
+//! 数据目录结构（V2）：
+//!   ~/.loong-recall/
+//!   ├── projects/
+//!   │   ├── {sha256_fingerprint}/    # 项目A
+//!   │   │   └── data/
+//!   │   │       ├── memories.json
+//!   │   │       ├── chunks.json
+//!   │   │       └── archive.json
+//!   │   └── {sha256_fingerprint}/    # 项目B
+//!   │       └── data/
+//!   ├── global/                      # --global 模式
+//!   │   └── data/
+//!   ├── config.json                  # 全局配置
+//!   ├── exports/                     # 导出文件存放
+//!   └── .lrc.lock                    # 全局服务锁（V2 移至根目录）
+//!
+//! 核心能力:
+//!   1. 获取 LRC 根目录 (~/.loong-recall/)
+//!   2. 根据项目指纹计算数据目录
+//!   3. 支持 --global 模式、--data-dir 覆盖、--db-path 兼容
+//!   4. 自动创建必要的子目录
 
 use crate::project_id;
 use std::path::{Path, PathBuf};
@@ -359,11 +359,14 @@ impl DataDir {
         }
 
         // 原子写入：先写 .tmp 再 rename（同一文件系统内 rename 是原子操作）
-        let tmp_path = path.with_extension("json.tmp");
+        //
+        // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P3-3「原子写入逻辑重复 4 处」）：
+        //   原为固定临时名 `path.with_extension("json.tmp")` 且失败不清理——
+        //   并发写同一项目 meta 时会争用同一临时文件。现统一委托 Layer 1
+        //   公共设施 [`crate::atomic_file::write_atomic`]（UUID 唯一名 + 失败清理）。
         let content = serde_json::to_string_pretty(meta)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&tmp_path, content)?;
-        std::fs::rename(&tmp_path, &path)?;
+        crate::atomic_file::write_atomic(&path, content.as_bytes())?;
 
         Ok(())
     }

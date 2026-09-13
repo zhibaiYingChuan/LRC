@@ -121,6 +121,8 @@ pub struct DaoRegulatorState {
 }
 
 /// 单次调节历史记录
+///
+/// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `fields 'timestamp_ms' and 'magnitude' are never read`）。
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct RegulationRecord {
@@ -240,6 +242,8 @@ pub struct DaoRegulator {
 ///
 /// 每次调节前记录系统关键指标，用于长周期对比分析。
 /// 灾难性转折检测器通过对比历史快照，识别系统状态的急剧恶化。
+///
+/// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报多个字段 `never read`）。
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct SystemHealthSnapshot {

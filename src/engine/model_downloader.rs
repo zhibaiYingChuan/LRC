@@ -291,7 +291,19 @@ impl std::fmt::Display for DownloadError {
     }
 }
 
-impl std::error::Error for DownloadError {}
+impl std::error::Error for DownloadError {
+    // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P1-6「错误处理不统一」）：
+    //   补齐 `source()`，使包裹的 io::Error 可沿错误链回溯（此前恒为 None）。
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Network(_)
+            | Self::Http(_, _)
+            | Self::RetriesExhausted { .. }
+            | Self::Cancelled => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for DownloadError {
     fn from(e: std::io::Error) -> Self {

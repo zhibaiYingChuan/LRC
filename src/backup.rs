@@ -1,27 +1,55 @@
-// ============================================================
-// 许可证: Apache 2.0
-// 本文件实现记忆数据自动备份机制，属于公开层 (Layer 1)。
-// ============================================================
-//
-// v0.8.0 "归一" 专项：记忆数据备份模块
-//
-// 功能：
-//   1. 手动/自动将当前记忆库导出为 JSON 备份文件
-//   2. 备份存储在 ~/.loong-recall/backups/ 目录
-//   3. 文件名格式：memories_YYYYMMDD_HHMMSS.json
-//   4. 自动清理旧备份，默认保留最近 4 份
-//
-// 设计原则：
-//   - 备份是只读拷贝，不修改原文件
-//   - 备份文件包含完整的 memories.json 内容
-//   - 清理策略基于文件修改时间，最旧的先删
-//   - 备份失败不影响主流程
+//! ============================================================
+//! 许可证: Apache 2.0
+//! 本文件实现记忆数据自动备份机制，属于公开层 (Layer 1)。
+//! ============================================================
+//!
+//! v0.8.0 "归一" 专项：记忆数据备份模块
+//!
+//! 功能：
+//!   1. 手动/自动将当前记忆库导出为 JSON 备份文件
+//!   2. 备份存储在 ~/.loong-recall/backups/ 目录
+//!   3. 文件名格式：memories_YYYYMMDD_HHMMSS.json
+//!   4. 自动清理旧备份，默认保留最近 4 份
+//!
+//! 设计原则：
+//!   - 备份是只读拷贝，不修改原文件
+//!   - 备份文件包含完整的 memories.json 内容
+//!   - 清理策略基于文件修改时间，最旧的先删
+//!   - 备份失败不影响主流程
 
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：恢复路径（安全关键）已由
+// 不可判别的 String 收敛为带域分类的 LrcError（io / not_found / invalid_input）。
+// 「快照越界」归 invalid_input、「路径/文件缺失」归 not_found，便于调用方与测试判别。
+use crate::errors::{LrcError, LrcResult};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+/// 备份锁序契约（v0.9.7 修复 GLOBAL_CODE_REVIEW_REPORT 并发 P2-3「备份锁序未文档化」）
+/// ============================================================
+/// 本模块**只持有一把锁**，代码库中的版本如下，改动时须刷新此说明：
+///
+/// ```text
+///   [1] BACKUP_OPERATION_LOCK (Mutex<()>)  —— 全局单例，串行化"创建/恢复/清理备份"
+/// ```
+///
+/// **与持久层的锁序关系（关键，避免 ABBA）**：
+///   - 本锁**从不**在持有 `persistence::json::JSON_WRITE_LOCK` 或
+///     `JsonPersistence::cache` 锁的情况下获取（备份流程为独立入口：
+///     仪表盘"立即备份"、CLI `--backup`、恢复均自顶向下调用）。
+///   - 反向：持久层写入路径（`save_memory` 等）**从不**调用备份模块。
+///     故两模块之间**无环路**，不存在跨模块 ABBA。
+///   - 若未来需要"写入前自动备份"，**必须**在**释放**本锁后再进入持久层写锁，
+///     即维持 `BACKUP → (release) → cache → JSON_WRITE` 的顺序，禁止嵌套获取。
+///
+/// **持锁期间的行为**：备份为文件级 `fs::copy`（见 `create_backup_locked`），
+///   持锁期间执行磁盘 IO 是**有意**的——备份的语义就是"某一时刻的一致快照"，
+///   必须与并发的写操作互斥。此处临界区放大是正确性要求，非缺陷。
+///
+/// **调用点**：[`create_backup`]（本文件 :109 附近）与 [`restore_backup`]
+///   （本文件 :267 附近）各获取一次；`count_backups` / `cleanup_old_backups`
+///   不单独加锁，仅由持锁方在临界区内调用。
 static BACKUP_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// 备份保留份数（超出此数量的最旧备份将被删除）
@@ -57,15 +85,35 @@ pub struct BackupReport {
 }
 
 /// 获取备份目录路径：~/.loong-recall/backups/
+///
+/// v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P2 安全「备份目录两套推导」+ P3「密钥路径回退 CWD」同源项）：
+///   原实现 `home_dir().unwrap_or_else(|| PathBuf::from("."))` 在 home 不可用时
+///   退化为**相对当前工作目录**的 `./.loong-recall/backups`——CWD 可被攻击者控制，
+///   备份（含全部记忆明文快照）会落到非预期位置。改为显式回退到系统临时目录，
+///   并打印告警，避免"静默写入相对路径"。
 pub fn backups_dir() -> PathBuf {
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".loong-recall").join("backups")
+    home_dir_or_fallback().join(".loong-recall").join("backups")
 }
 
 /// 获取全局数据目录路径：~/.loong-recall/global/data/
 fn global_data_dir() -> PathBuf {
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".loong-recall").join("global").join("data")
+    home_dir_or_fallback()
+        .join(".loong-recall")
+        .join("global")
+        .join("data")
+}
+
+/// home 目录解析：优先 `home_dir()`，失败时退到系统临时目录（**不用 CWD**）并告警
+fn home_dir_or_fallback() -> PathBuf {
+    if let Some(home) = dirs_next::home_dir() {
+        return home;
+    }
+    let fallback = std::env::temp_dir().join("loong-recall-home");
+    eprintln!(
+        "[备份][告警] 无法确定用户主目录，回退到 {} —— 该位置非持久化，请检查 HOME/USERPROFILE 环境变量",
+        fallback.display()
+    );
+    fallback
 }
 
 /// 生成带时间戳的备份文件名
@@ -118,22 +166,25 @@ pub fn create_backup() -> BackupReport {
         ".{}.tmp",
         BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let result = (|| -> Result<(), String> {
-        fs::create_dir(&temp_dir).map_err(|e| format!("创建临时快照失败: {}", e))?;
+    let result = (|| -> LrcResult<()> {
+        fs::create_dir(&temp_dir).map_err(|e| LrcError::io(format!("创建临时快照失败: {}", e)))?;
         for file in SNAPSHOT_FILES {
             let source = data_dir.join(file);
             let target = temp_dir.join(file);
             if source.exists() {
-                fs::copy(&source, &target).map_err(|e| format!("备份 {} 失败: {}", file, e))?;
+                fs::copy(&source, &target)
+                    .map_err(|e| LrcError::io(format!("备份 {} 失败: {}", file, e)))?;
             } else {
-                fs::write(&target, b"").map_err(|e| format!("创建空文件 {} 失败: {}", file, e))?;
+                fs::write(&target, b"")
+                    .map_err(|e| LrcError::io(format!("创建空文件 {} 失败: {}", file, e)))?;
             }
         }
-        fs::rename(&temp_dir, &final_dir).map_err(|e| format!("提交快照失败: {}", e))
+        fs::rename(&temp_dir, &final_dir).map_err(|e| LrcError::io(format!("提交快照失败: {}", e)))
     })();
     if let Err(e) = result {
         let _ = fs::remove_dir_all(&temp_dir);
-        report.error = Some(e);
+        // BackupReport.error 是对外 JSON 字段，仍为 String 契约：取 message。
+        report.error = Some(String::from(e));
         return report;
     }
     let backup_file = final_dir.join("memories.json");
@@ -243,7 +294,7 @@ fn count_backups(backups_dir: &Path) -> usize {
 }
 
 /// 从快照恢复全部运行时文件。
-pub fn restore_backup(snapshot_path: &Path) -> Result<(), String> {
+pub fn restore_backup(snapshot_path: &Path) -> LrcResult<()> {
     let _operation_guard = BACKUP_OPERATION_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -252,68 +303,81 @@ pub fn restore_backup(snapshot_path: &Path) -> Result<(), String> {
     // 端点默认无 token 保护，若不约束路径，本机任意进程可把任意目录内容
     // （SNAPSHOT_FILES 同名文件）覆盖进全局数据目录，属路径穿越/越权写。
     let allowed_root = backups_dir();
-    let canonical_snapshot = snapshot_path
-        .canonicalize()
-        .map_err(|e| format!("快照路径无法解析: {} ({})", snapshot_path.display(), e))?;
+    let canonical_snapshot = snapshot_path.canonicalize().map_err(|e| {
+        LrcError::not_found(format!(
+            "快照路径无法解析: {} ({})",
+            snapshot_path.display(),
+            e
+        ))
+    })?;
     let canonical_root = match allowed_root.canonicalize() {
         Ok(root) => root,
         // 备份目录尚不存在时不可能有合法快照，直接拒绝
-        Err(_) => return Err(format!("备份目录不存在: {}", allowed_root.display())),
+        Err(_) => {
+            return Err(LrcError::not_found(format!(
+                "备份目录不存在: {}",
+                allowed_root.display()
+            )))
+        }
     };
     if !canonical_snapshot.starts_with(&canonical_root) {
-        return Err(format!(
+        return Err(LrcError::invalid_input(format!(
             "拒绝恢复：快照目录 {} 不在备份目录 {} 内",
             canonical_snapshot.display(),
             canonical_root.display()
-        ));
+        )));
     }
     if !canonical_snapshot.is_dir() {
-        return Err(format!("快照目录不存在: {}", snapshot_path.display()));
+        return Err(LrcError::not_found(format!(
+            "快照目录不存在: {}",
+            snapshot_path.display()
+        )));
     }
     let required_memory_file = canonical_snapshot.join("memories.json");
     if !required_memory_file.is_file() {
-        return Err(format!(
+        return Err(LrcError::not_found(format!(
             "快照缺少有效的 memories.json: {}",
             required_memory_file.display()
-        ));
+        )));
     }
     let snapshot_path = canonical_snapshot.as_path();
     let data_dir = global_data_dir();
-    fs::create_dir_all(&data_dir).map_err(|e| format!("创建数据目录失败: {}", e))?;
+    fs::create_dir_all(&data_dir).map_err(|e| LrcError::io(format!("创建数据目录失败: {}", e)))?;
     let temp = data_dir.join(format!(
         ".restore-{}.tmp",
         BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::create_dir(&temp).map_err(|e| format!("创建恢复临时目录失败: {}", e))?;
-    let result = (|| -> Result<(), String> {
+    fs::create_dir(&temp).map_err(|e| LrcError::io(format!("创建恢复临时目录失败: {}", e)))?;
+    let result = (|| -> LrcResult<()> {
         for file in SNAPSHOT_FILES {
             let source = snapshot_path.join(file);
             if source.exists() {
                 fs::copy(&source, temp.join(file))
-                    .map_err(|e| format!("恢复 {} 失败: {}", file, e))?;
+                    .map_err(|e| LrcError::io(format!("恢复 {} 失败: {}", file, e)))?;
             } else {
                 fs::write(temp.join(file), b"")
-                    .map_err(|e| format!("恢复空文件 {} 失败: {}", file, e))?;
+                    .map_err(|e| LrcError::io(format!("恢复空文件 {} 失败: {}", file, e)))?;
             }
         }
         let rollback = data_dir.join(format!(
             ".restore-{}-rollback",
             BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&rollback).map_err(|e| format!("创建恢复回滚目录失败: {}", e))?;
+        fs::create_dir(&rollback)
+            .map_err(|e| LrcError::io(format!("创建恢复回滚目录失败: {}", e)))?;
         let mut originals = Vec::new();
         let mut committed = Vec::new();
-        let commit_result = (|| -> Result<(), String> {
+        let commit_result = (|| -> LrcResult<()> {
             for file in SNAPSHOT_FILES {
                 let target = data_dir.join(file);
                 if target.exists() {
                     let saved = rollback.join(file);
                     fs::rename(&target, &saved)
-                        .map_err(|e| format!("保存原始 {} 失败: {}", file, e))?;
+                        .map_err(|e| LrcError::io(format!("保存原始 {} 失败: {}", file, e)))?;
                     originals.push((target.clone(), saved));
                 }
                 fs::rename(temp.join(file), &target)
-                    .map_err(|e| format!("提交 {} 失败: {}", file, e))?;
+                    .map_err(|e| LrcError::io(format!("提交 {} 失败: {}", file, e)))?;
                 committed.push(target);
             }
             Ok(())
@@ -329,9 +393,10 @@ pub fn restore_backup(snapshot_path: &Path) -> Result<(), String> {
             for (target, saved) in originals.iter().rev() {
                 let _ = fs::rename(saved, target);
             }
-            return Err(format!("{}；已尝试回滚恢复文件", error));
+            return Err(LrcError::io(format!("{}；已尝试回滚恢复文件", error)));
         }
-        fs::remove_dir_all(&rollback).map_err(|e| format!("清理恢复回滚目录失败: {}", e))?;
+        fs::remove_dir_all(&rollback)
+            .map_err(|e| LrcError::io(format!("清理恢复回滚目录失败: {}", e)))?;
         Ok(())
     })();
     let _ = fs::remove_dir_all(&temp);

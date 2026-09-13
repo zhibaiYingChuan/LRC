@@ -63,13 +63,15 @@ aes-gcm = "0.10"        # AES-256-GCM 加密（API Key 存储）
 rand = "0.8"            # 随机数生成（nonce/salt）
 base64 = "0.22"         # Base64 编码（加密数据序列化）
 
-# ── Windows API（L2 反调试检测）──
+# ── Windows API（L2 反调试检测 + 系统代理读取）──
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Threading",
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    # v0.9.7：get_proxy_configuration 读取 WinINET 代理设置
+    "Win32_System_Registry",
 ] }
 
 # ── Unix API（macOS/Linux 反调试检测 + 进程管理）──

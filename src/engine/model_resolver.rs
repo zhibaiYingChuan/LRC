@@ -49,9 +49,13 @@ pub fn selected_model_id() -> String {
             .to_lowercase()
             .contains("zh")
     {
-        "BAAI/bge-small-zh".to_string()
+        // v0.9.7 修复（模型 ID 常量重复）：改用 Layer 1 单一真源常量。
+        // 注意：此处判定用 `contains("zh")`（宽匹配，可识别 "zh_CN.UTF-8"/"en_US.zh" 等），
+        // 与 model_ids::detect_default_model_by_lang 的 `starts_with("zh")` **语义不同**，
+        // 故仅替换字面量、保留原判定逻辑，不改为委托以避免行为变更。
+        crate::model_ids::MODEL_BGE_SMALL_ZH.to_string()
     } else {
-        "sentence-transformers/all-MiniLM-L6-v2".to_string()
+        crate::model_ids::MODEL_ALL_MINILM_L6_V2.to_string()
     }
 }
 

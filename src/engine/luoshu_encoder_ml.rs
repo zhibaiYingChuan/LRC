@@ -21,6 +21,7 @@
 
 use super::luoshu_encoder::{EncoderStatus, LuoShuEncoder, LuoShuVector, LUOSHU_WEIGHTS};
 use super::pooling::PoolingStrategy;
+use crate::errors::{LrcError, LrcResult};
 use candle_core::{Device, Tensor};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -46,9 +47,11 @@ use std::sync::{Arc, Mutex};
 /// 道枢映射: 坤卦·地 (☷) — 承载万物，语言检测是模型选择的基础
 /// 检测系统语言环境
 ///
-#[allow(dead_code)]
 /// 返回 BCP-47 风格的语言代码（如 "zh_CN"、"en_US"）。
 /// Windows 用户若未设置环境变量，默认返回 "zh_CN"。
+///
+/// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `never used`）。
+#[allow(dead_code)]
 fn detect_system_lang() -> String {
     // 1. 优先检查 LRC 自定义环境变量
     for var in &["LRC_LANG", "LANG", "LC_ALL"] {
@@ -76,15 +79,15 @@ fn detect_system_lang() -> String {
 
 /// 根据语言代码选择默认嵌入模型 ID
 ///
-/// - 中文（zh_*）→ `BAAI/bge-small-zh`（中文 SOTA）
-/// - 其他 → `sentence-transformers/all-MiniLM-L6-v2`（多语言轻量）
+/// v0.9.7 修复（模型 ID 常量重复）：改为委托 Layer 1 中立模块
+/// [`crate::model_ids::detect_default_model_by_lang`]，消除本文件与
+/// `model_resolver.rs` 的同名重复实现（两处此前各自硬编码同一对模型 ID）。
+///
+/// v0.9.7 核实：移除实验证明该 allow 非冗余（库目标下仍报 `never used`；
+/// 当前仅有测试模块引用此包装函数）。
 #[allow(dead_code)]
 fn detect_default_model_by_lang(lang: &str) -> &'static str {
-    if lang.to_lowercase().starts_with("zh") {
-        "BAAI/bge-small-zh"
-    } else {
-        "sentence-transformers/all-MiniLM-L6-v2"
-    }
+    crate::model_ids::detect_default_model_by_lang(lang)
 }
 
 /// 洛书编码器 ML 增强器
@@ -117,7 +120,7 @@ impl LuoShuMlEncoder {
     ///
     /// 镜像守卫：函数入口强制检查 HF_ENDPOINT，确保绝不访问外网。
     /// 若 HF_ENDPOINT 未设置，自动设为 hf-mirror.com 国内镜像。
-    pub fn load() -> Result<Self, String> {
+    pub fn load() -> LrcResult<Self> {
         // ════════════════════════════════════════════════════════════
         // 本地镜像守卫 — 确保 hf-hub 库的下载请求走国内镜像
         // v0.5.4 修复：使用 ApiBuilder::with_endpoint 替代 set_var，避免多线程数据竞争
@@ -187,10 +190,9 @@ impl LuoShuMlEncoder {
                     std::net::TcpStream::connect_timeout(&hf_ip, std::time::Duration::from_secs(6))
                         .is_ok();
                 if !hf_reachable_slow {
-                    return Err(
-                        "HuggingFace 不可达（3s+6s 双层检测均超时），自动降级为统计编码器"
-                            .to_string(),
-                    );
+                    return Err(LrcError::network(
+                        "HuggingFace 不可达（3s+6s 双层检测均超时），自动降级为统计编码器",
+                    ));
                 }
                 eprintln!("[LRC·洛书ML] 6s 宽容检测通过，网络较慢但可用");
             }
@@ -200,18 +202,18 @@ impl LuoShuMlEncoder {
         let tokenizer = if use_local {
             let tokenizer_path = model_dir.join("tokenizer.json");
             tokenizers::Tokenizer::from_file(&tokenizer_path)
-                .map_err(|e| format!("加载本地分词器失败: {}", e))?
+                .map_err(|e| LrcError::parse(format!("加载本地分词器失败: {}", e)))?
         } else {
             let api = hf_hub::api::sync::ApiBuilder::new()
                 .with_endpoint(hf_endpoint.clone())
                 .build()
-                .map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
+                .map_err(|e| LrcError::network(format!("连接 HF Hub 失败: {}", e)))?;
             let repo = api.model(model_id.clone());
             let tokenizer_path = repo
                 .get("tokenizer.json")
-                .map_err(|e| format!("下载分词器失败: {}", e))?;
+                .map_err(|e| LrcError::network(format!("下载分词器失败: {}", e)))?;
             tokenizers::Tokenizer::from_file(&tokenizer_path)
-                .map_err(|e| format!("解析分词器失败: {}", e))?
+                .map_err(|e| LrcError::parse(format!("解析分词器失败: {}", e)))?
         };
 
         // 加载模型
@@ -221,15 +223,15 @@ impl LuoShuMlEncoder {
             // 修复：不能使用 Default::default()，因为不同模型的层数/维度不同
             // 例如 all-MiniLM-L6-v2 是 6 层 384 维，而 default 是 12 层 768 维
             let config_file = std::fs::File::open(&config_path).map_err(|e| {
-                format!(
+                LrcError::io(format!(
                     "打开 config.json 失败: {}\n路径: {}",
                     e,
                     config_path.display()
-                )
+                ))
             })?;
             let config: candle_transformers::models::bert::Config =
                 serde_json::from_reader(std::io::BufReader::new(config_file))
-                    .map_err(|e| format!("解析 config.json 失败: {}", e))?;
+                    .map_err(|e| LrcError::parse(format!("解析 config.json 失败: {}", e)))?;
             let hidden_size = config.hidden_size;
 
             // 智能选择格式：safetensors 原生加载，pytorch_model.bin 使用 PthTensors
@@ -242,35 +244,36 @@ impl LuoShuMlEncoder {
 
             let tensors: HashMap<String, Tensor> = if is_safetensors {
                 candle_core::safetensors::load(&weights_path, &device).map_err(|e| {
-                    format!(
+                    LrcError::io(format!(
                         "safetensors 加载失败: {}\n路径: {}",
                         e,
                         weights_path.display()
-                    )
+                    ))
                 })?
             } else {
                 // pytorch_model.bin 使用 PthTensors 懒加载器（与 CodeBertEncoder 一致）
                 let pth =
                     candle_core::pickle::PthTensors::new(&weights_path, None).map_err(|e| {
-                        format!(
+                        LrcError::io(format!(
                             "pickle 加载 pytorch_model.bin 失败: {}\n\
                          提示: 文件可能已损坏，请尝试转换为 safetensors 格式后再试",
                             e
-                        )
+                        ))
                     })?;
                 let mut tensors = HashMap::new();
                 for name in pth.tensor_infos().keys() {
                     if let Some(tensor) = pth
                         .get(name)
-                        .map_err(|e| format!("加载 tensor '{}' 失败: {}", name, e))?
+                        .map_err(|e| LrcError::io(format!("加载 tensor '{}' 失败: {}", name, e)))?
                     {
                         tensors.insert(name.to_string(), tensor);
                     }
                 }
                 if tensors.is_empty() {
-                    return Err("pytorch_model.bin 中未找到任何 tensor\n\
-                         提示: 文件可能已损坏，请尝试重新下载"
-                        .to_string());
+                    return Err(LrcError::not_found(
+                        "pytorch_model.bin 中未找到任何 tensor\n\
+                         提示: 文件可能已损坏，请尝试重新下载",
+                    ));
                 }
                 tensors
             };
@@ -278,25 +281,25 @@ impl LuoShuMlEncoder {
             let vb = candle_nn::VarBuilder::from_tensors(tensors, candle_core::DType::F32, &device);
 
             let model = candle_transformers::models::bert::BertModel::load(vb, &config)
-                .map_err(|e| format!("构建 BERT 模型失败: {}", e))?;
+                .map_err(|e| LrcError::internal(format!("构建 BERT 模型失败: {}", e)))?;
 
             (model, hidden_size)
         } else {
             let api = hf_hub::api::sync::ApiBuilder::new()
                 .with_endpoint(hf_endpoint.clone())
                 .build()
-                .map_err(|e| format!("连接 HF Hub 失败: {}", e))?;
+                .map_err(|e| LrcError::network(format!("连接 HF Hub 失败: {}", e)))?;
             let repo = api.model(model_id);
 
             let config_path = repo
                 .get("config.json")
-                .map_err(|e| format!("下载配置失败: {}", e))?;
+                .map_err(|e| LrcError::network(format!("下载配置失败: {}", e)))?;
             // 从 config.json 解析真实的 BERT 配置（与 CodeBertEncoder 一致）
             let config_file = std::fs::File::open(&config_path)
-                .map_err(|e| format!("打开 config.json 失败: {}", e))?;
+                .map_err(|e| LrcError::io(format!("打开 config.json 失败: {}", e)))?;
             let config: candle_transformers::models::bert::Config =
                 serde_json::from_reader(std::io::BufReader::new(config_file))
-                    .map_err(|e| format!("解析 config.json 失败: {}", e))?;
+                    .map_err(|e| LrcError::parse(format!("解析 config.json 失败: {}", e)))?;
             let hidden_size = config.hidden_size;
 
             // 模型格式降级：safetensors → pytorch_model.bin（与 CodeBertEncoder 一致）
@@ -304,11 +307,11 @@ impl LuoShuMlEncoder {
                 Ok(path) => (path, true),
                 Err(_) => {
                     let path = repo.get("pytorch_model.bin").map_err(|e| {
-                        format!(
+                        LrcError::network(format!(
                             "下载模型文件失败（safetensors 和 pytorch_model.bin 均不可用）: {}\n\
                              提示: 请检查网络连接，或手动将模型文件放到 models/{} 目录",
                             e, local_model_name
-                        )
+                        ))
                     })?;
                     (path, false)
                 }
@@ -316,29 +319,30 @@ impl LuoShuMlEncoder {
 
             let tensors: HashMap<String, Tensor> = if is_safetensors {
                 candle_core::safetensors::load(&weights_path, &device)
-                    .map_err(|e| format!("safetensors 加载失败: {}", e))?
+                    .map_err(|e| LrcError::io(format!("safetensors 加载失败: {}", e)))?
             } else {
                 let pth =
                     candle_core::pickle::PthTensors::new(&weights_path, None).map_err(|e| {
-                        format!(
+                        LrcError::io(format!(
                             "pickle 加载 pytorch_model.bin 失败: {}\n\
                          提示: 如果持续失败，请尝试转换为 safetensors 格式",
                             e
-                        )
+                        ))
                     })?;
                 let mut tensors = HashMap::new();
                 for name in pth.tensor_infos().keys() {
                     if let Some(tensor) = pth
                         .get(name)
-                        .map_err(|e| format!("加载 tensor '{}' 失败: {}", name, e))?
+                        .map_err(|e| LrcError::io(format!("加载 tensor '{}' 失败: {}", name, e)))?
                     {
                         tensors.insert(name.to_string(), tensor);
                     }
                 }
                 if tensors.is_empty() {
-                    return Err("pytorch_model.bin 中未找到任何 tensor\n\
-                         提示: 文件可能已损坏，请尝试重新下载"
-                        .to_string());
+                    return Err(LrcError::not_found(
+                        "pytorch_model.bin 中未找到任何 tensor\n\
+                         提示: 文件可能已损坏，请尝试重新下载",
+                    ));
                 }
                 tensors
             };
@@ -346,18 +350,18 @@ impl LuoShuMlEncoder {
             let vb = candle_nn::VarBuilder::from_tensors(tensors, candle_core::DType::F32, &device);
 
             let model = candle_transformers::models::bert::BertModel::load(vb, &config)
-                .map_err(|e| format!("构建 BERT 模型失败: {}", e))?;
+                .map_err(|e| LrcError::internal(format!("构建 BERT 模型失败: {}", e)))?;
 
             (model, hidden_size)
         };
 
         // 模型完整性校验：hidden_size 必须合理（BERT 系模型常见 384/768/1024）
         if !(128..=2048).contains(&hidden_size) {
-            return Err(format!(
+            return Err(LrcError::invalid_input(format!(
                 "模型 config.json 中 hidden_size={} 异常，疑似文件损坏或版本不匹配。\
                  请检查 models/{} 目录下的模型文件是否完整",
                 hidden_size, local_model_name
-            ));
+            )));
         }
 
         // 初始化投影矩阵
@@ -385,20 +389,20 @@ impl LuoShuMlEncoder {
             Ok(vec) => {
                 let dev = vec.luoshu_deviation();
                 if dev > 2.0 {
-                    return Err(format!(
+                    return Err(LrcError::internal(format!(
                         "模型加载后验证失败：测试编码的幻和偏离度 {:.2} 异常（期望 < 2.0）。\
                          模型可能已损坏或与分词器不匹配",
                         dev
-                    ));
+                    )));
                 }
                 eprintln!("[LRC·洛书ML] 加载后验证通过，幻和偏离度: {:.2}", dev);
             }
             Err(e) => {
-                return Err(format!(
+                return Err(LrcError::internal(format!(
                     "模型加载后验证失败：测试编码出错: {}。\
                      模型可能已损坏，请尝试重新下载模型文件到 models/{} 目录",
                     e, local_model_name
-                ));
+                )));
             }
         }
 
@@ -454,12 +458,12 @@ impl LuoShuMlEncoder {
     }
 
     /// 使用 ML 模型将文本编码为洛书 9 维向量
-    pub fn encode_text(&self, text: &str) -> Result<LuoShuVector, String> {
+    pub fn encode_text(&self, text: &str) -> LrcResult<LuoShuVector> {
         // 1. Tokenize
         let encoding = self
             .tokenizer
             .encode(text, true)
-            .map_err(|e| format!("分词失败: {}", e))?;
+            .map_err(|e| LrcError::parse(format!("分词失败: {}", e)))?;
 
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
         let attention_mask: Vec<f32> = encoding
@@ -472,24 +476,24 @@ impl LuoShuMlEncoder {
 
         // 2. 创建输入张量（与 CodeBertEncoder 相同的模式）
         let input_ids = Tensor::new(&token_ids[..seq_len], &self.device)
-            .map_err(|e| format!("创建 input_ids: {}", e))?
+            .map_err(|e| LrcError::internal(format!("创建 input_ids: {}", e)))?
             .unsqueeze(0)
-            .map_err(|e| format!("unsqueeze: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("unsqueeze: {}", e)))?;
 
         let token_type_ids = input_ids
             .zeros_like()
-            .map_err(|e| format!("type_ids: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("type_ids: {}", e)))?;
 
         let attention_tensor = Tensor::new(&attention_mask[..seq_len], &self.device)
-            .map_err(|e| format!("attention: {}", e))?
+            .map_err(|e| LrcError::internal(format!("attention: {}", e)))?
             .unsqueeze(0)
-            .map_err(|e| format!("unsqueeze: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("unsqueeze: {}", e)))?;
 
         // 3. BERT 前向传播
         let output = self
             .model
             .forward(&input_ids, &token_type_ids, Some(&attention_tensor))
-            .map_err(|e| format!("BERT 前向: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("BERT 前向: {}", e)))?;
 
         // 4. 池化
         let embedding = match self.pooling {
@@ -497,30 +501,34 @@ impl LuoShuMlEncoder {
                 // [CLS] token 是第 0 个位置
                 output
                     .get(0)
-                    .map_err(|e| format!("batch: {}", e))?
+                    .map_err(|e| LrcError::internal(format!("batch: {}", e)))?
                     .get(0)
-                    .map_err(|e| format!("cls: {}", e))?
+                    .map_err(|e| LrcError::internal(format!("cls: {}", e)))?
             }
             PoolingStrategy::Mean => {
                 let mask = attention_tensor
                     .unsqueeze(2)
-                    .map_err(|e| format!("mask unsqueeze: {}", e))?;
+                    .map_err(|e| LrcError::internal(format!("mask unsqueeze: {}", e)))?;
                 let masked = output
                     .broadcast_mul(&mask)
-                    .map_err(|e| format!("masked mul: {}", e))?;
-                let sum = masked.sum(1).map_err(|e| format!("sum: {}", e))?;
-                let mask_sum = mask.sum(1).map_err(|e| format!("mask_sum: {}", e))?;
+                    .map_err(|e| LrcError::internal(format!("masked mul: {}", e)))?;
+                let sum = masked
+                    .sum(1)
+                    .map_err(|e| LrcError::internal(format!("sum: {}", e)))?;
+                let mask_sum = mask
+                    .sum(1)
+                    .map_err(|e| LrcError::internal(format!("mask_sum: {}", e)))?;
                 sum.broadcast_div(&mask_sum)
-                    .map_err(|e| format!("div: {}", e))?
+                    .map_err(|e| LrcError::internal(format!("div: {}", e)))?
             }
         };
 
         // 展平为 1D 向量
         let emb_vec: Vec<f32> = embedding
             .flatten_all()
-            .map_err(|e| format!("flatten: {}", e))?
+            .map_err(|e| LrcError::internal(format!("flatten: {}", e)))?
             .to_vec1()
-            .map_err(|e| format!("to_vec1: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("to_vec1: {}", e)))?;
 
         let actual_hidden = self.hidden_size.min(emb_vec.len());
 
@@ -572,11 +580,11 @@ impl LuoShuMlEncoder {
     /// 归一化对比学习训练，这是其官方检索用法。均值池化会让 BERT 族
     /// 句向量呈各向异性——实测任意中文短句对的余弦都挤在 ≈0.65，
     /// 语义相关对与无关对完全不可分（v0.9.7 联想探索标定结论）。
-    pub fn encode_embedding(&self, text: &str) -> Result<Vec<f32>, String> {
+    pub fn encode_embedding(&self, text: &str) -> LrcResult<Vec<f32>> {
         let encoding = self
             .tokenizer
             .encode(text, true)
-            .map_err(|e| format!("分词失败: {}", e))?;
+            .map_err(|e| LrcError::parse(format!("分词失败: {}", e)))?;
 
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
         let attention_mask: Vec<f32> = encoding
@@ -587,35 +595,35 @@ impl LuoShuMlEncoder {
         let seq_len = token_ids.len().min(512);
 
         let input_ids = Tensor::new(&token_ids[..seq_len], &self.device)
-            .map_err(|e| format!("input_ids: {}", e))?
+            .map_err(|e| LrcError::internal(format!("input_ids: {}", e)))?
             .unsqueeze(0)
-            .map_err(|e| format!("unsqueeze: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("unsqueeze: {}", e)))?;
 
         let token_type_ids = input_ids
             .zeros_like()
-            .map_err(|e| format!("type_ids: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("type_ids: {}", e)))?;
 
         let attention_tensor = Tensor::new(&attention_mask[..seq_len], &self.device)
-            .map_err(|e| format!("attention: {}", e))?
+            .map_err(|e| LrcError::internal(format!("attention: {}", e)))?
             .unsqueeze(0)
-            .map_err(|e| format!("unsqueeze: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("unsqueeze: {}", e)))?;
 
         let output = self
             .model
             .forward(&input_ids, &token_type_ids, Some(&attention_tensor))
-            .map_err(|e| format!("forward: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("forward: {}", e)))?;
 
         // CLS 池化：取序列首位 token 的隐层向量（[batch, seq, hidden] → [hidden]）
         let cls = output
             .narrow(1, 0, 1)
-            .map_err(|e| format!("cls narrow: {}", e))?
+            .map_err(|e| LrcError::internal(format!("cls narrow: {}", e)))?
             .squeeze(1)
-            .map_err(|e| format!("cls squeeze: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("cls squeeze: {}", e)))?;
         let vec = cls
             .flatten_all()
-            .map_err(|e| format!("cls flatten: {}", e))?
+            .map_err(|e| LrcError::internal(format!("cls flatten: {}", e)))?
             .to_vec1()
-            .map_err(|e| format!("cls to_vec1: {}", e))?;
+            .map_err(|e| LrcError::internal(format!("cls to_vec1: {}", e)))?;
         Ok(vec)
     }
 
@@ -811,7 +819,9 @@ impl HybridLuoShuEncoder {
                 }
                 Err(e) => {
                     eprintln!("[LRC·洛书] ML 编码失败 ({}), 回退到统计编码器", e);
-                    self.record_degradation(&e);
+                    // 签名迁移：record_degradation 接收 &str，LrcError 的 Display 即 message，
+                    // 故 to_string() 与迁移前文案逐字一致。
+                    self.record_degradation(&e.to_string());
                 }
             }
         }

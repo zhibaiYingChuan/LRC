@@ -372,10 +372,9 @@ fn canonical_hash_fields(
 ///
 /// v2.0 新增可选的 JSONL 持久化后端（质疑五）：
 /// 当设置 persist_path 后，所有事件自动追加写入 JSONL 文件。
-/// 缓冲区溢出的事件不会丢失——它们已持久化到磁盘。
-/// 关键事件类型（MemoryDeleted, MemoryIsolated, CatastrophicEvent,
-/// ChronicDegradation, RegulatorFrozen）即使溢出也始终保留在
-/// JSONL 文件中，确保长期审计完整性。
+/// JSONL 文件为只追加（append-only），任何事件都不会从中删除，
+/// 因此内存窗口（max_events）溢出不影响磁盘上的审计完整性——
+/// 溢出的事件仍可随时从文件重新加载并检索。
 ///
 /// v3.0 新增哈希链防篡改（质疑四）：
 /// 每条事件包含 previous_hash 和 event_hash，形成不可篡改的
@@ -446,19 +445,6 @@ impl Drop for AuditTrail {
         }
     }
 }
-
-/// 需要永久保留的关键事件类型（质疑五）
-///
-/// 即使缓冲区溢出，这些事件类型也应保留在 JSONL 文件中。
-#[allow(dead_code)]
-const CRITICAL_EVENT_TYPES: &[&str] = &[
-    "memory_deleted",
-    "memory_isolated",
-    "catastrophic_event",
-    "chronic_degradation",
-    "regulator_frozen",
-    "regulator_unfrozen",
-];
 
 impl AuditTrail {
     /// 创建新的审计追踪器
@@ -949,6 +935,11 @@ impl AuditTrail {
         self.integrity_seal = prev_hash.clone();
 
         // 按原始顺序（最旧在前）写入唯一临时文件，再原子替换原日志。
+        //
+        // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P3-3「原子写入逻辑重复 4 处」）：
+        //   原为固定临时名 `format!("{}.migration.tmp", path)` 且失败不清理——
+        //   并发迁移/写入同一审计日志时会争用同一临时文件。现统一委托 Layer 1
+        //   公共设施 [`crate::atomic_file::write_atomic`]（UUID 唯一名 + 失败清理）。
         let mut out = String::new();
         for event in &all_events {
             if let Ok(json) = serde_json::to_string(event) {
@@ -956,9 +947,7 @@ impl AuditTrail {
                 out.push('\n');
             }
         }
-        let temp_path = format!("{}.migration.tmp", path);
-        std::fs::write(&temp_path, out)?;
-        std::fs::rename(&temp_path, path)?;
+        crate::atomic_file::write_atomic(std::path::Path::new(path), out.as_bytes())?;
 
         // 内存仍只保留最新窗口，但磁盘已保留完整事件流。
         self.events = all_events.into_iter().rev().take(self.max_events).collect();
@@ -1169,18 +1158,6 @@ impl AuditTrail {
             // 最新的在列表开头
             self.last_hash = first.event_hash.clone();
         }
-    }
-
-    /// 追加一行到 JSONL 文件
-    #[allow(dead_code)]
-    fn append_to_file(&self, path: &str, line: &str) -> std::io::Result<()> {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(file, "{}", line)?;
-        Ok(())
     }
 
     /// 获取审计事件总数（含已溢出的，质疑五·健康报告）

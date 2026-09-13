@@ -5,8 +5,6 @@
   "identifier": "com.loongcode.lrc-desktop",
   "build": {
     "frontendDist": "../../static",
-    "devUrl": "http://localhost:1420",
-    "beforeDevCommand": "python G:/code-memory/scripts/dev-proxy.py 1420 --dev",
     "beforeBuildCommand": ""
   },
   "app": {

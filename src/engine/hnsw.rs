@@ -73,6 +73,8 @@ impl HnswGraph {
     }
 
     /// 图中节点数
+    ///
+    /// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `never used`）。
     #[allow(dead_code)]
     fn len(&self) -> usize {
         self.nodes.len()
@@ -253,6 +255,8 @@ impl HnswGraph {
     }
 
     /// 批量插入节点
+    ///
+    /// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `never used`）。
     #[allow(dead_code)]
     fn insert_batch(&mut self, vectors: Vec<(EmbeddingVector, usize)>) {
         for (vector, chunk_idx) in vectors {

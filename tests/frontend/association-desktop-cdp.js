@@ -163,8 +163,23 @@ async function main() {
 
   // 【强制刷新】桌面 WebView 可能停留在旧版静态页——dev-proxy 直接服务 static/，
   // 必须带时间戳重新导航，确保页面加载最新 app.js（否则测的是过期前端）。
-  await cdp.send('Page.navigate', { url: `http://localhost:1420/?r=${Date.now()}` });
-  await sleep(3000);
+  // dev 降级（2026-09-12，对齐同目录 cdp-regression.js / association-dashboard-cdp.js 的既有模式）：
+  //   根因：此前无条件导航到 1420，若 dev-proxy 未启动（如新克隆环境、CI），
+  //         导航会落到错误页并使后续断言以「页面未就绪」形式失败，
+  //         将「环境未就绪」误报为「代码缺陷」。
+  //   修复：先探测 1420 是否存活，不可用时回退原地重载（此时无法保证前端最新，
+  //         故显式告警，避免静默测到过期打包副本）。
+  const proxyAlive = await fetch('http://localhost:1420/', { signal: AbortSignal.timeout(2000) })
+    .then(() => true).catch(() => false);
+  if (proxyAlive) {
+    await cdp.send('Page.navigate', { url: `http://localhost:1420/?r=${Date.now()}` });
+    await sleep(3000);
+  } else {
+    console.warn('[WARN] dev-proxy(1420) 不可用，回退原地重载——无法保证加载的是磁盘最新前端；'
+      + '如需严格验证，请先运行: python scripts/dev-proxy.py 1420 --dev');
+    await cdp.send('Page.reload', { ignoreCache: true });
+    await sleep(3000);
+  }
   const appReady = await cdp.eval(`(() => ({
     query: !!document.getElementById('association-query'),
     hasWeakRender: String(window.startAssociationExplore || '').includes('weak_match'),

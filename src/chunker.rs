@@ -1,7 +1,7 @@
-// 通用代码/文档切分器
-// =========================
-// 支持多语言代码和通用文档切分。
-// Phase 1 使用正则/缩进（行走骨架），Phase 2 替换为 tree-sitter AST。
+//! 通用代码/文档切分器
+//! =========================
+//! 支持多语言代码和通用文档切分。
+//! Phase 1 使用正则/缩进（行走骨架），Phase 2 替换为 tree-sitter AST。
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;

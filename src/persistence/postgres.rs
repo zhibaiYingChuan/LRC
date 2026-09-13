@@ -13,6 +13,10 @@
 // 需要 `postgres` feature flag + 运行中的 PostgreSQL 服务。
 
 use crate::chunker::CodeChunk;
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：环境变量配置缺失错误由不可判别的
+// `String` 收敛为带域分类的 [`crate::errors::LrcError`]（config）。
+// `Display` 仅输出 message，故调用方/log 文案**零漂移**。
+use crate::errors::{LrcError, LrcResult};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::{Persistence, PersistenceError};
 use chrono::{DateTime, Utc};
@@ -47,11 +51,11 @@ impl PostgresConfig {
     ///
     /// 环境变量：
     /// - `DATABASE_URL` 或 `LRC_PG_URL`：数据库连接 URL
-    pub fn from_env() -> Result<Self, String> {
+    pub fn from_env() -> LrcResult<Self> {
         let database_url = std::env::var("LRC_PG_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .map_err(|_| {
-                "未设置数据库 URL，请设置 LRC_PG_URL 或 DATABASE_URL 环境变量".to_string()
+                LrcError::config("未设置数据库 URL，请设置 LRC_PG_URL 或 DATABASE_URL 环境变量")
             })?;
         Ok(Self {
             database_url,

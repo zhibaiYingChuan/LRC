@@ -1,22 +1,25 @@
-// ============================================================
-// 许可证: Apache 2.0
-// 本文件实现记忆数据迁移与合并工具，属于公开层 (Layer 1)。
-// ============================================================
-//
-// v0.8.0 "归一" 专项：记忆数据迁移工具
-//
-// 功能：
-//   1. 扫描已知老路径（项目指纹目录、老版本路径）
-//   2. 按 memory.id 去重合并到 global 目录
-//   3. 原文件重命名 .bak，不删除
-//   4. 生成迁移报告
-//
-// 设计原则：
-//   - 按 JSON 层面操作，兼容老版本格式差异
-//   - 按 id 去重，保留最新 updated_at 的版本
-//   - 原文件保留 .bak 备份，确保数据安全
-//   - 龙老版本（G:\loong\data\memory\）格式不兼容，跳过
+//! ============================================================
+//! 许可证: Apache 2.0
+//! 本文件实现记忆数据迁移与合并工具，属于公开层 (Layer 1)。
+//! ============================================================
+//!
+//! v0.8.0 "归一" 专项：记忆数据迁移工具
+//!
+//! 功能：
+//!   1. 扫描已知老路径（项目指纹目录、老版本路径）
+//!   2. 按 memory.id 去重合并到 global 目录
+//!   3. 原文件重命名 .bak，不删除
+//!   4. 生成迁移报告
+//!
+//! 设计原则：
+//!   - 按 JSON 层面操作，兼容老版本格式差异
+//!   - 按 id 去重，保留最新 updated_at 的版本
+//!   - 原文件保留 .bak 备份，确保数据安全
+//!   - 龙老版本（G:\loong\data\memory\）格式不兼容，跳过
 
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：迁移读取路径错误由 String 收敛为
+// 带域分类的 LrcError（io / parse），失败原因可从 `kind` 判别。
+use crate::errors::{LrcError, LrcResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -132,21 +135,21 @@ pub fn scan_legacy_sources() -> Vec<MigrationSource> {
 }
 
 /// 从 memories.json 文件读取记忆列表（JSON 层面，兼容老版本格式）
-fn read_memories(data_dir: &Path) -> Result<Vec<serde_json::Value>, String> {
+fn read_memories(data_dir: &Path) -> LrcResult<Vec<serde_json::Value>> {
     let memory_file = data_dir.join("memories.json");
     if !memory_file.exists() {
         return Ok(Vec::new());
     }
     let content = std::fs::read_to_string(&memory_file)
-        .map_err(|e| format!("读取 {} 失败: {}", memory_file.display(), e))?;
+        .map_err(|e| LrcError::io(format!("读取 {} 失败: {}", memory_file.display(), e)))?;
     // 兼容两种格式：Vec<Memory> 或单个 Memory 对象
     let memories: Vec<serde_json::Value> = if content.trim_start().starts_with('[') {
         serde_json::from_str(&content)
-            .map_err(|e| format!("解析 {} 失败: {}", memory_file.display(), e))?
+            .map_err(|e| LrcError::parse(format!("解析 {} 失败: {}", memory_file.display(), e)))?
     } else {
         // 单对象格式，包装为数组
         let single: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| format!("解析 {} 失败: {}", memory_file.display(), e))?;
+            .map_err(|e| LrcError::parse(format!("解析 {} 失败: {}", memory_file.display(), e)))?;
         vec![single]
     };
     Ok(memories)

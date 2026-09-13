@@ -23,6 +23,9 @@ jobs:
   fmt:
     name: Rustfmt
     runs-on: ubuntu-latest
+    # v0.9.7 审查修复（P2-1）：补齐超时保护，避免网络挂起时被 GitHub
+    #   以 6 小时默认上限回收，浪费 runner 配额。
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -51,6 +54,8 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    # v0.9.7 审查修复（P2-1）：补齐超时保护
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -92,6 +97,10 @@ jobs:
   test:
     name: Unit & Integration Tests
     runs-on: ubuntu-latest
+    # v0.9.7 审查修复（P2-1）：全仓仅 frontend-test 有 timeout-minutes，
+    # 测试作业挂起时会被 GitHub 以 6 小时默认上限才回收，现补显式上限。
+    # P2-2 追加 server,ml 测试后编译量上升（candle 全家桶），预算放宽到 45 分钟。
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -120,10 +129,85 @@ jobs:
             target/
           key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-test-
+      # v0.9.7 审查修复（P0-2）：全仓存在 31 处进程级 set_var 写入
+      #   （benchmarks.rs / memory_store.rs / model_downloader.rs / v1_api.rs 等），
+      #   libtest 默认多线程并行 → 环境变量互相污染 → 测试非确定性（本地偶发绿、CI 偶发红）。
+      #   此处以 --test-threads=1 串行化，消除跨测试环境变量竞态；
+      #   后续可按报告建议改为参数注入以恢复并行。
       - name: Run tests (server feature)
-        run: cargo test --features server --verbose
+        run: cargo test --features server --verbose -- --test-threads=1
       - name: Run tests (default features)
-        run: cargo test --verbose
+        run: cargo test --verbose -- --test-threads=1
+      # v0.9.7 审查修复（P2-2）：此前 build-matrix 仅对 ml/postgres/qdrant/neo4j 做
+      #   `cargo check`（只编译不测试），ml feature 全仓零测试执行。
+      #   取证结论：ml 相关用例均带"模型缺失即跳过"守卫——
+      #     · encoder_codebert.rs::should_skip() 基于 model_resolver::check_model_ready 文件检测；
+      #     · v1_api.rs::new_ml_capable_store() 用 LuoShuMlEncoder::load().ok()? 返回 None 后 return；
+      #     · luoshu_encoder_ml.rs 的 12 个单测全部走统计模式（new_statistical），不加载模型。
+      #   因此 CI（无模型、egress 受限）下可安全执行，不会因缺模型而失败。
+      #   postgres/qdrant/neo4j 需真实外部服务，暂不在此接入（见报告 P2-2 待跟踪项）。
+      - name: Run tests (server + ml features)
+        run: cargo test --features server,ml --verbose -- --test-threads=1
+
+  # ════════════════════════════════════════════════════════════
+  # Job 3b: 代码覆盖率门禁（v0.9.7 审查修复 P0-1）
+  # 背景：此前全 .github/ Grep codecov|llvm-cov|tarpaulin|coverage = 0 命中，
+  #   属"零覆盖率度量"——无法识别未执行分支，回归缺少雷达。
+  # 方案：cargo-llvm-cov 生成 lcov 报告 + --fail-under-lines 硬门禁 + artifact 留档。
+  # 阈值：40% 为保守起点（首次接入避免历史欠账直接锁死合流），
+  #   待 CI 实测基线稳定后按实调升；调整时须同步更新本注释。
+  # ════════════════════════════════════════════════════════════
+  coverage:
+    name: Coverage Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            crates.io:443
+            static.crates.io:443
+            index.crates.io:443
+            objects.githubusercontent.com:443
+            rustup.rs:443
+            static.rust-lang.org:443
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+          # cargo-llvm-cov 依赖 rustup 的 llvm-tools-preview 组件做插桩
+          components: llvm-tools-preview
+      - name: Cache Cargo deps
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cov-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cov-
+      - name: Install cargo-llvm-cov
+        # 与 license-check 同款策略：timeout 限制，防止网络问题导致 CI 挂起
+        run: timeout 600 cargo install cargo-llvm-cov --locked
+      - name: Run coverage with line threshold
+        # --test-threads=1 与 test job 保持一致，规避 set_var 环境变量竞态
+        run: |
+          cargo llvm-cov --features server --lcov --output-path lcov.info \
+            --fail-under-lines 40 -- --test-threads=1
+      - name: Upload coverage report
+        # 无论门禁是否通过都留档，便于定位未覆盖分支
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: warn
+          retention-days: 7
 
   # ════════════════════════════════════════════════════════════
   # Job 4: E2E Smoke Test
@@ -133,6 +217,9 @@ jobs:
   e2e-smoke:
     name: E2E Smoke Test
     runs-on: ubuntu-latest
+    # v0.9.7 审查修复（P2-1）：此前本 Job 无超时保护，
+    #   而 sidecar 启动含轮询等待，挂起时会拖到默认 6 小时上限。
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -335,6 +422,9 @@ jobs:
   build-matrix:
     name: Build Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # v0.9.7 审查修复（P2-1）：3 OS × 7 组 feature 编译 + apt 安装，
+    #   此前无超时；apt-get 挂起时会被 GitHub 以 SIGTERM(143) 杀死且日志不可读。
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -453,6 +543,14 @@ jobs:
       - name: cargo check (desktop)
         run: cd desktop/src-tauri && cargo check
 
+      # v0.9.7 审查修复（P0-3）：此前桌面端 80+ 单元测试（crypto/sidecar/integrity/
+      #   限流/托盘/配置向导/代理读取等）从未在 CI 执行——主 crate 的 Cargo.toml
+      #   `exclude` 了 desktop，导致安全关键模块长期无回归保护。
+      #   此处复用已创建的占位 sidecar 与已安装的 Tauri 系统依赖，仅跑 lib 单测
+      #   （--lib 避免构建需要 GUI 上下文的 bin 测试）。
+      - name: cargo test (desktop lib)
+        run: cd desktop/src-tauri && cargo test --lib
+
       # v0.8.8 新增：Tauri 配置校验（确保 targets 不是单一平台）
       - name: Tauri config lint
         run: |
@@ -561,6 +659,9 @@ jobs:
           node --check static/app.js
           node --check tests/frontend/cdp-regression.js
           node --check tests/frontend/playwright-smoke.js
+          node --check tests/frontend/association-dashboard-cdp.js
+          node --check tests/frontend/association-desktop-cdp.js
+          node --check tests/frontend/association-user-view-check.js
           node scripts/validate_frontend_contract.js
       - name: Run Chromium browser regression
         env:

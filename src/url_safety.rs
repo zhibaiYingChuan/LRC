@@ -21,9 +21,102 @@
 //   - /v1/config/llm        —— 持久化自定义 base_url
 //   - LlmApiConfig::parse   —— 配置解析入口（同步，仅字面量检查）
 //   - Tauri test_llm_connection —— 桌面端测试连接
+//
+// ⚠ 本文件**必须**使用 `//` 行注释而非 `//!` 内部文档注释（v0.9.7 核实）：
+//   桌面端 desktop/src-tauri/src/url_safety.rs 通过 `include!()` 引入本文件，
+//   而 `include!` 展开处不允许出现内部文档注释，否则报 E0753
+//   （expected outer doc comment）。改为 `//!` 会导致桌面端 crate 无法编译。
+//   因此本文件是全仓唯一**刻意**不做模块级 `//!` 文档化的顶层模块。
 
 use std::net::{IpAddr, Ipv4Addr};
 use url::{Host, Url};
+
+// ---------------------------------------------------------------------------
+// 类型化错误（v0.9.7，GLOBAL_CODE_REVIEW_REPORT P1-6「统一错误处理」的安全关键子集）
+//
+// 背景：本模块原以 `Result<_, String>` 表达失败，调用方只能拿到一个不可判别的
+//   字符串。SSRF 校验属安全边界，调用方需要区分"地址本身非法（用户输入问题）"
+//   与"DNS 层失败（网络/重绑定问题）"，以便分别给出处置（改配置 / 重试）。
+//
+// 约束（务必遵守）：本文件被桌面端 `include!()` 引入，**不得引入任何新依赖**
+//   （`thiserror` 未出现在主 crate 与桌面端 crate 的依赖表中），故此处手写
+//   `Display` 与 `std::error::Error`。文案与改造前**逐字保持一致**，
+//   以保证前端/日志中的用户可见消息零漂移。
+// ---------------------------------------------------------------------------
+
+/// URL 安全校验失败原因
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UrlSafetyError {
+    /// 主机名使用十进制/十六进制/八进制等编码形式（防 SSRF 混淆绕过）
+    EncodedHostname,
+    /// URL 无法解析
+    InvalidUrl(String),
+    /// scheme 非 http/https
+    UnsupportedScheme,
+    /// URL 内嵌 userinfo（user:pass@host）
+    UserInfoNotAllowed,
+    /// 端口非法（0 / 非数字 / 格式错误）
+    InvalidPort,
+    /// URL 缺少主机名
+    MissingHost,
+    /// 目标 IP 位于受保护网段（云 metadata / 链路本地 / 未指定 / 组播 / 广播）
+    ProtectedAddress(String),
+    /// 主机名不符合命名规则
+    InvalidHostname(String),
+    /// DNS 解析超时
+    DnsTimeout(String),
+    /// DNS 解析失败（含底层错误描述）
+    DnsResolveFailed {
+        /// 被解析的主机名
+        host: String,
+        /// 底层解析错误描述
+        detail: String,
+    },
+    /// 域名解析无任何结果（fail-closed）
+    DnsNoResult(String),
+    /// 域名解析到多个地址，HTTP 客户端无法无风险绑定完整校验结果（fail-closed）
+    DnsAmbiguous(String),
+    /// 域名解析到受保护地址，疑似 DNS rebinding
+    DnsRebinding {
+        /// 被解析的主机名
+        host: String,
+        /// 解析到的受保护地址
+        ip: IpAddr,
+    },
+}
+
+impl std::fmt::Display for UrlSafetyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EncodedHostname => write!(f, "不允许使用数字编码主机名"),
+            Self::InvalidUrl(detail) => write!(f, "URL 格式非法: {detail}"),
+            Self::UnsupportedScheme => write!(f, "不支持的 URL scheme（仅支持 http/https）"),
+            Self::UserInfoNotAllowed => write!(f, "URL 不允许包含 userinfo（user:pass@host）"),
+            Self::InvalidPort => write!(f, "URL 端口非法"),
+            Self::MissingHost => write!(f, "URL 缺少主机名"),
+            Self::ProtectedAddress(ip) => write!(f, "目标地址位于受保护网段，已拒绝: {ip}"),
+            Self::InvalidHostname(host) => write!(f, "主机名非法: {host}"),
+            Self::DnsTimeout(host) => write!(f, "DNS 解析超时（5s）: {host}"),
+            Self::DnsResolveFailed { host, detail } => {
+                write!(f, "DNS 解析失败（{host}）: {detail}")
+            }
+            Self::DnsNoResult(host) => write!(f, "域名 {host} 解析无结果，已拒绝"),
+            Self::DnsAmbiguous(host) => write!(
+                f,
+                "域名 {host} 解析到多个地址，当前 HTTP 客户端无法无风险绑定完整校验结果，已拒绝"
+            ),
+            Self::DnsRebinding { host, ip } => write!(
+                f,
+                "域名 {host} 解析到受保护地址（{ip}），已拒绝（疑似 DNS rebinding）"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UrlSafetyError {}
+
+/// URL 安全校验结果类型别名
+pub type UrlSafetyResult<T> = Result<T, UrlSafetyError>;
 
 /// 校验 HTTP(S) URL 的字面量安全属性（不发起 DNS 解析）。
 ///
@@ -36,7 +129,7 @@ use url::{Host, Url};
 ///
 /// 注意：域名不做 DNS 解析（同步上下文无法异步解析），
 /// 调用方在异步上下文中应额外调用 [check_dns_safety] 防 DNS rebinding。
-pub fn validate_http_url(url: &str) -> Result<(), String> {
+pub fn validate_http_url(url: &str) -> UrlSafetyResult<()> {
     let trimmed = url.trim();
     let authority = trimmed
         .split_once("://")
@@ -54,14 +147,14 @@ pub fn validate_http_url(url: &str) -> Result<(), String> {
     // 拒绝非标准 IPv4 编码形式（纯整数、十六进制 0x、八进制前导 0、省略段如 127.1）。
     // 这些混淆形式会被 url crate 规范化为回环/私网地址，若不预检可绕过网段检查。
     if is_encoded_ipv4(raw_host) {
-        return Err("不允许使用数字编码主机名".to_string());
+        return Err(UrlSafetyError::EncodedHostname);
     }
-    let parsed = Url::parse(trimmed).map_err(|e| format!("URL 格式非法: {e}"))?;
+    let parsed = Url::parse(trimmed).map_err(|e| UrlSafetyError::InvalidUrl(e.to_string()))?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("不支持的 URL scheme（仅支持 http/https）".to_string());
+        return Err(UrlSafetyError::UnsupportedScheme);
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("URL 不允许包含 userinfo（user:pass@host）".to_string());
+        return Err(UrlSafetyError::UserInfoNotAllowed);
     }
     if parsed.port() == Some(0)
         || url.trim().contains(":/")
@@ -69,22 +162,22 @@ pub fn validate_http_url(url: &str) -> Result<(), String> {
                 .host_str()
                 .is_some_and(|h| url.trim().contains(&format!("{h}:/")))
     {
-        return Err("URL 端口非法".to_string());
+        return Err(UrlSafetyError::InvalidPort);
     }
-    match parsed.host().ok_or_else(|| "URL 缺少主机名".to_string())? {
+    match parsed.host().ok_or(UrlSafetyError::MissingHost)? {
         Host::Ipv4(ip) => {
             if !is_safe_ipv4(ip) {
-                return Err(format!("目标地址位于受保护网段，已拒绝: {ip}"));
+                return Err(UrlSafetyError::ProtectedAddress(ip.to_string()));
             }
         }
         Host::Ipv6(ip) => {
             if !is_safe_ip(IpAddr::V6(ip)) {
-                return Err(format!("目标地址位于受保护网段，已拒绝: {ip}"));
+                return Err(UrlSafetyError::ProtectedAddress(ip.to_string()));
             }
         }
         Host::Domain(host) => {
             if !is_plausible_hostname(host) {
-                return Err(format!("主机名非法: {host}"));
+                return Err(UrlSafetyError::InvalidHostname(host.to_string()));
             }
         }
     }
@@ -97,22 +190,22 @@ pub fn validate_http_url(url: &str) -> Result<(), String> {
 /// 第二次解析却指向内网。此处一次性解析并复核所有候选 IP。
 /// 仅在 server feature 下可用（依赖 tokio net）。
 #[cfg(feature = "server")]
-pub async fn check_dns_safety(url: &str) -> Result<(), String> {
+pub async fn check_dns_safety(url: &str) -> UrlSafetyResult<()> {
     resolve_and_check_dns(url).await.map(|_| ())
 }
 
 /// 在同一次 DNS 解析结果上完成校验，并返回可绑定的连接地址。
 /// 调用方必须把返回地址注入 HTTP 客户端，避免校验解析与实际连接之间再次解析。
-pub async fn resolve_and_check_dns(url: &str) -> Result<Vec<std::net::IpAddr>, String> {
+pub async fn resolve_and_check_dns(url: &str) -> UrlSafetyResult<Vec<std::net::IpAddr>> {
     // 先执行完整的 URL 字面量校验，确保直接返回的 IP 地址也经过
     // scheme、userinfo、端口及受保护网段检查。
     validate_http_url(url)?;
-    let parsed = Url::parse(url.trim()).map_err(|e| format!("URL 格式非法: {e}"))?;
+    let parsed = Url::parse(url.trim()).map_err(|e| UrlSafetyError::InvalidUrl(e.to_string()))?;
     let host = match parsed.host() {
         Some(Host::Domain(domain)) => domain.to_string(),
         Some(Host::Ipv4(ip)) => return Ok(vec![IpAddr::V4(ip)]),
         Some(Host::Ipv6(ip)) => return Ok(vec![IpAddr::V6(ip)]),
-        None => return Err("URL 缺少主机名".to_string()),
+        None => return Err(UrlSafetyError::MissingHost),
     };
 
     // 2026-09-01 修复(P1)：DNS 校验必须拥有独立超时——调用方（如
@@ -124,29 +217,29 @@ pub async fn resolve_and_check_dns(url: &str) -> Result<Vec<std::net::IpAddr>, S
         tokio::net::lookup_host((host.clone(), 0)),
     )
     .await
-    .map_err(|_| format!("DNS 解析超时（5s）: {}", host))?
-    .map_err(|e| format!("DNS 解析失败（{}）: {}", host, e))?;
+    .map_err(|_| UrlSafetyError::DnsTimeout(host.clone()))?
+    .map_err(|e| UrlSafetyError::DnsResolveFailed {
+        host: host.clone(),
+        detail: e.to_string(),
+    })?;
     let addrs: Vec<std::net::SocketAddr> = iter.collect();
     // fail-closed：域名解析不到任何地址时直接拒绝，交由用户检查网络/拼写
     if addrs.is_empty() {
-        return Err(format!("域名 {} 解析无结果，已拒绝", host));
+        return Err(UrlSafetyError::DnsNoResult(host));
     }
     let ips: Vec<IpAddr> = addrs.into_iter().map(|addr| addr.ip()).collect();
     // reqwest 0.12 的 resolve(host, addr) 只提供单一覆盖地址；重复调用
     // 不能可靠地表达经过校验的多地址候选集。为避免只绑定首个地址而把
     // 其他候选留给连接器重新解析，这里对多地址结果 fail-closed。
     if ips.len() > 1 {
-        return Err(format!(
-            "域名 {} 解析到多个地址，当前 HTTP 客户端无法无风险绑定完整校验结果，已拒绝",
-            host
-        ));
+        return Err(UrlSafetyError::DnsAmbiguous(host));
     }
     for ip in &ips {
         if !is_safe_ip(*ip) {
-            return Err(format!(
-                "域名 {} 解析到受保护地址（{}），已拒绝（疑似 DNS rebinding）",
-                host, ip
-            ));
+            return Err(UrlSafetyError::DnsRebinding {
+                host: host.clone(),
+                ip: *ip,
+            });
         }
     }
     Ok(ips)
@@ -155,18 +248,18 @@ pub async fn resolve_and_check_dns(url: &str) -> Result<Vec<std::net::IpAddr>, S
 /// 从 URL authority 中提取主机名（兼容 host、host:port、[ipv6]:port 形式）。
 /// 仅测试使用（生产路径经 url crate 直接解析）。
 #[cfg(test)]
-fn extract_host(authority: &str) -> Result<String, String> {
-    let parsed =
-        Url::parse(&format!("http://{}", authority)).map_err(|e| format!("URL 格式非法: {e}"))?;
+fn extract_host(authority: &str) -> UrlSafetyResult<String> {
+    let parsed = Url::parse(&format!("http://{}", authority))
+        .map_err(|e| UrlSafetyError::InvalidUrl(e.to_string()))?;
     if parsed.username().is_empty() {
         match parsed.host() {
             Some(Host::Domain(domain)) => Ok(domain.to_string()),
             Some(Host::Ipv4(ip)) => Ok(ip.to_string()),
             Some(Host::Ipv6(ip)) => Ok(ip.to_string()),
-            None => Err("URL 缺少主机名".to_string()),
+            None => Err(UrlSafetyError::MissingHost),
         }
     } else {
-        Err("URL 不允许包含 userinfo（user:pass@host）".to_string())
+        Err(UrlSafetyError::UserInfoNotAllowed)
     }
 }
 

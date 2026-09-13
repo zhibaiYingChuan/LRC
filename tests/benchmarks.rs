@@ -11,6 +11,7 @@
 use std::time::Instant;
 use tempfile::TempDir;
 
+use code_memory::engine::audit_trail::{AuditEventType, AuditQuery};
 use code_memory::engine::dao_metrics::DaoMetricsSnapshot;
 use code_memory::memory_store::{MemoryStore, RecallFilter};
 use code_memory::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
@@ -353,10 +354,15 @@ fn benchmark_memory_decay_effectiveness() {
         }
     }
 
-    // 高重要性记忆应出现在检索结果中
+    // 检索必须返回候选集，且高重要性记忆应被检索到（衰减保护影响排序权重）
     assert!(
-        high_count >= 0,
+        high_count > 0,
         "高重要性记忆应出现在检索结果中，当前 high={high_count}, low={low_count}"
+    );
+    // 衰减保护的核心承诺：高重要性记忆的排序权重不应劣于低重要性记忆
+    assert!(
+        high_count >= low_count,
+        "高重要性记忆排序应不劣于低重要性记忆，当前 high={high_count}, low={low_count}"
     );
 
     // 检索结果中高重要性记忆的占比（在文本检索中，重要性会影响排序）
@@ -428,10 +434,16 @@ fn benchmark_synthesis_trigger_and_quality() {
         .collect::<Vec<_>>()
         .join(" ");
 
-    let has_keywords = combined.contains("数据库") && combined.contains("超时");
+    // 查询语义为“排查数据库超时的标准步骤”，检索结果必须命中核心主题词
+    assert!(!result.memories.is_empty(), "检索应返回至少一条结果");
+    let hit_db = result
+        .memories
+        .iter()
+        .take(5)
+        .any(|m| m.content.contains("数据库"));
     assert!(
-        has_keywords || result.memories.len() >= 3,
-        "检索结果应包含'数据库'和'超时'关键词，或返回至少 3 条结果"
+        hit_db,
+        "前 5 条检索结果中应至少有一条命中'数据库'主题词，实际结果: {combined}"
     );
 }
 
@@ -510,17 +522,19 @@ fn benchmark_anti_pollution_capability() {
     let prev_bias = std::env::var_os("LRC_STATE_BIAS");
     std::env::set_var("LRC_STATE_BIAS", "0");
 
-    // 写入 80 条核心事实记忆
+    // 写入 80 条核心事实记忆。
+    // 使用 remember_batch（明确跳过相似性合并，见 memory_store.rs:2924），
+    // 否则 80 条同模板、仅编号不同的核心事实会被 remember() 的相似合并
+    // （similarity_threshold = 0.5）折叠为 1 条，使 80/20 的注入比例失真，
+    // 导致"核心事实应占据检索高位"的抗污染度量无法成立。
     let core_facts = generate_test_memories(80, "core", Importance::new(8));
-    for m in &core_facts {
-        store.remember(m.clone()).expect("写入核心事实失败");
-    }
+    store
+        .remember_batch(core_facts)
+        .expect("批量写入核心事实失败");
 
-    // 写入 20 条噪声记忆（20% 噪声比例）
+    // 写入 20 条噪声记忆（20% 噪声比例），同样走批量路径保持 20 条独立噪声
     let noise = generate_noise_memories(20);
-    for m in &noise {
-        store.remember(m.clone()).expect("写入噪声记忆失败");
-    }
+    store.remember_batch(noise).expect("批量写入噪声记忆失败");
 
     // 多次检索核心事实，验证一致性
     let filter = RecallFilter::new().with_top_k(10);
@@ -553,19 +567,18 @@ fn benchmark_anti_pollution_capability() {
     );
 
     // 噪声记忆不应大量出现在前 5 条结果中
-    // v0.5.5 放宽：统计编码器（FastEncoder）在无 ML 模型时区分能力有限，
-    // 改为警告而非失败，记录噪声占比供后续优化参考
+    // 抗污染是核心承诺：噪声必须处于少数地位（前 5 条中至多 2 条），
+    // 否则"几何中心保护天然过滤外围噪声"的能力不成立。
     for ids in &top_ids {
         let noise_in_top5 = ids
             .iter()
             .take(5)
             .filter(|id| id.starts_with("noise"))
             .count();
-        if noise_in_top5 > 3 {
-            eprintln!(
-                "[测试警告] 前 5 条结果中噪声记忆 {noise_in_top5} 条（建议 ≤3），统计编码器区分能力有限，建议启用 ml feature 提升检索质量"
-            );
-        }
+        assert!(
+            noise_in_top5 <= 2,
+            "前 5 条结果中噪声记忆 {noise_in_top5} 条（应 ≤2），抗污染能力未达标，噪声可能污染核心事实"
+        );
     }
 
     // 恢复 LRC_STATE_BIAS 环境变量
@@ -622,12 +635,25 @@ fn benchmark_data_localization() {
         "记忆文件应包含写入的敏感数据"
     );
 
-    // 验证数据仅存储在本地（无外部网络请求）
-    // 信任中心 API 提供了网络请求验证能力
+    // 验证数据仅存储在本地：本地操作不应产生任何"对外发布"类审计事件
+    let published = store.audit_trail.query(&AuditQuery {
+        from_ms: None,
+        to_ms: None,
+        event_types: Some(vec![AuditEventType::TrustAnchorPublished]),
+        memory_id: None,
+        limit: None,
+    });
+    assert!(
+        published.is_empty(),
+        "本地读写操作不应产生对外发布审计事件，实际: {} 条",
+        published.len()
+    );
+
+    // 网络请求追踪变量若存在，不得包含任何对外 URL
     let network_var = std::env::var("LRC_NETWORK_REQUESTS").unwrap_or_default();
     assert!(
-        network_var.is_empty() || !network_var.contains("memory"),
-        "不应有记忆数据相关的网络请求"
+        !network_var.contains("http"),
+        "不应记录任何对外网络请求，实际: {network_var}"
     );
 }
 
@@ -645,7 +671,7 @@ fn benchmark_data_localization() {
 fn benchmark_audit_tamper_proof() {
     let (_dir, mut store) = make_store();
 
-    // 记录一些操作以生成审计事件
+    // 写入两条记忆，证明常规写入路径可用（该路径本身不产生审计事件）
     let mut m1 = Memory::new(
         "测试记忆 1".to_string(),
         MemoryType::Fact,
@@ -667,16 +693,33 @@ fn benchmark_audit_tamper_proof() {
     store.remember(m1).expect("写入记忆 1 失败");
     store.remember(m2).expect("写入记忆 2 失败");
 
-    // 验证审计日志完整性
-    // 注意：审计事件由系统自动记录，记录次数取决于系统配置
-    let total = store.audit_trail.total_count();
-    // 审计日志应在写入操作后至少有一条记录
-    // 如果审计事件未自动记录，则验证哈希链完整性（空链也是有效的）
-    if total > 0 {
-        assert!(total >= 1, "审计日志应至少有 1 条记录，当前 {total}");
-    }
+    // 生成真实审计事件。
+    // 注意：`remember()` 走"用户显式写入"路径，按设计不写审计日志；
+    // 审计事件仅由系统自主行为（GC / 合成 / 调节 / 隔离 / 锚定）产生，
+    // 见 memory_store.rs:2456 `record_audit` 的语义说明。
+    // 因此这里通过公开的 `record_audit` 显式落两条事件，作为哈希链的输入，
+    // 避免断言"记忆写入必然产生审计"这一与实现契约不符的前提。
+    store.record_audit(
+        AuditEventType::GcCleanup,
+        "基准测试：模拟 GC 清理审计",
+        "审计防篡改基准需要真实链输入",
+        vec!["test-audit-1".to_string()],
+    );
+    store.record_audit(
+        AuditEventType::RetrievalExecuted,
+        "基准测试：模拟检索执行审计",
+        "审计防篡改基准需要真实链输入",
+        vec!["test-audit-2".to_string()],
+    );
 
-    // 验证哈希链完整性（空链也应通过验证）
+    // 验证审计日志确有记录
+    let total = store.audit_trail.total_count();
+    assert!(
+        total >= 2,
+        "两次显式审计记录后审计日志应至少 2 条事件，当前 {total} 条"
+    );
+
+    // 验证哈希链完整性
     let integrity = store.audit_trail.verify_integrity();
     assert!(
         integrity.is_valid,
@@ -684,14 +727,29 @@ fn benchmark_audit_tamper_proof() {
         integrity.details
     );
 
-    // 验证信任锚点
+    // 验证信任锚点：链非空时创建锚点，锚点须封装真实链状态且锚点链可验证
+    let anchor = store.audit_trail.create_anchor();
+    assert!(!anchor.anchor_id.is_empty(), "创建的信任锚点应带有非空标识");
+    assert!(
+        !anchor.last_event_hash.is_empty(),
+        "非空审计链创建的锚点必须封装真实的最后事件哈希"
+    );
+    assert!(
+        !anchor.anchor_merkle_root.is_empty(),
+        "锚点应包含非空的 Merkle 根"
+    );
     let anchors = store.audit_trail.get_anchors();
     let anchor_count = anchors.len();
-    // 锚点可能为空（如果尚未自动创建），但不应报错
-    if anchor_count > 0 {
-        let anchor_valid = store.audit_trail.verify_anchor_chain();
-        assert!(anchor_valid, "锚点链应完整，锚点数: {anchor_count}");
-    }
+    assert!(anchor_count > 0, "创建锚点后锚点列表不应为空");
+    let anchor_valid = store.audit_trail.verify_anchor_chain();
+    assert!(anchor_valid, "锚点链应完整，锚点数: {anchor_count}");
+
+    // 创建锚点本身会写入一条 TrustAnchorCreated 审计事件，链长应增长
+    let after_anchor = store.audit_trail.total_count();
+    assert!(
+        after_anchor > total,
+        "创建锚点应追加 TrustAnchorCreated 审计事件，锚定前 {total} 条，锚定后 {after_anchor} 条"
+    );
 }
 
 /// 基准 3.3：隐私级别隔离

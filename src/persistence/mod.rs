@@ -9,7 +9,10 @@
 // 默认实现为 JSON 文件存储，后续可扩展 SQLite/Redis 等后端。
 
 use crate::chunker::CodeChunk;
-use crate::engine::memory_state_machine::MemoryState;
+// v0.9.7（P0-2 依赖倒置修复）：原为 `crate::engine::memory_state_machine::MemoryState`——
+// Layer 1 反向依赖 Layer 2。该类型已上提至 Layer 1 顶层（`crate::memory_state_machine`），
+// 本处改为指向中立层，消除 Layer 1 → Layer 2 的依赖倒置。
+use crate::memory_state_machine::MemoryState;
 use crate::memory_types::Memory;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -54,7 +57,18 @@ impl fmt::Display for PersistenceError {
     }
 }
 
-impl Error for PersistenceError {}
+impl Error for PersistenceError {
+    // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P1-6「错误处理不统一」）：
+    //   此前为空的 `impl Error`，包裹的 io::Error / serde_json::Error 无法沿错误链
+    //   回溯（`Error::source()` 恒为 None）。补齐后调用方可逐层打印根因。
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Serialization(e) => Some(e),
+            Self::NotFound(_) | Self::Other(_) => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for PersistenceError {
     fn from(e: std::io::Error) -> Self {

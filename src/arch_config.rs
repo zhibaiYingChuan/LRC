@@ -1,15 +1,15 @@
-// ============================================================
-// 许可证: Apache 2.0
-// 本文件实现架构记忆存储，属于公开层 (Layer 1)。
-// ============================================================
-//
-// 架构记忆配置（Architecture Memory Config）
-//
-// 架构记忆存储：
-//   存储编码器参数、衰减曲线、权限策略等系统级配置，
-//   支持系统自举与演化（服务重启后自动恢复上次运行参数）。
-//
-// 持久化格式：JSON 文件，存储在数据目录下的 `arch_config.json`
+//! ============================================================
+//! 许可证: Apache 2.0
+//! 本文件实现架构记忆存储，属于公开层 (Layer 1)。
+//! ============================================================
+//!
+//! 架构记忆配置（Architecture Memory Config）
+//!
+//! 架构记忆存储：
+//!   存储编码器参数、衰减曲线、权限策略等系统级配置，
+//!   支持系统自举与演化（服务重启后自动恢复上次运行参数）。
+//!
+//! 持久化格式：JSON 文件，存储在数据目录下的 `arch_config.json`
 
 use crate::memory_types::DecayConfig;
 use serde::{Deserialize, Serialize};
@@ -190,9 +190,10 @@ impl ArchConfig {
         let mut config = self.clone();
         config.updated_at = chrono::Utc::now().to_rfc3339();
         let json = serde_json::to_string_pretty(&config).map_err(std::io::Error::other)?;
-        let temp_path = format!("{}.tmp", path);
-        std::fs::write(&temp_path, json)?;
-        std::fs::rename(temp_path, path)
+        // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P3-3「原子写入逻辑重复 4 处」）：
+        //   原为固定临时名 `format!("{}.tmp", path)` 且失败不清理——并发写同一
+        //   数据目录时会争用同一临时文件。现统一委托 Layer 1 公共设施。
+        crate::atomic_file::write_atomic(std::path::Path::new(&path), json.as_bytes())
     }
 
     /// 更新衰减配置并保存

@@ -80,6 +80,22 @@ impl From<String> for EmbedError {
     }
 }
 
+/// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：编码器/LLM 的错误已收敛为
+/// [`crate::errors::LrcError`]，此处按其域映射到 EmbedError，保持 Embedder 抽象对
+/// 调用方的错误语义不退化（网络失败仍归 Network，其余归 Inference）。
+/// `Display` 只输出 message，故错误文案与改造前一致。
+impl From<crate::errors::LrcError> for EmbedError {
+    fn from(error: crate::errors::LrcError) -> Self {
+        use crate::errors::ErrorKind;
+        match error.kind {
+            ErrorKind::Network | ErrorKind::Timeout => EmbedError::Network(error.message),
+            ErrorKind::Config | ErrorKind::InvalidInput => EmbedError::Config(error.message),
+            ErrorKind::NotFound | ErrorKind::Unsupported => EmbedError::ModelLoad(error.message),
+            _ => EmbedError::Inference(error.message),
+        }
+    }
+}
+
 // ============================================================
 // Embedder Trait
 // ============================================================
@@ -284,7 +300,7 @@ impl Embedder for LlmApiEmbedder {
         self.config
             .embed_texts(texts)
             .await
-            .map_err(EmbedError::Network)
+            .map_err(EmbedError::from)
     }
 
     fn dim(&self) -> usize {

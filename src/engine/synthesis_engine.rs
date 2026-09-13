@@ -26,6 +26,24 @@ use crate::engine::synthesis_journal::SynthesisJournal;
 use crate::graph_store::{EdgeType, GraphMemoryStore};
 use crate::memory_types::{Importance, Memory, MemoryType};
 use crate::persistence::Persistence;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 协作式取消检查粒度（v0.9.7）
+///
+/// `cluster_from_all` 的 O(n²) 全对 Jaccard 比较最坏约 12.5 万次（n 上限 500）。
+/// 若每轮内层循环都读一次原子标志，检查开销会显著侵蚀计算本身；
+/// 每 64 次探测检查一次，兼顾"响应及时"（最多多算 63 次比较，微秒级）
+/// 与"开销可忽略"。取值理由与 `memory_store.rs` 的取消检查点同源。
+const CANCEL_CHECK_INTERVAL: usize = 64;
+
+/// 读取取消标志（缺失/未置位 = 不取消）
+///
+/// 内存序用 `Acquire`，与写入端的 `Release` 配对——保证置位前一瞬的
+/// 副作用对读到 `true` 的线程可见（与 v0.9.7 r15 统一的内存序口径一致）。
+#[inline]
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+}
 
 /// 合成引擎配置
 #[derive(Debug, Clone)]
@@ -144,6 +162,28 @@ impl SynthesisEngine {
     ///
     /// 三阶段锁解耦：此方法仅做 CPU 聚类计算，可在锁外调用。
     pub fn cluster_from_all(&self, all: &[Memory]) -> Vec<Vec<Memory>> {
+        self.cluster_from_all_cancellable(all, None).0
+    }
+
+    /// `cluster_from_all` 的**可取消**版本（v0.9.7 新增）。
+    ///
+    /// 背景（GLOBAL_CODE_REVIEW_REPORT 第五节第 7 项「`spawn_blocking` 超时后应可中断或补偿」）：
+    ///   `run_cycle` 用 `timeout(CYCLE_TIMEOUT, ...)` 包裹结晶流程，但 `spawn_blocking`
+    ///   提交的任务**无法被 tokio 强杀**——超时后该任务仍会在后台线程跑完 O(n²) 聚类。
+    ///   报告原文要求"可中断**或补偿**"，此处实现**协作式取消（补偿路径）**：
+    ///   调用方在超时/关闭时置位 `cancel`，计算方在循环内周期性自查后**提前返回**，
+    ///   从而把"超时后仍跑满 12.5 万次比较"降为"最多多跑 63 次"。
+    ///
+    /// 语义保证：`cancel` 为 `None` 时行为与 `cluster_from_all` **逐字节一致**（含返回值与顺序），
+    /// 故既有调用方与测试零影响。
+    ///
+    /// 返回 `(clusters, cancelled)`：`cancelled=true` 表示因取消而提前返回，
+    /// 此时 `clusters` 为**不完整结果**，调用方**不应**据此写回数据（须丢弃并保留待重试标记）。
+    pub fn cluster_from_all_cancellable(
+        &self,
+        all: &[Memory],
+        cancel: Option<&AtomicBool>,
+    ) -> (Vec<Vec<Memory>>, bool) {
         let mut candidates: Vec<&Memory> = all
             .iter()
             .filter(|m| !m.is_expired() && m.memory_type != MemoryType::Synthesis)
@@ -161,7 +201,7 @@ impl SynthesisEngine {
         }
 
         if candidates.len() < self.config.min_cluster {
-            return Vec::new();
+            return (Vec::new(), false);
         }
 
         let n = candidates.len();
@@ -191,8 +231,14 @@ impl SynthesisEngine {
             }
         }
 
+        let mut probes: usize = 0;
         for i in 0..n {
             for j in (i + 1)..n {
+                // 协作式取消：每 CANCEL_CHECK_INTERVAL 次比较检查一次标志
+                probes += 1;
+                if probes % CANCEL_CHECK_INTERVAL == 0 && is_cancelled(cancel) {
+                    return (Vec::new(), true);
+                }
                 let sim = self.compute_jaccard(&candidates[i].content, &candidates[j].content);
                 if sim >= self.config.similarity {
                     union(&mut parent, &mut rank, i, j);
@@ -207,11 +253,14 @@ impl SynthesisEngine {
             groups.entry(root).or_default().push(i);
         }
 
-        groups
-            .into_values()
-            .filter(|indices| indices.len() >= self.config.min_cluster)
-            .map(|indices| indices.into_iter().map(|i| candidates[i].clone()).collect())
-            .collect()
+        (
+            groups
+                .into_values()
+                .filter(|indices| indices.len() >= self.config.min_cluster)
+                .map(|indices| indices.into_iter().map(|i| candidates[i].clone()).collect())
+                .collect(),
+            false,
+        )
     }
 
     /// 查找相似记忆簇（用于递归合成）
@@ -362,9 +411,24 @@ impl SynthesisEngine {
     ///
     /// 接收全量记忆快照，产出 SynthesisPlan（不含持久化）。
     pub fn plan_jaccard(&self, all: &[Memory]) -> SynthesisPlan {
-        let clusters = self.cluster_from_all(all);
+        self.plan_jaccard_cancellable(all, None).0
+    }
+
+    /// `plan_jaccard` 的**可取消**版本（v0.9.7 新增，见 `cluster_from_all_cancellable` 的说明）。
+    ///
+    /// 返回 `(plan, cancelled)`：`cancelled=true` 时 `plan` 为**不完整计划**，
+    /// 调用方**不得**写回（否则会把只算了一半的聚类结果落盘）。
+    pub fn plan_jaccard_cancellable(
+        &self,
+        all: &[Memory],
+        cancel: Option<&AtomicBool>,
+    ) -> (SynthesisPlan, bool) {
+        let (clusters, cancelled) = self.cluster_from_all_cancellable(all, cancel);
+        if cancelled {
+            return (SynthesisPlan::default(), true);
+        }
         if clusters.is_empty() {
-            return SynthesisPlan::default();
+            return (SynthesisPlan::default(), false);
         }
 
         let existing_sources: std::collections::HashSet<Vec<String>> = all
@@ -380,6 +444,10 @@ impl SynthesisEngine {
         let mut plan = SynthesisPlan::default();
 
         for cluster in &clusters {
+            // 簇级取消检查：簇数远小于 O(n²)，此处逐簇检查代价可忽略
+            if is_cancelled(cancel) {
+                return (SynthesisPlan::default(), true);
+            }
             let mut cluster_ids: Vec<String> = cluster.iter().map(|m| m.id.clone()).collect();
             cluster_ids.sort();
 
@@ -397,7 +465,7 @@ impl SynthesisEngine {
             plan.synthesized += 1;
         }
 
-        plan
+        (plan, false)
     }
 
     /// 道枢映射: 震卦·雷 (☳) — 万物出乎震，合成如春雷唤醒新生，信息增益阈值是萌发的门槛
@@ -441,6 +509,23 @@ impl SynthesisEngine {
     /// 接收全量记忆快照，产出 SynthesisPlan（不含持久化与内存副作用）。
     /// 可在锁外调用，避免 CPU 密集的 recursive_compose 持有全局锁。
     pub fn plan_luoshu(&self, all: &[Memory], information_gain_threshold: f32) -> SynthesisPlan {
+        self.plan_luoshu_cancellable(all, information_gain_threshold, None)
+            .0
+    }
+
+    /// `plan_luoshu` 的**可取消**版本（v0.9.7 新增，见 `cluster_from_all_cancellable` 的说明）。
+    ///
+    /// 取消检查点设于**每个八卦分组**的开头：`recursive_compose` 单组耗时通常为毫秒级，
+    /// 组内不设检查点可避免侵入受保护的核心算法；组间检查已足以把
+    /// "超时后跑完所有分组"降为"最多多跑一个分组"。
+    ///
+    /// 返回 `(plan, cancelled)`：`cancelled=true` 时 `plan` 为**不完整计划**，调用方不得写回。
+    pub fn plan_luoshu_cancellable(
+        &self,
+        all: &[Memory],
+        information_gain_threshold: f32,
+        cancel: Option<&AtomicBool>,
+    ) -> (SynthesisPlan, bool) {
         let candidates: Vec<&Memory> = all
             .iter()
             .filter(|m| {
@@ -451,7 +536,7 @@ impl SynthesisEngine {
             .collect();
 
         if candidates.len() < self.config.min_cluster {
-            return SynthesisPlan::default();
+            return (SynthesisPlan::default(), false);
         }
 
         let mut groups: std::collections::HashMap<u8, Vec<&Memory>> =
@@ -476,6 +561,11 @@ impl SynthesisEngine {
         let mut plan = SynthesisPlan::default();
 
         for (bagua_idx, group) in &groups {
+            // v0.9.7 协作式取消：每个八卦分组开头检查一次（组内 recursive_compose
+            // 为受保护核心算法，不侵入其内部循环）
+            if is_cancelled(cancel) {
+                return (SynthesisPlan::default(), true);
+            }
             if group.len() < self.config.min_cluster {
                 continue;
             }
@@ -568,7 +658,7 @@ impl SynthesisEngine {
             plan.synthesized += 1;
         }
 
-        plan
+        (plan, false)
     }
 
     /// 洛书驱动递归合成（M.T.R. RecursiveCompose 增强版）
@@ -644,6 +734,8 @@ mod tests {
     }
 
     /// 创建合成类型测试用记忆
+    ///
+    /// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `never used`）。
     #[allow(dead_code)]
     fn make_synthesis_memory(source_ids: Vec<&str>) -> Memory {
         let mut m = Memory::new(

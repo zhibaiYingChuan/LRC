@@ -1,33 +1,37 @@
-// ============================================================
-// 许可证: Apache 2.0
-// 本文件实现记忆数据导出/导入，属于公开层 (Layer 1)。
-// ============================================================
-//
-// 数据导出/导入模块 — 支持记忆数据的备份、恢复和迁移
-//
-// 核心能力:
-//   1. lrc export — 导出记忆数据到 JSON 文件
-//   2. lrc import — 从 JSON 文件导入记忆数据
-//   3. 支持项目级和全局模式的导出
-//   4. 导入时验证数据格式和完整性
-//
-// 导出文件格式（V2）：
-//   {
-//     "version": "2.0",
-//     "exported_at": "ISO8601",
-//     "fingerprint": "sha256前16位",
-//     "canonical_path": "规范化路径",
-//     "memories": [...],
-//     "chunks": [...],
-//     "archive": [...]
-//   }
-//
-// 安全原则：
-//   - 导入时不清除现有数据（追加模式）
-//   - 导入前验证 JSON 结构完整性
-//   - 支持 dry-run 预览导入内容
+//! ============================================================
+//! 许可证: Apache 2.0
+//! 本文件实现记忆数据导出/导入，属于公开层 (Layer 1)。
+//! ============================================================
+//!
+//! 数据导出/导入模块 — 支持记忆数据的备份、恢复和迁移
+//!
+//! 核心能力:
+//!   1. lrc export — 导出记忆数据到 JSON 文件
+//!   2. lrc import — 从 JSON 文件导入记忆数据
+//!   3. 支持项目级和全局模式的导出
+//!   4. 导入时验证数据格式和完整性
+//!
+//! 导出文件格式（V2）：
+//!   {
+//!     "version": "2.0",
+//!     "exported_at": "ISO8601",
+//!     "fingerprint": "sha256前16位",
+//!     "canonical_path": "规范化路径",
+//!     "memories": [...],
+//!     "chunks": [...],
+//!     "archive": [...]
+//!   }
+//!
+//! 安全原则：
+//!   - 导入时不清除现有数据（追加模式）
+//!   - 导入前验证 JSON 结构完整性
+//!   - 支持 dry-run 预览导入内容
 
 use crate::data_dir::DataDir;
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：错误由不可判别的 String 收敛为
+// 带域分类的 LrcError（io / parse / not_found / invalid_input）。Display 只输出
+// message，故 CLI 边界的用户可见文案零漂移。
+use crate::errors::{LrcError, LrcResult};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -95,27 +99,27 @@ pub struct ExportResult {
 ///
 /// # 返回
 /// - `Ok(ExportResult)`: 导出结果
-/// - `Err(String)`: 错误描述
+/// - `Err(LrcError)`: 带域分类的错误（io / parse / not_found）
 pub fn export_memories(
     data_dir_manager: &DataDir,
     output_path: Option<&Path>,
     src_dir: Option<&Path>,
-) -> Result<ExportResult, String> {
+) -> LrcResult<ExportResult> {
     let data_path = data_dir_manager.data_path();
 
     // 确保数据目录存在
     if !data_path.exists() {
-        return Err(format!(
+        return Err(LrcError::not_found(format!(
             "数据目录不存在: {}。请先启动 LRC 服务以生成记忆数据。",
             data_path.display()
-        ));
+        )));
     }
 
     // 读取记忆数据
     let memories_path = data_path.join("memories.json");
     let memories: serde_json::Value = if memories_path.exists() {
         let content = fs::read_to_string(&memories_path)
-            .map_err(|e| format!("读取 memories.json 失败: {}", e))?;
+            .map_err(|e| LrcError::io(format!("读取 memories.json 失败: {}", e)))?;
         serde_json::from_str(&content).unwrap_or(serde_json::json!([]))
     } else {
         serde_json::json!([])
@@ -125,7 +129,7 @@ pub fn export_memories(
     let chunks_path = data_path.join("chunks.json");
     let chunks: serde_json::Value = if chunks_path.exists() {
         let content = fs::read_to_string(&chunks_path)
-            .map_err(|e| format!("读取 chunks.json 失败: {}", e))?;
+            .map_err(|e| LrcError::io(format!("读取 chunks.json 失败: {}", e)))?;
         serde_json::from_str(&content).unwrap_or(serde_json::json!([]))
     } else {
         serde_json::json!([])
@@ -135,7 +139,7 @@ pub fn export_memories(
     let archive_path = data_path.join("archive.json");
     let archive: serde_json::Value = if archive_path.exists() {
         let content = fs::read_to_string(&archive_path)
-            .map_err(|e| format!("读取 archive.json 失败: {}", e))?;
+            .map_err(|e| LrcError::io(format!("读取 archive.json 失败: {}", e)))?;
         serde_json::from_str(&content).unwrap_or(serde_json::json!([]))
     } else {
         serde_json::json!([])
@@ -172,7 +176,7 @@ pub fn export_memories(
 
     // 序列化导出数据
     let json_str = serde_json::to_string_pretty(&export_data)
-        .map_err(|e| format!("序列化导出数据失败: {}", e))?;
+        .map_err(|e| LrcError::parse(format!("序列化导出数据失败: {}", e)))?;
 
     // 确定输出路径
     let file_path = if let Some(path) = output_path {
@@ -180,7 +184,7 @@ pub fn export_memories(
     } else {
         let exports_dir = data_dir_manager
             .ensure_exports_dir()
-            .map_err(|e| format!("创建导出目录失败: {}", e))?;
+            .map_err(|e| LrcError::io(format!("创建导出目录失败: {}", e)))?;
         let timestamp = {
             use std::time::SystemTime;
             SystemTime::now()
@@ -193,7 +197,8 @@ pub fn export_memories(
     };
 
     // 写入文件
-    fs::write(&file_path, &json_str).map_err(|e| format!("写入导出文件失败: {}", e))?;
+    fs::write(&file_path, &json_str)
+        .map_err(|e| LrcError::io(format!("写入导出文件失败: {}", e)))?;
 
     let file_size = json_str.len() as u64;
 
@@ -214,34 +219,37 @@ pub fn export_memories(
 ///
 /// # 返回
 /// - `Ok(ImportResult)`: 导入结果
-/// - `Err(String)`: 错误描述
+/// - `Err(LrcError)`: 带域分类的错误（io / parse / not_found / invalid_input）
 pub fn import_memories(
     import_path: &Path,
     data_dir_manager: &DataDir,
     dry_run: bool,
-) -> Result<ImportResult, String> {
+) -> LrcResult<ImportResult> {
     // 验证导入文件存在
     if !import_path.exists() {
-        return Err(format!("导入文件不存在: {}", import_path.display()));
+        return Err(LrcError::not_found(format!(
+            "导入文件不存在: {}",
+            import_path.display()
+        )));
     }
 
     // 读取并解析导入文件
-    let content =
-        fs::read_to_string(import_path).map_err(|e| format!("读取导入文件失败: {}", e))?;
+    let content = fs::read_to_string(import_path)
+        .map_err(|e| LrcError::io(format!("读取导入文件失败: {}", e)))?;
 
     let export_data: ExportData = serde_json::from_str(&content).map_err(|e| {
-        format!(
+        LrcError::parse(format!(
             "解析导入文件失败: {}\n提示: 请确认文件是有效的 LRC 导出 JSON",
             e
-        )
+        ))
     })?;
 
     // 验证版本
     if export_data.version != EXPORT_VERSION {
-        return Err(format!(
+        return Err(LrcError::invalid_input(format!(
             "导出文件版本不匹配: 期望 {}，实际 {}",
             EXPORT_VERSION, export_data.version
-        ));
+        )));
     }
 
     let mut result = ImportResult::default();
@@ -271,7 +279,7 @@ pub fn import_memories(
     let data_path = data_dir_manager.data_path();
     data_dir_manager
         .ensure()
-        .map_err(|e| format!("创建数据目录失败: {}", e))?;
+        .map_err(|e| LrcError::io(format!("创建数据目录失败: {}", e)))?;
 
     // 导入记忆数据（追加模式）
     if memory_count > 0 {
@@ -286,9 +294,9 @@ pub fn import_memories(
         // 简单合并：将导入的记忆追加到现有数据
         let merged = merge_arrays(&existing, &export_data.memories);
         let merged_str = serde_json::to_string_pretty(&merged)
-            .map_err(|e| format!("序列化合并后的记忆数据失败: {}", e))?;
+            .map_err(|e| LrcError::parse(format!("序列化合并后的记忆数据失败: {}", e)))?;
         fs::write(&memories_path, merged_str)
-            .map_err(|e| format!("写入 memories.json 失败: {}", e))?;
+            .map_err(|e| LrcError::io(format!("写入 memories.json 失败: {}", e)))?;
         result.memories_imported = memory_count;
     }
 
@@ -304,8 +312,9 @@ pub fn import_memories(
 
         let merged = merge_arrays(&existing, &export_data.chunks);
         let merged_str = serde_json::to_string_pretty(&merged)
-            .map_err(|e| format!("序列化合并后的代码片段失败: {}", e))?;
-        fs::write(&chunks_path, merged_str).map_err(|e| format!("写入 chunks.json 失败: {}", e))?;
+            .map_err(|e| LrcError::parse(format!("序列化合并后的代码片段失败: {}", e)))?;
+        fs::write(&chunks_path, merged_str)
+            .map_err(|e| LrcError::io(format!("写入 chunks.json 失败: {}", e)))?;
         result.chunks_imported = chunk_count;
     }
 
@@ -321,9 +330,9 @@ pub fn import_memories(
 
         let merged = merge_arrays(&existing, &export_data.archive);
         let merged_str = serde_json::to_string_pretty(&merged)
-            .map_err(|e| format!("序列化合并后的归档数据失败: {}", e))?;
+            .map_err(|e| LrcError::parse(format!("序列化合并后的归档数据失败: {}", e)))?;
         fs::write(&archive_path, merged_str)
-            .map_err(|e| format!("写入 archive.json 失败: {}", e))?;
+            .map_err(|e| LrcError::io(format!("写入 archive.json 失败: {}", e)))?;
         result.archive_imported = archive_count;
     }
 
@@ -365,18 +374,22 @@ fn merge_arrays(existing: &serde_json::Value, new: &serde_json::Value) -> serde_
 }
 
 /// 验证导出文件格式
-pub fn validate_export_file(path: &Path) -> Result<ExportData, String> {
+pub fn validate_export_file(path: &Path) -> LrcResult<ExportData> {
     if !path.exists() {
-        return Err(format!("文件不存在: {}", path.display()));
+        return Err(LrcError::not_found(format!(
+            "文件不存在: {}",
+            path.display()
+        )));
     }
-    let content = fs::read_to_string(path).map_err(|e| format!("读取文件失败: {}", e))?;
-    let data: ExportData =
-        serde_json::from_str(&content).map_err(|e| format!("JSON 格式无效: {}", e))?;
+    let content =
+        fs::read_to_string(path).map_err(|e| LrcError::io(format!("读取文件失败: {}", e)))?;
+    let data: ExportData = serde_json::from_str(&content)
+        .map_err(|e| LrcError::parse(format!("JSON 格式无效: {}", e)))?;
     if data.version != EXPORT_VERSION {
-        return Err(format!(
+        return Err(LrcError::invalid_input(format!(
             "版本不匹配: 期望 {}，实际 {}",
             EXPORT_VERSION, data.version
-        ));
+        )));
     }
     Ok(data)
 }

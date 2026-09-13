@@ -11,7 +11,9 @@
 
 use super::{AssocFrequency, Persistence, PersistenceError};
 use crate::chunker::CodeChunk;
-use crate::engine::memory_state_machine::MemoryState;
+// v0.9.7（P0-2 依赖倒置修复）：原为 `crate::engine::memory_state_machine::MemoryState`，
+// 现指向 Layer 1 中立层，消除 Layer 1 → Layer 2 反向依赖。
+use crate::memory_state_machine::MemoryState;
 use crate::memory_types::Memory;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -19,6 +21,37 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+/// 锁序契约（v0.9.7 修复 GLOBAL_CODE_REVIEW_REPORT 并发 P1-5「嵌套锁」）
+/// ============================================================
+/// 本模块存在两把锁，**必须**按下述固定顺序获取，否则会构成 ABBA 死锁：
+///
+/// ```text
+///   获取顺序（外层 → 内层）：
+///     ① self.cache  (RwLock<Option<Vec<Memory>>>)   —— 进程内缓存一致性
+///     ② JSON_WRITE_LOCK (Mutex<()>)                 —— 跨进程/跨实例文件写入串行化
+///   另有独立于上述两把的进程级文件锁：
+///     ③ self.acquire_process_write_guard()          —— 跨进程 flock（实现见下）
+/// ```
+///
+/// **为什么 JSON_WRITE_LOCK 是全局单例而非 per-instance**：
+///   同一个数据目录可能被**多个 `JsonPersistence` 实例**持有（测试并行、多窗口
+///   桌面端、CLI 与 sidecar 同时运行）。若锁放在实例字段上，两个实例各自持有
+///   不同的锁去写**同一个** `memories.json`，`fs::rename` 前的 tmp 文件虽已加
+///   UUID（见 `atomic_write`），但重命名仍会互相覆盖。全局单例保证同一进程内
+///   所有实例的文件写入串行。
+///
+/// **当前调用点**：`atomic_write()` 内部获取 ②（见本文件 `atomic_write`）。
+///   调用方在 `save_memory` / `batch_update` 等路径上**先**持有 ① 的写锁，
+///   再通过 `atomic_write` 间接获取 ②，符合上文顺序，无逆向获取点。
+///
+/// **已知代价（有意接受，非缺陷）**：持 ① 期间执行磁盘 IO 会放大临界区
+///   （见报告并发 P2-1）。选择接受的原因：JSON 后端定位为轻量部署
+///   （<10,000 条），且放弃该顺序会引入"缓存与磁盘不一致"的正确性风险——
+///   正确性优先于吞吐。若未来切换 SQLite/Qdrant 后端，应改用后端自身的
+///   事务语义替代本锁序。
+///
+/// **改动须知**：任何新增的写路径都**不得**在持有 ② 时去获取 ①（即禁止
+///   在 `atomic_write` 内部或其后回调中调用 `self.cache.write()`）。
 static JSON_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// JSON 文件持久化后端
@@ -82,7 +115,6 @@ impl JsonPersistence {
     }
 
     /// 获取数据目录路径（供外部读取）
-    #[allow(dead_code)]
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -101,7 +133,6 @@ impl JsonPersistence {
     }
 
     /// 使缓存失效（当外部修改文件时调用）
-    #[allow(dead_code)]
     pub fn invalidate_cache(&self) {
         *self.cache.write().unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -221,9 +252,16 @@ impl Persistence for JsonPersistence {
         // 每个进程都必须在事务锁内重新读取事实源，避免旧缓存覆盖其他进程的更新。
         self.refresh_cache_from_disk()?;
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
-        let memories = cache
-            .as_mut()
-            .expect("缓存已通过 ensure_cache_loaded 初始化");
+        // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT 第五节第 5 项「收敛生产路径 expect」）：
+        //   原为 .expect("缓存已通过 ensure_cache_loaded 初始化")——该不变量由上一行
+        //   refresh_cache_from_disk() 的成功返回保证（失败时已 `?` 提前返回），
+        //   但一旦未来重构漏掉刷新调用，此处会 panic 而非返回可恢复错误。
+        //   改为 map_err 转 PersistenceError，消除库路径 panic 面。
+        let memories = cache.as_mut().ok_or_else(|| {
+            PersistenceError::Other(
+                "内存缓存未初始化（refresh_cache_from_disk 未生效）".to_string(),
+            )
+        })?;
         let previous = memories.clone();
 
         // 按 ID 查找并更新，或追加新记忆
@@ -271,7 +309,12 @@ impl Persistence for JsonPersistence {
         // 每个进程都必须在事务锁内重新读取事实源，避免旧缓存覆盖其他进程的更新。
         self.refresh_cache_from_disk()?;
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
-        let memories = cache.as_mut().expect("缓存已通过磁盘刷新初始化");
+        // v0.9.7 修复：同上，消除库路径 panic 面（原为 .expect("缓存已通过磁盘刷新初始化")）
+        let memories = cache.as_mut().ok_or_else(|| {
+            PersistenceError::Other(
+                "内存缓存未初始化（refresh_cache_from_disk 未生效）".to_string(),
+            )
+        })?;
         let previous = memories.clone();
 
         // 构建待更新记忆的 ID → Memory 映射，O(M) 查找
@@ -317,7 +360,12 @@ impl Persistence for JsonPersistence {
         let _process_guard = self.acquire_process_write_guard()?;
         self.refresh_cache_from_disk()?;
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
-        let existing = cache.as_mut().expect("缓存已通过磁盘刷新初始化");
+        // v0.9.7 修复：同上，消除库路径 panic 面（原为 .expect("缓存已通过磁盘刷新初始化")）
+        let existing = cache.as_mut().ok_or_else(|| {
+            PersistenceError::Other(
+                "内存缓存未初始化（refresh_cache_from_disk 未生效）".to_string(),
+            )
+        })?;
         let previous = existing.clone();
 
         // 构建 ID → 索引 映射，支持"已存在则更新，不存在则追加"
@@ -382,7 +430,12 @@ impl Persistence for JsonPersistence {
         // 每个进程都必须在事务锁内重新读取事实源，避免旧缓存覆盖其他进程的更新。
         self.refresh_cache_from_disk()?;
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
-        let memories = cache.as_mut().expect("缓存已通过磁盘刷新初始化");
+        // v0.9.7 修复：同上，消除库路径 panic 面（原为 .expect("缓存已通过磁盘刷新初始化")）
+        let memories = cache.as_mut().ok_or_else(|| {
+            PersistenceError::Other(
+                "内存缓存未初始化（refresh_cache_from_disk 未生效）".to_string(),
+            )
+        })?;
         let previous = memories.clone();
         let original_len = memories.len();
         memories.retain(|m| m.id != id);
@@ -530,6 +583,7 @@ impl Persistence for JsonPersistence {
 /// 原子写入：先写临时文件，再重命名（同文件系统内是原子操作）
 /// 防止崩溃时产生损坏的 JSON 文件
 fn atomic_write(path: &Path, content: &str) -> Result<(), PersistenceError> {
+    // 锁序②：见文件顶部「锁序契约」。调用方须已按序持有锁①（cache 写锁）。
     let _guard = JSON_WRITE_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()

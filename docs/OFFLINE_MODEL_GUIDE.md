@@ -2,6 +2,13 @@
 
 > 适用场景：网络受限、内网环境、或下载速度慢——希望手动下载模型文件，完全离线使用。
 
+> **⚠️ 默认模型提示（v0.9.x）**：当前默认嵌入模型由 `src/engine/model_resolver.rs` 的
+> `selected_model_id()` 决定——**中文环境为 `BAAI/bge-small-zh`**，其他语言为
+> **`sentence-transformers/all-MiniLM-L6-v2`**；可通过环境变量 `LRC_LUOSHU_MODEL_ID`
+> 或 `~/.lrc/config.toml` 的 `model_id` 覆盖。下文以 `microsoft/graphcodebert-base`
+> 为例演示目录结构，**该模型现为可选的代码检索/向后兼容模型**；若需离线使用默认模型，
+> 请把示例中的模型 ID 与文件夹名替换为 `BAAI/bge-small-zh`（对应目录 `models/BAAI--bge-small-zh/`）。
+
 ---
 
 ## 方式一：放到项目 `models/` 文件夹（最简单，推荐）

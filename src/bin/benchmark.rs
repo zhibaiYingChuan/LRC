@@ -64,7 +64,13 @@ fn main() {
     }
 
     let total_start = Instant::now();
-    let report = benchmark::run_all_benchmarks(target_layer);
+    let report = match benchmark::run_all_benchmarks(target_layer) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("基准测试运行失败: {e}");
+            process::exit(1);
+        }
+    };
     let total_ms = total_start.elapsed().as_millis() as u64;
 
     if json_mode {

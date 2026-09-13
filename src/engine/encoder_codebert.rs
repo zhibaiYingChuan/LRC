@@ -16,6 +16,7 @@
 use super::encoder::{CodeEncoder, EmbeddingVector};
 use super::pooling::PoolingStrategy;
 use crate::chunker::CodeChunk;
+use crate::errors::{LrcError, LrcResult};
 use candle_core::{Device, Tensor};
 use std::fs::File;
 use std::io::BufReader;
@@ -28,12 +29,13 @@ pub struct CodeBertEncoder {
 }
 
 impl CodeBertEncoder {
-    pub fn load() -> Result<Self, String> {
+    pub fn load() -> LrcResult<Self> {
         let device = Device::Cpu;
 
         // 默认使用 GraphCodeBERT（比 CodeBERT 代码检索精度高 12.3%，同架构同尺寸）
+        // v0.9.7 修复（模型 ID 常量重复）：改用 Layer 1 单一真源常量。
         let model_id = std::env::var("LRC_MODEL_ID")
-            .unwrap_or_else(|_| "microsoft/graphcodebert-base".to_string());
+            .unwrap_or_else(|_| crate::model_ids::MODEL_GRAPHCODEBERT_BASE.to_string());
 
         // ============================================================
         // 智能加载策略：本地 models/ 文件夹 → 缓存 → 远程下载
@@ -86,51 +88,55 @@ impl CodeBertEncoder {
             } else if model_dir.join("pytorch_model.bin").exists() {
                 model_dir.join("pytorch_model.bin")
             } else {
-                return Err(format!(
+                return Err(LrcError::not_found(format!(
                     "本地模型目录缺少模型文件: {}\n\
                      提示: 需要 model.safetensors 或 pytorch_model.bin",
                     model_dir.display()
-                ));
+                )));
             };
 
             let config_file = File::open(&config_path).map_err(|e| {
-                format!(
+                LrcError::io(format!(
                     "打开 config.json 失败: {e}\n路径: {}",
                     config_path.display()
-                )
+                ))
             })?;
             let config: candle_transformers::models::bert::Config =
                 serde_json::from_reader(BufReader::new(config_file))
-                    .map_err(|e| format!("解析 config.json 失败: {e}"))?;
+                    .map_err(|e| LrcError::parse(format!("解析 config.json 失败: {e}")))?;
 
             // 智能加载 tokenizer：优先 tokenizer.json，回退 vocab.json + merges.txt
             let tokenizer = load_tokenizer_local(&model_dir, &local_model_name)?;
 
             let tensors: std::collections::HashMap<String, Tensor> = if is_safetensors {
                 candle_core::safetensors::load(&model_path, &device).map_err(|e| {
-                    format!("safetensors 加载失败: {e}\n路径: {}", model_path.display())
+                    LrcError::io(format!(
+                        "safetensors 加载失败: {e}\n路径: {}",
+                        model_path.display()
+                    ))
                 })?
             } else {
                 // pytorch_model.bin 使用 PthTensors 懒加载器
                 let pth = candle_core::pickle::PthTensors::new(&model_path, None).map_err(|e| {
-                    format!(
+                    LrcError::io(format!(
                         "pickle 加载 pytorch_model.bin 失败: {e}\n\
                          提示: 如果持续失败，请尝试转换为 safetensors 格式后再试"
-                    )
+                    ))
                 })?;
                 let mut tensors = std::collections::HashMap::new();
                 for name in pth.tensor_infos().keys() {
                     if let Some(tensor) = pth
                         .get(name)
-                        .map_err(|e| format!("加载 tensor '{}' 失败: {}", name, e))?
+                        .map_err(|e| LrcError::io(format!("加载 tensor '{}' 失败: {}", name, e)))?
                     {
                         tensors.insert(name.to_string(), tensor);
                     }
                 }
                 if tensors.is_empty() {
-                    return Err("pytorch_model.bin 中未找到任何 tensor\n\
-                         提示: 文件可能已损坏，请尝试重新下载"
-                        .to_string());
+                    return Err(LrcError::not_found(
+                        "pytorch_model.bin 中未找到任何 tensor\n\
+                         提示: 文件可能已损坏，请尝试重新下载",
+                    ));
                 }
                 tensors
             };
@@ -142,7 +148,7 @@ impl CodeBertEncoder {
             );
 
             let model = candle_transformers::models::bert::BertModel::load(vb, &config)
-                .map_err(|e| format!("构建模型失败: {e}"))?;
+                .map_err(|e| LrcError::internal(format!("构建模型失败: {e}")))?;
 
             println!(
                 "  本地模型加载成功 (hidden_size={}, device=CPU)",
@@ -187,7 +193,7 @@ impl CodeBertEncoder {
             endpoint: &str,
             model_id: &str,
             cache_dir: &std::path::Path,
-        ) -> Result<std::path::PathBuf, String> {
+        ) -> LrcResult<std::path::PathBuf> {
             // 1. 纯本地文件系统检测缓存（绝不做任何网络请求）
             let cached_path = cache_dir.join(filename);
             if cached_path.exists() {
@@ -247,12 +253,12 @@ impl CodeBertEncoder {
 
                 // 3. 写入缓存目录
                 if let Err(e) = std::fs::create_dir_all(cache_dir) {
-                    return Err(format!("创建缓存目录失败: {}", e));
+                    return Err(LrcError::io(format!("创建缓存目录失败: {}", e)));
                 }
 
                 let mut file = match std::fs::File::create(&cached_path) {
                     Ok(f) => f,
-                    Err(e) => return Err(format!("创建文件失败: {}", e)),
+                    Err(e) => return Err(LrcError::io(format!("创建文件失败: {}", e))),
                 };
 
                 let mut reader = response.into_reader();
@@ -295,7 +301,7 @@ impl CodeBertEncoder {
                 }
             }
 
-            Err(last_error)
+            Err(LrcError::network(last_error))
         }
 
         // 尝试下载文件，404 返回 None 而非错误（用于可选文件下载）
@@ -305,7 +311,7 @@ impl CodeBertEncoder {
             endpoint: &str,
             model_id: &str,
             cache_dir: &std::path::Path,
-        ) -> Result<Option<std::path::PathBuf>, String> {
+        ) -> LrcResult<Option<std::path::PathBuf>> {
             let cached_path = cache_dir.join(filename);
             if cached_path.exists() {
                 let size = std::fs::metadata(&cached_path)
@@ -331,13 +337,13 @@ impl CodeBertEncoder {
                     return Ok(None);
                 }
                 Err(ureq::Error::Status(code, _response)) => {
-                    return Err(format!("HTTP {} (URL: {})", code, url));
+                    return Err(LrcError::network(format!("HTTP {} (URL: {})", code, url)));
                 }
                 Err(e) => {
-                    return Err(format!(
+                    return Err(LrcError::network(format!(
                         "下载失败: {} (URL: {})\n提示: 请检查网络连接",
                         e, url
-                    ));
+                    )));
                 }
             };
 
@@ -346,23 +352,24 @@ impl CodeBertEncoder {
                 .header("Content-Length")
                 .and_then(|v| v.parse().ok());
 
-            std::fs::create_dir_all(cache_dir).map_err(|e| format!("创建缓存目录失败: {}", e))?;
-            let mut file =
-                std::fs::File::create(&cached_path).map_err(|e| format!("创建文件失败: {}", e))?;
+            std::fs::create_dir_all(cache_dir)
+                .map_err(|e| LrcError::io(format!("创建缓存目录失败: {}", e)))?;
+            let mut file = std::fs::File::create(&cached_path)
+                .map_err(|e| LrcError::io(format!("创建文件失败: {}", e)))?;
             let mut reader = response.into_reader();
             let bytes_written = std::io::copy(&mut reader, &mut file)
-                .map_err(|e| format!("写入文件失败: {}", e))?;
+                .map_err(|e| LrcError::io(format!("写入文件失败: {}", e)))?;
 
             // 完整性校验
             if let Some(expected) = expected_size {
                 if bytes_written != expected {
                     let _ = std::fs::remove_file(&cached_path);
-                    return Err(format!(
+                    return Err(LrcError::io(format!(
                         "文件大小校验失败: {} (期望 {} MB, 实际 {} MB)",
                         filename,
                         expected / 1024 / 1024,
                         bytes_written / 1024 / 1024
-                    ));
+                    )));
                 }
             }
 
@@ -375,12 +382,12 @@ impl CodeBertEncoder {
         fn load_tokenizer_local(
             model_dir: &std::path::Path,
             _model_name: &str,
-        ) -> Result<tokenizers::Tokenizer, String> {
+        ) -> LrcResult<tokenizers::Tokenizer> {
             // 1. 尝试 tokenizer.json
             let tokenizer_json = model_dir.join("tokenizer.json");
             if tokenizer_json.exists() {
                 return tokenizers::Tokenizer::from_file(&tokenizer_json)
-                    .map_err(|e| format!("加载 tokenizer.json 失败: {}", e));
+                    .map_err(|e| LrcError::parse(format!("加载 tokenizer.json 失败: {}", e)));
             }
 
             // 2. 回退到 vocab.json + merges.txt
@@ -388,21 +395,21 @@ impl CodeBertEncoder {
             let merges_path = model_dir.join("merges.txt");
 
             if !vocab_path.exists() {
-                return Err(format!(
+                return Err(LrcError::not_found(format!(
                     "本地模型缺少 tokenizer.json: {}\n\
                      提示: 请确保 models/{} 目录包含完整的模型文件（vocab.json + merges.txt 或 tokenizer.json）",
                     tokenizer_json.display(),
                     model_dir.file_name().unwrap_or_default().to_string_lossy()
-                ));
+                )));
             }
 
             if !merges_path.exists() {
-                return Err(format!(
+                return Err(LrcError::not_found(format!(
                     "本地模型缺少 merges.txt: {}\n\
                      提示: 请确保 models/{} 目录包含完整的模型文件",
                     merges_path.display(),
                     model_dir.file_name().unwrap_or_default().to_string_lossy()
-                ));
+                )));
             }
 
             // 使用 BPE 模型从 vocab.json + merges.txt 构建 tokenizer
@@ -411,7 +418,7 @@ impl CodeBertEncoder {
             let bpe =
                 tokenizers::models::bpe::BPE::from_file(vocab_str.as_ref(), merges_str.as_ref())
                     .build()
-                    .map_err(|e| format!("构建 BPE 模型失败: {}", e))?;
+                    .map_err(|e| LrcError::parse(format!("构建 BPE 模型失败: {}", e)))?;
 
             let mut tokenizer = tokenizers::Tokenizer::new(bpe);
 
@@ -447,20 +454,20 @@ impl CodeBertEncoder {
             endpoint: &str,
             model_id: &str,
             cache_dir: &std::path::Path,
-        ) -> Result<tokenizers::Tokenizer, String> {
+        ) -> LrcResult<tokenizers::Tokenizer> {
             // 1. 尝试 tokenizer.json（HuggingFace tokenizers 统一格式）
             if let Some(path) = try_download("tokenizer.json", endpoint, model_id, cache_dir)? {
                 return tokenizers::Tokenizer::from_file(&path)
-                    .map_err(|e| format!("加载 tokenizer.json 失败: {}", e));
+                    .map_err(|e| LrcError::parse(format!("加载 tokenizer.json 失败: {}", e)));
             }
 
             // 2. 回退到 vocab.json + merges.txt（RoBERTa/GPT-2 等旧格式）
             println!("    tokenizer.json 不存在，使用 vocab.json + merges.txt 格式...");
 
             let vocab_path = manual_download("vocab.json", endpoint, model_id, cache_dir)
-                .map_err(|e| format!("vocab.json: {}", e))?;
+                .map_err(|e| LrcError::network(format!("vocab.json: {}", e)))?;
             let merges_path = manual_download("merges.txt", endpoint, model_id, cache_dir)
-                .map_err(|e| format!("merges.txt: {}", e))?;
+                .map_err(|e| LrcError::network(format!("merges.txt: {}", e)))?;
 
             // 下载辅助配置文件（不影响核心功能，但建议下载）
             let _ = try_download("special_tokens_map.json", endpoint, model_id, cache_dir);
@@ -472,7 +479,7 @@ impl CodeBertEncoder {
             let bpe =
                 tokenizers::models::bpe::BPE::from_file(vocab_str.as_ref(), merges_str.as_ref())
                     .build()
-                    .map_err(|e| format!("构建 BPE 模型失败: {}", e))?;
+                    .map_err(|e| LrcError::parse(format!("构建 BPE 模型失败: {}", e)))?;
 
             let mut tokenizer = tokenizers::Tokenizer::new(bpe);
 
@@ -503,28 +510,29 @@ impl CodeBertEncoder {
         }
 
         let config_path = manual_download("config.json", &endpoint, &model_id, &cache_dir)
-            .map_err(|e| format!("config.json: {}", e))?;
+            .map_err(|e| LrcError::network(format!("config.json: {}", e)))?;
         let tokenizer = load_tokenizer(&endpoint, &model_id, &cache_dir)
-            .map_err(|e| format!("tokenizer 加载失败: {}", e))?;
+            .map_err(|e| LrcError::network(format!("tokenizer 加载失败: {}", e)))?;
 
         // 模型格式降级：safetensors → pytorch_model.bin
         // GraphCodeBERT 只有 pytorch_model.bin，没有 safetensors 格式
         let model_path = manual_download("model.safetensors", &endpoint, &model_id, &cache_dir)
             .or_else(|_| manual_download("pytorch_model.bin", &endpoint, &model_id, &cache_dir))
             .map_err(|e| {
-                format!(
+                LrcError::network(format!(
                     "模型文件下载失败: {}\n\
                  提示: 1) 检查网络连接 2) 确认模型 ID 正确: '{}'\n\
                  3) 若只有 pytorch_model.bin 格式，请运行:\n\
                  pip install safetensors torch && python scripts/convert_to_safetensors.py",
                     e, model_id
-                )
+                ))
             })?;
 
-        let config_file = File::open(&config_path).map_err(|e| format!("open config: {e}"))?;
+        let config_file =
+            File::open(&config_path).map_err(|e| LrcError::io(format!("open config: {e}")))?;
         let config: candle_transformers::models::bert::Config =
             serde_json::from_reader(BufReader::new(config_file))
-                .map_err(|e| format!("parse config: {e}"))?;
+                .map_err(|e| LrcError::parse(format!("parse config: {e}")))?;
 
         // 根据文件格式选择加载器：.safetensors 用原生加载，.bin 用 pickle 加载 PyTorch 格式
         let is_pytorch_bin = model_path.to_str().is_some_and(|s| s.ends_with(".bin"));
@@ -533,31 +541,32 @@ impl CodeBertEncoder {
             // 注意：graphcodebert-base 是旧格式 raw pickle（非 zip），
             // candle_core::pickle::read_all 只支持 zip 格式，需用 PthTensors
             let pth = candle_core::pickle::PthTensors::new(&model_path, None).map_err(|e| {
-                format!(
+                LrcError::io(format!(
                     "pickle 加载 pytorch_model.bin 失败: {e}\n\
                     提示: 如果持续失败，请尝试转换为 safetensors 格式:\n\
                     pip install safetensors torch && python scripts/convert_to_safetensors.py"
-                )
+                ))
             })?;
             let mut tensors = std::collections::HashMap::new();
             for name in pth.tensor_infos().keys() {
                 if let Some(tensor) = pth
                     .get(name)
-                    .map_err(|e| format!("加载 tensor '{}' 失败: {}", name, e))?
+                    .map_err(|e| LrcError::io(format!("加载 tensor '{}' 失败: {}", name, e)))?
                 {
                     tensors.insert(name.to_string(), tensor);
                 }
             }
             if tensors.is_empty() {
-                return Err("pytorch_model.bin 中未找到任何 tensor\n\
+                return Err(LrcError::not_found(
+                    "pytorch_model.bin 中未找到任何 tensor\n\
                      提示: 文件可能已损坏，请尝试重新下载\n\
-                     cargo run --release --features ml 会自动重新下载"
-                    .to_string());
+                     cargo run --release --features ml 会自动重新下载",
+                ));
             }
             tensors
         } else {
             candle_core::safetensors::load(&model_path, &device)
-                .map_err(|e| format!("safetensors 加载失败: {e}"))?
+                .map_err(|e| LrcError::io(format!("safetensors 加载失败: {e}")))?
         };
         let vb = candle_nn::VarBuilder::from_tensors(
             tensors,
@@ -566,7 +575,7 @@ impl CodeBertEncoder {
         );
 
         let model = candle_transformers::models::bert::BertModel::load(vb, &config)
-            .map_err(|e| format!("model: {e}"))?;
+            .map_err(|e| LrcError::internal(format!("model: {e}")))?;
 
         println!(
             "external encoder loaded (hidden_size={}, device=CPU)",
@@ -586,11 +595,11 @@ impl CodeBertEncoder {
         self
     }
 
-    fn encode_text(&self, text: &str) -> Result<EmbeddingVector, String> {
+    fn encode_text(&self, text: &str) -> LrcResult<EmbeddingVector> {
         let encoding = self
             .tokenizer
             .encode(text, true)
-            .map_err(|e| format!("tokenize: {e}"))?;
+            .map_err(|e| LrcError::parse(format!("tokenize: {e}")))?;
 
         let token_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
         let attention_mask: Vec<f32> = encoding
@@ -601,54 +610,64 @@ impl CodeBertEncoder {
         let seq_len = token_ids.len();
 
         if seq_len > 512 {
-            return Err(format!("text too long: {} tokens (max 512)", seq_len));
+            return Err(LrcError::invalid_input(format!(
+                "text too long: {} tokens (max 512)",
+                seq_len
+            )));
         }
 
         let input_ids = Tensor::new(token_ids.as_slice(), &self.device)
-            .map_err(|e| format!("input_ids: {e}"))?
+            .map_err(|e| LrcError::internal(format!("input_ids: {e}")))?
             .unsqueeze(0)
-            .map_err(|e| format!("unsqueeze: {e}"))?;
+            .map_err(|e| LrcError::internal(format!("unsqueeze: {e}")))?;
 
         let token_type_ids = input_ids
             .zeros_like()
-            .map_err(|e| format!("type_ids: {e}"))?;
+            .map_err(|e| LrcError::internal(format!("type_ids: {e}")))?;
 
         let attention_tensor = Tensor::new(attention_mask.as_slice(), &self.device)
-            .map_err(|e| format!("attention: {e}"))?
+            .map_err(|e| LrcError::internal(format!("attention: {e}")))?
             .unsqueeze(0)
-            .map_err(|e| format!("unsqueeze: {e}"))?;
+            .map_err(|e| LrcError::internal(format!("unsqueeze: {e}")))?;
 
         let output = self
             .model
             .forward(&input_ids, &token_type_ids, Some(&attention_tensor))
-            .map_err(|e| format!("forward: {e}"))?;
+            .map_err(|e| LrcError::internal(format!("forward: {e}")))?;
 
         let values = match self.pooling {
             PoolingStrategy::Cls => {
                 let cls = output
                     .get(0)
-                    .map_err(|e| format!("batch: {e}"))?
+                    .map_err(|e| LrcError::internal(format!("batch: {e}")))?
                     .get(0)
-                    .map_err(|e| format!("cls: {e}"))?;
-                cls.to_vec1().map_err(|e| format!("to_vec: {e}"))?
+                    .map_err(|e| LrcError::internal(format!("cls: {e}")))?;
+                cls.to_vec1()
+                    .map_err(|e| LrcError::internal(format!("to_vec: {e}")))?
             }
             PoolingStrategy::Mean => {
                 let mask = attention_tensor
                     .unsqueeze(2)
-                    .map_err(|e| format!("mask unsqueeze: {e}"))?;
+                    .map_err(|e| LrcError::internal(format!("mask unsqueeze: {e}")))?;
                 let masked = output
                     .broadcast_mul(&mask)
-                    .map_err(|e| format!("masked mul: {e}"))?;
-                let sum = masked.sum_keepdim(1).map_err(|e| format!("sum: {e}"))?;
-                let count = mask.sum_keepdim(1).map_err(|e| format!("count: {e}"))?;
-                let pooled = sum.broadcast_div(&count).map_err(|e| format!("div: {e}"))?;
+                    .map_err(|e| LrcError::internal(format!("masked mul: {e}")))?;
+                let sum = masked
+                    .sum_keepdim(1)
+                    .map_err(|e| LrcError::internal(format!("sum: {e}")))?;
+                let count = mask
+                    .sum_keepdim(1)
+                    .map_err(|e| LrcError::internal(format!("count: {e}")))?;
+                let pooled = sum
+                    .broadcast_div(&count)
+                    .map_err(|e| LrcError::internal(format!("div: {e}")))?;
                 pooled
                     .squeeze(0)
-                    .map_err(|e| format!("squeeze: {e}"))?
+                    .map_err(|e| LrcError::internal(format!("squeeze: {e}")))?
                     .squeeze(0)
-                    .map_err(|e| format!("squeeze: {e}"))?
+                    .map_err(|e| LrcError::internal(format!("squeeze: {e}")))?
                     .to_vec1()
-                    .map_err(|e| format!("to_vec: {e}"))?
+                    .map_err(|e| LrcError::internal(format!("to_vec: {e}")))?
             }
         };
 
@@ -660,7 +679,7 @@ impl CodeBertEncoder {
 }
 
 impl CodeEncoder for CodeBertEncoder {
-    fn encode(&self, chunk: &CodeChunk) -> Result<EmbeddingVector, String> {
+    fn encode(&self, chunk: &CodeChunk) -> LrcResult<EmbeddingVector> {
         let text = format!(
             "{} {} {}",
             chunk.signature,

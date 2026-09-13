@@ -27,6 +27,7 @@
 //   - 双模价值宣言：明确系统在实用与哲学两个维度的价值承诺
 //   - 演化历史审计：所有已接受的演化可追溯，形成知识传承链
 
+use crate::errors::{LrcError, LrcResult};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -263,20 +264,26 @@ impl DaoEvolutionProtocol {
         new_philosophical_mapping: String,
         code_changes_summary: String,
         migration_guide: String,
-    ) -> Result<&AcceptedEvolution, String> {
+    ) -> LrcResult<&AcceptedEvolution> {
         // 查找提案
         let proposal = self
             .proposals
             .iter_mut()
             .find(|p| p.proposal_id == proposal_id)
-            .ok_or_else(|| format!("未找到提案: {}", proposal_id))?;
+            .ok_or_else(|| LrcError::not_found(format!("未找到提案: {}", proposal_id)))?;
 
         // 检查提案状态
         if proposal.status == ProposalStatus::Accepted {
-            return Err(format!("提案 {} 已被接受，不可重复接受", proposal_id));
+            return Err(LrcError::invalid_input(format!(
+                "提案 {} 已被接受，不可重复接受",
+                proposal_id
+            )));
         }
         if proposal.status == ProposalStatus::Rejected {
-            return Err(format!("提案 {} 已被拒绝，不可接受", proposal_id));
+            return Err(LrcError::invalid_input(format!(
+                "提案 {} 已被拒绝，不可接受",
+                proposal_id
+            )));
         }
 
         // 标记提案为已接受
@@ -301,19 +308,22 @@ impl DaoEvolutionProtocol {
 
         self.accepted_evolutions
             .last()
-            .ok_or_else(|| "Failed to retrieve the accepted evolution".to_string())
+            .ok_or_else(|| LrcError::internal("Failed to retrieve the accepted evolution"))
     }
 
     /// 拒绝提案
-    pub fn reject_proposal(&mut self, proposal_id: &str) -> Result<(), String> {
+    pub fn reject_proposal(&mut self, proposal_id: &str) -> LrcResult<()> {
         let proposal = self
             .proposals
             .iter_mut()
             .find(|p| p.proposal_id == proposal_id)
-            .ok_or_else(|| format!("未找到提案: {}", proposal_id))?;
+            .ok_or_else(|| LrcError::not_found(format!("未找到提案: {}", proposal_id)))?;
 
         if proposal.status == ProposalStatus::Accepted {
-            return Err(format!("提案 {} 已被接受，不可拒绝", proposal_id));
+            return Err(LrcError::invalid_input(format!(
+                "提案 {} 已被接受，不可拒绝",
+                proposal_id
+            )));
         }
 
         proposal.status = ProposalStatus::Rejected;
@@ -625,7 +635,8 @@ mod tests {
             "重复指南".to_string(),
         );
         assert!(result2.is_err());
-        assert!(result2.unwrap_err().contains("已被接受"));
+        // 签名迁移：unwrap_err() 现返回 LrcError，用 to_string() 取回 message 断言
+        assert!(result2.unwrap_err().to_string().contains("已被接受"));
     }
 
     /// 测试：拒绝已接受的提案应报错
@@ -656,7 +667,8 @@ mod tests {
         // 再拒绝应报错
         let result = protocol.reject_proposal("prop_005");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("已被接受"));
+        // 签名迁移：unwrap_err() 现返回 LrcError，用 to_string() 取回 message 断言
+        assert!(result.unwrap_err().to_string().contains("已被接受"));
     }
 
     /// 测试：拒绝提案

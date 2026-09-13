@@ -8,6 +8,7 @@
 // 将代码文本转换为结构化向量表示，用于后续相似度计算。
 
 use crate::chunker::CodeChunk;
+use crate::errors::LrcResult;
 use serde::{Deserialize, Serialize};
 
 /// 向量表示
@@ -56,9 +57,9 @@ impl EmbeddingVector {
 
 /// 编码器契约
 pub trait CodeEncoder: Send + Sync {
-    fn encode(&self, chunk: &CodeChunk) -> Result<EmbeddingVector, String>;
+    fn encode(&self, chunk: &CodeChunk) -> LrcResult<EmbeddingVector>;
 
-    fn encode_batch(&self, chunks: &[CodeChunk]) -> Result<Vec<EmbeddingVector>, String> {
+    fn encode_batch(&self, chunks: &[CodeChunk]) -> LrcResult<Vec<EmbeddingVector>> {
         chunks.iter().map(|c| self.encode(c)).collect()
     }
 
@@ -88,7 +89,7 @@ impl FastEncoder {
 }
 
 impl CodeEncoder for FastEncoder {
-    fn encode(&self, chunk: &CodeChunk) -> Result<EmbeddingVector, String> {
+    fn encode(&self, chunk: &CodeChunk) -> LrcResult<EmbeddingVector> {
         let combined = format!(
             "{} {} {}",
             chunk.signature,

@@ -183,9 +183,16 @@ impl RateLimiter {
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
             }
         }
-        // 耗尽所有尝试：返回最后一次错误（优先）或兜底生成（无法返回时由调用方处理）
-        // 由于 E 类型不能凭空构造，调用方至少会触发一次 op → 只要有 last_err 都返回
-        Err(last_err.expect("throttled_retry_with_backoff 至少执行 1 次 op，必须有 last_err; qed"))
+        // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P1 并发「rate_limiter panic 风险」）：
+        //   根因：原实现末尾 `Err(last_err.expect(...))`——若 MAX_ATTEMPTS 次 `should_throttle`
+        //         全为 true（令牌桶持续被限流），则 `op` 从未被执行，`last_err` 恒为 `None`
+        //         → **必然 panic**；该 panic 发生在 async 任务内，会毒化调用方而非返回可处理错误。
+        //   修复：仅在「op 从未执行」时做一次不检查令牌的强制执行，确保至少尝试一次并返回其真实结果；
+        //         其余情形（op 执行过）行为与原先完全一致，不多调用一次。
+        match last_err {
+            Some(e) => Err(e),
+            None => op(MAX_ATTEMPTS),
+        }
     }
 }
 

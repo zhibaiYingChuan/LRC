@@ -23,6 +23,7 @@
 //   - 隔离恢复：用户可手动恢复被隔离的记忆
 //   - 两阶段确认：高影响操作先返回影响评估，用户确认后执行
 
+use crate::errors::{LrcError, LrcResult};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -129,6 +130,10 @@ pub struct AffectedMemoryInfo {
 }
 
 /// 待确认操作记录
+///
+/// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报多个字段 `never read`）。
+/// 说明：这些字段为待确认操作的完整快照，用于后续确认/回滚语义，
+///       当前仅经由 `target_memory_ids` 参与流程，其余字段待接入。
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct PendingConfirmation {
@@ -897,7 +902,7 @@ impl UserFeedback {
     /// 用户审阅影响评估报告后，发送确认指令以执行操作。
     ///
     /// 返回确认结果：Ok(目标记忆 ID 列表) 或 Err(错误信息)。
-    pub fn confirm_action(&self, assessment_id: &str) -> Result<Vec<String>, String> {
+    pub fn confirm_action(&self, assessment_id: &str) -> LrcResult<Vec<String>> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -911,16 +916,16 @@ impl UserFeedback {
         // v0.5.4 修复：先 get 验证存在性和有效期，再 remove
         // 避免先 remove 后检查过期导致记录丢失无法恢复
         let pending = pending_map.get(assessment_id).ok_or_else(|| {
-            "未找到该评估 ID，可能已过期或已被处理。请重新发起影响评估。".to_string()
+            LrcError::not_found("未找到该评估 ID，可能已过期或已被处理。请重新发起影响评估。")
         })?;
 
         if pending.expires_at_ms < now {
             // 记录已过期，保留在 map 中供后续清理，不删除
-            return Err(format!(
+            return Err(LrcError::invalid_input(format!(
                 "评估 {} 已过期（{} 毫秒前），请重新发起影响评估。",
                 assessment_id,
                 now - pending.expires_at_ms
-            ));
+            )));
         }
 
         // 验证通过，安全移除并返回目标记忆 ID
@@ -936,7 +941,7 @@ impl UserFeedback {
     /// 取消待确认操作
     ///
     /// 用户在审阅影响评估后决定不执行，可取消操作。
-    pub fn cancel_pending(&self, assessment_id: &str) -> Result<(), String> {
+    pub fn cancel_pending(&self, assessment_id: &str) -> LrcResult<()> {
         let mut pending_map = self
             .pending_confirmations
             .lock()
@@ -945,7 +950,9 @@ impl UserFeedback {
         if pending_map.remove(assessment_id).is_some() {
             Ok(())
         } else {
-            Err("未找到该评估 ID，可能已过期或已被处理。".to_string())
+            Err(LrcError::not_found(
+                "未找到该评估 ID，可能已过期或已被处理。",
+            ))
         }
     }
 
@@ -1981,7 +1988,8 @@ mod tests {
         // 确认不存在的 ID 应报错
         let result = feedback.confirm_action("nonexistent_id");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("未找到"));
+        // 签名迁移：unwrap_err() 现返回 LrcError，用 to_string() 取回 message 断言
+        assert!(result.unwrap_err().to_string().contains("未找到"));
     }
 
     /// 测试：二阶影响评估 — 隔离核心节点时报告二阶间接影响

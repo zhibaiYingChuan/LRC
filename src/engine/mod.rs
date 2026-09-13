@@ -18,8 +18,12 @@ pub mod llm_translator; // LLM 查询翻译
 pub mod manager;
 pub mod model_resolver; // ML 模型下载/解析
 pub mod pooling; // 池化策略（CodeBERT + 洛书 ML 共享）
-pub mod retriever;
-pub mod rrf; // RRF 倒数排名融合（server + v1_api 共享） // 检索器 // 代码库管理器 (CoreManager)
+                 // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P1-4「行尾注释错位」）：
+                 //   原第 22 行把三条注释挤在同一行尾部（`pub mod rrf; // RRF ... // 检索器 // 代码库管理器`），
+                 //   后两条注释实际描述的是上一行的 `retriever` 与更早的 `manager`，属排版错位。
+                 //   现按各自归属拆分到对应模块旁。
+pub mod retriever; // 检索器
+pub mod rrf; // RRF 倒数排名融合（server + v1_api 共享）
 
 #[cfg(feature = "ml")]
 pub mod encoder_codebert; // CodeBERT 编码器实现
@@ -55,10 +59,24 @@ pub mod dao_metrics; // 道同构度 — 巽卦·风 (☴)
 pub mod dao_regulator; // 道调节器 — 震卦·雷 (☳)
 pub mod health_report; // 健康报告 — 乾卦·天 (☰)
 pub mod memory_gc; // 记忆回收 — 坎卦·水 (☵)
-pub mod memory_state_machine; // 内置记忆联想状态机：活性、转移与回归校验
+                   // v0.9.7（P0-2 依赖倒置修复）：memory_state_machine 已上提至 Layer 1（`crate::memory_state_machine`），
+                   // 因其文件头声明为 Apache 2.0 且零内部依赖，不应留在 DaoTi 许可的 engine/ 下。
+                   // 此处保留再导出，使既有 `crate::engine::memory_state_machine::*` 路径（36 处引用）继续可用。
+pub use crate::memory_state_machine;
 pub mod synthesis_engine; // 合成引擎 — 离卦·火 (☲)
 pub mod synthesis_journal; // 合成日志 — 兑卦·泽 (☱)
-pub mod user_feedback; // 用户反馈 — 坤卦·地 (☷) // 道枢演化 — 中宫 (五)
+                           // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P1-4「行尾注释错位」）：
+                           //   原第 68 行把「道枢演化 — 中宫 (五)」误挂在 user_feedback 行尾——该注释
+                           //   实际描述的是 `dao_evolution`（见上方 `pub mod dao_evolution;`），属排版错位。
+pub mod user_feedback; // 用户反馈 — 坤卦·地 (☷)
+
+// `engine/archive/` 为**有意保留**的归档位，非常规源码模块（故此处无 `pub mod`）：
+//   CHANGELOG「引擎代码归档流程规范」约定——`src/engine/` 核心文件发生重大变更时，
+//   旧版本文件必须先移入 `src/engine/archive/` 再删除，以便同一提交内保留可回溯实现。
+//   目录当前仅含 `.gitkeep`（Git 不跟踪空目录，占位文件用于在克隆后保留该目录）。
+//   审计提示：GLOBAL_CODE_REVIEW_REPORT 曾将其登记为 P3-1「空目录」，该定性过重——
+//   它是流程占位而非残留，与 P0-1（未识别 Junction 而误判残留）同属
+//   「未核对项目既有约定即判定为垃圾」的方法论问题。核对此项前请先查 CHANGELOG。
 
 pub use audit_trail::{AuditEvent, AuditEventType, AuditQuery, AuditTrail, IntegrityVerification};
 pub use complexity_budget::{
@@ -123,10 +141,15 @@ pub use encoder_codebert::CodeBertEncoder;
 #[cfg(feature = "ml")]
 pub use luoshu_encoder_ml::{HybridLuoShuEncoder, LuoShuMlEncoder};
 
+// 签名迁移：本函数为 ml feature 专属，故错误别名同样按 feature 门控引入，
+// 避免默认 feature（server）下产生 unused import 告警。
+#[cfg(feature = "ml")]
+use crate::errors::LrcResult;
+
 /// v0.9.1 算法泄露合规：公开层（bin/server.rs）通过此工厂函数创建编码器，
 /// 避免在公开层文件中直接引用受保护的算法类型名。
 #[cfg(feature = "ml")]
-pub fn create_smart_encoder() -> Result<(HybridLuoShuEncoder, bool), String> {
+pub fn create_smart_encoder() -> LrcResult<(HybridLuoShuEncoder, bool)> {
     match LuoShuMlEncoder::load() {
         Ok(ml) => Ok((HybridLuoShuEncoder::new_with_ml(ml), true)),
         Err(e) => Err(e),

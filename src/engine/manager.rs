@@ -10,6 +10,7 @@
 use crate::chunker::{chunk_by_language, is_supported_file, CodeChunk};
 use crate::engine::encoder::{CodeEncoder, EmbeddingVector, FastEncoder};
 use crate::engine::retriever::{CodeRetriever, LocalRetriever, RetrievalResult, ScoredChunk};
+use crate::errors::{LrcError, LrcResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -116,14 +117,16 @@ impl EmbeddingCache {
             .join("embedding_cache.json")
     }
 
-    fn save(&self, data_dir: &str) -> Result<(), String> {
+    fn save(&self, data_dir: &str) -> LrcResult<()> {
         let path = Self::cache_path(data_dir);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("创建缓存目录失败: {}", e))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| LrcError::io(format!("创建缓存目录失败: {}", e)))?;
         }
-        let json = serde_json::to_string(self).map_err(|e| format!("缓存序列化失败: {}", e))?;
+        let json = serde_json::to_string(self)
+            .map_err(|e| LrcError::parse(format!("缓存序列化失败: {}", e)))?;
         std::fs::write(&path, json)
-            .map_err(|e| format!("写入缓存文件失败: {} → {}", e, path.display()))?;
+            .map_err(|e| LrcError::io(format!("写入缓存文件失败: {} → {}", e, path.display())))?;
         Ok(())
     }
 
@@ -830,7 +833,7 @@ impl<E: CodeEncoder> CoreManager<E> {
     /// 保存嵌入向量缓存到磁盘（跳过后续启动的重复编码）
     ///
     /// 缓存文件位于 <data_dir>/../cache/embedding_cache.json
-    pub fn save_embedding_cache(&self, data_dir: &str) -> Result<(), String> {
+    pub fn save_embedding_cache(&self, data_dir: &str) -> LrcResult<()> {
         let chunks = self.retriever.all_chunks().to_vec();
         let vectors: Vec<Vec<f32>> = self
             .retriever

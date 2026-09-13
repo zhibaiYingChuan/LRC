@@ -2700,9 +2700,215 @@ pub async fn get_rules_status(store: State<'_, AppStore>) -> Result<Vec<RulesSta
     Ok(status)
 }
 
+/// 系统代理配置返回值（契约见 static/app.js:284-291）
+#[derive(Serialize)]
+pub struct ProxyConfigInfo {
+    /// 代理地址；空字符串表示未检测到代理
+    pub proxy_url: String,
+    /// 代理类型（用于 UI 展示）；未检测到代理时为空字符串
+    pub proxy_type: String,
+}
+
+/// 将代理服务地址规范化为带 scheme 的 URL 形式
+///
+/// 输入可能来自 WinINET 的 `ProxyServer` 或代理环境变量，存在三种形态：
+///   1. `host:port`                        → `http://host:port`
+///   2. `http=host:port;https=host:port`   → 取第一个条目（分号分隔）
+///   3. 已带 scheme 的完整 URL             → 原样返回
+fn normalize_proxy_url(raw: &str) -> String {
+    // 形如 `http=a:1;https=b:2` 时取首个条目，再剥离 `key=`
+    let first = raw.split(';').next().unwrap_or(raw).trim();
+    let value = first
+        .split_once('=')
+        .map(|(_, v)| v.trim())
+        .unwrap_or(first);
+    if value.is_empty() {
+        return String::new();
+    }
+    if value.contains("://") {
+        value.to_string()
+    } else {
+        format!("http://{value}")
+    }
+}
+
+/// 跨平台回退：读取标准代理环境变量
+///
+/// 顺序为 `HTTPS_PROXY` → `HTTP_PROXY` → `ALL_PROXY`，同时兼容小写形式。
+/// 使用 `var_os` + `to_string_lossy` 避免非 UTF-8 环境变量导致读取失败。
+fn proxy_from_env() -> Option<(String, String)> {
+    const KEYS: [&str; 6] = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+    for key in KEYS {
+        if let Some(value) = std::env::var_os(key) {
+            let value = value.to_string_lossy();
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some((normalize_proxy_url(value), "环境变量".to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Windows：读取 WinINET 注册表中的系统代理配置
+///
+/// 读取 `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`：
+///   - `ProxyEnable`=1 且存在 `ProxyServer` → 显式代理
+///   - 否则若存在 `AutoConfigURL`          → PAC 自动配置脚本
+#[cfg(target_os = "windows")]
+fn read_wininet_proxy() -> Option<(String, String)> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+    };
+
+    /// 转换为以 NUL 结尾的 UTF-16 缓冲区（Win32 宽字符 API 要求）
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// 读取 REG_SZ 值；值不存在、为空或读取失败时返回 None
+    ///
+    /// 使用固定容量缓冲区一次读取（代理地址远小于 8KB），
+    /// 避免依赖"传 NULL 探测长度"这一在 RegGetValueW 上不可靠的调用方式。
+    fn read_sz(subkey: &[u16], name: &str) -> Option<String> {
+        let name_w = to_wide(name);
+        let mut buf = vec![0u16; 2048];
+        // pcbdata 传入的是缓冲区字节容量
+        let mut size_written = (buf.len() * std::mem::size_of::<u16>()) as u32;
+        let read = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                name_w.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut size_written,
+            )
+        };
+        if read != ERROR_SUCCESS {
+            return None;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let text = String::from_utf16_lossy(&buf[..len]);
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    let subkey = to_wide(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings");
+
+    // ProxyEnable：DWORD，1 表示显式代理已启用
+    let enable_name = to_wide("ProxyEnable");
+    let mut proxy_enable: u32 = 0;
+    let mut dword_size = std::mem::size_of::<u32>() as u32;
+    let enable_ret = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            enable_name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&mut proxy_enable as *mut u32).cast(),
+            &mut dword_size,
+        )
+    };
+    if enable_ret == ERROR_SUCCESS && proxy_enable == 1 {
+        if let Some(server) = read_sz(&subkey, "ProxyServer") {
+            let url = normalize_proxy_url(&server);
+            if !url.is_empty() {
+                return Some((url, "WinINET 显式代理".to_string()));
+            }
+        }
+    }
+
+    // PAC 自动配置脚本地址
+    if let Some(pac) = read_sz(&subkey, "AutoConfigURL") {
+        return Some((pac, "WinINET 自动配置(PAC)".to_string()));
+    }
+
+    None
+}
+
+/// v0.9.7 修复（审查报告 P1）：获取系统代理配置
+///
+/// 前端在 Tauri 环境下调用 `invoke('get_proxy_configuration')`，
+/// 期望返回 `{ proxy_url, proxy_type }`；`proxy_url` 为空表示未检测到代理。
+/// 修复前该命令仅存在于前端调用侧（[app.js:285](static/app.js)），
+/// 后端既未定义也未注册，异常被静默吞掉，导致"系统代理检测"功能完全失效。
+///
+/// 探测顺序：Windows WinINET 注册表 → 标准代理环境变量。
+/// 本命令不依赖 sidecar，且不返回错误：未检测到代理即视为"无代理"。
+#[tauri::command]
+pub fn get_proxy_configuration() -> ProxyConfigInfo {
+    #[cfg(target_os = "windows")]
+    let detected = read_wininet_proxy().or_else(proxy_from_env);
+
+    #[cfg(not(target_os = "windows"))]
+    let detected = proxy_from_env();
+
+    match detected {
+        Some((proxy_url, proxy_type)) if !proxy_url.is_empty() => ProxyConfigInfo {
+            proxy_url,
+            proxy_type,
+        },
+        _ => ProxyConfigInfo {
+            proxy_url: String::new(),
+            proxy_type: String::new(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 验证代理地址规范化覆盖 WinINET 的三种取值形态
+    #[test]
+    fn test_normalize_proxy_url() {
+        assert_eq!(normalize_proxy_url("127.0.0.1:7890"), "http://127.0.0.1:7890");
+        assert_eq!(
+            normalize_proxy_url("http=a:1;https=b:2"),
+            "http://a:1",
+            "多协议条目应取首个"
+        );
+        assert_eq!(
+            normalize_proxy_url("socks5://127.0.0.1:1080"),
+            "socks5://127.0.0.1:1080",
+            "已带 scheme 应原样返回"
+        );
+        assert_eq!(normalize_proxy_url(""), "");
+        assert_eq!(normalize_proxy_url("   "), "");
+    }
+
+    /// 命令应始终返回合法契约：未检测到代理时为空串，检测到时为带 scheme 的 URL
+    ///
+    /// 不使用 `set_var`/`remove_var` 构造环境，避免全局环境写入污染并行测试。
+    #[test]
+    fn test_get_proxy_configuration_contract() {
+        let info = get_proxy_configuration();
+        assert!(
+            info.proxy_url.is_empty() || info.proxy_url.contains("://"),
+            "proxy_url 应为空或带 scheme 的完整 URL，实际: {}",
+            info.proxy_url
+        );
+        // 无代理时类型字段同样为空，前端据此组合展示文案
+        if info.proxy_url.is_empty() {
+            assert!(info.proxy_type.is_empty(), "无代理时 proxy_type 应为空串");
+        } else {
+            assert!(!info.proxy_type.is_empty(), "检测到代理时应标注来源类型");
+        }
+    }
 
     /// v0.5.4 P2-13 修复：验证中文健康检查超时错误能被正确匹配
     #[test]

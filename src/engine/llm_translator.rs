@@ -7,6 +7,7 @@
 // 只做一件事：把用户的模糊自然语言，翻译成精确的代码关键词。
 // 然后由 Fast Match 去执行真正的检索。
 
+use crate::errors::{LrcError, LrcResult};
 use serde::{Deserialize, Serialize};
 
 /// LLM API 配置
@@ -37,7 +38,7 @@ impl LlmApiConfig {
     ///   - `openai:sk-xxx:gpt-4o-mini`
     ///   - `openai:sk-xxx:gpt-4o-mini:https://custom.api.com/v1`
     ///   - `ollama:localhost:llama3`
-    pub fn parse(input: &str) -> Result<Self, String> {
+    pub fn parse(input: &str) -> LrcResult<Self> {
         // 自动检测分隔符：优先使用 || 分隔符（更安全），回退到 : 分隔符（向后兼容）
         let parts: Vec<&str> = if input.contains("||") {
             input.splitn(4, "||").collect()
@@ -50,12 +51,16 @@ impl LlmApiConfig {
                 let api_key = parts
                     .get(1)
                     .filter(|s| !s.is_empty())
-                    .ok_or("openai 模式需要 API Key: openai:sk-xxx:model")?
+                    .ok_or(LrcError::invalid_input(
+                        "openai 模式需要 API Key: openai:sk-xxx:model",
+                    ))?
                     .to_string();
                 let model = parts
                     .get(2)
                     .filter(|s| !s.is_empty())
-                    .ok_or("openai 模式需要模型名: openai:sk-xxx:gpt-4o-mini")?
+                    .ok_or(LrcError::invalid_input(
+                        "openai 模式需要模型名: openai:sk-xxx:gpt-4o-mini",
+                    ))?
                     .to_string();
                 let endpoint = parts
                     .get(3)
@@ -65,7 +70,10 @@ impl LlmApiConfig {
 
                 // SSRF 防护：配置入口统一字面量校验（拒绝 metadata/链路本地/未指定等）
                 if let Err(e) = crate::url_safety::validate_http_url(&endpoint) {
-                    return Err(format!("openai endpoint 地址校验失败: {}", e));
+                    return Err(LrcError::invalid_input(format!(
+                        "openai endpoint 地址校验失败: {}",
+                        e
+                    )));
                 }
 
                 Ok(LlmApiConfig::OpenAI {
@@ -78,12 +86,16 @@ impl LlmApiConfig {
                 let host = parts
                     .get(1)
                     .filter(|s| !s.is_empty())
-                    .ok_or("ollama 模式需要主机地址: ollama:localhost:model")?
+                    .ok_or(LrcError::invalid_input(
+                        "ollama 模式需要主机地址: ollama:localhost:model",
+                    ))?
                     .to_string();
                 let model = parts
                     .get(2)
                     .filter(|s| !s.is_empty())
-                    .ok_or("ollama 模式需要模型名: ollama:localhost:llama3")?
+                    .ok_or(LrcError::invalid_input(
+                        "ollama 模式需要模型名: ollama:localhost:llama3",
+                    ))?
                     .to_string();
 
                 // SSRF 防护：Ollama host 构造 http://host 统一校验
@@ -94,15 +106,18 @@ impl LlmApiConfig {
                     format!("http://{}", host)
                 };
                 if let Err(e) = crate::url_safety::validate_http_url(&target) {
-                    return Err(format!("ollama host 地址校验失败: {}", e));
+                    return Err(LrcError::invalid_input(format!(
+                        "ollama host 地址校验失败: {}",
+                        e
+                    )));
                 }
 
                 Ok(LlmApiConfig::Ollama { host, model })
             }
-            other => Err(format!(
+            other => Err(LrcError::invalid_input(format!(
                 "不支持的 LLM API 类型: {}。支持的类型: openai, ollama",
                 other
-            )),
+            ))),
         }
     }
 
@@ -117,7 +132,7 @@ impl LlmApiConfig {
     /// 返回高维向量（OpenAI 通常 1536 维，Ollama 取决于模型）。
     ///
     /// 失败时返回 Err，调用方应降级到洛书向量。
-    pub async fn embed_text(&self, text: &str) -> Result<Vec<f32>, String> {
+    pub async fn embed_text(&self, text: &str) -> LrcResult<Vec<f32>> {
         match self {
             LlmApiConfig::OpenAI {
                 api_key,
@@ -125,7 +140,7 @@ impl LlmApiConfig {
                 endpoint,
             } => embed_openai(endpoint, api_key, model, text).await,
             LlmApiConfig::Ollama { host, model } => embed_ollama(host, model, text).await,
-            LlmApiConfig::None => Err("LLM 未配置，无法调用 embedding API".to_string()),
+            LlmApiConfig::None => Err(LrcError::config("LLM 未配置，无法调用 embedding API")),
         }
     }
 
@@ -133,7 +148,7 @@ impl LlmApiConfig {
     ///
     /// OpenAI 支持 input 数组批量请求，Ollama 逐条调用。
     /// 返回顺序与输入一致的向量列表。
-    pub async fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, String> {
+    pub async fn embed_texts(&self, texts: &[&str]) -> LrcResult<Vec<Vec<f32>>> {
         match self {
             LlmApiConfig::OpenAI {
                 api_key,
@@ -148,7 +163,7 @@ impl LlmApiConfig {
                 }
                 Ok(results)
             }
-            LlmApiConfig::None => Err("LLM 未配置，无法调用 embedding API".to_string()),
+            LlmApiConfig::None => Err(LrcError::config("LLM 未配置，无法调用 embedding API")),
         }
     }
 
@@ -158,9 +173,9 @@ impl LlmApiConfig {
     /// 返回合成后的文本（已去除解释性前缀）。
     ///
     /// 失败时返回 Err，调用方应跳过该簇的合成。
-    pub async fn summarize_memories(&self, memories: &[String]) -> Result<String, String> {
+    pub async fn summarize_memories(&self, memories: &[String]) -> LrcResult<String> {
         if memories.is_empty() {
-            return Err("记忆列表为空，无法合成".to_string());
+            return Err(LrcError::invalid_input("记忆列表为空，无法合成"));
         }
         if memories.len() == 1 {
             return Ok(memories[0].clone());
@@ -175,7 +190,7 @@ impl LlmApiConfig {
                 endpoint,
             } => summarize_openai(endpoint, api_key, model, &prompt).await,
             LlmApiConfig::Ollama { host, model } => summarize_ollama(host, model, &prompt).await,
-            LlmApiConfig::None => Err("LLM 未配置，无法调用合成 API".to_string()),
+            LlmApiConfig::None => Err(LrcError::config("LLM 未配置，无法调用合成 API")),
         }
     }
 }
@@ -190,11 +205,11 @@ async fn summarize_openai(
     api_key: &str,
     model: &str,
     prompt: &str,
-) -> Result<String, String> {
+) -> LrcResult<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("创建 HTTP 客户端失败: {}", e)))?;
 
     let request = OpenAiChatRequest {
         model: model.to_string(),
@@ -215,7 +230,7 @@ async fn summarize_openai(
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("合成请求失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("合成请求失败: {}", e)))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -224,25 +239,25 @@ async fn summarize_openai(
             "[LRC·合成] OpenAI API 返回错误状态: {} (响应: {:.200})",
             status, body
         );
-        return Err(format!("合成 API 返回错误: {}", status));
+        return Err(LrcError::network(format!("合成 API 返回错误: {}", status)));
     }
 
     let raw_body = response
         .text()
         .await
-        .map_err(|e| format!("读取合成响应体失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("读取合成响应体失败: {}", e)))?;
 
     let body: OpenAiChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
             "[LRC·合成] OpenAI 响应 JSON 解析失败: {} (原始响应: {:.200})",
             e, raw_body
         );
-        format!("解析合成响应失败: {}", e)
+        LrcError::parse(format!("解析合成响应失败: {}", e))
     })?;
 
     if body.choices.is_empty() {
         eprintln!("[LRC·合成] OpenAI 返回空 choices 数组");
-        return Err("合成 API 返回空 choices".to_string());
+        return Err(LrcError::network("合成 API 返回空 choices"));
     }
 
     let content = body
@@ -251,17 +266,17 @@ async fn summarize_openai(
         .next()
         .map(|c| c.message.content.trim().to_string())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| "合成 API 返回空内容".to_string())?;
+        .ok_or_else(|| LrcError::network("合成 API 返回空内容"))?;
 
     Ok(content)
 }
 
 /// 通过 Ollama 合成记忆
-async fn summarize_ollama(host: &str, model: &str, prompt: &str) -> Result<String, String> {
+async fn summarize_ollama(host: &str, model: &str, prompt: &str) -> LrcResult<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("创建 HTTP 客户端失败: {}", e)))?;
 
     let request = OllamaChatRequest {
         model: model.to_string(),
@@ -280,7 +295,7 @@ async fn summarize_ollama(host: &str, model: &str, prompt: &str) -> Result<Strin
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("Ollama 合成请求失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("Ollama 合成请求失败: {}", e)))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -289,13 +304,16 @@ async fn summarize_ollama(host: &str, model: &str, prompt: &str) -> Result<Strin
             "[LRC·合成] Ollama API 返回错误状态: {} (响应: {:.200})",
             status, body
         );
-        return Err(format!("Ollama 合成 API 返回错误: {}", status));
+        return Err(LrcError::network(format!(
+            "Ollama 合成 API 返回错误: {}",
+            status
+        )));
     }
 
     let raw_body = response
         .text()
         .await
-        .map_err(|e| format!("读取 Ollama 合成响应体失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("读取 Ollama 合成响应体失败: {}", e)))?;
 
     let body: OllamaChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
@@ -303,13 +321,13 @@ async fn summarize_ollama(host: &str, model: &str, prompt: &str) -> Result<Strin
             e,
             response_log_summary(&raw_body)
         );
-        format!("解析 Ollama 合成响应失败: {}", e)
+        LrcError::parse(format!("解析 Ollama 合成响应失败: {}", e))
     })?;
 
     let content = body.message.content.trim().to_string();
 
     if content.is_empty() {
-        return Err("Ollama 合成返回空内容".to_string());
+        return Err(LrcError::network("Ollama 合成返回空内容"));
     }
 
     Ok(content)
@@ -529,11 +547,11 @@ async fn translate_openai(
     model: &str,
     query: &str,
     system_prompt: &str,
-) -> Result<Vec<String>, String> {
+) -> LrcResult<Vec<String>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("创建 HTTP 客户端失败: {}", e)))?;
 
     let request = OpenAiChatRequest {
         model: model.to_string(),
@@ -554,7 +572,7 @@ async fn translate_openai(
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("LLM 请求失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("LLM 请求失败: {}", e)))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -563,27 +581,27 @@ async fn translate_openai(
             "[LRC·LLM] OpenAI API 返回错误状态: {} (响应: {:.200})",
             status, body
         );
-        return Err(format!("LLM API 返回错误: {}", status));
+        return Err(LrcError::network(format!("LLM API 返回错误: {}", status)));
     }
 
     // v0.5.4 P2-11 修复：先获取原始文本，解析失败时可以记录用于调试
     let raw_body = response
         .text()
         .await
-        .map_err(|e| format!("读取 LLM 响应体失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("读取 LLM 响应体失败: {}", e)))?;
 
     let body: OpenAiChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
             "[LRC·LLM] OpenAI 响应 JSON 解析失败: {} (原始响应: {:.200})",
             e, raw_body
         );
-        format!("解析 LLM 响应失败: {}", e)
+        LrcError::parse(format!("解析 LLM 响应失败: {}", e))
     })?;
 
     // v0.5.4 P2-11 修复：防御性检查空 choices 数组
     if body.choices.is_empty() {
         eprintln!("[LRC·LLM] OpenAI 返回空 choices 数组，可能模型拒绝回答或发生内部错误");
-        return Err("LLM 返回空 choices 数组".to_string());
+        return Err(LrcError::network("LLM 返回空 choices 数组"));
     }
 
     let content = body
@@ -595,7 +613,7 @@ async fn translate_openai(
     // v0.5.4 P2-11 修复：防御性检查空内容
     if content.trim().is_empty() {
         eprintln!("[LRC·LLM] OpenAI 返回空内容，使用原始查询回退");
-        return Err("LLM 返回空内容".to_string());
+        return Err(LrcError::network("LLM 返回空内容"));
     }
 
     Ok(parse_keywords(&content))
@@ -612,11 +630,11 @@ async fn translate_ollama(
     model: &str,
     query: &str,
     system_prompt: &str,
-) -> Result<Vec<String>, String> {
+) -> LrcResult<Vec<String>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("创建 HTTP 客户端失败: {}", e)))?;
 
     let request = OllamaChatRequest {
         model: model.to_string(),
@@ -635,7 +653,7 @@ async fn translate_ollama(
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("Ollama 请求失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("Ollama 请求失败: {}", e)))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -644,14 +662,17 @@ async fn translate_ollama(
             "[LRC·LLM] Ollama API 返回错误状态: {} (响应: {:.200})",
             status, body
         );
-        return Err(format!("Ollama API 返回错误: {}", status));
+        return Err(LrcError::network(format!(
+            "Ollama API 返回错误: {}",
+            status
+        )));
     }
 
     // v0.5.4 P2-11 修复：先获取原始文本，解析失败时可以记录用于调试
     let raw_body = response
         .text()
         .await
-        .map_err(|e| format!("读取 Ollama 响应体失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("读取 Ollama 响应体失败: {}", e)))?;
 
     let body: OllamaChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
@@ -659,13 +680,13 @@ async fn translate_ollama(
             e,
             response_log_summary(&raw_body)
         );
-        format!("解析 Ollama 响应失败: {}", e)
+        LrcError::parse(format!("解析 Ollama 响应失败: {}", e))
     })?;
 
     // v0.5.4 P2-11 修复：防御性检查空内容
     if body.message.content.trim().is_empty() {
         eprintln!("[LRC·LLM] Ollama 返回空内容，使用原始查询回退");
-        return Err("Ollama 返回空内容".to_string());
+        return Err(LrcError::network("Ollama 返回空内容"));
     }
 
     Ok(parse_keywords(&body.message.content))
@@ -717,11 +738,11 @@ async fn embed_openai(
     api_key: &str,
     model: &str,
     text: &str,
-) -> Result<Vec<f32>, String> {
+) -> LrcResult<Vec<f32>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("创建 HTTP 客户端失败: {}", e)))?;
 
     let request = OpenAiEmbeddingRequest {
         model: model.to_string(),
@@ -737,7 +758,7 @@ async fn embed_openai(
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("Embedding 请求失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("Embedding 请求失败: {}", e)))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -747,13 +768,16 @@ async fn embed_openai(
             status,
             response_log_summary(&body)
         );
-        return Err(format!("Embedding API 返回错误: {}", status));
+        return Err(LrcError::network(format!(
+            "Embedding API 返回错误: {}",
+            status
+        )));
     }
 
     let raw_body = response
         .text()
         .await
-        .map_err(|e| format!("读取 Embedding 响应体失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("读取 Embedding 响应体失败: {}", e)))?;
 
     let body: OpenAiEmbeddingResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
@@ -761,14 +785,14 @@ async fn embed_openai(
             e,
             response_log_summary(&raw_body)
         );
-        format!("解析 Embedding 响应失败: {}", e)
+        LrcError::parse(format!("解析 Embedding 响应失败: {}", e))
     })?;
 
     body.data
         .into_iter()
         .next()
         .map(|d| d.embedding)
-        .ok_or_else(|| "Embedding 响应为空".to_string())
+        .ok_or_else(|| LrcError::network("Embedding 响应为空"))
 }
 
 /// 通过 OpenAI 兼容 API 批量获取 embedding
@@ -780,7 +804,7 @@ async fn embed_openai_batch(
     api_key: &str,
     model: &str,
     texts: &[&str],
-) -> Result<Vec<Vec<f32>>, String> {
+) -> LrcResult<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
@@ -788,7 +812,7 @@ async fn embed_openai_batch(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("创建 HTTP 客户端失败: {}", e)))?;
 
     let url = format!("{}/embeddings", endpoint.trim_end_matches('/'));
     let mut all_embeddings = Vec::with_capacity(texts.len());
@@ -807,7 +831,7 @@ async fn embed_openai_batch(
             .json(&request)
             .send()
             .await
-            .map_err(|e| format!("批量 Embedding 请求失败: {}", e))?;
+            .map_err(|e| LrcError::network(format!("批量 Embedding 请求失败: {}", e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -816,13 +840,16 @@ async fn embed_openai_batch(
                 "[LRC·Embedding] 批量 API 返回错误状态: {} (响应: {:.200})",
                 status, body
             );
-            return Err(format!("批量 Embedding API 返回错误: {}", status));
+            return Err(LrcError::network(format!(
+                "批量 Embedding API 返回错误: {}",
+                status
+            )));
         }
 
         let raw_body = response
             .text()
             .await
-            .map_err(|e| format!("读取批量 Embedding 响应体失败: {}", e))?;
+            .map_err(|e| LrcError::network(format!("读取批量 Embedding 响应体失败: {}", e)))?;
 
         let body: OpenAiEmbeddingResponse = serde_json::from_str(&raw_body).map_err(|e| {
             eprintln!(
@@ -830,7 +857,7 @@ async fn embed_openai_batch(
                 e,
                 response_log_summary(&raw_body)
             );
-            format!("解析批量 Embedding 响应失败: {}", e)
+            LrcError::parse(format!("解析批量 Embedding 响应失败: {}", e))
         })?;
 
         for data in body.data {
@@ -842,11 +869,11 @@ async fn embed_openai_batch(
 }
 
 /// 通过 Ollama 获取单条文本的 embedding
-async fn embed_ollama(host: &str, model: &str, text: &str) -> Result<Vec<f32>, String> {
+async fn embed_ollama(host: &str, model: &str, text: &str) -> LrcResult<Vec<f32>> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("创建 HTTP 客户端失败: {}", e)))?;
 
     let request = OllamaEmbeddingRequest {
         model: model.to_string(),
@@ -861,7 +888,7 @@ async fn embed_ollama(host: &str, model: &str, text: &str) -> Result<Vec<f32>, S
         .json(&request)
         .send()
         .await
-        .map_err(|e| format!("Ollama Embedding 请求失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("Ollama Embedding 请求失败: {}", e)))?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -870,13 +897,16 @@ async fn embed_ollama(host: &str, model: &str, text: &str) -> Result<Vec<f32>, S
             "[LRC·Embedding] Ollama API 返回错误状态: {} (响应: {:.200})",
             status, body
         );
-        return Err(format!("Ollama Embedding API 返回错误: {}", status));
+        return Err(LrcError::network(format!(
+            "Ollama Embedding API 返回错误: {}",
+            status
+        )));
     }
 
     let raw_body = response
         .text()
         .await
-        .map_err(|e| format!("读取 Ollama Embedding 响应体失败: {}", e))?;
+        .map_err(|e| LrcError::network(format!("读取 Ollama Embedding 响应体失败: {}", e)))?;
 
     let body: OllamaEmbeddingResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
@@ -884,7 +914,7 @@ async fn embed_ollama(host: &str, model: &str, text: &str) -> Result<Vec<f32>, S
             e,
             response_log_summary(&raw_body)
         );
-        format!("解析 Ollama Embedding 响应失败: {}", e)
+        LrcError::parse(format!("解析 Ollama Embedding 响应失败: {}", e))
     })?;
 
     Ok(body.embedding)

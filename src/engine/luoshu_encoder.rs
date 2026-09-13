@@ -541,6 +541,8 @@ fn extract_keywords(text: &str) -> Vec<String> {
 /// 4. 洛书编码：基底编码器完成最终编码
 pub struct EnhancedStatisticalEncoder {
     /// 基础洛书编码器（保留作为纯统计回退）
+    ///
+    /// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `field 'base' is never read`）。
     #[allow(dead_code)]
     base: LuoShuEncoder,
     /// TF-IDF 缓存

@@ -67,7 +67,75 @@ async function main() {
     fs.writeFileSync(path.join(artifactDir, 'dashboard.html'), await page.content(), 'utf8');
     fs.writeFileSync(path.join(artifactDir, 'console-errors.json'), JSON.stringify(consoleErrors, null, 2), 'utf8');
     fs.writeFileSync(path.join(artifactDir, 'network-failures.json'), JSON.stringify(networkFailures, null, 2), 'utf8');
-    console.log(JSON.stringify({ ok: true, baseUrl, dashboard }, null, 2));
+
+    // P1-8 修复：成功路径此前只落盘 console-errors/network-failures 而不参与判定，
+    // 导致"主断言通过但控制台报错 / 资源 404"仍以退出码 0 放行。
+    // 现改为阻断；豁免口径与 cdp-regression.js 保持一致（仅豁免已核实的预期错误），
+    // 且 unfold 豁免必须以"同批次存在 unfold 404 网络记录"为前置，避免正则过宽吞掉真实 404。
+    const hasUnfold404 = networkFailures.some((item) => /404/.test(item) && /\/v1\/memories\/unfold/.test(item));
+    const EXPECTED_ERROR_PATTERNS = [];
+    if (hasUnfold404) EXPECTED_ERROR_PATTERNS.push(/404|unfold/i);
+    EXPECTED_ERROR_PATTERNS.push(/(start_sidecar|command).{0,40}not allowed/i);
+
+    const unexpectedConsoleErrors = consoleErrors.filter((text) => !EXPECTED_ERROR_PATTERNS.some((re) => re.test(text)));
+    const unexpectedNetworkFailures = networkFailures.filter((text) => !EXPECTED_ERROR_PATTERNS.some((re) => re.test(text)));
+    assert(unexpectedConsoleErrors.length === 0, `控制台存在 ${unexpectedConsoleErrors.length} 条非预期错误: ${unexpectedConsoleErrors.slice(0, 3).join(' | ')}`);
+    assert(unexpectedNetworkFailures.length === 0, `存在 ${unexpectedNetworkFailures.length} 条非预期网络失败: ${unexpectedNetworkFailures.slice(0, 3).join(' | ')}`);
+
+    // ===== 超时/卡死路径韧性验证（闭环 HCSE_RESILIENCE_AUDIT 检查项 1.3）=====
+    // 目的：验证"底层调用永不返回"时 UI 是否有兜底反馈、是否可恢复——此前该路径无任何自动化验证。
+    // 手段：用 page.route 挂起三个健康检查端点（handler 不调用任何 route 方法 → 请求永久 pending），
+    //      触发 fetchWithTimeout 的 10s 硬超时，断言出现"请求超时"错误态 + 重试入口 + loading 已收起。
+    // 位置：置于 console/network 阻断断言之后，避免本测试预期的 abort 事件污染正常路径判定。
+    // 前提：sidecar 存活且未处于 lock_busy（若 lock_busy，loadDashboard 会走降级渲染而非超时分支）。
+    const consoleBaseline = consoleErrors.length;
+    const networkBaseline = networkFailures.length;
+    const timeoutProbeStartedAt = Date.now();
+    await page.route('**/v1/health/**', () => { /* 永久挂起：不 fulfill / 不 abort，模拟底层调用卡死 */ });
+    await page.evaluate(() => { window.loadDashboard(); });
+    await page.waitForFunction(() => {
+      const element = document.getElementById('dashboard-error');
+      return Boolean(element) && element.classList.contains('show') && element.textContent.includes('请求超时');
+    }, null, { timeout: 25000, polling: 500 });
+
+    const timeoutState = await page.evaluate(() => {
+      const errorElement = document.getElementById('dashboard-error');
+      const retryButton = errorElement
+        ? errorElement.querySelector('[data-action="manualRefreshDashboard"]')
+        : null;
+      return {
+        errorText: errorElement?.textContent?.trim() || '',
+        hasRetryButton: Boolean(retryButton),
+        retryDisabled: retryButton ? retryButton.disabled : null,
+        loadingHidden: document.getElementById('dashboard-loading')?.classList.contains('hidden') ?? false,
+        pageInteractive: document.readyState === 'complete',
+      };
+    });
+    assert(timeoutState.errorText.includes('请求超时'), `超时态未给出"请求超时"提示: ${timeoutState.errorText}`);
+    assert(timeoutState.hasRetryButton, '超时态缺少重试入口（用户无恢复路径）');
+    assert(timeoutState.retryDisabled === false, '超时态重试按钮处于禁用态（无法恢复）');
+    assert(timeoutState.loadingHidden, '超时后 loading 未收起（UI 卡死）');
+    assert(timeoutState.pageInteractive, '超时后页面不可交互');
+
+    await page.screenshot({ path: path.join(artifactDir, 'dashboard-timeout.png'), fullPage: true });
+    fs.writeFileSync(path.join(artifactDir, 'timeout-path.json'), JSON.stringify({
+      elapsedMs: Date.now() - timeoutProbeStartedAt,
+      ...timeoutState,
+      consoleErrorsSinceProbe: consoleErrors.slice(consoleBaseline),
+      networkFailuresSinceProbe: networkFailures.slice(networkBaseline),
+    }, null, 2), 'utf8');
+    await page.unroute('**/v1/health/**');
+
+    console.log(JSON.stringify({
+      ok: true,
+      baseUrl,
+      dashboard,
+      timeoutPath: { elapsedMs: Date.now() - timeoutProbeStartedAt, ...timeoutState },
+      consoleErrorCount: consoleErrors.length,
+      networkFailureCount: networkFailures.length,
+      exemptedErrors: consoleErrors.length - unexpectedConsoleErrors.length,
+      exemptedNetworkFailures: networkFailures.length - unexpectedNetworkFailures.length,
+    }, null, 2));
   } catch (error) {
     failures.push(error.message);
     await page.screenshot({ path: path.join(artifactDir, 'failure.png'), fullPage: true }).catch(() => {});

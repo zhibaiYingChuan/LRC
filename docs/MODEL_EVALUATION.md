@@ -4,6 +4,13 @@
 > 评估范围：CodeBERT-base 替代方案
 > 前提约束：candle BertModel 兼容、hf-mirror.com 可下载、模型体积可控（<500MB）
 
+> **⚠️ 现状更新（v0.9.x）**：本文档为 v0.1.x 时期的**历史评估记录**。自 v0.6.0 起，
+> 默认嵌入模型已切换为 **BGE-small-zh**（中文环境）/ **MiniLM-L6-v2**（其他语言），
+> 由 `src/engine/model_resolver.rs` 的 `selected_model_id()` 决定；可用环境变量
+> **`LRC_LUOSHU_MODEL_ID`** 或 `~/.lrc/config.toml` 的 `model_id` 覆盖。
+> GraphCodeBERT 已降级为**代码检索的可选/向后兼容模型**（见 `src/bin/server.rs` 的 `RECOMMENDED_MODELS`）。
+> 下文"默认"字样仅代表当时的评估结论，不再反映当前默认值。
+
 ---
 
 ## 一、现状与问题

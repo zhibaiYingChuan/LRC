@@ -10,6 +10,7 @@
 
 use crate::chunker::CodeChunk;
 use crate::engine::encoder::{CodeEncoder, EmbeddingVector, FastEncoder};
+use crate::errors::LrcResult;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -51,13 +52,13 @@ impl EncoderRegistry {
     }
 
     /// 编码单个代码片段（自动按语言路由）
-    pub fn encode(&self, chunk: &CodeChunk) -> Result<EmbeddingVector, String> {
+    pub fn encode(&self, chunk: &CodeChunk) -> LrcResult<EmbeddingVector> {
         let encoder = self.get_encoder(&chunk.language);
         encoder.encode(chunk)
     }
 
     /// 批量编码（自动按语言路由每个片段）
-    pub fn encode_batch(&self, chunks: &[CodeChunk]) -> Result<Vec<EmbeddingVector>, String> {
+    pub fn encode_batch(&self, chunks: &[CodeChunk]) -> LrcResult<Vec<EmbeddingVector>> {
         chunks.iter().map(|c| self.encode(c)).collect()
     }
 

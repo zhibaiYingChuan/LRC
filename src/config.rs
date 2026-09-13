@@ -1,26 +1,33 @@
-// ============================================================
-// 许可证: Apache 2.0
-// 本文件实现配置持久化，属于公开层 (Layer 1)。
-// ============================================================
-//
-// 配置持久化模块 — 支持桌面端agent配置保存与加载
-//
-// 核心能力:
-//   1. LrcConfig — 完整配置结构，包含端口、LLM API、源码目录等
-//   2. 自动保存到用户配置目录 (%APPDATA%\LoongRecall\config.json)
-//   3. 自动加载已有配置，支持增量修改
-//   4. 支持全局配置vs项目级配置分离
-//   5. P2-06 修复：API Key 使用 AES-256-GCM 加密存储（安全第一）
+//! ============================================================
+//! 许可证: Apache 2.0
+//! 本文件实现配置持久化，属于公开层 (Layer 1)。
+//! ============================================================
+//!
+//! 配置持久化模块 — 支持桌面端agent配置保存与加载
+//!
+//! 核心能力:
+//!   1. LrcConfig — 完整配置结构，包含端口、LLM API、源码目录等
+//!   2. 自动保存到用户配置目录 (%APPDATA%\LoongRecall\config.json)
+//!   3. 自动加载已有配置，支持增量修改
+//!   4. 支持全局配置vs项目级配置分离
+//!   5. P2-06 修复：API Key 使用 AES-256-GCM 加密存储（安全第一）
 
 use crate::engine::llm_translator::LlmApiConfig;
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：配置域错误收敛为带分类的 LrcError。
+// 存量调用方（返回 `Result<_, String>` 者）可继续用 `?` 上浮（见 errors.rs 的 From 实现）。
+use crate::errors::{LrcError, LrcResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, bytes).map_err(|e| format!("写入临时配置文件失败: {}", e))?;
-    fs::rename(&temp_path, path).map_err(|e| format!("原子替换配置文件失败: {}", e))
+fn atomic_write(path: &Path, bytes: &[u8]) -> LrcResult<()> {
+    // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P3-3「原子写入逻辑重复 4 处」）：
+    //   本函数原为四处重复实现之一（固定临时名 `path.with_extension("json.tmp")`，
+    //   且 rename 失败时不清理临时文件）。现统一委托 Layer 1 公共设施
+    //   [`crate::atomic_file::write_atomic`]——临时名带 UUID 保证唯一、
+    //   失败路径清理残留，全仓只此一份实现。
+    crate::atomic_file::write_atomic(path, bytes)
+        .map_err(|error| LrcError::io(format!("原子替换配置文件失败: {}", error)))
 }
 
 /// LRC 默认 HTTP 端口
@@ -145,11 +152,13 @@ impl LrcConfig {
     ///
     /// 自动创建父目录，如果创建失败则返回错误。
     /// 保存时自动将 llm_api 加密到 encrypted_api_key 字段。
-    pub fn save(&self) -> Result<(), String> {
-        let path = Self::get_config_path().map_err(|e| format!("获取配置路径失败: {}", e))?;
+    pub fn save(&self) -> LrcResult<()> {
+        let path = Self::get_config_path()
+            .map_err(|e| LrcError::config(format!("获取配置路径失败: {}", e)))?;
 
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
+            fs::create_dir_all(parent)
+                .map_err(|e| LrcError::io(format!("创建配置目录失败: {}", e)))?;
         }
 
         // 创建用于序列化的副本，加密 API Key
@@ -162,7 +171,7 @@ impl LrcConfig {
         }
 
         let json = serde_json::to_string_pretty(&save_config)
-            .map_err(|e| format!("序列化配置失败: {}", e))?;
+            .map_err(|e| LrcError::config(format!("序列化配置失败: {}", e)))?;
 
         atomic_write(&path, json.as_bytes())?;
 
@@ -227,10 +236,10 @@ impl LrcConfig {
     /// 解析LLM API配置（从保存的字符串解析为LlmApiConfig）
     ///
     /// 调用此方法后，结果存入 `parsed_llm_api` 字段。
-    pub fn parse_llm_api(&mut self) -> Result<(), String> {
+    pub fn parse_llm_api(&mut self) -> LrcResult<()> {
         if self.llm_config_invalid {
             self.parsed_llm_api = None;
-            return Err("LLM API 密钥无法解密，请重新配置".to_string());
+            return Err(LrcError::config("LLM API 密钥无法解密，请重新配置"));
         }
         match &self.llm_api {
             Some(raw) => {
@@ -238,7 +247,9 @@ impl LrcConfig {
                     self.parsed_llm_api = None;
                     return Ok(());
                 }
-                let parsed = LlmApiConfig::parse(raw.trim())?;
+                // LlmApiConfig::parse 仍以 String 报错（P1-6 迁移尚未覆盖该模块）；
+                // 此处显式标注为「输入非法」域，而非引入通用的 From<String> 静默重分类。
+                let parsed = LlmApiConfig::parse(raw.trim()).map_err(LrcError::invalid_input)?;
                 self.parsed_llm_api = Some(parsed);
                 Ok(())
             }

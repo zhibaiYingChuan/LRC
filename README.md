@@ -23,7 +23,28 @@
 
 LRC 的核心功能通过 Rust 单元测试、集成测试、前端契约检查和桌面端 CDP 回归门禁持续验证。
 
+**启用提交前检查（推荐）**：仓库自带版本控制的 Git 钩子，克隆后执行一次即可启用（提交前自动跑 fmt / clippy / check / test / 算法泄露检测 5 项检查）：
+
+```powershell
+.\scripts\enable_git_hooks.ps1          # 等价于 git config --local core.hooksPath .githooks
+git config --local --unset core.hooksPath   # 需要撤销时
+```
+
 > 性能数据会随版本、硬件和配置变化，发布前以当前版本的 CI 结果为准。
+
+**本地开发链路（桌面端 CDP 调试 / 双实例隔离）**：以下脚本随仓库交付，供本地开发与 CDP 回归测试使用（非生产运行时依赖）：
+
+```powershell
+# 1) 启动开发代理（端口 1420，直接服务磁盘 static/，并代理 API 到 sidecar）
+#    作用：WebView2 会启发式缓存旧 app.js；经 1420 访问可确保测到磁盘最新前端，并禁用缓存。
+python .\scripts\dev-proxy.py 1420 --dev
+
+# 2) 启动隔离的开发版实例（端口 3100 + 独立数据目录，不影响稳定版 3099）
+.\scripts\run-dev.ps1              # 或双击 scripts\run-dev.bat
+.\scripts\run-dev.ps1 -Build       # 先编译再启动
+```
+
+> `tests/frontend/` 下的 CDP 测试（`cdp-regression.js`、`association-dashboard-cdp.js`、`association-desktop-cdp.js`）优先经 `localhost:1420` 验证磁盘最新前端；dev-proxy 未启动时自动回退原地重载并告警（此时不保证验证的是最新前端）。
 
 ---
 
@@ -165,8 +186,8 @@ v0.6.0 同步完成 LRC 全案界面重构，基于"形现代，意古风"设计
 |------|------|------|
 | 色阶与排版 Token | [colors_and_type.css](static/colors_and_type.css) | 6 组色阶（墨韵/宣纸/金色/玉色/朱砂/水蓝，每色 10 级）+ 语义别名 + 排版/间距/圆角/阴影/动效 |
 | 全局组件库 | [components.css](static/components.css) | 按钮（5 种变体 + 3 种尺寸 + 洛书加载动画）、卡片（含记忆类型色条）、输入框、模态框、侧边栏 |
-| SVG 图标集 | [static/assets/icons/](static/assets/icons) | 15 个极简线性图标（24x24px 栅格） |
-| SVG Logo 集 | [static/assets/logo/](static/assets/logo) | 4 种 Logo 形态（主标/横版/纵版/纯文字） |
+| SVG 图标集 | [static/assets/icons/](static/assets/icons) | 56 个极简线性图标（53 个通用图标 + 3 个洛书能力图标，24x24px 栅格） |
+| SVG Logo 集 | [static/assets/logo/](static/assets/logo) | 2 种 SVG Logo 形态（主标/横版）+ 1 张设计稿 PNG |
 
 **记忆类型色条系统**：信任中心 6 张卡片按记忆类型添加左侧色条，实现"一眼可辨"的视觉分组。
 

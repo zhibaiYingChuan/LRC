@@ -1,18 +1,23 @@
-// 许可证: Apache 2.0
-//
-// 系统托盘模块 — 桌面端后台运行支持
-// =====================================
-//
-// 核心能力:
-//   1. 创建系统托盘图标，显示 "LRC 记忆服务运行中" 提示
-//   2. 右键菜单：打开仪表盘 / 退出
-//   3. 双击托盘图标：打开浏览器仪表盘
-//   4. 跨平台：Windows 原生 + Linux/macOS 降级提示
-//
-// 设计原则:
-//   - Windows 用 Win32 Shell_NotifyIconW API（独立线程消息循环）
-//   - Linux/macOS 打印提示而非阻塞
-//   - 不影响 tokio 异步主循环
+//! 许可证: Apache 2.0
+//!
+//! 系统托盘模块 — 桌面端后台运行支持
+//! =====================================
+//!
+//! 核心能力:
+//!   1. 创建系统托盘图标，显示 "LRC 记忆服务运行中" 提示
+//!   2. 右键菜单：打开仪表盘 / 退出
+//!   3. 双击托盘图标：打开浏览器仪表盘
+//!   4. 跨平台：Windows 原生 + Linux/macOS 降级提示
+//!
+//! 设计原则:
+//!   - Windows 用 Win32 Shell_NotifyIconW API（独立线程消息循环）
+//!   - Linux/macOS 打印提示而非阻塞
+//!   - 不影响 tokio 异步主循环
+
+// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：托盘线程启动错误由不可判别的
+// `String` 收敛为带域分类的 [`crate::errors::LrcError`]（内部错误）。
+// `Display` 仅输出 message，故 CLI 日志文案**零漂移**。
+use crate::errors::LrcResult;
 
 /// 启动系统托盘图标
 ///
@@ -21,7 +26,7 @@
 ///
 /// # 参数
 /// - `dashboard_url`: 仪表盘地址
-pub fn start_tray(dashboard_url: String) -> Result<TrayHandle, String> {
+pub fn start_tray(dashboard_url: String) -> LrcResult<TrayHandle> {
     #[cfg(windows)]
     {
         // 使用通道等待托盘线程初始化
@@ -34,7 +39,7 @@ pub fn start_tray(dashboard_url: String) -> Result<TrayHandle, String> {
                 let _ = tx.send(());
                 win_tray::run_tray_loop(&url);
             })
-            .map_err(|e| format!("托盘线程启动失败: {e}"))?;
+            .map_err(|e| crate::errors::LrcError::internal(format!("托盘线程启动失败: {e}")))?;
 
         // 等待线程就绪（最多1秒）
         let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
@@ -82,6 +87,19 @@ mod win_tray {
     const WM_TRAYICON: u32 = WM_USER + 1;
     const IDM_DASHBOARD: u32 = 1001;
     const IDM_EXIT: u32 = 1002;
+
+    /// 窗口用户数据的 magic 标记
+    ///
+    /// v0.9.7 新增（配合「托盘裸指针无来源校验」修复）：
+    ///   用于在解引用 GWLP_USERDATA 前证明该指针确由本模块写入，
+    ///   避免把任意非 0 值当作有效 `String` 解引用（未定义行为）。
+    const USER_DATA_MAGIC: u64 = 0x4C52_4354_5241_5901; // "LRCTRAY" + 版本位
+
+    /// 存入窗口用户数据的包裹结构（带 magic tag，供来源校验）
+    struct UserData {
+        magic: u64,
+        url: String,
+    }
 
     /// 启动托盘消息循环（在主线程中调用会阻塞）
     pub fn run_tray_loop(dashboard_url: &str) {
@@ -134,9 +152,23 @@ mod win_tray {
 
         if !hwnd.is_null() {
             // 保存 dashboard_url 到窗口数据
-            let url_ptr = Box::into_raw(Box::new(dashboard_url.to_string()));
-            // SAFETY: SetWindowLongPtrW 设置窗口用户数据，url_ptr 由 Box::into_raw 分配，生命周期由窗口管理
-            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, url_ptr as isize) };
+            //
+            // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P3 安全「托盘裸指针无来源校验」）：
+            //   根因：原实现把 `Box::into_raw(Box::new(String))` 的裸指针直接存入 GWLP_USERDATA，
+            //         读取侧仅做 `ptr != 0` 检查就 `&*(ptr as *const String)` 解引用——
+            //         无任何来源/类型校验。若该窗口数据被其它消息（如 WM_GETMINMAXINFO 等
+            //         早于本处赋值的路径）写入非 0 的其它值，或消息循环退出后仍有派发
+            //         （use-after-free 窗口期），解引用即为未定义行为。
+            //   修复：改用带 **magic tag** 的包裹结构 `UserData { magic, url }`；
+            //         读取侧先校验 magic 再取字段，且用 `addr_of!` 取字段地址避免
+            //         对可能失效的整体引用求值，消除"把任意非 0 值当 String"的风险。
+            let user_data_ptr = Box::into_raw(Box::new(UserData {
+                magic: USER_DATA_MAGIC,
+                url: dashboard_url.to_string(),
+            }));
+            // SAFETY: SetWindowLongPtrW 设置窗口用户数据；user_data_ptr 由 Box::into_raw 分配，
+            //         生命周期由本函数末尾的 Box::from_raw 回收（窗口销毁前完成）。
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, user_data_ptr as isize) };
 
             // 添加托盘图标
             add_tray_icon(hwnd);
@@ -158,9 +190,11 @@ mod win_tray {
             }
 
             // 清理
-            // SAFETY: Box::from_raw 从 SetWindowLongPtrW 保存的指针重建 Box，生命周期与窗口一致
+            // SAFETY: Box::from_raw 从 SetWindowLongPtrW 保存的指针重建 Box。
+            //         与写入侧配对，且此处置空窗口数据，消除消息循环退出后的 use-after-free 窗口。
             unsafe {
-                let _ = Box::from_raw(url_ptr);
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                let _ = Box::from_raw(user_data_ptr);
             }
         }
     }
@@ -200,15 +234,27 @@ mod win_tray {
 
     /// 打开仪表盘
     fn open_dashboard(hwnd: HWND) {
-        // SAFETY: GetWindowLongPtrW 读取窗口用户数据，返回由 SetWindowLongPtrW 设置的指针
-        // 解引用前检查 ptr != 0，确保指针有效
+        // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P3 安全「托盘裸指针无来源校验」）：
+        //   原实现仅检查 `ptr != 0` 就把窗口数据当 `*const String` 解引用，无类型/来源校验。
+        //   现要求：(1) 指针非 0；(2) magic 匹配 `USER_DATA_MAGIC`（证明确由本模块写入）；
+        //   否则直接返回，不再解引用任意非 0 值。
+        // SAFETY: GetWindowLongPtrW 读取先前由 SetWindowLongPtrW 写入的窗口用户数据指针；
+        //         解引用前已双重校验（非空 + magic 匹配），且仅在消息循环存活期内被调用
+        //         （消息循环退出时会先置空该数据，故不存在 use-after-free）。
         unsafe {
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-            if ptr != 0 {
-                let url = &*(ptr as *const String);
-                if let Err(e) = webbrowser::open(url) {
-                    eprintln!("[托盘] 打开浏览器失败: {e}");
-                }
+            if ptr == 0 {
+                return;
+            }
+            let user_data = &*(ptr as *const UserData);
+            if user_data.magic != USER_DATA_MAGIC {
+                eprintln!(
+                    "[托盘] 窗口用户数据 magic 校验失败，跳过打开仪表盘（防止非法指针解引用）"
+                );
+                return;
+            }
+            if let Err(e) = webbrowser::open(&user_data.url) {
+                eprintln!("[托盘] 打开浏览器失败: {e}");
             }
         }
     }
