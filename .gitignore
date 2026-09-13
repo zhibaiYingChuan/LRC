@@ -259,6 +259,14 @@ scripts/force_reload.py
 scripts/commit_msg_*.txt
 scripts/audit_report.json
 
+# P1: 本地测试/开发数据（非交付内容，2026-09-14 v0.9.7 推送前清理）
+# 依据: 这 4 个文件仅在本地用于联调与人工验证，全仓零引用（README/CI/测试均未引用），
+#       且 CDP 与单元测试不依赖它们 —— 属"本地测试与开发文件"，不随克隆交付。
+scripts/add_life_memories.ps1
+scripts/test_association_quality.ps1
+scripts/life_memories_batch.json
+scripts/life_memories_batch2.json
+
 # P1: 本地报告文档（内部审计/测试/评审报告，非用户文档）
 docs/CDP_TEST_REPORT_*.md
 docs/HCSE_VERIFICATION_REPORT_*.md
