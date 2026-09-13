@@ -893,9 +893,11 @@ python G:\code-memory\scripts\dev-proxy.py 1420 --dev
 | `src/memory_store_cache.rs` | **c7**（P2-2 缓存子系统外提） |
 | `docs/GLOBAL_CODE_REVIEW_REPORT.md` | 本报告 |
 
-> **口径说明**：`git diff --stat` 只统计**已跟踪文件的改动**，不含上述未跟踪文件；故 8.5/8.14.7 节"回归全绿"与本节统计是两套口径，前者验证**代码正确性**，后者衡量**交付面**。八轮累计 **16 个未跟踪文件**（实测 `git ls-files --others --exclude-standard`），**尚待 `git add` 后方可随克隆交付**。
+> **口径说明**：`git diff --stat` 只统计**已跟踪文件的改动**，不含上述未跟踪文件；故 8.5/8.14.7 节"回归全绿"与本节统计是两套口径，前者验证**代码正确性**，后者衡量**交付面**。
 >
-> **⚠ 其中 8 个是 `src/*.rs` 源文件**（`model_ids.rs`、`atomic_file.rs`、`v1_api_tests.rs`、`memory_store_tests.rs`、`memory_state_machine.rs`、**`errors.rs`**、**`memory_store_types.rs`**、**`memory_store_cache.rs`**）——**若未提交，克隆环境将编译失败**（`mod` 声明找不到文件）。这比"脚本缺失"更严重，发布前必须优先提交。
+> **✅ 已交付（2026-09-13）**：上表 16 个文件**已全部 `git add` 并提交**——提交 `b284ca2`（分支 `fix/code-review-8rounds`，`89 files changed, 13733 insertions(+), 8813 deletions(-)`；Git 正确识别 `src/engine/memory_state_machine.rs → src/memory_state_machine.rs` 为 rename，相似度 98%）。提交经**预提交钩子 5 项检查全部通过**（fmt + clippy + check + test + 算法泄露检测）。复核命令 `git ls-files --others --exclude-standard` 现返回**空**，即"克隆可用"这一交付前提已满足。
+>
+> **⚠ 其中 8 个是 `src/*.rs` 源文件**（`model_ids.rs`、`atomic_file.rs`、`v1_api_tests.rs`、`memory_store_tests.rs`、`memory_state_machine.rs`、**`errors.rs`**、**`memory_store_types.rs`**、**`memory_store_cache.rs`**）——若未提交，克隆环境将编译失败（`mod` 声明找不到文件）。这比"脚本缺失"更严重，**本次已优先纳入同一提交**。
 >
 > **被忽略条目现状（实测）**：`docs/` 下 114 项（r10 解除两份 HCSE 清单后由 116 降至 114）、`scripts/` 下 55 项（r14 解除三脚本后的当下值；`cdp_*.py`、`verify_*.ps1`、`run-dev.*` 通配规则下的历史脚本仍被忽略）。
 
