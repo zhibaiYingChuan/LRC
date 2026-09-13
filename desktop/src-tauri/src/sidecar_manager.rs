@@ -1448,22 +1448,31 @@ impl SidecarManager {
 
     /// 检查进程是否存活（跨平台，静态方法）
     ///
-    /// Windows: 通过子进程句柄的 try_wait 检查
-    /// Unix: 发送信号 0 检查进程是否存在
+    /// **两平台统一使用 `try_wait()`**，不要退回 `libc::kill(pid, 0)`——原因如下：
+    ///
+    /// v0.9.7 审查修复（P0 平台缺陷，CI 实测暴露）：Unix 分支此前实现为
+    /// `unsafe { libc::kill(child.id() as i32, 0) == 0 }`，该写法有两个缺陷：
+    ///   1. **僵尸进程仍被判定为"存活"**。子进程退出后若未被 reap，会处于僵尸态
+    ///      （`Z` 状态）；僵尸仍占据 PID 表项，故 `kill(pid, 0)` 返回 **0（成功）**。
+    ///      本函数的两处调用方（`prepare_start` / `collect_dead_instances`）都依赖
+    ///      "已退出的 sidecar 应被判为死亡"，僵尸误判会使死亡实例永远无法被回收，
+    ///      进而 `prepare_start` 恒返回 `AlreadyRunning`，形成**无法自愈的死锁**。
+    ///   2. **PID 复用风险**：进程被 reap 后 PID 可能被系统分配给新进程，
+    ///      `kill(pid, 0)` 会因此把"早已死去的 sidecar"判为存活。
+    /// 而 `try_wait()` 直接查询的是**本进程持有的子进程句柄**（内核 waitpid 语义），
+    /// 既能准确区分"已退出"，又顺带完成 reap，从根上规避上述两点。
+    ///
+    /// 该缺陷在 Windows 上不可见（Windows 分支本就使用 `try_wait`），
+    /// 故表现为 **ubuntu / macos 失败、windows 通过** 的平台差异——
+    /// 由 v0.9.7 新增的 CI 步骤 `cargo test (desktop lib)` 首次暴露
+    /// （此前桌面端单测从未在 CI 执行，故历史版本未发现）。
     fn is_process_alive(child: &mut Child) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            match child.try_wait() {
-                Ok(None) => true,     // 进程仍在运行
-                Ok(Some(_)) => false, // 进程已退出
-                Err(_) => true,       // try_wait 失败时保守假设仍在运行
-            }
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            // SAFETY: kill(pid, 0) 是 POSIX 标准调用，信号 0 仅检查进程是否存在，不发送实际信号
-            unsafe { libc::kill(child.id() as i32, 0) == 0 }
+        match child.try_wait() {
+            Ok(None) => true,     // 进程仍在运行
+            Ok(Some(_)) => false, // 进程已退出（try_wait 已顺带 reap）
+            // try_wait 失败时保守假设仍在运行：宁可让上层稍后重试，
+            // 也不误杀一个可能健康的 sidecar。
+            Err(_) => true,
         }
     }
 
