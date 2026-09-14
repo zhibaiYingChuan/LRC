@@ -486,6 +486,59 @@
     /* 折叠按钮用 hidden 控制显隐：.btn 的 display:inline-flex 会覆盖 UA 的 [hidden]，需显式压制 */
     .cm-toggle[hidden] { display: none; }
 
+    /* -------------------- P7 主动发现（"顺手想起"卡片） --------------------
+       原则二"提示必须可忽略"：这是一张普通的卡，可折叠、可无视，
+       无强色块、无动效催促、无浮层——避免任何"打扰感"。 */
+    .discovery-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .discovery-item {
+      padding: 10px 12px;
+      background: var(--lrc-宣纸-50, #faf8f4);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+    }
+
+    .discovery-head {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+
+    .discovery-preview {
+      font-size: 13px;
+      color: var(--ink);
+      line-height: 1.5;
+      cursor: pointer;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      line-clamp: 2;
+      -webkit-box-orient: vertical;
+    }
+
+    .discovery-preview:hover { color: var(--gold); }
+
+    /* 原则三：依据文案要可见（用户有知情权，知道"为什么给我看这条"） */
+    .discovery-reason {
+      margin-top: 6px;
+      line-height: 1.5;
+    }
+
+    .discovery-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+
+    .discovery-card[hidden] { display: none; }
+    .discovery-list[hidden] { display: none; }
+
     /* -------------------- M3 系统替你做的事 -------------------- */
     .af-list {
       display: grid;

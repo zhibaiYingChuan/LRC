@@ -595,6 +595,7 @@ fn run_association_explore(
         privacy_context: None,
         explore_pure: true,
         regression_query: None,
+        read_only: false,
     };
     // P8.2c：语义旁路活性观测状态（unused / applied / unavailable），
     // 随响应暴露，供评测断言旁路是否真实参与（避免 P7.4 的误读教训）。
@@ -1323,6 +1324,9 @@ pub fn build_v1_router(
     let regulator_store = store.clone();
     // v0.9.7 审查修复：备份恢复需持 store 锁防止并发写竞态，并失效缓存
     let restore_store = store.clone();
+    // P7 主动发现（daoti/PREREG_ACTIVE_DISCOVERY.md）：独立的"第二通道"，
+    // 不在任何用户查询路径上，且其内部检索一律 read_only（不写排序状态）。
+    let discovery_store = store.clone();
 
     // P0-1: 编码器创建一次，所有请求复用（避免每次请求都加载 ML 模型）
     let encode_encoder = std::sync::Arc::new(HybridLuoShuEncoder::default());
@@ -1606,6 +1610,7 @@ pub fn build_v1_router(
                                 privacy_context: privacy_ctx.clone(),
                                 explore_pure: false,
                                 regression_query: None,
+                                read_only: false,
                             };
                             let mut internal_error = false;
                             let fast_result = match store.recall_with_cancel(
@@ -1633,6 +1638,7 @@ pub fn build_v1_router(
                                 privacy_context: privacy_ctx,
                                 explore_pure: false,
                                 regression_query: None,
+                                read_only: false,
                             };
                             // 深度路径始终执行：查询意图权重会在 RRF 阶段抑制泛化词污染，
                             // 同时保留无 ML 模式下的真实结果，便于评估与后续升级编码器。
@@ -2933,6 +2939,166 @@ pub fn build_v1_router(
                     let cleared = store.audit_trail.clear_matching(|event| event.event_type == AuditEventType::RetrievalExecuted);
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "success": true, "cleared": cleared, "message": "联想记录已在本机清除"
+                    })))
+                }
+            }
+        }))
+        // POST /v1/discovery/check — P7 主动发现：拉取道体漂移事件并执行一次独立检查
+        //
+        // **原则一（不参与排序）**：本端点不在任何用户查询路径上，且其内部检索
+        // 一律 `read_only`（见 `RecallFilter::read_only`），不写回状态机/指标/审计，
+        // 因此开启与关闭本功能时，用户查询的返回结果逐字节一致（PREREG D3）。
+        //
+        // **原则二（可忽略）**：结果只返回候选列表，不推送、不弹窗、不阻塞。
+        // 前端以徽章/列表按需拉取。
+        //
+        // 触发链路：daemon `/drift`（漂移事件）→ 本端点（主动检查）→
+        // 成功后 `consume_drift_events` 置位，避免同一事件被重复消费。
+        .route("/discovery/check", post({
+            let store = discovery_store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    // 门控关闭 → 直接返回跳过态（不发起任何网络/磁盘工作）
+                    if !crate::discovery::active_discovery_enabled() {
+                        return Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+                            Json(serde_json::json!(
+                                crate::discovery::skipped_outcome("gate_off")
+                            )),
+                        );
+                    }
+                    // 漂移事件拉取在锁外完成（异步网络等待不占用 store 锁）
+                    let Some(drift) = crate::discovery::fetch_drift_state().await else {
+                        // daemon 不可达 → 静默降级，行为与未引入本模块一致
+                        return Ok(Json(serde_json::json!(
+                            crate::discovery::skipped_outcome("daemon_unreachable")
+                        )));
+                    };
+                    let consumed = drift.pending_events.len();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let mut guard = match store.try_lock() {
+                            Ok(g) => g,
+                            // 锁忙（用户查询/合成持有）→ 跳过本轮，下轮再试
+                            Err(_) => return None,
+                        };
+                        let data_dir = guard.persistence().data_dir().to_path_buf();
+                        Some(crate::discovery::run_discovery_cycle(
+                            &mut guard, &drift, &data_dir,
+                        ))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    let Some(outcome) = outcome else {
+                        return Ok(Json(serde_json::json!(
+                            crate::discovery::skipped_outcome("store_busy")
+                        )));
+                    };
+                    // 事件已在 LRC 侧成功转为检查 → 置位消费，避免重复检查同一事件。
+                    // 仅当确实消费了事件时调用（无事件时置位是无意义的空写）。
+                    if consumed > 0 {
+                        let _ = crate::discovery::consume_drift_events().await;
+                    }
+                    Ok(Json(serde_json::json!(outcome)))
+                }
+            }
+        }))
+        // GET /v1/discovery/drift — P7 可观测性：透传道体漂移状态（只读，不消费事件）
+        .route("/discovery/drift", get(|| async move {
+            match crate::discovery::fetch_drift_state().await {
+                Some(d) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                    serde_json::json!({
+                        "ok": true,
+                        "last_drift": d.last_drift,
+                        "drift_total": d.drift_total,
+                        "threshold": d.threshold,
+                        "explore_beats": d.explore_beats,
+                        "active_gua": d.active_gua,
+                        "active_palace": d.active_palace,
+                        "pending_events": d.pending_events.len(),
+                    }),
+                )),
+                None => Ok(Json(serde_json::json!({
+                    "ok": false,
+                    "error": "daemon_unreachable",
+                    "message": "道体推演进程不可达（主动发现为增强能力，不影响检索）"
+                }))),
+            }
+        }))
+        // POST /v1/discovery/feedback — P7 步骤四：登记用户对主动提示的响应
+        //
+        // 反馈只影响"是否触发"与"展示优先级"，**不改变检索排序**（原则一）。
+        .route("/discovery/feedback", post({
+            let store = discovery_store.clone();
+            move |Json(body): Json<serde_json::Value>| {
+                let store = store.clone();
+                async move {
+                    let kind_raw = body
+                        .get("kind")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let Some(kind) = crate::discovery::DiscoveryFeedbackKind::parse(kind_raw)
+                    else {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "invalid_kind",
+                                "message": "kind 必须是 shown | clicked | ignored | not_interested"
+                            })),
+                        ));
+                    };
+                    let memory_id = body
+                        .get("memory_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let gua = body
+                        .get("gua")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    // data_dir 从持久化层取（与 memories.json 同目录）
+                    let data_dir = match store.try_lock() {
+                        Ok(guard) => guard.persistence().data_dir().to_path_buf(),
+                        Err(_) => {
+                            return Err((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "error": "store_busy",
+                                    "message": "记忆服务繁忙，请稍后重试"
+                                })),
+                            ));
+                        }
+                    };
+                    let ledger = tokio::task::spawn_blocking(move || {
+                        crate::discovery::record_feedback_and_save(
+                            &data_dir, &memory_id, &gua, kind,
+                        )
+                    })
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "feedback_task_failed",
+                                "message": format!("反馈登记失败: {}", e)
+                            })),
+                        )
+                    })?;
+                    let suppressed: Vec<String> = ledger
+                        .by_gua
+                        .iter()
+                        .filter(|(_, f)| {
+                            f.ignored_streak >= crate::discovery::discovery_ignore_decay()
+                        })
+                        .map(|(g, _)| g.clone())
+                        .collect();
+                    Ok(Json(serde_json::json!({
+                        "success": true,
+                        "kind": kind.as_str(),
+                        "shown_today": ledger.shown_today,
+                        "daily_cap": crate::discovery::discovery_daily_cap(),
+                        "suppressed_guas": suppressed,
                     })))
                 }
             }

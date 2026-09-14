@@ -99,6 +99,14 @@ pub mod memory_state_machine;
 /// 三层基准测试框架（可被 CLI、仪表盘 API、CI/CD 复用）
 pub mod benchmark;
 
+/// P7 主动发现通道（产品侧只消费不计算）：把状态机的漂移信号当作"触发源"，
+/// 在独立只读路径上发起一次检查，结果以可忽略的提示呈现（判据见
+/// daoti 研究资产目录下的 PREREG_ACTIVE_DISCOVERY.md）。
+/// 许可边界：只消费 daemon 的 JSON 信号，不内置引擎/词典。
+/// 门控 `LRC_ACTIVE_DISCOVERY` 默认关。
+#[cfg(feature = "server")]
+pub mod discovery;
+
 // === Layer 2: 受保护核心引擎（专有研究许可） ===
 pub mod engine;
 

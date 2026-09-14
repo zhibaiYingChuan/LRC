@@ -859,6 +859,7 @@ async fn handle_recall_enhanced(
                 privacy_context: None,
                 explore_pure: false,
                 regression_query: None,
+                read_only: false,
             };
             let fast_result = store
                 .recall(&enrich_query, &fast_filter)
@@ -874,6 +875,7 @@ async fn handle_recall_enhanced(
                 privacy_context: None,
                 explore_pure: false,
                 regression_query: None,
+                read_only: false,
             };
             let deep_result = store
                 .trapezoid_focus_recall(&enrich_query, &deep_filter, 1)
@@ -1182,6 +1184,7 @@ async fn handle_recall(
         privacy_context: None,
         explore_pure: false,
         regression_query: None,
+        read_only: false,
     };
 
     // v0.9.7 导航层（预注册实验证实：导航改变候选集 > 随机方向扩展，

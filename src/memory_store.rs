@@ -1140,6 +1140,24 @@ impl<P: Persistence> MemoryStore<P> {
         self.cache.invalidate();
     }
 
+    /// 按 ID 集合只读取出记忆（P7 主动发现构造探索查询用）。
+    ///
+    /// 语义：纯读，不做过滤/排序/写回。`ids` 为空时返回空列表。
+    /// 抽出本方法的原因：`load_cached` 是私有实现细节，而调用方（discovery）
+    /// 需要一个"只读、不触发任何状态写入"的公开入口——若改用 `list_memories`
+    /// 则要先全量排序再按 limit 截断，既多算又可能截不到目标 ID。
+    pub fn memories_by_ids(&self, ids: &[String]) -> Vec<Memory> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let wanted: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+        self.load_cached()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| wanted.contains(m.id.as_str()))
+            .collect()
+    }
+
     /// v0.9.7 审查修复：外部替换数据文件（如备份恢复）后强制失效内存缓存，
     /// 否则后续读取仍返回恢复前的旧缓存数据
     pub fn invalidate_cache_after_external_restore(&self) {
@@ -3037,6 +3055,18 @@ impl<P: Persistence> MemoryStore<P> {
             }
         }
 
+        // P7 主动发现（PREREG §3.1 D3）：只读检索不得写回任何状态，与快路径同款。
+        // 深路径的写入面更广（指标、合成命中日志、状态机激活、合成预标记），
+        // 被主动发现调用时会同时污染排序输入与后台任务调度，故必须同样提前返回。
+        if filter.read_only {
+            return Ok(RecallResult {
+                memories,
+                scores,
+                total: total_count,
+                regression_evidence: deep_evidence,
+            });
+        }
+
         // LRC 内置道体状态机：激活本次召回的记忆、记录联想轨迹并持久化。
         // 这样下一次检索可感知"近期在想什么"，让信息从"查询依赖"变为"上下文依赖"。
         self.bake_activation(&memories, &scores);
@@ -3550,6 +3580,19 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 搜索是只读热路径：不在请求内更新 last_accessed 或同步重写记忆文件。
         // 访问时间由后台维护，避免每次搜索都序列化全量记忆并阻塞全局 store 锁。
+
+        // P7 主动发现（PREREG §3.1 D3 零伤害承诺）：read_only 检索是"第二通道"，
+        // 必须在**任何**状态写回之前返回——不写状态机、不写探索日志、不写指标。
+        // 这三个写入都会改变用户查询路径上的后续排序输入（活性偏置 + 联想桥词），
+        // 一旦发生，D3 的"逐字节一致"即在机制上不可能成立。
+        if filter.read_only {
+            return Ok(RecallResult {
+                memories,
+                scores,
+                total: total_count,
+                regression_evidence,
+            });
+        }
 
         // 记录指标：检索 + 1
         self.dao_metrics.record_recall();
