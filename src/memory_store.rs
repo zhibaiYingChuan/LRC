@@ -830,6 +830,30 @@ impl<P: Persistence> MemoryStore<P> {
         self.luoshu_encoder.get_status().mode.as_str() == "ml"
     }
 
+    /// 状态驱动发现（方向二）：编码**单条文本**为完整句向量（bge 原始维度）。
+    ///
+    /// **为什么需要这个入口**（实测驱动）：
+    /// 状态驱动发现的语义匹配需要"道体状态锚点 → 句向量"，再与记忆缓存向量
+    /// 做点积。9 维洛书投影承载不了语义区分度（实测：语义差异极大的文本
+    /// 只落 2 个母卦、真实库 4450 条中 96.8% 同属一卦），故必须用**未投影的
+    /// 完整句向量**。
+    ///
+    /// 契约：
+    ///   - ML 编码器不可用（未开 ml feature / 模型缺失）→ 返回 None，调用方
+    ///     回退到标签匹配路径（绝不放宽标准，也不报错）；
+    ///   - 单条耗时实测 ≈2.25s（bge-base-zh, 6 核已饱和、并发无加速），
+    ///     **故调用方只能编码极少量文本**（如单个锚点），不得逐条编码全库。
+    #[cfg(feature = "ml")]
+    pub fn encode_sentence_vector(&self, text: &str) -> Option<Vec<f32>> {
+        self.luoshu_encoder.encode_embedding(text)
+    }
+
+    /// 非 ml 构建下的同名入口：恒返回 None（调用方回退标签匹配）。
+    #[cfg(not(feature = "ml"))]
+    pub fn encode_sentence_vector(&self, _text: &str) -> Option<Vec<f32>> {
+        None
+    }
+
     /// v0.9.7 联想探索·真实语义相似度（bge 完整句向量余弦，0-1）。
     ///
     /// 9 维洛书投影粒度太粗，承担不了"重要日子 ↔ 结婚纪念日"这类
