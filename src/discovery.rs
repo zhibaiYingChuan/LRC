@@ -32,7 +32,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::memory_store::MemoryStore;
-use crate::memory_store_types::RecallFilter;
+use crate::memory_store_types::{RecallFilter, RecallResult};
 use crate::JsonPersistence;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -107,9 +107,9 @@ pub fn discovery_ignore_decay() -> u32 {
 
 /// 状态漂移事件（由 daemon `GET /drift` 的 `pending_events` 元素反序列化）。
 ///
-/// 契约与 daoti_daemon.py 的 `make_drift_event` 一一对应：
+/// 契约与 daoti 研究资产侧的 `make_drift_event` 一一对应：
 ///   StateDriftEvent { timestamp, drift_magnitude, dominant_gua_before,
-///                     dominant_gua_after }
+///                     dominant_gua_after, query_text }
 #[derive(Debug, Clone, Deserialize)]
 pub struct StateDriftEvent {
     /// 事件时间戳（毫秒，daemon 侧生成）
@@ -124,6 +124,16 @@ pub struct StateDriftEvent {
     /// 漂移后的主导卦
     #[serde(default)]
     pub dominant_gua_after: Option<String>,
+    /// **方案C：卦象→语义文本 的翻译结果**（daemon 侧用离线词典产出）。
+    ///
+    /// **为什么需要它**（实测驱动，见 PREREG §3.5.5）：卦名是 1-2 字的符号，
+    /// 与数百字的用户上下文**并置拼接**后交给加性 TF-IDF 检索时会被完全淹没——
+    /// 实测"换任何卦象候选都不变"（探索侧 B≡C 逐字节相同）。
+    /// 根因是"64 维符号信号 → 文本检索"之间缺少翻译层；`query_text` 即该层。
+    ///
+    /// 缺省（旧 daemon / 字段缺失）→ 空串 → 回退到卦名，行为与修正前一致。
+    #[serde(default)]
+    pub query_text: Option<String>,
 }
 
 /// daemon `GET /drift` 的响应体。
@@ -215,18 +225,44 @@ pub struct DiscoveryOutcome {
 /// 内容摘要截断长度（字符数，非字节；按 char 边界安全截断）。
 const PREVIEW_MAX_CHARS: usize = 80;
 
-/// 探索查询中"最近用户交互摘要"的最大字符数（避免长文把卦名信号淹没）。
+/// 探索查询中"最近用户交互摘要"的最大字符数（方案A 分路专用的上下文上限）。
 const QUERY_CONTEXT_MAX_CHARS: usize = 120;
 
-/// 构造探索查询：卦名 + 最近活跃记忆的内容摘要（PREREG §步骤二）。
+/// 方案A 的 RRF 融合常数（与既有检索一致，便于行为可比）。
+const DISCOVERY_RRF_K: f32 = 60.0;
+
+/// 构造**触发源查询**（方案C：卦象的语义文本）。
 ///
-/// 为什么需要后者：卦名是 1-2 个字，单独作检索词几乎不可能命中任何记忆
-/// （词面检索靠 bigram/词重叠）。而主动发现要检出的对象，恰恰是"与用户
-/// **当前状态**相关、但他自己没去查的旧记忆"——因此查询里必须带上
-/// "用户最近在想什么"的语义载体，这个载体就是状态机的活跃记忆内容。
+/// 为什么不再拼接上下文（v1.0 修正，实测驱动，见 PREREG §3.5.5）：
+/// 原实现把"卦名 + 数百字上下文摘要"**并置**成一条查询，交给加性 TF-IDF。
+/// 实测证明：短卦名被长摘要完全淹没——换任何卦象、甚至换成语料实词，
+/// 候选都**逐字节相同**（B≡C）。即触发源从未真正进入检索，实验等于没测。
 ///
-/// **只读保证**（D3）：`active_ids` 只读取快照，不激活、不转移、不持久化。
-fn build_exploration_query<P>(store: &MemoryStore<P>, gua: &str) -> String
+/// 修正后分工（方案C + 方案A）：
+///   - **本函数**只产出"触发源语义文本"（daemon 侧已把卦象翻译为多个实义词），
+///     作为**独立查询**走一路检索 —— 触发源不再与上下文竞争；
+///   - 上下文摘要另走一路（`build_context_query`），两路结果 RRF 融合。
+///     这既解决了淹没问题，又保留"用户最近在想什么"的语义贡献。
+///
+/// 回退：`query_text` 缺失（旧 daemon）→ 用卦名，行为与修正前一致。
+fn build_trigger_query(event: &StateDriftEvent) -> String {
+    if let Some(q) = event.query_text.as_deref() {
+        let q = q.trim();
+        if !q.is_empty() {
+            return q.to_string();
+        }
+    }
+    event
+        .dominant_gua_after
+        .clone()
+        .or_else(|| event.dominant_gua_before.clone())
+        .unwrap_or_default()
+}
+
+/// 构造**上下文查询**（方案A 的第二路：用户最近在想什么）。
+///
+/// 只读保证（D3）：`active_ids` 只读取快照，不激活、不转移、不持久化。
+fn build_context_query<P>(store: &MemoryStore<P>) -> Option<String>
 where
     P: crate::persistence::Persistence,
 {
@@ -234,7 +270,7 @@ where
         .memory_state_machine
         .active_ids(DISCOVERY_CONTEXT_ACTIVE_LIMIT);
     if active_ids.is_empty() {
-        return gua.to_string();
+        return None;
     }
     let mut context = String::new();
     for m in store.memories_by_ids(&active_ids) {
@@ -248,10 +284,9 @@ where
     }
     let context: String = context.chars().take(QUERY_CONTEXT_MAX_CHARS).collect();
     if context.trim().is_empty() {
-        gua.to_string()
+        None
     } else {
-        // 卦名在前（保持"触发源"信号在场），活跃上下文在后（提供语义载体）
-        format!("{} {}", gua, context)
+        Some(context)
     }
 }
 
@@ -371,32 +406,38 @@ where
         return base_outcome(true, Some("no_drift_events"), 0);
     }
 
-    // 以漂移事件的主导卦作为"探索查询"（步骤二：把漂移事件转为主动检查请求）。
-    // 用最新事件（队尾）——它代表当前状态的最新方向。
+    // 取最新事件（队尾）——它代表当前状态的最新方向。
     let latest = match drift.pending_events.last() {
         Some(e) => e,
         None => unreachable!("pending_events 非空已在上方保证"),
     };
-    let query_gua = latest
-        .dominant_gua_after
-        .clone()
-        .or_else(|| drift.active_gua.clone())
-        .unwrap_or_default();
 
-    if query_gua.trim().is_empty() {
-        return base_outcome(true, Some("no_query_gua"), drift.pending_events.len());
+    // 构造**触发源查询**（方案C）：卦象的语义文本，**独立成一路**，不与上下文拼接。
+    // 这是 §3.5.5 暴露缺陷的直接修正——详见 `build_trigger_query` 的文档。
+    let trigger_query = build_trigger_query(latest);
+    // **M9 门禁对照开关**（`LRC_M9_LEGACY_CONCAT=1`，默认关闭，生产零影响）：
+    // 临时恢复"卦名+上下文并置拼接"的旧实现，用于证明
+    // `trigger_source_must_change_candidates` 门禁**确实能失败**（M9 要求），
+    // 而不是空洞通过。实测结果（2026-09-14）：
+    //   拼接模式下两个不同触发源产出的候选**是无序集合相同的同一批记忆、
+    //   仅顺序不同** → 门禁（用无序集合比较）**确实失败**并给出准确诊断。
+    // 这同时实证了"仅顺序/分数变化不算触发源生效"这一口径升级的必要性。
+    let (trigger_query, m9_legacy_concat) = {
+        let mut q = trigger_query;
+        let mut concat = false;
+        if std::env::var("LRC_M9_LEGACY_CONCAT").as_deref() == Ok("1") {
+            if let Some(ctx) = build_context_query(store) {
+                q = format!("{} {}", q, ctx);
+                concat = true;
+            }
+        }
+        (q, concat)
+    };
+    if trigger_query.trim().is_empty() {
+        return base_outcome(true, Some("no_trigger_query"), drift.pending_events.len());
     }
 
-    // 构造"探索查询"（PREREG §步骤二）：卦名 + 最近用户交互摘要。
-    // 只用卦名太短（单字/双字），词面检索几乎必然落空；并入近期活跃记忆的
-    // 内容片段后，查询才携带"用户最近在想什么"的语义——这正是主动发现要
-    // 检出的对象（用户当前状态相关、但他自己没去查的旧记忆）。
-    //
-    // 读取活跃上下文是**只读**操作，不写回状态（不影响 D3）。
-    let query_text = build_exploration_query(store, &query_gua);
-
-    // 用该查询做一次独立检索（不进入用户请求路径）。
-    // top_k 取宽松值：候选池大一些，后续由 stale/relevance 判据筛选。
+    // 检索参数：top_k 取宽松值（候选池大一些，后续由 stale/relevance 判据筛选）。
     //
     // **read_only = true 是硬要求**（PREREG §3.1 D3）：见 `RecallFilter::read_only`
     // 的文档——若此处照常写回状态机，发现功能一开，用户查询的活性偏置与联想桥词
@@ -404,10 +445,37 @@ where
     let mut filter = RecallFilter::new();
     filter.top_k = DISCOVERY_MAX_CANDIDATES * 4;
     filter.read_only = true;
-    let result = match store.recall(&query_text, &filter) {
+
+    // 第一路：触发源语义文本（方案C）—— 不与上下文竞争，故其词面信号必被计入。
+    let trigger_result = match store.recall(&trigger_query, &filter) {
         Ok(r) => r,
         Err(_) => {
             return base_outcome(true, Some("recall_failed"), drift.pending_events.len());
+        }
+    };
+
+    // 第二路：用户上下文（方案A）—— 保留"最近在想什么"的语义贡献。
+    // 两路各自独立检索后再 RRF 融合：这既让触发源"可被听见"，
+    // 又不丢掉上下文对相关性的贡献（原设计想要的是两者兼得）。
+    let result = if m9_legacy_concat {
+        // M9 对照：拼接模式下用单路结果（模拟旧实现，不做分路融合）
+        trigger_result
+    } else {
+        match build_context_query(store) {
+            Some(ctx) => match store.recall(&ctx, &filter) {
+                Ok(ctx_result) => {
+                    let fused = crate::engine::rrf::rrf_fuse(
+                        &trigger_result,
+                        &ctx_result,
+                        DISCOVERY_MAX_CANDIDATES * 4,
+                        DISCOVERY_RRF_K,
+                    );
+                    RecallResult::basic(fused.memories, fused.scores, trigger_result.total)
+                }
+                // 第二路失败 → 退化为纯触发源检索（不影响主结果）
+                Err(_) => trigger_result,
+            },
+            None => trigger_result,
         }
     };
 
@@ -802,6 +870,11 @@ mod tests {
         (dir, MemoryStore::new(p))
     }
 
+    /// 构造测试用漂移响应。
+    ///
+    /// `query_text` 显式置 None → 走**向后兼容回退**（用卦名），
+    /// 用于验证"旧 daemon 无翻译字段时行为不退化"。
+    /// 需要测方案C 语义文本的用例请单独构造事件。
     fn drift_with(gua: &str, before: &str, mag: f32) -> DriftStateResponse {
         DriftStateResponse {
             last_drift: mag,
@@ -815,6 +888,7 @@ mod tests {
                 drift_magnitude: mag,
                 dominant_gua_before: Some(before.to_string()),
                 dominant_gua_after: Some(gua.to_string()),
+                query_text: None,
             }],
         }
     }
@@ -1130,25 +1204,25 @@ mod tests {
         );
     }
 
-    /// **触发源敏感性回归**（P7 §3.5.5 实测驱动的教训固化）：
-    /// 探索查询是"卦名 + 活跃记忆内容摘要"的**并置拼接**，而检索是加性 TF-IDF。
-    /// 实测证明：当活跃上下文较长时，1–2 字的卦名在数值上被完全淹没，
-    /// 使不同卦象产出**逐字节相同**的候选（B 臂 ≡ C 臂）。
+    /// **构造有效性检验**（PREREG §3.7，从 §3.5.5 事故中新增的**前置门禁**）：
+    /// 换触发源**必须**改变候选集——否则说明触发源根本没进入检索链路，
+    /// 实验无效（而非"机制无贡献"）。
     ///
-    /// 本测试把该现象**固化为可观测断言**，防止未来有人误读
-    /// "B≡C" 为"机制无贡献"——真实原因是"触发源未进入被检对象"。
+    /// 背景：v1.0 首轮实验把"卦名 + 长上下文"并置成一条查询，短卦名被淹没，
+    /// 导致换任何触发源候选都不变（B≡C），直到 NO-GO 之后才被发现。
+    /// 本测试把该检验**前移为门禁**：任何后续改动若再次让触发源失效，此处会红。
     ///
-    /// 断言分两部分：
-    ///   1. 卦名单独成查询时，不同卦名**能**产出不同候选（触发源本身有效）；
-    ///   2. 并置长上下文后，不同卦名的候选**趋于相同**（信号被淹没）。
+    /// 断言：同一上下文、同一记忆库下，两个**不同**触发源查询
+    /// （方案C 产出的语义文本）必须给出不同的候选集。
     #[test]
-    fn exploration_query_context_drowns_gua_signal() {
-        let (dir, mut store) = make_store();
-        // 构造两条只在"卦名"上不同的记忆，使卦名单独检索时可见差异
+    fn trigger_source_must_change_candidates() {
+        let (_d, mut store) = make_store();
+        // 两类记忆分别呼应两个不同的触发源语义（取自方案C 的词典词）
         for c in [
-            "离相关的内容：今晚想吃火锅",
-            "坎相关的内容：明天要去爬山",
-            "通用的旧记忆内容，与任何卦名都无字面交集",
+            "排查线上报错：服务异常崩溃，需要看 traceback 定位失败原因",
+            "危险与困境：这条记录讲的是陷入低谷时的情绪",
+            "准备汇报材料：需要做数据分析与统计报告",
+            "沟通交流：会议讨论中如何表达与谈判",
         ] {
             let mut m = Memory::new(
                 c.to_string(),
@@ -1162,34 +1236,122 @@ mod tests {
             store.remember(m).expect("应成功记住");
         }
 
-        // 1) 卦名单独成查询 → 不同卦名产出不同的首位候选
+        // 两个触发源：方案C 翻译出的语义文本（坎→报错域；兑→交流域）
+        let drift_a = DriftStateResponse {
+            last_drift: 0.9,
+            drift_total: 0.9,
+            threshold: 0.32,
+            explore_beats: 1,
+            active_gua: Some("坎".to_string()),
+            active_palace: None,
+            pending_events: vec![StateDriftEvent {
+                timestamp: 0,
+                drift_magnitude: 0.9,
+                dominant_gua_before: Some("兑".to_string()),
+                dominant_gua_after: Some("坎".to_string()),
+                query_text: Some("危险 困境 艰难".to_string()),
+            }],
+        };
+        let drift_b = DriftStateResponse {
+            active_gua: Some("兑".to_string()),
+            pending_events: vec![StateDriftEvent {
+                timestamp: 0,
+                drift_magnitude: 0.9,
+                dominant_gua_before: Some("坎".to_string()),
+                dominant_gua_after: Some("兑".to_string()),
+                query_text: Some("喜悦 交流 沟通".to_string()),
+            }],
+            ..drift_a.clone()
+        };
+
+        // 建立活跃上下文（模拟"用户最近在想什么"），使两路检索都真实生效。
+        // 这也是 M9 对照（LRC_M9_LEGACY_CONCAT）能起作用的前提——否则
+        // build_context_query 返回 None，拼接退化，测不出淹没问题。
+        let _ = store.recall("沟通交流 会议讨论", &RecallFilter::new());
+
+        let out_a = run_discovery_check(&mut store, &drift_a);
+        let out_b = run_discovery_check(&mut store, &drift_b);
+        assert!(
+            !out_a.produced.is_empty() && !out_b.produced.is_empty(),
+            "构造有效性前提：两个触发源都必须产出候选（否则差异断言无意义）"
+        );
+        let ids_a: Vec<&str> = out_a
+            .produced
+            .iter()
+            .map(|c| c.memory_id.as_str())
+            .collect();
+        let ids_b: Vec<&str> = out_b
+            .produced
+            .iter()
+            .map(|c| c.memory_id.as_str())
+            .collect();
+
+        // **必须比较无序集合**（PREREG §3.8.7 教训，口径升级）：
+        // 初版门禁比较有序序列，而实测（temp/p7-probe13.py）证明
+        // **分数/顺序变化会伪装成"集合变化"**——签名里含 relevance_score 时，
+        // 8 个语义完全不同的触发源被判为"3 种不同候选"，从而误判"构造有效"。
+        // 实际上那些触发源产出的是**同一批记忆，只是 RRF 重标定让分数不同**。
+        // 只有当**集合成员**本身改变，才说明触发源真的进入了检索链路。
+        let mut set_a = ids_a.clone();
+        let mut set_b = ids_b.clone();
+        set_a.sort_unstable();
+        set_b.sort_unstable();
+        assert_ne!(
+            set_a, set_b,
+            "构造有效性检验失败：换触发源后候选**无序集合**未改变 → 触发源未进入检索链路，\
+             实验无效。注意：仅顺序/分数变化不算有效（见 PREREG §3.8.7）。\
+             有序对比：a={ids_a:?} b={ids_b:?}"
+        );
+    }
+
+    /// 旧缺陷回归守卫（§3.5.5）：**并置拼接**会让短触发源信号被长上下文淹没。
+    ///
+    /// 本测试用底层 `recall` 直接复现该现象（不经过 discovery 的新实现），
+    /// 作为"为什么必须分路检索"的**证据留档**，防止有人把新实现改回拼接式。
+    #[test]
+    fn legacy_concatenated_query_drowns_short_signal() {
+        let (_d, mut store) = make_store();
+        for c in ["离相关的内容：今晚想吃火锅", "坎相关的内容：明天要去爬山"]
+        {
+            let mut m = Memory::new(
+                c.to_string(),
+                MemoryType::Fact,
+                None,
+                vec![],
+                Importance::default(),
+                None,
+            );
+            m.last_accessed = chrono::Utc::now() - chrono::Duration::days(30);
+            store.remember(m).expect("应成功记住");
+        }
         let mut f = RecallFilter::new();
         f.read_only = true;
-        f.top_k = 3;
-        let r_li = store.recall("离", &f).expect("检索应成功");
-        let r_kan = store.recall("坎", &f).expect("检索应成功");
-        let top_li = r_li.memories.first().map(|m| m.content.clone());
-        let top_kan = r_kan.memories.first().map(|m| m.content.clone());
+        f.top_k = 2;
+
+        // 短信号单独成查询 → 能区分
+        let solo_li = store.recall("离", &f).expect("检索应成功");
+        let solo_kan = store.recall("坎", &f).expect("检索应成功");
         assert_ne!(
-            top_li, top_kan,
-            "触发源有效性前提：卦名单独成查询时应能区分候选（否则本实验无法检验假说）"
+            solo_li.memories.first().map(|m| m.content.clone()),
+            solo_kan.memories.first().map(|m| m.content.clone()),
+            "前提：短信号单独成查询时应能区分候选"
         );
 
-        // 2) 并置长上下文后 → 卦名信号被淹没，候选趋同
+        // 并置长上下文 → 信号被淹没，两者趋同（这正是首轮实验的失效机制）
         let ctx = "今晚想吃火锅 冰箱里有半盒鸡蛋 楼下新开那家日料 外卖起送三十 \
                    上回吃太辣胃不舒服 商场停车两小时 她收藏了居酒屋 周末包了饺子";
-        let q_li = format!("离 {}", ctx);
-        let q_kan = format!("坎 {}", ctx);
-        let c_li = store.recall(&q_li, &f).expect("检索应成功");
-        let c_kan = store.recall(&q_kan, &f).expect("检索应成功");
+        let c_li = store
+            .recall(&format!("离 {}", ctx), &f)
+            .expect("检索应成功");
+        let c_kan = store
+            .recall(&format!("坎 {}", ctx), &f)
+            .expect("检索应成功");
         let sig_li: Vec<String> = c_li.memories.iter().map(|m| m.content.clone()).collect();
         let sig_kan: Vec<String> = c_kan.memories.iter().map(|m| m.content.clone()).collect();
         assert_eq!(
             sig_li, sig_kan,
-            "P7 §3.5.5 实测现象：并置长上下文后，不同卦象的候选应趋同\
-             （若此处失败，说明检索对卦名仍敏感，可重新评估探索查询设计）"
+            "并置长上下文后短信号应被淹没（若不再淹没，可考虑简化探索查询实现）"
         );
-        drop(dir);
     }
 
     /// 账本落盘/读取往返（含跨进程可见性：同目录重读内容一致）。
