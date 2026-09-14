@@ -117,6 +117,53 @@ fn abstract_vs_concrete_root_cause() {
     let mixed_related = concrete_related.clone();
     let mixed_unrelated = concrete_unrelated.clone();
 
+    // ---- 组④：**具体化的状态锚点** ↔ 具体记忆 ----
+    //
+    // **为什么加这一组**（它是"映射方向"假设的决定性检验）：
+    //   用户裁定的三分支之一要求区分"模型不行" vs "映射方向不行"。
+    //   前者需换模型验证；后者可在**当前模型**上直接验证——
+    //   只需把锚点从"抽象状态词"改写为**具体的状态描述**
+    //   （即把"危险 困境"翻译成"系统出了故障，需要排查和修复"）。
+    //   若 ④ 转正 ⇒ 问题在"抽象→具体"这一层，但**映射方向可救**
+    //   （让道体输出更具体的状态描述即可，无需换模型）。
+    //   若 ④ 仍不可分 ⇒ 连具体化的状态描述都无法匹配 ⇒ 映射方向本身有问题。
+    let concretized_anchor = "系统出了故障，需要排查和修复问题";
+    let concretized_related = concrete_related.clone();
+    let concretized_unrelated = concrete_unrelated.clone();
+
+    // ---- 组⑤/⑥：**跨场景泛化检验**（决定 ④ 是真规律还是单点现象）----
+    //
+    // **为什么必须做**：④ 只测了"故障排查"一个场景。若结论不能跨场景泛化，
+    // 那它只是这一条锚点的巧合，不足以支撑"具体化锚点"这条路线。
+    // 故为另两个状态各写一条"具体化锚点"，看是否同样转正。
+    //
+    // ⑤ 场景二：顺利/愉悦（对应卦象「喜悦 交流 沟通」）
+    // ⑥ 场景三：稳定/基础（对应卦象「承载 基础 稳定」）
+    let s2_related = vec![
+        "她很喜欢这家店的手冲咖啡，说下次还要来",
+        "和同事把想法聊透了，大家都很认同",
+        "聚会上大家聊得很投机，还加了联系方式",
+        "给朋友写了封信，把近况都说了一遍",
+    ];
+    let s2_unrelated = vec![
+        "服务器扩容到八台，负载均衡配置也更新了",
+        "底层基础设施：机房、网络、操作系统内核参数",
+        "把静态资源缓存起来，暂时不动这部分数据",
+        "机房空调检修，机柜温度需要盯着",
+    ];
+    let s3_related = vec![
+        "底层基础设施：机房、网络、操作系统内核参数",
+        "服务器扩容到八台，负载均衡配置也更新了",
+        "把静态资源缓存起来，暂时不动这部分数据",
+        "机房空调检修，机柜温度需要盯着",
+    ];
+    let s3_unrelated = vec![
+        "她很喜欢这家店的手冲咖啡，说下次还要来",
+        "线上报错崩溃，排查了很久才发现是空指针",
+        "下周六小赵结婚，请柬写的是香格里拉宴会厅",
+        "和同事把方案对齐了，双方都比较满意",
+    ];
+
     let cases = [
         Case {
             label: "① 抽象↔抽象",
@@ -136,11 +183,43 @@ fn abstract_vs_concrete_root_cause() {
             related: mixed_related,
             unrelated: mixed_unrelated,
         },
+        Case {
+            label: "④ 具体化状态↔具体记忆",
+            anchor: concretized_anchor,
+            related: concretized_related,
+            unrelated: concretized_unrelated,
+        },
+        // 抽象锚点（对照组：应为重叠）
+        Case {
+            label: "⑤a 抽象(喜悦)",
+            anchor: "喜悦 交流 沟通",
+            related: s2_related.clone(),
+            unrelated: s2_unrelated.clone(),
+        },
+        // 具体化锚点（实验组：期望转正）
+        Case {
+            label: "⑤b 具体化(喜悦)",
+            anchor: "和朋友们聊得很开心，交流气氛很好",
+            related: s2_related.clone(),
+            unrelated: s2_unrelated.clone(),
+        },
+        Case {
+            label: "⑥a 抽象(承载)",
+            anchor: "承载 基础 稳定",
+            related: s3_related.clone(),
+            unrelated: s3_unrelated.clone(),
+        },
+        Case {
+            label: "⑥b 具体化(承载)",
+            anchor: "底层设施和服务运行得很稳定，基础扎实",
+            related: s3_related.clone(),
+            unrelated: s3_unrelated.clone(),
+        },
     ];
 
     println!("\n[根因三分探针] 抽象/具体层次的对应关系");
     println!("{}", "=".repeat(80));
-    let mut verdict = [false; 3];
+    let mut verdict = [false; 8];
     for (i, c) in cases.iter().enumerate() {
         // 与生产同口径：加 BGE 检索指令前缀
         let instr = format!("为这个句子生成表示以用于检索相关文章：{}", c.anchor);
@@ -207,6 +286,30 @@ fn abstract_vs_concrete_root_cause() {
     }
 
     println!("\n{}", "=".repeat(80));
+    println!("【设计自检】④ 与 ② 的锚点是否实质相同？");
+    // **为什么必须自检**（诚实性关键）：④ 的锚点「系统出了故障，需要排查和修复问题」
+    // 与 ② 的锚点「线上系统报错崩溃需要排查」在语义上高度接近，且二者
+    // **记忆集完全相同**。若锚点余弦很高，则 ④ 通过的真正原因可能只是
+    // "重复验证了 ②（具体↔具体）"，而**不能**证明"把抽象状态具体化有效"
+    // —— 因为 ④ 里根本没用上抽象状态。
+    let a2 = "为这个句子生成表示以用于检索相关文章：线上系统报错崩溃需要排查";
+    let a4 = "为这个句子生成表示以用于检索相关文章：系统出了故障，需要排查和修复问题";
+    if let (Some(v2), Some(v4)) = (
+        store.encode_sentence_vector(a2),
+        store.encode_sentence_vector(a4),
+    ) {
+        let sim = cosine(&v2, &v4);
+        println!("  ②锚点 vs ④锚点 余弦 = {sim:.4}");
+        if sim > 0.90 {
+            println!("  ⇒ ⚠ 两锚点**实质相同**（>0.90）：④ 通过**不能**证明");
+            println!("     \"具体化抽象状态\"有效——它只是重复了 ② 的结论。");
+            println!("     **正确解读：④ 是探针设计缺陷（锚点选在了 ② 的同一语义域）**。");
+        } else {
+            println!("  ⇒ 两锚点可分（<0.90）：④ 的结论独立于 ②。");
+        }
+    }
+
+    println!("\n{}", "=".repeat(80));
     println!("【判定】");
     println!(
         "  ① 抽象↔抽象 = {}",
@@ -217,35 +320,62 @@ fn abstract_vs_concrete_root_cause() {
         if verdict[1] { "可分" } else { "重叠" }
     );
     println!(
-        "  ③ 抽象↔具体 = {}",
+        "  ③ 抽象↔具体（生产）= {}",
         if verdict[2] { "可分" } else { "重叠" }
     );
+    println!(
+        "  ④ 具体化状态↔具体记忆 = {}",
+        if verdict[3] { "可分" } else { "重叠" }
+    );
+    println!(
+        "  ⑤a 抽象(喜悦) = {}",
+        if verdict[4] { "可分" } else { "重叠" }
+    );
+    println!(
+        "  ⑤b 具体化(喜悦) = {}",
+        if verdict[5] { "可分" } else { "重叠" }
+    );
+    println!(
+        "  ⑥a 抽象(承载) = {}",
+        if verdict[6] { "可分" } else { "重叠" }
+    );
+    println!(
+        "  ⑥b 具体化(承载) = {}",
+        if verdict[7] { "可分" } else { "重叠" }
+    );
     println!();
-    if !verdict[1] {
-        println!("  ⇒ 命题 A（编码器全局失效）：连\"具体↔具体\"都不可分，");
-        println!("     换编码器（方案四）**有明确依据**。");
-    } else if verdict[1] && !verdict[2] {
-        println!("  ⇒ **失败被定位到\"抽象状态语义\"这一层**：");
-        println!("     · 编码器在\"具体↔具体\"上工作正常（②可分）");
-        println!("     · 但在\"抽象状态\"上失效（①③皆不可分）");
-        println!();
-        println!("     这**不是**\"编码器全局分辨力不足\"，而是 bge-zh 的");
-        println!("     **抽象/状态类语义缺乏分辨力**（可能与训练语料以");
-        println!("     具体检索对为主有关）。");
-        println!();
-        println!("     【对方案四的含义（须诚实区分，不得过度断言）】");
-        println!("     · 方案四**未被排除**——不同编码器对抽象语义的覆盖");
-        println!("       可能不同，这是训练数据层面的问题，有可能被换模型修复；");
-        println!("     · 但方案四**也未获支持**——本探针只证明\"当前编码器在此");
-        println!("       层面失效\"，不能推出\"换模型必然有效\"；");
-        println!("     · 故正确做法：**先用新模型跑本探针**（而非先集成），");
-        println!("       若 ①③ 转正再谈集成。");
-        println!();
-        println!("     【对\"是否用抽象状态做触发源\"的更深含义】");
-        println!("     若换模型后 ①③ 仍不可分，则说明\"抽象状态\"这一**表征层次");
-        println!("     本身**不适合驱动记忆匹配 —— 那时应改由行为信号主导（方案三），");
-        println!("     而不是继续换模型。");
+
+    // 泛化判定：三个场景的"具体化锚点"是否都优于对应"抽象锚点"
+    let gen_ok = verdict[3] && verdict[5] && verdict[7];
+    let abstract_fail = !verdict[0] && !verdict[2] && !verdict[4] && !verdict[6];
+    println!("【泛化判定】");
+    println!(
+        "  三个场景的具体化锚点（④⑤b⑥b）: {}",
+        if gen_ok {
+            "全部可分 ✅"
+        } else {
+            "未全部转正 ❌"
+        }
+    );
+    println!(
+        "  四个抽象锚点（①③⑤a⑥a）: {}",
+        if abstract_fail {
+            "全部重叠（一致）✅"
+        } else {
+            "存在可分项（需复查）"
+        }
+    );
+    println!();
+    if gen_ok && abstract_fail {
+        println!("  ⇒ **规律成立且可泛化**：");
+        println!("     · 抽象状态词锚点 → 4/4 场景不可分");
+        println!("     · 具体化状态锚点 → 3/3 场景可分");
+        println!("     ⇒ 结论不是单点现象，\"具体化锚点\"是一条**可落地**的路线");
+        println!("       （无需换模型、无需下载 2GB、不改 Rust 加载器）。");
+    } else if verdict[3] {
+        println!("  ⇒ ④ 转正但**泛化不足**：部分场景仍不可分。");
+        println!("     ⇒ \"具体化锚点\"路线**可能是单点现象**，需谨慎对待。");
     } else {
-        println!("  ⇒ 需结合 ① 的结论进一步分析。");
+        println!("  ⇒ ④ 未转正：具体化锚点亦不可分，问题在映射方向本身。");
     }
 }
