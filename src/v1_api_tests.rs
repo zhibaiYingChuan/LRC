@@ -1736,6 +1736,7 @@ mod api_contracts_tests {
             privacy_context: None,
             explore_pure: true,
             regression_query: None,
+            read_only: false,
         };
         store
             .recall(query, &filter)

@@ -7707,6 +7707,9 @@ async function loadHomeData(isRetry) {
     // --- M4 记忆资产（成长趋势的 sparkline 依赖 list 分桶，单独容错拉取） ---
     renderMemoryAssets(statsData, synthData);
 
+    // --- P7 主动发现（"顺手想起"卡片）：独立于 M1-M4，失败静默，不影响上面任何模块 ---
+    loadDiscovery();
+
     // 所有模块基于当前数据即时渲染后，若仍有核心端点 busy，则调度整页重试收敛
     if (homeBusy) {
       // 后台整理中：每次调度都刷新 M1/M2 占位，让重试进度可见
@@ -7748,6 +7751,11 @@ window.formatRelativeTime = formatRelativeTime;
 // M2 展开/收起按钮导出
 window.toggleHomeAssociations = toggleHomeAssociations;
 window.renderHomeAssociationItems = renderHomeAssociationItems;
+// P7 主动发现（data-action 集中绑定通过 window 解析）
+window.loadDiscovery = loadDiscovery;
+window.toggleDiscoveryList = toggleDiscoveryList;
+window.discoveryFeedback = discoveryFeedback;
+window.openDiscoveryMemory = openDiscoveryMemory;
 
 // 首页搜索框回车 → 携带关键词跳转记忆搜索
 function homeSearchSubmit() {
@@ -7870,6 +7878,165 @@ function refreshAfterMemoryWrite() {
   if (typeof debouncedMemorySearch === 'function') debouncedMemorySearch();
   // 统计（项目分布等）
   if (typeof loadMemoryStats === 'function') loadMemoryStats();
+}
+
+/* ============================================================
+ * P7 主动发现（道体状态机作为"触发源"）—— 前端展示层
+ *
+ * 判据见 daoti/PREREG_ACTIVE_DISCOVERY.md：
+ *   原则一（不参与排序）：本模块只渲染后端返回的候选，**不**参与、不触发、
+ *     不修改任何检索请求；后端的发现检查走独立只读通道（read_only），
+ *     因此开启/关闭本功能时用户搜索的结果逐字节一致（D3）。
+ *   原则二（可忽略）：默认隐藏卡片，失败静默；不弹窗、不聚焦、不阻塞。
+ *   原则三（有依据）：每条候选都展示后端给的 reason.human_readable。
+ * ============================================================ */
+
+// 发现候选（内存态；供展开/反馈复用）
+let _discoveryCandidates = [];
+let _discoveryExpanded = false;
+
+/**
+ * 拉取一次主动发现结果并渲染。
+ *
+ * 注意：本函数**只**在首页数据加载完成后调用，且失败时静默（不打扰用户）。
+ * 后端在门控关闭（LRC_ACTIVE_DISCOVERY≠1）时返回 executed=false，此时卡片保持隐藏。
+ */
+async function loadDiscovery() {
+  const card = document.getElementById('discovery-card');
+  if (!card) return;
+  try {
+    const resp = await fetchWithTimeout(
+      `${window.API_BASE}/v1/discovery/check`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' },
+      8000
+    );
+    if (!resp.ok) return; // 失败静默：发现是增强能力，不该产生任何可见报错
+    const data = await resp.json();
+    const candidates = (data && Array.isArray(data.candidates)) ? data.candidates : [];
+    // 额度口径（D4 无轰炸承诺）：来自后端账本，前端只做展示
+    if (data && typeof data.shown_today === 'number') {
+      window._discoveryShownToday = data.shown_today;
+    }
+    if (data && typeof data.daily_cap === 'number' && data.daily_cap > 0) {
+      window._discoveryDailyCap = data.daily_cap;
+    }
+    _discoveryCandidates = candidates;
+    _discoveryExpanded = false;
+    if (candidates.length === 0) {
+      card.hidden = true;
+      return;
+    }
+    renderDiscovery();
+    card.hidden = false;
+  } catch (_) {
+    // 静默降级：网络/服务异常一律不打扰用户（原则二）
+  }
+}
+
+/** 渲染发现卡片（列表 + 额度 + 依据文案）。 */
+function renderDiscovery() {
+  const listEl = document.getElementById('discovery-list');
+  const badgeEl = document.getElementById('discovery-badge');
+  const quotaEl = document.getElementById('discovery-quota');
+  const toggleBtn = document.getElementById('discovery-toggle');
+  if (!listEl) return;
+  const all = _discoveryCandidates;
+  const shown = _discoveryExpanded ? all : all.slice(0, 1);
+  if (badgeEl) badgeEl.textContent = String(all.length);
+  if (toggleBtn) {
+    if (all.length <= 1) {
+      toggleBtn.hidden = true;
+    } else {
+      toggleBtn.hidden = false;
+      toggleBtn.textContent = _discoveryExpanded ? '收起' : `展开其余 ${all.length - 1} 条`;
+    }
+  }
+  listEl.hidden = false;
+  listEl.innerHTML = shown.map((c) => {
+    const reason = c && c.reason ? c.reason : {};
+    const why = reason.human_readable || '这条记忆与你最近的状态相关';
+    const score = Number(c.relevance_score || 0);
+    const days = Number(c.days_since_last_access || 0);
+    const preview = c.content_preview || '';
+    const mid = htmlescape(String(c.memory_id || ''));
+    return `
+      <div class="discovery-item" data-memory-id="${mid}">
+        <div class="discovery-head">
+          <span class="badge info">${num(days)} 天没看</span>
+          <span class="text-sm text-dim">相关度 ${htmlescape(score.toFixed(2))}</span>
+        </div>
+        <div class="discovery-preview" role="button" tabindex="0"
+             data-action="openDiscoveryMemory" data-arg="${mid}"
+             aria-label="查看这条被想起的记忆">${htmlescape(preview)}</div>
+        <div class="text-sm text-dim discovery-reason">${htmlescape(why)}</div>
+        <div class="discovery-actions">
+          <button class="btn btn-ghost btn-sm" data-action="discoveryFeedback"
+                  data-arg-mode="this" data-arg="${mid}" data-kind="clicked">看看这条</button>
+          <button class="btn btn-ghost btn-sm" data-action="discoveryFeedback"
+                  data-arg-mode="this" data-arg="${mid}" data-kind="ignored">忽略</button>
+          <button class="btn btn-ghost btn-sm" data-action="discoveryFeedback"
+                  data-arg-mode="this" data-arg="${mid}" data-kind="not_interested">不感兴趣</button>
+        </div>
+      </div>`;
+  }).join('');
+  if (quotaEl) {
+    const cap = Number(window._discoveryDailyCap || 3);
+    const used = Number(window._discoveryShownToday || 0);
+    quotaEl.textContent = used > 0 ? `（今日已提示 ${used}/${cap} 条）` : '';
+  }
+  if (typeof bindAllActions === 'function') bindAllActions();
+}
+
+/** 展开/收起发现列表（纯展示层操作，不产生反馈信号）。 */
+function toggleDiscoveryList() {
+  _discoveryExpanded = !_discoveryExpanded;
+  renderDiscovery();
+}
+
+/**
+ * 上报一次用户反馈（步骤四：反馈回流）。
+ *
+ * 入参为触发元素本身（`data-arg-mode="this"`）——集中式 data-action 派发器
+ * 只支持单参数，故 kind / memory_id 从元素的 data-* 属性读取。
+ *
+ * 反馈**只**影响"是否触发"与展示优先级，不改变检索排序（原则一）。
+ * 上报失败静默：本地先行移除该项，保证交互即时，不因网络问题卡住用户。
+ */
+async function discoveryFeedback(el) {
+  const kind = el && el.getAttribute ? (el.getAttribute('data-kind') || '') : '';
+  const memoryId = el && el.getAttribute ? (el.getAttribute('data-arg') || '') : '';
+  if (!kind || !memoryId) return;
+  const card = document.getElementById('discovery-card');
+  const gua = (() => {
+    const item = _discoveryCandidates.find(c => String(c.memory_id || '') === String(memoryId));
+    return item && item.reason && item.reason.drift_to_gua ? item.reason.drift_to_gua : '';
+  })();
+  // 本地即时反馈：从列表移除该项（用户已表态，不必再等网络）
+  _discoveryCandidates = _discoveryCandidates.filter(
+    c => String(c.memory_id || '') !== String(memoryId));
+  if (_discoveryCandidates.length === 0) {
+    if (card) card.hidden = true;
+  } else {
+    renderDiscovery();
+  }
+  try {
+    await fetchWithTimeout(
+      `${window.API_BASE}/v1/discovery/feedback`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind, memory_id: String(memoryId || ''), gua }),
+      },
+      5000
+    );
+  } catch (_) {
+    // 静默：反馈丢失只影响后续推荐质量，不影响用户当前操作
+  }
+}
+
+/** 打开一条被发现的记忆（复用既有详情弹窗，不新增交互路径）。 */
+function openDiscoveryMemory(memoryId) {
+  if (typeof openMemoryDetail === 'function') openMemoryDetail(String(memoryId || ''));
 }
 
 // 查看结晶历史：v0.9.7 首页重构后结晶成果在 M4d，定位到该卡并保留折叠区内的历史加载

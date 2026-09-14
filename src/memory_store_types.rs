@@ -47,6 +47,17 @@ pub struct RecallFilter {
     /// 若每跳独立校验，语义会随深度漂移（父内容 → 无关领域噪声）。
     /// 锚定到起点记忆主题可保证每一跳结果都必须"收束回联想主题"。
     pub regression_query: Option<String>,
+    /// 只读检索（P7 主动发现专用，判据见研究资产侧 PREREG_ACTIVE_DISCOVERY.md §3.1 D3）：
+    /// 置 true 时本次 recall **不写回任何状态**——不更新状态机活跃锚点
+    /// （`bake_activation`）、不记录探索日志、不累加检索指标。
+    ///
+    /// **为什么必须有这个开关**：主动发现是"第二通道"，它在后台自主发起检索。
+    /// 若该检索照常写入状态机，则用户查询路径上的两个排序输入会随发现功能的
+    /// 开关而改变——① 活性偏置（`active_map` 按激活强度加分）；
+    /// ② 联想桥词扩展（`active_ids` 的内容抽词并入查询）。届时 D3「零伤害
+    /// 承诺」（开关开启与关闭时用户查询返回结果逐字节一致）**在机制上不可能
+    /// 成立**，无论发现逻辑写得多干净。
+    pub read_only: bool,
 }
 
 impl RecallFilter {
@@ -61,6 +72,7 @@ impl RecallFilter {
             privacy_context: None,
             explore_pure: false,
             regression_query: None,
+            read_only: false,
         }
     }
 
