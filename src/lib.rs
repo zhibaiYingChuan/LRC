@@ -106,6 +106,9 @@ pub mod benchmark;
 /// 门控 `LRC_ACTIVE_DISCOVERY` 默认关。
 #[cfg(feature = "server")]
 pub mod discovery;
+// state_matcher 依赖 discovery（复用其账本/门控辅助），故同样按 server feature 门控。
+#[cfg(feature = "server")]
+pub mod state_matcher;
 
 // === Layer 2: 受保护核心引擎（专有研究许可） ===
 pub mod engine;

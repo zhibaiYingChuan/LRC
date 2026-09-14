@@ -3103,6 +3103,56 @@ pub fn build_v1_router(
                 }
             }
         }))
+        // GET /v1/discovery/state-driven — v2.0 状态驱动发现
+        //
+        // 与 `/discovery/check`（P7 文本触发）的**类别差别**：
+        //   - P7：把卦象翻译成文本 → 走 TF-IDF 检索（实测否证，见 PREREG §3.8）
+        //   - 本端点：**跳过文本层**，用道体 8 维母卦分布 ↔ 记忆 `bagua_index`
+        //     做同体系匹配。这是 §3.8.6「必须换中介」结论的直接落实。
+        //
+        // 原则一（不参与排序）：本端点不写回任何排序状态，也**不调用 recall**。
+        // daemon 不可达 → 静默降级（不产生候选），行为与未引入本模块时一致。
+        .route("/discovery/state-driven", get({
+            let store = discovery_store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    if !crate::state_matcher::state_driven_enabled() {
+                        return Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+                            Json(serde_json::json!(
+                                crate::state_matcher::skipped_outcome("gate_off")
+                            )),
+                        );
+                    }
+                    // 快照拉取在锁外完成（异步网络等待不占用 store 锁）
+                    let Some(snapshot) = crate::state_matcher::fetch_state_snapshot().await else {
+                        return Ok(Json(serde_json::json!(
+                            crate::state_matcher::skipped_outcome("daemon_unreachable")
+                        )));
+                    };
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let guard = match store.try_lock() {
+                            Ok(g) => g,
+                            // 锁忙（用户查询/合成持有）→ 跳过本轮，下轮再试
+                            Err(_) => return None,
+                        };
+                        let data_dir = guard.persistence().data_dir().to_path_buf();
+                        Some(crate::state_matcher::run_state_driven_cycle(
+                            &guard, &snapshot, &data_dir,
+                        ))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    let Some(outcome) = outcome else {
+                        return Ok(Json(serde_json::json!(
+                            crate::state_matcher::skipped_outcome("store_busy")
+                        )));
+                    };
+                    Ok(Json(serde_json::json!(outcome)))
+                }
+            }
+        }))
         // GET /v1/audit-trail — 审计追踪（质疑五：透明度与信任）
         //
         // 提供完整的、可回溯的系统自主行为日志。

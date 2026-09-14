@@ -7710,6 +7710,9 @@ async function loadHomeData(isRetry) {
     // --- P7 主动发现（"顺手想起"卡片）：独立于 M1-M4，失败静默，不影响上面任何模块 ---
     loadDiscovery();
 
+    // --- v2.0 状态驱动发现：同样独立、失败静默（门控关闭时后端返回 executed=false） ---
+    loadStateDiscovery();
+
     // 所有模块基于当前数据即时渲染后，若仍有核心端点 busy，则调度整页重试收敛
     if (homeBusy) {
       // 后台整理中：每次调度都刷新 M1/M2 占位，让重试进度可见
@@ -7756,6 +7759,10 @@ window.loadDiscovery = loadDiscovery;
 window.toggleDiscoveryList = toggleDiscoveryList;
 window.discoveryFeedback = discoveryFeedback;
 window.openDiscoveryMemory = openDiscoveryMemory;
+// v2.0 状态驱动发现（道体状态直接匹配，不经文本检索）
+window.loadStateDiscovery = loadStateDiscovery;
+window.toggleStateDiscoveryList = toggleStateDiscoveryList;
+window.stateDiscoveryFeedback = stateDiscoveryFeedback;
 
 // 首页搜索框回车 → 携带关键词跳转记忆搜索
 function homeSearchSubmit() {
@@ -8037,6 +8044,163 @@ async function discoveryFeedback(el) {
 /** 打开一条被发现的记忆（复用既有详情弹窗，不新增交互路径）。 */
 function openDiscoveryMemory(memoryId) {
   if (typeof openMemoryDetail === 'function') openMemoryDetail(String(memoryId || ''));
+}
+
+// ============================================================
+// v2.0：状态驱动发现
+//
+// 与「顺手想起」（P7 文本触发）的区别：本卡片的候选由后端用道体
+// **8 维母卦分布**直接匹配记忆的卦象标签得出，**不经文本检索**。
+//
+// 展示纪律与「顺手想起」一致：默认隐藏、失败静默、额度共享同一账本。
+// ============================================================
+let _stateDiscoveryCandidates = [];
+let _stateDiscoveryExpanded = false;
+
+/**
+ * 拉取一次状态驱动发现结果并渲染。
+ *
+ * 门控关闭（LRC_STATE_DRIVEN_DISCOVERY≠1）/ daemon 不可达 / 冷启动期
+ * 时后端返回 executed=false，此时卡片保持隐藏——用户看不到任何提示，
+ * 与未引入本功能时完全一致。
+ */
+async function loadStateDiscovery() {
+  const card = document.getElementById('state-discovery-card');
+  if (!card) return;
+  try {
+    const resp = await fetchWithTimeout(
+      `${window.API_BASE}/v1/discovery/state-driven`,
+      { method: 'GET' },
+      8000
+    );
+    if (!resp.ok) return; // 失败静默：发现是增强能力，不该产生任何可见报错
+    const data = await resp.json();
+    const candidates = (data && Array.isArray(data.candidates)) ? data.candidates : [];
+    if (data && typeof data.shown_today === 'number') {
+      window._stateDiscoveryShownToday = data.shown_today;
+    }
+    if (data && typeof data.daily_cap === 'number' && data.daily_cap > 0) {
+      window._stateDiscoveryDailyCap = data.daily_cap;
+    }
+    _stateDiscoveryCandidates = candidates;
+    _stateDiscoveryExpanded = false;
+    if (candidates.length === 0) {
+      card.hidden = true;
+      return;
+    }
+    // 提示文案带上实际触发卦（让用户看到依据）
+    const hintEl = document.getElementById('state-discovery-hint');
+    if (hintEl && data.trigger_bagua) {
+      hintEl.textContent =
+        `你当前的状态集中在「${data.trigger_bagua}」，这些旧记忆也属于同一方向。`;
+    }
+    renderStateDiscovery();
+    card.hidden = false;
+  } catch (_) {
+    // 静默降级：网络/服务异常一律不打扰用户（原则二）
+  }
+}
+
+/** 渲染状态驱动发现卡片（列表 + 额度 + 依据文案）。 */
+function renderStateDiscovery() {
+  const listEl = document.getElementById('state-discovery-list');
+  const badgeEl = document.getElementById('state-discovery-badge');
+  const quotaEl = document.getElementById('state-discovery-quota');
+  const toggleBtn = document.getElementById('state-discovery-toggle');
+  if (!listEl) return;
+  const all = _stateDiscoveryCandidates;
+  const shown = _stateDiscoveryExpanded ? all : all.slice(0, 1);
+  if (badgeEl) badgeEl.textContent = String(all.length);
+  if (toggleBtn) {
+    if (all.length <= 1) {
+      toggleBtn.hidden = true;
+    } else {
+      toggleBtn.hidden = false;
+      toggleBtn.textContent = _stateDiscoveryExpanded ? '收起' : `展开其余 ${all.length - 1} 条`;
+    }
+  }
+  listEl.hidden = false;
+  listEl.innerHTML = shown.map((c) => {
+    const reason = c && c.reason ? c.reason : {};
+    const why = reason.human_readable || '这条记忆与你当前的状态同属一个方向';
+    const score = Number(c.match_score || 0);
+    const days = Number(c.days_since_last_access || 0);
+    const preview = c.content_preview || '';
+    const mid = htmlescape(String(c.memory_id || ''));
+    const bagua = c.bagua_name || '';
+    return `
+      <div class="discovery-item" data-memory-id="${mid}">
+        <div class="discovery-head">
+          <span class="badge info">${num(days)} 天没看</span>
+          <span class="text-sm text-dim">匹配度 ${htmlescape(score.toFixed(2))}${
+            bagua ? ' · ' + htmlescape(bagua) : ''}</span>
+        </div>
+        <div class="discovery-preview" role="button" tabindex="0"
+             data-action="openDiscoveryMemory" data-arg="${mid}"
+             aria-label="查看这条被想起的记忆">${htmlescape(preview)}</div>
+        <div class="text-sm text-dim discovery-reason">${htmlescape(why)}</div>
+        <div class="discovery-actions">
+          <button class="btn btn-ghost btn-sm" data-action="stateDiscoveryFeedback"
+                  data-arg-mode="this" data-arg="${mid}" data-kind="clicked">看看这条</button>
+          <button class="btn btn-ghost btn-sm" data-action="stateDiscoveryFeedback"
+                  data-arg-mode="this" data-arg="${mid}" data-kind="ignored">忽略</button>
+          <button class="btn btn-ghost btn-sm" data-action="stateDiscoveryFeedback"
+                  data-arg-mode="this" data-arg="${mid}" data-kind="not_interested">不感兴趣</button>
+        </div>
+      </div>`;
+  }).join('');
+  if (quotaEl) {
+    const cap = Number(window._stateDiscoveryDailyCap || 3);
+    const used = Number(window._stateDiscoveryShownToday || 0);
+    quotaEl.textContent = used > 0 ? `（今日已提示 ${used}/${cap} 条）` : '';
+  }
+  if (typeof bindAllActions === 'function') bindAllActions();
+}
+
+/** 展开/收起状态驱动发现列表（纯展示层操作，不产生反馈信号）。 */
+function toggleStateDiscoveryList() {
+  _stateDiscoveryExpanded = !_stateDiscoveryExpanded;
+  renderStateDiscovery();
+}
+
+/**
+ * 上报一次状态驱动发现的用户反馈（步骤四：反馈回流）。
+ *
+ * **复用既有 `/v1/discovery/feedback` 端点与账本**（不新增第二套反馈机制）：
+ * 反馈按"触发卦"聚合，连续忽略达阈值后该卦整体降频 —— 这既覆盖文本通道
+ * 也覆盖状态通道，口径统一。
+ */
+async function stateDiscoveryFeedback(el) {
+  const kind = el && el.getAttribute ? (el.getAttribute('data-kind') || '') : '';
+  const memoryId = el && el.getAttribute ? (el.getAttribute('data-arg') || '') : '';
+  if (!kind || !memoryId) return;
+  const card = document.getElementById('state-discovery-card');
+  const gua = (() => {
+    const item = _stateDiscoveryCandidates.find(
+      c => String(c.memory_id || '') === String(memoryId));
+    return item && item.reason && item.reason.trigger_bagua ? item.reason.trigger_bagua : '';
+  })();
+  // 本地即时反馈：从列表移除该项（用户已表态，不必再等网络）
+  _stateDiscoveryCandidates = _stateDiscoveryCandidates.filter(
+    c => String(c.memory_id || '') !== String(memoryId));
+  if (_stateDiscoveryCandidates.length === 0) {
+    if (card) card.hidden = true;
+  } else {
+    renderStateDiscovery();
+  }
+  try {
+    await fetchWithTimeout(
+      `${window.API_BASE}/v1/discovery/feedback`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind, memory_id: String(memoryId || ''), gua }),
+      },
+      5000
+    );
+  } catch (_) {
+    // 静默：反馈丢失只影响后续推荐质量，不影响用户当前操作
+  }
 }
 
 // 查看结晶历史：v0.9.7 首页重构后结晶成果在 M4d，定位到该卡并保留折叠区内的历史加载
