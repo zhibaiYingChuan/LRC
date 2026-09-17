@@ -18,7 +18,9 @@ use crate::chunker::CodeChunk;
 // `Display` 仅输出 message，故调用方/log 文案**零漂移**。
 use crate::errors::{LrcError, LrcResult};
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
-use crate::persistence::{Persistence, PersistenceError};
+use crate::persistence::{AssocFrequency, Persistence, PersistenceError};
+// v0.9.8：状态持久化需要 MemoryState（此前本后端未实现该组方法）
+use crate::memory_state_machine::MemoryState;
 use chrono::{DateTime, Utc};
 
 /// PostgreSQL 持久化配置
@@ -176,6 +178,8 @@ impl PostgresPersistence {
                 privacy_level TEXT DEFAULT 'user', \
                 session_id TEXT, \
                 user_id TEXT, \
+                event_id TEXT, \
+                entities JSONB DEFAULT '[]', \
                 source TEXT, \
                 source_ids JSONB DEFAULT '{{}}', \
                 confidence REAL, \
@@ -218,6 +222,37 @@ impl PostgresPersistence {
                 ))
             })?;
 
+        // v0.9.8：状态表（键值对）。
+        //
+        // **为什么必须新增**：`load/save_memory_state` 与
+        // `load/save_assoc_frequency` 此前**只有 JsonPersistence 实现**，
+        // Postgres/Qdrant 走 trait 默认实现（返回空 + 忽略保存）——即
+        // **静默降级**：用户在本后端下，B 通路的活性状态与"语义吸铁石"
+        // 压制统计**每次进程重启全部归零**，且没有任何提示。
+        //
+        // **类型选 TEXT 而非 JSONB**：本 crate 的 sqlx 只启用了
+        // `runtime-tokio, postgres, chrono`（**未启用 `json` feature**），
+        // 绑定 `serde_json::Value` / 用 query_as 解码 Value 都不成立。
+        // 故与既有代码同款做法：**序列化为字符串后绑定**（见 save_memory
+        // 对 tags/entities 的处理）。读取时自行反序列化。
+        let state_table = format!(
+            "CREATE TABLE IF NOT EXISTS {}state (\
+                key TEXT PRIMARY KEY, \
+                value TEXT NOT NULL, \
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\
+            )",
+            self.table_prefix
+        );
+        sqlx::query(&state_table)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("创建 state 表失败: {}", e),
+                ))
+            })?;
+
         Ok(())
     }
 
@@ -242,6 +277,8 @@ impl PostgresPersistence {
             "privacy_level": memory.privacy_level.as_str(),
             "session_id": memory.session_id,
             "user_id": memory.user_id,
+            "event_id": memory.event_id,
+            "entities": memory.entities,
             "source": memory.source,
             "source_ids": memory.source_ids,
             "confidence": memory.confidence,
@@ -289,6 +326,12 @@ impl PostgresPersistence {
             .unwrap_or_default();
         let session_id: Option<String> = row.try_get("session_id").ok();
         let user_id: Option<String> = row.try_get("user_id").ok();
+        // 事件维度：旧库可能无这两列，故用 .ok() 容错（等价于取默认值）
+        let event_id: Option<String> = row.try_get("event_id").ok().flatten();
+        let entities_json: Option<serde_json::Value> = row.try_get("entities").ok();
+        let entities: Vec<crate::memory_types::EventEntity> = entities_json
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
         let source: Option<String> = row.try_get("source").ok();
         let source_ids_json: Option<serde_json::Value> = row.try_get("source_ids").ok();
         let source_ids: Vec<String> = source_ids_json
@@ -320,6 +363,8 @@ impl PostgresPersistence {
         memory.privacy_level = privacy_level;
         memory.session_id = session_id;
         memory.user_id = user_id;
+        memory.event_id = event_id;
+        memory.entities = entities;
         memory.source = source;
         memory.source_ids = source_ids;
         memory.confidence = confidence;
@@ -357,6 +402,74 @@ impl PostgresPersistence {
         // v0.5.4 修复：block_in_place 通知 tokio 当前线程将阻塞
         tokio::task::block_in_place(|| handle.block_on(future))
     }
+
+    /// 读取状态表中的一个 JSON 值（v0.9.8）
+    ///
+    /// 键不存在 ⇒ 返回 `Ok(None)`（正常情况，首次运行无状态）。
+    /// 存储为 TEXT（见 `migrate` 的说明），此处自行反序列化。
+    fn load_state_value(&self, key: &str) -> Result<Option<serde_json::Value>, PersistenceError> {
+        use sqlx::Row;
+        let pool = self.pool.clone();
+        let table = format!("{}state", self.table_prefix);
+        let key = key.to_string();
+        self.block_on_async(async move {
+            // 与 load_all_memories 同款：用 sqlx::query + Row::try_get，
+            // 不依赖 query_as 的 FromRow 推断（本项目 sqlx 未启用宏特性）
+            let row = sqlx::query(&format!("SELECT value FROM {} WHERE key = $1", table))
+                .bind(&key)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|e| {
+                    PersistenceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("读取状态 {} 失败: {}", key, e),
+                    ))
+                })?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let raw: String = row.try_get("value").map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("状态 {} 的 value 列读取失败: {}", key, e),
+                ))
+            })?;
+            // 解析失败降级为 None（视同无状态）：一个损坏的状态不应
+            // 阻断整个记忆系统启动——状态是可再生的，启动不可阻断。
+            Ok(serde_json::from_str(&raw).ok())
+        })
+    }
+
+    /// 写入状态表中的一个 JSON 值（v0.9.8，upsert 幂等）
+    fn save_state_value(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), PersistenceError> {
+        let pool = self.pool.clone();
+        let table = format!("{}state", self.table_prefix);
+        let key = key.to_string();
+        // 与既有代码同款：序列化为字符串后绑定（sqlx 未启用 json feature）
+        let payload = serde_json::to_string(value)?;
+        self.block_on_async(async move {
+            sqlx::query(&format!(
+                "INSERT INTO {} (key, value, updated_at) VALUES ($1, $2, NOW()) \
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+                table
+            ))
+            .bind(&key)
+            .bind(&payload)
+            .execute(&pool)
+            .await
+            .map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("写入状态 {} 失败: {}", key, e),
+                ))
+            })?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -371,8 +484,9 @@ impl Persistence for PostgresPersistence {
                 "INSERT INTO {} (id, content, memory_type, project, tags, importance, version, \
                  created_at, updated_at, last_accessed, ttl_days, luoshu_vector, bagua_index, \
                  bagua_category, topological_depth, privacy_level, session_id, user_id, \
+                 event_id, entities, \
                  source, source_ids, confidence, version_history) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) \
                  ON CONFLICT (id) DO UPDATE SET \
                  content = EXCLUDED.content, \
                  memory_type = EXCLUDED.memory_type, \
@@ -381,6 +495,8 @@ impl Persistence for PostgresPersistence {
                  updated_at = EXCLUDED.updated_at, \
                  last_accessed = EXCLUDED.last_accessed, \
                  luoshu_vector = EXCLUDED.luoshu_vector, \
+                 event_id = EXCLUDED.event_id, \
+                 entities = EXCLUDED.entities, \
                  topological_depth = EXCLUDED.topological_depth",
                 table
             ))
@@ -402,6 +518,8 @@ impl Persistence for PostgresPersistence {
             .bind(row["privacy_level"].as_str().unwrap_or("user"))
             .bind(row["session_id"].as_str().map(|s| s.to_string()))
             .bind(row["user_id"].as_str().map(|s| s.to_string()))
+            .bind(row["event_id"].as_str().map(|s| s.to_string()))
+            .bind(serde_json::to_string(&row["entities"]).unwrap_or_default())
             .bind(row["source"].as_str().map(|s| s.to_string()))
             .bind(serde_json::to_string(&row["source_ids"]).unwrap_or_default())
             .bind(row["confidence"].as_f64().map(|v| v as f32))
@@ -475,7 +593,7 @@ impl Persistence for PostgresPersistence {
                 .map_err(|e| PersistenceError::Other(format!("事务内清空记忆失败: {}", e)))?;
             for row in rows {
                 sqlx::query(&format!(
-                    "INSERT INTO {} (id, content, memory_type, project, tags, importance, version, created_at, updated_at, last_accessed, ttl_days, luoshu_vector, bagua_index, bagua_category, topological_depth, privacy_level, session_id, user_id, source, source_ids, confidence, version_history) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)", table
+                    "INSERT INTO {} (id, content, memory_type, project, tags, importance, version, created_at, updated_at, last_accessed, ttl_days, luoshu_vector, bagua_index, bagua_category, topological_depth, privacy_level, session_id, user_id, event_id, entities, source, source_ids, confidence, version_history) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)", table
                 ))
                 .bind(row["id"].as_str().unwrap_or(""))
                 .bind(row["content"].as_str().unwrap_or(""))
@@ -495,6 +613,8 @@ impl Persistence for PostgresPersistence {
                 .bind(row["privacy_level"].as_str().unwrap_or("user"))
                 .bind(row["session_id"].as_str().map(str::to_owned))
                 .bind(row["user_id"].as_str().map(str::to_owned))
+                .bind(row["event_id"].as_str().map(str::to_owned))
+                .bind(serde_json::to_string(&row["entities"]).unwrap_or_default())
                 .bind(row["source"].as_str().map(str::to_owned))
                 .bind(serde_json::to_string(&row["source_ids"]).unwrap_or_default())
                 .bind(row["confidence"].as_f64().map(|v| v as f32))
@@ -583,6 +703,46 @@ impl Persistence for PostgresPersistence {
         Err(PersistenceError::Other(
             "PostgreSQL 后端不支持归档记忆接口".to_string(),
         ))
+    }
+
+    // ── v0.9.8：状态持久化（此前缺失导致**静默降级**）──
+    //
+    // 这两个状态此前只有 JsonPersistence 实现，本后端走 trait 默认实现
+    // （返回空 + 忽略保存）⇒ 用户在本后端下：
+    //   · 联想活性状态（B 通路"近期在想什么"）每次重启归零
+    //   · "语义吸铁石"压制统计（LRC_ASSOC_DEBIAS）每次重启归零
+    // **且没有任何提示**——用户只会感觉"联想时好时坏"。
+    // 现在用 state 表承载，行为与 JSON 后端对齐。
+
+    fn load_memory_state(&self) -> Result<MemoryState, PersistenceError> {
+        match self.load_state_value("memory_state")? {
+            Some(v) => Ok(serde_json::from_value(v).unwrap_or_default()),
+            // 键不存在 = 首次运行（非错误）；解析失败也降级为默认，
+            // 不让一个损坏的状态文件阻断整个记忆系统启动
+            None => Ok(MemoryState::default()),
+        }
+    }
+
+    fn save_memory_state(&self, state: &MemoryState) -> Result<(), PersistenceError> {
+        let v = serde_json::to_value(state)?;
+        self.save_state_value("memory_state", &v)
+    }
+
+    fn load_assoc_frequency(&self) -> Result<AssocFrequency, PersistenceError> {
+        match self.load_state_value("assoc_frequency")? {
+            Some(v) => Ok(serde_json::from_value(v).unwrap_or_default()),
+            None => Ok(AssocFrequency::default()),
+        }
+    }
+
+    fn save_assoc_frequency(&self, state: &AssocFrequency) -> Result<(), PersistenceError> {
+        let v = serde_json::to_value(state)?;
+        self.save_state_value("assoc_frequency", &v)
+    }
+
+    /// v0.9.8：本后端已实现状态持久化（state kv 表）
+    fn supports_state_persistence(&self) -> bool {
+        true
     }
 }
 

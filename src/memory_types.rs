@@ -84,6 +84,11 @@ pub enum MemoryType {
     CodeContext,
     /// 对话 — 对话轮次中提炼的关键信息
     Conversation,
+    /// 经历 — 一次具体经历/事件中发生的事，如 "周五和家人去吃了潮汕牛肉火锅"
+    ///
+    /// 与 Fact 的区别：Fact 是客观信息，Experience 是"我经历过什么"。
+    /// Experience 通常携带 `event_id` 与 `entities`，是"共同经历"联想的载体。
+    Experience,
     /// 合成 — 递归合成产生的抽象知识（多条相关记忆的融合结果）
     Synthesis,
 }
@@ -104,6 +109,7 @@ impl MemoryType {
             Self::Decision => "decision",
             Self::CodeContext => "code_context",
             Self::Conversation => "conversation",
+            Self::Experience => "experience",
             Self::Synthesis => "synthesis",
         }
     }
@@ -116,6 +122,7 @@ impl MemoryType {
             "decision",
             "code_context",
             "conversation",
+            "experience",
             "synthesis",
         ]
     }
@@ -131,6 +138,7 @@ impl FromStr for MemoryType {
             "decision" => Ok(Self::Decision),
             "code_context" | "codecontext" => Ok(Self::CodeContext),
             "conversation" => Ok(Self::Conversation),
+            "experience" => Ok(Self::Experience),
             "synthesis" => Ok(Self::Synthesis),
             _ => Err(format!(
                 "无效的记忆类型: '{}'，有效值: {:?}",
@@ -300,6 +308,20 @@ pub struct Memory {
     /// 用户 ID（privacy_level=User/Global 时用于用户级隔离）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+    /// 事件 ID — 这条记忆来自哪一次经历/事件
+    ///
+    /// **"共同经历"联想的载体**：同一 `event_id` 的多条记忆来自同一次经历，
+    /// 它们之间可建立"同源关联"（即使语义不相似、无共享实体）。
+    /// 反查同经历记忆的方式：按 event_id 分组（**不冗余存储**，避免不一致）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// 事件实体 — 这条记忆涉及的人/地/时/物
+    ///
+    /// **"实体关联"的载体**：两条记忆若共享实体（如都提到"爸爸"），
+    /// 即可建立实体关联。与 event_id 互补：event_id 管"同一次经历"，
+    /// entities 管"跨经历的同一对象"。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entities: Vec<EventEntity>,
     /// 拓扑深度（0.0 ~ 1.0，0.0=九宫格中心/永久，1.0=边缘/快速衰减）
     /// 由洛书编码器自动计算：九宫格位置越靠近中心（太极），深度越小，衰减越慢
     #[serde(default = "default_topological_depth")]
@@ -323,6 +345,78 @@ pub struct MemoryVersion {
     pub updated_at: DateTime<Utc>,
     /// 变更原因（如 "用户修正: 信息已过时"）
     pub reason: Option<String>,
+}
+
+/// 实体类型（事件维度）
+///
+/// 用于回答"谁 / 何时 / 何地 / 何物"，是"共同经历"之外的第二类关联依据：
+/// 两条记忆若共享实体（如都提到"爸爸"），即可建立实体关联。
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityKind {
+    /// 人 — 如 "小美"、"爸爸"
+    Person,
+    /// 地点 — 如 "海底捞"、"杭州西湖"
+    Place,
+    /// 时间 — 如 "周五晚上"、"10 月 20 号"
+    Time,
+    /// 事物 — 如 "钓鱼竿"、"火锅"
+    Thing,
+    /// 其他/未分类
+    #[default]
+    Other,
+}
+
+impl EntityKind {
+    /// 转为小写字符串
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Person => "person",
+            Self::Place => "place",
+            Self::Time => "time",
+            Self::Thing => "thing",
+            Self::Other => "other",
+        }
+    }
+
+    /// 从字符串解析（无效时返回 None）
+    pub fn try_parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "person" => Some(Self::Person),
+            "place" => Some(Self::Place),
+            "time" => Some(Self::Time),
+            "thing" => Some(Self::Thing),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    /// 全部有效值
+    pub fn valid_values() -> &'static [&'static str] {
+        &["person", "place", "time", "thing", "other"]
+    }
+}
+
+/// 事件实体（带类型的维度项）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EventEntity {
+    /// 实体名称（如 "小美"、"海底捞"）
+    pub name: String,
+    /// 实体类型
+    #[serde(default)]
+    pub kind: EntityKind,
+}
+
+impl EventEntity {
+    /// 创建实体
+    pub fn new(name: impl Into<String>, kind: EntityKind) -> Self {
+        Self {
+            name: name.into(),
+            kind,
+        }
+    }
 }
 
 fn default_topological_depth() -> f32 {
@@ -370,10 +464,24 @@ impl Memory {
             privacy_level: PrivacyLevel::default(),
             session_id: None,
             user_id: None,
+            event_id: None,
+            entities: Vec::new(),
             topological_depth: default_topological_depth(),
             version: 1,
             version_history: Vec::new(),
         }
+    }
+
+    /// 设置事件 ID（这条记忆来自哪一次经历）
+    pub fn with_event(mut self, event_id: Option<String>) -> Self {
+        self.event_id = event_id;
+        self
+    }
+
+    /// 设置事件实体（人/地/时/物）
+    pub fn with_entities(mut self, entities: Vec<EventEntity>) -> Self {
+        self.entities = entities;
+        self
     }
 
     /// 设置记忆来源
@@ -536,6 +644,7 @@ impl Memory {
             MemoryType::Decision => "[决策]",
             MemoryType::CodeContext => "[代码]",
             MemoryType::Conversation => "[对话]",
+            MemoryType::Experience => "[经历]",
             MemoryType::Synthesis => "[合成]",
         };
         let content_preview: String = self.content.chars().take(200).collect();

@@ -158,20 +158,55 @@ impl AssocFrequency {
 ///
 /// 定义记忆和代码片段的 CRUD 操作接口。
 /// 实现此 trait 即可接入不同的存储后端（JSON、SQLite、Redis 等）。
+///
+/// # ⚠ 状态类方法的实现义务（v0.9.8 明确）
+///
+/// 下列 4 个方法是**状态类**（非记忆数据），它们有默认实现，
+/// 默认行为是**"返回空 + 忽略保存"**。这带来一个容易被忽略的后果：
+///
+/// | 未实现时的影响 | 后果 |
+/// |---|---|
+/// | `load/save_memory_state` | 联想活性状态（"近期在想什么"）**每次进程重启归零** |
+/// | `load/save_assoc_frequency` | "语义吸铁石"压制统计**每次进程重启归零** |
+///
+/// 二者都**不会报错**，用户只会感觉"联想时好时坏"——属**静默功能降级**。
+///
+/// **实现新后端时的义务**：要么实现这 4 个方法，要么在文档/日志中
+/// **显式声明**本后端不支持状态持久化（不得让用户以为它生效了）。
+/// 参考实现：`json.rs`（文件）、`postgres.rs`（state kv 表）。
 pub trait Persistence: Send + Sync {
     /// 保存一条记忆（新增或更新）
     fn save_memory(&self, memory: &Memory) -> Result<(), PersistenceError>;
 
     /// 加载 LRC 内置道体状态机的持久化快照。
-    /// 未实现的后端返回空状态，保证旧后端兼容。
+    ///
+    /// **默认实现返回空状态** ⇒ 本后端下联想活性每次重启归零
+    /// （见 trait 文档「状态类方法的实现义务」）。
     fn load_memory_state(&self) -> Result<MemoryState, PersistenceError> {
         Ok(MemoryState::default())
     }
 
     /// 保存 LRC 内置道体状态机的持久化快照。
-    /// 未实现的后端默认忽略，具体后端可提供原子持久化。
+    ///
+    /// **默认实现忽略保存** ⇒ 本后端下联想活性只在进程内有效
+    /// （见 trait 文档「状态类方法的实现义务」）。
     fn save_memory_state(&self, _state: &MemoryState) -> Result<(), PersistenceError> {
         Ok(())
+    }
+
+    /// 本后端是否支持**跨进程重启**的状态持久化（v0.9.8）
+    ///
+    /// **为什么需要这个自报开关**：trait 无法自省"某个方法是否被覆盖实现"，
+    /// 因此调用方（`MemoryStore::new`）无从得知"我刚加载到的空状态
+    /// 是因为首次运行，还是因为这个后端根本不持久化"。
+    /// 二者对用户的意义完全不同：前者正常，后者是**功能降级**。
+    ///
+    /// 后端实现者须如实返回：
+    /// - `true`：`load/save_memory_state` 与 `load/save_assoc_frequency` 均已实现
+    /// - `false`（默认）：未实现 ⇒ 调用方会**打印显式告警**，
+    ///   而不是让用户误以为"联想时好时坏"是随机现象
+    fn supports_state_persistence(&self) -> bool {
+        false
     }
 
     /// 加载跨查询命中频次统计（P8.2o 状态化方案）。
@@ -274,4 +309,62 @@ pub trait Persistence: Send + Sync {
 /// - `{data_dir}/chunks.json`    — 代码片段存储
 pub fn create_json_persistence(data_dir: &str) -> Result<json::JsonPersistence, PersistenceError> {
     json::JsonPersistence::new(data_dir)
+}
+
+/// 测试用最小持久化桩件（v0.9.8）
+///
+/// **存在理由**：需要验证 trait 的**默认行为**（尤其是
+/// `supports_state_persistence()` 必须默认为 `false`）——若不实现任何
+/// 状态方法，才能真实走到默认分支。仅断言"常量等于 false"是恒真的，
+/// 无法发现"默认实现被误改为 true"这类回归。
+///
+/// 放在 `pub(crate)` 命名空间下，供 crate 内多处测试复用（避免每个测试
+/// 各写一遍 8 个必需方法）。
+#[cfg(test)]
+pub(crate) mod test_stub {
+    use super::{CodeChunk, Persistence, PersistenceError};
+    use crate::memory_types::Memory;
+
+    /// 只实现 8 个必需方法的空桩件；状态方法**全部走默认实现**。
+    #[derive(Default)]
+    pub(crate) struct StubPersistence;
+
+    impl Persistence for StubPersistence {
+        fn save_memory(&self, _memory: &Memory) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+        fn load_all_memories(&self) -> Result<Vec<Memory>, PersistenceError> {
+            Ok(Vec::new())
+        }
+        fn delete_memory(&self, _id: &str) -> Result<bool, PersistenceError> {
+            Ok(false)
+        }
+        fn clear_memories(&self) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+        fn save_chunks(&self, _chunks: &[CodeChunk]) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+        fn load_chunks(&self) -> Result<Vec<CodeChunk>, PersistenceError> {
+            Ok(Vec::new())
+        }
+        fn clear_chunks(&self) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+        fn size_bytes(&self) -> Result<u64, PersistenceError> {
+            Ok(0)
+        }
+        fn load_archived_memories(&self) -> Result<Vec<Memory>, PersistenceError> {
+            Ok(Vec::new())
+        }
+        fn save_archived_memories(&self, _memories: &[Memory]) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+        fn add_to_archive(&self, _memories: &[Memory]) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+        fn delete_from_archive(&self, _id: &str) -> Result<bool, PersistenceError> {
+            Ok(false)
+        }
+    }
 }

@@ -63,7 +63,7 @@ use crate::engine::user_feedback::{
     AffectedMemoryInfo, ImplicitSignal, MemoryGraphQuery, UserFeedback,
 };
 use crate::graph_store::{EdgeType, GraphMemoryStore};
-use crate::memory_types::{DecayConfig, Importance, Memory, MemoryType, PrivacyLevel};
+use crate::memory_types::{DecayConfig, EntityKind, Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::{AssocFrequency, Persistence, PersistenceError};
 
 /// 记忆写入性能剖析输出
@@ -99,13 +99,542 @@ const BM25_B: f32 = 0.75;
 /// 权重可通过环境变量 LRC_DEEP_LEX_DOMAIN_WEIGHT 覆盖（阶段 B scale 消融用），默认 0.25。
 const LEX_DOMAIN_WEIGHT: f32 = 0.25;
 
+/// hub 实体判定·文档频率占比阈值（v0.9.7，PREREG §3.45.5）
+///
+/// **问题**：过于泛化的实体会产生海量零区分度的假关联。
+/// 实测（§3.45.5）一个真实样例库中，`shared_entity` 关联的 **95.7%** 来自
+/// 两个项目名型实体（`玄盾` 出现于 70% 记忆、`LRC` 出现于 30%），
+/// 它们"共享"近乎恒真 ⇒ 不是关联，是噪声。**假关联比无关联更糟**——污染用户信任。
+///
+/// **阈值取值依据（实测定标，非拍脑袋）**：在 53 条真实记忆上实测实体 df 分布，
+/// 存在**极宽的断层**：
+///
+/// | 实体类型 | df / 总数 | 占比 |
+/// |---|---|---|
+/// | 项目名型（hub） | 37 / 16 | **69.8% / 30.2%** |
+/// | 具体产物型（有效） | 1 ~ 7 | **1.9% ~ 13.2%** |
+///
+/// ⇒ 断层位于 13.2% 与 30.2% 之间，取 **0.20** 居中，
+/// 两侧各留 ≥6.8pp 余量 ⇒ **对样本波动鲁棒**（详见 `temp/hub-calib.py` 输出）。
+///
+/// **为什么不需要语义判断**（承 §3.45.8 方法论 99）：
+/// 该判定只用频次统计，**不涉及"两个实体是否同一对象"的语义问题**，
+/// 因此可以自动执行——这与"判断两条记忆是否真的同一次经历"（需知情者）
+/// 是完全不同的两类问题。
+///
+/// **⚠ 分母必须按项目内计算，不能用全库（§3.49 修正）**：
+/// 初版用**全库占比**判定，在多项目混合库中会**系统性漏判**——
+/// 实测：`app.js` 在 LRC 项目内占 **43.8%**（典型前端主文件，应判为 hub），
+/// 但全库占比仅 **13.2%**（因分母混入 37 条玄盾记忆而被**稀释**）⇒ 未被拦下，
+/// 结果它单独贡献了 **43.2% 的间接边**（95/220 条），成为最大的假关联源。
+/// ⇒ 现改为**按记忆所属 project 分组统计 df**（见 [`MemoryStore::hub_entities`]），
+/// 无 project 的记忆归入 `_global_` 组。同一实体在**任一**项目内达阈值即判为 hub。
+const HUB_ENTITY_DF_RATIO: f32 = 0.20;
+
+/// hub 实体判定·文档频率绝对下限
+///
+/// **用途**：小库（记忆数很少）时占比法会误伤——例如全库仅 5 条记忆时，
+/// 出现 2 次的实体占比 40% 会被误判为 hub，但它显然是具体产物。
+/// 要求 df **同时** 达到此绝对下限才可能是 hub。
+///
+/// 取值 5：低于 5 条记忆共享的实体，其关联对最多 C(4,2)=6 对，
+/// 规模上不构成"噪声淹没信号"的问题，无需过滤。
+const HUB_ENTITY_MIN_DF: usize = 5;
+
+/// 判定某实体是否为 hub（过于泛化、关联无区分度）
+///
+/// 判据 = **占比高（≥[`HUB_ENTITY_DF_RATIO`]）且绝对频次足够（≥[`HUB_ENTITY_MIN_DF`]）**。
+/// 双条件设计的原因见两常量各自的文档。
+fn is_hub_entity(df: usize, total: usize) -> bool {
+    if total == 0 {
+        return false;
+    }
+    df >= HUB_ENTITY_MIN_DF && (df as f32) / (total as f32) >= HUB_ENTITY_DF_RATIO
+}
+
+/// 自动事件推断·时间窗口（秒）= 1 小时（v0.9.8，PREREG §3.54）
+///
+/// **为什么需要自动事件**：`event_id` 是"共同经历"的唯一载体，但实测
+/// 真实库填写率 **0.00%**（§3.51）——记录层联想因此**产出恒为 0**。
+/// 而"同项目 + 同一小时写入"是**客观事实**（不需要任何用户判断），
+/// 实测覆盖 **70.7%（global）/ 90.4%（dev）**，且抽样证实桶内确实是
+/// **同一次连续工作**（如 CSCD 08:01→08:59 的重构→Phase2→Phase4→审查）。
+///
+/// **窗口取值依据（实测定标，非拍脑袋）**：
+///
+/// | 窗口 | 覆盖率(global) | 关联对 | 大桶纯度 |
+/// |---|---|---|---|
+/// | **1h** | **70.7%** | **627** | 0.0474（稳定） |
+/// | 2h | 79.1% | 945 | 0.0486 |
+/// | 4h | 84.9% | 1305 | 0.0438 |
+/// | 8h | 89.6% | **1908** | **0.0365**（明显下降） |
+///
+/// ⇒ 1h 用 3 倍少的关联对换取足够覆盖，且纯度不随窗口放大而退化。
+const AUTO_EVENT_WINDOW_SECS: i64 = 3600;
+
+/// 自动事件推断·**批量写入排斥**阈值（秒/条）（v0.9.8，实测定标）
+///
+/// **为什么必须排斥**：实测发现"同一小时内"存在两类**截然不同**的桶：
+///
+/// | 类别 | 时间戳特征 | 实例 |
+/// |---|---|---|
+/// | **一次经历**（应关联） | 跨度/条数 **≥ 106.6 秒** | CSCD 08:01→08:59 共 14 条 |
+/// | **批量写入**（应排斥） | 跨度/条数 **≤ 17.3 秒** | XuanDun 11 条**全在同一秒** |
+///
+/// 后者是脚本批量导入/测试语料注入（dev 库 32 条在 **3 秒内**写完），
+/// 桶内内容互相无关（纯度 0.0027 ≈ 随机）——把它们当作"同一次经历"
+/// 会产出**海量假关联**（比不做更糟，污染用户信任）。
+///
+/// **判据 = 时间跨度 / 条数 < 60 秒**（平均每条不足 1 分钟 ⇒ 非人工可产出）。
+/// **断层实测**：坏桶最大 17.3s ↔ 好桶最小 106.6s，**89 秒空白带**，
+/// 取 60 居中，两侧各留 >40s 余量 ⇒ 对样本波动鲁棒。
+/// **为什么用"跨度/条数"而非"固定条数上限"**：实测两库坏桶规模分布
+/// （global 最坏 11 条而好桶有 14 条）⇒ **规模无法区分**，但时间密度可以。
+const AUTO_EVENT_MIN_SECS_PER_MEMORY: i64 = 60;
+
+/// 产物标识符（artifact）的**项目内占比** hub 阈值（v0.9.8，实测定标）
+///
+/// # 为什么需要这一维度（承 PREREG_MEMORY_ASSOCIATION.md §三）
+///
+/// 实测：`entities` 填写率 **0.00%** ⇒ `shared_entity` 在真实库上**产出恒为 0**；
+/// 且各维度覆盖的**记忆子集几乎不重叠**（`same_event_auto` 覆盖日常写入，
+/// 谱系维度只覆盖 `synthesis` 类型）⇒ 实测**多维并存率仅 1.02%**
+/// （从单条记忆出发能看到 ≥2 种关系类型的比例）。
+///
+/// §3.54.8 方法论 110 已确立规范：**依赖人工填写的通路，必须同时提供
+/// 一条零填写负担的客观替代路径**，判据是覆盖率 <5% 即视为**未激活**。
+/// 本维度即 `shared_entity` 的那条替代路径——输入从「人工填 entities」
+/// 换成「从正文**形态**检出具体产物标识符」。
+///
+/// # 为什么这是"形态检出"而非"语义推断"（承 §3.44.5 方法론 97 的边界）
+///
+/// §3.44.5 禁止"自动推断"，其判据是：**该判断是否需要「对世界做一次判断」**。
+/// 本维度只做前一件事、不做后一件：
+/// - ✅ **可自动**：「`app.js` 是文件名」——只由这 6 个字符决定，不引用其他记忆、
+///   不引用外部世界（属 §3.44.5 明文允许的「格式化/校验」类）
+/// - ❌ **留知情者**：「这两条是不是同一次经历」——需理解语义
+///
+/// 且**不回写 `entities` 字段**、**独立命名 `shared_artifact`**、
+/// `why` 显式标注检出方式——与 `same_event_auto` 对 `same_event` 的关系同构
+/// （§3.54 已确立的"不越界的自动推断"三约束）。
+///
+/// # 阈值取值依据（实测定标，非拍脑袋）
+///
+/// 在 **1283 条真实记忆**（注入语料已实测覆盖率仅 1.0%，不参与标定）上
+/// 统计 artifact 的**项目内占比**（承 §3.49：分母必须按项目分层，
+/// 用全库分母会稀释而系统性漏判）：
+///
+/// | 层 | 占比区间 | 实例 | 性质 |
+/// |---|---|---|---|
+/// | **恒真层（应拦）** | **42.86% ~ 100%** | `Cargo.toml`(100%) / `README.md`(75%) / `app.py`(66.7%) | 出现于多数记忆 ⇒ "共享"近乎恒真 ⇒ 零区分度 |
+/// | 断层 | **42.86% → 28.57%（14.29pp）** | — | 最大有效断层 |
+/// | 具体产物层（保留） | ≤28.57% | `app.js`(18.2%) / `v1_api.rs`(14.5%) / `commands.rs`(14.3%) | 具体产物 ⇒ 关联有信息量 |
+///
+/// ⇒ 取 **0.35**：位于断层中点（35.71%）且**两侧各留 ≥6.4pp 余量**。
+///
+/// # ⚠ 已知未决项（必须如实保留，不得静默）
+///
+/// **`app.js`（占比 18.24%）会逃过本阈值**，而它单独贡献 **16.04%** 的全部关联对
+/// （df=69 ⇒ C(69,2)=2346 对），是全库**最大的单点来源**。
+/// 两个选项各有代价，当前**择优保留现状并标注**：
+/// - 若降到 0.18 以拦下它，则该阈值**落在连续分布内部**（18.24% / 14.47% /
+///   14.29% / …相邻差仅 3~4pp）⇒ 属"拍脑袋"，违反 §3.49.5「无断层则不设阈值」；
+/// - 保留 0.35 ⇒ 如实承认 `app.js` 未被拦下。
+///
+/// **为什么不删除该维度**：即使含 `app.js` 噪声，它仍把多维并存率从 1.02%
+/// 提升到 17.35%（**合并口径**，见下），且样例经人工核验为
+/// "同一具体函数在不同时间被碰过"的**有效跨会话关联**（`fetchWithTimeout`
+/// ↔ v0.8.2 修复 / v0.8.4 审计）——这是 BGE 给不出的类型。
+const HUB_ARTIFACT_DF_RATIO: f32 = 0.35;
+
+/// hub artifact 判定·文档频率绝对下限
+///
+/// 与 [`HUB_ENTITY_MIN_DF`] 同理由：小库时占比法会误伤具体产物
+/// （全库 3 条时出现 2 次的占比 66% 但显然是具体文件）。
+/// 低于 5 条记忆共享的 artifact 最多 C(4,2)=6 对，不构成噪声淹没。
+const HUB_ARTIFACT_MIN_DF: usize = 5;
+
+/// 产物标识符（artifact）词法抽取：后缀长度上限
+///
+/// **为什么用"形态类"而非后缀白名单**：用户要求「不能是死的映射」——
+/// 白名单（50 个后缀的静态表）会让新语言后缀（`.zig`/`.proto`）**静默漏检**。
+/// 实测对比（1283 条真实记忆）：
+///
+/// | 方案 | 覆盖率 | 问题 |
+/// |---|---|---|
+/// | 固定白名单（50 后缀） | 75.60% | 漏检 48 条（含 `tauri.conf`/`daoti.onnx`/`hello_libc.elf`） |
+/// | **形态类（本方案）** | **79.35%** | 多抓 48 条，且正确排除 `v0.9`/`127.0`/`2.35`（版本号/IP，共 2268 次） |
+///
+/// 形态类判据：**后缀以 ASCII 字母开头、长度 1~8、其余为字母数字**——
+/// 该约束天然排除「纯数字后缀」（版本号 `v0.9.8`、浮点 `2.35`、IP `127.0`）。
+const ARTIFACT_MAX_SUFFIX_LEN: usize = 8;
+
+/// 产物标识符最小长度（过短的多为短语缩写，非具体产物）
+const ARTIFACT_MIN_TOKEN_LEN: usize = 4;
+
+/// 判定某 artifact 是否为 hub（过于泛化、关联无区分度）
+///
+/// 判据 = **占比高（≥[`HUB_ARTIFACT_DF_RATIO`]）且绝对频次足够（≥[`HUB_ARTIFACT_MIN_DF`]）**。
+/// 与 [`is_hub_entity`] 同构——复用同一条纪律（占比型判定的分母必须按项目分层，§3.49）。
+fn is_hub_artifact(df: usize, total: usize) -> bool {
+    if total == 0 {
+        return false;
+    }
+    df >= HUB_ARTIFACT_MIN_DF && (df as f32) / (total as f32) >= HUB_ARTIFACT_DF_RATIO
+}
+
+/// 从正文抽取**形态可识别的产物标识符**（纯形态，无语义判断）
+///
+/// 扫描规则：把正文按"是否属于标识符字符集"（ASCII 字母/数字/`_`/`-`/`.`）
+/// 切成候选 token，再对每个候选套一道形态判据：
+///
+/// 1. 含至少一个 `.`（点号是"文件名/限定名"的形态特征）；
+/// 2. 长度 ≥ [`ARTIFACT_MIN_TOKEN_LEN`]；
+/// 3. 以**最后一个点号**为界取后缀，后缀长度 1~[`ARTIFACT_MAX_SUFFIX_LEN`]
+///    且**首字符为 ASCII 字母**、其余为字母数字
+///    （该条排除版本号 `v0.9.8` / 浮点 `2.35` / IP `127.0.0.1` 的尾段）；
+/// 4. 前缀部分至少含一个 ASCII 字母（排除 `1.5` 这类纯数字）；
+/// 5. 只取 ASCII（CJK 文本中不会出现"文件名"形态，且避免 CJK 被误切）。
+///
+/// **为什么不用正则库**：本项目未引入 `regex` 依赖，且本抽取是**手写状态机**
+/// 即可完成的线性扫描；引入依赖会为单一用途增加编译期与二进制体积成本。
+/// 手写实现的行为已由单元测试逐案锁定（含负向对照）。
+///
+/// **为什么取"最后一个点号"**：`tauri.conf.json` 的后缀应是 `json` 而非 `conf`；
+/// `delivery_audit_v1.3.2.md` 的后缀应是 `md`。取最后一个点号同时让
+/// 版本号形态（`v1.3.2.md` 中 `v1.3.2` 被跳过、整串作为前缀）自然成立。
+///
+/// 返回**去重后**的列表（同一条记忆内同一产物只计一次），保持首次出现顺序。
+fn extract_artifacts(text: &str) -> Vec<String> {
+    /// 标识符允许的字符：ASCII 字母/数字/下划线/连字符/点号。
+    #[inline]
+    fn is_ident_char(c: char) -> bool {
+        c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+
+    // 收尾逻辑抽成闭包，供"遇到非标识符字符"与"文本结束"两处复用
+    // （避免两处实现漂移——历史上这类收尾漏写导致的静默丢 token 很难察觉）
+    let flush = |cur: &mut String, out: &mut Vec<String>| {
+        if !cur.is_empty() {
+            if let Some(tok) = normalize_artifact(cur) {
+                if !out.contains(&tok) {
+                    out.push(tok);
+                }
+            }
+            cur.clear();
+        }
+    };
+
+    for ch in text.chars() {
+        if is_ident_char(ch) {
+            cur.push(ch);
+        } else {
+            flush(&mut cur, &mut out);
+        }
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
+/// 对单个候选 token 套形态判据，通过则归一化为小写返回
+///
+/// 归一化为小写的原因：`App.js` 与 `app.js` 指同一产物，
+/// 大小写差异不应产生两条互不相连的关联。
+fn normalize_artifact(tok: &str) -> Option<String> {
+    let lower = tok.to_lowercase();
+    if lower.chars().count() < ARTIFACT_MIN_TOKEN_LEN {
+        return None;
+    }
+    // 必须以最后一个点号分隔，且两侧都非空
+    let idx = lower.rfind('.')?;
+    if idx == 0 || idx + 1 >= lower.len() {
+        return None;
+    }
+    let (prefix, suffix) = (&lower[..idx], &lower[idx + 1..]);
+    if suffix.chars().count() > ARTIFACT_MAX_SUFFIX_LEN {
+        return None;
+    }
+    // 后缀：首字符必须是 ASCII 字母（排除纯数字后缀 ⇒ 版本号/浮点/IP）
+    let mut sfx = suffix.chars();
+    let first = sfx.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    if !suffix.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    // 前缀至少含一个 ASCII 字母（排除 `1.5`、`2026.09` 这类纯数字）
+    if !prefix.chars().any(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(lower)
+}
+
+/// 计算 artifact 的**项目内占比**表：`artifact -> 最大项目内占比`
+///
+/// **为什么要抽成独立函数**：hub 判定依赖"分母按项目分层"（§3.49 的教训），
+/// 而占比需遍历全库统计。检索主路径要复用该表（避免每起点重算 O(N)）。
+fn artifact_project_ratio(all: &[Memory]) -> std::collections::HashMap<String, (usize, usize)> {
+    use std::collections::{HashMap, HashSet};
+
+    // 各项目的记忆总数（分母）
+    let mut proj_total: HashMap<String, usize> = HashMap::new();
+    for m in all {
+        *proj_total
+            .entry(m.project.as_deref().unwrap_or("_global_").to_string())
+            .or_insert(0) += 1;
+    }
+
+    // (项目, artifact) -> 该 artifact 在该项目内出现的记忆 id 集合
+    let mut per_proj: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    for m in all {
+        let proj = m.project.as_deref().unwrap_or("_global_").to_string();
+        for a in extract_artifacts(&m.content) {
+            per_proj
+                .entry((proj.clone(), a))
+                .or_default()
+                .insert(m.id.clone());
+        }
+    }
+
+    // 取"任一项目内占比最大"的那次（与 hub_entity_set 同口径）
+    let mut out: HashMap<String, (usize, usize)> = HashMap::new();
+    for ((proj, a), ids) in per_proj {
+        let total = proj_total.get(&proj).copied().unwrap_or(0);
+        let df = ids.len();
+        let ratio = if total == 0 {
+            0.0
+        } else {
+            df as f32 / total as f32
+        };
+        let entry = out.entry(a).or_insert((df, total));
+        let cur_ratio = if entry.1 == 0 {
+            0.0
+        } else {
+            entry.0 as f32 / entry.1 as f32
+        };
+        if ratio > cur_ratio {
+            *entry = (df, total);
+        }
+    }
+    out
+}
+
+/// artifact → 出现过它的记忆 ID 集合（供关联展开查表）
+fn artifact_members(all: &[Memory]) -> std::collections::HashMap<String, Vec<String>> {
+    use std::collections::HashMap;
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for m in all {
+        for a in extract_artifacts(&m.content) {
+            out.entry(a).or_default().push(m.id.clone());
+        }
+    }
+    out
+}
+
+/// artifact 维度的两张全库统计表（一次构建，多次复用）
+///
+/// **为什么把两张表打包**：它们必须**同源构建**（都来自同一次
+/// `extract_artifacts` 遍历）——若分别构建，两处抽取实现漂移时
+/// 「被 hub 判定的名字」与「实际连接的成员」会不一致，
+/// 产生"拦了 A 却仍由 A 连出边"这类静默错误。
+/// 打包后**结构上不可能**出现该不一致。
+struct ArtifactTables {
+    /// artifact → (df, 该项目内记忆数)：用于 hub 判定（占比按项目分层，§3.49）
+    ratio: std::collections::HashMap<String, (usize, usize)>,
+    /// artifact → 出现过它的记忆 ID 列表：用于展开关联
+    members: std::collections::HashMap<String, Vec<String>>,
+}
+
+impl ArtifactTables {
+    /// 一次遍历构建两张表（供检索主路径与详情页复用）
+    fn build(all: &[Memory]) -> Self {
+        Self {
+            ratio: artifact_project_ratio(all),
+            members: artifact_members(all),
+        }
+    }
+
+    /// 该 artifact 是否应被跳过（过泛化、或成员不足 2 条而无关联可言）
+    fn is_skipped(&self, artifact: &str) -> bool {
+        let (df, total) = self.ratio.get(artifact).copied().unwrap_or((0, 0));
+        if is_hub_artifact(df, total) {
+            return true;
+        }
+        // 只有一条记忆提到它 ⇒ 无关联对可言（但仍可能是有效产物，
+        // 只是本维度对它不产出边）
+        // 注：此处不用 `is_none_or`（Rust 1.82+），项目 MSRV 为 1.80
+        match self.members.get(artifact) {
+            None => true,
+            Some(ids) => ids.len() < 2,
+        }
+    }
+}
+
+/// 判定某个"同项目 + 同窗口"分组是否构成**自动事件**
+///
+/// 判据：条数 ≥ 2（否则无关联可言）且**不是批量写入**
+/// （时间跨度/条数 ≥ [`AUTO_EVENT_MIN_SECS_PER_MEMORY`]）。
+///
+/// **为什么条数 ≥ 2 才能成为事件**：单条记忆没有"共同经历"可言——
+/// 它与谁都不是"同一次"。（但它仍可作 shared_entity 关联的来源。）
+fn is_auto_event_cluster(count: usize, span_secs: i64) -> bool {
+    if count < 2 {
+        return false;
+    }
+    // 跨度/条数：整数除法在 count 很大时足够（判据本身是量级判断）
+    span_secs / (count as i64) >= AUTO_EVENT_MIN_SECS_PER_MEMORY
+}
+
+/// 实词集 Jaccard 相似度——**「意外性」的廉价代理**（v0.9.8）
+///
+/// # 它是做什么的（这是本轮的核心设计）
+///
+/// 用户对"联想"的价值判据（§3.43.9 逐字）：
+/// > 「道体的价值判据不是'能否产出关联图'，而是'**产出的关联图中，
+/// >   有多少条是 BGE 给不出的**'」
+///
+/// 实测（`temp/assoc-bge-giveup.py`，真实库 1285 条 + BGE 全库排名）：
+/// 联想产出的对，**BGE 排名中位仅 0.0685**（= BGE top 6.9%）——
+/// 即**大部分联想对 BGE 本来就能找到**，那部分没有增量。
+///
+/// 因此需要"该对是否 BGE 给不出"的判据。精确做法要编码全库（热路径不可接受），
+/// 故用本函数做**廉价代理**。实测有效性（`temp/assoc-proxy-test.py`）：
+///
+/// | 代理 | Spearman（vs BGE 排名） | AUC（判"给不出"） |
+/// | --- | --- | --- |
+/// | **实词 Jaccard（本函数）** | **−0.6855** | **0.9275** |
+/// | 3-gram Jaccard | −0.6678 | 0.9099 |
+/// | 字符集 Jaccard | −0.5964 | 0.8748 |
+///
+/// # 为什么它是"代理"而不是"又一层相似度打分"
+///
+/// **陷阱检验**（同上脚本）：若代理只是 BGE 的粗粒度版本，那用它筛低相似对
+/// 与用 BGE 筛等价 ⇒ 无独立价值。实测**否证了该陷阱**：
+/// 代理筛出的低分对与 BGE 低相似对**重叠 Jaccard 仅 0.081**（θ_p=0.02）；
+/// 且代理选出的对里 **BGE 给不出率 98.4%**，而随机同量对照仅 65.3%
+/// （**+33.1pp**）⇒ 代理确实在**识别意外关联**，不是在复刻 BGE。
+///
+/// # 词表口径
+/// 复用生产既有的 CJK bigram + ASCII 词抽取口径，并过滤泛指虚词
+/// （「什么」「怎么」「可以」等）——虚词命中不代表主题相关，
+/// 留着会让"两条都在讲废话"的记忆产生虚假高相似（承 §3.47 的泛指 bigram 教训）。
+fn content_words(text: &str) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    // 泛指虚词（单字）：这些字参与组成的 bigram 不携带主题信息
+    const GENERIC_CHARS: &[char] = &[
+        '的', '是', '了', '在', '和', '有', '就', '不', '人', '都', '一', '上', '也', '很', '到',
+        '说', '要', '去', '你', '会', '着', '没', '看', '好', '自', '己', '这', '那', '么', '些',
+        '什', '怎',
+    ];
+    // 泛指 bigram（双字词）：整体是功能短语，非主题
+
+    let lower = text.to_lowercase();
+    let mut out: HashSet<String> = HashSet::new();
+
+    // ASCII 词（长度 ≥2，含 `_`/`-`），保留整词以便与 CJK 区分
+    let mut buf = String::new();
+    let flush_ascii = |buf: &mut String, out: &mut HashSet<String>| {
+        if buf.chars().count() >= 2 {
+            out.insert(buf.clone());
+        }
+        buf.clear();
+    };
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            buf.push(ch);
+        } else {
+            flush_ascii(&mut buf, &mut out);
+        }
+    }
+    flush_ascii(&mut buf, &mut out);
+
+    // CJK bigram（跳过含泛指虚词或跨 ASCII 边界的组合）
+    let cjk: Vec<char> = lower
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_ascii())
+        .collect();
+    for w in cjk.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        if GENERIC_CHARS.contains(&a) || GENERIC_CHARS.contains(&b) {
+            continue;
+        }
+        out.insert(format!("{a}{b}"));
+    }
+    out
+}
+
+/// 实词 Jaccard 相似度（0.0 ~ 1.0）。两文本均无实词时返回 0.0。
+fn word_jaccard(
+    a: &std::collections::HashSet<String>,
+    b: &std::collections::HashSet<String>,
+) -> f32 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let inter = a.intersection(b).count() as f32;
+    let union = a.union(b).count() as f32;
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+/// 门控：道体预判卦是否参与候选剪枝（**v0.9.8 起默认关闭**）
+///
+/// `LRC_DAOTI_PREVIEW_PRUNE=1` / `=true` 时开启；未设或其它值 ⇒ 关闭。
+///
+/// **为什么默认关闭**：该剪枝的第二证据 `daoti_preview_bagua` 与
+/// `bagua_index` 同源（均出自洛书编码器 + `mirror_project`），
+/// 而 `daoti/PREREG_ACTIVE_DISCOVERY.md` §3.37 已实测该编码**不读语义**——
+/// 打乱字符顺序后分类 100% 不变（根因：9 维特征仅含字符密度/字符熵/位置权重），
+/// 且真实语料上最大单类占比 99~100%（`data_beir_eval` 3633 条全落同一卦）。
+///
+/// 抽成独立函数（而非内联 `matches!`）的原因：门控判据是**默认值契约**
+/// 的单一事实来源，测试须直接断言本函数而非复刻判据（承方法论 79：
+/// 两处实现必然漂移，而漂移后的测试会失去鉴别力）。
+pub(crate) fn daoti_preview_prune_enabled() -> bool {
+    matches!(
+        std::env::var("LRC_DAOTI_PREVIEW_PRUNE").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// 关系类型的中文标签（用于把路径写成人可读的解释）
+///
+/// 存在的原因：`why` 字段的判据是"**人类可解释**"（用户指引 §六）。
+/// 直接输出 `same_event` 这类标识符对用户无意义，必须给出中文说明。
+///
+/// **注意（§3.49.2）**：间接边的解释**不使用**本函数——
+/// 它直接拼接两段的真实 `why`（含具体实体名，如"共享 thing 实体「app.js」"），
+/// 因为只写"共享实体"而不写共享的是什么，恰好违背可解释判据。
+/// 本函数保留供 `why` 的生成路径与未来按类型聚合展示复用。
+pub(crate) fn relation_label(relation: &str) -> &'static str {
+    match relation {
+        "same_event" => "同一次经历",
+        "same_event_auto" => "同期工作记录",
+        "shared_entity" => "共享实体",
+        "shared_artifact" => "共享具体产物",
+        "derived_from" => "结晶来源",
+        "crystallized_into" => "被结晶为",
+        "evolved_from" => "被更新过",
+        "indirect" => "间接关联",
+        _ => "相关联",
+    }
+}
+
 /// 数据契约类型重导出（v0.9.7，GLOBAL_CODE_REVIEW_REPORT P2-2「MemoryStore God Object」）
 ///
 /// 以下类型的**本体**已外提至 [`crate::memory_store_types`]（纯数据契约、零状态依赖）。
 /// 在此重导出以保持 `crate::memory_store::Xxx` 既有路径与
 /// `use crate::memory_store::*` 调用方**零改动**。
 pub use crate::memory_store_types::{
-    ListFilter, MemoryStats, RecallFilter, RecallResult, RegulatorHeartbeat, SortBy, SortOrder,
+    AssociatedMemory, AssociationGraph, GraphEdge, GraphNode, ListFilter, MemoryAssociation,
+    MemoryStats, RecallFilter, RecallResult, RegulatorHeartbeat, SortBy, SortOrder,
     SynthesisSnapshot,
 };
 
@@ -723,6 +1252,23 @@ impl<P: Persistence> MemoryStore<P> {
     pub fn new(persistence: P) -> Self {
         let memory_state = persistence.load_memory_state().unwrap_or_default();
         let assoc_frequency = persistence.load_assoc_frequency().unwrap_or_default();
+        // v0.9.8：状态持久化能力**显式可见**。
+        //
+        // 背景：`load/save_memory_state` 与 `load/save_assoc_frequency` 有
+        // trait 默认实现（返回空 + 忽略保存）。若后端未实现且**无人声明**，
+        // 用户会看到"联想活性/语义吸铁石压制每次重启归零"却**毫无提示**，
+        // 只感觉"联想时好时坏"——这是**静默功能降级**。
+        //
+        // 注意：此处用 `supports_state_persistence()` 自报开关，而不是
+        // 靠"加载到的状态是否为空"推断——首次运行（正常的空）与
+        // 后端不持久化（降级的空）在返回值上**完全一样**，无法区分。
+        if !persistence.supports_state_persistence() {
+            eprintln!(
+                "[LRC·持久化] ⚠ 当前后端未实现状态持久化：\
+联想活性（近期在想什么）与「语义吸铁石」压制统计**仅在本进程内有效，重启后归零**。\
+这是已知限制，不是故障；若需跨重启保留，请使用 JSON 后端（默认）。"
+            );
+        }
         // 质疑二·终极：启动时打印完整的隐私清单，而非一闪而过的日志
         eprintln!(
             "{}",
@@ -2483,11 +3029,59 @@ impl<P: Persistence> MemoryStore<P> {
             // 构建合并后的记忆
             let mut merged = existing.clone();
             let old_content = merged.content.clone();
-            merged.content = memory.content;
+            // ⭐ 内容被**真实替换**时必须存档旧版本（v0.9.8 §3.55 根因修复）
+            //
+            // **修的是什么**：此前这里直接 `merged.content = memory.content`，
+            // 旧内容**当场被丢弃**——`version_history` 与 `version` 都不留痕。
+            // 实测（`temp/multidim-input-measure.py`，global 4485 条）：
+            // `updated_at` 变过的有 463 条（10.32%），但其中 **448 条（96.8%）
+            // 没有任何版本历史** ⇒ "同一件事被更新过"这一事实**被销毁**，
+            // 演进维度因此几乎无法产出（全库仅 15 条有版本历史）。
+            //
+            // **为什么用 `update_content` 而非手动 push**：该函数已实现
+            // "存档旧内容 + 版本号 +1 + 只保留最近 5 版"，是单一事实来源
+            //（承方法论 79）。手写一份会与它漂移。
+            //
+            // **为什么先比内容**：相似记忆合并很常见（同一条被重记一次），
+            // 内容没变时不该虚增版本号——否则版本历史会被无意义的重复填满，
+            // 真正有信息量的旧版本反而被挤出最近 5 版之外。
+            let content_changed = merged.content != memory.content;
+            if content_changed {
+                merged.update_content(memory.content);
+            }
             merged.tags = merged_tags;
             merged.daoti_preview_gua = memory.daoti_preview_gua;
             merged.daoti_preview_bagua = memory.daoti_preview_bagua;
             merged.daoti_preview_version = memory.daoti_preview_version;
+            // **事件维度必须合并而非丢弃**（否则"共同经历"信息被静默吃掉）：
+            // 新记忆带来 event_id 时以新值为准（内容已更新为最新表述）；
+            // entities 取并集去重（同一次经历的两条记忆可能各提到不同实体）。
+            if memory.event_id.is_some() {
+                merged.event_id = memory.event_id.clone();
+            }
+            for e in &memory.entities {
+                if !merged.entities.contains(e) {
+                    merged.entities.push(e.clone());
+                }
+            }
+            // ⭐ 来源关系同样**必须合并而非丢弃**（v0.9.8 §3.55）
+            //
+            // **为什么必须**：`source_ids` 是"这条记忆从哪几条衍生"的**唯一载体**，
+            // 也是记录层唯一不需要用户填写的依据（实测覆盖 8.54%，全库最高）。
+            // 合并时丢弃它 ⇒ 记忆一旦被合并就**永久失去来源关系**，
+            // 且该损失不可恢复（原始 source_ids 无处可查）。
+            //
+            // **触发场景是常态而非边缘**：本次实测就是这样发现的——
+            // 测试给记忆加上 `source_ids` 后 `remember` 一次，因与既有记忆
+            // 相似而走了合并路径，`source_ids` 当场丢失，关联为空。
+            //
+            // 取**并集去重**（与 entities 同款）：新旧来源都指向真实存在的
+            // 记忆，任一条都是有效证据，不应因为"新的一次写入没提"而丢弃。
+            for s in &memory.source_ids {
+                if !merged.source_ids.contains(s) {
+                    merged.source_ids.push(s.clone());
+                }
+            }
             merged.touch();
 
             // 如果新记忆的重要性更高，则提升
@@ -2684,13 +3278,22 @@ impl<P: Persistence> MemoryStore<P> {
         let query_proj = mirror_project(&query_vec);
         let query_bagua = query_proj.best_index as u8;
 
-        // 阶段三 b2：预判元数据参与候选剪枝（默认开启）。
-        // LRC_DAOTI_PREVIEW_PRUNE=0 / =false 时关闭，退化为仅 LRC 自分类卦硬剪除
-        // （保持 v0.8.50 回滚后的行为）。
-        let daoti_prune_enabled = !matches!(
-            std::env::var("LRC_DAOTI_PREVIEW_PRUNE").as_deref(),
-            Ok("0") | Ok("false")
-        );
+        // 阶段三 b2：预判元数据参与候选剪枝（**v0.9.8 起默认关闭**，
+        // LRC_DAOTI_PREVIEW_PRUNE=1 显式开启）。
+        //
+        // **为什么改为默认关闭**：本剪枝的第二证据是 `daoti_preview_bagua`，
+        // 其取值与 `bagua_index` 同源（均来自洛书编码器 + mirror_project）。
+        // §3.37 已实测该编码**不读语义**——打乱字符顺序后分类 100% 不变
+        // （根因：9 维特征仅含字符密度/字符熵/位置权重），且真实语料上
+        // 最大单类占比 99~100%（`data_beir_eval` 3633 条全部落入同一卦）。
+        // 用一个无语义判别力的标签去"修正跨域误剪"，实质是用噪声换噪声。
+        //
+        // 关闭后退化为 v0.8.50 回滚后行为：仅按 LRC 自分类卦做环形距离硬剪除。
+        // 注意 LRC 自分类卦本身同样不读语义（同一根因），故该硬剪除的
+        // 语义有效性同样存疑——但那属于**更上游**的编码器问题（须单独立项），
+        // 不在本次门控翻转的范围内，此处不擅自改动既有剪除行为。
+        // LRC_DAOTI_PREVIEW_PRUNE=1 可复现 v0.9.7 行为（对照实验用）。
+        let daoti_prune_enabled = daoti_preview_prune_enabled();
 
         // 3. 以查询向量重心为中心创建 ROI
         let center = query_vec
@@ -3760,6 +4363,1155 @@ impl<P: Persistence> MemoryStore<P> {
         Ok((paged, total))
     }
 
+    /// 按事件 ID 反查「同一次经历」产生的其他记忆
+    ///
+    /// **记录层 → 关联的推导**：不冗余存储"共同经历"列表，
+    /// 而是以 `event_id` 为键即时分组。这样避免了冗余字段与主体不一致的风险。
+    ///
+    /// 返回该 event_id 下的全部记忆（含起点自身，按 created_at 升序），
+    /// 便于上层判断"先后顺序"。`exclude_id` 用于排除起点。
+    pub fn memories_by_event(
+        &self,
+        event_id: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<Vec<Memory>, PersistenceError> {
+        let all = self.load_cached()?;
+        let mut hits: Vec<Memory> = all
+            .into_iter()
+            .filter(|m| m.event_id.as_deref() == Some(event_id))
+            .filter(|m| exclude_id != Some(m.id.as_str()))
+            .collect();
+        hits.sort_by_key(|m| m.created_at);
+        Ok(hits)
+    }
+
+    /// 列出全部事件及其记忆数（按记忆数降序）
+    ///
+    /// 用于观测"经历"维度的覆盖情况：有多少条记忆带 event_id、
+    /// 形成了多少个经历簇、簇的规模分布如何。
+    pub fn event_index(&self) -> Result<Vec<(String, usize)>, PersistenceError> {
+        let all = self.load_cached()?;
+        let mut cnt: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for m in &all {
+            if let Some(ref e) = m.event_id {
+                *cnt.entry(e.clone()).or_insert(0) += 1;
+            }
+        }
+        let mut out: Vec<(String, usize)> = cnt.into_iter().collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
+    /// 按实体名反查共享该实体的记忆
+    ///
+    /// 与 `memories_by_event` 互补：event_id 管"同一次经历"，
+    /// entities 管"跨经历的同一对象"（如两条不同记忆都提到"爸爸"）。
+    pub fn memories_by_entity(
+        &self,
+        name: &str,
+        kind: Option<EntityKind>,
+        exclude_id: Option<&str>,
+    ) -> Result<Vec<Memory>, PersistenceError> {
+        let all = self.load_cached()?;
+        let mut hits: Vec<Memory> = all
+            .into_iter()
+            .filter(|m| {
+                m.entities
+                    .iter()
+                    .any(|e| e.name == name && kind.map(|k| e.kind == k).unwrap_or(true))
+            })
+            .filter(|m| exclude_id != Some(m.id.as_str()))
+            .collect();
+        hits.sort_by_key(|m| std::cmp::Reverse(m.created_at));
+        Ok(hits)
+    }
+
+    /// 统计实体的文档频率（df = 出现在多少条记忆里），**按项目分组**
+    ///
+    /// 键为 `(项目, 实体名, 实体类型)`；项目取自 `Memory.project`，
+    /// 无 project 者归入 `_global_`（与 `list`/`stats` 的项目口径一致）。
+    ///
+    /// **为什么必须按项目分组**（§3.49 修正）：全库占比会被**其他项目稀释**，
+    /// 导致项目内高度泛化的实体（如 LRC 的 `app.js`，项目内 43.8%）被判为"不泛化"。
+    ///
+    /// 与 `associations` 的匹配口径（name + kind 均相同）**严格一致**。
+    /// 同一条记忆内重复出现的同一实体只计 1 次（df 语义是"文档数"而非"出现次数"）。
+    fn entity_df_map(
+        &self,
+        all: &[Memory],
+    ) -> std::collections::HashMap<((String, String), EntityKind), usize> {
+        let mut df: std::collections::HashMap<((String, String), EntityKind), usize> =
+            std::collections::HashMap::new();
+        for m in all {
+            let proj = m.project.as_deref().unwrap_or("_global_").to_string();
+            // 去重：同一条记忆里同一实体只算一次
+            let mut seen_in_doc: std::collections::HashSet<(String, EntityKind)> =
+                std::collections::HashSet::new();
+            for e in &m.entities {
+                if seen_in_doc.insert((e.name.clone(), e.kind)) {
+                    *df.entry(((proj.clone(), e.name.clone()), e.kind))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        df
+    }
+
+    /// 计算 hub 实体集合（按项目口径判定）
+    ///
+    /// 返回 `(实体名, 类型) -> (df, 该项目总记忆数)`——
+    /// 保留命中时的**项目分母**，使调用方能如实展示"在哪个项目里泛化"。
+    ///
+    /// 判定规则：**任一项目内**满足 `df >= HUB_ENTITY_MIN_DF` 且
+    /// `df / 该项目记忆数 >= HUB_ENTITY_DF_RATIO` 即视为 hub。
+    fn hub_entity_set(
+        &self,
+        all: &[Memory],
+    ) -> std::collections::HashMap<(String, EntityKind), (usize, usize)> {
+        use std::collections::HashMap;
+        // 各项目的记忆总数（分母）
+        let mut proj_total: HashMap<String, usize> = HashMap::new();
+        for m in all {
+            *proj_total
+                .entry(m.project.as_deref().unwrap_or("_global_").to_string())
+                .or_insert(0) += 1;
+        }
+        let df = self.entity_df_map(all);
+
+        let mut out: HashMap<(String, EntityKind), (usize, usize)> = HashMap::new();
+        for (((proj, name), kind), c) in df {
+            let total = proj_total.get(&proj).copied().unwrap_or(0);
+            if is_hub_entity(c, total) {
+                // 同一实体可能命中多个项目：保留 df 最大（最泛化）的那次
+                let entry = out.entry((name.clone(), kind)).or_insert((c, total));
+                if c > entry.0 {
+                    *entry = (c, total);
+                }
+            }
+        }
+        out
+    }
+
+    /// 列出被判为 hub 的实体及其频次（**让过滤可见，而非静默**）
+    ///
+    /// **为什么必须提供此查询**：hub 过滤会**丢弃**部分关联。若用户不知道
+    /// "哪些关联被丢了、为什么丢"，就会把过滤后的稀疏结果误读为"没有关联"——
+    /// 这与此前 §3.42.5 批评过的"静默丢字段"是同一类失败。
+    /// 因此过滤规则必须**可查询、可解释**。
+    ///
+    /// 返回 `(实体名, 类型, df, 所属项目内的记忆数)`，按 df 降序。
+    /// **注意第 4 项分母是"该项目内的记忆数"**，不是全库总数（§3.49 修正）。
+    pub fn hub_entities(
+        &self,
+    ) -> Result<Vec<(String, EntityKind, usize, usize)>, PersistenceError> {
+        let all = self.load_cached()?;
+        let mut out: Vec<(String, EntityKind, usize, usize)> = self
+            .hub_entity_set(&all)
+            .into_iter()
+            .map(|((name, kind), (c, total))| (name, kind, c, total))
+            .collect();
+        out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
+    }
+
+    /// 记忆的关联图谱：以一条记忆为起点，推导它的多类型关联
+    ///
+    /// 返回 **结构化关联**（非排序列表）：每条关联带 `relation` 类型与 `why` 解释。
+    /// 这是"联想"的载体——不同类型的关联并存，而非单一相似度排序。
+    ///
+    /// 关系类型：
+    /// - `same_event` — 来自同一次经历（依据：相同 event_id）
+    /// - `shared_entity` — 共享实体（依据：实体名+类型相同）
+    /// - `derived_from` — 谱系衍生（依据：source_ids 互指）
+    ///
+    /// **hub 实体过滤（v0.9.7，PREREG §3.45.5）**：
+    /// 过于泛化的实体（如项目名，出现在 70% 的记忆里）其"共享"近乎恒真，
+    /// 会产生海量**零区分度的假关联**（实测 95.7% 的 shared_entity 来自两个项目名）。
+    /// 此类实体在本方法中被**跳过**，其判定规则见 [`Self::hub_entities`]。
+    ///
+    /// **为什么过滤而非降权**：假关联比无关联更糟——它会污染用户对系统的信任
+    /// （§3.45.5）。而降权只是把噪声排后，用户仍会看到它们。
+    /// 被过滤的实体可通过 [`Self::hub_entities`] 显式查询（保证过滤**可见**，非静默）。
+    pub fn associations(
+        &self,
+        memory_id: &str,
+    ) -> Result<Vec<MemoryAssociation>, PersistenceError> {
+        let all = self.load_cached()?;
+
+        // 一次性统计 hub 实体（按**项目内**占比判定；见 `hub_entity_set` 与
+        // `HUB_ENTITY_DF_RATIO` 的文档：全库分母会被其他项目稀释而漏判）
+        let hub_set = self.hub_entity_set(&all);
+
+        Ok(Self::associations_in(
+            &all,
+            memory_id,
+            &hub_set,
+            &Self::auto_event_map(&all),
+            &ArtifactTables::build(&all),
+        ))
+    }
+
+    /// 计算**自动事件**分组（v0.9.8）：`memory_id -> 同一次自动经历的其他记忆`
+    ///
+    /// **为什么需要它**：`event_id` 实测填写率 0%（§3.51），记录层联想因此
+    /// 产出恒为 0。本函数用**客观事实**（同项目 + 同小时写入）推断"同一次经历"，
+    /// 零填写负担，实测覆盖 70.7%（global）/ 90.4%（dev）。
+    ///
+    /// **必须做成"一次算全库"而非"逐条算"**：分组需要先按 (项目, 小时桶)
+    /// 聚合并算时间跨度——逐条计算会退化为 O(N²)。故本函数一次遍历建表，
+    /// 供 [`Self::associations_in_with_auto`] 以 O(1) 查表。
+    ///
+    /// **⭐ 批量写入必须排斥**（见 [`AUTO_EVENT_MIN_SECS_PER_MEMORY`]）：
+    /// 实测坏桶（脚本导入/测试注入）的时间戳**集中在几秒内**，桶内内容
+    /// 互相无关；若纳入会产生海量假关联。
+    ///
+    /// **仅对 `memory_type == Experience` 生效**吗？——不。
+    /// 实测候选以 `decision`(69%) / `fact`(30%) 为主（§3.51.3 抽样显示
+    /// 它们确像"某次工作会话产出的结论"），故**不按类型限制**，
+    /// 否则会把绝大多数真实候选排除在外。类型由调用方的 filter 决定。
+    fn auto_event_map(
+        all: &[Memory],
+    ) -> std::collections::HashMap<String, Vec<(String, i64, String)>> {
+        use std::collections::HashMap;
+        /// 自动事件 ID 前缀：与手填 `event_id` **显式区分**
+        ///（用户可能在 `why` 中看到，必须能分辨这是系统推断而非人工填写）
+        const AUTO_PREFIX: &str = "auto:";
+
+        // 分桶键 = (项目, 小时窗口序号)。用时间戳整除窗口得到**稳定序号**，
+        // 避免依赖字符串格式化（跨时区/格式差异会导致同组被拆散）。
+        let mut buckets: HashMap<(String, i64), Vec<(&Memory, i64)>> = HashMap::new();
+        for m in all {
+            let Some(ts) = m.created_at.timestamp_nanos_opt() else {
+                continue;
+            };
+            let secs = ts / 1_000_000_000;
+            let proj = m.project.as_deref().unwrap_or("_global_").to_string();
+            let slot = secs.div_euclid(AUTO_EVENT_WINDOW_SECS);
+            buckets.entry((proj, slot)).or_default().push((m, secs));
+        }
+
+        let mut out: HashMap<String, Vec<(String, i64, String)>> = HashMap::new();
+        for ((proj, slot), members) in buckets {
+            let count = members.len();
+            if count < 2 {
+                continue; // 单条构不成"共同经历"
+            }
+            let min_t = members.iter().map(|(_, t)| *t).min().unwrap_or(0);
+            let max_t = members.iter().map(|(_, t)| *t).max().unwrap_or(0);
+            let span = max_t - min_t;
+            if !is_auto_event_cluster(count, span) {
+                // 批量写入（脚本导入/测试注入）：时间过度集中 ⇒ 不是一次经历
+                continue;
+            }
+            // 事件 ID 含项目与窗口序号：稳定、可复现、与真实 event_id 不冲突
+            let auto_id = format!("{}{}-{}", AUTO_PREFIX, proj, slot);
+            for (m, _t) in &members {
+                // 记录 (对方 id, 时间戳, 自动事件 ID)，供关联推导与 why 生成
+                out.entry(m.id.clone()).or_default().extend(
+                    members
+                        .iter()
+                        .filter(|(o, _)| o.id != m.id)
+                        .map(|(o, ot)| (o.id.clone(), *ot, auto_id.clone())),
+                );
+            }
+        }
+        out
+    }
+
+    /// 在**已加载的全量记忆**上推导关联（纯函数：不触 I/O、不重算 hub）
+    ///
+    /// **为什么要抽出来**（v0.9.8）：检索主路径需要对若干条已入选记忆批量展开
+    /// 关联。若逐条调用 [`Self::associations`]，每条都会 `load_cached()` +
+    /// 全库重算 hub 实体 + 全库重建自动事件表（3 次 O(N) 扫描），
+    /// 在检索热路径上不可接受。抽出后主路径**只加载/统计一次**，
+    /// 再对 k 条记忆复用。
+    ///
+    /// **为什么不是"在主路径里重新实现一遍规则"**：检索时用的关联
+    /// 必须与详情页看到的关联**完全同源**，否则两处漂移——
+    /// 用户会发现"检索说有关联、点进去却没有"。故主路径复用本函数。
+    ///
+    /// **为什么 `auto_events` 必须由调用方传入**（而非本函数内自建）：
+    /// 自动事件分组是**全库统计量**（需先按 (项目,窗口) 聚合再算跨度），
+    /// 放在本函数内会把 O(N) 建表塞进"每起点一次"的循环里。
+    ///
+    /// **为什么 `artifact_tabs` 也必须由调用方传入**（v0.9.8 同款理由）：
+    /// artifact 的占比表与倒排表都是**全库统计量**（需遍历全库抽取 + 按项目聚合），
+    /// 同理不能放进"每起点一次"的循环。
+    fn associations_in(
+        all: &[Memory],
+        memory_id: &str,
+        hub_set: &std::collections::HashMap<(String, EntityKind), (usize, usize)>,
+        auto_events: &std::collections::HashMap<String, Vec<(String, i64, String)>>,
+        artifact_tabs: &ArtifactTables,
+    ) -> Vec<MemoryAssociation> {
+        let Some(anchor) = all.iter().find(|m| m.id == memory_id) else {
+            return Vec::new();
+        };
+
+        let mut out: Vec<MemoryAssociation> = Vec::new();
+
+        // ① 共同经历（event_id 相同）
+        if let Some(ref ev) = anchor.event_id {
+            for m in all.iter() {
+                if m.id != anchor.id && m.event_id.as_deref() == Some(ev.as_str()) {
+                    out.push(MemoryAssociation {
+                        memory_id: m.id.clone(),
+                        relation: "same_event".to_string(),
+                        why: format!("同一次经历（event_id={}）", ev),
+                        content_preview: m.content.chars().take(120).collect(),
+                    });
+                }
+            }
+        }
+
+        // ② 共享实体（名称+类型均相同），跳过 hub 实体
+        for e in &anchor.entities {
+            if hub_set.contains_key(&(e.name.clone(), e.kind)) {
+                continue; // 过于泛化：共享近乎恒真，关联无区分度
+            }
+            for m in all.iter() {
+                if m.id == anchor.id {
+                    continue;
+                }
+                if m.entities
+                    .iter()
+                    .any(|x| x.name == e.name && x.kind == e.kind)
+                {
+                    // 去重：同一目标记忆若已由"共同经历"关联，则不再重复加入
+                    if out
+                        .iter()
+                        .any(|a| a.memory_id == m.id && a.relation == "shared_entity")
+                    {
+                        continue;
+                    }
+                    out.push(MemoryAssociation {
+                        memory_id: m.id.clone(),
+                        relation: "shared_entity".to_string(),
+                        why: format!(
+                            "{}「{}」（{}）",
+                            relation_label("shared_entity"),
+                            e.name,
+                            e.kind.as_str()
+                        ),
+                        content_preview: m.content.chars().take(120).collect(),
+                    });
+                }
+            }
+        }
+
+        // ③ 谱系关联（source_ids）—— **双向**（v0.9.8 §3.55）
+        //
+        // 此前只做**单向**：仅当锚点自己有 `source_ids` 时才产出关联
+        //（即只有"结晶产物"能联想到"它的来源"）。
+        // 但记录本身是**双向可读**的：来源记忆同样能联想到"我被结晶成了什么"。
+        // **实测定标**（`temp/multidim-input-measure.py`，global 4485 条）：
+        // 单向覆盖 93 条（2.07%）→ 双向 383 条（**8.54%**，**4.1×**）。
+        //
+        // **为什么不复用同一个 relation 名**：方向语义不同。
+        // `derived_from` = "我由它衍生"；反向 = "它被结晶成了我"。
+        // 用同一个名字会让前端画成同向边（`GraphEdge.symmetric` 判定依赖
+        // relation），用户会误读"谁来自谁"——承 §3.53「证据要可区分」的原则。
+        if !anchor.source_ids.is_empty() {
+            for m in all.iter() {
+                if anchor.source_ids.contains(&m.id) {
+                    out.push(MemoryAssociation {
+                        memory_id: m.id.clone(),
+                        relation: "derived_from".to_string(),
+                        why: format!("由来源「{}」衍生", m.id),
+                        content_preview: m.content.chars().take(120).collect(),
+                    });
+                }
+            }
+        }
+        // 反向：哪些记忆把**锚点**当作了来源（即锚点被结晶成了它们）
+        for m in all.iter() {
+            if m.id == anchor.id || !m.source_ids.contains(&anchor.id) {
+                continue;
+            }
+            // 去重：同一目标若已由其他规则关联，则不重复加入
+            //（否则用户会看到同一对记忆出现两条不同依据的边）
+            if out.iter().any(|a| a.memory_id == m.id) {
+                continue;
+            }
+            out.push(MemoryAssociation {
+                memory_id: m.id.clone(),
+                relation: "crystallized_into".to_string(),
+                why: format!(
+                    "被结晶为合成记忆（该记忆由 {} 条来源融合而成）",
+                    m.source_ids.len()
+                ),
+                content_preview: m.content.chars().take(120).collect(),
+            });
+        }
+
+        // ④ 自动事件（v0.9.8）：系统按「同项目 + 同窗口」推断的「同一次经历」
+        //
+        // 与 ① 的**关键区别**：① 依据 `event_id` 是**知情者的断言**，
+        // 本规则依据写入时间是**系统的事实统计**。二者可信度不同，
+        // 故**必须分类型标注**，让用户自己判断依据强度（承 §3.53 原则）。
+        if let Some(peers) = auto_events.get(&anchor.id) {
+            let anchor_ts = anchor
+                .created_at
+                .timestamp_nanos_opt()
+                .map(|n| n / 1_000_000_000)
+                .unwrap_or(0);
+            for (peer_id, peer_ts, auto_id) in peers {
+                // 去重：同一目标若已由 ①（更强依据）关联，则不再重复加入
+                if out
+                    .iter()
+                    .any(|a| &a.memory_id == peer_id && a.relation == "same_event")
+                {
+                    continue;
+                }
+                let Some(peer) = all.iter().find(|m| &m.id == peer_id) else {
+                    continue;
+                };
+                // 时间间隔写进 why：这是用户**唯一能自行复核**的客观量
+                //（"相隔 12 分钟"比"同一小时"信息量大得多）
+                //
+                // **必须区分分钟/秒**：实测一个桶内可能既有间隔数十分钟的
+                // 记录，也有**同一秒**写入的两条。若统一按分钟取整，
+                // 后者会显示"相隔约 0 分钟"——不仅无信息量，还掩盖了
+                // "这两条可能是批量写入"这一用户本该看到的线索。
+                let gap_secs = (anchor_ts - *peer_ts).abs();
+                let gap_desc = if gap_secs >= 60 {
+                    format!("相隔约 {} 分钟", gap_secs / 60)
+                } else {
+                    format!("相隔 {} 秒", gap_secs)
+                };
+                out.push(MemoryAssociation {
+                    memory_id: peer_id.clone(),
+                    relation: "same_event_auto".to_string(),
+                    why: format!(
+                        "{}（{}，{}）",
+                        relation_label("same_event_auto"),
+                        auto_id,
+                        gap_desc
+                    ),
+                    content_preview: peer.content.chars().take(120).collect(),
+                });
+            }
+        }
+
+        // ⑤ 演进（v0.9.8 §3.55）：依据 `version_history`——**同一件事被更新过**
+        //
+        // **为什么这条规则不需要新的输入**：`version_history` 是每次修正
+        // 记忆时**系统自动**存档的旧内容，不依赖用户填写、不依赖相似度猜测。
+        // 它是"这条记忆确实被替换过"的**直接证据**。
+        //
+        // ⚠ **本轮同时修了一个根因**：写入路径合并相似记忆时，
+        // 旧内容被直接覆盖、从不存档（实测 96.8% 的更新未留痕）。
+        // 若不修，本条规则只在极少数"手动修正"的记忆上生效（全库 15 条）。
+        //
+        // **为什么不用"新旧内容相似度"判演进**：相似 ≠ 同一件事被更新。
+        // "我爱吃苹果"与"我爱吃苹果派"高度相似，但并非演进关系。
+        // 相似度只能产生**猜测**，而版本历史是**事实**（承 §3.53 的原则）。
+        //
+        // **为什么只在 `why` 中给出旧版本、不产出独立节点**：
+        // 旧版本内容**不是另一条记忆**（没有自己的 ID，也不该被检索到）。
+        // 若伪造一个 ID 塞进 `memory_id`，下游的"排除已在结果中""可见性过滤"
+        // 都会因为查不到该 ID 而静默丢弃它——产出一条用不了的关系。
+        // 故演进信息**附在锚点自身的 why 里**，由前端在展开时展示。
+        if !anchor.version_history.is_empty() {
+            let mut versions: Vec<String> = anchor
+                .version_history
+                .iter()
+                .map(|v| {
+                    format!(
+                        "第 {} 版（{}）",
+                        v.version,
+                        v.updated_at.format("%Y-%m-%d %H:%M")
+                    )
+                })
+                .collect();
+            versions.sort();
+            out.push(MemoryAssociation {
+                memory_id: anchor.id.clone(), // 自指：表示"这是关于自身的演变线索"
+                relation: "evolved_from".to_string(),
+                why: format!(
+                    "这条记忆被更新过 {} 次：{}",
+                    versions.len(),
+                    versions.join("、")
+                ),
+                content_preview: anchor
+                    .version_history
+                    .last()
+                    .map(|v| v.content.chars().take(120).collect())
+                    .unwrap_or_default(),
+            });
+        }
+
+        // ⑥ 共享产物标识符（v0.9.8，PREREG_MEMORY_ASSOCIATION.md）
+        //
+        // **为什么需要这条规则**：② `shared_entity` 依赖人工填 `entities`，
+        // 实测填写率 **0.00%** ⇒ 在真实库上**产出恒为 0**。本规则是它的
+        // **零填写负担客观替代路径**（§3.54.8 方法论 110 的规范要求）。
+        //
+        // **与 ② 的关系**：**同一关系语义**（跨经历引用同一具体对象），
+        // 但**证据来源不同** —— ② 是**知情者断言**（人填），
+        // 本条是**系统形态检出**（从正文识别产物标识符）。
+        // 依 §3.53「证据要可区分」原则，**必须独立命名**，让用户判断依据强度
+        //（与 `same_event` / `same_event_auto` 的拆分同构）。
+        //
+        // **为什么它是"形态检出"而非"语义推断"**：见 [`HUB_ARTIFACT_DF_RATIO`]
+        // 的文档——「`app.js` 是文件名」只由字符本身决定，不需要"对世界做判断"，
+        // 属 §3.44.5 明文允许的「格式化/校验」类。
+        //
+        // **不回写 `entities` 字段**：本维度**只产出关联、不修改记忆**——
+        // 一旦回写，用户就无法分辨"哪些实体是 AI 填的、哪些是系统检出的"，
+        // 知情者断言的证据强度会被系统检出污染（这是本轮刻意守住的红线）。
+        for art in extract_artifacts(&anchor.content) {
+            if artifact_tabs.is_skipped(&art) {
+                // hub（过泛化 ⇒ 共享近乎恒真 ⇒ 零区分度）
+                // 或成员不足 2 条（无关联对可言）
+                continue;
+            }
+            let Some(ids) = artifact_tabs.members.get(&art) else {
+                continue;
+            };
+            let (df, total) = artifact_tabs.ratio.get(&art).copied().unwrap_or((0, 0));
+            for other in ids {
+                if other == &anchor.id {
+                    continue;
+                }
+                let Some(peer) = all.iter().find(|m| &m.id == other) else {
+                    continue;
+                };
+                // 去重：同一目标若已由更强的"人工实体"关联（②），不再重复加入
+                if out
+                    .iter()
+                    .any(|a| a.memory_id == *other && a.relation == "shared_entity")
+                {
+                    continue;
+                }
+                out.push(MemoryAssociation {
+                    memory_id: other.clone(),
+                    relation: "shared_artifact".to_string(),
+                    // `why` 必须含**具体产物名**（承方法论 105：解释要解释到
+                    // 可核验的具体对象），并按 §3.53 标注**证据来源**
+                    //（"系统识别" 而非"你填的"），让用户能自行判断可信度。
+                    // 括号内给出该产物在库中的覆盖度（df/项目内总数），
+                    // 这是用户**唯一能自行复核"它是否过于泛化"**的客观量。
+                    why: format!(
+                        "{}（系统识别「{}」，库内 {} 条出现过 / 该项目共 {} 条）",
+                        relation_label("shared_artifact"),
+                        art,
+                        df,
+                        total
+                    ),
+                    content_preview: peer.content.chars().take(120).collect(),
+                });
+            }
+        }
+
+        out
+    }
+
+    /// 为**一批检索结果**计算「为什么这条会出现」的可复核理由（v0.9.8）
+    ///
+    /// # 为什么需要它（用户裁定 + 实测）
+    ///
+    /// 用户对道体的定位裁定（逐字）：「道体不是检索器、不是排序器、不是分类器，
+    /// 是**关系与规则的推理引擎**」「道体要做的不是"匹配"，是**解释关联**」。
+    /// 实测（`temp/assoc-gua-necessity7.py`）：元数据作**召回器**时相对 BGE 冗余
+    /// （关系对落 BGE top-20 的比例 16.0~44.0%，随机仅 1.6%），作**解释器**时
+    /// 覆盖率 60.8% vs 随机 8.1%（**7.5×**）⇒ 价值在解释，不在召回。
+    ///
+    /// 但生产上**主检索结果从不带理由**：搜索结果卡片只显示通路标签
+    /// （"快速 + 深度 · 贡献 0.0164"），而 [`Self::associations_in`] 里
+    /// 精心写好的 `why`（含具体产物名、覆盖度、时间间隔）只在详情页/联想分区出现。
+    /// 本方法把记录层理由接到**检索出口**。
+    ///
+    /// # 判据来源（已实测，避免造出低价值机制）
+    ///
+    /// **不用「对查询的理由」**：实测（`temp/assoc-why-hitrate.py`，真实库 1294 条）
+    /// 真实短查询的实词 token 中位仅 **2 个**，87% 的结果都是"词面命中查询词"
+    /// ⇒ 显示"这条含你搜的词"是**同义反复**（用户本来就知道），零重合（纯语义）
+    /// 仅占 0~2.6% ⇒ 该口径**不足以支撑功能**。
+    ///
+    /// **用「与结果集内兄弟的关系」**：实测（`temp/assoc-sibling-coverage.py`）
+    /// 结果集内至少有一条兄弟关系的结果占 **68.1%（关键词型）/ 59.3%（短查询）**
+    /// ⇒ 可挂在多数卡片上。且这正是用户举例的原话
+    /// （「"同项目"、"共享 memory_store.rs"、"同标签 daoti 且间隔3小时"」）。
+    ///
+    /// # 边界（刻意守住的红线）
+    ///
+    /// 1. **只产出理由，不改排序**：返回 `id -> why` 映射供展示，
+    ///    调用方不得据此调分（与 §3.48「联想不并入排序」同纪律）。
+    /// 2. **不做自动推断**：理由**全部来自已有记录**（`project` / 正文形态 /
+    ///    时间 / `event_id` / `source_ids`），不引入任何新的语义判断
+    ///    （承 §3.44.5 与六钥匙判据：形态问题可自动，语义问题留知情者）。
+    /// 3. **证据强度必须可区分**：不同来源的理由前缀不同
+    ///    （「同项目」vs「系统识别」vs「同一次经历」），用户据此判断可信度
+    ///    （承 §3.53）。
+    /// 4. **不静默**：无理由的记忆不出现在返回映射中，调用方据此展示空态；
+    ///    绝不编造一个"弱理由"填满每个位置。
+    ///
+    /// # 参数
+    /// - `results`：本次检索的结果集（**顺序即展示顺序**，理由按此顺序取最优）
+    /// - 返回：`记忆 ID -> 人类可读理由`（仅含**确有理由**的条目）
+    pub fn result_reasons(
+        &self,
+        results: &[Memory],
+    ) -> Result<std::collections::HashMap<String, String>, PersistenceError> {
+        if results.len() < 2 {
+            // 单条结果没有"兄弟关系"可言（同一次经历也需要至少两条才算共同经历）
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut out: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let artifacts: Vec<Vec<String>> = results
+            .iter()
+            .map(|m| extract_artifacts(&m.content))
+            .collect();
+
+        for (i, anchor) in results.iter().enumerate() {
+            let mut best: Option<(u8, String)> = None;
+            for (j, peer) in results.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                if let Some((prio, why)) =
+                    Self::pair_reason(anchor, peer, &artifacts[i], &artifacts[j])
+                {
+                    // 取**证据最强**（prio 最小）的一条作为卡片理由
+                    match &best {
+                        Some((bp, _)) if *bp <= prio => {}
+                        _ => best = Some((prio, why)),
+                    }
+                }
+            }
+            if let Some((_, why)) = best {
+                out.insert(anchor.id.clone(), why);
+            }
+        }
+        Ok(out)
+    }
+
+    /// 判定**两条记忆之间**的记录层理由（供 [`Self::result_reasons`] 调用）
+    ///
+    /// 返回 `(优先级, 人类可读理由)`；无理由返回 `None`。
+    /// 优先级口径与 [`Self::relation_priority`] 同源（数字越小证据越强），
+    /// **不新造一套分级**——否则两处漂移后用户看到的强弱顺序会自相矛盾。
+    fn pair_reason(
+        a: &Memory,
+        b: &Memory,
+        art_a: &[String],
+        art_b: &[String],
+    ) -> Option<(u8, String)> {
+        // ① 同一次经历（知情者断言，证据最强）
+        if let (Some(ea), Some(eb)) = (a.event_id.as_deref(), b.event_id.as_deref()) {
+            if !ea.is_empty() && ea == eb {
+                return Some((0, format!("与结果内另一条同属一次经历（event_id={ea}）")));
+            }
+        }
+        // ② 谱系互指（source_ids 是直接证据，非推断）
+        if a.source_ids.contains(&b.id) {
+            return Some((1, "结果内另一条是它的结晶来源".to_string()));
+        }
+        if b.source_ids.contains(&a.id) {
+            return Some((1, "结果内另一条由它结晶而来".to_string()));
+        }
+        // ③ 共享具体产物（形态检出：由字符本身决定，不涉及语义判断）
+        //    必须给出**具体产物名**——只写"共享产物"不可复核（承方法论 105）
+        if let Some(shared) = art_a.iter().find(|x| art_b.contains(x)) {
+            return Some((
+                3,
+                format!("与结果内另一条共享「{shared}」（系统从正文识别）"),
+            ));
+        }
+        // ④ 同项目 + 同一时段（统计推断，证据最弱 ⇒ 必须标明这是系统推断）
+        if let (Some(pa), Some(pb)) = (a.project.as_deref(), b.project.as_deref()) {
+            if !pa.is_empty() && pa == pb {
+                if let (Some(ta), Some(tb)) = (
+                    a.created_at.timestamp_nanos_opt(),
+                    b.created_at.timestamp_nanos_opt(),
+                ) {
+                    let gap = (ta - tb).abs() / 1_000_000_000;
+                    if gap < AUTO_EVENT_WINDOW_SECS {
+                        let desc = if gap >= 60 {
+                            format!("相隔约 {} 分钟", gap / 60)
+                        } else {
+                            format!("相隔 {gap} 秒")
+                        };
+                        return Some((
+                            4,
+                            format!("与结果内另一条同属「{pa}」的同一时段（{desc}）"),
+                        ));
+                    }
+                }
+                return Some((5, format!("与结果内另一条同属项目「{pa}」")));
+            }
+        }
+        None
+    }
+
+    /// 由检索结果**联想补全**：找出「本次没召回、但由记录层必然关联」的记忆（v0.9.8）
+    ///
+    /// # 这一步补的是什么（为什么它是"真正的联想"）
+    ///
+    /// 在此之前，本项目所有检索通路（fast / deep / RRF）**全部是相似度驱动的**——
+    /// 它们只能在"语义相近"的记忆里找。而用户要的能力是：
+    /// 查「游西湖」时，把同一次杭州之行的「吃楼外楼」也带出来，
+    /// 哪怕两句话**没有一个共同词、语义也不相似**。
+    /// 这类连接**不可能**由相似度产生，只能由**记录**（`event_id` / `entities`）
+    /// 推导——这就是记录层存在的意义，也是本方法存在的意义。
+    ///
+    /// **在此之前关联推导已经实现，但只挂在详情页接口上**：
+    /// 用户必须"先点开某条记忆"才看得到关联，检索结果本身从不带联想。
+    /// 本方法把同一套记录层规则（复用 [`Self::associations_in`]，不重新实现）
+    /// 接入检索出口。
+    ///
+    /// # 设计约束（每条都有理由）
+    ///
+    /// 1. **不并入排序，单独分区返回**：联想结果的证据性质不同
+    ///    （记录必然成立 vs 相似度打分），混排会让调用方误以为二者可比。
+    ///    且现有 fast/deep/RRF 的排序质量有大量 A/B 证据支撑，
+    ///    不应被一个新通道改变（PREREG §3.48 同理）。
+    /// 2. **★必须复用候选可见性规则**：联想是"绕过查询词"直接取记忆，
+    ///    若不做隐私/项目/类型过滤，就会成为**绕过权限的后门**——
+    ///    这是安全红线，不是体验问题。故本方法显式复用与检索
+    ///    相同的过滤谓词（`is_visible` + 类型/项目/标签/重要性）。
+    /// 3. **只对已召回的记忆展开**（不扩张检索根集）：联想的价值是
+    ///    "把没召回到的补上"，而非"再检一遍"。以已召回的 top-k 为起点，
+    ///    既保证联想与本次查询**语义相关**（起点回应了查询），
+    ///    又把展开成本限定在 k 次关联查询。
+    /// 4. **`read_only` 检索不展开**：P7 主动发现的"零伤害承诺"
+    ///    （PREREG §3.1 D3）要求只读检索与基线逐字节一致，
+    ///    任何额外产出都必须跳过。
+    /// 5. **每条补入记忆附带 `via_*` 溯源**：用户必须能看到
+    ///    "它是因为哪条记忆被带上来的"，否则无法判断这个联想是否合理
+    ///    （承方法论 105：解释必须解释到具体对象）。
+    ///
+    /// # 参数
+    /// - `seed_ids`：已召回记忆的 ID（联想起点）
+    /// - `exclude`：需要排除的"已在结果中"的 ID 集合
+    /// - `filter`：**复用检索的过滤条件**（隐私/项目/类型/标签/重要性）
+    /// - `max_out`：补入上限（防大簇把输出撑爆）
+    pub fn expand_associations(
+        &self,
+        seed_ids: &[String],
+        filter: &RecallFilter,
+        max_out: usize,
+    ) -> Result<Vec<AssociatedMemory>, PersistenceError> {
+        if seed_ids.is_empty() || max_out == 0 {
+            return Ok(Vec::new());
+        }
+        // P7 只读检索必须与基线逐字节一致 ⇒ 不做任何联想补全
+        if filter.read_only {
+            return Ok(Vec::new());
+        }
+
+        let all = self.load_cached()?;
+
+        // 已在结果中的记忆：不再作为联想补入（否则是重复，不是联想）
+        let exclude: std::collections::HashSet<&str> =
+            seed_ids.iter().map(|s| s.as_str()).collect();
+
+        // hub 实体一次性统计（与详情页关联同口径，见 `hub_entity_set`）
+        let hub_set = self.hub_entity_set(&all);
+        // 自动事件表一次性统计（同口径）：**必须提到循环外**，
+        // 否则每条起点都要重建一次全库分组（O(N) × k）
+        let auto_events = Self::auto_event_map(&all);
+        // artifact 两张表一次性统计（同口径，v0.9.8）：同上，
+        // 建表需遍历全库做形态抽取 + 按项目聚合，逐起点重建是 O(N × k)
+        let artifact_tabs = ArtifactTables::build(&all);
+        // 起点记忆索引（用于填 via_* 溯源字段）
+        let by_id: std::collections::HashMap<&str, &Memory> =
+            all.iter().map(|m| (m.id.as_str(), m)).collect();
+
+        // ★ 可见性判定：与检索路径**同一套规则**（复用谓词，非另写一份）
+        // 顺序与 RecallFilter 字段一一对应，便于核对是否漏项。
+        let visible = |m: &Memory| -> bool {
+            if m.is_expired() {
+                return false;
+            }
+            if let Some(ref mt) = filter.memory_type {
+                if m.memory_type != *mt {
+                    return false;
+                }
+            }
+            if let Some(ref proj) = filter.project {
+                if m.project.as_deref() != Some(proj.as_str()) {
+                    return false;
+                }
+            }
+            if !filter.tags.is_empty() && !filter.tags.iter().any(|t| m.tags.contains(t)) {
+                return false;
+            }
+            if let Some(min_imp) = filter.min_importance {
+                if m.importance < min_imp {
+                    return false;
+                }
+            }
+            // ★隐私：联想不得成为绕过权限的后门
+            if !is_visible(m, &filter.privacy_context) {
+                return false;
+            }
+            true
+        };
+
+        let mut out: Vec<AssociatedMemory> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // ★ 多维度交错取用（v0.9.8 §3.55）
+        //
+        // # 解决两个**不同**的"某一来源刷满"问题
+        //
+        // **问题一（上一轮已修）**：单个**起点**吃光配额。
+        // 真实库实测：联想输出 100% 是自动事件、单桶占比 88%——
+        // 第一个种子的同小时桶把 max_out 全占了，其余种子一条不露。
+        //
+        // **问题二（本轮修）**：单个**关系类型**吃光配额。
+        // 即使按起点均分，若某起点只有 `same_event_auto` 一种候选
+        //（实测这正是常态：该类型覆盖 70%，其余类型覆盖个位数百分比），
+        // 那么输出仍然是"一种关系的堆砌"，用户看不到"联想可以从不同
+        // 角度发生"——而多维度正是本次要交付的能力。
+        //
+        // # 做法：把"通道"定义为 (起点, 关系类型)，在通道间轮转
+        //
+        // 这样**同时**保证两件事：
+        // - 每轮每个起点都会推进 ⇒ per-seed 公平（上一轮的保证不退化）
+        // - 每轮每个关系的每种类型都会推进 ⇒ **多维度覆盖**
+        //
+        // **通道内按「意外性优先」排序**（v0.9.8，本轮核心）——
+        // 不是按证据强度。实测（`temp/assoc-bge-giveup.py`）发现：
+        // 联想产出的对，**BGE 排名中位仅 0.0685（top 6.9%）**，
+        // 即**大部分联想对 BGE 本来就能找到**，那部分没有增量。
+        // 而用户对联想的价值判据（§3.43.9 逐字）是
+        // 「**产出的关联图中，有多少条是 BGE 给不出的**」。
+        //
+        // ⇒ 把「BGE 给不出」的候选排在通道前面。判据用实词 Jaccard 代理
+        //（见 [`content_words`] 文档：AUC 0.9275 识别"给不出"，且与 BGE
+        // 低相似对的**重叠仅 0.081** ⇒ 是独立信息，非 BGE 的粗粒度版）。
+        //
+        // **为什么不是"过滤掉 BGE 能给的"**：那会丢弃 85% 产出
+        //（实测 proxy<0.02 只留 386/2615 对）。本设计只改**顺序**，配额仍由
+        // 轮转决定 ⇒ "先给意外、后给常规"，不减少总量，也不引入新阈值
+        //（承 §3.49.5：无断层则不设阈值）。
+        //
+        // **轮转的代价已实测**（`temp/assoc-quota-calibrate.py`，真实库 251 桶）：
+        // 每起点取 K 条时，联想总量保留 K=1→43% / K=2→68% / **K=3→81%**。
+        // 本实现用"轮转"而非固定 K：等价于 K = max_out/通道数（动态），
+        // 因此**不需要新阈值**——配额天然按通道数均分。
+        let per_seed: Vec<(String, String, Vec<Vec<MemoryAssociation>>)> = seed_ids
+            .iter()
+            .filter_map(|seed| {
+                let seed_mem = by_id.get(seed.as_str())?;
+                let assocs =
+                    Self::associations_in(&all, seed, &hub_set, &auto_events, &artifact_tabs);
+                // 按关系类型分组成通道
+                let seed_words = content_words(&seed_mem.content);
+                let mut by_rel: Vec<(u8, String, Vec<MemoryAssociation>)> = Vec::new();
+                for a in assocs {
+                    let prio = Self::relation_priority(&a.relation);
+                    match by_rel.iter_mut().find(|(_, r, _)| *r == a.relation) {
+                        Some((_, _, v)) => v.push(a),
+                        None => by_rel.push((prio, a.relation.clone(), vec![a])),
+                    }
+                }
+                // 组内按"意外性"降序（代理相似度越低 ⇒ 越意外 ⇒ 越靠前）。
+                // 用 `total_cmp` 保证全序（`partial_cmp` 对 NaN 会退化为 Equal，
+                // 使排序结果依赖输入顺序 ⇒ 不可复现）。
+                for (_, _, v) in by_rel.iter_mut() {
+                    v.sort_by(|x, y| {
+                        let wx = content_words(&x.content_preview);
+                        let wy = content_words(&y.content_preview);
+                        let sx = word_jaccard(&seed_words, &wx);
+                        let sy = word_jaccard(&seed_words, &wy);
+                        sx.total_cmp(&sy)
+                    });
+                }
+                by_rel.sort_by(|x, y| x.0.cmp(&y.0).then_with(|| x.1.cmp(&y.1)));
+                Some((
+                    seed.clone(),
+                    seed_mem.content.chars().take(60).collect::<String>(),
+                    by_rel.into_iter().map(|(_, _, v)| v).collect(),
+                ))
+            })
+            .collect();
+
+        // 最大轮数 = 任一通道的最长长度（通道长度参差，短的跳过即可）
+        let max_rounds = per_seed
+            .iter()
+            .flat_map(|(_, _, channels)| channels.iter().map(|c| c.len()))
+            .max()
+            .unwrap_or(0);
+        'rounds: for round in 0..max_rounds {
+            for (seed, seed_preview, channels) in &per_seed {
+                for channel in channels {
+                    if out.len() >= max_out {
+                        break 'rounds;
+                    }
+                    let Some(a) = channel.get(round) else {
+                        continue;
+                    };
+                    // 排除：已在结果中的、已补入过的、自身
+                    if exclude.contains(a.memory_id.as_str())
+                        || a.memory_id == *seed
+                        || !seen.insert(a.memory_id.clone())
+                    {
+                        continue;
+                    }
+                    // ★可见性过滤：不可见的记忆绝不因"有关联"而被带出
+                    let Some(target) = by_id.get(a.memory_id.as_str()) else {
+                        continue;
+                    };
+                    if !visible(target) {
+                        continue;
+                    }
+                    out.push(AssociatedMemory {
+                        memory_id: a.memory_id.clone(),
+                        content_preview: a.content_preview.clone(),
+                        memory_type: target.memory_type.as_str().to_string(),
+                        relation: a.relation.clone(),
+                        why: a.why.clone(),
+                        via_memory_id: seed.clone(),
+                        via_preview: seed_preview.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// 关系类型的**证据强度**排序键（越小越强），用于同类型内/通道间的出场顺序
+    ///
+    /// **为什么需要它**：配额有限时，"先出哪一条"直接影响用户对系统可信度的
+    /// 判断。若让最弱的一类（统计推断）先占位，用户第一眼看到的联想就最可疑。
+    ///
+    /// 强度分层的依据（承 §3.53「证据要可区分」的原则）：
+    /// - **知情者断言**（人明确说过）：`same_event` — 最强
+    /// - **系统确定性记录**（产生于真实操作，不是猜测）：
+    ///   `derived_from` / `crystallized_into` / `evolved_from`
+    /// - **系统实体匹配**（客观共现，但 hub 过滤后仍有噪声）：`shared_entity`
+    /// - **系统形态检出**（v0.9.8 新增）：`shared_artifact` —— 与 `shared_entity`
+    ///   同属"共享具体对象"，证据强度略低于人工填写（人填时可确认"这是同一个对象"，
+    ///   形态检出只能确认"两处字符串相同"）
+    /// - **统计推断**（只看时间，同小时可能含两段无关工作）：`same_event_auto`
+    fn relation_priority(relation: &str) -> u8 {
+        match relation {
+            "same_event" => 0,
+            "derived_from" | "crystallized_into" | "evolved_from" => 1,
+            "shared_entity" => 2,
+            // 形态检出：与 shared_entity 同关系、证据强度略低 ⇒ 紧随其后
+            "shared_artifact" => 3,
+            "same_event_auto" => 4,
+            _ => 5,
+        }
+    }
+
+    /// 构造以某条记忆为起点的**关联图**（联想的结构化形态）
+    ///
+    /// 与 [`Self::associations`] 的区别：
+    /// - `associations` 返回**一列边**（扁平）
+    /// - 本方法返回**图**（节点 + 边 + 路径），并做 **2 跳结构传递**
+    ///
+    /// **多跳推理是"推理"而非"匹配"**（用户指引 §七）：
+    /// 用户给的例子是「A 因果 B，B 与 C 共享情境 ⇒ A 与 C 间接关联」。
+    /// 这里的多跳**不是**"猜两条记忆语义相关"，而是**图上的路径合成**——
+    /// 每一步都由记录（event_id / entities）保证成立，路径本身即是解释。
+    /// 因此它产出的关联是**必然成立**的，不是相似度推测。
+    ///
+    /// **为什么只做 2 跳**：3 跳及以上会迅速膨胀（实测典型同经历簇规模 2~8），
+    /// 且路径越长，"同一次经历"的传递越弱（A 与 B 同经历、B 与 C 同经历
+    /// 不能推出 A 与 C 同经历）。故 2 跳是**信息量与可靠性**的平衡点，
+    /// 并显式标注 `hops`，让用户知道这是间接关联。
+    ///
+    /// **一个必须知道的结构事实（§3.48.5，已构造性验证）**：
+    /// `same_event` 是**等价关系**（自反/对称/传递），因此"2 跳同为 same_event"
+    /// 必然退化为"1 跳 same_event"，其目标**必已在直接邻居中而被排除**
+    /// ⇒ `same_event → same_event` 型间接边**恒为 0**（数学必然，与数据无关）。
+    /// **推论**：2 跳的产出**只能来自交叉路径**（含 `shared_entity` / `derived_from`）。
+    /// 换言之，当前记录层能推出的"意外关联"，实质是
+    /// "经由同一实体（如某文件）把两次不同经历连起来"，
+    /// **而非**用户设想的"因果传递"——后者需要记录**因果/时序**关系，
+    /// 属记录层的后续扩展（§3.48.6）。
+    ///
+    /// # 参数
+    /// - `memory_id`：根节点
+    /// - `max_nodes`：节点数上限（防大簇爆图）；超出时 `truncated = true`
+    pub fn association_graph(
+        &self,
+        memory_id: &str,
+        max_nodes: usize,
+    ) -> Result<AssociationGraph, PersistenceError> {
+        let all = self.load_cached()?;
+        let by_id: std::collections::HashMap<&str, &Memory> =
+            all.iter().map(|m| (m.id.as_str(), m)).collect();
+
+        let empty = |root: &str| AssociationGraph {
+            root: root.to_string(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            direct_count: 0,
+            indirect_count: 0,
+            truncated: false,
+        };
+
+        if !by_id.contains_key(memory_id) {
+            return Ok(empty(memory_id));
+        }
+
+        // 复用关联推导的**纯函数**：它的边语义（含 hub 过滤）已在本方法之外
+        // 被验证过，此处不复刻规则，避免两处实现漂移（承方法论 79：单一事实来源）。
+        //
+        // **为什么不再逐节点调 `self.associations()`**（v0.9.8 修正）：
+        // 该路径第二层要对**每个直接邻居**取一次关联，而 `associations()`
+        // 每次都做 `load_cached()` + 全库 hub 统计 + 全库自动事件分组。
+        // 加入自动事件后，这里从"2 次全库扫描/邻居"恶化到"3 次"，
+        // 大簇场景（实测同经历簇可达 20+ 节点）会明显变慢。
+        // 本方法已持有 `all`，故两张表**在全图构建期间只算一次**。
+        let hub_set = self.hub_entity_set(&all);
+        let auto_events = Self::auto_event_map(&all);
+        // artifact 两张表：全图构建期间只算一次（同 hub / auto_events 的理由）
+        let artifact_tabs = ArtifactTables::build(&all);
+        let anchor_edges =
+            Self::associations_in(&all, memory_id, &hub_set, &auto_events, &artifact_tabs);
+
+        let mut edges: Vec<GraphEdge> = Vec::new();
+        let mut node_ids: Vec<String> = vec![memory_id.to_string()];
+        let mut seen_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen_nodes.insert(memory_id.to_string());
+        // 已加入的直接边目标（避免重复的间接边指向同一节点）
+        let mut direct_targets: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // 去重键：(from, to, relation)
+        let mut edge_keys: std::collections::HashSet<(String, String, String)> =
+            std::collections::HashSet::new();
+
+        let mut truncated = false;
+
+        // ---- 第一层：直接边（hops = 1）----
+        for a in &anchor_edges {
+            if !seen_nodes.insert(a.memory_id.clone()) {
+                // 节点已在图中（可能由不同类型的边重复指向）：边仍要加
+            } else {
+                if node_ids.len() >= max_nodes {
+                    // 节点预算耗尽：**明确标记截断**，不静默丢弃（方法论 100）
+                    truncated = true;
+                    break;
+                }
+                node_ids.push(a.memory_id.clone());
+            }
+            direct_targets.insert(a.memory_id.clone());
+            let key = (
+                memory_id.to_string(),
+                a.memory_id.clone(),
+                a.relation.clone(),
+            );
+            if edge_keys.insert(key) {
+                edges.push(GraphEdge {
+                    from: memory_id.to_string(),
+                    to: a.memory_id.clone(),
+                    relation: a.relation.clone(),
+                    why: a.why.clone(),
+                    hops: 1,
+                    // **对称白名单**（而非"非 derived_from 即对称"的黑名单）：
+                    // 方向语义明确的关系（derived_from / crystallized_into）
+                    // 必须画成有向，否则用户误读"谁来自谁"。
+                    // 用白名单的原因：未来新增关系类型若忘记分类，默认按
+                    // **非对称**处理（多画一个箭头）比默认对称（丢掉方向信息）
+                    // 更安全——方向信息丢失是静默错误，箭头多余是可见的。
+                    symmetric: matches!(
+                        a.relation.as_str(),
+                        "same_event" | "same_event_auto" | "shared_entity" | "shared_artifact"
+                    ),
+                    path: vec![memory_id.to_string(), a.memory_id.clone()],
+                    via: None,
+                });
+            }
+        }
+
+        // ---- 第二层：间接边（hops = 2，图上的路径合成）----
+        // 对每个直接邻居，取其关联；若指向的节点尚未与根相连，则形成间接边。
+        // **排除回到根自身**（否则会产出"A→B→A"这种零信息的自环）。
+        let direct_targets_snapshot: Vec<String> = direct_targets.iter().cloned().collect();
+        for mid in &direct_targets_snapshot {
+            if truncated {
+                break;
+            }
+            let mid_edges =
+                Self::associations_in(&all, mid, &hub_set, &auto_events, &artifact_tabs);
+            for a2 in mid_edges {
+                if a2.memory_id == memory_id || a2.memory_id == *mid {
+                    continue; // 回到根 or 自环：无信息量
+                }
+                // 已达直接关联的节点，不再作为间接目标（直接边更有解释力）
+                if direct_targets.contains(&a2.memory_id) {
+                    continue;
+                }
+                if !seen_nodes.contains(&a2.memory_id) {
+                    if node_ids.len() >= max_nodes {
+                        truncated = true;
+                        break;
+                    }
+                    seen_nodes.insert(a2.memory_id.clone());
+                    node_ids.push(a2.memory_id.clone());
+                }
+                let key = (
+                    memory_id.to_string(),
+                    a2.memory_id.clone(),
+                    "indirect".to_string(),
+                );
+                if !edge_keys.insert(key) {
+                    continue; // 已有指向同一节点的间接边
+                }
+                // 找出中间节点与根的关系，用于写出可读路径。
+                // **必须带上两段的 `why`（含具体实体名），而非只写关系类型**：
+                // 间接边是最需要解释的一类（用户看不出两条无关记忆为何相连），
+                // 若只写"共享实体"而不写"共享的是 app.js"，
+                // 恰好违背「人类可解释」判据（PREREG §3.49.2）。
+                let (first_leg, first_why) = edges
+                    .iter()
+                    .find(|e| e.to == *mid && e.hops == 1)
+                    .map(|e| (e.relation.clone(), e.why.clone()))
+                    .unwrap_or_else(|| ("related".to_string(), "相关联".to_string()));
+                edges.push(GraphEdge {
+                    from: memory_id.to_string(),
+                    to: a2.memory_id.clone(),
+                    relation: "indirect".to_string(),
+                    why: format!("间接关联：根 —{}→ 中间记忆 —{}→ 此记忆", first_why, a2.why),
+                    hops: 2,
+                    // 间接边是路径合成，方向仅表示书写顺序，不表示因果
+                    symmetric: true,
+                    path: vec![memory_id.to_string(), mid.clone(), a2.memory_id.clone()],
+                    // 标注本段的关系类型，便于前端按强弱路径分组展示
+                    via: Some(format!("{} → {}", first_leg, a2.relation)),
+                });
+            }
+        }
+
+        // ---- 组装节点 ----
+        let nodes: Vec<GraphNode> = node_ids
+            .iter()
+            .filter_map(|nid| by_id.get(nid.as_str()).map(|m| (*m).clone()))
+            .map(|m| GraphNode {
+                memory_id: m.id.clone(),
+                content_preview: m.content.chars().take(120).collect(),
+                memory_type: m.memory_type.as_str().to_string(),
+                event_id: m.event_id.clone(),
+                entities: m
+                    .entities
+                    .iter()
+                    .map(|e| format!("{}:{}", e.kind.as_str(), e.name))
+                    .collect(),
+            })
+            .collect();
+
+        let direct_count = edges.iter().filter(|e| e.hops == 1).count();
+        let indirect_count = edges.iter().filter(|e| e.hops >= 2).count();
+
+        Ok(AssociationGraph {
+            root: memory_id.to_string(),
+            nodes,
+            edges,
+            direct_count,
+            indirect_count,
+            truncated,
+        })
+    }
+
     /// 获取记忆库统计信息
     pub fn stats(&self) -> Result<MemoryStats, PersistenceError> {
         let all = self.load_cached()?;
@@ -3787,6 +5539,28 @@ impl<P: Persistence> MemoryStore<P> {
             if m.created_at >= recent_cutoff {
                 stats.recent_added += 1;
             }
+
+            // 记录层覆盖度（v0.9.7）：让「共同经历」的积累可观测
+            if m.event_id.is_some() {
+                stats.with_event_count += 1;
+            }
+            if !m.entities.is_empty() {
+                stats.with_entity_count += 1;
+            }
+            if m.memory_type == crate::memory_types::MemoryType::Experience {
+                stats.experience_count += 1;
+            }
+        }
+
+        // 事件簇数：不同 event_id 的个数（与 event_index 的分组口径一致）
+        {
+            let mut seen = std::collections::HashSet::new();
+            for m in &all {
+                if let Some(ref e) = m.event_id {
+                    seen.insert(e.as_str());
+                }
+            }
+            stats.event_cluster_count = seen.len();
         }
 
         stats.storage_size_bytes = self.persistence.size_bytes()?;

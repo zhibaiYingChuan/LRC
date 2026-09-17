@@ -20,6 +20,130 @@ use crate::engine::synthesis_engine::SynthesisConfig;
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use serde::{Deserialize, Serialize};
 
+/// 由检索结果**联想补全**出的一条记忆（v0.9.8）
+///
+/// 与 [`MemoryAssociation`] 的区别：后者描述"某条记忆的关联"（详情页用），
+/// 本类型描述"**本次检索之外、但由记录层必然关联**的记忆"——
+/// 它带 `via_*` 字段说明"从哪条已召回的记忆联想过来"，让"为什么它会出现"
+/// 可追溯到具体起点。
+///
+/// **典型形态**（用户原始设想）：用户查「游西湖」，
+/// 结果里补出同一次杭州之行的「吃楼外楼」——两句话义毫不相似，
+/// 靠 `event_id`（共同经历）连上，这是任何相似度算法都给不出的。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssociatedMemory {
+    /// 被联想出来的记忆 ID（**不在本次召回结果中**）
+    pub memory_id: String,
+    /// 内容预览
+    pub content_preview: String,
+    /// 记忆类型字符串（fact / experience / decision ...）
+    pub memory_type: String,
+    /// 关联类型：same_event | shared_entity | derived_from
+    pub relation: String,
+    /// 人类可读的关联依据（如 "同一次经历（event_id=trip-hangzhou-2026-09）"）
+    pub why: String,
+    /// **从哪条已召回记忆**联想过来（起点，可追溯）
+    pub via_memory_id: String,
+    /// 起点记忆的内容预览
+    pub via_preview: String,
+}
+
+/// 记忆间的结构化关联（联想的结果形态）
+///
+/// 与"排序后的检索结果"不同：每条关联都带**类型**与**依据说明**，
+/// 使"为什么关联"可被人类检验（对应"人类可解释"判据）。
+/// 不同类型的关联**并存**，而非被压成单一相似度分数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryAssociation {
+    /// 关联到的目标记忆 ID
+    pub memory_id: String,
+    /// 关系类型：same_event | same_event_auto | shared_entity | derived_from | crystallized_into | evolved_from
+    pub relation: String,
+    /// 关联依据（人类可读，如 "同一次经历（event_id=e1）"）
+    pub why: String,
+    /// 目标记忆内容预览
+    pub content_preview: String,
+}
+
+/// 关联图中的一个节点（一条记忆）
+///
+/// 与 [`MemoryAssociation`] 的区别：后者只描述"边"，
+/// 本类型让图**自洽**——前端拿到 nodes + edges 即可独立渲染，
+/// 无需再逐条查询节点内容。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub memory_id: String,
+    pub content_preview: String,
+    /// 记忆类型字符串（fact / experience / decision ...）
+    pub memory_type: String,
+    /// 该记忆所属的事件 ID（若有）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    /// 实体描述（如 `person:小美`），供前端展示"为什么连到这里"
+    pub entities: Vec<String>,
+}
+
+/// 关联图中的一条边（有类型、有方向、有解释）
+///
+/// **方向语义**：`from` → `to` 是路径书写顺序（从根节点向外）。
+/// 但**并非所有关系都有方向**——`same_event` / `shared_entity` 是**对称关系**
+/// （"A 与 B 同一次经历"等价于"B 与 A 同一次经历"），此时 `symmetric = true`，
+/// 方向仅为书写顺序，**不表示因果或先后**。
+/// 只有 `derived_from` 等**非对称**关系，方向才有实质含义。
+/// 前端据此决定是否显示箭头——避免把对称关系误画成有向因果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+    /// 关系类型：same_event | same_event_auto | shared_entity |
+    /// derived_from | crystallized_into | evolved_from | indirect
+    pub relation: String,
+    /// 人类可读依据（间接边会写出完整路径）
+    pub why: String,
+    /// 跳数：1 = 由记录直接推导；2 = 经中间记忆间接推导
+    pub hops: usize,
+    /// 是否为对称关系（true 时方向无语义，仅表示书写顺序）
+    pub symmetric: bool,
+    /// 完整路径（节点 ID 序列）：直接边为 [from, to]；间接边为 [root, mid, to]
+    pub path: Vec<String>,
+    /// 间接边的路径类型（如 `same_event → shared_entity`），直接边为 None
+    ///
+    /// **为什么需要它**：2 跳路径由两段关系合成，而**两段的证据强度不同**
+    /// （PREREG §3.48.4 实测：`same_event → same_event` 因传递性恒为 0，
+    /// 故实际产出**全部**含 `shared_entity` 段）。
+    /// 前端/调用方据此可区分"共同经历传递"与"经由同一实体桥接"——
+    /// 二者含义不同，不应混为一谈。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+}
+
+/// 关联图 —— 联想的**结构化**形态（非排序列表）
+///
+/// 这是"记录层推导 + 多跳传递推理"的结果：节点是记忆，边是**有类型、有方向、有解释**
+/// 的关系。与检索结果的根本区别在于：它可以包含**用户没直接问、但由图结构必然成立**
+/// 的间接关联——这正是"意外性"的来源。
+///
+/// 设计原则（PREREG §3.48）：
+/// 1. **不做语义匹配**：边全部来自记录（event_id / entities / source_ids），
+///    不引入任何向量相似度——语义匹配交给 BGE。
+/// 2. **间接关联只做结构传递**：多跳是图上的路径合成，
+///    不是"猜"两条记忆在语义上相关。路径本身即是解释。
+/// 3. **裁剪必须可见**：若因规模上限截断，`truncated` 会标记
+///    （承方法论 100：过滤不得静默）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssociationGraph {
+    /// 根节点（推理起点）的记忆 ID
+    pub root: String,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+    /// 直接边数量（hops == 1）
+    pub direct_count: usize,
+    /// 间接边数量（hops >= 2）
+    pub indirect_count: usize,
+    /// 是否因规模上限而被截断（true 时用户不应把结果视为完整图）
+    pub truncated: bool,
+}
+
 /// 记忆召回过滤条件
 #[derive(Debug, Clone, Default)]
 pub struct RecallFilter {
@@ -172,6 +296,19 @@ pub struct MemoryStats {
     pub recent_added: usize,
     /// 存储文件大小（字节）
     pub storage_size_bytes: u64,
+    /// 带 event_id 的记忆数（v0.9.7 记录层：让"共同经历"的积累可观测）
+    ///
+    /// **为什么必须暴露**：`event_id` 是联想的前提（PREREG §3.42/§3.43），
+    /// 但它是**可选字段**，若无人填写则覆盖率恒为 0，关联推导永远为空。
+    /// 不暴露该指标，产品侧无法判断"记录层是否真的在积累"，
+    /// 会把"无人填写"误读为"机制无效"（承接方法论 92：先查记录层）。
+    pub with_event_count: usize,
+    /// 带实体的记忆数（`entities` 非空）
+    pub with_entity_count: usize,
+    /// 已形成的事件簇数（不同 event_id 的个数）
+    pub event_cluster_count: usize,
+    /// 记忆类型为 Experience 的条数
+    pub experience_count: usize,
 }
 
 /// 召回结果

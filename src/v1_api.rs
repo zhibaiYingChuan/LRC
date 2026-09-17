@@ -11,6 +11,7 @@
 //!   POST /v1/memories/enrich       — 根据查询返回结构化长期记忆
 //!   POST /v1/memories/correct      — 用户手动修正一个已结晶的事实
 //!   POST /v1/memories/unfold       — 拆解合成记忆为子记忆（RecursiveUnfold）
+//!   POST /v1/memories/associations — 查询一条记忆的多类型关联（记录层→关系网络）
 //!   GET  /v1/health/dao_metrics    — 返回道同构度仪表数据
 //!   GET  /v1/health/system         — 系统健康报告（可解释性面板）
 //!   GET  /v1/health/detailed       — 详细系统健康报告（运维级，含 GC / 反馈 / 调节器耦合信息）
@@ -31,7 +32,7 @@ use std::time::Duration;
 use crate::engine::synthesis_engine::SynthesisEngine;
 use crate::engine::user_feedback::{FeedbackTarget, FeedbackType};
 use crate::memory_store::{ListFilter, MemoryStore, RecallFilter};
-use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
+use crate::memory_types::{EventEntity, Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::json::JsonPersistence;
 use crate::persistence::Persistence;
 use crate::server::{safe_code_search, safe_recent_code_search, IndexedCodebase, SearchError};
@@ -67,7 +68,33 @@ type EnrichBlockingResult = (
     usize,
     Vec<crate::engine::memory_state_machine::AssociationStep>,
     HashMap<String, String>,
+    // v0.9.8：记录层联想补全结果（与 memories 分区，不混排）
+    Vec<crate::memory_store::AssociatedMemory>,
 );
+
+/// HTTP enrich 联想补全的条数上限（v0.9.8）
+///
+/// 与 MCP `recall` 的 `ASSOCIATION_EXPAND_MAX` 同值同理由：
+/// 联想是**补充**，不得盖过主结果（主结果默认 top_k=5~10）。
+///
+/// # ★ 取值 3 是**诊断目的**（2026-09-16 用户裁定）
+///
+/// 原值 8 导致一个真实问题：**意外性排序机制在实际配置下不工作**。
+/// 实测（`temp/assoc-e2e-diagnose.py`，真实库）：
+/// - 每种子**通道数中位仅 1**（平均 1.19）⇒ 每通道配额 ≈ 8
+/// - 而**通道长度 > 8 的比例仅 13.9%** ⇒ **86% 的种子，其通道内候选全部输出**
+///   ⇒ 通道内排序**改变不了输出集合**（顺序变了，集合相同）
+/// - 实测提升：max_out=8 → **+1.2pp**（近零）；max_out=3 → **+7.2pp**（6 倍）
+///
+/// ⇒ 取 3 **不是**为了"提升精度"，而是**让排序机制真正进入可观测状态**：
+/// 只有配额小于通道长度时，"先给哪条"才真正决定了用户看到什么。
+/// 否则无法回答"BGE 给不出的那些关联到底有没有意义"——
+/// 因为那些关联根本没机会出现在输出里。
+///
+/// **代价（必须如实记录）**：联想总量会减少（实测保留约 43%）。
+/// 这是**可接受**的，因为当前问题不是"联想太少"，而是
+/// "做了机制却无法验证它是否有效"（详见 `daoti/PREREG_MEMORY_ASSOCIATION.md` §3.10）。
+const ASSOC_EXPAND_MAX_HTTP: usize = 3;
 
 /// 请求级取消标志守卫：Drop 时置位，通知阻塞任务提前退出
 struct CancellationFlag(Arc<AtomicBool>);
@@ -274,10 +301,24 @@ pub struct ExploreNode {
     /// 所处的联想层（起点为 0）
     pub depth: u8,
     pub score: f32,
-    /// 节点来源：root（起点）/ expanded（发散）
+    /// 节点来源：root（起点）/ expanded（相似度扩散）/ record（记录层联想，v0.9.8）
     pub source: String,
     /// 道体再次校验·保留证据（无则为空）
     pub evidence: Option<String>,
+    /// **记录层关联类型**（v0.9.8，仅 source="record" 时有值）：
+    /// `same_event`（手填 event_id，知情者断言）/ `same_event_auto`
+    /// （系统按同项目+同窗口推断）/ `shared_entity`（共享实体）/
+    /// `derived_from`（由它衍生）/ `crystallized_into`（被结晶为它）/
+    /// `evolved_from`（自身被更新过）。
+    ///
+    /// **为什么必须区分**：相似度扩散与记录层联想的**证据性质根本不同**——
+    /// 前者是"语义相近"（可能错），后者是"记录必然成立"（不会错）。
+    /// 混为一谈会让用户无法判断哪条更可信。
+    /// 为 None 表示该节点来自相似度扩散。
+    pub relation: Option<String>,
+    /// 记录层关联的人类可读依据（如"同一次经历（event_id=trip-hangzhou-2026-09）"）。
+    /// 仅 source="record" 时有值——用户据此核验"凭什么关联"。
+    pub why: Option<String>,
 }
 
 /// 联想探索边
@@ -288,6 +329,9 @@ pub struct ExploreEdge {
     pub score: f32,
     /// 从父节点联想到子节点的回归证据
     pub evidence: Option<String>,
+    /// **记录层关联类型**（v0.9.8）：同 [`ExploreNode::relation`]。
+    /// 该边由记录推导（如"同一次经历"）而非相似度扩散时为 Some。
+    pub relation: Option<String>,
 }
 
 fn default_top_k() -> usize {
@@ -311,6 +355,11 @@ pub struct EnrichResponse {
     pub association_mode: String,
     /// 阶段D 联想解释块（只观测，不参与排序决策）
     pub explanation: EnrichExplanation,
+    /// **记录层联想补全**（v0.9.8）：本次没召回、但由共同经历/共享实体
+    /// 必然关联的记忆。**单独分区**，不与 `memories` 混排——两类结果的
+    /// 证据性质不同（相似度打分 vs 记录必然成立），混排会误导排序解读。
+    /// 无联想时为空数组（前端据此整块隐藏）。
+    pub associated: Vec<crate::memory_store::AssociatedMemory>,
 }
 
 /// 联想解释块：面向用户解释"为什么联想这条"（阶段D 可观测性）。
@@ -377,6 +426,23 @@ pub struct EnrichedMemory {
     pub topological_depth: f32,
     pub version: u32,
     pub created_at: String,
+    /// 事件 ID — 这条记忆来自哪一次经历（"共同经历"关联的载体）
+    pub event_id: Option<String>,
+    /// 事件实体（人/地/时/物）—— "实体关联"的载体
+    pub entities: Vec<EventEntity>,
+    /// ★v0.9.8：**为什么这条会出现在结果里**（记录层可复核理由）。
+    ///
+    /// 与 `score` 的区别：`score` 是"有多像"（相似度，BGE 给得出），
+    /// 本字段是"**为什么相关**"（记录依据，BGE 给不出）——例如
+    /// 「与结果内另一条共享「memory_store.rs」（系统从正文识别）」。
+    ///
+    /// **来源是结果集内的兄弟关系**（不是对查询的关系）：实测真实短查询的
+    /// 实词 token 中位仅 2 个，87% 的结果都是"词面命中查询词"⇒ 那是同义反复；
+    /// 而结果集内至少一条兄弟关系的覆盖为 59~68% ⇒ 有信息量。
+    ///
+    /// `None` = **本条确无可复核的记录理由**（不编造弱理由填充，承 §3.53）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
 }
 
 /// 联想探索·根节点最小实质重叠 token 数（v0.9.7 精确度门禁）。
@@ -391,6 +457,16 @@ const ASSOCIATION_ROOT_MIN_OVERLAP: usize = 2;
 /// 池子必须比扩散宽度宽——只看 top-2/3 时，真正相关的记忆可能排在
 /// 噪声之后而根本没被门禁看到。
 const ASSOCIATION_ROOT_POOL_TOPK: usize = 8;
+
+/// 联想探索·每个节点挂出的**记录层**联想上限（v0.9.8）
+///
+/// **为什么单独设限**：记录层关联是"结构必然"的——同一次经历的簇可能有
+/// 几十条（实测有 32 条的同小时簇）。若不加限，一个节点就能把整簇挂出，
+/// 联想树立刻被单一事件淹没，用户看不到跨事件的联想。
+///
+/// 取 6：明显小于相似度扩散宽度（默认 3）的**倍数级**，使记录层节点
+/// 成为"补充证据"而非主体；同时足够展示一次经历的多个侧面。
+const ASSOC_RECORD_PER_NODE: usize = 6;
 
 /// 联想探索·根节点语义旁路阈值（bge 完整句向量余弦，0-1）。
 ///
@@ -872,6 +948,9 @@ fn run_association_explore(
         score: root_score,
         source,
         evidence,
+        // 起点本身来自召回（相似度/词面），不是记录层血缘
+        relation: None,
+        why: None,
     });
     // v0.9.7 精确度修复：多跳扩散的回归校验锚定到起点记忆主题。
     // 每一跳以父记忆内容为查询逐层扩散，但校验一律对齐起点——
@@ -887,7 +966,48 @@ fn run_association_explore(
     // 超预算即优雅收敛：返回已找到的部分 + interrupted=true。
     // P7.3 路径级评分：克隆 root 内容供主题一致性计算（content 随后被移入队列）。
     let root_path_content = root_memory.content.clone();
-    queue.push_back((root_id, root_memory.content, 0u8));
+    queue.push_back((root_id.clone(), root_memory.content.clone(), 0u8));
+
+    // ★v0.9.8：起点的记录层联想（depth 1）。
+    //
+    // **为什么起点必须单独做一次**：BFS 循环只对"扩散出来的子节点"挂记录层，
+    // 起点本身不经过那个路径。而起点恰恰是**最贴合用户问题的记忆**——
+    // 它所属的那次经历（同 event_id 的其他记忆）正是用户最该看到的"意外关联"。
+    // 例：用户问「苏堤」→ 起点是西湖徒步 → 同一次离开杭州时"充电宝忘在高铁上"
+    // 应当在此挂出；漏掉起点会丢掉最有价值的一批联想。
+    if explore_started.elapsed() < ASSOCIATION_EXPLORE_TIME_BUDGET {
+        let rec = store
+            .expand_associations(
+                std::slice::from_ref(&root_id),
+                &filter,
+                ASSOC_RECORD_PER_NODE,
+            )
+            .unwrap_or_default();
+        for a in rec {
+            if visited.contains(&a.memory_id) {
+                continue;
+            }
+            visited.insert(a.memory_id.clone());
+            edges.push(ExploreEdge {
+                from: root_id.clone(),
+                to: a.memory_id.clone(),
+                score: 0.0,
+                evidence: None,
+                relation: Some(a.relation.clone()),
+            });
+            nodes.push(ExploreNode {
+                id: a.memory_id.clone(),
+                content: a.content_preview.clone(),
+                depth: 1,
+                score: 0.0,
+                source: "record".to_string(),
+                evidence: None,
+                relation: Some(a.relation.clone()),
+                why: Some(a.why.clone()),
+            });
+        }
+    }
+
     // P7.2 联想边反馈：门控开启时构建 (from→to) 净调整表供 BFS 排序消费；
     // 关闭时为空表，候选顺序与现状逐字节一致（零影响承诺）。
     let edge_adjust: std::collections::HashMap<(String, String), f32> =
@@ -990,6 +1110,8 @@ fn run_association_explore(
                 to: child_id.clone(),
                 score: child_score,
                 evidence: evidence.clone(),
+                // 相似度扩散的边：无记录层关联类型
+                relation: None,
             });
             nodes.push(ExploreNode {
                 id: child_id.clone(),
@@ -998,7 +1120,51 @@ fn run_association_explore(
                 score: child_score,
                 source: "expanded".to_string(),
                 evidence,
+                relation: None,
+                why: None,
             });
+            // ★v0.9.8：记录层联想——把"同一次经历/共享实体"必然关联、
+            // 但**相似度给不出**的记忆，作为同一层的节点挂在此节点下。
+            //
+            // **为什么放在扩散内部而非 BFS 结束后统一做**：这样每个记录层
+            // 节点都能挂到**具体的父节点**（edges.from = from_id），
+            // 路径可追溯；且天然受 depth/width 语义约束（与相似度扩散同级）。
+            //
+            // 代价控制：每次调用 `expand_associations` 都会 `load_cached()`
+            // 并对该节点的记录做一次关联推导——这是 O(1) 条记忆的关联，
+            // 不是全库扫描（全库只加载一次，走缓存）。
+            // 上限 ASSOC_RECORD_PER_NODE 防止单节点挂出过多。
+            if explore_started.elapsed() < ASSOCIATION_EXPLORE_TIME_BUDGET {
+                let seeds = [child_id.clone()];
+                let rec = store
+                    .expand_associations(&seeds, &filter, ASSOC_RECORD_PER_NODE)
+                    .unwrap_or_default();
+                for a in rec {
+                    if visited.contains(&a.memory_id) {
+                        continue;
+                    }
+                    visited.insert(a.memory_id.clone());
+                    edges.push(ExploreEdge {
+                        from: child_id.clone(),
+                        to: a.memory_id.clone(),
+                        // 记录层关联无相似度分：给 0 而非编造一个分数，
+                        // 避免前端把它误当作相似度参与比较（前端按 relation 区分）。
+                        score: 0.0,
+                        evidence: None,
+                        relation: Some(a.relation.clone()),
+                    });
+                    nodes.push(ExploreNode {
+                        id: a.memory_id.clone(),
+                        content: a.content_preview.clone(),
+                        depth: next_depth,
+                        score: 0.0,
+                        source: "record".to_string(),
+                        evidence: None,
+                        relation: Some(a.relation.clone()),
+                        why: Some(a.why.clone()),
+                    });
+                }
+            }
             queue.push_back((child_id, memory.content, next_depth));
             added += 1;
         }
@@ -1021,6 +1187,170 @@ fn run_association_explore(
         interrupted,
         weak_match,
         semantic_bypass,
+    }
+}
+
+/// 联想中心的「试试看」示例问题（v0.9.8）
+#[derive(Debug, Serialize)]
+pub struct AssociationSuggestion {
+    /// 展示给用户的问题文本（由该用户自己的记忆派生）
+    pub text: String,
+    /// 该示例的来源类型：`event_cluster`（同一次经历）/ `entity`（具体实体）
+    /// 供前端/评测区分示例是怎么来的（避免"看起来像随机凑的"）
+    pub origin: String,
+    /// 该示例背后有多少条记忆支撑（给用户"点了会有多少内容"的预期）
+    pub support: usize,
+}
+
+/// 从**用户自己的记忆库**构造联想示例问题（v0.9.8）
+///
+/// 设计约束（每条都有理由）：
+///
+/// 1. **零硬编码语料**：所有文本都取自该用户的记忆内容或实体名。
+///    此前前端硬编码四个生活场景（晚餐/周末/父母/纪念日），对只记技术
+///    内容的用户必然全部弱匹配——用户会误以为功能坏了。
+///
+/// 2. **优先事件簇**：同 `event_id` ≥2 条的簇，"共同经历"的联想必然成立，
+///    点下去最可能出效果。这是"用最可能成功的例子引导用户"。
+///
+/// 3. **实体优先于内容**：直接用实体名（如「杭州西湖」）提问比截取记忆正文
+///    命中率更高——正文含虚词与上下文，实体是检索时最有效的锚。
+///
+/// 4. **跳过 hub 实体**：过于泛化的实体（项目名等）几乎出现在所有记忆里，
+///    用它提问会召回一大堆无关内容，与"精准联想"的意图相反。
+///
+/// 5. **返回空数组而非凑数**：库为空/全是代码片段时返回空。
+///    诚实优于给用户点不通的假引导（承 §3.44「不得滑向编造」的原则）。
+pub fn build_association_suggestions<P: crate::persistence::Persistence>(
+    store: &crate::memory_store::MemoryStore<P>,
+) -> Vec<AssociationSuggestion> {
+    /// 示例条数上限：与前端示例区视觉容量一致（一行 chips）
+    const MAX_SUGGESTIONS: usize = 4;
+    /// 一个实体至少要在该用户库中出现这么多次，才值得作为示例
+    const MIN_ENTITY_SUPPORT: usize = 2;
+
+    let Ok((all, _)) = store.list_memories(&crate::memory_store::ListFilter {
+        limit: usize::MAX,
+        ..crate::memory_store::ListFilter::new()
+    }) else {
+        return Vec::new();
+    };
+
+    // 经历候选：排除自动索引的代码片段与合成产物
+    //（口径与 memory_stats 的 incident_candidates 一致，避免两处漂移）
+    let is_incident = |m: &crate::memory_types::Memory| {
+        !m.is_expired()
+            && m.memory_type != crate::memory_types::MemoryType::CodeContext
+            && m.memory_type != crate::memory_types::MemoryType::Synthesis
+    };
+    let incidents: Vec<&crate::memory_types::Memory> =
+        all.iter().filter(|m| is_incident(m)).collect();
+    if incidents.is_empty() {
+        return Vec::new(); // 诚实空态：无可构造示例的数据
+    }
+
+    let mut out: Vec<AssociationSuggestion> = Vec::new();
+
+    // ① 事件簇优先：同 event_id 的记忆 ≥2 条
+    let mut clusters: std::collections::HashMap<&str, Vec<&crate::memory_types::Memory>> =
+        std::collections::HashMap::new();
+    for m in &incidents {
+        if let Some(ref ev) = m.event_id {
+            clusters.entry(ev.as_str()).or_default().push(m);
+        }
+    }
+    let mut cluster_list: Vec<(&str, Vec<&crate::memory_types::Memory>)> =
+        clusters.into_iter().filter(|(_, v)| v.len() >= 2).collect();
+    // 大簇优先（更多内容可联想），同规模按 event_id 保证确定性顺序
+    cluster_list.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
+    // event_id 本身只用于分组，不外泄（它可能含用户命名习惯）——
+    // 示例问题只需"能命中"，不需要暴露内部标识，故此处不解构该字段。
+    for (_ev, members) in cluster_list {
+        if out.len() >= MAX_SUGGESTIONS {
+            break;
+        }
+        // 用簇内**最长**的一条内容作为示例文本：
+        // 长内容含更多实词，检索时命中率更高（短句常只有 1~2 个实义 token）
+        let anchor = members
+            .iter()
+            .max_by_key(|m| m.content.chars().count())
+            .expect("簇非空且规模≥2");
+        out.push(AssociationSuggestion {
+            text: suggestion_text_from(&anchor.content),
+            origin: "event_cluster".to_string(),
+            support: members.len(),
+            // 注：event_id 本身不外泄（它可能含用户命名习惯），
+            // 示例问题只需"能命中"，不需要暴露内部标识
+        });
+    }
+
+    // ② 实体补充：用该用户记忆里**具体**（非 hub）的实体提问
+    if out.len() < MAX_SUGGESTIONS {
+        let hubs = store.hub_entities().unwrap_or_default();
+        let is_hub = |name: &str| hubs.iter().any(|(n, _, _, _)| n == name);
+
+        // 统计实体出现次数（按记忆数计，与 df 语义一致）
+        let mut ent_count: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        for m in &incidents {
+            let mut seen = std::collections::HashSet::new();
+            for e in &m.entities {
+                if is_hub(&e.name) {
+                    continue; // 泛化实体：提问会召回无关内容
+                }
+                if seen.insert(e.name.clone()) {
+                    *ent_count.entry(e.name.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        // 已用于示例的文本去重（避免与事件簇示例重复）
+        let used: std::collections::HashSet<String> = out.iter().map(|s| s.text.clone()).collect();
+        let mut ents: Vec<(String, usize)> = ent_count
+            .into_iter()
+            .filter(|(name, c)| *c >= MIN_ENTITY_SUPPORT && !used.contains(name))
+            .collect();
+        // 出现次数多者优先；同频按名称保证确定性
+        ents.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (name, count) in ents {
+            if out.len() >= MAX_SUGGESTIONS {
+                break;
+            }
+            out.push(AssociationSuggestion {
+                text: name,
+                origin: "entity".to_string(),
+                support: count,
+            });
+        }
+    }
+
+    out
+}
+
+/// 从记忆正文中提取一段适合作为「示例问题」的片段
+///
+/// **为什么不是整条正文**：记忆正文可能很长（实测有 1700+ 字的技术总结），
+/// 直接把全文塞进提问框既不像"用户会问的话"，也会让检索变成"用长文本搜自己"
+/// （命中率反而下降——长文本的实义 token 被虚词稀释）。
+///
+/// 做法：取**首句**（到第一个句读为止），并限制长度；首句通常是主题句，
+/// 实词密度最高。若首句仍过长，则按字符截断——这不产生新语义，
+/// 只是长度控制，不属"编造"。
+fn suggestion_text_from(content: &str) -> String {
+    /// 示例文本长度上限（字符）
+    const MAX_LEN: usize = 40;
+    let trimmed = content.trim();
+    // 首个句读位置（中文句号/问号/感叹号/分号/换行）
+    let head_end = trimmed
+        .char_indices()
+        .find(|(_, c)| matches!(c, '。' | '？' | '！' | '；' | '\n'))
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    let head = trimmed[..head_end].trim();
+    let head = if head.is_empty() { trimmed } else { head };
+    if head.chars().count() <= MAX_LEN {
+        head.to_string()
+    } else {
+        head.chars().take(MAX_LEN).collect()
     }
 }
 
@@ -1155,6 +1485,12 @@ pub struct MemoryRememberRequest {
     /// 按标签过滤
     #[serde(default)]
     pub tags: Vec<String>,
+    /// 事件 ID — 同一次经历产生的多条记忆使用相同值（建立"共同经历"关联）
+    #[serde(default)]
+    pub event_id: Option<String>,
+    /// 事件实体（人/地/时/物）
+    #[serde(default)]
+    pub entities: Vec<EventEntity>,
 }
 
 /// /v1/memories/forget 请求体
@@ -1164,6 +1500,33 @@ pub struct MemoryRememberRequest {
 pub struct ForgetRequest {
     /// 待删除的记忆 ID（必填）
     pub memory_id: String,
+}
+
+/// /v1/memories/associations 请求体
+///
+/// 返回一条记忆在**记录层**上的多类型关联（不是相似度排序）。
+/// 用于回答"我记得 A，什么会让我想起 B"——依据是共同经历与共享实体。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryAssociationsRequest {
+    /// 起点记忆 ID（必填）
+    pub memory_id: String,
+    /// 只返回某类关联：same_event（手填 event_id）| same_event_auto（系统按同项目+同窗口推断）| shared_entity（共享实体）| derived_from（由它衍生）| crystallized_into（被结晶为它）| evolved_from（自身被更新过）（缺省=全部并存）
+    #[serde(default)]
+    pub relation: Option<String>,
+}
+
+/// /v1/memories/association-graph 请求体
+///
+/// 返回以一条记忆为中心的**关联图**（含多跳结构推理）。
+/// 与 `MemoryAssociationsRequest` 的区别：后者只给一层直接关联，
+/// 本请求会额外推出「经中间记忆可达」的**间接关联**。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryGraphRequest {
+    /// 起点记忆 ID（图的中心，必填）
+    pub memory_id: String,
+    /// 节点数上限（默认 50）；超出时响应中的 `truncated` 会标记为 true
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
 }
 
 /// v0.8.1 新增：/v1/config/llm/test 请求体
@@ -1319,6 +1682,8 @@ pub fn build_v1_router(
     let correct_store = store.clone();
     let explore_store = store.clone();
     let confirm_store = store.clone();
+    // v0.9.8：联想中心「试试看」示例（数据驱动，非硬编码）
+    let suggestions_store = store.clone();
     let metrics_store = store.clone();
     let unfold_store = store.clone();
     let regulator_store = store.clone();
@@ -1572,6 +1937,9 @@ pub fn build_v1_router(
                     } else {
                         None
                     };
+                    // 联想补全用的隐私上下文副本（v0.9.8）：与检索同源，
+                    // 保证"检索看不到的记忆，联想也不许带出"。
+                    let privacy_ctx_for_expand = privacy_ctx.clone();
 
                     // Phase 1+2：锁获取与 CPU 密集检索统一放入 spawn_blocking（阻塞上下文）。
                     // 锁获取采用"有界 try_lock 轮询"（2 秒截止）——若锁被长期占用，
@@ -1640,6 +2008,19 @@ pub fn build_v1_router(
                                 regression_query: None,
                                 read_only: false,
                             };
+                            // 联想补全用的过滤条件（v0.9.8）：字段与 deep_filter 同源，
+                            // 确保"检索过滤掉的记忆，联想也不许带出"（隐私红线）。
+                            let expand_filter = RecallFilter {
+                                memory_type: None,
+                                project: req.project.clone(),
+                                tags: req.tags.clone(),
+                                min_importance: None,
+                                top_k: top_k * 2,
+                                privacy_context: privacy_ctx_for_expand,
+                                explore_pure: false,
+                                regression_query: None,
+                                read_only: false,
+                            };
                             // 深度路径始终执行：查询意图权重会在 RRF 阶段抑制泛化词污染，
                             // 同时保留无 ML 模式下的真实结果，便于评估与后续升级编码器。
                             let deep_result = match store.trapezoid_focus_recall_with_cancel(
@@ -1703,6 +2084,23 @@ pub fn build_v1_router(
                             let total = fused.total_candidates;
                             let fast_hits = fast_result.memories.len();
                             let deep_hits = deep_result.memories.len();
+                            // ★v0.9.8：为本次结果集计算「为什么这条会出现」的记录层理由。
+                            //
+                            // **为什么在检索出口做**：用户对道体的定位裁定是
+                            // 「解释关联」而非「召回匹配」（实测解释覆盖率 60.8% vs
+                            // 随机 8.1%，而作召回器时相对 BGE 冗余）。但此前主检索
+                            // 结果**从不带理由**，卡片上只有通路标签（"快速+深度"）。
+                            //
+                            // **为什么不改排序**：本块只产出 id→理由映射供展示，
+                            // 不参与任何打分（与 §3.48「联想不并入排序」同纪律）。
+                            //
+                            // **失败静默**：理由是附加信息，不得影响主检索结果。
+                            // 无理由的条目不出现在映射中（不编造弱理由填充）。
+                            let owned_for_reasons: Vec<crate::memory_types::Memory> =
+                                fused.memories.iter().map(|m| (*m).clone()).collect();
+                            let reasons = store
+                                .result_reasons(&owned_for_reasons)
+                                .unwrap_or_default();
                             let mut memories: Vec<EnrichedMemory> = Vec::with_capacity(fused.memories.len());
                             let mut explanation_items: Vec<EnrichExplanationItem> =
                                 Vec::with_capacity(fused.memories.len());
@@ -1725,6 +2123,11 @@ pub fn build_v1_router(
                                     topological_depth: m.topological_depth,
                                     version: m.version,
                                     created_at: m.created_at.to_rfc3339(),
+                                    event_id: m.event_id.clone(),
+                                    entities: m.entities.clone(),
+                                    // 记录层理由（无则 None，前端据此留空，
+                                    // 不用"弱理由"填充）
+                                    why: reasons.get(&m.id).cloned(),
                                 });
                                 // 阶段D：每条的路径贡献明细（只观测，不参与排序）
                                 explanation_items.push(EnrichExplanationItem {
@@ -1779,6 +2182,25 @@ pub fn build_v1_router(
                                 .saturating_sub(total);
                             let affected_ids =
                                 explanation_items.iter().map(|item| item.id.clone()).collect();
+
+                            // ═══ 记录层联想补全（v0.9.8：真正的记忆联想）═══
+                            // 上面 fast/deep/RRF 全部是相似度驱动，只能在"语义相近"
+                            // 的记忆里找。本步补入由 event_id（共同经历）/ entities
+                            // （共享实体）/ source_ids（谱系）必然关联、
+                            // 但**语义可以毫不相似**的记忆。
+                            //
+                            // 复用与检索**同一套可见性规则**（expand_filter 与
+                            // fast_filter 字段同源），确保联想不会成为越权后门。
+                            // 失败静默：联想是附加价值，不得影响主检索结果。
+                            let assoc_seeds: Vec<String> =
+                                explanation_items.iter().map(|i| i.id.clone()).collect();
+                            let associated = store
+                                .expand_associations(
+                                    &assoc_seeds,
+                                    &expand_filter,
+                                    ASSOC_EXPAND_MAX_HTTP,
+                                )
+                                .unwrap_or_default();
                             let evidence_json = serde_json::to_string(&regression_evidence)
                                 .unwrap_or_else(|_| "{}".to_string());
                             audit_meta.insert("filtered_count".to_string(), filtered_count.to_string());
@@ -1813,12 +2235,13 @@ pub fn build_v1_router(
                                 filtered_count,
                                 state_snapshot.trail,
                                 regression_evidence,
+                                associated,
                             ))
                         })
                     ).await;
 
                     match result {
-                        Ok(Ok(Ok((memories, explanation_items, fast_weight, deep_weight, fast_hits, deep_hits, total, filtered_count, trail, regression_evidence)))) => {
+                        Ok(Ok(Ok((memories, explanation_items, fast_weight, deep_weight, fast_hits, deep_hits, total, filtered_count, trail, regression_evidence, associated)))) => {
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(EnrichResponse {
                                 memories,
                                 fast_path_hits: fast_hits,
@@ -1840,6 +2263,7 @@ pub fn build_v1_router(
                                     total_candidates: total,
                                     items: explanation_items,
                                 },
+                                associated,
                             }))
                         }
                         Ok(Ok(Err("search_internal_error"))) => {
@@ -2025,6 +2449,45 @@ pub fn build_v1_router(
                             }))))
                         }
                     }
+                }
+            }
+        }))
+        // GET /v1/associations/suggestions — 联想中心的「试试看」示例（v0.9.8）
+        //
+        // **为什么必须由后端数据驱动**：此前前端把示例问题**硬编码**为
+        // 四个生活场景（「今晚吃什么？」「周末去哪儿玩？」…）。但每个用户的
+        // 记忆库内容完全不同——一个只记技术决策的库，点这四个示例
+        // **必然全部落到"弱匹配空态"**，用户会以为"联想功能是坏的"。
+        //
+        // 规则（全部来自该用户自己的数据，无任何硬编码语料）：
+        // 1. 只取**经历候选**（排除 code_context 自动索引片段 / 合成产物），
+        //    与 `memory_stats` 的经历候选口径一致；
+        // 2. 优先用**已形成事件簇**（同 event_id ≥2 条）的簇：这类记忆天然
+        //    有"同一次经历"可联想，点下去最可能出效果；
+        // 3. 用记忆内容里的**具体实体**（entities，且跳过 hub）构造问题，
+        //    而不是笼统问句——实体型提问命中率显著更高；
+        // 4. 库为空或全是代码片段时**返回空数组**（前端据此隐藏示例区，
+        //    而不是显示点不通的假引导）——诚实优于凑数。
+        .route("/associations/suggestions", get({
+            let store = suggestions_store;
+            move || {
+                let store = store.clone();
+                async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let guard = match store.try_lock() {
+                            Ok(g) => g,
+                            Err(_) => return Vec::new(),
+                        };
+                        build_association_suggestions(&guard)
+                    })
+                    .await;
+                    let items = result.unwrap_or_default();
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                        "suggestions": items,
+                        // 空数组表示"该用户库中没有可构造示例的经历记忆"，
+                        // 前端应隐藏示例区（而非展示点不通的引导）
+                        "count": items.len(),
+                    })))
                 }
             }
         }))
@@ -2925,6 +3388,16 @@ pub fn build_v1_router(
             }
         }))
         // DELETE /v1/associations/records — 清除本机联想过程记录。
+        //
+        // v0.9.8 修复（用户报告"功能无效"）：原实现调 `clear_matching`，
+        // 它只清**内存** `events`，而审计 JSONL 是 append-only 且
+        // `load_from_file` 在启动时会把磁盘记录灌回内存 ⇒
+        // **sidecar 重启后记录全部复活**（实测：内存 141→0→141）。
+        //
+        // 现改为 `hide_matching`：把命中事件 ID 记入**独立隐藏集合**并落盘
+        // （`<audit>.hidden`），`query` 过滤之 ⇒ 重启后仍隐藏。
+        // **为什么不真删**：审计是防篡改哈希链，删行会让 `verify_integrity`
+        // 报篡改；隐藏把"用户隐私诉求"（视图层）与"审计完整性"（存储层）解耦。
         .route("/associations/records", delete({
             let store = metrics_store.clone();
             move || {
@@ -2936,9 +3409,12 @@ pub fn build_v1_router(
                             "error": "store_busy", "message": "记忆服务繁忙，请稍后重试"
                         })))),
                     };
-                    let cleared = store.audit_trail.clear_matching(|event| event.event_type == AuditEventType::RetrievalExecuted);
+                    let hidden = store.audit_trail.hide_matching(|event| event.event_type == AuditEventType::RetrievalExecuted);
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                        "success": true, "cleared": cleared, "message": "联想记录已在本机清除"
+                        "success": true,
+                        "cleared": hidden,
+                        "hidden_total": store.audit_trail.hidden_count(),
+                        "message": "联想记录已隐藏（审计完整性不受影响，重启后仍不显示）"
                     })))
                 }
             }
@@ -3268,6 +3744,31 @@ pub fn build_v1_router(
                                 "storage_size_bytes": stats.storage_size_bytes,
                                 "by_type": stats.by_type,
                                 "by_project": stats.by_project,
+                                // 记录层覆盖度（v0.9.7）：让「共同经历」的积累可观测。
+                                // 前端/运维据此判断"关联推导是否具备前提"，
+                                // 避免把"无人填写 event_id"误读为"机制无效"。
+                                //
+                                // **必须同时给出分母**：只给 `with_event` 数字而不给
+                                // 基数时，前端无从判断"0 是没人填，还是全库都没数据"。
+                                // 且 `total` 与 `incident_candidates` 二者**含义不同**——
+                                // 后者排除了本就不该带 event_id 的自动索引片段
+                                // （code_context / synthesis），是"应该填的"真实基数。
+                                // 只报全库分母会严重低估填写率（PREREG §3.47）。
+                                "record_layer": {
+                                    "with_event": stats.with_event_count,
+                                    "with_entity": stats.with_entity_count,
+                                    "event_clusters": stats.event_cluster_count,
+                                    "experience": stats.experience_count,
+                                    // 分母：全库
+                                    "total": stats.total_memories,
+                                    // 分母：经历候选（排除 code_context / synthesis）
+                                    "incident_candidates": stats
+                                        .total_memories
+                                        .saturating_sub(
+                                            stats.by_type.get("code_context").copied().unwrap_or(0)
+                                                + stats.by_type.get("synthesis").copied().unwrap_or(0),
+                                        ),
+                                },
                             })))
                         }
                         Err(e) => Err((
@@ -3347,6 +3848,8 @@ pub fn build_v1_router(
                                         "daoti_preview_version": m.daoti_preview_version,
                                         "luoshu_vector": m.luoshu_vector,
                                         "topological_depth": m.topological_depth,
+                                        "event_id": m.event_id,
+                                        "entities": m.entities,
                                     })
                                 })
                                 .collect();
@@ -3425,6 +3928,8 @@ pub fn build_v1_router(
                                         "daoti_preview_gua": m.daoti_preview_gua,
                                         "daoti_preview_bagua": m.daoti_preview_bagua,
                                         "daoti_preview_version": m.daoti_preview_version,
+                                        "event_id": m.event_id,
+                                        "entities": m.entities,
                                     })
                                 })
                                 .collect();
@@ -3532,6 +4037,8 @@ pub fn build_v1_router(
                                         "daoti_preview_gua": m.daoti_preview_gua,
                                         "daoti_preview_bagua": m.daoti_preview_bagua,
                                         "daoti_preview_version": m.daoti_preview_version,
+                                        "event_id": m.event_id,
+                                        "entities": m.entities,
                                     })
                                 })
                                 .collect();
@@ -3605,7 +4112,9 @@ pub fn build_v1_router(
                             params.tags,
                             importance,
                             None,
-                        );
+                        )
+                        .with_event(params.event_id)
+                        .with_entities(params.entities);
                         match store.remember(memory) {
                             Ok(saved) => Ok(saved.id),
                             Err(e) => {
@@ -3722,6 +4231,105 @@ pub fn build_v1_router(
                             ))
                         }
                     }
+                }
+            }
+        }))
+        // POST /v1/memories/associations — 查询一条记忆的多类型关联（记录层→关系网络）
+        //
+        // 与 /v1/memories/enrich（按查询相似度检索）不同：本端点不排序、不打分，
+        // 只返回**带类型与依据的结构化关联**（same_event / shared_entity / derived_from）。
+        // 依据全部来自记录层字段，因此"为什么关联"可被用户检验。
+        .route("/memories/associations", post({
+            let store = metrics_store.clone();
+            move |Json(req): Json<MemoryAssociationsRequest>| {
+                let store = store.clone();
+                async move {
+                    let store = lock_store_with_timeout(&store).await?;
+                    let all = match store.associations(&req.memory_id) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "associations_failed",
+                                    "message": format!("关联查询失败: {}", e)
+                                })),
+                            ));
+                        }
+                    };
+                    let items: Vec<serde_json::Value> = all
+                        .into_iter()
+                        .filter(|a| {
+                            req.relation
+                                .as_deref()
+                                .map(|r| a.relation == r)
+                                .unwrap_or(true)
+                        })
+                        .map(|a| {
+                            serde_json::json!({
+                                "memory_id": a.memory_id,
+                                "relation": a.relation,
+                                "why": a.why,
+                                "content_preview": a.content_preview,
+                            })
+                        })
+                        .collect();
+                    // hub 实体清单：**让过滤可见**（§3.45.5）。
+                    // 这些实体的关联被有意跳过（其"共享"近乎恒真、零区分度）。
+                    // 若不暴露，用户会把过滤后的稀疏结果误读为"没有关联"。
+                    //
+                    // `count`/`total` 的分母是**该记忆所属项目内**的记忆数
+                    // （§3.49 修正：按项目口径判定，否则会被其他项目稀释而漏判）。
+                    let hubs: Vec<serde_json::Value> = match store.hub_entities() {
+                        Ok(v) => v
+                            .into_iter()
+                            .map(|(name, kind, df, total)| {
+                                serde_json::json!({
+                                    "name": name,
+                                    "kind": kind.as_str(),
+                                    "count": df,
+                                    "project_total": total,
+                                    "ratio": if total == 0 { 0.0 } else { df as f64 / total as f64 },
+                                })
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                        "associations": items,
+                        "total": items.len(),
+                        // 被跳过的泛化实体（原因此处的实体其关联无区分度）
+                        "skipped_entities": hubs,
+                    })))
+                }
+            }
+        }))
+        // POST /v1/memories/association-graph — 联想图（含多跳结构推理）
+        //
+        // 与 /v1/memories/associations 的区别：后者只返回一层直接关联；
+        // 本端点额外推出**间接关联**——若 A 与 B 同一次经历、B 与 C 共享实体，
+        // 则 A 与 C 之间即使没有任何直接记录，也由图结构必然可达。
+        // 这不是相似度推测，而是**路径合成**，故附带完整 `path` 供人工核验。
+        .route("/memories/association-graph", post({
+            let store = metrics_store.clone();
+            move |Json(req): Json<MemoryGraphRequest>| {
+                let store = store.clone();
+                async move {
+                    let max_nodes = req.max_nodes.unwrap_or(50).clamp(2, 500);
+                    let store = lock_store_with_timeout(&store).await?;
+                    let g = match store.association_graph(&req.memory_id, max_nodes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "association_graph_failed",
+                                    "message": format!("关联图构造失败: {}", e)
+                                })),
+                            ));
+                        }
+                    };
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!(g)))
                 }
             }
         }))

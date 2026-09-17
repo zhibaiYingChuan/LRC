@@ -131,7 +131,10 @@ pub use memory_store::{
     ListFilter, MemoryStats, MemoryStore, RecallFilter, RecallResult, SortBy, SortOrder,
 };
 
-pub use memory_types::{DecayConfig, Importance, Memory, MemoryType, MemoryVersion, PrivacyLevel};
+pub use memory_types::{
+    DecayConfig, EntityKind, EventEntity, Importance, Memory, MemoryType, MemoryVersion,
+    PrivacyLevel,
+};
 
 pub use persistence::{
     create_json_persistence, json::JsonPersistence, Persistence, PersistenceError,
