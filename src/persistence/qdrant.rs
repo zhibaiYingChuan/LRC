@@ -398,6 +398,15 @@ impl QdrantPersistence {
             privacy_level,
             session_id: None,
             user_id: None,
+            // 事件维度：缺失（旧数据）时退化为默认值，不影响加载
+            event_id: payload
+                .get("event_id")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            entities: payload
+                .get("entities")
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+                .unwrap_or_default(),
             topological_depth: payload
                 .get("topological_depth")
                 .and_then(|v| v.as_f64())
@@ -443,6 +452,10 @@ impl Persistence for QdrantPersistence {
                     "bagua_category": memory.bagua_category,
                     "topological_depth": memory.topological_depth,
                     "privacy_level": memory.privacy_level.as_str(),
+                    // 事件维度：共同经历（event_id）与实体关联（entities）
+                    // 缺此二者会导致重载后"同源/共享实体"关联全部丢失
+                    "event_id": memory.event_id,
+                    "entities": memory.entities,
                 }),
             };
 

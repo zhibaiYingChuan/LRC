@@ -3162,6 +3162,34 @@ recall(query="<模块名或关键词>", top_k=3)
 
 ---
 
+### 规则 4：写「经历」时填 `event_id` —— 这是「联想」的唯一依据
+
+记忆之间能互相联想，靠的**不是内容相似**，而是**它们来自同一次经历**。
+例：`游西湖` 与 `吃楼外楼` 语义上毫不相关，但只要同属"一次杭州之行"，
+它们就该能互相联想——这是任何相似度算法都给不出的连接。
+
+**做法**（写经历类内容时：一次外出 / 一次会议 / 一次排障 / 一段对话）：
+
+- `memory_type` 用 `experience`（区别于 `fact`：后者是客观信息，不是"我经历过什么"）
+- `event_id` 由**你**生成并复用，建议「类型-对象-时间窗」，如
+  `trip-hangzhou-2026-09`、`task-fix-login-20260916`、`session-2026-09-16-a`
+- 一次写多条时，用 `batch_remember` 在**批次级**传一次 `event_id` 即可，不必逐条重复
+- 换一次经历就换新值；只写一条、不成组的记忆可以不填
+- `entities` 填**内容里明确出现**的人/地/时/物（每项写成 name + kind 两个字段，
+  如 name=小美、kind=person），
+  **只做誊写、不做推断**——不要补一个内容里没写的实体；
+  优先填**具体对象**（`commands.rs`、`楼外楼`），不要填泛化名（项目名、公司名）
+
+**判定边界**：`event_id` 回答的是「**它们是不是同一次发生的**」，
+这个问题只有知情者能回答——**你正是那个知情者**（是你刚写下它们）。
+不要因为"内容看起来相关"就补一个 `event_id`（那是相似度反推，不是经历）；
+若确实不确定，在回复里问用户一句。
+
+**为什么必须填**：不填，这些记忆之间就无法互相联想——
+它们的关联依据（同一次经历）**从未被记录**，事后无法补。
+
+---
+
 ### v0.6.0~v0.8.0 新功能说明
 
 **v0.6.0 合成引擎与道同构度**：
@@ -3190,7 +3218,8 @@ recall(query="<模块名或关键词>", top_k=3)
 
 | 工具 | 用途 | 关键参数 |
 |---|---|---|
-| `remember` | 记录新记忆 | content（内容）、memory_type（类型）、tags（标签）、importance（重要性 1-10） |
+| `remember` | 记录新记忆 | content（内容）、memory_type（类型）、tags（标签）、importance（重要性 1-10）、**event_id（同一次经历，见规则 4）**、**entities（人/地/时/物）** |
+| `batch_remember` | 批量写入（≤200 条） | memories（数组）、**event_id（批次级共用一次，见规则 4）** |
 | `recall` | 语义检索历史记忆 | query（自然语言查询）、top_k（返回数量，建议 3-5） |
 | `update_memory` | 更新已有记忆 | memory_id（记忆 ID）、content（新内容） |
 | `forget` | 删除记忆 | memory_id（记忆 ID） |
@@ -3201,6 +3230,8 @@ recall(query="<模块名或关键词>", top_k=3)
 - `decision` — 架构决策（如"选择 PostgreSQL 因为需要事务支持"）
 - `preference` — 约定偏好（如"用户偏好使用 pnpm 而非 npm"）
 - `fact` — 事实信息（如"数据库连接字符串在 .env 文件中"）
+- `experience` — **经历**（如"和爸妈去了杭州西湖"）——**"我经历过什么"，
+  应带 `event_id` 与 `entities`**，是"联想"的载体（见规则 4）
 
 ---
 
@@ -3518,6 +3549,121 @@ fn is_system_dir(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ════════════════════════════════════════════════════════════
+    // 记录层分发回归：规则文件必须教 AI 填 event_id / entities
+    // ════════════════════════════════════════════════════════════
+    //
+    // **为什么需要这组测试**（PREREG §3.51）：
+    // event_id 的实际填写率实测为 **0.00%**。归因时发现：
+    // 工具 schema 里写了 event_id，但 AI 助手真正读到的是**规则文件**
+    // （`~/.trae-cn/rules.md` 等），而规则文件里 event_id / entities
+    // / experience **一个字都没有** ⇒ 填写要求**从未被分发**。
+    // 0% 是"要求没送达"，不是"用户不愿填"。
+    //
+    // 本测试固化"分发必须存在"，防止日后精简文案时又把它删掉。
+    #[test]
+    fn test_rules_content_distributes_event_id() {
+        // 抽查多个工具（共用同一份正文，只需验证正文）
+        for tool_id in ["trae-cn", "cursor", "claude-desktop", "cline", "vscode"] {
+            let content = AgentDetectorRegistry::generate_ai_rules_content(tool_id);
+
+            // ① 独立的「规则 4」段落必须存在（新用户的入门说明）
+            assert!(
+                content.contains("### 规则 4"),
+                "{} 的规则文件缺少『规则 4』（写经历时填 event_id 的说明）\
+⇒ AI 无从知晓要填（实测填写率 0% 的根因）",
+                tool_id
+            );
+
+            // ② ★段落级断言（不是全文包含）：
+            // 历史教训：仅断言"全文含 event_id"会被**冗余出现**掩盖——
+            // 删掉工具表里的 event_id 列后，规则 4 正文里的 event_id 仍让断言通过
+            // ⇒ 断言失去定位能力。故此处按**段落**切分后分别断言。
+            //
+            // 【工具表】必须把 event_id / entities 列为 remember 的关键参数
+            let tool_table = segment(&content, "### 记忆工具说明", "**记忆类型**")
+                .expect("规则文件缺少『记忆工具说明』段落");
+            assert!(
+                tool_table.contains("event_id"),
+                "{} 的『记忆工具说明』表中 remember 未列 event_id ⇒ 查表的 AI 看不到",
+                tool_id
+            );
+            assert!(
+                tool_table.contains("entities"),
+                "{} 的『记忆工具说明』表中 remember 未列 entities",
+                tool_id
+            );
+            assert!(
+                tool_table.contains("batch_remember"),
+                "{} 的『记忆工具说明』表未列 batch_remember（批次级填 event_id 的载体）",
+                tool_id
+            );
+
+            // 【类型表】必须列出 experience（否则 AI 不知道用哪个类型）
+            let type_list = segment(&content, "**记忆类型**", "### 最佳实践")
+                .or_else(|| segment(&content, "**记忆类型**", "### 示例"))
+                .or_else(|| segment(&content, "**记忆类型**", "---"))
+                .expect("规则文件缺少『记忆类型』段落");
+            assert!(
+                type_list.contains("experience"),
+                "{} 的『记忆类型』清单未列出 experience ⇒ AI 不会用它标记经历",
+                tool_id
+            );
+
+            // ③ 必须给出「批次级」写法（否则批量写入要逐条重复，徒增负担）
+            assert!(
+                content.contains("批次级") || content.contains("批次"),
+                "{} 的规则文件未说明可以批次级只填一次 event_id",
+                tool_id
+            );
+        }
+    }
+
+    /// 从 `content` 中截取 `start` 到首个 `end` 之间的片段（用于段落级断言）
+    fn segment(content: &str, start: &str, end: &str) -> Option<String> {
+        let i = content.find(start)?;
+        let rest = &content[i..];
+        // 从 start 之后寻找 end，避免 start 自身匹配到 end
+        let j = rest[start.len()..].find(end)? + start.len();
+        Some(rest[..j].to_string())
+    }
+
+    /// 段落级断言本身的负向对照：确认 segment() 真的会切分（防恒真）
+    ///
+    /// 若 segment 实现错误（例如忽略 start，直接返回全文），
+    /// 上面的段落级断言会退化为"全文包含"，鉴别力归零且无人察觉。
+    #[test]
+    fn test_segment_really_slices() {
+        let content = "AAA\n### 记忆工具说明\nxxx\n### 记忆类型\nyyy\n---\n";
+        let seg = segment(content, "### 记忆工具说明", "### 记忆类型").unwrap();
+        assert!(seg.contains("xxx"), "切出的片段应含目标段内容");
+        assert!(
+            !seg.contains("yyy"),
+            "切出的片段不应延伸到下一个段落（否则 segment 无效）"
+        );
+
+        // 段落不存在时返回 None（而非静默返回全文）
+        assert!(segment(content, "### 不存在的段落", "### 记忆类型").is_none());
+    }
+
+    /// 规则文件必须包含判定边界：禁止用"内容相似"反推 event_id
+    ///
+    /// 理由（PREREG §3.44）：降低填写门槛**不得**滑向自动推断。
+    /// `event_id` 回答的是"是不是同一次发生的"，只有知情者能答；
+    /// 若允许"看起来相关就同组"，则关联退化为相似度——正是本方向要摆脱的东西。
+    #[test]
+    fn test_rules_content_forbids_inferring_event_id_from_similarity() {
+        let content = AgentDetectorRegistry::generate_ai_rules_content("trae-cn");
+        assert!(
+            content.contains("只做誊写") || content.contains("不要补"),
+            "规则文件缺少「不得推断实体」的约束"
+        );
+        assert!(
+            content.contains("不是内容相似") || content.contains("相似度反推"),
+            "规则文件缺少「联想依据是共同经历、不是相似度」的说明"
+        );
+    }
 
     // ════════════════════════════════════════════════════════════
     // v0.8.0 "归一"：规则版本管理单元测试

@@ -59,8 +59,44 @@ fn recall_first(store: &mut MemoryStore<JsonPersistence>, query: &str) -> Vec<St
         .unwrap_or_default()
 }
 
+/// v0.9.8：显式开启 `LRC_STATE_BIAS` 门控（**进程级一次性，不撤销**）。
+///
+/// # 为什么需要它
+///
+/// 「道体状态机·联想导航」通路（含本文件验证的**回归校验层**与
+/// `regression_evidence` 证据标签）已按 `PREREG_FAIR_STATE_MACHINE`
+/// 协议裁定**默认关闭**。但门控文档承诺：「开 `LRC_STATE_BIAS=1` 可完整
+/// 复现 v0.9.7 行为（用于对照实验与回归取证）」。
+///
+/// ⇒ 本文件中依赖该通路的用例是**回归取证**：通路默认关，但**开启后行为
+///   必须仍然正确**——若算法被改坏，在此暴露（而不是因为门控关着就静默通过）。
+///
+/// # 为什么是 `Once` 一次性开启，而不是每个用例各自的 RAII 守卫
+///
+/// 环境变量是**进程级全局状态**，而 `cargo test` 默认**多线程并行**执行用例。
+/// 若每个用例用完就恢复原值，一个用例的 `Drop` 会关掉另一个**仍在运行**用例的
+/// 通路 ⇒ 结果由线程调度决定。实测对照：
+///   · 单独跑本文件（`--test memory_state_machine_e2e`）→ 8 passed；
+///   · 全量跑（`cargo test --features server`）→ 1 failed。
+/// 同一份代码两种结果，正是并行竞争而非算法缺陷。
+///
+/// ⇒ 改为 `Once`：整个测试进程只开启一次且**永不撤销**。
+///
+/// # 隔离性如何保证
+///
+/// 集成测试文件各自编译为**独立二进制、独立进程**运行，因此本次开启
+/// 不会影响 `--lib` 中的「门控默认关闭」契约测试
+/// （见 `memory_state_machine.rs` 与 `memory_store_tests.rs`）。
+fn enable_state_bias() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("LRC_STATE_BIAS", "1");
+    });
+}
+
 #[test]
 fn 跨会话活性导航让无词重叠的关联记忆被找回() {
+    enable_state_bias();
     // 用独立临时目录，隔离 LRC_STATE_BIAS 环境与库干扰
     let dir = temp_dir("nav_recall");
     let mut store = new_store(&dir);
@@ -81,6 +117,7 @@ fn 跨会话活性导航让无词重叠的关联记忆被找回() {
 
 #[test]
 fn 无关记忆不因活性偏置浮动() {
+    enable_state_bias();
     // 防止活性偏置造成"只要活跃就顶到前面"的污染
     let dir = temp_dir("nav_negative");
     let mut store = new_store(&dir);
@@ -105,6 +142,7 @@ fn 无关记忆不因活性偏置浮动() {
 
 #[test]
 fn 活性状态跨store实例持久化() {
+    enable_state_bias();
     // 验证 restart 后（新建 MemoryStore 指向同一数据目录）活性被加载
     let dir = temp_dir("nav_restart");
     {
@@ -144,6 +182,7 @@ fn 联想桥扩散拉回无词面重叠的孤立记忆() {
     //   1. 记下"朋友阿龙在泉州做木偶戏"（孤立记忆，与后续查询无词重叠）
     //   2. 查询"最近值得记录的人和事"（激活一个相关话题，如"出差见闻"）
     //   3. 通过活跃记忆内容作为联想桥，阿龙那条记忆应能进入结果
+    enable_state_bias();
     let dir = temp_dir("nav_bridge");
     let mut store = new_store(&dir);
 
@@ -172,6 +211,7 @@ fn 联想桥扩散拉回无词面重叠的孤立记忆() {
 fn 联想扩散不污染直接命中的记忆() {
     // 回归约束：原查询直接命中的记忆必须排在联想桥拉回的记忆之前，
     // 证明扩展词不干扰原查询主导地位。
+    enable_state_bias();
     let dir = temp_dir("nav_no_pollute");
     let mut store = new_store(&dir);
 
@@ -208,6 +248,7 @@ fn 联想扩散不污染直接命中的记忆() {
 fn deep路径活跃记忆免于八卦剪除() {
     // deep 路径：活跃记忆无论卦象一律进入候选（白名单），
     // 验证即使八卦分类不同也不会被硬剪除丢记忆。
+    enable_state_bias();
     let dir = temp_dir("nav_deep_whitelist");
     let mut store = new_store(&dir);
 
@@ -248,6 +289,15 @@ fn 道体再次校验剔除碰巧共享词的噪声() {
     //   2. 噪声记忆："泉州路是条老街"（碰巧含"泉州"，但与原查询、联想链都无关）
     //   3. 查询"有什么见闻值得记录"（原查询零重叠）
     //   → 噪声记忆桥命中仅 1（泉州），无其他共鸣 → 应被剔除
+    //
+    // ★v0.9.8：必须**显式开启** `LRC_STATE_BIAS=1`。
+    //   本测试验证的是「道体回归校验层」——而该层所属的联想导航通路
+    //   已按 `PREREG_FAIR_STATE_MACHINE` 协议裁定**默认关闭**
+    //   （依据：判据 G2 未达，道体信号参与排序无净增量）。
+    //   门控文档明确承诺「开 `LRC_STATE_BIAS=1` 可完整复现 v0.9.7 行为（用于
+    //   对照实验与回归取证）」⇒ 本测试正是该承诺的**回归取证**：
+    //   通路默认关，但**开启后行为必须仍然正确**（若算法被改坏，在此暴露）。
+    enable_state_bias();
     let dir = temp_dir("nav_regression_reject");
     let mut store = new_store(&dir);
 
@@ -279,6 +329,10 @@ fn 道体再次校验剔除碰巧共享词的噪声() {
 fn evidence_tags_alongside_recall_result() {
     // 可观测增强：联想扩散保留的记忆应携带"联想桥强关联"证据标签，
     // 调用方（server 联想链输出）能解释"为什么这条被联想回来"。
+    //
+    // ★v0.9.8：同 `道体再次校验剔除碰巧共享词的噪声` —— 证据标签由
+    //   联想导航通路产出，该通路默认关闭 ⇒ 显式开启做回归取证。
+    enable_state_bias();
     let dir = temp_dir("nav_evidence_expose");
     let mut store = new_store(&dir);
 

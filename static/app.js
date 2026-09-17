@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.9.7';
+const APP_VERSION = '0.9.8';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -1950,6 +1950,7 @@ async function loadRecentMemories() {
       code_context: '代码',
       conversation: '对话',
       synthesis: '合成',
+      experience: '经历',
     };
     // 类型颜色映射(与 typeLabels 键严格一致)
     const typeColors = {
@@ -1959,6 +1960,7 @@ async function loadRecentMemories() {
       code_context: 'jade',
       conversation: 'info',
       synthesis: 'jade',
+      experience: 'gold',
     };
 
     container.innerHTML = memories.map(m => {
@@ -4643,6 +4645,12 @@ async function importMemories(event) {
               content: mem.content || JSON.stringify(mem),
               memory_type: normalizeMemoryType(mem.memory_type),
               importance: mem.importance || 5,
+              tags: mem.tags || [],
+              project: mem.project || null,
+              // 事件维度透传：备份恢复必须保留「共同经历」与「实体关联」，
+              // 否则恢复后的记忆无法参与关联推导（字段静默丢失）
+              event_id: mem.event_id || null,
+              entities: mem.entities || [],
               metadata: mem
             }),
           }, 30000);
@@ -7108,6 +7116,7 @@ const HOME_TYPE_LABELS = {
   code_context: '代码',
   conversation: '对话',
   synthesis: '结晶',
+  experience: '经历',
 };
 
 // M4a 条形标签：沿用 HOME_TYPE_LABELS，但结晶类对用户说全称更直观
@@ -7516,6 +7525,41 @@ function renderMemoryAssets(statsData, synthData) {
     }
   }
 
+  // --- 4b2 联想积累（记录层覆盖度） ---
+  // 目的：让用户区分「还没人记录同一次经历」与「记录了但没关联」。
+  // 分母用「经历候选」（排除 code_context/synthesis）——这两类本就不该带
+  // event_id，用全库做分母会让填写率看起来永远是 0，误导用户（PREREG §3.47）。
+  const recEl = document.getElementById('memory-record-layer-body');
+  if (recEl) {
+    if (!stats) {
+      recEl.innerHTML = `<div class="text-center text-dim" style="padding:12px;">${busy ? '记忆正在后台整理中，已有数据照常可看' : '暂时读不到积累数据'}</div>`;
+    } else {
+      const rl = stats.record_layer || {};
+      const withEvent = Number(rl.with_event || 0);
+      const clusters = Number(rl.event_clusters || 0);
+      const base = Number(rl.incident_candidates != null ? rl.incident_candidates : (rl.total || 0));
+      const rate = base > 0 ? (withEvent / base * 100) : 0;
+      if (withEvent === 0) {
+        // 前提缺失：明确说明"不是系统坏了"，与 §3.44 的告警口径一致
+        recEl.innerHTML = `
+          <div class="text-center text-dim" style="padding:12px;line-height:1.7;">
+            还没有记忆记录「同一次经历」<br>
+            <span class="text-sm">写入时给同一次经历的多条记忆填相同的事件 ID，它们之间就能互相联想</span>
+          </div>`;
+      } else {
+        recEl.innerHTML = `
+          <div class="bar-row">
+            <span class="bar-label">已记录经历</span>
+            <span class="bar-track"><span class="bar-fill" style="width:${Math.max(3, Math.min(100, Math.round(rate)))}%"></span></span>
+            <span class="bar-value">${num(clusters)} 组</span>
+          </div>
+          <div class="text-sm text-dim" style="margin-top:6px;">
+            ${num(withEvent)} 条记忆带事件 ID（占经历候选 ${rate.toFixed(2)}%），共 ${num(clusters)} 次经历
+          </div>`;
+      }
+    }
+  }
+
   // --- 4c 成长趋势（P0 降级：大字 + 可选 sparkline） ---
   renderMemoryGrowth(stats);
 
@@ -7795,12 +7839,16 @@ function openQuickAdd() {
   const contentEl = document.getElementById('quick-add-content');
   const tagsEl = document.getElementById('quick-add-tags');
   const projectEl = document.getElementById('quick-add-project');
+  const eventIdEl = document.getElementById('quick-add-event-id');
+  const entitiesEl = document.getElementById('quick-add-entities');
   const errEl = document.getElementById('quick-add-error');
   if (typeSel) typeSel.value = 'fact';
   if (impSel) impSel.value = '5';
   if (contentEl) contentEl.value = '';
   if (tagsEl) tagsEl.value = '';
   if (projectEl) projectEl.value = '';
+  if (eventIdEl) eventIdEl.value = '';
+  if (entitiesEl) entitiesEl.value = '';
   if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
   modal.hidden = false;
   if (contentEl) setTimeout(() => contentEl.focus(), 60);
@@ -7819,6 +7867,8 @@ async function submitQuickAddMemory() {
   const impSel = document.getElementById('quick-add-importance');
   const tagsEl = document.getElementById('quick-add-tags');
   const projectEl = document.getElementById('quick-add-project');
+  const eventIdEl = document.getElementById('quick-add-event-id');
+  const entitiesEl = document.getElementById('quick-add-entities');
   const errEl = document.getElementById('quick-add-error');
   const saveBtn = document.getElementById('quick-add-save-btn');
   if (!contentEl || !typeSel) return;
@@ -7839,6 +7889,12 @@ async function submitQuickAddMemory() {
     : [];
   // 项目（可选）
   const project = (projectEl && projectEl.value.trim()) ? projectEl.value.trim() : null;
+  // 事件 ID（可选）：同一次经历的多条记忆填相同值，建立「共同经历」关联
+  const eventId = (eventIdEl && eventIdEl.value.trim()) ? eventIdEl.value.trim() : null;
+  // 实体（可选）：人/地/时/物，逗号分隔；kind 交由后端解析（缺省 other）
+  const entities = (entitiesEl && entitiesEl.value.trim())
+    ? entitiesEl.value.split(/[,，、\s]+/).map(s => s.trim()).filter(Boolean).map(name => ({ name }))
+    : [];
 
   // 进入加载态，防止重复提交
   if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '保存中…'; }
@@ -7855,6 +7911,8 @@ async function submitQuickAddMemory() {
         importance,
         tags,
         project,
+        event_id: eventId,
+        entities,
       }),
     }, 15000);
     if (!res.ok) {
@@ -8966,6 +9024,8 @@ async function searchMemories() {
         </div>
       `;
     }
+    // v0.9.8：联想补全分区（与主结果分开渲染）
+    renderAssociatedMemories(data.associated);
   } catch (err) {
     // v0.8.4 Step 11 / G037：AbortError 静默处理，不显示错误
     if (err.name === 'AbortError' && currentSignal.aborted) {
@@ -8979,6 +9039,7 @@ async function searchMemories() {
         <p class="text-sm text-dim">${htmlescape(err.message || String(err))}</p>
       </div>
     `;
+    renderAssociatedMemories(null);
     console.error('[LRC v' + APP_VERSION + ']记忆搜索失败:', err);
   } finally {
     // v0.8.4 Step 11 / G037：清理 AbortController 引用（仅当当前请求未被打断）
@@ -8987,6 +9048,57 @@ async function searchMemories() {
     }
   }
 }
+
+/**
+ * v0.9.8：渲染「联想补全」分区（由记录推导、非语义相似的记忆）
+ *
+ * **这一块补的是什么**：上方搜索结果全部由相似度产生（语义相近才会被召回）。
+ * 本分区展示的是**语义可能毫不相似**、但由记录必然关联的记忆——
+ * 例：搜「苏堤」补出同一次杭州之行的「充电宝忘在高铁上」。
+ * 这是任何相似度算法都给不出的连接，只能靠 event_id/entities 推导。
+ *
+ * **渲染约束（每条都有理由）**：
+ * - 单独分区：证据性质与相似度结果不同，混排会让用户误以为可按分数比较
+ * - 必须显示 why（依据）与 via（从哪条联想过来）：否则用户无法判断联想是否合理
+ * - 无结果整块隐藏：不显示空标题（避免"看起来坏了"）
+ * - 失败静默：联想是附加信息，不可打断搜索主流程
+ *
+ * @param {Array|null} items - 后端 associated 数组；null 表示本次无该分区/请求失败
+ */
+function renderAssociatedMemories(items) {
+  const box = document.getElementById('memory-search-associated');
+  if (!box) return;
+  const list = Array.isArray(items) ? items : [];
+  if (list.length === 0) {
+    box.innerHTML = '';
+    box.style.display = 'none';
+    return;
+  }
+  const rows = list.map(a => {
+    const preview = htmlescape(String(a.content_preview || ''));
+    const why = htmlescape(String(a.why || ''));
+    const via = htmlescape(String(a.via_preview || ''));
+    const type = htmlescape(String(a.memory_type || ''));
+    // 「经由什么」必须可见——用户据此判断联想是否合理
+    return `
+      <div class="memory-assoc-item">
+        <div class="memory-assoc-head">
+          <span class="memory-assoc-badge">${why}</span>
+          <span class="text-sm text-dim">${type}</span>
+        </div>
+        <div class="memory-assoc-content">${preview}</div>
+        ${via ? `<div class="memory-assoc-via text-sm text-dim">由「${via}」联想到此</div>` : ''}
+      </div>`;
+  }).join('');
+  box.innerHTML = `
+    <div class="memory-assoc-title">
+      联想 <span class="text-sm text-dim">（与上方结果语义不相似，但由「共同经历 / 共享实体」必然关联）</span>
+    </div>
+    ${rows}
+  `;
+  box.style.display = '';
+}
+window.renderAssociatedMemories = renderAssociatedMemories;
 
 /**
  * v0.9.6 G6 新增：统一渲染记忆结果（enrich 搜索与 list 全部记忆共用）
@@ -9063,11 +9175,21 @@ function renderMemoryResults(memories, explanationById) {
     const associationHint = association
       ? `<span title="联想路径：${htmlescape(pathLabel || '未知')}">联想：${htmlescape(pathLabel || '未知')} · 贡献 ${Number(association.fused_contrib || 0).toFixed(4)}</span>`
       : '';
+    // ★v0.9.8：记录层理由（"为什么这条会出现"）。
+    // **与上面的 associationHint 的区别**：那条是"哪条通路找到的"（过程指标，
+    // 贡献 0.0164 用户看不懂），本条是"凭什么相关"（可复核的证据，
+    // 如「与结果内另一条共享「memory_store.rs」」）——承用户裁定
+    // 「道体不是检索器，是解释关联」。
+    // 后端在**确无理由**时不返回该字段 ⇒ 此处留空，不编造弱理由填充（§3.53）。
+    const why = memory.why
+      ? `<div class="memory-card-why text-sm" title="记录层依据（非相似度）">依据：${htmlescape(String(memory.why))}</div>`
+      : '';
     // v0.8.4 Step 9 / G025 修复：移除内联 onclick，改用 data-action + data-arg（索引）
     // v0.9.7 无障碍修复（D-9）：补 role/tabindex/aria-label，使记忆卡可键盘聚焦并被读屏播报
     return `
       <div class="memory-card-item ${typeClass}" data-action="openMemoryDetail" data-memory-id="${htmlescape(String(memory.id || ''))}" role="button" tabindex="0" aria-label="查看记忆详情：${htmlescape(preview)}">
         <div class="memory-card-preview">${htmlescape(preview)}</div>
+        ${why}
         <div class="memory-card-meta">
           <span><img src="/assets/icons/icon-memory.svg" alt="" width="12" height="12"> ${htmlescape(memory.memory_type || '未分类')}</span>
           <span>重要性: ${htmlescape(String(importance))}</span>
@@ -9207,8 +9329,13 @@ function openMemoryDetail(memoryOrIndex) {
       <span class="value">${htmlescape(memoryId || '--')}</span>
       <span class="label">标签</span>
       <span class="value">${htmlescape((memory.tags || []).join(', ') || '--')}</span>
+      <span class="label">事件 ID</span>
+      <span class="value">${htmlescape(memory.event_id || '--')}</span>
+      <span class="label">涉及实体</span>
+      <span class="value">${htmlescape((memory.entities || []).map(e => (e && e.name) ? e.name : String(e)).join(', ') || '--')}</span>
     </div>
     ${associationHtml}
+    <div id="memory-detail-record-assoc" class="memory-detail-record-assoc" style="margin-top:12px;"></div>
     ${!memoryId ? '<p class="text-sm text-dim" style="margin-top:8px;">该记忆无有效 ID，以下操作不可用</p>' : ''}
     <div class="memory-detail-actions" style="margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px;">
       <!-- v0.8.3 Step 11：N12 XSS 修复，使用 data-action + data-arg 替代内联 onclick（修复 G001-G003） -->
@@ -9267,7 +9394,139 @@ function openMemoryDetail(memoryOrIndex) {
 
   panel.classList.add('open');
   backdrop.classList.add('open');
+
+  // 记录层关联（异步）：仅当该记忆携带 event_id/entities 时才有内容。
+  // 与上方"为什么联想这条"（查询驱动的相似度解释）不同，这里展示的是
+  // **记录层推导出的关联**（同一次经历 / 共享实体），依据是记录而非相似度。
+  loadRecordAssociations(memoryId);
 }
+
+/**
+ * 拉取并渲染「记录层关联」（同一次经历 / 共享实体 / 结晶谱系）
+ *
+ * 数据源 POST /v1/memories/associations。与查询驱动的联想解释相互独立：
+ *  - 无关则静默（不显示占位、不打断用户）
+ *  - 每条关联都展示后端给的 why 依据（对应「人类可解释」要求）
+ *
+ * @param {string} memoryId
+ */
+async function loadRecordAssociations(memoryId) {
+  const box = document.getElementById('memory-detail-record-assoc');
+  if (!box) return;
+  const id = String(memoryId || '').trim();
+  if (!id) { box.innerHTML = ''; return; }
+  try {
+    const res = await fetchWithTimeout(window.API_BASE + '/v1/memories/associations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memory_id: id }),
+    }, 8000);
+    if (!res.ok) { box.innerHTML = ''; return; }
+    const data = await res.json();
+    const items = Array.isArray(data.associations) ? data.associations : [];
+    const skipped = Array.isArray(data.skipped_entities) ? data.skipped_entities : [];
+    if (items.length === 0) {
+      // 静默：无关联不是错误（该记忆可能未记录事件/实体）
+      box.innerHTML = '';
+      return;
+    }
+    const LABELS = {
+      same_event: '同一次经历',
+      same_event_auto: '同期工作记录',
+      crystallized_into: '被结晶为',
+      evolved_from: '被更新过',
+      shared_entity: '共享实体',
+      // v0.9.8：系统从正文形态识别出的具体产物（如 app.js / v1_api.rs）。
+      // 与上面的 shared_entity 区分：后者是**用户填的**实体，本条是**系统识别的**，
+      // 证据来源不同 ⇒ 标签也必须不同（承 §3.53「证据要可区分」）。
+      shared_artifact: '共享具体产物',
+      derived_from: '结晶来源',
+    };
+    const rows = items.map(a => `
+      <li style="margin-top:6px;">
+        <span class="badge info">${htmlescape(LABELS[a.relation] || a.relation)}</span>
+        <span class="text-sm" style="margin-left:6px;">${htmlescape(a.why || '')}</span>
+        <div class="text-sm text-dim" style="margin-top:2px;">${htmlescape(a.content_preview || '')}</div>
+      </li>`).join('');
+    // 被跳过的泛化实体：让过滤可见（否则用户会把稀疏结果误读为"没有关联"）
+    const skippedNote = skipped.length > 0
+      ? `<div class="text-sm text-dim" style="margin-top:8px;">已跳过过于泛化的实体（其「共享」近乎恒真，无区分度）：${htmlescape(skipped.map(e => `${e.name}(${e.count} 条, ${Math.round((e.ratio || 0) * 100)}%)`).join('、'))}</div>`
+      : '';
+    box.innerHTML = `
+      <div style="padding:10px;border:1px solid var(--border-color,#ddd);border-radius:6px;">
+        <strong>这条记忆的关联</strong>
+        <div class="text-sm text-dim" style="margin-top:4px;">依据是记录（同一次经历 / 共享实体），不是内容相似。</div>
+        <ul style="margin:8px 0 0;padding-left:16px;">${rows}</ul>
+        ${skippedNote}
+        <div id="memory-detail-indirect" style="margin-top:10px;"></div>
+      </div>`;
+    // 间接关联由「关联图」接口单独加载（多一跳推理，成本更高，故按需拉取）。
+    // 与上面的直接关联**分开展示**：间接关联的证据强度不同（经中间记忆传递），
+    // 混在一起会让用户误以为它们与直接关联等价（§3.48.4）。
+    loadIndirectAssociations(id);
+  } catch (e) {
+    // 静默失败：关联是附加信息，不可因此打断详情查看
+    console.warn('[loadRecordAssociations] 关联加载失败（已忽略）:', e && e.message);
+    box.innerHTML = '';
+  }
+}
+window.loadRecordAssociations = loadRecordAssociations;
+
+/**
+ * 拉取并渲染「间接关联」（经中间记忆可达的 2 跳关联）
+ *
+ * 数据源 POST /v1/memories/association-graph。
+ * **为什么与直接关联分开**：间接关联是「推理」的产物——
+ * 两条记忆之间**没有任何直接记录**，但经中间记忆可达。
+ * 其证据强度弱于直接关联，必须：
+ *   - 单独分区展示（不混入直接关联列表）
+ *   - 显示完整路径（用户可逐跳核验，对应「人类可解释」）
+ *   - 无结果时整块隐藏（不显示空标题）
+ *
+ * @param {string} memoryId
+ */
+async function loadIndirectAssociations(memoryId) {
+  const box = document.getElementById('memory-detail-indirect');
+  if (!box) return;
+  try {
+    const res = await fetchWithTimeout(window.API_BASE + '/v1/memories/association-graph', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ memory_id: memoryId, max_nodes: 30 }),
+    }, 8000);
+    if (!res.ok) { box.innerHTML = ''; return; }
+    const g = await res.json();
+    const edges = Array.isArray(g.edges) ? g.edges : [];
+    const indirect = edges.filter(e => Number(e.hops) >= 2);
+    if (indirect.length === 0) { box.innerHTML = ''; return; }
+    // 节点内容预览按 id 建索引，供展示目标内容
+    const byId = {};
+    (Array.isArray(g.nodes) ? g.nodes : []).forEach(n => { byId[n.memory_id] = n; });
+    const rows = indirect.map(e => {
+      const target = byId[e.to] || {};
+      const pathLen = Array.isArray(e.path) ? e.path.length : 0;
+      return `
+        <li style="margin-top:8px;">
+          <span class="badge">间接关联</span>
+          <span class="text-sm" style="margin-left:6px;">${htmlescape(e.why || '')}</span>
+          <div class="text-sm text-dim" style="margin-top:2px;">${htmlescape(target.content_preview || '')}</div>
+          <div class="text-sm text-dim" style="margin-top:2px;">路径：${pathLen} 个节点（比直接关联多 ${Math.max(0, pathLen - 2)} 跳）</div>
+        </li>`;
+    }).join('');
+    box.innerHTML = `
+      <div style="padding:8px;border-top:1px dashed var(--border-color,#ddd);">
+        <strong>推理出的间接关联</strong>
+        <div class="text-sm text-dim" style="margin-top:4px;">这两条记忆之间<b>没有直接记录</b>，但经中间记忆可达。每条都附了「经由什么」的解释，可自行核验。</div>
+        <ul style="margin:8px 0 0;padding-left:16px;">${rows}</ul>
+        ${g.truncated ? '<div class="text-sm text-dim" style="margin-top:6px;">结果已按节点上限截断，可能不完整。</div>' : ''}
+      </div>`;
+  } catch (e) {
+    // 静默失败：间接关联是附加信息
+    console.warn('[loadIndirectAssociations] 间接关联加载失败（已忽略）:', e && e.message);
+    box.innerHTML = '';
+  }
+}
+window.loadIndirectAssociations = loadIndirectAssociations;
 
 /**
  * 关闭记忆详情面板
@@ -9971,12 +10230,15 @@ async function loadAssociationRecords() {
 }
 
 async function clearAssociationRecords() {
-  if (!window.confirm('确认清除本机保存的全部联想过程记录吗？这不会删除记忆内容。')) return;
+  if (!window.confirm('确认清除本机保存的全部联想过程记录吗？这不会删除记忆内容，也不影响审计完整性。')) return;
   try {
     const response = await fetchWithTimeout(`${API_BASE}/v1/associations/records`, { method: 'DELETE' }, 8000);
     if (!response.ok) throw new Error(`清除失败（${response.status}）`);
     await loadAssociationRecords();
-    showToast('联想记录已在本机清除', 'success');
+    // v0.9.8：文案改为「隐藏」——本操作把记录 ID 记入隐藏集合（重启后仍不显示），
+    // 而非物理删除（审计是防篡改哈希链，删行会让完整性校验报篡改）
+    const d = await response.json().catch(() => null);
+    showToast(`联想记录已隐藏${d && d.cleared ? `（${d.cleared} 条）` : ''}，重启后仍不显示`, 'success');
   } catch (error) {
     console.error('[association] 记录清除失败:', error);
     showToast(error.message || '联想记录清除失败', 'error');
@@ -9992,13 +10254,11 @@ async function startAssociationExplore() {
   const trailEl = document.getElementById('association-trail');
   const evidenceEl = document.getElementById('association-evidence');
   const query = input?.value.trim();
-  if (!query) { status.textContent = '先输入一句话，例如：今晚吃什么？'; input?.focus(); return; }
-  // 深度与方向交给系统自动决定；隐藏参数保留默认值，仅供技术详情使用
-  const body = {
-    query,
-    depth: Number(document.getElementById('association-depth')?.value || 4) || 4,
-    width: Number(document.getElementById('association-width')?.value || 3) || 3
-  };
+  if (!query) { status.textContent = '先输入一句话，或者点一个上面的例子试试。'; input?.focus(); return; }
+  // 联想深度与方向由后端决定（v0.9.8 起不再由前端硬编码指定）：
+  // 此前 HTML 里写 depth=2、JS 兜底写 4，两者互相矛盾且都没有依据。
+  // 现在不传这两个参数，由后端用其默认值（深度/宽度均已有 clamp 保护）。
+  const body = { query };
   status.textContent = '正在翻你的记忆…';
   if (resultCard) resultCard.hidden = false;
   if (conclusionEl) conclusionEl.innerHTML = '<span class="association-loading">正在回想…</span>';
@@ -10057,17 +10317,24 @@ async function startAssociationExplore() {
             '活跃锚点': '是你最近常想起的记忆',
             '无共鸣信号·发散噪声': '离得太远，已略过'
           };
-          return map[reason] || reason || '和你记下的内容有关';
+          // v0.9.8：未知证据类型**不再回落到原始标识符**——
+          // 后端新增证据类型时，旧前端会把内部标签直接显示给用户
+          //（如 evidence_key_v3），既不可读也可能暴露实现细节。
+          // 改为通用说明：诚实但不说错。
+          return map[reason] || '和你记下的内容有关';
         };
         // 按深度分组：0 最贴合查询的起点，1 直接想起，2 再往前一步，3+ 更远一步
         const byDepth = {};
         nodes.forEach(node => { (byDepth[node.depth] = byDepth[node.depth] || []).push(node); });
-        const groupTitle = {
-          0: '最贴合你问的',
-          1: '直接联想',
-          2: '再往前一步',
-          3: '更远一步',
-          4: '更远一步'
+        // 层级标题**由实际数据派生**而非硬编码映射（v0.9.8）：
+        // 此前写死 {0:'最贴合你问的',1:'直接联想',2:'再往前一步',3/4:'更远一步'}，
+        // 一旦后端默认深度变化，标题就与实际层数脱节（且 3/4 都叫"更远一步"）。
+        // 现在：0 层说明来源，其余层按相对距离生成。
+        const groupTitle = d => {
+          const n = Number(d);
+          if (n === 0) return '最贴合你问的';
+          if (n === 1) return '直接联想';
+          return `更远一步（第 ${n} 层）`;
         };
         // v0.9.7：直接联想优先展示；更远的联想默认折叠，减少视觉噪声——
         // 用户主要关心"直接想到什么"，深层发散按需展开。
@@ -10076,16 +10343,42 @@ async function startAssociationExplore() {
         // 看不到最好的联想结果；同时它也带"就是这个"确认按钮。
         const nearDepths = Object.keys(byDepth).sort((a, b) => Number(a) - Number(b)).filter(d => Number(d) >= 0 && Number(d) <= 1);
         const farDepths = Object.keys(byDepth).sort((a, b) => Number(a) - Number(b)).filter(d => Number(d) >= 2);
+        // 记录层关联类型 → 普通人能看懂的话（v0.9.8）
+        // 依据来自记录（event_id/entities），与相似度扩散的"语义相近"性质不同，
+        // 必须让用户看得出区别——这是"这条为什么一定会被想起来"的解释。
+        const relationPlain = rel => {
+          const map = {
+            'same_event': '同一次经历中记下的',
+            'same_event_auto': '同一时段一起写下的',
+            'crystallized_into': '这条被结晶成了它',
+            'evolved_from': '这条本身被更新过',
+            'shared_entity': '提到了同一个对象',
+            // v0.9.8：与 shared_entity 的区别要写清——用户填的实体 vs 系统识别的产物
+            'shared_artifact': '提到了同一个具体产物（系统从正文识别）',
+            'derived_from': '由这条记忆结晶而来'
+          };
+          return map[rel] || '由记录推导出的关联';
+        };
         const renderGroup = d => {
           const list = byDepth[d].map(node => {
-            const reason = evidenceMap[node.id] ? ` · ${htmlescape(String(plain(evidenceMap[node.id])))}` : '';
+            // 记录层节点：显示"凭什么关联"（relation + 后端给的具体依据 why）
+            const isRecord = node.source === 'record';
+            let reason;
+            if (isRecord) {
+              const why = node.why ? `（${htmlescape(String(node.why))}）` : '';
+              reason = ` · ${relationPlain(node.relation)}${why}`;
+            } else {
+              const ev = evidenceMap[node.id];
+              reason = ev ? ` · ${htmlescape(String(plain(ev)))}` : '';
+            }
             // v0.9.7：确认按钮——用户点击"就是这个"后，该记忆以最高激活强度
             // 写回道体状态机活跃锚点，之后的联想会优先想起它。
             // data-arg-mode="this" 让集中分发器把元素自身传入处理函数。
             const confirmBtn = `<button type="button" class="btn btn-sm association-confirm-btn" data-action="confirmAssociation" data-arg-mode="this" data-memory-id="${htmlescape(node.id)}" data-query="${htmlescape(query)}">就是这个</button>`;
-            return `<div class="association-story-node"><span class="association-branch-dot"></span><div><strong>${htmlescape(node.content)}</strong><div class="text-sm text-dim">${reason || '和你问的主题有关'}</div></div>${confirmBtn}</div>`;
+            const tag = isRecord ? '<span class="association-record-tag">记录关联</span>' : '';
+            return `<div class="association-story-node"><span class="association-branch-dot"></span><div><strong>${htmlescape(node.content)}</strong><div class="text-sm text-dim">${reason.replace(/^ · /, '') || '和你问的主题有关'}</div></div>${tag}${confirmBtn}</div>`;
           }).join('');
-          return `<div class="association-story-group"><div class="association-subtitle">${d === '1' ? '直接联想' : groupTitle[d]}</div>${list}</div>`;
+          return `<div class="association-story-group"><div class="association-subtitle">${groupTitle(d)}</div>${list}</div>`;
         };
         const farCount = farDepths.reduce((sum, d) => sum + byDepth[d].length, 0);
         const farBlock = farCount
@@ -10162,6 +10455,69 @@ async function confirmAssociation(button) {
 }
 window.confirmAssociation = confirmAssociation;
 
+/**
+ * 加载「试试看」示例问题（v0.9.8，数据驱动）
+ *
+ * **为什么必须走后端**：此前这里是四个硬编码的生活场景
+ *（「今晚吃什么？」「周末去哪儿玩？」…）。但每个用户的记忆库内容不同——
+ * 只记技术内容的用户点这些示例必然全部落到弱匹配空态，
+ * 会误以为"联想功能坏了"。
+ *
+ * 现在由 GET /v1/associations/suggestions 从该用户**自己的记忆**生成：
+ * 优先用同一事件簇，其次用具体实体（并跳过泛化实体）。
+ * 返回空数组时整块隐藏——诚实优于给点不通的假引导。
+ */
+async function loadAssociationSuggestions() {
+  const box = document.getElementById('association-presets');
+  if (!box) return;
+  try {
+    const res = await fetchWithTimeout(`${API_BASE}/v1/associations/suggestions`, {}, 8000);
+    if (!res.ok) { box.innerHTML = ''; box.style.display = 'none'; return; }
+    const data = await res.json();
+    const list = Array.isArray(data.suggestions) ? data.suggestions : [];
+    if (!list.length) {
+      // 该用户库中没有可构造示例的经历记忆：隐藏整块，不显示点不通的引导
+      box.innerHTML = '';
+      box.style.display = 'none';
+      return;
+    }
+    box.innerHTML = list.map(s => {
+      const text = htmlescape(String(s.text || ''));
+      // title 说明这条示例是怎么来的（可核验，非随机凑数）
+      const hint = s.origin === 'event_cluster'
+        ? `来自同一次经历的 ${Number(s.support || 0)} 条记忆`
+        : `来自 ${Number(s.support || 0)} 条提到它的记忆`;
+      return `<button type="button" class="association-preset-chip" data-explore-preset="${text}" title="${htmlescape(hint)}">${text}</button>`;
+    }).join('');
+    box.style.display = '';
+    bindAssociationPresets();
+  } catch (error) {
+    // 示例是附加价值，失败静默（不打断用户手动提问）
+    console.warn('[association] 示例加载失败（已忽略）:', error && error.message);
+    box.innerHTML = '';
+    box.style.display = 'none';
+  }
+}
+
+/**
+ * 绑定示例 chip 点击（每次重新渲染后需重绑）
+ *
+ * 用事件委托在容器上绑一次，避免"重新渲染后监听器丢失"——
+ * 这与 v0.9.8 新增的"从后端动态生成示例"直接相关（内容变了，按钮是新的）。
+ */
+function bindAssociationPresets() {
+  const box = document.getElementById('association-presets');
+  if (!box || box.dataset.delegated === '1') return;
+  box.dataset.delegated = '1';
+  box.addEventListener('click', event => {
+    const chip = event.target.closest('[data-explore-preset]');
+    if (!chip) return;
+    const input = document.getElementById('association-query');
+    if (input) input.value = chip.dataset.explorePreset || '';
+    startAssociationExplore();
+  });
+}
+
 function initAssociationCenter() {
   document.querySelectorAll('[data-association-view]').forEach(button => {
     if (button.dataset.associationBound === '1') return;
@@ -10175,16 +10531,8 @@ function initAssociationCenter() {
     });
   });
   ['association-record-multi-hop', 'association-record-evidence'].forEach(id => document.getElementById(id)?.addEventListener('change', loadAssociationRecords));
-  // 一键示例：点击后填入输入框并直接开始联想（面向普通用户）
-  document.querySelectorAll('[data-explore-preset]').forEach(chip => {
-    if (chip.dataset.presetBound === '1') return;
-    chip.dataset.presetBound = '1';
-    chip.addEventListener('click', () => {
-      const input = document.getElementById('association-query');
-      if (input) input.value = chip.dataset.explorePreset || '';
-      startAssociationExplore();
-    });
-  });
+  // 示例问题：从后端按该用户真实记忆生成（v0.9.8，替换硬编码）
+  loadAssociationSuggestions();
 }
 
 async function loadAssociationCenterObservation() {

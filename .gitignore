@@ -455,3 +455,31 @@ benchmarks/*_raw_*.json
 !scripts/dev-proxy.py
 !scripts/run-dev.ps1
 !scripts/run-dev.bat
+
+# v0.9.8 发布清理（2026-09-16）：道体研究资产目录（不随产品发布）
+# 依据：与上文 :422 `daoti/` 同性质——三者均为**道体研究的选型/源码/权重归档**，
+#       面向维护者的研究材料，非产品交付内容；体积合计约 **91.4 MB**
+#       （选型包 2.3MB / 融合引擎源码与文档 44.1MB / v15 权重包 45.0MB），
+#       远超 GitHub 单文件与仓库体量惯例，且含模型权重（*.onnx / *.pt / .safetensors）。
+# 边界：Cargo 打包走 Cargo.toml 的 include/exclude，与本文件无关；
+#       本规则仅阻止其进入 git 仓库，不删除本地文件。
+# 注：选型结论已提炼进 `daoti/PREREG_MEMORY_ASSOCIATION.md`（该文件亦在 daoti/ 忽略范围内）。
+11_记忆联想专项_选型包/
+DAOti+llm_融合引擎源码与文档/
+daoti_v15_package/
+
+# v0.9.8 本地研究过程文档（不交付用户，与 :394 docs/*验证*.md 同类）
+docs/RECORD_LAYER_ROLLOUT.md
+
+# v0.9.8：内部架构文档（不交付用户，与 :91 docs/ARCHITECTURE.md 同类）
+# 依据：一份面向维护者的 LRC 全栈架构说明（354 行），经全仓引用反向扫描确认**零引用**；
+#       且其文档基准为 v0.9.7（含"未提交的状态驱动发现改动"），已落后于当前版本，
+#       随产品交付会立即产生文档漂移。
+docs/ARCHITECTURE_OVERVIEW.md
+
+# v0.9.8：过程验证报告（不交付用户）
+# 依据：与上文 :271 `docs/CDP_TEST_REPORT_*.md`、:398 `docs/*验证*.md` 同类——
+#       均为一次性验收/技术验证的过程留痕，非产品文档。
+#       仅因文件名为英文而未被上述中文/模式规则覆盖，此处补齐口径。
+docs/CDP_WHY_VERIFY_*.md
+docs/DAOTI_INTEGRATION_VERIFY.md

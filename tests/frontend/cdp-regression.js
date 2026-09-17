@@ -495,10 +495,27 @@ async function deepTestActionInner(cdp, action, arg) {
   // 豁免特征收紧为两条精确正则：unfold 预期 404、Tauri capability 跨 origin 拒绝。
   const EXPECTED_ERROR_PATTERNS = [];
   if (expectedUnfoldFailure) EXPECTED_ERROR_PATTERNS.push(/404|unfold/i);
+  // ★v0.9.8 修复：豁免必须与**触发条件**绑定——只有在页面确实被导航到
+  // 非 tauri origin（dev-proxy 1420）时，IPC 被 capability 拒绝才是"预期副作用"。
+  //
+  // 为什么必须加此前置判断（实测故障）：此豁免原为无条件，导致页面停留在
+  // tauri.localhost（**用户正常使用开发桌面端**）时出现的同类错误也被静默豁免
+  // ⇒ 用户点「启动服务」报 "start_sidecar not allowed by ACL"（真实故障），
+  //    而本脚本照旧报 PASS —— 消除假失败却掩盖了真失败。
+  //
+  // 承 v0.9.7 审查结论：「豁免必须按错误文本逐条过滤」；本条是该原则的延伸——
+  // **不仅过滤文本，还要校验触发前提**。
   if (action === 'handleStartServiceClick') {
-    // Tauri capability 对非 tauri origin 的 IPC 拒绝消息形如
-    // "start_sidecar not allowed. Plugin not found" / "...not allowed on origin..."
-    EXPECTED_ERROR_PATTERNS.push(/(start_sidecar|command).{0,40}not allowed/i);
+    const pageOrigin = await cdp.eval('location.origin').catch(() => '');
+    if (pageOrigin !== 'https://tauri.localhost') {
+      // Tauri capability 对非 tauri origin 的 IPC 拒绝消息形如
+      // "start_sidecar not allowed. Plugin not found" / "...not allowed on origin..."
+      EXPECTED_ERROR_PATTERNS.push(/(start_sidecar|command).{0,40}not allowed/i);
+    } else {
+      // 页面在 tauri.localhost（正常 origin）⇒ IPC **必须可用**，
+      // 出现 "not allowed" 即为真实故障，不得豁免
+      r.notes.push('★页面在 tauri.localhost（IPC 应可用）⇒ 不豁免 not allowed 错误（若出现即为真实故障）');
+    }
   }
   const removed = cdp.consoleErrors.filter((e, i) => i >= preConsoleErrors && EXPECTED_ERROR_PATTERNS.some((re) => re.test(e)));
   if (removed.length > 0) {
@@ -908,6 +925,26 @@ async function main() {
   console.log(`input 结果: ${JSON.stringify(summary.counts.inputs)}`);
   console.log(`发布门禁: ${gateStatus}`);
   console.log(`报告: ${outMd}`);
+
+  // ★v0.9.8 修复：把页面**导航回 tauri.localhost**。
+  //
+  // 为什么必须做（实测故障）：本脚本在 BOOT 阶段会把页面 Page.navigate 到
+  // dev-proxy(1420) 以测磁盘最新前端，但此前**结束后不导航回去** ⇒
+  // 用户桌面端永久停留在 1420 origin，该 origin 下 Tauri capability
+  // 拒绝所有 IPC（"start_sidecar not allowed by ACL"）⇒ **开发桌面端启动失败**。
+  // 这一步是"测试不得留下副作用"的兜底：跑完回到用户可用的状态。
+  try {
+    const curOrigin = await cdp.eval('location.origin').catch(() => '');
+    if (curOrigin && curOrigin !== 'https://tauri.localhost') {
+      await cdp.send('Page.navigate', { url: 'https://tauri.localhost/index.html' });
+      await sleep(3000);
+      const nowOrigin = await cdp.eval('location.origin').catch(() => '');
+      console.log(`[RESTORE] 页面已从 ${curOrigin} 导航回 ${nowOrigin}（恢复 IPC 可用状态）`);
+    }
+  } catch (e) {
+    console.log(`[RESTORE] 导航回 tauri.localhost 失败（请手动重载桌面端）: ${e.message}`);
+  }
+
   if (gateStatus === 'FAIL') process.exitCode = 1;
 }
 

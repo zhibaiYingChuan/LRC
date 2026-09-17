@@ -244,6 +244,11 @@ impl Persistence for JsonPersistence {
         Ok(())
     }
 
+    /// JSON 后端完整实现状态持久化（memory_state.json / assoc_frequency.json）
+    fn supports_state_persistence(&self) -> bool {
+        true
+    }
+
     fn save_memory(&self, memory: &Memory) -> Result<(), PersistenceError> {
         // 防御性检查：确保数据目录存在（应对临时目录被清理等场景）
         self.ensure_data_dir()?;
@@ -649,6 +654,78 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "mem-1");
         assert_eq!(loaded[0].content, "测试记忆内容");
+    }
+
+    // ── v0.9.8：状态持久化能力声明 ──
+    //
+    // 背景：这两个状态方法有 trait 默认实现（返回空 + 忽略保存），
+    // 未实现的后端会导致"联想活性/语义吸铁石压制重启归零"且**无提示**。
+    // 故此组测试既验证 JSON 后端**做到**了，也验证它**声明**了。
+
+    /// JSON 后端必须声明支持状态持久化（否则启动时会打印降级告警）
+    #[test]
+    fn test_json_backend_declares_state_persistence() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let p = JsonPersistence::new(dir.path().to_string_lossy().as_ref()).expect("应成功创建");
+        assert!(
+            p.supports_state_persistence(),
+            "JSON 后端已实现 load/save_memory_state 与 load/save_assoc_frequency，\
+必须如实声明 true——否则用户会看到不该出现的降级告警"
+        );
+    }
+
+    /// 负向对照：默认实现（未声明）必须为 false
+    ///
+    /// **为什么需要**：若 `supports_state_persistence` 的默认值被误改为 true，
+    /// 所有未实现的后端都会**静默**降级（告警永不触发）——本测试固化默认值。
+    ///
+    /// 实现方式：复用已有的 `StubPersistence`（只实现必需方法，不实现任何
+    /// 状态方法），从而**真实地**走 trait 默认实现，而不是断言常量。
+    #[test]
+    fn test_default_supports_state_persistence_is_false() {
+        let p = crate::persistence::test_stub::StubPersistence;
+        assert!(
+            !p.supports_state_persistence(),
+            "默认实现必须为 false：未实现状态持久化的后端不该声称支持，\
+否则降级告警永不触发（静默功能降级会重新出现）"
+        );
+        // 同时确认默认实现的行为确实是"空 + 忽略"
+        assert!(p
+            .load_memory_state()
+            .expect("默认实现不应报错")
+            .active
+            .is_empty());
+        assert_eq!(
+            p.load_assoc_frequency()
+                .expect("默认实现不应报错")
+                .total_queries,
+            0
+        );
+    }
+
+    /// 状态确实能跨实例读回（写 → 新实例 → 读到，非内存缓存假绿）
+    #[test]
+    fn test_memory_state_persists_across_instances() {
+        use crate::memory_state_machine::{ActiveMemory, MemoryState};
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let first = JsonPersistence::new(&data_dir).expect("应创建第一个实例");
+
+        let mut state = MemoryState::default();
+        state.active.push(ActiveMemory {
+            memory_id: "mem-x".to_string(),
+            activation: 0.75,
+            hits: 3,
+            last_step: 5,
+        });
+        first.save_memory_state(&state).expect("应成功保存状态");
+
+        // 新实例（不共享内存）读取
+        let second = JsonPersistence::new(&data_dir).expect("应创建第二个实例");
+        let loaded = second.load_memory_state().expect("应成功加载状态");
+        assert_eq!(loaded.active.len(), 1, "状态必须跨实例可读回");
+        assert_eq!(loaded.active[0].memory_id, "mem-x");
+        assert!((loaded.active[0].activation - 0.75).abs() < 1e-6);
     }
 
     #[test]

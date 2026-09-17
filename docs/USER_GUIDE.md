@@ -2,7 +2,7 @@
 
 > **AI 编程助手的记忆与检索插件** — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定。
 >
-> 版本：v0.9.7 | 适用于：Trae / Cursor / VS Code / Claude Desktop 等支持 MCP 协议的 AI 工具
+> 版本：v0.9.8 | 适用于：Trae / Cursor / VS Code / Claude Desktop 等支持 MCP 协议的 AI 工具
 
 ---
 
@@ -336,11 +336,26 @@ alwaysApply: true
 
 每次完成代码修改任务后，**自动检查并同步记忆库**，无需用户提醒。
 
+### 规则 4：写「经历」时填 `event_id` —— 这是「联想」的唯一依据
+
+记忆之间能互相联想，靠的**不是内容相似**，而是**它们来自同一次经历**。
+例：`游西湖` 与 `吃楼外楼` 语义上毫不相关，但只要同属"一次杭州之行"，
+它们就该能互相联想——这是任何相似度算法都给不出的连接。
+
+- `memory_type` 用 `experience`；写一次外出 / 会议 / 排障 / 对话时可用
+- `event_id` 由 AI 生成并复用，建议「类型-对象-时间窗」，
+  如 `trip-hangzhou-2026-09`、`task-fix-login-20260916`
+- 一次写多条时，用 `batch_remember` 在**批次级**传一次 `event_id` 即可
+- `entities` 填**内容里明确出现**的人/地/时/物（name + kind），
+  只做誊写、不做推断；优先填具体对象（`commands.rs`、`楼外楼`），
+  不要填泛化名（项目名、公司名）
+
 ### 记忆工具说明
 
 | 工具 | 用途 | 关键参数 |
 |------|------|---------|
-| `remember` | 记录新记忆 | content（内容）、memory_type（类型）、tags（标签）、importance（重要性 1-10） |
+| `remember` | 记录新记忆 | content（内容）、memory_type（类型）、tags（标签）、importance（重要性 1-10）、**event_id（同一次经历，见规则 4）**、**entities（人/地/时/物）** |
+| `batch_remember` | 批量写入（≤200 条） | memories（数组）、**event_id（批次级共用一次）** |
 | `recall` | 语义检索历史记忆 | query（自然语言查询）、top_k（返回数量，建议 3-5） |
 | `update_memory` | 更新已有记忆 | memory_id（记忆 ID）、content（新内容） |
 | `forget` | 删除记忆 | memory_id（记忆 ID） |
@@ -352,6 +367,7 @@ alwaysApply: true
 - `decision` — 架构决策
 - `preference` — 约定偏好
 - `fact` — 事实信息
+- `experience` — **经历**（"我经历过什么"，应带 `event_id` 与 `entities`，是"联想"的载体）
 
 ---
 

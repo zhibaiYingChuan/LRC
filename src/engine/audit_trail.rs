@@ -429,6 +429,29 @@ pub struct AuditTrail {
     /// 关键操作需要第二人确认才能执行，防止单个恶意
     /// 内部人员或被盗账号进行隐蔽的数据污染。
     pending_dual_confirmations: Vec<PendingConfirmation>,
+    /// 被用户**隐藏**的事件 ID 集合（v0.9.8）
+    ///
+    /// # 为什么用"隐藏集合"而不是"真删除"
+    ///
+    /// 用户点「清除联想足迹」的诉求是"不想再看到这些记录"，而审计日志是
+    /// **防篡改哈希链**（`event_hash` 由 `previous_hash + 事件内容` 计算，
+    /// 见 [`canonical_hash_fields`]）——**从 JSONL 中删行会让链条断裂**，
+    /// `verify_integrity` 将报篡改。
+    ///
+    /// 因此采用**独立隐藏集合**：
+    /// - 不动事件内容 ⇒ 哈希链完好，完整性校验照常通过
+    /// - [`Self::query`] 过滤掉隐藏项 ⇒ 用户视角"已清除"
+    /// - 隐藏集合**独立落盘**（`.hidden` 文件，JSONL 每行一个 ID）⇒ 重启后仍隐藏
+    ///
+    /// # 为什么不能用 `metadata` 打标记
+    ///
+    /// `metadata` 的**全部键值**都参与 `canonical_hash_fields` ⇒ 往里加
+    /// `hidden=true` 会改变 `metadata_canon`，导致该事件的
+    /// `event_hash` 与重算值不符 ⇒ **立即被判定为篡改**（硬失败）。
+    /// 故标记必须存放在事件**之外**。
+    hidden_ids: std::collections::HashSet<String>,
+    /// 隐藏集合的持久化路径（派生自审计日志路径：`<audit>.hidden`）
+    hidden_path: Option<String>,
 }
 
 impl Drop for AuditTrail {
@@ -465,6 +488,8 @@ impl AuditTrail {
             anchor_config: TrustAnchorConfig::default(), // 质疑四：锚点配置
             last_anchor_ms: 0,         // 质疑四：尚未锚定
             pending_dual_confirmations: Vec::new(), // 质疑四：待确认列表
+            hidden_ids: std::collections::HashSet::new(), // v0.9.8：初始无隐藏事件
+            hidden_path: None,
         }
     }
 
@@ -485,6 +510,12 @@ impl AuditTrail {
         // 质疑三·终极：设置封印路径（.lrc_audit_seal）
         let seal_path = format!("{}.seal", path);
         self.seal_path = Some(seal_path.clone());
+
+        // v0.9.8：「清除联想足迹」的隐藏集合——独立于审计日志的文件，
+        // 避免"删除记录"与"防篡改哈希链"的根本冲突（见 hidden_ids 字段文档）
+        let hidden_path = format!("{}.hidden", path);
+        self.hidden_path = Some(hidden_path.clone());
+        self.load_hidden_from_disk(&hidden_path);
 
         // 质疑四·锚点跨重启持久化：若未显式配置锚点文件，
         // 默认派生 `<audit>.anchors.jsonl`，并从磁盘恢复历史锚点。
@@ -1172,12 +1203,20 @@ impl AuditTrail {
 
     /// 道枢映射: 离卦·火 (☲) — 明也，查询如火光之照亮审计历史
     /// 按查询条件筛选事件
+    ///
+    /// v0.9.8：**过滤被用户隐藏的事件**（「清除联想足迹」的实现载体）。
+    /// 过滤发生在本层而非删除层——事件在存储中仍完整保留以维持哈希链，
+    /// 只是不再对用户可见（见 [`Self::hide_matching`] 的设计说明）。
     pub fn query(&self, query: &AuditQuery) -> Vec<&AuditEvent> {
         let limit = query.limit.unwrap_or(100).min(1000);
 
         self.events
             .iter()
             .filter(|event| {
+                // v0.9.8：用户隐藏的事件不返回（用户视角"已清除"）
+                if self.hidden_ids.contains(&event.id) {
+                    return false;
+                }
                 // 时间范围过滤
                 if let Some(from) = query.from_ms {
                     if event.timestamp_ms < from {
@@ -1224,17 +1263,115 @@ impl AuditTrail {
         stats
     }
 
-    /// 清理符合条件的事件，返回清理数量。
-    pub fn clear_matching<F>(&mut self, mut predicate: F) -> usize
+    /// **隐藏**符合条件的事件，返回隐藏数量（v0.9.8，替代原 `clear_matching`）。
+    ///
+    /// # 与"删除"的区别（这是本轮修复的核心）
+    ///
+    /// 原名 `clear_matching` 只做 `self.events.retain(...)` —— **仅清内存**。
+    /// 但审计日志是 append-only 的 JSONL（见结构体文档），且
+    /// [`Self::load_from_file`] 在每次启动时会把磁盘记录**重新灌回内存**
+    /// ⇒ 用户点「清除联想足迹」后，**重启 sidecar 记录全部复活**，功能实际无效。
+    ///
+    /// 实测（v0.9.8，dev 库）：
+    /// ```text
+    /// 清除前   内存 141 条 / 磁盘 141 行
+    /// 清除后   内存   0 条 / 磁盘 141 行   ← 用户看到"已清除"，磁盘未变
+    /// 重启后   内存 141 条 / 磁盘 141 行   ← 全部复活
+    /// ```
+    ///
+    /// 本方法改为把命中事件的 **ID 记入隐藏集合**：
+    /// - 事件本身**不删**（哈希链完好，`verify_integrity` 照常通过）
+    /// - [`Self::query`] 过滤隐藏项 ⇒ 用户视角已清除
+    /// - 隐藏集合落盘（`<audit>.hidden`）⇒ **重启后仍隐藏**
+    ///
+    /// # 为什么"隐藏"而不是"真删+重建链"
+    ///
+    /// 真删需要重算整条哈希链并重写封印与信任锚点——那会**摧毁
+    /// "审计不可篡改"这一承诺本身**（用户将无法区分"系统重建了链"与
+    /// "攻击者改了链"）。隐藏则把"用户隐私诉求"与"审计完整性"解耦：
+    /// 前者是**视图层**的事，后者是**存储层**的事。
+    pub fn hide_matching<F>(&mut self, mut predicate: F) -> usize
     where
         F: FnMut(&AuditEvent) -> bool,
     {
-        let before = self.events.len();
-        self.events.retain(|event| !predicate(event));
-        before.saturating_sub(self.events.len())
+        // 先收集 ID（不可在遍历中借用 self.events 的可变引用）
+        let ids: Vec<String> = self
+            .events
+            .iter()
+            .filter(|e| predicate(e))
+            .map(|e| e.id.clone())
+            .collect();
+        let n = ids.len();
+        for id in ids {
+            self.hidden_ids.insert(id);
+        }
+        if n > 0 {
+            self.persist_hidden();
+        }
+        n
+    }
+
+    /// 取消隐藏（恢复可见），返回恢复数量。用于误操作回退。
+    pub fn unhide_all(&mut self) -> usize {
+        let n = self.hidden_ids.len();
+        self.hidden_ids.clear();
+        if n > 0 {
+            self.persist_hidden();
+        }
+        n
+    }
+
+    /// 当前隐藏的事件数量
+    pub fn hidden_count(&self) -> usize {
+        self.hidden_ids.len()
+    }
+
+    /// 把隐藏集合写入磁盘（JSONL：每行一个事件 ID）
+    ///
+    /// **失败不静默**：写盘失败会打印错误（隐藏集合丢失会导致"重启后复活"
+    /// 这一用户可见缺陷重现，必须可诊断）。
+    fn persist_hidden(&self) {
+        let Some(path) = self.hidden_path.as_ref() else {
+            return;
+        };
+        let mut buf = String::new();
+        for id in &self.hidden_ids {
+            buf.push_str(id);
+            buf.push('\n');
+        }
+        if let Err(e) = std::fs::write(path, buf) {
+            eprintln!(
+                "[LRC·审计] 隐藏集合写盘失败（重启后隐藏将失效）: {} - {}",
+                path, e
+            );
+        }
+    }
+
+    /// 从磁盘加载隐藏集合（启动时调用）
+    fn load_hidden_from_disk(&mut self, path: &str) {
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            // 文件不存在 = 从未隐藏过任何记录，属正常情况（不告警）
+            Err(_) => return,
+        };
+        for line in content.lines() {
+            let id = line.trim();
+            if !id.is_empty() {
+                self.hidden_ids.insert(id.to_string());
+            }
+        }
+        if !self.hidden_ids.is_empty() {
+            eprintln!(
+                "[LRC·审计] 从文件加载了 {} 条隐藏记录（这些记录不会出现在联想足迹中）",
+                self.hidden_ids.len()
+            );
+        }
     }
 
     /// 清理所有事件（慎用）
+    ///
+    /// **注意**：本方法只清内存，不影响磁盘 JSONL（append-only）。
+    /// 若要"用户视角清除"，请用 [`Self::hide_matching`]。
     pub fn clear(&mut self) {
         self.events.clear();
     }
@@ -2666,5 +2803,167 @@ mod tests {
             !trail.verify_anchor_chain(),
             "悬空锚点（引用链上不存在的哈希）应被检测"
         );
+    }
+
+    // ============================================================
+    // v0.9.8：「清除联想足迹」修复——隐藏集合机制
+    // ============================================================
+
+    /// 「清除联想足迹」：隐藏后 query 不再返回，但**哈希链必须完好**。
+    ///
+    /// 这是修复的核心判据：用户的隐私诉求（不再看到）与审计的完整性
+    /// （不可篡改）必须**同时满足**——原实现只清内存，破坏了后者没保住前者。
+    #[test]
+    fn test_hide_matching_hides_from_query_but_keeps_chain() {
+        let mut trail = AuditTrail::new();
+        make_event(&mut trail, AuditEventType::RetrievalExecuted, "检索 A");
+        make_event(&mut trail, AuditEventType::RetrievalExecuted, "检索 B");
+        make_event(&mut trail, AuditEventType::SynthesisCreated, "合成 C");
+
+        let q = AuditQuery {
+            from_ms: None,
+            to_ms: None,
+            event_types: Some(vec![AuditEventType::RetrievalExecuted]),
+            memory_id: None,
+            limit: None,
+        };
+        assert_eq!(trail.query(&q).len(), 2, "隐藏前应能查到 2 条检索记录");
+
+        let n = trail.hide_matching(|e| e.event_type == AuditEventType::RetrievalExecuted);
+        assert_eq!(n, 2, "应隐藏 2 条");
+        assert_eq!(trail.hidden_count(), 2);
+
+        assert_eq!(trail.query(&q).len(), 0, "隐藏后不应再查到检索记录");
+
+        // ★关键：其他类型不受影响，且完整性校验仍通过
+        let q_all = AuditQuery {
+            from_ms: None,
+            to_ms: None,
+            event_types: None,
+            memory_id: None,
+            limit: None,
+        };
+        assert_eq!(trail.query(&q_all).len(), 1, "未隐藏的合成事件应仍然可见");
+        assert!(
+            trail.verify_integrity().is_valid,
+            "隐藏不得破坏哈希链（事件本体未被修改）：{}",
+            trail.verify_integrity().details
+        );
+    }
+
+    /// ★★ 决定性：隐藏集合**落盘**，模拟跨进程重启后**不复活**。
+    ///
+    /// 这正是用户报告的缺陷场景：原实现下重启会 load_from_file 把记录灌回内存，
+    /// 用户"清除了"但重启后全部回来。本测试锁定修复后的行为。
+    #[test]
+    fn test_hidden_survives_restart() {
+        let tmp_dir = std::env::temp_dir();
+        let file_path = tmp_dir
+            .join("lrc_audit_hidden_restart_test.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let hidden_path = format!("{}.hidden", file_path);
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_file(&hidden_path);
+        let _ = std::fs::remove_file(format!("{}.seal", file_path));
+        let _ = std::fs::remove_file(format!("{}.anchors.jsonl", file_path));
+
+        let q = AuditQuery {
+            from_ms: None,
+            to_ms: None,
+            event_types: Some(vec![AuditEventType::RetrievalExecuted]),
+            memory_id: None,
+            limit: None,
+        };
+
+        // 第一次运行：写 3 条检索记录并隐藏
+        {
+            let mut trail = AuditTrail::new();
+            trail.set_persist_path(&file_path).unwrap();
+            make_event(&mut trail, AuditEventType::RetrievalExecuted, "检索 1");
+            make_event(&mut trail, AuditEventType::RetrievalExecuted, "检索 2");
+            make_event(&mut trail, AuditEventType::RetrievalExecuted, "检索 3");
+            trail.flush();
+            assert_eq!(trail.query(&q).len(), 3);
+
+            let n = trail.hide_matching(|e| e.event_type == AuditEventType::RetrievalExecuted);
+            assert_eq!(n, 3);
+            assert_eq!(trail.query(&q).len(), 0, "隐藏后当前进程应为 0 条");
+        }
+
+        // 模拟重启：新实例从磁盘加载
+        {
+            let mut trail2 = AuditTrail::new();
+            trail2.set_persist_path(&file_path).unwrap();
+            assert_eq!(
+                trail2.total_count(),
+                3,
+                "磁盘事件本体应仍完整（append-only，未删除）"
+            );
+            assert_eq!(trail2.hidden_count(), 3, "隐藏集合应从 <audit>.hidden 恢复");
+            assert_eq!(
+                trail2.query(&q).len(),
+                0,
+                "★重启后仍应为 0 条（修复前此处会复活为 3 条）"
+            );
+            assert!(
+                trail2.verify_integrity().is_valid,
+                "重启加载后哈希链仍应完好：{}",
+                trail2.verify_integrity().details
+            );
+        }
+
+        for p in [
+            &file_path,
+            &hidden_path,
+            &format!("{}.seal", file_path),
+            &format!("{}.anchors.jsonl", file_path),
+        ] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// 取消隐藏可恢复可见（误操作回退），且同样落盘。
+    #[test]
+    fn test_unhide_all_restores_visibility() {
+        let tmp_dir = std::env::temp_dir();
+        let file_path = tmp_dir
+            .join("lrc_audit_unhide_test.jsonl")
+            .to_string_lossy()
+            .to_string();
+        let hidden_path = format!("{}.hidden", file_path);
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_file(&hidden_path);
+        let _ = std::fs::remove_file(format!("{}.seal", file_path));
+        let _ = std::fs::remove_file(format!("{}.anchors.jsonl", file_path));
+
+        let q = AuditQuery {
+            from_ms: None,
+            to_ms: None,
+            event_types: Some(vec![AuditEventType::RetrievalExecuted]),
+            memory_id: None,
+            limit: None,
+        };
+
+        let mut trail = AuditTrail::new();
+        trail.set_persist_path(&file_path).unwrap();
+        make_event(&mut trail, AuditEventType::RetrievalExecuted, "检索 1");
+        trail.flush();
+        trail.hide_matching(|e| e.event_type == AuditEventType::RetrievalExecuted);
+        assert_eq!(trail.query(&q).len(), 0);
+
+        let restored = trail.unhide_all();
+        assert_eq!(restored, 1);
+        assert_eq!(trail.query(&q).len(), 1, "取消隐藏后应恢复可见");
+        assert_eq!(trail.hidden_count(), 0);
+
+        for p in [
+            &file_path,
+            &hidden_path,
+            &format!("{}.seal", file_path),
+            &format!("{}.anchors.jsonl", file_path),
+        ] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

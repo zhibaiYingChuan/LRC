@@ -4546,6 +4546,23 @@ code, pre, .code-block {
   align-items: center;
 }
 
+/* v0.9.8：记录层理由（"为什么这条会出现"）。
+   与 .memory-card-meta 的"联想路径/贡献分"区分：那条是过程指标（用户看不懂
+   0.0164 的含义），本条是**可复核的证据**（如"与结果内另一条共享
+   「memory_store.rs」"）——视觉上给足可读性，不压在元信息行里。 */
+.memory-card-why {
+  color: var(--lrc-墨韵-400);
+  line-height: 1.5;
+  margin-bottom: var(--space-2);
+  padding-left: var(--space-2);
+  border-left: 2px solid var(--lrc-墨韵-200);
+  /* 理由可能较长（含产物名与覆盖度），最多两行，超出省略 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
 /* 右侧滑出详情面板（40% 宽度） */
 .memory-detail-panel {
   position: fixed;
@@ -4663,6 +4680,73 @@ code, pre, .code-block {
   font-size: var(--type-poetic-size);
   color: var(--lrc-墨韵-300);
   margin-bottom: var(--space-3);
+}
+
+/* ============================================================
+ * v0.9.8：联想补全分区（由记录推导、非语义相似）
+ *
+ * 视觉上刻意与上方相似度结果**区分**：用较弱的边框与底色，
+ * 并显式标注「依据」——让用户一眼看出这类结果的证据性质不同，
+ * 不是"分数更低的搜索结果"，而是"另一种连接"。
+ * ============================================================ */
+.memory-assoc-title {
+  font-family: var(--font-serif);
+  font-size: var(--type-body-size);
+  color: var(--lrc-墨韵-700);
+  margin: var(--space-5) 0 var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--lrc-宣纸-500);
+}
+
+.memory-assoc-item {
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-2);
+  background: var(--lrc-宣纸-200);
+  border-left: 3px solid var(--lrc-金色-500);
+  border-radius: 4px;
+}
+
+.memory-assoc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+/* 「依据」徽标：把 why 前置为视觉重点，用户先看"凭什么关联" */
+.memory-assoc-badge {
+  display: inline-block;
+  padding: 2px var(--space-2);
+  font-size: var(--type-body-sm-size);
+  color: var(--lrc-墨韵-700);
+  background: var(--lrc-宣纸-400);
+  border-radius: 3px;
+}
+
+.memory-assoc-content {
+  color: var(--lrc-墨韵-800);
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.memory-assoc-via {
+  margin-top: var(--space-2);
+}
+
+/* 联想中心·记录关联标签（v0.9.8）
+ * 用于区分"由记录必然关联"与"相似度扩散"两类节点——
+ * 前者证据强度更高（记录必然成立），必须让用户一眼可辨。 */
+.association-record-tag {
+  display: inline-block;
+  align-self: flex-start;
+  margin-left: var(--space-2);
+  padding: 1px var(--space-2);
+  font-size: var(--type-body-sm-size);
+  color: var(--lrc-墨韵-700);
+  background: var(--lrc-金色-500);
+  border-radius: 3px;
+  white-space: nowrap;
 }
 
 /* ============================================================

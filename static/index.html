@@ -6,7 +6,7 @@
   <!-- 之前完全未配置 CSP，XSS/数据注入防御缺失，HCSE 安全不变量 INV-01 违规 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.openai.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="version" content="0.9.7">
+  <meta name="version" content="0.9.8">
   <!-- v0.9.0 开发模式隔离：注入 sidecar 端口号，前端通过此标签获取正确的 API 端点 -->
   <!-- 开发版默认 3111，稳定版打包时替换为 3099 -->
   <meta name="lrc-sidecar-port" content="3111">
@@ -279,6 +279,19 @@
         </div>
         <div class="bar-list" id="memory-project-top-list" aria-live="polite">
           <div class="text-center text-dim" style="padding:16px;">正在统计项目分布…</div>
+        </div>
+      </div>
+
+      <!-- 4b2 记录层积累（v0.9.7）：让「共同经历」的积累可见。
+           联想的前提是同一次经历被记录（event_id）；此处展示积累进度，
+           使用户能区分「还没人填」与「填了但没关联」两种不同情况。 -->
+      <div class="card" id="memory-record-layer">
+        <div class="card-title">
+          <img src="/assets/icons/icon-memory.svg" alt="" width="18" height="18"> 联想积累
+          <span class="text-sm text-dim" style="margin-left:auto;">同一次经历被记录后即可互相联想</span>
+        </div>
+        <div id="memory-record-layer-body" aria-live="polite">
+          <div class="text-center text-dim" style="padding:16px;">正在统计…</div>
         </div>
       </div>
 
@@ -570,6 +583,11 @@
             <p class="text-sm text-dim">浏览全部记忆，或输入关键词搜索</p>
           </div>
         </div>
+
+        <!-- 联想补全（v0.9.8）：本次没搜到、但由「共同经历/共享实体」必然关联的记忆。
+             与上方相似度结果**分区展示**——两类证据性质不同，混排会误导。
+             无结果时整块隐藏（由 JS 控制 display）。 -->
+        <div class="memory-card-stream" id="memory-search-associated" style="display:none;"></div>
       </div>
     </div>
 
@@ -602,20 +620,17 @@
       <div id="association-view-explore" class="association-view active">
         <div class="card association-explore-hero">
           <p class="association-hero-title">它帮你想起什么？</p>
-          <div class="association-preset-row" id="association-presets">
-            <button type="button" class="association-preset-chip" data-explore-preset="今晚吃什么？">今晚吃什么？</button>
-            <button type="button" class="association-preset-chip" data-explore-preset="周末去哪儿玩？">周末去哪儿玩？</button>
-            <button type="button" class="association-preset-chip" data-explore-preset="上次和爸妈去过哪儿？">上次和爸妈去过哪儿？</button>
-            <button type="button" class="association-preset-chip" data-explore-preset="我以前记过什么重要日子？">我以前记过什么重要日子？</button>
-          </div>
+          <!-- 示例问题（v0.9.8）：**由后端从该用户自己的记忆生成**，不是硬编码。
+               此前这里是四个生活场景固定文本，对只记技术内容的用户必然全部
+               落到弱匹配空态，用户会误以为功能坏了。现在由
+               GET /v1/associations/suggestions 数据驱动填充；
+               若该用户库中没有可构造示例的经历记忆，整块隐藏（不显示点不通的假引导）。 -->
+          <div class="association-preset-row" id="association-presets"></div>
           <div class="association-ask-row">
-            <input id="association-query" class="input association-ask-input" maxlength="200" placeholder="输入一句话，例如：今晚吃什么？" aria-label="记忆联想提问">
+            <input id="association-query" class="input association-ask-input" maxlength="200" placeholder="输入一句话，看看它想起了什么" aria-label="记忆联想提问">
             <button class="btn btn-accent association-start-btn" data-action="startAssociationExplore">开始联想</button>
           </div>
-          <!-- 联想的深度与方向由系统自动决定；此处保留旧契约默认值，供技术详情使用 -->
-          <input type="hidden" id="association-start-type" value="query">
-          <input type="hidden" id="association-depth" value="2">
-          <input type="hidden" id="association-width" value="3">
+          <!-- 联想深度与方向由系统自动决定，不再暴露给用户 -->
         </div>
         <div id="association-explore-status" class="association-status" aria-live="polite">从一个念头出发，看看它能想起多少相关的记忆。</div>
         <!-- 用户视角结果 -->
@@ -639,7 +654,7 @@
       </div>
       <!-- 小统计视图 -->
       <div id="association-view-observe" class="association-view" hidden>
-        <div class="stats-grid association-observe-grid"><div class="stat-card"><div class="stat-value" id="association-center-count">--</div><div class="stat-label">联想次数</div></div><div class="stat-card"><div class="stat-value" id="association-center-avg">--</div><div class="stat-label">平均想起几条</div></div><div class="stat-card"><div class="stat-value" id="association-center-dual">--</div><div class="stat-label">联想靠谱率</div></div><div class="stat-card"><div class="stat-value" id="association-center-filtered">--</div><div class="stat-label">避免跑偏</div></div></div>
+        <div class="stats-grid association-observe-grid"><div class="stat-card"><div class="stat-value" id="association-center-count">--</div><div class="stat-label">联想次数</div></div><div class="stat-card"><div class="stat-value" id="association-center-avg">--</div><div class="stat-label">平均想起几条</div></div><div class="stat-card"><div class="stat-value" id="association-center-dual">--</div><div class="stat-label">两路都命中</div></div><div class="stat-card"><div class="stat-value" id="association-center-filtered">--</div><div class="stat-label">避免跑偏</div></div></div>
         <div class="card"><div class="card-title">最近的联想</div><div id="association-center-recent" class="association-records"><div class="association-empty">进入统计页加载。</div></div></div>
       </div>
     </div>
@@ -2327,7 +2342,7 @@
 <footer class="status-bar">
   <div class="status-bar-left">
     <span><span class="status-dot unknown" id="status-dot"></span><span id="status-text" class="status-clickable" title="点击启动 LRC 服务">检测中...</span></span>
-    <span>版本 <strong id="status-version">v0.9.7</strong></span>
+    <span>版本 <strong id="status-version">v0.9.8</strong></span>
   </div>
   <div class="status-bar-right">
     <span>数据目录：<code id="status-data-dir" class="status-clickable" title="点击打开数据目录">--</code></span>
@@ -2405,6 +2420,7 @@
           <option value="decision">决策</option>
           <option value="code_context">代码上下文</option>
           <option value="conversation">对话</option>
+          <option value="experience">经历</option>
           <option value="synthesis">合成</option>
         </select>
       </div>
@@ -2419,6 +2435,16 @@
       <div class="form-group">
         <label for="quick-add-project">项目（可选）</label>
         <input type="text" id="quick-add-project" class="input" placeholder="留空则为全局记忆">
+      </div>
+      <div class="form-group">
+        <label for="quick-add-event-id">事件 ID（可选）</label>
+        <input type="text" id="quick-add-event-id" class="input" placeholder="同一次经历的多条记忆填相同值，如 hangzhou-2026-09">
+        <div style="font-size:12px;opacity:.7;margin-top:4px;">记录「共同经历」：同一次出行/同一场对话的多条记忆填同一个 ID，之后它们之间就能互相联想。</div>
+      </div>
+      <div class="form-group">
+        <label for="quick-add-entities">涉及实体（可选，逗号分隔）</label>
+        <input type="text" id="quick-add-entities" class="input" placeholder="如：小美, 海底捞, 周五晚上">
+        <div style="font-size:12px;opacity:.7;margin-top:4px;">记录人/地点/时间/事物：不同经历里出现的同一个对象（如「爸爸」）会因此建立关联。</div>
       </div>
       <div id="quick-add-error" style="display:none;color:var(--lrc-朱砂-400,#c04851);font-size:12px;margin-bottom:8px;"></div>
     </div>

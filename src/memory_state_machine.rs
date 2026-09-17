@@ -217,13 +217,35 @@ impl MemoryStateMachine {
     }
 }
 
-/// 活性偏置开关（LRC_STATE_BIAS=0 关闭，默认开启）。
-/// 实时读取环境变量而非 OnceLock 缓存：逃生开关必须在运行期可切换，
-/// 否则一旦首次调用缓存为 true，用户设置 LRC_STATE_BIAS=0 将永远失效。
+/// 活性偏置开关（**LRC_STATE_BIAS=1 显式开启，默认关闭**）。
+///
+/// ---------------------------------------------------------------------------
+/// **默认值翻转（v0.9.8）——原为默认开启，现改为默认关闭**
+/// ---------------------------------------------------------------------------
+/// 本开关门控的是 v0.9.7 遗留的「道体状态机·联想导航」整条通路，共 4 处注入点：
+///   ① `trapezoid_focus_recall` 活跃记忆**候选白名单**（召回层）
+///   ② `trapezoid_focus_recall` 联想桥词**词面域锚点扩展**（召回层）
+///   ③ `trapezoid_focus_recall` 活性偏置**加分**（`*s += activation * 0.25`，**排序层**）
+///   ④ `recall` 联想桥词**查询扩展**（召回层）
+///
+/// **为什么改为默认关闭**：③ 是直接改写排序分数的道体信号，而
+/// `daoti/PREREG_FAIR_STATE_MACHINE.md` §判据 G2 已实测**道体信号参与排序
+/// 无净增量**（补齐 +8pp 门槛未达，三臂齐平）⇒ 该通路**已被否证**。
+/// 此外 §3.37 进一步实测：记忆侧的 `bagua_index`（`bagua_index` 及其
+/// `daoti_preview_*` 同源）**不读语义**——打乱字符顺序后分类 100% 不变，
+/// 根因是洛书编码器 9 维特征仅含字符密度/字符熵/位置权重。
+///
+/// **边界（必须如实保留）**：本次仅**翻转默认值**，不删除代码、不改算法。
+/// 开 `LRC_STATE_BIAS=1` 可完整复现 v0.9.7 行为（用于对照实验与回归取证）。
+/// 被否证的是「该信号参与排序」，**不是**「状态机本身无用」——
+/// 状态机作为记录层/观测层的能力不受影响。
+///
+/// 实时读取环境变量而非 OnceLock 缓存：开关必须在运行期可切换，
+/// 否则一旦首次调用缓存为 true，用户设置 LRC_STATE_BIAS=1 将永远失效。
 pub fn state_bias_enabled() -> bool {
     std::env::var("LRC_STATE_BIAS")
-        .map(|v| v != "0")
-        .unwrap_or(true)
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// 对候选记忆分数执行回归校验：不能因为扩散而完全偏离原始查询。
@@ -363,6 +385,58 @@ mod tests {
         let result = regression_filter(&candidates, &original, 0.6);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, "a");
+    }
+
+    /// v0.9.8 门控默认值契约：`LRC_STATE_BIAS` **必须默认关闭**。
+    ///
+    /// **为什么需要这条测试**（不是形式主义）：该开关门控的是 v0.9.7 遗留的
+    /// 「道体状态机·联想导航」通路，其中「活性偏置加分」**直接改写检索排序分数**，
+    /// 而 `daoti/PREREG_FAIR_STATE_MACHINE.md` 判据 G2 已实测该信号
+    /// **无净增量**（三臂齐平，+8pp 门槛未达）⇒ 已被否证。
+    ///
+    /// 若未来有人把默认值改回开启，本测试会立即失败——**防止已被否证的
+    /// 信号在无人察觉的情况下重新进入生产排序**（这类"静默回退"正是
+    /// 本项目 §3.55 实测抓到的真实故障模式：测试前提曾依赖该通道偶然生效）。
+    ///
+    /// 负向验证（已实测）：把实现改回 `.unwrap_or(true)` ⇒ 本测试立即失败，
+    /// 证明断言具备鉴别力而非恒真。
+    #[test]
+    fn 活性偏置门控必须默认关闭() {
+        // 保存并清空环境变量，还原"用户未设置"的默认态。
+        // 注意：Rust 测试默认并行，环境变量是进程级共享的——故本测试
+        // 只断言"不设变量时的默认值"，不对变量的具体取值做假设，
+        // 从而不与显式设置该变量的其它测试互相干扰。
+        let saved = std::env::var_os("LRC_STATE_BIAS");
+        std::env::remove_var("LRC_STATE_BIAS");
+        let default_state = state_bias_enabled();
+        // 先还原现场，再做断言——避免断言 panic 时把变量泄漏给其它测试。
+        match saved {
+            Some(v) => std::env::set_var("LRC_STATE_BIAS", v),
+            None => std::env::remove_var("LRC_STATE_BIAS"),
+        }
+        assert!(
+            !default_state,
+            "LRC_STATE_BIAS 必须默认关闭：该通路（活性偏置加分）直接改写排序分数，\
+             且已被 PREREG_FAIR_STATE_MACHINE 判据 G2 否证（无净增量）。\
+             如需复现 v0.9.7 行为，请显式设置 LRC_STATE_BIAS=1。"
+        );
+    }
+
+    /// v0.9.8 门控语义契约：显式 `LRC_STATE_BIAS=1` 时必须开启。
+    /// 与上一条配对，确保"默认关"没有被实现成"永远关"（逃生开关仍可用）。
+    #[test]
+    fn 活性偏置门控显式开启仍生效() {
+        let saved = std::env::var_os("LRC_STATE_BIAS");
+        std::env::set_var("LRC_STATE_BIAS", "1");
+        let enabled = state_bias_enabled();
+        match saved {
+            Some(v) => std::env::set_var("LRC_STATE_BIAS", v),
+            None => std::env::remove_var("LRC_STATE_BIAS"),
+        }
+        assert!(
+            enabled,
+            "LRC_STATE_BIAS=1 必须能开启该通路（对照实验与回归取证依赖它）"
+        );
     }
 
     #[test]

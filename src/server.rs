@@ -8,11 +8,13 @@
 //! 协议参考: <https://spec.modelcontextprotocol.io/>
 //! 当前暴露 search_code + codebase_stats 两个工具
 
-use crate::memory_store::{ListFilter, MemoryStore, RecallFilter, SortBy, SortOrder};
+use crate::memory_store::{
+    relation_label, AssociatedMemory, ListFilter, MemoryStore, RecallFilter, SortBy, SortOrder,
+};
 use crate::persistence::json::JsonPersistence;
 use crate::{
-    ChunkStats, CodeMemoryManager, Importance, LlmApiConfig, Memory, MemoryType, PrivacyLevel,
-    RecallResult, RetrievalResult,
+    ChunkStats, CodeMemoryManager, EntityKind, EventEntity, Importance, LlmApiConfig, Memory,
+    MemoryType, PrivacyLevel, RecallResult, RetrievalResult,
 };
 // v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：wizard.json 同步路径错误由不可判别的
 // `String` 收敛为带域分类的 [`crate::errors::LrcError`]（io / parse / config / crypto）。
@@ -407,7 +409,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
     let tools = vec![
         ToolDefinition {
             name: "remember".into(),
-            description: "帮 AI 记住一件事——就像给 AI 装了个记事本。记住的内容会在后续对话中自动被检索到。【主动调用时机】1) 用户表达了技术偏好（'用 pnpm'）；2) 做了项目决策（'数据库选 PostgreSQL'）；3) 有重要的约定需要跨会话保留；4) 完成代码修改任务后，自动记录新增的模块、API 端点、架构变更等关键信息（这是任务的自然收尾，无需用户提醒）。".into(),
+            description: "帮 AI 记住一件事——就像给 AI 装了个记事本。记住的内容会在后续对话中自动被检索到。【主动调用时机】1) 用户表达了技术偏好（'用 pnpm'）；2) 做了项目决策（'数据库选 PostgreSQL'）；3) 有重要的约定需要跨会话保留；4) 完成代码修改任务后，自动记录新增的模块、API 端点、架构变更等关键信息（这是任务的自然收尾，无需用户提醒）；5) **经历类内容**（一次外出/一次对话/一件事），此时应带 `event_id` 把同一次经历的多条记忆串起来。【关于 event_id】同一次经历产生的多条记忆填相同值（如一次杭州之行写了『游西湖』和『吃楼外楼』两条），它们之间就能互相联想——即使内容看上去毫不相关。这是『联想』的唯一依据，不填则这些记忆彼此孤立。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
@@ -417,7 +419,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                     },
                     "memory_type": {
                         "type": "string",
-                        "description": "记忆类型: fact | preference | decision | code_context | conversation",
+                        "description": "记忆类型: fact | preference | decision | code_context | conversation | experience",
                         "default": "fact"
                     },
                     "project": {
@@ -451,6 +453,22 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                         "type": "string",
                         "description": "用户 ID（privacy_level=user 时使用）"
                     },
+                    "event_id": {
+                        "type": "string",
+                        "description": "事件 ID — 这条记忆来自哪一次经历/事件。同一次经历产生的多条记忆使用**相同** event_id，即可建立『共同经历』关联（即使内容语义不相似）。【生成规则】由调用方（你）生成并复用，不要由系统猜：用『类型-对象-时间窗』构成可读 ID，如 `trip-hangzhou-2026-09`、`dinner-2026-09-16`、`task-fix-login-20260916`。规则：① 同一次对话/外出/任务内写入的多条记忆，全部用同一个值；② 换一次经历就换新值；③ 只写一次的记忆可不填（填了也无害）。【为什么重要】不填则这些记忆之间无法互相联想——它们的关联依据（同一次经历）从未被记录。"
+                    },
+                    "entities": {
+                        "type": "array",
+                        "description": "事件实体 — 这条记忆涉及的人/地/时/物，用于建立『共享实体』关联（跨经历的同一对象，如两条不同记忆都提到『爸爸』）。",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "实体名称，如 '小美'、'海底捞'" },
+                                "kind": { "type": "string", "description": "实体类型: person | place | time | thing | other", "default": "other" }
+                            },
+                            "required": ["name"]
+                        }
+                    },
                     "daoti_preview_gua": {
                         "type": "string",
                         "description": "可选：道体写入时预判的六十四卦名称"
@@ -469,10 +487,14 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
         },
         ToolDefinition {
             name: "batch_remember".into(),
-            description: "批量记忆注入 — 一次性写入多条记忆，大幅提升大批量数据注入性能。适用于 LongMemEval 等需要注入大量会话历史的场景。单次最多 200 条。".into(),
+            description: "批量记忆注入 — 一次性写入多条记忆，大幅提升大批量数据注入性能。适用于 LongMemEval 等需要注入大量会话历史的场景。单次最多 200 条。【共同经历】若这批记忆来自同一次经历，在**批次级**传一次 event_id 即可（无需逐条重复）；若批次内混有不同经历，则在对应条目上写各自的 event_id 覆盖。".into(),
             input_schema: ToolInputSchema {
                 schema_type: "object".into(),
                 properties: serde_json::json!({
+                    "event_id": {
+                        "type": "string",
+                        "description": "批次级事件 ID — 这批记忆同属一次经历时填一次即可（等价于给每条填相同的 event_id）。条目级 event_id 优先于此值。"
+                    },
                     "memories": {
                         "type": "array",
                         "description": "记忆列表，每条记忆包含 content、memory_type、project、tags、importance 等字段",
@@ -485,7 +507,7 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                                 },
                                 "memory_type": {
                                     "type": "string",
-                                    "description": "记忆类型: fact | preference | decision | code_context | conversation",
+                                    "description": "记忆类型: fact | preference | decision | code_context | conversation | experience",
                                     "default": "fact"
                                 },
                                 "project": {
@@ -501,6 +523,22 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                                     "type": "integer",
                                     "description": "重要性 1-10（默认 5）",
                                     "default": 5
+                                },
+                                "event_id": {
+                                    "type": "string",
+                                    "description": "事件 ID — 同一次经历产生的多条记忆使用相同 event_id（建立『共同经历』关联）"
+                                },
+                                "entities": {
+                                    "type": "array",
+                                    "description": "事件实体（人/地/时/物）",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": { "type": "string" },
+                                            "kind": { "type": "string", "description": "person | place | time | thing | other" }
+                                        },
+                                        "required": ["name"]
+                                    }
                                 }
                             },
                             "required": ["content"]
@@ -761,6 +799,42 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                 required: vec!["query".into()],
             },
         },
+        ToolDefinition {
+            name: "associations".into(),
+            description: "记忆关联 — 给出一条记忆，返回它在记录层上的**多类型关联**（结构化关系网络，而非相似度排序）。关系类型：same_event（同一次经历产生，依据 event_id）/ shared_entity（共享人/地/时/物）/ derived_from（由该记忆结晶衍生）。每条关联都带人类可读的『为什么关联』依据。用于回答『我记得 A，什么会让我想起 B』——依据是共同经历与共享实体，不是语义相似。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "memory_id": {
+                        "type": "string",
+                        "description": "起点记忆 ID"
+                    },
+                    "relation": {
+                        "type": "string",
+                        "description": "只返回某类关联: same_event（手填 event_id）| same_event_auto（系统按同项目+同窗口推断）| shared_entity（共享实体）| derived_from（由它衍生）| crystallized_into（被结晶为它）| evolved_from（自身被更新过）（缺省=全部类型并存）"
+                    }
+                }),
+                required: vec!["memory_id".into()],
+            },
+        },
+        ToolDefinition {
+            name: "association_graph".into(),
+            description: "联想图 — 给出一条记忆，返回以它为中心的**关联图**（节点=记忆，边=有类型/有方向/有解释的关系）。与 associations 的区别：associations 只给一层直接关联，本工具会做**结构性多跳推理**——若 A 与 B 同一次经历、B 与 C 共享实体，则推出 A 与 C 的**间接关联**（即使 A 与 C 之间没有任何直接记录）。这不是语义相似度匹配，而是由记录推出的、必然成立的结构关系；间接关联会附完整路径，供人工核验。用于发现『用户自己没想到但合理』的关联。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "memory_id": {
+                        "type": "string",
+                        "description": "起点记忆 ID（图的中心）"
+                    },
+                    "max_nodes": {
+                        "type": "integer",
+                        "description": "节点数上限（默认 50，范围 2~500）。超出时结果会标记「已被截断」"
+                    }
+                }),
+                required: vec!["memory_id".into()],
+            },
+        },
     ];
 
     let result = ToolsListResult { tools };
@@ -831,6 +905,20 @@ async fn handle_recall_enhanced(
     let mem_type = memory_type.clone();
     let proj = project.clone();
     let tag_list = tags.clone();
+    // 联想补全用的过滤条件（v0.9.8）：与检索**同一套可见性规则**，
+    // 由下面两个 filter 复用同一份字段，避免"检索过滤了、联想没过滤"的越权口子。
+    let filter_for_expand = RecallFilter {
+        memory_type: mem_type.clone(),
+        project: proj.clone(),
+        tags: tag_list.clone(),
+        min_importance: None,
+        top_k: top_k * 2,
+        privacy_context: None,
+        explore_pure: false,
+        regression_query: None,
+        read_only: false,
+    };
+
     let retrieval_result = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         tokio::task::spawn_blocking(move || {
@@ -898,18 +986,28 @@ async fn handle_recall_enhanced(
             for (id, ev) in deep_result.regression_evidence {
                 merged_evidence.insert(id, ev);
             }
+
+            // ═══ 记录层联想补全（v0.9.8）═══
+            // 与 handle_recall 同源同口径：复用 SearchData.expand_associations。
+            // 在锁内执行（避免再次加锁），失败静默。
+            let seed_ids: Vec<String> = fused.memories.iter().map(|m| m.id.clone()).collect();
+            let associated = store
+                .expand_associations(&seed_ids, &filter_for_expand, ASSOCIATION_EXPAND_MAX)
+                .unwrap_or_default();
+
             Some((
                 fused.memories,
                 fused.scores,
                 fused.total_candidates,
                 state_snapshot,
                 merged_evidence,
+                associated,
             ))
         }),
     )
     .await;
 
-    let (result_memories, result_scores, total, state_snapshot, merged_evidence) =
+    let (result_memories, result_scores, total, state_snapshot, merged_evidence, associated) =
         match retrieval_result {
             Ok(Ok(Some(ok))) => ok,
             Ok(Ok(None)) => {
@@ -1007,6 +1105,12 @@ async fn handle_recall_enhanced(
         text.push_str(
             "💡 回归校验确认联想扩散的记忆确实回应了原始查询；无共鸣信号的记忆已被剔除。\n",
         );
+    }
+
+    // ═══ 记录层联想补全（v0.9.8）═══
+    // 与 handle_recall 同款分区渲染（同样的 why/via 可追溯要求）。
+    if !associated.is_empty() {
+        append_associated_memories(&mut text, &associated);
     }
 
     let call_result = ToolCallResult {
@@ -1120,10 +1224,68 @@ pub(crate) async fn post_daoti_reflect(memories: &[String], session_id: &str) ->
     post_daoti_reflect_with_base(memories, session_id, None).await
 }
 
+/// 联想补全的条数上限（v0.9.8）
+///
+/// **为什么需要上限**：同一次经历的簇可能很大（实测有 32 条的同小时簇），
+/// 若不设限，一次检索的输出会被联想结果淹没，主结果反而看不见。
+///
+/// # ★ 取值 3 是**诊断目的**（2026-09-16 用户裁定）
+///
+/// 原值 8 使**意外性排序机制在实际配置下不工作**：实测每种子通道数中位仅 1
+/// ⇒ 每通道配额 ≈8，而**通道长度 > 8 的比例仅 13.9%**
+/// ⇒ 86% 的种子其通道内候选全部输出，排序改变不了集合。
+/// 实测提升：max_out=8 → +1.2pp（近零）；**max_out=3 → +7.2pp**。
+///
+/// ⇒ 取 3 是为**让排序机制进入可观测状态**，而非"提升精度"。
+/// 否则无法回答"BGE 给不出的那些关联有没有意义"——它们根本没机会被输出。
+/// 代价（如实记录）：联想总量减少（保留约 43%）。
+/// 完整实测记录见内部预注册文档 §3.10（研究材料，不随产品发布）。
+const ASSOCIATION_EXPAND_MAX: usize = 3;
+
+/// 把「联想补全」结果渲染成 MCP 文本块（v0.9.8）
+///
+/// **为什么单独分区、不混进主结果列表**：
+/// 两类结果的**证据性质不同**——主结果是相似度打分（可比大小），
+/// 联想是记录层的确定性推导（只有"成立/不成立"，没有强弱）。
+/// 混排会让调用方误以为二者可以按分数排序，也会破坏既有排序的 A/B 证据。
+///
+/// **为什么必须显示 `why` 与 `via`**：用户要判断"这个联想是否合理"，
+/// 就必须知道①凭什么关联（`why`，含具体 event_id 或实体名）
+/// ②从哪条记忆联想过来（`via`）。缺任一项，联想就成了无从检验的黑箱
+/// （承方法论 105：解释必须解释到具体对象）。
+fn append_associated_memories(text: &mut String, assoc: &[AssociatedMemory]) {
+    text.push_str(
+        "\n═══ 联想（由记录推导，非语义相似）═══\n\
+         以下记忆**与本次查询语义可能毫不相似**，但它们由记录必然关联——\n\
+         这是相似度检索给不出的连接。\n\n",
+    );
+    for (i, a) in assoc.iter().enumerate() {
+        text.push_str(&format!(
+            "（联想 #{} · {} · {}）\n",
+            i + 1,
+            relation_label(&a.relation),
+            a.memory_type
+        ));
+        text.push_str(&format!("内容: {}\n", a.content_preview));
+        text.push_str(&format!("依据: {}\n", a.why));
+        text.push_str(&format!(
+            "来路: 由「{}」联想到此（{}）\n",
+            a.via_preview.chars().take(40).collect::<String>(),
+            a.via_memory_id.chars().take(12).collect::<String>(),
+        ));
+        text.push_str(&format!("ID: `{}`\n\n", a.memory_id));
+    }
+    text.push_str(
+        "💡 这些是「共同经历 / 共享实体」带来的连接。若要它们更丰富，\
+写入时给同一次经历的多条记忆填相同的 event_id。\n",
+    );
+}
+
 /// 处理 recall 工具调用 — 关键词匹配 / 深度语义检索
 ///
 /// 支持 lrc_mode: "fast"（关键词匹配，默认）或 "deep"（深度语义检索）
-/// 若配置了 LLM API，自动将查询翻译为答案关键词以桥接语义鸿沟
+/// 若配置了 LLM API，自动将查询翻译为答案关键词以桥接语义鸿沟。
+/// v0.9.8 起，结果尾部追加「记录层联想」分区（见 [`append_associated_memories`]）。
 async fn handle_recall(
     state: &AppState,
     arguments: &serde_json::Value,
@@ -1358,6 +1520,26 @@ async fn handle_recall(
                 );
             }
 
+            // ═══ 记录层联想补全（v0.9.8：真正的记忆联想）═══
+            //
+            // 上面所有通路（fast / deep / RRF / 状态机联想链）**全部是相似度驱动**，
+            // 只能在"语义相近"的记忆里找。本段补的是另一类：
+            // 由记录层（event_id 共同经历 / entities 共享实体 / source_ids 谱系）
+            // 推导出的、**语义可以毫不相似**的关联。
+            //
+            // 典型形态：用户查「游西湖」→ 补出同一次杭州之行的「吃楼外楼」。
+            // 这是任何相似度算法都给不出的连接，也是"记录层"存在的全部意义。
+            //
+            // 失败静默：联想是附加价值，不可因它失败而影响检索主结果
+            //（与详情页间接关联的处理一致）。
+            let seed_ids: Vec<String> = result.memories.iter().map(|m| m.id.clone()).collect();
+            let assoc = store
+                .expand_associations(&seed_ids, &filter, ASSOCIATION_EXPAND_MAX)
+                .unwrap_or_default();
+            if !assoc.is_empty() {
+                append_associated_memories(&mut text, &assoc);
+            }
+
             let call_result = ToolCallResult {
                 content: vec![TextContent {
                     content_type: "text".into(),
@@ -1401,6 +1583,15 @@ async fn handle_batch_remember(
             &format!("批量注入上限为 200 条，收到 {} 条", memories_array.len()),
         );
     }
+
+    // 批次级 event_id（v0.9.7 降低填写负担）：
+    // 同一次经历往往就是"一次批量写入"——此时让调用方在**批次级**写一次 event_id，
+    // 而不是在每条记忆里重复写 N 次。逐条的 event_id 优先（允许批次内混入其他经历）。
+    // 这一设计不降低语义要求（仍需知情者给出经历标识），只消除**机械重复**。
+    let batch_event_id = arguments
+        .get("event_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let mut memories = Vec::with_capacity(memories_array.len());
     for item in memories_array {
@@ -1446,6 +1637,16 @@ async fn handle_batch_remember(
             importance,
             None, // ttl_days
         );
+
+        // 事件维度（批量路径同样支持"共同经历"）
+        // 逐条的 event_id 优先；缺失时回退到批次级 event_id（避免逐个重复填写）
+        let mut memory = memory;
+        memory.event_id = item
+            .get("event_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| batch_event_id.clone());
+        memory.entities = parse_entities(item.get("entities"));
 
         memories.push(memory);
     }
@@ -1612,6 +1813,33 @@ async fn handle_list_memories(
     }
 }
 
+/// 解析 entities 参数（人/地/时/物）
+///
+/// 容错策略：数组内非对象项、缺 name 或 name 为空白的项均跳过；
+/// kind 非法时退化为 `EntityKind::Other`（不报错，避免因拼写问题丢整条记忆）。
+fn parse_entities(v: Option<&serde_json::Value>) -> Vec<EventEntity> {
+    let Some(arr) = v.and_then(|x| x.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(name) = item.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let kind = item
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .and_then(EntityKind::try_parse)
+            .unwrap_or_default();
+        out.push(EventEntity::new(name, kind));
+    }
+    out
+}
+
 /// 处理 remember 工具调用 — 写入单条记忆
 ///
 /// 支持记忆类型、项目、标签、重要性、TTL、隐私级别等参数
@@ -1674,6 +1902,13 @@ async fn handle_remember(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // 事件维度：event_id（同一次经历）+ entities（人/地/时/物）
+    let event_id = arguments
+        .get("event_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let entities = parse_entities(arguments.get("entities"));
+
     let preview_gua = arguments
         .get("daoti_preview_gua")
         .and_then(|v| v.as_str())
@@ -1698,6 +1933,8 @@ async fn handle_remember(
     .with_privacy(privacy_level, session_id, user_id);
 
     let mut memory = memory;
+    memory.event_id = event_id;
+    memory.entities = entities;
     memory.daoti_preview_gua = preview_gua;
     memory.daoti_preview_bagua = preview_bagua;
     memory.daoti_preview_version = preview_version;
@@ -1860,6 +2097,164 @@ async fn handle_tools_call(
             return handle_list_memories(state, &arguments, id).await;
         }
 
+        // === 记忆关联（记录层→多类型关系网络）===
+        "associations" => {
+            let memory_id = match arguments.get("memory_id").and_then(|v| v.as_str()) {
+                Some(v) => v,
+                None => return make_error(id, -32602, "缺少参数: memory_id"),
+            };
+            let relation_filter = arguments.get("relation").and_then(|v| v.as_str());
+
+            let store = state.memory_store.lock().await;
+            match store.associations(memory_id) {
+                Ok(all_assoc) => {
+                    // hub 实体（泛化实体）清单：**让过滤可见**（§3.45.5）
+                    let hubs = store.hub_entities().unwrap_or_default();
+                    let hub_note = if hubs.is_empty() {
+                        String::new()
+                    } else {
+                        let list: Vec<String> = hubs
+                            .iter()
+                            .map(|(n, k, c, t)| {
+                                format!(
+                                    "`{}`({}, {}/{}={:.0}%)",
+                                    n,
+                                    k.as_str(),
+                                    c,
+                                    t,
+                                    if *t == 0 {
+                                        0.0
+                                    } else {
+                                        *c as f64 / *t as f64 * 100.0
+                                    }
+                                )
+                            })
+                            .collect();
+                        format!(
+                            "\n\n注：以下实体因过于泛化已被跳过（其「共享」近乎恒真、无区分度）。\
+分母为该**记忆所属项目内**的记忆数（§3.49：按项目内占比判定，避免被其他项目稀释）：{}",
+                            list.join("、")
+                        )
+                    };
+                    let filtered: Vec<_> = all_assoc
+                        .into_iter()
+                        .filter(|a| relation_filter.map(|r| a.relation == r).unwrap_or(true))
+                        .collect();
+                    if filtered.is_empty() {
+                        let text = format!(
+                            "未找到关联。\n\n可能原因：该记忆未记录 event_id（无共同经历），\
+没有可共享的实体（entities 为空），也不是结晶产物（无 source_ids）。\n\
+记录层字段缺失时无法推导关联——这不是「没有关系」，而是「关系未被记录」。{}",
+                            hub_note
+                        );
+                        let call_result = ToolCallResult {
+                            content: vec![TextContent {
+                                content_type: "text".into(),
+                                text,
+                            }],
+                        };
+                        return make_response(id, to_json_value_safe(&call_result));
+                    }
+                    let mut text = format!("关联图谱（{} 条）\n\n", filtered.len());
+                    for a in &filtered {
+                        text.push_str(&format!("- [{}] `{}`\n", a.relation, a.memory_id));
+                        text.push_str(&format!("  依据: {}\n", a.why));
+                        text.push_str(&format!("  内容: {}\n\n", a.content_preview));
+                    }
+                    text.push_str(&hub_note);
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
+                    };
+                    make_response(id, to_json_value_safe(&call_result))
+                }
+                Err(e) => make_error(id, -32603, &format!("关联查询失败: {}", e)),
+            }
+        }
+
+        // === 联想（关联图 + 多跳结构化推理）===
+        "association_graph" => {
+            let memory_id = match arguments.get("memory_id").and_then(|v| v.as_str()) {
+                Some(v) => v,
+                None => return make_error(id, -32602, "缺少参数: memory_id"),
+            };
+            // 节点上限：默认 50（足以覆盖典型同经历簇），可由调用方收紧以防大簇爆图
+            let max_nodes = arguments
+                .get("max_nodes")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(50)
+                .clamp(2, 500);
+
+            let store = state.memory_store.lock().await;
+            match store.association_graph(memory_id, max_nodes) {
+                Ok(g) => {
+                    if g.nodes.is_empty() {
+                        let text = "未找到该记忆，或它没有任何关联。\n\n\
+记录层字段（event_id / entities / source_ids）缺失时无法推导关联——\
+这不是「没有关系」，而是「关系未被记录」。"
+                            .to_string();
+                        let call_result = ToolCallResult {
+                            content: vec![TextContent {
+                                content_type: "text".into(),
+                                text,
+                            }],
+                        };
+                        return make_response(id, to_json_value_safe(&call_result));
+                    }
+
+                    let mut text = format!(
+                        "关联图（以 `{}` 为中心）\n\
+                         ══════════════════════\n\
+                         节点 {} 个 | 直接关联 {} 条 | 间接关联 {} 条{}\n\n\
+                         【直接关联】由记录直接推导\n",
+                        memory_id,
+                        g.nodes.len(),
+                        g.direct_count,
+                        g.indirect_count,
+                        if g.truncated {
+                            "  ⚠ 节点数已达上限，图被截断（结果不完整）"
+                        } else {
+                            ""
+                        }
+                    );
+                    for e in g.edges.iter().filter(|e| e.hops == 1) {
+                        text.push_str(&format!(
+                            "- [{}] `{}`\n  依据: {}\n",
+                            e.relation, e.to, e.why
+                        ));
+                    }
+                    let indirect: Vec<_> = g.edges.iter().filter(|e| e.hops >= 2).collect();
+                    if indirect.is_empty() {
+                        text.push_str("\n【间接关联】无（未发现经中间记忆可达的新节点）\n");
+                    } else {
+                        text.push_str(
+                            "\n【间接关联】由结构传递推出 —— 两条记忆间**无直接记录**，\
+但经中间记忆可达。这类关联是「推理」而非「匹配」的结果：\n",
+                        );
+                        for e in indirect {
+                            text.push_str(&format!(
+                                "- `{}`\n  依据: {}\n  路径: {}\n",
+                                e.to,
+                                e.why,
+                                e.path.join(" → ")
+                            ));
+                        }
+                    }
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
+                    };
+                    make_response(id, to_json_value_safe(&call_result))
+                }
+                Err(e) => make_error(id, -32603, &format!("关联图构造失败: {}", e)),
+            }
+        }
+
         "memory_stats" => {
             let store = state.memory_store.lock().await;
             match store.stats() {
@@ -1877,6 +2272,60 @@ async fn handle_tools_call(
                     types.sort_by(|a, b| b.1.cmp(a.1));
                     for (t, count) in types {
                         text.push_str(&format!("- `{}`: {} 条\n", t, count));
+                    }
+
+                    // 记录层覆盖度（v0.9.7）：联想的前提是"共同经历"被记录。
+                    // 若 with_event 长期为 0，关联推导必然为空——那是"前提缺失"，
+                    // 不是"机制无效"（PREREG §3.42/§3.43、方法论 92）。
+                    //
+                    // **分母口径（重要，防误读）**：此处百分比的分母是**全库记忆**，
+                    // 包含自动索引的 code_context 片段——而它们**本就不该带 event_id**。
+                    // 实测（PREREG §3.47）某真实库 4477 条中 code_context 占绝大多数，
+                    // 用全库做分母会**严重低估**填写率（0.0x% 量级），
+                    // 让人误以为"没人填"。故此处**显式标注分母**，并额外给出
+                    // "经历候选"口径（排除 code_context/导入语料/合成产物），
+                    // 后者才是"应该填的"真实基数。
+                    text.push_str("\n### 记录层覆盖度（联想的前提）\n");
+                    let pct_of = |n: usize, d: usize| {
+                        if d == 0 {
+                            0.0
+                        } else {
+                            n as f64 / d as f64 * 100.0
+                        }
+                    };
+                    // 经历候选 = 全库 - code_context - 导入语料 - 合成产物
+                    let code_ctx = stats.by_type.get("code_context").copied().unwrap_or(0);
+                    let synth = stats.by_type.get("synthesis").copied().unwrap_or(0);
+                    let incident_base = stats.total_memories.saturating_sub(code_ctx + synth);
+                    text.push_str(&format!(
+                        "- 带事件 ID（共同经历）: {} 条（占全库 {:.2}%，占经历候选 {:.2}%）\n",
+                        stats.with_event_count,
+                        pct_of(stats.with_event_count, stats.total_memories),
+                        pct_of(stats.with_event_count, incident_base),
+                    ));
+                    text.push_str(&format!(
+                        "- 带实体（人/地/时/物）: {} 条（占经历候选 {:.2}%）\n",
+                        stats.with_entity_count,
+                        pct_of(stats.with_entity_count, incident_base),
+                    ));
+                    text.push_str(&format!(
+                        "- 已形成事件簇: {} 个\n",
+                        stats.event_cluster_count
+                    ));
+                    text.push_str(&format!(
+                        "- 类型为「经历」: {} 条\n",
+                        stats.experience_count
+                    ));
+                    text.push_str(&format!(
+                        "  分母说明：全库 {} 条；经历候选 {} 条\
+（= 全库 − code_context {} − synthesis {}，这两类本就不该带事件 ID）\n",
+                        stats.total_memories, incident_base, code_ctx, synth
+                    ));
+                    if stats.with_event_count == 0 {
+                        text.push_str(
+                            "  ⚠ 尚无记忆携带事件 ID ⇒ 关联推导无输入。\
+写入时请为同一次经历的多条记忆填相同的 `event_id`。\n",
+                        );
                     }
 
                     text.push_str("\n### 项目分布\n");
@@ -4172,8 +4621,8 @@ mod tests {
             .expect("tools/list 响应中 tools 应为数组，检查工具注册逻辑");
         assert_eq!(
             tools.len(),
-            13,
-            "应注册 13 个工具（8 个记忆 + 2 个代码 + 3 个新增）"
+            15,
+            "应注册 15 个工具（9 个记忆 + 2 个代码 + 4 个新增）"
         );
 
         // 验证记忆工具存在
@@ -4204,6 +4653,14 @@ mod tests {
             tool_names.contains(&"memory_stats"),
             "缺少 memory_stats 工具"
         );
+        assert!(
+            tool_names.contains(&"associations"),
+            "缺少 associations 工具（记录层→多类型关联）"
+        );
+        assert!(
+            tool_names.contains(&"association_graph"),
+            "缺少 association_graph 工具（联想图 + 多跳结构推理）"
+        );
         assert!(tool_names.contains(&"archive"), "缺少 archive 工具");
         assert!(tool_names.contains(&"search_code"), "缺少 search_code 工具");
         assert!(
@@ -4221,6 +4678,10 @@ mod tests {
         assert!(
             tool_names.contains(&"recall_enhanced"),
             "缺少 recall_enhanced 工具"
+        );
+        assert!(
+            tool_names.contains(&"associations"),
+            "缺少 associations 工具"
         );
     }
 
@@ -4631,6 +5092,80 @@ mod tests {
             .expect("list_memories 工具返回的 text 字段应为字符串");
         assert!(list_text.contains("记忆列表"), "应包含标题: {}", list_text);
         assert!(list_text.contains("共"), "应包含总数: {}", list_text);
+    }
+
+    // ---- associations 记忆关联工具测试 ----
+
+    /// 记录层端到端：写入同一次经历的两条记忆 + 共享实体，
+    /// 关联工具必须同时给出 same_event 与 shared_entity 两类关联。
+    #[tokio::test]
+    async fn test_associations_multi_type_end_to_end() {
+        let state = test_state();
+
+        // 同一次经历（event_id=e1）的两条记忆：语义上分属"吃"与"路况"
+        let a = serde_json::json!({
+            "name": "remember",
+            "arguments": {
+                "content": "和爸妈去杭州西湖，在苏堤走了一下午",
+                "memory_type": "experience",
+                "event_id": "e1",
+                "entities": [{"name": "爸妈", "kind": "person"}]
+            }
+        });
+        let resp_a = handle_tools_call(&state, &a, None).await;
+        let text_a = to_json(&resp_a)["result"]["content"][0]["text"]
+            .as_str()
+            .expect("remember 应返回 text")
+            .to_string();
+        let id_start = text_a.find("ID: ").expect("未找到 ID 前缀") + 4;
+        let id_end = text_a[id_start..]
+            .find([')', '\n', ' '])
+            .map(|i| id_start + i)
+            .unwrap_or_else(|| text_a[id_start..].trim_end().len() + id_start);
+        let mem_a = text_a[id_start..id_end].to_string();
+
+        // 跨经历共享实体「爸妈」的记忆
+        let b = serde_json::json!({
+            "name": "remember",
+            "arguments": {
+                "content": "爸爸下个月生日，想送他一套钓鱼竿",
+                "memory_type": "experience",
+                "event_id": "e2",
+                "entities": [{"name": "爸妈", "kind": "person"}]
+            }
+        });
+        handle_tools_call(&state, &b, None).await;
+
+        let params = serde_json::json!({
+            "name": "associations",
+            "arguments": { "memory_id": mem_a }
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(200.into()))).await;
+        let json = to_json(&resp);
+        let text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("associations 应返回 text");
+        assert!(
+            text.contains("shared_entity"),
+            "应给出共享实体关联（依据是实体，不是语义相似）: {}",
+            text
+        );
+        assert!(text.contains("依据:"), "每条关联须有人类可读依据: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_associations_missing_memory_id() {
+        let state = test_state();
+        let params = serde_json::json!({
+            "name": "associations",
+            "arguments": {}
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(201.into()))).await;
+        let json = to_json(&resp);
+        assert!(json["error"].is_object());
+        assert_eq!(json["error"]["code"], -32602);
     }
 
     // ---- memory_stats 记忆统计工具测试 ----

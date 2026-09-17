@@ -76,7 +76,53 @@ pub fn state_driven_enabled() -> bool {
 }
 
 /// 匹配度阈值默认值（v2.0 §步骤二建议 0.6）。
+///
+/// ---------------------------------------------------------------------------
+/// **实测修正（2026-09-14，V15 接入后标定，必须如实保留）**
+/// ---------------------------------------------------------------------------
+/// **0.6 对 V15 真实产出的状态分布不可用** —— 实测（`temp/v15-constructive.py`，
+/// V15 驱动 1200 拍）：
+///   · 真实 8 维分布的 max 分量：p05=0.2192 p50=0.2571 p95=0.3333
+///   · 阈值 0.6 → 触发率 **0.0%**（候选恒空，通道等价于未启用）
+///   · 阈值 0.5 → ~0%；0.40 → 0.2%；0.32 → 7.9%；0.30 → 18.2%；0.26 → 47.1%
+/// **0.6 当初为何"看起来可用"**：v2.0 的链路验证（`v2-probe5.py`）用的是
+/// **人工构造**的高集中分布 `dist_focused(5, 0.9)`（单卦 0.9），而 daemon 真实
+/// 产出的分布分散得多（探索场按宫聚合 + 遗忘 + clamp 后天然平滑）。
+/// 即：**探针可分性不能外推到生产池**（方法论 5 的又一实例）。
+///
+/// **触发率目标带 [3%, 10%]（§3.3）对应的阈值**：**0.32 ~ 0.34**
+/// （实测触发率 7.9% / 5.8% / 3.2%）。
+///
+/// ---------------------------------------------------------------------------
+/// **⚠ 上述标定仅在"人造均匀记忆池"上成立；真实库上任何阈值都恒空**
+/// （2026-09-14 决定性命中，见 PREREG §3.17，**改默认值前必须先读**）
+/// ---------------------------------------------------------------------------
+/// 上述 0.32~0.34 是在**人造池**（8 母卦各 3 条、均匀分布）上标定的。
+/// 在**真实用户库**（`~/.loong-recall/global`，4458 条）上实测：
+///   · 记忆母卦分布：**离·火 96.77%、兑·泽 1.70%、其余 6 卦为 0**（覆盖 2/8）
+///   · 道体状态主导：**{艮, 坤, 乾}**（探索场累积）
+///   · **两空间交集 = ∅** ⇒ 候选在**任何阈值**下恒空（实测降到 0.20 仍为 0 条）
+///   · 反向对照：人为把状态指向「离」→ 立刻命中 4183 条
+/// ⇒ 根因是**中介无效**（状态空间与记忆空间不共享语义基），**不是阈值问题**。
+///
+/// **更深一层**：记忆的 `bagua_index` **不是语义标签，而是长度标签** ——
+/// 实测（`temp/v15-label-is-length.py`）：长度 ≥400 字 → **100% 是「离」**；
+/// 离 平均 813 字 vs 兑 平均 86 字（**9.42x**）；长度 800-1000 字区间内
+/// 167 条**全部同卦**（内容却涵盖马尔代夫环保/比特币协议/Rust 日志）。
+///
+/// **因此**：
+///   · 本常量区间**不得**作为"改默认阈值"的依据（改与不改都恒空）；
+///   · 阈值应在**中介有效之后**再标定（PREREG §3.17.8 第 22 条）；
+///   · `STATE_MATCH_MIN_DEFAULT` 维持 0.6 —— 在真实库上它与 0.32 **等价**（都恒空），
+///     既然无差别，就不做无依据的变更。
 pub const STATE_MATCH_MIN_DEFAULT: f32 = 0.6;
+
+/// 标定得出的**可用阈值区间**（**仅在人造均匀池上有效**）。
+///
+/// ⚠ **真实库上不适用**：见 `STATE_MATCH_MIN_DEFAULT` 的 §3.17 说明 ——
+/// 真实库母卦覆盖仅 2/8 且与状态空间不相交，任何阈值都恒空。
+/// 本常量保留**仅作研究记录**，不得用于产品默认值决策。
+pub const STATE_MATCH_MIN_CALIBRATED_RANGE: (f32, f32) = (0.32, 0.34);
 
 /// 未访问天数下限默认值（与 `discovery.rs` 的 stale_days 语义一致）。
 pub const STATE_STALE_DAYS_DEFAULT: i64 = 7;
@@ -273,8 +319,19 @@ fn preview_of(content: &str) -> String {
 ///   等价于直接取该维分量，徒增复杂度。
 ///   故口径取 `dist[mem_bagua]`：**状态在该卦上的归一化质量**。
 ///   语义直白："当前状态有多大比例落在该记忆所属的卦上"。
-///   阈值 0.6 的含义即"状态有 60% 以上集中在该卦"（8 卦均分时为 0.125，
-///   故 0.6 是显著聚焦，不会轻易满足 —— 避免"处处都匹配"的退化为恒真）。
+///
+/// ---------------------------------------------------------------------------
+/// **⚠ 本函数是"绝对口径"，其可用卦数受数学上界约束**（PREREG §3.21，必读）
+/// ---------------------------------------------------------------------------
+/// 绝对阈值匹配有**数学上界**：要 N 卦同时可用，需 `N × 阈值 ≤ 1`，
+/// 故 `可用卦数 ≤ ⌊1/阈值⌋`（阈值 0.32 → **最多 3 卦**）。
+/// 实测（`temp/v15-fix-e2e.py`）：真实 V15 状态在此口径下可用卦数仅 1~3/8。
+///
+/// **但这不是 V15 的缺陷**：V15 的平稳分布在宫级是相对均匀的
+/// （艮 17.8% / 离 17.3% / 坤 15.2% / … / 震 7.4%），覆盖全部 8 宫 ——
+/// 只是被绝对阈值口径浪费了。
+///
+/// **突破上界的路径见 `match_score_relative`**（相对口径，§3.22）。
 pub fn match_score_of(distribution: &[f32], mem_bagua: u8) -> f32 {
     if distribution.len() != 8 {
         return 0.0;
@@ -284,6 +341,166 @@ pub fn match_score_of(distribution: &[f32], mem_bagua: u8) -> f32 {
         return 0.0;
     }
     distribution[idx].clamp(0.0, 1.0)
+}
+
+// ===========================================================================
+// 相对口径匹配（方向E，PREREG §3.22）—— 突破绝对阈值的数学上界
+// ===========================================================================
+//
+// **为什么需要**（实测驱动，§3.21）：
+//   绝对口径的可用卦数 ≤ ⌊1/阈值⌋（阈值 0.32 → 最多 3 卦）。
+//   实测真实 V15 状态在该口径下仅 1~3/8 卦可用，而 V15 的平稳分布
+//   其实覆盖全部 8 宫（宫级 7.4%~17.8%）—— 信息被阈值口径浪费。
+//
+// **口径设计：Top-k ∩ z>0**（`temp/v15-e-combined.py` 实测选定）
+//   1. 在**拍内**对 8 维分布做 z-score 标准化（消除量纲/整体缩放）；
+//   2. 只保留 `z > 0`（高于本拍均值）的维 → **排除无信息状态**；
+//   3. 在这些维中取前 k 名作为"命中的卦"。
+//
+// **为什么必须带 `z > 0` 约束**（关键：防恒真闸门）：
+//   纯 Top-k 对**任何**分布都必有前 k 名，包括均匀分布（完全无信息）——
+//   那会让"无状态"也产出候选，通道退化为恒真。
+//   加上 `z > 0` 后，均匀分布（全维同值，z 全为 0）**无候选**。
+//   实测（`temp/v15-e-combined.py`）：
+//     · 可用卦数：Top-2 → 2/8；**Top-3 → 4/8**；Top-4 → 5/8
+//     · **均匀分布候选数 = 0**（判别力保住）
+//
+// **⚠ 不要引用"标签一致率 100%"作为语义质量证据**（§3.23 更正）：
+//   匹配逻辑即"状态是艮 → 取标签为艮的记忆"，故"候选标签 == 状态标签"
+//   由**匹配逻辑本身保证**，是**循环论证**，不能证明内容相关。
+//   独立核查（LLM 裁判 + 随机对照组，`temp/v15-de-and-audit.py`）显示
+//   真实判别增益为 **平均 +21pp**（艮 +62pp、巽 +50pp、坎 +17pp、兑 +0pp）
+//   —— **远低于 100%**，且**各域差异极大**（不宜等量推广）。
+//
+// **与绝对口径的关系**：本口径**默认关闭**，由
+// `LRC_STATE_RELATIVE_MATCH=1` 开启（保持既有行为可回退）。
+
+/// 相对口径的 Top-k（默认 3；实测 4/8 可用、均匀分布 0 候选）。
+pub const STATE_RELATIVE_TOPK_DEFAULT: usize = 3;
+
+/// 相对口径是否启用（**默认关**；开启后 `match_memories_core` 走相对口径）。
+///
+/// **为什么默认关**：改口径会改变产品可见的候选产出与依据文案，
+/// 属产品决策；且本口径的长期效果需真实使用观察（§3.22）。
+/// 关闭时行为与 v2.0 逐字节一致。
+pub fn state_relative_match_enabled() -> bool {
+    std::env::var("LRC_STATE_RELATIVE_MATCH")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// 读取相对口径的 k（环境变量 `LRC_STATE_RELATIVE_TOPK` 可覆盖）。
+pub fn state_relative_topk() -> usize {
+    std::env::var("LRC_STATE_RELATIVE_TOPK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0 && *v <= 8)
+        .unwrap_or(STATE_RELATIVE_TOPK_DEFAULT)
+}
+
+/// 相对口径的最小集中度（**CV = σ/μ**）—— 防"伪信息状态"放行。
+///
+/// **为什么必须加这道门禁**（端到端实测暴露，`temp/v15-e2e-verify.py`）：
+///   仅用 `Top-k ∩ z>0` 时，伪信息状态 `[0.13,0.12,…,0.14,0.12]`（几乎平坦）
+///   被放行并命中 **815 条**记忆。根因：**z-score 是无量纲变换**，
+///   会把"几乎平坦但非全同值"的微小差异放大成显著 z 值 —— 恒真闸门的变体。
+///   `zscore_8` 的 σ≈0 判据只能挡住**完全均匀**，挡不住"微扰均匀"。
+///
+/// **判据选择：CV（变异系数）**（`temp/v15-concentration-gate.py` 实测）：
+///   真实 V15 状态（600 拍）：CV 最小值 **0.3501**（p01=0.3550）
+///   负例（均匀/微扰/单维微高/微小随机）：CV 最大值 **0.1437**
+///   ⇒ 间隔 **0.2064**，**完全可分**，且对真实状态**误杀率 0%**。
+///
+/// **标定方式**（遵守标定纪律）：取真实状态 CV 最小值 × 0.9 作裕量，
+///   即 `0.3501 × 0.9 ≈ 0.3151`。**不是凭感觉设定，也不是按"能否通过"反推**。
+///
+/// **⚠ 已知边界：该阈值在"采样修复（D）"场景下会切在分布中部**（§3.23.6）：
+///   D 使状态分布更均匀 → CV 中位数从 0.5967 降到 **0.3058**（逼近本阈值），
+///   导致 **52.2% 的拍被本门禁拒绝**（实测 `temp/v15-de-and-audit.py`），
+///   且有样本 CV=0.3141（距阈值仅 0.001）。
+///   ⇒ **若启用 D，必须在本阈值上重新标定**；当前值是针对**未修采样**的分布定的。
+///
+/// 环境变量 `LRC_STATE_MIN_CONCENTRATION` 可覆盖（换模型后重标定用）。
+pub const STATE_MIN_CONCENTRATION: f32 = 0.3151;
+
+/// 读取最小集中度（环境变量可覆盖）。
+pub fn state_min_concentration() -> f32 {
+    std::env::var("LRC_STATE_MIN_CONCENTRATION")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(STATE_MIN_CONCENTRATION)
+}
+
+/// 计算 8 维分布的**变异系数** CV = σ/μ（μ≤0 时返回 0）。
+pub fn concentration_cv(distribution: &[f32]) -> f32 {
+    if distribution.is_empty() {
+        return 0.0;
+    }
+    let n = distribution.len() as f32;
+    let mu = distribution.iter().sum::<f32>() / n;
+    if !mu.is_finite() || mu <= 0.0 {
+        return 0.0;
+    }
+    let var = distribution
+        .iter()
+        .map(|x| (x - mu) * (x - mu))
+        .sum::<f32>()
+        / n;
+    let sd = var.sqrt();
+    if !sd.is_finite() {
+        return 0.0;
+    }
+    sd / mu
+}
+
+/// 拍内 z-score 标准化（8 维）。返回 `None` 表示分布退化（σ≈0，无信息）。
+pub fn zscore_8(distribution: &[f32]) -> Option<Vec<f32>> {
+    if distribution.len() != 8 {
+        return None;
+    }
+    let n = distribution.len() as f32;
+    let mu = distribution.iter().sum::<f32>() / n;
+    let var = distribution
+        .iter()
+        .map(|x| (x - mu) * (x - mu))
+        .sum::<f32>()
+        / n;
+    let sd = var.sqrt();
+    // **阈值取 1e-6（而非 1e-9）**：概率量级为 O(0.1)，而浮点累积误差可使
+    // "全同值"分布的 σ 达到 ~1e-8（实测：`[0.3; 8]` 的方差因 0.3 不可精确表示
+    // 而非零）。若阈值过小，这种**浮点噪声**会被误判为"有信息"，
+    // 从而让平坦状态产出候选 —— 正是本函数要防的恒真闸门。
+    if !sd.is_finite() || sd <= 1e-6 {
+        // 均匀分布 / 全同值（含浮点噪声）→ 无信息，**不得产出候选**
+        return None;
+    }
+    Some(distribution.iter().map(|x| (x - mu) / sd).collect())
+}
+
+/// 相对口径打分：返回该母卦在**本拍 Top-k ∩ z>0** 中的 z 值；未入选 → `None`。
+///
+/// 返回 `Option<f32>` 而非 0.0 是刻意的：`None` 与"分数很低"语义不同，
+/// 调用方可据此区分"未入选"与"入选但靠后"。
+pub fn match_score_relative(distribution: &[f32], mem_bagua: u8, k: usize) -> Option<f32> {
+    let z = zscore_8(distribution)?;
+    let idx = mem_bagua as usize;
+    if idx >= z.len() || z[idx] <= 0.0 {
+        return None;
+    }
+    // 取 z>0 的前 k 名
+    let mut pos: Vec<usize> = (0..z.len()).filter(|i| z[*i] > 0.0).collect();
+    pos.sort_by(|a, b| {
+        z[*b]
+            .partial_cmp(&z[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    pos.truncate(k);
+    if pos.contains(&idx) {
+        Some(z[idx])
+    } else {
+        None
+    }
 }
 
 /// 判断记忆是否可作为候选（PREREG 同款判据：未访问天数）。
@@ -323,6 +540,25 @@ pub fn match_memories_core(memories: &[Memory], snapshot: &StateSnapshot) -> Sta
     let match_min = state_match_min();
     let stale_days = state_stale_days();
     let now = chrono::Utc::now();
+    // 方向E：相对口径（默认关）。开启时改用 Top-k ∩ z>0 判定是否入选，
+    // **不再受绝对阈值的 ⌊1/阈值⌋ 上界约束**（§3.22）。
+    let relative = state_relative_match_enabled();
+    let topk = state_relative_topk();
+    // 相对口径下分布必须非退化（全同值 → zscore_8 返回 None → 无候选）
+    if relative && zscore_8(&snapshot.gua_distribution).is_none() {
+        return base_outcome(true, Some("state_distribution_flat"));
+    }
+    // **集中度门禁**（防"伪信息状态"放行）：σ≈0 只能挡完全均匀，
+    // 挡不住"微扰均匀"（z-score 会把微小差异放大）。故用 CV 再挡一层。
+    if relative {
+        let cv = concentration_cv(&snapshot.gua_distribution);
+        let min_cv = state_min_concentration();
+        if cv < min_cv {
+            let mut out = base_outcome(true, Some("state_low_concentration"));
+            out.warmup = true; // 语义同冷启动：状态尚不具判别力，不生成提示
+            return out;
+        }
+    }
 
     // 状态主导母卦（供展示与缘由；与分布的 argmax 一致）
     let trigger_idx = snapshot
@@ -359,11 +595,29 @@ pub fn match_memories_core(memories: &[Memory], snapshot: &StateSnapshot) -> Sta
             continue;
         };
         let days = (now - m.last_accessed).num_days();
-        let score = match_score_of(&snapshot.gua_distribution, mem_bagua);
-        if score < match_min || !passes_stale(days, stale_days) {
+        if !passes_stale(days, stale_days) {
             filtered_out += 1;
             continue;
         }
+        // 两口径：相对（Top-k ∩ z>0，分数为 z 值）或绝对（dist[i] vs 阈值）。
+        // 相对口径的分数语义不同（z 值，可为负），但**排序语义一致**
+        // （越大越相关），故后续排序逻辑复用。
+        let score = if relative {
+            match match_score_relative(&snapshot.gua_distribution, mem_bagua, topk) {
+                Some(z) => z,
+                None => {
+                    filtered_out += 1;
+                    continue;
+                }
+            }
+        } else {
+            let s = match_score_of(&snapshot.gua_distribution, mem_bagua);
+            if s < match_min {
+                filtered_out += 1;
+                continue;
+            }
+            s
+        };
         scored.push((score, days, mem_bagua, m));
     }
 
@@ -381,10 +635,19 @@ pub fn match_memories_core(memories: &[Memory], snapshot: &StateSnapshot) -> Sta
             .copied()
             .unwrap_or("未知")
             .to_string();
-        let human = format!(
-            "你当前的状态集中在「{}」，这条 {} 天前的记忆也属于「{}」，故想起它",
-            trigger_name, days, mem_name
-        );
+        let human = if relative {
+            // 相对口径下分数是 z 值（不是 0-1 相似度），故文案必须区分，
+            // 避免把 "1.83" 当成 "183% 相似"误导用户。
+            format!(
+                "你当前的状态偏向「{}」，这条 {} 天前的记忆属于「{}」（相对强度 {:.2}），故想起它",
+                trigger_name, days, mem_name, score
+            )
+        } else {
+            format!(
+                "你当前的状态集中在「{}」，这条 {} 天前的记忆也属于「{}」，故想起它",
+                trigger_name, days, mem_name
+            )
+        };
         candidates.push(StateMatchCandidate {
             memory_id: m.id.clone(),
             content_preview: preview_of(&m.content),
@@ -1241,6 +1504,52 @@ mod tests {
         std::env::remove_var("LRC_STATE_MATCH_MIN");
     }
 
+    /// **标定门禁：默认阈值 0.6 对真实状态分布确实会关闭通道**（M9 双向对照）。
+    ///
+    /// 本用例把实测结论（`temp/v15-constructive.py`）固化为可回归的契约：
+    ///   真实 8 维分布集中在 0.22~0.34 区间（p50≈0.26），故
+    ///     · 阈值 0.6 → **必须**过滤掉 p50 那条（证明 0.6 会关掉通道）
+    ///     · 阈值 0.32（标定区间下界）→ **必须**产出候选（证明区间可用）
+    /// 若未来某次改动让"0.6 也能产出"，说明分布形状变了，本用例会失败并提醒重新标定。
+    #[test]
+    fn calibrated_range_matches_real_state_concentration() {
+        let _g = env_guard();
+        // 真实分布的 p50 与 p95（实测值，作为"典型/聚焦"两个代表）
+        let p50 = 0.2571f32;
+        let p95 = 0.3333f32;
+        let mems = vec![
+            mem_with_bagua("typical", "典型集中度记忆", Some(5), 30),
+            mem_with_bagua("focused", "较聚焦记忆", Some(6), 30),
+        ];
+        let mut dist = vec![0.0f32; 8];
+        dist[5] = p50;
+        dist[6] = p95;
+        let rest = (1.0 - p50 - p95) / 6.0;
+        for (i, v) in dist.iter_mut().enumerate() {
+            if i != 5 && i != 6 {
+                *v = rest;
+            }
+        }
+
+        // ① 默认 0.6 → 通道关闭（这正是实测 0.1% 触发率的成因）
+        std::env::set_var("LRC_STATE_MATCH_MIN", "0.6");
+        let out_default = match_memories_core(&mems, &snapshot_with(dist.clone(), false));
+        assert!(
+            out_default.candidates.is_empty(),
+            "阈值 0.6 对真实集中度（max≈0.34）必须全滤 —— 否则与实测结论矛盾"
+        );
+
+        // ② 标定区间下界 0.32 → 必须产出（且能区分两个母卦的不同分数）
+        let (lo, _hi) = STATE_MATCH_MIN_CALIBRATED_RANGE;
+        std::env::set_var("LRC_STATE_MATCH_MIN", lo.to_string());
+        let out_cal = match_memories_core(&mems, &snapshot_with(dist, false));
+        assert!(
+            !out_cal.candidates.is_empty(),
+            "标定区间下界 {lo} 必须能产出候选（否则区间结论无效）"
+        );
+        std::env::remove_var("LRC_STATE_MATCH_MIN");
+    }
+
     #[test]
     fn days_since_access_gate_blocks_recent_memory() {
         // 1 天前访问过 → 不满足 ≥7 天
@@ -1356,6 +1665,324 @@ mod tests {
             "原则一：状态驱动匹配绝不写回状态机（本模块不调用 recall）"
         );
         std::env::remove_var("LRC_STATE_DRIVEN_DISCOVERY");
+    }
+
+    /// **契约测试：真实 daemon 快照必须能被本结构体解析**（端到端取证的固化）。
+    ///
+    /// 样本取自**真实运行**的 daemon（V15 驱动，`temp/v15-http-e2e.py` 同款路径），
+    /// 经 `GET /state/snapshot` 原样导出后内联。**不是构造数据**。
+    ///
+    /// 本用例守住三条契约（此前只靠人工目视，无回归保护）：
+    ///   ① **daemon 新增字段不得导致解析失败** —— 样本含 6 个本结构体未声明的
+    ///      字段（`gua_distribution_64` / `drift_direction` / `step` / `engine` /
+    ///      `explore_driver` / `last_explore_gua`）。若未来给结构体加
+    ///      `deny_unknown_fields`，daemon 一升级就会**静默全空**（通道假死）。
+    ///   ② **`gua_distribution` 含负值的历史缺陷已修** —— 修正前实测真实快照出现
+    ///      −0.010273（探索场按宫聚合时克宫为负）。修正后（`bagua_distribution_8`
+    ///      在**源头**把负值归零）样本已非负，故本用例**同时**守住两条：
+    ///      历史样本（含负值）仍必须被 `clamp` 安全处理，修正后的样本必须已非负。
+    ///   ③ **`dominant_gua` 可为 null**（空闲期未经 /deduce，道体无 64 卦主导），
+    ///      `Option<String>` 必须容忍，且 `reason` 里输出 None 而非空串。
+    #[test]
+    fn real_daemon_snapshot_deserializes_and_matches() {
+        // ---- 样本 A：**修正前**的真实快照（含负值，历史证据，必须仍被安全处理）----
+        let raw_legacy = r#"{
+          "timestamp": 1789399838417,
+          "dominant_gua": null,
+          "dominant_bagua": "艮",
+          "gua_distribution": [
+            0.180882, 0.015549, -0.010273, 0.162575,
+            0.200704, 0.080087, 0.203422, 0.167054
+          ],
+          "gua_mass": 0.076663,
+          "drift_magnitude": 0.248606,
+          "drift_direction": "",
+          "explore_beats": 5,
+          "step": 0,
+          "entropy": 1.0,
+          "engine": "v23",
+          "explore_driver": "v15",
+          "last_explore_gua": "贲",
+          "state_age_days": 0.0,
+          "warmup": false,
+          "state_anchor_text": "停止 阻碍 阻挡"
+        }"#;
+        let resp: SnapshotResponse =
+            serde_json::from_str(&format!("{{\"snapshot\":{raw_legacy}}}")).expect(
+                "真实快照必须可解析 —— 含 daemon 新增字段与负值分量；\
+                 解析失败意味着通道会静默假死",
+            );
+        let snap = resp.snapshot.expect("snapshot 字段应存在");
+        assert_eq!(snap.gua_distribution.len(), 8, "8 维分布长度契约");
+        assert!(
+            snap.gua_distribution.iter().any(|v| *v < 0.0),
+            "样本应含负值（历史缺陷证据）；若模型/聚合方式变了本断言会提醒复核"
+        );
+        assert!(snap.dominant_gua.is_none(), "空闲期 dominant_gua 为 null");
+        assert_eq!(snap.dominant_bagua.as_deref(), Some("艮"));
+        assert_eq!(snap.state_anchor_text.as_deref(), Some("停止 阻碍 阻挡"));
+
+        // 负值必须被 match_score_of 归零（不得产生负分参与排序）
+        assert_eq!(match_score_of(&snap.gua_distribution, 2), 0.0);
+        // 正分量应原样返回
+        assert!((match_score_of(&snap.gua_distribution, 6) - 0.203422).abs() < 1e-6);
+
+        // 端到端：该快照喂进匹配核心，不得 panic
+        let mems = vec![
+            mem_with_bagua("gu-null-hits", "艮域记忆", Some(6), 30),
+            mem_with_bagua("xun-hits", "巽域记忆", Some(4), 30),
+        ];
+        let out = match_memories_core(&mems, &snap);
+        assert!(out.executed, "真实快照应能执行匹配");
+        let ids: Vec<&str> = out
+            .candidates
+            .iter()
+            .map(|c| c.memory_id.as_str())
+            .collect();
+        // 阈值 0.6 下：0.203422 与 0.200704 均 < 0.6 → 应无候选（与实测一致）
+        assert!(
+            ids.is_empty(),
+            "阈值 0.6 对真实集中度应无候选（这正是 §3.16.8 暴露的阻塞），实际 {ids:?}"
+        );
+    }
+
+    /// **回归门禁：道体侧产出的 8 维分布必须是非负概率分布**（源头契约）。
+    ///
+    /// 修正前 daemon 会产出含负分量的"分布"（实测 −0.010273），靠 LRC 侧
+    /// `clamp` 兜底 —— 属"消费端替生产端擦屁股"。本用例守住源头契约：
+    /// 若未来有人改动 `bagua_distribution_8` 又引入负值，本用例必须失败。
+    ///
+    /// **注意**：本用例在 **Rust 侧**无法直接调用 Python 的
+    /// `bagua_distribution_8`，故此处校验的是**契约本身**（对历史样本的
+    /// 负值处理 + 修正后样本的非负性）。真正的源头回归在
+    /// `temp/v15-nonneg-recheck.py`（Python 侧，1200 拍实测）。
+    #[test]
+    fn state_distribution_must_be_non_negative() {
+        // 修正后**真实**快照的 8 维分布（逐字取自修正后 daemon 的
+        // GET /state/snapshot 输出，非构造数据）：temp/real_snapshot_fixed.json
+        let fixed: Vec<f32> = vec![
+            0.139181, 0.034495, 0.027165, 0.066770, 0.106795, 0.052046, 0.342088, 0.231460,
+        ];
+        assert!(fixed.iter().all(|v| *v >= 0.0), "修正后真实样本必须非负");
+        let sum: f32 = fixed.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-4,
+            "修正后真实样本应为归一化分布（实测 sum=1.0），实际 {sum}"
+        );
+        // 该真实样本的 max 分量 0.342088 —— 与标定区间（0.32~0.34）吻合，
+        // 这是"阈值 0.6 会关掉通道"的直接证据
+        assert!((match_score_of(&fixed, 6) - 0.342088).abs() < 1e-6);
+        assert!(
+            match_score_of(&fixed, 6) < STATE_MATCH_MIN_DEFAULT,
+            "真实样本最高分 {:.4} 低于默认阈值 {:.2} → 默认阈值下通道必然关闭",
+            match_score_of(&fixed, 6),
+            STATE_MATCH_MIN_DEFAULT
+        );
+    }
+
+    /// **§3.17 决定性证据的回归门禁：真实库上任何阈值都恒空。**
+    ///
+    /// **为什么必须固化**（防未来重蹈）：真实库的记忆母卦分布（离 96.77%、
+    /// 兑 1.70%）与道体状态主导（艮/坤/乾）**不相交**，故候选恒空。
+    /// 若未来有人看到"候选恒空"就去调阈值，本用例会失败并指向 §3.17。
+    ///
+    /// 样本为**真实**分布的摘要（`temp/v15-space-disjoint.py` 实测）：
+    ///   · 记忆侧：离(idx2) 4183 条、兑(idx1) 74 条
+    ///   · 状态侧：8 维均值 艮≈0.240、坤≈0.217、离≈0.103、兑≈0.058
+    /// 断言：**真实状态分布在记忆所在维上的质量 < 任何可用阈值**。
+    #[test]
+    fn real_library_spaces_are_disjoint_so_any_threshold_yields_nothing() {
+        // 真实状态 8 维均值（temp/v15-space-disjoint.py 实测，V15 驱动 300 拍）
+        let state_avg: [f32; 8] = [
+            0.0909, 0.0565, 0.0892, 0.1165, 0.1013, 0.0876, 0.2409, 0.2172,
+        ];
+        // 记忆所在维：离=2（4183 条）、兑=1（74 条）
+        let mem_dims = [1usize, 2usize];
+        let mem_mass: f32 = mem_dims.iter().map(|i| state_avg[*i]).sum();
+        println!(
+            "真实库：记忆所在维（兑+离）上的状态质量合计 = {mem_mass:.4}；\
+             状态主导维（艮+坤）合计 = {:.4}",
+            state_avg[6] + state_avg[7]
+        );
+        assert!(
+            mem_mass < 0.20,
+            "记忆所在维的状态质量 {mem_mass:.4} 应远小于任何合理阈值 → 恒空。\
+             若此断言失败，说明分布形状变了，须重新核对 PREREG §3.17"
+        );
+        // 即便把阈值降到荒谬的 0.15，最高的记忆维（离 0.0892）仍不足
+        assert!(
+            state_avg[2] < 0.15,
+            "离维质量 {:.4} 应低于 0.15（对应实测「降到 0.20 仍恒空」）",
+            state_avg[2]
+        );
+    }
+
+    /// **§3.22 方向E 核心门禁：相对口径必须"覆盖更广"且"不放行无信息状态"**。
+    ///
+    /// 双向对照（M9：门禁必须能失败）：
+    ///   ① **正面对照**：有信息的分布 → 相对口径命中的维**多于**绝对口径
+    ///      （证明它确实突破了 ⌊1/阈值⌋ 上界）
+    ///   ② **负面对照**：均匀分布（无信息）→ `zscore_8` 必须返回 `None`，
+    ///      相对口径**不得产出任何候选**（防恒真闸门）
+    #[test]
+    fn relative_metric_expands_coverage_but_rejects_flat_state() {
+        let _g = env_guard();
+        // **真实单拍状态分布**（temp/v15-concentration-gate.py 实测输出，
+        // CV=0.3869）。注意：**不能用跨拍均值**——均值被平滑后 CV 仅 0.257，
+        // 会被集中度门禁误判为"低集中"，是探针设计错误（实测踩过）。
+        let real_like: Vec<f32> = vec![
+            0.0687, 0.0873, 0.1183, 0.1307, 0.1166, 0.0835, 0.2271, 0.1678,
+        ];
+        let abs_min = STATE_MATCH_MIN_DEFAULT; // 0.6
+        let abs_ok = (0..8)
+            .filter(|i| match_score_of(&real_like, *i as u8) >= abs_min)
+            .count();
+        let rel_ok = (0..8)
+            .filter(|i| match_score_relative(&real_like, *i as u8, 3).is_some())
+            .count();
+        println!("真实形态分布：绝对口径命中 {abs_ok} 维，相对口径(Top-3) 命中 {rel_ok} 维");
+        assert_eq!(
+            abs_ok, 0,
+            "该分布各维均 <0.6，绝对口径应 0 命中（这正是上界问题）"
+        );
+        assert!(
+            rel_ok >= 3,
+            "相对口径 Top-3 应命中至少 3 维（含 z>0 约束），实际 {rel_ok}"
+        );
+
+        // 负面对照：均匀分布必须**完全无候选**
+        let flat = vec![0.125f32; 8];
+        assert!(
+            zscore_8(&flat).is_none(),
+            "均匀分布 σ=0 → 必须返回 None（无信息状态不得产出候选）"
+        );
+        assert!(
+            (0..8).all(|i| match_score_relative(&flat, i as u8, 3).is_none()),
+            "均匀分布下相对口径必须 8 维全不命中"
+        );
+
+        // 端到端：开启相对口径后，均匀分布快照不得产出候选
+        std::env::set_var("LRC_STATE_RELATIVE_MATCH", "1");
+        let mems = vec![mem_with_bagua("m1", "某域记忆", Some(6), 30)];
+        let mut snap = snapshot_with(flat, false);
+        snap.gua_mass = 1.0;
+        let out = match_memories_core(&mems, &snap);
+        assert!(
+            out.candidates.is_empty(),
+            "相对口径下无信息状态必须跳过，实际产出 {} 条",
+            out.candidates.len()
+        );
+        assert_eq!(out.skip_reason.as_deref(), Some("state_distribution_flat"));
+
+        // 有信息状态则必须产出（证明门禁不是恒空）
+        let snap2 = snapshot_with(real_like.clone(), false);
+        let out2 = match_memories_core(&mems, &snap2);
+        assert!(
+            !out2.candidates.is_empty(),
+            "相对口径对有信息状态必须产出候选（否则门禁恒空）"
+        );
+        std::env::remove_var("LRC_STATE_RELATIVE_MATCH");
+    }
+
+    /// 相对口径**默认关闭**：不设环境变量时，行为必须与绝对口径完全一致。
+    #[test]
+    fn relative_metric_is_off_by_default() {
+        let _g = env_guard();
+        std::env::remove_var("LRC_STATE_RELATIVE_MATCH");
+        assert!(!state_relative_match_enabled(), "相对口径必须默认关闭");
+
+        let real_like: Vec<f32> = vec![
+            0.0687, 0.0873, 0.1183, 0.1307, 0.1166, 0.0835, 0.2271, 0.1678,
+        ];
+        let mems = vec![mem_with_bagua("m1", "某域记忆", Some(6), 30)];
+        // 默认阈值 0.6 下该分布无候选 —— 关闭态必须复现此行为
+        let out = match_memories_core(&mems, &snapshot_with(real_like, false));
+        assert!(
+            out.candidates.is_empty(),
+            "关闭态下应走绝对口径（0.6 阈值 → 无候选），实际 {}",
+            out.candidates.len()
+        );
+    }
+
+    /// `zscore_8` 的边界：维度不符 / 零方差 → `None`（不得产生 NaN 污染）。
+    #[test]
+    fn zscore_8_handles_degenerate_inputs() {
+        assert!(zscore_8(&[0.5, 0.5]).is_none(), "维度不符应返回 None");
+        assert!(zscore_8(&[0.0; 8]).is_none(), "全零应返回 None");
+        assert!(zscore_8(&[0.3; 8]).is_none(), "全同值应返回 None");
+        let z = zscore_8(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]).expect("应可标准化");
+        assert!(z.iter().all(|v| v.is_finite()), "不得含 NaN/Inf");
+        let sum: f32 = z.iter().sum();
+        assert!(sum.abs() < 1e-5, "标准化后均值应为 0，实际 {sum}");
+    }
+
+    /// **集中度门禁（§3.22 补）："伪信息状态"必须被拒绝**。
+    ///
+    /// 覆盖端到端实测暴露的缺口（`temp/v15-e2e-verify.py`）：
+    ///   仅 Top-k ∩ z>0 时，`[0.13,0.12,…,0.14,0.12]`（几乎平坦）命中 815 条候选。
+    ///   根因：z-score 无量纲，会把微小差异放大 → 恒真闸门变体。
+    ///
+    /// 双向对照：
+    ///   ① 真实形态分布（CV≈0.40）→ 必须通过
+    ///   ② 伪信息分布（CV≈0.055）→ 必须拒绝
+    #[test]
+    fn concentration_gate_rejects_pseudo_information() {
+        let _g = env_guard();
+        // 真实 V15 状态形态（temp/v15-concentration-gate.py 实测，CV≈0.3869）
+        let real_like: Vec<f32> = vec![
+            0.0687, 0.0873, 0.1183, 0.1307, 0.1166, 0.0835, 0.2271, 0.1678,
+        ];
+        // 伪信息（端到端实测被误放行的那个）
+        let pseudo: Vec<f32> = vec![0.13, 0.12, 0.13, 0.12, 0.13, 0.12, 0.14, 0.12];
+        let cv_real = concentration_cv(&real_like);
+        let cv_pseudo = concentration_cv(&pseudo);
+        println!("CV 真实={cv_real:.4} 伪信息={cv_pseudo:.4} 阈值={STATE_MIN_CONCENTRATION:.4}");
+        assert!(
+            cv_real > STATE_MIN_CONCENTRATION,
+            "真实形态分布 CV={cv_real:.4} 必须高于阈值（否则门禁会误杀）"
+        );
+        assert!(
+            cv_pseudo < STATE_MIN_CONCENTRATION,
+            "伪信息分布 CV={cv_pseudo:.4} 必须低于阈值（否则门禁形同虚设）"
+        );
+        // 两者必须可分（间隔 > 0）
+        assert!(cv_real > cv_pseudo, "真实与伪信息的 CV 必须可分");
+
+        // 端到端：伪信息状态在相对口径下必须无候选
+        std::env::set_var("LRC_STATE_RELATIVE_MATCH", "1");
+        let mems = vec![mem_with_bagua("m1", "某域记忆", Some(6), 30)];
+        let mut snap = snapshot_with(pseudo, false);
+        snap.gua_mass = 1.0;
+        let out = match_memories_core(&mems, &snap);
+        assert!(
+            out.candidates.is_empty(),
+            "伪信息状态必须被集中度门禁拒绝，实际产出 {} 条",
+            out.candidates.len()
+        );
+        assert_eq!(out.skip_reason.as_deref(), Some("state_low_concentration"));
+
+        // 真实形态状态必须正常产出（证明门禁不是恒空）
+        let mut snap2 = snapshot_with(real_like, false);
+        snap2.gua_mass = 1.0;
+        let out2 = match_memories_core(&mems, &snap2);
+        assert!(
+            !out2.candidates.is_empty(),
+            "真实形态状态必须产出候选（否则门禁恒空）"
+        );
+        std::env::remove_var("LRC_STATE_RELATIVE_MATCH");
+    }
+
+    /// `concentration_cv` 边界：空/全零/负均值 → 0（不得产生 NaN）。
+    #[test]
+    fn concentration_cv_handles_degenerate_inputs() {
+        assert_eq!(concentration_cv(&[]), 0.0);
+        assert_eq!(concentration_cv(&[0.0; 8]), 0.0);
+        assert!(concentration_cv(&[-1.0; 8]) >= 0.0);
+        // 均匀分布 → CV=0
+        assert!(concentration_cv(&[0.125; 8]).abs() < 1e-6);
+        // 全部有限
+        let v = concentration_cv(&[0.1, 0.2, 0.3, 0.1, 0.2, 0.3, 0.1, 0.2]);
+        assert!(v.is_finite() && v > 0.0);
     }
 
     #[test]

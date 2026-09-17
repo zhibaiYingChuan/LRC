@@ -185,6 +185,32 @@ mod api_contracts_tests {
     }
 
     #[test]
+    fn test_associations_request_serde() {
+        // 最小请求体：仅 memory_id，relation 缺省表示"全部类型并存"
+        let json = r#"{"memory_id":"mem-001"}"#;
+        let req: MemoryAssociationsRequest = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(req.memory_id, "mem-001");
+        assert!(
+            req.relation.is_none(),
+            "relation 缺省应为 None（返回全部类型）"
+        );
+    }
+
+    #[test]
+    fn test_associations_request_with_relation_filter() {
+        let json = r#"{"memory_id":"mem-001","relation":"same_event"}"#;
+        let req: MemoryAssociationsRequest = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(req.relation.as_deref(), Some("same_event"));
+    }
+
+    #[test]
+    fn test_associations_request_requires_memory_id() {
+        let json = r#"{}"#;
+        let result: Result<MemoryAssociationsRequest, _> = serde_json::from_str(json);
+        assert!(result.is_err(), "缺失 memory_id 字段应反序列化失败");
+    }
+
+    #[test]
     fn test_encode_request_required_fields() {
         // text 是必填字段，缺失应反序列化失败
         let json = r#"{}"#;
@@ -336,6 +362,9 @@ mod api_contracts_tests {
             topological_depth: 0.5,
             version: 1,
             created_at: "2026-07-29T00:00:00Z".to_string(),
+            event_id: None,
+            entities: Vec::new(),
+            why: None,
         };
         let json = serde_json::to_value(&mem).expect("序列化失败");
         assert_eq!(json["id"], "mem-001");
@@ -384,6 +413,7 @@ mod api_contracts_tests {
                     hit_paths: vec!["fast", "deep"],
                 }],
             },
+            associated: vec![],
         };
         let json = serde_json::to_value(&resp).expect("序列化失败");
         let exp = &json["explanation"];
@@ -440,6 +470,7 @@ mod api_contracts_tests {
                     hit_paths: vec!["fast"],
                 }],
             },
+            associated: vec![],
         };
         let json = serde_json::to_value(&resp).expect("序列化失败");
         let item = &json["explanation"]["items"][0];
@@ -664,6 +695,8 @@ mod api_contracts_tests {
                     score: 1.0,
                     source: "root".into(),
                     evidence: None,
+                    relation: None,
+                    why: None,
                 },
                 ExploreNode {
                     id: "mem-child".into(),
@@ -672,6 +705,8 @@ mod api_contracts_tests {
                     score: 0.7,
                     source: "expanded".into(),
                     evidence: Some("联想桥强关联".into()),
+                    relation: None,
+                    why: None,
                 },
             ],
             edges: vec![ExploreEdge {
@@ -679,6 +714,7 @@ mod api_contracts_tests {
                 to: "mem-child".into(),
                 score: 0.7,
                 evidence: Some("联想桥强关联".into()),
+                relation: None,
             }],
             trail: vec![AssociationStep {
                 from_id: Some("mem-root".into()),
@@ -4563,5 +4599,761 @@ mod api_contracts_tests {
             root_node.is_some_and(|n| n.content.contains("番茄炒蛋")),
             "回退基线仍应由词面门禁选出生活记忆"
         );
+    }
+
+    // ============================================================
+    // 记录层（event_id / entities / Experience）端到端验证
+    //
+    // 背景（daoti/PREREG_ACTIVE_DISCOVERY.md §3.42 / §3.43）：
+    //   用户裁定「先改记录层」。此前验证只到 store 层单元测试与 remember
+    //   工具层，**未验证真实 HTTP → 落盘 → 重载**这一完整链路。
+    //   本组用例补上该缺口：走生产同构链路（build_v1_router → oneshot），
+    //   并**从磁盘重新加载**（而非复用内存缓存），以捕获
+    //   "写入成功、重载后字段消失"这一类最隐蔽的失败（§3.42.5 缺陷二）。
+    // ============================================================
+
+    /// 记录层用例专用代码库桩：本组端点（remember / associations）不触碰代码库，
+    /// 该桩仅满足 build_v1_router 的构造签名。**刻意不 panic**——任何代码库调用
+    /// 都属意外，应表现为 0 结果而非掩盖真实失败。
+    struct NoopCodebase;
+
+    impl IndexedCodebase for NoopCodebase {
+        fn search(&self, query: &str, _top_k: usize) -> crate::RetrievalResult {
+            crate::RetrievalResult {
+                query: query.to_string(),
+                returned: 0,
+                total_indexed: 0,
+                results: Vec::new(),
+            }
+        }
+
+        fn multi_keyword_search(
+            &self,
+            _keywords: &[String],
+            _top_k: usize,
+        ) -> crate::RetrievalResult {
+            crate::RetrievalResult {
+                query: String::new(),
+                returned: 0,
+                total_indexed: 0,
+                results: Vec::new(),
+            }
+        }
+
+        fn get_stats(&self) -> crate::ChunkStats {
+            crate::ChunkStats {
+                file_count: 0,
+                total_chunks: 0,
+                type_counts: std::collections::HashMap::new(),
+                language_counts: std::collections::HashMap::new(),
+                avg_lines: 0.0,
+            }
+        }
+
+        fn recent_chunks(&self, _top_k: usize) -> crate::RetrievalResult {
+            crate::RetrievalResult {
+                query: String::new(),
+                returned: 0,
+                total_indexed: 0,
+                results: Vec::new(),
+            }
+        }
+    }
+
+    /// 记录层端到端：HTTP 写入带 event_id/entities 的记忆 → 落盘 → 重载读回，
+    /// 并用 `/memories/associations` 验证三类关联可被真实查询。
+    #[tokio::test]
+    async fn test_record_layer_end_to_end_persist_and_associate() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_record_layer_e2e_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared.clone(), manager, llm_api, llm_ready, false);
+
+        // 两次经历，各自产生"语义不同侧面"的记忆：
+        // - e-trip（出行）：西湖徒步 / 楼外楼吃饭 —— 无共享专名，语义相距远
+        // - e-bday（生日）：买钓鱼竿 / 订蛋糕 —— 共享实体「爸爸」
+        let payloads = [
+            serde_json::json!({
+                "content": "和爸妈去杭州西湖，在苏堤上走了整整一下午",
+                "memory_type": "experience",
+                "event_id": "e-trip",
+                "entities": [{"name": "爸妈", "kind": "person"},
+                             {"name": "西湖", "kind": "place"}],
+                "importance": 7,
+            }),
+            serde_json::json!({
+                "content": "中午在楼外楼吃了西湖醋鱼，味道一般但环境好",
+                "memory_type": "experience",
+                "event_id": "e-trip",
+                "entities": [{"name": "楼外楼", "kind": "place"}],
+                "importance": 5,
+            }),
+            serde_json::json!({
+                "content": "爸爸下个月生日，想送他一套钓鱼竿",
+                "memory_type": "experience",
+                "event_id": "e-bday",
+                "entities": [{"name": "爸妈", "kind": "person"},
+                             {"name": "钓鱼竿", "kind": "thing"}],
+                "importance": 8,
+            }),
+            // ★v0.9.8 联想用例的**关键一条**：与 e-trip 同一次经历，
+            // 但内容在词面与语义上都**远离**「苏堤」（讲的是回程与充电宝）——
+            // 因此它不会被检索召回，却应当被"共同经历"联想补出来。
+            // 这正是"相似度给不出、只能靠记录"的连接（本用例的验证靶心）。
+            serde_json::json!({
+                "content": "回程的高铁上把充电宝忘在了座位底下",
+                "memory_type": "experience",
+                "event_id": "e-trip",
+                "entities": [{"name": "充电宝", "kind": "thing"}],
+                "importance": 3,
+            }),
+        ];
+
+        let mut ids = Vec::new();
+        for payload in &payloads {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/memories/remember")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap();
+            let response = app
+                .clone()
+                .into_service()
+                .oneshot(request)
+                .await
+                .expect("HTTP 层调用失败");
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "记忆写入应返回 200，实测 {status}，body={}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["success"], true, "写入应成功: {body}");
+            ids.push(body["memory_id"].as_str().unwrap().to_string());
+        }
+
+        // ---------- 关键：从磁盘重新加载（而非复用内存缓存）----------
+        // 这一步是"持久层字段白名单漏字段"的唯一检出手段（§3.42.5）。
+        // 用 persistence().load_all_memories() 直读磁盘，绕开 store 内存缓存。
+        let reloaded = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let all = reloaded
+            .persistence()
+            .load_all_memories()
+            .expect("重载失败");
+        assert_eq!(all.len(), 4, "重载后应有 4 条记忆");
+
+        // 负向对照（方法论 74）：断言字段**确实出现在磁盘文本中**。
+        // 若仅断言"内存读回正确"，当 JSON 序列化漏掉 skip_serializing 字段时
+        // 测试仍可能因缓存而通过；直接查磁盘文本可堵住该假绿。
+        let raw = std::fs::read_to_string(dir.join("memories.json")).expect("读取落盘 JSON 失败");
+        assert!(
+            raw.contains("\"event_id\""),
+            "落盘 JSON 文本必须含 event_id 键——不在则字段在序列化环节被丢弃"
+        );
+        assert!(raw.contains("e-trip"), "落盘 JSON 必须含事件 ID 值 e-trip");
+        assert!(
+            raw.contains("钓鱼竿"),
+            "落盘 JSON 必须含实体名——不在则 entities 在序列化环节被丢弃"
+        );
+
+        let by_content = |key: &str| {
+            all.iter()
+                .find(|m| m.content.contains(key))
+                .unwrap_or_else(|| panic!("重载后未找到含『{key}』的记忆——字段可能在落盘环节丢失"))
+        };
+
+        let trip = by_content("苏堤");
+        assert_eq!(
+            trip.event_id.as_deref(),
+            Some("e-trip"),
+            "重载后 event_id 必须保留（否则『共同经历』信息在落盘环节被静默丢弃）"
+        );
+        assert_eq!(
+            trip.memory_type,
+            crate::memory_types::MemoryType::Experience
+        );
+        assert!(
+            trip.entities.iter().any(|e| e.name == "爸妈"),
+            "重载后 entities 必须保留，实测 {:?}",
+            trip.entities
+        );
+
+        let meal = by_content("楼外楼");
+        assert_eq!(meal.event_id.as_deref(), Some("e-trip"));
+
+        let gift = by_content("钓鱼竿");
+        assert_eq!(gift.event_id.as_deref(), Some("e-bday"));
+
+        // ---------- 关联推导：同经历 + 共享实体两类并存 ----------
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/associations")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "memory_id": gift.id }).to_string(),
+            ))
+            .unwrap();
+        let response = app
+            .clone()
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("associations HTTP 调用失败");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "关联查询应返回 200");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let assoc = body["associations"]
+            .as_array()
+            .expect("associations 应为数组");
+
+        // 「钓鱼竿」这条：与「西湖」共享实体爸妈（shared_entity）
+        assert!(
+            assoc.iter().any(|a| {
+                a["relation"] == "shared_entity"
+                    && a["content_preview"].as_str().unwrap_or("").contains("苏堤")
+            }),
+            "应给出与西湖记忆的『共享实体』关联（依据实体而非语义相似）: {body}"
+        );
+        // 每条关联必须带人类可读依据（对应判据「人类可解释」）
+        for a in assoc {
+            assert!(
+                a["why"].as_str().is_some_and(|w| !w.is_empty()),
+                "每条关联必须携带 why 依据: {a}"
+            );
+        }
+
+        // ---------- 关联类型过滤 ----------
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/associations")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "memory_id": trip.id, "relation": "same_event" }).to_string(),
+            ))
+            .unwrap();
+        let response = app
+            .clone()
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("associations 过滤调用失败");
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let filtered = body["associations"].as_array().unwrap();
+        assert!(
+            filtered.iter().all(|a| a["relation"] == "same_event"),
+            "relation 过滤应只返回同经历关联: {body}"
+        );
+        assert!(
+            filtered.iter().any(|a| a["content_preview"]
+                .as_str()
+                .unwrap_or("")
+                .contains("楼外楼")),
+            "『西湖徒步』的同经历关联应包含『楼外楼吃饭』（语义不相似但同源）: {body}"
+        );
+
+        // ---------- 关联图端到端：HTTP → 多跳结构推理 ----------
+        // 以「钓鱼竿」（e-bday，含实体 爸妈/钓鱼竿）为根：
+        //   直接：同经历「蛋糕」…（本数据集无第二条 e-bday，故直接边为 0）
+        //   间接：根 —共享实体(爸妈)— 「西湖」 —同经历— 「楼外楼」 ⇒ 两层
+        // 关键：根与「楼外楼」之间**无任何直接记录**，该关联只能由结构推出。
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/association-graph")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "memory_id": gift.id }).to_string(),
+            ))
+            .unwrap();
+        let response = app
+            .clone()
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("association-graph HTTP 调用失败");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "关联图应返回 200，实测 {status}，body={}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let g: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(g["root"].as_str(), Some(gift.id.as_str()));
+        assert_eq!(g["truncated"], false, "默认上限 50 不应截断: {g}");
+
+        let edges = g["edges"].as_array().expect("edges 应为数组");
+        // 直接边：与「西湖」共享 person 实体「爸妈」
+        assert!(
+            edges.iter().any(|e| {
+                e["hops"] == 1
+                    && e["relation"] == "shared_entity"
+                    && e["to"].as_str() == Some(trip.id.as_str())
+            }),
+            "应有直接边：与西湖记忆共享实体「爸妈」，实际: {edges:?}"
+        );
+        // ★ 间接边：根 →(共享实体)→ 西湖 →(同一次经历)→ 楼外楼
+        let ind = edges
+            .iter()
+            .find(|e| e["hops"] == 2 && e["to"].as_str() == Some(meal.id.as_str()))
+            .unwrap_or_else(|| {
+                panic!("应推出指向『楼外楼』的间接关联（二者无任何直接记录）: {edges:?}")
+            });
+        assert_eq!(ind["relation"], "indirect");
+        assert_eq!(
+            ind["path"].as_array().map(|p| p.len()),
+            Some(3),
+            "间接边的 path 必须含 [根, 中间, 目标] 三个节点，供人工核验: {ind}"
+        );
+        assert!(
+            ind["why"]
+                .as_str()
+                .is_some_and(|w| w.contains("共享实体") && w.contains("同一次经历")),
+            "间接边的解释须写出两段关系类型，实际: {}",
+            ind["why"]
+        );
+
+        // 节点自洽：edges 中出现的所有节点 ID 都必须在 nodes 中
+        // （否则前端渲染悬空边——图数据不自洽）
+        let node_ids: Vec<&str> = g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["memory_id"].as_str().unwrap())
+            .collect();
+        for e in edges {
+            for k in ["from", "to"] {
+                let id = e[k].as_str().unwrap();
+                assert!(
+                    node_ids.contains(&id),
+                    "边引用了不存在的节点 {id}（图不自洽）: nodes={node_ids:?}"
+                );
+            }
+        }
+
+        // ---------- ★v0.9.8：联想接入**检索出口**（真正的记忆联想）----------
+        //
+        // 此前关联推导只挂在详情页接口：用户必须先点开某条记忆才看得到关联，
+        // **检索结果本身从不带联想**。本段验证 enrich 检索出口真的带出联想，
+        // 且是"语义不相似、但由记录必然关联"的那一类。
+        //
+        // 检索「苏堤」→ 主结果应含西湖记忆 → 联想分区应补出同一次经历的
+        // 「楼外楼」（两句无共同词、语义不相似，靠 event_id 连上）。
+        //
+        // ★`top_k` 必须 **小于语料条数（4）**，否则主检索会把全部记忆都返回
+        // ⇒「充电宝不在主结果」这一前提**无法由构造保证**，整个"补全"断言退化。
+        // （v0.9.8 门控翻转实测暴露：此前该前提是**旧道体回归校验层**偶然
+        // 过滤掉「充电宝」才成立的——见 daoti/PREREG §3.55。
+        // 依赖一个已被否证的通道来满足测试前提属设计缺陷，故改为构造保证。）
+        // 取 3：主结果为 [苏堤, 钓鱼竿, 楼外楼]，「充电宝」被 top_k 截断——
+        // 与被过滤时得到的主结果集**完全相同**，但依据由"噪声过滤"换成"截断"。
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/enrich")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "query": "苏堤", "top_k": 3 }).to_string(),
+            ))
+            .unwrap();
+        let response = app
+            .clone()
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("enrich HTTP 调用失败");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "enrich 应返回 200，实测 {status}，body={}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // 联想必须**单独分区**（不混进 memories），否则两类不同证据性质的结果
+        // 会被误当作可按分数排序的同一列表
+        let associated = body["associated"]
+            .as_array()
+            .unwrap_or_else(|| panic!("enrich 响应必须含 associated 分区: {body}"));
+
+        // 负向对照（防退化为恒真）：先确认「充电宝」那条**确实没被主检索召回**
+        // ——若它本就在主结果里，那这段断言就无法证明"联想补全"起了作用。
+        let main_ids: Vec<&str> = body["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["id"].as_str())
+            .collect();
+        assert!(
+            !body["memories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["content"].as_str().unwrap_or("").contains("充电宝")),
+            "前提不成立：『充电宝』那条若已被主检索召回，则本用例无法证明联想补全的价值。\
+             主检索实际返回内容：{:?}",
+            body["memories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["content"].as_str().unwrap_or(""))
+                .collect::<Vec<_>>()
+        );
+
+        let meal_assoc = associated
+            .iter()
+            .find(|a| {
+                a["content_preview"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("充电宝")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "检索「苏堤」时应联想起同一次经历的「充电宝」\
+（二者词面与语义都远离，唯一依据是 event_id）: {associated:?}"
+                )
+            });
+        assert_eq!(
+            meal_assoc["relation"], "same_event",
+            "该联想必须标注为『共同经历』: {meal_assoc}"
+        );
+        assert!(
+            meal_assoc["why"]
+                .as_str()
+                .is_some_and(|w| w.contains("e-trip")),
+            "依据须写出具体 event_id（可解释到具体对象）: {meal_assoc}"
+        );
+        // 可追溯：必须说明从哪条记忆联想过来
+        assert!(
+            meal_assoc["via_memory_id"].as_str().is_some(),
+            "必须标注联想起点 via_memory_id: {meal_assoc}"
+        );
+
+        // 联想项不得同时出现在主结果里（否则是重复，不是联想）
+        for a in associated {
+            let aid = a["memory_id"].as_str().unwrap();
+            assert!(
+                !main_ids.contains(&aid),
+                "联想项 {aid} 不应同时出现在主结果中（应去重）"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 记录层异常路径：memory_id 不存在时返回空关联而非报错
+    /// （HCSE 要求：异常输入必须有明确、可预期的应答，不得挂死或 500）。
+    #[tokio::test]
+    async fn test_associations_unknown_memory_returns_empty_not_error() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_record_layer_unknown_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared, manager, llm_api, llm_ready, false);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/associations")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "memory_id": "not-exist-id" }).to_string(),
+            ))
+            .unwrap();
+        let response = app
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("HTTP 层调用失败");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "不存在的 memory_id 应返回 200 + 空列表，而非 5xx"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["total"], 0, "应返回空关联: {body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ============================================================
+    // v0.9.8：联想中心接入「记录层联想」+ 示例问题数据驱动
+    //
+    // 背景：联想中心此前走的是**相似度 BFS 逐跳扩散**——一个专门叫
+    // 「联想中心」的页面，用的却是相似度，记录层关联（同一次经历/共享实体）
+    // **从未被它消费**。本组用例固化"它真的用上了记录层"。
+    // ============================================================
+
+    /// ★核心：联想中心探索结果中必须出现「记录层」节点
+    ///
+    /// 构造：起点与另一条记忆同属一次经历，但内容**语义毫不相似**——
+    /// 相似度 BFS 不可能把它带出来，只有记录层关联能。若该节点出现
+    /// （source="record" 且带 relation/why），说明联想中心真的用上了记录层。
+    #[tokio::test]
+    async fn test_explore_surfaces_record_layer_node() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_record_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared, manager, llm_api, llm_ready, false);
+
+        // 两条同一次经历、但语义毫不相似的记忆
+        for payload in [
+            serde_json::json!({
+                "content": "和爸妈去杭州西湖，在苏堤上走了整整一下午",
+                "memory_type": "experience",
+                "event_id": "e-trip-x",
+                "importance": 7,
+            }),
+            serde_json::json!({
+                "content": "回程的高铁上把充电宝忘在了座位底下",
+                "memory_type": "experience",
+                "event_id": "e-trip-x",
+                "importance": 3,
+            }),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/memories/remember")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap();
+            let response = app.clone().into_service().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // 从「苏堤」出发探索
+        let request = Request::builder()
+            .method("POST")
+            .uri("/associations/explore")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "query": "苏堤", "depth": 2, "width": 3 }).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().into_service().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "探索应返回 200，实测 {status}，body={}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let nodes = body["nodes"].as_array().expect("nodes 应为数组");
+
+        // ★记录层节点必须出现（这是本用例的靶心）
+        let rec = nodes
+            .iter()
+            .find(|n| {
+                n["source"] == "record" && n["content"].as_str().unwrap_or("").contains("充电宝")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "联想中心应通过**记录层**带回同一次经历的「充电宝」记忆\
+（相似度 BFS 给不出它，只能靠 event_id）: {nodes:?}"
+                )
+            });
+        assert_eq!(
+            rec["relation"], "same_event",
+            "记录层节点必须标注关联类型: {rec}"
+        );
+        assert!(
+            rec["why"].as_str().is_some_and(|w| w.contains("e-trip-x")),
+            "记录层节点必须带人类可读依据（含具体 event_id）: {rec}"
+        );
+
+        // 边也必须标注关系类型，且自洽（from/to 均在 nodes 中）
+        let edges = body["edges"].as_array().expect("edges 应为数组");
+        let node_ids: Vec<&str> = nodes.iter().filter_map(|n| n["id"].as_str()).collect();
+        let rec_edge = edges
+            .iter()
+            .find(|e| e["to"] == rec["id"] && e["relation"] == "same_event");
+        assert!(
+            rec_edge.is_some(),
+            "应有标注 same_event 的记录层边指向该节点: {edges:?}"
+        );
+        for e in edges {
+            for k in ["from", "to"] {
+                let id = e[k].as_str().unwrap();
+                assert!(
+                    node_ids.contains(&id),
+                    "边引用了不存在的节点 {id}（图不自洽）"
+                );
+            }
+        }
+
+        // 负向对照：相似度扩散的节点**不应**带 relation（两类性质必须可区分）
+        for n in nodes {
+            if n["source"] == "expanded" {
+                assert!(
+                    n["relation"].is_null(),
+                    "相似度扩散节点不应带记录层 relation（否则两类无法区分）: {n}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 示例问题必须来自用户真实记忆，且空库时返回空（不得编造）
+    #[tokio::test]
+    async fn test_association_suggestions_are_data_driven() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_suggest_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared, manager, llm_api, llm_ready, false);
+
+        // ① 空库：必须返回空数组（诚实空态，不得编造示例）
+        let request = Request::builder()
+            .method("GET")
+            .uri("/associations/suggestions")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().into_service().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["count"], 0,
+            "空库必须返回 0 条示例（不得硬编码任何语料）: {body}"
+        );
+
+        // ② 写入技术类记忆（**非生活场景**）：示例必须来自这些内容
+        for payload in [
+            serde_json::json!({
+                "content": "v0.9.8 修复了 event_id 填写率 0% 的分发缺口问题",
+                "memory_type": "decision",
+                "entities": [{"name": "event_id", "kind": "thing"}],
+                "importance": 8,
+            }),
+            serde_json::json!({
+                "content": "排查了 Nginx proxy_pass 前缀替换的陷阱",
+                "memory_type": "decision",
+                "entities": [{"name": "Nginx", "kind": "thing"}],
+                "importance": 7,
+            }),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/memories/remember")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap();
+            let response = app.clone().into_service().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/associations/suggestions")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().into_service().oneshot(request).await.unwrap();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let items = body["suggestions"]
+            .as_array()
+            .expect("suggestions 应为数组");
+
+        // 每一条的文本必须**能在该用户记忆中找到来源**（不出现库外语料）
+        let all_text = body.to_string();
+        assert!(
+            !all_text.contains("今晚吃什么") && !all_text.contains("周末去哪儿玩"),
+            "★不得出现硬编码的生活场景示例（这正是本次修复的缺陷）: {body}"
+        );
+        for s in items {
+            let text = s["text"].as_str().unwrap_or("");
+            let from_memory = text.contains("event_id")
+                || text.contains("Nginx")
+                || text.contains("填写率")
+                || text.contains("proxy_pass");
+            assert!(
+                from_memory || text.is_empty(),
+                "示例文本必须来自用户记忆内容/实体，实测: {s}"
+            );
+            assert!(
+                s["origin"].as_str().is_some(),
+                "示例必须标注来源类型（可核验非凑数）: {s}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
