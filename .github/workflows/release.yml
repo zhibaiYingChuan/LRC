@@ -84,6 +84,20 @@ jobs:
           fi
           echo "发布版本校验通过: $VERSION"
 
+      # 0b. 算法泄露门禁（v0.9.9 新增）
+      #
+      # 为什么必须放在**发版**路径而不只是 ci.yml：
+      #   ci.yml 只监听 `push.branches`（main/develop），**不打 tag 就不触发**；
+      #   而本工作流由 `push.tags: 'v*'` 触发 —— 两条路径**互不相交**。
+      #   发版是"把产物交出去"的动作，许可门禁若只守在分支侧，
+      #   发版路径上就等于完全敞开，故在 preflight 内再守一道。
+      #
+      # 口径与 ci.yml / `.githooks/pre-commit` 严格一致：
+      #   三处调用**同一个脚本** `scripts/check_algorithm_leak.py`，
+      #   避免各自维护规则导致漂移。
+      - name: Algorithm leak guard
+        run: python3 scripts/check_algorithm_leak.py
+
       # 1. 代码格式检查（与 CI Rustfmt job 对齐）
       - name: Format check
         run: cargo fmt --all -- --check
