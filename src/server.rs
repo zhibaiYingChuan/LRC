@@ -34,6 +34,9 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+// ★符号层超时时的结果槽：临界区只有"写一个 Option"这一条非 await 语句，
+//   用 std 同步锁即可（不跨 await 持锁，也不引入 tokio 异步锁的开销）。
+use std::sync::Mutex as StdMutex;
 use tokio::sync::{Mutex, RwLock};
 
 const SEARCH_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -979,14 +982,6 @@ async fn handle_recall_enhanced(
                 deep_weight,
             );
 
-            // LRC 内置道体状态机·联想链（在锁内取快照，随结果一起返回）
-            let state_snapshot = store.memory_state_machine.snapshot();
-            // 合并 fast+deep 两路的回归证据（保留融合后仍在结果中的记忆）
-            let mut merged_evidence = fast_result.regression_evidence;
-            for (id, ev) in deep_result.regression_evidence {
-                merged_evidence.insert(id, ev);
-            }
-
             // ═══ 记录层联想补全（v0.9.8）═══
             // 与 handle_recall 同源同口径：复用 SearchData.expand_associations。
             // 在锁内执行（避免再次加锁），失败静默。
@@ -999,34 +994,31 @@ async fn handle_recall_enhanced(
                 fused.memories,
                 fused.scores,
                 fused.total_candidates,
-                state_snapshot,
-                merged_evidence,
                 associated,
             ))
         }),
     )
     .await;
 
-    let (result_memories, result_scores, total, state_snapshot, merged_evidence, associated) =
-        match retrieval_result {
-            Ok(Ok(Some(ok))) => ok,
-            Ok(Ok(None)) => {
-                // 锁获取超时：返回忙态错误，提示稍后重试
-                return make_error(id.clone(), -32000, "搜索服务繁忙，请稍后重试");
-            }
-            Ok(Err(join_error)) => {
-                // spawn_blocking 内部 panic 被捕获
-                eprintln!(
-                    "[recall_enhanced] spawn_blocking 内部 panic: {}",
-                    join_error
-                );
-                return make_error(id.clone(), -32603, "搜索内部错误，服务已保持运行");
-            }
-            Err(_) => {
-                // 15s 超时：返回超时错误
-                return make_error(id.clone(), -32001, "搜索超时，请稍后重试");
-            }
-        };
+    let (result_memories, result_scores, total, associated) = match retrieval_result {
+        Ok(Ok(Some(ok))) => ok,
+        Ok(Ok(None)) => {
+            // 锁获取超时：返回忙态错误，提示稍后重试
+            return make_error(id.clone(), -32000, "搜索服务繁忙，请稍后重试");
+        }
+        Ok(Err(join_error)) => {
+            // spawn_blocking 内部 panic 被捕获
+            eprintln!(
+                "[recall_enhanced] spawn_blocking 内部 panic: {}",
+                join_error
+            );
+            return make_error(id.clone(), -32603, "搜索内部错误，服务已保持运行");
+        }
+        Err(_) => {
+            // 15s 超时：返回超时错误
+            return make_error(id.clone(), -32001, "搜索超时，请稍后重试");
+        }
+    };
 
     let mut text = format!(
         "双路检索增强结果 (共 {} 条候选，返回 {} 条)\n\
@@ -1058,60 +1050,26 @@ async fn handle_recall_enhanced(
         text.push_str("💡 双路检索融合了快速关键词匹配和深度语义定位，兼顾了召回率和精度。\n");
     }
 
-    // LRC 内置道体状态机·联想链输出（与标准 recall 一致）
-    if state_snapshot.trail.len() >= 2 {
-        text.push_str("\n═══ 联想链（状态机轨迹）═══\n");
-        for step in &state_snapshot.trail {
-            let from = step.from_id.as_deref().unwrap_or("查询起点");
-            text.push_str(&format!(
-                "  {} ──(深度 {})──▶ {}\n",
-                from.chars().take(24).collect::<String>(),
-                step.depth,
-                step.to_id.chars().take(24).collect::<String>(),
-            ));
-        }
-        text.push_str(
-            "💡 联想链展示记忆如何由一件事发散到相关记忆；活性状态已持久化，下次检索会感知近期语境。\n",
-        );
-    } else if !state_snapshot.active.is_empty() {
-        let active_note: Vec<String> = state_snapshot
-            .active
-            .iter()
-            .take(3)
-            .map(|a| {
-                format!(
-                    "{} (强度 {:.2})",
-                    a.memory_id.chars().take(16).collect::<String>(),
-                    a.activation
-                )
-            })
-            .collect();
-        text.push_str(&format!("\n🧠 当前活跃记忆: {}\n", active_note.join(", ")));
-    }
-
-    // LRC 内置道体状态机·回归证据（道体再次校验）
-    if !merged_evidence.is_empty() {
-        text.push_str("\n🔍 回归校验证据（道体再次校验）\n");
-        for m in &result_memories {
-            if let Some(evidence) = merged_evidence.get(&m.id) {
-                text.push_str(&format!(
-                    "  #{} [{}] {}\n",
-                    m.id.chars().take(12).collect::<String>(),
-                    evidence,
-                    m.content.chars().take(28).collect::<String>(),
-                ));
-            }
-        }
-        text.push_str(
-            "💡 回归校验确认联想扩散的记忆确实回应了原始查询；无共鸣信号的记忆已被剔除。\n",
-        );
-    }
-
     // ═══ 记录层联想补全（v0.9.8）═══
     // 与 handle_recall 同款分区渲染（同样的 why/via 可追溯要求）。
     if !associated.is_empty() {
         append_associated_memories(&mut text, &associated);
     }
+
+    // ═══ 符号层联想（道体 §4.4 状态机循环 + §5.4 落边，v0.9.8）═══
+    //
+    // ★两个分区统一走 `append_symbolic_layer`（2026-09-18 审查 G5b/G8 修复）：
+    //   · G8：此前本段与 `handle_recall` 里的代码**逐字重复** ⇒ 只改一处会静默漏改
+    //   · G5b：此前两次调用**串行**（最坏 4s + 6s = 10s 叠加在检索之后），
+    //     现改为**并发 + 总预算 6s**（详见该函数文档）
+    //
+    // 锁已在 spawn_blocking 内释放，此处网络等待不持锁。
+    let seeds_for_symbolic: Vec<(String, String)> = result_memories
+        .iter()
+        .take(8)
+        .map(|m| (m.id.clone(), m.content.clone()))
+        .collect();
+    append_symbolic_layer(&mut text, query, &seeds_for_symbolic).await;
 
     let call_result = ToolCallResult {
         content: vec![TextContent {
@@ -1224,6 +1182,623 @@ pub(crate) async fn post_daoti_reflect(memories: &[String], session_id: &str) ->
     post_daoti_reflect_with_base(memories, session_id, None).await
 }
 
+/// 道体联想服务的 HTTP 契约版本（`/cycle` 响应里的字段协商依据）。
+///
+/// 与 `fetch_daoti_navigation` 的 `source_version` 协商（navigation.rs
+/// `"daoti-lexicon-v1"`）同一模式：LRC 只消费 JSON，不内置道体算法。
+const DAOTI_CYCLE_VERSION: &str = "daoti-assoc-v1";
+
+/// 道体**联想服务**（`daoti_assoc`）的基址。
+///
+/// ## ★为什么必须与 `DAOTI_SERVICE_URL` **分开**（2026-09-18 修）
+///
+/// 这是两个**不同的服务**，端点集合不同：
+///
+/// | 服务 | 默认端口 | 拥有的端点 |
+/// |---|---|---|
+/// | `daoti_daemon`（`daoti/daoti_daemon.py`） | **3222** | `/deduce` `/reflect` `/drift/*` |
+/// | `daoti_assoc`（`temp/daoti_assoc/server.py`） | **3223** | `/cycle` `/build_edges` `/parse` `/associate` … |
+///
+/// 此前 `/cycle` 与 `/build_edges` 复用了 `DAOTI_SERVICE_URL`（默认 **3222**），
+/// 而这两个端点在 3222 上**不存在** ⇒ 请求打到 daemon 的 404 路径 ⇒
+/// 静默降态返回 `None` ⇒ **即使开了门控也永远无输出、且无任何日志**。
+/// 这正是"接了但没生效"的失效形态（本案的头号阻断项）。
+///
+/// ## 为什么不做 `DAOTI_SERVICE_URL` 回退（刻意的）
+///
+/// 回退看似兼容，实则保留了同一个陷阱：一旦 `DAOTI_SERVICE_URL` 被显式设为
+/// 3222（daemon 的**文档默认值**），联想端点就会再次静默打到错误服务。
+/// ⇒ **宁可让配置缺失时落到正确默认值，也不让"配置存在但指向错服务"静默通过。**
+/// 需要自定义时显式设 `DAOTI_ASSOC_URL`（如 `http://127.0.0.1:3223`）。
+fn daoti_assoc_url() -> String {
+    std::env::var("DAOTI_ASSOC_URL").unwrap_or_else(|_| "http://127.0.0.1:3223".to_string())
+}
+
+/// 向道体联想服务请求一次 §4.4 状态机循环（`POST /cycle`）。
+///
+/// ## 为什么需要这个调用（2026-09-17 接入盘点结论）
+///
+/// 实测发现 LRC ↔ daoti_assoc **此前只接了 1 个端点**（`/deduce` + `/reflect`），
+/// 而 `assoc_service` 里 §6 定义的 `parse` / `associate` / `scheduler`
+/// **从未被调用**——即"符号层联想"整条链在 LRC 里是断的：
+///
+/// | 道体端点 | 设计意图（§6） | 接入前 | 接入后 |
+/// |---|---|---|---|
+/// | `/deduce` | 取导航信号 | ✅ | ✅ |
+/// | `/reflect` | 回传结果 | ✅ | ✅ |
+/// | `/cycle` | **联想候选 + 目标层次** | ❌ 不存在 | ✅ |
+///
+/// ## `target` 为什么就是 query
+///
+/// 用户裁定：「目标就是召回」「不需要解析，因为很多召回它可能只是一个词，
+/// 比如说召回一个苹果……你只能朝着苹果的目标去走就行了」。
+/// ⇒ 这里把 **recall 的查询本身**作为 target 传入，不做任何解析。
+///
+/// ## 降态（§6）
+///
+/// daemon 不可达 / 超时 / 响应缺字段 / 版本不匹配 ⇒ 返回 None。
+/// 调用方必须容忍 None（联想缺失是可接受的降态，宁缺勿错）。
+/// 门控 `LRC_DAOTI_CYCLE=1` 默认关闭 ⇒ 行为与既有版本逐字节一致。
+async fn fetch_daoti_cycle_with_base(
+    text: &str,
+    target: &str,
+    base: Option<&str>,
+) -> Option<serde_json::Value> {
+    let base = match base {
+        Some(b) => b.to_string(),
+        // ★用联想服务专用变量（默认 3223），**不**回退到
+        //   `DAOTI_SERVICE_URL`（默认 3222 是 daemon，无 /cycle）——见
+        //   `daoti_assoc_url()` 的说明。
+        None => daoti_assoc_url(),
+    };
+    let url = format!("{}/cycle", base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        // ★超时给 4s（比 /deduce 的 2s 宽）：/cycle 内含一次 BGE 编码 +
+        //   最多 6 次结构距离 BFS，比纯导航推导重。但仍**必须**有上限——
+        //   道体挂起时绝不能拖慢检索主链路（承"绝不拖累用户可见请求"）。
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(4))
+        .build()
+        .ok()?;
+    let body = serde_json::json!({"text": text, "target": target});
+    let resp = client.post(&url).json(&body).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let value: serde_json::Value = resp.json().await.ok()?;
+    // ★契约校验：`associations` 必须存在且是数组。
+    //   缺失 ⇒ 对方不是本服务或缺字段 ⇒ None（不猜、不兜底）。
+    if !value
+        .get("associations")
+        .map(|a| a.is_array())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    // ★版本协商：道体在响应里回 `version`。缺失或非预期值 ⇒ 协议不认识 ⇒ None。
+    //   这与 navigation.rs 的 source_version 协商同一纪律：**不做字段猜测**，
+    //   否则对方改了字段语义后，我们会静默地按旧含义解读（比失败更危险）。
+    match value.get("version").and_then(|v| v.as_str()) {
+        Some(v) if v == DAOTI_CYCLE_VERSION => {}
+        _ => return None,
+    }
+    Some(value)
+}
+
+/// fetch_daoti_cycle 的生产入口（base_url 走环境变量/默认端口）。
+pub(crate) async fn fetch_daoti_cycle(text: &str, target: &str) -> Option<serde_json::Value> {
+    fetch_daoti_cycle_with_base(text, target, None).await
+}
+
+/// 向 daoti_assoc 请求「标卦 → 结构候选 → 落边」（`POST /build_edges`，§5.4 写入端）。
+///
+/// ## 为什么必须接它（2026-09-18 盘点）
+///
+/// `/build_edges` 是 §5.4 闭环（候选命中 → 生成边 → **可检索**）的写入端。
+/// 接入前它**没有任何调用方**——即"函数写好了却从没被调用"，
+/// 与 `/associate` `/parse` `/scheduler` 此前是同一种失效形态。
+///
+/// ## ★但接它不等于"放开落边"（**必须说清，防误读**）
+///
+/// 该端点内部有**主动门控**：`「文本→卦」通路未过 §8.1 J1 判据`
+/// ⇒ 默认返回 `blocked: "text_to_gua_judge_not_passed"` 且 `edges: []`。
+///
+/// ★原因码**必须与 Python 侧逐字一致**：真值取自
+/// `temp/daoti_assoc/assoc_service.py` 的 `build_edges_for_seeds`
+/// （`"blocked": "text_to_gua_judge_not_passed"`）。
+/// 此前该注释写的是 `no_usable_text_to_gua_path`（**早已弃用的旧值**）——
+/// 按注释去搜代码/日志会一无所获，属"文档与实现不一致"的一类。
+/// ⇒ 契约串在两侧各写一份时，改一侧必须同步另一侧。
+///
+/// **这个阻断不能被"接上"消除**——它是实测结论（A 路线判别力不足
+/// 1.50x/p=0.1479；B 路线分词表只覆盖易经古文），为了**不污染图**
+/// 而存在：无依据的边比没有边更糟，用户会按错误关系理解记忆关联。
+///
+/// ⇒ 因此本函数的正确职责是：**把链路接通，并把"为什么没有边"透出**。
+///   让用户/开发者看得见阻断原因，而不是让系统静默地"什么都没有"。
+///
+/// ## 降态
+///
+/// 不可达/超时/版本不符 ⇒ None（与 `/cycle` 同纪律）。
+/// 门控 `LRC_DAOTI_BUILD_EDGES=1` 默认关闭；`write_back` 需再显式开启，
+/// 因为写图是**有副作用**的动作，不能让一次检索意外改图。
+async fn fetch_daoti_build_edges_with_base(
+    seeds: &[(String, String)],
+    write_back: bool,
+    base: Option<&str>,
+) -> Option<serde_json::Value> {
+    if seeds.is_empty() {
+        return None;
+    }
+    let base = match base {
+        Some(b) => b.to_string(),
+        // ★同 `/cycle`：用联想服务专用变量（默认 3223），不回退 3222。
+        None => daoti_assoc_url(),
+    };
+    let url = format!("{}/build_edges", base.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        // 内含一次批量 BGE 编码（max_seeds 条）⇒ 比 /cycle 更重，给 6s。
+        // 但仍必须有上限：道体挂起绝不能拖慢检索主链路。
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .ok()?;
+    let seed_json: Vec<serde_json::Value> = seeds
+        .iter()
+        .map(|(mid, text)| serde_json::json!({"memory_id": mid, "text": text}))
+        .collect();
+    let body = serde_json::json!({"seeds": seed_json, "write_back": write_back});
+    let resp = client.post(&url).json(&body).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let value: serde_json::Value = resp.json().await.ok()?;
+    // ★契约校验：`edges` 必须存在且是数组（门控阻断时为空数组，也算合法）。
+    //   缺失 ⇒ 对方不是本服务 ⇒ None（不猜）。
+    if !value.get("edges").map(|a| a.is_array()).unwrap_or(false) {
+        return None;
+    }
+    match value.get("version").and_then(|v| v.as_str()) {
+        Some(v) if v == DAOTI_CYCLE_VERSION => {}
+        _ => return None,
+    }
+    Some(value)
+}
+
+/// fetch_daoti_build_edges 的生产入口。
+pub(crate) async fn fetch_daoti_build_edges(
+    seeds: &[(String, String)],
+    write_back: bool,
+) -> Option<serde_json::Value> {
+    fetch_daoti_build_edges_with_base(seeds, write_back, None).await
+}
+
+/// 落边结果 → MCP 文本块（v0.9.8）
+///
+/// ## ★这个函数的主要职责是**解释"为什么没有边"**
+///
+/// 当 `blocked` 存在时，必须把阻断原因与**解封条件**都写出来。
+/// 若只显示"无符号层边"，用户会以为是功能坏了或还没做——
+/// 而实际是**实测判据未过，系统主动不产出**（两者处置完全不同）。
+fn append_daoti_build_edges(text: &mut String, res: &serde_json::Value) {
+    let edges = res.get("edges").and_then(|e| e.as_array());
+    let blocked = res.get("blocked").and_then(|b| b.as_str());
+
+    text.push_str("\n═══ 联想 · 符号层落边（§5.4 写入端）═══\n");
+
+    if let Some(reason) = blocked {
+        // ★阻断路径：把"为什么"与"怎么解"都给出（缺任一项用户都无从处置）
+        text.push_str("状态: **未产出边**（主动门控，非故障）\n");
+        text.push_str(&format!("原因码: `{}`\n", reason));
+        if let Some(detail) = res.get("blocked_detail").and_then(|d| d.as_str()) {
+            text.push_str(&format!("依据: {}\n", detail));
+        }
+        if let Some(env) = res.get("unblock_env").and_then(|e| e.as_str()) {
+            text.push_str(&format!(
+                "解封条件: 实验结果达到判据后自动放行；\
+                 仅做形态观察可用 `{}`（**仅供实验，产出的边不可作证据**）。\n",
+                env
+            ));
+        }
+        text.push_str("💡 这不影响上面的检索与记录层联想——它们不依赖「文本→卦」通路。\n");
+        return;
+    }
+
+    match edges {
+        Some(list) if !list.is_empty() => {
+            text.push_str(&format!("状态: 产出 {} 条结构边\n", list.len()));
+            for (i, e) in list.iter().take(10).enumerate() {
+                let from = e.get("from_id").and_then(|v| v.as_str()).unwrap_or("?");
+                let to = e.get("to_id").and_then(|v| v.as_str()).unwrap_or("?");
+                let rel = e.get("rel_type").and_then(|v| v.as_str()).unwrap_or("?");
+                let how = e.get("how").and_then(|v| v.as_str()).unwrap_or("");
+                let gua = e.get("gua_name").and_then(|v| v.as_str()).unwrap_or("?");
+                text.push_str(&format!(
+                    "（结构边 #{} · {} → {} · {} · 算子 {} · 候选卦 {}）\n",
+                    i + 1,
+                    from.chars().take(8).collect::<String>(),
+                    to.chars().take(8).collect::<String>(),
+                    structural_rel_label(rel),
+                    how,
+                    gua
+                ));
+            }
+            if let Some(wb) = res.get("write_back") {
+                text.push_str(&format!(
+                    "落图: 新增 {} / 跳过 {} / 共 {}\n",
+                    wb.get("written").and_then(|v| v.as_u64()).unwrap_or(0),
+                    wb.get("skipped").and_then(|v| v.as_u64()).unwrap_or(0),
+                    wb.get("total").and_then(|v| v.as_u64()).unwrap_or(0),
+                ));
+            }
+            // ★实验放行时必须显示警告（承"证据要可区分"纪律）
+            if let Some(w) = res.get("unstable_warning").and_then(|v| v.as_str()) {
+                text.push_str(&format!("⚠ {}\n", w));
+            }
+            // ★显示"被跳过的候选"数量，让"为什么边比预期少"可解释：
+            //   不动点算子（候选卦 == 种子自身卦）会被主动跳过——它等价于
+            //   「同卦建边」，而"同卦"在本数据上几近恒真（零区分度）。
+            //   若不显示，用户会以为落边功能残缺。
+            if let Some(n) = res
+                .get("stats")
+                .and_then(|s| s.get("fixed_point_skipped"))
+                .and_then(|v| v.as_u64())
+            {
+                if n > 0 {
+                    text.push_str(&format!(
+                        "（另有 {} 个候选因「结构算子返回自身卦」被跳过：\
+                         那等价于同卦建边，无区分度 ⇒ 宁缺勿错）\n",
+                        n
+                    ));
+                }
+            }
+        }
+        _ => {
+            // 门控关了、但也没产出 ⇒ 如实说明，不静默。
+            // ★成因必须**从数据读出**而非猜（三种成因处置完全不同）：
+            //   ① 种子不足 2 条（边需要两端）
+            //   ② 候选全是不动点算子（等价同卦建边，已主动跳过）
+            //   ③ 其余（如候选卦下没有别的召回记忆）
+            let stat = |k: &str| -> u64 {
+                res.get("stats")
+                    .and_then(|s| s.get(k))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+            };
+            let seeds_used = stat("seeds_used");
+            let fp = stat("fixed_point_skipped");
+            if seeds_used < 2 {
+                text.push_str(&format!(
+                    "状态: 本次未产出边（**种子不足 2 条**，实际 {} 条；\
+                     边需要两端，单条无从建边）\n",
+                    seeds_used
+                ));
+            } else if fp > 0 {
+                text.push_str(&format!(
+                    "状态: 本次未产出边（候选卦均为结构算子的**不动点**\
+                     ⇒ 等价于同卦建边，已跳过 {} 个；这是主动取舍，非故障）\n",
+                    fp
+                ));
+            } else {
+                text.push_str(
+                    "状态: 本次未产出边（候选卦下没有其他召回记忆，\
+                     即无结构相关者）\n",
+                );
+            }
+        }
+    }
+}
+
+/// 符号层（道体）两个分区的**统一接入点** —— 合并 G5b + G8 两项审查问题。
+///
+/// ## G8（本轮修复）：为什么必须抽成一个函数
+///
+/// 此前 `handle_recall` 与 `handle_recall_enhanced` 里各有一份**逐字重复**的
+/// 接入代码（门控读取 → 种子构造 → 两次网络调用 → 渲染）。两处一致性靠人工同步
+/// ⇒ 后续只改一处会静默漏改（如本轮的预算控制、契约告警）。
+///
+/// ## G5b（本轮修复）：为什么改为**并发**调用
+///
+/// ### 此前的问题
+///
+/// 两个调用是**串行 `await`**：
+///   · `/cycle` 超时 = 连接 2s + 总 4s
+///   · `/build_edges` 超时 = 连接 2s + 总 6s
+///
+/// ⇒ 最坏 `4 + 6 = 10s` 全部叠加在**用户可见的检索结果之后**。
+/// 而 `handle_recall` **没有外层超时包裹**（只有 enhanced 的检索段有 15s），
+/// 故最坏 = 检索耗时 **+ 10s**；enhanced 则是 **15s + 10s = 25s**。
+///
+/// 项目前端自身的请求预算是 **10s**（`static/app.js`），且既有纪律明确要求
+/// "后端超时必须小于前端预算"（`server.rs` 的超时预算注释）。
+/// ⇒ 用户会先撞上前端超时，看到"请求超时"而非检索结果 —— 与
+/// 「联想是附加价值，不可影响主结果」的设计前提**直接冲突**。
+///
+/// ### 修法：并发 + 总预算
+///
+/// 1. **两次调用并发**（`tokio::join!`）⇒ 最坏从 10s 降到 **6s**（取较大者）
+/// 2. 再包一层**总预算**（`SYMBOLIC_LAYER_BUDGET`，默认 6s）⇒ 即使两边都挂，
+///    也**绝不**超过该预算
+///
+/// ⇒ 最坏 = 检索耗时 + 6s，仍在 10s 前端预算内（留 4s 给检索本身）。
+///
+/// ## 保持的行为（不得退化）
+///
+/// · 门控语义不变：`LRC_DAOTI_CYCLE` 控制 `/cycle`，`LRC_DAOTI_BUILD_EDGES`
+///   控制 `/build_edges`，`LRC_DAOTI_WRITE_BACK` 控制是否写图
+/// · 两个分区分开渲染、不混排（`append_daoti_cycle` / `append_daoti_build_edges`）
+/// · 任一失败静默降态，**不影响**记录层联想与检索主结果
+/// · 关掉门控时**不发任何请求**（与前次逐字节一致）
+async fn append_symbolic_layer(text: &mut String, query: &str, seeds: &[(String, String)]) {
+    let want_cycle = std::env::var("LRC_DAOTI_CYCLE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let want_edges = std::env::var("LRC_DAOTI_BUILD_EDGES")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !want_cycle && !want_edges {
+        return; // 两个门控都关 ⇒ 不发任何请求（行为与既有版本一致）
+    }
+    let write_back = std::env::var("LRC_DAOTI_WRITE_BACK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    // ★并发：两次网络调用同时进行（此前是串行，最坏 4s + 6s = 10s）
+    //
+    // ★2026-09-18 审查修复：**分别持有结果槽**，而非依赖 `join!` 的返回值。
+    //
+    // 为什么必须这样改（原实现的缺陷）：
+    //   `tokio::time::timeout(BUDGET, join!(cycle_fut, edges_fut))` 一旦超时，
+    //   只能拿到 `Err(_)` —— **join 的整体返回值被丢弃**，于是**已完成的一侧
+    //   也一并牺牲**。而 `/cycle` 的读超时是 4s、`/build_edges` 是 6s，
+    //   当后者真的走到自己的 6s 超时时（正是它设计要处理的慢服务场景），
+    //   外层预算（同为 6s、且计时更早）必然先触发 ⇒ **必然**把已经成功
+    //   返回的候选卦丢掉。用户看到的信息量最低的降态块，
+    //   而不是"候选照常 + 落边未跑完"。
+    //
+    // 修法：两个 future 各自把结果写进 `Arc<Mutex<Option<..>>>` 槽位
+    //（写入发生在 future 内部，一旦完成即已落槽，不依赖 join 的返回），
+    // 超时时直接读槽：**谁已完成就渲染谁**，只对未完成的给降态说明。
+    let cyc_slot: Arc<StdMutex<Option<serde_json::Value>>> = Arc::new(StdMutex::new(None));
+    let be_slot: Arc<StdMutex<Option<serde_json::Value>>> = Arc::new(StdMutex::new(None));
+    let cyc_out = Arc::clone(&cyc_slot);
+    let be_out = Arc::clone(&be_slot);
+
+    let cycle_fut = async move {
+        if want_cycle {
+            let got = fetch_daoti_cycle(query, query).await;
+            if let Some(v) = got {
+                if let Ok(mut slot) = cyc_out.lock() {
+                    *slot = Some(v);
+                }
+            }
+        }
+    };
+    let edges_fut = async move {
+        if want_edges {
+            let got = fetch_daoti_build_edges(seeds, write_back).await;
+            if let Some(v) = got {
+                if let Ok(mut slot) = be_out.lock() {
+                    *slot = Some(v);
+                }
+            }
+        }
+    };
+
+    // ★总预算：两边都挂时也绝不超出（超过 ⇒ 未完成的分区降态，**已完成的不丢**）
+    let joined = tokio::time::timeout(SYMBOLIC_LAYER_BUDGET, async {
+        tokio::join!(cycle_fut, edges_fut)
+    })
+    .await;
+
+    let timed_out = joined.is_err();
+
+    // 从槽位取回各自结果（超时与非超时都走同一读取路径，行为一致）
+    let cyc = cyc_slot.lock().ok().and_then(|mut s| s.take());
+    let be = be_slot.lock().ok().and_then(|mut s| s.take());
+
+    // 分区渲染：与记录层**分开**（两套证据性质不同，不混排）
+    //
+    // ★先记录"是否拿到"再移动取值：`Option<Value>` 非 Copy，若先 `if let Some(c) = cyc`
+    //   把值 move 走，后面再读 `cyc.is_none()` 会触发 E0382（借用已部分移动的值）。
+    let got_cyc = cyc.is_some();
+    let got_be = be.is_some();
+    if let Some(c) = cyc {
+        append_daoti_cycle(text, &c);
+    }
+    if let Some(b) = be {
+        append_daoti_build_edges(text, &b);
+    }
+    // 只有"确实超时且两边都没拿到"时才整体降态；
+    // 若至少一侧成功，则用更精确的分区级降态说明（不掩盖已拿到的结果）。
+    if timed_out && !got_cyc && !got_be {
+        append_symbolic_layer_degraded(text);
+    } else if timed_out {
+        append_symbolic_layer_partial(text, want_cycle && !got_cyc, want_edges && !got_be);
+    }
+}
+
+/// 符号层（道体）调用的**总预算**（2026-09-18 审查 G5b 修复）。
+///
+/// **取值依据**：前端请求预算是 10s（`static/app.js`），既有纪律要求
+/// 后端超时 < 前端预算。两次道体调用并发后最坏为 6s（`/build_edges` 的读超时），
+/// 故预算取 **6s** 与之对齐 —— 既覆盖正常并发路径，又给"检索本身"留出 4s。
+///
+/// **为什么需要它（而非只靠各调用的超时）**：两个调用各自的超时是
+/// "连接 2s + 总 4/6s"，但**并发后仍需一个整体闸门** —— 否则将来若新增
+/// 第三个道体调用，叠加风险会无声重现。总预算是**结构性**上限，
+/// 不随调用个数增长。
+const SYMBOLIC_LAYER_BUDGET: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// 符号层超预算降态时的分区标题（承 G9：标题是**契约**，抽成常量供测试锁定）。
+///
+/// 为什么值得抽出来：它是"符号层本次没跑"的**唯一**信号。若标题被改，
+/// 用户看到的是一个陌生分区，无法与上一条"没跑完"对上号。
+const SYMBOLIC_LAYER_DEGRADED_TITLE: &str = "联想 · 符号层（道体）";
+
+/// 渲染「符号层本次未跑完」的降态块（超预算路径专用）。
+///
+/// 抽成独立函数的原因（承 G9）：该分支只在**真实超时**时才走到，
+/// 而超时受 `SYMBOLIC_LAYER_BUDGET`（6s）控制 ⇒ 若写在内联里，
+/// 测试要复现必须真的等 6 秒（或起一个永不响应的 mock）——
+/// 成本高到没人会写，于是这条路径长期**无测试**。
+/// 抽出来后可直接断言"降态时用户看到什么"，成本为零。
+fn append_symbolic_layer_degraded(text: &mut String) {
+    text.push_str(&format!(
+        "\n═══ {} ═══\n\
+         状态: 本次跳过（超过 {}s 预算，已降态）\n\
+         💡 这不影响上面的检索与记录层联想——它们不依赖「文本→卦」通路。\n",
+        SYMBOLIC_LAYER_DEGRADED_TITLE,
+        SYMBOLIC_LAYER_BUDGET.as_secs()
+    ));
+}
+
+/// 渲染「符号层**部分**未跑完」的说明块（2026-09-18 审查修复）。
+///
+/// # 与 [`append_symbolic_layer_degraded`] 的分工
+///
+/// · 整体降态：**两边都没拿到** ⇒ 用那个（"本次跳过"）
+/// · 部分降态：**至少一侧成功** ⇒ 用本函数
+///
+/// # 为什么必须区分（原来的缺陷）
+///
+/// 原实现在超时就 `return` + 整体降态，即使 `/cycle` 已成功返回也照丢。
+/// 用户看到的是"符号层本次跳过"，而**实际拿到了候选卦** ——
+/// 这既丢能力，又对用户说错话（"没跑"与"跑了一半"是两件事）。
+///
+/// 故本函数按**各自的实际状态**分别说明，不让已完成的一侧被未完成的一侧掩盖。
+///
+/// 参数 `cyc_missing` / `edges_missing` 用布尔而非枚举：调用点已知道
+/// "该门控是否开着且结果为空"，此处无需再理解门控语义。
+fn append_symbolic_layer_partial(text: &mut String, cyc_missing: bool, edges_missing: bool) {
+    if !cyc_missing && !edges_missing {
+        return; // 两边都在超时前完成 ⇒ 无需任何降态说明
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if cyc_missing {
+        parts.push("符号层候选（结构方向）");
+    }
+    if edges_missing {
+        parts.push("符号层落边（§5.4）");
+    }
+    text.push_str(&format!(
+        "\n═══ {} ═══\n\
+         状态: 部分完成（超过 {}s 预算）\n\
+         未跑完: {}\n\
+         💡 上面已展示的部分是**真实结果**，不是降级数据；未列出的分区本次超时未返回。\n",
+        SYMBOLIC_LAYER_DEGRADED_TITLE,
+        SYMBOLIC_LAYER_BUDGET.as_secs(),
+        parts.join("、")
+    ));
+}
+
+/// 符号层关系类型 → 中文标签（§5.3 五类逻辑关系）
+/// ★为什么不复用 `relation_label`：那是**记录层**标签表
+/// （same_event / shared_entity / …），符号层的 CONSTRAINT / COORDINATE
+/// 等类型撞进去会全部落到兜底值「相关联」，把类型信息抹平。
+/// 两张表语义不同，必须分开（承「证据要可区分」）。
+///
+/// 未知类型**原样回显**而非兜底：兜底会把"新类型/对方升级"伪装成已知类型，
+/// 排查时看不出差异。
+fn structural_rel_label(rel: &str) -> &str {
+    match rel {
+        "CAUSE" => "因果",
+        "TEMPORAL" => "时序",
+        "CONSTRAINT" => "相错（约束）",
+        "FACILITATE" => "变爻（促成）",
+        "COORDINATE" => "相综/互卦（协同）",
+        other => other,
+    }
+}
+
+/// 道体循环结果 → MCP 文本块（v0.9.8）
+///
+/// ## 为什么单独分区、且**必须显示层次与目标**
+///
+/// 用户对联想的价值判据原话是：「它会告诉你，**这是第几层**他能想到的
+/// 这个记忆数据。然后你再进行调取」。
+/// ⇒ 层次（`target_hops`）是**可核验的坐标**，不是装饰：
+///    · 0 跳 = 候选卦就是目标卦（最近）
+///    · 1 跳 = 一个结构算子可达
+///    · 2~3 跳 = 需经中间卦
+///    · 缺 `target_hops` = **算不出**（L3 不可用/超 3 跳），须如实标注，
+///      不可默认成某个数——"算不出"与"很远"是两件事。
+///
+/// ## 与「记录层联想」的分区关系
+///
+/// 记录层（`append_associated_memories`）给的是**记忆**；
+/// 本函数给的是**卦候选 + 目标坐标**（符号层，尚无记忆 ID）。
+/// 二者证据性质不同，必须分区显示，不可混排。
+fn append_daoti_cycle(text: &mut String, cyc: &serde_json::Value) {
+    let assoc = match cyc.get("associations").and_then(|a| a.as_array()) {
+        Some(a) if !a.is_empty() => a,
+        _ => return,
+    };
+    let target = cyc.get("target").and_then(|t| t.as_str()).unwrap_or("");
+    let target_gua = cyc
+        .get("target_gua")
+        .and_then(|t| t.as_str())
+        .unwrap_or("（未知）");
+
+    text.push_str(
+        "\n═══ 联想 · 符号层候选（道体 §4.4 状态机循环）═══\n\
+         以下不是记忆，而是**候选方向**：由结构算子（错/综/互/变爻）从当前卦\n 衍出，并标注**朝目标还差几跳**。\n",
+    );
+    text.push_str(&format!(
+        "目标: 「{}」 → 目标卦: {}\n\n",
+        target.chars().take(40).collect::<String>(),
+        target_gua
+    ));
+
+    for (i, c) in assoc.iter().enumerate() {
+        let gua = c.get("gua_name").and_then(|v| v.as_str()).unwrap_or("?");
+        let rel = c.get("rel_type").and_then(|v| v.as_str()).unwrap_or("?");
+        let how = c.get("how").and_then(|v| v.as_str()).unwrap_or("");
+        let l3 = c.get("l3_source").and_then(|v| v.as_str()).unwrap_or("");
+        // ★层次：None 必须显示为"算不出"，不可省略（否则读者会以为是 0 跳）
+        let hops = match c.get("target_hops") {
+            Some(v) if v.is_u64() => format!("第 {} 层", v.as_u64().unwrap_or(0)),
+            Some(serde_json::Value::Null) | None => {
+                "层次: 算不出（超 3 跳或 L3 不可用）".to_string()
+            }
+            Some(v) => format!("第 {} 层", v),
+        };
+        text.push_str(&format!(
+            "（符号候选 #{} · {} · {} · 依据 {} · {}）\n",
+            i + 1,
+            hops,
+            gua,
+            structural_rel_label(rel),
+            how
+        ));
+        if let Some(wx) = c.get("wuxing_relation").and_then(|v| v.as_str()) {
+            // 生克只作辅助特征（§1.2 已否证其作主判据），故标为"附注"
+            text.push_str(&format!("附注: 五行生克 {}（辅助特征，不参与排序）\n", wx));
+        }
+        if !l3.is_empty() {
+            text.push_str(&format!("结构算子来源: {}\n", l3));
+        }
+        text.push('\n');
+    }
+
+    if let Some(d) = cyc.get("degraded").and_then(|v| v.as_array()) {
+        if !d.is_empty() {
+            let items: Vec<String> = d
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            text.push_str(&format!(
+                "⚠ 降态项: {}（这些字段当前是默认值，非实测）\n",
+                items.join(", ")
+            ));
+        }
+    }
+    text.push_str(
+        "💡 符号层候选当前**不落图**（「文本→卦」通路未通过判据，见设计文档 §11）；\n\
+         它给的是方向与层次，不是可直接引用的记忆。\n",
+    );
+}
+
 /// 联想补全的条数上限（v0.9.8）
 ///
 /// **为什么需要上限**：同一次经历的簇可能很大（实测有 32 条的同小时簇），
@@ -1253,32 +1828,117 @@ const ASSOCIATION_EXPAND_MAX: usize = 3;
 /// 就必须知道①凭什么关联（`why`，含具体 event_id 或实体名）
 /// ②从哪条记忆联想过来（`via`）。缺任一项，联想就成了无从检验的黑箱
 /// （承方法论 105：解释必须解释到具体对象）。
+///
+/// # ★按证据来源**分区**渲染（2026-09-18 审查修复）
+///
+/// 本函数收到的 `assoc` 是**混合列表**：记录层（由记录必然成立）与
+/// 符号层落盘边（结构算子推导，**可能不成立**）并存。此前两者共用
+/// 一个分区标题「记录型关联（由记录推导…由记录必然关联）」与页脚
+/// 「这些是「共同经历 / 共享实体」带来的连接」——对符号层边是**事实错误**。
+///
+/// 这与 UI 侧已修掉的失效模式同源（`v1_api.rs::explore_source_of`
+/// 把符号层标成 `symbolic` 而非 `record`），只是漏在了 MCP 文本出口。
+/// ⇒ 以 `is_symbolic_edge_type` 为**唯一判据**分流，两区各有各的标题与页脚
+///（单一事实来源：不在此另列一份类型名，避免与 `memory_store.rs` 漂移）。
 fn append_associated_memories(text: &mut String, assoc: &[AssociatedMemory]) {
+    // 分流：符号层落盘边 vs 记录层关联。保持原有相对顺序（调用方已排好序）。
+    let (sym, rec): (Vec<&AssociatedMemory>, Vec<&AssociatedMemory>) = assoc
+        .iter()
+        .partition(|a| crate::memory_store::is_symbolic_edge_type(&a.relation));
+
+    if !rec.is_empty() {
+        append_record_layer_section(text, &rec);
+    }
+    if !sym.is_empty() {
+        append_symbolic_stored_section(text, &sym);
+    }
+}
+
+/// 渲染**记录层**关联分区（由记录必然成立）。
+fn append_record_layer_section(text: &mut String, rec: &[&AssociatedMemory]) {
     text.push_str(
-        "\n═══ 联想（由记录推导，非语义相似）═══\n\
+        "\n═══ 联想 · 记录型关联（由记录推导，非语义相似）═══\n\
          以下记忆**与本次查询语义可能毫不相似**，但它们由记录必然关联——\n\
-         这是相似度检索给不出的连接。\n\n",
+         这是相似度检索给不出的连接。\n\
+         【层次】标注它距联想起点几跳：1 跳=记录直接成立；2 跳=经中间记忆的间接关联。\n\n",
     );
-    for (i, a) in assoc.iter().enumerate() {
-        text.push_str(&format!(
-            "（联想 #{} · {} · {}）\n",
-            i + 1,
-            relation_label(&a.relation),
-            a.memory_type
-        ));
-        text.push_str(&format!("内容: {}\n", a.content_preview));
-        text.push_str(&format!("依据: {}\n", a.why));
-        text.push_str(&format!(
-            "来路: 由「{}」联想到此（{}）\n",
-            a.via_preview.chars().take(40).collect::<String>(),
-            a.via_memory_id.chars().take(12).collect::<String>(),
-        ));
-        text.push_str(&format!("ID: `{}`\n\n", a.memory_id));
+    for (i, a) in rec.iter().enumerate() {
+        append_one_association(text, a, "记录型关联", i + 1, &a.relation);
     }
     text.push_str(
         "💡 这些是「共同经历 / 共享实体」带来的连接。若要它们更丰富，\
 写入时给同一次经历的多条记忆填相同的 event_id。\n",
     );
+}
+
+/// 渲染**符号层落盘边**分区（结构算子推导，**可能不成立**）。
+///
+/// 与记录层分区的措辞必须**处处相反**（必然/可能、记录/推导）：
+/// 两者混排或共用标题，用户就会把推测当事实引用。
+fn append_symbolic_stored_section(text: &mut String, sym: &[&AssociatedMemory]) {
+    text.push_str(
+        "\n═══ 联想 · 符号层落边（结构算子推导，可能不成立）═══\n\
+         以下连接来自图里**已落盘**的结构推导边（由结构算子从卦推出），\n\
+         与「记录型关联」性质相反：它们**不是**记录事实，**可能不成立**，\n\
+         请当作线索而非结论。\n\n",
+    );
+    for (i, a) in sym.iter().enumerate() {
+        append_one_association(text, a, "符号层落边", i + 1, &a.relation);
+    }
+    text.push_str(
+        "💡 这些是「结构推导」带来的连接，**不可直接当证据引用**。\
+若要它们更可靠，需先让判据通过后再落边（详见落边分区的解封条件）。\n",
+    );
+}
+
+/// 渲染**单条**联想（两区共用，仅"类型名"与"关系标签表"不同）。
+///
+/// `kind_name` 是分区性质名（记录型关联 / 符号层落边）；
+/// `relation` 决定标签表——符号层类型必须走 `structural_rel_label`，
+/// 否则 `COORDINATE` 等会落到记录层的兜底值「相关联」，把类型抹平。
+fn append_one_association(
+    text: &mut String,
+    a: &AssociatedMemory,
+    kind_name: &str,
+    seq: usize,
+    relation: &str,
+) {
+    // ★先绑定大写形式再借用：`structural_rel_label` 匹配的是大写键，
+    //   若直接写 `&relation.to_uppercase()`，临时 String 会在语句末尾被
+    //   drop，返回的 `&str` 立刻悬空（E0716）。
+    let upper = relation.to_ascii_uppercase();
+    let label = if crate::memory_store::is_symbolic_edge_type(relation) {
+        structural_rel_label(&upper)
+    } else {
+        relation_label(relation)
+    };
+    // ★层次必须显示（用户对联想的价值判据：「告诉我这是第几层能想到的」）。
+    //   `hops` 是寻路的坐标，不是分类标签——故与关系类型**并列**展示，
+    //   让调用方一眼看出证据强度（1 跳强于 2 跳）。
+    text.push_str(&format!(
+        "（{} #{} · 第 {} 层 · {} · {}）\n",
+        kind_name, seq, a.hops, label, a.memory_type
+    ));
+    text.push_str(&format!("内容: {}\n", a.content_preview));
+    text.push_str(&format!("依据: {}\n", a.why));
+    // 2 跳的"意外性"来自**路径本身**：写出完整路径可核，
+    // 用户据此判断这个跳跃是否合理（只给终点则无法判断）。
+    if a.hops >= 2 && a.path.len() >= 3 {
+        let mut p = String::new();
+        for (k, id) in a.path.iter().enumerate() {
+            if k > 0 {
+                p.push_str(" → ");
+            }
+            p.push_str(&id.chars().take(8).collect::<String>());
+        }
+        text.push_str(&format!("路径: {}\n", p));
+    }
+    text.push_str(&format!(
+        "来路: 由「{}」联想到此（{}）\n",
+        a.via_preview.chars().take(40).collect::<String>(),
+        a.via_memory_id.chars().take(12).collect::<String>(),
+    ));
+    text.push_str(&format!("ID: `{}`\n\n", a.memory_id));
 }
 
 /// 处理 recall 工具调用 — 关键词匹配 / 深度语义检索
@@ -1466,60 +2126,6 @@ async fn handle_recall(
                 text.push_str("💡 在回复中引用记忆时，请使用「（根据记忆 #N）」的格式标注来源，让用户能看见和信任记忆的存在。\n");
             }
 
-            // LRC 内置道体状态机·联想链输出：
-            // 将本次检索激活的记忆及联想轨迹直接暴露给调用方，
-            // 让"如何从一件事联想到另一件事"可观测、可审计。
-            let state_snapshot = store.memory_state_machine.snapshot();
-            if state_snapshot.trail.len() >= 2 {
-                text.push_str("\n═══ 联想链（状态机轨迹）═══\n");
-                for step in &state_snapshot.trail {
-                    let from = step.from_id.as_deref().unwrap_or("查询起点");
-                    text.push_str(&format!(
-                        "  {} ──(深度 {})──▶ {}\n",
-                        from.chars().take(24).collect::<String>(),
-                        step.depth,
-                        step.to_id.chars().take(24).collect::<String>(),
-                    ));
-                }
-                text.push_str(
-                    "💡 联想链展示记忆如何由一件事发散到相关记忆；活性状态已持久化，下次检索会感知近期语境。\n",
-                );
-            } else if !state_snapshot.active.is_empty() {
-                let active_note: Vec<String> = state_snapshot
-                    .active
-                    .iter()
-                    .take(3)
-                    .map(|a| {
-                        format!(
-                            "{} (强度 {:.2})",
-                            a.memory_id.chars().take(16).collect::<String>(),
-                            a.activation
-                        )
-                    })
-                    .collect();
-                text.push_str(&format!("\n🧠 当前活跃记忆: {}\n", active_note.join(", ")));
-            }
-
-            // LRC 内置道体状态机·回归证据（道体再次校验）：
-            // 展示联想扩散保留每条记忆的判定证据——"为什么这条被联想回来"，
-            // 让发散-回归闭环对调用方完全可审计。
-            if !result.regression_evidence.is_empty() {
-                text.push_str("\n🔍 回归校验证据（道体再次校验）\n");
-                for m in &result.memories {
-                    if let Some(evidence) = result.regression_evidence.get(&m.id) {
-                        text.push_str(&format!(
-                            "  #{} [{}] {}\n",
-                            m.id.chars().take(12).collect::<String>(),
-                            evidence,
-                            m.content.chars().take(28).collect::<String>(),
-                        ));
-                    }
-                }
-                text.push_str(
-                    "💡 回归校验确认联想扩散的记忆确实回应了原始查询；无共鸣信号的记忆已被剔除。\n",
-                );
-            }
-
             // ═══ 记录层联想补全（v0.9.8：真正的记忆联想）═══
             //
             // 上面所有通路（fast / deep / RRF / 状态机联想链）**全部是相似度驱动**，
@@ -1539,6 +2145,29 @@ async fn handle_recall(
             if !assoc.is_empty() {
                 append_associated_memories(&mut text, &assoc);
             }
+            // 锁在此处释放：道体调用是**网络等待**，绝不能持锁进行
+            //（否则道体挂起会阻塞所有记忆读写；与既有"先翻译再取锁"同一纪律）。
+            drop(store);
+
+            // ═══ 符号层联想（道体 §4.4 状态机循环 + §5.4 落边，v0.9.8）═══
+            //
+            // ★target = 本次查询本身（用户裁定「目标就是召回」，不做解析）。
+            // 该调用返回**候选卦 + 朝目标还差几跳**，与上面的记录层联想
+            // 是两套证据（符号层尚无记忆 ID），故分区显示、不混排。
+            //
+            // ★两个分区统一走 `append_symbolic_layer`（2026-09-18 审查 G5b/G8 修复）：
+            //   · G8：此前本段与 `handle_recall_enhanced` 逐字重复
+            //   · G5b：此前两次调用**串行**（最坏 4s + 6s = 10s 叠加），
+            //     现为**并发 + 总预算 6s**（详见该函数文档）
+            //
+            // 门控默认全关 ⇒ 行为与既有版本逐字节一致（且不发任何请求）。
+            let seeds_for_symbolic: Vec<(String, String)> = result
+                .memories
+                .iter()
+                .take(8)
+                .map(|m| (m.id.clone(), m.content.clone()))
+                .collect();
+            append_symbolic_layer(&mut text, query, &seeds_for_symbolic).await;
 
             let call_result = ToolCallResult {
                 content: vec![TextContent {
@@ -4481,6 +5110,669 @@ mod tests {
             .await,
             "daemon 不可达时应静默降级返回 false"
         );
+    }
+
+    /// v0.9.8：/cycle 在线时应解析出候选与**目标层次**，
+    /// 且请求体必须携带 text 与 target（target = 查询本身，不解析）。
+    #[tokio::test]
+    async fn test_fetch_daoti_cycle_online_parses_hops() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // ★★ 断言必须**回传测试线程**（2026-09-18 修 S8）★★
+        //
+        // 此前契约断言写在 `tokio::spawn` 的 task 内，而 `JoinHandle` 从未被
+        // await（末尾 `mock.abort()` 直接把它丢弃）⇒ **task 内 panic 不会传播
+        // 到测试线程**，测试照常通过。后果：本轮最核心的契约断言
+        // （target = 查询本身，用户裁定的关键设计）**实际从未生效**——
+        // 即使把 body 改成不传 target，这条测试依然是绿的。
+        //
+        // ⇒ 改为「mock 只记录收到的请求，断言在主线程做」：
+        //   这样断言失败会真的让测试红。
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_mock = seen.clone();
+        let mock = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                if req.starts_with("POST /cycle") {
+                    // 只记录，不 assert（assert 在主线程做）
+                    if let Ok(mut g) = seen_mock.lock() {
+                        g.push(req.clone());
+                    }
+                    let body = "{\"associations\":[{\"gua_name\":\"兑为泽\",\"rel_type\":\"COORDINATE\",\"how\":\"zong_gua\",\"target_hops\":1,\"wuxing_relation\":\"生\",\"l3_source\":\"rust_cli\"}],\"target\":\"今晚吃什么\",\"target_gua\":\"兑为泽\",\"degraded\":[\"scheduler.curiosity\"],\"version\":\"daoti-assoc-v1\"}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                } else {
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                }
+            }
+        });
+
+        let cyc = fetch_daoti_cycle_with_base(
+            "今晚吃什么",
+            "今晚吃什么",
+            Some(&format!("http://{}", addr)),
+        )
+        .await;
+        mock.abort();
+
+        // ---- ★契约断言（在主线程，失败真的会红）----
+        let reqs = seen.lock().map(|g| g.clone()).unwrap_or_default();
+        assert!(
+            !reqs.is_empty(),
+            "mock 应至少收到一次 /cycle 请求（否则断言形同虚设）"
+        );
+        let req = &reqs[0];
+        assert!(
+            req.contains("\"text\":\"今晚吃什么\""),
+            "cycle 请求必须携带 text，实际: {}",
+            req
+        );
+        assert!(
+            req.contains("\"target\":\"今晚吃什么\""),
+            "cycle 请求必须携带 target（= 查询本身，不解析），实际: {}",
+            req
+        );
+
+        let cyc = cyc.expect("道体在线且契约匹配时应返回循环结果");
+        let assoc = cyc["associations"]
+            .as_array()
+            .expect("associations 应为数组");
+        assert_eq!(assoc.len(), 1);
+        assert_eq!(assoc[0]["target_hops"].as_u64(), Some(1));
+        // 渲染层必须把层次与目标都呈现出来（用户判据：要能看见"第几层"）
+        let mut text = String::new();
+        append_daoti_cycle(&mut text, &cyc);
+        assert!(text.contains("第 1 层"), "渲染必须显示层次: {}", text);
+        assert!(text.contains("目标卦: 兑为泽"), "渲染必须显示目标卦");
+        assert!(
+            text.contains("相综/互卦（协同）"),
+            "符号层关系标签须独立于记录层"
+        );
+        // 降态项必须透出（不能把默认值当实测读数）
+        assert!(text.contains("降态项"), "降态项必须显示");
+    }
+
+    /// v0.9.8：/cycle 的三类降态 —— 不可达 / 版本不符 / 缺 associations。
+    ///
+    /// ★为什么必须逐条测：这三种都会让 `fetch_daoti_cycle` 返回 None，
+    /// 但原因不同。若不区分，服务端升级改字段时会**静默变成"无联想"**，
+    /// 排查时看不出是哪一类（承"不做字段猜测"纪律）。
+    #[tokio::test]
+    async fn test_fetch_daoti_cycle_degrades_on_unreachable_and_bad_contract() {
+        // (1) 不可达端口
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        assert!(
+            fetch_daoti_cycle_with_base("x", "x", Some(&format!("http://{}", addr)))
+                .await
+                .is_none(),
+            "道体不可达必须降态为 None"
+        );
+
+        // (2) 版本不符 —— 协议不认识，必须拒绝而非按旧含义解读
+        let body_v = "{\"associations\":[],\"version\":\"unknown-v9\"}";
+        assert!(
+            run_mock_cycle_and_fetch(body_v).await.is_none(),
+            "版本不符必须降态为 None（不做字段猜测）"
+        );
+
+        // (3) 缺 associations 字段
+        let body_m = "{\"version\":\"daoti-assoc-v1\"}";
+        assert!(
+            run_mock_cycle_and_fetch(body_m).await.is_none(),
+            "缺 associations 必须降态为 None"
+        );
+    }
+
+    /// 起一个只回固定 body 的 mock /cycle，返回客户端结果（供降态用例复用）。
+    async fn run_mock_cycle_and_fetch(body: &'static str) -> Option<serde_json::Value> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await.unwrap_or(0);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let out = fetch_daoti_cycle_with_base("x", "x", Some(&format!("http://{}", addr))).await;
+        mock.abort();
+        out
+    }
+
+    /// v0.9.8（2026-09-18 修 G9）：**四个分区标题**必须有测试锁定。
+    ///
+    /// ★为什么标题值得单独测：四个分区冠名各自**声明了一种证据性质**——
+    ///   · 「记录型关联（由记录推导，非语义相似）」⇒ 用户据此认为"必然成立"
+    ///   · 「符号层落边（§5.4 写入端）」     ⇒ 结构算子**推导**，可能不成立
+    ///   · 「符号层候选（道体 §4.4 状态机循环）」⇒ 给的是**方向**，不是记忆
+    ///   · 「符号层（道体）」降态兜底          ⇒ 本次**没跑**，什么都没有
+    ///
+    /// 此前这些串只以字面量散落在三个 `push_str` 里，**无任何测试**：
+    /// 改一个字（如把"由记录推导"删成"关联"）不会有测试变红，而这恰好
+    /// 把"事实"与"推导"的区分抹掉了——正是 S4 修的那个失效模式。
+    /// 本测试锁住：①四个标题各自存在 ②彼此**互不相同**（不可合并成同一顶帽子）。
+    #[test]
+    fn test_association_section_titles_are_locked_and_distinct() {
+        // ---- ① 记录层 ----
+        let mut t = String::new();
+        append_associated_memories(
+            &mut t,
+            &[AssociatedMemory {
+                memory_id: "11111111-aaaa".to_string(),
+                content_preview: "吃楼外楼".to_string(),
+                memory_type: "experience".to_string(),
+                relation: "same_event".to_string(),
+                why: "同一次经历（event_id=trip-hangzhou-2026-09）".to_string(),
+                via_memory_id: "22222222-bbbb".to_string(),
+                via_preview: "游西湖".to_string(),
+                hops: 1,
+                path: vec!["22222222-bbbb".to_string(), "11111111-aaaa".to_string()],
+            }],
+        );
+        assert!(
+            t.contains("联想 · 记录型关联（由记录推导，非语义相似）"),
+            "记录层分区标题被改动（它声明了『必然成立』这一证据性质）: {}",
+            t
+        );
+
+        // ---- ② 符号层落边（写入端）----
+        let mut t_be = String::new();
+        append_daoti_build_edges(
+            &mut t_be,
+            &serde_json::json!({
+                "edges": [], "blocked": "any_reason", "version": "daoti-assoc-v1"
+            }),
+        );
+        assert!(
+            t_be.contains("联想 · 符号层落边（§5.4 写入端）"),
+            "符号层落边分区标题被改动: {}",
+            t_be
+        );
+
+        // ---- ③ 符号层候选（读端）----
+        let mut t_cyc = String::new();
+        append_daoti_cycle(
+            &mut t_cyc,
+            &serde_json::json!({
+                "associations": [{"gua_name": "需", "rel_type": "COORDINATE",
+                                  "how": "cuo_gua", "target_hops": 1}],
+                "target": "游西湖", "target_gua": "兑为泽",
+                "version": "daoti-assoc-v1"
+            }),
+        );
+        assert!(
+            t_cyc.contains("联想 · 符号层候选（道体 §4.4 状态机循环）"),
+            "符号层候选分区标题被改动（它声明了『给方向而非记忆』）: {}",
+            t_cyc
+        );
+
+        // ---- ④ 符号层降态（超预算）----
+        // ★直接调**真实渲染函数**：若只比对字面量常量，测试无法发现
+        //   "常量改了但渲染处忘了用"（渲染处会硬编码旧串，测试照样绿）。
+        let mut t_deg = String::new();
+        append_symbolic_layer_degraded(&mut t_deg);
+        assert!(
+            t_deg.contains(SYMBOLIC_LAYER_DEGRADED_TITLE),
+            "降态块必须使用分区标题常量: {}",
+            t_deg
+        );
+        assert!(
+            t_deg.contains("本次跳过"),
+            "降态块必须明说『本次跳过』（否则用户以为符号层没做）: {}",
+            t_deg
+        );
+
+        // ---- ⑤ 四个标题互不相同 ----
+        // 若有人把符号层两个分区合并成一个标题、或让记录层复用符号层标题，
+        // 用户将无法分辨拿到的到底是"事实"、"推导"还是"方向"。
+        let titles = [
+            "联想 · 记录型关联（由记录推导，非语义相似）",
+            "联想 · 符号层落边（§5.4 写入端）",
+            "联想 · 符号层候选（道体 §4.4 状态机循环）",
+            SYMBOLIC_LAYER_DEGRADED_TITLE,
+        ];
+        let uniq: std::collections::HashSet<&str> = titles.iter().copied().collect();
+        assert_eq!(
+            uniq.len(),
+            titles.len(),
+            "四个分区标题必须互不相同（证据性质不同，不可合并冠名）"
+        );
+        // 记录层标题必须含"由记录推导"——这是它与符号层最关键的区分词，
+        // 单独断言以防有人只改这四个字（其余标题仍全绿）。
+        assert!(
+            titles[0].contains("由记录推导"),
+            "记录层标题必须保留『由记录推导』，否则与符号层推导无法区分"
+        );
+    }
+
+    /// v0.9.8：符号层渲染不得复用记录层的 `relation_label`
+    /// （否则 CONSTRAINT/COORDINATE 全落到兜底「相关联」，类型信息被抹平）。
+    #[test]
+    fn test_structural_rel_label_is_distinct_from_record_layer() {
+        assert_eq!(structural_rel_label("COORDINATE"), "相综/互卦（协同）");
+        assert_eq!(structural_rel_label("CONSTRAINT"), "相错（约束）");
+        // 未知类型原样回显（不伪造成已知类型）
+        assert_eq!(structural_rel_label("NEW_KIND"), "NEW_KIND");
+        // 与记录层标签表确实不同源
+        assert_ne!(
+            structural_rel_label("COORDINATE"),
+            relation_label("COORDINATE")
+        );
+    }
+
+    /// ★★审查发现 3：符号层落盘边**必须独立分区**，不得共用记录层的
+    /// 「由记录必然关联」标题与「共同经历 / 共享实体」页脚。
+    ///
+    /// # 为什么必须有这条
+    ///
+    /// `append_associated_memories` 收到的是**混合列表**（记录层 + 符号层落盘边）。
+    /// 修复前它对全部条目作记录层断言 —— 对 `coordinate`（结构推导、**可能不成立**）
+    /// 是**事实错误**，用户会把推测当事实引用。
+    ///
+    /// 这与 UI 侧已修掉的失效模式同源（`explore_source_of`），只是漏在 MCP 文本出口。
+    #[test]
+    fn test_symbolic_stored_edges_get_own_section() {
+        let mk = |id: &str, rel: &str, why: &str| AssociatedMemory {
+            memory_id: id.to_string(),
+            content_preview: format!("内容-{id}"),
+            memory_type: "experience".to_string(),
+            relation: rel.to_string(),
+            why: why.to_string(),
+            via_memory_id: "seed-1".to_string(),
+            via_preview: "起点".to_string(),
+            hops: 1,
+            path: vec!["seed-1".to_string(), id.to_string()],
+        };
+        let assoc = vec![
+            mk("rec-1", "same_event", "同一次经历（event_id=trip-x）"),
+            mk(
+                "sym-1",
+                "coordinate",
+                "图存储既有边（符号层推导边，相综/互卦（协同））",
+            ),
+        ];
+        let mut text = String::new();
+        append_associated_memories(&mut text, &assoc);
+
+        // ① 两个分区标题都必须出现
+        assert!(
+            text.contains("联想 · 记录型关联（由记录推导，非语义相似）"),
+            "记录层分区标题必须保留: {}",
+            text
+        );
+        assert!(
+            text.contains("联想 · 符号层落边（结构算子推导，可能不成立）"),
+            "★符号层落盘边必须有独立分区标题: {}",
+            text
+        );
+        // ② 符号层分区必须显式声明"不是记录事实 / 可能不成立"
+        assert!(
+            text.contains("可能不成立"),
+            "★符号层分区必须声明可能不成立（否则用户当事实引用）: {}",
+            text
+        );
+        // ③ 符号层条目必须用符号层标签表（而非记录层兜底「相关联」）
+        assert!(
+            text.contains("相综/互卦（协同）"),
+            "★符号层类型必须走 structural_rel_label: {}",
+            text
+        );
+        // ④ 符号层条目不得被冠以「记录型关联」的条目名
+        let sym_line = text
+            .lines()
+            .find(|l| l.contains("sym-1") || l.contains("符号层落边 #"))
+            .unwrap_or("");
+        assert!(
+            sym_line.contains("符号层落边 #"),
+            "★符号层条目应以「符号层落边 #N」开头，实际: {sym_line}"
+        );
+        assert!(
+            !sym_line.contains("记录型关联 #"),
+            "★符号层条目不得被标为「记录型关联」: {sym_line}"
+        );
+        // ⑤ 记录层条目仍走「记录型关联 #N」
+        assert!(
+            text.contains("记录型关联 #1"),
+            "记录层条目命名不得被改: {}",
+            text
+        );
+    }
+
+    /// ★★审查发现 3 的**边界**：只有一种来源时不得凭空产生另一个分区。
+    #[test]
+    fn test_only_one_source_renders_only_one_section() {
+        let rec = vec![AssociatedMemory {
+            memory_id: "rec-only".to_string(),
+            content_preview: "只有记录层".to_string(),
+            memory_type: "fact".to_string(),
+            relation: "shared_entity".to_string(),
+            why: "共享实体（杭州）".to_string(),
+            via_memory_id: "seed".to_string(),
+            via_preview: "起点".to_string(),
+            hops: 1,
+            path: vec!["seed".to_string(), "rec-only".to_string()],
+        }];
+        let mut t = String::new();
+        append_associated_memories(&mut t, &rec);
+        assert!(t.contains("记录型关联"), "应渲染记录层分区");
+        assert!(
+            !t.contains("符号层落边（结构算子推导"),
+            "★无符号层条目时不得出现符号层分区（否则是虚假分区）: {}",
+            t
+        );
+
+        let sym = vec![AssociatedMemory {
+            memory_id: "sym-only".to_string(),
+            content_preview: "只有符号层".to_string(),
+            memory_type: "fact".to_string(),
+            relation: "cause".to_string(),
+            why: "图存储既有边（符号层推导边，因果）".to_string(),
+            via_memory_id: "seed".to_string(),
+            via_preview: "起点".to_string(),
+            hops: 1,
+            path: vec!["seed".to_string(), "sym-only".to_string()],
+        }];
+        let mut t2 = String::new();
+        append_associated_memories(&mut t2, &sym);
+        assert!(t2.contains("符号层落边"), "应渲染符号层分区");
+        assert!(
+            !t2.contains("记录型关联（由记录推导"),
+            "★无记录层条目时不得出现记录层分区: {}",
+            t2
+        );
+        // 符号层单独出现时也不得使用"由记录必然关联"这类断言
+        assert!(
+            !t2.contains("由记录必然关联"),
+            "★符号层分区不得断言'由记录必然关联': {}",
+            t2
+        );
+    }
+
+    /// ★★审查发现 1：超时降态必须**分级**——部分完成时不得说成"本次跳过"。
+    ///
+    /// # 为什么必须有这条
+    ///
+    /// 修复前超时分支只 `return` + 整体降态，**已完成的一侧被一起丢弃**，
+    /// 用户看到"符号层本次跳过"，而实际拿到了候选卦。
+    /// "没跑"与"跑了一半"是两件事，对用户的处置完全不同。
+    #[test]
+    fn test_partial_degraded_is_distinct_from_total_skip() {
+        // ① 部分完成：只说未跑完的那个分区
+        let mut t1 = String::new();
+        append_symbolic_layer_partial(&mut t1, true, false);
+        assert!(
+            t1.contains("部分完成"),
+            "★部分完成必须明说『部分完成』而非『本次跳过』: {t1}"
+        );
+        assert!(
+            !t1.contains("本次跳过"),
+            "★部分完成不得说成『本次跳过』（会掩盖已拿到的结果）: {t1}"
+        );
+        assert!(
+            t1.contains("符号层候选（结构方向）"),
+            "★必须指明是哪个分区未跑完: {t1}"
+        );
+        assert!(
+            !t1.contains("符号层落边（§5.4）"),
+            "★已完成的分区不得被列为未跑完: {t1}"
+        );
+        assert!(
+            t1.contains("真实结果"),
+            "★必须说明上面展示的是真实结果（不是降级数据）: {t1}"
+        );
+
+        // ② 反向：只有落边未跑完
+        let mut t2 = String::new();
+        append_symbolic_layer_partial(&mut t2, false, true);
+        assert!(t2.contains("符号层落边（§5.4）"));
+        assert!(!t2.contains("符号层候选（结构方向）"));
+
+        // ③ 两边都完成 ⇒ 不输出任何降态块（避免虚假降态）
+        let mut t3 = String::new();
+        append_symbolic_layer_partial(&mut t3, false, false);
+        assert!(
+            t3.is_empty(),
+            "★两边都完成时不得输出降态块（否则是虚假降态）: {t3}"
+        );
+
+        // ④ 整体降态（两边都没拿到）仍走原函数，措辞与之必须不同
+        let mut t4 = String::new();
+        append_symbolic_layer_degraded(&mut t4);
+        assert!(t4.contains("本次跳过"));
+        assert_ne!(t1, t4, "两种降态措辞必须不同");
+    }
+
+    /// v0.9.8：`/build_edges` 被门控阻断时，渲染层必须输出**四要素**：
+    /// 状态（主动门控，非故障）/ 原因码 / 判据依据 / 解封条件。
+    ///
+    /// ★为什么这条是核心：阻断本身是**正确行为**（防污染图）。
+    /// 真正的失效模式是**静默阻断**——用户以为功能坏了或没做，
+    /// 而实际是判据未过、有明确的解封路径。两种认知的处置完全不同。
+    #[test]
+    fn test_append_daoti_build_edges_explains_block() {
+        // ★原因码取**Python 侧真实值**（`assoc_service.py` 的
+        //   `build_edges_for_seeds` 实际返回 `text_to_gua_judge_not_passed`）。
+        //   此前 mock 里写的是 `no_usable_text_to_gua_path`（旧值，早已弃用）
+        //   ⇒ mock 与实现"一起错"，测试永远绿、却测不到真实契约。
+        let res = serde_json::json!({
+            "edges": [],
+            "blocked": "text_to_gua_judge_not_passed",
+            "blocked_detail": "四条判据未全过，未通过项: ['dispersion']",
+            "blocked_is_gate": true,
+            "unblock_env": "DAOTI_ALLOW_UNSTABLE_GUA=1",
+            "version": "daoti-assoc-v1"
+        });
+        let mut text = String::new();
+        append_daoti_build_edges(&mut text, &res);
+        assert!(
+            text.contains("主动门控"),
+            "必须说明是主动门控而非故障: {}",
+            text
+        );
+        // ★断言"回显了服务端给的原因码"，而**不拼死具体字面量**：
+        //   渲染层的职责是透传，不该知道有哪些原因码。
+        //   若在此写死某个串，Python 侧改原因码时这里会静默失配
+        //   （这正是上一版 mock 的病因）。
+        assert!(
+            text.contains("text_to_gua_judge_not_passed"),
+            "必须原样回显服务端给的原因码: {}",
+            text
+        );
+        assert!(text.contains("四条判据未全过"), "必须给出判据依据");
+        assert!(
+            text.contains("DAOTI_ALLOW_UNSTABLE_GUA"),
+            "必须给出解封条件"
+        );
+        assert!(text.contains("不依赖"), "必须说明不影响其它分区");
+    }
+
+    /// v0.9.8：原因码是**透传**的 —— 换任意值都必须原样回显。
+    ///
+    /// ★为什么单独测"任意值"：上面那条只验了一个具体串，若渲染层哪天
+    ///   变成"只认某个白名单、其余显示 unknown"，上面那条仍会通过。
+    ///   本测试用一个人为值，锁住"纯透传"这一契约。
+    #[test]
+    fn test_append_daoti_build_edges_echoes_any_reason_code() {
+        let res = serde_json::json!({
+            "edges": [],
+            "blocked": "some_future_reason_v2",
+            "blocked_detail": "未来某版新增的判据",
+            "blocked_is_gate": true,
+            "version": "daoti-assoc-v1"
+        });
+        let mut text = String::new();
+        append_daoti_build_edges(&mut text, &res);
+        assert!(
+            text.contains("some_future_reason_v2"),
+            "原因码必须纯透传（不得白名单化）: {}",
+            text
+        );
+    }
+
+    /// v0.9.8：实验放行（`DAOTI_ALLOW_UNSTABLE_GUA=1`）时，渲染层
+    /// **必须**显示 `unstable_warning`——否则用户会把实验边当证据引用。
+    #[test]
+    fn test_append_daoti_build_edges_warns_on_unstable_release() {
+        let res = serde_json::json!({
+            "edges": [{
+                "from_id": "aaaaaaaa-1111", "to_id": "bbbbbbbb-2222",
+                "rel_type": "COORDINATE", "how": "cuo_gua", "gua_name": "需"
+            }],
+            "unstable_warning": "本次落边使用了未通过判据的通路",
+            "write_back": {"written": 1, "skipped": 0, "total": 1},
+            "version": "daoti-assoc-v1"
+        });
+        let mut text = String::new();
+        append_daoti_build_edges(&mut text, &res);
+        assert!(text.contains("产出 1 条结构边"), "应报告边数");
+        assert!(text.contains("相综/互卦（协同）"), "关系名应走符号层标签表");
+        assert!(text.contains("未通过判据"), "★必须显示不可作证据的警告");
+        assert!(text.contains("落图: 新增 1"), "应报告写图统计");
+    }
+
+    /// v0.9.8：`/build_edges` 客户端的三类降态（不可达 / 版本不符 / 缺 edges）。
+    ///
+    /// 与 `/cycle` 同纪律：**不做字段猜测**——对方改字段语义后静默按旧含义
+    /// 解读，比失败更危险。
+    #[tokio::test]
+    async fn test_fetch_daoti_build_edges_degrades() {
+        // (1) 空种子：不发请求
+        assert!(
+            fetch_daoti_build_edges_with_base(&[], false, Some("http://127.0.0.1:1"))
+                .await
+                .is_none()
+        );
+        // (2) 不可达端口
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let seeds = vec![("a".to_string(), "文本".to_string())];
+        assert!(
+            fetch_daoti_build_edges_with_base(&seeds, false, Some(&format!("http://{}", addr)))
+                .await
+                .is_none(),
+            "不可达必须降态为 None"
+        );
+        // (3) 版本不符 / (4) 缺 edges
+        let bad_version = "{\"edges\":[],\"version\":\"unknown-v9\"}";
+        assert!(
+            run_mock_build_edges_and_fetch(bad_version).await.is_none(),
+            "版本不符必须降态"
+        );
+        let no_edges = "{\"version\":\"daoti-assoc-v1\"}";
+        assert!(
+            run_mock_build_edges_and_fetch(no_edges).await.is_none(),
+            "缺 edges 必须降态"
+        );
+        // (5) 合法但被阻断（空 edges + blocked）⇒ 必须**成功返回**（不是降态）
+        // ★原因码用 Python 侧真实值（旧值 `no_usable_text_to_gua_path` 已弃用）
+        let blocked = "{\"edges\":[],\"blocked\":\"text_to_gua_judge_not_passed\",\"version\":\"daoti-assoc-v1\"}";
+        let got = run_mock_build_edges_and_fetch(blocked).await;
+        assert!(got.is_some(), "阻断是合法业务结果，不得当降态丢弃");
+        assert_eq!(
+            got.unwrap().get("blocked").and_then(|v| v.as_str()),
+            Some("text_to_gua_judge_not_passed")
+        );
+    }
+
+    /// 起一个只回固定 body 的 mock `/build_edges`（供降态用例复用）。
+    ///
+    /// ★把收到的请求体一并回传（2026-09-18，同 S8 修法）：断言在主线程做，
+    ///   不写在 spawn 的 task 内——task 内 panic 不会传播（见
+    ///   `test_fetch_daoti_cycle_online_parses_hops` 的说明）。
+    async fn run_mock_build_edges_and_fetch(body: &'static str) -> Option<serde_json::Value> {
+        let (out, _) = run_mock_build_edges_and_fetch_capture(body).await;
+        out
+    }
+
+    /// 同上，但额外回传 mock 收到的请求体（供契约断言）。
+    async fn run_mock_build_edges_and_fetch_capture(
+        body: &'static str,
+    ) -> (Option<serde_json::Value>, Vec<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_mock = seen.clone();
+        let mock = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if let Ok(mut g) = seen_mock.lock() {
+                    g.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let seeds = vec![("a".to_string(), "文本".to_string())];
+        let out =
+            fetch_daoti_build_edges_with_base(&seeds, false, Some(&format!("http://{}", addr)))
+                .await;
+        mock.abort();
+        let reqs = seen.lock().map(|g| g.clone()).unwrap_or_default();
+        (out, reqs)
+    }
+
+    /// v0.9.8：`/build_edges` 请求体必须携带 seeds（memory_id + text），
+    /// 且 `write_back` 必须随门控如实传递（默认 false ⇒ 不得悄悄写图）。
+    ///
+    /// ★为什么必须测"不写图"：`write_back` 是**有副作用**的开关，
+    ///   若默认被传成 true，一次普通检索就会改用户的图（承"写图需更严门控"）。
+    #[tokio::test]
+    async fn test_fetch_daoti_build_edges_sends_seeds_and_write_back() {
+        let body = "{\"edges\":[],\"blocked\":\"x\",\"version\":\"daoti-assoc-v1\"}";
+        let (out, reqs) = run_mock_build_edges_and_fetch_capture(body).await;
+
+        assert!(!reqs.is_empty(), "mock 应至少收到一次 /build_edges 请求");
+        let req = &reqs[0];
+        assert!(
+            req.contains("\"seeds\""),
+            "请求必须携带 seeds，实际: {}",
+            req
+        );
+        assert!(
+            req.contains("\"memory_id\":\"a\""),
+            "seeds 必须含 memory_id，实际: {}",
+            req
+        );
+        assert!(
+            req.contains("\"text\":\"文本\""),
+            "seeds 必须含 text（该字段是服务端推导的输入），实际: {}",
+            req
+        );
+        assert!(
+            req.contains("\"write_back\":false"),
+            "★write_back 必须如实传 false（写图有副作用，不得默认写），实际: {}",
+            req
+        );
+        assert!(out.is_some(), "合法响应不应降态");
     }
 
     /// 构建测试用 AppState（带已索引的 manager 和记忆存储）

@@ -146,6 +146,38 @@ impl HintEscalationTracker {
     /// 1. 清除上一轮不再出现的指纹（ = 该问题已解决）
     /// 2. 对当前轮的每个 Hint，计算指纹并递增计数
     /// 3. 超过阈值的 Hint 升级 severity
+    ///
+    /// # ★★v0.9.9 修复：只升级 `warning`，**不升级 `info`**
+    ///
+    /// ## 修的什么问题（实测现场）
+    ///
+    /// 原实现对**任何** `severity != "action_required"` 的提示都无条件升级，
+    /// 包括 `info` 级的**纯告知型**提示 ⇒ 产生自相矛盾的用户可见输出：
+    ///
+    /// ```text
+    /// [feedback/action_required] 用户反馈正面率 100.0，系统输出质量良好
+    ///                            [已连续 449 次出现此警告，级别提升]
+    /// suggested_action: 此问题已持续 449 次未解决，请优先处理。
+    /// ```
+    ///
+    /// 「系统输出质量良好」被当成**需要优先处理的故障**，
+    /// 并因为原 `suggested_action` 为空而产生前导空格的拼接残迹。
+    /// 同类的还有 `SystemMode::Healthy` 的「系统运行正常，所有子系统健康。无需干预」。
+    ///
+    /// ## 为什么 `info` 不该升级
+    ///
+    /// `info` 在这里的语义是「**正常 / 无需干预**」（见各条 info 提示的措辞：
+    /// "处于正常范围"、"无需操作"、"这是正常现象，无需干预"、"系统输出质量良好"）。
+    /// 而"连续出现 N 次"的升级机制针对的是**未解决的告警**——
+    /// 把"持续正常"说成"持续未解决，请优先处理"是**语义反了**，
+    /// 而且是用户最容易看到的那类输出（它天天在，且会被推到最高级别）。
+    ///
+    /// ## 附带修正
+    ///
+    /// 升级时不再无脑拼接 `suggested_action`——原实现用
+    /// `format!("{} 此问题已...", h.suggested_action)`，当原值为空串时
+    /// 会留下前导空格。现改为**非空才拼接**（只升级 warning 后此路径本已罕见，
+    /// 但仍按契约处理，避免将来新增空建议的 warning 时复发）。
     pub fn process_hints(&mut self, hints: &[ActionHint]) -> Vec<ActionHint> {
         // 收集本轮所有指纹
         let current_fingerprints: std::collections::HashSet<String> =
@@ -166,18 +198,25 @@ impl HintEscalationTracker {
                     .and_modify(|c| *c += 1)
                     .or_insert(1);
 
-                if *count >= self.escalation_threshold && h.severity != "action_required" {
+                // ★只升级 warning：info = 正常/告知，升级它会把"好消息"说成"待处理故障"
+                if *count >= self.escalation_threshold && h.severity == "warning" {
                     // 升级 severity 并追加升级说明
                     let escalated_message =
                         format!("{} [已连续 {} 次出现此警告，级别提升]", h.message, count);
+                    // 非空才拼接，避免前导空格
+                    let escalated_action = if h.suggested_action.trim().is_empty() {
+                        format!("此问题已持续 {} 次未解决，请优先处理。", count)
+                    } else {
+                        format!(
+                            "{} 此问题已持续 {} 次未解决，请优先处理。",
+                            h.suggested_action, count
+                        )
+                    };
                     ActionHint {
                         category: h.category.clone(),
                         severity: self.escalated_severity.clone(),
                         message: escalated_message,
-                        suggested_action: format!(
-                            "{} 此问题已持续 {} 次未解决，请优先处理。",
-                            h.suggested_action, count
-                        ),
+                        suggested_action: escalated_action,
                     }
                 } else {
                     h.clone()
@@ -789,6 +828,90 @@ mod tests {
         let result4 = tracker.process_hints(&hints1);
         assert_eq!(result4[0].severity, "action_required");
         assert!(result4[0].message.contains("已连续 4 次出现"));
+    }
+
+    /// ★★v0.9.9：`info` 级提示**不得**被升级为告警。
+    ///
+    /// # 这条测的是实测发现的自相矛盾
+    ///
+    /// 原实现无条件升级所有非 `action_required` 的提示，于是：
+    /// `[feedback/action_required] 用户反馈正面率 100.0，系统输出质量良好
+    ///  [已连续 449 次出现此警告，级别提升]`
+    /// `suggested_action: 此问题已持续 449 次未解决，请优先处理。`
+    ///
+    /// ——把「质量良好」当成「需优先处理的故障」。`info` 的语义是「正常/无需干预」，
+    /// 升级它属于**语义反转**。
+    #[test]
+    fn test_info_hints_are_never_escalated() {
+        let mut tracker = HintEscalationTracker::new();
+
+        // 复刻实测现场：一条 info 级的"好消息"（原 suggested_action 为空）
+        let good_news = vec![ActionHint {
+            category: "feedback".to_string(),
+            severity: "info".to_string(),
+            message: "用户反馈正面率 100.0，系统输出质量良好".to_string(),
+            suggested_action: "".to_string(),
+        }];
+
+        // 连跑 5 次（远超阈值 3）
+        for round in 1..=5 {
+            let out = tracker.process_hints(&good_news);
+            assert_eq!(
+                out[0].severity, "info",
+                "★第 {round} 轮：info 级提示不得被升级（否则会把『质量良好』说成『待处理故障』）"
+            );
+            assert!(
+                !out[0].message.contains("级别提升"),
+                "★第 {round} 轮：info 提示不得被追加『级别提升』措辞"
+            );
+            assert!(
+                !out[0].suggested_action.contains("未解决"),
+                "★第 {round} 轮：info 提示不得被追加『未解决，请优先处理』"
+            );
+            assert!(
+                !out[0].suggested_action.starts_with(' '),
+                "★第 {round} 轮：不得留下前导空格（原实现无脑拼接空建议的残迹）"
+            );
+        }
+    }
+
+    /// v0.9.9：`warning` 仍必须能被升级（修复不能把原有能力一起削掉）。
+    #[test]
+    fn test_warning_hints_still_escalate() {
+        let mut tracker = HintEscalationTracker::new();
+        let warn = vec![ActionHint {
+            category: "gc".to_string(),
+            severity: "warning".to_string(),
+            message: "GC 队列偏高".to_string(),
+            suggested_action: "考虑缩短 GC 间隔".to_string(),
+        }];
+        tracker.process_hints(&warn);
+        tracker.process_hints(&warn);
+        let r3 = tracker.process_hints(&warn);
+        assert_eq!(r3[0].severity, "action_required", "warning 第 3 次必须升级");
+        assert!(r3[0].message.contains("已连续 3 次出现"));
+    }
+
+    /// v0.9.9：`warning` 的 `suggested_action` 为空时，升级后不得有前导空格。
+    #[test]
+    fn test_escalation_no_leading_space_when_action_empty() {
+        let mut tracker = HintEscalationTracker::new();
+        let empty_action_warn = vec![ActionHint {
+            category: "gc".to_string(),
+            severity: "warning".to_string(),
+            message: "某告警但无建议".to_string(),
+            suggested_action: "".to_string(),
+        }];
+        tracker.process_hints(&empty_action_warn);
+        tracker.process_hints(&empty_action_warn);
+        let r3 = tracker.process_hints(&empty_action_warn);
+        assert_eq!(r3[0].severity, "action_required");
+        assert!(
+            !r3[0].suggested_action.starts_with(' '),
+            "★空建议升级后不得有前导空格，实际: {:?}",
+            r3[0].suggested_action
+        );
+        assert!(r3[0].suggested_action.contains("未解决"));
     }
 
     /// 测试：提示升级追踪器 — 警告消失后重置计数

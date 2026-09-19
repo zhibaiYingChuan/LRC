@@ -16,6 +16,8 @@
 // 启动后 IDE 可通过 MCP 配置连接此服务，AI 助手即可调用 search_code 工具。
 
 use code_memory::{server, CodeMemoryManager, JsonPersistence, LlmApiConfig, MemoryStore};
+// v0.9.8：记忆图存储（记录层关系持久化）
+use code_memory::graph_store::GraphMemoryStore;
 // v0.5.4 P2-10 修复：导入后台结晶流水线组件
 use code_memory::consolidation::{
     run_consolidation_loop, ConsolidationConfig, ConsolidationPipeline, InMemorySource,
@@ -680,6 +682,30 @@ async fn try_run() -> LrcResult<()> {
         ))
     })?;
 
+    // v0.9.8：启用记忆图存储（此前 `GraphMemoryStore` 已实现但零调用点 = 死代码）
+    //
+    // **为什么现在启用**：记录层关系（`associations_in` 的 7 类）此前只存在于
+    // 一次检索的内存返回值里，检索结束即消失，**跨会话无法累积**。
+    // 图化后关系落盘（`graph_edges.json`），才可能做多跳与关系统计。
+    //
+    // **为什么必须 load**：`GraphMemoryStore::new` 是空状态，若只 new 不 load，
+    // 首次 `add_edge` 会把**只有新边**的图写回文件 ⇒ 历史边全部丢失
+    //（这正是 `graph_store.rs::load` 注释里警示的"用空状态覆盖原图"）。
+    let graph_store = {
+        let mut g = GraphMemoryStore::new(&data_dir);
+        match g.load() {
+            Ok(()) => {
+                let n = g.edge_count();
+                if n > 0 {
+                    log(&format!("  ✓ 记忆图已加载: {n} 条关系边"));
+                }
+            }
+            // load 失败不阻断启动：图是增强能力，不应让服务起不来
+            Err(e) => log(&format!("  ⚠ 记忆图加载失败（将以空图继续）: {e}")),
+        }
+        g
+    };
+
     // v0.9.0 修复：根据 mode 加载编码器
     // 此前 `--mode smart` 是死参数，MemoryStore::new 永远用统计编码器，
     // 导致"下载模型后仍降级"。现在 ml feature 下：
@@ -703,10 +729,16 @@ async fn try_run() -> LrcResult<()> {
         } else {
             (code_memory::engine::create_statistical_encoder(), false)
         };
-        (MemoryStore::new_with_encoder(persistence, encoder), loaded)
+        (
+            MemoryStore::new_with_encoder(persistence, encoder).with_graph_store(graph_store),
+            loaded,
+        )
     };
     #[cfg(not(feature = "ml"))]
-    let (store, ml_loaded) = (MemoryStore::new(persistence), false);
+    let (store, ml_loaded) = (
+        MemoryStore::new(persistence).with_graph_store(graph_store),
+        false,
+    );
     let memory_store = Arc::new(Mutex::new(store));
 
     // ╔═══════════════════════════════════════════════════════════════╗

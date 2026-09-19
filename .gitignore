@@ -449,8 +449,13 @@ benchmarks/*_raw_*.json
 #       且两份文档（HCSE_RELEASE_PROTOCOL 检查项 3）均无"如何获取"说明。
 # 安全性：三脚本均无硬编码绝对路径（分别用相对路径 / Get-Location / %~dp0..），
 #         无 token/secret 等敏感内容，dev-proxy 仅绑定本地回环用途。
-# 边界：Cargo 打包走 Cargo.toml 的 include/exclude，与本文件无关；
-#       本例外仅使三脚本可提交，不会使其进入 crate/Tauri 发布产物。
+# 边界（★v0.9.9 事实核查修正）：
+#       **本文件不影响任何打包产物** —— 它只管 git 是否跟踪，与 Cargo / Tauri 打包无关。
+#       ⚠ 原表述为「Cargo 打包走 Cargo.toml 的 include/exclude」，**该说法是错的**：
+#         Cargo.toml 里**从来没有** include / exclude / files 任何一个键（已全仓核实）。
+#         按 Rust 默认行为，`src/` 下所有被 `mod` 图可达的 `.rs` **都会进包**。
+#         ⇒ 别再把"已由打包边界保护"当作免责依据（详见 docs/V099_INTERACTION_USABILITY.md §十）。
+#       本例外仅使三脚本可提交，与打包无关。
 # 顺序约束：负向规则必须置于其对应忽略规则之后，故集中于此，勿上移。
 !scripts/dev-proxy.py
 !scripts/run-dev.ps1
@@ -461,8 +466,18 @@ benchmarks/*_raw_*.json
 #       面向维护者的研究材料，非产品交付内容；体积合计约 **91.4 MB**
 #       （选型包 2.3MB / 融合引擎源码与文档 44.1MB / v15 权重包 45.0MB），
 #       远超 GitHub 单文件与仓库体量惯例，且含模型权重（*.onnx / *.pt / .safetensors）。
-# 边界：Cargo 打包走 Cargo.toml 的 include/exclude，与本文件无关；
-#       本规则仅阻止其进入 git 仓库，不删除本地文件。
+# 边界（★v0.9.9 事实核查修正）：**本规则只阻止其进入 git 仓库，不删除本地文件，
+#       也不影响打包产物** —— 本文件与 Cargo / Tauri 打包完全无关。
+#       ⚠ 原表述为「Cargo 打包走 Cargo.toml 的 include/exclude」，**该说法是错的**：
+#         Cargo.toml 里从来没有 include / exclude / files 键（已全仓核实）。
+#       ★★另需注意一个**容易误读的点**：此处"道体研究资产不随产品发布"**只对这个目录成立**，
+#          **不等于"道体算法不随产品发布"**。`src/engine/` 下这些自认 DaoTi Research License
+#          的 Rust 模块是**同源的另一套实现，它会无条件参与编译并进入安装包**（已由二进制
+#          字符串级实证：`lrc-sidecar.exe` 内含"承载基础/刚性法则/陷溺困境/愉悦表达"等
+#          只存在于 `mirror_trapezoid.rs` 的宫义串，且这些串在前端资源里 0 命中）：
+#            dao_evolution.rs / dao_metrics.rs / dao_regulator.rs / mirror_trapezoid.rs /
+#            luoshu_encoder.rs / navigation.rs（+ ml 门控下的 luoshu_encoder_ml.rs）
+#          实证与方法见 docs/V099_INTERACTION_USABILITY.md §十。
 # 注：选型结论已提炼进 `daoti/PREREG_MEMORY_ASSOCIATION.md`（该文件亦在 daoti/ 忽略范围内）。
 11_记忆联想专项_选型包/
 DAOti+llm_融合引擎源码与文档/

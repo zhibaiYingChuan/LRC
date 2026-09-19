@@ -5255,6 +5255,279 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ★2026-09-18（补 S4 的 UI 侧复现）：符号层边在探索结果中必须标
+    /// `source="symbolic"`，**不得**被贴上 `source="record"`。
+    ///
+    /// # 为什么这条必须存在
+    ///
+    /// 探索路径此前把 `expand_associations` 的产出**一律**标成 `"record"`。
+    /// 而该函数自 v0.9.8 起会并入**符号层**边（`cause` / `coordinate` / …）
+    /// ——那是结构算子**推导**（可能不成立）。前端据此渲染为
+    /// `isRecord = (source === 'record')` ⇒ 打上「记录关联」标签、
+    /// 文案落到"由记录推导出的关联"。
+    ///
+    /// ⇒ 用户看到的是**最高证据等级**的口径，而实际是推测。
+    /// 这与 `memory_store.rs` 已修的 S4 是**同一个失效模式**，只是漏在 UI 侧。
+    /// 本测试用**只注入符号层边**的最小构造，锁住"两类必须可区分"。
+    #[tokio::test]
+    async fn test_explore_labels_symbolic_edges_distinctly() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_explore_symbolic_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        // ★必须带图存储：符号层边只存在于图里（expand_associations 的并入段读图）
+        let mut store = new_statistical_store(&dir_str);
+        store = store.with_graph_store(crate::graph_store::GraphMemoryStore::new(&dir_str));
+        let shared = Arc::new(Mutex::new(store));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared.clone(), manager, llm_api, llm_ready, false);
+
+        // 起点：查询能召回它（内容含查询词）
+        let mut ids = Vec::new();
+        for payload in [
+            serde_json::json!({
+                "content": "苏堤春晓是西湖十景之首，适合傍晚散步",
+                "memory_type": "experience",
+                "importance": 7,
+            }),
+            // 对端：语义与起点**毫不相似** ⇒ 相似度扩散带不出它
+            //（只有图里的符号层边能把它带出来）
+            serde_json::json!({
+                "content": "数据库连接池的最大连接数需要重新调整",
+                "memory_type": "fact",
+                "importance": 3,
+            }),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/memories/remember")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap();
+            let response = app.clone().into_service().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            ids.push(
+                v["memory_id"]
+                    .as_str()
+                    .expect("remember 应返回 memory_id")
+                    .to_string(),
+            );
+        }
+        let (from_id, to_id) = (ids[0].clone(), ids[1].clone());
+        assert_ne!(from_id, to_id, "两条记忆不应被相似合并");
+
+        // 注入**符号层**边（`coordinate` 属 §5.3 五类逻辑关系）
+        {
+            let mut guard = shared.lock().await;
+            let ok = guard
+                .add_external_edge(&from_id, &to_id, "coordinate", 0.9)
+                .expect("写外部边应成功");
+            assert!(ok, "符号层边应被接受（前置条件）");
+        }
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/associations/explore")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "query": "苏堤", "depth": 2, "width": 3 }).to_string(),
+            ))
+            .unwrap();
+        let response = app.clone().into_service().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "探索应返回 200，实测 {status}，body={}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let nodes = body["nodes"].as_array().expect("nodes 应为数组");
+
+        let sym = nodes
+            .iter()
+            .find(|n| n["content"].as_str().unwrap_or("").contains("连接池"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "图里的符号层边应把「连接池」带进探索结果\
+（它与起点语义毫不相似，只能靠落盘边）: {nodes:?}"
+                )
+            });
+        assert_eq!(
+            sym["relation"], "coordinate",
+            "该节点应标注符号层关系名: {sym}"
+        );
+        // ★靶心：证据来源必须区分为 symbolic
+        assert_eq!(
+            sym["source"], "symbolic",
+            "★符号层边（结构算子推导，可能不成立）**不得**被标成 source=\"record\"\
+（那会让前端渲染为『记录关联』『由记录推导』= 把推测当事实）: {sym}"
+        );
+        assert!(
+            sym["why"]
+                .as_str()
+                .is_some_and(|w| w.contains("符号层推导边")),
+            "why 必须写明这是符号层推导（非记录事实）: {sym}"
+        );
+
+        // 边同样要标注关系名（前端按 relation 渲染文案）
+        let edges = body["edges"].as_array().expect("edges 应为数组");
+        assert!(
+            edges.iter().any(|e| e["relation"] == "coordinate"),
+            "应有标注 coordinate 的边: {edges:?}"
+        );
+
+        // ★反向对照：相似度扩散的节点**不得**带 relation/source=record|symbolic
+        for n in nodes {
+            if n["source"] == "expanded" {
+                assert!(
+                    n["relation"].is_null(),
+                    "相似度扩散节点不应带关联类型（两类必须可区分）: {n}"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `explore_source_of` 的**分类口径**必须与边类型表同源。
+    ///
+    /// 为什么单测它：上面的用例只覆盖了 `coordinate` 一类。若分类函数
+    /// 只认 `coordinate`、其余四类漏判，上面的用例仍会通过。
+    /// 本测试逐类断言，且断言"未知关系名按 record 处理"——
+    /// 那是**保守**方向（记录层类型是白名单外的默认），但必须显式固定，
+    /// 否则将来新增关系类型时无人知道它会落到哪一类。
+    #[test]
+    fn test_explore_source_of_covers_all_symbolic_types() {
+        for rel in [
+            "cause",
+            "temporal",
+            "constraint",
+            "facilitate",
+            "coordinate",
+        ] {
+            assert_eq!(
+                explore_source_of(rel),
+                "symbolic",
+                "§5.3 符号层关系 `{rel}` 必须标为 symbolic"
+            );
+        }
+        for rel in [
+            "same_event",
+            "same_event_auto",
+            "shared_entity",
+            "shared_artifact",
+            "derived_from",
+            "crystallized_into",
+            "evolved_from",
+            "indirect",
+        ] {
+            assert_eq!(
+                explore_source_of(rel),
+                "record",
+                "记录层关系 `{rel}` 必须标为 record"
+            );
+        }
+        // 分类口径与权威判定同源（防两处列举漂移）
+        for rel in ["cause", "coordinate"] {
+            assert!(
+                crate::memory_store::is_symbolic_edge_type(rel),
+                "分类函数必须复用 is_symbolic_edge_type，不得另列一份类型名"
+            );
+        }
+    }
+
+    /// ★★v0.9.9：**跨语言契约**——前端符号层类型清单必须与后端权威判定一致。
+    ///
+    /// # 为什么必须有这条
+    ///
+    /// 「记忆搜索」的联想分区（`renderAssociatedMemories`）在前端按
+    /// `SYMBOLIC_RELATIONS` 给节点打「结构推导 / 记录关联」徽章。
+    /// 前端无法直接 `use` Rust 函数，只能在 `static/app.js` 里**再列一份**清单
+    /// ——这正是"两处列举必然漂移"的典型场景：
+    ///   后端新增一类符号层关系时，前端清单不会自动更新，
+    ///   该类型边会被静默渲染成「**记录关联**」（把推测说成事实）。
+    ///
+    /// 本测试把两边的清单**钉在一起**：任一侧增删类型而另一侧未同步 ⇒ 当场变红。
+    ///
+    /// # 判定方式
+    ///
+    /// 从 `static/app.js` 里抽取 `SYMBOLIC_RELATIONS` 数组的字面量元素，
+    /// 与 `is_symbolic_edge_type` 的实际判定逐个比对（双向）。
+    #[test]
+    fn test_frontend_symbolic_relations_matches_backend_authority() {
+        const APP_JS: &str = include_str!("../static/app.js");
+
+        // 抽取 `const SYMBOLIC_RELATIONS = Object.freeze([ ... ]);` 的数组体
+        let anchor = "const SYMBOLIC_RELATIONS = Object.freeze([";
+        let start = APP_JS.find(anchor).unwrap_or_else(|| {
+            panic!("static/app.js 里找不到 SYMBOLIC_RELATIONS 定义（前端清单被改名/删除）")
+        });
+        let rest = &APP_JS[start + anchor.len()..];
+        let end = rest
+            .find(']')
+            .unwrap_or_else(|| panic!("SYMBOLIC_RELATIONS 数组未闭合"));
+        let body = &rest[..end];
+
+        // 逐行取引号内的字符串字面量
+        let frontend: Vec<String> = body
+            .lines()
+            .filter_map(|line| {
+                let t = line.trim();
+                let q1 = t.find('\'')?;
+                let q2 = t[q1 + 1..].find('\'')?;
+                Some(t[q1 + 1..q1 + 1 + q2].to_string())
+            })
+            .collect();
+
+        assert!(
+            !frontend.is_empty(),
+            "未能从 SYMBOLIC_RELATIONS 解析出任何类型（解析方式需随前端写法更新）"
+        );
+
+        // ① 前端列出的每一个，后端都必须认定为符号层
+        for rel in &frontend {
+            assert!(
+                crate::memory_store::is_symbolic_edge_type(rel),
+                "★前端 SYMBOLIC_RELATIONS 含 `{rel}`，但后端 is_symbolic_edge_type 不认它\
+                 ⇒ 前端会把该类型的边打上「结构推导」徽章，而后端并不产出它（口径漂移）"
+            );
+        }
+
+        // ② 后端认定的每一个，前端都必须列出
+        //    （漏列 ⇒ 该类型边在前端被当成记录层，打「记录关联」徽章 = 把推测说成事实）
+        for rel in [
+            "cause",
+            "temporal",
+            "constraint",
+            "facilitate",
+            "coordinate",
+        ] {
+            assert!(
+                frontend.iter().any(|f| f == rel),
+                "★★后端认定 `{rel}` 是符号层，但前端 SYMBOLIC_RELATIONS **漏列**它\
+                 ⇒ 该类型的边会被静默渲染成「记录关联」（把可能不成立的推测说成必然事实）"
+            );
+        }
+    }
+
     /// 示例问题必须来自用户真实记忆，且空库时返回空（不得编造）
     #[tokio::test]
     async fn test_association_suggestions_are_data_driven() {

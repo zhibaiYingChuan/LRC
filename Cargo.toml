@@ -4,7 +4,7 @@ exclude = ["desktop/src-tauri"]
 
 [package]
 name = "code-memory"
-version = "0.9.8"
+version = "0.9.9"
 edition = "2021"
 # v0.7.1 P2-5：声明最低支持 Rust 版本（MSRV）
 # v0.8.8：提升到 1.80（std::sync::LazyLock 需要 1.80+）
@@ -17,8 +17,21 @@ repository = "https://github.com/zhibaiYingChuan/LRC"
 
 [features]
 # v0.5.5 内存优化：默认不启用 ml feature，减少 sidecar 基线内存占用
-# LRC Desktop 的 sidecar 默认使用 Fast Match（统计编码器），无需 ML 依赖
-# 如需 Smart Match（语义编码），使用 cargo build --features server,ml
+#
+# ★★v0.9.9 澄清（重要，别被这行注释误导）：
+#   「默认不启用 ml」只描述**本地 `cargo build` 的默认行为**，
+#   **不代表发布产物也不含 ml**。事实上：
+#     · 正式发布（`.github/workflows/release.yml` 第 447 / 732 行）
+#       用的是 `cargo build --release --features server,ml`
+#       ⇒ **发布出去的 sidecar 与安装包是带 ML 的**
+#     · 实测证据：安装版 sidecar（%LOCALAPPDATA%\LRC Desktop\lrc-sidecar.exe）
+#       运行后 `/v1/health/system` 返回 `encoder.mode = "ml"`、`system_mode = "healthy"`
+#   ⇒ 本地开发若想与发布版行为一致，应显式构建：
+#     `cargo build --features server,ml`（桌面端 dev 亦同，见 desktop 构建说明）
+#
+# 语义编码模型**不进安装包**：权重走界面「下载模型」通道按需下载到
+#   `~/.loong-recall/models/`。安装包内实测 0 个 .onnx/.pt/.safetensors。
+# 如需禁用语义编码（退回关键词模式），用 `cargo build --features server`。
 default = ["server"]
 # 启用 candle + CodeBERT 真实语义编码（体积大 ~200MB）
 # 仅在需要 Smart Match（离线语义搜索）时启用
@@ -105,6 +118,83 @@ sha2 = "0.10"
 # 导致下载的 exe 在资源管理器中显示为默认图标
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
+
+# ★v0.9.9 关键修复：dev 构建下**依赖**使用优化编译。
+#
+# ## 根因（实测，同一份代码 / 同一份数据，仅构建模式不同）
+#
+# ```text
+#                release      debug(修复前)   debug(修复后,实测)
+# 今晚吃什么      1.95s ✓     10.75s ✓        10.48s ✓
+# 量子物理是什么   8.83s ✓     15.00s ✗ 503    仍 503（见下"边界"）
+# 重要日子        4.82s ✓     15.05s ✗ 503    11.60s ✓ interrupted=true
+# ```
+# 联想探索的语义旁路要对候选池做 ML 句向量前向。candle 是**依赖**，
+# 而 Cargo 默认对 dev profile 的依赖也用 `opt-level = 0`（未优化）——
+# 张量运算在未优化下慢 2~4 倍，把原本约 9s 的请求推到 15s 外墙之上，
+# 于是 `v1_api.rs` 设计好的"优雅收敛"（10s 预算到点返回
+# `interrupted=true` / 弱匹配诚实空态）被 503 取代，
+# 表现为 `association-desktop-cdp.js` 的 B/C 用例稳定失败。
+#
+# ## 为什么改依赖而不改自己的代码
+#
+# · `[profile.dev.package."*"]` 只影响**依赖 crate** 的优化级别，
+#   本项目的源码仍保持 opt-level=0 ⇒ **日常增量编译速度不受影响**；
+# · 这正是 Cargo 官方推荐用于"依赖含重型计算库"场景的做法；
+# · 若只优化本项目代码，candle 内部仍是未优化，问题不会消失。
+#
+# ## 边界（如实记录，勿据此认为已完全解决）
+#
+# · 仅优化**依赖**仍不足以让全部查询在 debug 下达标：`量子物理是什么`
+#   走的是本项目自身代码（opt-level=0）的较慢路径，修复后**仍可能 503**。
+# · 但**产品发布走 release**（`release.yml` 用 `--release --features server,ml`），
+#   实测 release 下该查询 11.71s 正常返回 ⇒ **不影响用户**。
+# · 若要让 debug 也全达标，需连本项目代码一起优化（会显著拖慢增量编译），
+#   当前**有意不做**。
+#
+# ## 为什么只列 5 个 ML 包，而不用 `"*"`（CI 成本考量）
+#
+# 曾用 `[profile.dev.package."*"]`（优化**全部**依赖），但那会让 CI 的
+# dev profile 作业（`cargo clippy` / `cargo test` / `cargo check`）
+# 把 tokio/axum/serde 等约 200 个依赖全部重编为优化版，
+# 直接拉长 `ci.yml` 中 clippy(30min) / test(45min) 等作业，
+# 有撞上 `timeout-minutes` 的风险。
+# 而实测表明**瓶颈只在 ML 张量运算**（candle 全家桶 + 分词），
+# 故收窄为下列 5 个包——同样解决问题，CI 只需多编 5 个包。
+#
+# 注意：首次生效需重编这些包（一次性成本），后续增量不受影响。
+#
+# 包清单说明（为什么是这几个）：
+# · `candle-*` / `tokenizers` / `hf-hub` —— ML 主链路
+# · `gemm*` —— candle-core 的**矩阵乘法后端**（`candle-core` 的直接依赖），
+#   张量前向的实际热点在此；漏掉它优化效果会大打折扣
+# · `half` —— gemm 的 f16 支持，与 gemm 同层
+[profile.dev.package.candle-core]
+opt-level = 3
+[profile.dev.package.candle-nn]
+opt-level = 3
+[profile.dev.package.candle-transformers]
+opt-level = 3
+[profile.dev.package.tokenizers]
+opt-level = 3
+[profile.dev.package.hf-hub]
+opt-level = 3
+[profile.dev.package.gemm]
+opt-level = 3
+[profile.dev.package.gemm-common]
+opt-level = 3
+[profile.dev.package.gemm-f32]
+opt-level = 3
+[profile.dev.package.gemm-f16]
+opt-level = 3
+[profile.dev.package.gemm-f64]
+opt-level = 3
+[profile.dev.package.gemm-c32]
+opt-level = 3
+[profile.dev.package.gemm-c64]
+opt-level = 3
+[profile.dev.package.half]
+opt-level = 3
 
 [profile.release]
 opt-level = "z"

@@ -38,7 +38,7 @@ pub struct AssociatedMemory {
     pub content_preview: String,
     /// 记忆类型字符串（fact / experience / decision ...）
     pub memory_type: String,
-    /// 关联类型：same_event | shared_entity | derived_from
+    /// 关联类型：same_event | shared_entity | derived_from | indirect
     pub relation: String,
     /// 人类可读的关联依据（如 "同一次经历（event_id=trip-hangzhou-2026-09）"）
     pub why: String,
@@ -46,6 +46,29 @@ pub struct AssociatedMemory {
     pub via_memory_id: String,
     /// 起点记忆的内容预览
     pub via_preview: String,
+    /// 距联想起点的**跳数**：1 = 直接记录关联；2 = 经中间记忆的**间接关联**
+    ///
+    /// **为什么要它**（2026-09-17）：用户对联想的价值判据是
+    /// 「告诉我这是第几层能想到的」——层次是**寻路**的坐标，
+    /// 而非分类的标签。1 跳是"记录直接成立"，2 跳是"图上的路径合成"，
+    /// 二者证据强度不同，必须可区分。
+    #[serde(default = "default_hops_one")]
+    pub hops: usize,
+    /// 完整路径（记忆 ID 序列）
+    ///
+    /// - 1 跳：`[起点, 此记忆]`
+    /// - 2 跳：`[起点, 中间记忆, 此记忆]`
+    ///
+    /// **为什么要有它**：2 跳的"意外性"来自**路径本身**——
+    /// 用户看到 `游西湖 → 同一项目 → 某次会议记录` 才能判断这个跳跃是否合理。
+    /// 只给终点而不给路径，间接关联就变成了无解释的推测。
+    #[serde(default)]
+    pub path: Vec<String>,
+}
+
+/// 兼容旧序列化数据的 `hops` 默认值（1 = 直接关联）
+fn default_hops_one() -> usize {
+    1
 }
 
 /// 记忆间的结构化关联（联想的结果形态）
@@ -142,6 +165,47 @@ pub struct AssociationGraph {
     pub indirect_count: usize,
     /// 是否因规模上限而被截断（true 时用户不应把结果视为完整图）
     pub truncated: bool,
+}
+
+/// 从图存储**直读**的关系边（v0.9.8）
+///
+/// 与 [`GraphEdge`] 的区别（**不可混同**）：
+///
+/// | | `GraphEdge` | 本类型 |
+/// |---|---|---|
+/// | 来源 | `associations_in` 当场推导 | `graph_edges.json` 落盘边 |
+/// | 内容 | 记录层关系 + 2 跳路径合成 | **全部**落盘边（含 §5.3 逻辑关系） |
+/// | 解释 | 带 `why` / `via`（可读路径） | 带 `weight` / `created_at`（可核证据） |
+///
+/// **为什么必须有它**（实测缺口，2026-09-17）：
+/// `graph_store` 的边此前**没有任何 HTTP 读出口**——唯一的读端点
+/// `/memories/association-graph` 走的是 `associations_in`（内存记录层推导），
+/// **完全不读 `graph_store`**。实测证据：写入 `coordinate` 边后，
+/// `graph_edges.json` 里确有此边，但该端点的返回中看不到它。
+/// ⇒ 文档 §6 #4 的 `engram.query(node_id, rel_type?, hops≤3)` 契约此前**不可满足**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEdge {
+    /// 边的源记忆 ID（**落盘边的真实方向**，非查询根）
+    pub from: String,
+    /// 边的目标记忆 ID（同上）
+    pub to: String,
+    /// 关系类型（`EdgeType::as_str()` 的取值，如 `coordinate` / `cause`）
+    pub relation: String,
+    /// 边权（0~1）；多跳时已按 `γ^hop` 衰减（γ=0.7，承 §4.5）
+    pub weight: f32,
+    /// 是否为对称关系（true 时方向仅表示书写顺序，不表示因果）
+    pub symmetric: bool,
+    /// 距查询根的跳数：1 = 直接边；≥2 = 经中间节点
+    pub hops: usize,
+    /// 遍历路径（节点 ID 序列）：恒以查询根开头、以本次边的一端结尾。
+    ///
+    /// **与 `from`/`to` 的关系**：`path` 描述**怎么走到的**，`from`/`to`
+    /// 描述**这条落盘边的真实两端**。对称关系在图里是按 ID 字典序规范化的，
+    /// 故 `path` 的末节点可能与 `to` 相同也可能与 `from` 相同——
+    /// 用 `hops`/`path` 判断可达性，用 `from`/`to` 判断边的原始方向。
+    pub path: Vec<String>,
+    /// 边创建时间（RFC3339）
+    pub created_at: String,
 }
 
 /// 记忆召回过滤条件

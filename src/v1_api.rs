@@ -301,23 +301,32 @@ pub struct ExploreNode {
     /// 所处的联想层（起点为 0）
     pub depth: u8,
     pub score: f32,
-    /// 节点来源：root（起点）/ expanded（相似度扩散）/ record（记录层联想，v0.9.8）
+    /// 节点来源：root（起点）/ expanded（相似度扩散）/ **record**（记录层联想
+    /// —— 由记录字段必然成立）/ **symbolic**（符号层联想 —— 由结构算子推导，
+    /// **可能不成立**，v0.9.8 2026-09-18 补）
+    ///
+    /// ★`record` 与 `symbolic` 必须区分（承「证据要可区分」）：两者都来自
+    /// `expand_associations`，但证据性质相反（事实 vs 推测）。若合并为一个
+    /// 取值，前端会把结构推导渲染成"记录关联"——用户据此以为必然成立。
     pub source: String,
     /// 道体再次校验·保留证据（无则为空）
     pub evidence: Option<String>,
-    /// **记录层关联类型**（v0.9.8，仅 source="record" 时有值）：
+    /// **关联类型**（v0.9.8，仅 source="record" / "symbolic" 时有值）：
     /// `same_event`（手填 event_id，知情者断言）/ `same_event_auto`
     /// （系统按同项目+同窗口推断）/ `shared_entity`（共享实体）/
     /// `derived_from`（由它衍生）/ `crystallized_into`（被结晶为它）/
-    /// `evolved_from`（自身被更新过）。
+    /// `evolved_from`（自身被更新过）；
+    /// 以及符号层五类 `cause` / `temporal` / `constraint` / `facilitate` /
+    /// `coordinate`（结构算子推导）。
     ///
     /// **为什么必须区分**：相似度扩散与记录层联想的**证据性质根本不同**——
-    /// 前者是"语义相近"（可能错），后者是"记录必然成立"（不会错）。
+    /// 前者是"语义相近"（可能错），后者是"记录必然成立"（不会错）；
+    /// 符号层则是**第三种**：结构推导（可能不成立，但非语义相似）。
     /// 混为一谈会让用户无法判断哪条更可信。
     /// 为 None 表示该节点来自相似度扩散。
     pub relation: Option<String>,
-    /// 记录层关联的人类可读依据（如"同一次经历（event_id=trip-hangzhou-2026-09）"）。
-    /// 仅 source="record" 时有值——用户据此核验"凭什么关联"。
+    /// 关联依据的人类可读说明（如"同一次经历（event_id=trip-hangzhou-2026-09）"）。
+    /// 仅 source="record" / "symbolic" 时有值——用户据此核验"凭什么关联"。
     pub why: Option<String>,
 }
 
@@ -1000,7 +1009,10 @@ fn run_association_explore(
                 content: a.content_preview.clone(),
                 depth: 1,
                 score: 0.0,
-                source: "record".to_string(),
+                // ★按边类型区分证据来源（2026-09-18 修 S4 的 UI 侧复现）：
+                //   `expand_associations` 也会产出符号层（结构推导，可能不成立）
+                //   的边，一律标 "record" 会让前端把它渲染成"记录关联"。
+                source: explore_source_of(&a.relation).to_string(),
                 evidence: None,
                 relation: Some(a.relation.clone()),
                 why: Some(a.why.clone()),
@@ -1158,7 +1170,8 @@ fn run_association_explore(
                         content: a.content_preview.clone(),
                         depth: next_depth,
                         score: 0.0,
-                        source: "record".to_string(),
+                        // ★同起点：按边类型区分（见 `explore_source_of` 文档）
+                        source: explore_source_of(&a.relation).to_string(),
                         evidence: None,
                         relation: Some(a.relation.clone()),
                         why: Some(a.why.clone()),
@@ -1187,6 +1200,35 @@ fn run_association_explore(
         interrupted,
         weak_match,
         semantic_bypass,
+    }
+}
+
+/// 联想中心探索节点的「证据来源」分类（v0.9.8，2026-09-18 审查 S4 的 UI 侧补齐）
+///
+/// # 为什么需要它
+///
+/// 探索路径把 `expand_associations` 的产出**一律**标成 `source = "record"`，
+/// 但该函数自 v0.9.8 起会输出**两类**证据性质不同的边：
+///   · **记录层**（`same_event` / `shared_entity` / `derived_from` / …）
+///     —— 由记录字段**必然**推导成立（"同一次经历"是知情者断言）
+///   · **符号层**（`cause` / `temporal` / `constraint` / `facilitate` / `coordinate`）
+///     —— 由结构算子从卦**推导**而来，**可能不成立**
+///
+/// 二者混用同一个 `source` 值 ⇒ 前端 `isRecord = (node.source === 'record')`
+/// 会把符号层推导也打上「**记录关联**」标签、并渲染为"由记录推导出的关联"。
+/// 这正是 `memory_store.rs` 已修掉的 S4/S5 失效模式，**只是漏在了 UI 侧**：
+/// 用户看到的是最高证据等级的口径，而实际是推测。
+///
+/// # 判定口径
+///
+/// 复用 [`crate::memory_store::is_symbolic_edge_type`]（而非在此另列一份
+/// 类型名）——两处列举必然漂移，而漂移后前端会静默错标（承方法论 79：
+/// 单一事实来源）。
+fn explore_source_of(relation: &str) -> &'static str {
+    if crate::memory_store::is_symbolic_edge_type(relation) {
+        "symbolic"
+    } else {
+        "record"
     }
 }
 
@@ -1527,6 +1569,70 @@ pub struct MemoryGraphRequest {
     /// 节点数上限（默认 50）；超出时响应中的 `truncated` 会标记为 true
     #[serde(default)]
     pub max_nodes: Option<usize>,
+}
+
+/// /v1/memories/external-edge 请求体（v0.9.8）
+///
+/// 接收**外部推导的**关系边（承《记忆联想系统设计文档》§5.4）：
+/// 道体联想服务由结构算子（互/错/综/变）产出候选关系后，经此端点落图。
+///
+/// **为什么需要它**：LRC 的图此前只有两个写入方（`expand_associations`
+/// 的记录层事实、`synthesis_engine` 的结晶链路），都产自 LRC 内部。
+/// §5.4 要求「结构算子候选命中 → 生成边」，而算子跑在道体服务里
+/// ⇒ 必须有一个**受控的外部写入入口**。
+///
+/// **安全边界**：本端点只接受 §5.3 的 5 类逻辑关系
+/// （cause/temporal/constraint/facilitate/coordinate），
+/// 且两端记忆必须已存在（防悬空边）。未知 rel_type 会被静默跳过。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExternalEdgeRequest {
+    /// 源记忆 ID
+    pub from_id: String,
+    /// 目标记忆 ID
+    pub to_id: String,
+    /// 关系类型（§5.3：cause | temporal | constraint | facilitate | coordinate）
+    pub rel_type: String,
+    /// 置信度 0~1（缺省 0.5）
+    #[serde(default)]
+    pub weight: Option<f32>,
+}
+
+/// /v1/memories/stored-edges 请求体（v0.9.8）
+///
+/// 从图存储**直读**落盘的关系边（补文档 §6 #4 的读通路）。
+///
+/// **与 /v1/memories/association-graph 的区别**（互补，非替代）：
+///   · `association-graph` → 记录层**当场推导**（event_id/entities/source_ids），
+///     含 2 跳路径合成与可读 `why`，**但看不到图中已落盘的关系**
+///   · 本端点 → 图里**已落盘**的边（含 §5.4 由结构算子推导的逻辑关系）
+///
+/// 前者答"为什么这两条相关"，后者答"图里已确立哪些关系"。
+#[derive(Debug, Clone, Deserialize)]
+pub struct StoredEdgesRequest {
+    /// 起点记忆 ID（必填）
+    pub memory_id: String,
+    /// 按关系名过滤（§5.3 五类 + 记录层 7 类，大小写皆可）；
+    /// 缺省 = 不过滤。**未知类型名返回空**（不回退为全部）
+    #[serde(default)]
+    pub rel_type: Option<String>,
+    /// 最大跳数，**上限 3**（承 §6 #4 契约）；缺省 1
+    #[serde(default)]
+    pub hops: Option<usize>,
+    /// 请求方会话 ID（v0.9.8，2026-09-18 审查 G2 修复）
+    ///
+    /// **为什么必须补上**：本端点此前**不透传**隐私三元组，实现处硬编码
+    /// `&None` ⇒ `is_visible` 的 `User` / `Session` 两条分支**生产不可达**，
+    /// 即任何调用者都能读出他人会话私有记忆的 **ID + 关系拓扑**
+    /// （不含正文，但"记忆 ID 与关系图"本身即敏感信息）。
+    ///
+    /// **与 `/memories/enrich` 同口径**：那边只要 `user_id` 存在就构造
+    /// `(User, session_id, user_id)` 三元组。本端点沿用同一规则，
+    /// 使"检索看不到的记忆，边的读取也看不到"。
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// 请求方用户 ID（同上；缺省 ⇒ 不做隐私过滤，保持既有行为）
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 /// v0.8.1 新增：/v1/config/llm/test 请求体
@@ -2367,6 +2473,34 @@ pub fn build_v1_router(
                     } else {
                         None
                     };
+                    // ★v0.9.9 修复（超时阶梯）：外墙**保持 15s**，改由前端让出余量。
+                    //
+                    // ## 实测（同一份代码、同一份数据，仅构建模式不同）
+                    //
+                    // ```text
+                    //                release      debug
+                    // 今晚吃什么      1.95s ✓     10.75s ✓
+                    // 量子物理是什么   8.83s ✓     15.00s ✗ 503
+                    // 重要日子        4.82s ✓     15.05s ✗ 503
+                    // ```
+                    // ML 句向量前向在未优化构建下膨胀约 2~4 倍。
+                    //
+                    // ## 为什么外墙不动（试过 25s，反而更糟）
+                    //
+                    // 曾把外墙放宽到 25s，结果**三条查询全部**由"约 10s 返回"
+                    // 变为"25s 才失败"——因为拖长的那部分不是被超时截断的等待，
+                    // 而是真实计算；放宽外墙只是把失败点后移，还增加了用户可见延迟。
+                    // 故外墙维持 15s 不变。
+                    //
+                    // ## 真正的缺陷与本轮修法
+                    //
+                    // 缺陷是**层级顺序错误**：原先前端 `fetchWithTimeout` 也是 15000ms，
+                    // 与后端外墙**完全相等** ⇒ 前端 abort 与后端超时同时触发，
+                    // 前端总是先报"请求超时"，使后端设计好的优雅收敛
+                    // （10s 预算到点 → 200 + `interrupted=true`；无相关内容 → 200 + `weak_match`）
+                    // 全部成为不可达代码。
+                    // 修法：只把**前端**提到 30s，形成单调阶梯：
+                    //   10s(内部预算) < 15s(外层外墙) < 30s(前端兜底)
                     let result = tokio::time::timeout(
                         Duration::from_secs(15),
                         tokio::task::spawn_blocking(move || -> Result<AssociationExploreResponse, &'static str> {
@@ -2443,9 +2577,23 @@ pub fn build_v1_router(
                         Err(_timeout) => {
                             cancellation.store(true, Ordering::Release);
                             eprintln!("[v1/associations/explore] 探索超时（15s），已置取消标志");
+                            // ★v0.9.9 修复：超时提示词必须**对两种成因都准确**。
+                            //
+                            // 实测（ML 启用后）：探索超时主要发生在**慢构建/高负载**下——
+                            // ML 句向量前向在未优化构建下膨胀 2~4 倍，把原本约 9s 的
+                            // 请求推到外墙之上（同代码 release 构建全部正常）。
+                            // 原提示只有「请降低联想层数后重试」一句 ⇒ 用户会去做无效操作。
+                            // 现按「重试即可」为主、「降低层数」为辅给出建议。
+                            let runtime_mode = if cfg!(feature = "ml") { "ml" } else { "statistical" };
                             Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
                                 "error": "explore_timeout",
-                                "message": "联想探索超时，请降低联想层数后重试"
+                                "message": if runtime_mode == "ml" {
+                                    "联想探索超时（本机负载较高或服务刚启动）。请直接重试一次，通常即可成功；若仍超时，可减少联想层数。"
+                                } else {
+                                    "联想探索超时，请降低联想层数后重试"
+                                },
+                                "encoder_mode": runtime_mode,
+                                "retryable": true
                             }))))
                         }
                     }
@@ -4330,6 +4478,107 @@ pub fn build_v1_router(
                         }
                     };
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!(g)))
+                }
+            }
+        }))
+        // POST /v1/memories/external-edge — 写入外部推导的关系边（v0.9.8）
+        //
+        // 承《记忆联想系统设计文档》§5.4：道体联想服务用结构算子
+        // （互/错/综/变）产出候选关系，经此端点落入 LRC 图。
+        //
+        // **为什么要有这个入口**：图的既有写入方（expand_associations /
+        // synthesis_engine）都是 LRC 内部逻辑；结构算子跑在道体服务
+        // （Python）里，跨进程 ⇒ 必须有一个受控的外部写入通路。
+        //
+        // **安全边界**（三重重校验，均在 store 方法内）：
+        //   ① rel_type 必须是 §5.3 五类之一（未知静默跳过，不兜底映射）
+        //   ② 两端记忆必须已存在（防悬空边）
+        //   ③ 自环跳过；已存在的边去重
+        .route("/memories/external-edge", post({
+            let store = metrics_store.clone();
+            move |Json(req): Json<ExternalEdgeRequest>| {
+                let store = store.clone();
+                async move {
+                    let weight = req.weight.unwrap_or(0.5).clamp(0.0, 1.0);
+                    let mut store = lock_store_with_timeout(&store).await?;
+                    match store.add_external_edge(&req.from_id, &req.to_id, &req.rel_type, weight) {
+                        Ok(added) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                            serde_json::json!({
+                                "ok": true,
+                                "added": added,
+                                "rel_type": req.rel_type,
+                                // 未写入的两种原因都如实回传，便于调用方区分
+                                // "去重"（已存在，正常）与"被校验拒绝"（需排查）
+                                "note": if added { "新边已写入" } else { "已存在或未通过校验（未知类型/悬空/自环）" }
+                            }),
+                        )),
+                        Err(e) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "external_edge_failed",
+                                "message": format!("写入外部边失败: {}", e)
+                            })),
+                        )),
+                    }
+                }
+            }
+        }))
+        // POST /v1/memories/stored-edges — 直读图存储的落盘边（v0.9.8）
+        //
+        // **为什么必须有它**（实测缺口，2026-09-17）：
+        //   `/memories/external-edge` 写入的 §5.3 逻辑关系边此前**无人能读出**——
+        //   因为 `/memories/association-graph` 走 `associations_in`（记录层当场
+        //   推导），**完全不读 `graph_store`**。取证见 `temp/daoti_assoc/probe_read_gap.py`：
+        //   写入 coordinate 边后 `graph_edges.json` 里有，但 association-graph 返回中无。
+        //   ⇒ 文档 §6 #4「engram.query(node_id, rel_type?, hops≤3)」契约此前不可满足。
+        //
+        // 本端点补这个读出口，使 §5.4「候选命中 → 生成边 → 可检索」闭环成立。
+        .route("/memories/stored-edges", post({
+            let store = metrics_store.clone();
+            move |Json(req): Json<StoredEdgesRequest>| {
+                let store = store.clone();
+                async move {
+                    let hops = req.hops.unwrap_or(1);
+                    let store = lock_store_with_timeout(&store).await?;
+                    // ★隐私上下文（2026-09-18 审查 G2 修复）
+                    //
+                    // 此前硬编码 `&None` ⇒ `is_visible` 的 User/Session 分支
+                    // **生产不可达** ⇒ 任何调用者都能读出他人会话私有记忆的
+                    // ID 与关系拓扑。
+                    //
+                    // 现与 `/memories/enrich` **同一条规则**：
+                    //   `user_id` 存在 ⇒ 构造 `(User, session_id, user_id)`；
+                    //   缺省 ⇒ `None`（保持既有行为，不引入breaking change）。
+                    // 这样"检索看不到的记忆，边的读取也看不到"。
+                    let privacy = if req.user_id.is_some() {
+                        Some((PrivacyLevel::User, req.session_id.clone(), req.user_id.clone()))
+                    } else {
+                        None
+                    };
+                    match store.query_stored_edges(
+                        &req.memory_id,
+                        req.rel_type.as_deref(),
+                        hops,
+                        &privacy,
+                    ) {
+                        Ok(edges) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                            serde_json::json!({
+                                "ok": true,
+                                "root": req.memory_id,
+                                "hops": hops.clamp(1, 3),
+                                "rel_type": req.rel_type,
+                                "count": edges.len(),
+                                "edges": edges,
+                            }),
+                        )),
+                        Err(e) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "stored_edges_failed",
+                                "message": format!("读取落盘边失败: {}", e)
+                            })),
+                        )),
+                    }
                 }
             }
         }))
