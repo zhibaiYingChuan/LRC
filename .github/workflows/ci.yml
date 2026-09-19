@@ -49,6 +49,41 @@ jobs:
         run: cargo fmt --all -- --check
 
   # ════════════════════════════════════════════════════════════
+  # Job 1b: 算法泄露门禁（v0.9.9 新增）
+  #
+  # 背景：该检查此前**只存在于 `.githooks/pre-commit`**（本地钩子），
+  #   线上 CI 从不执行 ⇒ 两类绕过：
+  #     ① 贡献者未启用钩子（钩子需手动 `enable_git_hooks.ps1` 一次）；
+  #     ② `git commit --no-verify` 可完全跳过。
+  #   而"公开仓库不得出现核心算法明文"正是本项目的许可边界
+  #   （见 LICENSE 2.2 分层许可），必须由服务端门禁兜底、不能只靠自觉。
+  #
+  # 无外部依赖、无需 Rust 工具链，秒级完成，故与其本地版同口径接入。
+  # 口径严格一致：与 `.githooks/pre-commit` 调用**同一个脚本**，
+  #   避免两处各自维护规则导致漂移。
+  # ════════════════════════════════════════════════════════════
+  algorithm-leak-guard:
+    name: Algorithm Leak Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: 公开层算法泄露检测
+        run: python scripts/check_algorithm_leak.py
+
+  # ════════════════════════════════════════════════════════════
   # Job 2: Clippy 静态检查（拒绝 warnings）
   # ════════════════════════════════════════════════════════════
   clippy:

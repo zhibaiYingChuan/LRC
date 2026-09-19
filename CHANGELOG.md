@@ -21,11 +21,19 @@
   - **为何不用 `[profile.dev.package."*"]`**：那会让 CI 的 dev profile 作业（clippy/test/check）把约 200 个依赖全部重编为优化版，而线上仓库是在线编译的，会拉长 `ci.yml` 作业并可能撞 `timeout-minutes`。收窄后 CI 只需多编 13 个包。
   - **实测**：补入 `gemm*` 后 `量子物理是什么` 由「仍 503」变为 **9.91s 通过**；三条查询全通过（9.60s / 9.91s / 12.61s）。
   - **注意**：产品发布走 release（`--release --features server,ml`），release 下本就全部通过；本修复让 **debug 开发环境与 release 行为一致**，避免开发期误判"功能坏了"。
+- **★许可门禁从「本地自觉」升级为「服务端强制」**：`scripts/check_algorithm_leak.py` 此前**只被 `.githooks/pre-commit` 调用**，而钩子需手动启用、且 `--no-verify` 可完全跳过 ⇒ 门禁形同建议。
+  - **接入两条路径**：`ci.yml` 新增独立作业 `algorithm-leak-guard`（无 Rust 工具链依赖，秒级）；`release.yml` preflight 新增 `Algorithm leak guard` 步骤。
+  - **为什么两条都要**：`ci.yml` 只监听 `push.branches`，**不打 tag 就不触发**；`release.yml` 由 `push.tags: 'v*'` 触发 —— 两条路径**互不相交**。发版才是"把产物交出去"的动作，只守分支侧等于发版路径完全敞开。
+  - **口径一致**：三处（CI / Release / 本地钩子）调用**同一个脚本**，避免各自维护规则导致漂移。
+- **★README「道体边界」措辞与事实对齐**：原表述「推演引擎为独立研究资产，**不随产品分发**」与事实不符——符号层的推理与状态机**依赖道体代码参与编译**，`src/engine/` 下的道体模块确随安装包分发。
+  - 新表述明确四件事：①道体源码与产品**同源公开**，无隐藏实现；②适用 DaoTi Research License，二进制产物同样受约束（LICENSE §2.2）；③`daoti_daemon` / `daoti_assoc` 等**独立进程**服务不随包；④道体**不参与**检索与排序决策。
+  - **同时澄清检测脚本的职责边界**：实测把 `check_algorithm_leak.py` 扫描范围扩为全仓会命中 **2039 处**（八卦编码 821 / 洛书算法 806 / 道枢映射 368 / 剪枝算法 32），遍布 `memory_store.rs`、`graph_store.rs`、`memory_state_machine.rs` —— 这些**不是泄露而是产品功能本身**，故扫描范围**有意**限定为 4 个不承载符号层数据结构的纯公开层文件。
 - **接口与文案修正**：
   - `explore_timeout` 提示词改准确（原说「降低联想层数」，实际成因是编码慢），加 `retryable: true`，前端补「重试」按钮。
   - 记忆类型标签全局唯一映射（`synthesis: '结晶知识'`）；原生 `confirm` → `showConfirm`；空值字段整行隐藏；`formatAnyTime()` 兼容 ISO 字符串与时间戳。
   - `checkEmbedderStatus` 增加运行时 `encoder.mode` 校验，区分「文件就绪」与「正在生效」。
 - **门禁**：`cargo test --features server` **790 passed / 0 failed**；desktop crate **96 passed / 0 failed**；clippy 干净；`check_algorithm_leak.py` 退出码 **0**；CDP 三套件全绿（`cdp-regression` 发布门禁 PASS、`association-desktop-cdp` 7/7、`symbolic-layer-desktop-cdp` 7/7）。
+- **线上 CI 实测**：run `35431963121` 全部 8 个作业通过（8m0s）；其中 `Clippy` 仅 **44s**，印证「只优化 13 个 ML 包」的收窄策略未拖慢 CI（若用 `"*"` 需重编约 200 个依赖）。
 
 ## [0.9.8] - 2026-09-17
 
