@@ -340,6 +340,21 @@ impl Neo4jGraphStore {
             EdgeType::Evolves => "EVOLVES",
             EdgeType::SynthesizesFrom => "SYNTHESIZES_FROM",
             EdgeType::RelatedTo => "RELATED_TO",
+            // 记录层关系（v0.9.8）：保留完整语义，不与上面四类合并——
+            // 它们的证据性质不同（记录事实 vs 系统推断），合并后无法反向区分。
+            EdgeType::SameEvent => "SAME_EVENT",
+            EdgeType::SameEventAuto => "SAME_EVENT_AUTO",
+            EdgeType::SharedEntity => "SHARED_ENTITY",
+            EdgeType::SharedArtifact => "SHARED_ARTIFACT",
+            EdgeType::DerivedFrom => "DERIVED_FROM",
+            EdgeType::CrystallizedInto => "CRYSTALLIZED_INTO",
+            EdgeType::EvolvedFrom => "EVOLVED_FROM",
+            // 逻辑关系（§5.3）
+            EdgeType::Cause => "CAUSE",
+            EdgeType::Temporal => "TEMPORAL",
+            EdgeType::Constraint => "CONSTRAINT",
+            EdgeType::Facilitate => "FACILITATE",
+            EdgeType::Coordinate => "COORDINATE",
         };
 
         // v0.5.4 修复：纵深防御 — 校验 relation 名称仅含大写字母和下划线

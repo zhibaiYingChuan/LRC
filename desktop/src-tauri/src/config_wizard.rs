@@ -349,6 +349,37 @@ impl WizardState {
         &self.config
     }
 
+    /// v0.9.9：是否**确有使用痕迹**（用户已实际用过这个应用）。
+    ///
+    /// # 为什么需要它（修「每次打开都要手动点启动服务」）
+    ///
+    /// 自动启动原先只看 `setup_complete`。但 `setup_complete` 只有在**走完向导**
+    /// 时才会置位，而本项目的两条正常使用路径都不走向导：
+    ///   · **全局模式**（不选项目目录）⇒ `project_dir == None`
+    ///   · **不用 LLM**（纯本地检索）⇒ `llm_configured == false`
+    /// 而上面的自动迁移（`project_dir.is_some() && llm_configured`）恰好
+    /// **要求这两个都成立** ⇒ 该路径下 `setup_complete` 永远为 false
+    /// ⇒ 自动启动被永久跳过。实测实锤：`tauri-dev-run.log` 第 38 行
+    /// 「wizard 未完成配置（setup_complete=false, file_existed=true），跳过自动启动」，
+    /// 而同一台机器上记忆库已有 3175 条、规则已写入 4 个 AI 工具
+    /// ——用户明显在正常使用，配置**实际可用**。
+    ///
+    /// # 判据：以「能否正常工作」为准，而非「是否走过向导」
+    ///
+    /// 只要满足任一条，就说明用户已经用起来了：
+    ///   · 走过向导（`setup_complete`）
+    ///   · 有项目目录（项目模式已被使用）
+    ///   · 配过 LLM
+    ///   · **写过 AI 规则**（`rules_agents` 非空）—— 这是最可靠的痕迹：
+    ///     规则写入发生在启动流程里，能写成功说明应用已在正常提供服务
+    pub fn has_usage_history(&self) -> bool {
+        self.config.setup_complete
+            || self.config.project_dir.is_some()
+            || self.config.llm_configured
+            || !self.config.rules_agents.is_empty()
+            || !self.config.configured_agents.is_empty()
+    }
+
     /// 设置项目目录
     pub fn set_project_dir(&mut self, dir: &str) -> Result<(), String> {
         self.config.project_dir = Some(dir.into());
@@ -558,6 +589,106 @@ mod tests {
         assert!(config.project_dir.is_none());
         assert!(!config.llm_configured);
         assert_eq!(config.llm_type, "none");
+    }
+
+    /// ★★v0.9.9：全新安装**不得**被判为"有使用痕迹"。
+    ///
+    /// 这是自动启动判据的安全边界：若全新安装被误判为"老用户"，
+    /// 首次打开就会跳过向导直接起服务，用户失去配置入口。
+    #[test]
+    fn test_has_usage_history_false_for_fresh_install() {
+        let state = WizardState {
+            config: WizardConfig::default(),
+            config_path: PathBuf::new(),
+            corrupted_on_load: false,
+            file_existed: true,
+        };
+        assert!(
+            !state.has_usage_history(),
+            "★全新安装（无任何痕迹）不得被判为有使用痕迹"
+        );
+    }
+
+    /// ★★v0.9.9：**全局模式 + 不用 LLM** 的正常使用路径必须被判为"有使用痕迹"。
+    ///
+    /// # 这条测的就是用户报的那个 bug
+    ///
+    /// 实测现场：`setup_complete=false` + `project_dir=null` + `llm_configured=false`
+    /// + `rules_agents` 有 4 个工具 ⇒ 原判据（只看 `setup_complete`）判为"未配置"
+    /// ⇒ 自动启动被跳过 ⇒ 用户每次都要手点。
+    /// 修法后凭 `rules_agents` 非空即可判定 —— 本测试锁住这个判定。
+    #[test]
+    fn test_has_usage_history_true_for_global_mode_with_rules() {
+        let mut config = WizardConfig::default();
+        // 复刻实测现场：不走向导、全局模式、不用 LLM，但已写过规则
+        config.setup_complete = false;
+        config.project_dir = None;
+        config.llm_configured = false;
+        config.rules_agents = vec![
+            "codebuddy".into(),
+            "minimax-code".into(),
+            "tongyi-lingma".into(),
+            "trae-cn".into(),
+        ];
+        let state = WizardState {
+            config,
+            config_path: PathBuf::new(),
+            corrupted_on_load: false,
+            file_existed: true, // ★文件存在（不是丢失），故不走 file_existed 兜底
+        };
+        assert!(
+            state.has_usage_history(),
+            "★★全局模式 + 不用 LLM + 已写规则，必须判为有使用痕迹\
+             （否则自动启动被永久跳过，用户每次都要手点）"
+        );
+    }
+
+    /// v0.9.9：单一痕迹各自也能成立（判据取「或」，不是「且」）。
+    #[test]
+    fn test_has_usage_history_each_signal_alone_suffices() {
+        // ① 只走过向导
+        let mut c = WizardConfig::default();
+        c.setup_complete = true;
+        assert!(WizardState {
+            config: c,
+            config_path: PathBuf::new(),
+            corrupted_on_load: false,
+            file_existed: true
+        }
+        .has_usage_history());
+
+        // ② 只有项目目录
+        let mut c = WizardConfig::default();
+        c.project_dir = Some("G:/proj".into());
+        assert!(WizardState {
+            config: c,
+            config_path: PathBuf::new(),
+            corrupted_on_load: false,
+            file_existed: true
+        }
+        .has_usage_history());
+
+        // ③ 只配过 LLM
+        let mut c = WizardConfig::default();
+        c.llm_configured = true;
+        assert!(WizardState {
+            config: c,
+            config_path: PathBuf::new(),
+            corrupted_on_load: false,
+            file_existed: true
+        }
+        .has_usage_history());
+
+        // ④ 只有 configured_agents
+        let mut c = WizardConfig::default();
+        c.configured_agents = vec!["trae-cn".into()];
+        assert!(WizardState {
+            config: c,
+            config_path: PathBuf::new(),
+            corrupted_on_load: false,
+            file_existed: true
+        }
+        .has_usage_history());
     }
 
     /// TDD：测试 LLM 配置解析（旧格式冒号分隔，向后兼容）

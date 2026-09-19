@@ -26,6 +26,1725 @@ mod tests {
         (dir, MemoryStore::new(p))
     }
 
+    /// 创建带有图存储的 MemoryStore（v0.9.8：记录层关系图化测试用）
+    ///
+    /// **为什么要单独一个辅助函数**：`make_store()` 不带图存储
+    /// （`graph_store: None`），而图化的行为只有启用图后才会发生。
+    fn make_store_with_graph() -> (
+        TempDir,
+        MemoryStore<crate::persistence::json::JsonPersistence>,
+    ) {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = create_json_persistence(&data_dir).expect("应成功创建");
+        let graph = crate::graph_store::GraphMemoryStore::new(&data_dir);
+        (dir, MemoryStore::new(p).with_graph_store(graph))
+    }
+
+    /// ★v0.9.8：记录层联想产出必须写入图存储（图化的核心契约）
+    ///
+    /// **为什么必须有这个测试**：图化是"关系跨会话累积"的唯一途径，
+    /// 若产出没写进图，`graph_edges.json` 会恒为空文件，
+    /// 用户看不到任何错误，而所有依赖图的能力（多跳/关系统计）都静默失效。
+    #[test]
+    fn test_expand_associations_writes_record_edges_to_graph() {
+        let (_dir, mut store) = make_store_with_graph();
+        let ev = "ev-graph-write";
+        let a = store
+            .remember(
+                make_test_memory("在西湖边走了很久", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+        let b = store
+            .remember(
+                make_test_memory("晚上吃了西湖醋鱼", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+
+        // ★前置断言（防测试自欺）：两条内容若相似度过高会被 `remember` 合并，
+        //   合并后只剩一条记忆 ⇒ 关联推导自然为空 ⇒ 断言会因"无数据"而非
+        //   "图化失效"失败/通过。故先确认两条确实是独立记忆。
+        assert_ne!(a.id, b.id, "前提：两条应是不相似的独立记忆（未被合并）");
+
+        let out = store
+            .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 8)
+            .expect("联想补全应成功");
+        assert!(
+            out.iter().any(|x| x.memory_id == b.id),
+            "前提：应先产出 same_event 关联"
+        );
+
+        let edges = store.graph_store_ref().expect("图应已启用").all_edges();
+        assert!(
+            edges.iter().any(|e| {
+                (e.source_id == a.id || e.target_id == a.id)
+                    && (e.source_id == b.id || e.target_id == b.id)
+                    && e.edge_type == crate::graph_store::EdgeType::SameEvent
+            }),
+            "记录层关联应写入图（same_event 边）。实际边: {:?}",
+            edges
+                .iter()
+                .map(|e| (&e.source_id, &e.target_id, e.edge_type.as_str()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// ★2026-09-18（审查断链 #2）：**落图段必须只写记录层边**，
+    /// 符号层边与自指边都不得由它写入。
+    ///
+    /// # 为什么必须测
+    ///
+    /// 落图段的语义是"记录层关系图化"，但它遍历的是 `out`——而 `out` 现在
+    /// 同时含**符号层边**（并入段从图里读出来的）。两种失效：
+    ///
+    /// ① **符号层边被冗余写回**：它们本来就在图里，再写一遍无意义；
+    ///    且让"本次产出了哪些边"的来源统计含混。
+    /// ② **自指边（`evolved_from`）白构造后静默丢弃**：它是"这条记忆自身
+    ///    被更新过"（`memory_id == anchor.id`），而图的边是**两端之间**的
+    ///    关系 ⇒ 在 `add_edges_batch` 里撞上 `s == t` 被无声 continue。
+    ///    每次 recall 都白跑一趟。
+    ///
+    /// ⚠ 本例的靶心是 ① —— 因为 ② 的观测结果（图里没有自环）与
+    /// "被 `add_edges_batch` 丢弃"**无法区分**。故断言"图里不存在符号层边
+    /// 的新增写入"，用**预先在图里的符号层边**做对照：它必须保持原样（不被重写）。
+    #[test]
+    fn test_graph_write_back_is_record_layer_only() {
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory(
+                "周末去杭州看桂花，满城都是香味",
+                MemoryType::Experience,
+            ))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "数据库连接池的最大连接数需要重新调整",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        assert_ne!(a.id, b.id, "两条记忆不应被相似合并");
+
+        // 预先在图里放一条**符号层**边（模拟道体服务经 /external-edge 写入）
+        assert!(
+            store
+                .add_external_edge(&a.id, &b.id, "coordinate", 0.42)
+                .expect("写外部边应成功"),
+            "前置：符号层边应成功入图"
+        );
+        let before: Vec<(String, String, String, f32)> = store
+            .graph_store_ref()
+            .expect("图应已启用")
+            .all_edges()
+            .iter()
+            .map(|e| {
+                (
+                    e.source_id.clone(),
+                    e.target_id.clone(),
+                    e.edge_type.as_str().to_string(),
+                    e.weight,
+                )
+            })
+            .collect();
+        assert_eq!(before.len(), 1, "前置：图里应恰好只有 1 条（符号层）边");
+
+        // 跑一次联想（会走并入段 + 落图段）
+        let out = store
+            .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 6)
+            .expect("联想应成功");
+        assert!(
+            out.iter().any(|x| x.relation == "coordinate"),
+            "前提：符号层边应被并入（否则本测试测不到落图段）: {:?}",
+            out.iter().map(|x| &x.relation).collect::<Vec<_>>()
+        );
+
+        let after: Vec<(String, String, String, f32)> = store
+            .graph_store_ref()
+            .expect("图应已启用")
+            .all_edges()
+            .iter()
+            .map(|e| {
+                (
+                    e.source_id.clone(),
+                    e.target_id.clone(),
+                    e.edge_type.as_str().to_string(),
+                    e.weight,
+                )
+            })
+            .collect();
+
+        // ★① 符号层边必须保持**原样**（权重未被落图段用 1/(1+prio) 覆盖）
+        let coord = after
+            .iter()
+            .find(|(_, _, t, _)| t == "coordinate")
+            .expect("符号层边应仍在图中");
+        assert!(
+            (coord.3 - 0.42).abs() < 1e-6,
+            "★符号层边的权重不得被落图段覆盖（说明它被冗余写回了）。\
+实际: {}（期望 0.42 = 外部写入时的原值）",
+            coord.3
+        );
+        // ★② 图里不得出现任何自环（`evolved_from` 这类自指关系无法在图里表达）
+        for (s, t, ty, _) in &after {
+            assert_ne!(
+                s, t,
+                "★图中不得有自环（自指关系 `{}` 不应由落图段构造）",
+                ty
+            );
+        }
+        // ★③ 图里不得出现"系统推断"类边（`contradicts`/`evolves` 只在合并路径产生）
+        for (_, _, ty, _) in &after {
+            assert!(
+                !matches!(ty.as_str(), "contradicts" | "evolves" | "synthesizes_from"),
+                "★落图段不得写入系统推断类边（`{}`），那会与记录层事实混同",
+                ty
+            );
+        }
+    }
+
+    /// ★v0.9.8：对称关系必须去重（A→B 与 B→A 只能是同一条边）
+    ///
+    /// **为什么必须去重**：`expand_associations` 从每个 seed 出发产出，
+    /// 一次检索里 A、B 都是 seed 时，"同一次经历"会被双向产出。
+    /// 若不去重，边数虚增一倍，且 `query_edges` 会返回重复邻居——
+    /// 多跳遍历时同一节点被反复展开，路径数指数膨胀。
+    #[test]
+    fn test_symmetric_relation_edges_are_deduplicated() {
+        let (_dir, mut store) = make_store_with_graph();
+        let ev = "ev-sym";
+        // ★内容必须**不相似**：`remember` 会在相似度 ≥ 0.5 时合并为同一条记忆，
+        //   若两条内容相近（如"行程记录甲/乙"），会被合并 ⇒ 只剩一条 ⇒ 无边可测。
+        //   故刻意用共享词极少的两句话（与同事件簇的真实形态一致）。
+        let a = store
+            .remember(
+                make_test_memory("在西湖边走了很久，看了断桥残雪", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+        let b = store
+            .remember(
+                make_test_memory("晚上在楼外楼吃了西湖醋鱼", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+        assert_ne!(a.id, b.id, "前提：两条内容不相似，不得被合并为同一条");
+
+        // 两个方向都作为 seed 展开一次（模拟真实检索：A、B 都被召回）
+        store
+            .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 8)
+            .expect("应成功");
+        store
+            .expand_associations(std::slice::from_ref(&b.id), &RecallFilter::new(), 8)
+            .expect("应成功");
+
+        let g = store.graph_store_ref().expect("图应已启用");
+        let same_event_edges: Vec<_> = g
+            .all_edges()
+            .iter()
+            .filter(|e| e.edge_type == crate::graph_store::EdgeType::SameEvent)
+            .collect();
+        assert_eq!(
+            same_event_edges.len(),
+            1,
+            "A↔B 的同一次经历应只存 1 条边（对称去重），实际: {:?}",
+            same_event_edges
+                .iter()
+                .map(|e| (&e.source_id, &e.target_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// ★v0.9.8：有向关系**不得**被对称化（方向是记录语义）
+    ///
+    /// **为什么这是独立风险**：`add_edges_batch` 对对称关系做了字典序规范化，
+    /// 若把 `derived_from` 也纳入规范化，就会把「来源→产物」翻成
+    /// 「产物→来源」，用户会读到相反的因果（承方法论 122：
+    /// 方向是记录的性质，不可由推导虚构）。
+    #[test]
+    fn test_directed_relation_keeps_direction() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let mut g = crate::graph_store::GraphMemoryStore::new(&dir.path().to_string_lossy());
+        // 刻意用 ID 字典序**相反**的方向：bb → aa（若被对称化会变成 aa → bb）
+        let added = g
+            .add_edges_batch(&[(
+                "bb".to_string(),
+                "aa".to_string(),
+                crate::graph_store::EdgeType::DerivedFrom,
+                0.5,
+            )])
+            .expect("应成功");
+        assert_eq!(added, 1);
+        let e = &g.all_edges()[0];
+        assert_eq!(
+            (&e.source_id, &e.target_id),
+            (&"bb".to_string(), &"aa".to_string()),
+            "有向关系不得被对称化（方向即语义）"
+        );
+    }
+
+    /// ★v0.9.8：`evolved_from`（自指关系）不得产生自环边
+    ///
+    /// **为什么**：`evolved_from` 的 `memory_id` 与锚点相同（见
+    /// `associations_in` 的 ⑤ 规则），是"这条记忆被更新过"的标记。
+    /// 自环边在图里无信息量，且会让 `query_subgraph` 的 BFS 计数虚增。
+    #[test]
+    fn test_self_loop_edges_are_skipped() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let mut g = crate::graph_store::GraphMemoryStore::new(&dir.path().to_string_lossy());
+        let added = g
+            .add_edges_batch(&[(
+                "same".to_string(),
+                "same".to_string(),
+                crate::graph_store::EdgeType::EvolvedFrom,
+                1.0,
+            )])
+            .expect("应成功");
+        assert_eq!(added, 0, "自环边应被跳过，实际新增 {added}");
+        assert!(g.all_edges().is_empty(), "不应留下任何边");
+    }
+
+    // ==================== 外部边写入（§5.4 写入端）====================
+
+    /// ★v0.9.8：外部推导的关系边必须能写入图，且**真的要落盘**
+    ///
+    /// **为什么断言落盘而非只看返回值**：`add_external_edge` 返回 `Ok(true)`
+    /// 只说明"内存里加了"。若 `save()` 静默失败，返回值照样是 true，
+    /// 而重启后边全丢——只断言返回值会让这类失效完全不可见。
+    #[test]
+    fn test_add_external_edge_writes_to_graph() {
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory(
+                "道体结构算子产出候选关系",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "外部推导的关系边需要受控通路",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        assert_ne!(a.id, b.id, "前提：两条应是不相似的独立记忆");
+
+        let added = store
+            .add_external_edge(&a.id, &b.id, "COORDINATE", 0.7)
+            .expect("写入外部边应成功");
+        assert!(added, "首次写入应返回 true");
+
+        // 落盘证据：不信任返回值，直接查图
+        let edges = store.graph_store_ref().expect("图应已启用").all_edges();
+        let hit: Vec<_> = edges
+            .iter()
+            .filter(|e| e.edge_type == crate::graph_store::EdgeType::Coordinate)
+            .collect();
+        assert_eq!(hit.len(), 1, "应有且仅有 1 条 coordinate 边（无向去重）");
+        assert!(
+            (hit[0].weight - 0.7).abs() < 1e-6,
+            "权重应保留传入值 0.7，实际 {}",
+            hit[0].weight
+        );
+
+        // 幂等：再写一次不应新增
+        let again = store
+            .add_external_edge(&a.id, &b.id, "coordinate", 0.9)
+            .expect("重复写入应成功返回");
+        assert!(!again, "重复写入应返回 false（已存在）");
+        assert_eq!(
+            store.graph_store_ref().unwrap().all_edges().len(),
+            1,
+            "重复写入不得新增边"
+        );
+    }
+
+    /// ★v0.9.8：外部边写入的三重校验（未知类型 / 悬空 ID / 自环）
+    ///
+    /// **为什么合并成一个测试**：三者都是"**返回 false 且不污染图**"，
+    /// 分散成三个测试会让"共同的不变量"（图边数不变）被复制三份，
+    /// 未来新增一种拒绝原因时容易漏改其中一处。
+    #[test]
+    fn test_add_external_edge_rejects_invalid() {
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory(
+                "校验用例甲：结构算子候选",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "校验用例乙：受控写入通路",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        assert_ne!(a.id, b.id);
+
+        // ① 未知关系类型：不兜底映射
+        assert!(
+            !store
+                .add_external_edge(&a.id, &b.id, "NOT_A_TYPE", 0.5)
+                .expect("应成功返回"),
+            "未知 rel_type 应被拒绝"
+        );
+        // ①b ★合法但**越界**的类型必须被拒绝（2026-09-18 修 S3）
+        //
+        // 此前只测了 "NOT_A_TYPE"（不存在的名字），漏掉了**合法但不该接受**
+        // 的那类——它们能被通用解析器认出，于是被静默接受。
+        //
+        // 危害最大的是 `same_event`：它是"知情者断言"、证据最强
+        // （relation_priority=0 ⇒ 权重 1.0），且会经 expand_associations
+        // 进入 recall 并被渲染为"由记录推导、必然成立"。
+        // ⇒ 若外部可写，任意本机进程都能把两条真实记忆伪造成"同一次经历"，
+        //   用户看到的是最高证据等级的**假事实**。
+        for rel in [
+            "same_event",       // 记录层，证据最强 ⇒ 绝不可外部写
+            "shared_entity",    // 记录层
+            "derived_from",     // 记录层
+            "evolved_from",     // 记录层
+            "synthesizes_from", // 图存储内生（系统推断）
+            "contradicts",      // 图存储内生
+            "evolves",          // 图存储内生
+            "related_to",       // 图存储内生
+        ] {
+            assert!(
+                !store
+                    .add_external_edge(&a.id, &b.id, rel, 0.5)
+                    .expect("应成功返回"),
+                "★类型 `{}` 属记录层/图存储内生，**不得**由外部端点写入",
+                rel
+            );
+        }
+        // ①c §5.3 五类逻辑关系**必须**被接受（白名单不能过窄）
+        //
+        // ★两条记忆的内容必须**彼此差异足够大**（2026-09-18 实测教训）：
+        //   `remember` 内有**相似记忆合并**（`find_similar_scoped_with_privacy`）
+        //   ⇒ 若两条文案共享较多字词，第二条会被合并进第一条，
+        //     于是 `x.id == y.id`、边退化成自环被丢弃 ⇒ 断言失败。
+        //   初版用「白名单正例甲-0-cause / 白名单正例乙-0-cause」正是这样失败的。
+        for (i, rel) in [
+            "cause",
+            "temporal",
+            "constraint",
+            "facilitate",
+            "coordinate",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (d2, mut s2) = make_store_with_graph();
+            let _ = i;
+            let x = s2
+                .remember(make_test_memory(
+                    "周末去西湖边散步，看了很久的荷花",
+                    MemoryType::Experience,
+                ))
+                .expect("写入应成功");
+            let y = s2
+                .remember(make_test_memory(
+                    "数据库连接池的最大连接数需要重新调整",
+                    MemoryType::Fact,
+                ))
+                .expect("写入应成功");
+            assert_ne!(
+                x.id, y.id,
+                "两条内容差异足够大的记忆不应被合并（rel={}）",
+                rel
+            );
+            assert!(
+                s2.add_external_edge(&x.id, &y.id, rel, 0.5)
+                    .expect("应成功返回"),
+                "§5.3 关系 `{}` 应被接受",
+                rel
+            );
+            drop(d2);
+        }
+        // ② 悬空 ID：对端记忆不存在
+        let ghost = "00000000-0000-0000-0000-000000000000";
+        assert!(
+            !store
+                .add_external_edge(&a.id, ghost, "cause", 0.5)
+                .expect("应成功返回"),
+            "悬空 ID 应被拒绝（防悬空边）"
+        );
+        // ③ 自环
+        assert!(
+            !store
+                .add_external_edge(&a.id, &a.id, "facilitate", 0.5)
+                .expect("应成功返回"),
+            "自环应被拒绝"
+        );
+
+        assert!(
+            store.graph_store_ref().unwrap().all_edges().is_empty(),
+            "三种被拒场景都**不得**留下任何边（图不被污染）"
+        );
+    }
+
+    /// ★v0.9.8（2026-09-18 修 G9）：图边「三来源」分类必须**穷尽且互斥**。
+    ///
+    /// **为什么这条值得有**：`is_record_edge_type` / `is_symbolic_edge_type`
+    /// 是**白名单**（`matches!` 列举名字）。白名单的失效模式是**静默漏项**：
+    /// 将来新增一个 `EdgeType` 变体，若忘了归入任一类，两个函数都对它返回
+    /// `false` ⇒ 它会被当作"不属于任何一层"，在并入选边时被无声跳过，
+    /// 或在按来源统计时凭空消失。没有任何运行时报错。
+    ///
+    /// **本测试的兜底方式**：`edge_source_of` 是一个**编译器强制穷尽**的
+    /// `match`——新增变体不更新它则**编译失败**。再用它交叉验证两个
+    /// 字符串白名单：某个变体被 `match` 归入「记录层」、而
+    /// `is_record_edge_type` 却不认它 ⇒ 当场变红。
+    ///
+    /// ⇒ 白名单漏项从"静默"变为"编译/测试期可见"。
+    #[test]
+    fn test_edge_type_three_source_taxonomy_is_exhaustive() {
+        use crate::graph_store::EdgeType;
+
+        /// 变体的**权威来源归类**（编译器穷尽检查：新增变体必须在此表态）
+        fn edge_source_of(et: &EdgeType) -> &'static str {
+            match et {
+                // 第一组：图存储内生（系统推断，可能错）
+                EdgeType::Contradicts
+                | EdgeType::Evolves
+                | EdgeType::SynthesizesFrom
+                | EdgeType::RelatedTo => "graph_internal",
+                // 第二组：记录层（记录事实，不会错）
+                EdgeType::SameEvent
+                | EdgeType::SameEventAuto
+                | EdgeType::SharedEntity
+                | EdgeType::SharedArtifact
+                | EdgeType::DerivedFrom
+                | EdgeType::CrystallizedInto
+                | EdgeType::EvolvedFrom => "record",
+                // 第三组：逻辑关系（结构推导，§5.3）
+                EdgeType::Cause
+                | EdgeType::Temporal
+                | EdgeType::Constraint
+                | EdgeType::Facilitate
+                | EdgeType::Coordinate => "symbolic",
+            }
+        }
+
+        // 全部 16 个变体（若新增变体，上面的 match 已先一步编译失败）
+        let all = [
+            EdgeType::Contradicts,
+            EdgeType::Evolves,
+            EdgeType::SynthesizesFrom,
+            EdgeType::RelatedTo,
+            EdgeType::SameEvent,
+            EdgeType::SameEventAuto,
+            EdgeType::SharedEntity,
+            EdgeType::SharedArtifact,
+            EdgeType::DerivedFrom,
+            EdgeType::CrystallizedInto,
+            EdgeType::EvolvedFrom,
+            EdgeType::Cause,
+            EdgeType::Temporal,
+            EdgeType::Constraint,
+            EdgeType::Facilitate,
+            EdgeType::Coordinate,
+        ];
+        assert_eq!(
+            all.len(),
+            16,
+            "EdgeType 变体数变了：请同步本测试与三来源分类"
+        );
+
+        let mut counts = std::collections::HashMap::new();
+        for et in &all {
+            let s = et.as_str();
+            let authoritative = edge_source_of(et);
+            *counts.entry(authoritative).or_insert(0usize) += 1;
+
+            // ① 两个字符串白名单必须与权威归类**一致**
+            assert_eq!(
+                is_record_edge_type(s),
+                authoritative == "record",
+                "`{}` 的记录层判定与权威归类不符（白名单漏项或被误加）",
+                s
+            );
+            assert_eq!(
+                is_symbolic_edge_type(s),
+                authoritative == "symbolic",
+                "`{}` 的符号层判定与权威归类不符（白名单漏项或被误加）",
+                s
+            );
+            // ② 互斥：不得同时属于两层
+            assert!(
+                !(is_record_edge_type(s) && is_symbolic_edge_type(s)),
+                "`{}` 不得同时属于记录层与符号层",
+                s
+            );
+            // ③ 外部写入白名单**只**放行符号层（S3 的安全边界）
+            assert_eq!(
+                EdgeType::from_external_rel_str(s).is_some(),
+                authoritative == "symbolic",
+                "`{}` 的外部可写性必须与「仅符号层可写」一致",
+                s
+            );
+        }
+        // ④ 三组都非空（否则归类表被整体改错时上面的循环仍可能全绿）
+        for g in ["graph_internal", "record", "symbolic"] {
+            assert!(
+                counts.get(g).copied().unwrap_or(0) > 0,
+                "来源分组 `{}` 不应为空",
+                g
+            );
+        }
+    }
+
+    /// ★v0.9.8：有向外部边**不得**被对称化（`temporal` 的方向即语义）
+    #[test]
+    fn test_add_external_edge_keeps_direction_for_directed() {
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory(
+                "方向用例甲：先做的事",
+                MemoryType::Experience,
+            ))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "方向用例乙：后做的事",
+                MemoryType::Experience,
+            ))
+            .expect("写入应成功");
+        assert_ne!(a.id, b.id);
+
+        assert!(store
+            .add_external_edge(&a.id, &b.id, "TEMPORAL", 0.6)
+            .expect("写入应成功"));
+        let edges = store.graph_store_ref().unwrap().all_edges();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            (&edges[0].source_id, &edges[0].target_id),
+            (&a.id, &b.id),
+            "有向关系方向不得被规范化（a 先于 b ≠ b 先于 a）"
+        );
+        assert!(
+            !edges[0].edge_type.is_symmetric(),
+            "temporal 应是非对称关系"
+        );
+    }
+
+    // ==================== 落盘边读取（§6 #4 读通路）====================
+
+    /// ★v0.9.8（2026-09-18）：符号层边必须能被 **expand_associations 读回**
+    ///
+    /// ## 为什么这条是本轮最关键的回归测试
+    ///
+    /// `query_stored_edges` 只服务 HTTP 端点（诊断用），而**检索主链路**
+    /// 走的是 `expand_associations`。实测确认：后者此前**只写不读**——
+    /// 符号层边经 `/v1/memories/external-edge` 落图后，
+    /// **没有任何路径能把它们带回检索结果**（`grep query_stored_edges src/server.rs`
+    /// → 零匹配）。这是"写进去了但读不出"的完整形态：
+    ///
+    ///   · 写端点存在 ✅  · 读端点存在 ✅  · **但检索不调用读端点** ❌
+    ///
+    /// 故本测试**必须断言 `expand_associations` 的产出**，而不是
+    /// `query_stored_edges`——后者过了也证明不了检索能看到边。
+    #[test]
+    fn test_expand_associations_reads_stored_edges() {
+        let (_dir, mut store) = make_store_with_graph();
+        // 两条记忆**无任何记录层关联**（无 event_id / 无共享实体 / 无共同字词）
+        // ⇒ 若联想结果出现乙，只可能来自图上的落盘边
+        let a = store
+            .remember(make_test_memory(
+                "甲：在西湖边走了很久",
+                MemoryType::Experience,
+            ))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "乙：傍晚去楼外楼吃了醋鱼",
+                MemoryType::Experience,
+            ))
+            .expect("写入应成功");
+        // 外部写入符号层边（模拟道体 §5.4 落边）
+        assert!(store
+            .add_external_edge(&a.id, &b.id, "coordinate", 0.75)
+            .expect("写入应成功"));
+
+        let assoc = store
+            .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 5)
+            .expect("联想应成功");
+        let hit = assoc
+            .iter()
+            .find(|x| x.memory_id == b.id)
+            .expect("★符号层边必须能被 expand_associations 读回（否则写进去就沉底）");
+        assert_eq!(hit.relation, "coordinate");
+        assert_eq!(hit.hops, 1);
+        assert_eq!(hit.path, vec![a.id.clone(), b.id.clone()]);
+        // why 必须含**权重**这一具体证据（否则无从核验这条边凭什么成立）
+        assert!(
+            hit.why.contains("0.75"),
+            "why 应含边权作证据，实际: {}",
+            hit.why
+        );
+        assert!(
+            hit.why.contains("图存储既有边"),
+            "why 应标明来源是落盘边（与记录层推导区分），实际: {}",
+            hit.why
+        );
+        // ★v0.9.8（2026-09-18 修 S5）：符号层关系名必须渲染成**自己的标签**，
+        //   不得落到兜底「相关联」——否则用户无法分辨是因果、时序还是约束。
+        assert!(
+            hit.why.contains("相综/互卦（协同）"),
+            "★符号层 coordinate 必须渲染为专属标签，不得落到兜底「相关联」。实际: {}",
+            hit.why
+        );
+        assert!(
+            !hit.why.contains("，相关联，"),
+            "★不得把符号层类型抹平成「相关联」（承「证据要可区分」）。实际: {}",
+            hit.why
+        );
+        // ★v0.9.8（2026-09-18 修 S4）：why 必须写明**证据性质来源**，
+        //   让用户能判断该不该采信（符号层=推导，记录层=事实）。
+        assert!(
+            hit.why.contains("符号层推导边"),
+            "★why 必须标明这是符号层推导（非记录事实）。实际: {}",
+            hit.why
+        );
+    }
+
+    /// ★v0.9.8（2026-09-18 修 S4）：**系统推断**边不得冒充「记录型关联」
+    ///
+    /// **为什么必须单独测**：图里有三类来源不同的边，而渲染分区冠名是
+    /// 「联想 · 记录型关联（**由记录推导，非语义相似**）」——用户读到这句
+    /// 就会认为"这条边必然成立"。若把 `evolves` / `synthesizes_from` 这类
+    /// **系统推断**（可能错）的边混进去，就是把推断当事实断言。
+    ///
+    /// **实测背景**：生产样本 `graph_edges.json` 里 14 条边**全部**是
+    /// `evolves`(12) + `synthesizes_from`(2) ⇒ 该分区在实际数据上会被
+    /// 纯推断边占满（这不是理论担忧）。
+    #[test]
+    fn test_expand_associations_excludes_system_inferred_edges() {
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory(
+                "周末去西湖边散步，看了很久的荷花",
+                MemoryType::Experience,
+            ))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "数据库连接池的最大连接数需要重新调整",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        // ★必须确认未被合并（同 ①c 的教训：相似记忆会被 `remember` 合并，
+        //   合并后 x.id == y.id ⇒ 边退化成自环、测的就不是过滤逻辑了）
+        assert_ne!(a.id, b.id, "两条记忆不应被相似合并");
+
+        // 直接向图写入**系统推断类**边（模拟合成/冲突链路的生产行为）
+        {
+            let mut edges = Vec::new();
+            for et in [
+                crate::graph_store::EdgeType::Evolves,
+                crate::graph_store::EdgeType::SynthesizesFrom,
+                crate::graph_store::EdgeType::Contradicts,
+                crate::graph_store::EdgeType::RelatedTo,
+            ] {
+                edges.push((a.id.clone(), b.id.clone(), et, 0.9f32));
+            }
+            // 同时写一条符号层边作对照（它**应该**被并入）
+            edges.push((
+                a.id.clone(),
+                b.id.clone(),
+                crate::graph_store::EdgeType::Cause,
+                0.6f32,
+            ));
+            store
+                .graph_store_mut_for_test()
+                .expect("应启用图存储")
+                .add_edges_batch(&edges)
+                .expect("写图应成功");
+        }
+
+        let assoc = store
+            .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 10)
+            .expect("联想应成功");
+
+        // ★诊断前置断言：先确认边**真的写进图了**，再断言过滤行为。
+        //   否则"过滤生效"与"根本没写进去"会得出同一个空结果 ——
+        //   即测试无法区分"正确过滤"与"链路断了"（承「验证要能区分原因」）。
+        let edge_count = store.graph_store_ref().expect("应启用图存储").edge_count();
+        assert!(
+            edge_count >= 5,
+            "★5 条边都应写入图（4 推断 + 1 符号层），实际 {} ⇒ 先修写入链路，否则下面的空结果无从归因",
+            edge_count
+        );
+
+        // 符号层 cause 应被并入（白名单内）
+        assert!(
+            assoc.iter().any(|x| x.relation == "cause"),
+            "符号层 cause 边应被并入，实际: {:?}",
+            assoc.iter().map(|x| &x.relation).collect::<Vec<_>>()
+        );
+        // 四类系统推断边**都不得**出现
+        for rel in ["evolves", "synthesizes_from", "contradicts", "related_to"] {
+            assert!(
+                !assoc.iter().any(|x| x.relation == rel),
+                "★系统推断边 `{}` 不得冒充「记录型关联」（可能错的推断≠记录事实）",
+                rel
+            );
+        }
+        // ★记录层类型的边**也不得**经并入段产出（2026-09-18 补）
+        //
+        // 为什么：图里的记录层边全部由 `expand_associations` 自己写入，
+        // 而 `associations_in` **每次都会从记忆数据重新算出**同样的关系
+        // ⇒ 从图里再读一遍是**纯冗余**，且会挤占并入段留给符号层的席位。
+        // 该冗余是 `test_symbolic_edges_get_reserved_seat_under_quota_pressure`
+        // 实测抓出的（`same_event` 被从图里读回、挤掉了符号层边）。
+        for rel in ["same_event", "shared_entity", "derived_from"] {
+            assert!(
+                !assoc.iter().any(|x| x.relation == rel),
+                "★记录层边 `{}` 不得经并入段重复产出（`associations_in` 已当场算出）",
+                rel
+            );
+        }
+    }
+
+    /// ★v0.9.8（2026-09-18）：符号层边并入同样受**可见性**约束
+    ///
+    /// **为什么必须单独测**：图里的边由**外部服务**写入，不经过检索的
+    /// `visible` 过滤。若并入时不复查可见性，用户就能通过联想读到
+    /// **无权看到的记忆 ID**——这是隐私红线（与 `associations_in` 同等级）。
+    ///
+    /// ★口径说明：`privacy_context = None` 表示"无上下文 ⇒ 全可见"
+    /// （见 `is_visible`），故本测试**必须显式传上下文**才能验过滤，
+    /// 否则测的是"没过滤"而不是"过滤生效"（与既有
+    /// `test_expand_associations_respects_privacy_filter` 同口径）。
+    #[test]
+    fn test_expand_associations_stored_edges_respect_privacy() {
+        use crate::memory_types::PrivacyLevel;
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory("甲：公开记忆", MemoryType::Fact))
+            .expect("写入应成功");
+        // 乙属于**别人的会话**：在"我的会话"上下文下不可见
+        let b = store
+            .remember(
+                make_test_memory("乙：他人会话私有记忆", MemoryType::Fact).with_privacy(
+                    PrivacyLevel::Session,
+                    Some("other-session".to_string()),
+                    None,
+                ),
+            )
+            .expect("写入应成功");
+        assert!(store
+            .add_external_edge(&a.id, &b.id, "coordinate", 0.9)
+            .expect("写入应成功"));
+
+        // 以"我的会话"为上下文 ⇒ 乙不可见 ⇒ 该边不得并入
+        let filter = RecallFilter {
+            privacy_context: Some((PrivacyLevel::Session, Some("my-session".to_string()), None)),
+            top_k: 5,
+            ..RecallFilter::new()
+        };
+        let assoc = store
+            .expand_associations(std::slice::from_ref(&a.id), &filter, 5)
+            .expect("联想应成功");
+        assert!(
+            !assoc.iter().any(|x| x.memory_id == b.id),
+            "★隐私红线：符号层边不得把不可见的 Session 记忆带出。实际: {:?}",
+            assoc.iter().map(|x| &x.memory_id).collect::<Vec<_>>()
+        );
+
+        // 负向对照：上下文匹配时**应当**能读到（证明上一条来自过滤而非功能失效）
+        let ok_filter = RecallFilter {
+            privacy_context: Some((
+                PrivacyLevel::Session,
+                Some("other-session".to_string()),
+                None,
+            )),
+            top_k: 5,
+            ..RecallFilter::new()
+        };
+        let assoc_ok = store
+            .expand_associations(std::slice::from_ref(&a.id), &ok_filter, 5)
+            .expect("联想应成功");
+        assert!(
+            assoc_ok.iter().any(|x| x.memory_id == b.id),
+            "上下文匹配时符号层边应可读（否则上一条断言无意义）"
+        );
+    }
+
+    /// ★v0.9.8（2026-09-18）：悬空边（另一端已删除）不得构造假记忆
+    ///
+    /// 图是**外部可写**的（`/v1/memories/external-edge`），边可能先于
+    /// 记忆删除而残留。若不查 `by_id` 就产出，联想会返回一个
+    /// **在库里根本不存在的 memory_id**——调用方后续取内容必然失败。
+    #[test]
+    fn test_expand_associations_skips_dangling_stored_edges() {
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory("甲：仍在库中", MemoryType::Fact))
+            .expect("写入应成功");
+        // 直接写一条指向不存在 ID 的边（绕过三重重校验，模拟历史残留）：
+        // `add_external_edge` 会拒绝悬空 ID，故此处直接改盘文件再重载，
+        // 忠实模拟"边先写、记忆后删"的时序。
+        let data_dir = _dir.path().to_string_lossy().to_string();
+        let path = format!("{}/graph_edges.json", data_dir);
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|_| "[]".to_string());
+        let mut arr: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap_or_default();
+        arr.push(serde_json::json!({
+            "id": "dangling-edge-1",
+            "source_id": a.id,
+            "target_id": "nonexistent-memory-id",
+            "edge_type": "coordinate",
+            "weight": 0.9,
+            "created_at": "2026-09-18T00:00:00+08:00"
+        }));
+        std::fs::write(&path, serde_json::to_string(&arr).unwrap()).expect("写盘应成功");
+        // 重新加载图（模拟进程重启后读到残留边）
+        let p = create_json_persistence(&data_dir).expect("应成功创建");
+        let mut graph = crate::graph_store::GraphMemoryStore::new(&data_dir);
+        graph.load().expect("加载应成功");
+        let mut store2 = MemoryStore::new(p).with_graph_store(graph);
+
+        let assoc = store2
+            .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 5)
+            .expect("联想应成功");
+        assert!(
+            !assoc.iter().any(|x| x.memory_id == "nonexistent-memory-id"),
+            "悬空边不得产出不存在的记忆 ID，实际: {:?}",
+            assoc.iter().map(|x| &x.memory_id).collect::<Vec<_>>()
+        );
+    }
+
+    /// ★v0.9.8（2026-09-18 审查 G3 修复）：`forget` 必须**清理该记忆在图上的边**
+    ///
+    /// **为什么必须测**：图此前**只增不减**——`remove_edge` 定义存在但零生产调用，
+    /// `forget` 也不触碰图 ⇒ 已删除记忆的边永久残留为"悬空边"，
+    /// 每轮检索都要为它们付出一次遍历+判空，成本随生命期单调增长。
+    ///
+    /// **为什么断言"图里真的没有了"而非只看返回值**：清理逻辑若有缺陷
+    /// （如只删了一端、或只在内存删未落盘），返回值仍可能"看起来正常"。
+    /// 故直接读图核验，且在**重新加载后**再核验一次（确认已落盘）。
+    #[test]
+    fn test_forget_removes_related_graph_edges() {
+        let (dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory(
+                "周末去西湖边散步，看了很久的荷花",
+                MemoryType::Experience,
+            ))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "数据库连接池的最大连接数需要重新调整",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        assert_ne!(a.id, b.id, "两条记忆不应被相似合并");
+
+        // 建两条边：一条以 a 为源、一条以 a 为目标（两种方向都要被清）
+        {
+            let graph = store.graph_store_mut_for_test().expect("应启用图存储");
+            graph
+                .add_edges_batch(&[
+                    (
+                        a.id.clone(),
+                        b.id.clone(),
+                        crate::graph_store::EdgeType::Cause,
+                        0.6,
+                    ),
+                    (
+                        b.id.clone(),
+                        a.id.clone(),
+                        crate::graph_store::EdgeType::Coordinate,
+                        0.5,
+                    ),
+                ])
+                .expect("写图应成功");
+        }
+        assert_eq!(
+            store.graph_store_ref().unwrap().edge_count(),
+            2,
+            "前置：应有 2 条边"
+        );
+
+        // 删除 a ⇒ 两条边（任一方向）都应消失
+        assert!(store.forget(&a.id).expect("删除应成功"), "删除应返回 true");
+
+        assert_eq!(
+            store.graph_store_ref().unwrap().edge_count(),
+            0,
+            "★forget 后，任一方向的边都应被清理（否则残留为悬空边）"
+        );
+
+        // ★落盘核验：重新加载（模拟进程重启）后仍应为 0 —— 防"只在内存删了"
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let mut graph = crate::graph_store::GraphMemoryStore::new(&data_dir);
+        graph.load().expect("加载应成功");
+        assert_eq!(
+            graph.edge_count(),
+            0,
+            "★清理必须已落盘（否则重启后悬空边复活）"
+        );
+    }
+
+    /// ★v0.9.8（2026-09-18 审查 G3 修复）：图持久化必须是**原子写**
+    ///
+    /// **为什么必须测**：`save()` 此前直接 `fs::write` 覆盖目标文件，
+    /// 而图文件在**写入热路径**上（每次 `expand_associations` 都可能触发）。
+    /// 若进程在写入中途崩溃，会留下**截断的 JSON** ⇒ 下次启动 `load()`
+    /// 解析失败、整张图不可用。改为 tmp+rename 后，目标文件要么是旧的完整
+    /// 内容、要么是新的完整内容，**不存在中间态**。
+    ///
+    /// **本测试断言的是"原子写不残留 tmp 文件 + 内容完整"**
+    /// （真正的崩溃场景无法在单测中可靠复现，故以"实现特征"为断言对象）。
+    #[test]
+    fn test_graph_save_is_atomic_no_tmp_leftover() {
+        let (dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory(
+                "周末去西湖边散步，看了很久的荷花",
+                MemoryType::Experience,
+            ))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "数据库连接池的最大连接数需要重新调整",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        {
+            let graph = store.graph_store_mut_for_test().expect("应启用图存储");
+            graph
+                .add_edges_batch(&[(
+                    a.id.clone(),
+                    b.id.clone(),
+                    crate::graph_store::EdgeType::Cause,
+                    0.6,
+                )])
+                .expect("写图应成功");
+        }
+
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let main = format!("{}/graph_edges.json", data_dir);
+        let tmp = format!("{}.tmp", main);
+
+        assert!(std::path::Path::new(&main).exists(), "主文件应存在");
+        assert!(
+            !std::path::Path::new(&tmp).exists(),
+            "★原子写不得残留 .tmp 文件（残留说明 rename 未执行或失败被吞）"
+        );
+        // 内容必须是**完整可解析**的 JSON（这也是截断检测）
+        let raw = std::fs::read_to_string(&main).expect("应能读取");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("★内容必须是完整 JSON（截断会在此失败）");
+        assert!(parsed.is_array(), "图文件应是一个数组");
+    }
+
+    /// ★v0.9.8：`query_stored_edges` 必须能**读回**外部写入的边
+    ///
+    /// **为什么这是独立测试**（而非写入测试的一部分）：
+    /// 实测确认过写入与读取是**两条独立通路**——`/association-graph` 能写入
+    /// 也读不出（它走 `associations_in`，不读 graph_store）。
+    /// 只测写入会漏掉"写进去了但读不出"这一整类失效。
+    #[test]
+    fn test_query_stored_edges_reads_external_edges() {
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory(
+                "读取用例甲：写入的边要能读出",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "读取用例乙：读通路是独立的一环",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        assert_ne!(a.id, b.id);
+        assert!(store
+            .add_external_edge(&a.id, &b.id, "coordinate", 0.7)
+            .expect("写入应成功"));
+
+        let edges = store
+            .query_stored_edges(&a.id, None, 1, &None)
+            .expect("读取应成功");
+        assert_eq!(edges.len(), 1, "应读回 1 条边，实际 {:?}", edges);
+        assert_eq!(edges[0].relation, "coordinate");
+        assert!(edges[0].symmetric, "coordinate 应标记为对称（无向）");
+        assert_eq!(edges[0].hops, 1);
+        assert!(
+            (edges[0].weight - 0.7).abs() < 1e-6,
+            "1 跳不衰减，权重应为 0.7"
+        );
+        // 边的原始方向是落盘顺序（对称关系按 ID 字典序规范化）
+        let (lo, hi) = if a.id < b.id {
+            (&a.id, &b.id)
+        } else {
+            (&b.id, &a.id)
+        };
+        assert_eq!((&edges[0].from, &edges[0].to), (lo, hi));
+    }
+
+    /// ★v0.9.8（2026-09-18 审查 G1 修复）：`query_stored_edges` 必须与检索
+    /// **同口径地**排除已过期记忆
+    ///
+    /// **修的是什么**：本函数此前只调 `is_visible`（仅隐私三级），
+    /// **不查 `is_expired`**。而 TTL 语义是"过期即应消失"——
+    /// recall / list / stats 都已排除，本端点却仍能读出其 ID、关系、权重
+    /// 与创建时间 ⇒ **同一份数据两种可见性口径**。
+    ///
+    /// **为什么断言"过期后读不到"而非只看返回值**：过滤逻辑若有缺陷
+    /// （如只过滤根、漏了对端），返回值仍可能"看起来正常"。
+    #[test]
+    fn test_query_stored_edges_excludes_expired_memories() {
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory(
+                "过期用例甲：根记忆仍然有效",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        // b 构造为**已过期**：`created_at` 在很久以前 + 极短 TTL
+        // （`is_expired` 的定义：ttl_days 存在且非 0 时，
+        //   created_at + ttl_days < now ⇒ 已过期；ttl_days==0 表示永不过期）
+        let mut bm = make_test_memory("过期用例乙：这条应当不可见", MemoryType::Fact);
+        bm.created_at = Utc::now() - chrono::Duration::days(365);
+        bm.ttl_days = Some(1);
+        assert!(bm.is_expired(), "前置：b 必须处于已过期状态");
+        let b = store.remember(bm).expect("写入应成功");
+        assert_ne!(a.id, b.id);
+        assert!(store
+            .add_external_edge(&a.id, &b.id, "coordinate", 0.7)
+            .expect("写入应成功"));
+
+        // ① 对端过期 ⇒ 整条边不返回
+        let edges = store
+            .query_stored_edges(&a.id, None, 1, &None)
+            .expect("读取应成功");
+        assert!(
+            edges.is_empty(),
+            "★对端已过期 ⇒ 边不得返回（TTL 语义与 recall 一致）。实际: {:?}",
+            edges.iter().map(|e| (&e.from, &e.to)).collect::<Vec<_>>()
+        );
+
+        // ② 根过期 ⇒ 直接空结果
+        let edges2 = store
+            .query_stored_edges(&b.id, None, 1, &None)
+            .expect("读取应成功");
+        assert!(edges2.is_empty(), "★根已过期 ⇒ 不得返回任何边");
+
+        // ③ 反向确认：把 b 改为未过期后，边应能读回
+        //    （否则上面的断言可能只是因为"边没写进去"而通过）
+        //
+        // 做法：直接改盘文件里的 `expire_at` 再重载 store ——
+        // 与 `test_expand_associations_skips_dangling_stored_edges` 同款
+        // （那里也是改盘再重载）。**不新增生产 API 仅为测试服务**。
+        let data_dir = _dir.path().to_string_lossy().to_string();
+        let mem_path = format!("{}/memories.json", data_dir);
+        let raw = std::fs::read_to_string(&mem_path).expect("应能读取记忆库");
+        let mut arr: Vec<serde_json::Value> =
+            serde_json::from_str(&raw).expect("记忆库应是 JSON 数组");
+        for m in arr.iter_mut() {
+            if m.get("id").and_then(|v| v.as_str()) == Some(b.id.as_str()) {
+                // ttl_days = 0 ⇒ `is_expired` 恒为 false（永不过期）
+                m["ttl_days"] = serde_json::json!(0);
+            }
+        }
+        std::fs::write(&mem_path, serde_json::to_string(&arr).unwrap()).expect("写盘应成功");
+
+        // 重载 store（模拟重启后读到未过期的 b）
+        let mut graph2 = crate::graph_store::GraphMemoryStore::new(&data_dir);
+        graph2.load().expect("加载应成功");
+        let p2 = create_json_persistence(&data_dir).expect("应成功创建");
+        let store2 = MemoryStore::new(p2).with_graph_store(graph2);
+        let edges3 = store2
+            .query_stored_edges(&a.id, None, 1, &None)
+            .expect("读取应成功");
+        assert_eq!(
+            edges3.len(),
+            1,
+            "★对照组：b 未过期时边必须能读回（否则上一条断言无意义）"
+        );
+    }
+
+    /// ★v0.9.8（2026-09-18 审查 G2 修复）：`query_stored_edges` 必须尊重
+    /// **会话/用户隐私**（此前该分支生产不可达）
+    ///
+    /// **修的是什么**：HTTP 端点此前硬编码 `privacy = &None` ⇒
+    /// `is_visible` 的 `User` / `Session` 两条分支**在生产中永远不会被触发**
+    /// ⇒ 任何调用者都能读出他人会话私有记忆的 ID 与关系拓扑。
+    ///
+    /// **本测试直接测 store 层**（HTTP 层只是透传），确保过滤谓词本身有效。
+    #[test]
+    fn test_query_stored_edges_respects_privacy_context() {
+        use crate::memory_types::{Memory, PrivacyLevel};
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory("隐私用例甲：公开可见", MemoryType::Fact))
+            .expect("写入应成功");
+        // b 是**他人会话**的私有记忆
+        let mut bm = Memory::new(
+            "隐私用例乙：属于别人会话".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            crate::memory_types::Importance::default(),
+            None,
+        );
+        bm.privacy_level = PrivacyLevel::Session;
+        bm.session_id = Some("other-session".to_string());
+        let b = store.remember(bm).expect("写入应成功");
+        assert_ne!(a.id, b.id);
+        assert!(store
+            .add_external_edge(&a.id, &b.id, "coordinate", 0.7)
+            .expect("写入应成功"));
+
+        // ① 带"我的会话"上下文 ⇒ b 不可见 ⇒ 边不返回
+        let mine = Some((
+            PrivacyLevel::User,
+            Some("my-session".to_string()),
+            Some("me".to_string()),
+        ));
+        let edges = store
+            .query_stored_edges(&a.id, None, 1, &mine)
+            .expect("读取应成功");
+        assert!(
+            !edges.iter().any(|e| e.from == b.id || e.to == b.id),
+            "★他人会话的私有记忆不得经落盘边被读出"
+        );
+
+        // ② 反向确认：不带隐私上下文时能读到（否则 ① 可能因"边没写进去"而通过）
+        let edges_none = store
+            .query_stored_edges(&a.id, None, 1, &None)
+            .expect("读取应成功");
+        assert_eq!(
+            edges_none.len(),
+            1,
+            "★对照组：无隐私上下文时应能读回（证明边确实存在）"
+        );
+    }
+
+    /// ★★v0.9.8（2026-09-18 审查 G5a 修复）：符号层落盘边必须**预留席位**
+    ///
+    /// ## 这条测试锁定的是实测发现的"结构性饿死"
+    ///
+    /// 真实库副本实测（`docs/G5A_QUOTA_COMPETITION_MEASUREMENT.md`，11 组）：
+    ///
+    /// | 记录层 1 跳产出 | 样本 | 符号层读回 | 读回率 |
+    /// |---|---|---|---|
+    /// | ≥3（配额吃满） | 10 | 0 | **0%** |
+    /// | <3（配额有余） | 1 | 1 | **100%** |
+    ///
+    /// 且记录层 ≥3 条的概率 **91%** ⇒ 符号层边**在真实 recall 中读不回来**。
+    ///
+    /// ## 为什么必须用"记录层能产出很多条"的构造
+    ///
+    /// 若种子关联稀疏，`out` 本来就填不满，符号层自然能进
+    /// ⇒ **测不出**饿死。故必须造一个"记录层候选很多"的场景。
+    #[test]
+    fn test_symbolic_edges_get_reserved_seat_under_quota_pressure() {
+        let (_dir, mut store) = make_store_with_graph();
+        let ev = "ev-g5a-quota";
+        // 造一个关联密集的簇（同一 event_id ⇒ 记录层会产出大量 1 跳候选）
+        let seed = store
+            .remember(
+                make_test_memory("G5a 配额测试的起点", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+        for t in [
+            "沿途买了当地特产糕点",
+            "在江边看了夜景灯光",
+            "参观了市博物馆的青铜展",
+            "排队坐缆车上山看日出",
+            "在古镇的石板路上拍照",
+            "尝了巷子里的手打鱼丸",
+        ] {
+            store
+                .remember(
+                    make_test_memory(t, MemoryType::Experience).with_event(Some(ev.to_string())),
+                )
+                .expect("写入应成功");
+        }
+        // 另造一条**与簇内毫无记录层关联**的记忆，作为符号层边的对端
+        let outsider = store
+            .remember(make_test_memory(
+                "数据库连接池的最大连接数需要重新调整",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+
+        // 前置确认：不加符号层边时，记录层确实能填满配额 3
+        let before = store
+            .expand_associations(std::slice::from_ref(&seed.id), &RecallFilter::new(), 3)
+            .expect("联想应成功");
+        assert_eq!(
+            before.len(),
+            3,
+            "★前置：记录层应能填满配额 3（否则本测试测不到饿死场景），实际 {}",
+            before.len()
+        );
+
+        // 写入一条符号层边（seed → outsider）
+        assert!(store
+            .add_external_edge(&seed.id, &outsider.id, "coordinate", 0.8)
+            .expect("写入应成功"));
+
+        let after = store
+            .expand_associations(std::slice::from_ref(&seed.id), &RecallFilter::new(), 3)
+            .expect("联想应成功");
+
+        assert_eq!(after.len(), 3, "总产出仍须遵守 max_out 上限");
+        assert!(
+            after.iter().any(|x| x.memory_id == outsider.id),
+            "★★符号层落盘边必须能被读回（预留席位）。\
+             否则本轮打通的「落边→读回」闭环在真实数据上等于没接。\
+             实际产出: {:?}",
+            after
+                .iter()
+                .map(|x| (&x.memory_id, &x.relation))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            after.iter().any(|x| x.relation == "coordinate"),
+            "读回的那条应是符号层 coordinate 关系"
+        );
+    }
+
+    /// ★对照组：**无**落盘边时，记录层不得因"预留席位"而少产出
+    ///
+    /// **为什么这条与上一条同等重要**：预留席位若**无条件**生效，
+    /// 就是拿既有能力（记录层少 1 条）换一个空的承诺。
+    /// 故必须锁定"没有落盘边 ⇒ 配额不压缩 ⇒ 行为与改动前一致"。
+    #[test]
+    fn test_no_seat_reserved_when_no_graph_edges() {
+        let (_dir, mut store) = make_store_with_graph();
+        let ev = "ev-g5a-noseat";
+        let seed = store
+            .remember(
+                make_test_memory("无落盘边时的起点", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+        for t in [
+            "在江边看了夜景灯光",
+            "参观了市博物馆的青铜展",
+            "排队坐缆车上山看日出",
+            "在古镇的石板路上拍照",
+            "尝了巷子里的手打鱼丸",
+        ] {
+            store
+                .remember(
+                    make_test_memory(t, MemoryType::Experience).with_event(Some(ev.to_string())),
+                )
+                .expect("写入应成功");
+        }
+
+        // 图里**没有任何边** ⇒ 不得压缩记录层配额
+        let out = store
+            .expand_associations(std::slice::from_ref(&seed.id), &RecallFilter::new(), 3)
+            .expect("联想应成功");
+        assert_eq!(
+            out.len(),
+            3,
+            "★无落盘边时记录层必须拿满配额（不得为空的承诺牺牲既有能力），实际 {}",
+            out.len()
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2026-09-18 代码审查修复对应测试
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// ★★审查发现 2：**不可读**的符号层边**不得**占用预留席位。
+    ///
+    /// # 为什么必须有这条（原测试恰好绕过了失效路径）
+    ///
+    /// `test_symbolic_edges_get_reserved_seat_under_quota_pressure` 的对端
+    /// 是一条真实且可见的孤立记忆，并入**必然成功** ⇒ 它只覆盖了"预留有效"的
+    /// 一侧。而预留判据（原始版）只要求"一端是种子 ∧ 符号层类型"，**不校验**
+    /// 对端是否在 `exclude` 里 / 是否可见 / 是否存在 ⇒ 会出现
+    /// **"预留了席位，却并入 0 条"** ⇒ 记录层已被压到 `max_out - 1`，
+    /// 用户**净损失 1 条记录层联想**。
+    ///
+    /// 本测试构造的就是那个最易命中的破绽：**符号层边的两端都是种子**
+    ///（`exclude` 即 seed_ids 全体）⇒ 该边物理上不可能被并入。
+    #[test]
+    fn test_unreadable_symbolic_edge_must_not_reserve_seat() {
+        let (_dir, mut store) = make_store_with_graph();
+        let ev = "ev-review2-unreadable";
+        // 造一个关联密集的簇（记录层能填满配额 3）
+        let seed = store
+            .remember(
+                make_test_memory("预留判据测试的起点", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+        let mut cluster = Vec::new();
+        for t in [
+            "沿途买了当地特产糕点",
+            "在江边看了夜景灯光",
+            "参观了市博物馆的青铜展",
+            "排队坐缆车上山看日出",
+            "在古镇的石板路上拍照",
+        ] {
+            let m = store
+                .remember(
+                    make_test_memory(t, MemoryType::Experience).with_event(Some(ev.to_string())),
+                )
+                .expect("写入应成功");
+            cluster.push(m);
+        }
+
+        // ★前置：不加任何边时，记录层能填满配额 3
+        let before = store
+            .expand_associations(std::slice::from_ref(&seed.id), &RecallFilter::new(), 3)
+            .expect("联想应成功");
+        assert_eq!(
+            before.len(),
+            3,
+            "★前置：记录层应能填满 3，实际 {}",
+            before.len()
+        );
+
+        // ★关键构造：符号层边的**两端都是种子**（第二个簇成员）——
+        //   并入段会因 `exclude.contains(to_id)` 拦下它。
+        assert!(store
+            .add_external_edge(&seed.id, &cluster[0].id, "cause", 0.9)
+            .expect("写入应成功"));
+
+        let after = store
+            .expand_associations(std::slice::from_ref(&seed.id), &RecallFilter::new(), 3)
+            .expect("联想应成功");
+
+        // ★★断言核心：既然那条边不可能被并入，就**不得**压缩记录层配额。
+        //   修复前：record_cap = 3-1 = 2 ⇒ after.len() 最多 2（净损失 1 条）。
+        //   修复后：判据同源 ⇒ 不预留 ⇒ record_cap = 3 ⇒ after.len() == 3。
+        assert_eq!(
+            after.len(),
+            3,
+            "★不可读的符号层边不得占用预留席位（否则净损失 1 条记录层联想）。\
+             实际产出: {:?}",
+            after
+                .iter()
+                .map(|x| (&x.memory_id, &x.relation))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            after.iter().all(|x| x.relation != "cause"),
+            "两端都是种子的边不应出现在结果里"
+        );
+    }
+
+    /// ★★审查发现 5：`max_out == 1` 时记录层**不得**被完全饿死。
+    ///
+    /// 修复前：`record_cap = 1.saturating_sub(1) = 0` ⇒ `out.len() >= 0` 恒真
+    /// ⇒ 记录层 1 跳一条都不产出。
+    /// 修法：`record_cap = max_out.saturating_sub(1).max(1)`。
+    #[test]
+    fn test_max_out_one_still_yields_record_layer() {
+        let (_dir, mut store) = make_store_with_graph();
+        let ev = "ev-review5-starve";
+        let seed = store
+            .remember(
+                make_test_memory("配额为 1 时的起点", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+        for t in ["在江边看了夜景灯光", "参观了市博物馆的青铜展"] {
+            store
+                .remember(
+                    make_test_memory(t, MemoryType::Experience).with_event(Some(ev.to_string())),
+                )
+                .expect("写入应成功");
+        }
+        // 一条**可读**的符号层边（对端是真实可见的孤立记忆）
+        let outsider = store
+            .remember(make_test_memory(
+                "数据库连接池的最大连接数需要重新调整",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        assert!(store
+            .add_external_edge(&seed.id, &outsider.id, "temporal", 0.7)
+            .expect("写入应成功"));
+
+        let out = store
+            .expand_associations(std::slice::from_ref(&seed.id), &RecallFilter::new(), 1)
+            .expect("联想应成功");
+
+        // max_out == 1 ⇒ 总量仍是 1（不得突破上限）
+        assert_eq!(out.len(), 1, "总产出仍须遵守 max_out 上限");
+        // ★修复前 record_cap == 0 ⇒ 记录层被饿死（out 只能靠符号层填，
+        //   若并入段条件不满足则为空）。修复后保证记录层至少 1 席。
+        assert!(
+            !out.is_empty(),
+            "★max_out==1 时不得记录层全空（修复前 record_cap==0 ⇒ out 恒空）"
+        );
+    }
+
+    /// ★v0.9.8：`rel_type` 过滤语义——未知类型返回空（**不兜底为全部**）
+    ///
+    /// **为什么这条最重要**：若未知类型被兜底为"全部"，调用方拼错类型名时
+    /// 会**拿到全部边并以为过滤生效**——错误被结果掩盖，是最难发现的一类。
+    #[test]
+    fn test_query_stored_edges_filter_semantics() {
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory(
+                "过滤用例甲：类型名打错不该拿到全部",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "过滤用例乙：区分约束与并列同源",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        assert_ne!(a.id, b.id);
+        assert!(store
+            .add_external_edge(&a.id, &b.id, "coordinate", 0.7)
+            .expect("写入应成功"));
+
+        // 命中的类型（大小写皆可）
+        let hit = store
+            .query_stored_edges(&a.id, Some("COORDINATE"), 1, &None)
+            .expect("应成功");
+        assert_eq!(hit.len(), 1, "大写的 COORDINATE 应能命中");
+        let hit_lower = store
+            .query_stored_edges(&a.id, Some("coordinate"), 1, &None)
+            .expect("应成功");
+        assert_eq!(hit_lower.len(), 1, "小写的 coordinate 也应命中");
+
+        // 不命中但**合法**的类型：返回空
+        let miss = store
+            .query_stored_edges(&a.id, Some("cause"), 1, &None)
+            .expect("应成功");
+        assert!(miss.is_empty(), "cause 与 coordinate 不同类，应为空");
+
+        // 未知类型：必须返回空，不得回退为"全部"
+        let unknown = store
+            .query_stored_edges(&a.id, Some("NOT_A_TYPE"), 1, &None)
+            .expect("应成功");
+        assert!(
+            unknown.is_empty(),
+            "未知 rel_type 必须返回空（不得兜底为全部，否则打错字会被掩盖）"
+        );
+    }
+
+    /// ★v0.9.8：多跳遍历 + γ 衰减 + hops 上限 3
+    #[test]
+    fn test_query_stored_edges_multihop_and_clamp() {
+        let (_dir, mut store) = make_store_with_graph();
+        // 三段链：a -coordinate- b -cause- c（有向：b 引发 c）
+        let a = store
+            .remember(make_test_memory("多跳用例甲：链的起点", MemoryType::Fact))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "多跳用例乙：链的中间节点",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        let c = store
+            .remember(make_test_memory(
+                "多跳用例丙：链的末端节点",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        assert_eq!(
+            [a.id.clone(), b.id.clone(), c.id.clone()]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "前提：三条应是独立记忆（未被合并）"
+        );
+        assert!(store
+            .add_external_edge(&a.id, &b.id, "coordinate", 1.0)
+            .expect("应成功"));
+        assert!(store
+            .add_external_edge(&b.id, &c.id, "cause", 1.0)
+            .expect("应成功"));
+
+        // 1 跳：只有 a-b
+        let h1 = store
+            .query_stored_edges(&a.id, None, 1, &None)
+            .expect("应成功");
+        assert_eq!(h1.len(), 1, "1 跳应只见 a-b，实际 {:?}", h1);
+        assert_eq!(h1[0].hops, 1);
+        assert!((h1[0].weight - 1.0).abs() < 1e-6, "1 跳不衰减");
+
+        // 2 跳：a-b、b-c；b-c 权重按 γ=0.7 衰减
+        let h2 = store
+            .query_stored_edges(&a.id, None, 2, &None)
+            .expect("应成功");
+        assert_eq!(h2.len(), 2, "2 跳应见 2 条边，实际 {:?}", h2);
+        let far = h2.iter().find(|e| e.hops == 2).expect("应有 2 跳边");
+        assert_eq!(far.relation, "cause", "2 跳边应是 b-c（cause）");
+        assert!(
+            (far.weight - 0.7).abs() < 1e-5,
+            "2 跳权重应为 1.0 × 0.7 = 0.7，实际 {}",
+            far.weight
+        );
+        assert_eq!(far.path.len(), 3, "路径应为 [a, b, c]");
+        assert_eq!(far.path[0], a.id, "路径应以查询根开头");
+        assert_eq!(&far.path[2], &c.id, "路径应以本次边的一端结尾");
+
+        // hops 上限 3：传 99 应等价于 3（不报错、不无限扩）
+        let h99 = store
+            .query_stored_edges(&a.id, None, 99, &None)
+            .expect("应成功");
+        assert_eq!(
+            h99.len(),
+            2,
+            "链只有 3 节点 ⇒ 最多 2 条边（clamp 后同 2 跳）"
+        );
+
+        // ★★ 2026-09-18 审查 G7 修复：**clamp 上限必须用足够长的链验证** ★★
+        //
+        // ## 此前的问题
+        //
+        // 上面那条 `h99 == 2` 的断言**证明不了 clamp**：本测试的链只有
+        // 3 节点、最多 2 条边 ⇒ `hops=3`、`hops=5`、`hops=99` 的结果**完全相同**。
+        // 若有人把 `hops.clamp(1, 3)` 误写成 `clamp(1, 30)`，这条断言照样绿
+        // ⇒ clamp 从未真正被验证。
+        //
+        // ## 修法：造 6 节点链（5 条边），使各档位结果**可区分**
+        //
+        //   6 节点 ⇒ 可达边数：hops=1 → 1 条；hops=2 → 2 条；hops=3 → 3 条
+        //   故 `hops=3/5/99` 应同为 3 条，且**若上限被放宽**就会变成 4、5 条
+        let mut chain = Vec::new();
+        // ★内容必须**彼此毫无共同实词**（2026-09-18 实测教训）：
+        //   `remember` 内有相似记忆合并 ⇒ 用「同模板+编号」会被合并成一条
+        //   （初版用 `format!("clamp 链节点 {}：主题为编号{}的独立事项", ...)`
+        //    正是这样失败的）。改用**完全不同的短句**。
+        for (t, ty) in [
+            ("周末去西湖边散步看荷花", MemoryType::Experience),
+            ("数据库连接池最大连接数需要调整", MemoryType::Fact),
+            ("编译报错定位到模板参数不匹配", MemoryType::Decision),
+            ("养一只橘猫需要注意的事项", MemoryType::Experience),
+            ("量子纠缠的物理直觉是什么", MemoryType::Fact),
+            ("下周产品评审会的议程安排", MemoryType::Decision),
+        ] {
+            chain.push(store.remember(make_test_memory(t, ty)).expect("写入应成功"));
+        }
+        assert_eq!(
+            chain
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            6,
+            "前提：六条应是独立记忆（未被合并）"
+        );
+        for i in 0..5 {
+            assert!(store
+                .add_external_edge(&chain[i].id, &chain[i + 1].id, "coordinate", 1.0)
+                .expect("应成功"));
+        }
+
+        let n1 = store
+            .query_stored_edges(&chain[0].id, None, 1, &None)
+            .expect("应成功")
+            .len();
+        let n2 = store
+            .query_stored_edges(&chain[0].id, None, 2, &None)
+            .expect("应成功")
+            .len();
+        let n3 = store
+            .query_stored_edges(&chain[0].id, None, 3, &None)
+            .expect("应成功")
+            .len();
+        let n5 = store
+            .query_stored_edges(&chain[0].id, None, 5, &None)
+            .expect("应成功")
+            .len();
+        let n99 = store
+            .query_stored_edges(&chain[0].id, None, 99, &None)
+            .expect("应成功")
+            .len();
+
+        assert_eq!(n1, 1, "6 节点链：1 跳应 1 条边");
+        assert_eq!(n2, 2, "6 节点链：2 跳应 2 条边");
+        assert_eq!(n3, 3, "6 节点链：3 跳应 3 条边");
+        // ★这两条才是真正的 clamp 断言：链长达 5 条边，若上限没生效会 >3
+        assert_eq!(
+            n5, 3,
+            "★hops=5 必须被 clamp 到 3（链有 5 条边可达，实际 {n5}）"
+        );
+        assert_eq!(n99, 3, "★hops=99 必须被 clamp 到 3（实际 {n99}）");
+        assert_eq!(n3, n5, "★clamp 上方档位结果必须相同");
+        assert_eq!(n5, n99, "★clamp 上方档位结果必须相同");
+
+        // 下限：hops=0 视为 1（"至少一跳"才有意义）
+        let n0 = store
+            .query_stored_edges(&chain[0].id, None, 0, &None)
+            .expect("应成功")
+            .len();
+        assert_eq!(n0, n1, "★hops=0 必须被 clamp 到 1（与 hops=1 结果一致）");
+    }
+
+    /// ★v0.9.8：过滤只作用于**输出**，不阻断遍历
+    ///
+    /// **为什么必须固定这条语义**：`query(a, rel_type=X, hops=2)` 的自然读法是
+    /// "两跳内可达的 X 边"。若过滤同时阻断遍历，末端的 X 边会因**中间边类型不符**
+    /// 而不可达 ⇒ 多跳 + 过滤组合下静默丢结果。
+    #[test]
+    fn test_query_stored_edges_filter_does_not_block_traversal() {
+        let (_dir, mut store) = make_store_with_graph();
+        let a = store
+            .remember(make_test_memory("过滤遍历用例甲：起点", MemoryType::Fact))
+            .expect("写入应成功");
+        let b = store
+            .remember(make_test_memory(
+                "过滤遍历用例乙：中间节点类型不同",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        let c = store
+            .remember(make_test_memory(
+                "过滤遍历用例丙：末端才是目标类型",
+                MemoryType::Fact,
+            ))
+            .expect("写入应成功");
+        assert_eq!(
+            [a.id.clone(), b.id.clone(), c.id.clone()]
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3
+        );
+        // 中间边是 coordinate（非目标类型），末端才是 cause（目标类型）
+        assert!(store
+            .add_external_edge(&a.id, &b.id, "coordinate", 1.0)
+            .expect("应成功"));
+        assert!(store
+            .add_external_edge(&b.id, &c.id, "cause", 1.0)
+            .expect("应成功"));
+
+        let got = store
+            .query_stored_edges(&a.id, Some("cause"), 2, &None)
+            .expect("应成功");
+        assert_eq!(
+            got.len(),
+            1,
+            "应能经 coordinate 中间边到达末端的 cause 边（过滤不得阻断遍历），实际 {:?}",
+            got
+        );
+        assert_eq!(got[0].relation, "cause");
+        assert_eq!(got[0].hops, 2);
+    }
+
+    /// ★v0.9.8：根记忆不存在时返回空（不构造悬空边）
+    #[test]
+    fn test_query_stored_edges_missing_root_returns_empty() {
+        let (_dir, store) = make_store_with_graph();
+        let got = store
+            .query_stored_edges("nonexistent-id", None, 1, &None)
+            .expect("应成功返回");
+        assert!(got.is_empty(), "根不存在时应返回空，实际 {:?}", got);
+    }
+
     /// 创建具有自定义相似度阈值的 MemoryStore（用于合成测试）
     fn make_store_with_threshold(
         threshold: f32,
@@ -1518,6 +3237,155 @@ mod tests {
             .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 3)
             .expect("应成功返回");
         assert_eq!(out.len(), 3, "必须严格遵守 max_out 上限");
+    }
+
+    // ==================== 间接关联（2 跳 · 联想层次，2026-09-17）====================
+
+    /// ★2 跳间接关联必须产出，且带正确的 `hops` 与 `path`
+    ///
+    /// **为什么必须有这个测试**：用户对联想的价值判据是
+    /// 「**告诉我这是第几层能想到的**」。此前 `expand_associations` 只有 1 跳，
+    /// `hops` 恒为 1 ⇒ recall 出口（联想最常用路径）**永远看不到层次**。
+    ///
+    /// **为什么断言 `path` 而不只断言 `hops`**：2 跳的价值在于
+    /// **路径可核**——只给终点，用户无法判断这个跳跃是否合理；
+    /// 若 `path` 长度与 `hops` 不一致，则说明二者口径漂移。
+    #[test]
+    fn test_expand_associations_produces_two_hop_indirect() {
+        let (_dir, mut store) = make_store();
+        // 构造 A(起点) —B(中间)— C(两跳终点)：
+        //   A 与 B 共同经历（ev1）
+        //   B 与 C 共享实体（entity）
+        //   A 与 C **无任何直接记录**（这是"间接"的前提）
+        let ev = "ev-hop";
+        let a = store
+            .remember(
+                make_test_memory("在西湖边走了很久，看了断桥残雪", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+        let mut b_mem = make_test_memory("晚上在楼外楼吃了西湖醋鱼", MemoryType::Experience);
+        b_mem.event_id = Some(ev.to_string());
+        let b = store.remember(b_mem).expect("写入应成功");
+        let mut c_mem = make_test_memory("机组复盘会上讨论了台风季的备件储备", MemoryType::Fact);
+        c_mem.entities = vec![crate::memory_types::EventEntity {
+            name: "楼外楼".to_string(),
+            kind: EntityKind::Place,
+        }];
+        let c = store.remember(c_mem).expect("写入应成功");
+        // B 也要带该实体，才能与 C 建立 shared_entity
+        let mut b2 = b.clone();
+        b2.entities = vec![crate::memory_types::EventEntity {
+            name: "楼外楼".to_string(),
+            kind: EntityKind::Place,
+        }];
+        store.remember(b2).expect("更新应成功");
+
+        assert_ne!(a.id, c.id, "前提：A 与 C 应是不同记忆");
+
+        // 配额 8：1 跳用不完 ⇒ 应追加 2 跳（这是本测试的触发条件）
+        let out = store
+            .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 8)
+            .expect("联想补全应成功");
+
+        // 每条都必须有 `hops` 与 `path`（层次是必备字段）
+        for m in &out {
+            assert!(
+                m.hops >= 1,
+                "`hops` 必须 ≥1，实际 {}（{:?}）",
+                m.hops,
+                m.content_preview
+            );
+            assert_eq!(
+                m.path.len(),
+                m.hops + 1,
+                "`path` 应为 [起点..终点] 共 hops+1 个节点，实际 hops={} path={:?}",
+                m.hops,
+                m.path
+            );
+            assert_eq!(m.path[0], a.id, "path 必须以联想起点开头");
+        }
+
+        // 必须至少有一条 2 跳（否则本功能等于没接）
+        let indirect: Vec<_> = out.iter().filter(|m| m.hops == 2).collect();
+        assert!(
+            !indirect.is_empty(),
+            "★应产出至少一条 2 跳间接关联，实际全部 {:?}",
+            out.iter()
+                .map(|m| (m.hops, &m.content_preview))
+                .collect::<Vec<_>>()
+        );
+        // 2 跳的 relation 必须标为 indirect（与 1 跳的"记录直接成立"显式区分）
+        for m in &indirect {
+            assert_eq!(m.relation, "indirect", "2 跳关系名应为 indirect");
+            assert_eq!(m.path.len(), 3, "2 跳路径应为 3 个节点");
+            assert_eq!(m.path[2], m.memory_id, "路径末节点应是该记忆自身");
+            // why 必须写出两段依据（含具体对象名），否则不可解释
+            assert!(
+                m.why.contains("间接关联") && m.why.contains("→"),
+                "2 跳的 why 应写出两段依据，实际: {}",
+                m.why
+            );
+        }
+    }
+
+    /// ★配额被 1 跳吃满时，**不得**产出 2 跳（保守优先的契约）
+    ///
+    /// **为什么这条是独立契约**：既有 1 跳轮转有 10 个单测锁定行为。
+    /// 若 2 跳会挤占 1 跳的配额，那些测试的构成就会漂移。
+    /// ⇒ 本测试固定"2 跳只在配额有余时追加"这一约定，
+    /// 使"改动前行为逐字节一致"成为可验证的契约而非口头承诺。
+    #[test]
+    fn test_expand_associations_two_hop_never_squeezes_one_hop() {
+        let (_dir, mut store) = make_store();
+        let ev = "ev-squeeze";
+        let a = store
+            .remember(
+                make_test_memory("起点：在西湖边走了很久", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+        let b = store
+            .remember(
+                make_test_memory("同次经历：晚上吃了西湖醋鱼", MemoryType::Experience)
+                    .with_event(Some(ev.to_string())),
+            )
+            .expect("写入应成功");
+        assert_ne!(a.id, b.id, "前提：两条应是独立记忆（未被合并）");
+
+        // 配额恰为 1：应正好出 1 条 1 跳，且**没有** 2 跳
+        let out = store
+            .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 1)
+            .expect("联想补全应成功");
+        assert_eq!(out.len(), 1, "配额 1 应恰好产出 1 条");
+        assert_eq!(
+            out[0].hops, 1,
+            "配额被吃满时不得有 2 跳（2 跳只在配额有余时追加），实际 hops={}",
+            out[0].hops
+        );
+    }
+
+    /// ★`AssociatedMemory` 的 `hops`/`path` 必须向后兼容旧序列化数据
+    ///
+    /// **为什么需要**：这两个字段是 v0.9.8 新增，此前写入的 JSON
+    /// **没有**它们。若反序列化失败，会让既有缓存/接口报错。
+    /// 故两字段都带 `#[serde(default)]`，此处固定该契约。
+    #[test]
+    fn test_associated_memory_deserializes_without_new_fields() {
+        // 模拟旧版本序列化输出（无 hops / path）
+        let legacy = r#"{
+            "memory_id": "m1",
+            "content_preview": "旧数据",
+            "memory_type": "fact",
+            "relation": "same_event",
+            "why": "同一次经历",
+            "via_memory_id": "m0",
+            "via_preview": "起点"
+        }"#;
+        let parsed: AssociatedMemory =
+            serde_json::from_str(legacy).expect("旧格式应能反序列化（向后兼容）");
+        assert_eq!(parsed.hops, 1, "缺省 hops 应为 1（旧数据都是直接关联）");
+        assert!(parsed.path.is_empty(), "缺省 path 应为空");
     }
 
     #[test]
@@ -4257,7 +6125,7 @@ mod tests {
     /// 一条与起点**零重叠**（BGE 给不出）⇒ 后者必须排在前面。
     #[test]
     fn test_expand_associations_prefers_unexpected_first() {
-        let (_dir, store) = make_store();
+        let (_dir, mut store) = make_store();
         // 起点与"常规条"共享大量实词；与"意外条"完全不共享
         let mut seed = make_test_memory(
             "数据库连接池参数调优方案：maxPoolSize 与 idleTimeout 配置",
@@ -4318,7 +6186,7 @@ mod tests {
     /// 顺序会随 HashMap 迭代序漂移 ⇒ 用户两次看到不同联想顺序。
     #[test]
     fn test_unexpected_order_is_deterministic() {
-        let (_dir, store) = make_store();
+        let (_dir, mut store) = make_store();
         let mut seed = make_test_memory(
             "核心主题词：缓存穿透 布隆过滤器 兜底",
             MemoryType::CodeContext,

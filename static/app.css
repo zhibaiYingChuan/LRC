@@ -4749,6 +4749,23 @@ code, pre, .code-block {
   white-space: nowrap;
 }
 
+/* 联想中心·符号层「结构推导」标签（v0.9.8，2026-09-18 补）
+ * 与「记录关联」必须**视觉可辨**：前者是结构算子推导（可能不成立），
+ * 后者是记录必然成立。故用**虚框 + 低饱和**而非实底金色——
+ * 视觉强度即证据强度，不能让推测看起来和事实一样硬。 */
+.association-symbolic-tag {
+  display: inline-block;
+  align-self: flex-start;
+  margin-left: var(--space-2);
+  padding: 1px var(--space-2);
+  font-size: var(--type-body-sm-size);
+  color: var(--lrc-墨韵-300);
+  background: transparent;
+  border: 1px dashed var(--lrc-墨韵-300);
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
 /* ============================================================
  * 设计文档 5.6 / 3.5：基准报告三层测试切换标签（胶囊样式）
  * 背景 宣纸 300，圆角 20px，选中项背景 金色 500，文字 墨韵 900

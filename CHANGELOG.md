@@ -2,6 +2,31 @@
 
 所有重要变更记录。遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.9.9] - 2026-09-19
+
+### 交互可用性修复 + ML 模式下联想探索超时根因 + 符号层接入 UI
+
+- **★修复「每次打开都要手动点启动服务」（用户报告）**：根因是自动启动判据选错了对象——原判据 `wizard.setup_complete`（= **是否走过向导**），而**正常使用根本不需要走向导**（全局模式不选项目目录 ⇒ `project_dir == None`；不用 LLM ⇒ `llm_configured == false`）⇒ 该路径下 `setup_complete` **永远为 false**，自动启动被永久跳过。
+  - **修复**：新增 `WizardState::has_usage_history()`（`setup_complete ∨ 有项目目录 ∨ 配过 LLM ∨ 写过规则 ∨ configured_agents`），判据改为「**是否确有使用痕迹**」。
+  - **实测**：多次杀掉 3111 后重开桌面端，**全部自动拉起、无需手动点击**。
+- **★修复 `action_hints` 自相矛盾（语义反转）**：`HintEscalationTracker::process_hints` 的判据是 `h.severity != "action_required"`，**无条件升级所有非最高级提示，包括 `info` 级**。于是「用户反馈正面率 100.0，**系统输出质量良好**」连续出现后被升级成「**请优先处理**」。
+  - **修复**：只升级 `warning`（`info` = 正常/告知，升级它自相矛盾）；并修正空 `suggested_action` 产生的前导空格。新增 3 条测试 + 1 次负向验证。
+- **★符号层接入 UI（证据性质分离）**：`expand_associations` 会产出**记录层**（记录必成立）与**符号层**（结构推导，可能不成立）两类边，但探索路径把它**一律标成 `source="record"`** ⇒ 前端把符号层推导也渲染成「**记录关联**」，让用户以为必然成立。
+  - **修复**：新增 `explore_source_of()`，复用 `is_symbolic_edge_type()` 判定（**单一事实来源**，避免两处列举漂移）；符号层节点显示「**结构推导**」徽章，带 `hasRecordTag=false`。
+  - **跨语言契约测试**：前端 `SYMBOLIC_RELATIONS` 与后端 `is_symbolic_edge_type` 必须一致（`include_str!("../static/app.js")` 抽取比对）。
+- **★修复「语义旁路超时阶梯」层级错误**：前端 `fetchWithTimeout` 原为 15000ms，与后端外层硬超时**完全相等** ⇒ 前端 abort 与后端超时同时触发，使后端设计好的优雅收敛（10s 预算到点返回 `interrupted=true` / 弱匹配诚实空态）**全部成为不可达代码**。
+  - **修复**：前端提到 30000ms，形成单调阶梯 `10s(内部预算) < 15s(后端外墙) < 30s(前端兜底)`。
+- **★ML 模式下 debug 构建联想探索超时根因（实测确证）**：启用 ML 后 `association-desktop-cdp.js` 由 7/7 掉到 3/7。**决定性对照（同一份代码 + 同一份数据，仅切构建模式）**：release 全部通过（1.95s / 8.83s / 4.82s），debug 则撞 15s 外墙返回 503（10.75s / **15.00s ✗** / **15.05s ✗**）⇒ **非代码缺陷**，而是 Cargo 默认对 dev profile 的**依赖**也用 `opt-level=0`，ML 张量前向慢 2~4 倍。
+  - **修复**：`[profile.dev.package.*]` 只优化 **ML 链路 13 个包**——`candle-core/-nn/-transformers`、`tokenizers`、`hf-hub`，以及**关键但易漏**的 `gemm*`（candle-core 的矩阵乘法后端，前向真正热点）+ `half`。
+  - **为何不用 `[profile.dev.package."*"]`**：那会让 CI 的 dev profile 作业（clippy/test/check）把约 200 个依赖全部重编为优化版，而线上仓库是在线编译的，会拉长 `ci.yml` 作业并可能撞 `timeout-minutes`。收窄后 CI 只需多编 13 个包。
+  - **实测**：补入 `gemm*` 后 `量子物理是什么` 由「仍 503」变为 **9.91s 通过**；三条查询全通过（9.60s / 9.91s / 12.61s）。
+  - **注意**：产品发布走 release（`--release --features server,ml`），release 下本就全部通过；本修复让 **debug 开发环境与 release 行为一致**，避免开发期误判"功能坏了"。
+- **接口与文案修正**：
+  - `explore_timeout` 提示词改准确（原说「降低联想层数」，实际成因是编码慢），加 `retryable: true`，前端补「重试」按钮。
+  - 记忆类型标签全局唯一映射（`synthesis: '结晶知识'`）；原生 `confirm` → `showConfirm`；空值字段整行隐藏；`formatAnyTime()` 兼容 ISO 字符串与时间戳。
+  - `checkEmbedderStatus` 增加运行时 `encoder.mode` 校验，区分「文件就绪」与「正在生效」。
+- **门禁**：`cargo test --features server` **790 passed / 0 failed**；desktop crate **96 passed / 0 failed**；clippy 干净；`check_algorithm_leak.py` 退出码 **0**；CDP 三套件全绿（`cdp-regression` 发布门禁 PASS、`association-desktop-cdp` 7/7、`symbolic-layer-desktop-cdp` 7/7）。
+
 ## [0.9.8] - 2026-09-17
 
 ### 修复「清除联想足迹」无效（隐藏集合）+ 观测器假否证 + 记录链路梳理

@@ -6,7 +6,7 @@
   <!-- 之前完全未配置 CSP，XSS/数据注入防御缺失，HCSE 安全不变量 INV-01 违规 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.openai.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="version" content="0.9.8">
+  <meta name="version" content="0.9.9">
   <!-- v0.9.0 开发模式隔离：注入 sidecar 端口号，前端通过此标签获取正确的 API 端点 -->
   <!-- 开发版默认 3111，稳定版打包时替换为 3099 -->
   <meta name="lrc-sidecar-port" content="3111">
@@ -253,7 +253,11 @@
       </div>
       <div class="af-actions">
         <button class="btn btn-ghost btn-sm" data-action="gotoMemorySearch">查看全部记忆 →</button>
-        <button class="btn btn-ghost btn-sm" data-action="gotoSynthesisHistory">查看结晶历史 →</button>
+        <!-- ★v0.9.9 修复：原按钮文案为「查看结晶历史 →」，但 `#crystallization-timeline`
+             容器在 v0.9.7 首页重构时已从 HTML 移除（`app.js:8310` 读该 id 时直接 return）
+             ⇒ 点击后页面只是滚到「结晶成果」卡，没有任何"历史"，也无提示，
+             用户会以为功能坏了。改文案为「查看结晶成果」以与实际展示一致。 -->
+        <button class="btn btn-ghost btn-sm" data-action="gotoSynthesisHistory">查看结晶成果 →</button>
       </div>
     </section>
 
@@ -420,25 +424,34 @@
       <div class="card-title">
         <img src="/assets/icons/icon-bagua.svg" alt="" width="18" height="18"> 预设场景模板
       </div>
-      <p class="text-sm text-dim mb-4">一键启用场景模板，无需手动设计记忆类型与标签体系。</p>
+      <!-- ★v0.9.9 诚实性修复：原文案为「一键启用场景模板，无需手动设计记忆类型与标签体系」，
+           但后端**尚无场景概念**（`src/` 下 grep `scenario` 零匹配），点击只记录偏好、
+           不改变任何记忆类型/标签/结晶策略。原措辞会让用户以为配置已生效（点了没变化
+           会以为坏了）。改为如实说明当前作用，并指明它影响什么。 -->
+      <p class="text-sm text-dim mb-4">选定一个使用场景，它会作为你记录时的**默认偏好**保存下来。<br>
+        <span class="text-sm text-dim">（当前版本仅记录偏好，尚未自动改写记忆类型与标签体系。）</span></p>
       <div class="preset-scenario-grid" id="preset-scenario-grid">
-        <div class="preset-scenario-card" data-scenario="personal-notes" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="启用预设场景：个人笔记">
+        <div class="preset-scenario-card" data-scenario="personal-notes" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="选择预设场景：个人笔记">
           <div class="preset-scenario-title">个人笔记</div>
           <div class="preset-scenario-desc">灵感、日记、个人知识沉淀</div>
         </div>
-        <div class="preset-scenario-card" data-scenario="project-management" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="启用预设场景：项目管理">
+        <div class="preset-scenario-card" data-scenario="project-management" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="选择预设场景：项目管理">
           <div class="preset-scenario-title">项目管理</div>
           <div class="preset-scenario-desc">决策、会议纪要、任务跟踪</div>
         </div>
-        <div class="preset-scenario-card" data-scenario="learning-assistant" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="启用预设场景：学习助手">
+        <div class="preset-scenario-card" data-scenario="learning-assistant" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="选择预设场景：学习助手">
           <div class="preset-scenario-title">学习助手</div>
           <div class="preset-scenario-desc">知识点、问答、学科分类</div>
         </div>
-        <div class="preset-scenario-card selected" data-scenario="coding-helper" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="启用预设场景：编程助手（默认）">
+        <div class="preset-scenario-card selected" data-scenario="coding-helper" data-action="selectPresetScenario" data-arg-mode="this" role="button" tabindex="0" aria-label="选择预设场景：编程助手（默认）">
           <div class="preset-scenario-title">编程助手</div>
           <div class="preset-scenario-desc">代码决策、偏好、约定（默认）</div>
         </div>
       </div>
+      <!-- ★v0.9.9：补上 `#preset-scenario-info` 容器。
+           此前 `app.js::selectPresetScenario` 会写入该 id，但 HTML 中**不存在**
+           （全仓库仅 app.js 一处引用）⇒ 说明永远不显示，用户点完不知道为什么被点亮。 -->
+      <p class="text-sm text-dim" id="preset-scenario-info" style="display:none;margin-top:8px;"></p>
     </div>
 
     <!-- 「结晶历史时间线」「最近记忆」「项目分布」已并入首屏 M3/M4d，避免重复展示；
@@ -557,7 +570,13 @@
             <span class="memory-filter-tag" data-filter-type="decision">决策</span>
             <span class="memory-filter-tag" data-filter-type="code_context">代码</span>
             <span class="memory-filter-tag" data-filter-type="conversation">对话</span>
-            <span class="memory-filter-tag" data-filter-type="synthesis">合成</span>
+            <!-- ★v0.9.9 修复（交互审计 P1）：补「经历」。
+                 首页「我的记忆资产」构成条形里「经历」是可点击的（会调用
+                 filterMemoriesByType('experience')），但本面板缺该标签
+                 ⇒ 跳转后筛选生效、左侧却**没有任何标签高亮**，
+                 用户看不到当前筛选条件，也无法直观退回。 -->
+            <span class="memory-filter-tag" data-filter-type="experience">经历</span>
+            <span class="memory-filter-tag" data-filter-type="synthesis">结晶知识</span>
           </div>
           <h4>重要性</h4>
           <div class="memory-filter-group" id="filter-importance">
@@ -608,6 +627,10 @@
         <div>
           <h3>联想中心</h3>
           <p class="text-sm text-dim">随便问一句，它帮你想起记过的点点滴滴。</p>
+          <p class="text-sm text-dim" style="margin-top:6px;">
+            <strong>联想</strong>分两类：<strong>记录型关联</strong>（已可用——同一趟行程、共享同一份文件、互相结晶而来）
+            与 <strong>推理型关联</strong>（<em>待建</em>——由因果/时序/约束等逻辑关系推出的连接）。当前展示的是前者。
+          </p>
         </div>
         <span class="association-privacy-note">只在本机进行，数据不上传</span>
       </div>
@@ -1593,15 +1616,22 @@
         </div>
         <div style="background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); border-radius: var(--radius-lg); padding: 20px; text-align: center;">
           <div style="font-size: 2em; font-weight: 700; color: var(--lrc-玉色-600);" id="stat-crystallizations">--</div>
-          <div style="color: var(--lrc-墨韵-500); font-size: 0.9em; margin-top: 4px;">结晶次数</div>
+          <!-- ★v0.9.9 修复（交互审计 P1）：原标签为「结晶次数」，但取值是
+               `dao_metrics.crystallized_memories`（**已结晶的记忆条数**），
+               与「次数」不是一回事 ⇒ 用户会把它读成"结晶发生了 N 次"，
+               与首页 M1「N 条结晶知识」口径冲突。 -->
+          <div style="color: var(--lrc-墨韵-500); font-size: 0.9em; margin-top: 4px;">已结晶记忆（条）</div>
         </div>
         <div style="background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); border-radius: var(--radius-lg); padding: 20px; text-align: center;">
           <div style="font-size: 2em; font-weight: 700; color: var(--lrc-朱砂-600);" id="stat-decays">--</div>
-          <div style="color: var(--lrc-墨韵-500); font-size: 0.9em; margin-top: 4px;">衰减次数</div>
+          <!-- ★v0.9.9：同上。取值为 `memory_stats.expired_memories`（已过期条数），
+               原标签「衰减次数」同样是"数量"被写成"次数"。 -->
+          <div style="color: var(--lrc-墨韵-500); font-size: 0.9em; margin-top: 4px;">已过期记忆（条）</div>
         </div>
         <div style="background: var(--lrc-宣纸-400); border: 1px solid var(--lrc-宣纸-600); border-radius: var(--radius-lg); padding: 20px; text-align: center;">
           <div style="font-size: 2em; font-weight: 700; color: var(--lrc-水蓝-600);" id="stat-syntheses">--</div>
-          <div style="color: var(--lrc-墨韵-500); font-size: 0.9em; margin-top: 4px;">合成次数</div>
+          <!-- 本项取值 `compositions_total` 确实是**次数**，标签正确，保留 -->
+          <div style="color: var(--lrc-墨韵-500); font-size: 0.9em; margin-top: 4px;">合成执行次数</div>
         </div>
       </div>
     </div>
@@ -2342,7 +2372,7 @@
 <footer class="status-bar">
   <div class="status-bar-left">
     <span><span class="status-dot unknown" id="status-dot"></span><span id="status-text" class="status-clickable" title="点击启动 LRC 服务">检测中...</span></span>
-    <span>版本 <strong id="status-version">v0.9.8</strong></span>
+    <span>版本 <strong id="status-version">v0.9.9</strong></span>
   </div>
   <div class="status-bar-right">
     <span>数据目录：<code id="status-data-dir" class="status-clickable" title="点击打开数据目录">--</code></span>
@@ -2421,7 +2451,8 @@
           <option value="code_context">代码上下文</option>
           <option value="conversation">对话</option>
           <option value="experience">经历</option>
-          <option value="synthesis">合成</option>
+          <!-- ★v0.9.9：统一为「结晶知识」（与筛选面板、首页「结晶成果」同口径） -->
+          <option value="synthesis">结晶知识</option>
         </select>
       </div>
       <div class="form-group">

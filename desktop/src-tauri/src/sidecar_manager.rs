@@ -5,7 +5,8 @@
 ///
 /// 生命周期保证：
 ///   - Drop 时自动 kill 所有子进程（防止僵尸进程）
-///   - 启动时等待健康检查通过（总预算最多 40 秒，见 HEALTH_CHECK_TOTAL_BUDGET_SECS）
+///   - 启动时等待健康检查通过（总预算最多 180 秒，见 HEALTH_CHECK_TOTAL_BUDGET_SECS。
+///     v0.9.9 由 40s 放宽：ML 冷启动需加载 390MB 语义模型 + 建索引，40s 会被击穿）
 ///   - 端口自适应：每个 sidecar 自动扫描可用端口
 ///
 /// 默认端口：3099（与 sidecar 默认值一致）。
@@ -54,17 +55,61 @@ const PORT_SCAN_RANGE: u16 = 100;
 // 此前注释称"最多 10 秒"、实现实为"20 轮 × 500ms + 每轮 100 端口串行扫描"、
 // 日志又称"20次/10秒"，三者互相矛盾且均低估真实耗时。现集中定义常量，
 // 注释/实现/日志一律引用它们，杜绝再次漂移。
-/// 健康检查最大轮次（每轮扫描全部端口后 sleep 一次）
-const HEALTH_CHECK_MAX_ATTEMPTS: u32 = 20;
+/// 健康检查最大轮次（每轮**并发**扫描全部端口后 sleep 一次）
+///
+/// ★v0.9.9：20 → **60**。端口扫描改为并发后单轮 ≈ 1s，
+/// 60 轮 × ~1.5s ≈ 90s，与 `HEALTH_CHECK_TOTAL_BUDGET_SECS`（90s）同量级。
+const HEALTH_CHECK_MAX_ATTEMPTS: u32 = 60;
 /// 每轮之间的间隔
 const HEALTH_CHECK_INTERVAL_MS: u64 = 500;
-/// 单次 /health 请求超时
+/// 单次 /health 请求超时（整次请求上限）
 const HEALTH_CHECK_REQUEST_TIMEOUT_SECS: u64 = 2;
+/// 连接建立的独立超时。
+///
+/// ★v0.9.9 新增（真实根因修复的关键一半）：
+/// 本机实测——连接**未监听**的 127.0.0.1 端口需 **~2.05s** 才失败
+/// （不是立即 RST，实测数据见 `HEALTH_CHECK_TOTAL_BUDGET_SECS` 注释）。
+/// 若不单独约束连接阶段，每个"无服务"端口都要吃满 2s，
+/// 100 端口即便并发也会把单轮拖到 ~2s。
+/// 收到 800ms 后单轮 ≈ 0.8s；而 localhost 正常连接实测仅 13ms，
+/// 留 60 倍余量，不会误伤"已就绪但稍慢"的实例。
+const HEALTH_CHECK_CONNECT_TIMEOUT_MS: u64 = 800;
 /// 健康检查总预算（硬上限）：无论轮次与端口扫描如何放大，超过即收敛为 E003。
-/// 取 40s 是为兼容"每轮 100 端口 × 2s 串行"的最坏路径，同时避免拖到分钟级。
-const HEALTH_CHECK_TOTAL_BUDGET_SECS: u64 = 40;
-/// 端口扫描循环内检查取消/超时的粒度（每 N 个端口一次，开销可忽略）
-const HEALTH_CHECK_CANCEL_CHECK_STRIDE: u16 = 10;
+///
+/// ★★v0.9.9 修复：40s → 90s。**注意根因不是 ML 冷启动。**
+///
+/// ## 曾经的误判（已用实测推翻，留档避免重蹈）
+///
+/// 一度把 40s 超时归因为"ML 冷启动要加载 390MB 模型 + 建索引，40s 不够"，
+/// 于是把预算抬到 180s。**该归因经实测证伪**：
+/// 用 `--features server,ml` 的二进制单独冷启动，`/health` 首次 200 仅
+/// **1.5s**（模型加载 + 索引均已完成，`encoder.mode=ml`）。
+/// 即：**ML 冷启动从不是瓶颈**，抬预算只是把症状往后推。
+///
+/// ## 真实根因：端口扫描被"慢失败端口"串行放大
+///
+/// 本机实测（Windows 11 + Hyper-V/WSL 动态端口环境）：
+/// ```text
+/// 连接 127.0.0.1 未监听端口 → ~2.05s 才返回失败（不是立即 RST）
+/// 连接 127.0.0.1:3111（已就绪）→ 13ms
+/// ```
+/// 而 `wait_for_health_static` 的每轮是 **for 循环串行**扫
+/// `PORT_SCAN_RANGE(100)` 个端口，单请求超时 2s ⇒
+/// **单轮最坏 100 × 2.05s ≈ 200s**，早已超出任何预算。
+///
+/// 于是出现"进程明明在 4s 就绑好 3111 了，桌面端却报健康检查超时"：
+/// sidecar 绑定完成时，扫描游标可能已越过 3111 走入 3112..3210 的黑洞区间，
+/// 只能逐个把 2s 超时吃满，等回到 3111 时外层总闸已判失败。
+///
+/// ## 修复（两处合力，见对应常量）
+///
+/// ① `HEALTH_CHECK_CONNECT_TIMEOUT_MS`：把"连接建立"与"整次请求"分离，
+///    黑洞端口 800ms 即放弃 ⇒ 单轮从 ~200s 降到 ~0.8s；
+/// ② 本常量：预算按"并发扫描后的真实单轮耗时"重算——
+///    单轮 ≈ 0.8s + 500ms 间隔 ≈ 1.3s，90s 可覆盖 ~60 轮
+///    （即 sidecar 有 90s 时间完成绑定并接受连接，远超实测 1.5s 需求）。
+/// 上限仍存在（不取消），避免真正卡死时无限等待。
+const HEALTH_CHECK_TOTAL_BUDGET_SECS: u64 = 90;
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1102,16 +1147,22 @@ impl SidecarManager {
     /// 端口自适应扫描：sidecar 可能因端口冲突而绑定到不同端口，
     /// 因此从起始端口开始扫描 PORT_SCAN_RANGE 个端口，找到实际绑定的端口。
     ///
-    /// 超时语义（三者统一，常量见模块头部）：
-    ///   - 轮次：最多 HEALTH_CHECK_MAX_ATTEMPTS(20) 轮，每轮间隔 HEALTH_CHECK_INTERVAL_MS(500ms)；
+    /// 超时语义（四者统一，常量见模块头部）：
+    ///   - 轮次：最多 HEALTH_CHECK_MAX_ATTEMPTS(60) 轮，每轮间隔 HEALTH_CHECK_INTERVAL_MS(500ms)；
     ///   - 单请求：HEALTH_CHECK_REQUEST_TIMEOUT_SECS(2s)；
-    ///   - 总预算：HEALTH_CHECK_TOTAL_BUDGET_SECS(40s) 的共享 deadline 为硬上限，
+    ///   - 连接：HEALTH_CHECK_CONNECT_TIMEOUT_MS(800ms)，独立于整次请求；
+    ///   - 总预算：HEALTH_CHECK_TOTAL_BUDGET_SECS(90s) 的共享 deadline 为硬上限，
     ///     一旦超出立即收敛为 E003（不等待剩余轮次）。
+    ///     （v0.9.9：预算 40s→90s、轮次 20→60；真实根因是端口串行扫描，见常量处说明）
+    ///
     /// v0.9.7 审查修复（P1-1）：旧注释宣称"每 500ms 检查一次，最多尝试 20 次 / 最多 10 秒"，
-    /// 但每轮 attempt 会串行扫描 PORT_SCAN_RANGE(100) 个端口、单请求超时 2s，
-    /// Windows Hyper-V 动态端口保留或"接受 TCP 但不回 HTTP"的服务会把单轮放大到
-    /// ~200s。现以共享 deadline 约束真实上限，并在端口循环内按
-    /// HEALTH_CHECK_CANCEL_CHECK_STRIDE 检查取消标志，保证"取消"和"超时"都真正生效。
+    /// 与实现不符。现已统一为上述四常量，注释/实现/日志一律引用。
+    ///
+    /// ★v0.9.9 根因修复（P1-1 的续修）：P1-1 只用 deadline 约束上限，**没有消除放大源**——
+    /// 每轮仍串行扫 100 端口，本机实测每个"未监听端口"需 ~2.05s 才失败，
+    /// 单轮最坏 ~200s 直接把预算打爆（表现为"sidecar 已绑 3111，桌面端却报超时"）。
+    /// 现改为**并发扫描**（JoinSet）+ **连接超时 800ms**，
+    /// 单轮降到 ~0.8s，并按 offset 取最小端口，保证优先复用起始端口。
     async fn wait_for_health_static(
         child: &mut Child,
         start_port: u16,
@@ -1123,6 +1174,11 @@ impl SidecarManager {
             tokio::time::Instant::now() + Duration::from_secs(HEALTH_CHECK_TOTAL_BUDGET_SECS);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(HEALTH_CHECK_REQUEST_TIMEOUT_SECS))
+            // ★v0.9.9 根因修复：连接阶段单独设短超时。
+            // 本机实测「连接未监听端口需 ~2.05s 才失败」，若不约束，
+            // 并发扫描虽并行，但整轮仍会被最慢端口拖到 ~2s；
+            // 设 800ms 后单轮 ≈ 0.8s，而 localhost 正常连接实测仅 13ms。
+            .connect_timeout(Duration::from_millis(HEALTH_CHECK_CONNECT_TIMEOUT_MS))
             .build()
             .map_err(|e| SidecarStartError::HttpClientError {
                 reason: e.to_string(),
@@ -1210,44 +1266,50 @@ impl SidecarManager {
                 }
             }
 
-            // 端口自适应：从起始端口开始扫描
+            // 端口自适应：并发扫描，避免"慢失败端口"串行放大
+            //
+            // ★v0.9.9 根因修复：原实现是 for 循环串行请求，
+            // 而本机实测「连接未监听端口需 ~2.05s 才失败」，
+            // 100 端口串行 ⇒ 单轮最坏 ~200s，直接把总预算打爆。
+            // 改为并发后单轮 ≈ 单端口耗时（受 connect_timeout 约束），
+            // 且能一次性覆盖整个端口区间，不会像串行那样"游标越过已就绪端口"。
+            let mut probes = tokio::task::JoinSet::new();
             for offset in 0..PORT_SCAN_RANGE {
                 let Some(port) = start_port.checked_add(offset) else {
                     break;
                 };
-                // v0.9.7：细粒度取消/超时检查（按 HEALTH_CHECK_CANCEL_CHECK_STRIDE 个端口一次，
-                // 开销可忽略），避免单个 attempt 内 100 端口串行扫描拖到分钟级
-                if offset % HEALTH_CHECK_CANCEL_CHECK_STRIDE == HEALTH_CHECK_CANCEL_CHECK_STRIDE - 1 {
-                    if cancel_flag.load(Ordering::SeqCst) {
-                        return Err(SidecarStartError::UserCancelled);
-                    }
-                    if tokio::time::Instant::now() >= health_deadline {
-                        break;
-                    }
-                }
-                let health_url = format!("http://127.0.0.1:{port}/health");
+                let probe_client = client.clone();
+                probes.spawn(async move {
+                    let health_url = format!("http://127.0.0.1:{port}/health");
+                    let ok = matches!(
+                        probe_client.get(&health_url).send().await,
+                        Ok(resp) if resp.status().is_success()
+                    );
+                    (offset, port, ok)
+                });
+            }
 
-                match client.get(&health_url).send().await {
-                    Ok(resp) if resp.status().is_success() => {
-                        if offset > 0 {
-                            tracing::info!(
-                                "Sidecar 端口自适应: {} → {} (第{attempt}次尝试)",
-                                start_port,
-                                port
-                            );
-                        }
-                        return Ok(port);
-                    }
-                    Ok(resp) => {
-                        tracing::debug!(
-                            "Sidecar 健康检查 port={port} 第{attempt}/{HEALTH_CHECK_MAX_ATTEMPTS}次: HTTP {}",
-                            resp.status()
-                        );
-                    }
-                    Err(_) => {
-                        // 连接被拒绝，继续尝试下一个端口
-                    }
+            // 按 offset 升序收敛：优先返回最靠近起始端口的健康实例
+            let mut healthy: Vec<(u16, u16)> = Vec::new();
+            while let Some(joined) = probes.join_next().await {
+                // 取消：用户中止时立即停止等待剩余端口
+                if cancel_flag.load(Ordering::SeqCst) {
+                    probes.abort_all();
+                    return Err(SidecarStartError::UserCancelled);
                 }
+                if let Ok((offset, port, true)) = joined {
+                    healthy.push((offset, port));
+                }
+            }
+            if let Some((offset, port)) = healthy.into_iter().min_by_key(|(o, _)| *o) {
+                if offset > 0 {
+                    tracing::info!(
+                        "Sidecar 端口自适应: {} → {} (第{attempt}次尝试)",
+                        start_port,
+                        port
+                    );
+                }
+                return Ok(port);
             }
 
             let end_port = start_port.saturating_add(PORT_SCAN_RANGE.saturating_sub(1));

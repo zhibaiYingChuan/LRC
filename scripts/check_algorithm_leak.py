@@ -93,7 +93,10 @@ def scan_file(filepath: Path, verbose: bool = False) -> list[dict]:
         # 跳过内置联想状态机的公开 API 调用与用户可观察行为注释
         # 状态机实现位于 src/engine/memory_state_machine.rs（受保护层），
         # 此处仅消费公共方法（snapshot/activate），同"道同构度 UI 指标名"白名单
-        if re.search(r'(memory_state_machine|内置道体状态机|联想链（状态机轨迹）)', line):
+        # ★2026-09-18：移除了 `联想链（状态机轨迹）` —— 该文案已从
+        #   src/server.rs 移除（本轮审查确认全仓零匹配）⇒ 规则失效，
+        #   留着只会让"白名单比代码长寿"（下次审计会误以为它还在保护什么）。
+        if re.search(r'(memory_state_machine|内置道体状态机)', line):
             continue
         # 跳过 License 边界门控注释与信号消费声明（产品侧只消费信号、不内置算法）
         if re.search(r'(产品侧只消费不计算|DaoTi License|LRC_DAOTI_NAVIGATE|daoti\s+pilot)', line, re.IGNORECASE):
@@ -105,6 +108,58 @@ def scan_file(filepath: Path, verbose: bool = False) -> list[dict]:
         # P6/CL2 新增同类消费侧契约引用：post_daoti_reflect（explore 后回传 /reflect
         # 的客户端函数）、LRC_DAOTI_REFLECT（回传门控环境变量）——均只消费 JSON 信号
         if re.search(r'(daoti_daemon|DAOTI_SERVICE_URL|fetch_daoti_navigation|post_daoti_reflect|LRC_DAOTI_REFLECT|from daoti|daoti-lexicon-v1|daoti 研究资产)', line, re.IGNORECASE):
+            continue
+        # 跳过 v0.9.8 §4.4 状态机循环的**消费侧**契约引用（同 daoti_daemon 先例）。
+        # daoti_assoc 是独立研究资产服务（temp/daoti_assoc），LRC 仅消费其 JSON：
+        #   · fetch_daoti_cycle / append_daoti_cycle —— 客户端函数与渲染函数
+        #   · LRC_DAOTI_CYCLE                        —— 接入门控环境变量
+        #   · DAOTI_CYCLE_VERSION / daoti-assoc-v1   —— 协议版本协商标识
+        # 不属算法内容：算法（结构算子、卦映射、调度）全在该服务内，不随产品发布。
+        if re.search(r'(daoti_assoc|fetch_daoti_cycle|append_daoti_cycle|DAOTI_CYCLE_VERSION|LRC_DAOTI_CYCLE|daoti-assoc-v1)', line, re.IGNORECASE):
+            continue
+        # v0.9.8 §5.4 写入端（/build_edges）的**消费侧**引用，同上一条先例：
+        #   · fetch_daoti_build_edges / append_daoti_build_edges —— 客户端与渲染函数
+        #   · LRC_DAOTI_BUILD_EDGES / LRC_DAOTI_WRITE_BACK     —— 双层门控
+        # 算法（标卦、结构算子、门控判据）全在独立研究资产进程内，不随产品发布；
+        # 此处仅出现调用与门控名。
+        if re.search(r'(fetch_daoti_build_edges|append_daoti_build_edges|LRC_DAOTI_BUILD_EDGES|LRC_DAOTI_WRITE_BACK)', line, re.IGNORECASE):
+            continue
+        # DAOTI_ALLOW_UNSTABLE_GUA 是**道体侧**的实验开关名。LRC 侧出现它
+        # 仅有两处用途，都不是算法内容：
+        #   ① 断言渲染层把"解封条件"透出（可操作性要求）
+        #   ② 测试用例的字面量
+        # 开关本身的判定逻辑（判据、阈值）在独立研究资产进程内，不随产品发布。
+        if re.search(r'DAOTI_ALLOW_UNSTABLE_GUA', line):
+            continue
+        # 跳过指代**服务本体**的「道体」短语（同「道体预判」「道体再次校验」先例）。
+        # 受保护的是算法（结构算子、卦映射、调度公式），它们全在独立研究资产进程
+        # temp/daoti_assoc 内；此处仅出现服务名/端点/挂起状态等**集成引用**。
+        #
+        # ★★2026-09-18 审查修复：原规则含裸词 `循环` 与 `侧`，两者都会
+        #   放过真算法术语——
+        #     · `道体循环推演公式` / `道体循环的调度权重` ⇒ 被 `循环` 放过
+        #     · `道体侧算法参数: 卦宫宫义 = …`           ⇒ 被 `侧` 放过
+        #   A/B 实测（HEAD 脚本 vs 本脚本扫同一批构造样本）证实这两条
+        #   在修改后由"拦"变"放"。其中 `侧` 更是**纯空转**：
+        #   它在 PUBLIC_FILES（chunker/server/bin-server/lib）里命中 **0 次**
+        #   （唯一出现处 `state_matcher.rs` 不在扫描范围）⇒ 零收益、纯开洞。
+        #   `循环` 也只在 `道体循环结果 → MCP 文本块` 这一处注释里出现，
+        #   属"服务名 + 名词"，用更精确的形态即可覆盖，无需裸词。
+        # ⇒ 修法：删掉 `侧`；把 `循环` 收窄为**必须后接特定名词**的形态
+        #   （`循环结果` / `循环状态` / `循环推演`），使"道体循环推演公式"
+        #   这类真算法术语仍能被拦下。
+        # ★纪律：短语必须精确列出，不得放宽为"包含道体"。
+        if re.search(
+            r'道体(联想服务|端点|挂起|调用|在线|不可达|在响应里|↔|\s*§4\.4|循环(结果|状态))',
+            line,
+        ):
+            continue
+        # 跳过**分区名**「符号层（道体）」（服务名作括注，同"道体再次校验"先例）。
+        # 为什么必须单列而**不能**放宽为 `（道体）`：后者会连 `（道体）推演` 一起放过
+        # ——那是真算法术语。此处要求**整串** `符号层（道体）`（实际出现形式只有
+        # 这一个：三个分区标题常量 + 一处标题清单注释 + 一处接入点注释），
+        # 是"服务名作括注"的最小可识别单元。
+        if re.search(r'符号层（道体）', line):
             continue
         # 跳过 API schema 中 daoti_preview 字段的 description 描述文本
         # （如 "道体写入时预判的六十四卦名称"）—— 契约字段含义，非算法

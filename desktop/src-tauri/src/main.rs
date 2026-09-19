@@ -393,35 +393,66 @@ fn main() {
                 // 自动启动条件：
                 //   1. 桌面端无管理的 sidecar 实例（sidecar_running == false）
                 //   2. 未探测到外部 sidecar（probed 为空或未执行探测）
-                //   3. wizard.setup_complete == true（首次安装不自动启动，引导用户走向导）
+                //   3. **已有使用痕迹**（首次安装不自动启动，引导用户走向导）
+                //      ★v0.9.9 修正：原为 `setup_complete == true`，见下方说明
                 //
                 // 失败处理：
                 //   - 自动启动失败后不重试（与心跳协程的自动恢复不同）
                 //   - 仅发射 sidecar-auto-start-failed 事件，前端显示横幅让用户手动启动
                 // ════════════════════════════════════════════════════════════════
+                // ════════════════════════════════════════════════════════════════
+                // v0.9.9 入口体验修复：自动启动判据改为「**是否确有使用痕迹**」
+                //
+                // ## 修的什么问题
+                //
+                // 用户反馈：「每次打开需要手动点击启动服务」。
+                // 实测实锤（`temp/tauri-dev-run.log` 第 38 行）：
+                //   「[v0.8.16 自动启动] wizard 未完成配置
+                //     （setup_complete=false, file_existed=true），跳过自动启动」
+                // 而同一台机器上记忆库已有 3175 条、AI 规则已写入 4 个工具
+                // —— 用户明显在正常使用，配置**实际可用**，却被判为"未配置"。
+                //
+                // ## 根因：判据选错了对象
+                //
+                // 原判据是 `setup_complete`（**是否走过向导**），但正常使用
+                // 这个应用根本不需要走向导：
+                //   · 全局模式（不选项目目录）⇒ project_dir == None
+                //   · 不用 LLM（纯本地检索）⇒ llm_configured == false
+                // 而 `config_wizard.rs` 的自动迁移恰好要求
+                // `project_dir.is_some() && llm_configured`
+                // ⇒ 该路径下 setup_complete **永远为 false** ⇒ 自动启动被永久跳过。
+                //
+                // ## 修法：判据改为「能否正常工作」
+                //
+                // 用 `has_usage_history()`（走过向导 ∨ 有项目目录 ∨ 配过 LLM
+                // ∨ 写过规则）。**首次安装**（真·全新用户）所有痕迹都为空
+                // ⇒ 仍不自动启动，引导走向导 —— 原有意图完整保留。
+                // ════════════════════════════════════════════════════════════════
                 {
                     let state = monitor_handle.state::<AppStore>();
-                    // 检查 wizard 是否已完成配置（首次安装不自动启动）
-                    // v0.8.21 P0-01 修复（interaction-resilience-auditor）：
-                    //   根因：wizard.json 文件意外丢失时，WizardState::load() 返回默认配置
-                    //         (setup_complete=false)，导致 sidecar 永不自动启动，用户被困
-                    //   修复：wizard.json 不存在时（file_existed=false）兜底视为已完成配置
-                    //         - 首次安装：用户通过向导完成配置后 wizard.json 才会生成
-                    //         - 文件丢失：sidecar 自动启动（全局模式），用户可继续使用
-                    let (setup_complete, file_existed) = {
+                    let (has_usage, setup_complete, file_existed) = {
                         let wizard = state.wizard.lock().await;
-                        (wizard.config().setup_complete, wizard.file_existed)
+                        (
+                            wizard.has_usage_history(),
+                            wizard.config().setup_complete,
+                            wizard.file_existed,
+                        )
                     }; // wizard 锁立即释放
 
-                    // P0-01 兜底：wizard.json 不存在时强制视为已完成配置
-                    let effective_setup_complete = setup_complete || !file_existed;
-                    if !file_existed && !setup_complete {
+                    // P0-01 兜底保持不变：wizard.json 不存在时视为已有使用痕迹
+                    let effective_usage = has_usage || !file_existed;
+                    if !file_existed {
                         tracing::warn!(
-                            "[v0.8.21 自动启动] wizard.json 不存在（file_existed=false），兜底视为已完成配置以避免 sidecar 永不自动启动"
+                            "[v0.9.9 自动启动] wizard.json 不存在（file_existed=false），兜底视为已有使用痕迹以避免 sidecar 永不自动启动"
+                        );
+                    }
+                    if effective_usage && !setup_complete {
+                        tracing::info!(
+                            "[v0.9.9 自动启动] setup_complete=false 但检测到使用痕迹（全局模式/未配 LLM 的正常路径），仍自动启动"
                         );
                     }
 
-                    if effective_setup_complete {
+                    if effective_usage {
                         // 再次检查 sidecar 是否已在运行（probe 可能已检测到外部 sidecar）
                         let sidecar_running = {
                             let sidecar = state.sidecar.lock().await;

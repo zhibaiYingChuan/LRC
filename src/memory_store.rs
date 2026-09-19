@@ -62,7 +62,7 @@ use crate::engine::synthesis_journal::SynthesisJournal;
 use crate::engine::user_feedback::{
     AffectedMemoryInfo, ImplicitSignal, MemoryGraphQuery, UserFeedback,
 };
-use crate::graph_store::{EdgeType, GraphMemoryStore};
+use crate::graph_store::{EdgeType, GraphMemoryStore, MemoryEdge};
 use crate::memory_types::{DecayConfig, EntityKind, Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::{AssocFrequency, Persistence, PersistenceError};
 
@@ -140,6 +140,19 @@ const HUB_ENTITY_DF_RATIO: f32 = 0.20;
 /// 取值 5：低于 5 条记忆共享的实体，其关联对最多 C(4,2)=6 对，
 /// 规模上不构成"噪声淹没信号"的问题，无需过滤。
 const HUB_ENTITY_MIN_DF: usize = 5;
+
+/// 间接关联（2 跳）的**中间节点数上限**
+///
+/// **用途**：`expand_associations` 的第二层从"已补入的 1 跳结果"里挑中间节点
+/// 再走一步。若不限制中间节点数，每个 1 跳结果都要做一次
+/// `associations_in`（每次含全库遍历 + 查表），会被放大成
+/// `max_out × O(全库)`。
+///
+/// **取值 3**：与 `max_out` 的默认量级（server 侧 `ASSOCIATION_EXPAND_MAX = 3`）
+/// 对齐 —— 中间节点数不超过"起点数"，避免第二层的成本超过第一层。
+/// 这是**成本约束**而非质量阈值：中间节点再多也只是产出更多候选，
+/// 而配额（`max_out`）决定了最终留下几条。
+const INDIRECT_MID_MAX: usize = 3;
 
 /// 判定某实体是否为 hub（过于泛化、关联无区分度）
 ///
@@ -623,8 +636,84 @@ pub(crate) fn relation_label(relation: &str) -> &'static str {
         "crystallized_into" => "被结晶为",
         "evolved_from" => "被更新过",
         "indirect" => "间接关联",
+        // ═══ ★符号层（§5.3 逻辑关系）标签（2026-09-18 修 S5）═══
+        //
+        // ## 此前的问题
+        //
+        // 符号层边经 `/external-edge` 落图后，会在 `expand_associations`
+        // 的并入段被读回并渲染。但那段用的是**本表**，而本表当时没有
+        // 这 5 个键 ⇒ 全部落到兜底 `"相关联"` ⇒ 用户拿到一条**无法分辨
+        // 是因果、时序还是约束**的联想。
+        //
+        // 更矛盾的是：同一轮里作者在 `server.rs` 明确写过
+        //   「不能复用 relation_label：那是**记录层**标签表，
+        //     符号层的 CONSTRAINT/COORDINATE 撞进去会全部落到兜底值
+        //     『相关联』，把类型信息抹平。两张表语义不同，必须分开。」
+        // 并为此新写了 `structural_rel_label` —— 但它只用在了 MCP 的
+        // `/cycle`、`/build_edges` 两个**写入端回显**分区上，
+        // **真正落图并进入 recall 的那条路没接上**。
+        //
+        // ## 修法：把符号层键并入本表，而非让调用方换函数
+        //
+        // 为什么并入而不是"让调用方改用 structural_rel_label"：
+        //   · `relation` 字段存的是**小写**（`EdgeType::as_str()`），
+        //     而 `structural_rel_label` 的键是**大写**（COORDINATE/…）
+        //     ⇒ 直接换函数会**全部失配**（这是上一轮已有的隐患）。
+        //   · 本表已是"关系名 → 中文标签"的**唯一**通用入口，
+        //     分散成两表就还会再有第三处漏接。
+        //   ⇒ 保留 `structural_rel_label` 供大写输入（道体响应直接回显），
+        //     本表覆盖小写输入（图存储读出），两者标签文案**逐字一致**。
+        "cause" => "因果",
+        "temporal" => "时序",
+        "constraint" => "相错（约束）",
+        "facilitate" => "变爻（促成）",
+        "coordinate" => "相综/互卦（协同）",
         _ => "相关联",
     }
+}
+
+/// 该图边类型是否属于**符号层（§5.3 逻辑关系）**。
+///
+/// 用途：`expand_associations` 的落盘边并入段据此**分区**（2026-09-18 修 S4）。
+/// 为什么需要：图里有三类来源不同的边，混在一起会混淆证据性质：
+///   · 图存储内生（系统推断）：`contradicts` / `evolves` / `synthesizes_from` / `related_to`
+///   · 记录层（记录事实）：`same_event` 等 7 类
+///   · 符号层（结构推导）：`cause` / `temporal` / `constraint` / `facilitate` / `coordinate`
+pub(crate) fn is_symbolic_edge_type(rel: &str) -> bool {
+    matches!(
+        rel,
+        "cause" | "temporal" | "constraint" | "facilitate" | "coordinate"
+    )
+}
+
+/// 该图边类型是否属于**记录层**（记录事实）。
+///
+/// # 生产调用方
+///
+/// `expand_associations` 的**落图段**用它做白名单：只把记录层关系写进图。
+/// （语义上那段就是"记录层关系图化"；符号层边有自己的写入口
+/// `/v1/memories/external-edge`，且是**从图里读出来**的，不该再写回。）
+///
+/// # 与 [`is_symbolic_edge_type`] 一起构成「图边三来源」的完整分类
+///
+///   · 图存储内生（系统推断）：`contradicts` / `evolves` / `synthesizes_from` / `related_to`
+///     —— 上述两个判定都返回 `false`（**不属于**记录层/符号层）
+///   · 记录层（记录事实）：本函数返回 `true`
+///   · 符号层（结构推导）：[`is_symbolic_edge_type`] 返回 `true`
+///
+/// 该分类由 `test_edge_type_three_source_taxonomy_is_exhaustive` 断言
+/// **穷尽且互斥**（新增 `EdgeType` 变体若忘记归类会当场变红）。
+pub(crate) fn is_record_edge_type(rel: &str) -> bool {
+    matches!(
+        rel,
+        "same_event"
+            | "same_event_auto"
+            | "shared_entity"
+            | "shared_artifact"
+            | "derived_from"
+            | "crystallized_into"
+            | "evolved_from"
+    )
 }
 
 /// 数据契约类型重导出（v0.9.7，GLOBAL_CODE_REVIEW_REPORT P2-2「MemoryStore God Object」）
@@ -634,7 +723,7 @@ pub(crate) fn relation_label(relation: &str) -> &'static str {
 /// `use crate::memory_store::*` 调用方**零改动**。
 pub use crate::memory_store_types::{
     AssociatedMemory, AssociationGraph, GraphEdge, GraphNode, ListFilter, MemoryAssociation,
-    MemoryStats, RecallFilter, RecallResult, RegulatorHeartbeat, SortBy, SortOrder,
+    MemoryStats, RecallFilter, RecallResult, RegulatorHeartbeat, SortBy, SortOrder, StoredEdge,
     SynthesisSnapshot,
 };
 
@@ -1710,6 +1799,36 @@ impl<P: Persistence> MemoryStore<P> {
         self.cache.invalidate();
     }
 
+    /// 确保缓存有效（脏则从持久层重载），**不做任何克隆**
+    ///
+    /// 供只读元信息查询使用（如"某 ID 是否存在"）——这类调用不需要
+    /// `Memory` 本体，只需缓存处于可用状态。
+    fn ensure_cache_loaded(&self) -> Result<(), PersistenceError> {
+        if self.cache.is_dirty() {
+            let loaded = self.persistence.load_all_memories()?;
+            self.cache.store(loaded);
+        }
+        Ok(())
+    }
+
+    /// 判断指定 ID 的记忆是否存在（v0.9.8 审查 G6 修复引入）
+    ///
+    /// 与 `memories_by_ids(&[id]).len() == 1` 等价，但**不克隆记忆本体**：
+    /// 后者会走 `load_cached()` → `snapshot()`（整库深拷贝）再过滤，
+    /// 在逐条调用的存在性校验路径上是纯浪费。
+    ///
+    /// # 为什么返回 `Result` 而非 `bool`
+    ///
+    /// 初版写成"出错即 `false`"，但那是**静默降级**：磁盘故障与"该 ID 确实
+    /// 不存在"会得到同一个结果，而两者对调用方的含义完全不同——前者是
+    /// 系统故障（应上报），后者是**正常的业务过滤**（宁缺勿错，静默跳过）。
+    /// 把故障伪装成业务拒绝，排查时看到的是"边被规则拒了"，而无从知道
+    /// 持久层不可读。故错误**必须**向上传播（与原来的 `load_cached()?` 一致）。
+    pub fn has_memory_id(&self, id: &str) -> Result<bool, PersistenceError> {
+        self.ensure_cache_loaded()?;
+        Ok(self.cache.contains_id(id))
+    }
+
     /// 按 ID 集合只读取出记忆（P7 主动发现构造探索查询用）。
     ///
     /// 语义：纯读，不做过滤/排序/写回。`ids` 为空时返回空列表。
@@ -1789,6 +1908,305 @@ impl<P: Persistence> MemoryStore<P> {
     pub fn with_graph_store(mut self, graph_store: GraphMemoryStore) -> Self {
         self.graph_store = Some(graph_store);
         self
+    }
+
+    /// 图存储的只读访问（v0.9.8：测试与诊断用）
+    ///
+    /// 生产路径不需要它——图由 `expand_associations` 内部写入。
+    /// 暴露只读引用是为了让测试能**直接断言图的真实内容**，
+    /// 而不是只断言返回值（返回值写图失败时仍可能正确，
+    /// 只断言返回值会让"图化失效"静默通过）。
+    pub fn graph_store_ref(&self) -> Option<&GraphMemoryStore> {
+        self.graph_store.as_ref()
+    }
+
+    /// 测试用：可变访问图存储，以便**直接写入特定类型的边**。
+    ///
+    /// **为什么必须可变访问**（与 `graph_store_ref` 同理由，2026-09-18 补）：
+    /// 有些边类型**无法经生产路径构造**——例如 `Evolves` /
+    /// `SynthesizesFrom` / `Contradicts` / `RelatedTo` 由图存储内生的
+    /// 合成/冲突链路产出，而 `add_external_edge` 又（正确地）拒绝它们
+    /// ⇒ 若不给测试直写图的口子，就无法验证"这些边不得冒充记录型关联"。
+    ///
+    /// **为什么只给测试**：生产代码**不应**绕过 `add_external_edge` 的白名单
+    /// 直写图（那正是 S3 要防的）。故此处显式标注 `_for_test` 并仅由单测调用。
+    #[cfg(test)]
+    pub fn graph_store_mut_for_test(&mut self) -> Option<&mut GraphMemoryStore> {
+        self.graph_store.as_mut()
+    }
+
+    /// 写入一条**外部推导的**关系边（v0.9.8，承《记忆联想系统设计文档》§5.4）
+    ///
+    /// # 用途
+    ///
+    /// 道体联想服务（`temp/daoti_assoc`）由结构算子（互/错/综/变）产出候选关系，
+    /// 经 HTTP 回传后由本方法落入图。这是 §5.4「候选命中 → 生成边」的写入端。
+    ///
+    /// # 与 `expand_associations` 内建写入的区别（不可混同）
+    ///
+    /// | | `expand_associations` 内建 | 本方法 |
+    /// |---|---|---|
+    /// | 边来源 | **记录层事实**（event_id/entities/source_ids） | **结构算子推导**（道体） |
+    /// | 证据性质 | 记录必然成立 | 推导，可能不成立 |
+    /// | rel_type | 7 类记录层关系 | 5 类逻辑关系（§5.3） |
+    ///
+    /// 两者写入同一张图，但 `rel_type` 不同 ⇒ 消费方可按类型区分证据强度。
+    ///
+    /// # 参数
+    /// - `from_id` / `to_id`：两端记忆 ID。**必须都已存在于记忆库**，
+    ///   否则边指向不存在的记忆（悬空边），消费时会查到空节点。
+    /// - `rel_type`：§5.3 的关系名（大小写皆可，见 `EdgeType::from_relation_str`）
+    /// - `weight`：置信度 0~1（超出会被 clamp）
+    ///
+    /// # 返回
+    /// `Ok(true)` 表示新写入；`Ok(false)` 表示已存在（去重）或校验不通过被跳过。
+    /// 校验不通过**不报错**——外部推导的候选本就允许被过滤（宁缺勿错）。
+    pub fn add_external_edge(
+        &mut self,
+        from_id: &str,
+        to_id: &str,
+        rel_type: &str,
+        weight: f32,
+    ) -> Result<bool, PersistenceError> {
+        // 解析关系类型：★走**外部白名单**（只接受 §5.3 五类逻辑关系）。
+        //
+        // 为什么不能用通用的 `from_relation_str`（2026-09-18 修 S3）：
+        //   通用解析器接受**全部 12 类**，包括记录层的 `same_event`——
+        //   那是"知情者断言"、证据最强（relation_priority=0、权重 1.0），
+        //   且会经 expand_associations 进入 recall 并被渲染为"由记录推导、
+        //   必然成立"。若外部可写，任意本机进程都能把两条真实记忆伪造成
+        //   "同一次经历"，用户看到的是最高证据等级的**假事实**。
+        //   本方法文档上方也明写"5 类逻辑关系"，故这是**实现向注释对齐**。
+        let Some(etype) = EdgeType::from_external_rel_str(rel_type) else {
+            return Ok(false);
+        };
+        // 自环无信息量
+        if from_id == to_id {
+            return Ok(false);
+        }
+        // ★两端必须都是**已知记忆**：防悬空边（图里出现指向不存在记忆的边，
+        //   消费方按图取节点会得到空，用户看到"关联到空"）
+        //
+        // ★★ 2026-09-18 审查 G6 修复：不再用 `load_cached()` ★★
+        //
+        // ## 此前的问题
+        //
+        // 原实现 `let all = self.load_cached()?` 会**深拷贝整库**
+        // （`MemoryStoreCache::snapshot()` 是 `Vec<Memory>::clone()`），
+        // 然后再 `all.iter().any(...)` 线性查两个 ID。
+        //
+        // 而本端点的设计用途是**批量回传候选边**
+        // （`max_out_per_seed × max_seeds` 可达 48 条），
+        // 且调用方是逐条 HTTP 回传 ⇒ 每条边一次全库克隆 = **O(N×M)**。
+        // 在真实库（4500+ 条）上会放大成明显的内存抖动与锁持有时间。
+        //
+        // ## 修法：用只查存在性的 `has_memory_id`（无克隆）
+        //
+        // 语义完全等价（都只判断 ID 是否存在），但不复制任何 `Memory`。
+        // 实现见 `MemoryStoreCache::contains_id`（直接遍历缓存借用，不取副本）。
+        // ★返回 `Result`：持久层不可读时**照旧向上报错**（不降级成 false——
+        //   那会把"磁盘故障"伪装成"该边被规则拒绝"，两者处置完全不同）。
+        if !self.has_memory_id(from_id)? || !self.has_memory_id(to_id)? {
+            return Ok(false);
+        }
+        let Some(ref mut graph) = self.graph_store else {
+            return Ok(false); // 未启用图存储：静默跳过（图是增强能力）
+        };
+        let before = graph.edge_count();
+        graph.add_edges_batch(&[(
+            from_id.to_string(),
+            to_id.to_string(),
+            etype,
+            weight.clamp(0.0, 1.0),
+        )])?;
+        Ok(graph.edge_count() > before)
+    }
+
+    /// 从图存储**直读**关系边（v0.9.8，补文档 §6 #4 的读通路）
+    ///
+    /// # 为什么需要它（实测缺口，2026-09-17）
+    ///
+    /// `graph_store` 此前**只有写入方、没有读出口**：
+    ///   · `/memories/association-graph` → 走 `associations_in`（内存记录层推导），
+    ///     **完全不读 `graph_store`**
+    ///   · `/memories/associations` → 同上
+    /// ⇒ `add_external_edge` 写进去的 §5.3 逻辑关系边**无人能读出**。
+    /// 实测证据：写入 `coordinate` 边后，`graph_edges.json` 里确有此边，
+    /// 但 `association-graph` 的返回中看不到它（见 `temp/daoti_assoc/probe_read_gap.py`）。
+    /// 本方法即补这个读出口，使 §5.4「候选命中 → 生成边 → 可检索」闭环成立。
+    ///
+    /// # 与 `association_graph` 的分工（互补，非替代）
+    ///
+    /// | | `association_graph` | 本方法 |
+    /// |---|---|---|
+    /// | 读什么 | 记录层**当场推导**（event_id/entities/source_ids） | 图里**已落盘**的边 |
+    /// | 含 2 跳路径合成 | 是（带 `why` 可读路径） | 否（只走真实边，每跳有据） |
+    /// | 含 §5.3 逻辑关系 | 否 | **是** |
+    ///
+    /// 两者回答不同问题："为什么这两条相关"（前者）vs "图里有哪些已确立的关系"（后者）。
+    ///
+    /// # 参数
+    /// - `memory_id`：起点。**必须已存在**，否则返回空（不构造悬空边）。
+    /// - `rel_type`：按关系名过滤（大小写皆可，走 `EdgeType::from_relation_str`）；
+    ///   `None` = 不过滤。**未知类型返回空**（不兜底为"全部"——
+    ///   调用方打错字时若拿到全部边，会误以为过滤生效）。
+    /// - `hops`：最大跳数，**上限 3**（承 §6 #4 契约）。传 0 按 1 处理。
+    ///
+    /// # 返回值
+    /// 按 `weight` 降序排列（同权按 `hops` 升序）。多跳边的 `weight` 已按
+    /// `γ^hop` 衰减（γ=0.7，承 §4.5），故跨跳比较权重是有意义的。
+    ///
+    /// # 可见性
+    /// 边**两端都必须是当前可见的记忆**才返回——否则图里会漏出
+    /// 用户无权看到的记忆 ID（隐私红线，与 `associations_in` 的 `visible`
+    /// 过滤同等严重）。任一端不可见 ⇒ 整条边不返回。
+    pub fn query_stored_edges(
+        &self,
+        memory_id: &str,
+        rel_type: Option<&str>,
+        hops: usize,
+        privacy: &Option<(PrivacyLevel, Option<String>, Option<String>)>,
+    ) -> Result<Vec<StoredEdge>, PersistenceError> {
+        // §6 #4 契约：hops ≤ 3。0 视为 1（"至少一跳"才有意义）
+        let max_hops = hops.clamp(1, 3);
+        let all = self.load_cached()?;
+        let Some(root) = all.iter().find(|m| m.id == memory_id) else {
+            return Ok(Vec::new()); // 根不存在：无图可言
+        };
+        // ★可见性判定必须与检索路径**同口径**（2026-09-18 审查 G1 修复）
+        //
+        // ## 此前的问题
+        //
+        // 本函数只调 `is_visible`（**仅隐私三级**），**不查 `is_expired`**。
+        // 而 `Memory::is_expired` 的 TTL 语义是"过期即应消失"——
+        // recall / list / stats 都已把它排除，本端点却仍能读出其 ID、
+        // 关系、权重与创建时间 ⇒ **同一份数据两种可见性口径**。
+        //
+        // 而本函数自己的文档还写着"边**两端都必须是当前可见的记忆**才算
+        // 可见"——实现与文档不一致（同 S7 的一类问题）。
+        //
+        // ## 为什么抽成闭包（而非两处各写一遍）
+        //
+        // 下面是"根 + 每个对端"两处判定。若各写一遍，将来加过滤项
+        // （如新增某种可见性维度）会漏改其一 —— 承「同一套规则复用谓词，
+        // 不另写一份」的既有纪律（`expand_associations` 的 `visible` 闭包
+        // 就是这么写的）。
+        let visible = |m: &Memory| -> bool {
+            if m.is_expired() {
+                return false;
+            }
+            is_visible(m, privacy)
+        };
+        if !visible(root) {
+            return Ok(Vec::new());
+        }
+        let by_id: std::collections::HashMap<&str, &Memory> =
+            all.iter().map(|m| (m.id.as_str(), m)).collect();
+        let Some(graph) = self.graph_store.as_ref() else {
+            return Ok(Vec::new()); // 未启用图存储：降态为空（图是增强能力）
+        };
+
+        // 过滤函数：None = 不过滤；Some(未知名) = 空（不回退为"全部"）
+        let want: Option<EdgeType> = match rel_type {
+            None => None,
+            Some(s) => match EdgeType::from_relation_str(s) {
+                Some(t) => Some(t),
+                // 类型名无法识别 ⇒ 直接空结果，避免"打错字却拿到全部边"
+                None => return Ok(Vec::new()),
+            },
+        };
+
+        // ---- BFS（沿无向邻接遍历，但保留每条边的原始方向）----
+        //
+        // 邻接表按**无向**建：`query_edges` 的语义是"与此记忆相关的边"，
+        // 方向不参与"能不能走到"。边的原始方向在产出时由 `edge.source_id`
+        // 还原（见下），故遍历无向不会丢失方向信息。
+        let mut adj: std::collections::HashMap<&str, Vec<&MemoryEdge>> =
+            std::collections::HashMap::new();
+        for e in graph.all_edges() {
+            adj.entry(e.source_id.as_str()).or_default().push(e);
+            adj.entry(e.target_id.as_str()).or_default().push(e);
+        }
+
+        let mut out: Vec<StoredEdge> = Vec::new();
+        let mut seen_edges: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        // 已访问节点：防止在多跳里绕回，也避免同一节点被两条路径重复展开
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        visited.insert(root.id.as_str());
+        // 本层待展开：(节点ID, 迄今为止的路径)
+        let mut frontier: Vec<(String, Vec<String>)> =
+            vec![(root.id.clone(), vec![root.id.clone()])];
+
+        // §4.5 多跳衰减系数 γ = 0.7
+        const GAMMA: f32 = 0.7;
+
+        for hop in 1..=max_hops {
+            if frontier.is_empty() {
+                break;
+            }
+            let mut next: Vec<(String, Vec<String>)> = Vec::new();
+            for (cur_id, path) in &frontier {
+                let Some(edges) = adj.get(cur_id.as_str()) else {
+                    continue;
+                };
+                for e in edges.iter() {
+                    // 同一条边在一轮里只产出一次（避免 A→B 与 B→A 重复）
+                    if !seen_edges.insert(e.id.as_str()) {
+                        continue;
+                    }
+                    let Some(other) = by_id.get(if e.source_id == *cur_id {
+                        e.target_id.as_str()
+                    } else {
+                        e.source_id.as_str()
+                    }) else {
+                        continue; // 悬空边（对端记忆已删除）：跳过
+                    };
+                    // ★可见性：任一端不可见 ⇒ 整条边不返回（隐私红线）
+                    //   与根同一套规则（含 is_expired，见上方闭包说明）
+                    if !visible(other) {
+                        continue;
+                    }
+                    let etype_str = e.edge_type.as_str();
+                    // ★过滤只作用于**输出**，不阻断遍历：
+                    //   `query(node, rel_type=coordinate, hops=2)` 的语义是
+                    //   "两跳内可达的 coordinate 边"，而非"只经由 coordinate 边走"。
+                    //   若在此 `continue`，长跳的匹配边会因中间边类型不符而不可达。
+                    // 注：此处用 `map_or` 而非 `is_none_or`（Rust 1.82+），
+                    // 项目 MSRV 为 1.80（与 memory_store.rs 内既有注释同纪律）。
+                    let matched = want.as_ref().map_or(true, |t| e.edge_type == *t);
+                    let mut p = path.clone();
+                    p.push(other.id.clone());
+                    if matched {
+                        out.push(StoredEdge {
+                            // 原始方向取自落盘边，与遍历方向无关
+                            from: e.source_id.clone(),
+                            to: e.target_id.clone(),
+                            relation: etype_str.to_string(),
+                            weight: e.weight * GAMMA.powi(hop as i32 - 1),
+                            symmetric: e.edge_type.is_symmetric(),
+                            hops: hop,
+                            path: p,
+                            created_at: e.created_at.clone(),
+                        });
+                    }
+                    if visited.insert(other.id.as_str()) {
+                        let mut np = path.clone();
+                        np.push(other.id.clone());
+                        next.push((other.id.clone(), np));
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        // 权重降序；同权按跳数升序（近的更可信）
+        out.sort_by(|a, b| {
+            b.weight
+                .partial_cmp(&a.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.hops.cmp(&b.hops))
+        });
+        Ok(out)
     }
 
     /// 计算 Jaccard 词集相似度
@@ -2094,41 +2512,6 @@ impl<P: Persistence> MemoryStore<P> {
         Ok(None)
     }
 
-    /// 尝试执行递归合成（在写入新记忆后调用）
-    ///
-    /// 扫描记忆库，找到所有满足条件的记忆簇，为每个簇生成合成记忆。
-    /// 如果簇中已有合成记忆（通过 source_ids 判断），则跳过该簇。
-    ///
-    /// 返回本次新生成的合成记忆数量。
-    pub fn try_synthesize(&mut self) -> Result<usize, PersistenceError> {
-        // v0.6.0+ 参赛扩展：探索日志埋点（synthesize 事件）
-        let synthesize_start = std::time::Instant::now();
-
-        let result = self.synthesis_engine.try_synthesize(
-            &self.persistence,
-            &mut self.graph_store,
-            &mut self.dao_metrics,
-        );
-
-        // v0.6.0+ 参赛扩展：探索日志记录（synthesize 事件）
-        if let Ok(synthesized_count) = &result {
-            self.exploration_logger.log(
-                crate::engine::exploration_log::ExplorationEventType::Synthesize,
-                serde_json::json!({
-                    "engine": "jaccard",
-                    "synthesized_count": synthesized_count,
-                }),
-                Some(crate::engine::exploration_log::Metrics {
-                    latency_ms: Some(synthesize_start.elapsed().as_millis() as u64),
-                    result_count: Some(*synthesized_count),
-                    ..Default::default()
-                }),
-            );
-        }
-
-        result
-    }
-
     /// 合成快照（三阶段锁解耦·Phase 1）：持锁下快速读取全量记忆 + 配置
     ///
     /// 仅做磁盘读取，不执行 CPU 密集的聚类计算，锁持有时间极短。
@@ -2261,8 +2644,19 @@ impl<P: Persistence> MemoryStore<P> {
     /// v0.5.4 运行待处理的合成任务（从关键路径移出，由后台调用）
     ///
     /// 检查 `synthesis_pending` 标记，如果为 true 则执行合成并清除标记。
-    /// 此方法设计为从健康检查、定时任务或后台线程中调用，
-    /// 避免合成操作阻塞用户的记忆写入/检索请求。
+    ///
+    /// ## ★当前接线状态（2026-09-18 审查核实，修正过期注释）
+    ///
+    /// 本方法**当前无生产调用方**（仅单测调用）。原注释称"由健康检查调用"，
+    /// 但实际 `server.rs` 的 `memory_stats` / `system_health` 两个 handler
+    /// **都不调用它**——原因是 v0.9.1 三阶段锁解耦后，`synthesis_pending`
+    /// 标记改由**后台结晶流水线**消费（见 `consolidation.rs` 的三阶段合成：
+    /// 成功后置 `false`、取消/失败则保留以便重试）。
+    ///
+    /// ⇒ 这是**遗留兼容入口**，不是死代码：它封装了"CAS + 委托 luoshu_synthesize"
+    ///   这一在同进程内触发合成的语义，`benchmark.rs` 走的 `luoshu_synthesize`
+    ///   是它的无 CAS 版本。**是否删除待定**（删除会连带影响 5 个单测），
+    ///   故本轮**只修正注释**，不改行为。
     ///
     /// v0.8.48 P0 修复：使用 AtomicBool + compare_exchange 确保
     /// 多个后台任务并发调用时，合成恰好执行一次（Leader Election 模式）。
@@ -3017,7 +3411,7 @@ impl<P: Persistence> MemoryStore<P> {
                 similar.is_some()
             );
         }
-        let mut result = if let Some(existing) = similar.as_ref() {
+        let result = if let Some(existing) = similar.as_ref() {
             // 合并标签（去重）
             let mut merged_tags = existing.tags.clone();
             for tag in &memory.tags {
@@ -3089,30 +3483,48 @@ impl<P: Persistence> MemoryStore<P> {
                 merged.importance = memory.importance;
             }
 
-            // 自动建立冲突关系边（Section 3.3 冲突解决）
+            // 自动建立冲突/演进关系边（Section 3.3 冲突解决）
+            //
+            // ★★ 2026-09-18 审查 G4 修复：两处改动 ★★
+            //
+            // ## 1. 从 `?` 传播改为「显式告警 + 不阻断」
+            //
+            // 此前这里用 `?` 传播（`graph.add_edge(...)?`），与
+            // `expand_associations` 里写图用的**静默**策略**互相矛盾**：
+            // 同一种失败（图写盘失败）在一条路径上让用户操作失败、
+            // 在另一条上静默 ⇒ 同仓库两套纪律，后来者无法判断哪条是规范。
+            //
+            // ⇒ 统一为「图是增强能力，写图失败不阻断主操作，但**必须发声**」
+            //   （与 `forget` 清理边、`expand_associations` 落图的处置一致）。
+            //
+            // ## 2. ★写图移到**记忆落盘之后**（修一个真实的悬空边风险）
+            //
+            // 原顺序是「先写图 → 再 `save_memory`」。而 `Contradicts` 边先写成功后，
+            // 若 `Evolves` 边失败并 `?` 返回，**`save_memory` 根本不会执行**
+            // ⇒ 图里留下一条**指向不存在记忆的边**（因为合并后的记忆从未落盘）。
+            // 这正是 `add_external_edge` 花大力气用 `by_id` 防御的悬空边，
+            // 却被写路径**自己制造**出来。
+            //
+            // ⇒ 顺序改为「先落盘记忆，再写图」：记忆一定存在，边不会悬空。
+            //   实现上把这批边**收集起来**，在 `save_memory` 之后统一写。
+            let mut pending_edges: Vec<(EdgeType, f32)> = Vec::new();
             if self.graph_store.is_some() {
                 let jaccard = self.compute_jaccard(&old_content, &merged.content);
-                if let Some(ref mut graph) = self.graph_store {
-                    // 内容实质不同的合并 → Contradicts 边（需要后续解决）
-                    if jaccard < 0.9 {
-                        // 相似但不等同 → 可能是矛盾或演进
-                        let _ = graph.add_edge(
-                            &memory.id,
-                            &existing.id,
-                            EdgeType::Contradicts,
-                            jaccard,
-                        );
-                    }
-                    // 内容更新 → Evolves 边
-                    let _ = graph.add_edge(&memory.id, &existing.id, EdgeType::Evolves, jaccard);
+                // 内容实质不同的合并 → Contradicts 边（需要后续解决）
+                if jaccard < 0.9 {
+                    // 相似但不等同 → 可能是矛盾或演进
+                    pending_edges.push((EdgeType::Contradicts, jaccard));
                 }
+                // 内容更新 → Evolves 边
+                pending_edges.push((EdgeType::Evolves, jaccard));
             }
 
-            merged
+            (merged, pending_edges)
         } else {
-            // 无冲突，正常写入
-            memory
+            // 无冲突，正常写入（无待写边）
+            (memory, Vec::new())
         };
+        let (mut result, pending_edges) = result;
 
         // 洛书编码 + 八卦分类（透明地附加到每条记忆）
         {
@@ -3131,6 +3543,32 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 统一在编码和分类完成后持久化一次，避免单条写入重复重写整个 JSON。
         self.persistence.save_memory(&result)?;
+
+        // ★★ 图边写入放在**记忆落盘之后**（2026-09-18 审查 G4 修复）
+        //
+        // **为什么不放在前面**：若先写边再落盘，一旦落盘失败（或中间的
+        // 边写入失败并中断），图里就会留下**指向不存在记忆的边**——正是
+        // `add_external_edge` 用 `by_id` 防御的悬空边。现在记忆一定已落盘，
+        // 边不可能悬空。
+        //
+        // **失败策略**：显式告警、**不阻断**（图是增强能力；且此处记忆
+        // 已经保存成功，再返回错误会让用户误以为"没记住"——那是更严重的误导）。
+        if !pending_edges.is_empty() {
+            if let Some(existing) = similar.as_ref() {
+                if let Some(ref mut graph) = self.graph_store {
+                    for (etype, weight) in &pending_edges {
+                        if let Err(e) =
+                            graph.add_edge(&result.id, &existing.id, etype.clone(), *weight)
+                        {
+                            eprintln!(
+                                "[LRC-GRAPH] ⚠ 记忆已保存，但写入 {:?} 边失败（该关系将缺失）：{}",
+                                etype, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if let Some(existing) = similar.as_ref() {
             self.replace_memory_in_index(existing, &result);
         } else {
@@ -4257,6 +4695,35 @@ impl<P: Persistence> MemoryStore<P> {
                 self.remove_memory_from_index(old);
             }
             self.mark_cache_dirty_preserving_index();
+            // ═══ ★清理该记忆在图上的边（2026-09-18 审查 G3 修复）═══
+            //
+            // **修的是什么**：图此前**只增不减**——`remove_edge` / `clear`
+            // 定义存在但**零生产调用**，而 forget 也不触碰图 ⇒ 已删除记忆的边
+            // **永久残留**为"悬空边"。消费侧只能靠 `by_id.get()` 查不到而跳过，
+            // 即每轮检索都为死边付出一次遍历+判空，成本随生命期单调增长。
+            //
+            // **为什么放这里（而非让调用方自己清）**：删除记忆是**唯一**使边
+            // 失效的事件，把它与"清理其边"放在同一处，才不会漏（承
+            // 「生命周期事件与其清理必须同处」）。
+            //
+            // **失败策略：显式告警但不阻断**（与 `expand_associations` 写图的
+            // 静默策略一致——图是增强能力，删记忆这个主操作不该因图失败而失败）。
+            // 但**不能静默**：残留边会持续占用遍历成本，用户需要知道。
+            if let Some(ref mut graph) = self.graph_store {
+                match graph.remove_edges_of_memory(id) {
+                    Ok(n) if n > 0 => {
+                        eprintln!("[LRC-GRAPH] 已随记忆删除清理 {} 条关联边（id={}）", n, id);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        // 不阻断：记忆本体已删除成功；但必须发声
+                        eprintln!(
+                            "[LRC-GRAPH] ⚠ 记忆已删除，但其关联边清理失败（将残留为悬空边）: {}",
+                            e
+                        );
+                    }
+                }
+            }
         }
         Ok(result)
     }
@@ -4559,7 +5026,11 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// **必须做成"一次算全库"而非"逐条算"**：分组需要先按 (项目, 小时桶)
     /// 聚合并算时间跨度——逐条计算会退化为 O(N²)。故本函数一次遍历建表，
-    /// 供 [`Self::associations_in_with_auto`] 以 O(1) 查表。
+    /// 供 [`Self::associations_in`] 以 O(1) 查表。
+    ///
+    /// ★2026-09-18 修正悬空引用：原文指向 `Self::associations_in_with_auto`，
+    /// 但该函数**全仓不存在**（已合并进 `associations_in` 的 `auto_events` 参数）
+    /// ⇒ 读者按图索骥会找不到实现。改为实际消费方 `associations_in`。
     ///
     /// **⭐ 批量写入必须排斥**（见 [`AUTO_EVENT_MIN_SECS_PER_MEMORY`]）：
     /// 实测坏桶（脚本导入/测试注入）的时间戳**集中在几秒内**，桶内内容
@@ -5087,8 +5558,15 @@ impl<P: Persistence> MemoryStore<P> {
     /// - `exclude`：需要排除的"已在结果中"的 ID 集合
     /// - `filter`：**复用检索的过滤条件**（隐私/项目/类型/标签/重要性）
     /// - `max_out`：补入上限（防大簇把输出撑爆）
+    ///
+    /// # 为什么是 `&mut self`（v0.9.8 改）
+    ///
+    /// 本方法现在会把产出的关系**写入图存储**（见函数尾部），故需可变借用。
+    /// 三个生产调用点均已持有 `&mut MemoryStore`（server 的 recall 在
+    /// `spawn_blocking` 内持锁、`run_association_explore` 形参即 `&mut`），
+    /// 故此次签名变更不引入新的锁竞争。
     pub fn expand_associations(
-        &self,
+        &mut self,
         seed_ids: &[String],
         filter: &RecallFilter,
         max_out: usize,
@@ -5106,6 +5584,67 @@ impl<P: Persistence> MemoryStore<P> {
         // 已在结果中的记忆：不再作为联想补入（否则是重复，不是联想）
         let exclude: std::collections::HashSet<&str> =
             seed_ids.iter().map(|s| s.as_str()).collect();
+
+        // ═══ ★★ 为符号层边**预留席位**（2026-09-18 审查 G5a 修复）★★ ═══
+        //
+        // ## 实测结论（`docs/G5A_QUOTA_COMPETITION_MEASUREMENT.md`）
+        //
+        // 配额（`max_out`，默认 3）原先的分配顺序是：
+        //   记录层 1 跳 → 记录层 2 跳 → **符号层落盘边**（最后）。
+        //
+        // 真实库副本实测（11 组样本）：
+        //
+        //   | 记录层 1 跳产出 | 样本 | 符号层读回 | 读回率 |
+        //   |---|---|---|---|
+        //   | ≥3 条（配额吃满） | 10 | 0 | **0%** |
+        //   | <3 条（配额有余） | 1 | 1 | **100%** |
+        //
+        // ⇒ **完美分离**（排除"边没加载/可见性/种子不匹配"等替代解释），
+        //   且**记录层 ≥3 条的概率 = 10/11 = 91%**
+        // ⇒ 符号层边在真实 recall 中**可读回率 ≈ 0%**，即"接了等于没接"。
+        //
+        // ## 原注释的假设被实测否定
+        //
+        // `memory_store.rs` 原注释称「只有配额有余（**真实 recall 的常见情形**）
+        // 才出现 2 跳」——实测"有余"仅 **9%**（1/11），与"常见"相反。
+        //
+        // ## 修法：条件式预留（关键在"条件式"）
+        //
+        // 若种子节点在图上**确有**可读的边（记录层或符号层），
+        // 则把**记录层**可用配额压到 `max_out - 1`，给落盘边留 ≥1 席。
+        //
+        // ## 修法：为符号层边预留席位（关键在"条件式"）
+        //
+        // 若种子节点在图上**确有符号层边**，则把**记录层**可用配额压到
+        // `max_out - 1`，给那些边留 ≥1 席。
+        //
+        // **为什么必须"确有边"才预留**：若无收益而仍压缩记录层配额，
+        // 就是**白白少产出 1 条**——拿既有能力换一个空的承诺。
+        // 故只在真有待读的边时才压缩，其余情形与改动前**逐字节一致**
+        // ⇒ 既有配额/轮转/2 跳测试不受影响。
+        //
+        // ## ★★ 为什么只看**符号层**边（而非"记录层 ∪ 符号层"）
+        //
+        // 这一点由 `test_symbolic_edges_get_reserved_seat_under_quota_pressure`
+        // 实测逼出：初版把"记录层类型"也算作"有待读的边"，结果
+        // **并入段把 `same_event` 从图里又读回来一条**，反而挤掉了符号层边。
+        //
+        // 根因是一个**冗余**：
+        //   · 图里的**记录层边**全部是 `expand_associations` 自己写的
+        //     （S3 修复后，外部写入已只允许符号层类型）
+        //   · 而 `associations_in` **每次都从记忆数据重新算出**同样的关系
+        //   ⇒ 把记录层边从图里读回来，是**纯冗余**（同一关系出现两次来源）
+        //
+        // 而符号层边是**唯一**记录层产出不了的（`cause`/`temporal`/
+        // `constraint`/`facilitate`/`coordinate` 由结构算子推导，
+        // 由图外的道体服务经 `/external-edge` 写入）
+        // ⇒ 并入段只需负责读这一类。
+        // ═══ ★预留判据执行位置：见下方 `visible` 闭包**之后** ═══
+        //
+        // （2026-09-18 审查修复：原实现在此处计算 `has_symbolic_edges`，
+        //  但此处 `by_id` / `visible` 尚未就绪 ⇒ 判据只能看出"一端是种子
+        //  且是符号层边"，比并入段实际的门槛**宽**，会造成"预留了席位却
+        //  并入 0 条"⇒ 净损失 1 条记录层联想。现移到判据可复用的位置。）
 
         // hub 实体一次性统计（与详情页关联同口径，见 `hub_entity_set`）
         let hub_set = self.hub_entity_set(&all);
@@ -5149,6 +5688,43 @@ impl<P: Persistence> MemoryStore<P> {
             }
             true
         };
+
+        // ═══ ★★ 符号层落盘边的席位：**后置让位**（2026-09-18 审查修复）★★ ═══
+        //
+        // ## 为什么不预压缩记录层配额（前两版都错在这里）
+        //
+        // v1（原始）：判据只要求"一端是种子 ∧ 符号层类型" ⇒ 比并入段实际门槛宽
+        //   ⇒ 会出现"预留了席位却并入 0 条"⇒ 净损失 1 条记录层联想。
+        // v2（本审查初版）：试图让预留判据复用并入段的四道门槛
+        //   （`exclude` / `seen` / `by_id` / `visible`）。
+        //   **实测失败**（由 `test_unreadable_symbolic_edge_must_not_reserve_seat`
+        //   当场抓出）：其中 **`seen` 在预留决策时根本不存在**——它是记录层
+        //   边跑边填的集合，而预留发生在记录层**之前** ⇒ 逻辑上不可能复用
+        //   （循环依赖）。于是"对端会被记录层先取走"这一破绽无法预先排除。
+        //
+        // ## 修法：把决策**推到事后**（后置让位）
+        //
+        // 不再预先压缩配额，改为：
+        //   ① 记录层按 `max_out` 正常产出（行为与改动前**逐字节一致**）
+        //   ② 并入段把可读的符号层边收进**独立缓冲** `sym_merged`
+        //   ③ 全部并入完成后，才按 `max_out` 上限让位：每并入 1 条，
+        //      从 `out` **尾部**弹掉 1 条（此时 `out` 只含记录层条目
+        //      ⇒ 弹掉的一定是记录层条目）
+        //
+        // ## 为什么这版三条不变量同时成立
+        //
+        //   · **无收益必无损失**：并入 0 条 ⇒ 让位 0 次 ⇒ 记录层拿满配额
+        //     （不再有"空的承诺"）
+        //   · **有收益才让位**：`seen`/`by_id`/`visible` 的真实结果在并入时
+        //     已知，无需预估 ⇒ 不会空占席位
+        //   · **不饿死记录层**：`max_out == 1` 时记录层照常产出 1 条
+        //     （v1 的 `record_cap = 0` 饿死问题连带消失）
+        //
+        // ## 附带收益：去掉一次 O(E) 全图扫描
+        //
+        // 旧实现在函数开头无条件扫全图判断 `has_symbolic_edges`，
+        // 而探索路径会按节点重复调用本方法（深度≤4 × 宽度≤3）
+        // ⇒ 放大为 O(深度 × 宽度 × E)。后置让位不需要这次预扫描。
 
         let mut out: Vec<AssociatedMemory> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -5239,6 +5815,10 @@ impl<P: Persistence> MemoryStore<P> {
         'rounds: for round in 0..max_rounds {
             for (seed, seed_preview, channels) in &per_seed {
                 for channel in channels {
+                    // ★记录层按 `max_out` **正常**产出（不预压缩配额）：
+                    //   预压缩会造成"预留了席位却并入 0 条" ⇒ 净损失 1 条。
+                    //   符号层边的席位改为**后置让位**（见函数尾部并入段），
+                    //   行为与改动前逐字节一致（见上方说明）。
                     if out.len() >= max_out {
                         break 'rounds;
                     }
@@ -5267,9 +5847,381 @@ impl<P: Persistence> MemoryStore<P> {
                         why: a.why.clone(),
                         via_memory_id: seed.clone(),
                         via_preview: seed_preview.clone(),
+                        // ★1 跳 = 直接记录关联（起点 → 此记忆）
+                        hops: 1,
+                        path: vec![seed.clone(), a.memory_id.clone()],
                     });
                 }
             }
+        }
+
+        // ═══ 第二层：间接关联（2 跳，v0.9.8 §5.4 / 用户指引"第几层"）═══
+        //
+        // # 为什么必须补这一层（2026-09-17）
+        //
+        // 用户对联想的价值判据是「**告诉我这是第几层能想到的**」。
+        // 但 `expand_associations` 此前**只有 1 跳**，`hops` 恒为 1，
+        // 而 recall 是联想最常用的出口 ⇒ 用户永远看不到"层次"。
+        //
+        // 同一件事在别处已实现（口径不一致）：
+        //   · `association_graph`（联想中心）：2 跳，带 `path`/`hops`/`via`
+        //   · `query_stored_edges`（stored-edges 读端）：1~3 跳，带 `hops`/`path`
+        //   · **本方法（recall 出口）：1 跳，无层次** ← 补的就是这个缺口
+        // 且 `association_graph` 的文档明确写着「多跳推理是"**推理**"而非"匹配"」
+        // ⇒ recall 出口缺这一层，等于最常用的路径上没有"推理"。
+        //
+        // # 为什么只做 2 跳（与 `association_graph` 同口径，非新阈值）
+        //
+        // 承 `association_graph` 的既有纪律：3 跳及以上会迅速膨胀，且
+        // 「A 与 B 同经历、B 与 C 同经历」**推不出**「A 与 C 同经历」
+        // ⇒ 2 跳是"信息量与可靠性"的平衡点。此处**不引入新参数**。
+        //
+        // # 为什么放在 1 跳轮转**之后**（保守优先）
+        //
+        // 既有 1 跳轮转有 12 个单测锁定（配额公平、多维覆盖、意外性优先……）。
+        // 若把 2 跳混进轮转，会改变这些测试的输出顺序与构成。
+        // ⇒ 设计为「1 跳先用配额，**配额有余时**才追加 2 跳」：
+        //    · 配额被 1 跳吃满时，行为与改动前**逐字节一致**
+        //    · 只有配额有余（真实 recall 的常见情形）才出现 2 跳
+        //
+        // # 依据的来源
+        //
+        // 中间节点取自**本次已补入的 1 跳结果**（`out` 的前若干条），
+        // 而不是全库任意节点 ⇒ 路径的每一段都由记录保证成立，
+        // 且中间节点必然**可见**（已在 `out` 里过了一道 `visible`）。
+        //
+        // 每个中间节点连**它自己的起点与首跳关系**一起取出，
+        // 这样 `why` 与 `path` 都能写出完整两段，不留空占位。
+        if out.len() < max_out {
+            let mid_candidates: Vec<(String, String, String, String, String)> = out
+                .iter()
+                .take(INDIRECT_MID_MAX)
+                .map(|a| {
+                    (
+                        a.memory_id.clone(),
+                        a.content_preview.clone(),
+                        a.via_memory_id.clone(),
+                        a.via_preview.clone(),
+                        a.relation.clone(),
+                    )
+                })
+                .collect();
+
+            'outer: for (mid_id, mid_preview, seed_id, seed_preview, first_rel) in &mid_candidates {
+                if out.len() >= max_out {
+                    break;
+                }
+                let Some(mid_mem) = by_id.get(mid_id.as_str()) else {
+                    continue;
+                };
+                // 从中间节点再走一步（复用同一套记录层规则，不重写）
+                let step2 =
+                    Self::associations_in(&all, mid_id, &hub_set, &auto_events, &artifact_tabs);
+                // 组内按「意外性优先」排序（与 1 跳同口径：BGE 给不出的先给）
+                let mid_words = content_words(&mid_mem.content);
+                let mut step2_sorted = step2;
+                step2_sorted.sort_by(|x, y| {
+                    let sx = word_jaccard(&mid_words, &content_words(&x.content_preview));
+                    let sy = word_jaccard(&mid_words, &content_words(&y.content_preview));
+                    sx.total_cmp(&sy)
+                });
+                for b in step2_sorted {
+                    if out.len() >= max_out {
+                        break 'outer;
+                    }
+                    // 排除：已在召回结果中 / 已补入 / 回到中间节点自身
+                    if exclude.contains(b.memory_id.as_str())
+                        || b.memory_id == *mid_id
+                        || !seen.insert(b.memory_id.clone())
+                    {
+                        continue;
+                    }
+                    let Some(target) = by_id.get(b.memory_id.as_str()) else {
+                        continue;
+                    };
+                    if !visible(target) {
+                        continue;
+                    }
+                    out.push(AssociatedMemory {
+                        memory_id: b.memory_id.clone(),
+                        content_preview: b.content_preview.clone(),
+                        memory_type: target.memory_type.as_str().to_string(),
+                        // 关系名标为 `indirect`：与 1 跳的"记录直接成立"**显式区分**
+                        relation: "indirect".to_string(),
+                        // why 写出**两段的真实依据**（承 §3.49.2：必须含具体对象名，
+                        // 只写"间接关联"而不写经由什么 => 不可解释）
+                        why: format!(
+                            "间接关联（2 跳）：由「{}」—{}→ 「{}」—{}→ 此记忆",
+                            seed_preview.chars().take(30).collect::<String>(),
+                            relation_label(first_rel),
+                            mid_preview.chars().take(30).collect::<String>(),
+                            relation_label(&b.relation),
+                        ),
+                        via_memory_id: mid_id.clone(),
+                        via_preview: mid_preview.clone(),
+                        hops: 2,
+                        // 路径：起点 → 中间 → 终点（用户据此判断这个跳跃是否合理）
+                        path: vec![seed_id.clone(), mid_id.clone(), b.memory_id.clone()],
+                    });
+                }
+            }
+        }
+
+        // ═══ 记录层关系图化（v0.9.8）═══
+        //
+        // **为什么在这里写**：`out` 是本次检索**实际采用**的关联（已过可见性
+        // 过滤、已按配额截断），正是用户能看到的那部分关系。把它落图，
+        // 图的内容与用户看到的内容一致；若改用 `associations_in` 的全量产出，
+        // 图里会含**用户无权看到**的边（隐私红线，与 `visible` 过滤同等严重）。
+        //
+        // **为什么失败静默**：图是增强能力，写图失败（磁盘满/权限）不应
+        // 让检索本身失败——联想是附加价值，主结果必须照常返回。
+        //
+        // **注意对称关系去重**：`expand_associations` 从每个 seed 出发产出，
+        // A→B 与 B→A 都会出现；`add_edges_batch` 内按 ID 字典序规范化，
+        // 故这里直接传原样即可，无需在此判重。
+        //
+        // ═══ ★★ 2026-09-18 审查断链 #2 修复：只写**记录层**边 ★★ ═══
+        //
+        // ## 此前的问题（两处，都不报错）
+        //
+        // ① **符号层边被冗余写回**：`out` 现在也含符号层边（并入段从图里读出来的），
+        //    而它们**本来就在图里** ⇒ 写回是无用功。后果虽轻（`add_edges_batch`
+        //    按 (source,target,type) 去重，不会重复计数、也不覆盖权重），
+        //    但让"图化"的来源统计含混：读进来的边又被当成"本次产出"写一遍。
+        //
+        // ② **`evolved_from` 落图永不可达**：它是**自指**关系
+        //    （`memory_id == anchor.id`，见 `associations_in` ⑤），
+        //    故此处构造出的边两端相同 ⇒ 在 `add_edges_batch` 里撞上
+        //    `if s == t { continue }` 被**静默丢弃**。
+        //    即：每次 recall 都白构造一条边、传下去、无声丢掉。
+        //
+        // ## 修法
+        //
+        // ① 用**白名单** `is_record_edge_type` 而非黑名单 `!is_symbolic`：
+        //    本段的语义定义就是"**记录层**关系图化"（见上方小节标题），
+        //    白名单让实现与注释对齐（承 S3 的修法原则）。
+        //    新增符号层类型时忘加白名单不会漏写记录层边——
+        //    因为符号层边**本就不该**由本段写入（它有自己的写入口
+        //    `/v1/memories/external-edge`）。
+        // ② 显式跳过自指，并**说明为什么**——避免下一位读者以为漏了 `evolved_from`。
+        if let Some(ref mut graph) = self.graph_store {
+            let mut pending: Vec<(String, String, EdgeType, f32)> = Vec::with_capacity(out.len());
+            for a in &out {
+                // ★只写记录层：符号层边已在图中（本段是从图里读出来的）
+                if !is_record_edge_type(&a.relation) {
+                    continue;
+                }
+                // ★自指关系（`evolved_from`）无法在图里表达：图的边是"两端之间的关系"，
+                //   而它是"这条记忆自身被更新过"——信息在 `version_history` 里，
+                //   已由 `associations_in` 直接渲染进 `why`，不依赖图。
+                //   ⇒ 显式跳过（而非靠 `add_edges_batch` 静默丢弃）。
+                if a.via_memory_id == a.memory_id {
+                    continue;
+                }
+                let Some(etype) = EdgeType::from_relation_str(&a.relation) else {
+                    // 未知关系名不落图：宁缺勿错（把未知关系硬塞进已知类型
+                    // 会让用户读到错误的关系语义）
+                    continue;
+                };
+                // 权重取自证据强度：priority 越小证据越强 ⇒ 权重越大。
+                // 与 `relation_priority` 同源，避免两处各定一套强度口径。
+                let prio = Self::relation_priority(&a.relation) as f32;
+                pending.push((
+                    a.via_memory_id.clone(),
+                    a.memory_id.clone(),
+                    etype,
+                    1.0 / (1.0 + prio),
+                ));
+            }
+            if !pending.is_empty() {
+                let _ = graph.add_edges_batch(&pending);
+            }
+        }
+
+        // ═══ ★符号层边并入（v0.9.8，2026-09-18）═══
+        //
+        // **修的是什么**：上面那段只把记录层关系**写**进图，但本次检索
+        // **从不读**图。实测取证（`grep query_stored_edges src/server.rs`
+        // → 零匹配）：符号层（§5.3 逻辑关系 cause/temporal/constraint/
+        // facilitate/coordinate）经 `/v1/memories/external-edge` 落图后，
+        // **再也没有任何路径能把它们带回检索结果**——写进去就沉底了。
+        //
+        // ⇒ 这使 §5.4 的闭环（候选命中 → 生成边 → **可检索**）缺最后一环。
+        //   本节补上：把种子节点在图上的既有边读出来并入 `out`。
+        //
+        // **为什么放在写图之后**：先写后读，本次产出的记录层边也能
+        // 在**同一次检索**里被读到（否则新边要等下次检索才可见）。
+        //
+        // **为什么必须过滤可见性**：图里可能有用户无权看到的记忆 ID
+        //（边由外部服务写入，不经过检索的 visible 过滤）。任一端不可见
+        // ⇒ 整条边不并入，与 `query_stored_edges` 内部的隐私红线同口径。
+        //
+        // ═══ ★★ 为符号层边**预留席位**（2026-09-18 审查 G5a 修复）★★ ═══
+        //
+        // ## 实测结论（`docs/G5A_QUOTA_COMPETITION_MEASUREMENT.md`）
+        //
+        // 配额（`max_out`，默认 3）的分配顺序是：记录层 1 跳 → 2 跳 → 符号层。
+        // 实测（真实库副本，11 组样本）：
+        //
+        //   | 记录层 1 跳产出 | 样本 | 符号层读回 | 读回率 |
+        //   |---|---|---|---|
+        //   | ≥3 条（配额吃满） | 10 | 0 | **0%** |
+        //   | <3 条（配额有余） | 1 | 1 | **100%** |
+        //
+        // ⇒ **完美分离**，且**记录层 ≥3 条的概率 = 10/11 = 91%**
+        // ⇒ 符号层边在真实 recall 中**可读回率 ≈ 0%**，即"接了等于没接"。
+        //
+        // 而代码原来的假设（`memory_store.rs:5553` 注释）
+        // 「只有配额有余（**真实 recall 的常见情形**）才出现」**被实测否定**：
+        // 配额有余仅 **9%**（1/11），与"常见"相反。
+        //
+        // ## 修法：为符号层预留席位（v1 的预留版本已被 v3 替换）
+        //
+        // ★v3（2026-09-18 审查修复）：**后置让位**。本段不再受"记录层已压缩
+        //   配额"的恩惠（记录层现在拿满 `max_out`），而是把可读的符号层边先收进
+        //   `sym_merged` 缓冲，全部并入完成后，再按 `max_out` 上限从 `out`
+        //   **尾部**（纯记录层条目）等量让位。
+        //   ⇒ 并入 0 条则让位 0 次（无收益必无损失）；有并入才让位（不空占席位）。
+        let mut sym_merged: Vec<AssociatedMemory> = Vec::new();
+        if let Some(graph) = self.graph_store.as_ref() {
+            // 只取种子节点**直接相邻**的边：多跳留给下次检索，
+            // 避免一次检索把所有可达节点都拉进来（CP 成本 + 淹没主结果）。
+            let seed_set: std::collections::HashSet<&str> =
+                seed_ids.iter().map(|s| s.as_str()).collect();
+            for e in graph.all_edges() {
+                // ★v3：本段不再受 `out` 剩余配额限制（席位由**后置让位**保证）。
+                //   但仍设上限 `max_out`，防一次并入过多把输出撑爆。
+                if sym_merged.len() >= max_out {
+                    break;
+                }
+                // 边必须**一端是种子**、另一端是**其他记忆**
+                let (from_id, to_id) = if seed_set.contains(e.source_id.as_str()) {
+                    (e.source_id.as_str(), e.target_id.as_str())
+                } else if seed_set.contains(e.target_id.as_str()) {
+                    (e.target_id.as_str(), e.source_id.as_str())
+                } else {
+                    continue;
+                };
+                let rel = e.edge_type.as_str();
+                // ═══ ★证据性质过滤（2026-09-18 修 S4）═══
+                //
+                // ## 此前的问题
+                //
+                // 本段此前**只按"一端是种子"筛选，不看边类型** ⇒ 把图里
+                // **系统推断**的边（`contradicts` / `evolves` /
+                // `synthesizes_from` / `related_to`）也当作"记录型关联"
+                // 输出。而渲染分区冠名是「**由记录推导**、非语义相似」，
+                // 用户会把推断当成**记录必然成立的事实**。
+                //
+                // 实测证据：生产样本 `graph_edges.json` 里 14 条边**全部**是
+                // `evolves`(12) + `synthesizes_from`(2)，无一条外部/记录层边
+                // ⇒ 该分区在实际数据上会被纯推断边占满。
+                //
+                // ## ★★ 顺序至关重要：类型过滤必须**先于** `seen` 去重
+                //
+                // 初版把本过滤放在 `seen.insert` **之后**，结果实测失败：
+                //   第一条是 `evolves`（应被过滤）→ 但它已把 `to_id` 插进
+                //   `seen` ⇒ 随后同一目标的 `cause`（应被并入）撞上
+                //   `!seen.insert(...)` 被 **误丢** ⇒ 联想结果全空。
+                //
+                // ⇒ 这类"被过滤的边**占用**了去重名额"是隐蔽的顺序 bug：
+                //   它只在"同一目标上既有应过滤边、又有应保留边"时暴露，
+                //   单看代码不易发现（本次由 `test_expand_associations_
+                //   excludes_system_inferred_edges` 实测抓出）。
+                //
+                // ## 为什么必须排除（而非"标注一下就行"）
+                //
+                // `graph_store.rs` 已按来源把边分三组，并注明第一组
+                // 「语义是**系统推断**（可能错）」。把可能错的推断放进
+                // "由记录必然关联"的分区，正是该文件明令禁止的混同
+                //（承「证据要可区分」）。
+                //
+                // ⇒ 只并入**符号层**（结构推导）边；记录层边由
+                //   `associations_in` 当场算出，从图里再读一遍是纯冗余
+                //   （且会挤占并入选段留给符号层的席位）。
+                //   图存储内生四类（`evolves`/`synthesizes_from`/…）
+                //   语义是"系统推断（可能错）"，也不得并入
+                //   （`graph_store.rs` 明令禁止混同）。
+                if !is_symbolic_edge_type(rel) {
+                    continue;
+                }
+                // 已在召回结果中 / 已由记录层补入 ⇒ 不重复
+                //
+                // ★注意：本检查必须在类型过滤**之后**（见上），否则被过滤的
+                //   边会占用 `seen` 名额，把同目标的合法边挤掉。
+                if exclude.contains(to_id) || !seen.insert(to_id.to_string()) {
+                    continue;
+                }
+                let Some(target) = by_id.get(to_id) else {
+                    continue; // 悬空边（另一端已删除）：跳过，不构造假记忆
+                };
+                if !visible(target) {
+                    continue; // 隐私红线：任一端不可见 ⇒ 整条边不并入
+                }
+                let from_preview = by_id
+                    .get(from_id)
+                    .map(|m| m.content.chars().take(120).collect::<String>())
+                    .unwrap_or_default();
+                // ★来源标注（承「证据要可区分」）：
+                //   本段只并入符号层边 ⇒ 恒为"结构推导"（可能不成立），
+                //   与记录层的"记录事实"性质不同，必须在 why 里写清，
+                //   否则用户无法判断该不该采信。
+                let origin = "符号层推导边";
+                // ★v3：收进**独立缓冲**而非直接进 `out`。
+                //   理由见本段开头：席位由"后置让位"保证，
+                //   若直接进 `out` 则需先腾位，又会退回"预压缩"的老问题。
+                sym_merged.push(AssociatedMemory {
+                    memory_id: to_id.to_string(),
+                    content_preview: target.content.chars().take(120).collect(),
+                    memory_type: target.memory_type.as_str().to_string(),
+                    relation: rel.to_string(),
+                    // why 必须含**具体证据**（承 §3.49.2）：写清这是
+                    // 图上的**落盘边**及其权重，而非"看起来相关"
+                    why: format!(
+                        "图存储既有边（{}，{}，权重 {:.2}）：由「{}」经此关系连到本记忆",
+                        origin,
+                        relation_label(rel),
+                        e.weight,
+                        from_preview.chars().take(30).collect::<String>(),
+                    ),
+                    via_memory_id: from_id.to_string(),
+                    via_preview: from_preview,
+                    hops: 1,
+                    path: vec![from_id.to_string(), to_id.to_string()],
+                });
+            }
+        }
+
+        // ═══ ★★ 后置让位（2026-09-18 审查修复，v3）★★ ═══
+        //
+        // ## 位置至关重要：必须在并入段**全部完成之后**
+        //
+        // 此时 `out` 只含**记录层**条目（符号层边都收在 `sym_merged` 里），
+        // 故从尾部弹掉的**一定是记录层条目**——不会误弹符号层。
+        //
+        // ## 让位规则
+        //
+        //   `out` 已有 L 条，并入 S 条，上限 M：
+        //     · S == 0 ⇒ 不让位（**无收益必无损失**：记录层拿满，与改动前一致）
+        //     · S > 0  ⇒ 从尾部弹 `min(S, L)` 条，再把 S 条符号层边接上，
+        //                 总量仍 ≤ M
+        //
+        // ## 为什么不担心"让位后记录层变少"
+        //
+        // 让位**只在符号层确有产出时**发生，即"拿 1 条记录层换取 1 条符号层"，
+        // 是**等价交换**而非净损失。反之并入 0 条时一次都不让——
+        // 这恰是 v1/v2 反复出错的地方（预先压缩无法知道并入能否成功）。
+        //
+        // ## 顺序
+        //
+        // 让位后符号层条目接在 `out` 尾部：记录层在前、符号层在后。
+        // 排序理由与 `association_evidence_rank` 无关——两者证据性质不同，
+        // 详情由渲染层按来源分区呈现（见 `append_associated_memories`）。
+        if !sym_merged.is_empty() {
+            let keep = max_out.saturating_sub(sym_merged.len());
+            out.truncate(keep);
+            out.extend(sym_merged);
         }
 
         Ok(out)

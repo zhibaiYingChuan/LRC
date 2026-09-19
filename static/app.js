@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.9.8';
+const APP_VERSION = '0.9.9';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -173,15 +173,34 @@ function formatUptime(ms) {
   return s + '秒';
 }
 
-/** 获取状态徽章 HTML */
+/** 获取状态徽章 HTML（v0.9.9：显示中文，而非后端枚举原文） */
 function statusBadge(status) {
+  // 类名映射：决定徽章颜色
   const map = {
     healthy: 'healthy', warning: 'warning', critical: 'critical',
     degraded: 'warning', oscillating: 'warning', drifting: 'warning',
     frozen: 'critical', overloaded: 'critical',
   };
+  // ★v0.9.9 修复（交互审计 P1）：文本映射。
+  //   此前 `map` 只决定 CSS 类名，而**渲染的是 `htmlescape(status)`**
+  //   ⇒ 用户在「运行模式」处看到的是 `degraded` / `oscillating` 等英文枚举。
+  //   而同一份 system_mode 在系统状态页（app.js 的 modeMap）已翻译为
+  //   「运行中/调整中/…」⇒ 同一数据两处口径不一致。
+  //   这里补上文本映射，与 modeMap 保持同一口径。
+  const textMap = {
+    healthy: '正常运行',
+    warning: '需要留意',
+    critical: '异常',
+    degraded: '降级运行',
+    oscillating: '调整中',
+    drifting: '优化中',
+    frozen: '已暂停',
+    overloaded: '繁忙',
+    unknown: '未知',
+  };
   const cls = map[status] || 'info';
-  return `<span class="badge ${cls}">${htmlescape(status)}</span>`;
+  const text = textMap[status] || String(status || '未知');
+  return `<span class="badge ${cls}">${htmlescape(text)}</span>`;
 }
 
 /** 安全 JSON 解析 */
@@ -446,6 +465,103 @@ const MAX_RETRY_COUNT = 3;
 let _retryModalActive = false;
 
 /**
+ * v0.9.9：记忆类型 → 中文标签（**全局唯一来源**）
+ *
+ * ## 为什么要有它
+ *
+ * 此前本项目有 **3 份**各自独立的类型映射表（`typeLabels` / `MEMORY_CATEGORY_LABELS`
+ * / `HOME_TYPE_LABELS`），但**最高频的三条路径**（「全部记忆」列表卡片、记忆详情面板、
+ * 联想补全卡片）都**没有使用**它们，而是直接输出后端枚举原文
+ * ⇒ 用户看到的是 `code_context`、`synthesis`、`fact` 这类**英文标识符**。
+ * 实测现象：首页 M2 卡片显示中文「代码」，点进详情变成「code_context」
+ * ——同一份数据两种语言，对普通用户等于外语。
+ *
+ * 更糟的是三份表还可能彼此漂移（如 `synthesis` 一处叫「合成」一处叫「结晶」）。
+ * ⇒ 收敛为这一个函数，全部调用点复用它。
+ *
+ * ## 为什么用函数而非再建一张表
+ *
+ * 函数可以内建**兜底**（未知类型回落「其他」），而散落的表各自兜底口径不一。
+ *
+ * @param {string} type - 后端 `MemoryType` 的 snake_case 值
+ * @returns {string} 中文标签；未知/空值回落「其他」
+ */
+function memoryTypeLabel(type) {
+  const MAP = {
+    fact: '事实',
+    preference: '偏好',
+    decision: '决策',
+    code_context: '代码',
+    conversation: '对话',
+    synthesis: '结晶知识',
+    experience: '经历',
+  };
+  const key = String(type || '').trim();
+  return MAP[key] || '其他';
+}
+// 导出：多处渲染与测试需要调用（data-action 集中分发通过 window 解析）
+window.memoryTypeLabel = memoryTypeLabel;
+
+/**
+ * v0.9.9：符号层（结构推导）关系类型集合 —— **前端唯一来源**
+ *
+ * ## 为什么要有它
+ *
+ * 符号层五类关系（`cause`/`temporal`/`constraint`/`facilitate`/`coordinate`）
+ * 是**结构算子推导**的产物（**可能不成立**），与记录层关联（**必然成立**）
+ * 证据性质相反。前端有多个出口要据它分流（联想中心、搜索联想分区），
+ * 若各自内联一份清单，必然漂移——漂移后某个出口会静默把推测渲染成事实。
+ *
+ * 后端对应物：`src/memory_store.rs::is_symbolic_edge_type`（同一套判定）。
+ * 前端不做跨语言导入，故此处显式列出并**由测试锁定**与后端一致的取值集合。
+ */
+const SYMBOLIC_RELATIONS = Object.freeze([
+  'cause',
+  'temporal',
+  'constraint',
+  'facilitate',
+  'coordinate',
+]);
+
+/**
+ * 该关系是否为符号层（结构推导）。
+ * @param {string} rel - `node.relation` / `a.relation`
+ * @returns {boolean}
+ */
+function isSymbolicRelation(rel) {
+  return SYMBOLIC_RELATIONS.includes(String(rel || ''));
+}
+window.isSymbolicRelation = isSymbolicRelation;
+window.SYMBOLIC_RELATIONS = SYMBOLIC_RELATIONS;
+
+/**
+ * v0.9.9：把记忆 ID 显示为**人可读**的短标签，而非裸 UUID。
+ *
+ * # 为什么需要它
+ *
+ * 「联想足迹」等位置此前直接渲染 `from_id` / `to_id`（后端记忆 ID，UUID 形如
+ * `9f3a1c2e-...`）⇒ 用户看到的是一串乱码，**完全不可读**，
+ * 无法据此判断这个联想跳跃是否合理（而这正是该面板存在的意义）。
+ *
+ * # 取值优先级
+ *   ① 有内容预览 ⇒ 用预览（用户认得出"这是哪条"）
+ *   ② 无预览但有 ID ⇒ 显示前 8 位 + 省略号（可核对、不刷屏）
+ *   ③ 都没有 ⇒ 「查询起点」（轨迹首步的语义）
+ *
+ * @param {string} id - 记忆 ID
+ * @param {string} preview - 可选的内容预览
+ * @returns {string} 可直接渲染的短标签
+ */
+function shortIdLabel(id, preview) {
+  const p = String(preview || '').trim();
+  if (p) return p.length > 24 ? p.slice(0, 24) + '…' : p;
+  const s = String(id || '').trim();
+  if (!s) return '查询起点';
+  return s.length > 8 ? s.slice(0, 8) + '…' : s;
+}
+window.shortIdLabel = shortIdLabel;
+
+/**
  * P0-2 修复：后端错误文案人话化映射层
  * 将后端返回的技术术语（invalid args 'provider'、lock_busy、connection refused 等）
  * 统一翻译为用户可理解的中文提示，避免技术细节直接上屏。
@@ -678,15 +794,46 @@ async function handleHttpError(response, context = '操作', retryContext = null
     //         仅保留 30s 冷却期的 toast 提示，避免 toast 风暴
     // v0.8.22 P0-4 修复（interaction-resilience-auditor Round3 P0-LOCKBUSY-01）：
     //   30s 冷却期，冷却期内不再显示 toast，避免 toast 风暴
+    //
+    // ★★v0.9.9 修复（交互审计 P1）：503 的**原因**必须区分，不能一律说"后台合成中"。
+    //
+    // ## 问题
+    //
+    // 后端 503 至少有三种成因：
+    //   · `lock_busy`      —— 后台合成占用写锁（原本文案针对的就是它）
+    //   · `search_timeout` —— 检索超 15s 被中止（`v1_api.rs` 返回）
+    //   · `search_busy`    —— 已有检索在跑
+    // 而此处**不区分**，一律 toast「记忆系统正在后台合成，请稍后重试」。
+    // 后果：搜索超时时，用户上方看到 toast 说"正在后台合成"，
+    //       下方面板显示「搜索超时，请稍后重试」——**同一时刻两条互相矛盾的提示**，
+    //       用户无法判断到底该等、还是该缩小范围重试。
+    //
+    // 更糟的是：`humanizeErrorDetail` 里**本来就有** `search_timeout` 的正确文案
+    // （「搜索耗时过长已中止，请缩小范围后重试」），却因本分支提前 return 而走不到。
+    //
+    // ## 修法
+    //
+    // 按 `errorDetail` 的关键字细分文案；只有确实是 lock_busy（或无法判别）时
+    // 才用"后台合成中"的说法。冷却期逻辑保持不变。
+    const detailLower = String(errorDetail || '').toLowerCase();
+    let busyMsg;
+    if (detailLower.includes('search_timeout')) {
+      busyMsg = '搜索耗时过长已中止，请缩小范围后重试';
+    } else if (detailLower.includes('search_busy')) {
+      busyMsg = '上一次搜索还没结束，请稍候再试';
+    } else {
+      // lock_busy 或无法判别的 503：沿用"后台合成中"（这是最常见的成因）
+      busyMsg = '记忆系统正在后台整理，请稍后重试';
+    }
     const lockBusyCooldownKey = `503_cooldown:${context}`;
     const lastToastTime = _retryCounters.get(lockBusyCooldownKey) || 0;
     const now = Date.now();
     if (now - lastToastTime > 30000) {
       // 超过 30s 冷却期，显示 toast
       _retryCounters.set(lockBusyCooldownKey, now);
-      showToast('记忆系统正在后台合成，请稍后重试', 'info', 5000);
+      showToast(busyMsg, 'info', 5000);
     } else {
-      console.log(`[handleHttpError] 503 lock_busy 冷却期内，跳过 toast（剩余 ${Math.ceil((30000 - (now - lastToastTime)) / 1000)}s）`);
+      console.log(`[handleHttpError] 503 冷却期内，跳过 toast（剩余 ${Math.ceil((30000 - (now - lastToastTime)) / 1000)}s）`);
     }
     // 直接返回 cancel，由上层调用者的重试机制处理
     return { action: 'cancel', status, errorDetail };
@@ -1949,7 +2096,10 @@ async function loadRecentMemories() {
       decision: '决策',
       code_context: '代码',
       conversation: '对话',
-      synthesis: '合成',
+      // ★v0.9.9：统一为「结晶知识」（与首页 M4d「结晶成果」、筛选面板、
+      //   `memoryTypeLabel()` 同一口径）。此前此处叫「合成」、别处叫「结晶」，
+      //   同一类型两套名字，用户以为是两个东西。
+      synthesis: '结晶知识',
       experience: '经历',
     };
     // 类型颜色映射(与 typeLabels 键严格一致)
@@ -6930,20 +7080,37 @@ function selectPresetScenario(card) {
       console.warn('[selectPresetScenario] localStorage 写入失败:', e);
     }
 
-    // 显示提示信息（诗意文案）
+    // 显示提示信息（v0.9.9：文案改为**如实描述当前作用**）
+    //
+    // ★此前这里写的是「记忆类型：note / 标签：[note, personal] / 结晶策略：…」，
+    //   但三个问题叠在一起：
+    //     ① `#preset-scenario-info` 容器在 HTML 中**不存在** ⇒ 永远不显示；
+    //     ② `note`/`task`/`knowledge` **都不是后端合法记忆类型**
+    //        （合法值见 `src/memory_types.rs::valid_values()`：fact/preference/
+    //        decision/code_context/conversation/experience/synthesis）；
+    //     ③ 后端**没有场景概念**（`src/` 下 grep `scenario` 零匹配），
+    //        「结晶策略」等承诺不成立。
+    //   ⇒ 改为只陈述**确实发生的事**：偏好已记录。
     const scenarioMap = {
-      'personal-notes': { title: '个人笔记', desc: '记忆类型：note / 标签：[note, personal] / 结晶策略：按主题聚类，7 天结晶' },
-      'project-management': { title: '项目管理', desc: '记忆类型：decision/task / 标签：[project, {id}] / 结晶策略：按项目聚类，实时结晶' },
-      'learning-assistant': { title: '学习助手', desc: '记忆类型：knowledge / 标签：[learn, {subject}] / 结晶策略：按学科聚类，按需结晶' },
-      'coding-helper': { title: '编程助手', desc: '记忆类型：code_context/preference / 标签：[code, {lang}] / 结晶策略：按代码语言聚类' }
+      'personal-notes': { title: '个人笔记', desc: '适合记灵感、日记、个人知识沉淀' },
+      'project-management': { title: '项目管理', desc: '适合记决策、会议纪要、任务跟踪' },
+      'learning-assistant': { title: '学习助手', desc: '适合记知识点、问答、学科分类' },
+      'coding-helper': { title: '编程助手', desc: '适合记代码决策、偏好、约定' }
     };
     const info = scenarioMap[scenario];
     if (info) {
       // v0.8.4 Step 5：在卡片下方显示场景信息（替代原 TODO）
       const infoEl = document.getElementById('preset-scenario-info');
       if (infoEl) {
-        infoEl.innerHTML = '<strong>' + htmlescape(info.title) + '</strong>：' + htmlescape(info.desc);
+        infoEl.innerHTML = '已选择「' + htmlescape(info.title) + '」：' + htmlescape(info.desc) +
+          '。<span class="text-dim">已记住你的偏好。</span>';
         infoEl.style.display = '';
+      }
+      // ★v0.9.9：补一次 toast 反馈。
+      //   此前只有 CSS 类变化（卡片高亮），在长列表里点完几乎无感知，
+      //   用户不确定"到底生效没有"。明确回执可消除这个疑问。
+      if (typeof showToast === 'function') {
+        showToast('已选择「' + info.title + '」场景偏好', 'success', 2500);
       }
     }
   }
@@ -8364,6 +8531,42 @@ function formatTimelineTime(timestamp) {
   return new Date(value).toLocaleString('zh-CN', { hour12: false });
 }
 
+/**
+ * v0.9.9：把**任意形态**的时间字段格式化为本地可读时间。
+ *
+ * # 为什么需要它（而不是直接用 formatTimelineTime）
+ *
+ * `formatTimelineTime` 只接受**数字毫秒时间戳**；但后端的记忆对象里
+ * 时间字段有两种形态：
+ *   · `created_at_ms` —— 数字毫秒（列表接口）
+ *   · `created_at`    —— **ISO 字符串**（如 `2026-09-19T10:00:00.000Z`）
+ * 若把 ISO 字符串直接喂给 `formatTimelineTime`，`Number(...)` 得到 `NaN`
+ * ⇒ 一律返回 `'--'`（这正是"记忆详情里创建时间显示 `--`"的成因）。
+ *
+ * # 行为
+ *   · 数字（毫秒）⇒ 按毫秒解析
+ *   · 数字字符串 ⇒ 按毫秒解析
+ *   · ISO/其它可解析字符串 ⇒ 交给 `Date` 解析
+ *   · 无法解析/空 ⇒ 返回 `'--'`（如实告知"没有这个信息"，不显示原始值）
+ *
+ * @param {number|string} v - 毫秒时间戳或 ISO 时间字符串
+ * @returns {string} 本地化时间文本，或 `'--'`
+ */
+function formatAnyTime(v) {
+  if (v == null || v === '') return '--';
+  // 数字或纯数字字符串：按毫秒时间戳处理（避免 Date 把 "1789747631" 当字符串解析）
+  const n = Number(v);
+  if (Number.isFinite(n) && n > 0) {
+    return new Date(n).toLocaleString('zh-CN', { hour12: false });
+  }
+  const d = new Date(String(v));
+  if (!Number.isNaN(d.getTime())) {
+    return d.toLocaleString('zh-CN', { hour12: false });
+  }
+  return '--';
+}
+window.formatAnyTime = formatAnyTime;
+
 // 页面加载完成后初始化结晶历史加载
 document.addEventListener('DOMContentLoaded', function() {
   // 延迟加载结晶历史，避免阻塞首屏渲染
@@ -8885,6 +9088,20 @@ function debouncedMemorySearch() {
   memorySearchTimer = setTimeout(searchMemories, 300);
 }
 
+/**
+ * v0.9.9：重试上一次记忆搜索（供失败态的「重试」按钮调用）。
+ *
+ * 为什么单独抽一个函数：`data-action` 集中分发通过 `window[action]` 解析，
+ * 需要显式导出；直接挂 `searchMemories` 也可行，但那个函数签名是为
+ * debounce 设计的（无参、内部读 DOM），语义上不如一个具名"重试"清晰，
+ * 也便于将来加"重试计数"。
+ */
+function retryMemorySearch() {
+  console.log('[v0.9.9] 用户点击「重试」，重新执行记忆搜索');
+  searchMemories();
+}
+window.retryMemorySearch = retryMemorySearch;
+
 // v0.8.4 Step 11 / G037：搜索请求的 AbortController，避免快速输入触发竞态
 let searchAbortController = null;
 
@@ -9036,7 +9253,11 @@ async function searchMemories() {
       <div class="memory-search-empty">
         <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
         <div class="empty-poem">搜索出错</div>
-        <p class="text-sm text-dim">${htmlescape(err.message || String(err))}</p>
+        <p class="text-sm text-dim">${htmlescape(humanizeErrorDetail(err.message || String(err)))}</p>
+        <!-- ★v0.9.9（交互审计 P2）：补重试入口。
+             此前失败只报错、不给恢复动作，用户只能靠"再输一遍关键词"碰运气；
+             而本文件其它位置（演化时间线、联想足迹）都提供了「重试」按钮。 -->
+        <button class="btn btn-ghost btn-sm" data-action="retryMemorySearch" style="margin-top:8px;">重试</button>
       </div>
     `;
     renderAssociatedMemories(null);
@@ -9078,13 +9299,27 @@ function renderAssociatedMemories(items) {
     const preview = htmlescape(String(a.content_preview || ''));
     const why = htmlescape(String(a.why || ''));
     const via = htmlescape(String(a.via_preview || ''));
-    const type = htmlescape(String(a.memory_type || ''));
+    const type = htmlescape(memoryTypeLabel(a.memory_type));
+    // ★v0.9.9：证据性质必须可辨（承「证据要可区分」纪律）
+    //
+    // 本分区收到的是 `expand_associations` 的**混合产出**：既有记录层关联
+    //（同一次经历/共享实体，**必然成立**），也有符号层落盘边
+    //（cause/temporal/… 由结构算子推导，**可能不成立**）。
+    // 此前两者共用同一句"由记录必然关联"的说明 —— 对符号层是**事实错误**，
+    // 用户会把推测当事实引用。
+    // ⇒ 与 MCP 文本侧（`append_symbolic_stored_section`）和联想中心
+    //   （`association-symbolic-tag`）保持同一口径：符号层单独打徽章。
+    const isSymbolic = isSymbolicRelation(a.relation);
+    const tag = isSymbolic
+      ? '<span class="association-symbolic-tag">结构推导</span>'
+      : '<span class="association-record-tag">记录关联</span>';
     // 「经由什么」必须可见——用户据此判断联想是否合理
     return `
       <div class="memory-assoc-item">
         <div class="memory-assoc-head">
           <span class="memory-assoc-badge">${why}</span>
           <span class="text-sm text-dim">${type}</span>
+          ${tag}
         </div>
         <div class="memory-assoc-content">${preview}</div>
         ${via ? `<div class="memory-assoc-via text-sm text-dim">由「${via}」联想到此</div>` : ''}
@@ -9092,7 +9327,7 @@ function renderAssociatedMemories(items) {
   }).join('');
   box.innerHTML = `
     <div class="memory-assoc-title">
-      联想 <span class="text-sm text-dim">（与上方结果语义不相似，但由「共同经历 / 共享实体」必然关联）</span>
+      联想 <span class="text-sm text-dim">（与上方结果语义不相似，但由记录必然关联——同一次经历、共享同一对象等）</span>
     </div>
     ${rows}
   `;
@@ -9117,7 +9352,12 @@ function renderMemoryResults(memories, explanationById) {
       <div class="memory-search-empty">
         <img class="empty-icon" src="/assets/icons/icon-search-lrc.svg" alt="">
         <div class="empty-poem">暂无记忆</div>
-        <p class="text-sm text-dim">这里将展示全部记忆，暂无内容可浏览。</p>
+        <!-- ★v0.9.9 修复（交互审计 P2）：补"下一步做什么"。
+             此前 JS 渲染的空态只说"暂无内容可浏览"，反而比静态空态
+             （原写有"浏览全部记忆，或输入关键词搜索"）更弱 ——
+             用户看到空页面不知道该怎么办。 -->
+        <p class="text-sm text-dim">这里会展示你记下的全部内容。还没有任何记忆——<br>
+          点右上角的「记一笔」写入第一条，之后就能在这里搜索、联想。</p>
       </div>
     `;
     return;
@@ -9166,14 +9406,14 @@ function renderMemoryResults(memories, explanationById) {
     const safeType = sanitizeMemoryType(memory.memory_type || 'conversation');
     const typeClass = `card-memory-${safeType}`;
     const preview = (memory.content || '').substring(0, 200);
-    const time = memory.created_at || memory.timestamp || '--';
+    const time = formatAnyTime(memory.created_at || memory.timestamp || memory.created_at_ms);
     const importance = memory.importance || 5;
     const association = memory._associationExplanation;
     const pathLabel = association && Array.isArray(association.hit_paths)
       ? association.hit_paths.map(path => path === 'fast' ? '快速' : '深度').join(' + ')
       : '';
     const associationHint = association
-      ? `<span title="联想路径：${htmlescape(pathLabel || '未知')}">联想：${htmlescape(pathLabel || '未知')} · 贡献 ${Number(association.fused_contrib || 0).toFixed(4)}</span>`
+      ? `<span title="联想路径：${htmlescape(pathLabel || '未知')}">联想：${htmlescape(pathLabel || '未知')}</span>`
       : '';
     // ★v0.9.8：记录层理由（"为什么这条会出现"）。
     // **与上面的 associationHint 的区别**：那条是"哪条通路找到的"（过程指标，
@@ -9191,8 +9431,8 @@ function renderMemoryResults(memories, explanationById) {
         <div class="memory-card-preview">${htmlescape(preview)}</div>
         ${why}
         <div class="memory-card-meta">
-          <span><img src="/assets/icons/icon-memory.svg" alt="" width="12" height="12"> ${htmlescape(memory.memory_type || '未分类')}</span>
-          <span>重要性: ${htmlescape(String(importance))}</span>
+          <span><img src="/assets/icons/icon-memory.svg" alt="" width="12" height="12"> ${htmlescape(memoryTypeLabel(memory.memory_type))}</span>
+          <span>重要性: ${htmlescape(String(importance))}/10</span>
           ${associationHint}
           <span>${htmlescape(time)}</span>
         </div>
@@ -9320,20 +9560,29 @@ function openMemoryDetail(memoryOrIndex) {
     <div class="memory-detail-fulltext">${htmlescape(memory.content || '')}</div>
     <div class="memory-detail-metadata">
       <span class="label">记忆类型</span>
-      <span class="value">${htmlescape(memoryType || '--')}</span>
+      <span class="value">${htmlescape(memoryTypeLabel(memoryType))}</span>
       <span class="label">重要性</span>
-      <span class="value">${memory.importance || '--'}</span>
+      <span class="value">${htmlescape(String(memory.importance ?? '--'))}/10</span>
       <span class="label">创建时间</span>
-      <span class="value">${htmlescape(memory.created_at || memory.timestamp || '--')}</span>
-      <span class="label">记忆 ID</span>
-      <span class="value">${htmlescape(memoryId || '--')}</span>
+      <span class="value">${htmlescape(formatAnyTime(memory.created_at || memory.timestamp))}</span>
+      ${/* ★v0.9.9 修复（交互审计 P2）：
+           ① 「记忆 ID」是 UUID，对普通用户是纯噪音，已移入下方「技术详情」折叠区；
+           ② 「事件 ID」「涉及实体」无值时整行隐藏（原实现输出 `--`，
+              与相邻字段视觉无差别，用户会以为"数据丢了"，而这两字段本就可选）。 */''}
       <span class="label">标签</span>
       <span class="value">${htmlescape((memory.tags || []).join(', ') || '--')}</span>
-      <span class="label">事件 ID</span>
-      <span class="value">${htmlescape(memory.event_id || '--')}</span>
-      <span class="label">涉及实体</span>
-      <span class="value">${htmlescape((memory.entities || []).map(e => (e && e.name) ? e.name : String(e)).join(', ') || '--')}</span>
+      ${(() => {
+        const entStr = (memory.entities || []).map(e => (e && e.name) ? e.name : String(e)).filter(Boolean).join(', ');
+        return entStr ? `<span class="label">涉及实体</span><span class="value">${htmlescape(entStr)}</span>` : '';
+      })()}
+      ${memory.event_id ? `<span class="label">同一次经历</span><span class="value">${htmlescape(memory.event_id)}</span>` : ''}
     </div>
+    <details style="margin-top:8px;">
+      <summary class="text-dim" style="cursor:pointer;font-size:12px;">技术详情（记忆 ID）</summary>
+      <div class="text-sm text-dim" style="margin-top:4px;">
+        记忆 ID：<code>${htmlescape(memoryId || '（无）')}</code>
+      </div>
+    </details>
     ${associationHtml}
     <div id="memory-detail-record-assoc" class="memory-detail-record-assoc" style="margin-top:12px;"></div>
     ${!memoryId ? '<p class="text-sm text-dim" style="margin-top:8px;">该记忆无有效 ID，以下操作不可用</p>' : ''}
@@ -10220,7 +10469,7 @@ async function loadAssociationRecords() {
       const trail = Array.isArray(record.trail) ? record.trail : [];
       const evidence = record.regression_evidence && typeof record.regression_evidence === 'object' ? record.regression_evidence : {};
       const evidenceText = Object.values(evidence).slice(0, 4).join('、') || '暂无回归证据';
-      return `<details class="association-record-item"><summary><span>${htmlescape(formatTimelineTime(record.timestamp_ms))}</span><strong>${trail.length > 1 ? `多跳 ${trail.length} 步` : '单次联想'}</strong><span>保留 ${Object.keys(evidence).length} 条</span><span>剔除 ${Number(record.filtered_count || 0)} 条</span></summary><div class="association-record-detail"><div>过程：${trail.length ? trail.map(step => `${htmlescape(String(step.from_id || '查询起点'))} → ${htmlescape(String(step.to_id || ''))}`).join(' · ') : '暂无轨迹'}</div><div>回归：${htmlescape(evidenceText)}</div><div>结果：${Number(record.total_candidates || 0)} 条候选</div></div></details>`;
+      return `<details class="association-record-item"><summary><span>${htmlescape(formatTimelineTime(record.timestamp_ms))}</span><strong>${trail.length > 1 ? `多跳 ${trail.length} 步` : '单次联想'}</strong><span>保留 ${Object.keys(evidence).length} 条</span><span>剔除 ${Number(record.filtered_count || 0)} 条</span></summary><div class="association-record-detail"><div>过程：${trail.length ? trail.map(step => `${htmlescape(shortIdLabel(step.from_id, step.from_preview))} → ${htmlescape(shortIdLabel(step.to_id, step.to_preview))}`).join(' · ') : '暂无轨迹'}</div><div>回归：${htmlescape(evidenceText)}</div><div>结果：${Number(record.total_candidates || 0)} 条候选</div></div></details>`;
     }).join('');
   } catch (error) {
     console.error('[association] 记录加载失败:', error);
@@ -10230,7 +10479,12 @@ async function loadAssociationRecords() {
 }
 
 async function clearAssociationRecords() {
-  if (!window.confirm('确认清除本机保存的全部联想过程记录吗？这不会删除记忆内容，也不影响审计完整性。')) return;
+  // ★v0.9.9 修复（交互审计 P2）：原用原生 `window.confirm`，
+  //   而全站其余 30+ 处已统一为 `showConfirm`。原生 confirm 在 Tauri WebView 中
+  //   **会阻塞 JS 主线程**（见本文件另一处注释里明确要避免的情形），
+  //   且样式与全站弹窗体系不一致。
+  const ok = await showConfirm('确认清除本机保存的全部联想过程记录吗？这不会删除记忆内容，也不影响审计完整性。', '清除联想过程记录');
+  if (!ok) return;
   try {
     const response = await fetchWithTimeout(`${API_BASE}/v1/associations/records`, { method: 'DELETE' }, 8000);
     if (!response.ok) throw new Error(`清除失败（${response.status}）`);
@@ -10266,10 +10520,31 @@ async function startAssociationExplore() {
   if (trailEl) trailEl.innerHTML = '<div class="association-loading">正在展开联想路径…</div>';
   if (evidenceEl) evidenceEl.innerHTML = '<div class="association-loading">整理保留理由…</div>';
   try {
+    // ★v0.9.9 修复：前端超时必须**严格大于**后端，否则后端的优雅降级不可达。
+    //
+    // 根因：后端 `/v1/associations/explore` 有硬超时；前端此处原本也是 15000ms。
+    // 两者相等 ⇒ 前端 abort 与后端超时几乎同时触发，前端**总是先报"请求超时"**，
+    // 于是后端所有"优雅收敛"路径全部变成不可达死代码：
+    //   · 内部 10s 预算到点 → 返回 200 + `interrupted=true`（"已展示完成的部分"）
+    //   · 无相关内容 → 返回 200 + `weak_match=true`（诚实空态）
+    //
+    // 实测（同一份代码、同一份数据，仅构建模式不同）：
+    // ```text
+    //                 release     debug
+    // 今晚吃什么       1.95s ✓    10.75s ✓
+    // 量子物理是什么    8.83s ✓    15.00s ✗ 503
+    // 重要日子         4.82s ✓    15.05s ✗ 503
+    // ```
+    // 即 ML 句向量前向在未优化构建下膨胀 2~4 倍。原后端 15s 外墙在这类
+    // 慢环境下会被击穿，用户看到 503 而非产品设计好的部分结果/空态。
+    //
+    // 现三层形成单调阶梯（前端 > 外层 > 内部），任一层先返回都留有余量：
+    //   10s(后端内部预算) < 25s(后端外墙) < 30s(前端本次超时)
+    // 边界：若后端真卡死，由后端 25s 超时兜底返回 503，前端不会无限等待。
     const response = await fetchWithTimeout(`${API_BASE}/v1/associations/explore`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
-    }, 15000);
+    }, 30000);
     if (!response.ok) {
       const err = await response.json().catch(() => ({}));
       throw new Error(err.message || `联想失败（${response.status}）`);
@@ -10346,6 +10621,11 @@ async function startAssociationExplore() {
         // 记录层关联类型 → 普通人能看懂的话（v0.9.8）
         // 依据来自记录（event_id/entities），与相似度扩散的"语义相近"性质不同，
         // 必须让用户看得出区别——这是"这条为什么一定会被想起来"的解释。
+        //
+        // ★2026-09-18（补 S5 的 UI 侧复现）：符号层五类关系必须有自己的说法。
+        //   此前本表只有记录层 7 类 ⇒ 符号层边（cause/coordinate/…）全部落到
+        //   兜底文案「由记录推导出的关联」，把**结构推导**（可能不成立）
+        //   说成了**记录推导**（必然成立）——与后端 S5 修掉的是同一个失效模式。
         const relationPlain = rel => {
           const map = {
             'same_event': '同一次经历中记下的',
@@ -10355,16 +10635,28 @@ async function startAssociationExplore() {
             'shared_entity': '提到了同一个对象',
             // v0.9.8：与 shared_entity 的区别要写清——用户填的实体 vs 系统识别的产物
             'shared_artifact': '提到了同一个具体产物（系统从正文识别）',
-            'derived_from': '由这条记忆结晶而来'
+            'derived_from': '由这条记忆结晶而来',
+            // ── 符号层（结构算子推导，§5.3 五类；不是记录事实）──
+            'cause': '结构推导：它可能引发了这条',
+            'temporal': '结构推导：它可能在这条之前',
+            'constraint': '结构推导：它可能与这条相互约束',
+            'facilitate': '结构推导：它可能促成了这条',
+            'coordinate': '结构推导：两者可能同属一个框架'
           };
           return map[rel] || '由记录推导出的关联';
         };
         const renderGroup = d => {
           const list = byDepth[d].map(node => {
-            // 记录层节点：显示"凭什么关联"（relation + 后端给的具体依据 why）
+            // 记录层/符号层节点：显示"凭什么关联"（relation + 后端给的具体依据 why）
+            //
+            // ★2026-09-18：符号层（source="symbolic"）与记录层（source="record"）
+            //   的证据性质不同——前者是**结构算子推导**（可能不成立），
+            //   后者是**记录必然成立**。二者都必须显示 why（可核验），
+            //   但标签文案必须分开，否则用户会把推测当成事实。
             const isRecord = node.source === 'record';
+            const isSymbolic = node.source === 'symbolic';
             let reason;
-            if (isRecord) {
+            if (isRecord || isSymbolic) {
               const why = node.why ? `（${htmlescape(String(node.why))}）` : '';
               reason = ` · ${relationPlain(node.relation)}${why}`;
             } else {
@@ -10375,7 +10667,13 @@ async function startAssociationExplore() {
             // 写回道体状态机活跃锚点，之后的联想会优先想起它。
             // data-arg-mode="this" 让集中分发器把元素自身传入处理函数。
             const confirmBtn = `<button type="button" class="btn btn-sm association-confirm-btn" data-action="confirmAssociation" data-arg-mode="this" data-memory-id="${htmlescape(node.id)}" data-query="${htmlescape(query)}">就是这个</button>`;
-            const tag = isRecord ? '<span class="association-record-tag">记录关联</span>' : '';
+            // ★标签文案必须与证据强度一致：符号层不得戴「记录关联」的帽子
+            let tag = '';
+            if (isRecord) {
+              tag = '<span class="association-record-tag">记录关联</span>';
+            } else if (isSymbolic) {
+              tag = '<span class="association-symbolic-tag">结构推导</span>';
+            }
             return `<div class="association-story-node"><span class="association-branch-dot"></span><div><strong>${htmlescape(node.content)}</strong><div class="text-sm text-dim">${reason.replace(/^ · /, '') || '和你问的主题有关'}</div></div>${tag}${confirmBtn}</div>`;
           }).join('');
           return `<div class="association-story-group"><div class="association-subtitle">${groupTitle(d)}</div>${list}</div>`;
@@ -10412,8 +10710,20 @@ async function startAssociationExplore() {
   } catch (error) {
     console.error('[association] 联想失败:', error);
     if (status) status.textContent = `联想失败：${error.message || '服务暂不可用'}`;
+    // ★v0.9.9：补「重试」入口。
+    //
+    // 实测背景：ML 语义编码**首次运行需要预热**（模型加载 + 首条 768 维编码），
+    // 首次 explore 会撞 15s 超时；预热后稳定可用（实测 ~11.9s 返回）。
+    // 后端已把该情形标为 `retryable: true` 并在 message 里提示"请直接重试一次"，
+    // 但此前**没有可点的按钮** ⇒ 用户得自己回想"刚才问的是什么"再输一遍。
+    // 此处给出与其它失败态一致的重试入口。
+    if (storyEl) {
+      storyEl.innerHTML = '<div class="association-empty">本次没有返回结果。' +
+        '<button class="btn btn-ghost btn-sm" data-action="startAssociationExplore" style="margin-left:8px;">重试</button>' +
+        '</div>';
+    }
     if (trailEl) trailEl.innerHTML = '<div class="association-error">请检查 LRC 服务状态后重试。</div>';
-    if (storyEl) storyEl.innerHTML = '<div class="association-empty">暂无结果。</div>';
+    if (typeof bindAllActions === 'function') bindAllActions();
   }
 }
 
@@ -10546,8 +10856,14 @@ async function loadAssociationCenterObservation() {
     const total = Number(data.total_executions || 0);
     setVal('association-center-dual', total ? `${Math.round((Number(data.both_count || 0) / total) * 100)}%` : '--');
     setVal('association-center-filtered', String((data.recent || []).reduce((sum, item) => sum + Number(item.filtered_count || 0), 0)));
+    // ★v0.9.9 修复（交互审计 P1）：`fast` / `deep` 是后端**通路标识符**
+    //   （`v1_api.rs` 的 fast_path_hits / deep_path_hits），直接上屏用户看不懂。
+    //   本文件另一处（联想解释的 reason 映射）早已有人话版
+    //   「被关键词快速检索命中 / 被语义相似度检索找到」——此处沿用同一口径。
     const recent = document.getElementById('association-center-recent');
-    if (recent) recent.innerHTML = (data.recent || []).length ? data.recent.map(item => `<div class="association-record-item"><span>${htmlescape(formatTimelineTime(item.timestamp_ms))}</span><span>fast ${Number(item.fast_hits || 0)} · deep ${Number(item.deep_hits || 0)} · 候选 ${Number(item.total_candidates || 0)}</span></div>`).join('') : '<div class="association-empty">暂无联想执行。</div>';
+    if (recent) recent.innerHTML = (data.recent || []).length
+      ? data.recent.map(item => `<div class="association-record-item"><span>${htmlescape(formatTimelineTime(item.timestamp_ms))}</span><span>关键词命中 ${Number(item.fast_hits || 0)} · 语义命中 ${Number(item.deep_hits || 0)} · 候选 ${Number(item.total_candidates || 0)}</span></div>`).join('')
+      : '<div class="association-empty">暂无联想执行。</div>';
   } catch (error) { console.error('[association] 观测加载失败:', error); }
 }
 
@@ -11409,6 +11725,31 @@ function selectEmbedderModel(modelId) {
 
 /**
  * 检测嵌入模型状态
+ *
+ * ★★v0.9.9 修复（交互审计 P1）：必须区分「**文件已就绪**」与「**正在生效**」。
+ *
+ * # 修的什么问题
+ *
+ * 原实现看到 `/api/embedder/status` 返回 `ready` 就显示「模型已就绪」，
+ * 但 `ready` 只表示**权重文件在磁盘上齐全**（`check_model_ready` 校验
+ * config.json + safetensors），**不代表它真的在参与编码**。
+ *
+ * 实测现场（本机）：`~/.loong-recall/models/BAAI--bge-base-zh` 有 **390.6 MB**
+ * 权重、接口返回 `ready`，但健康报告里 `encoder.mode == "statistical"`、
+ * `degradation_reason == "ML 编码器未启用"` —— 因为**当前构建未编译 ml feature**
+ *（`Cargo.toml` 的 `ml = [...]`，桌面端 dev 脚本用
+ * `--no-default-features --features server`，主动排除 ml 省内存）。
+ *
+ * 后果：用户下载了 390MB 模型、看到「已就绪」、点「应用」后收到
+ * 「重启服务后生效」，**重启后发现仍无变化**，却没有任何地方说明原因。
+ *
+ * # 修法
+ *
+ * 查健康报告的 `encoder.mode`（**权威判据**：它反映运行时实际状态）：
+ *   · `statistical` ⇒ 模型文件就绪但**未生效**，明确告知"当前构建未启用语义编码"
+ *   · 非 statistical ⇒ 真在生效
+ *
+ * 这样用户不会再对着"已就绪"困惑为什么联想质量没变。
  */
 async function checkEmbedderStatus() {
   const dotEl = document.getElementById('embedder-status-dot');
@@ -11424,20 +11765,42 @@ async function checkEmbedderStatus() {
       method: 'GET'
     }, 5000);
 
-    if (resp.ok) {
-      const data = await resp.json();
-      if (data.status === 'ready') {
-        dotEl.className = 'ollama-status-dot online';
-        textEl.textContent = '模型已就绪：' + (data.model_id || '未知');
-      } else if (data.status === 'not_downloaded') {
-        dotEl.className = 'ollama-status-dot offline';
-        textEl.textContent = '模型未下载';
-      } else {
-        dotEl.className = 'ollama-status-dot unknown';
-        textEl.textContent = '未知状态';
+    if (!resp.ok) throw new Error('服务响应异常');
+    const data = await resp.json();
+
+    // ★查运行时的编码器模式（权威：文件就绪 ≠ 正在生效）
+    let runtimeMode = null;
+    try {
+      const hResp = await fetchWithTimeout(API_BASE + '/v1/health/system', { method: 'GET' }, 5000);
+      if (hResp.ok) {
+        const h = await hResp.json();
+        runtimeMode = h && h.encoder ? h.encoder.mode : null;
       }
+    } catch (e) {
+      // 拿不到运行时状态时不阻断：降级为仅报文件状态
+      console.warn('[checkEmbedderStatus] 读取运行时编码器状态失败:', e.message);
+    }
+
+    const fileReady = data.status === 'ready';
+    const actuallyRunning = runtimeMode && runtimeMode !== 'statistical';
+
+    if (fileReady && actuallyRunning) {
+      dotEl.className = 'ollama-status-dot online';
+      textEl.textContent = '语义编码已生效：' + (data.model_id || '未知');
+    } else if (fileReady && runtimeMode === 'statistical') {
+      // ★关键分支：文件就绪但没生效 —— 必须说清原因，否则用户反复重启试
+      dotEl.className = 'ollama-status-dot warning';
+      textEl.textContent = '模型文件已就绪，但当前构建未启用语义编码（正在用关键词模式兜底）';
+    } else if (data.status === 'not_downloaded') {
+      dotEl.className = 'ollama-status-dot offline';
+      textEl.textContent = '模型未下载';
+    } else if (fileReady) {
+      // 文件就绪，但没取到运行时状态（健康接口不可用）
+      dotEl.className = 'ollama-status-dot unknown';
+      textEl.textContent = '模型文件已就绪（未能确认是否生效）';
     } else {
-      throw new Error('服务响应异常');
+      dotEl.className = 'ollama-status-dot unknown';
+      textEl.textContent = '未知状态';
     }
   } catch (e) {
     dotEl.className = 'ollama-status-dot offline';
@@ -11463,6 +11826,8 @@ async function downloadEmbedderModel() {
     return;
   }
 
+  // ★注意：**下载**不做二次确认（只写磁盘，不触发重编码）；
+  //   会触发全库重编码的是 `applyEmbedderModel`，确认加在那边。
   const mirror = document.getElementById('embedder-mirror')?.value || 'hf-mirror';
   const progressEl = document.getElementById('embedder-download-progress');
   const percentEl = document.getElementById('embedder-download-percent');
@@ -11565,6 +11930,24 @@ async function applyEmbedderModel() {
     return;
   }
 
+  // ★v0.9.9 修复（交互审计 P2）：换模型是**重操作**，必须先确认。
+  //
+  // 依据：设置页自身对「应用已下载的模型」的说明是
+  //   「安装完成后自动生效，所有记忆将使用新模型重新编码」
+  // ——即触发**全库重新编码**（本机 3175 条记忆）。此前点击即执行，
+  // 无二次确认，用户误点后会进入长时间重编码且无法中止。
+  // 对照：本文件其它同类重操作（清空/删除/迁移/导入）都有 `showConfirm`。
+  const modelLabel = (
+    document.querySelector(`[data-arg="${modelId}"] .provider-card-name`)?.textContent || modelId
+  ).trim();
+  const okApply = await showConfirm(
+    `将把「${modelLabel}」设为默认语义编码模型。\n\n` +
+      '这会让你已有的全部记忆用新模型重新编码，可能需要较长时间，期间检索质量可能暂时波动。\n\n' +
+      '确定继续吗？',
+    '更换语义编码模型'
+  );
+  if (!okApply) return;
+
   // v0.9.0 修复 M-2：应用模型期间禁用按钮 + 加载态，防止重复点击
   const applyBtn = document.querySelector('[data-action="applyEmbedderModel"]');
   if (applyBtn) setButtonState(applyBtn, 'loading');
@@ -11580,7 +11963,11 @@ async function applyEmbedderModel() {
 
     if (data.success) {
       if (applyBtn) setButtonState(applyBtn, 'success');
-      showToast(data.message || '模型已设为默认，重启服务后生效', 'success');
+      // ★v0.9.9：原提示为「模型已设为默认，重启服务后生效」，但对**未编译 ml
+      //   feature 的构建**来说，重启也永远不会生效（实测：模型 390MB 已下载、
+      //   接口返回 ready，但 encoder.mode 仍是 statistical）。
+      //   故此处如实说明两种情形，避免用户反复重启试。
+      showToast(data.message || '模型已设为默认。若长期显示"未启用语义编码"，说明当前构建未含 ML 组件', 'success', 6000);
       checkEmbedderStatus();
     } else {
       throw new Error(data.message || '设置失败');

@@ -95,6 +95,15 @@ impl MemoryStoreCache {
         self.memory.borrow().clone()
     }
 
+    /// 仅判断指定 ID 是否存在（**不克隆**任何 `Memory`）
+    ///
+    /// 与 `snapshot().iter().any(|m| m.id == id)` 语义完全相同，但后者会先
+    /// 深拷贝整库（`Memory` 含正文字符串、实体列表、卦象等），在**逐条**执行的
+    /// 存在性校验路径上是纯浪费的内存抖动与锁持有时间。
+    pub(crate) fn contains_id(&self, id: &str) -> bool {
+        self.memory.borrow().iter().any(|m| m.id == id)
+    }
+
     // ---------- 失效 ----------
 
     /// 全量失效：任何写操作（保存/删除/修改）后调用
