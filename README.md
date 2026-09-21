@@ -191,6 +191,82 @@ code-memory-server model remove BAAI/bge-small-zh
 
 ---
 
+## MCP 接入方式
+
+LRC 通过标准 MCP 协议向 AI 工具暴露记忆与代码搜索能力，支持 **stdio** 与 **HTTP** 两种传输。桌面端会自动写入配置；从源码编译的 CLI 用户按下文手动配置。
+
+> **托管部署说明**：LRC 依赖本机资源（本地源码索引、`~/.loong-recall/` 记忆库、本机嵌入模型），**不适合远程托管部署**。在 ModelScope MCP 广场等平台创建时，托管类型请选择「**仅本地可用**」。
+
+### 方式一：stdio（CLI 二进制，标准接入）
+
+以 stdio 传输启动，由 AI 工具将 `code-memory-server` 作为子进程拉起：
+
+```json
+{
+  "mcpServers": {
+    "lrc-memory": {
+      "command": "code-memory-server",
+      "args": ["--src-dir", ".", "--stdio"],
+      "env": {
+        "HF_ENDPOINT": "https://hf-mirror.com",
+        "LRC_MODEL_MIRROR": "hf-mirror"
+      }
+    }
+  }
+}
+```
+
+- `command` 用 `code-memory-server` 需先把二进制加入 `PATH`；否则填完整路径（Windows 为 `code-memory-server.exe`）。
+- `--src-dir .` 以 AI 工具的工作目录（通常为项目根）为索引目标；如需跨项目共享记忆，改用 `--global` 并省略 `--src-dir`。
+- 以上 JSON 即 **ModelScope「从 GitHub 仓库快速创建」自动解析的服务配置**，`env` 中的键值对会被平台提取为环境变量配置项。
+
+### 方式二：HTTP（LRC Desktop 或常驻端口模式）
+
+服务常驻后由 AI 工具连接。LRC Desktop 会自动启动服务，CLI 等价启动命令：
+
+```bash
+code-memory-server --src-dir ./src --port 3099
+```
+
+再写入客户端配置：
+
+```json
+{
+  "mcpServers": {
+    "lrc-memory": {
+      "type": "http",
+      "url": "http://127.0.0.1:3099/mcp"
+    }
+  }
+}
+```
+
+### 常见客户端配置位置
+
+| 客户端 | 配置文件 |
+|--------|---------|
+| Trae | `%APPDATA%/Trae/User/mcp.json` |
+| Trae CN | `%APPDATA%/Trae CN/User/mcp.json` |
+| Cursor | 项目根 `.cursor/mcp.json` |
+| VS Code | 项目根 `.vscode/mcp.json` |
+| Windsurf | `%APPDATA%/Windsurf/User/globalStorage/mcp.json` |
+| Claude Desktop | `%APPDATA%/Claude/claude_desktop_config.json` |
+
+也可用 `code-memory-server --install-ide <IDE>` 自动写入，支持 `trae` `trae-cn` `cursor` `vscode` `windsurf` `codebuddy` `qoder` `kiro` 等；`--list-ides` 可列出全部。
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `HF_ENDPOINT` | `https://hf-mirror.com` | 嵌入模型下载站点；未设置时自动指向国内镜像 |
+| `LRC_MODEL_MIRROR` | `hf-mirror` | 模型镜像源：`hf` / `hf-mirror` / `modelscope` / `auto` |
+| `LRC_MODELS_DIR` | `~/.loong-recall/models/` | 本地模型权重存放目录 |
+| `LRC_LUOSHU_MODEL_ID` | 按系统语言判定 | 语义搜索使用的嵌入模型；中文环境 `BAAI/bge-small-zh`，其他 `sentence-transformers/all-MiniLM-L6-v2` |
+| `LRC_LLM_API` | 空（未设置） | LLM 查询翻译配置，格式见 [用户使用说明书](docs/USER_GUIDE.md) |
+| `LRC_DEV_MODE` | 空（未设置） | 设为任意值即隔离开发环境：配置文件与向导存于 `dev/` 子目录、使用独立锁文件 `.lrc-dev.lock` |
+
+---
+
 ## MCP 工具
 
 桌面端和 CLI 通过 MCP 提供记忆、检索、代码搜索与系统管理能力。当前内置工具数量和名称以运行中的 `tools/list` 返回为准，避免文档与实际版本漂移。

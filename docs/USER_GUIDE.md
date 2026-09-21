@@ -312,6 +312,32 @@ alwaysApply: true
 
 > ⚠️ VS Code 需在项目目录下手动创建 mcp.json，LRC 无法自动写入项目级配置。
 
+#### 其他方式：stdio 与常驻端口
+
+以上示例均为 HTTP 模式（连接已常驻的 `3099` 服务）。若希望由 AI 工具直接拉起 CLI 二进制，改用 stdio 模式：
+
+```json
+{
+  "mcpServers": {
+    "lrc-memory": {
+      "command": "code-memory-server",
+      "args": ["--src-dir", ".", "--stdio"],
+      "env": {
+        "HF_ENDPOINT": "https://hf-mirror.com",
+        "LRC_MODEL_MIRROR": "hf-mirror"
+      }
+    }
+  }
+}
+```
+
+- `command` 用 `code-memory-server` 需先把二进制加入 `PATH`；否则填完整路径（Windows 为 `code-memory-server.exe`）。
+- `--src-dir .` 以 AI 工具的工作目录（通常为项目根）为索引目标；如需跨项目共享记忆，改用 `--global` 并省略 `--src-dir`。
+
+也可用 `code-memory-server --install-ide <IDE>` 自动写入配置，支持 `trae` `trae-cn` `cursor` `vscode` `windsurf` `codebuddy` `qoder` `kiro` 等；`--list-ides` 可列出全部。
+
+> **托管部署说明**：LRC 依赖本机资源（本地源码索引、`~/.loong-recall/` 记忆库、本机嵌入模型），**不适合远程托管部署**。在 ModelScope MCP 广场等平台创建时，托管类型请选择「**仅本地可用**」。
+
 ### 第 3 步：验证一切正常
 
 1. 启动 LRC Desktop（或运行 `code-memory-server --src-dir ./src --port 3099`）
