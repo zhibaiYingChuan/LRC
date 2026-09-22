@@ -454,7 +454,7 @@ benchmarks/*_raw_*.json
 #       ⚠ 原表述为「Cargo 打包走 Cargo.toml 的 include/exclude」，**该说法是错的**：
 #         Cargo.toml 里**从来没有** include / exclude / files 任何一个键（已全仓核实）。
 #         按 Rust 默认行为，`src/` 下所有被 `mod` 图可达的 `.rs` **都会进包**。
-#         ⇒ 别再把"已由打包边界保护"当作免责依据（详见 docs/V099_INTERACTION_USABILITY.md §十）。
+#         ⇒ 别再把"已由打包边界保护"当作免责依据（v0.9.9 实测结论，报告为本地维护资料，不入库）。
 #       本例外仅使三脚本可提交，与打包无关。
 # 顺序约束：负向规则必须置于其对应忽略规则之后，故集中于此，勿上移。
 !scripts/dev-proxy.py
@@ -477,7 +477,7 @@ benchmarks/*_raw_*.json
 #          只存在于 `mirror_trapezoid.rs` 的宫义串，且这些串在前端资源里 0 命中）：
 #            dao_evolution.rs / dao_metrics.rs / dao_regulator.rs / mirror_trapezoid.rs /
 #            luoshu_encoder.rs / navigation.rs（+ ml 门控下的 luoshu_encoder_ml.rs）
-#          实证与方法见 docs/V099_INTERACTION_USABILITY.md §十。
+#          实证与方法见 v0.9.9 实测结论（二进制字符串级实证；报告为本地维护资料，不入库）。
 # 注：选型结论已提炼进 `daoti/PREREG_MEMORY_ASSOCIATION.md`（该文件亦在 daoti/ 忽略范围内）。
 11_记忆联想专项_选型包/
 DAOti+llm_融合引擎源码与文档/
@@ -498,3 +498,25 @@ docs/ARCHITECTURE_OVERVIEW.md
 #       仅因文件名为英文而未被上述中文/模式规则覆盖，此处补齐口径。
 docs/CDP_WHY_VERIFY_*.md
 docs/DAOTI_INTEGRATION_VERIFY.md
+
+# v0.9.9 发布清理（2026-09-22）：内部研发过程文档（不交付用户）
+# 依据：以下 7 份均为**面向维护者的过程产物**（实测报告 / 代码审查报告 / 验收结果），
+#       非产品文档；旧规则因文件名是英文而未被上述中文模式规则（docs/*验证*.md 等）覆盖，此处补齐口径。
+#       本次一并 `git rm --cached` 取消跟踪，**本地文件保留**。
+#   · G5A_QUOTA_COMPETITION_MEASUREMENT.md    — 配额竞争实测报告
+#   · GOAL_DRIVEN_VALUE_MEASUREMENT.md        — 目标驱动价值测量报告
+#   · MEMORY_ASSOCIATION_CODE_REVIEW.md       — 联想子系统代码审查报告
+#   · SYMBOLIC_LAYER_INTEGRATION_ACCEPTANCE.md— 符号层接入验收标准（待确认稿）
+#   · SYMBOLIC_LAYER_INTEGRATION_RESULT.md    — 符号层接入验收实测结果
+#   · SYMBOLIC_LAYER_TWO_CRITERIA_MEASUREMENT.md — 符号层两条判据落地实测
+#   · V099_INTERACTION_USABILITY.md           — v0.9.9 交互可用性实测报告
+# 边界：其关键结论已内联到引用它们的源码注释中（`src/memory_store.rs` 两处、
+#       `src/memory_store_tests.rs` 一处），移出文档**不影响代码可读性**。
+# 注：**基准测试文档不在此列** —— `benchmarks/` 下全部报告按产品材料保留交付。
+docs/G5A_QUOTA_COMPETITION_MEASUREMENT.md
+docs/GOAL_DRIVEN_VALUE_MEASUREMENT.md
+docs/MEMORY_ASSOCIATION_CODE_REVIEW.md
+docs/SYMBOLIC_LAYER_INTEGRATION_ACCEPTANCE.md
+docs/SYMBOLIC_LAYER_INTEGRATION_RESULT.md
+docs/SYMBOLIC_LAYER_TWO_CRITERIA_MEASUREMENT.md
+docs/V099_INTERACTION_USABILITY.md

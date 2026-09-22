@@ -791,7 +791,7 @@ v0.6.0 起，点击状态栏的"已停止 / 不可达"文本会弹出启动服�
 ## 参考链接
 
 - [Smart Match 离线安装指南](OFFLINE_MODEL_GUIDE.md) — 内网/离线环境配置
-- [性能测试指南](BENCHMARK.md) — 百万条记忆 < 30ms
+- [性能测试指南](../benchmarks/comparative/BENCHMARK_GUIDE.md) — 百万条记忆检索 < 30ms（P99，参考值，以当前版本实测为准）
 
 > 算法概述文档受 DaoTi Research License 保护，不公开分发。如需了解算法原理，请参阅源码 `src/engine/` 目录下的相关模块。
 
