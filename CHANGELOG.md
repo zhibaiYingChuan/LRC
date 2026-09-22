@@ -34,6 +34,7 @@
   - `checkEmbedderStatus` 增加运行时 `encoder.mode` 校验，区分「文件就绪」与「正在生效」。
 - **门禁**：`cargo test --features server` **790 passed / 0 failed**；desktop crate **96 passed / 0 failed**；clippy 干净；`check_algorithm_leak.py` 退出码 **0**；CDP 三套件全绿（`cdp-regression` 发布门禁 PASS、`association-desktop-cdp` 7/7、`symbolic-layer-desktop-cdp` 7/7）。
 - **线上 CI 实测**：run `35431963121` 全部 8 个作业通过（8m0s）；其中 `Clippy` 仅 **44s**，印证「只优化 13 个 ML 包」的收窄策略未拖慢 CI（若用 `"*"` 需重编约 200 个依赖）。
+- **注**：本条目所述发版门禁在 `release.yml` 中，该工作流由 `push.tags: 'v*'` 触发——**推送分支不会触发发版构建**，须另行打 tag。（`ci.yml` 与 `release.yml` 是两条互不相交的触发链，详见本地内部审计清单「检查项 6」。）
 
 ## [0.9.8] - 2026-09-17
 
