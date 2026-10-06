@@ -140,6 +140,11 @@ fn default_source() -> String {
 /// 表层记忆数据源抽象（可接入任意表层记忆系统或 HTTP API）
 ///
 /// 实现此 trait 即可将任意表层记忆系统接入结晶流水线。
+///
+/// 说明：rustc 1.99 起 clippy 新增「double must use」lint，会命中 async_trait
+/// 宏展开出的 must_use 属性（宏生成，源码无法移除），属工具链与属性宏交互的已知
+/// 误报，故此处显式 allow；待 async-trait 与 clippy 收敛后可移除。
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait SurfaceMemorySource: Send + Sync {
     /// 获取自指定时间以来的新记忆
