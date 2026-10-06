@@ -195,7 +195,15 @@ fn main() {
         })
         .setup(|app| {
             // 构建系统托盘（右键菜单 + 双击打开仪表盘）
-            tray::build_tray(app.app_handle())?;
+            // v0.9.10 修复：托盘是可选的增强能力，不应成为致命依赖。
+            // 在缺少 appindicator / D-Bus StatusNotifier 主机的环境（容器、
+            // 精简桌面、AppImage 测试沙箱）下 build_tray 会返回 Err；此前用 `?`
+            // 直接向上传播，导致 setup 失败 → run() 失败 → exit(1)，
+            // 整个应用"启动即退出"（AppImageHub 收录测试判定 error-app-exits）。
+            // 改为降级告警：托盘不可用，但主窗口正常显示。
+            if let Err(e) = tray::build_tray(app.app_handle()) {
+                tracing::warn!("系统托盘构建失败（降级为无托盘模式，不阻断启动）: {e}");
+            }
 
             // ════════════════════════════════════════════════════════════════
             // v0.8.0 "归一" 新增：启动时自动写入 AI 规则文件

@@ -812,6 +812,29 @@ pub fn save_semantic_cache(data_dir: &Path, cache: &SemanticVectorCache) {
     }
 }
 
+/// 以实测维度校准缓存（供**旁路缓存复用**入口在打分后调用）。
+///
+/// **为什么需要独立入口**：`SEMANTIC_CACHE_VERSION` 是模块私有，外部（`memory_store`
+/// 的缓存复用入口、`v1_api` 的旁路）无法直接写 `version`/`dim`；若不治理，
+/// 首次运行后 `version` 仍为 0，落盘后将被 [`load_semantic_cache`] 判为版本不符而整体丢弃。
+///
+/// 语义：
+///   - 始终把 `version` 对齐当前 [`SEMANTIC_CACHE_VERSION`]（保证落盘可被后续读取）；
+///   - `dim == 0`（编码器不可用）⇒ 不改动 `dim` 与向量（避免误清空既有缓存）；
+///   - `dim` 变更（换模型）⇒ 丢弃维度不符的旧向量，避免按旧维度打分；
+///   - 首次设定 `dim`（原为 0）⇒ 直接采用。
+pub fn ensure_semantic_cache_dim(cache: &mut SemanticVectorCache, dim: usize) {
+    cache.version = SEMANTIC_CACHE_VERSION;
+    if dim == 0 {
+        return;
+    }
+    if cache.dim != 0 && cache.dim != dim {
+        // 维度变更：旧维度向量不可复用，静默丢弃（与 load 的整体失效语义一致）。
+        cache.vectors.retain(|_, v| v.len() == dim);
+    }
+    cache.dim = dim;
+}
+
 /// 余弦相似度（两向量；维度不符/零模长 → None）。
 fn cosine(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.len() != b.len() || a.is_empty() {
@@ -1221,6 +1244,115 @@ where
     );
     outcome.match_min_used = state_semantic_min();
     Some(outcome)
+}
+
+/// **显式回填**语义向量缓存（补上缺失的 `reencode` 语义入口）。
+///
+/// 与 [`run_semantic_match`] 内"顺带回填"的关键差别：
+///   - **不受 `stale_days` 限制** —— 顺带回填只挑"久未访问且未缓存"的记忆；
+///     本入口的语义就是"把尚未缓存的向量补齐"，因此候选是**全部未缓存且未过期**
+///     的记忆（显式触发场景），按 `last_accessed` 升序优先补齐最可能成为候选者。
+///   - 保留与顺带回填一致的**双约束**（条数 `batch` + 时间 `budget`）：
+///     防止单次请求吃满 CPU 或超出前端超时（实测教训见 `semantic_backfill_budget_ms`）。
+///
+/// 落盘纪律（与旁路缓存复用一致）：
+///   - `dim == 0`（编码器不可用 → 无向量产出）⇒ **不落盘**，不覆盖既有缓存（诚实降级）；
+///   - 首次成功产出向量时以其实测维度为准；若与旧缓存维度不符 ⇒ 旧向量整体失效
+///     （换模型场景，与 `load_semantic_cache` 的整体失效语义一致）。
+///
+/// 返回**实际编码并写入缓存**的条数（供端点回显与测试断言）。
+///
+/// 说明：模型更换后若**全部**记忆都已在旧维度缓存中，本入口候选为空（返回 0）；
+/// 此时由 `run_semantic_match` 在维度不符时整体重置缓存，随后本入口即可重新填充。
+pub fn backfill_semantic_cache<P>(
+    store: &MemoryStore<P>,
+    memories: &[Memory],
+    data_dir: &Path,
+    batch: usize,
+    budget: std::time::Duration,
+) -> usize
+where
+    P: crate::persistence::Persistence,
+{
+    let mut cache = load_semantic_cache(data_dir);
+    // 编码器以闭包注入纯核心，便于在**无 ML 编码器**的测试 build 下确定性验证不变量。
+    let encoded = backfill_semantic_cache_core(memories, &mut cache, batch, budget, |text| {
+        store.encode_sentence_vector(text)
+    });
+    // `dim == 0`（无产出）⇒ 不落盘，不覆盖既有缓存（诚实降级）。
+    if encoded > 0 {
+        save_semantic_cache(data_dir, &cache);
+    }
+    encoded
+}
+
+/// [`backfill_semantic_cache`] 的**纯核心**（编码器以闭包注入，便于确定性测试）。
+///
+/// **为什么解耦编码器**（与 `memory_store::resolve_candidate_vectors` 同款理由）：
+/// 测试 build 下 `MemoryStore::new()` 的编码器恒返回 `None`（统计降级模式），
+/// 无法走真实 ML 编码路径；若不解耦，「候选筛选 / 双约束 / 维度校准 / 失败跳过」
+/// 这些不变量就只能靠人工目视，无回归保护。
+///
+/// 语义与生产路径**逐字节一致**：
+///   - 候选：`!is_expired() && !已缓存`，按 `last_accessed` 升序（更久未访问者优先）；
+///   - 双约束：`take(batch)` 条数上限 + **每轮编码前**复核 `budget` 时间上限（先到者生效）；
+///   - 首条成功产出即以其长度校准维度；与旧缓存维度不符 ⇒ 旧向量整体失效（换模型）；
+///   - 单条失败（`None`/空向量/同轮维度漂移）⇒ 跳过该条，不阻断整轮；
+///   - 仅在**确有产出**时调用 `ensure_semantic_cache_dim`（`dim == 0` 的不落盘语义
+///     由调用方 `encoded > 0` 把关）。
+///
+/// 返回实际写入缓存的条数。
+fn backfill_semantic_cache_core<F>(
+    memories: &[Memory],
+    cache: &mut SemanticVectorCache,
+    batch: usize,
+    budget: std::time::Duration,
+    encode: F,
+) -> usize
+where
+    F: Fn(&str) -> Option<Vec<f32>>,
+{
+    // 候选：未过期且**未缓存**；按"更久未访问"升序（优先补齐早期有效性更高者）
+    let mut todo: Vec<&Memory> = memories
+        .iter()
+        .filter(|m| !m.is_expired() && !cache.vectors.contains_key(&m.id))
+        .collect();
+    todo.sort_by_key(|m| m.last_accessed);
+
+    let started = std::time::Instant::now();
+    let mut encoded = 0usize;
+    // 0 = 尚未产出向量（维度未定）；首个成功产出即以其长度为准
+    let mut dim = 0usize;
+    for m in todo.into_iter().take(batch) {
+        // **时间预算检查（每轮编码前）**：单次请求必须落在调用方可接受范围内
+        if started.elapsed() >= budget {
+            break;
+        }
+        // 单条失败（超长文本/分词异常）→ 跳过该条，不阻断整轮
+        let Some(v) = encode(m.content.as_str()) else {
+            continue;
+        };
+        if v.is_empty() {
+            continue;
+        }
+        if dim == 0 {
+            dim = v.len();
+            // 首次产出即维度校准：与旧缓存维度不符 ⇒ 旧向量整体失效（换模型）
+            if cache.dim != 0 && cache.dim != dim {
+                cache.vectors.clear();
+            }
+        }
+        // 同一次调用内维度漂移（不应发生）⇒ 跳过，保持缓存一致性
+        if v.len() != dim {
+            continue;
+        }
+        cache.vectors.insert(m.id.clone(), v);
+        encoded += 1;
+    }
+    if encoded > 0 {
+        ensure_semantic_cache_dim(cache, dim);
+    }
+    encoded
 }
 
 /// 从 daemon 拉取状态快照（超时 2s，失败返回 None —— 静默降级）。
@@ -2235,5 +2367,197 @@ mod tests {
         // 回退标签路径后仍能产出（证明缺字段不导致通道失效）
         assert!(out.executed, "缺锚点文本不应让通道失效");
         std::env::remove_var("LRC_STATE_DRIVEN_DISCOVERY");
+    }
+
+    // ---- semantic-3：显式回填语义向量缓存（backfill_semantic_cache）----
+    // 承「复用侧车缓存」决策：补上缺失的 `reencode()` 语义入口（显式触发全量补齐）。
+    // 因测试 build 下 `MemoryStore::new()` 的编码器恒返回 None（统计降级），
+    // 生产不变量的验证走**注入编码闭包**的纯核心 `backfill_semantic_cache_core`；
+    // 「无编码器 ⇒ 诚实降级不落盘」另用真实 store 作确定性契约测试。
+
+    /// 构造一条带可控未访问天数的普通记忆（复用 `mem_with_bagua` 的构造纪律）。
+    fn mem_aged(id: &str, content: &str, days: i64) -> Memory {
+        mem_with_bagua(id, content, Some(0), days)
+    }
+
+    /// **只补未缓存且未过期**：已缓存者零编码（旧向量原样保留）、已过期者被排除。
+    #[test]
+    fn backfill_selects_only_uncached_and_unexpired() {
+        let cached = mem_aged("cached", "已缓存", 30);
+        let mut expired = mem_aged("expired", "已过期", 30);
+        // 令其过期：创建于 3 天前 + TTL 1 天
+        expired.created_at = chrono::Utc::now() - chrono::Duration::days(3);
+        expired.ttl_days = Some(1);
+        let fresh = mem_aged("fresh", "待补", 30);
+        let memories = vec![cached, expired, fresh];
+
+        let mut cache = SemanticVectorCache {
+            version: SEMANTIC_CACHE_VERSION,
+            dim: 3,
+            vectors: HashMap::new(),
+        };
+        cache
+            .vectors
+            .insert("cached".to_string(), vec![1.0, 0.0, 0.0]);
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let encoded = backfill_semantic_cache_core(
+            &memories,
+            &mut cache,
+            8,
+            std::time::Duration::from_secs(5),
+            |_text| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(vec![0.0, 1.0, 0.0])
+            },
+        );
+
+        assert_eq!(encoded, 1, "只应编码 fresh 一条");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "已缓存者不得编码；已过期者不得编码"
+        );
+        assert_eq!(cache.vectors.get("fresh").map(|v| v.len()), Some(3));
+        assert_eq!(
+            cache.vectors.get("cached").cloned(),
+            Some(vec![1.0f32, 0.0, 0.0]),
+            "已缓存向量必须原样保留，不得被覆盖"
+        );
+        assert!(
+            !cache.vectors.contains_key("expired"),
+            "过期记忆不得进入缓存"
+        );
+    }
+
+    /// **条数上限 + 陈旧优先**：batch=2 时只编码最久未访问的 2 条。
+    #[test]
+    fn backfill_respects_batch_cap_by_staleness() {
+        let memories = vec![
+            mem_aged("m-oldest", "最久未访问", 50),
+            mem_aged("m-mid", "中间", 20),
+            mem_aged("m-newest", "最近", 5),
+        ];
+        let mut cache = SemanticVectorCache::default();
+        let encoded = backfill_semantic_cache_core(
+            &memories,
+            &mut cache,
+            2,
+            std::time::Duration::from_secs(5),
+            |_t| Some(vec![1.0, 0.0]),
+        );
+        assert_eq!(encoded, 2, "batch 上限应截断");
+        assert!(
+            cache.vectors.contains_key("m-oldest"),
+            "应优先补齐最久未访问者"
+        );
+        assert!(cache.vectors.contains_key("m-mid"));
+        assert!(
+            !cache.vectors.contains_key("m-newest"),
+            "超出 batch 者本轮不编码"
+        );
+        assert_eq!(cache.dim, 2, "应校准为实测维度");
+    }
+
+    /// **零预算硬保护**：不得编码、不得改动缓存（硬时限优先于条数）。
+    #[test]
+    fn backfill_zero_budget_encodes_nothing() {
+        let memories = vec![mem_aged("m1", "待补", 30)];
+        let mut cache = SemanticVectorCache::default();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let encoded = backfill_semantic_cache_core(
+            &memories,
+            &mut cache,
+            8,
+            std::time::Duration::ZERO,
+            |_t| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(vec![1.0])
+            },
+        );
+        assert_eq!(encoded, 0, "零预算下不得编码");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(cache.vectors.is_empty(), "零预算不得写入缓存");
+        assert_eq!(cache.dim, 0, "零产出不得设定维度");
+    }
+
+    /// **换模型（维度变更）⇒ 旧维度向量整体失效**，新向量按新维度写入。
+    #[test]
+    fn backfill_dim_change_invalidates_old_vectors() {
+        let memories = vec![mem_aged("m-new", "新模型维度", 30)];
+        let mut cache = SemanticVectorCache {
+            version: SEMANTIC_CACHE_VERSION,
+            dim: 2,
+            vectors: HashMap::new(),
+        };
+        // 旧模型遗留的 2 维向量（不属于本批候选）
+        cache.vectors.insert("m-stale".to_string(), vec![1.0, 0.0]);
+        let encoded = backfill_semantic_cache_core(
+            &memories,
+            &mut cache,
+            8,
+            std::time::Duration::from_secs(5),
+            |_t| Some(vec![1.0, 0.0, 0.0, 0.0]),
+        );
+        assert_eq!(encoded, 1);
+        assert_eq!(cache.dim, 4, "维度应校准为新模型维度");
+        assert!(
+            !cache.vectors.contains_key("m-stale"),
+            "旧维度向量必须整体失效（避免按旧维度打分）"
+        );
+        assert!(cache.vectors.contains_key("m-new"));
+    }
+
+    /// **单条编码失败静默跳过**，不阻断整轮（返回值为成功条数）。
+    #[test]
+    fn backfill_skips_failed_encodes_without_aborting() {
+        let memories = vec![
+            mem_aged("bad", "超长文本导致编码失败", 40),
+            mem_aged("good", "可正常编码", 30),
+        ];
+        let mut cache = SemanticVectorCache::default();
+        let encoded = backfill_semantic_cache_core(
+            &memories,
+            &mut cache,
+            8,
+            std::time::Duration::from_secs(5),
+            |text| {
+                if text.contains("超长") {
+                    None
+                } else {
+                    Some(vec![1.0, 0.0])
+                }
+            },
+        );
+        assert_eq!(encoded, 1, "仅成功者计数");
+        assert!(!cache.vectors.contains_key("bad"), "失败项不得写入");
+        assert!(cache.vectors.contains_key("good"), "成功项应写入");
+    }
+
+    /// **编码器不可用（无 ML）⇒ 诚实降级**：返回 0 且**不创建缓存文件**。
+    ///
+    /// 确定性契约：绝不能用"空结果"覆盖/创建磁盘上的缓存 —— 否则会误导后续
+    /// 读取方以为"缓存已建立但全空的库"。测试 build 下编码器恒返回 None，
+    /// 正是此降级路径的真实触发条件。
+    #[test]
+    fn backfill_without_encoder_degrades_without_touching_disk() {
+        let (dir, mut store) = make_store();
+        store
+            .remember(mem_aged("m1", "待补记忆", 30))
+            .expect("应成功记住");
+        let filter = crate::memory_store_types::ListFilter::new();
+        let (memories, _total) = store.list_memories(&filter).expect("应能列出记忆");
+        let encoded = backfill_semantic_cache(
+            &store,
+            &memories,
+            dir.path(),
+            8,
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(encoded, 0, "无编码器时不得编码");
+        assert!(
+            !semantic_cache_path(dir.path()).exists(),
+            "无产出时不得创建缓存文件（诚实降级）"
+        );
     }
 }

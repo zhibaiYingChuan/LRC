@@ -55,7 +55,7 @@ use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder;
 use crate::engine::memory_gc::{GcStats, MemoryGarbageCollector, MemoryInfoQuery, MemorySnapshot};
 use crate::engine::memory_state_machine::MemoryStateMachine;
 use crate::engine::mirror_trapezoid::{
-    bagua_name_to_index, mirror_project, recursive_unfold, TrapezoidROI,
+    bagua_name_to_index, bagua_ring_distance, mirror_project, recursive_unfold, TrapezoidROI,
 };
 use crate::engine::synthesis_engine::{SynthesisConfig, SynthesisEngine, SynthesisPlan};
 use crate::engine::synthesis_journal::SynthesisJournal;
@@ -98,6 +98,27 @@ const BM25_B: f32 = 0.75;
 /// 域外高余弦记忆无词面加分自然沉底。词面域是内容锚，不涉及八卦元数据，遵循方案 §3.5。
 /// 权重可通过环境变量 LRC_DEEP_LEX_DOMAIN_WEIGHT 覆盖（阶段 B scale 消融用），默认 0.25。
 const LEX_DOMAIN_WEIGHT: f32 = 0.25;
+
+/// deep 路候选数量下限（v0.9.10「兜底回补」）。
+///
+/// 八卦硬剪除 + ROI 聚焦是对候选的"粗筛"。当编码分布变化使本查询的
+/// 同卦/相邻卦候选过少时，二者叠加会把相关记忆整体剪光，导致 root 落在
+/// 无关的跨卦幸存记忆上（记忆丢失的另一种形态）。故当聚焦后候选低于
+/// 本下限时，从合格池按环形距离就近回补。
+///
+/// **取值 2 的硬约束**：A/B 锁用例 `test_trapezoid_recall_prunes_cross_bagua_candidates`
+/// 要求在「剪除后恰 2 条」时不得回补（否则跨卦的 ma 会被拉回、破坏剪除语义）。
+/// 故下限只能取 ≤2；取 2 既满足锁用例，又能覆盖「剪到 0/1 条」的退化场景。
+const MIN_DEEP_CANDIDATES: usize = 2;
+
+/// 兜底回补的最大环形距离（v0.9.10）。
+///
+/// 八卦硬剪除保留环形距离 ≤1 的候选；回补作为「剪除过严」时的兜底，
+/// 只向外放宽**一环**（≤2），绝不把剪除明确拒绝的远端跨卦候选
+/// （环形距离 3/4）重新拉回——否则等于否定硬剪除本身，令
+/// `test_trapezoid_recall_daoti_preview_keeps_cross_domain_candidate`
+/// 的默认值契约（跨卦 A 应被剪除）回归。
+const DEEP_BACKFILL_MAX_RING: u8 = 2;
 
 /// hub 实体判定·文档频率占比阈值（v0.9.7，PREREG §3.45.5）
 ///
@@ -787,6 +808,77 @@ pub struct MemoryStore<P: Persistence> {
     exploration_logger: crate::engine::exploration_log::ExplorationLogger,
 }
 
+/// 洛书八卦历史重分类报告（v0.9.10 塔缩修复·第 2 层）
+///
+/// 背景：`bagua_index` 在写入时被冻结（写时持久化），存量记忆长期停留在
+/// 旧编码器的错误分类下（实测 95%+ 同卦）。本报告让调用方能**如实**看到
+/// 一次重分类扫描的处理量与分布变化，而不是只看一个"成功"。
+#[derive(Debug, Clone)]
+pub struct BaguaReclassifyReport {
+    /// 扫描到的记忆总数（全库）
+    pub scanned: usize,
+    /// 实际用当前编码器重算的条数（受 `limit` 约束）
+    pub processed: usize,
+    /// 本轮未处理的条数（`scanned - processed`）
+    pub skipped: usize,
+    /// `bagua_index` 发生变化的条数（仅计已处理部分）
+    pub changed: usize,
+    /// 重分类前全量分布（按 `bagua_index` 0..8 计数）
+    pub before: [usize; 8],
+    /// 重分类后全量分布（已处理用新值、未处理沿用旧值）
+    pub after: [usize; 8],
+    /// 重分类前分布香农熵（范围 [0, 3.0]）
+    pub entropy_before: f32,
+    /// 重分类后分布香农熵（范围 [0, 3.0]）
+    pub entropy_after: f32,
+}
+
+/// 重分类批量编码的分块大小（v0.9.10 吞吐优化）。
+///
+/// 每块调用一次 `HybridLuoShuEncoder::encode_text_batch` 做单次 BERT 批量前向。
+/// 取值权衡：过小则批量收益被摊薄，过大则单次前向的峰值内存与单次持锁时长上升。
+/// 16 在 CPU 前向下兼顾吞吐与内存，且与异步任务的批大小（50）解耦——
+/// 一个任务批可含多个编码块。
+const BAGUA_RECLASSIFY_ENCODE_CHUNK: usize = 16;
+
+/// 单条记忆的洛书/八卦派生字段重算结果（内部使用）。
+///
+/// 抽取目的：让"全量重分类 / 分批重分类 / 异步任务"三条路径复用**同一套编码口径**，
+/// 与写入路径（remember）保持一致，避免不同入口产生分类漂移。
+struct BaguaRecompute {
+    /// 重算后的八卦下标（0..8）
+    new_index: u8,
+    /// 重算后的卦名
+    new_category: String,
+    /// 重算后的洛书 9 维向量
+    new_values: [f32; 9],
+    /// 重算后的拓扑深度
+    new_depth: f32,
+    /// 任一派生字段与旧值不同（即需要落盘）
+    field_changed: bool,
+}
+
+/// 单批重分类的结果（供异步任务按 offset 分片推进）。
+///
+/// 与 `BaguaReclassifyReport` 的区别：报告面向"一次全量扫描"的分布前后对比；
+/// 本结构面向"分片推进"——只统计本批切片，分布以 `old_counts`/`new_counts`
+/// **增量**形式给出，由调用方跨批累加，从而在不做全量重扫的前提下得到全库进度。
+#[derive(Debug, Clone)]
+pub struct BaguaReclassifyBatch {
+    /// 全库记忆总数
+    pub total: usize,
+    /// 本批实际起始下标（已按 [0, total] 夹取）
+    pub offset: usize,
+    /// 本批实际处理条数
+    pub processed: usize,
+    /// 本批 `bagua_index` 发生变化的条数
+    pub changed: usize,
+    /// 本批所处理记忆的旧分布（按处理前的 `bagua_index` 计数，仅计 0..8）
+    pub old_counts: [usize; 8],
+    /// 本批所处理记忆的新分布（按重算后的 `bagua_index` 计数，仅计 0..8）
+    pub new_counts: [usize; 8],
+}
+
 // ============================================================
 // MemoryGraphQuery trait 实现（供两阶段确认的影响评估使用）
 // ============================================================
@@ -1336,8 +1428,155 @@ fn is_visible(
     }
 }
 
+/// 写入去重（`remember` 相似合并）所用的 Jaccard 相似度阈值。
+///
+/// 默认 `0.5`，与历史行为**完全一致** —— 不设环境变量时行为零变化。
+///
+/// 可用环境变量 `LRC_SIMILARITY_THRESHOLD` 覆盖（取值需在 `[0.0, 1.0]`，
+/// 非法值回退默认）。设为接近 `1.0` 即可近乎关闭"相似即合并"，
+/// 使每一次写入都独立成条、可被单独召回。
+///
+/// 为什么需要这个开关：默认策略下，两条 Jaccard 词集相似度 ≥ 0.5 的记忆
+/// 会被**合并为一条**（内容替换 + 版本号 +1）。这对代码记忆库是合理的抗重复
+/// 设计，但在"投喂的每个分块都必须能被召回"的记忆评测场景（如 AML）中，
+/// 模板相近的分块会被大量压掉，导致召回量严重不足。
+fn similarity_threshold_from_env() -> f32 {
+    const DEFAULT: f32 = 0.5;
+    match std::env::var("LRC_SIMILARITY_THRESHOLD") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            match trimmed.parse::<f32>() {
+                Ok(v) if (0.0..=1.0).contains(&v) => {
+                    if (v - DEFAULT).abs() > f32::EPSILON {
+                        eprintln!(
+                            "[LRC·写入去重] 相似度阈值被 LRC_SIMILARITY_THRESHOLD 覆盖为 {:.3}（默认 {:.3}）",
+                            v, DEFAULT
+                        );
+                    }
+                    v
+                }
+                _ => {
+                    eprintln!(
+                        "[LRC·写入去重] ⚠ 环境变量 LRC_SIMILARITY_THRESHOLD={:?} 非法（需 0.0~1.0），已回退默认 {:.3}",
+                        raw, DEFAULT
+                    );
+                    DEFAULT
+                }
+            }
+        }
+        Err(_) => DEFAULT,
+    }
+}
+
+/// bge-zh 官方用法：短查询侧需加检索指令前缀，文档侧不加。
+/// 缺省前缀时句向量各向异性严重（实测相关对与无关对差距仅 ~0.01）。
+#[cfg(feature = "ml")]
+const BGE_QUERY_INSTRUCTION: &str = "为这个句子生成表示以用于检索相关文章：";
+
+/// 向量 L2 范数（句向量余弦归一化用）。
+#[cfg(feature = "ml")]
+fn l2_norm(v: &[f32]) -> f32 {
+    v.iter().map(|x| x * x).sum::<f32>().sqrt()
+}
+
+/// 向量点积（句向量余弦分子）。
+#[cfg(feature = "ml")]
+fn dot(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// 解析候选记忆的语义向量：**优先命中侧车缓存**，仅在未命中时于时间预算内编码回填。
+///
+/// **为什么需要它**（承「复用侧车缓存」决策，见内存报告 §semantic）：
+/// Path A 联想探索旁路原先对**每条候选实时编码**（实测 ≈2.25s/条、并发无加速），
+/// 全库规模下不可行；而仓库既有 `semantic_vectors.json` 侧车缓存设施（[`crate::state_matcher`]）
+/// 此前**仅 Path B 使用**。本函数使旁路复用同一缓存，消除逐条实时编码。
+///
+/// 契约（不变量，逐条被 `memory_store_tests` 覆盖）：
+///   - **命中判据**：条目存在**且** `v.len() == dim`（`dim > 0`）——换模型后旧维度
+///     向量不可复用，视为未命中（绝不按旧维度打分，绝不放宽标准）；
+///   - **预算硬保护**：每块编码前检查 `started.elapsed() >= budget` 立即截断，
+///     零预算 ⇒ 零编码；**绝不超支**（外层 6s 旁路时限的兜底）；
+///   - **失败诚实降级**：编码返回 `None` 或维度不符 ⇒ 该条保持 `None`，
+///     不写入缓存、不置 `dirty`；
+///   - **成功回填**：编码成功且维度合规 ⇒ 写回 `cache_vectors` 并置 `dirty=true`，
+///     由调用方决定是否落盘。
+///
+/// 返回 `(每候选向量, 是否产生新回填)`，顺序与 `memories` 严格一致。
+///
+/// 并发说明：`MemoryStore` 因持久化缓存字段含 `RefCell` 而 `!Sync`，跨线程只能
+/// 共享**编码闭包**（`F: Sync` ⇒ `&F: Send`），与历史并行编码范式一致。
+#[cfg(feature = "ml")]
+fn resolve_candidate_vectors<F>(
+    memories: &[&Memory],
+    cache_vectors: &mut std::collections::HashMap<String, Vec<f32>>,
+    dim: usize,
+    encode: F,
+    budget: std::time::Duration,
+) -> (Vec<Option<Vec<f32>>>, bool)
+where
+    F: Fn(&str) -> Option<Vec<f32>> + Sync,
+{
+    let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(memories.len());
+    // 第一遍：缓存命中直接复用（零编码）；未命中登记索引与文本待回填。
+    let mut pending: Vec<(usize, &str)> = Vec::new();
+    for memory in memories {
+        if dim > 0 {
+            if let Some(v) = cache_vectors.get(&memory.id) {
+                if v.len() == dim {
+                    out.push(Some(v.clone()));
+                    continue;
+                }
+            }
+        }
+        out.push(None);
+        pending.push((out.len() - 1, memory.content.as_str()));
+    }
+    if pending.is_empty() {
+        return (out, false);
+    }
+    // 第二遍：预算内并行编码回填。按可用并行度分块，块间复核时间预算——
+    // 单块内并发不打断，保证墙钟时间压缩到单条耗时量级（历史范式）。
+    let started = std::time::Instant::now();
+    let parallelism = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1);
+    let encode_ref = &encode;
+    let mut dirty = false;
+    let mut chunk_start = 0usize;
+    while chunk_start < pending.len() {
+        if started.elapsed() >= budget {
+            break;
+        }
+        let chunk_end = (chunk_start + parallelism).min(pending.len());
+        let chunk = &pending[chunk_start..chunk_end];
+        let encoded: Vec<Option<Vec<f32>>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|(_, text)| scope.spawn(move || encode_ref(text)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or(None))
+                .collect()
+        });
+        for ((idx, _), vector) in chunk.iter().zip(encoded) {
+            if let Some(v) = vector {
+                if dim > 0 && v.len() == dim {
+                    cache_vectors.insert(memories[*idx].id.clone(), v.clone());
+                    out[*idx] = Some(v);
+                    dirty = true;
+                }
+            }
+        }
+        chunk_start = chunk_end;
+    }
+    (out, dirty)
+}
+
 impl<P: Persistence> MemoryStore<P> {
-    /// 创建新的记忆存储器（默认相似度阈值 0.5）
+    /// 创建新的记忆存储器（相似度阈值默认 0.5，可用 LRC_SIMILARITY_THRESHOLD 覆盖）
     pub fn new(persistence: P) -> Self {
         let memory_state = persistence.load_memory_state().unwrap_or_default();
         let assoc_frequency = persistence.load_assoc_frequency().unwrap_or_default();
@@ -1366,7 +1605,7 @@ impl<P: Persistence> MemoryStore<P> {
 
         Self {
             persistence,
-            similarity_threshold: 0.5,
+            similarity_threshold: similarity_threshold_from_env(),
             synthesis_min_cluster: 3,
             synthesis_similarity: 0.4,
             luoshu_encoder: HybridLuoShuEncoder::default(),
@@ -1407,7 +1646,7 @@ impl<P: Persistence> MemoryStore<P> {
     pub fn new_statistical(persistence: P) -> Self {
         Self {
             persistence,
-            similarity_threshold: 0.5,
+            similarity_threshold: similarity_threshold_from_env(),
             synthesis_min_cluster: 3,
             synthesis_similarity: 0.4,
             #[cfg(feature = "ml")]
@@ -1535,6 +1774,10 @@ impl<P: Persistence> MemoryStore<P> {
     /// 语义相似度公共实现。`decenter=false` 时与历史实现逐字节一致；
     /// `decenter=true` 时追加"候选池均值去中心化"步骤（P8.2j）；
     /// `suppress=Some(λ)` 时在去中心化余弦上追加"池内中心度去偏"（P8.2n）。
+    ///
+    /// 本方法保持"实时逐条编码"语义（供历史通路与既有测试使用）；旁路的
+    /// 侧车缓存复用入口见 [`Self::semantic_similarities_cached`]。两者打分逻辑
+    /// 共用 [`Self::score_semantic_vectors`]，确保判别力**逐字节一致**。
     #[cfg(feature = "ml")]
     fn semantic_similarities_impl(
         &self,
@@ -1543,20 +1786,10 @@ impl<P: Persistence> MemoryStore<P> {
         decenter: bool,
         suppress: Option<f32>,
     ) -> Vec<Option<f32>> {
-        fn l2_norm(v: &[f32]) -> f32 {
-            v.iter().map(|x| x * x).sum::<f32>().sqrt()
-        }
-        fn dot(a: &[f32], b: &[f32]) -> f32 {
-            a.iter().zip(b).map(|(x, y)| x * y).sum()
-        }
-        // bge-zh 官方用法：短查询侧需加检索指令前缀，文档侧不加。
-        // 缺省前缀时句向量各向异性严重（实测相关对与无关对差距仅 ~0.01）。
-        const BGE_QUERY_INSTRUCTION: &str = "为这个句子生成表示以用于检索相关文章：";
         let instructed_query = format!("{BGE_QUERY_INSTRUCTION}{query}");
         let Some(q) = self.luoshu_encoder.encode_embedding(&instructed_query) else {
             return vec![None; memories.len()];
         };
-        let mut q = q;
         let q_norm_pre = l2_norm(&q);
         if !q_norm_pre.is_finite() || q_norm_pre <= 0.0 {
             return vec![None; memories.len()];
@@ -1581,6 +1814,27 @@ impl<P: Persistence> MemoryStore<P> {
                 .map(|h| h.join().unwrap_or(None))
                 .collect()
         });
+        self.score_semantic_vectors(q, q_norm_pre, vectors, memories, decenter, suppress)
+    }
+
+    /// 语义打分：给定查询向量与候选向量，产出每候选相似度（0-1 或 None）。
+    ///
+    /// **逐字节保留历史打分逻辑**——`!decenter` 原始余弦 / `decenter` 池内
+    /// 去中心化 / `suppress` 跨查询留一率折扣。两条入口（实时编码
+    /// [`Self::semantic_similarities_impl`] 与缓存复用
+    /// [`Self::semantic_similarities_cached`]）共用本函数，保证判别力零偏移。
+    ///
+    /// `q` 以值传入：去中心化分支需就地在查询侧减去池均值。
+    #[cfg(feature = "ml")]
+    fn score_semantic_vectors(
+        &self,
+        mut q: Vec<f32>,
+        q_norm_pre: f32,
+        vectors: Vec<Option<Vec<f32>>>,
+        memories: &[&Memory],
+        decenter: bool,
+        suppress: Option<f32>,
+    ) -> Vec<Option<f32>> {
         if !decenter {
             // 历史路径（逐字节保留）：直接以原始句向量算余弦。
             return memories
@@ -1676,6 +1930,72 @@ impl<P: Persistence> MemoryStore<P> {
         }
         drop(freq);
         sims
+    }
+
+    /// v0.9.8 联想探索·**缓存复用**语义相似度（承「复用侧车缓存」决策）。
+    ///
+    /// 与 [`Self::semantic_similarities`] 的差别**仅在候选向量的取得方式**：
+    ///   - 本方法**优先命中** `semantic_vectors.json` 侧车缓存（零编码），仅对
+    ///     未命中项在 `encode_budget` 内编码回填（见 `resolve_candidate_vectors`）；
+    ///   - 历史方法对**每条候选实时编码**，全库规模不可行。
+    ///
+    /// 打分逻辑与 `semantic_similarities_impl` 共用 `score_semantic_vectors`，
+    /// 判别力零偏移。
+    ///
+    /// 返回 `(每候选相似度, 是否产生新回填, 查询向量维度)`：
+    ///   - `dim == 0` 表示编码器不可用（诚实降级，调用方不应落盘）；
+    ///   - `dirty == true` 时调用方应将更新后的缓存落盘（
+    ///     见 [`crate::state_matcher::save_semantic_cache`]）。
+    ///
+    /// **调用约束**：`cache_vectors` 由调用方从侧车文件载入并在维度变更时
+    /// 先行校准（[`crate::state_matcher::ensure_semantic_cache_dim`]），
+    /// 本方法只负责命中/回填，不负责版本与维度治理。
+    #[cfg(feature = "ml")]
+    pub fn semantic_similarities_cached(
+        &self,
+        query: &str,
+        memories: &[&Memory],
+        cache_vectors: &mut std::collections::HashMap<String, Vec<f32>>,
+        decenter: bool,
+        suppress: Option<f32>,
+        encode_budget: std::time::Duration,
+    ) -> (Vec<Option<f32>>, bool, usize) {
+        let instructed_query = format!("{BGE_QUERY_INSTRUCTION}{query}");
+        let Some(q) = self.luoshu_encoder.encode_embedding(&instructed_query) else {
+            return (vec![None; memories.len()], false, 0);
+        };
+        let q_norm_pre = l2_norm(&q);
+        if !q_norm_pre.is_finite() || q_norm_pre <= 0.0 {
+            return (vec![None; memories.len()], false, 0);
+        }
+        let dim = q.len();
+        // 跨线程只共享编码器字段（MemoryStore 因 RefCell 而 !Sync）。
+        let encoder = &self.luoshu_encoder;
+        let (vectors, dirty) = resolve_candidate_vectors(
+            memories,
+            cache_vectors,
+            dim,
+            |text| encoder.encode_embedding(text),
+            encode_budget,
+        );
+        let sims =
+            self.score_semantic_vectors(q, q_norm_pre, vectors, memories, decenter, suppress);
+        (sims, dirty, dim)
+    }
+
+    /// 非 ml 构建：缓存复用语义相似度同样恒不可用（无编码器、无向量可算）。
+    /// 返回 `dim == 0` 明确告知调用方**未产出任何向量**，不应落盘缓存。
+    #[cfg(not(feature = "ml"))]
+    pub fn semantic_similarities_cached(
+        &self,
+        _query: &str,
+        memories: &[&Memory],
+        _cache_vectors: &mut std::collections::HashMap<String, Vec<f32>>,
+        _decenter: bool,
+        _suppress: Option<f32>,
+        _encode_budget: std::time::Duration,
+    ) -> (Vec<Option<f32>>, bool, usize) {
+        (vec![None; memories.len()], false, 0)
     }
 
     /// 非 ml 构建：语义相似度恒不可用（返回全 None），词面通路独自生效。
@@ -2784,10 +3104,19 @@ impl<P: Persistence> MemoryStore<P> {
                 ..
             } => {
                 let old_cluster = self.synthesis_min_cluster;
-                self.synthesis_min_cluster = *new_min_cluster;
+                // 防御性兜底：上游若发生 usize 下溢（如 2^64-11），会污染合成配置，
+                // 导致合成永久无法触发、调节器误判"连续无效"并冻结整个系统。
+                let clamped = (*new_min_cluster).clamp(2, 10);
+                if clamped != *new_min_cluster {
+                    eprintln!(
+                        "[LRC·调节] 合成最小聚类越界 {} 已修正为 {}（防御性下限）",
+                        new_min_cluster, clamped
+                    );
+                }
+                self.synthesis_min_cluster = clamped;
                 // 同步更新合成引擎配置
                 self.synthesis_engine = SynthesisEngine::new(SynthesisConfig {
-                    min_cluster: *new_min_cluster,
+                    min_cluster: clamped,
                     similarity: self.synthesis_similarity,
                 });
                 eprintln!(
@@ -3630,19 +3959,46 @@ impl<P: Persistence> MemoryStore<P> {
         // 快速批量注入路径（LongMemEval 优化）：
         // 跳过相似性检查（每条会话独立唯一），直接编码并追加写入，
         // 避免 O(N*M) 的相似度比较和 clear+re-save 的昂贵全量重写。
-        let mut results = Vec::with_capacity(memories.len());
+        //
+        // v0.9.10 吞吐优化：洛书编码由"逐条 encode_text"改为按
+        // [`BAGUA_RECLASSIFY_ENCODE_CHUNK`] 分块调用 `encode_text_batch`
+        // （单次批量前向 + 跨条目并行），把单条前向的固定开销摊薄——
+        // 逐条编码下 200 条/块需 ~240s，逼近客户端单块 300s 超时。
+        // 派生字段逐条走 [`Self::bagua_from_luoshu`] 同一投影链路，
+        // 与重分类路径口径逐位一致（分块与长度契约防御同 `recompute_bagua_fields_batch`）。
+        let luoshu_vecs: Vec<LuoShuVector> = {
+            // 先借用 memories 收集文本，编码完成后释放借用，之后方可移动 memories。
+            let texts: Vec<&str> = memories.iter().map(|m| m.content.as_str()).collect();
+            let mut vecs: Vec<LuoShuVector> = Vec::with_capacity(texts.len());
+            for chunk in texts.chunks(BAGUA_RECLASSIFY_ENCODE_CHUNK) {
+                let batch = self.luoshu_encoder.encode_text_batch(chunk);
+                if batch.len() == chunk.len() {
+                    vecs.extend(batch);
+                } else {
+                    // 长度契约防御：理论上不应发生，退化为逐条编码，绝不静默错位。
+                    eprintln!(
+                        "[LRC·写入] 批量编码返回 {} 条，期望 {} 条；本块逐条回退",
+                        batch.len(),
+                        chunk.len()
+                    );
+                    for t in chunk.iter() {
+                        vecs.push(self.luoshu_encoder.encode_text(t));
+                    }
+                }
+            }
+            vecs
+        };
 
-        for memory in memories {
+        let mut results = Vec::with_capacity(memories.len());
+        for (memory, luoshu_vec) in memories.into_iter().zip(luoshu_vecs) {
             let mut result = memory;
 
             // 洛书编码 + 八卦分类（保留 L2 层检索能力）
-            let luoshu_vec = self.luoshu_encoder.encode_text(&result.content);
-            let proj = mirror_project(&luoshu_vec);
-            result.luoshu_vector = Some(luoshu_vec.values);
-            result.bagua_index = Some(proj.best_index as u8);
-            result.bagua_category = Some(proj.best_category.to_string());
-            let center_val = luoshu_vec.center_value();
-            result.topological_depth = (1.0 - center_val).clamp(0.0, 1.0);
+            let rec = Self::bagua_from_luoshu(&result, &luoshu_vec);
+            result.luoshu_vector = Some(rec.new_values);
+            result.bagua_index = Some(rec.new_index);
+            result.bagua_category = Some(rec.new_category);
+            result.topological_depth = rec.new_depth;
 
             // 先完成整批编码，持久化统一在循环结束后执行。
             results.push(result);
@@ -3766,8 +4122,11 @@ impl<P: Persistence> MemoryStore<P> {
         let mut deep_evidence: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
-        // 4. 构建 (索引, 洛书向量) 对 — 增加八卦预过滤
-        let indexed: Vec<(usize, LuoShuVector)> = all_memories
+        // 4. 构建候选：(a) 先过基础过滤得到"合格池" eligible（不做八卦剪除），
+        //    (b) 再施加八卦硬剪除得到 indexed。
+        //    拆成两步是为支持「兜底回补」（见步骤 5b）：剪除+聚焦后候选过少时，
+        //    可从合格池按环形距离就近回补，避免相关记忆被整体剪光。
+        let eligible: Vec<(usize, Option<u8>)> = all_memories
             .iter()
             .enumerate()
             .filter(|(_, m)| {
@@ -3795,52 +4154,56 @@ impl<P: Persistence> MemoryStore<P> {
                 if !is_visible(m, &filter.privacy_context) {
                     return false;
                 }
+                // 回补候选必须带洛书向量（评分与 ROI 聚焦都依赖它）
+                m.luoshu_vector.is_some()
+            })
+            .map(|(i, m)| (i, m.bagua_index))
+            .collect();
+
+        // 八卦硬剪除：仅保留同卦或相邻卦候选，其余剪除（活跃记忆白名单豁免）。
+        // v0.8.50 检索质量修复 A/B（3111 旧 vs 3122 BM25+八卦降权）后回滚：
+        // 八卦降权（0.6~1.0 惩罚）对 deep 命中零改进（top1 2/32 持平），
+        // 且把卦近/跨卦的无关全局记忆顶上 top1、污染 RRF top1 命中
+        // （model_file_missing/orig、port_binding/rewrite 各退回 1 处）。
+        // 按方案 §3.5「预判元数据只做观测、不接入默认排序」，恢复原硬剪除：
+        // 仅保留同卦或相邻卦候选，其余剪除。
+        // 阶段三 b2：接入道体预判卦（daoti_preview_bagua）作为候选保留的
+        // 第二证据——LRC 自分类与道体预判不一致（跨域）时，任一证据命中
+        // 即保留，修正跨域污染误剪；仅影响召回候选、不改 RRF 评分权重。
+        let indexed: Vec<(usize, LuoShuVector)> = eligible
+            .iter()
+            .filter(|(i, mem_bagua)| {
+                let m = &all_memories[*i];
                 // 活跃记忆白名单：无论卦象一律保留（联想导航锚点，防记忆丢失）
                 if active_whitelist.contains(&m.id) {
-                    return m.luoshu_vector.is_some();
+                    return true;
                 }
-                // v0.8.50 检索质量修复 A/B（3111 旧 vs 3122 BM25+八卦降权）后回滚：
-                // 八卦降权（0.6~1.0 惩罚）对 deep 命中零改进（top1 2/32 持平），
-                // 且把卦近/跨卦的无关全局记忆顶上 top1、污染 RRF top1 命中
-                // （model_file_missing/orig、port_binding/rewrite 各退回 1 处）。
-                // 按方案 §3.5「预判元数据只做观测、不接入默认排序」，恢复原硬剪除：
-                // 仅保留同卦或相邻卦候选，其余剪除。
-                // 阶段三 b2：接入道体预判卦（daoti_preview_bagua）作为候选保留的
-                // 第二证据——LRC 自分类与道体预判不一致（跨域）时，任一证据命中
-                // 即保留，修正跨域污染误剪；仅影响召回候选、不改 RRF 评分权重。
-                m.luoshu_vector.is_some() && {
-                    // 证据1：LRC 自分类卦（环形距离 ≤1 保留）
-                    let lrc_keep = match m.bagua_index {
-                        Some(mem_bagua) => {
-                            let diff = (mem_bagua as i8 - query_bagua as i8).abs();
-                            // 八卦环形距离：diff 与 8-diff 取小者；≤1（同卦/相邻卦）保留
-                            let ring_dist = diff.min(8 - diff);
-                            ring_dist <= 1
-                        }
-                        None => true,
-                    };
-                    if lrc_keep {
-                        true
-                    } else if daoti_prune_enabled {
-                        // 证据2：道体预判卦（按名称映射，修正跨域污染）
-                        match m
-                            .daoti_preview_bagua
-                            .as_deref()
-                            .and_then(bagua_name_to_index)
-                        {
-                            Some(daoti_bagua) => {
-                                let diff = (daoti_bagua as i8 - query_bagua as i8).abs();
-                                let ring_dist = diff.min(8 - diff);
-                                ring_dist <= 1
-                            }
-                            None => false,
-                        }
-                    } else {
-                        false
+                // 证据1：LRC 自分类卦（环形距离 ≤1 保留）
+                let lrc_keep = match mem_bagua {
+                    Some(mem_bagua) => bagua_ring_distance(*mem_bagua, query_bagua) <= 1,
+                    None => true,
+                };
+                if lrc_keep {
+                    true
+                } else if daoti_prune_enabled {
+                    // 证据2：道体预判卦（按名称映射，修正跨域污染）
+                    match m
+                        .daoti_preview_bagua
+                        .as_deref()
+                        .and_then(bagua_name_to_index)
+                    {
+                        Some(daoti_bagua) => bagua_ring_distance(daoti_bagua, query_bagua) <= 1,
+                        None => false,
                     }
+                } else {
+                    false
                 }
             })
-            .filter_map(|(i, m)| m.luoshu_vector.map(|v| (i, LuoShuVector { values: v })))
+            .filter_map(|(i, _)| {
+                all_memories[*i]
+                    .luoshu_vector
+                    .map(|v| (*i, LuoShuVector { values: v }))
+            })
             .collect();
         // 阶段D 审计：八卦硬剪除后的候选规模
         let trace_candidates = indexed.len();
@@ -3851,13 +4214,55 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 5. 从匹配索引还原记忆
         let all: Vec<Memory> = all_memories;
-        let mut memories: Vec<Memory> = focus_result
-            .matched_indices
+        let matched_indices: Vec<usize> = focus_result.matched_indices.clone();
+        let mut memories: Vec<Memory> = matched_indices
             .iter()
             .filter_map(|&idx| all.get(idx).cloned())
             .collect();
         // 阶段D 审计：ROI 聚焦原始召回数（词面域过滤前）
         let trace_roi = memories.len();
+
+        // 5b. 兜底回补（v0.9.10）：八卦硬剪除 + ROI 聚焦叠加后候选低于下限时，
+        //     说明本查询在当前编码分布下同卦/相邻卦可用候选过少，若不放宽会把
+        //     相关记忆整体剪光（root 落到无关的跨卦幸存记忆上）。故从合格池
+        //     eligible 按「环形距离就近优先、其次洛书余弦」回补至下限。
+        //     仅补足数量下限，不改动剪除逻辑本身；上限取 2 以兼容 A/B 锁用例。
+        if memories.len() < MIN_DEEP_CANDIDATES {
+            let present: std::collections::HashSet<usize> =
+                matched_indices.iter().copied().collect();
+            let mut backfill: Vec<(usize, u8, f32)> = eligible
+                .iter()
+                .filter(|(i, _)| !present.contains(i))
+                .filter_map(|(i, mem_bagua)| {
+                    let lv = all.get(*i)?.luoshu_vector?;
+                    // 环形距离（无卦象者 None：本就被剪除规则默认保留，允许回补）
+                    let ring = mem_bagua.map(|b| bagua_ring_distance(b, query_bagua));
+                    // 只回补近卦候选（环形距离 ≤ DEEP_BACKFILL_MAX_RING）；
+                    // 远端跨卦候选（距离 3/4）是硬剪除明确拒绝的对象，不得拉回。
+                    if let Some(r) = ring {
+                        if r > DEEP_BACKFILL_MAX_RING {
+                            return None;
+                        }
+                    }
+                    // 无卦象者置于最末（u8::MAX），避免抢占近卦候选名额。
+                    let ring_key = ring.unwrap_or(u8::MAX);
+                    let cos = LuoShuVector { values: lv }.cosine_similarity(&query_vec);
+                    Some((*i, ring_key, cos))
+                })
+                .collect();
+            backfill.sort_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            for (i, _, _) in backfill {
+                if memories.len() >= MIN_DEEP_CANDIDATES {
+                    break;
+                }
+                if let Some(m) = all.get(i) {
+                    memories.push(m.clone());
+                }
+            }
+        }
 
         // 6. 计算分数（纯洛书向量余弦相似度；八卦已在候选阶段硬剪除，评分不再降权）
         let mut scores: Vec<f32> = memories
@@ -3991,7 +4396,17 @@ impl<P: Persistence> MemoryStore<P> {
         // 与 fast 路径同语义——联想扩散（词面域锚点扩展）拉进候选的记忆，
         // 必须在输出前验证与原查询的共鸣。活跃记忆白名单是联想锚点本身，
         // 不参与校验（它们代表近期语境，保留是设计意图）。
-        if !active_whitelist.is_empty() {
+        //
+        // 门控放宽（与 fast 路口径对齐）：
+        //   仅「存在活跃白名单」时校验，会让深路在无近期语境的普通检索中
+        //   完全跳过校验。此时任何"同卦但零词面重合"的发散噪声（仅因洛书
+        //   同卦被 ROI 选中的远端记忆）都会被深路注入，并借 RRF 名次加分
+        //   压过 fast 路的真实命中。
+        //   故当词面域确有锚点（`trace_lex_max > 0`：查询与候选池存在词面
+        //   重合）时一并启用校验；查询与全池零词面重合（纯语义检索，
+        //   `trace_lex_max == 0`）时保持关闭，以免误伤"词不相邻而义相邻"的召回。
+        let recheck_active = !active_whitelist.is_empty() || trace_lex_max > 0.0;
+        if recheck_active {
             let original_tokens = tokenize_query(query);
             let bridge_words: Vec<String> = {
                 let all = self.load_cached().unwrap_or_default();
@@ -4828,6 +5243,278 @@ impl<P: Persistence> MemoryStore<P> {
             .collect();
 
         Ok((paged, total))
+    }
+
+    /// 由洛书向量推导单条记忆的洛书/八卦派生字段（纯计算，不触发编码）。
+    ///
+    /// 抽取目的：批量路径先一次性得到整批洛书向量，再对每条调用本函数，
+    /// 保证与写入路径（`remember`/`remember_batch`）**同一套投影口径**。
+    fn bagua_from_luoshu(m: &Memory, luoshu_vec: &LuoShuVector) -> BaguaRecompute {
+        let proj = mirror_project(luoshu_vec);
+        let new_index = proj.best_index as u8;
+        let new_category = proj.best_category.to_string();
+        let new_values = luoshu_vec.values;
+        let new_depth = (1.0 - luoshu_vec.center_value()).clamp(0.0, 1.0);
+        let field_changed = m.bagua_index != Some(new_index)
+            || m.bagua_category.as_deref() != Some(new_category.as_str())
+            || m.luoshu_vector != Some(new_values)
+            || (m.topological_depth - new_depth).abs() > f32::EPSILON;
+        BaguaRecompute {
+            new_index,
+            new_category,
+            new_values,
+            new_depth,
+            field_changed,
+        }
+    }
+
+    /// 批量重算一组记忆的洛书/八卦派生字段（内部 helper）。
+    ///
+    /// v0.9.10 吞吐优化：按 [`BAGUA_RECLASSIFY_ENCODE_CHUNK`] 分块调用
+    /// `HybridLuoShuEncoder::encode_text_batch`（单次 BERT 批量前向），
+    /// 把逐条编码的固定开销摊薄；随后逐条走同一投影链路
+    /// [`Self::bagua_from_luoshu`]，与单条路径结果逐位一致。
+    ///
+    /// **长度契约防御**：若批量编码返回条数与分块条数不等（理论上不应发生），
+    /// 打印告警并退化为逐条 `encode_text`，绝不静默错位。
+    fn recompute_bagua_fields_batch(&self, mems: &[&Memory]) -> Vec<BaguaRecompute> {
+        let mut out: Vec<BaguaRecompute> = Vec::with_capacity(mems.len());
+        for chunk in mems.chunks(BAGUA_RECLASSIFY_ENCODE_CHUNK) {
+            let texts: Vec<&str> = chunk.iter().map(|m| m.content.as_str()).collect();
+            let vecs = self.luoshu_encoder.encode_text_batch(&texts);
+            if vecs.len() == chunk.len() {
+                for (m, v) in chunk.iter().zip(vecs.iter()) {
+                    out.push(Self::bagua_from_luoshu(m, v));
+                }
+            } else {
+                eprintln!(
+                    "[LRC·重分类] 批量编码返回 {} 条，期望 {} 条；本块逐条回退",
+                    vecs.len(),
+                    chunk.len()
+                );
+                for m in chunk.iter() {
+                    let v = self.luoshu_encoder.encode_text(&m.content);
+                    out.push(Self::bagua_from_luoshu(m, &v));
+                }
+            }
+        }
+        out
+    }
+
+    /// 用**当前**编码器重算存量记忆的洛书/八卦派生字段（历史重分类）
+    ///
+    /// **为什么需要它**：`bagua_index` 在 `remember`/`remember_batch` 时由当时
+    /// 的编码器计算并持久化（写时冻结）。一旦编码器被修正（如 v0.9.10 移除
+    /// 量纲失配的编码先验），**存量记忆不会自动跟随**——它们仍停留在旧的
+    /// 错误分类下（实测真实库 95%+ 落同一卦「离」）。此前全仓库没有任何
+    /// 重分类入口，导致"编码器已修好、但历史数据依旧塔缩"。
+    ///
+    /// **本方法做什么**：逐条用当前 `luoshu_encoder` 重算
+    /// `luoshu_vector` / `bagua_index` / `bagua_category` / `topological_depth`
+    /// 四个派生字段，并在有实际改动时批量落盘（单次序列化 + 单次原子写）。
+    ///
+    /// **不做什么**：不改 `content` 及任何用户可见字段；不重建倒排索引
+    /// （内容未变、词项未变，只需失效快照缓存）。
+    ///
+    /// **幂等性**：编码器确定性 + JSON f32 无损 round-trip ⇒ 对已重分类过的
+    /// 记忆再次调用不会产生任何改动，`changed == 0` 且不写盘。
+    ///
+    /// - `limit`：本轮最多处理的条数；`0` 表示处理全部（用于一次性全量重建，
+    ///   对真实大盘库建议分批传入较小 `limit` 以控制单次持锁时长）。
+    pub fn reclassify_bagua(
+        &self,
+        limit: usize,
+    ) -> Result<BaguaReclassifyReport, PersistenceError> {
+        let all = self.load_cached()?;
+        let scanned = all.len();
+
+        // 重分类前分布：仅统计有效的八卦下标（0..8）
+        let mut before = [0usize; 8];
+        for m in &all {
+            if let Some(idx) = m.bagua_index {
+                let i = idx as usize;
+                if i < 8 {
+                    before[i] += 1;
+                }
+            }
+        }
+
+        let take = if limit == 0 {
+            scanned
+        } else {
+            limit.min(scanned)
+        };
+
+        // 后分布以旧分布为基底：未处理部分沿用旧值，已处理部分做"旧桶 −1 / 新桶 +1"
+        let mut after = before;
+        let mut changed = 0usize;
+        let mut modified_any = false;
+        let mut updated: Vec<Memory> = Vec::with_capacity(take);
+
+        // v0.9.10：先对切片做分块批量编码（单次前向摊薄开销），再逐条投影与统计
+        let slice: Vec<&Memory> = all.iter().take(take).collect();
+        let results = self.recompute_bagua_fields_batch(&slice);
+        for (m, r) in slice.iter().zip(results) {
+            let m: &Memory = m;
+            let old_index = m.bagua_index;
+
+            // 调整后分布：旧桶 −1 / 新桶 +1
+            if let Some(idx) = old_index {
+                let i = idx as usize;
+                if i < 8 {
+                    after[i] = after[i].saturating_sub(1);
+                }
+            }
+            let ni = r.new_index as usize;
+            if ni < 8 {
+                after[ni] += 1;
+            }
+
+            if old_index != Some(r.new_index) {
+                changed += 1;
+            }
+
+            // 任一派生字段变化即视为需要落盘
+            if r.field_changed {
+                modified_any = true;
+                let mut copy = m.clone();
+                copy.luoshu_vector = Some(r.new_values);
+                copy.bagua_index = Some(r.new_index);
+                copy.bagua_category = Some(r.new_category);
+                copy.topological_depth = r.new_depth;
+                updated.push(copy);
+            }
+        }
+
+        if modified_any {
+            // json 后端 save_memories 为"按 id 合并"语义：只传被改动的子集
+            // 不会清除其余记忆（已核实 json.rs 实现）。
+            self.persistence.save_memories(&updated)?;
+            // 仅元数据（编码派生字段）变化、词面内容未变 ⇒ 保留已建好的倒排索引，
+            // 只失效快照与文档缓存（与 correct_memory 同款范式）。
+            self.mark_cache_dirty_preserving_index();
+        }
+
+        Ok(BaguaReclassifyReport {
+            scanned,
+            processed: take,
+            skipped: scanned - take,
+            changed,
+            before,
+            after,
+            entropy_before: crate::engine::dao_metrics::compute_bagua_entropy(&before),
+            entropy_after: crate::engine::dao_metrics::compute_bagua_entropy(&after),
+        })
+    }
+
+    /// 统计全库当前的 `bagua_index` 分布快照。
+    ///
+    /// 返回 `(总数, [index0..index7 的计数])`。仅统计有效下标（0..8）；
+    /// `bagua_index == None` 的记忆计入总数但不落入任何桶。
+    ///
+    /// 用途：异步重分类任务在**启动瞬间**捕获 `before` 基线，之后靠
+    /// `reclassify_bagua_batch` 的增量分布累加得到 `after`，无需二次全量扫描。
+    pub fn bagua_distribution(&self) -> Result<(usize, [usize; 8]), PersistenceError> {
+        let all = self.load_cached()?;
+        let mut dist = [0usize; 8];
+        for m in &all {
+            if let Some(idx) = m.bagua_index {
+                let i = idx as usize;
+                if i < 8 {
+                    dist[i] += 1;
+                }
+            }
+        }
+        Ok((all.len(), dist))
+    }
+
+    /// 分批重分类：对按 `(created_at, id)` 稳定排序后的切片 `[offset, offset+limit)` 重算并落盘。
+    ///
+    /// **为什么要稳定排序**：异步任务跨批以 `offset` 步进，若列表顺序在两次
+    /// `load_cached` 间不稳定（HashMap 迭代序、并发写入导致重排），会出现
+    /// "某些记忆被处理两次、某些被跳过"。按 `(created_at, id)` 给出**确定性**全序
+    /// ⇒ 只要库内条目集合不变，offset 切片即不重不漏。
+    ///
+    /// 分布以 `old_counts`/`new_counts` 增量返回，由调用方跨批累加即可得到全库
+    /// 进度；每条记忆的新分类**独立于处理顺序**，故累加结果与单次全量重分类一致。
+    ///
+    /// - `offset`：起始下标（超出总数时会被夹到 `total`）；
+    /// - `limit`：本批最多处理条数；`0` 表示处理到末尾。
+    ///
+    /// 仅在存在实际字段改动时落盘（幂等，与 `reclassify_bagua` 同款）。
+    pub fn reclassify_bagua_batch(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<BaguaReclassifyBatch, PersistenceError> {
+        let mut all = self.load_cached()?;
+        // 确定性稳定全序：先按创建时间，再按 id（UUID 唯一，构成全序）
+        all.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let total = all.len();
+        let start = offset.min(total);
+        let end = if limit == 0 {
+            total
+        } else {
+            offset.saturating_add(limit).min(total)
+        };
+        // offset 越界时 end 可能小于 start ⇒ 夹取保证 end >= start（processed 非负）
+        let end = end.max(start);
+
+        let mut old_counts = [0usize; 8];
+        let mut new_counts = [0usize; 8];
+        let mut changed = 0usize;
+        let mut modified_any = false;
+        let mut updated: Vec<Memory> = Vec::with_capacity(end - start);
+
+        // v0.9.10：先对切片做分块批量编码（单次前向摊薄开销），再逐条投影与统计
+        let slice: Vec<&Memory> = all.iter().take(end).skip(start).collect();
+        let results = self.recompute_bagua_fields_batch(&slice);
+        for (m, r) in slice.iter().zip(results) {
+            let m: &Memory = m;
+            let old_index = m.bagua_index;
+            if let Some(idx) = old_index {
+                let i = idx as usize;
+                if i < 8 {
+                    old_counts[i] += 1;
+                }
+            }
+
+            let ni = r.new_index as usize;
+            if ni < 8 {
+                new_counts[ni] += 1;
+            }
+            if old_index != Some(r.new_index) {
+                changed += 1;
+            }
+            if r.field_changed {
+                modified_any = true;
+                let mut copy = m.clone();
+                copy.luoshu_vector = Some(r.new_values);
+                copy.bagua_index = Some(r.new_index);
+                copy.bagua_category = Some(r.new_category);
+                copy.topological_depth = r.new_depth;
+                updated.push(copy);
+            }
+        }
+
+        if modified_any {
+            // 同 reclassify_bagua：按 id 合并语义，只传改动子集不清除其余记忆
+            self.persistence.save_memories(&updated)?;
+            self.mark_cache_dirty_preserving_index();
+        }
+
+        Ok(BaguaReclassifyBatch {
+            total,
+            offset: start,
+            processed: end - start,
+            changed,
+            old_counts,
+            new_counts,
+        })
     }
 
     /// 按事件 ID 反查「同一次经历」产生的其他记忆

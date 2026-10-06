@@ -110,6 +110,12 @@ pub mod discovery;
 #[cfg(feature = "server")]
 pub mod state_matcher;
 
+// v0.9.10 塔缩修复·第 2 层：历史重分类的异步任务与进度状态机（依赖 v1_api 的 SharedStore）。
+// 命名说明：模块与文件采用中性命名 `reclassify_job`，使**公开层**（本文件）
+// 不出现受保护术语，与 `engine` 同属"公开层用中性名"的既有约定。
+#[cfg(feature = "server")]
+pub mod reclassify_job;
+
 // === Layer 2: 受保护核心引擎（专有研究许可） ===
 pub mod engine;
 

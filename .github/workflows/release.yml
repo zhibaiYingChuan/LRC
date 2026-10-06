@@ -880,6 +880,111 @@ jobs:
           fi
         shell: bash
 
+      # 步骤 5.5（v0.9.10 修复）：AppImage 权限归一化 + .DirIcon 修复
+      #
+      # 背景：AppImageHub（appimage.github.io）收录 CI 会实际运行 AppImage，
+      #   失败时给出 error-not-executable / error-app-exits 标签。
+      #   其官方诊断（code/diagnose.sh）明确点名：
+      #     "AppRun.wrapped (or the launcher it starts) could not be executed.
+      #      This typically happens with Tauri and linuxdeploy builds when a
+      #      cached launcher was packaged with mode 0770 and is owned by root,
+      #      so that it is not executable for the test user."
+      #   即 Tauri 打进 AppImage 的 AppRun.wrapped 权限是 0770（部分目录 0700），
+      #   非属主用户执行报 "Permission denied" → 被判定 error-not-executable，
+      #   且应用启动即退出 → 同时触发 error-app-exits。
+      #   另外 Tauri 写入的 .DirIcon 是指向 /home/runner/... 的**绝对符号链接**，
+      #   在其它系统上无法解析（官方提示中同样点名 Tauri），会触发 error-no-icon。
+      #
+      # 处置（官方推荐）：解包 → 目录 0755 / 文件 0644 / AppRun(.wrapped) 可执行
+      #   / .DirIcon 换成真实图标副本 → 用 appimagetool 重新打包。
+      # 保护：重新打包失败时回退为原始 AppImage，保证发布流程不被打断。
+      - name: Normalize AppImage permissions and icon (repack)
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+
+          BUNDLE_DIR="$(pwd)/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/appimage"
+          APPIMAGE="$(find "$BUNDLE_DIR" -maxdepth 1 -name '*.AppImage' -print -quit)"
+          if [ -z "$APPIMAGE" ]; then
+            echo "ERROR: bundle/appimage 下未找到 .AppImage"
+            find "$BUNDLE_DIR" -type f 2>/dev/null || true
+            exit 1
+          fi
+          echo "目标 AppImage: $APPIMAGE"
+          chmod +x "$APPIMAGE"
+
+          ORIG="$(mktemp).AppImage"
+          cp "$APPIMAGE" "$ORIG"
+
+          WORK="$(mktemp -d)"
+          cd "$WORK"
+          "$APPIMAGE" --appimage-extract >/dev/null
+          APPDIR="$WORK/squashfs-root"
+
+          echo "== 1. 权限归一化 =="
+          find "$APPDIR" -type d -exec chmod 755 {} +
+          find "$APPDIR" -type f -exec chmod 644 {} +
+          chmod 755 "$APPDIR/AppRun" 2>/dev/null || true
+          chmod 755 "$APPDIR/AppRun.wrapped" 2>/dev/null || true
+          # 主程序与 sidecar 必须可执行（0644 归一化会误伤它们，此处恢复）
+          find "$APPDIR/usr/bin" -type f -exec chmod 755 {} + 2>/dev/null || true
+
+          echo "== 2. 修复 .DirIcon 绝对符号链接 =="
+          if [ -L "$APPDIR/.DirIcon" ]; then
+            LINK_TARGET="$(readlink "$APPDIR/.DirIcon")"
+            echo "  .DirIcon -> $LINK_TARGET"
+            case "$LINK_TARGET" in
+              /*)
+                ICON="$(find "$APPDIR" -maxdepth 4 -type f -name '*.png' -print -quit)"
+                if [ -n "$ICON" ]; then
+                  rm -f "$APPDIR/.DirIcon"
+                  cp "$ICON" "$APPDIR/.DirIcon"
+                  chmod 644 "$APPDIR/.DirIcon"
+                  echo "  已替换为真实图标副本: $ICON"
+                else
+                  echo "  WARNING: 未找到可用 PNG 图标，保留原链接"
+                fi
+                ;;
+            esac
+          fi
+
+          echo "== 3. 用 appimagetool 重新打包 =="
+          # v0.9.10 加固（HCSE P1-1）：下载失败也走回退分支。原实现 `set -eu` 下
+          #   `wget` 失败会立即硬终止步骤，而回退逻辑只在 appimagetool 执行失败时生效，
+          #   与本步骤"失败时回退为原始 AppImage，保证发布流程不被打断"的承诺不符。
+          if ! wget -q -O "$WORK/appimagetool" \
+              https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage; then
+            echo "::warning::appimagetool 下载失败，回退为原始 AppImage（AppImageHub 收录可能仍失败）"
+            cp "$ORIG" "$APPIMAGE"
+            chmod 755 "$APPIMAGE"
+            exit 0
+          fi
+          chmod +x "$WORK/appimagetool"
+          NEW_OUT="$WORK/repacked.AppImage"
+
+          if ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$WORK/appimagetool" "$APPDIR" "$NEW_OUT"; then
+            echo "== 4. 复核重新打包结果 =="
+            CHECK_DIR="$(mktemp -d)"
+            ( cd "$CHECK_DIR" && "$NEW_OUT" --appimage-extract >/dev/null )
+            if [ ! -x "$CHECK_DIR/squashfs-root/AppRun" ]; then
+              echo "ERROR: 重新打包后 AppRun 不可执行"
+              exit 1
+            fi
+            if [ -f "$CHECK_DIR/squashfs-root/AppRun.wrapped" ] && [ ! -x "$CHECK_DIR/squashfs-root/AppRun.wrapped" ]; then
+              echo "ERROR: 重新打包后 AppRun.wrapped 不可执行"
+              exit 1
+            fi
+            cp "$NEW_OUT" "$APPIMAGE"
+            chmod 755 "$APPIMAGE"
+            echo "✅ AppImage 已用归一化权限重新打包"
+          else
+            echo "::warning::appimagetool 重新打包失败，回退为原始 AppImage（AppImageHub 收录可能仍失败）"
+            cp "$ORIG" "$APPIMAGE"
+            chmod 755 "$APPIMAGE"
+          fi
+          ls -la "$APPIMAGE"
+        shell: bash
+
       # 步骤 6: 收集安装包
       - name: Collect desktop artifacts (Windows)
         if: runner.os == 'Windows'
