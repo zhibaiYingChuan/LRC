@@ -180,6 +180,13 @@ pub struct DaoRegulator {
     is_frozen: bool,
     /// 上次调节的 action_tag（用于检测"重复无效建议"）
     last_action_tag: Option<String>,
+    /// 合成引擎是否启用（false 表示由 --disable-synthesis 显式禁用）
+    ///
+    /// 合成被禁用时，合成相关的指标（合成比率/合成频率）恒为 0，
+    /// 若调节器仍据此生成"降低合成阈值"建议，会陷入"建议同一动作却
+    /// 永远无法改善"的死循环，最终触发冻结保护把整个系统冻结。
+    /// 因此禁用合成时必须停止一切合成阈值类调节。
+    synthesis_enabled: bool,
     /// 耦合指数：跟踪多指标同时异常的相关性（解决质疑二"多指标耦合"）
     ///
     /// 当多个指标同时触发异常时，耦合指数递增。高耦合指数表明
@@ -694,6 +701,7 @@ impl DaoRegulator {
             freeze_threshold: 10,
             is_frozen: false,
             last_action_tag: None,
+            synthesis_enabled: true,
             coupling_score: 0.0,
             coupling_history: Vec::new(),
             catastrophic_detector: CatastrophicEventDetector::new(),
@@ -863,6 +871,29 @@ impl DaoRegulator {
     /// 当同一 action_tag 反复出现但系统指标没有改善时，
     /// 说明自动调节在当前状态下无效，需要冻结等待外部干预。
     fn detect_freeze(&mut self, action_tag: &str) {
+        // 修复（v0.9.10）：只统计"会真正改变系统状态"的调节动作。
+        //
+        // 冻结保护的语义是"同一调节反复施加却始终无改善"→ 停手等人工介入。
+        // 但下面这些 tag 的执行端**只落日志与审计，不改任何参数**（见
+        // memory_store.rs 的 regulate() 执行分支），属于"建议"而非"调节"：
+        //   - no_action            ：当前无需调节，本身就是健康信号
+        //   - retrieval_weights    ：仅建议调整检索权重（new_weights 恒为 None）
+        //   - reencoding           ：仅建议重新编码，需人工确认
+        //   - comprehensive_rebalance：仅建议综合再平衡
+        // 它们永远不可能让指标"改善"，若计入"连续无效"，只要某个指标长期异常
+        // （例如八卦熵=0：全部记忆落在同一类别），调节器就会在 freeze_threshold
+        // 轮后冻结，**连带停掉其余真正生效的调节**。
+        //
+        // 2026-10-03 线上评估实测复现：bagua_entropy 恒为 0.00 → 每轮都产出
+        // retrieval_weights → 连续 10 轮 → system_mode=frozen。
+        if matches!(
+            action_tag,
+            "no_action" | "retrieval_weights" | "reencoding" | "comprehensive_rebalance"
+        ) {
+            self.consecutive_ineffective = 0;
+            self.last_action_tag = Some(action_tag.to_string());
+            return;
+        }
         if let Some(ref last) = self.last_action_tag {
             if last == action_tag {
                 self.consecutive_ineffective += 1;
@@ -1279,7 +1310,7 @@ impl DaoRegulator {
         if dao_score < 0.3 && synthesis_ratio > 0.5 {
             let raw_step = 1.0;
             let step = (raw_step * self.step_multiplier).max(1.0).round() as usize;
-            let new_cluster = (current_min_cluster + step).min(10);
+            let new_cluster = current_min_cluster.saturating_add(step).clamp(2, 10);
             candidates.push((3, RegulationAction::AdjustSynthesisThreshold {
                 new_min_cluster: new_cluster,
                 reason: format!(
@@ -1365,6 +1396,19 @@ impl DaoRegulator {
                     bagua_entropy, synthesis_ratio, current_decay_rate, new_rate, self.step_multiplier
                 ),
             }));
+        }
+
+        // 修复：合成引擎被显式禁用时（--disable-synthesis），合成比率/频率恒为 0，
+        // 合成阈值类候选动作既无意义又永远无法"生效"，会被 detect_freeze 判为
+        // 重复无效调节并最终冻结系统。此处统一剔除所有依赖合成活动的候选动作。
+        if !self.synthesis_enabled {
+            candidates.retain(|(_, a)| {
+                !matches!(
+                    a,
+                    RegulationAction::AdjustSynthesisThreshold { .. }
+                        | RegulationAction::AdjustInformationGainThreshold { .. }
+                )
+            });
         }
 
         // 按优先级排序（数字越小优先级越高）
@@ -1977,6 +2021,14 @@ impl DaoRegulator {
     /// 设置调节间隔
     pub fn set_interval(&mut self, interval_ms: u64) {
         self.regulation_interval_ms = interval_ms;
+    }
+
+    /// 标记合成引擎是否启用（由 --disable-synthesis 调用）
+    ///
+    /// 禁用后调节器不再生成合成阈值类动作，避免"反复建议却永远无法改善"
+    /// 被误判为无效调节而冻结整个系统。
+    pub fn set_synthesis_enabled(&mut self, enabled: bool) {
+        self.synthesis_enabled = enabled;
     }
 
     /// 获取当前振荡状态（监控用）
@@ -2686,6 +2738,53 @@ mod tests {
 
         // 第 10 次同一建议 → 应触发冻结
         assert!(regulator.is_frozen(), "连续 10 次同一建议应触发冻结保护");
+    }
+
+    /// 测试：合成被禁用时不再产生合成阈值类动作，也不会被误冻结
+    ///
+    /// 复现线上缺陷：`--disable-synthesis` 将最小聚类设为 `usize::MAX`，
+    /// 旧调节器会反复建议"降低合成阈值"（usize::MAX-1、-2 …），
+    /// 连续 10 轮后触发冻结保护，使 system_mode 变为 frozen。
+    #[test]
+    fn test_disabled_synthesis_never_freezes() {
+        let mut regulator = DaoRegulator::new();
+        regulator.set_synthesis_enabled(false);
+
+        // 模拟线上场景：合成频率/比率恒为 0，最小聚类为 usize::MAX
+        for i in 0..15 {
+            let action = regulator.regulate(0.85, 2.0, 0.0, 0.1, 0.0, 0.1, usize::MAX);
+            assert!(
+                !matches!(action, RegulationAction::AdjustSynthesisThreshold { .. }),
+                "第 {} 次不应返回合成阈值调整（合成已禁用）",
+                i + 1
+            );
+        }
+
+        assert!(!regulator.is_frozen(), "合成禁用时不应被冻结保护误触发");
+    }
+
+    /// 测试：建议型动作（不改变任何参数）不应触发冻结保护
+    ///
+    /// 复现 2026-10-03 线上缺陷：八卦熵恒为 0.00（全部记忆落在同一类别），
+    /// 调节器每轮都产出 `retrieval_weights` 建议；而该动作的执行端只落审计
+    /// 日志、不改任何参数，指标永远"不改善" ⇒ 连续 10 轮后误触发冻结，
+    /// 连带停掉其余真正生效的调节（system_mode=frozen）。
+    #[test]
+    fn test_advisory_action_never_freezes() {
+        let mut regulator = DaoRegulator::new();
+        // 低道同构度 + 低八卦熵 → 稳定产出 AdjustRetrievalWeights
+        for i in 0..20 {
+            let action = regulator.regulate(0.2, 0.5, 0.2, 0.1, 0.5, 0.1, 3);
+            assert!(
+                matches!(action, RegulationAction::AdjustRetrievalWeights { .. }),
+                "第 {} 轮应返回检索权重建议",
+                i + 1
+            );
+        }
+        assert!(
+            !regulator.is_frozen(),
+            "建议型动作不应计入连续无效调节，不得触发冻结"
+        );
     }
 
     /// 测试：冻结后拒绝调节

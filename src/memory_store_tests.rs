@@ -6246,4 +6246,517 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    // ==================== semantic：候选向量解析（缓存优先 + 预算内回填）====================
+    // 承「复用侧车缓存」决策：Path A 联想探索旁路不再逐条实时编码，改为优先命中
+    // `semantic_vectors.json` 侧车缓存，未命中才在时间预算内回填。
+    // 以下用**合成闭包 + 计数原子**验证不变量——测试 build 下 `MemoryStore::new`
+    // 的编码器恒返回 None（统计降级模式），无法走真实 ML 编码路径，故必须解耦编码器。
+
+    /// 缓存全命中必须**零编码**（本优化的核心承诺：消除逐条实时编码）
+    #[cfg(feature = "ml")]
+    #[test]
+    fn test_resolve_candidate_vectors_cache_hit_skips_encoding() {
+        let items = [
+            make_test_memory("第一条已缓存", MemoryType::Fact),
+            make_test_memory("第二条已缓存", MemoryType::Fact),
+        ];
+        let refs: Vec<&Memory> = items.iter().collect();
+        let mut cache: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        for m in &items {
+            cache.insert(m.id.clone(), vec![1.0, 0.0, 0.0]);
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (out, dirty) = resolve_candidate_vectors(
+            &refs,
+            &mut cache,
+            3,
+            |_text| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(vec![1.0, 0.0, 0.0])
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "缓存全命中时不得触发任何编码"
+        );
+        assert!(!dirty, "无新增则 dirty 应为 false");
+        assert!(out.iter().all(|v| v.is_some()), "命中项应全部有向量");
+    }
+
+    /// 未缓存项必须在预算内回填，并置 dirty=true（供调用方落盘）
+    #[cfg(feature = "ml")]
+    #[test]
+    fn test_resolve_candidate_vectors_backfills_missing() {
+        let a = make_test_memory("已被缓存的甲", MemoryType::Fact);
+        let b = make_test_memory("尚未缓存的乙", MemoryType::Fact);
+        let refs: Vec<&Memory> = vec![&a, &b];
+        let mut cache: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        cache.insert(a.id.clone(), vec![1.0, 0.0, 0.0]);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (out, dirty) = resolve_candidate_vectors(
+            &refs,
+            &mut cache,
+            3,
+            |_text| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(vec![0.0, 1.0, 0.0])
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "仅未缓存项应被编码"
+        );
+        assert!(dirty, "有新回填必须置 dirty=true");
+        assert!(cache.contains_key(&b.id), "回填结果应写回缓存");
+        assert!(out[0].is_some() && out[1].is_some(), "两条都应拿到向量");
+    }
+
+    /// 维度不符的缓存项必须视为未命中（换模型后旧维度向量不可复用）
+    #[cfg(feature = "ml")]
+    #[test]
+    fn test_resolve_candidate_vectors_dim_mismatch_reencodes() {
+        let a = make_test_memory("旧维度向量的记忆", MemoryType::Fact);
+        let refs: Vec<&Memory> = vec![&a];
+        let mut cache: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        cache.insert(a.id.clone(), vec![1.0, 0.0]); // 2 维，与新维度 3 不符
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (out, dirty) = resolve_candidate_vectors(
+            &refs,
+            &mut cache,
+            3,
+            |_text| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(vec![1.0, 0.0, 0.0])
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "维度不符应重新编码"
+        );
+        assert!(dirty, "维度不符重新编码属新增 → dirty=true");
+        assert_eq!(
+            out[0].as_ref().map(|v| v.len()),
+            Some(3),
+            "应拿到新维度向量"
+        );
+    }
+
+    /// 预算为零时必须全部跳过（硬时限保护：绝不超支编码）
+    #[cfg(feature = "ml")]
+    #[test]
+    fn test_resolve_candidate_vectors_zero_budget_skips_all() {
+        let a = make_test_memory("未缓存甲不编码", MemoryType::Fact);
+        let b = make_test_memory("未缓存乙不编码", MemoryType::Fact);
+        let refs: Vec<&Memory> = vec![&a, &b];
+        let mut cache: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (out, dirty) = resolve_candidate_vectors(
+            &refs,
+            &mut cache,
+            3,
+            |_text| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(vec![1.0, 0.0, 0.0])
+            },
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "零预算下不得编码"
+        );
+        assert!(!dirty, "零预算无回填 → dirty=false");
+        assert!(out.iter().all(|v| v.is_none()), "全部保持 None（诚实降级）");
+        assert!(cache.is_empty(), "零预算不得写入缓存");
+    }
+
+    /// 编码失败（返回 None）必须静默跳过，不写入缓存
+    #[cfg(feature = "ml")]
+    #[test]
+    fn test_resolve_candidate_vectors_encode_none_yields_none() {
+        let a = make_test_memory("编码会失败的文本", MemoryType::Fact);
+        let refs: Vec<&Memory> = vec![&a];
+        let mut cache: std::collections::HashMap<String, Vec<f32>> =
+            std::collections::HashMap::new();
+        let (out, dirty) = resolve_candidate_vectors(
+            &refs,
+            &mut cache,
+            3,
+            |_text| None,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(out[0].is_none(), "编码失败应为 None");
+        assert!(!dirty, "失败不得置 dirty");
+        assert!(cache.is_empty(), "失败不得写入缓存");
+    }
+
+    // ==================== 洛书塔缩修复：历史重分类能力 ====================
+    // 背景：`bagua_index` 在写入时被冻结（写时持久化），全仓库此前无任何
+    // 重分类入口 ⇒ 即便编码先验已修，存量记忆仍停留在旧编码器的错误分类下
+    // （实测 95%+ 同卦）。以下测试锁定 reclassify_bagua 的三条契约：
+    // 分布如实统计、结果落盘、二次调用幂等。
+
+    /// 历史重分类必须用**当前编码器**重算存量记忆的洛书/八卦字段，
+    /// 且落盘生效、二次调用幂等。
+    #[test]
+    fn test_reclassify_bagua_fixes_stale_index_and_is_idempotent() {
+        let (_dir, store) = make_store();
+        let contents = [
+            "数据库连接池参数调优：最大连接数与空闲超时设置",
+            "西湖边散步，看晚霞映在湖面上，风很轻",
+            "Rust 所有权与借用检查器：生命周期与可变借用冲突",
+            "比特币协议中的工作量证明与全网难度调整机制",
+        ];
+
+        // 全部伪造为同一卦 index=0，复现"塔缩"（全部落单卦）。
+        for c in contents.iter() {
+            let mut m = make_test_memory(c, MemoryType::Fact);
+            m.bagua_index = Some(0);
+            m.bagua_category = Some("伪造的旧分类".to_string());
+            store.persistence.save_memory(&m).expect("应能保存伪造记忆");
+        }
+        store.invalidate_cache();
+
+        let report = store.reclassify_bagua(0).expect("重分类应成功");
+        assert_eq!(report.scanned, contents.len(), "应扫描到全部记忆");
+        assert_eq!(report.processed, contents.len(), "limit=0 应处理全部");
+        assert_eq!(report.skipped, 0, "limit=0 不应有跳过");
+        // 重分类前全部落单卦 → 分布集中、香农熵为 0
+        assert_eq!(
+            report.before[0],
+            contents.len(),
+            "重分类前应全部落 index=0（塔缩复现）"
+        );
+        assert!(
+            report.entropy_before.abs() < 1e-6,
+            "单卦分布香农熵应为 0，实际 {}",
+            report.entropy_before
+        );
+        assert_eq!(
+            report.before.iter().sum::<usize>(),
+            contents.len(),
+            "before 分布总数应等于扫描数"
+        );
+        assert_eq!(
+            report.after.iter().sum::<usize>(),
+            contents.len(),
+            "after 分布总数应等于扫描数"
+        );
+
+        // changed 与 after 分布必须与"按当前编码器重算"完全一致
+        let mut expected_after = [0usize; 8];
+        let mut expected_changed = 0usize;
+        for c in contents.iter() {
+            let idx = mirror_project(&store.luoshu_encoder.encode_text(c)).best_index as u8;
+            expected_after[idx as usize] += 1;
+            if idx != 0 {
+                expected_changed += 1;
+            }
+        }
+        assert_eq!(
+            report.after, expected_after,
+            "after 分布应等于按当前编码器重算的分布"
+        );
+        assert_eq!(
+            report.changed, expected_changed,
+            "changed 应如实反映分类变动数"
+        );
+        if expected_after.iter().filter(|&&x| x > 0).count() > 1 {
+            assert!(
+                report.entropy_after > report.entropy_before,
+                "分布被打散后香农熵应上升（{} → {}）",
+                report.entropy_before,
+                report.entropy_after
+            );
+        }
+
+        // 落盘生效：重新加载后每条 bagua_index 与当前编码器一致
+        store.invalidate_cache();
+        let (all, _) = store.list_memories(&ListFilter::new()).expect("列出应成功");
+        for m in &all {
+            let expected =
+                mirror_project(&store.luoshu_encoder.encode_text(&m.content)).best_index as u8;
+            assert_eq!(
+                m.bagua_index,
+                Some(expected),
+                "重分类后落盘值应与当前编码器一致（内容：{}）",
+                m.content
+            );
+            assert!(m.luoshu_vector.is_some(), "重分类应回填洛书向量");
+            assert!(
+                m.bagua_category.as_deref() != Some("伪造的旧分类"),
+                "重分类应覆盖旧的分类名（内容：{}）",
+                m.content
+            );
+        }
+
+        // 幂等：再次调用不应产生任何变动（也证明不会重复写盘）
+        let report2 = store.reclassify_bagua(0).expect("二次重分类应成功");
+        assert_eq!(report2.changed, 0, "重分类应幂等：第二次 changed 必须为 0");
+    }
+
+    /// `limit` 必须被严格遵守：仅处理前 limit 条，其余计入 skipped。
+    #[test]
+    fn test_reclassify_bagua_respects_limit() {
+        let (_dir, store) = make_store();
+        let contents = [
+            "记忆一：编译器前端词法分析",
+            "记忆二：编译器后端指令选择",
+            "记忆三：链接器符号解析",
+        ];
+        for c in contents.iter() {
+            let mut m = make_test_memory(c, MemoryType::Fact);
+            m.bagua_index = Some(0);
+            m.bagua_category = Some("伪造".to_string());
+            store.persistence.save_memory(&m).expect("应能保存");
+        }
+        store.invalidate_cache();
+
+        let report = store.reclassify_bagua(2).expect("重分类应成功");
+        assert_eq!(report.scanned, 3, "应扫描到全部记忆");
+        assert_eq!(report.processed, 2, "limit=2 应只处理前两条");
+        assert_eq!(report.skipped, 1, "剩余一条应计入 skipped");
+        assert_eq!(
+            report.before.iter().sum::<usize>(),
+            3,
+            "before 覆盖全量扫描"
+        );
+        assert_eq!(report.after.iter().sum::<usize>(), 3, "after 覆盖全量扫描");
+    }
+
+    /// 全库分布快照：`bagua_distribution` 必须与同一时刻全量重分类的 `before` 一致。
+    ///
+    /// 为什么要单独锁定：异步任务启动时先捕获 `before` 作为累计基线，
+    /// 若快照口径与全量重分类不一致，进度统计的 `after` 会整体偏移。
+    #[test]
+    fn test_bagua_distribution_matches_full_before() {
+        let (_dir, store) = make_store();
+        let contents = [
+            "分布快照测试一：网络协议栈分层",
+            "分布快照测试二：文件系统 inode 管理",
+            "分布快照测试三：分布式共识算法",
+            "分布快照测试四：编译器中间表示",
+            "分布快照测试五：数据库索引结构",
+        ];
+        for c in contents.iter() {
+            let mut m = make_test_memory(c, MemoryType::Fact);
+            m.bagua_index = Some(0);
+            m.bagua_category = Some("伪造".to_string());
+            store.persistence.save_memory(&m).expect("应能保存伪造记忆");
+        }
+        store.invalidate_cache();
+
+        let (total, dist) = store.bagua_distribution().expect("分布快照应成功");
+        assert_eq!(total, contents.len(), "总数应为全库条数");
+        assert_eq!(
+            dist.iter().sum::<usize>(),
+            contents.len(),
+            "分布计数之和应等于总数"
+        );
+        assert_eq!(dist[0], contents.len(), "伪造后应全部落 index=0");
+
+        let report = store.reclassify_bagua(0).expect("全量重分类应成功");
+        assert_eq!(
+            dist, report.before,
+            "分布快照应与全量重分类的 before 完全一致"
+        );
+    }
+
+    /// 分批重分类：offset 切片不重不漏，跨批累计分布收敛到单次全量结果。
+    ///
+    /// 本测试同时锁定三条契约：
+    ///   1. 各批 `processed` 之和 == 全库数（offset 稳定、不重不漏）；
+    ///   2. 累计一致性等式 `before − Σold_counts + Σnew_counts == 编码器实算分布`；
+    ///   3. 分批处理完后全量重分类 `changed == 0`（无遗漏、无重复处理）。
+    #[test]
+    fn test_reclassify_bagua_batch_aggregates_to_full_run() {
+        let (_dir, store) = make_store();
+        let contents = [
+            "分批测试一：TCP 拥塞控制与滑动窗口",
+            "分批测试二：GPU 显存分配与碎片整理",
+            "分批测试三：图数据库的最短路径查询",
+            "分批测试四：时区与夏令时转换陷阱",
+            "分批测试五：编译器常量折叠优化",
+            "分批测试六：正则表达式回溯爆炸",
+            "分批测试七：LSM 树写放大问题",
+        ];
+        for c in contents.iter() {
+            let mut m = make_test_memory(c, MemoryType::Fact);
+            m.bagua_index = Some(0);
+            m.bagua_category = Some("伪造".to_string());
+            store.persistence.save_memory(&m).expect("应能保存伪造记忆");
+        }
+        store.invalidate_cache();
+
+        let (total, before) = store.bagua_distribution().expect("分布快照应成功");
+        assert_eq!(total, contents.len());
+
+        // 以 batch_size=2 分批推进，模拟异步任务的 offset 步进
+        let batch_size = 2usize;
+        let mut offset = 0usize;
+        let mut sum_processed = 0usize;
+        let mut sum_old = [0usize; 8];
+        let mut sum_new = [0usize; 8];
+        loop {
+            let batch = store
+                .reclassify_bagua_batch(offset, batch_size)
+                .expect("分批重分类应成功");
+            assert_eq!(batch.total, total, "每批都应如实报告全库总数");
+            assert_eq!(batch.offset, offset.min(total), "批次 offset 应如实回填");
+            if batch.processed == 0 {
+                break;
+            }
+            sum_processed += batch.processed;
+            for i in 0..8 {
+                sum_old[i] += batch.old_counts[i];
+                sum_new[i] += batch.new_counts[i];
+            }
+            offset += batch.processed;
+            if offset >= total {
+                break;
+            }
+        }
+        assert_eq!(
+            sum_processed, total,
+            "各批处理数之和应等于全库数（不重不漏）"
+        );
+        assert_eq!(sum_old, before, "Σold_counts 应等于重分类前全量分布");
+
+        // 累计一致性：before − Σold + Σnew 应等于按当前编码器实算的最终分布
+        let mut expected_after = [0usize; 8];
+        for c in contents.iter() {
+            let idx = mirror_project(&store.luoshu_encoder.encode_text(c)).best_index as u8;
+            expected_after[idx as usize] += 1;
+        }
+        let mut aggregate_after = before;
+        for i in 0..8 {
+            aggregate_after[i] = aggregate_after[i] - sum_old[i] + sum_new[i];
+        }
+        assert_eq!(
+            aggregate_after, expected_after,
+            "跨批累计分布应等于编码器实算分布"
+        );
+
+        // 分批落盘后全量重分类应无残留变动（证明每条都被正确重算并持久化）
+        let report2 = store.reclassify_bagua(0).expect("全量重分类应成功");
+        assert_eq!(report2.changed, 0, "分批处理完后全量重分类应 0 变动");
+        assert_eq!(report2.after, expected_after, "全量 after 应等于编码器实算");
+    }
+
+    /// 分批边界：`limit == 0` 表示"处理到末尾"，且 offset 超出总数时返回 0 条。
+    #[test]
+    fn test_reclassify_bagua_batch_limit_zero_and_offset_beyond_end() {
+        let (_dir, store) = make_store();
+        for c in ["边界一：无锁队列", "边界二：内存对齐"].iter() {
+            let mut m = make_test_memory(c, MemoryType::Fact);
+            m.bagua_index = Some(0);
+            m.bagua_category = Some("伪造".to_string());
+            store.persistence.save_memory(&m).expect("应能保存");
+        }
+        store.invalidate_cache();
+
+        // offset=0, limit=0 → 处理到末尾
+        let batch = store.reclassify_bagua_batch(0, 0).expect("应成功");
+        assert_eq!(batch.processed, 2, "limit=0 应处理到末尾");
+        assert_eq!(batch.total, 2);
+
+        // offset 超出总数 → 处理 0 条（不得 panic / 越界）
+        let beyond = store
+            .reclassify_bagua_batch(99, 10)
+            .expect("越界 offset 应安全");
+        assert_eq!(beyond.processed, 0, "越界 offset 应返回 0 条");
+        assert_eq!(beyond.offset, 2, "越界 offset 应被夹到 total");
+    }
+
+    // ==================== 批量写入的批量编码口径（v0.9.10 吞吐优化）====================
+    // 背景：`remember_batch` 原为**逐条** `encode_text`（单条前向 ~1.2s），
+    // 200 条/块必然超过客户端 300s 单块超时。优化改为按
+    // `BAGUA_RECLASSIFY_ENCODE_CHUNK` 分块调用 `encode_text_batch`
+    // （单次批量前向 + 跨条目并行）。以下测试锁定三条契约：
+    // ① 与重分类批量路径逐位同口径；② 不得改变离散分类；③ 不得错位、可落盘复原。
+
+    /// 批量写入的派生字段必须与"重分类批量路径"逐位一致，且离散分类与单条编码一致。
+    ///
+    /// 20 条 > 分块大小 16，强制跨两个编码块，检验分块拼接与顺序对齐
+    /// （若 zip 错位，落盘向量将属于别的内容，重算时 `field_changed` 会翻为 true）。
+    #[test]
+    fn test_remember_batch_derived_fields_match_encoder() {
+        let (_dir, mut store) = make_store();
+
+        let bases = [
+            "数据库连接池参数调优：最大连接数与空闲超时设置",
+            "西湖边散步，看晚霞映在湖面上，风很轻",
+            "Rust 所有权与借用检查器：生命周期与可变借用冲突",
+            "比特币协议中的工作量证明与全网难度调整机制",
+            "会议室预定：周三下午三点，需要投影仪",
+        ];
+        let contents: Vec<String> = (0..20)
+            .map(|i| format!("{}（样本 {}）", bases[i % bases.len()], i))
+            .collect();
+        let mems: Vec<Memory> = contents
+            .iter()
+            .map(|c| make_test_memory(c, MemoryType::Fact))
+            .collect();
+
+        let saved = store.remember_batch(mems).expect("批量写入应成功");
+        assert_eq!(
+            saved.len(),
+            contents.len(),
+            "长度契约：写入返回条数必须与输入严格相等"
+        );
+
+        // ①② 逐条与重分类批量路径同口径（同分块、同序），且离散分类与单条编码一致
+        let refs: Vec<&Memory> = saved.iter().collect();
+        let recomputed = store.recompute_bagua_fields_batch(&refs);
+        assert_eq!(recomputed.len(), saved.len(), "重算条数应与写入条数一致");
+        for (i, (m, rec)) in saved.iter().zip(recomputed.iter()).enumerate() {
+            assert!(
+                !rec.field_changed,
+                "第 {} 条写入口径与重分类路径不一致（内容：{}）",
+                i, m.content
+            );
+            assert!(m.luoshu_vector.is_some(), "第 {} 条应回填洛书向量", i);
+            let expected_idx =
+                mirror_project(&store.luoshu_encoder.encode_text(&m.content)).best_index as u8;
+            assert_eq!(
+                m.bagua_index,
+                Some(expected_idx),
+                "第 {} 条离散分类与单条编码不一致（内容：{}）",
+                i,
+                m.content
+            );
+            assert_eq!(
+                rec.new_index, expected_idx,
+                "第 {} 条重算分类应与单条编码一致",
+                i
+            );
+        }
+
+        // ③ 落盘可复原：重新加载后派生字段仍与单条编码一致
+        store.invalidate_cache();
+        let (all, _) = store.list_memories(&ListFilter::new()).expect("列出应成功");
+        assert_eq!(all.len(), saved.len(), "落盘条数应一致");
+        for m in &all {
+            assert!(m.luoshu_vector.is_some(), "落盘后应保留洛书向量");
+            let expected_idx =
+                mirror_project(&store.luoshu_encoder.encode_text(&m.content)).best_index as u8;
+            assert_eq!(
+                m.bagua_index,
+                Some(expected_idx),
+                "落盘后分类应与当前编码器一致（内容：{}）",
+                m.content
+            );
+        }
+    }
 }

@@ -20,6 +20,8 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::engine::luoshu_encoder::LUOSHU_DEVIATION_MAX;
+
 /// 道同构度指标聚合器
 ///
 /// 线程安全的计数器集合，使用 AtomicU64 实现无锁并发更新。
@@ -159,8 +161,17 @@ impl DaoMetrics {
         avg_luoshu_deviation: f32,
         bagua_counts: &[usize; 8],
     ) -> DaoMetricsSnapshot {
-        // 计算道同构度：1.0 - 归一化偏离度（偏离度越低越好）
-        let dao_score = (1.0 - avg_luoshu_deviation.min(1.0)).max(0.0);
+        // 计算道同构度：按 luoshu_deviation 的**结构最大值**归一化，回到 [0,1]（偏离度越低越好）。
+        // v0.9.10 修正：luoshu_deviation 归一化契约变更后，其可行域已扩展为
+        // [0, LUOSHU_DEVIATION_MAX]（≈2.0456），而旧实现 `1.0 - x.min(1.0)` 中的
+        // `.min(1.0)` 是旧尺度遗留 —— 实测均值偏离度≈1.62 会被饱和钳到 0.0，
+        // 指标失去区分度，并因此误判系统处于异常。改为除以结构最大值。
+        // NaN 安全：非有限偏离度 → 0.0，与旧实现语义一致。
+        let dao_score = if avg_luoshu_deviation.is_finite() {
+            (1.0 - avg_luoshu_deviation / LUOSHU_DEVIATION_MAX).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
         // 计算八卦分布熵（香农熵）
         let bagua_entropy = compute_bagua_entropy(bagua_counts);
@@ -200,7 +211,12 @@ impl Default for DaoMetrics {
 ///
 /// 熵值范围 [0, log2(8)] = [0, 3.0]。
 /// 熵越大表示记忆在八卦类别上的分布越均匀。
-fn compute_bagua_entropy(counts: &[usize; 8]) -> f32 {
+///
+/// v0.9.10：可见性由 `fn` 放宽为 `pub(crate)`，供
+/// [`crate::memory_store::MemoryStore::reclassify_bagua`] 复用同一公式
+/// （历史重分类需在重分类前后各算一次熵以校验分布是否被打散，
+/// 若重复实现会导致两处口径漂移）。
+pub(crate) fn compute_bagua_entropy(counts: &[usize; 8]) -> f32 {
     let total: usize = counts.iter().sum();
     if total == 0 {
         return 0.0;
@@ -316,5 +332,69 @@ mod tests {
         let metrics = DaoMetrics::new();
         let snapshot = metrics.snapshot(5, 0, 0, 0.0, &[0; 8]);
         assert_eq!(snapshot.dao_isomorphism_score, 1.0, "零偏离度 → 完美道同构");
+    }
+
+    /// ★★v0.9.10：道同构度必须按**结构最大值**归一化，而非旧尺度的 `.min(1.0)`。
+    ///
+    /// # 这条测的是实测发现的指标失效
+    ///
+    /// v0.9.10 改了 `luoshu_deviation` 的尺度（归一化契约变更后，理想每线和
+    /// 目标改为 `15/√285 ≈ 0.8885`，偏离度可行域扩展为 `[0, 2.0456]`），
+    /// 但 [`DaoMetrics::snapshot`] 的 score 映射仍停留在旧尺度：
+    ///
+    /// ```text
+    /// dao_score = (1.0 - avg_deviation.min(1.0)).max(0.0)
+    /// ```
+    ///
+    /// 于是实测 `avg_deviation ≈ 1.62` 被 `.min(1.0)` 饱和 → `dao_score` 恒为 0.0，
+    /// 指标**彻底失去区分度**，还连带把健康的系统误判为「道同构度异常」。
+    ///
+    /// 修复契约：除以结构最大值 `LUOSHU_DEVIATION_MAX`，使 score 回到 [0,1] 且单调。
+    #[test]
+    fn test_dao_score_uses_structural_max() {
+        let metrics = DaoMetrics::new();
+
+        // 实测场景：avg_deviation ≈ 1.62（dev 服务 regulator 报「洛书幻和平齐偏离度 1.62」）
+        let snapshot = metrics.snapshot(3189, 47, 0, 1.62, &[400; 8]);
+        let expected = 1.0 - 1.62 / 2.0456; // ≈ 0.208
+        assert!(
+            (snapshot.dao_isomorphism_score - expected).abs() < 0.005,
+            "avg_deviation=1.62 → score 应≈{:.3}（按结构最大值归一化），实际 {:.4}",
+            expected,
+            snapshot.dao_isomorphism_score
+        );
+        assert!(
+            snapshot.dao_isomorphism_score > 0.0,
+            "旧实现因 .min(1.0) 饱和把 score 钳为 0.0，失去区分度"
+        );
+
+        // 单调性：偏离度越大 score 越小
+        let low = metrics
+            .snapshot(10, 0, 0, 0.5, &[1; 8])
+            .dao_isomorphism_score;
+        let high = metrics
+            .snapshot(10, 0, 0, 1.5, &[1; 8])
+            .dao_isomorphism_score;
+        assert!(
+            low > high,
+            "偏离度越大，道同构度应越小（{} > {}）",
+            low,
+            high
+        );
+
+        // 边界：超出结构最大值 → 钳为 0.0；零偏离 → 1.0
+        assert_eq!(
+            metrics
+                .snapshot(10, 0, 0, 5.0, &[1; 8])
+                .dao_isomorphism_score,
+            0.0,
+            "偏离度超出结构最大值应钳为 0.0"
+        );
+        assert_eq!(
+            metrics
+                .snapshot(10, 0, 0, 0.0, &[1; 8])
+                .dao_isomorphism_score,
+            1.0
+        );
     }
 }

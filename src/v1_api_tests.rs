@@ -5629,4 +5629,148 @@ mod api_contracts_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ============================================================
+    // v0.9.10 塔缩修复·第 2 层：reclassify-bagua 异步化（解决大库 504）
+    //
+    // 背景：全量重分类在大库上耗时远超 server.rs 的 30s 全局超时 ⇒ HTTP 必返
+    // 504（后台却仍在继续跑）。本组用例固化"显式 async 参数"契约：
+    //   - 请求体 `{"async": true}` → 立即 202 + task_id；
+    //   - 进度可经 GET /memories/reclassify-bagua/progress 查询；
+    //   - 缺省/false 时保持既有同步 200 行为（向后兼容）。
+    // 注：tokio 未启用 time feature，轮询必须用 std::thread::sleep；
+    //     后台任务在 spawn_blocking 线程池推进，不受宿主线程阻塞影响。
+    // ============================================================
+
+    /// async=true 立即返回 202 + task_id；轮询进度至 completed；缺省仍为同步 200。
+    #[tokio::test]
+    async fn test_reclassify_bagua_async_returns_202_then_completes() {
+        use crate::persistence::Persistence;
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_reclassify_async_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        // 先就地播种 3 条"伪造 index=0"的记忆，再包进共享锁传给路由
+        let store = new_statistical_store(&dir_str);
+        let contents = [
+            "异步重分类一：HTTP 缓存控制头语义",
+            "异步重分类二：B+ 树页分裂过程",
+            "异步重分类三：垃圾回收的分代假设",
+        ];
+        for (i, c) in contents.iter().enumerate() {
+            let mut m = timed_memory(
+                &format!("reclassify-async-seed-{i}"),
+                1_700_000_000_000 + i as u64,
+                c,
+                MemoryType::Fact,
+            );
+            m.bagua_index = Some(0);
+            m.bagua_category = Some("伪造".to_string());
+            // 经公开持久化入口写入伪造值（绕过编码器），复现"塔缩"分布
+            store
+                .persistence()
+                .save_memory(&m)
+                .expect("应能播种伪造记忆");
+        }
+
+        let shared = Arc::new(Mutex::new(store));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared, manager, llm_api, llm_ready, false);
+
+        // 1) 显式 async=true → 立即 202 + task_id
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/reclassify-bagua")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "async": true }).to_string()))
+            .unwrap();
+        let response = app.clone().into_service().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "async=true 应返回 202 而非阻塞至超时"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["async"], true, "应回显 async 标志: {body}");
+        assert_eq!(body["total"], contents.len(), "应报告全库总数: {body}");
+        let task_id = body["task_id"].as_str().unwrap_or("");
+        assert!(!task_id.is_empty(), "202 必须携带 task_id: {body}");
+        assert_eq!(body["status"], "running", "应报告运行中: {body}");
+
+        // 2) 轮询进度端点，直至 completed
+        let mut final_body = serde_json::Value::Null;
+        let mut done = false;
+        for _ in 0..500 {
+            let request = Request::builder()
+                .method("GET")
+                .uri("/memories/reclassify-bagua/progress")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().into_service().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "进度端点应恒返回 200");
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let status = snapshot["status"].as_str().unwrap_or("");
+            assert_ne!(status, "failed", "异步任务不应失败: {snapshot}");
+            if status == "completed" {
+                final_body = snapshot;
+                done = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(done, "异步任务应在轮询窗口内完成");
+        assert_eq!(
+            final_body["processed"],
+            contents.len(),
+            "完成后 processed 应等于全库数: {final_body}"
+        );
+        assert_eq!(final_body["total"], contents.len(), "{final_body}");
+        assert_eq!(
+            final_body["task_id"].as_str().unwrap_or(""),
+            task_id,
+            "进度应属于同一 task_id: {final_body}"
+        );
+        // before 为全落 index=0 的伪造分布
+        assert_eq!(final_body["before"][0], contents.len(), "{final_body}");
+
+        // 3) 向后兼容：缺省 async 仍走同步 200，且已幂等（changed=0）
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/reclassify-bagua")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({}).to_string()))
+            .unwrap();
+        let response = app.clone().into_service().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "缺省 async 应保持同步 200（向后兼容）"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let sync_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(sync_body["scanned"], contents.len(), "{sync_body}");
+        assert_eq!(sync_body["processed"], contents.len(), "{sync_body}");
+        assert_eq!(
+            sync_body["changed"], 0,
+            "异步已全量重分类过后，同步重跑应幂等: {sync_body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

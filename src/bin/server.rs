@@ -721,8 +721,12 @@ async fn try_run() -> LrcResult<()> {
                     log("  ✓ ML 语义编码器加载成功（Smart Match 已启用）");
                     (enc, true)
                 }
-                _ => {
-                    log("  ⚠ ML 编码器加载失败，降级统计模式");
+                Ok((enc, false)) => {
+                    log("  ⚠ ML 编码器返回未就绪，降级统计模式");
+                    (enc, false)
+                }
+                Err(e) => {
+                    log(&format!("  ⚠ ML 编码器加载失败，降级统计模式：{e}"));
                     (code_memory::engine::create_statistical_encoder(), false)
                 }
             }
@@ -792,6 +796,10 @@ async fn try_run() -> LrcResult<()> {
         // 通过设置 synthesis_min_cluster 为 usize::MAX，使合成永远不会触发
         if disable_synthesis {
             store.synthesis_min_cluster = usize::MAX;
+            // 关键：必须同时告知调节器"合成已禁用"。否则调节器会把
+            // "合成永不发生"误判为待改善的异常，反复建议降低合成阈值，
+            // 并在连续 10 轮后被冻结保护误触发（system_mode=frozen）。
+            store.dao_regulator.set_synthesis_enabled(false);
             log("   ⚠ 合成引擎: 已禁用（基线 B：no_evolution）");
         }
 
@@ -996,7 +1004,14 @@ async fn try_run() -> LrcResult<()> {
             synthesis_threshold: 3,
             synthesis_similarity: 0.4,
             run_on_start: false, // v0.5.5 内存优化：延迟首次合成，避免启动内存峰值
-            auto_synthesize: true,
+            // v0.9.10 修复：`--disable-synthesis` 此前只把 synthesis_min_cluster 置为
+            // usize::MAX（让合成"空转"），但**后台结晶流水线照常每 5 分钟跑一轮**，
+            // 合成阶段仍会去抢全局存储锁 —— 在 2GB 机器 + 2000 条记忆下，一轮可占锁
+            // 24~66 秒，期间前台 `/v1/memories/consolidate`、`/v1/memories/enrich`
+            // 在 2 秒内拿不到锁即返回 503，实测导致评测期间 Add/Search 大量失败
+            // （2026-10-03 首次评估，适配层日志 429/442 行是 503/504）。
+            // 现在让该标志真正关掉合成阶段（拉取/写入结晶不受影响），与它的语义一致。
+            auto_synthesize: !disable_synthesis,
             verbose: 1,
         };
         // v0.5.18：传入 LLM 配置，启用高维 embedding 合成

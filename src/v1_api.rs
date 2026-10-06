@@ -789,11 +789,31 @@ fn run_association_explore(
                 // 单条记忆被误判为弱匹配）。此时退回原始空间，并配对使用
                 // 原始量纲的 0.55 阈值（与 P8.2h 逐字节一致）。
                 let use_decenter = assoc_debias_enabled() && mem_refs.len() >= 2;
-                let sims = if use_decenter {
-                    store.semantic_similarities_debiased(text, &mem_refs, assoc_suppress_lambda())
-                } else {
-                    store.semantic_similarities(text, &mem_refs)
-                };
+                // v0.9.8 缓存复用（承「复用侧车缓存」决策）：候选向量优先命中
+                // `semantic_vectors.json` 侧车缓存（零编码），仅对未命中项在**剩余
+                // 旁路预算**内并行编码回填；打分逻辑与历史实时路径共用
+                // `score_semantic_vectors`，判别力零偏移。历史实时路径对每条候选
+                // 编码（~2.25s/条），全库规模不可行，故改为缓存优先。
+                let data_dir = store.persistence().data_dir().to_path_buf();
+                let mut semantic_cache = crate::state_matcher::load_semantic_cache(&data_dir);
+                let bypass_remaining =
+                    ASSOCIATION_SEMANTIC_BYPASS_BUDGET.saturating_sub(explore_started.elapsed());
+                let (sims, cache_dirty, sem_dim) = store.semantic_similarities_cached(
+                    text,
+                    &mem_refs,
+                    &mut semantic_cache.vectors,
+                    use_decenter,
+                    assoc_suppress_lambda(),
+                    bypass_remaining,
+                );
+                // 仅在编码器真实产出向量（dim != 0）时校准并落盘缓存；dim == 0
+                // 表示不可用，不得覆盖既有缓存（诚实降级，与词面通路一致）。
+                if sem_dim != 0 {
+                    crate::state_matcher::ensure_semantic_cache_dim(&mut semantic_cache, sem_dim);
+                    if cache_dirty {
+                        crate::state_matcher::save_semantic_cache(&data_dir, &semantic_cache);
+                    }
+                }
                 // 阈值必须与所用向量空间配对：去中心化后的余弦量纲不同于
                 // 原始空间，0.18 只对去中心化空间标定（见常量注释），
                 // 否则"空间 A 的分值 + 空间 B 的门槛"会让放行判定失效。
@@ -1798,6 +1818,8 @@ pub fn build_v1_router(
     // P7 主动发现（daoti/PREREG_ACTIVE_DISCOVERY.md）：独立的"第二通道"，
     // 不在任何用户查询路径上，且其内部检索一律 read_only（不写排序状态）。
     let discovery_store = store.clone();
+    // v0.9.10 塔缩修复·第 2 层：洛书八卦历史重分类（用当前编码器重算存量记忆）
+    let reclassify_store = store.clone();
 
     // P0-1: 编码器创建一次，所有请求复用（避免每次请求都加载 ML 模型）
     let encode_encoder = std::sync::Arc::new(HybridLuoShuEncoder::default());
@@ -3777,6 +3799,228 @@ pub fn build_v1_router(
                 }
             }
         }))
+        // POST /v1/state/semantic-backfill — 显式回填语义向量缓存
+        //
+        // 与联想探索/状态发现的"顺带回填"（受 stale_days + 条数 + 时间预算三重约束）
+        // 不同：本端点**不受 stale_days 限制**，显式触发把尚未缓存的记忆句向量
+        // 补齐（替代缺失的 `reencode()` 语义，用于预暖缓存/模型更换后重建）。
+        // 双约束（batch 条数 + budget_ms 时间）防止单次请求吃满 CPU 或超出前端超时。
+        // 不参与排序，不写回任何排序状态（原则一）。
+        // 请求体：{ "batch": 8, "budget_ms": 4000 }（两字段均可缺省，取环境变量默认值）
+        .route("/state/semantic-backfill", post({
+            let store = discovery_store.clone();
+            move |Json(body): Json<serde_json::Value>| {
+                let store = store.clone();
+                async move {
+                    let batch = body
+                        .get("batch")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .filter(|v| *v > 0)
+                        .unwrap_or_else(crate::state_matcher::semantic_backfill_batch);
+                    let budget_ms = body
+                        .get("budget_ms")
+                        .and_then(|v| v.as_u64())
+                        .filter(|v| *v > 0)
+                        .unwrap_or_else(crate::state_matcher::semantic_backfill_budget_ms);
+                    let result = tokio::task::spawn_blocking(move || {
+                        // 锁忙（用户查询/合成持有）→ 跳过本轮，返回降级（与 state-driven 同款）
+                        let guard = store.try_lock().ok()?;
+                        let data_dir = guard.persistence().data_dir().to_path_buf();
+                        let filter = crate::memory_store_types::ListFilter::new();
+                        let Ok((memories, total)) = guard.list_memories(&filter) else {
+                            return Some((0usize, 0usize));
+                        };
+                        let encoded = crate::state_matcher::backfill_semantic_cache(
+                            &guard,
+                            &memories,
+                            &data_dir,
+                            batch,
+                            std::time::Duration::from_millis(budget_ms),
+                        );
+                        Some((encoded, total))
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    match result {
+                        Some((encoded, total)) => Ok(Json(serde_json::json!({
+                            "success": true,
+                            "encoded": encoded,
+                            "total": total,
+                            "batch": batch,
+                            "budget_ms": budget_ms,
+                        }))),
+                        None => Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "store_busy",
+                                "message": "记忆服务繁忙，请稍后重试"
+                            })),
+                        )),
+                    }
+                }
+            }
+        }))
+        // POST /v1/memories/reclassify-bagua — 洛书八卦历史重分类（v0.9.10 塔缩修复·第 2 层）
+        //
+        // 背景：`bagua_index` 在写入时被冻结（写时持久化），编码器修正后存量记忆
+        // **不会自动跟随**，导致"编码器已修好、历史数据依旧塔缩"（实测真实库
+        // 95%+ 落同一卦「离」）。本端点用当前编码器重算存量记忆的四个洛书/八卦
+        // 派生字段并落盘，是让历史数据回归的先决能力。
+        //
+        // 请求体：
+        //   - { "limit": 0 }             → 同步全量（缺省行为，向后兼容；大库会阻塞）
+        //   - { "async": true, "limit": 0 } → 异步：立即 202 + task_id，进度查询 progress 端点
+        //   - "batch_size"（可选）：异步每批条数，缺省 50
+        //
+        // 同步路径采用 spawn_blocking + try_lock：锁忙（用户查询/合成持有）时返回 503 store_busy。
+        // 异步路径按 offset 分批、每批处理完即释放锁，用户请求可穿插其间，避免长时独占；
+        // 同一时刻仅允许一个异步任务（重复触发返回 409 + 现有 task_id）。
+        .route("/memories/reclassify-bagua", post({
+            let store = reclassify_store.clone();
+            move |Json(body): Json<serde_json::Value>| {
+                let store = store.clone();
+                async move {
+                    let limit = body
+                        .get("limit")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(0);
+                    let is_async = body
+                        .get("async")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    if is_async {
+                        let batch_size = body
+                            .get("batch_size")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or(crate::reclassify_job::DEFAULT_RECLASSIFY_BATCH_SIZE);
+
+                        // 短暂持锁抓取全库基线（total + before 分布），随后立即释放
+                        let baseline = {
+                            let store = store.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let guard = store.try_lock().ok()?;
+                                guard.bagua_distribution().ok()
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        };
+                        let (total, before) = match baseline {
+                            Some(v) => v,
+                            None => {
+                                return Err((
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    Json(serde_json::json!({
+                                        "error": "store_busy",
+                                        "message": "记忆服务繁忙，请稍后重试"
+                                    })),
+                                ))
+                            }
+                        };
+
+                        let task_id = uuid::Uuid::new_v4().to_string();
+                        let job = crate::reclassify_job::global_job();
+                        if let Err(existing) = job.try_start(task_id.clone(), total, before) {
+                            return Err((
+                                StatusCode::CONFLICT,
+                                Json(serde_json::json!({
+                                    "error": "already_running",
+                                    "task_id": existing,
+                                    "message": "已有重分类任务在运行，请轮询进度或稍后重试"
+                                })),
+                            ));
+                        }
+
+                        // 后台推进：按 offset 分批、每批持锁处理完即释放
+                        let store_bg = store.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::reclassify_job::run_reclassify_job(
+                                crate::reclassify_job::global_job(),
+                                &store_bg,
+                                batch_size,
+                                crate::reclassify_job::DEFAULT_RECLASSIFY_BUSY_RETRIES,
+                            );
+                        });
+
+                        return Ok((
+                            StatusCode::ACCEPTED,
+                            Json(serde_json::json!({
+                                "success": true,
+                                "async": true,
+                                "task_id": task_id,
+                                "total": total,
+                                "status": "running",
+                                "poll": "/v1/memories/reclassify-bagua/progress"
+                            })),
+                        ));
+                    }
+
+                    // 同步路径（向后兼容）：一次性全量/限量重分类，锁忙时降级 503
+                    let result = tokio::task::spawn_blocking(move || {
+                        let guard = store.try_lock().ok()?;
+                        guard.reclassify_bagua(limit).ok()
+                    })
+                    .await
+                    .ok()
+                    .flatten();
+                    match result {
+                        Some(report) => Ok((
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "success": true,
+                                "scanned": report.scanned,
+                                "processed": report.processed,
+                                "skipped": report.skipped,
+                                "changed": report.changed,
+                                "before": report.before,
+                                "after": report.after,
+                                "entropy_before": report.entropy_before,
+                                "entropy_after": report.entropy_after,
+                            })),
+                        )),
+                        None => Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "store_busy",
+                                "message": "记忆服务繁忙，请稍后重试"
+                            })),
+                        )),
+                    }
+                }
+            }
+        }))
+        // GET /v1/memories/reclassify-bagua/progress — 异步重分类任务进度
+        //
+        // 恒返回 200；`status` ∈ idle / running / completed / failed。
+        // 空闲时返回 { "status": "idle" }，其余字段为零值，便于前端统一处理。
+        .route("/memories/reclassify-bagua/progress", get({
+            move || async move {
+                let snap = crate::reclassify_job::global_job().snapshot();
+                let percent = if snap.total == 0 {
+                    0.0f64
+                } else {
+                    (snap.processed as f64 / snap.total as f64 * 100.0).min(100.0)
+                };
+                Json(serde_json::json!({
+                    "status": snap.status.as_str(),
+                    "task_id": snap.task_id,
+                    "total": snap.total,
+                    "processed": snap.processed,
+                    "changed": snap.changed,
+                    "before": snap.before,
+                    "after": snap.after,
+                    "percent": percent,
+                    "started_ms": snap.started_ms,
+                    "finished_ms": snap.finished_ms,
+                    "error": snap.error,
+                }))
+            }
+        }))
         // GET /v1/audit-trail — 审计追踪（质疑五：透明度与信任）
         //
         // 提供完整的、可回溯的系统自主行为日志。
@@ -4871,6 +5115,7 @@ pub fn build_v1_router(
                         match h.system_mode {
                             crate::engine::health_report::SystemMode::Healthy => "系统运行健康",
                             crate::engine::health_report::SystemMode::Degraded => "编码器已降级，语义能力降低",
+                            crate::engine::health_report::SystemMode::Misaligned => "记忆几何结构偏离，建议重编码",
                             crate::engine::health_report::SystemMode::Oscillating => "系统参数正在自我调整中",
                             crate::engine::health_report::SystemMode::Drifting => "检测到参数持续漂移，建议检查",
                             crate::engine::health_report::SystemMode::Frozen => "调节器已冻结，需要手动干预",

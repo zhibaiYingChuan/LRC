@@ -121,6 +121,35 @@ pub fn bagua_name_to_index(name: &str) -> Option<u8> {
         .map(|index| index as u8)
 }
 
+/// 八卦环形距离（先天八卦圆环上的最短步数，取值 0..=4）。
+///
+/// 先天八卦按 `BAGUA_BASES` 顺序首尾相接围成一圈
+/// （乾→兑→离→震→巽→坎→艮→坤→乾），卦与卦的"邻近度"必须沿圆环度量，
+/// 而非线性索引差：例如 乾(0) 与 坤(7) 线性距离为 7，环形距离却是 1，
+/// 二者在圆环上实为相邻卦。
+///
+/// 检索门禁据此剪除候选：环形距离 ≤1（同卦/相邻卦）保留，其余剪除。
+pub fn bagua_ring_distance(a: u8, b: u8) -> u8 {
+    let diff = (a as i16 - b as i16).unsigned_abs() as i16; // 0..=7
+    diff.min(8 - diff) as u8 // 0..=4
+}
+
+/// 八卦索引 → 洛书九宫位置（与 `BAGUA_BASES` 严格同序）
+///
+/// v0.9.10 新增。此前的实现把「卦 index」与「九宫位置」混用（`mirror_project`
+/// 由基底内积得到 index，却当成位置使用），两处顺序一旦漂移就会静默错位。
+/// 现在显式固化，任何改动都必须与 `BAGUA_BASES` 同步。
+///
+/// 对应关系（由 `BAGUA_BASES` 逐一核出）：
+///   乾→8  兑→5  离→1  震→3  巽→0  坎→7  艮→6  坤→2
+///
+/// 注意：**外圈 8 个位置各出现一次，唯独没有 4（中心）**——这正是
+/// 「中心点始终不变」（中心不属于任何梯形）的体现。
+pub const BAGUA_PALACE_POS: [usize; 8] = [8, 5, 1, 3, 0, 7, 6, 2];
+
+/// 洛书九宫的中心位置。中心不参与螺旋轮转，只作为不变量存在。
+pub const LUOSHU_CENTER_POS: usize = 4;
+
 /// 八卦的先天类别含义（用于记忆分类）
 pub const BAGUA_CATEGORIES: [&str; 8] = [
     "刚性法则", // 乾 — 核心规则、架构约束
@@ -134,38 +163,199 @@ pub const BAGUA_CATEGORIES: [&str; 8] = [
 ];
 
 // ============================================================
+// 五行生克偏置（逐字移植道体 `MirrorRecursiveCell`）
+// ============================================================
+//
+// 出处：`12_记忆层与镜像递归_part3/modules/daoti_modules_part3.py:30-35, 496-536`
+//
+// 道体原式（`MirrorRecursiveCell.forward`）：
+//   gua_scores  = gua_query(state) * gua_scale
+//   top1_wuxing = gua_wuxing_idx[argmax(gua_scores)]   ← 先定主卦，取其五行
+//   gua_scores += wuxing_sheng_bias[top1_wuxing] * sheng_scale
+//   gua_scores += wuxing_ke_bias[top1_wuxing] * (-|ke_scale_raw|)
+//   gua_scores  = clamp(-8, 8) → softmax
+//
+// 偏置表（`daoti_modules_part3.py:507-517`）：
+//   同行   → 0.3
+//   我生者 → +1.0
+//   我克者 → +1.0，随后乘 -|ke_scale_raw|（默认 0.5 ⇒ 实际 −0.5）
+//   其余   → 0
+//
+// **这是 `MirrorRecursiveCell` 里唯一能确定性移植到 LRC 的部分** —— 它是纯符号
+// 先验、不含任何可学习权重。其余部分（`yang_net` / `yin_net` / `gua_prototypes`）
+// 为随机初始化 + 在线学习，**无预训练权重**，移植到 Rust 侧等于注入噪声。
+
+/// 八卦 → 五行索引（与 `BAGUA_NAMES` / 道体 `BAGUA_ORDER` **同序**）
+///
+/// 已核对：道体 `BAGUA_ORDER = ["乾","兑","离","震","巽","坎","艮","坤"]` 与
+/// LRC 的 `BAGUA_NAMES` 顺序**完全一致**，故索引可直接对齐，无需名称转换。
+/// 五行编码沿用道体 `WUXING_MAP = {金:0, 木:1, 水:2, 火:3, 土:4}`。
+pub const BAGUA_WUXING: [usize; 8] = [0, 0, 3, 1, 1, 2, 4, 4];
+//                                  乾 兑 离 震 巽 坎 艮 坤
+//                                  金 金 火 木 木 水 土 土
+
+/// 相生：我生者（道体 `WUXING_SHENG`：金生水、木生火、水生木、火生土、土生金）
+pub const WUXING_SHENG: [usize; 5] = [2, 3, 0, 4, 1];
+
+/// 相克：我克者（道体 `WUXING_KE`：金克木、木克土、水克火、火克金、土克水）
+pub const WUXING_KE: [usize; 5] = [1, 4, 3, 0, 2];
+
+/// 五行索引 → 名称（日志与排错用）
+pub const WUXING_NAMES: [&str; 5] = ["金", "木", "水", "火", "土"];
+
+/// 生项尺度默认值（对应道体 `sheng_scale = 1.0`）
+pub const DEFAULT_SHENG_SCALE: f32 = 1.0;
+/// 克项尺度默认值（对应道体 `ke_scale_raw = 0.5`，实际施加 −0.5）
+pub const DEFAULT_KE_SCALE: f32 = 0.5;
+
+/// 8 维取 argmax（平票取小索引，与 numpy / torch argmax 一致）
+pub fn argmax8(v: &[f32; 8]) -> usize {
+    let mut best = 0usize;
+    for (i, &x) in v.iter().enumerate().skip(1) {
+        if x > v[best] {
+            best = i;
+        }
+    }
+    best
+}
+
+/// 由主卦求对全部 8 卦的五行偏置（逐字移植道体偏置表）
+pub fn wuxing_bias(dominant: usize, sheng_scale: f32, ke_scale: f32) -> [f32; 8] {
+    let dw = BAGUA_WUXING[dominant.min(7)];
+    let mut bias = [0.0f32; 8];
+    for (j, b) in bias.iter_mut().enumerate() {
+        let w = BAGUA_WUXING[j];
+        if w == dw {
+            *b = 0.3; // 同行
+        } else if WUXING_SHENG[dw] == w {
+            *b = sheng_scale; // 我生者
+        } else if WUXING_KE[dw] == w {
+            *b = -ke_scale.abs(); // 我克者
+        }
+    }
+    bias
+}
+
+/// 施加五行生克偏置后的主卦索引
+///
+/// 对应道体 `argmax(gua_scores + sheng_bias + ke_bias)`：
+/// 先取原始主卦 → 由其五行求偏置 → 再取一次 argmax（偏置可能改变主卦）。
+pub fn dominant_with_wuxing(scores: &[f32; 8], sheng_scale: f32, ke_scale: f32) -> usize {
+    let raw = argmax8(scores);
+    let bias = wuxing_bias(raw, sheng_scale, ke_scale);
+    let mut biased = [0.0f32; 8];
+    for j in 0..8 {
+        biased[j] = scores[j] + bias[j];
+    }
+    argmax8(&biased)
+}
+
+// ============================================================
+// 操作 1：MirrorProject — 先天八卦分类
+// ============================================================
+
+// 镜像投影算子：将洛书向量投影到 8 个先天八卦基底上
+
+#[cfg(test)]
+mod wuxing_tests {
+    use super::*;
+
+    // === 五行生克偏置（移植自道体 MirrorRecursiveCell） ===
+
+    /// 逐字核对移植自道体的两张表
+    #[test]
+    fn test_wuxing_tables_match_daoti() {
+        // 道体 WUXING_MAP = {金:0, 木:1, 水:2, 火:3, 土:4}
+        assert_eq!(WUXING_NAMES, ["金", "木", "水", "火", "土"]);
+        // 道体 WUXING_SHENG = {0:2, 1:3, 2:0, 3:4, 4:1}
+        assert_eq!(WUXING_SHENG, [2, 3, 0, 4, 1], "相生表必须与道体逐字一致");
+        // 道体 WUXING_KE = {0:1, 1:4, 2:3, 3:0, 4:2}
+        assert_eq!(WUXING_KE, [1, 4, 3, 0, 2], "相克表必须与道体逐字一致");
+        // 道体 BAGUA_WUXING：乾兑=金、震巽=木、坎=水、离=火、艮坤=土
+        // （索引顺序 = BAGUA_NAMES = 道体 BAGUA_ORDER）
+        assert_eq!(
+            BAGUA_WUXING,
+            [0, 0, 3, 1, 1, 2, 4, 4],
+            "八卦五行表必须与道体一致"
+        );
+    }
+
+    /// 偏置取值：同行 0.3 / 我生者 +1.0 / 我克者 −0.5 / 其余 0
+    ///
+    /// 以乾（索引 0，金）为主卦：
+    ///   同行 乾/兑 → 0.3
+    ///   金生水 → 坎(索引 5) → +1.0
+    ///   金克木 → 震/巽(索引 3/4) → −0.5
+    ///   火/土 → 0
+    #[test]
+    fn test_wuxing_bias_values() {
+        let b = wuxing_bias(0, DEFAULT_SHENG_SCALE, DEFAULT_KE_SCALE);
+        let expect = [0.3, 0.3, 0.0, -0.5, -0.5, 1.0, 0.0, 0.0];
+        for j in 0..8 {
+            assert!(
+                (b[j] - expect[j]).abs() < 1e-6,
+                "索引 {} 的偏置应为 {}，实际 {}",
+                j,
+                expect[j],
+                b[j]
+            );
+        }
+    }
+
+    /// 偏置确实能改变主卦（对应道体 `argmax(scores + sheng + ke)`）
+    #[test]
+    fn test_dominant_with_wuxing_can_change_choice() {
+        // 原始主卦 = 乾（金）
+        let scores = [0.9, 0.2, 0.1, 0.1, 0.1, 0.5, 0.1, 0.1];
+        assert_eq!(argmax8(&scores), 0, "原始主卦应为乾");
+
+        // 金生水 ⇒ 坎(5) 得 +1.0 → 1.5 > 0.9，主卦被改写
+        let biased = dominant_with_wuxing(&scores, DEFAULT_SHENG_SCALE, DEFAULT_KE_SCALE);
+        assert_eq!(biased, 5, "相生偏置应把主卦从乾改写为坎（金生水）");
+
+        // 若关闭相生（sheng_scale = 0），主卦保持乾
+        let no_sheng = dominant_with_wuxing(&scores, 0.0, DEFAULT_KE_SCALE);
+        assert_eq!(no_sheng, 0, "关闭相生后不应改写主卦");
+    }
+}
+
+// ============================================================
 // 操作 1：MirrorProject — 先天八卦分类
 // ============================================================
 
 /// 镜像投影算子：将洛书向量投影到 8 个先天八卦基底上
 ///
-/// 算法：
-/// 1. 对每个八卦基底，计算与洛书向量的内积
-/// 2. 返回匹配度最高的基底及其类别
+/// 算法（v0.9.10 起含两层）：
+/// 1. 对每个八卦基底计算与洛书向量的内积 → 原始匹配度
+/// 2. **五行生克偏置**（移植自道体 `MirrorRecursiveCell`）：
+///    先由原始匹配度定主卦 → 取其五行 → 对 8 卦施加 同行(0.3)/相生(+1.0)/
+///    相克(−0.5) 偏置 → 重新取主卦。
+///
+/// 第 2 层把**符号因果**引入分类：主卦牵动其所生者、压制其所克者。这是道体
+/// `MirrorRecursiveCell` 里唯一不依赖可学习权重的部分，因此可以确定性移植。
+/// 返回的 `scores` 是**加偏置后**的得分，保证恒有 `best_index == argmax(scores)`。
 ///
 /// 复杂度：O(8 × 9) = O(1)
-///
-/// 先天八卦投影 — 将洛书向量映射到八卦类别。
 pub fn mirror_project(vector: &LuoShuVector) -> BaguaProjection {
-    let mut scores = [0.0f32; 8];
-    let mut best_index = 0usize;
-    let mut best_score = f32::NEG_INFINITY;
-
+    // 1) 原始匹配度（内积）
+    let mut raw = [0.0f32; 8];
     for i in 0..8 {
-        // 内积计算
-        let dot: f32 = vector
+        raw[i] = vector
             .values
             .iter()
             .zip(BAGUA_BASES[i].iter())
             .map(|(a, b)| a * b)
             .sum();
-        scores[i] = dot;
-
-        if dot > best_score {
-            best_score = dot;
-            best_index = i;
-        }
     }
+
+    // 2) 五行生克偏置
+    let anchor = argmax8(&raw);
+    let bias = wuxing_bias(anchor, DEFAULT_SHENG_SCALE, DEFAULT_KE_SCALE);
+    let mut scores = [0.0f32; 8];
+    for i in 0..8 {
+        scores[i] = raw[i] + bias[i];
+    }
+    let best_index = argmax8(&scores);
 
     BaguaProjection {
         scores,
@@ -179,6 +369,280 @@ pub fn mirror_project(vector: &LuoShuVector) -> BaguaProjection {
 pub fn classify(vector: &LuoShuVector) -> (&'static str, &'static str) {
     let proj = mirror_project(vector);
     (proj.best_name, proj.best_category)
+}
+
+// ============================================================
+// 操作 0：镜像双梯形螺旋递归（符号/几何路线，无可学习权重）
+// ============================================================
+//
+// 这是「镜像双梯形螺旋递归」在 LRC 本体中的符号/几何落地。
+// 与神经网络设计稿（PyTorch `BiTrapezoidRecurrent`）的对应关系：
+//
+//   设计稿                            本实现
+//   ────────────────────────────────  ─────────────────────────────
+//   可学习线性层 W_f / W_b            固定几何算子（折叠/展开/镜像/螺旋）
+//   tanh(W·concat(a,b) + b)           非负清理 + L2 单位化 + α 混合
+//   T 次全层同步迭代                  同（每轮先正向后逆向，各自读旧状态）
+//   最宽层逆向状态 h_b[0] 作输出       同
+//
+// 设计稿的三处实质缺陷在本实现中被显式处理：
+//   1) 输入被首轮递归冲掉 → `MirrorRecursionConfig::re_inject`（默认 true）
+//   2) b_f / b_b 是死参数 → 符号路线无偏置参数
+//   3) 2 维瓶颈不可逆 → 本实现的瓶颈是「对称折叠」而非线性压缩，信息损失
+//      发生在折叠时刻，展开只能复原「成对相等」的分量。
+//
+// 诚实的边界声明：本算子是**确定性固定参数映射**，做的是「整形/共振」
+// （把洛书向量投影到镜像对称子空间并反复迭代），**无法凭空恢复编码阶段
+// 已丢失的区分度**。八卦塔缩（96.88% 同卦）的根治必须靠编码先验修复，
+// 而非本算子。
+
+/// 螺旋序：以坎（九宫位置 7）为起点，相邻两两即为一对镜像。
+///
+/// 位置布局（洛书九宫，位置索引 = 行×3 + 列）：
+/// ```text
+///   0(4/巽) 1(9/离) 2(2/坤)
+///   3(3/震) 4(5/中) 5(7/兑)
+///   6(8/艮) 7(1/坎) 8(6/乾)
+/// ```
+/// 走完四对镜像恰好绕外圈一圈。
+pub const SPIRAL_ORDER: [usize; 8] = [7, 1, 6, 2, 3, 5, 0, 8];
+
+/// 四对镜像位置（洛书数之和恒为 10：1+9、8+2、3+7、4+6）。
+///
+/// 注意：这是**洛书数值**之和为 10，而非位置索引之和
+/// （位置索引之和为 8：7+1、6+2、3+5、0+8）。
+pub const MIRROR_PAIRS: [[usize; 2]; 4] = [[7, 1], [6, 2], [3, 5], [0, 8]];
+
+/// 梯形各层宽度：全量 → 去中外圈 → 四镜像对 → 两半环 → 太一。
+pub const TRAPEZOID_LEVELS: [usize; 5] = [9, 8, 4, 2, 1];
+
+/// 九宫格绕中心的 180° 旋转：外圈 `i ↦ 8 − i`，中心 4 自映射。
+#[inline]
+pub fn mirror_index(i: usize) -> usize {
+    if i == 4 {
+        4
+    } else {
+        8 - i
+    }
+}
+
+/// 镜像双梯形螺旋递归的配置
+#[derive(Debug, Clone, Copy)]
+pub struct MirrorRecursionConfig {
+    /// 递归迭代次数 T
+    pub iterations: usize,
+    /// 每轮融合旧状态的比例 α（0.0 = 全用新折叠值，1.0 = 全用旧状态）
+    pub mix_scale: f32,
+    /// 是否每轮把输入重注入最宽层正向状态。
+    ///
+    /// true（默认）修正设计稿缺陷 #1；false 复刻设计稿原始行为（首轮即用
+    /// 逆向零状态覆盖输入），仅用于对照实验。
+    pub re_inject: bool,
+}
+
+impl Default for MirrorRecursionConfig {
+    fn default() -> Self {
+        Self {
+            iterations: 5,
+            mix_scale: 0.5,
+            re_inject: true,
+        }
+    }
+}
+
+/// 镜像双梯形螺旋递归的输出
+#[derive(Debug, Clone)]
+pub struct MirrorRecursionResult {
+    /// 迭代后的洛书向量（已归一化）
+    pub vector: LuoShuVector,
+    /// 每轮最宽层逆向状态相对上一轮的余弦相似度（收敛轨迹）
+    pub trace: Vec<f32>,
+    /// 实际迭代次数
+    pub iterations: usize,
+}
+
+/// 相邻成对平均：n → ⌈n/2⌉，奇数时末位原样保留。
+fn fold_adjacent(values: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(values.len().div_ceil(2));
+    let mut i = 0;
+    while i + 1 < values.len() {
+        out.push(0.5 * (values[i] + values[i + 1]));
+        i += 2;
+    }
+    if i < values.len() {
+        out.push(values[i]);
+    }
+    out
+}
+
+/// 逐值复制展开：n → 2n（`fold_adjacent` 的伴随算子，`fold∘expand = id`）。
+fn expand_adjacent(values: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(values.len() * 2);
+    for &v in values {
+        out.push(v);
+        out.push(v);
+    }
+    out
+}
+
+/// 非负清理 + L2 单位化；全零时退化为均匀分布。
+fn nonneg_l2(values: &mut [f32]) {
+    for v in values.iter_mut() {
+        if !v.is_finite() || *v < 0.0 {
+            *v = 0.0;
+        }
+    }
+    let norm: f32 = values.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm <= 1e-12 {
+        let uniform = 1.0 / (values.len().max(1) as f32).sqrt();
+        for v in values.iter_mut() {
+            *v = uniform;
+        }
+    } else {
+        for v in values.iter_mut() {
+            *v /= norm;
+        }
+    }
+}
+
+/// 新折叠值与旧状态的线性混合，再非负单位化（对应设计稿的 tanh 非线性压缩）。
+fn mix_normalize(new_part: &[f32], old_part: &[f32], alpha: f32) -> Vec<f32> {
+    let n = new_part.len().min(old_part.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push((1.0 - alpha) * new_part[i] + alpha * old_part[i]);
+    }
+    nonneg_l2(&mut out);
+    out
+}
+
+/// 九宫向量 → 外圈 8 维螺旋序（跳过中心位置 4）。
+fn to_spiral8(values: &[f32; 9]) -> Vec<f32> {
+    SPIRAL_ORDER.iter().map(|&pos| values[pos]).collect()
+}
+
+/// 外圈 8 维螺旋序 → 九宫向量（中心 = 外圈均值）。
+fn from_spiral8(values: &[f32]) -> [f32; 9] {
+    let mut out = [0.0f32; 9];
+    let mut sum = 0.0f32;
+    for (i, &pos) in SPIRAL_ORDER.iter().enumerate() {
+        let v = values.get(i).copied().unwrap_or(0.0);
+        out[pos] = v;
+        sum += v;
+    }
+    out[LUOSHU_CENTER_POS] = sum / 8.0;
+    out
+}
+
+/// 切片 → 固定 9 维数组（不足补零，超出截断）。
+fn to_array9(values: &[f32]) -> [f32; 9] {
+    let mut out = [0.0f32; 9];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = values.get(i).copied().unwrap_or(0.0);
+    }
+    out
+}
+
+/// 两个等长切片的余弦相似度；任一方范数为零时返回 0.0。
+fn cosine_slice(a: &[f32], b: &[f32]) -> f32 {
+    let n = a.len().min(b.len());
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..n {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na <= 1e-12 || nb <= 1e-12 {
+        0.0
+    } else {
+        (dot / (na.sqrt() * nb.sqrt())).clamp(-1.0, 1.0)
+    }
+}
+
+/// 镜像双梯形螺旋递归（符号/几何路线）。
+///
+/// 在梯形 `TRAPEZOID_LEVELS = [9,8,4,2,1]` 上做 T 轮双向迭代：
+///
+/// * 正向（宽 → 窄）：`h_f[k] = mix(fold(h_f[k-1]), h_b[k])`
+/// * 逆向（窄 → 宽）：`h_b[k] = mix(expand(h_b[k+1]), h_f[k])`
+/// * 每轮全层**读旧状态、写新状态**（同步更新，对应设计稿的并行更新）
+///
+/// `k = 1` 的正向折叠用螺旋序 `to_spiral8`；`k = 0` 的逆向展开用
+/// `from_spiral8`（中心取外圈均值）。输出为最宽层逆向状态 `h_b[0]`。
+///
+/// 复杂度：O(T · 9)
+pub fn symbolic_mirror_recursion(
+    input: &LuoShuVector,
+    config: &MirrorRecursionConfig,
+) -> MirrorRecursionResult {
+    let x = input.values;
+
+    // 初始化正向状态：第 0 层为输入，其后逐层折叠。
+    let mut h_f: Vec<Vec<f32>> = Vec::with_capacity(TRAPEZOID_LEVELS.len());
+    h_f.push(x.to_vec());
+    h_f.push(to_spiral8(&x));
+    for k in 2..TRAPEZOID_LEVELS.len() {
+        let folded = fold_adjacent(&h_f[k - 1]);
+        h_f.push(folded);
+    }
+
+    // 逆向状态全部初始化为零。
+    let mut h_b: Vec<Vec<f32>> = TRAPEZOID_LEVELS.iter().map(|&w| vec![0.0f32; w]).collect();
+
+    let alpha = config.mix_scale.clamp(0.0, 1.0);
+    let last = TRAPEZOID_LEVELS.len() - 1;
+    let mut trace = Vec::with_capacity(config.iterations);
+
+    for _ in 0..config.iterations {
+        let f_old: Vec<Vec<f32>> = h_f.clone();
+        let b_old: Vec<Vec<f32>> = h_b.clone();
+
+        // 最宽层正向：重注入输入（修正设计稿缺陷 #1）。
+        if config.re_inject {
+            h_f[0] = x.to_vec();
+        } else {
+            let mut injected = b_old[0].clone();
+            nonneg_l2(&mut injected);
+            h_f[0] = injected;
+        }
+
+        // 正向扫描：宽 → 窄。
+        for k in 1..TRAPEZOID_LEVELS.len() {
+            let folded = if k == 1 {
+                to_spiral8(&to_array9(&f_old[0]))
+            } else {
+                fold_adjacent(&f_old[k - 1])
+            };
+            h_f[k] = mix_normalize(&folded, &b_old[k], alpha);
+        }
+
+        // 逆向扫描：窄 → 宽（读旧状态，同步更新）。
+        h_b[last] = mix_normalize(&b_old[last], &f_old[last], alpha);
+        for k in (0..last).rev() {
+            let expanded = if k == 0 {
+                from_spiral8(&b_old[1]).to_vec()
+            } else {
+                expand_adjacent(&b_old[k + 1])
+            };
+            h_b[k] = mix_normalize(&expanded, &f_old[k], alpha);
+        }
+
+        // 收敛轨迹：本轮最宽层逆向状态与上轮的余弦相似度。
+        trace.push(cosine_slice(&h_b[0], &b_old[0]));
+    }
+
+    let mut vector = LuoShuVector {
+        values: to_array9(&h_b[0]),
+    };
+    vector.normalize_to_luoshu();
+
+    MirrorRecursionResult {
+        vector,
+        trace,
+        iterations: config.iterations,
+    }
 }
 
 // ============================================================
@@ -644,7 +1108,7 @@ pub fn evolution_cycle(
 
 #[cfg(test)]
 mod tests {
-    use super::super::luoshu_encoder::LuoShuEncoder;
+    use super::super::luoshu_encoder::{LuoShuEncoder, LUOSHU_WEIGHTS};
     use super::*;
 
     fn make_vec(text: &str) -> LuoShuVector {
@@ -662,20 +1126,83 @@ mod tests {
         assert!(!proj.best_category.is_empty());
     }
 
+    /// 八卦分类的结构契约（统计编码器路径）
+    ///
+    /// v0.9.10 修正：原断言"不同文本应分到不同类别"是一条**语义属性**，但本
+    /// 测试跑的是统计编码器——它自述"仅含字符密度 / 字符熵 / 位置权重"（见
+    /// `luoshu_encoder.rs` 的编码器说明），**本就不承诺语义区分度**。
+    /// 把语义断言压在它身上，等于让测试依赖一个组件从未声明的能力。
+    /// 语义属性已移到唯一具备该能力的 ML 路径上验证
+    /// （见 `test_mirror_project_semantic_discrimination_ml`）。
     #[test]
-    fn test_mirror_project_different_texts() {
-        let v1 = make_vec("数据库 PostgreSQL 配置");
-        let v2 = make_vec("React 前端组件样式");
-        let v3 = make_vec("API 接口 JWT 认证");
+    fn test_mirror_project_produces_valid_classification() {
+        for text in [
+            "数据库 PostgreSQL 配置",
+            "React 前端组件样式",
+            "API 接口 JWT 认证",
+        ] {
+            let v = make_vec(text);
+            let p = mirror_project(&v);
 
-        let p1 = mirror_project(&v1);
-        let p2 = mirror_project(&v2);
-        let p3 = mirror_project(&v3);
+            assert!(
+                p.best_index < 8,
+                "八卦索引必须落在 0..8，实际 {}",
+                p.best_index
+            );
+            assert!(!p.best_name.is_empty(), "卦名不可为空");
+            assert!(!p.best_category.is_empty(), "类别名不可为空");
 
-        // 三者不应全部分到同一类别（至少有两种不同分类）
-        let categories = vec![p1.best_index, p2.best_index, p3.best_index];
-        let unique: std::collections::HashSet<usize> = categories.into_iter().collect();
-        assert!(unique.len() >= 2, "不同文本应分到不同类别");
+            // best_index 必须真的是 argmax（投影算子的核心契约）
+            let max_score = p.scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!(
+                p.scores[p.best_index], max_score,
+                "best_index 必须是 8 个基底得分的 argmax"
+            );
+        }
+    }
+
+    /// 八卦分类的**语义区分度**（ML 路径才有；无模型时优雅跳过）
+    ///
+    /// v0.9.10 新增，承担两个职责：
+    ///   1. 把"不同语义的文本落到不同卦"这条语义断言放到唯一有语义能力的路径；
+    ///   2. 作为**塌缩回归防线**——若上游编码再次退化（例如有人把固定的
+    ///      洛书先验权重加回去、或把幻和约束重新压到激活值上），立即变红。
+    #[cfg(feature = "ml")]
+    #[test]
+    fn test_mirror_project_semantic_discrimination_ml() {
+        let enc = match crate::engine::create_smart_encoder() {
+            Ok((e, true)) => e,
+            _ => {
+                eprintln!("[跳过] ML 编码器不可用（CI 无模型时属预期）");
+                return;
+            }
+        };
+
+        // 语义上相距较远的 6 段文本
+        let texts = [
+            "数据库 PostgreSQL 连接池配置",
+            "React 前端组件样式与主题",
+            "API 接口 JWT 认证流程",
+            "医生建议每天服用两次降压药",
+            "周末去西湖散步顺便吃片儿川",
+            "服务器内存不足被 OOM Killer 杀掉",
+        ];
+        let cats: Vec<usize> = texts
+            .iter()
+            .map(|t| mirror_project(&enc.encode_text(t)).best_index)
+            .collect();
+        let unique: std::collections::HashSet<usize> = cats.iter().cloned().collect();
+
+        eprintln!(
+            "[诊断] 6 段远距文本的卦分布 = {:?}（不同卦数 {}）",
+            cats,
+            unique.len()
+        );
+        assert!(
+            unique.len() >= 2,
+            "ML 路径下语义相距较远的文本不应全部塌到同一卦，实际 {:?}",
+            cats
+        );
     }
 
     // === TrapezoidFocus 测试 ===
@@ -835,5 +1362,202 @@ mod tests {
 
         let results = evolution_cycle(&vectors);
         assert!(!results.is_empty(), "演化周期应产生至少一个合成结果");
+    }
+
+    // === 镜像双梯形螺旋递归测试 ===
+
+    /// 九宫格绕中心 180° 旋转是**对合**（自逆），且中心自映射。
+    #[test]
+    fn test_mirror_index_is_involution() {
+        for i in 0..9usize {
+            assert_eq!(
+                mirror_index(mirror_index(i)),
+                i,
+                "mirror_index 必须是对合：mirror(mirror({})) == {}",
+                i,
+                i
+            );
+        }
+        assert_eq!(mirror_index(4), 4, "中心位置 4 必须自映射");
+    }
+
+    /// 螺旋序必须恰好覆盖外圈 8 个位置（不含中心 4），且无重复。
+    #[test]
+    fn test_spiral_order_covers_outer_ring() {
+        let mut sorted = SPIRAL_ORDER.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            vec![0, 1, 2, 3, 5, 6, 7, 8],
+            "螺旋序必须恰好覆盖外圈 8 个位置（不含中心 4）"
+        );
+    }
+
+    /// 每对镜像位置的**洛书数值**之和恒为 10，位置索引之和恒为 8。
+    #[test]
+    fn test_mirror_pairs_numeral_sum_is_ten() {
+        for pair in MIRROR_PAIRS.iter() {
+            // 洛书数值 = 先验权重 × 15（权重已除 15 归一）
+            let numeral_sum = LUOSHU_WEIGHTS[pair[0]] * 15.0 + LUOSHU_WEIGHTS[pair[1]] * 15.0;
+            assert!(
+                (numeral_sum - 10.0).abs() < 1e-3,
+                "镜像对 {:?} 的洛书数之和应为 10，实际 {}",
+                pair,
+                numeral_sum
+            );
+            // 位置索引之和恒为 8（与洛书数之和 10 不同，勿混淆）
+            assert_eq!(
+                pair[0] + pair[1],
+                8,
+                "镜像对 {:?} 的位置索引之和应为 8",
+                pair
+            );
+            // 两个位置必须互为镜像（180° 旋转）
+            assert_eq!(mirror_index(pair[0]), pair[1]);
+            assert_eq!(mirror_index(pair[1]), pair[0]);
+        }
+    }
+
+    /// 梯形层级必须从宽到窄严格递减，且首尾为 9 / 1。
+    #[test]
+    fn test_trapezoid_levels_shrink() {
+        assert_eq!(TRAPEZOID_LEVELS[0], 9, "最宽层应为全量 9");
+        assert_eq!(*TRAPEZOID_LEVELS.last().unwrap(), 1, "最窄层应为太一 1");
+        for w in TRAPEZOID_LEVELS.windows(2) {
+            assert!(
+                w[0] > w[1],
+                "梯形层宽必须严格递减，出现 {} -> {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// 同一输入 + 同一配置，输出必须完全一致（确定性算子）。
+    #[test]
+    fn test_recursion_is_deterministic() {
+        let v = make_vec("数据库 PostgreSQL 配置与查询优化");
+        let cfg = MirrorRecursionConfig::default();
+        let a = symbolic_mirror_recursion(&v, &cfg);
+        let b = symbolic_mirror_recursion(&v, &cfg);
+        assert_eq!(a.vector.values, b.vector.values, "递归算子必须是确定性的");
+    }
+
+    /// 输出必须是合法的洛书向量：有限、非负、L2 单位化。
+    #[test]
+    fn test_recursion_output_is_valid_luoshu() {
+        let v = make_vec("镜像双梯形螺旋递归验证文本");
+        let result = symbolic_mirror_recursion(&v, &MirrorRecursionConfig::default());
+
+        for (i, &x) in result.vector.values.iter().enumerate() {
+            assert!(x.is_finite(), "第 {} 维必须有限，实际 {}", i, x);
+            assert!(x >= 0.0, "第 {} 维必须非负，实际 {}", i, x);
+        }
+        let norm: f32 = result
+            .vector
+            .values
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-3,
+            "输出必须 L2 单位化，实际范数 {}",
+            norm
+        );
+    }
+
+    /// 全零输入 → 均匀分布（1/√9 = 1/3）。
+    #[test]
+    fn test_recursion_zero_input_is_uniform() {
+        let v = LuoShuVector::zeros();
+        let result = symbolic_mirror_recursion(&v, &MirrorRecursionConfig::default());
+        for (i, &x) in result.vector.values.iter().enumerate() {
+            assert!(
+                (x - 1.0 / 3.0).abs() < 1e-4,
+                "零输入应退化为均匀分布，第 {} 维实际 {}",
+                i,
+                x
+            );
+        }
+    }
+
+    /// 镜像对称性保持：外圈镜像对称的输入，其输出同样镜像对称。
+    #[test]
+    fn test_recursion_preserves_mirror_symmetry() {
+        // 构造外圈镜像对称的输入：每对镜像位置取均值。
+        let base = make_vec("镜像对称保持性验证 PostgreSQL");
+        let mut vals = base.values;
+        for pair in MIRROR_PAIRS.iter() {
+            let avg = 0.5 * (vals[pair[0]] + vals[pair[1]]);
+            vals[pair[0]] = avg;
+            vals[pair[1]] = avg;
+        }
+        // 中心取外圈均值（与算子输出口径一致）
+        vals[LUOSHU_CENTER_POS] = 0.5 * (vals[0] + vals[1]);
+        let sym = LuoShuVector { values: vals };
+
+        let out = symbolic_mirror_recursion(&sym, &MirrorRecursionConfig::default());
+        for pair in MIRROR_PAIRS.iter() {
+            let diff = (out.vector.values[pair[0]] - out.vector.values[pair[1]]).abs();
+            assert!(
+                diff < 1e-4,
+                "镜像对 {:?} 的输出应保持对称，偏差 {}",
+                pair,
+                diff
+            );
+        }
+    }
+
+    /// 不同输入必须产生不同输出（算子不能把一切压成同一常量）。
+    #[test]
+    fn test_recursion_output_depends_on_input() {
+        // 两个互相镜像但明显不同的单热点输入。
+        let mut a = [0.0f32; 9];
+        a[7] = 1.0; // 坎
+        let mut b = [0.0f32; 9];
+        b[0] = 1.0; // 巽
+
+        let cfg = MirrorRecursionConfig::default();
+        let out_a = symbolic_mirror_recursion(&LuoShuVector { values: a }, &cfg);
+        let out_b = symbolic_mirror_recursion(&LuoShuVector { values: b }, &cfg);
+
+        let l1: f32 = out_a
+            .vector
+            .values
+            .iter()
+            .zip(out_b.vector.values.iter())
+            .map(|(x, y)| (x - y).abs())
+            .sum();
+        assert!(l1 > 1e-3, "不同输入应产生不同输出，实际 L1 差 {}", l1);
+    }
+
+    /// 迭代次数边界：T=0（退化）与 T=100（深迭代）都不得 panic 或产生非法值。
+    #[test]
+    fn test_recursion_iteration_bounds() {
+        let v = make_vec("迭代次数边界测试文本");
+
+        let zero = symbolic_mirror_recursion(
+            &v,
+            &MirrorRecursionConfig {
+                iterations: 0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(zero.trace.len(), 0, "T=0 时不应有收敛轨迹");
+        let norm0: f32 = zero.vector.values.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm0 - 1.0).abs() < 1e-3, "T=0 输出仍须是合法洛书向量");
+
+        let deep = symbolic_mirror_recursion(
+            &v,
+            &MirrorRecursionConfig {
+                iterations: 100,
+                ..Default::default()
+            },
+        );
+        assert_eq!(deep.trace.len(), 100, "T=100 应记录 100 条收敛轨迹");
+        for (i, &x) in deep.vector.values.iter().enumerate() {
+            assert!(x.is_finite() && x >= 0.0, "深迭代第 {} 维非法：{}", i, x);
+        }
     }
 }

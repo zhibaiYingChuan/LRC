@@ -31,6 +31,13 @@ pub enum SystemMode {
     Healthy,
     /// 部分降级：ML 编码器降级为统计模式，但核心功能正常
     Degraded,
+    /// 道同构度偏低：洛书几何结构偏离过大，语义空间出现结构性失配
+    ///
+    /// v0.9.10 从 `Degraded` 中拆出。此前「道同构度低」与「编码器降级」共用
+    /// `Degraded` 枚举，导致 `encoder.mode="ml"` 时仍上报「编码器已降级为
+    /// 统计模式」，上报口径自相矛盾。二者根因不同（一个在编码器、一个在
+    /// 记忆几何结构）、处置也不同（前者查模型，后者重编码），必须解耦。
+    Misaligned,
     /// 调节器振荡：检测到调节参数频繁反转，系统正在自我稳定
     Oscillating,
     /// 调节器漂移：检测到参数持续单向漂移，可能存在根因问题
@@ -46,6 +53,7 @@ impl SystemMode {
         match self {
             SystemMode::Healthy => "healthy",
             SystemMode::Degraded => "degraded",
+            SystemMode::Misaligned => "misaligned",
             SystemMode::Oscillating => "oscillating",
             SystemMode::Drifting => "drifting",
             SystemMode::Frozen => "frozen",
@@ -58,6 +66,7 @@ impl SystemMode {
         match self {
             SystemMode::Healthy => "系统运行正常，所有功能在线，语义理解能力完整",
             SystemMode::Degraded => "编码器已降级为统计模式，语义理解能力降低。建议检查网络连接或安装本地 ML 模型",
+            SystemMode::Misaligned => "记忆的洛书几何结构偏离过大（道同构度偏低），语义空间出现结构性失配。编码器本身正常，建议触发一次重编码以恢复几何约束",
             SystemMode::Oscillating => "系统参数正在自我调整中，调节器检测到振荡并已启动稳定机制。这是正常现象，无需干预",
             SystemMode::Drifting => "检测到系统参数持续单向漂移，可能存在根因问题（如编码器质量下降、记忆增长速度异常）。建议检查系统日志",
             SystemMode::Frozen => "调节器已冻结——连续多次建议未改善系统状态。建议手动检查并调整参数后解除冻结",
@@ -482,6 +491,18 @@ fn generate_action_hints(
                 suggested_action: "建议检查 ML 模型是否可用、网络连接是否正常。如长期处于降级模式，建议安装本地 ML 模型".to_string(),
             });
         }
+        SystemMode::Misaligned => {
+            hints.push(ActionHint {
+                category: "degradation".to_string(),
+                severity: "warning".to_string(),
+                message:
+                    "记忆的洛书几何结构偏离过大，道同构度偏低。编码器本身正常，属语义空间结构性问题"
+                        .to_string(),
+                suggested_action:
+                    "建议触发一次全量重编码（重新编码 / reclassify-bagua）以恢复几何约束"
+                        .to_string(),
+            });
+        }
         SystemMode::Overloaded => {
             hints.push(ActionHint {
                 category: "degradation".to_string(),
@@ -544,8 +565,10 @@ fn determine_system_mode(
     }
 
     // 6. 道同构度异常检测
+    //    注意：这与第 3 条的「编码器降级」是**不同根因**，故用独立变体
+    //    `Misaligned`，避免 `encoder.mode="ml"` 时被误报为「编码器已降级」。
     if dao.dao_isomorphism_score < 0.2 {
-        return SystemMode::Degraded;
+        return SystemMode::Misaligned;
     }
 
     SystemMode::Healthy
@@ -716,6 +739,62 @@ mod tests {
 
         assert_eq!(report.system_mode, SystemMode::Degraded);
         assert!(report.system_mode_description.contains("降级"));
+    }
+
+    /// ★★v0.9.10：道同构度偏低**不得**被上报为「编码器降级」。
+    ///
+    /// # 这条测的是实测发现的自相矛盾
+    ///
+    /// dev 实测：`encoder.mode="ml"`（total_encodings=3181、quality_score=1.0）
+    /// 与 `system_mode="degraded"`（描述为「编码器已降级为统计模式」）同时出现，
+    /// 自相矛盾。根因是 [`determine_system_mode`] 第 6 条把「道同构度低
+    /// （`dao_isomorphism_score < 0.2`）」也返回了 `SystemMode::Degraded`——
+    /// 复用了「编码器降级」这一枚举，于是文案与 `encoder.mode="ml"` 直接冲突。
+    ///
+    /// 修复契约：道同构度偏低应归入**独立**变体（`as_str() == "misaligned"`），
+    /// 与编码器降级彻底解耦，上报口径不再冤枉编码器。
+    #[test]
+    fn test_dao_mismatch_not_reported_as_encoder_degraded() {
+        let (encoder, mut dao, journal, regulator) = make_healthy_state();
+        // 前置：编码器状态完全健康（ML 模式、无降级原因）
+        assert_eq!(encoder.mode, "ml");
+        assert!(encoder.degradation_reason.is_none());
+        // 道同构度低（模拟旧尺度饱和：实测 avg_deviation≈1.62 → score 被钳为 0.0）
+        dao.dao_isomorphism_score = 0.0;
+
+        let report = generate_health_report(
+            encoder,
+            dao,
+            journal,
+            regulator,
+            100,
+            95,
+            20,
+            5,
+            0,
+            [12, 13, 12, 13, 12, 13, 12, 13],
+            make_gc_stats(),
+            make_feedback_stats(),
+            make_complexity_budget(),
+            &mut make_escalation(),
+            false,
+        );
+
+        assert_eq!(
+            report.system_mode.as_str(),
+            "misaligned",
+            "道同构度低应上报独立变体 misaligned，而非 degraded"
+        );
+        assert_ne!(
+            report.system_mode,
+            SystemMode::Degraded,
+            "encoder.mode=ml 时不得上报 Degraded（那会把责任错归给编码器）"
+        );
+        assert!(
+            !report.system_mode_description.contains("编码器已降级"),
+            "道同构度低时的描述不得声称编码器降级，实际：{}",
+            report.system_mode_description
+        );
     }
 
     #[test]

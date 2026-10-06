@@ -9,6 +9,8 @@
 // 提供统一的模型文件检测接口，供启动检查和测试跳过判断使用。
 // 不重复实现下载逻辑（各编码器内部已有），只负责文件存在性检查。
 
+use crate::engine::pooling::PoolingStrategy;
+
 /// 获取当前生效的嵌入模型 ID。
 ///
 /// 优先级：环境变量 > ~/.lrc/config.toml > 系统语言默认模型。
@@ -56,6 +58,210 @@ pub fn selected_model_id() -> String {
         crate::model_ids::MODEL_BGE_SMALL_ZH.to_string()
     } else {
         crate::model_ids::MODEL_ALL_MINILM_L6_V2.to_string()
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// v0.9.10 新增：模型家族的「输入约定」（前缀 / 池化）
+//
+// ## 为什么需要它
+//
+// 不同嵌入模型家族对**输入格式**与**池化方式**有硬性约定，用错会让嵌入质量
+// 显著退化，甚至接近坍缩。实测佐证：LRC v0.9.9 线上 9 维洛书向量
+// 1963/1963 全落同一八卦类别；上游成因之一就是"用了 e5 的模型、却按 bge 的
+// 约定处理"（无前缀 + 注释按 bge 论证池化）。
+//
+//   · e5 系列（intfloat/*-e5-*）：输入需加 `query: ` / `passage: ` 前缀；
+//     官方池化为 **Mean**。缺前缀会明显退化。
+//   · bge 系列（BAAI/bge-*）：不要求前缀；以 CLS + 归一化对比学习训练，
+//     官方检索用法取 **CLS**。
+//   · 未知家族：不加前缀 + Mean（安全默认）。
+//
+// ## 设计原则（避免硬编码）
+//
+//   1. 家族判定基于模型 ID / 目录名的**子串匹配表**，新增家族只需加一行；
+//   2. 两个维度都可用环境变量显式覆盖，不改代码即可做对照实验：
+//        `LRC_MODEL_PREFIX_STYLE` = auto | none | e5
+//        `LRC_MODEL_POOLING`      = auto | mean | cls
+//   3. 本模块**不写死任何具体模型 ID**——具体 ID 仍由 `model_ids` 常量、
+//      `LRC_*_MODEL_ID` 环境变量或 `~/.lrc/config.toml` 决定。
+// ════════════════════════════════════════════════════════════════
+
+/// 编码角色：决定使用哪一个前缀（e5 对查询与文档使用不同前缀）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncodeRole {
+    /// 查询侧（e5 → `query: `）
+    Query,
+    /// 文档 / 记忆侧（e5 → `passage: `）
+    Passage,
+}
+
+/// 模型家族的输入约定
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelFamilyProfile {
+    /// 查询侧前缀（该家族不要求前缀时为空串）
+    pub prefix_query: &'static str,
+    /// 文档侧前缀（该家族不要求前缀时为空串）
+    pub prefix_passage: &'static str,
+    /// 池化策略
+    pub pooling: PoolingStrategy,
+}
+
+impl ModelFamilyProfile {
+    /// 按角色取前缀
+    pub fn prefix_for(&self, role: EncodeRole) -> &'static str {
+        match role {
+            EncodeRole::Query => self.prefix_query,
+            EncodeRole::Passage => self.prefix_passage,
+        }
+    }
+
+    /// 给文本加上该角色应有的前缀（前缀为空时原样返回）
+    pub fn apply_prefix(&self, text: &str, role: EncodeRole) -> String {
+        let p = self.prefix_for(role);
+        if p.is_empty() {
+            text.to_string()
+        } else {
+            format!("{p}{text}")
+        }
+    }
+}
+
+/// 依据模型 ID 解析其家族输入约定（含环境变量覆盖）
+///
+/// 环境变量优先级高于家族表：
+///   - `LRC_MODEL_POOLING`：`mean` / `cls`（其他值或未设 → 用家族表）
+///   - `LRC_MODEL_PREFIX_STYLE`：`none`（强制无前缀）/ `e5`（强制 e5 前缀）
+pub fn profile_for_model(model_id: &str) -> ModelFamilyProfile {
+    let lower = model_id.to_lowercase();
+
+    // 家族表：新增家族只需加一行（自上而下，先命中者生效）
+    let base = if lower.contains("-e5-")
+        || lower.contains("-e5")
+        || lower.contains("e5/")
+        || lower.contains("/e5")
+    {
+        ModelFamilyProfile {
+            prefix_query: "query: ",
+            prefix_passage: "passage: ",
+            pooling: PoolingStrategy::Mean,
+        }
+    } else if lower.contains("bge") {
+        ModelFamilyProfile {
+            prefix_query: "",
+            prefix_passage: "",
+            pooling: PoolingStrategy::Cls,
+        }
+    } else {
+        ModelFamilyProfile {
+            prefix_query: "",
+            prefix_passage: "",
+            pooling: PoolingStrategy::Mean,
+        }
+    };
+
+    let pooling = match std::env::var("LRC_MODEL_POOLING")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "mean" => PoolingStrategy::Mean,
+        "cls" => PoolingStrategy::Cls,
+        _ => base.pooling,
+    };
+
+    let (prefix_query, prefix_passage) = match std::env::var("LRC_MODEL_PREFIX_STYLE")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "none" => ("", ""),
+        "e5" => ("query: ", "passage: "),
+        _ => (base.prefix_query, base.prefix_passage),
+    };
+
+    ModelFamilyProfile {
+        prefix_query,
+        prefix_passage,
+        pooling,
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 环境变量是**进程级全局状态**，而 cargo 默认多线程并行跑测试。
+    /// `test_env_override_pooling_and_prefix` 会临时改写 `LRC_MODEL_POOLING` /
+    /// `LRC_MODEL_PREFIX_STYLE`，若与其它用例并发，就会串改它们的读取结果
+    /// （实测：全量跑时 `test_unknown_family_uses_safe_default` 因读到 `cls` 而失败）。
+    /// 故凡依赖这两个环境变量的用例，先取此锁串行执行。
+    /// 用 `unwrap_or_else` 容忍持锁用例 panic 导致的毒化，避免连带失败。
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn test_e5_family_requires_prefix_and_mean_pooling() {
+        let _g = env_guard();
+        let p = profile_for_model("intfloat/multilingual-e5-small");
+        assert_eq!(p.prefix_query, "query: ");
+        assert_eq!(p.prefix_passage, "passage: ");
+        assert_eq!(p.pooling, PoolingStrategy::Mean);
+    }
+
+    #[test]
+    fn test_bge_family_has_no_prefix_and_cls_pooling() {
+        let _g = env_guard();
+        let p = profile_for_model("BAAI/bge-base-zh");
+        assert_eq!(p.prefix_query, "");
+        assert_eq!(p.prefix_passage, "");
+        assert_eq!(p.pooling, PoolingStrategy::Cls);
+    }
+
+    #[test]
+    fn test_unknown_family_uses_safe_default() {
+        let _g = env_guard();
+        let p = profile_for_model("some/unknown-model");
+        assert_eq!(p.prefix_query, "");
+        assert_eq!(p.pooling, PoolingStrategy::Mean);
+    }
+
+    #[test]
+    fn test_apply_prefix_by_role() {
+        let _g = env_guard();
+        let p = profile_for_model("intfloat/multilingual-e5-small");
+        assert_eq!(p.apply_prefix("你好", EncodeRole::Query), "query: 你好");
+        assert_eq!(p.apply_prefix("你好", EncodeRole::Passage), "passage: 你好");
+
+        let q = profile_for_model("BAAI/bge-base-zh");
+        assert_eq!(q.apply_prefix("你好", EncodeRole::Query), "你好");
+    }
+
+    #[test]
+    fn test_env_override_pooling_and_prefix() {
+        let _g = env_guard();
+        // 环境变量覆盖家族表（用临时值，测试后恢复）
+        let old_pooling = std::env::var("LRC_MODEL_POOLING").ok();
+        let old_prefix = std::env::var("LRC_MODEL_PREFIX_STYLE").ok();
+
+        std::env::set_var("LRC_MODEL_POOLING", "cls");
+        std::env::set_var("LRC_MODEL_PREFIX_STYLE", "none");
+        let p = profile_for_model("intfloat/multilingual-e5-small");
+        assert_eq!(p.pooling, PoolingStrategy::Cls, "环境变量应覆盖家族表池化");
+        assert_eq!(p.prefix_query, "", "环境变量应覆盖家族表前缀");
+
+        match old_pooling {
+            Some(v) => std::env::set_var("LRC_MODEL_POOLING", v),
+            None => std::env::remove_var("LRC_MODEL_POOLING"),
+        }
+        match old_prefix {
+            Some(v) => std::env::set_var("LRC_MODEL_PREFIX_STYLE", v),
+            None => std::env::remove_var("LRC_MODEL_PREFIX_STYLE"),
+        }
     }
 }
 

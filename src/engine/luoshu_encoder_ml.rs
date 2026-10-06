@@ -20,8 +20,10 @@
 //   LRC_LUOSHU_MODEL_ID=sentence-transformers/all-MiniLM-L6-v2  (默认)
 
 use super::luoshu_encoder::{EncoderStatus, LuoShuEncoder, LuoShuVector, LUOSHU_WEIGHTS};
+use super::mirror_trapezoid::{BAGUA_PALACE_POS, LUOSHU_CENTER_POS};
+use super::model_resolver::{EncodeRole, ModelFamilyProfile};
 use super::pooling::PoolingStrategy;
-use crate::errors::{LrcError, LrcResult};
+use crate::errors::{ErrorKind, LrcError, LrcResult};
 use candle_core::{Device, Tensor};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -102,9 +104,37 @@ pub struct LuoShuMlEncoder {
     /// 计算设备（CPU/CUDA）
     device: Device,
     /// 池化策略：CLS 或 Mean
+    ///
+    /// v0.9.10：不再硬编码，改由**模型家族的输入约定**决定
+    /// （见 `model_resolver::profile_for_model`：e5 → Mean、bge → CLS）。
     pooling: PoolingStrategy,
-    /// 投影矩阵 W ∈ R^(hidden_size × 9)，将 BERT 隐藏层映射到洛书 9 维
-    projection: Vec<Vec<f32>>,
+    /// 模型家族的输入约定（前缀 / 池化）
+    ///
+    /// v0.9.10 新增：把"与模型强绑定"的输入格式约定集中到一处，
+    /// 避免散落硬编码（此前是硬编码 `PoolingStrategy::Mean` + 全仓库无前缀）。
+    profile: ModelFamilyProfile,
+    /// 结构投影的 8 个「卦义原型」单位方向（8 × hidden）
+    ///
+    /// v0.9.10 取代原先的伪随机投影矩阵 `W ∈ R^(hidden×9)`。
+    ///
+    /// 原实现的问题（与产品的价值判据直接冲突，见 `memory_store.rs` §3.43.9）：
+    /// 伪随机线性投影得到的 9 维只是 768 维语义向量的线性组合，即"BGE 的
+    /// **粗粒度版本**"——而产品的价值判据是「关联图中**有多少条是 BGE 给不出
+    /// 的**」，粗粒度版本注定给不出增量（该陷阱在 §3.47 已被明确否证）。
+    ///
+    /// 现改为「结构投影」：`value[宫] = cos(emb − μ, 原型方向[宫])`，
+    /// 原型取自 `BAGUA_CATEGORIES`（与道体 GUA_LEXICON 同属一套语义坐标系）。
+    /// 这是一次**有损的结构化量化**——两条主题不同但"性质"相同的记忆会因
+    /// 落在同一宫位而彼此关联，正是 BGE 给不出的那类关联。
+    archetype_dirs: Vec<Vec<f32>>,
+    /// 结构投影的公共方向 μ（= 8 个原型嵌入的均值）
+    ///
+    /// v0.9.10 新增，同时解决两件事：
+    ///   1. 去掉嵌入里的共模分量（实测其占嵌入能量约 73%，会淹没差异）；
+    ///   2. 为什么用"8 个原型嵌入的均值"而不是样本均值——**μ 必须固定**。
+    ///      若 μ 随使用漂移，第 1 天写入的向量与第 30 天写入的将不可比，
+    ///      那比不修更糟。原型均值是模型自带、零新数据、零硬编码且时间恒定的。
+    archetype_mu: Vec<f32>,
     /// 实际隐藏层维度
     hidden_size: usize,
 }
@@ -365,67 +395,203 @@ impl LuoShuMlEncoder {
         }
 
         // 初始化投影矩阵
-        let projection = Self::init_projection(hidden_size);
+        // v0.9.10：原先在此构造伪随机投影矩阵（`init_projection`），现已由
+        // 「结构投影」取代 —— 见 `build_archetype_projection`。
+
+        // v0.9.10：池化与输入前缀由**模型家族**决定，不再硬编码 Mean。
+        // 修的是"换模型时约定没跟着换"这一上游成因：
+        //   e5 系列需要 `query:` / `passage:` 前缀，官方池化 = Mean；
+        //   bge 系列不需前缀，官方检索用法 = CLS。
+        let profile =
+            crate::engine::model_resolver::profile_for_model(&local_model_name.to_string());
+        let pooling_name = match profile.pooling {
+            PoolingStrategy::Cls => "CLS",
+            PoolingStrategy::Mean => "Mean",
+        };
+        let prefix_name = if profile.prefix_passage.is_empty() {
+            "无"
+        } else {
+            profile.prefix_passage.trim()
+        };
 
         eprintln!(
-            "[LRC·洛书ML] 模型加载完成: {} (hidden_size={}, 池化=Mean)",
+            "[LRC·洛书ML] 模型加载完成: {} (hidden_size={}, 池化={}, 前缀={})",
             if use_local { "本地" } else { "远程" },
-            hidden_size
+            hidden_size,
+            pooling_name,
+            prefix_name
         );
 
-        // 构建编码器实例
-        let encoder = Self {
+        // 构建编码器实例（结构投影方向在模型就绪后再构建）
+        let mut encoder = Self {
             model,
             tokenizer,
             device,
-            pooling: PoolingStrategy::Mean,
-            projection,
+            pooling: profile.pooling,
+            profile,
+            archetype_dirs: Vec::new(),
+            archetype_mu: Vec::new(),
             hidden_size,
         };
 
-        // 加载后验证：编码一个简单测试文本，确保模型实际可用
-        // 这能捕获模型权重损坏、分词器不匹配等隐蔽问题
-        match encoder.encode_text("Hello") {
-            Ok(vec) => {
-                let dev = vec.luoshu_deviation();
-                if dev > 2.0 {
+        // v0.9.10 构建结构投影：8 个卦义原型方向 + 公共方向 μ
+        encoder.build_archetype_projection()?;
+
+        // 加载后验证（v0.9.11：与表示层温度旋钮解耦）
+        //
+        // 历史缺陷：原实现以 `encode_text("Hello")` 的「幻和偏离度 < 2.0」为门槛。
+        // 但该偏离度随 `LRC_LUOSHU_CONTRAST_TEMP`（对比度温度）**单调漂移**——
+        // 它实际在测"当前温度"，而非"模型是否健康"：为提升判别分辨率而调低温度，
+        // 会让健康模型被误判为"损坏/分词器不匹配"，进而整体降级为统计编码器
+        // （实测：temp=0.40 → 偏离度 2.033 ≥ 2.0 → 加载失败）。这是 v0.9.10 引入
+        // 表示层旋钮时遗留的耦合。
+        //
+        // 新判据与温度无关，只检验"编码器是否真的在工作"：
+        //   (1) 输出有限、非退化（非 NaN/Inf、非全零）；
+        //   (2) 不同输入可区分（不会塌缩为同一向量）。
+        // 权重损坏或分词器不匹配都会使输出退化或不可区分，故仍被捕获；
+        // 同时不再随表示层参数漂移。
+        let probe_texts: [&str; 2] = ["Hello", "数据库连接池的最大连接数配置为 20"];
+        let mut probes: Vec<LuoShuVector> = Vec::with_capacity(probe_texts.len());
+        for t in probe_texts {
+            match encoder.encode_text(t) {
+                Ok(vec) => probes.push(vec),
+                Err(e) => {
                     return Err(LrcError::internal(format!(
-                        "模型加载后验证失败：测试编码的幻和偏离度 {:.2} 异常（期望 < 2.0）。\
-                         模型可能已损坏或与分词器不匹配",
-                        dev
+                        "模型加载后验证失败：测试编码出错: {}。\
+                         模型可能已损坏，请尝试重新下载模型文件到 models/{} 目录",
+                        e, local_model_name
                     )));
                 }
-                eprintln!("[LRC·洛书ML] 加载后验证通过，幻和偏离度: {:.2}", dev);
-            }
-            Err(e) => {
-                return Err(LrcError::internal(format!(
-                    "模型加载后验证失败：测试编码出错: {}。\
-                     模型可能已损坏，请尝试重新下载模型文件到 models/{} 目录",
-                    e, local_model_name
-                )));
             }
         }
+
+        // (1) 有限且非退化
+        for (k, v) in probes.iter().enumerate() {
+            if v.values.iter().any(|x| !x.is_finite()) {
+                return Err(LrcError::internal(format!(
+                    "模型加载后验证失败：测试编码[{}] 含非有限值（NaN/Inf）。\
+                     模型可能已损坏或与分词器不匹配",
+                    k
+                )));
+            }
+            if !(v.values.iter().sum::<f32>() > 0.0) {
+                return Err(LrcError::internal(
+                    "模型加载后验证失败：测试编码退化（全零）。\
+                     模型可能已损坏或与分词器不匹配"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // (2) 不同输入可区分。1e-3 仅为浮点噪声下限（非标定阈值），
+        //     健康状态下两路语义不同的探测文本差异远大于此（含低温区间）。
+        let max_abs_diff = probes[0]
+            .values
+            .iter()
+            .zip(probes[1].values.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        if max_abs_diff <= 1e-3 {
+            return Err(LrcError::internal(format!(
+                "模型加载后验证失败：不同输入编码不可区分（最大分量差 {:.2e}）。\
+                 模型可能已损坏或与分词器不匹配",
+                max_abs_diff
+            )));
+        }
+
+        eprintln!(
+            "[LRC·洛书ML] 加载后验证通过（温度无关判据）：两路探测最大分量差 {:.4}",
+            max_abs_diff
+        );
 
         Ok(encoder)
     }
 
-    /// 初始化投影矩阵 W ∈ R^(hidden_size × 9)
-    fn init_projection(hidden_size: usize) -> Vec<Vec<f32>> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+    /// 构建结构投影：8 个「卦义原型」单位方向 + 公共方向 μ
+    ///
+    /// ## 为什么是原型投影，而不是随机投影
+    ///
+    /// 产品对联想层的价值判据（`memory_store.rs` §3.43.9 逐字）：
+    /// > 「道体的价值判据不是'能否产出关联图'，而是'**产出的关联图中，
+    /// >   有多少条是 BGE 给不出的**'」
+    ///
+    /// 伪随机线性投影产出的 9 维是 768 维语义向量的线性组合，即"BGE 的粗粒度
+    /// 版本"——这类投影注定给不出增量（该陷阱在 §3.47 已被实测否证）。
+    ///
+    /// 改为把嵌入投影到 8 个**卦义原型**方向后，得到的是"这条记忆在八卦这套
+    /// 语义坐标系里的**性质画像**"：两条主题不同但性质相同的记忆会因落在同一
+    /// 宫位而彼此关联 —— 这正是 BGE 给不出的那类关联。
+    ///
+    /// ## μ 为什么用「原型均值」
+    ///
+    /// μ 必须**固定**：若随使用漂移，第 1 天写入的向量与第 30 天写入的将不可比，
+    /// 那比不修更糟。原型均值满足全部约束：模型自带、零新数据、零硬编码、
+    /// 时间恒定，且能抵掉嵌入里约 73% 能量的共模分量。
+    ///
+    /// ## 原型文本
+    ///
+    /// 默认取 `BAGUA_CATEGORIES`（LRC 既有卦义表）；可用
+    /// `LRC_BAGUA_ARCHETYPE_TEXTS`（JSON 字符串数组，必须 8 项）覆盖，
+    /// 以便与道体 `GUA_LEXICON` 的词表对齐。
+    fn build_archetype_projection(&mut self) -> LrcResult<()> {
+        use crate::engine::mirror_trapezoid::BAGUA_CATEGORIES;
 
-        let bound = (6.0_f32 / (hidden_size as f32 + 9.0)).sqrt();
-        let mut proj = vec![vec![0.0f32; 9]; hidden_size];
+        let from_env = std::env::var("LRC_BAGUA_ARCHETYPE_TEXTS").ok();
+        let texts: Vec<String> = from_env
+            .as_ref()
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .filter(|v| v.len() == 8)
+            .unwrap_or_else(|| BAGUA_CATEGORIES.iter().map(|s| s.to_string()).collect());
 
-        for (i, row) in proj.iter_mut().enumerate().take(hidden_size) {
-            for (j, cell) in row.iter_mut().enumerate() {
-                let mut hasher = DefaultHasher::new();
-                (i * 9 + j).hash(&mut hasher);
-                let seed = hasher.finish() as f32 / u64::MAX as f32;
-                *cell = (seed - 0.5) * 2.0 * bound;
+        let mut embs: Vec<Vec<f32>> = Vec::with_capacity(8);
+        for t in &texts {
+            embs.push(self.encode_embedding_role(t, EncodeRole::Passage)?);
+        }
+
+        let dim = embs[0].len().min(self.hidden_size);
+        if dim == 0 {
+            return Err(LrcError::internal("结构投影构建失败：原型嵌入维度为 0"));
+        }
+
+        // μ = 8 个原型嵌入的均值（确定性的公共方向）
+        let mut mu = vec![0.0f32; dim];
+        for e in &embs {
+            for i in 0..dim {
+                mu[i] += e[i];
             }
         }
-        proj
+        for m in mu.iter_mut() {
+            *m /= embs.len() as f32;
+        }
+
+        // 原型方向 = 单位化(原型嵌入 − μ)
+        let mut dirs: Vec<Vec<f32>> = Vec::with_capacity(embs.len());
+        for e in &embs {
+            let mut v: Vec<f32> = (0..dim).map(|i| e[i] - mu[i]).collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 1e-6 {
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+            }
+            dirs.push(v);
+        }
+
+        eprintln!(
+            "[LRC·结构投影] 已构建 {} 个卦义原型方向（dim={}），原型来源: {}",
+            dirs.len(),
+            dim,
+            if from_env.is_some() {
+                "环境变量覆盖"
+            } else {
+                "BAGUA_CATEGORIES"
+            }
+        );
+
+        self.archetype_mu = mu;
+        self.archetype_dirs = dirs;
+        Ok(())
     }
 
     /// v0.9.2 对比度增强（纯函数，可单测）
@@ -457,12 +623,26 @@ impl LuoShuMlEncoder {
         out
     }
 
-    /// 使用 ML 模型将文本编码为洛书 9 维向量
+    /// 使用 ML 模型将文本编码为洛书 9 维向量（默认按「文档 / 记忆」角色）
+    ///
+    /// v0.9.10：改为委托 [`Self::encode_text_role`]，默认 `EncodeRole::Passage`
+    /// （记忆写入路径占绝大多数）；检索侧请显式用 `EncodeRole::Query`。
     pub fn encode_text(&self, text: &str) -> LrcResult<LuoShuVector> {
+        self.encode_text_role(text, EncodeRole::Passage)
+    }
+
+    /// 按指定角色把文本编码为洛书 9 维向量
+    ///
+    /// 角色只影响**输入前缀**：e5 系列要求查询用 `query: `、文档用 `passage: `；
+    /// 其余家族前缀为空串，行为与改动前完全一致。
+    pub fn encode_text_role(&self, text: &str, role: EncodeRole) -> LrcResult<LuoShuVector> {
+        // 0. 按模型家族补输入前缀（e5 必需；其余家族为空前缀，无行为变化）
+        let prefixed = self.profile.apply_prefix(text, role);
+
         // 1. Tokenize
         let encoding = self
             .tokenizer
-            .encode(text, true)
+            .encode(prefixed, true)
             .map_err(|e| LrcError::parse(format!("分词失败: {}", e)))?;
 
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
@@ -530,32 +710,85 @@ impl LuoShuMlEncoder {
             .to_vec1()
             .map_err(|e| LrcError::internal(format!("to_vec1: {}", e)))?;
 
+        // 步骤 5~7 抽为 project_embedding（v0.9.10 批量编码复用，行为逐字不变）
+        Ok(self.project_embedding(&emb_vec))
+    }
+
+    /// 把单条 BERT 句嵌入（hidden 维）投影为洛书 9 维向量
+    ///
+    /// v0.9.10 从 [`Self::encode_text_role`] 的步骤 5~7 原样抽出，供单条与
+    /// 批量编码共用同一条投影链路。**保证批量与逐条结果逐位一致**——批量
+    /// 编码只改变 BERT 前向的并行度，不改变这里的任何数学。
+    fn project_embedding(&self, emb_vec: &[f32]) -> LuoShuVector {
         let actual_hidden = self.hidden_size.min(emb_vec.len());
 
-        // 5. 投影：hidden_size → 9
+        // 5. 结构投影（v0.9.10）：hidden → 8 宫义亲和度 + 1 中心
+        //
+        // value[宫] = cos(emb − μ, 原型方向[宫])：给出"这条记忆在八卦语义坐标系
+        // 里的性质画像"。原型方向在模型加载时构建（见 build_archetype_projection）。
+        let dim = actual_hidden.min(self.archetype_mu.len());
         let mut raw_features = [0.0f32; 9];
-        for (j, rf) in raw_features.iter_mut().enumerate() {
-            let mut sum = 0.0f32;
-            for (i, &ev) in emb_vec.iter().enumerate().take(actual_hidden) {
-                sum += ev * self.projection[i][j];
+        {
+            let mut outer = [0.0f32; 8];
+            for (j, dir) in self.archetype_dirs.iter().enumerate().take(8) {
+                let mut dot = 0.0f32;
+                for i in 0..dim {
+                    dot += (emb_vec[i] - self.archetype_mu[i]) * dir[i];
+                }
+                outer[j] = dot;
             }
-            *rf = sum;
+            // 卦索引 → 洛书九宫位置（与 BAGUA_BASES 严格同序）
+            for (j, &pos) in BAGUA_PALACE_POS.iter().enumerate() {
+                raw_features[pos] = outer[j];
+            }
+            // 中心（位置 4）= 外圈 8 宫的均值。
+            // 理据：理想洛书 (4+9+2+3+7+8+1+6)/8 = 5 = 中心数，即"中心 = 外圈均值"
+            // 是洛书自带的平衡性。中心因此天然"始终不变"（它是外圈的确定函数），
+            // 且永远不是最大值，不破坏依赖 argmax 的几何。
+            let sum: f32 = outer.iter().sum();
+            raw_features[LUOSHU_CENTER_POS] = sum / 8.0;
         }
 
         // 5.5 v0.9.2 对比度增强：中心化 + softmax 放大维度差异，防止编码塌缩
         // 根因：ML 投影在贝叶斯融合前被 LUOSHU_WEIGHTS 先验主导，不同输入的 9 维
         // 向量高度相似 → mirror_project 全部落入同一八卦类别 -> 信息增量守卫拦截合成。
         // 修复：先中心化消除公共偏置，再用温度调制的 softmax 放大输入相关的差异。
-        let enhanced = Self::contrast_normalize(&raw_features, 0.7);
+        //
+        // v0.9.10：温度去硬编码，便于按模型家族标定；
+        //   可用 `LRC_LUOSHU_CONTRAST_TEMP`（> 0）覆盖做对照实验。
+        // v0.9.11：默认值由 0.7 重标定为 **0.4**（基于温度扫描 + 端到端基准复测）。
+        //   依据：0.4 处于判别分辨率最优区（近义/无关分离度最高），且 30 实例
+        //   基准下 ML 双维优于统计回退（Session 0.8000 vs 0.6333，Turn 0.5000
+        //   vs 0.4333），而 0.7 时 Turn(0.4138) 反低于统计回退。此项为单变量标定，
+        //   非为迁就评测而改语义能力。
+        let contrast_temp: f32 = std::env::var("LRC_LUOSHU_CONTRAST_TEMP")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.4);
+        let enhanced = Self::contrast_normalize(&raw_features, contrast_temp);
 
-        // 6. v0.9.2 混合融合：输入相关的增强分布（75%）+ 洛书先验（25%）
-        // 根因：原实现 posterior = LUOSHU_WEIGHTS * (1 + likelihood)，likelihood 微弱时
-        // 后验 ≈ LUOSHU_WEIGHTS → mirror_project 全部映射到同一八卦类别（离·火）。
-        // 改为加权混合后，后验由输入特征主导，不同输入的编码向量在八卦类别间分散。
-        const PRIOR_WEIGHT: f32 = 0.25;
+        // 6. 输入特征与洛书先验的加权融合
+        //
+        // 历史根因：原实现 posterior = LUOSHU_WEIGHTS * (1 + likelihood)，
+        //   likelihood 微弱时后验 ≈ LUOSHU_WEIGHTS ⇒ mirror_project 全部映射到
+        //   同一八卦类别（离·火）——因为 LUOSHU_WEIGHTS 的 argmax 恒在位置 1
+        //   （9/45 最大）。v0.9.2 把先验权重降到 25%，但仍**保留了一个固定偏置**：
+        //   只要 enhanced 接近均匀，25% 的先验就足以把 argmax 拉回位置 1。
+        //
+        // v0.9.10：默认权重降为 **0** —— 先验不再充当偏置源。
+        //   与 normalize_to_luoshu 的修正同一原则：**洛书结构是骨架，
+        //   语义在激活值里**；把"理想洛书形状"强行叠加到激活值上，等于把
+        //   固定的 argmax 预埋进每一个向量。
+        //   可用 `LRC_LUOSHU_PRIOR_WEIGHT`（0.0~1.0）覆盖，做对照实验。
+        let prior_weight: f32 = std::env::var("LRC_LUOSHU_PRIOR_WEIGHT")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .filter(|v| (0.0..=1.0).contains(v))
+            .unwrap_or(0.0);
         let mut posterior = [0.0f32; 9];
         for i in 0..9 {
-            posterior[i] = (1.0 - PRIOR_WEIGHT) * enhanced[i] + PRIOR_WEIGHT * LUOSHU_WEIGHTS[i];
+            posterior[i] = (1.0 - prior_weight) * enhanced[i] + prior_weight * LUOSHU_WEIGHTS[i];
         }
 
         // 7. 归一化
@@ -570,20 +803,139 @@ impl LuoShuMlEncoder {
 
         let mut vec = LuoShuVector { values: posterior };
         vec.normalize_to_luoshu();
-        Ok(vec)
+        vec
     }
 
-    /// 道枢映射: 洛书·九宫 — 将语义向量映射到洛书九宫格，实现数与义的统一
+    /// 批量把文本编码为洛书 9 维向量（v0.9.10 吞吐优化）
+    ///
+    /// 与 [`Self::encode_text_role`] 语义完全一致，仅把逐条的 BERT 前向合并为
+    /// **单次批量前向**（candle `BertModel::forward` 原生支持 `[batch, seq]`），
+    /// 以摊薄 CPU 前向的固定开销。输出与逐条调用逐位一致（同一池化 + 同一投影）。
+    ///
+    /// 约定：
+    ///   - 空入参返回空 `Vec`（不触发任何前向）；
+    ///   - 输出条数与输入条数严格相等，顺序一一对应；
+    ///   - padding 到批内最长（上限 512），`[PAD]` 的 attention_mask=0，
+    ///     CLS 池化取位置 0、Mean 池化按 mask 加权，均不受 padding 影响。
+    pub fn encode_text_batch(
+        &self,
+        texts: &[&str],
+        role: EncodeRole,
+    ) -> LrcResult<Vec<LuoShuVector>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 1. 逐条补前缀 + 分词（中文注释：与单条路径 apply_prefix 完全一致）
+        let mut seqs: Vec<Vec<u32>> = Vec::with_capacity(texts.len());
+        for text in texts {
+            let prefixed = self.profile.apply_prefix(text, role);
+            let encoding = self
+                .tokenizer
+                .encode(prefixed, true)
+                .map_err(|e| LrcError::parse(format!("分词失败: {}", e)))?;
+            let ids: Vec<u32> = encoding.get_ids().iter().take(512).copied().collect();
+            seqs.push(ids);
+        }
+
+        // 2. 批内 padding：pad_id 取分词表的 [PAD]（缺省 0），max_len 上限 512
+        let pad_id = self.tokenizer.token_to_id("[PAD]").unwrap_or(0);
+        let max_len = seqs
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0)
+            .clamp(1, 512);
+        let batch = seqs.len();
+
+        // 构造扁平 [batch * max_len] 的 input_ids 与 attention_mask（0/1）
+        let mut flat_ids: Vec<u32> = Vec::with_capacity(batch * max_len);
+        let mut flat_mask: Vec<f32> = Vec::with_capacity(batch * max_len);
+        for seq in &seqs {
+            for i in 0..max_len {
+                if i < seq.len() {
+                    flat_ids.push(seq[i]);
+                    flat_mask.push(1.0);
+                } else {
+                    flat_ids.push(pad_id);
+                    flat_mask.push(0.0);
+                }
+            }
+        }
+
+        // 3. 建张量：[batch, max_len]
+        let input_ids = Tensor::new(flat_ids.as_slice(), &self.device)
+            .map_err(|e| LrcError::internal(format!("创建 input_ids: {}", e)))?
+            .reshape((batch, max_len))
+            .map_err(|e| LrcError::internal(format!("reshape input_ids: {}", e)))?;
+        let attention_tensor = Tensor::new(flat_mask.as_slice(), &self.device)
+            .map_err(|e| LrcError::internal(format!("创建 attention: {}", e)))?
+            .reshape((batch, max_len))
+            .map_err(|e| LrcError::internal(format!("reshape attention: {}", e)))?;
+        let token_type_ids = input_ids
+            .zeros_like()
+            .map_err(|e| LrcError::internal(format!("type_ids: {}", e)))?;
+
+        // 4. 单次 BERT 前向：[batch, max_len] → [batch, max_len, hidden]
+        let output = self
+            .model
+            .forward(&input_ids, &token_type_ids, Some(&attention_tensor))
+            .map_err(|e| LrcError::internal(format!("BERT 前向: {}", e)))?;
+
+        // 5. 池化（与单条路径同策略，仅多保留 batch 维）
+        let pooled = match self.pooling {
+            PoolingStrategy::Cls => output
+                // 取位置 0 的 [CLS]：narrow(1,0,1) → [batch,1,hidden] → squeeze(1)
+                .narrow(1, 0, 1)
+                .map_err(|e| LrcError::internal(format!("cls narrow: {}", e)))?
+                .squeeze(1)
+                .map_err(|e| LrcError::internal(format!("cls squeeze: {}", e)))?,
+            PoolingStrategy::Mean => {
+                let mask = attention_tensor
+                    .unsqueeze(2)
+                    .map_err(|e| LrcError::internal(format!("mask unsqueeze: {}", e)))?;
+                let masked = output
+                    .broadcast_mul(&mask)
+                    .map_err(|e| LrcError::internal(format!("masked mul: {}", e)))?;
+                let sum = masked
+                    .sum(1)
+                    .map_err(|e| LrcError::internal(format!("sum: {}", e)))?;
+                let mask_sum = mask
+                    .sum(1)
+                    .map_err(|e| LrcError::internal(format!("mask_sum: {}", e)))?;
+                sum.broadcast_div(&mask_sum)
+                    .map_err(|e| LrcError::internal(format!("div: {}", e)))?
+            }
+        };
+
+        // 6. [batch, hidden] → Vec<Vec<f32>>，逐行复用同一投影链路
+        let rows: Vec<Vec<f32>> = pooled
+            .to_vec2()
+            .map_err(|e| LrcError::internal(format!("to_vec2: {}", e)))?;
+        Ok(rows.iter().map(|row| self.project_embedding(row)).collect())
+    }
+
     /// 获取底层 BERT 编码器的句嵌入（未经投影，用于其他语义场景）
     ///
-    /// 池化方式必须是 CLS（首位 token 隐层）：bge 系列模型以 CLS +
-    /// 归一化对比学习训练，这是其官方检索用法。均值池化会让 BERT 族
-    /// 句向量呈各向异性——实测任意中文短句对的余弦都挤在 ≈0.65，
-    /// 语义相关对与无关对完全不可分（v0.9.7 联想探索标定结论）。
+    /// 默认按「文档 / 记忆」角色补前缀；检索侧请用
+    /// [`Self::encode_embedding_role`] 传 `EncodeRole::Query`。
     pub fn encode_embedding(&self, text: &str) -> LrcResult<Vec<f32>> {
+        self.encode_embedding_role(text, EncodeRole::Passage)
+    }
+
+    /// 按指定角色获取底层 BERT 编码器的句嵌入（未经投影）
+    ///
+    /// v0.9.10 修正此处的两处硬编码：
+    ///   1. **池化改为随模型家族**（`self.pooling`）。此前硬编码 CLS，而注释
+    ///      以 bge 论证——当实际模型换成 e5（官方池化 = Mean）时，约定与模型
+    ///      不匹配。现在由 `model_resolver::profile_for_model` 决定。
+    ///   2. **补输入前缀**。e5 系列要求 `query: ` / `passage: `；此前全仓库
+    ///      无任何前缀注入。
+    pub fn encode_embedding_role(&self, text: &str, role: EncodeRole) -> LrcResult<Vec<f32>> {
+        let prefixed = self.profile.apply_prefix(text, role);
         let encoding = self
             .tokenizer
-            .encode(text, true)
+            .encode(prefixed, true)
             .map_err(|e| LrcError::parse(format!("分词失败: {}", e)))?;
 
         let token_ids: Vec<u32> = encoding.get_ids().to_vec();
@@ -613,17 +965,44 @@ impl LuoShuMlEncoder {
             .forward(&input_ids, &token_type_ids, Some(&attention_tensor))
             .map_err(|e| LrcError::internal(format!("forward: {}", e)))?;
 
-        // CLS 池化：取序列首位 token 的隐层向量（[batch, seq, hidden] → [hidden]）
-        let cls = output
-            .narrow(1, 0, 1)
-            .map_err(|e| LrcError::internal(format!("cls narrow: {}", e)))?
-            .squeeze(1)
-            .map_err(|e| LrcError::internal(format!("cls squeeze: {}", e)))?;
-        let vec = cls
-            .flatten_all()
-            .map_err(|e| LrcError::internal(format!("cls flatten: {}", e)))?
-            .to_vec1()
-            .map_err(|e| LrcError::internal(format!("cls to_vec1: {}", e)))?;
+        // 池化：随模型家族选择（v0.9.10 起不再硬编码 CLS）
+        let vec: Vec<f32> = match self.pooling {
+            PoolingStrategy::Cls => {
+                // 取序列首位 token 的隐层向量（[batch, seq, hidden] → [hidden]）
+                let cls = output
+                    .narrow(1, 0, 1)
+                    .map_err(|e| LrcError::internal(format!("cls narrow: {}", e)))?
+                    .squeeze(1)
+                    .map_err(|e| LrcError::internal(format!("cls squeeze: {}", e)))?;
+                cls.flatten_all()
+                    .map_err(|e| LrcError::internal(format!("cls flatten: {}", e)))?
+                    .to_vec1()
+                    .map_err(|e| LrcError::internal(format!("cls to_vec1: {}", e)))?
+            }
+            PoolingStrategy::Mean => {
+                // 掩码平均池化（与 encode_text 同一实现）
+                let mask = attention_tensor
+                    .unsqueeze(2)
+                    .map_err(|e| LrcError::internal(format!("mask unsqueeze: {}", e)))?;
+                let masked = output
+                    .broadcast_mul(&mask)
+                    .map_err(|e| LrcError::internal(format!("masked mul: {}", e)))?;
+                let sum = masked
+                    .sum(1)
+                    .map_err(|e| LrcError::internal(format!("sum: {}", e)))?;
+                let mask_sum = mask
+                    .sum(1)
+                    .map_err(|e| LrcError::internal(format!("mask_sum: {}", e)))?;
+                let pooled = sum
+                    .broadcast_div(&mask_sum)
+                    .map_err(|e| LrcError::internal(format!("div: {}", e)))?;
+                pooled
+                    .flatten_all()
+                    .map_err(|e| LrcError::internal(format!("mean flatten: {}", e)))?
+                    .to_vec1()
+                    .map_err(|e| LrcError::internal(format!("mean to_vec1: {}", e)))?
+            }
+        };
         Ok(vec)
     }
 
@@ -853,6 +1232,112 @@ impl HybridLuoShuEncoder {
         self.fallback.encode_text(text)
     }
 
+    /// 批量编码文本为洛书向量（v0.9.10 吞吐优化）
+    ///
+    /// 语义与 [`Self::encode_text`] 完全一致（同样的降级/恢复状态机），差别只在
+    /// 于有 ML 编码器时调用 `encode_text_batch` 做**单次批量前向**。约定：
+    ///   - 空入参返回空 `Vec`；
+    ///   - 输出条数与输入条数严格相等、顺序一一对应；
+    ///   - **一次批量调用只算一次恢复探测**（冷却期内累计 1 次成功），避免
+    ///     批量路径瞬间刷满 `recovery_threshold` 造成误恢复；
+    ///   - 整批 ML 失败时，整批回退到统计编码器逐条编码。
+    pub fn encode_text_batch(&self, texts: &[&str]) -> Vec<LuoShuVector> {
+        if texts.is_empty() {
+            return Vec::new();
+        }
+
+        // 与 encode_text 一致：先读降级状态（锁顺序 status → recovery）
+        let is_degraded = {
+            let recovery = self
+                .recovery_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            recovery.is_degraded
+        };
+
+        if let Some(ref ml) = self.ml_encoder {
+            // v0.9.10：跨条目分片并行——瓶颈在单线程 elementwise，故按条目并行
+            // 才能吃到多核；内部保序，返回顺序与输入严格一致。
+            match encode_text_batch_parallel(ml, texts) {
+                Ok(vecs) => {
+                    // 长度契约防御：正常情况下二者的长度严格相等
+                    if vecs.len() != texts.len() {
+                        eprintln!(
+                            "[LRC·洛书] 批量编码返回 {} 条，期望 {} 条；整批回退统计编码器",
+                            vecs.len(),
+                            texts.len()
+                        );
+                    } else {
+                        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+                        status.total_encodings += vecs.len() as u64;
+                        status.last_encoding_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+
+                        // 延迟恢复：整批只算一次探测成功
+                        if is_degraded {
+                            let mut recovery = self
+                                .recovery_state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            recovery.consecutive_successes += 1;
+                            eprintln!(
+                                "[LRC·编码器] ML 批量探测成功 {}/{}（冷却中...）",
+                                recovery.consecutive_successes, recovery.recovery_threshold
+                            );
+
+                            if recovery.consecutive_successes >= recovery.recovery_threshold {
+                                recovery.is_degraded = false;
+                                recovery.consecutive_successes = 0;
+                                status.mode = "ml".to_string();
+                                status.degradation_reason = None;
+                                status.quality_score = 1.0;
+                                status.capability_description =
+                                    "ML 语义模式：已恢复，提供高精度语义理解".to_string();
+                                eprintln!(
+                                    "[LRC·编码器] 模式切换: 统计 → ML（冷却期结束，连续 {} 次成功）",
+                                    recovery.recovery_threshold
+                                );
+                            }
+                        }
+                        return vecs;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[LRC·洛书] ML 批量编码失败 ({}), 整批回退到统计编码器", e);
+                    self.record_degradation(&e.to_string());
+                }
+            }
+        }
+
+        // 统计模式编码（逐条）
+        let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        status.total_encodings += texts.len() as u64;
+        status.last_encoding_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        drop(status);
+
+        // ML 存在但降级且本次 ML 失败 → 中断恢复过程
+        if self.ml_encoder.is_some() {
+            let mut recovery = self
+                .recovery_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if recovery.is_degraded && recovery.consecutive_successes > 0 {
+                eprintln!(
+                    "[LRC·编码器] ML 批量探测失败，重置冷却计数（之前: {} 次成功）",
+                    recovery.consecutive_successes
+                );
+                recovery.consecutive_successes = 0;
+            }
+        }
+
+        texts.iter().map(|t| self.fallback.encode_text(t)).collect()
+    }
+
     /// 检查是否使用 ML 模式
     pub fn is_ml_mode(&self) -> bool {
         self.ml_encoder.is_some()
@@ -921,6 +1406,114 @@ impl Default for HybridLuoShuEncoder {
     }
 }
 
+// ============================================================
+// 跨条目并行编码（v0.9.10 吞吐优化）
+// ============================================================
+// 背景（实测驱动的自我评估结论）：
+//   candle CPU 后端的矩阵乘已由 gemm+rayon 多核并行，故"批内并行"没有收益；
+//   真正的瓶颈是单线程的 LayerNorm / GELU / softmax 等 elementwise 算子——
+//   实测 reclassify 稳态进程 CPU 占用仅 ~1.5/6 核。
+//   因此把并行度提到**条目维度**：把一批文本切成若干片，各片独立做前向，
+//   让多个核同时推进 elementwise 计算，从而重叠彼此的单线程停顿。
+
+/// 环境变量：跨条目并行编码的工作线程数覆盖项。
+///
+/// 不设置时按逻辑核数（`std::thread::available_parallelism`）自动决定；
+/// 设为 1 可强制串行（便于对照实验或规避线程开销）。
+const ENV_ENCODE_WORKERS: &str = "LRC_ENCODE_WORKERS";
+
+/// 解析批量编码应使用的**跨条目**工作线程数（纯函数，便于无环境竞争地测试）。
+///
+/// 规则：
+///   - `text_count ≤ 1` 直接返回 `text_count`（0/1 条不启线程）；
+///   - 显式 `override_n` 且 >0 时采用之，否则取逻辑核数；
+///   - 结果夹紧到 `[1, text_count]`，绝不超出待编码条目数（避免空分片）。
+fn resolve_encode_workers(text_count: usize, override_n: Option<usize>) -> usize {
+    if text_count <= 1 {
+        return text_count;
+    }
+    let desired = match override_n {
+        Some(n) if n > 0 => n,
+        _ => std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(1),
+    };
+    desired.clamp(1, text_count)
+}
+
+/// 读取 `LRC_ENCODE_WORKERS` 后解析工作线程数（环境变量是唯一的可配置入口）。
+fn resolve_encode_workers_from_env(text_count: usize) -> usize {
+    let override_n = std::env::var(ENV_ENCODE_WORKERS)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok());
+    resolve_encode_workers(text_count, override_n)
+}
+
+/// 将条目按 `workers` 分片并行执行 `f`，并按输入顺序拼接结果（保序契约）。
+///
+/// 设计要点：
+///   - **保序**：先按分片顺序收集句柄，再顺序 `join`，输出与输入严格一一对应；
+///   - **异常隔离**：任一分片返回 `Err` → 整体 `Err`；分片线程 `panic` →
+///     转成 `LrcError`（绝不让调用方线程崩溃，也绝不静默丢条目）；
+///   - `workers ≤ 1` 或条目 ≤1 时直接串行，避免无谓线程开销。
+fn map_chunks_ordered<T, F>(texts: &[&str], workers: usize, f: F) -> LrcResult<Vec<T>>
+where
+    T: Send,
+    F: Fn(&[&str]) -> LrcResult<Vec<T>> + Sync,
+{
+    if workers <= 1 || texts.len() <= 1 {
+        return f(texts);
+    }
+
+    // 向上取整分片：保证片数 ≤ workers 且不产生空片
+    let chunk_size = texts.len().div_ceil(workers);
+    let mut out: Vec<T> = Vec::with_capacity(texts.len());
+
+    std::thread::scope(|scope| -> LrcResult<()> {
+        let mut handles = Vec::new();
+        for slice in texts.chunks(chunk_size) {
+            let f_ref = &f;
+            handles.push(scope.spawn(move || f_ref(slice)));
+        }
+        // 顺序 join：这是"保序"的唯一保证，不得改为乱序收集
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(part)) => out.extend(part),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(LrcError::new(
+                        ErrorKind::Internal,
+                        "并行编码线程 panic，已隔离为错误",
+                    ))
+                }
+            }
+        }
+        Ok(())
+    })?;
+
+    Ok(out)
+}
+
+/// 跨条目并行批量编码（工作线程数由 `LRC_ENCODE_WORKERS` 或逻辑核数决定）。
+fn encode_text_batch_parallel(
+    ml: &LuoShuMlEncoder,
+    texts: &[&str],
+) -> LrcResult<Vec<LuoShuVector>> {
+    let workers = resolve_encode_workers_from_env(texts.len());
+    encode_text_batch_parallel_with(ml, texts, workers)
+}
+
+/// 跨条目并行批量编码（显式指定工作线程数，供对照实验与测试使用）。
+fn encode_text_batch_parallel_with(
+    ml: &LuoShuMlEncoder,
+    texts: &[&str],
+    workers: usize,
+) -> LrcResult<Vec<LuoShuVector>> {
+    map_chunks_ordered(texts, workers, |chunk| {
+        ml.encode_text_batch(chunk, EncodeRole::Passage)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -937,21 +1530,34 @@ mod tests {
         assert!(dev < 1.0, "幻和偏离度 {} 过高", dev);
     }
 
-    /// 测试：投影矩阵初始化有效性
+    /// 测试：八卦索引 → 洛书九宫位置映射的结构契约
+    ///
+    /// v0.9.10 取代原 `test_projection_initialization`（伪随机投影矩阵已删除，
+    /// 改为结构投影）。这条契约必须成立，否则「卦」与「九宫位置」会静默错位：
+    ///   1. 外圈 8 个位置各被占用一次（卦与位置一一对应）；
+    ///   2. **绝不包含中心位置** —— 中心不属于任何梯形，即"中心点始终不变"。
     #[test]
-    fn test_projection_initialization() {
-        let proj = LuoShuMlEncoder::init_projection(384);
-
-        // 计算每列投影权重绝对值之和，确保每列非零
-        let col_sums: [f32; 9] = proj.iter().fold([0.0f32; 9], |mut acc, row| {
-            for (j, &val) in row.iter().enumerate() {
-                acc[j] += val.abs();
-            }
-            acc
-        });
-        for (j, &sum) in col_sums.iter().enumerate() {
-            assert!(sum > 0.0, "第 {} 列投影权重全为零", j);
+    fn test_bagua_palace_pos_contract() {
+        let mut seen = [false; 9];
+        for &pos in BAGUA_PALACE_POS.iter() {
+            assert!(pos < 9, "九宫位置越界: {}", pos);
+            assert!(
+                !seen[pos],
+                "位置 {} 被重复占用（卦与位置必须一一对应）",
+                pos
+            );
+            seen[pos] = true;
         }
+        assert!(
+            !seen[LUOSHU_CENTER_POS],
+            "中心位置 {} 不得被任何卦占用（中心点始终不变）",
+            LUOSHU_CENTER_POS
+        );
+        assert_eq!(
+            seen.iter().filter(|&&s| s).count(),
+            8,
+            "外圈应恰好被占用 8 个位置"
+        );
     }
 
     /// 测试：混合编码器在统计模式下也能工作
@@ -1154,5 +1760,790 @@ mod tests {
         assert!(!lang.is_empty(), "系统语言不应为空");
         // 默认应为 "zh_CN"（LRC 主要服务中文用户）或环境变量值
         println!("[smoke test] 当前系统语言检测: {}", lang);
+    }
+
+    /// 诊断：**去共模分量的 oracle 上界**（决定去共模这条路要不要走）
+    ///
+    /// ## 为什么先做这个
+    ///
+    /// 去共模需要知道公共方向 μ。而**任何 μ 估计都有误差**。若连"完美 μ"
+    /// （直接用样本均值，即 oracle）都无法改善表示质量，那么换任何 μ 估计
+    /// 都注定无效，这条路应当直接放弃——而不是先花力气去实现 μ 的估计。
+    ///
+    /// ## 判据（两个指标必须同时看）
+    ///
+    /// 1. **argmax 分散度**：命中位置数、最大单类占比（越大越差）
+    /// 2. **语义分离度**：近义对余弦 − 无关对余弦（越大越好）
+    ///
+    /// 只看指标 1 会被误导：温度实验里 temp=0.3 时散布最大，但语义顺序
+    /// 反而被打乱（近义分离度变负）。
+    #[cfg(feature = "ml")]
+    #[test]
+    fn diagnostic_oracle_centering_upper_bound_ml() {
+        let enc = match LuoShuMlEncoder::load() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[Oracle 中心化] 跳过：ML 模型不可用（{}）", e);
+                return;
+            }
+        };
+
+        // 近义对索引：(0,1) (2,3) (4,5)；其余为无关对
+        let texts: [&str; 12] = [
+            "数据库连接池的最大连接数配置为 20",
+            "数据库连接池最大连接数设置成 20 个",
+            "查询性能优化",
+            "查询性能很差需要优化",
+            "我喜欢喝美式咖啡，不加糖",
+            "偏好美式咖啡不加糖",
+            "项目使用 PostgreSQL 数据库存储用户数据",
+            "前端使用 React 框架构建组件界面",
+            "医生建议每天服用两次降压药",
+            "周末去西湖散步顺便吃片儿川",
+            "服务器内存不足被 OOM Killer 杀掉",
+            "会议定在周三下午三点",
+        ];
+        let near_pairs: [(usize, usize); 3] = [(0, 1), (2, 3), (4, 5)];
+
+        let embs: Vec<Vec<f32>> = texts
+            .iter()
+            .filter_map(|t| enc.encode_embedding(t).ok())
+            .collect();
+        if embs.len() != texts.len() {
+            eprintln!(
+                "[Oracle 中心化] 跳过：嵌入数量 {} != {}",
+                embs.len(),
+                texts.len()
+            );
+            return;
+        }
+
+        let dim = embs[0].len();
+        let n = embs.len() as f32;
+
+        // 公共方向 μ（样本均值 —— 即 oracle，此处仅用于对照打印）
+        let mut mu = vec![0.0f32; dim];
+        for e in &embs {
+            for (i, x) in e.iter().enumerate() {
+                mu[i] += x;
+            }
+        }
+        for m in mu.iter_mut() {
+            *m /= n;
+        }
+
+        // v0.9.10：结构投影已内建"减 μ"，本诊断改为比较「减 / 不减」的端到端效果。
+        // 用的是 **encoder 自带的确定性 μ**（= 8 个原型嵌入的均值），而不是样本
+        // 均值 —— 因为产品里不能有会随使用漂移的 μ（否则新旧记忆不可比）。
+        let enc_mu: Vec<f32> = enc.archetype_mu.clone();
+        {
+            let (mut dot, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+            for i in 0..mu.len().min(enc_mu.len()) {
+                dot += mu[i] * enc_mu[i];
+                na += mu[i] * mu[i];
+                nb += enc_mu[i] * enc_mu[i];
+            }
+            let c = if na > 1e-9 && nb > 1e-9 {
+                dot / (na.sqrt() * nb.sqrt())
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[Oracle 中心化] 样本 μ 与 encoder μ 的余弦 = {:.4}（越接近 1，说明「原型均值」越能代表真实公共方向）",
+                c
+            );
+        }
+
+        for &centered in &[false, true] {
+            let vecs: Vec<LuoShuVector> = embs
+                .iter()
+                .map(|e| {
+                    let mut raw = [0.0f32; 9];
+                    let d = e.len().min(enc.hidden_size).min(enc_mu.len());
+                    let mut outer = [0.0f32; 8];
+                    for (j, dir) in enc.archetype_dirs.iter().enumerate().take(8) {
+                        let mut s = 0.0f32;
+                        for i in 0..d {
+                            let x = if centered { e[i] - enc_mu[i] } else { e[i] };
+                            s += x * dir[i];
+                        }
+                        outer[j] = s;
+                    }
+                    for (j, &pos) in BAGUA_PALACE_POS.iter().enumerate() {
+                        raw[pos] = outer[j];
+                    }
+                    raw[LUOSHU_CENTER_POS] = outer.iter().sum::<f32>() / 8.0;
+                    let enhanced = LuoShuMlEncoder::contrast_normalize(&raw, 0.7);
+                    // 复刻 encode_text_role 的归一化收口
+                    let total: f32 = enhanced.iter().sum();
+                    let posterior = if total > 1e-6 {
+                        let mut p = [0.0f32; 9];
+                        for i in 0..9 {
+                            p[i] = enhanced[i] / total;
+                        }
+                        p
+                    } else {
+                        [1.0 / 9.0; 9]
+                    };
+                    let mut v = LuoShuVector { values: posterior };
+                    v.normalize_to_luoshu();
+                    v
+                })
+                .collect();
+
+            // 指标 1：argmax 分散度
+            let mut dist = [0usize; 9];
+            for v in &vecs {
+                let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
+                for (i, &x) in v.values.iter().enumerate() {
+                    if x > bv {
+                        bv = x;
+                        bi = i;
+                    }
+                }
+                dist[bi] += 1;
+            }
+            let hit = dist.iter().filter(|&&c| c > 0).count();
+            let maxc = *dist.iter().max().unwrap_or(&0);
+
+            // 指标 2：余弦分布 + 语义分离度
+            let mut cos: Vec<f32> = Vec::new();
+            for i in 0..vecs.len() {
+                for j in (i + 1)..vecs.len() {
+                    cos.push(vecs[i].cosine_similarity(&vecs[j]));
+                }
+            }
+            cos.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let q = |p: f32| cos[(((cos.len() - 1) as f32) * p) as usize];
+
+            let near_mean: f32 = near_pairs
+                .iter()
+                .map(|&(i, j)| vecs[i].cosine_similarity(&vecs[j]))
+                .sum::<f32>()
+                / near_pairs.len() as f32;
+            let mut far_sum = 0.0f32;
+            let mut far_cnt = 0usize;
+            for i in 0..vecs.len() {
+                for j in (i + 1)..vecs.len() {
+                    if !near_pairs.contains(&(i, j)) {
+                        far_sum += vecs[i].cosine_similarity(&vecs[j]);
+                        far_cnt += 1;
+                    }
+                }
+            }
+            let far_mean = far_sum / far_cnt.max(1) as f32;
+
+            eprintln!(
+                "[Oracle 中心化] centered={:<5} 分布={:?} 命中={}/9 最大单类={}",
+                centered, dist, hit, maxc
+            );
+            eprintln!(
+                "[Oracle 中心化] centered={:<5} 余弦 P10/P50/P90={:.4}/{:.4}/{:.4}  近义={:.4} 无关={:.4} 分离度={:+.4}",
+                centered,
+                q(0.10),
+                q(0.50),
+                q(0.90),
+                near_mean,
+                far_mean,
+                near_mean - far_mean
+            );
+        }
+    }
+
+    /// 诊断（enc-1c）：**对比度温度扫描** —— 找出让结构空间分离度最佳的温度。
+    ///
+    /// ## 背景
+    /// 新编码（BGE-base + 结构投影 + 减 μ）的中位两两余弦被压缩到 ~0.66，
+    /// 远高于统计编码器 ~0.50，致 deep 排序分辨率下降（turn 级命中坍塌）。
+    /// 本诊断固定 centered=true（= 产品路线），扫描 `contrast_temp` 观察：
+    ///   - 余弦 P10/P50/P90（动态范围是否被拉开）
+    ///   - 近义/无关分离度（判别力是否提升）
+    ///   - argmax 分布命中度（表征是否仍分散，未塌缩回单类）
+    /// 结论用于选 `LRC_LUOSHU_CONTRAST_TEMP`（env 可覆盖，**不改产品源码**）。
+    #[cfg(feature = "ml")]
+    #[test]
+    fn diagnostic_contrast_temp_sweep_ml() {
+        let enc = match LuoShuMlEncoder::load() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[温度扫描] 跳过：ML 模型不可用（{}）", e);
+                return;
+            }
+        };
+
+        // 与 oracle 诊断同批文本，保证可比
+        let texts: [&str; 12] = [
+            "数据库连接池的最大连接数配置为 20",
+            "数据库连接池最大连接数设置成 20 个",
+            "查询性能优化",
+            "查询性能很差需要优化",
+            "我喜欢喝美式咖啡，不加糖",
+            "偏好美式咖啡不加糖",
+            "项目使用 PostgreSQL 数据库存储用户数据",
+            "前端使用 React 框架构建组件界面",
+            "医生建议每天服用两次降压药",
+            "周末去西湖散步顺便吃片儿川",
+            "服务器内存不足被 OOM Killer 杀掉",
+            "会议定在周三下午三点",
+        ];
+        let near_pairs: [(usize, usize); 3] = [(0, 1), (2, 3), (4, 5)];
+
+        let embs: Vec<Vec<f32>> = texts
+            .iter()
+            .filter_map(|t| enc.encode_embedding(t).ok())
+            .collect();
+        if embs.len() != texts.len() {
+            eprintln!(
+                "[温度扫描] 跳过：嵌入数量 {} != {}",
+                embs.len(),
+                texts.len()
+            );
+            return;
+        }
+
+        // 构造闭包：给定温度，复刻 encode_text_role 的 centered 投影 + 对比度归一化 + 收口
+        let build_one = |e: &Vec<f32>, temp: f32| -> LuoShuVector {
+            let mut raw = [0.0f32; 9];
+            let d = e.len().min(enc.hidden_size).min(enc.archetype_mu.len());
+            let mut outer = [0.0f32; 8];
+            for (j, dir) in enc.archetype_dirs.iter().enumerate().take(8) {
+                let mut s = 0.0f32;
+                for i in 0..d {
+                    let x = e[i] - enc.archetype_mu[i];
+                    s += x * dir[i];
+                }
+                outer[j] = s;
+            }
+            for (j, &pos) in BAGUA_PALACE_POS.iter().enumerate() {
+                raw[pos] = outer[j];
+            }
+            raw[LUOSHU_CENTER_POS] = outer.iter().sum::<f32>() / 8.0;
+            let enhanced = LuoShuMlEncoder::contrast_normalize(&raw, temp);
+            let total: f32 = enhanced.iter().sum();
+            let posterior = if total > 1e-6 {
+                let mut p = [0.0f32; 9];
+                for i in 0..9 {
+                    p[i] = enhanced[i] / total;
+                }
+                p
+            } else {
+                [1.0 / 9.0; 9]
+            };
+            let mut v = LuoShuVector { values: posterior };
+            v.normalize_to_luoshu();
+            v
+        };
+        let build_vecs =
+            |temp: f32| -> Vec<LuoShuVector> { embs.iter().map(|e| build_one(e, temp)).collect() };
+
+        // enc-1c：自检门槛关乎「模型是否可用」，而它经 encode_text 间接用到 contrast_temp。
+        // 同时打印自检文本 "Hello" 在各温度下的幻和偏离度，用于找出 temp 的安全区间。
+        let hello_emb: Option<Vec<f32>> = enc.encode_embedding("Hello").ok();
+
+        // 对给定向量序列打印分布 + 余弦分位 + 分离度
+        let report = |tag: &str, vecs: &[LuoShuVector]| {
+            let mut dist = [0usize; 9];
+            for v in vecs {
+                let (mut bi, mut bv) = (0usize, f32::NEG_INFINITY);
+                for (i, &x) in v.values.iter().enumerate() {
+                    if x > bv {
+                        bv = x;
+                        bi = i;
+                    }
+                }
+                dist[bi] += 1;
+            }
+            let hit = dist.iter().filter(|&&c| c > 0).count();
+            let maxc = *dist.iter().max().unwrap_or(&0);
+            let mut cos: Vec<f32> = Vec::new();
+            for i in 0..vecs.len() {
+                for j in (i + 1)..vecs.len() {
+                    cos.push(vecs[i].cosine_similarity(&vecs[j]));
+                }
+            }
+            cos.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let q = |p: f32| cos[(((cos.len() - 1) as f32) * p) as usize];
+            let near_mean: f32 = near_pairs
+                .iter()
+                .map(|&(i, j)| vecs[i].cosine_similarity(&vecs[j]))
+                .sum::<f32>()
+                / near_pairs.len() as f32;
+            let mut far_sum = 0.0f32;
+            let mut far_cnt = 0usize;
+            for i in 0..vecs.len() {
+                for j in (i + 1)..vecs.len() {
+                    if !near_pairs.contains(&(i, j)) {
+                        far_sum += vecs[i].cosine_similarity(&vecs[j]);
+                        far_cnt += 1;
+                    }
+                }
+            }
+            let far_mean = far_sum / far_cnt.max(1) as f32;
+            eprintln!(
+                "[温度扫描] {} 分布={:?} 命中={}/9 最大单类={}",
+                tag, dist, hit, maxc
+            );
+            eprintln!(
+                "[温度扫描] {} 余弦 P10/P50/P90={:.4}/{:.4}/{:.4}  近义={:.4} 无关={:.4} 分离度={:+.4}",
+                tag,
+                q(0.10),
+                q(0.50),
+                q(0.90),
+                near_mean,
+                far_mean,
+                near_mean - far_mean
+            );
+        };
+
+        for &temp in &[0.20f32, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 1.00] {
+            let vecs = build_vecs(temp);
+            report(&format!("temp={:.2}", temp), &vecs);
+            // 自检文本的幻和偏离度：load() 内以该值是否 < 2.0 决定 ML 是否可用
+            if let Some(he) = &hello_emb {
+                let dev = build_one(he, temp).luoshu_deviation();
+                eprintln!(
+                    "[温度扫描] temp={:.2} 自检文本\"Hello\" 幻和偏离度={:.3}（自检门槛 < 2.0：{}）",
+                    temp,
+                    dev,
+                    if dev < 2.0 { "通过" } else { "拒绝" }
+                );
+            }
+        }
+    }
+
+    /// 诊断：**联想对的「BGE 给不出」程度**（产品价值判据的直接检验）
+    ///
+    /// ## 判据出处
+    ///
+    /// `memory_store.rs` §3.43.9 逐字：
+    /// > 「道体的价值判据不是'能否产出关联图'，而是'**产出的关联图中，
+    /// >   有多少条是 BGE 给不出的**'」
+    ///
+    /// 且明确警告过陷阱：若本层只是 BGE 的粗粒度版本，则它与 BGE 等价、无独立价值。
+    ///
+    /// ## 测什么
+    ///
+    /// 对每条记忆：
+    ///   - 在 **9 维结构空间**里取 top-3 邻居（= 结构视角给出的"联想对"）
+    ///   - 记录这些对在 **768 维 BGE 全库排名**中的分位
+    ///   - 同时记录 BGE **自身** top-3 邻居的分位，作为"零增量"基线
+    ///
+    /// **分位越高 = BGE 越排不出来 = 增量越大。**
+    /// 若两者接近，说明结构视图只是复刻 BGE —— 那这条路就没有价值，应停手。
+    #[cfg(feature = "ml")]
+    #[test]
+    fn diagnostic_bge_giveup_rate_ml() {
+        let enc = match LuoShuMlEncoder::load() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[BGE 给不出率] 跳过：ML 模型不可用（{}）", e);
+                return;
+            }
+        };
+
+        // 模拟真实记忆库：同一项目内主题分散、任意两条都可能相邻
+        let texts: [&str; 24] = [
+            "数据库连接池的最大连接数配置为 20",
+            "数据库连接池最大连接数设置成 20 个",
+            "查询性能优化",
+            "查询性能很差需要优化",
+            "我喜欢喝美式咖啡，不加糖",
+            "偏好美式咖啡不加糖",
+            "项目使用 PostgreSQL 数据库存储用户数据",
+            "前端使用 React 框架构建组件界面",
+            "医生建议每天服用两次降压药",
+            "周末去西湖散步顺便吃片儿川",
+            "服务器内存不足被 OOM Killer 杀掉",
+            "会议定在周三下午三点",
+            "把日志级别从 debug 调回 info",
+            "日志里出现了大量重复的 warning",
+            "用户反馈登录按钮点了没反应",
+            "登录成功后需要跳转到首页",
+            "这个接口的响应时间超过了 2 秒",
+            "接口返回 500 说明后端异常",
+            "缓存失效导致每次都查数据库",
+            "加一层 Redis 缓存能减轻数据库压力",
+            "部署脚本里写错了环境变量名",
+            "上线前必须先在预发环境验证一遍",
+            "这个名字取得太随意了，后面会看不懂",
+            "变量命名要能表达它的用途",
+        ];
+
+        let sem: Vec<Vec<f32>> = texts
+            .iter()
+            .filter_map(|t| enc.encode_embedding(t).ok())
+            .collect();
+        let st: Vec<LuoShuVector> = texts
+            .iter()
+            .filter_map(|t| enc.encode_text(t).ok())
+            .collect();
+        if sem.len() != texts.len() || st.len() != texts.len() {
+            eprintln!("[BGE 给不出率] 跳过：编码数量不足");
+            return;
+        }
+
+        let n = sem.len();
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let (mut d, mut na, mut nb) = (0.0f32, 0.0f32, 0.0f32);
+            for i in 0..a.len().min(b.len()) {
+                d += a[i] * b[i];
+                na += a[i] * a[i];
+                nb += b[i] * b[i];
+            }
+            if na > 1e-9 && nb > 1e-9 {
+                d / (na.sqrt() * nb.sqrt())
+            } else {
+                0.0
+            }
+        };
+
+        const TOP_K: usize = 3;
+        let mut struct_ranks: Vec<f32> = Vec::new();
+        let mut bge_ranks: Vec<f32> = Vec::new();
+
+        for i in 0..n {
+            // BGE 全库排名（降序），换算为分位（0 = 最相似，1 = 最不相似）
+            let mut by_sem: Vec<(usize, f32)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| (j, cos(&sem[i], &sem[j])))
+                .collect();
+            by_sem.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let denom = (n - 2).max(1) as f32;
+            let mut rank_of = std::collections::HashMap::new();
+            for (r, (j, _)) in by_sem.iter().enumerate() {
+                rank_of.insert(*j, r as f32 / denom);
+            }
+
+            // 9 维结构空间的 top-K 邻居 —— 这就是"结构视角给出的联想对"
+            let mut by_struct: Vec<(usize, f32)> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| (j, st[i].cosine_similarity(&st[j])))
+                .collect();
+            by_struct.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            for k in 0..TOP_K.min(by_struct.len()) {
+                if let Some(&r) = rank_of.get(&by_struct[k].0) {
+                    struct_ranks.push(r);
+                }
+            }
+            // 基线：BGE 自身 top-K（它们必然排在最前，分位≈0，"零增量"）
+            for k in 0..TOP_K.min(by_sem.len()) {
+                bge_ranks.push(rank_of[&by_sem[k].0]);
+            }
+        }
+
+        let median = |mut v: Vec<f32>| -> f32 {
+            if v.is_empty() {
+                return -1.0;
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let mean = |v: &[f32]| -> f32 {
+            if v.is_empty() {
+                -1.0
+            } else {
+                v.iter().sum::<f32>() / v.len() as f32
+            }
+        };
+
+        let sm = median(struct_ranks.clone());
+        let bm = median(bge_ranks.clone());
+        eprintln!(
+            "[BGE 给不出率] 结构联想对（9 维 top{}) 的 BGE 排名分位: 中位={:.4} 均值={:.4} 样本={}",
+            TOP_K,
+            sm,
+            mean(&struct_ranks),
+            struct_ranks.len()
+        );
+        eprintln!(
+            "[BGE 给不出率] BGE 自身 top{}        的 BGE 排名分位: 中位={:.4} 均值={:.4} 样本={}",
+            TOP_K,
+            bm,
+            mean(&bge_ranks),
+            bge_ranks.len()
+        );
+        eprintln!(
+            "[BGE 给不出率] 分位差 = {:.4}（越高说明结构联想越能给出 BGE 排不出来的关联；接近 0 则本层无独立价值）",
+            sm - bm
+        );
+    }
+
+    /// 测试：批量编码接口的**长度契约**（统计回退路径，无需 ML 模型）
+    ///
+    /// 契约：`encode_text_batch` 恒返回与输入等长的向量，空输入返回空。
+    /// 这是 `MemoryStore` 分块批量重算做 `zip` 对齐的前提——长度不等会静默丢条目。
+    #[test]
+    fn test_hybrid_encode_text_batch_length_contract() {
+        let encoder = HybridLuoShuEncoder::new_statistical();
+
+        // 空输入 → 空输出（不得 panic）
+        assert!(encoder.encode_text_batch(&[]).is_empty());
+
+        // 含空串：回退路径也必须逐条给出 9 维向量
+        let texts = ["数据库", "数据库配置", ""];
+        let out = encoder.encode_text_batch(&texts);
+        assert_eq!(out.len(), texts.len(), "批量输出条数必须与输入一致");
+        for v in &out {
+            assert_eq!(v.values.len(), 9);
+        }
+    }
+
+    /// 测试：批量编码与逐条编码的**一致性契约**（批量吞吐优化的正确性护栏）
+    ///
+    /// 判据：① 条数一致；② 每条向量的 argmax（决定 `mirror_project` 的八卦归属）
+    /// 与逐条编码一致；③ 数值差异在浮点容差内——批处理改变 GEMM 归约顺序，
+    /// 允许 ~1e-3 级差异，但**不得改变离散分类**（否则历史重分类会漂移）。
+    #[cfg(feature = "ml")]
+    #[test]
+    fn test_encode_text_batch_matches_single() {
+        let enc = match LuoShuMlEncoder::load() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[批量编码一致性] 跳过：ML 模型不可用（{}）", e);
+                return;
+            }
+        };
+
+        let texts: [&str; 5] = [
+            "数据库连接池的最大连接数配置为 20",
+            "前端使用 React 框架构建组件界面",
+            "周末去西湖散步顺便吃片儿川",
+            "把日志级别从 debug 调回 info",
+            "会议定在周三下午三点",
+        ];
+        // 本地 argmax（避免为测试引入额外依赖）
+        let argmax = |v: &[f32; 9]| -> usize {
+            let mut best = 0usize;
+            for i in 1..9 {
+                if v[i] > v[best] {
+                    best = i;
+                }
+            }
+            best
+        };
+
+        let batch = enc
+            .encode_text_batch(&texts, EncodeRole::Passage)
+            .expect("批量编码失败");
+        assert_eq!(batch.len(), texts.len());
+
+        for (i, t) in texts.iter().enumerate() {
+            let single = enc
+                .encode_text_role(t, EncodeRole::Passage)
+                .expect("单条编码失败");
+            assert_eq!(
+                argmax(&batch[i].values),
+                argmax(&single.values),
+                "第 {} 条（{}）批量/逐条 argmax 不一致",
+                i,
+                t
+            );
+            for k in 0..9 {
+                assert!(
+                    (batch[i].values[k] - single.values[k]).abs() < 1e-3,
+                    "第 {} 条维度 {} 差异过大: 批量={} 逐条={}",
+                    i,
+                    k,
+                    batch[i].values[k],
+                    single.values[k]
+                );
+            }
+        }
+    }
+
+    /// 测试：批量编码的边界输入（空串 / 超长文本）不 panic 且条数正确
+    ///
+    /// 覆盖异常路径：空串只有特殊 token、超长需截断到 512、批内长度不齐需 padding。
+    #[cfg(feature = "ml")]
+    #[test]
+    fn test_encode_text_batch_edge_inputs() {
+        let enc = match LuoShuMlEncoder::load() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[批量编码边界] 跳过：ML 模型不可用（{}）", e);
+                return;
+            }
+        };
+
+        let long = "长".repeat(2000);
+        let texts: Vec<&str> = vec!["", "短", long.as_str()];
+        let out = enc
+            .encode_text_batch(&texts, EncodeRole::Passage)
+            .expect("边界批量编码失败");
+        assert_eq!(out.len(), texts.len());
+        for v in &out {
+            assert_eq!(v.values.len(), 9);
+            assert!(v.values.iter().all(|x| x.is_finite()), "向量含非有限值");
+        }
+    }
+
+    /// 测试：跨线程并行编码的**工作线程数解析契约**（纯函数，无副作用）
+    ///
+    /// 判据：① 条目数 ≤1 时直接返回条目数（空/单条不启线程）；
+    /// ② 显式覆盖值生效且被 `[1, text_count]` 夹紧；
+    /// ③ 覆盖值非法（0）时回退到逻辑核数，同样被夹紧；
+    /// ④ 结果恒 ≤ text_count，绝不超出待编码条目数。
+    #[test]
+    fn test_resolve_encode_workers_bounds() {
+        // ① 退化输入：不启线程
+        assert_eq!(resolve_encode_workers(0, None), 0);
+        assert_eq!(resolve_encode_workers(1, None), 1);
+        assert_eq!(resolve_encode_workers(1, Some(8)), 1);
+
+        // ② 显式覆盖生效并夹紧
+        assert_eq!(resolve_encode_workers(100, Some(1)), 1);
+        assert_eq!(resolve_encode_workers(2, Some(4)), 2);
+        assert_eq!(resolve_encode_workers(12, Some(3)), 3);
+
+        // ③ 非法覆盖（0）→ 回退逻辑核数，仍夹紧到条目数以内
+        let auto_zero = resolve_encode_workers(64, Some(0));
+        assert!(
+            (1..=64).contains(&auto_zero),
+            "非法覆盖应回退到逻辑核数，实际 {}",
+            auto_zero
+        );
+
+        // ④ 不设覆盖时按逻辑核数，恒 ≤ 条目数
+        let auto = resolve_encode_workers(64, None);
+        assert!(
+            (1..=64).contains(&auto),
+            "自动解析应落在 [1, text_count]，实际 {}",
+            auto
+        );
+    }
+
+    /// 测试：保序分片执行器的**顺序与结果一致性契约**（无 ML 依赖，纯逻辑）
+    ///
+    /// 覆盖异常路径（HCSE L5）：
+    ///   - 正常路径：多线程结果与串行逐条结果完全一致且严格保序；
+    ///   - 错误路径：任一分片返回 `Err` 时整体返回 `Err`（不静默丢条目）；
+    ///   - 卡死路径：分片内 `panic` 被隔离为 `Err`，不炸掉调用方。
+    #[test]
+    fn test_map_chunks_ordered_contract() {
+        // 12 条 ≥ workers(4) ⇒ 必然走到多线程分支
+        let texts: Vec<&str> = vec![
+            "a",
+            "bb",
+            "ccc",
+            "dddd",
+            "eeeee",
+            "ffffff",
+            "ggggggg",
+            "hhhhhhhh",
+            "iiiiiiiii",
+            "jjjjjjjjjj",
+            "kkkkkkkkkkk",
+            "llllllllllll",
+        ];
+
+        // 正常路径：每片按元素自身长度产出 ⇒ 与分片方式无关，可验证保序
+        let serial: Vec<usize> = texts.iter().map(|s| s.len()).collect();
+        let parallel = map_chunks_ordered(&texts, 4, |chunk| {
+            Ok(chunk.iter().map(|s| s.len()).collect())
+        })
+        .expect("并行执行失败");
+        assert_eq!(parallel, serial, "并行结果必须与串行严格一致且保序");
+
+        // workers=1 → 串行等价
+        let single = map_chunks_ordered(&texts, 1, |chunk| {
+            Ok(chunk.iter().map(|s| s.len()).collect())
+        })
+        .expect("串行执行失败");
+        assert_eq!(single, serial, "workers=1 应与逐条串行一致");
+
+        // 空输入 → 空输出
+        let empty = map_chunks_ordered(&[] as &[&str], 4, |chunk| {
+            Ok(chunk.iter().map(|s| s.len()).collect::<Vec<usize>>())
+        })
+        .expect("空输入应返回空");
+        assert!(empty.is_empty());
+
+        // 错误路径：分片返回 Err → 整体 Err
+        let err = map_chunks_ordered(&texts, 4, |chunk| {
+            if chunk.iter().any(|s| s.starts_with('g')) {
+                Err(LrcError::new(ErrorKind::Timeout, "模拟分片超时"))
+            } else {
+                Ok(chunk.iter().map(|s| s.len()).collect())
+            }
+        });
+        assert!(err.is_err(), "分片失败必须向上传播，不得静默丢条目");
+
+        // 卡死路径：分片 panic → 隔离为 Err
+        let panicked = map_chunks_ordered(&texts, 4, |chunk| {
+            if chunk.iter().any(|s| s.starts_with('g')) {
+                panic!("模拟分片线程崩溃");
+            }
+            Ok(chunk.iter().map(|s| s.len()).collect())
+        });
+        assert!(panicked.is_err(), "分片 panic 必须被隔离为 Err");
+    }
+
+    /// 测试：跨线程并行批量编码与**单次批量前向**的一致性 + 保序契约
+    ///
+    /// 12 条 ≥ workers(4) ⇒ 真正走多线程；逐维差异须 <1e-3、argmax 须相等，
+    /// 否则历史重分类会因并行度不同而漂移（幂等性被破坏）。
+    #[cfg(feature = "ml")]
+    #[test]
+    fn test_encode_batch_parallel_matches_serial() {
+        let enc = match LuoShuMlEncoder::load() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[并行编码一致性] 跳过：ML 模型不可用（{}）", e);
+                return;
+            }
+        };
+
+        let texts: Vec<&str> = vec![
+            "数据库连接池的最大连接数配置为 20",
+            "前端使用 React 框架构建组件界面",
+            "周末去西湖散步顺便吃片儿川",
+            "把日志级别从 debug 调回 info",
+            "会议定在周三下午三点",
+            "用户登录接口需要校验 JWT 令牌",
+            "缓存穿透的兜底策略是布隆过滤器",
+            "把 CI 的构建产物缓存到 G 盘",
+            "洛书编码器使用幻和归一化约束",
+            "晚餐吃西红柿鸡蛋面",
+            "把提交历史压缩成单个 commit",
+            "雨天出门记得带伞",
+        ];
+
+        let argmax = |v: &[f32; 9]| -> usize {
+            let mut best = 0usize;
+            for i in 1..9 {
+                if v[i] > v[best] {
+                    best = i;
+                }
+            }
+            best
+        };
+
+        // 串行基线：一次性批量前向
+        let serial = enc
+            .encode_text_batch(&texts, EncodeRole::Passage)
+            .expect("串行批量编码失败");
+        // 并行：显式 4 线程
+        let parallel = encode_text_batch_parallel_with(&enc, &texts, 4).expect("并行批量编码失败");
+
+        assert_eq!(parallel.len(), texts.len());
+        for i in 0..texts.len() {
+            assert_eq!(
+                argmax(&parallel[i].values),
+                argmax(&serial[i].values),
+                "第 {} 条（{}）并行/串行 argmax 不一致",
+                i,
+                texts[i]
+            );
+            for k in 0..9 {
+                assert!(
+                    (parallel[i].values[k] - serial[i].values[k]).abs() < 1e-3,
+                    "第 {} 条维度 {} 差异过大: 并行={} 串行={}",
+                    i,
+                    k,
+                    parallel[i].values[k],
+                    serial[i].values[k]
+                );
+            }
+        }
     }
 }

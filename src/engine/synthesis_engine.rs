@@ -45,6 +45,85 @@ fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
 }
 
+/// 洛书合成·跨卦相似合并阈值（组质心余弦）
+///
+/// 硬八卦分类把「内容敏感」的洛书向量按 argmax 落到 8 个离散卦位。两条高度相似
+/// 的记忆若恰分居分类边界两侧（实测：近义文本余弦 ≈ 0.94，却分落「离」「坎」），
+/// 就会各自不足 `min_cluster` 而被漏合成——近义记忆退回 Jaccard 兜底，
+/// 削弱洛书几何合成这条**本体路径**的真实能力。
+///
+/// 因此对「不足 `min_cluster`」的卦组，按**组质心余弦**并入最相近的卦组：
+/// 只补回被硬分类切开的高相似记忆，达标卦组的既有合成结果不受影响。
+///
+/// 取值 0.75：显著高于「无关对」的洛书余弦（实测约 0.56），又低于「近义对」
+/// （实测约 0.94），可稳定分离二者。属 `enc-1c 阈值重标定`的校准对象，
+/// 后续按真实语料分布复核。
+const LUOSHU_NEIGHBOR_MERGE_COSINE: f32 = 0.75;
+
+/// 计算卦组质心向量（成员 `luoshu_vector` 的逐维均值；无有效向量返回 None）
+fn group_centroid(group: &[&Memory]) -> Option<LuoShuVector> {
+    let mut acc = [0.0f32; 9];
+    let mut n = 0usize;
+    for m in group {
+        if let Some(v) = m.luoshu_vector {
+            for (a, b) in acc.iter_mut().zip(v.iter()) {
+                *a += *b;
+            }
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return None;
+    }
+    for a in acc.iter_mut() {
+        *a /= n as f32;
+    }
+    Some(LuoShuVector { values: acc })
+}
+
+/// 两卦组的质心余弦（任一组无有效向量时返回 0）
+fn centroid_cosine(a: &[&Memory], b: &[&Memory]) -> f32 {
+    match (group_centroid(a), group_centroid(b)) {
+        (Some(ca), Some(cb)) => ca.cosine_similarity(&cb),
+        _ => 0.0,
+    }
+}
+
+/// 把「不足 `min_cluster`」的高相似卦组并回最相近的卦组。
+///
+/// 纯数据驱动、无副作用。卦组最多 8 个，故最坏开销 O(8² × 轮数) 可忽略。
+/// 合并方向：小组合并进大组（保留大组的卦位键，用于后续类别标签）。
+fn merge_undersized_bagua_groups(
+    mut groups: std::collections::HashMap<u8, Vec<&Memory>>,
+    min_cluster: usize,
+) -> std::collections::HashMap<u8, Vec<&Memory>> {
+    loop {
+        let keys: Vec<u8> = groups.keys().copied().collect();
+        let mut best: Option<(u8, u8, f32)> = None;
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                let (a, b) = (keys[i], keys[j]);
+                if groups[&a].len() >= min_cluster && groups[&b].len() >= min_cluster {
+                    continue; // 两组都达标：保持原样，不改动既有合成
+                }
+                let cos = centroid_cosine(&groups[&a], &groups[&b]);
+                if cos >= LUOSHU_NEIGHBOR_MERGE_COSINE && best.map_or(true, |(_, _, c)| cos > c) {
+                    best = Some((a, b, cos));
+                }
+            }
+        }
+        let Some((a, b, _)) = best else { break };
+        let (keep, remove) = if groups[&a].len() >= groups[&b].len() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let moved = groups.remove(&remove).expect("刚查过的组必然存在");
+        groups.get_mut(&keep).expect("保留组必然存在").extend(moved);
+    }
+    groups
+}
+
 /// 合成引擎配置
 #[derive(Debug, Clone)]
 pub struct SynthesisConfig {
@@ -530,6 +609,10 @@ impl SynthesisEngine {
     /// 组内不设检查点可避免侵入受保护的核心算法；组间检查已足以把
     /// "超时后跑完所有分组"降为"最多多跑一个分组"。
     ///
+    /// 分组在原始八卦分组基础上做一次**跨卦相似合并**：把「成员不足 `min_cluster`」
+    /// 且与某组质心余弦 ≥ `LUOSHU_NEIGHBOR_MERGE_COSINE` 的小组并回该组，
+    /// 以修复硬八卦分类在边界翻转时把近义记忆拆散、导致漏合成的问题。
+    ///
     /// 返回 `(plan, cancelled)`：`cancelled=true` 时 `plan` 为**不完整计划**，调用方不得写回。
     pub fn plan_luoshu_cancellable(
         &self,
@@ -557,6 +640,12 @@ impl SynthesisEngine {
                 groups.entry(idx).or_default().push(m);
             }
         }
+
+        // 跨卦相似合并：硬八卦分类会把「内容高度相似」的记忆按 argmax 切到
+        // 不同卦位（分类边界翻转），使近义记忆各自不足 min_cluster 而被漏合成。
+        // 此处按组质心余弦把「不足 min_cluster」的小组并回最相近的卦组，
+        // 只补回被硬分类切开的高相似记忆，达标卦组的既有合成结果不受影响。
+        let groups = merge_undersized_bagua_groups(groups, self.config.min_cluster);
 
         // 去重集合：提前构建，避免循环内重复构建（性能优化 P1-4）
         let existing_sources: std::collections::HashSet<Vec<String>> = all

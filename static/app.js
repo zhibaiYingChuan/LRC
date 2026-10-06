@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.9.9';
+const APP_VERSION = '0.9.10';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -179,6 +179,7 @@ function statusBadge(status) {
   const map = {
     healthy: 'healthy', warning: 'warning', critical: 'critical',
     degraded: 'warning', oscillating: 'warning', drifting: 'warning',
+    misaligned: 'warning',
     frozen: 'critical', overloaded: 'critical',
   };
   // ★v0.9.9 修复（交互审计 P1）：文本映射。
@@ -194,6 +195,7 @@ function statusBadge(status) {
     degraded: '降级运行',
     oscillating: '调整中',
     drifting: '优化中',
+    misaligned: '结构偏离',
     frozen: '已暂停',
     overloaded: '繁忙',
     unknown: '未知',
@@ -11302,13 +11304,14 @@ async function loadSysStatusFloat() {
         degraded: '运行中',
         oscillating: '调整中',
         drifting: '优化中',
+        misaligned: '结构偏离',
         frozen: '已暂停',
         overloaded: '繁忙',
       };
       sysModeEl.textContent = modeMap[mode] || mode;
       if (mode === 'healthy') {
         sysModeEl.className = 'sys-status-value healthy';
-      } else if (mode === 'degraded' || mode === 'oscillating' || mode === 'drifting') {
+      } else if (mode === 'degraded' || mode === 'oscillating' || mode === 'drifting' || mode === 'misaligned') {
         sysModeEl.className = 'sys-status-value warning';
       } else {
         sysModeEl.className = 'sys-status-value critical';
@@ -11425,6 +11428,7 @@ async function loadSystemStatusPage() {
         degraded: '运行中',
         oscillating: '调整中',
         drifting: '优化中',
+        misaligned: '结构偏离',
         frozen: '已暂停',
         overloaded: '繁忙',
       };
