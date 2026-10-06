@@ -121,6 +121,11 @@ impl From<crate::errors::LrcError> for EmbedError {
 ///     Ok(())
 /// }
 /// ```
+///
+/// 说明：rustc 1.99 起 clippy 新增「double must use」lint，会命中 async_trait
+/// 宏展开出的 must_use 属性（宏生成，源码无法移除），属工具链与属性宏交互的已知
+/// 误报，故此处显式 allow；待 async-trait 与 clippy 收敛后可移除。
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Embedder: Send + Sync {
     /// 将文本数组编码为高维向量数组
