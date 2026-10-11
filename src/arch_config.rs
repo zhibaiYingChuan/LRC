@@ -95,8 +95,9 @@ pub struct EncoderArchConfig {
 impl Default for SynthesisArchConfig {
     fn default() -> Self {
         Self {
-            min_cluster: 3,
-            similarity_threshold: 0.4,
+            // v0.9.11（G9 / CR-24）：改用合成阈值的单一真源（修前硬编码 3 / 0.4）
+            min_cluster: crate::engine::synthesis_engine::DEFAULT_MIN_CLUSTER,
+            similarity_threshold: crate::engine::synthesis_engine::DEFAULT_SIMILARITY,
             confidence_threshold: 0.3,
             use_categorical_synthesis: true,
             use_jaccard_synthesis: true,

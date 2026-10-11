@@ -83,8 +83,21 @@ pub struct SourceReport {
 /// 2. G:\data\code-memory\（老版本路径）
 /// 3. ~/.loong-recall/global/data/（global 目录，仅作为合并目标）
 pub fn scan_legacy_sources() -> Vec<MigrationSource> {
+    scan_legacy_sources_in(&home_dir_or_dot())
+}
+
+/// home 解析（`None` 时退当前目录，保持既有行为）
+fn home_dir_or_dot() -> PathBuf {
+    dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// [`scan_legacy_sources`] 的**可注入家目录内核**（v0.9.11 / G7 / CR-45）。
+///
+/// 原实现把 `dirs_next::home_dir()` 写死在函数体内 ⇒ 一测就会去扫**真实**家目录，
+/// 这条"迁移源发现"逻辑因此长期 0 覆盖。params 化后测试只指向临时目录。
+fn scan_legacy_sources_in(home: &Path) -> Vec<MigrationSource> {
     let mut sources = Vec::new();
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let home = home.to_path_buf();
 
     // 1. 扫描项目指纹目录
     let projects_dir = home.join(".loong-recall").join("projects");
@@ -180,6 +193,28 @@ fn get_id_and_updated(mem: &serde_json::Value) -> (String, String) {
 /// 4. 写入 global 目录
 /// 5. 非 global 源文件重命名 .bak
 pub fn execute_migration() -> MigrationReport {
+    let report = execute_migration_in(&home_dir_or_dot());
+    // 数据操作日志只在**真实**入口记录：`execute_migration_in` 会被测试以临时家目录调用，
+    // 不应把测试运行写进用户的 `~/.loong-recall/data_operations.log`。
+    if report.success {
+        let details = format!(
+            "扫描 {} 处源，合并 {} 条记忆至 global（新增 {}，备份 {} 文件）",
+            report.sources_scanned,
+            report.global_after,
+            report.memories_added,
+            report.files_backed_up
+        );
+        crate::data_log::log_operation(crate::data_log::OperationType::Migrate, &details);
+    }
+    report
+}
+
+/// [`execute_migration`] 的**可注入家目录内核**（v0.9.11 / G7 / CR-45）。
+///
+/// 迁移会**写** `global/data/memories.json` 并给迁移源打 `.json.bak` ——
+/// 若不可注入，测试就会写真实的记忆库与备份，故必须先拆出本函数。
+fn execute_migration_in(home: &Path) -> MigrationReport {
+    let home = home.to_path_buf();
     let mut report = MigrationReport {
         sources_scanned: 0,
         sources: Vec::new(),
@@ -192,7 +227,7 @@ pub fn execute_migration() -> MigrationReport {
         error: None,
     };
 
-    let sources = scan_legacy_sources();
+    let sources = scan_legacy_sources_in(&home);
     report.sources_scanned = sources.len();
 
     // 按 id 去重的记忆池：id -> (记忆, 来源, updated_at)
@@ -238,6 +273,11 @@ pub fn execute_migration() -> MigrationReport {
                 if source.is_global {
                     report.global_before = count;
                 }
+
+                // v0.9.11（G7 / CR-45）：**新增测试当场抓到的真实缺陷** ——
+                // `duplicates_skipped` 此前只在初始化时置 0、**从未被赋值**，
+                // 于是对外 `/v1/migrate` 响应里"跳过多少重复"永远是 0（误导调用方以为没去重）。
+                report.duplicates_skipped += duplicates;
 
                 report.sources.push(SourceReport {
                     data_dir: source.data_dir.to_string_lossy().to_string(),
@@ -288,7 +328,6 @@ pub fn execute_migration() -> MigrationReport {
     }
 
     // 写入 global 目录
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let global_dir = home.join(".loong-recall").join("global").join("data");
     if let Err(e) = std::fs::create_dir_all(&global_dir) {
         report.error = Some(format!("创建 global 目录失败: {}", e));
@@ -369,19 +408,6 @@ pub fn execute_migration() -> MigrationReport {
     }
 
     report.success = report.error.is_none();
-
-    // v0.8.0 "归一"：记录数据操作日志
-    if report.success {
-        let details = format!(
-            "扫描 {} 处源，合并 {} 条记忆至 global（新增 {}，备份 {} 文件）",
-            report.sources_scanned,
-            report.global_after,
-            report.memories_added,
-            report.files_backed_up
-        );
-        crate::data_log::log_operation(crate::data_log::OperationType::Migrate, &details);
-    }
-
     report
 }
 
@@ -455,5 +481,132 @@ mod tests {
         let dir = std::env::temp_dir().join("lrc_migration_test_nonexist");
         let memories = read_memories(&dir).unwrap();
         assert_eq!(memories.len(), 0);
+    }
+
+    // ════ v0.9.11（G7 / CR-45）：迁移的**端到端**用例（此前 `scan_legacy_sources` /
+    // `execute_migration` 因把家目录写死而 0 覆盖）════
+
+    /// 在家目录下造一个"项目指纹数据源"
+    fn write_project_source(home: &Path, fingerprint: &str, json: &str) -> std::path::PathBuf {
+        let data = home
+            .join(".loong-recall")
+            .join("projects")
+            .join(fingerprint)
+            .join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("memories.json"), json).unwrap();
+        data
+    }
+
+    /// 扫描必须认出「项目指纹数据源」与「global 目录」，且 global 被标记为合并目标
+    #[test]
+    fn scan_legacy_sources_in_finds_project_and_global() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        let data = write_project_source(home, "fp-abc", r#"[{"id":"a"}]"#);
+        let global_data = home.join(".loong-recall").join("global").join("data");
+        std::fs::create_dir_all(&global_data).unwrap();
+        std::fs::write(global_data.join("memories.json"), r#"[{"id":"g"}]"#).unwrap();
+
+        let sources = scan_legacy_sources_in(home);
+        assert!(
+            sources.iter().any(|s| s.data_dir == data && !s.is_global),
+            "必须认出项目指纹数据源：{sources:?}"
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.data_dir == global_data && s.is_global),
+            "global 目录必须被标记为合并目标（is_global=true）：{sources:?}"
+        );
+    }
+
+    /// 空家目录 ⇒ 不得凭空造出数据源
+    #[test]
+    fn scan_legacy_sources_in_returns_empty_for_empty_home() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sources = scan_legacy_sources_in(tmp.path());
+        // 机器上可能真的存在 G:\data\code-memory（硬编码的老路径），
+        // 故只断言"不会凭空造出项目指纹/global 源"。
+        assert!(
+            !sources.iter().any(|s| s.is_global),
+            "无 global/data/memories.json 时不得报告 global 源"
+        );
+        assert!(
+            !sources.iter().any(|s| s.source_type.contains("项目指纹")),
+            "无项目目录时不得报告项目指纹源：{sources:?}"
+        );
+    }
+
+    /// 迁移必须：合并 legacy ∪ global、按 id 去重、legacy 源改名 `.json.bak`
+    #[test]
+    fn execute_migration_in_merges_dedups_and_backs_up_legacy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        let legacy = write_project_source(
+            home,
+            "fp-legacy",
+            r#"[{"id":"a","content":"A","updated_at":"2026-01-01T00:00:00Z"},
+                {"id":"b","content":"B","updated_at":"2026-01-02T00:00:00Z"}]"#,
+        );
+        let global_data = home.join(".loong-recall").join("global").join("data");
+        std::fs::create_dir_all(&global_data).unwrap();
+        // global 里已有一条**同 id** 的记忆 ⇒ 必须去重，不得变成 3 条
+        std::fs::write(
+            global_data.join("memories.json"),
+            r#"[{"id":"a","content":"A-global","updated_at":"2026-01-03T00:00:00Z"}]"#,
+        )
+        .unwrap();
+
+        let report = execute_migration_in(home);
+        assert!(report.success, "迁移应成功：{:?}", report.error);
+        assert_eq!(report.global_before, 1, "应识别出 global 原有 1 条");
+        assert_eq!(report.global_after, 2, "合并去重后应为 2 条（a + b）");
+        assert_eq!(report.duplicates_skipped, 1, "同 id 的 1 条应被记为重复");
+
+        let merged: Vec<serde_json::Value> = serde_json::from_str(
+            &std::fs::read_to_string(global_data.join("memories.json")).unwrap(),
+        )
+        .unwrap();
+        let mut ids: Vec<String> = merged
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+
+        assert!(
+            !legacy.join("memories.json").exists(),
+            "迁移后 legacy 源应被改名（避免下次迁移重复计入）"
+        );
+        assert!(
+            legacy.join("memories.json.bak").exists(),
+            "legacy 源必须留有 .json.bak 备份（可回滚）"
+        );
+    }
+
+    /// 迁移源已有 `.json.bak` ⇒ **预检拒绝**（防止覆盖上一次迁移的备份）
+    #[test]
+    fn execute_migration_in_refuses_when_backup_target_already_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path();
+        let legacy = write_project_source(home, "fp-dup", r#"[{"id":"a"}]"#);
+        std::fs::write(legacy.join("memories.json.bak"), r#"[{"id":"old"}]"#).unwrap();
+
+        let report = execute_migration_in(home);
+        assert!(!report.success, "备份目标已存在时必须拒绝迁移");
+        assert!(
+            report
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("备份目标已存在"),
+            "应指明原因，实际 {:?}",
+            report.error
+        );
+        assert!(
+            legacy.join("memories.json").exists(),
+            "拒绝之后 legacy 源必须原封不动"
+        );
     }
 }

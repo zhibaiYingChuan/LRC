@@ -158,35 +158,22 @@ impl PostgresPersistence {
 
     /// 自动创建表（幂等操作）
     async fn migrate(&self) -> Result<(), PersistenceError> {
-        let memories_table = format!(
-            "CREATE TABLE IF NOT EXISTS {}memories (\
-                id TEXT PRIMARY KEY, \
-                content TEXT NOT NULL, \
-                memory_type TEXT NOT NULL DEFAULT 'fact', \
-                project TEXT, \
-                tags JSONB DEFAULT '[]', \
-                importance SMALLINT DEFAULT 5, \
-                version INTEGER DEFAULT 1, \
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-                last_accessed TIMESTAMPTZ NOT NULL DEFAULT NOW(), \
-                ttl_days INTEGER, \
-                luoshu_vector JSONB, \
-                bagua_index SMALLINT, \
-                bagua_category TEXT, \
-                topological_depth REAL DEFAULT 0.5, \
-                privacy_level TEXT DEFAULT 'user', \
-                session_id TEXT, \
-                user_id TEXT, \
-                event_id TEXT, \
-                entities JSONB DEFAULT '[]', \
-                source TEXT, \
-                source_ids JSONB DEFAULT '{{}}', \
-                confidence REAL, \
-                version_history JSONB DEFAULT '{{}}'\
-            )",
+        // v0.9.11（G2）：DDL 改由**单一真源** `persistence::fields` 派生。
+        // 手写列清单曾导致 `information_gain` / `resolution` / `daoti_preview_*`
+        // 这 5 个字段**从未建列**（CR-08），且 `source_ids` / `version_history`
+        // 的默认值被 `format!` 误渲染成 `'{}'`（空**对象**，而实际承载数组）。
+        let memories_table =
+            crate::persistence::fields::create_table_sql(&format!("{}memories", self.table_prefix));
+
+        // v0.9.11（G2）：`CREATE TABLE IF NOT EXISTS` **不会给已存在的表补列**
+        // ⇒ 必须逐列 `ADD COLUMN IF NOT EXISTS`，否则老部署永远拿不到新字段
+        //   （这是 `information_gain` 等 5 列"从未生效"的第二个原因）。
+        // 语句由同一真源派生，且 `IF NOT EXISTS` 幂等 ⇒ 可安全重复执行。
+        // **注意顺序**：必须在 `CREATE TABLE` **执行之后**（否则表不存在会报错）。
+        let add_columns = crate::persistence::fields::add_missing_columns_sql(&format!(
+            "{}memories",
             self.table_prefix
-        );
+        ));
 
         let chunks_table = format!(
             "CREATE TABLE IF NOT EXISTS {}chunks (\
@@ -211,6 +198,16 @@ impl PostgresPersistence {
                     format!("创建 memories 表失败: {}", e),
                 ))
             })?;
+
+        // v0.9.11（G2）：建表后**逐列补列**（幂等），保证老库也能拿到新字段。
+        for stmt in &add_columns {
+            sqlx::query(stmt).execute(&self.pool).await.map_err(|e| {
+                PersistenceError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("补充 memories 表列失败: {}", e),
+                ))
+            })?;
+        }
 
         sqlx::query(&chunks_table)
             .execute(&self.pool)
@@ -290,6 +287,12 @@ impl PostgresPersistence {
                     "reason": v.reason,
                 })
             }).collect::<Vec<_>>(),
+            // v0.9.11（G2）：以下 5 个字段此前**未参与持久化**（写不落库、读不回来）
+            "information_gain": memory.information_gain,
+            "resolution": memory.resolution,
+            "daoti_preview_gua": memory.daoti_preview_gua,
+            "daoti_preview_bagua": memory.daoti_preview_bagua,
+            "daoti_preview_version": memory.daoti_preview_version,
         })
     }
 
@@ -342,6 +345,13 @@ impl PostgresPersistence {
         let version_history: Vec<crate::memory_types::MemoryVersion> = version_history_json
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
+        // v0.9.11（G2）：补读此前未持久化的 5 个字段（旧库无此列时 `.ok()` 落回默认）
+        let information_gain: Option<f32> = row.try_get("information_gain").ok().flatten();
+        let resolution: Option<String> = row.try_get("resolution").ok().flatten();
+        let daoti_preview_gua: Option<String> = row.try_get("daoti_preview_gua").ok().flatten();
+        let daoti_preview_bagua: Option<String> = row.try_get("daoti_preview_bagua").ok().flatten();
+        let daoti_preview_version: Option<String> =
+            row.try_get("daoti_preview_version").ok().flatten();
 
         let mut memory = Memory::new(
             content,
@@ -369,6 +379,14 @@ impl PostgresPersistence {
         memory.source_ids = source_ids;
         memory.confidence = confidence;
         memory.version_history = version_history;
+        // v0.9.11（G2）：补齐此前未持久化的 5 个字段
+        memory.information_gain = information_gain;
+        if let Some(r) = resolution {
+            memory.resolution = r;
+        }
+        memory.daoti_preview_gua = daoti_preview_gua;
+        memory.daoti_preview_bagua = daoti_preview_bagua;
+        memory.daoti_preview_version = daoti_preview_version;
 
         Ok(memory)
     }
@@ -480,56 +498,60 @@ impl Persistence for PostgresPersistence {
         let table = format!("{}memories", self.table_prefix);
 
         self.block_on_async(async move {
-            sqlx::query(&format!(
-                "INSERT INTO {} (id, content, memory_type, project, tags, importance, version, \
-                 created_at, updated_at, last_accessed, ttl_days, luoshu_vector, bagua_index, \
-                 bagua_category, topological_depth, privacy_level, session_id, user_id, \
-                 event_id, entities, \
-                 source, source_ids, confidence, version_history) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24) \
-                 ON CONFLICT (id) DO UPDATE SET \
-                 content = EXCLUDED.content, \
-                 memory_type = EXCLUDED.memory_type, \
-                 importance = EXCLUDED.importance, \
-                 version = EXCLUDED.version, \
-                 updated_at = EXCLUDED.updated_at, \
-                 last_accessed = EXCLUDED.last_accessed, \
-                 luoshu_vector = EXCLUDED.luoshu_vector, \
-                 event_id = EXCLUDED.event_id, \
-                 entities = EXCLUDED.entities, \
-                 topological_depth = EXCLUDED.topological_depth",
-                table
-            ))
-            .bind(row["id"].as_str().unwrap_or(""))
-            .bind(row["content"].as_str().unwrap_or(""))
-            .bind(row["memory_type"].as_str().unwrap_or("fact"))
-            .bind(row["project"].as_str())
-            .bind(serde_json::to_string(&row["tags"]).unwrap_or_default())
-            .bind(row["importance"].as_i64().unwrap_or(5) as i16)
-            .bind(row["version"].as_i64().unwrap_or(1) as i32)
-            .bind(row["created_at"].as_str().map(|s| s.to_string()))
-            .bind(row["updated_at"].as_str().map(|s| s.to_string()))
-            .bind(row["last_accessed"].as_str().map(|s| s.to_string()))
-            .bind(row["ttl_days"].as_i64().map(|v| v as i32))
-            .bind(serde_json::to_string(&row["luoshu_vector"]).unwrap_or_default())
-            .bind(row["bagua_index"].as_i64().map(|v| v as i16))
-            .bind(row["bagua_category"].as_str().map(|s| s.to_string()))
-            .bind(row["topological_depth"].as_f64().unwrap_or(0.5) as f32)
-            .bind(row["privacy_level"].as_str().unwrap_or("user"))
-            .bind(row["session_id"].as_str().map(|s| s.to_string()))
-            .bind(row["user_id"].as_str().map(|s| s.to_string()))
-            .bind(row["event_id"].as_str().map(|s| s.to_string()))
-            .bind(serde_json::to_string(&row["entities"]).unwrap_or_default())
-            .bind(row["source"].as_str().map(|s| s.to_string()))
-            .bind(serde_json::to_string(&row["source_ids"]).unwrap_or_default())
-            .bind(row["confidence"].as_f64().map(|v| v as f32))
-            .bind(serde_json::to_string(&row["version_history"]).unwrap_or_default())
-            .execute(&pool)
-            .await
-            .map_err(|e| PersistenceError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("保存记忆失败: {}", e),
-            )))?;
+            // v0.9.11（G2）：列清单 / 占位符 / upsert 的 SET 子句**全部由单一真源派生**。
+            // 此前 SET 子句**手写且只覆盖 10 列** ⇒ 更新既有记忆时
+            // `project`/`tags`/`created_at`/`privacy_level`/`session_id`/`user_id`/
+            // `source`/`source_ids`/`confidence`/`version_history` 等**静默丢弃**（CR-07）。
+            // 派生后"漏列"在构造上不可能发生。
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT ({}) DO UPDATE SET {}",
+                table,
+                crate::persistence::fields::insert_columns_sql(),
+                crate::persistence::fields::insert_placeholders_sql(),
+                crate::persistence::fields::MEMORY_PRIMARY_KEY,
+                crate::persistence::fields::upsert_set_clause_sql(),
+            );
+            sqlx::query(&sql)
+                .bind(row["id"].as_str().unwrap_or(""))
+                .bind(row["content"].as_str().unwrap_or(""))
+                .bind(row["memory_type"].as_str().unwrap_or("fact"))
+                .bind(row["project"].as_str())
+                .bind(serde_json::to_string(&row["tags"]).unwrap_or_default())
+                .bind(row["importance"].as_i64().unwrap_or(5) as i16)
+                .bind(row["version"].as_i64().unwrap_or(1) as i32)
+                .bind(row["created_at"].as_str().map(|s| s.to_string()))
+                .bind(row["updated_at"].as_str().map(|s| s.to_string()))
+                .bind(row["last_accessed"].as_str().map(|s| s.to_string()))
+                .bind(row["ttl_days"].as_i64().map(|v| v as i32))
+                .bind(serde_json::to_string(&row["luoshu_vector"]).unwrap_or_default())
+                .bind(row["bagua_index"].as_i64().map(|v| v as i16))
+                .bind(row["bagua_category"].as_str().map(|s| s.to_string()))
+                .bind(row["topological_depth"].as_f64().unwrap_or(0.5) as f32)
+                .bind(row["privacy_level"].as_str().unwrap_or("user"))
+                .bind(row["session_id"].as_str().map(|s| s.to_string()))
+                .bind(row["user_id"].as_str().map(|s| s.to_string()))
+                .bind(row["event_id"].as_str().map(|s| s.to_string()))
+                .bind(serde_json::to_string(&row["entities"]).unwrap_or_default())
+                .bind(row["source"].as_str().map(|s| s.to_string()))
+                .bind(serde_json::to_string(&row["source_ids"]).unwrap_or_default())
+                .bind(row["confidence"].as_f64().map(|v| v as f32))
+                .bind(serde_json::to_string(&row["version_history"]).unwrap_or_default())
+                // v0.9.11（G2）追加：单一真源末尾新增的 5 个字段。
+                // **绑定顺序必须与 `fields::MEMORY_FIELDS` 完全一致**，否则会写到错列
+                // （守卫测试 `insert_columns_and_placeholders_are_aligned` 校验数量一致）。
+                .bind(row["information_gain"].as_f64().map(|v| v as f32))
+                .bind(row["resolution"].as_str().unwrap_or("detailed"))
+                .bind(row["daoti_preview_gua"].as_str().map(|s| s.to_string()))
+                .bind(row["daoti_preview_bagua"].as_str().map(|s| s.to_string()))
+                .bind(row["daoti_preview_version"].as_str().map(|s| s.to_string()))
+                .execute(&pool)
+                .await
+                .map_err(|e| {
+                    PersistenceError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("保存记忆失败: {}", e),
+                    ))
+                })?;
             Ok(())
         })
     }

@@ -1466,10 +1466,11 @@ mod tests {
     /// 用例都要改**进程级**环境变量 —— 并发时会互相覆盖（实测：
     /// `gate_off_skips_without_touching_store` 因另一个用例设了 gate=1 而假失败）。
     /// 故所有改环境变量的用例先取本锁，把它们串行化。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    // v0.9.11（G6 / CR-20）：**不再自持锁**，改用全 crate 唯一锁。
+    // 各模块自持锁的致命点：**它们互不排斥** ⇒ "跨模块改同一变量"的竞态依旧存在，
+    // 只是从"必现"变成"偶发"（更难查）。故此处只做委托。
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_env::lock()
     }
 
     /// 构造一条指定母卦、指定未访问天数的记忆。

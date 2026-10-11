@@ -235,6 +235,18 @@ impl PrivacyLevel {
 ///
 /// 这是面向 AI 助手的通用永久记忆单元，不局限于代码。
 /// 通过 MCP 协议暴露给 AI 助手进行读写操作。
+///
+/// ## 关于「本结构没有 `schema_version` 字段」（v0.9.11 / CR-44 显式声明）
+///
+/// 审查清单曾建议为每条记忆增加 `schema_version`。**本仓有意不引入**，原因：
+/// ① 格式版本由**导出信封** `ExportData.version`（`"2.0"`）承载；JSON 后端以
+///    `serde` derive 为**唯一真源**（字段增删即格式变更，无第二处需同步）；
+/// ② 结构化后端（Postgres）的**列—写—读一致性**已由 `persistence::fields`
+///    的字段矩阵守卫按构造保证（CR-07/CR-08），无需再逐条打版本号；
+/// ③ 逐条版本号会**引入第二真源**：一旦某条记录的 `schema_version` 与实际字段
+///    形态不一致，读者必须决定"信谁"——这正是本项目反复出现的缺陷模式。
+/// 若未来出现**需要逐条迁移**的破坏性格式变更，正确做法是升级**信封版本**并在
+/// 加载边界做一次性迁移，而非在每条记录里内嵌版本号。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
     /// 唯一标识符（UUID v4）
@@ -327,7 +339,13 @@ pub struct Memory {
     #[serde(default = "default_topological_depth")]
     pub topological_depth: f32,
     /// 版本号（用于冲突解决追踪，每次修正 +1）
-    #[serde(default)]
+    ///
+    /// **缺省必须为 1 而非 0**（v0.9.11 / CR-43）：一条记忆自诞生即处于"第 1 版"，
+    /// `0` 在本域内不是一个合法版本号。此前 `#[serde(default)]` 会把"字段缺失"
+    /// 静默降级为 `0`，于是"真·初版"（应为 1）与"旧数据丢失该字段"（也是 0）
+    /// **无法区分**，且后续 `version + 1` 会产出 `1`，与真实初版撞号。
+    /// 现以命名默认函数显式钉为 1：缺失仍可反序列化（向后兼容），但语义正确。
+    #[serde(default = "default_version")]
     pub version: u32,
     /// 历史版本内容列表（仅保留最近 5 个版本，用于版本回溯）
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -427,6 +445,14 @@ fn default_resolution() -> String {
     "detailed".to_string() // 默认原始具体记忆
 }
 
+/// `Memory::version` 的缺省值（v0.9.11 / CR-43）：一条记忆自诞生即"第 1 版"。
+///
+/// 独立成命名函数而非 `#[serde(default)]`（后者给 `0`）的原因见 `version` 字段文档：
+/// `0` 不是合法版本号，且会与"字段丢失"混淆。
+fn default_version() -> u32 {
+    1
+}
+
 impl Memory {
     /// 创建新的记忆项
     pub fn new(
@@ -500,6 +526,20 @@ impl Memory {
         self.privacy_level = level;
         self.session_id = session_id;
         self.user_id = user_id;
+        self
+    }
+
+    /// 设置**创建时间**（保留"源时间"）。
+    ///
+    /// ## 为什么需要它
+    /// `Memory::new` 把 `created_at` 固定为 `Utc::now()`，于是"导入备份 / 迁移历史记忆"
+    /// 只能得到**摄入时刻**，原始发生时间被永久丢弃——而 `/v1/memories/remember` 的定位
+    /// 恰恰是「导入恢复用」。缺了这条通路，日期、间隔与事件顺序类推理都失去时间依据。
+    ///
+    /// 本方法只供**外部可信来源**（备份文件、上游系统的源时间戳）显式回填；
+    /// 常规写入仍走 `Utc::now()`，既有行为零变更。
+    pub fn with_created_at(mut self, created_at: DateTime<Utc>) -> Self {
+        self.created_at = created_at;
         self
     }
 
@@ -808,6 +848,38 @@ mod tests {
         assert_eq!(restored.memory_type, m.memory_type);
         assert_eq!(restored.importance, m.importance);
         assert_eq!(restored.ttl_days, m.ttl_days);
+    }
+
+    /// v0.9.11（CR-43）：`Memory::version` 缺省必须是 **1**，而非 `#[serde(default)]` 的 0。
+    ///
+    /// 鉴别力：把 `#[serde(default = "default_version")]` 退回裸 `#[serde(default)]`
+    /// 时本用例失败（得 0）——证明它真能钉住该语义而非恒真。
+    #[test]
+    fn memory_version_defaults_to_one_not_zero() {
+        let mut value = serde_json::to_value(Memory::new(
+            "测试缺省版本".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        ))
+        .expect("序列化失败");
+        value
+            .as_object_mut()
+            .expect("Memory 应为 JSON 对象")
+            .remove("version");
+        // 前置校验：确认 version 字段确实已被移除，否则本用例断言无意义。
+        assert!(
+            value.get("version").is_none(),
+            "测试前提：version 字段应已移除"
+        );
+
+        let restored: Memory = serde_json::from_value(value).expect("缺失 version 应仍可反序列化");
+        assert_eq!(
+            restored.version, 1,
+            "缺省 version 必须是 1（合法初版）；0 会把『真·初版』与『字段丢失』混为一谈"
+        );
     }
 
     #[test]

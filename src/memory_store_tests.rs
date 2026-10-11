@@ -26,6 +26,46 @@ mod tests {
         (dir, MemoryStore::new(p))
     }
 
+    /// ★CR-42：**别的进程写入后，本进程必须能看到**（不能无限期读陈旧缓存）。
+    ///
+    /// 模拟方式：绕过 store 的缓存与失效机制，**直接改磁盘上的 `memories.json`
+    /// **（等价于"另一个进程写了一份新数据"，本进程收不到任何通知）。
+    ///
+    /// 修前：外层缓存只在**自身**写操作后置脏 ⇒ 这里会一直返回 1 条，用户表现为
+    /// "我明明刚记过，怎么搜不到"。
+    /// 修后：`source_fingerprint`（mtime + 长度）变化即触发重载 ⇒ 看到 2 条。
+    #[test]
+    fn cache_sees_writes_made_by_another_process() {
+        use std::fs;
+        let (dir, mut store) = make_store();
+        store
+            .remember(make_test_memory("本进程写入", MemoryType::Fact))
+            .expect("写入应成功");
+        assert_eq!(
+            store.total_count().expect("应取到总数"),
+            1,
+            "前置：先有 1 条"
+        );
+
+        // —— 模拟另一进程：直接改磁盘文件（复制既有对象，保证字段完整可反序列化）——
+        let path = dir.path().join("memories.json");
+        let raw = fs::read_to_string(&path).expect("数据文件应存在");
+        let mut arr: Vec<serde_json::Value> = serde_json::from_str(&raw).expect("应是 JSON 数组");
+        let mut external = arr[0].clone();
+        external["id"] = serde_json::json!("external-proc-1");
+        external["content"] = serde_json::json!("另一进程写入的记忆");
+        arr.push(external);
+        fs::write(&path, serde_json::to_string(&arr).expect("应可序列化")).expect("外部写入应成功");
+
+        assert_eq!(
+            store.total_count().expect("应取到总数"),
+            2,
+            "必须看到别的进程写入的记忆（CR-42：跨进程缓存失效）"
+        );
+        // 负向对照：紧接着再读一次不得把结果累加（证明是"重载"而非"重复计数"）
+        assert_eq!(store.total_count().expect("应取到总数"), 2);
+    }
+
     /// 创建带有图存储的 MemoryStore（v0.9.8：记录层关系图化测试用）
     ///
     /// **为什么要单独一个辅助函数**：`make_store()` 不带图存储
@@ -1772,6 +1812,138 @@ mod tests {
         )
     }
 
+    /// ★v0.9.11（F1 修复）：**合成快照必须能按分区裁剪**。
+    ///
+    /// 背景（实测）：`synthesis_snapshot()` 每次都对**全库**做 O(n²) 聚类
+    /// （AML 线上 6285 条 ⇒ 一轮占锁 24~66 秒 ⇒ 前台取锁超时 503 ⇒ 丢数据），
+    /// 故线上只能把合成**整体关掉** ⇒ F1「摘要/长历史全局综合」恒为 0。
+    /// 分区后每用户仅约 65 条 ⇒ 可留在**同步**路径上，F1 才有机会非 0
+    /// （评测是"先 Add 完再立刻 Search"，只交给 300s 后台周期则来不及）。
+    ///
+    /// 鉴别力：让 `synthesis_snapshot_scoped` 去掉 `retain`（退回全量）⇒ 断言 ① 失败。
+    #[test]
+    fn synthesis_snapshot_scoped_must_be_partition_local() {
+        let _env_guard = crate::test_env::lock();
+        // 关掉相似合并（阈值 1.0），保证条数可精确断言
+        std::env::set_var("LRC_SIMILARITY_THRESHOLD", "1.0");
+        let (_dir, mut store) = make_store();
+        for (uid, proj) in [("u-a", "proj-a"), ("u-b", "proj-a"), ("u-c", "proj-c")] {
+            for i in 0..3 {
+                let mut m =
+                    make_test_memory(&format!("{uid} {proj} 独立条目 {i}"), MemoryType::Fact);
+                m.project = Some(proj.to_string());
+                m.user_id = Some(uid.to_string());
+                store.remember(m).expect("写入应成功");
+            }
+        }
+        std::env::remove_var("LRC_SIMILARITY_THRESHOLD");
+
+        // ① 分区快照：只含该 user
+        let snap = store
+            .synthesis_snapshot_scoped(Some("proj-a"), Some("u-a"), 3, 0.4)
+            .expect("快照应成功");
+        assert!(!snap.all.is_empty(), "分区内应有记忆");
+        assert!(
+            snap.all.iter().all(|m| m.user_id.as_deref() == Some("u-a")),
+            "分区快照必须只含该 user 的记忆，实际: {:?}",
+            snap.all
+                .iter()
+                .map(|m| m.user_id.clone())
+                .collect::<Vec<_>>()
+        );
+        // ② 阈值来自显式入参（不受 store 字段 / --disable-synthesis 影响）
+        assert_eq!(snap.config.min_cluster, 3, "min_cluster 应取自入参");
+        assert!(
+            (snap.config.similarity - 0.4).abs() < 1e-6,
+            "similarity 应取自入参"
+        );
+        // ③ 无分区键 ⇒ 保持既有全量行为（向后兼容）
+        let full = store
+            .synthesis_snapshot_scoped(None, None, 3, 0.4)
+            .expect("快照应成功");
+        assert_eq!(full.all.len(), 9, "无分区键时应返回全量（3 用户 × 3 条）");
+    }
+
+    /// ★v0.9.11 缺陷修复（**合成产物可达性**）：派生记忆必须继承来源的可见性归属。
+    ///
+    /// **实测缺陷**：`synthesis_engine` 构造合成记忆时只继承 `project`，
+    /// `privacy_level` 落到默认 `User` 而 `user_id` 仍为 `None`
+    /// ⇒ `is_visible` 对 `(Some(uid), None)` 判 **false** ⇒ **任何 user 都看不到**
+    /// （真实数据实测：212/212 条合成记忆**全部不可见**）⇒ 合成"写进去等于消失"，
+    /// 依赖全局综合/摘要的能力（F1 类）恒为 0。
+    ///
+    /// **修法**：在 Layer 1 的唯一写回口 `apply_synthesis_plan`，用
+    /// [`crate::privacy::inherit_privacy`]（与 CR-04 同一真源）回填三元组；
+    /// 跨可见性域（返回 `None`）则**放弃该合成产物**，绝不回退为全可见。
+    ///
+    /// **鉴别力**：注掉 `apply_synthesis_plan` 的继承逻辑 ⇒ 断言 ② 失败（可见 0 条）。
+    #[test]
+    fn synthesized_memory_must_inherit_source_visibility() {
+        use crate::engine::synthesis_engine::SynthesisPlan;
+        use crate::memory_types::{Importance, PrivacyLevel};
+
+        let (_dir, mut store) = make_store();
+        let uid = "u-synth-1";
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let mut m = make_test_memory(&format!("跑步习惯 {i}"), MemoryType::Fact);
+            m.project = Some("proj-synth".into());
+            m.privacy_level = PrivacyLevel::User;
+            m.user_id = Some(uid.to_string());
+            m.session_id = None;
+            ids.push(store.remember(m).expect("写入应成功").id);
+        }
+
+        // 直接构造合成计划（不依赖聚类与"信息增量"守卫 ⇒ 完全确定性）
+        let mut synth =
+            make_test_memory("用户每周跑步三次，配速 5 分 30 秒", MemoryType::Synthesis);
+        synth.project = Some("proj-synth".into());
+        synth.source_ids = ids.clone();
+        synth.importance = Importance::new(8);
+        // 刻意保持"引擎构造后的原样"：privacy_level 默认 User、user_id = None
+        let sid = synth.id.clone();
+        let written = store.apply_synthesis_plan(SynthesisPlan {
+            batch: vec![synth],
+            graph_edges: vec![(sid, ids.clone(), 0.9)],
+            journal_entries: vec![],
+            synthesized: 1,
+        });
+        assert_eq!(written, 1, "前置：应写入 1 条合成记忆");
+
+        let synth_filter = || ListFilter {
+            memory_type: Some(MemoryType::Synthesis),
+            limit: 100,
+            ..ListFilter::new()
+        };
+
+        // ① 结构：必须带上来源的 user_id
+        let all = store.list_memories(&synth_filter()).expect("列出应成功").0;
+        assert_eq!(all.len(), 1, "应存在 1 条合成记忆");
+        assert_eq!(
+            all[0].user_id.as_deref(),
+            Some(uid),
+            "合成记忆必须继承来源 user_id（否则对任何 user 都不可见）"
+        );
+
+        // ② 行为：带该 user 的隐私上下文必须可见（修前恒 0 条）
+        let mut f = synth_filter();
+        f.privacy_context = Some((PrivacyLevel::User, None, Some(uid.to_string())));
+        assert_eq!(
+            store.list_memories(&f).expect("列出应成功").0.len(),
+            1,
+            "合成记忆必须对该 user 可见（修前 is_visible 判 false ⇒ 0 条）"
+        );
+
+        // ③ 反面对照：别的 user 不得看到（隔离不得被削弱）
+        let mut f = synth_filter();
+        f.privacy_context = Some((PrivacyLevel::User, None, Some("u-other".to_string())));
+        assert!(
+            store.list_memories(&f).expect("列出应成功").0.is_empty(),
+            "合成记忆不得跨 user 泄漏"
+        );
+    }
+
     // ==================== 事件维度（共同经历）====================
 
     #[test]
@@ -1864,6 +2036,76 @@ mod tests {
         assert_eq!(idx.len(), 2, "应有 2 个事件簇");
         assert_eq!(idx[0].0, ev, "簇应按大小降序（本簇 2 条）");
         assert_eq!(idx[0].1, 2);
+    }
+
+    /// ★契约（v0.9.11 / G3 / CR-03）：**关联查询跨 user 零泄漏**。
+    ///
+    /// ## 为什么必须有这条测试
+    /// `associations()` 是**存储层**语义 —— 它**不判可见性**。出口若直调它，
+    /// 其他 user 的记忆就会以 `content_preview` 泄漏出去。本测试同时钉死两侧，
+    /// 使断言具备**鉴别力**（而不是"本来就没有关联"的恒真断言）：
+    /// ① 无 scope ⇒ 关联**确实存在**；② 带 scope ⇒ 该关联**必须消失**。
+    #[test]
+    fn test_associations_scoped_no_cross_user_leak() {
+        use crate::memory_types::PrivacyLevel;
+        let (_dir, mut store) = make_store();
+
+        // alice 与 bob 共享同一 `event_id` ⇒ 二者之间存在 same_event 关联
+        let alice = store
+            .remember(
+                make_test_memory("alice 的行程：周五去西湖", MemoryType::Experience)
+                    .with_event(Some("ev-shared".to_string()))
+                    .with_privacy(PrivacyLevel::User, None, Some("alice".to_string())),
+            )
+            .expect("alice 记忆应写入成功");
+        let bob = store
+            .remember(
+                make_test_memory("bob 的行程：周五去灵隐寺", MemoryType::Experience)
+                    .with_event(Some("ev-shared".to_string()))
+                    .with_privacy(PrivacyLevel::User, None, Some("bob".to_string())),
+            )
+            .expect("bob 记忆应写入成功");
+
+        // ① 前提：无 scope（本地可信域）下关联**确实存在** —— 否则本测试无鉴别力
+        let all = store.associations(&alice.id).expect("关联推导应成功");
+        assert!(
+            all.iter().any(|a| a.memory_id == bob.id),
+            "前提不成立：无 scope 时 alice 与 bob 应存在关联，否则本测试无法证明过滤生效"
+        );
+
+        // ② alice 的作用域下**不得**出现 bob 的记忆
+        let alice_scope = Some((PrivacyLevel::User, None, Some("alice".to_string())));
+        let scoped = store
+            .associations_scoped(&alice.id, &alice_scope)
+            .expect("过滤后关联查询应成功");
+        assert!(
+            !scoped.iter().any(|a| a.memory_id == bob.id),
+            "跨 user 泄漏：alice 的作用域下不应出现 bob 的记忆"
+        );
+
+        // ③ 锚点自身不可见（用 bob 的作用域查 alice 的锚点）⇒ 返回**空**（fail-closed）
+        let bob_scope = Some((PrivacyLevel::User, None, Some("bob".to_string())));
+        let empty = store
+            .associations_scoped(&alice.id, &bob_scope)
+            .expect("越权锚点应返回空而非报错");
+        assert!(empty.is_empty(), "越权锚点必须返回空结果");
+
+        // ④ 关联图同样零泄漏（节点与边均不得出现 bob）
+        let g = store
+            .association_graph_scoped(&alice.id, 50, &alice_scope)
+            .expect("带过滤的构图应成功");
+        assert!(
+            !g.nodes.iter().any(|n| n.memory_id == bob.id),
+            "跨 user 泄漏：图中不应出现 bob 的节点"
+        );
+        assert!(
+            !g.edges.iter().any(|e| e.from == bob.id || e.to == bob.id),
+            "跨 user 泄漏：图中不应出现 bob 的边"
+        );
+        assert!(
+            !g.nodes.is_empty(),
+            "alice 自己的节点应保留（过滤不得误杀合法数据）"
+        );
     }
 
     #[test]
@@ -3634,6 +3876,8 @@ mod tests {
     #[test]
     fn test_trapezoid_recall_daoti_preview_keeps_cross_domain_candidate() {
         use crate::engine::mirror_trapezoid::BAGUA_NAMES;
+        // v0.9.11（G6 / CR-20）：本用例改进程级环境变量，须持全 crate 唯一 env 锁。
+        let _env_guard = crate::test_env::lock();
         let (_dir, mut store) = make_store();
         // 本测试聚焦八卦剪除语义：显式关闭联想导航（活性偏置），
         // 否则活跃记忆白名单会豁免跨卦候选，干扰剪除断言。
@@ -3794,6 +4038,8 @@ mod tests {
     #[test]
     fn test_daoti_preview_prune_defaults_off() {
         use crate::memory_store::daoti_preview_prune_enabled;
+        // v0.9.11（G6 / CR-20）：本用例改进程级环境变量，须持全 crate 唯一 env 锁。
+        let _env_guard = crate::test_env::lock();
         let saved = std::env::var_os("LRC_DAOTI_PREVIEW_PRUNE");
 
         std::env::remove_var("LRC_DAOTI_PREVIEW_PRUNE");
@@ -4448,6 +4694,8 @@ mod tests {
 
     #[test]
     fn test_domain_candidate_index_finds_same_project_language_candidate() {
+        // v0.9.11（G6 / CR-20）：本用例改进程级环境变量，须持全 crate 唯一 env 锁。
+        let _env_guard = crate::test_env::lock();
         let (_dir, mut store) = make_store();
         let previous = std::env::var_os("LRC_DOMAIN_CANDIDATE_INDEX");
         std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX", "1");
@@ -4472,6 +4720,8 @@ mod tests {
 
     #[test]
     fn test_domain_candidate_index_fallback_matches_full_scan() {
+        // v0.9.11（G6 / CR-20）：本用例改进程级环境变量，须持全 crate 唯一 env 锁。
+        let _env_guard = crate::test_env::lock();
         let (_dir, mut store) = make_store();
         store
             .remember(make_test_memory(
@@ -4507,6 +4757,8 @@ mod tests {
 
     #[test]
     fn test_domain_candidate_index_nolang_recovers_cross_bucket_exact_match() {
+        // v0.9.11（G6 / CR-20）：本用例改进程级环境变量，须持全 crate 唯一 env 锁。
+        let _env_guard = crate::test_env::lock();
         // 复现 §5.11 真实库漏检模式：中文 query（is_cjk=true）+ 同项目纯英文记忆
         // （is_cjk=false）。两者通过 'of'/'on' 等两字母词 term 进入同一倒排并集，
         // 但普通 domain 分桶用 memory_is_cjk == scope_is_cjk 把它们剪掉导致漏检。

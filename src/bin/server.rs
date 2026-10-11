@@ -415,6 +415,24 @@ async fn try_run() -> LrcResult<()> {
         if host == "127.0.0.1" && saved_config.default_host != "127.0.0.1" {
             host = saved_config.default_host.clone();
         }
+        // ★ v0.9.12（2026-10-10 实测修正）：**环境变量优先于已保存的全局配置**。
+        //
+        // 实测踩坑：LLM 配置（含**端点**）会被持久化进侧车的加密存储，而原判定顺序是
+        // "先看保存配置、环境变量只作兜底" ⇒ **一份陈旧配置会把显式的 `LRC_LLM_API` 顶掉**，
+        // 且日志只显示"从全局配置加载"，外部极难察觉。实测后果：端点被留在早已下线的
+        // 本地 mock（`http://127.0.0.1:3980/v1`）上，每次检索都**静默降级为空操作**
+        // （配与不配 LLM，R_sim 逐位相同）。
+        //
+        // 环境变量是**显式**意图，且桌面端与部署脚本（`run-lrc.cmd`）正是用它传参
+        // ⇒ 应当优先。若确实要以保存配置为准，显式清空该环境变量即可。
+        if llm_api_raw.is_none() {
+            if let Ok(env_llm) = std::env::var("LRC_LLM_API") {
+                if !env_llm.is_empty() {
+                    eprintln!("[配置] 从环境变量 LRC_LLM_API 加载 LLM API（凭据已隐藏）");
+                    llm_api_raw = Some(env_llm);
+                }
+            }
+        }
         if llm_api_raw.is_none() {
             if let Some(ref saved_llm) = saved_config.llm_api {
                 if !saved_llm.is_empty() {
@@ -1001,8 +1019,12 @@ async fn try_run() -> LrcResult<()> {
         let consolidation_config = ConsolidationConfig {
             poll_interval_secs: 300, // 5 分钟轮询
             batch_size: 100,
-            synthesis_threshold: 3,
-            synthesis_similarity: 0.4,
+            // v0.9.11（G9 / CR-24）：改用命名常量（修前是裸字面量 3 / 0.4）。
+            // 注意此处取**引擎默认**（3），与 `ConsolidationConfig::default()` 的
+            // `DEFAULT_CONSOLIDATION_THRESHOLD`（5）**不同** —— 这是既有的显式覆写：
+            // sidecar 的前台/后台口径要与 store 默认一致。
+            synthesis_threshold: code_memory::engine::synthesis_engine::DEFAULT_MIN_CLUSTER,
+            synthesis_similarity: code_memory::engine::synthesis_engine::DEFAULT_SIMILARITY,
             run_on_start: false, // v0.5.5 内存优化：延迟首次合成，避免启动内存峰值
             // v0.9.10 修复：`--disable-synthesis` 此前只把 synthesis_min_cluster 置为
             // usize::MAX（让合成"空转"），但**后台结晶流水线照常每 5 分钟跑一轮**，

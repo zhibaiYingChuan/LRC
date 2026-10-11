@@ -4,8 +4,14 @@ exclude = ["desktop/src-tauri"]
 
 [package]
 name = "code-memory"
-version = "0.9.10"
+version = "0.9.11"
 edition = "2021"
+# v0.9.11（G10 / CR-56）：本包有两个 `[[bin]]`，却未声明 `default-run`
+#   ⇒ `cargo run --features server,ml -- ...` 会以
+#   "error: `cargo run` could not determine which binary to run" **必然失败**，
+#   而 `docs/OFFLINE_MODEL_GUIDE.md` 正是指引用户这样运行的。
+#   声明默认二进制为用户实际要启动的 sidecar。
+default-run = "code-memory-server"
 # v0.7.1 P2-5：声明最低支持 Rust 版本（MSRV）
 # v0.8.8：提升到 1.80（std::sync::LazyLock 需要 1.80+）
 # 基于依赖矩阵：axum 0.7 (1.66+)、tokio 1.x (1.63+)、reqwest (1.64+)、LazyLock (1.80+)
@@ -200,7 +206,13 @@ opt-level = 3
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# v0.9.11（G8 / CR-06）：**由 `abort` 改为 `unwind`**。
+# 为什么必须改：代码中大量 `catch_unwind` / `JoinError → "服务已保持运行"` 的隔离分支
+#   **只在 unwind 下才有意义**；`abort` 让它们全部成为**死逻辑**，且任何一处 panic
+#   （含 `overflow-checks` 触发的整数溢出）都会 abort **整个 sidecar**，
+#   且 `Drop` 不执行 ⇒ `SingletonLock` 锁文件残留。
+# 代价：体积略增、个别路径由"整进程退出"变为"隔离并保持运行"（这正是既有代码的承诺）。
+panic = "unwind"
 strip = true
 # v0.5.4 修复：启用溢出检查，防止整数溢出导致的安全漏洞
 overflow-checks = true

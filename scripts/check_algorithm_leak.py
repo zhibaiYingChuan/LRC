@@ -36,12 +36,32 @@ import sys
 from pathlib import Path
 
 # ─── 公开层文件（Apache 2.0 许可） ───
+#
+# ⚠️ 口径澄清（v0.9.11 / G10 / CR-52）—— 本列表**不是**许可边界：
+#   · **许可边界**由 `LICENSE` §2.2 定义为**目录级**：
+#       `src/engine/` 之外的全部源码 = 公开层（Apache 2.0）；
+#       `src/engine/` 目录（及其再导出）= 受保护层（DaoTi Research License）。
+#   · **本列表是"泄露扫描面"**：从公开层里挑出**有可能误引受保护术语**的文件
+#     （服务入口、切分器、crate 根）逐行扫描。它是公开层的**真子集**，
+#     二者不相等**是设计使然**，不是遗漏。
+#   · 为什么必须区分：把"扫描面"当成"许可边界"会得出两个错误结论 ——
+#     ① 以为公开层只有这 4 个文件（漏掉 `v1_api.rs`/`memory_store.rs`/`persistence/` 等
+#        十余个同样适用 Apache 的模块）；② 以为未扫描 = 已确认公开（不成立）。
+#   · 下方 `_SELF_CHECK` 断言扫描面**不含受保护层文件**，防止列表被悄悄扩大。
 PUBLIC_FILES = [
     "src/chunker.rs",
     "src/server.rs",
     "src/bin/server.rs",
     "src/lib.rs",
 ]
+
+# ─── 扫描面自检（CR-52）：不得包含受保护层文件 ───
+_PROTECTED_PREFIX = "src/engine/"
+for _f in PUBLIC_FILES:
+    assert not _f.replace("\\", "/").startswith(_PROTECTED_PREFIX), (
+        f"泄露扫描面不得包含受保护层文件: {_f}"
+        f"（LICENSE §2.2：{_PROTECTED_PREFIX} 为受保护层，应适用 DaoTi Research License）"
+    )
 
 # ─── 泄露检测规则 ───
 # 每条规则：(名称, 正则模式, 严重级别: error|warn)

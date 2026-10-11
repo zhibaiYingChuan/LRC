@@ -38,7 +38,7 @@ use crate::persistence::Persistence;
 use crate::server::{safe_code_search, safe_recent_code_search, IndexedCodebase, SearchError};
 use crate::{LlmApiConfig, RecallResult};
 use axum::{
-    extract::Query,
+    extract::{DefaultBodyLimit, Query},
     http::StatusCode,
     response::Json,
     routing::{delete, get, post},
@@ -46,7 +46,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -122,7 +121,10 @@ type ApiError = (StatusCode, Json<serde_json::Value>);
 async fn lock_store_with_timeout<T>(
     store: &Arc<Mutex<T>>,
 ) -> Result<tokio::sync::MutexGuard<'_, T>, ApiError> {
-    tokio::time::timeout(std::time::Duration::from_secs(2), store.lock())
+    // v0.9.11（G4 / CR-23）：引用**超时真源**，不再硬编码 2s。
+    // 此前这里与 `timeouts::LOCK_WAIT` 是两个独立的 2s —— 一旦真源调整，
+    // v1 与 MCP 两条通道的口径就会静默分叉（CR-11 的同类根因）。
+    tokio::time::timeout(crate::timeouts::LOCK_WAIT, store.lock())
         .await
         .map_err(|_| {
             (
@@ -185,6 +187,22 @@ pub struct ConsolidateMemory {
     pub privacy_level: String,
     pub session_id: Option<String>,
     pub user_id: Option<String>,
+    /// v0.9.11：事件 ID —— 同一次交互产生的多条记忆使用相同值，
+    /// 是「共同经历」关联（`same_event`）的**唯一载体**。
+    ///
+    /// 此前本端点无法写入它，导致接入方在「隔离（需 `user_id`）」与
+    /// 「共同经历（需 `event_id`）」之间被迫二选一 ⇒ 记录层关联整体失效。
+    #[serde(default)]
+    pub event_id: Option<String>,
+    /// v0.9.11：事件实体（人/地/时/物）—— 「实体关联」的载体。
+    #[serde(default)]
+    pub entities: Vec<EventEntity>,
+    /// v0.9.11：**源时间**（Unix 毫秒）—— 该记忆在来源系统中真实发生的时间。
+    ///
+    /// 缺省（`None`）时沿用摄入时刻，**既有行为零变更**；
+    /// 显式提供时回填到 `created_at`，使日期 / 间隔 / 事件顺序推理有真实时间依据。
+    #[serde(default)]
+    pub source_timestamp_ms: Option<i64>,
 }
 
 fn default_memory_type() -> String {
@@ -694,18 +712,21 @@ fn run_association_explore(
     // v0.9.7 韧性修复：探索耗时预算从函数入口起算——root 召回（含语义
     // 旁路的并行编码）与 BFS 扩散共享同一预算，确保任何路径下探索都
     // 在外层 15s 超时之前优雅收敛，用户看到部分结果或诚实空态而非 503。
-    const ASSOCIATION_EXPLORE_TIME_BUDGET: Duration = Duration::from_secs(10);
+    const ASSOCIATION_EXPLORE_TIME_BUDGET: Duration = crate::timeouts::EXPLORE_INNER_BUDGET;
     const ASSOCIATION_SEMANTIC_BYPASS_BUDGET: Duration = Duration::from_secs(6);
     let explore_started = std::time::Instant::now();
 
     let root_memory = if let Some(id) = memory_id {
+        // v0.9.11（CR-36）：此前用 `list_memories(limit = usize::MAX)` **全量列出**
+        // 再线性查找目标 id —— 在**持锁路径内**做整库克隆，代价随库大小线性增长，
+        // 而目标只是"取一条"。改为定向查询 `memories_by_ids([id])`：同样只读、
+        // 不触发任何写回/排序，但**不克隆无关记忆**，也**不按 limit 截断**
+        // （避免"目标 id 排在 limit 之外被漏掉"这一隐患）。
+        let ids = [id.to_string()];
         store
-            .list_memories(&ListFilter {
-                limit: usize::MAX,
-                ..ListFilter::new()
-            })
-            .ok()
-            .and_then(|(all, _)| all.into_iter().find(|memory| memory.id == id))
+            .memories_by_ids(&ids)
+            .into_iter()
+            .next()
             .map(|memory| (memory, 1.0f32, "root".to_string(), None))
     } else {
         query.and_then(|text| {
@@ -1515,6 +1536,12 @@ pub type SharedStore = Arc<Mutex<MemoryStore<JsonPersistence>>>;
 pub struct RecentMemoriesParams {
     /// 返回的记忆数量（默认 5，最大 20）
     pub limit: Option<usize>,
+    /// v0.9.11（G3 / CR-01）：归属 —— 不传时在**多租户域**会被拒绝（400 `scope_required`）
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// v0.9.11（G3 / CR-01）：来源会话
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// v0.6.0 新增：/v1/memories/list 请求体
@@ -1529,6 +1556,12 @@ pub struct MemoryListRequest {
     /// 按标签过滤（任一标签匹配）
     #[serde(default)]
     pub tags: Vec<String>,
+    /// v0.9.11（G3 / CR-01）：归属 —— 不传时在**多租户域**会被拒绝（400 `scope_required`）
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// v0.9.11（G3 / CR-01）：来源会话
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// v0.6.0 新增：/v1/memories/remember 请求体
@@ -1553,6 +1586,26 @@ pub struct MemoryRememberRequest {
     /// 事件实体（人/地/时/物）
     #[serde(default)]
     pub entities: Vec<EventEntity>,
+    /// v0.9.11：隐私级别（`session` | `user` | `global`，缺省 `user`）。
+    ///
+    /// 与 `user_id` 同时提供才构成完整的用户级隔离。**本端点此前没有 `user_id`**，
+    /// 于是"带归属的写入"只能绕道 `consolidate`，代价是丢掉 `event_id`/`entities`。
+    #[serde(default)]
+    pub privacy_level: Option<String>,
+    /// v0.9.11：来源会话 ID
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// v0.9.11：来源用户 ID（用户级隔离的载体）
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// v0.9.11：**源时间**（Unix 毫秒）—— 导入备份时保留原始发生时间；
+    /// 缺省用摄入时刻（**既有行为零变更**）。
+    ///
+    /// **为什么与 `consolidate` 用同一字段名与类型**：此前两条端点对"源时间"
+    /// 分别用 RFC3339 字符串与毫秒整数，属**同一语义两种契约**，调用方需分别编码。
+    /// 现统一为毫秒（与 AML `messages[].timestamp` 的原生单位一致）。
+    #[serde(default)]
+    pub source_timestamp_ms: Option<i64>,
 }
 
 /// /v1/memories/forget 请求体
@@ -1575,6 +1628,14 @@ pub struct MemoryAssociationsRequest {
     /// 只返回某类关联：same_event（手填 event_id）| same_event_auto（系统按同项目+同窗口推断）| shared_entity（共享实体）| derived_from（由它衍生）| crystallized_into（被结晶为它）| evolved_from（自身被更新过）（缺省=全部并存）
     #[serde(default)]
     pub relation: Option<String>,
+    /// 归属：用户名（v0.9.11 / G3 / CR-03）。
+    /// **为什么补**：该端点此前连归属参数都没有 ⇒ 恒以"全可见"返回，
+    /// peer 记忆会以 `content_preview` 形式**跨 user 泄漏**。
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// 归属：会话 ID（比 user 更细的可见性粒度）
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// /v1/memories/association-graph 请求体
@@ -1589,6 +1650,13 @@ pub struct MemoryGraphRequest {
     /// 节点数上限（默认 50）；超出时响应中的 `truncated` 会标记为 true
     #[serde(default)]
     pub max_nodes: Option<usize>,
+    /// 归属：用户名（v0.9.11 / G3 / CR-03）—— 该端点此前无归属参数，
+    /// 图的 nodes/edges 会**跨 user 泄漏**。
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// 归属：会话 ID
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// /v1/memories/external-edge 请求体（v0.9.8）
@@ -1793,8 +1861,59 @@ fn aggregate_association_activity(events: &[&AuditEvent]) -> serde_json::Value {
 
 /// 创建 v1 REST API 路由（状态类型为 ()，以便与主路由合并）
 ///
+/// v0.9.11（G3 / CR-01）：多租户域下缺 scope 的统一 400 应答。
+fn scope_required_error() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": "scope_required",
+            "message": "本服务已启用鉴权（多租户模式），读取入口必须提供 user_id 或 session_id"
+        })),
+    )
+}
+
+/// v1 REST 路由的**请求体上限**（v0.9.11 / CR-32：把隐式契约变显式）。
+///
+/// ## 为什么必须显式声明
+///
+/// 修前本路由**从不设置** `DefaultBodyLimit` ⇒ 上限由 axum 框架默认值隐式决定
+/// （2 MiB）。这意味着"单请求最大多少"这个**对外契约**既不在本仓代码里、也无法
+/// 被断言或监控，且会随框架版本静默漂移（一次 `cargo update` 即可能改变对外行为）。
+///
+/// ## 取值
+///
+/// 与 axum `DefaultBodyLimit` 的内置默认值**一致**（2 MiB = `2 * 1024 * 1024`），
+/// 故**对外行为零变化**；显式化的唯一目的是让上限成为本仓可读、可断言、可演进
+/// 的契约。超过上限的请求由 `DefaultBodyLimit` 在**进入 handler 之前**直接拒绝为
+/// **413 Payload Too Large**（不会触达业务逻辑，也就不会占用存储锁）。
+pub const V1_MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
+
 /// 通过闭包捕获 memory_store 和 codebase_manager，无需使用 axum State。
+///
+/// **默认信任域 = 本地可信域**（`LocalTrusted`）：保持既有调用方（含测试）的语义不变。
+/// 需要"多租户域强制 scope"的调用方请用 [`build_v1_router_with_trust`]。
 pub fn build_v1_router(
+    store: SharedStore,
+    codebase_manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
+    llm_api: Arc<RwLock<LlmApiConfig>>,
+    llm_configured_atomic: Arc<std::sync::atomic::AtomicBool>,
+    dev_mode: bool,
+) -> Router {
+    build_v1_router_with_trust(
+        store,
+        codebase_manager,
+        llm_api,
+        llm_configured_atomic,
+        dev_mode,
+        crate::privacy::TrustMode::LocalTrusted,
+    )
+}
+
+/// 同 [`build_v1_router`]，但**显式指定信任域**（v0.9.11 / G3 / CR-01）。
+///
+/// 生产入口（`bin/server.rs`）以 [`crate::privacy::from_env`] 传入 ——
+/// 启用 `LRC_API_TOKEN` 时即为多租户域，对外读取入口将强制要求 scope。
+pub fn build_v1_router_with_trust(
     store: SharedStore,
     codebase_manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
     llm_api: Arc<RwLock<LlmApiConfig>>,
@@ -1802,9 +1921,15 @@ pub fn build_v1_router(
     llm_configured_atomic: Arc<std::sync::atomic::AtomicBool>,
     // v0.9.0: 开发模式标志，注入到 /health/system 响应中
     dev_mode: bool,
+    // v0.9.11（G3 / CR-01）：信任域。本地可信域保留"无 scope 即全可见"（桌面单用户场景），
+    // 多租户域要求对外读取入口**显式给出 scope**（判据见 `crate::privacy`）。
+    trust_mode: crate::privacy::TrustMode,
 ) -> Router {
     let consolidate_store = store.clone();
     let enrich_store = store.clone();
+    // v0.9.11（能力对齐）：enrich 检索需要与 MCP `recall` 共用 LLM 查询翻译，
+    // 故把 LLM 配置句柄同样注入该 handler（只读快照，取锁前使用）。
+    let enrich_llm_api = llm_api.clone();
     let correct_store = store.clone();
     let explore_store = store.clone();
     let confirm_store = store.clone();
@@ -1876,44 +2001,133 @@ pub fn build_v1_router(
 
                     // Phase 1：持锁写入记忆。
                     // v0.9.6 P1 修复：整体移入 spawn_blocking，避免守卫自旋占死 worker。
+                    //
+                    // ★v0.9.11（F1 修复）：**在移走 `req.memories` 之前**先取"分区键"。
+                    // 同一次 Add 内的记忆必然同属一个 user/project（AML 的 Add 就是
+                    // "一个会话块"），故可取首个带归属的作为分区键。
+                    // 后续若 `LRC_SCOPED_INLINE_SYNTHESIS=1`，合成只在该分区内聚类
+                    // （约 65 条 ⇒ 平方聚类可忽略），从而既能同步产出摘要、又不会像
+                    // "全库 O(n²)" 那样占锁数十秒导致 503（详见
+                    // `MemoryStore::synthesis_snapshot_scoped` 的实测依据）。
+                    let scope_project = req
+                        .memories
+                        .iter()
+                        .find_map(|m| m.project.clone().filter(|s| !s.is_empty()));
+                    let scope_user = req
+                        .memories
+                        .iter()
+                        .find_map(|m| m.user_id.clone().filter(|s| !s.is_empty()));
+                    let scoped_inline_synthesis = std::env::var("LRC_SCOPED_INLINE_SYNTHESIS")
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
                     let mem_inputs = req.memories;
                     let phase1_store = store.clone();
                     let stored = tokio::task::spawn_blocking(move || -> Option<usize> {
-                        // 有界 try_lock 轮询（2s），与 remember 一致：
-                        // 在阻塞线程中自旋，不饥饿 HTTP worker，也不无限占用阻塞线程
-                        let lock_deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(2);
-                        let mut store = loop {
-                            match phase1_store.try_lock() {
-                                Ok(guard) => break guard,
-                                Err(_) if std::time::Instant::now() < lock_deadline => {
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                        // 有界 try_lock 轮询（2s）由下面三个阶段**各自**执行：
+                        // 在阻塞线程中自旋，不饥饿 HTTP worker，也不无限占用阻塞线程。
+                        //
+                        // ★v0.9.12：此处**不再**预先取锁。修前这里先取一次锁、再在其内部
+                        // 调用写入（单次持锁全程）；现在改为三阶段，若仍保留这次取锁，
+                        // 会因 `std::sync::Mutex` **不可重入**而在阶段 1 自死锁（实测：
+                        // 全新实例上 Add 也恒 503、日志报"取编码器句柄等待存储锁超时"）。
+                        // ★ v0.9.12（线上实测修复）：本端点此前**逐条** `store.remember()`，
+                        //   而单条 `remember` 会为**每条**记忆做一次全量相似度扫描 + 一次
+                        //   **全库序列化重写**，并且**全程持着存储锁** ⇒ 成本随库大小线性增长。
+                        //   线上实测后果（库 858 条 / 1 核）：单次 Add 需数十秒，锁被占满 ⇒
+                        //   前台 Add/Search 全部 `503 store_busy`（后台"结晶周期 66~94s"
+                        //   其实全是在**等锁**）；评测的「记忆注入」阶段因此恒为 0%。
+                        //   现改走**既有**的 `remember_batch`（其文档即"快速批量注入路径"）：
+                        //   **只做一次落盘**、分块批量编码、跳过逐条相似度扫描。
+                        //   代价（已知并接受）：写时不合并近重复记忆（该检查对批量注入本就
+                        //   被标为"每条会话独立唯一"而跳过）。
+                        //
+                        // ★ v0.9.12（第二阶段修复）：把**最昂贵的编码**移出存储锁。
+                        //   线上实测：65~71 条分片在 1 核机器上编码需 70~100 秒，若全程持锁，
+                        //   任何其它请求等待 >2s 即 503 ⇒ 队列永远排不完。
+                        //   现按"三阶段锁安全模式"拆开：**锁内只做取句柄与落盘，锁外做编码**。
+                        //   编码链路是纯函数（编码器只依赖文本，ML 模型为全局单例），
+                        //   因此锁外编码与锁内编码**逐位等价**。
+                        let mut batch = Vec::with_capacity(mem_inputs.len());
+                        for mem in &mem_inputs {
+                            // v0.9.11：所有写入入口共用 `MemoryWriteInput`（**写入单一真源**），
+                            // 避免"字段集按端点各自定义"与"新增字段只改一路径"。
+                            batch.push(
+                                crate::memory_write::MemoryWriteInput {
+                                    content: mem.content.clone(),
+                                    memory_type: MemoryType::try_parse(&mem.memory_type),
+                                    importance: Some(Importance::new(mem.importance)),
+                                    // 本端点不收 TTL / 道体预判（保持既有行为）
+                                    ttl_days: None,
+                                    project: mem.project.clone(),
+                                    tags: mem.tags.clone(),
+                                    privacy_level: PrivacyLevel::try_parse(&mem.privacy_level),
+                                    session_id: mem.session_id.clone(),
+                                    user_id: mem.user_id.clone(),
+                                    event_id: mem.event_id.clone(),
+                                    entities: mem.entities.clone(),
+                                    // 源时间仅在上游**显式提供**时回填；缺省保持"摄入时刻"
+                                    source_timestamp: mem
+                                        .source_timestamp_ms
+                                        .and_then(crate::memory_write::ts_from_millis),
+                                    daoti_preview_gua: None,
+                                    daoti_preview_bagua: None,
+                                    daoti_preview_version: None,
                                 }
-                                Err(_) => return None,
+                                .into_memory(),
+                            );
+                        }
+
+                        // 阶段 1（**短暂持锁**）：仅取编码器句柄（克隆成本 ≈ 一个 bool）。
+                        let encoder = {
+                            let lock_deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(2);
+                            let store_guard = loop {
+                                match phase1_store.try_lock() {
+                                    Ok(guard) => break guard,
+                                    Err(_) if std::time::Instant::now() < lock_deadline => {
+                                        std::thread::sleep(std::time::Duration::from_millis(10));
+                                    }
+                                    Err(_) => {
+                                        eprintln!(
+                                            "[v1/consolidate] 取编码器句柄等待存储锁超时（2s），本次写入放弃"
+                                        );
+                                        return None;
+                                    }
+                                }
+                            };
+                            store_guard.luoshu_encoder_handle()
+                        };
+
+                        // 阶段 2（**不持锁**）：最昂贵的编码阶段。
+                        let luoshu_vecs =
+                            crate::memory_store::encode_luoshu_batch(&encoder, &batch);
+
+                        // 阶段 3（**短暂持锁**）：投影 + 一次落盘 + 索引维护。
+                        let stored = {
+                            let lock_deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(2);
+                            let mut store_guard = loop {
+                                match phase1_store.try_lock() {
+                                    Ok(guard) => break guard,
+                                    Err(_) if std::time::Instant::now() < lock_deadline => {
+                                        std::thread::sleep(std::time::Duration::from_millis(10));
+                                    }
+                                    Err(_) => {
+                                        eprintln!(
+                                            "[v1/consolidate] 写入阶段等待存储锁超时（2s），本次写入放弃（编码已白做）"
+                                        );
+                                        return None;
+                                    }
+                                }
+                            };
+                            match store_guard.remember_batch_preencoded(batch, luoshu_vecs) {
+                                Ok(v) => v.len(),
+                                Err(e) => {
+                                    eprintln!("[v1/consolidate] 批量写入失败: {}", e);
+                                    0
+                                }
                             }
                         };
-                        let mut stored = 0usize;
-                        for mem in &mem_inputs {
-                            let memory_type = MemoryType::try_parse(&mem.memory_type)
-                                .unwrap_or(MemoryType::Fact);
-                            let privacy_level = PrivacyLevel::try_parse(&mem.privacy_level)
-                                .unwrap_or_default();
-
-                            let memory = Memory::new(
-                                mem.content.clone(),
-                                memory_type,
-                                mem.project.clone(),
-                                mem.tags.clone(),
-                                Importance::new(mem.importance),
-                                None,
-                            )
-                            .with_privacy(privacy_level, mem.session_id.clone(), mem.user_id.clone());
-
-                            match store.remember(memory) {
-                                Ok(_) => stored += 1,
-                                Err(e) => eprintln!("[v1/consolidate] 写入失败: {}", e),
-                            }
-                        }
                         Some(stored)
                     })
                     .await
@@ -1929,8 +2143,19 @@ pub fn build_v1_router(
                     // Phase 2：异步超时获取快照，锁外执行 CPU 聚类计算。
                     let snapshot = {
                         let store = lock_store_with_timeout(&store).await?;
-                        store
-                            .synthesis_snapshot()
+                        let snap_result = if scoped_inline_synthesis {
+                            // 分区内合成（F1）：~65 条/用户 ⇒ 平方聚类可忽略；
+                            // 详见 `MemoryStore::synthesis_snapshot_scoped` 的实测依据。
+                            store.synthesis_snapshot_scoped(
+                                scope_project.as_deref(),
+                                scope_user.as_deref(),
+                                crate::engine::synthesis_engine::DEFAULT_MIN_CLUSTER,
+                                crate::engine::synthesis_engine::DEFAULT_SIMILARITY,
+                            )
+                        } else {
+                            store.synthesis_snapshot()
+                        };
+                        snap_result
                             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                                 "error": "consolidation_failed",
                                 "message": format!("合成快照失败: {}", e)
@@ -1946,7 +2171,11 @@ pub fn build_v1_router(
                         let cancel_for_timeout = cancel.clone();
                         let cancel_for_task = cancel.clone();
                         match tokio::time::timeout(
-                            Duration::from_secs(60),
+                            // v0.9.11（G4 / CR-05）：此前硬编码 **60s > 外层 30s**
+                            // ⇒ 外层先丢弃 future，下面"超时置位 cancel"的分支**永不执行**，
+                            // 协作式取消成为不可达代码，O(n²) 聚类空跑到底。
+                            // 现由超时阶梯单一真源给出（20s < 30s），并受守卫测试保护。
+                            crate::timeouts::CONSOLIDATE_INNER_TIMEOUT,
                             tokio::task::spawn_blocking(move || {
                                 let engine = SynthesisEngine::new(snapshot.config);
                                 let (mut plan, mut cancelled) = engine.plan_luoshu_cancellable(
@@ -2053,12 +2282,25 @@ pub fn build_v1_router(
         //       无超时保护时若检索卡死，锁永不释放，后续请求全部超时
         .route("/memories/enrich", post({
             let store = enrich_store;
+            let llm_api = enrich_llm_api;
             move |Json(req): Json<EnrichRequest>| {
                 let store = store.clone();
+                let llm_api = llm_api.clone();
                 async move {
-                    let query = req.query;
+                    // ★v0.9.11（能力对齐）：REST `enrich` 此前**缺少** LLM 查询翻译 ——
+                    // 同一条查询经 MCP `recall` 会做"关键词 + 原查询"富化，经 REST `enrich`
+                    // 却不会 ⇒ 同一引擎两条入口检索质量不一致。而 AML 与桌面端
+                    // 实际使用的正是 REST `enrich`。
+                    // 现与 MCP 共用 `enrich_query_for_retrieval`（Single Source of Truth），
+                    // 并**在取存储锁之前**完成（网络等待不得发生在持锁期；底层已带 5s/10s 超时）。
+                    // 未配置 LLM 或翻译失败 ⇒ **逐字返回原查询**（零行为变更）。
+                    let query = {
+                        let cfg = llm_api.read().await.clone();
+                        crate::engine::llm_translator::enrich_query_for_retrieval(&cfg, &req.query)
+                            .await
+                    };
                     // 联想解释块需要保留查询原文（query 将被 move 进 spawn_blocking 闭包）
-                    let query_text = query.clone();
+                    let query_text = req.query.clone();
                     let top_k = req.top_k.clamp(1, 100);
                     let privacy_ctx = if req.user_id.is_some() {
                         Some((PrivacyLevel::User, req.session_id.clone(), req.user_id.clone()))
@@ -2125,12 +2367,27 @@ pub fn build_v1_router(
                                 }
                             };
 
+                            // ★ P6（候选容量）：deep 路候选上限**可配**。
+                            //
+                            // 实测依据（门代价表，全库 3189）：把 deep 的三道门全部关闭
+                            // （LRC_DEEP_BAGUA_PRUNE=0 + LRC_DEEP_ROI=0 + 关词面门），
+                            // 端到端也只覆盖 **6.3%** —— 恰好等于 `top_k×2 = 200` / 3189。
+                            // ⇒ 说明瓶颈是**出口容量**：全库候选根本没机会参与竞争最终的
+                            //   `top_k`（=100）个名额。
+                            //
+                            // 故把该上限做成可配（缺省维持 `top_k*2`，零行为变更），
+                            // 用于验证「把全库候选放进同一个排序池」能带来多少可达率提升。
+                            let deep_candidates = std::env::var("LRC_DEEP_CANDIDATES")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .filter(|v| *v > 0)
+                                .unwrap_or(top_k * 2);
                             let deep_filter = RecallFilter {
                                 memory_type: None,
                                 project: req.project.clone(),
                                 tags: req.tags.clone(),
                                 min_importance: None,
-                                top_k: top_k * 2,
+                                top_k: deep_candidates,
                                 privacy_context: privacy_ctx,
                                 explore_pure: false,
                                 regression_query: None,
@@ -2284,8 +2541,22 @@ pub fn build_v1_router(
                             audit_meta.insert("fast_hits".to_string(), fast_hits.to_string());
                             audit_meta.insert("deep_hits".to_string(), deep_hits.to_string());
                             audit_meta.insert("total_candidates".to_string(), total.to_string());
+                            // ★v0.9.11 修复（审计日志体积爆炸 / 热路径浪费）：**审计只写有限切片**。
+                            //
+                            // 实测（AML 线上）：单条 `RetrievalExecuted` 事件中位长度 **1.03 MB**
+                            // （最大 2.69 MB），累计 **1.41 GB** —— 因为此处把"全部逐结果回归证据 +
+                            // 整条道体轨迹 + 全部命中 id"都序列化进了 metadata；而且**每次检索都要在
+                            // 内存里构造这些 MB 级字符串**（热路径上的纯浪费）。
+                            // 审计只需"可复核的骨架"（前 N 条 + 总数），细节不参与排序、与能力无关。
+                            // 注：`AuditTrail::record` 另有**体积预算**兜底（纵深防御，任何调用点都撑不爆）。
+                            //
+                            // ⚠️ 只裁**审计副本**：`regression_evidence` 与 `trail` 本体仍原样进入响应。
+                            const AUDIT_MAX_ITEMS: usize = 30;
+                            const AUDIT_MAX_EVIDENCE: usize = 30;
+                            const AUDIT_MAX_TRAIL: usize = 50;
                             let items_json = serde_json::json!(explanation_items
                                 .iter()
+                                .take(AUDIT_MAX_ITEMS)
                                 .map(|item| {
                                     serde_json::json!({
                                         "rank": item.rank,
@@ -2300,6 +2571,10 @@ pub fn build_v1_router(
                                 })
                                 .collect::<Vec<_>>());
                             audit_meta.insert("items".to_string(), items_json.to_string());
+                            audit_meta.insert(
+                                "items_total".to_string(),
+                                explanation_items.len().to_string(),
+                            );
                             let state_snapshot = store.memory_state_machine.snapshot();
                             let mut regression_evidence = fast_result.regression_evidence.clone();
                             for (id, evidence) in &deep_result.regression_evidence {
@@ -2322,20 +2597,111 @@ pub fn build_v1_router(
                             // 失败静默：联想是附加价值，不得影响主检索结果。
                             let assoc_seeds: Vec<String> =
                                 explanation_items.iter().map(|i| i.id.clone()).collect();
+                            // ★ P8（关联补全接出口）：配额可配。
+                            //   实测依据：同一次 Add 请求内的记忆对（词面中位重叠仅 16.8%），
+                            //   用其中一条去查另一条，命中率仅 **40%**；且**换 384 维排序 /
+                            //   放开三道剪除 / 把容量加到 4000，三者都无法提升该指标（A=C=40.0%）**
+                            //   ⇒ 缺的不是"语义尺子"，而是**"记录关联"这条通道没有进出口**。
+                            //   现有配额仅 3（`ASSOC_EXPAND_MAX_HTTP`），在 top_k=100 下几乎不可见。
+                            let assoc_quota = std::env::var("LRC_ASSOC_MAX")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .filter(|v| *v > 0)
+                                .unwrap_or(ASSOC_EXPAND_MAX_HTTP);
                             let associated = store
                                 .expand_associations(
                                     &assoc_seeds,
                                     &expand_filter,
-                                    ASSOC_EXPAND_MAX_HTTP,
+                                    assoc_quota,
                                 )
                                 .unwrap_or_default();
-                            let evidence_json = serde_json::to_string(&regression_evidence)
-                                .unwrap_or_else(|_| "{}".to_string());
+                            // ★ P8：**替换式**并入结果（门控 `LRC_ASSOC_INTO_RESULTS=1`，默认关）。
+                            //
+                            // 为什么必须"替换"而不是"尾部追加"：`fused` 已按 `top_k` 截断，
+                            // 追加后再截断 ⇒ 新追加的会被整体丢掉（等于没做）。
+                            // 故先给主结果让出 `min(quota, top_k/4)` 个名额，再把关联条目补进去。
+                            if std::env::var("LRC_ASSOC_INTO_RESULTS")
+                                .map(|v| v == "1")
+                                .unwrap_or(false)
+                                && !associated.is_empty()
+                            {
+                                let ids: Vec<String> =
+                                    associated.iter().map(|a| a.memory_id.clone()).collect();
+                                // ★ 纵深防御：用**带可见性过滤**的取法，而不是裸 `memories_by_ids`。
+                                //   `expand_associations` 上游已按 `expand_filter` 过滤过，
+                                //   但出口处再判一次 `is_visible`，避免上游一旦被改坏就静默越权。
+                                let resolved = store.memories_by_ids_visible(
+                                    &ids,
+                                    &expand_filter.privacy_context,
+                                );
+                                {
+                                    let mut seen: std::collections::HashSet<String> =
+                                        memories.iter().map(|m| m.id.clone()).collect();
+                                    // ★ **精确让位**（实测修正，2026-10-10）：
+                                    //   先算出"真正能补入几条"，再按该条数截断主结果，
+                                    //   而不是预扣一个固定配额。
+                                    //   实测（40 对同事件样本）：预扣 20 个名额、实际只补入 9 条
+                                    //   ⇒ 白白丢掉 11 个主结果名额，其中 **3 条原本命中的记忆
+                                    //   被截掉**（`A 命中、D 丢失 = 3`）。精确让位后只损失
+                                    //   真正的补入条数（0 条时 `truncate(top_k)` 为无操作）。
+                                    let fresh: Vec<Memory> = resolved
+                                        .into_iter()
+                                        .filter(|m| seen.insert(m.id.clone()))
+                                        .take(assoc_quota.min(top_k))
+                                        .collect();
+                                    let n_new = fresh.len();
+                                    memories.truncate(top_k.saturating_sub(n_new));
+                                    // 关联条目的分数：取"主结果最低分"之下的一档。
+                                    // **必须在 push 之前算好**：否则 `push(..)` 与 `last()`
+                                    // 同时借用 `memories`（一个可变一个不可变）会编译失败。
+                                    let assoc_score =
+                                        memories.last().map(|x| x.score * 0.99).unwrap_or(0.0);
+                                    for m in fresh {
+                                        memories.push(EnrichedMemory {
+                                            id: m.id.clone(),
+                                            content: m.content.clone(),
+                                            memory_type: m.memory_type.as_str().to_string(),
+                                            // 明确其证据性质为"记录必然成立"，故排在相似度可比
+                                            // 的结果之下
+                                            score: assoc_score,
+                                            bagua_category: m.bagua_category.clone(),
+                                            daoti_preview_gua: m.daoti_preview_gua.clone(),
+                                            daoti_preview_bagua: m.daoti_preview_bagua.clone(),
+                                            daoti_preview_version: m.daoti_preview_version.clone(),
+                                            importance: m.importance.value(),
+                                            topological_depth: m.topological_depth,
+                                            version: m.version,
+                                            created_at: m.created_at.to_rfc3339(),
+                                            event_id: m.event_id.clone(),
+                                            entities: m.entities.clone(),
+                                            why: Some("记录层关联补全（由已召回记忆必然关联）".to_string()),
+                                        });
+                                    }
+                                }
+                            }
+                            // 审计副本**有界**：只取前 N 条证据（本体仍原样进响应）
+                            let evidence_json = serde_json::to_string(
+                                &regression_evidence
+                                    .iter()
+                                    .take(AUDIT_MAX_EVIDENCE)
+                                    .collect::<std::collections::HashMap<_, _>>(),
+                            )
+                            .unwrap_or_else(|_| "{}".to_string());
                             audit_meta.insert("filtered_count".to_string(), filtered_count.to_string());
+                            audit_meta.insert(
+                                "evidence_total".to_string(),
+                                regression_evidence.len().to_string(),
+                            );
                             audit_meta.insert("regression_evidence".to_string(), evidence_json);
+                            // 审计副本**有界**：只取轨迹的**末** N 步（最近的才有诊断价值）
+                            let trail_cut = state_snapshot.trail.len().saturating_sub(AUDIT_MAX_TRAIL);
+                            audit_meta.insert(
+                                "trail_total".to_string(),
+                                state_snapshot.trail.len().to_string(),
+                            );
                             audit_meta.insert(
                                 "trail".to_string(),
-                                serde_json::to_string(&state_snapshot.trail)
+                                serde_json::to_string(&state_snapshot.trail[trail_cut..])
                                     .unwrap_or_else(|_| "[]".to_string()),
                             );
                             store.audit_trail.record(
@@ -2527,6 +2893,18 @@ pub fn build_v1_router(
                         Duration::from_secs(15),
                         tokio::task::spawn_blocking(move || -> Result<AssociationExploreResponse, &'static str> {
                             let _guard = CancellationFlag(cancellation_for_task.clone());
+                            // v0.9.11（CR-34）：取锁循环此前**无独立 deadline**（只查取消标志
+                            // + 50ms 轮询），与仓库其它取锁点"统一 2s 有界等待"不一致；锁被
+                            // 长任务握住时本线程会一路自旋到外层 15s 超时才被丢弃。现补齐与
+                            // `timeouts::LOCK_WAIT` 同口径的**独立 deadline**，超时即返回
+                            // `search_busy`（503，与 confirm 的 `store_busy` 同语义）。
+                            //
+                            // 关键收益：锁等待被**限界在 2s** ⇒ 最坏路径 "2s 锁等待 + 10s 探索预算"
+                            // = 12s < 外层 15s，使 v0.9.9 设计的"到点优雅收敛（200 + interrupted）"
+                            // 在锁忙时**重新可达**（修前锁等待不计入内部预算、可耗尽整段 15s，
+                            // 优雅收敛不可达）。
+                            let lock_deadline =
+                                std::time::Instant::now() + crate::timeouts::LOCK_WAIT;
                             let mut store = loop {
                                 match store.try_lock() {
                                     Ok(guard) => break guard,
@@ -2534,7 +2912,10 @@ pub fn build_v1_router(
                                         if cancellation_for_task.load(Ordering::Acquire) {
                                             return Err("search_busy");
                                         }
-                                        std::thread::sleep(Duration::from_millis(50));
+                                        if std::time::Instant::now() >= lock_deadline {
+                                            return Err("search_busy");
+                                        }
+                                        std::thread::sleep(crate::timeouts::LOCK_POLL);
                                     }
                                 }
                             };
@@ -2679,23 +3060,32 @@ pub fn build_v1_router(
                     // 克隆后移入阻塞任务，避免外层后续审计与响应无法使用
                     let blocking_store = store.clone();
                     let confirm_id = memory_id.clone();
-                    let result = tokio::task::spawn_blocking(move || -> LrcResult<bool> {
+                    // v0.9.11（G4 / CR-13）：返回值加一层 `Option` —— `None` = 存储锁等待超时。
+                    // 此前这里**无界自旋**（只 `sleep` 无 deadline）⇒ 锁被长任务持有时该阻塞
+                    // 线程**永不返回**；与仓库其它取锁点"统一 2s 有界等待"的口径明显不一致。
+                    let result = tokio::task::spawn_blocking(move || -> Option<LrcResult<bool>> {
+                        let deadline = std::time::Instant::now() + crate::timeouts::LOCK_WAIT;
                         let mut guard = loop {
                             match blocking_store.try_lock() {
                                 Ok(g) => break g,
-                                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+                                Err(_) if std::time::Instant::now() < deadline => {
+                                    std::thread::sleep(crate::timeouts::LOCK_POLL);
+                                }
+                                Err(_) => return None,
                             }
                         };
                         // confirm_memory 的错误为 PersistenceError；本闭包错误仅用于
                         // 上位统一映射为 500 字符串响应，故按「内部」域收敛。
-                        guard
-                            .confirm_memory(&confirm_id)
-                            .map_err(|e| LrcError::internal(e.to_string()))
+                        Some(
+                            guard
+                                .confirm_memory(&confirm_id)
+                                .map_err(|e| LrcError::internal(e.to_string())),
+                        )
                     })
                     .await;
 
                     match result {
-                        Ok(Ok(true)) => {
+                        Ok(Some(Ok(true))) => {
                             // 结构化审计：记录用户确认行为（可观测，不参与排序）
                             if let Ok(mut guard) = store.try_lock() {
                                 let mut meta = std::collections::HashMap::new();
@@ -2732,11 +3122,16 @@ pub fn build_v1_router(
                                 "memory_id": memory_id
                             })))
                         }
-                        Ok(Ok(false)) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
+                        Ok(Some(Ok(false))) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({
                             "error": "memory_not_found",
                             "message": "该记忆不存在或已过期"
                         })))),
-                        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        // v0.9.11（G4 / CR-13）：锁等待超时 ⇒ 503（与其它端点 `store_busy` 同口径）
+                        Ok(None) => Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                            "error": "store_busy",
+                            "message": "记忆服务繁忙，请稍后重试"
+                        })))),
+                        Ok(Some(Err(e))) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                             "error": "confirm_failed",
                             // 闭包错误已收敛为 LrcError（P1-6）；Display 只输出 message
                             "message": e.to_string()
@@ -3818,16 +4213,40 @@ pub fn build_v1_router(
                         .map(|v| v as usize)
                         .filter(|v| *v > 0)
                         .unwrap_or_else(crate::state_matcher::semantic_backfill_batch);
+                    // ★ 单次预算**硬上限**（调用方不可越过）。
+                    //
+                    // 为什么必须钳：本 handler 在 `spawn_blocking` 内**持存储锁**执行。
+                    // 若单次耗时超过网关超时（30s），外层 future 会被丢弃，而 blocking 任务
+                    // **仍在持锁跑完预算** ⇒ 锁被占满、后续请求全部 `503 store_busy`。
+                    // 实测指纹：传 `budget_ms=60000` 时，第 2 轮 504、第 3 轮起 503 风暴。
+                    //
+                    // 取 15s：既给单批编码留足时间（实测 4s 预算可编 5~7 条），
+                    // 又稳稳落在网关超时之内 —— 让"超时即弃锁不释放"这条路径不可达。
+                    const SEMANTIC_BACKFILL_BUDGET_CAP_MS: u64 = 15_000;
                     let budget_ms = body
                         .get("budget_ms")
                         .and_then(|v| v.as_u64())
                         .filter(|v| *v > 0)
-                        .unwrap_or_else(crate::state_matcher::semantic_backfill_budget_ms);
+                        .unwrap_or_else(crate::state_matcher::semantic_backfill_budget_ms)
+                        .min(SEMANTIC_BACKFILL_BUDGET_CAP_MS);
                     let result = tokio::task::spawn_blocking(move || {
                         // 锁忙（用户查询/合成持有）→ 跳过本轮，返回降级（与 state-driven 同款）
                         let guard = store.try_lock().ok()?;
                         let data_dir = guard.persistence().data_dir().to_path_buf();
-                        let filter = crate::memory_store_types::ListFilter::new();
+                        // ★ 缺陷修复（实测定位）：此处原为 `ListFilter::new()`，
+                        //   而 `ListFilter::new()` 的默认分页是 **limit=20 / offset=0**
+                        //   （见 memory_store_types.rs:326-327）。
+                        //   后端 `backfill_semantic_cache` 的语义是"把**尚未缓存**的补齐"，
+                        //   输入却永远只有前 20 条 ⇒ 第一页缓存满后 `todo` 恒空：
+                        //     `encoded` 恒为 0、耗时 0.0s、`total` 报 3189（全量）——
+                        //   三者同时出现即本缺陷的指纹（实测在开发库 3189 条上复现，
+                        //   缓存永远停在 20 条）。
+                        //   ⇒ 改为**取全量**：预算控制交给 `budget_ms`（编码逐条前复核），
+                        //     条数控制交给 `batch`，二者本就是该端点的双约束。
+                        let filter = crate::memory_store_types::ListFilter {
+                            limit: usize::MAX,
+                            ..crate::memory_store_types::ListFilter::new()
+                        };
                         let Ok((memories, total)) = guard.list_memories(&filter) else {
                             return Some((0usize, 0usize));
                         };
@@ -4203,12 +4622,22 @@ pub fn build_v1_router(
                         }
                     };
 
+                    // v0.9.11（G3 / CR-01）：同上 —— 该端点同样缺 `user_id` 参数
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        params.user_id.as_deref(),
+                        params.session_id.as_deref(),
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     // 使用 ListFilter 按创建时间降序获取最近记忆
                     let filter = crate::memory_store::ListFilter {
                         limit,
                         offset: 0,
                         sort_by: crate::memory_store::SortBy::CreatedAt,
                         order: crate::memory_store::SortOrder::Desc,
+                        privacy_context: scope,
                         ..Default::default()
                     };
 
@@ -4293,6 +4722,16 @@ pub fn build_v1_router(
                         }
                     };
 
+                    // v0.9.11（G3 / CR-01）：解析并按信任域强制 scope
+                    //（此前该端点连 `user_id` 参数都没有 ⇒ 恒以 None 列出全库并返回**完整 content**）
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        params.user_id.as_deref(),
+                        params.session_id.as_deref(),
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     let filter = crate::memory_store::ListFilter {
                         project: params.project.clone(),
                         tags: params.tags.clone(),
@@ -4300,6 +4739,7 @@ pub fn build_v1_router(
                         offset: 0,
                         sort_by: crate::memory_store::SortBy::CreatedAt,
                         order: crate::memory_store::SortOrder::Desc,
+                        privacy_context: scope,
                         ..Default::default()
                     };
 
@@ -4471,10 +4911,7 @@ pub fn build_v1_router(
                         ));
                     }
 
-                    // 解析记忆类型，无效时回退到 Fact
-                    let memory_type = MemoryType::from_str(&params.memory_type)
-                        .unwrap_or(MemoryType::Fact);
-
+                    // 记忆类型解析改由 `MemoryWriteInput` 统一处理（无效即回退 `Fact`）
                     // 解析重要性，限制 1-10
                     let importance = Importance::new(params.importance.unwrap_or(5));
 
@@ -4497,16 +4934,31 @@ pub fn build_v1_router(
                                 Err(_) => return Err("store_busy"),
                             }
                         };
-                        let memory = Memory::new(
-                            params.content,
-                            memory_type,
-                            params.project,
-                            params.tags,
-                            importance,
-                            None,
-                        )
-                        .with_event(params.event_id)
-                        .with_entities(params.entities);
+                        // v0.9.11：所有写入入口共用 `MemoryWriteInput`（**写入单一真源**）
+                        let memory = crate::memory_write::MemoryWriteInput {
+                            content: params.content,
+                            memory_type: MemoryType::try_parse(&params.memory_type),
+                            importance: Some(importance),
+                            // 本端点不收 TTL / 道体预判（保持既有行为）
+                            ttl_days: None,
+                            project: params.project,
+                            tags: params.tags,
+                            privacy_level: params
+                                .privacy_level
+                                .as_deref()
+                                .and_then(PrivacyLevel::try_parse),
+                            session_id: params.session_id,
+                            user_id: params.user_id,
+                            event_id: params.event_id,
+                            entities: params.entities,
+                            source_timestamp: params
+                                .source_timestamp_ms
+                                .and_then(crate::memory_write::ts_from_millis),
+                            daoti_preview_gua: None,
+                            daoti_preview_bagua: None,
+                            daoti_preview_version: None,
+                        }
+                        .into_memory();
                         match store.remember(memory) {
                             Ok(saved) => Ok(saved.id),
                             Err(e) => {
@@ -4637,7 +5089,18 @@ pub fn build_v1_router(
                 let store = store.clone();
                 async move {
                     let store = lock_store_with_timeout(&store).await?;
-                    let all = match store.associations(&req.memory_id) {
+                    // v0.9.11（G3 / CR-03）：解析并按信任域强制 scope。
+                    // 此前该端点直调存储层的 `associations()`（**不做可见性判断**）⇒
+                    // 其他 user/session 的记忆会以 `content_preview` 泄漏。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.session_id.as_deref(),
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => return Err(scope_required_error()),
+                    };
+                    let all = match store.associations_scoped(&req.memory_id, &scope) {
                         Ok(v) => v,
                         Err(e) => {
                             return Err((
@@ -4708,8 +5171,18 @@ pub fn build_v1_router(
                 let store = store.clone();
                 async move {
                     let max_nodes = req.max_nodes.unwrap_or(50).clamp(2, 500);
+                    // v0.9.11（G3 / CR-03）：同 `/memories/associations` —— 该端点此前
+                    // 无归属参数且直调存储层未过滤版本 ⇒ 图会跨 user 泄漏。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.session_id.as_deref(),
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     let store = lock_store_with_timeout(&store).await?;
-                    let g = match store.association_graph(&req.memory_id, max_nodes) {
+                    let g = match store.association_graph_scoped(&req.memory_id, max_nodes, &scope) {
                         Ok(v) => v,
                         Err(e) => {
                             return Err((
@@ -4794,10 +5267,15 @@ pub fn build_v1_router(
                     //   `user_id` 存在 ⇒ 构造 `(User, session_id, user_id)`；
                     //   缺省 ⇒ `None`（保持既有行为，不引入breaking change）。
                     // 这样"检索看不到的记忆，边的读取也看不到"。
-                    let privacy = if req.user_id.is_some() {
-                        Some((PrivacyLevel::User, req.session_id.clone(), req.user_id.clone()))
-                    } else {
-                        None
+                    // v0.9.11（G3 / CR-01）：统一 scope 构造 + 信任域强制。
+                    // 此前只判"user_id 是否 Some" ⇒ 多租户域下**省略即全可见**。
+                    let privacy = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.session_id.as_deref(),
+                    ) {
+                        Ok(s) => s,
+                        Err(_) => return Err(scope_required_error()),
                     };
                     match store.query_stored_edges(
                         &req.memory_id,
@@ -5447,6 +5925,9 @@ pub fn build_v1_router(
 
                 // 在独立线程中运行基准测试，添加 90 秒超时
                 let report = tokio::time::timeout(
+                    // v0.9.11（G4 / CR-14）：此前硬编码 **90s > 外层 30s**
+                    // ⇒ 外层丢弃 future 后该任务仍跑满 90s（白耗 CPU）。
+                    // 现由超时阶梯单一真源给出（20s < 30s）。
                     std::time::Duration::from_secs(90),
                     tokio::task::spawn_blocking(|| {
                         crate::benchmark::run_all_benchmarks(None)
@@ -5880,6 +6361,9 @@ pub fn build_v1_router(
                 }
             }
         }))
+        // v0.9.11（CR-32）：显式钉住请求体上限（见 `V1_MAX_REQUEST_BODY_BYTES` 文档）。
+        // 放在链尾 ⇒ 对**全部**已注册路由生效；超限请求在进入 handler 前即 413。
+        .layer(DefaultBodyLimit::max(V1_MAX_REQUEST_BODY_BYTES))
 }
 
 /// 比较版本号：latest > current 返回 true

@@ -294,12 +294,75 @@ pub struct RegressionVerdict {
 /// 视为"回应原意图"（与计划文档 P4.1 一致）。
 pub const ASSOCIATION_INTENT_RESPONSE_THRESHOLD: f32 = 0.5;
 
+/// 第五证据位（**本地语义同源度**）的默认阈值。
+///
+/// ## 为什么需要这一位（根因与设计意图）
+///
+/// 深度检索的**召回阶段用语义**（洛书向量余弦 + 卦象/ROI），
+/// 而**验收阶段此前只有词面判据**（证据 1~3 全是 token 重叠）。
+/// 两阶段判据不同源 ⇒ **"语义相关但词面零重叠"的候选被系统性否决**。
+///
+/// 实测（开发端 3189 条库，`LRC_DEEP_TRACE=1`）：
+///   ROI 命中 311 → 深度路仅存活 72（23.15%）；另一查询 385 → 12（3.12%）。
+/// 关掉词面门后存活率升到 63.67% / 51.95% ⇒ 上限被这道门锁死。
+///
+/// 修法：把**召回阶段已算出的语义余弦**作为第五证据喂回来 —— 判据同源。
+///
+/// ## 关于默认值：**是标定出来的，不是拍脑袋**
+///
+/// 方法：用**金丝雀**（`test_record_layer_end_to_end_persist_and_associate` ——
+/// 它断言"语义无关的记忆不得进主结果"）做门槛扫描，找它转绿的拐点：
+///
+/// ```text
+///  threshold=0.60 → FAILED      （漏噪：把「充电宝」放进了「苏堤」的主结果）
+///  threshold=0.70 → FAILED
+///  threshold=0.75 → ok          ← 拐点（本默认值）
+///  0.80/0.85/0.90/0.95 → ok
+/// ```
+///
+/// 即该负例的余弦约 0.70~0.75。取拐点值 0.75 作为默认；
+/// 可用 `LRC_DEEP_SEMANTIC_KEEP` 覆盖（标定/消融），
+/// `LRC_DEEP_SEMANTIC_GATE=0` 可整体关闭。
+///
+/// ## 已知残余风险（诚实标注）
+///
+/// 绝对阈值对**查询长度**敏感（本例查询仅 2 字，短查询的向量余弦普遍偏高）。
+/// 更稳的形态是"池内相对分位 + 绝对底线"双条件，留待用真实库标定后再切换；
+/// 当前以金丝雀守住下限，先确保**不引入噪声**。
+pub const DEEP_SEMANTIC_KEEP_DEFAULT: f32 = 0.75;
+
+/// 读取第五证据位的阈值（运行期实时读取，便于标定与消融，不必重启）。
+pub fn deep_semantic_keep_threshold() -> f32 {
+    std::env::var("LRC_DEEP_SEMANTIC_KEEP")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| (0.0..=1.0).contains(v))
+        .unwrap_or(DEEP_SEMANTIC_KEEP_DEFAULT)
+}
+
+/// 第五证据位的**总开关**（消融 / 归因 / 回滚用）。
+///
+/// - 缺省 **开启**（这是能力修复的默认形态）
+/// - `LRC_DEEP_SEMANTIC_GATE=0` 显式关闭 ⇒ 行为与"未接入 P5 前"逐字节一致
+///
+/// 为什么要有它：定位回归时必须能做 A/B 归因（"这个失败是我引入的还是本来就有的"），
+/// 而不必重新编译。（与 `LRC_STATE_BIAS` / `LRC_DEEP_LEX_DOMAIN` 同款约定。）
+pub fn deep_semantic_gate_enabled() -> bool {
+    !matches!(
+        std::env::var("LRC_DEEP_SEMANTIC_GATE").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
 pub fn regression_recheck(
     original_overlap: usize,
     bridge_hits: usize,
     tag_hits: usize,
     // P4 第四证据位：daemon 返回的意图相关分（None = daemon 离线，跳过）
     intent_score: Option<f32>,
+    // P5 第五证据位：**本地语义同源度**——召回阶段已算出的"候选 vs 原查询"余弦相似度。
+    // None = 编码器不可用/未提供 → 缺省跳过，行为与"未接入 P5 前"逐字节一致。
+    semantic_sim: Option<f32>,
 ) -> RegressionVerdict {
     if original_overlap > 0 {
         RegressionVerdict {
@@ -321,6 +384,15 @@ pub fn regression_recheck(
         RegressionVerdict {
             keep: true,
             evidence: "原意图回应度",
+        }
+    } else if deep_semantic_gate_enabled()
+        && semantic_sim.is_some_and(|s| s >= deep_semantic_keep_threshold())
+    {
+        // P5 第五证据：**判据同源**——凭召回阶段自己的语义分通过验收。
+        // 位置放在词面证据之后，保证既有语义（词面优先）不被掩盖。
+        RegressionVerdict {
+            keep: true,
+            evidence: "语义同源命中",
         }
     } else {
         RegressionVerdict {
@@ -387,6 +459,24 @@ mod tests {
         assert_eq!(result[0].0, "a");
     }
 
+    // 串行化对**进程级**环境变量 `LRC_STATE_BIAS` 的读写（v0.9.11 修竞态）。
+    //
+    // ## 为什么必须（这是一处真实的测试竞态，不是形式主义）
+    // Rust 测试默认**并行**，而环境变量是**进程级共享**的。下面两条配对用例：
+    //   - `活性偏置门控必须默认关闭`：清除变量 → 断言默认关
+    //   - `活性偏置门控显式开启仍生效`：设为 `"1"` → 断言开启
+    //
+    // 二者并发时存在真实竞态——若"设为 1"恰好插在"清除"与"读取"之间，
+    // 前者会读到 `"1"` 而**偶发失败**（实测：全量并行跑时复现过，
+    // 单独跑该用例则始终通过）。
+    //
+    // 原注释声称"不对变量的具体取值做假设，即可不与其它测试互相干扰"**不成立**：
+    // `state_bias_enabled()` 每次调用都**实时读全局变量**，读到什么完全取决于调度时机。
+    // 修法与 `dao_regulator::info_gain_threshold_tests` 同款——统一使用
+    // **全 crate 唯一**的 env 锁（`crate::test_env::lock()`，v0.9.11 / G6 / CR-20）。
+    // 曾用模块私锁，但模块间互不排斥 ⇒ 跨模块改同一变量（如 `LRC_STATE_BIAS`
+    // 亦被 `memory_store_tests` 修改）的竞态仍在，只是从必现退化为偶发。
+
     /// v0.9.8 门控默认值契约：`LRC_STATE_BIAS` **必须默认关闭**。
     ///
     /// **为什么需要这条测试**（不是形式主义）：该开关门控的是 v0.9.7 遗留的
@@ -402,10 +492,12 @@ mod tests {
     /// 证明断言具备鉴别力而非恒真。
     #[test]
     fn 活性偏置门控必须默认关闭() {
+        // v0.9.11（G6 / CR-20）：改用**全 crate 唯一**的 env 锁
+        //（模块私锁互不排斥 ⇒ 跨模块竞态仍在，如 `memory_store_tests` 亦改 `LRC_STATE_BIAS`）
+        let _guard = crate::test_env::lock();
         // 保存并清空环境变量，还原"用户未设置"的默认态。
-        // 注意：Rust 测试默认并行，环境变量是进程级共享的——故本测试
-        // 只断言"不设变量时的默认值"，不对变量的具体取值做假设，
-        // 从而不与显式设置该变量的其它测试互相干扰。
+        // 串行化：持全 crate 唯一 env 锁（见其文档），避免与
+        // `活性偏置门控显式开启仍生效` 并发时读到对方写入的 `"1"`。
         let saved = std::env::var_os("LRC_STATE_BIAS");
         std::env::remove_var("LRC_STATE_BIAS");
         let default_state = state_bias_enabled();
@@ -426,6 +518,7 @@ mod tests {
     /// 与上一条配对，确保"默认关"没有被实现成"永远关"（逃生开关仍可用）。
     #[test]
     fn 活性偏置门控显式开启仍生效() {
+        let _guard = crate::test_env::lock();
         let saved = std::env::var_os("LRC_STATE_BIAS");
         std::env::set_var("LRC_STATE_BIAS", "1");
         let enabled = state_bias_enabled();
@@ -441,14 +534,14 @@ mod tests {
 
     #[test]
     fn 道体再次校验原查询直接命中保留() {
-        let verdict = regression_recheck(2, 0, 0, None);
+        let verdict = regression_recheck(2, 0, 0, None, None);
         assert!(verdict.keep);
         assert_eq!(verdict.evidence, "原查询词面命中");
     }
 
     #[test]
     fn 道体再次校验联想桥强关联保留() {
-        let verdict = regression_recheck(0, 3, 0, None);
+        let verdict = regression_recheck(0, 3, 0, None, None);
         assert!(verdict.keep);
         assert_eq!(verdict.evidence, "联想桥强关联");
     }
@@ -456,14 +549,14 @@ mod tests {
     #[test]
     fn 道体再次校验单泛词不通过() {
         // 仅 1 个联想桥词命中、原查询零重叠、无标签 → 发散噪声，剔除
-        let verdict = regression_recheck(0, 1, 0, None);
+        let verdict = regression_recheck(0, 1, 0, None, None);
         assert!(!verdict.keep);
         assert_eq!(verdict.evidence, "无共鸣信号·发散噪声");
     }
 
     #[test]
     fn 道体再次校验标签共鸣兜底() {
-        let verdict = regression_recheck(0, 0, 1, None);
+        let verdict = regression_recheck(0, 0, 1, None, None);
         assert!(verdict.keep);
         assert_eq!(verdict.evidence, "标签共鸣");
     }
@@ -473,7 +566,7 @@ mod tests {
     /// P4.1-1：词面全空但意图相关分 ≥0.5 → 保留，证据"原意图回应度"
     #[test]
     fn 第四证据意图回应度高分保留() {
-        let verdict = regression_recheck(0, 0, 0, Some(0.7));
+        let verdict = regression_recheck(0, 0, 0, Some(0.7), None);
         assert!(verdict.keep, "intent_score ≥0.5 时应凭第四证据保留");
         assert_eq!(verdict.evidence, "原意图回应度");
     }
@@ -481,7 +574,7 @@ mod tests {
     /// P4.1-2：意图相关分 <0.5 → 第四证据不通过，回退三证据裁决（此处全空 → 剔除）
     #[test]
     fn 第四证据低分不通过回退三证据() {
-        let verdict = regression_recheck(0, 0, 0, Some(0.3));
+        let verdict = regression_recheck(0, 0, 0, Some(0.3), None);
         assert!(!verdict.keep, "intent_score <0.5 且词面全空时应仍剔除");
         assert_eq!(verdict.evidence, "无共鸣信号·发散噪声");
     }
@@ -489,7 +582,7 @@ mod tests {
     /// P4.1-3：意图分数在场且词面证据存在时，词面证据优先（不掩盖原证据）
     #[test]
     fn 第四证据不与词面证据冲突() {
-        let verdict = regression_recheck(2, 0, 0, Some(0.1));
+        let verdict = regression_recheck(2, 0, 0, Some(0.1), None);
         assert!(verdict.keep);
         assert_eq!(verdict.evidence, "原查询词面命中", "词面证据优先于第四证据");
     }
@@ -498,8 +591,87 @@ mod tests {
     #[test]
     fn 第四证据离线缺省跳过() {
         // 词面全空 + intent=None → 与"未接入 P4 前"的现状一致（剔除）
-        let verdict = regression_recheck(0, 0, 0, None);
+        let verdict = regression_recheck(0, 0, 0, None, None);
         assert!(!verdict.keep);
         assert_eq!(verdict.evidence, "无共鸣信号·发散噪声");
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // P5：判据同源 —— 本地语义同源度作为第五证据
+    //
+    // 根因：召回用语义、验收用词面 ⇒ "语义相关但词面零重叠"的候选被系统性否决。
+    // 实测开发端：ROI 命中 311 → 深度路存活 72（23.15%）。
+    // ══════════════════════════════════════════════════════════════
+
+    /// P5-1（红→绿）：词面全空但语义余弦达标 → **必须保留**（这是本次修复的目标行为）
+    #[test]
+    fn 第五证据语义同源命中保留() {
+        let _g = crate::test_env::lock();
+        std::env::remove_var("LRC_DEEP_SEMANTIC_KEEP");
+        let verdict = regression_recheck(0, 0, 0, None, Some(0.8));
+        assert!(verdict.keep, "语义余弦 ≥ 阈值时应凭第五证据保留");
+        assert_eq!(verdict.evidence, "语义同源命中");
+    }
+
+    /// P5-2（负向对照，**不可省**）：语义余弦不达标 → **仍须剔除**。
+    /// 缺了这条，等于把验收门开成全通，只是把噪声换了个来源。
+    #[test]
+    fn 第五证据语义不足仍剔除() {
+        let _g = crate::test_env::lock();
+        std::env::remove_var("LRC_DEEP_SEMANTIC_KEEP");
+        let verdict = regression_recheck(0, 0, 0, None, Some(0.2));
+        assert!(!verdict.keep, "语义余弦低于阈值且词面全空时应仍判发散噪声");
+        assert_eq!(verdict.evidence, "无共鸣信号·发散噪声");
+    }
+
+    /// P5-3：第五证据缺省（None，编码器不可用）时，行为与"未接入 P5 前"逐字节一致
+    #[test]
+    fn 第五证据缺省时行为不变() {
+        let _g = crate::test_env::lock();
+        std::env::remove_var("LRC_DEEP_SEMANTIC_KEEP");
+        let verdict = regression_recheck(0, 0, 0, None, None);
+        assert!(!verdict.keep);
+        assert_eq!(verdict.evidence, "无共鸣信号·发散噪声");
+    }
+
+    /// P5-4：**词面证据优先**——第五证据不得掩盖更强的词面证据（保持既有语义可读性）
+    #[test]
+    fn 第五证据不与词面证据冲突() {
+        let _g = crate::test_env::lock();
+        let verdict = regression_recheck(2, 0, 0, None, Some(0.99));
+        assert!(verdict.keep);
+        assert_eq!(
+            verdict.evidence, "原查询词面命中",
+            "词面证据应优先于第五证据"
+        );
+    }
+
+    /// P5-5：阈值可经环境变量覆盖（标定/消融用），且非法值回退默认
+    #[test]
+    fn 第五证据阈值可配置且非法值回退() {
+        let _g = crate::test_env::lock();
+        std::env::set_var("LRC_DEEP_SEMANTIC_KEEP", "0.3");
+        assert!((deep_semantic_keep_threshold() - 0.3).abs() < 1e-6);
+        // 0.5 在 0.3 阈值下应通过
+        assert!(regression_recheck(0, 0, 0, None, Some(0.5)).keep);
+        // 非法值（>1）必须回退默认，而不是被当成 1.0 用（否则等于全通）
+        std::env::set_var("LRC_DEEP_SEMANTIC_KEEP", "9");
+        assert!((deep_semantic_keep_threshold() - DEEP_SEMANTIC_KEEP_DEFAULT).abs() < 1e-6);
+        std::env::remove_var("LRC_DEEP_SEMANTIC_KEEP");
+    }
+
+    /// P5-6：总开关可关闭 ⇒ 用于**回归归因**（"这个失败是不是我引入的"）
+    /// 关闭后行为必须与"未接入 P5 前"逐字节一致（高语义分也不放行）。
+    #[test]
+    fn 第五证据总开关关闭后行为不变() {
+        let _g = crate::test_env::lock();
+        std::env::remove_var("LRC_DEEP_SEMANTIC_KEEP");
+        std::env::set_var("LRC_DEEP_SEMANTIC_GATE", "0");
+        assert!(!deep_semantic_gate_enabled());
+        let verdict = regression_recheck(0, 0, 0, None, Some(0.99));
+        assert!(!verdict.keep, "总开关关闭时，第五证据必须完全失效");
+        assert_eq!(verdict.evidence, "无共鸣信号·发散噪声");
+        std::env::remove_var("LRC_DEEP_SEMANTIC_GATE");
+        assert!(deep_semantic_gate_enabled(), "移除开关后应恢复默认开启");
     }
 }

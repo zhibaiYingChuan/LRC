@@ -68,6 +68,10 @@ cargo clippy --all-targets -- -D warnings 2>&1 || {
     echo "  Clippy (all-targets) 检查失败！请修复 lint 错误后再提交。"
     exit 1
 }
+# 说明（v0.9.11 / G6 / CR-59）：`--features server,ml` 的 clippy 口径**不在本钩子执行**——
+#   它需要编译 candle 全家桶，会给每次提交带来数分钟开销。
+#   该口径已由 CI 的 clippy job（`Run clippy (server + ml features)`）与
+#   release.yml preflight（`Clippy check (server + ml features)`）强制，故门禁不缺位。
 echo "  Clippy 通过。"
 
 # 3. Rust 编译检查
@@ -82,7 +86,11 @@ echo "  编译通过。"
 # 4. 测试
 echo ""
 echo "[4/5] 运行单元测试..."
-cargo test 2>&1 || {
+# v0.9.11（G6 / CR-21）：口径统一为 `--test-threads=1`。
+#   修前本钩子**并行**跑测试，而 CI 的 test job 用 `--test-threads=1` 串行 ——
+#   于是"CI 全绿"并不代表本钩子也绿（反之亦然），进程级环境变量竞态只在其中一侧暴露。
+#   现三处（ci.yml / release.yml preflight / 本钩子）统一串行口径。
+cargo test -- --test-threads=1 2>&1 || {
     echo "  测试失败！请修复测试后再提交。"
     exit 1
 }

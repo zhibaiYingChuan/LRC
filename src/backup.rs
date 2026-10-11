@@ -28,24 +28,34 @@ use std::sync::{Mutex, OnceLock};
 
 /// 备份锁序契约（v0.9.7 修复 GLOBAL_CODE_REVIEW_REPORT 并发 P2-3「备份锁序未文档化」）
 /// ============================================================
-/// 本模块**只持有一把锁**，代码库中的版本如下，改动时须刷新此说明：
+/// 本模块持有**两把**锁，代码库中的版本如下，改动时须刷新此说明：
 ///
 /// ```text
-///   [1] BACKUP_OPERATION_LOCK (Mutex<()>)  —— 全局单例，串行化"创建/恢复/清理备份"
+///   [1] BACKUP_OPERATION_LOCK (Mutex<()>)          —— 全局单例，串行化"创建/恢复/清理备份"
+///   [2] atomic_file::snapshot_guard() (RwLock 写)  —— 快照一致性闸门，独占（CR-37）
 /// ```
 ///
 /// **与持久层的锁序关系（关键，避免 ABBA）**：
-///   - 本锁**从不**在持有 `persistence::json::JSON_WRITE_LOCK` 或
+///   - 本模块**从不**在持有 `persistence::json::JSON_WRITE_LOCK` 或
 ///     `JsonPersistence::cache` 锁的情况下获取（备份流程为独立入口：
 ///     仪表盘"立即备份"、CLI `--backup`、恢复均自顶向下调用）。
-///   - 反向：持久层写入路径（`save_memory` 等）**从不**调用备份模块。
-///     故两模块之间**无环路**，不存在跨模块 ABBA。
+///   - 反向：持久层写入路径（`save_memory` 等）在**释放**其写锁前不调用备份模块，
+///     但会在写完一个文件时取 [2] 的**读**锁（`atomic_file::writer_guard`）。
+///     方向为"写入方持读、备份方持写"，是标准读写语义，**不构成 ABBA**：
+///     备份方只取 [2]，写入方在 [2] 之下不再取别的锁。
 ///   - 若未来需要"写入前自动备份"，**必须**在**释放**本锁后再进入持久层写锁，
 ///     即维持 `BACKUP → (release) → cache → JSON_WRITE` 的顺序，禁止嵌套获取。
 ///
 /// **持锁期间的行为**：备份为文件级 `fs::copy`（见 `create_backup_locked`），
 ///   持锁期间执行磁盘 IO 是**有意**的——备份的语义就是"某一时刻的一致快照"，
 ///   必须与并发的写操作互斥。此处临界区放大是正确性要求，非缺陷。
+///
+/// **⚠️ v0.9.11（G5 / CR-37）修正**：上面这句"必须与并发的写操作互斥"此前**只是承诺、没有机制**
+///   —— 写路径从不取本模块的任何锁，于是快照仍可能是"半新半旧"的文件组（如
+///   `memories.json` 已是新版而 `audit.jsonl` 还是旧版 ⇒ 悬空审计引用）。
+///   现在由 [2] 兑现：备份/恢复持**写**锁独占，所有落盘路径持**读**锁共享。
+///   **持 [2] 写锁期间不得调用 `atomic_file::write_atomic`**（同线程会自锁死），
+///   本模块因此坚持文件级 `fs::copy`。
 ///
 /// **调用点**：[`create_backup`]（本文件 :109 附近）与 [`restore_backup`]
 ///   （本文件 :267 附近）各获取一次；`count_backups` / `cleanup_old_backups`
@@ -138,6 +148,36 @@ pub fn create_backup() -> BackupReport {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    // v0.9.11（G5 / CR-37）：取**独占**快照闸门（锁序 [1] → [2]）。
+    //   一旦取得，所有 JSON 落盘路径（持 writer_guard 读锁）都被排除 ⇒
+    //   7 个文件取自**同一时刻**，兑现上方"必须与并发写互斥"的承诺。
+    let _snapshot_guard = crate::atomic_file::snapshot_guard();
+    let report = create_backup_in(&global_data_dir(), &backups_dir());
+    // 数据操作日志只在**真实**入口记录：`create_backup_in` 供测试注入临时目录调用，
+    // 不应把测试运行写进用户的 `~/.loong-recall/data_operations.log`。
+    if report.success {
+        let details = format!(
+            "备份 {} 条记忆至 {}（清理 {} 份旧备份，当前共 {} 份）",
+            report.memory_count,
+            report.backup_path.as_deref().unwrap_or("未知路径"),
+            report.old_backups_removed,
+            report.total_backups
+        );
+        crate::data_log::log_operation(crate::data_log::OperationType::Backup, &details);
+    }
+    report
+}
+
+/// [`create_backup`] 的**可注入路径内核**（v0.9.11 / G7 / CR-45）。
+///
+/// `data_dir` 与 `root` 由调用方给定 ⇒ 测试可指向临时目录，
+/// **绝不触碰**用户的真实 `~/.loong-recall/`。
+/// 这正是本函数被拆出来的唯一理由：原实现把 home 路径写死在函数体内，
+/// 使这条"数据安全最后防线"长期 **0 测试覆盖**（一测就会污染真实记忆库）。
+///
+/// **调用方契约**：本函数**不取任何锁** —— 锁由 [`create_backup`] 在同一临界区内持有。
+/// 生产代码不得直接调用它（`fn` 私有即为此）。
+fn create_backup_in(data_dir: &Path, root: &Path) -> BackupReport {
     let mut report = BackupReport {
         success: false,
         backup_path: None,
@@ -147,7 +187,7 @@ pub fn create_backup() -> BackupReport {
         total_backups: 0,
         error: None,
     };
-    let data_dir = global_data_dir();
+    let data_dir = data_dir.to_path_buf();
     if !data_dir.join("memories.json").exists() {
         report.error = Some(format!(
             "记忆文件不存在: {}",
@@ -155,7 +195,7 @@ pub fn create_backup() -> BackupReport {
         ));
         return report;
     }
-    let root = backups_dir();
+    let root = root.to_path_buf();
     if let Err(e) = fs::create_dir_all(&root) {
         report.error = Some(format!("创建备份目录失败: {}", e));
         return report;
@@ -215,17 +255,6 @@ pub fn create_backup() -> BackupReport {
     report.total_backups = count_backups(&root);
 
     report.success = true;
-
-    // v0.8.0 "归一"：记录数据操作日志
-    let details = format!(
-        "备份 {} 条记忆至 {}（清理 {} 份旧备份，当前共 {} 份）",
-        report.memory_count,
-        report.backup_path.as_deref().unwrap_or("未知路径"),
-        report.old_backups_removed,
-        report.total_backups
-    );
-    crate::data_log::log_operation(crate::data_log::OperationType::Backup, &details);
-
     report
 }
 
@@ -299,10 +328,22 @@ pub fn restore_backup(snapshot_path: &Path) -> LrcResult<()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    // v0.9.11（G5 / CR-37）：恢复同样要**独占**（锁序 [1] → [2]）。
+    //   否则恢复进行到一半时，实时写会把"旧版本记忆"重新落盘 ⇒ 恢复结果被静默污染。
+    let _snapshot_guard = crate::atomic_file::snapshot_guard();
+    restore_backup_in(snapshot_path, &backups_dir(), &global_data_dir())
+}
+
+/// [`restore_backup`] 的**可注入路径内核**（v0.9.11 / G7 / CR-45）。
+///
+/// `allowed_root` / `data_dir` 由调用方给定 ⇒ 测试可指向临时目录，
+/// **绝不触碰**用户的真实记忆库（恢复是要覆盖数据的操作，测错路径后果极重）。
+///
+/// **调用方契约**：不取锁；锁由 [`restore_backup`] 在同一临界区持有。
+fn restore_backup_in(snapshot_path: &Path, allowed_root: &Path, data_dir: &Path) -> LrcResult<()> {
     // v0.9.7 审查修复（HCSE-P0 安全）：快照目录必须位于本工具的备份目录内。
     // 端点默认无 token 保护，若不约束路径，本机任意进程可把任意目录内容
     // （SNAPSHOT_FILES 同名文件）覆盖进全局数据目录，属路径穿越/越权写。
-    let allowed_root = backups_dir();
     let canonical_snapshot = snapshot_path.canonicalize().map_err(|e| {
         LrcError::not_found(format!(
             "快照路径无法解析: {} ({})",
@@ -341,8 +382,7 @@ pub fn restore_backup(snapshot_path: &Path) -> LrcResult<()> {
         )));
     }
     let snapshot_path = canonical_snapshot.as_path();
-    let data_dir = global_data_dir();
-    fs::create_dir_all(&data_dir).map_err(|e| LrcError::io(format!("创建数据目录失败: {}", e)))?;
+    fs::create_dir_all(data_dir).map_err(|e| LrcError::io(format!("创建数据目录失败: {}", e)))?;
     let temp = data_dir.join(format!(
         ".restore-{}.tmp",
         BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -579,5 +619,164 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"success\":true"));
         assert!(json.contains("\"memory_count\":100"));
+    }
+
+    // ════════ v0.9.11（G7 / CR-45）：备份 / 恢复的**端到端**用例（此前 0 覆盖）════════
+    //
+    // 为什么此前没有：`create_backup()` / `restore_backup()` 把 home 路径**写死在函数体内**，
+    // 一测就会读写**真实**的 `~/.loong-recall/`（恢复甚至会覆盖真实记忆库）。
+    // 故先拆出可注入路径的 `create_backup_in` / `restore_backup_in` 内核，
+    // 下面的用例只指向临时目录 —— 这也是这两个内核存在的唯一理由。
+
+    /// 造一套临时目录：(临时目录守卫, 数据目录, 备份根目录)
+    fn setup_dirs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().expect("创建临时目录");
+        let data = tmp.path().join("data");
+        let backups = tmp.path().join("backups");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&backups).unwrap();
+        (tmp, data, backups)
+    }
+
+    /// 快照必须覆盖 `SNAPSHOT_FILES` **全清单**：存在的复制、缺失的置空
+    #[test]
+    fn create_backup_in_snapshots_all_files() {
+        let (_tmp, data, backups) = setup_dirs();
+        fs::write(data.join("memories.json"), r#"[{"id":"m1"},{"id":"m2"}]"#).unwrap();
+        fs::write(data.join("audit.jsonl"), "{\"a\":1}\n").unwrap();
+        // 其余 5 个文件故意不创建
+
+        let report = create_backup_in(&data, &backups);
+        assert!(report.success, "备份应成功：{:?}", report.error);
+        assert_eq!(report.memory_count, 2, "应数出 2 条记忆");
+        let snapshot = std::path::PathBuf::from(report.backup_path.as_ref().unwrap());
+        for file in SNAPSHOT_FILES {
+            assert!(
+                snapshot.join(file).exists(),
+                "快照必须包含 {file}（缺失也要置空）"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(snapshot.join("memories.json")).unwrap(),
+            r#"[{"id":"m1"},{"id":"m2"}]"#,
+            "内容必须逐字节一致"
+        );
+        assert_eq!(
+            fs::metadata(snapshot.join("archive.json")).unwrap().len(),
+            0,
+            "缺失的文件必须落成空文件（否则恢复会把它当成'不存在'）"
+        );
+        assert_eq!(report.total_backups, 1);
+    }
+
+    /// 无 `memories.json` ⇒ **明确失败**并给出可读原因（不得静默造出空快照）
+    #[test]
+    fn create_backup_in_fails_loudly_without_memories_file() {
+        let (_tmp, data, backups) = setup_dirs();
+        let report = create_backup_in(&data, &backups);
+        assert!(!report.success, "缺 memories.json 时不得报告成功");
+        assert!(
+            report
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("记忆文件不存在"),
+            "错误信息应指明原因，实际 {:?}",
+            report.error
+        );
+        assert_eq!(count_backups(&backups), 0, "失败不得留下半成品快照");
+    }
+
+    /// 恢复必须把快照内容**逐字节**写回数据目录
+    #[test]
+    fn restore_backup_in_writes_snapshot_back_into_data_dir() {
+        let (_tmp, data, backups) = setup_dirs();
+        let snapshot = backups.join("memories_20260101_000000.snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("memories.json"), r#"[{"id":"restored"}]"#).unwrap();
+        // 数据目录里先放"被覆盖前"的旧内容
+        fs::write(data.join("memories.json"), r#"[{"id":"stale"}]"#).unwrap();
+
+        restore_backup_in(&snapshot, &backups, &data).expect("恢复应成功");
+
+        assert_eq!(
+            fs::read_to_string(data.join("memories.json")).unwrap(),
+            r#"[{"id":"restored"}]"#,
+            "恢复后必须是快照内容"
+        );
+        // 快照中缺失的其它文件也应被恢复成空文件（保持"全量覆盖"语义）
+        assert!(
+            data.join("audit.jsonl").exists(),
+            "缺失文件应被恢复为空文件"
+        );
+        assert_eq!(fs::metadata(data.join("audit.jsonl")).unwrap().len(), 0);
+    }
+
+    /// **安全红线**：快照目录必须位于备份目录内，否则拒绝（路径穿越/越权写）
+    #[test]
+    fn restore_backup_in_rejects_snapshot_outside_backups_root() {
+        let (tmp, data, backups) = setup_dirs();
+        let outside = tmp.path().join("evil");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("memories.json"), r#"[{"id":"evil"}]"#).unwrap();
+        fs::write(data.join("memories.json"), r#"[{"id":"keep"}]"#).unwrap();
+
+        let err =
+            restore_backup_in(&outside, &backups, &data).expect_err("备份目录外的快照必须被拒绝");
+        assert!(
+            err.to_string().contains("不在备份目录"),
+            "应给出越界原因，实际 {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(data.join("memories.json")).unwrap(),
+            r#"[{"id":"keep"}]"#,
+            "拒绝之后目标数据必须**原封不动**"
+        );
+    }
+
+    /// 恢复同样要求快照内确有 `memories.json`（空目录不得被当成合法快照）
+    #[test]
+    fn restore_backup_in_rejects_snapshot_without_memories_file() {
+        let (_tmp, data, backups) = setup_dirs();
+        let snapshot = backups.join("memories_20260101_000001.snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(data.join("memories.json"), r#"[{"id":"keep"}]"#).unwrap();
+
+        let err = restore_backup_in(&snapshot, &backups, &data)
+            .expect_err("缺 memories.json 的快照必须被拒绝");
+        assert!(
+            err.to_string().contains("memories.json"),
+            "应指明缺失项，实际 {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(data.join("memories.json")).unwrap(),
+            r#"[{"id":"keep"}]"#,
+            "数据必须原封不动"
+        );
+    }
+
+    /// 源码级守卫：生产入口必须走可注入内核，且**不得**把 home 路径写回函数体
+    /// （写回去 = 这些用例会立刻变成"污染真实记忆库"的危险测试）
+    ///
+    /// ⚠️ 断言范围截到测试模块之前：测试自身源码含 `create_backup_in(` 字样，
+    /// 整文件扫描会"自己匹配自己"⇒ 守卫恒真。
+    #[test]
+    fn backup_entrypoints_delegate_to_injectable_cores() {
+        let src = include_str!("backup.rs");
+        let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let pub_create = prod
+            .find("pub fn create_backup()")
+            .expect("必须存在 create_backup");
+        assert!(
+            prod[pub_create..].contains("create_backup_in("),
+            "create_backup 必须委托 create_backup_in（否则无法被隔离测试）"
+        );
+        let pub_restore = prod
+            .find("pub fn restore_backup(")
+            .expect("必须存在 restore_backup");
+        assert!(
+            prod[pub_restore..].contains("restore_backup_in("),
+            "restore_backup 必须委托 restore_backup_in（否则无法被隔离测试）"
+        );
     }
 }

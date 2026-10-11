@@ -54,6 +54,10 @@ pub(crate) struct MemoryStoreCache {
     memory: RefCell<Vec<Memory>>,
     /// 缓存脏标记：任何写操作后置 true，读操作前检查
     dirty: Cell<bool>,
+    /// 加载本缓存时数据源的指纹（v0.9.11 / CR-42）：
+    /// 与持久层当前指纹不符 ⇒ 说明**别的进程**改过数据，必须重载。
+    /// `None` 表示后端不提供指纹（则只看 `dirty`，行为与修前一致）。
+    source_fingerprint: Cell<Option<u64>>,
     /// 候选 term 倒排索引（默认启用域候选索引；最终仍由 Jaccard 判定）
     index: RefCell<BigramIndex>,
     /// 索引脏标记
@@ -70,6 +74,7 @@ impl MemoryStoreCache {
         Self {
             memory: RefCell::new(Vec::new()),
             dirty: Cell::new(true), // 初始为脏，首次读取时加载
+            source_fingerprint: Cell::new(None),
             index: RefCell::new(HashMap::new()),
             index_dirty: Cell::new(true),
             documents: RefCell::new(HashMap::new()),
@@ -79,14 +84,29 @@ impl MemoryStoreCache {
 
     // ---------- 全量记忆快照 ----------
 
-    /// 全量记忆缓存是否已失效
-    pub(crate) fn is_dirty(&self) -> bool {
-        self.dirty.get()
+    /// 是否需要从持久层重载
+    ///
+    /// 条件（v0.9.11 / CR-42 新增第 2 条）：
+    ///   1. 自身被标记为脏（本进程写过）；
+    ///   2. **数据源指纹变了**（别的进程写过）—— 这是修前缺失的一环，
+    ///      导致多窗口/多进程并存时可能**无限期读陈旧数据**。
+    ///
+    /// 后端不提供指纹（`current == None`）时只按 `dirty` 判定 ⇒ 与修前行为一致。
+    pub(crate) fn needs_reload(&self, current: Option<u64>) -> bool {
+        if self.dirty.get() {
+            return true;
+        }
+        match (current, self.source_fingerprint.get()) {
+            (Some(now), Some(loaded)) => now != loaded,
+            (Some(_), None) => true, // 首次拿到指纹（此前未记录）⇒ 保守重载一次
+            _ => false,
+        }
     }
 
-    /// 用新加载的全量记忆替换缓存并清除脏标记
-    pub(crate) fn store(&self, memories: Vec<Memory>) {
+    /// 用新加载的全量记忆替换缓存并清除脏标记，同时记录数据源指纹
+    pub(crate) fn store(&self, memories: Vec<Memory>, source_fingerprint: Option<u64>) {
         *self.memory.borrow_mut() = memories;
+        self.source_fingerprint.set(source_fingerprint);
         self.dirty.set(false);
     }
 

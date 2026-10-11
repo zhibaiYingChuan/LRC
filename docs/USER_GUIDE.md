@@ -2,7 +2,7 @@
 
 > **给 AI 装上记忆的本地服务** — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定与决策。
 >
-> 版本：**v0.9.9** | 适用于：Trae / Trae CN / Cursor / VS Code / Windsurf / Claude Desktop 等支持 MCP 协议的 AI 工具
+> 版本：**v0.9.10** | 适用于：Trae / Trae CN / Cursor / VS Code / Windsurf / Claude Desktop 等支持 MCP 协议的 AI 工具
 >
 > 本文面向**使用者**。想了解实现原理与能力实测数据，请看 [README](../README.md)；想了解本版本的修复内容，见 [CHANGELOG](../CHANGELOG.md)。
 
@@ -46,15 +46,15 @@ AI 回复："（根据记忆 #3）你之前选择了 PostgreSQL，原因是需�
 
 | 平台 | 安装包文件名 |
 |------|------------|
-| Windows | `lrc-desktop-v0.9.9-windows-x86_64-setup.exe` |
-| macOS | `lrc-desktop-v0.9.9-macos-arm64.dmg` |
-| Linux | `lrc-desktop-v0.9.9-linux-amd64.deb` 或 `...-linux-x86_64.AppImage` |
+| Windows | `lrc-desktop-v0.9.10-windows-x86_64-setup.exe` |
+| macOS | `lrc-desktop-v0.9.10-macos-arm64.dmg` |
+| Linux | `lrc-desktop-v0.9.10-linux-amd64.deb` 或 `...-linux-x86_64.AppImage` |
 
-> ⚠️ **注意区分**：Release 里形如 `lrc-v0.9.9-windows-x86_64.exe` 的文件是 **CLI 命令行工具**（供脚本调用），**不是安装包**，双击无法安装。安装请认准 `lrc-desktop-*` 开头的文件名。
+> ⚠️ **注意区分**：Release 里形如 `lrc-v0.9.10-windows-x86_64.exe` 的文件是 **CLI 命令行工具**（供脚本调用），**不是安装包**，双击无法安装。安装请认准 `lrc-desktop-*` 开头的文件名。
 
 双击安装并启动，桌面端会自动完成所有配置：**检测 AI 工具 → 写入 MCP 配置 → 写入 AI 规则文件**。完成后重启 IDE 即可使用。
 
-> 💡 **安装包为什么只有几 MB？** 是设计使然——语义模型按需下载（首次约 100~400MB，自动走国内镜像），道体推演引擎为独立研究资产不随产品分发。详见 [README 的道体边界说明](../README.md)。
+> 💡 **安装包为什么只有几 MB？** 是设计使然——语义模型按需下载（首次约 100~400MB，自动走国内镜像）；**独立的道体推演服务**（`daoti_daemon` / `daoti_assoc`，非本仓库代码）不随包分发。（注意：`src/engine/` 下的**道体源码**属功能必需，**随包编译分发**——两者不是一回事。）详见 [README 的道体边界说明](../README.md)。
 
 ---
 

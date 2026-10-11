@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.9.10';
+const APP_VERSION = '0.9.11';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -1194,7 +1194,6 @@ const SidecarHealthMonitor = {
         setTimeout(() => loadDaoMetrics(), 800);
       }
       if (online) {
-        if (typeof loadCrystallizationHistory === 'function') setTimeout(loadCrystallizationHistory, 900);
         if (typeof loadEvolutionTimeline === 'function') setTimeout(loadEvolutionTimeline, 900);
       }
       // 3. 发出自定义事件，供其他模块解耦响应
@@ -8439,9 +8438,6 @@ function gotoSynthesisHistory() {
   }
   const morePanel = document.getElementById('home-advanced-details');
   if (morePanel) morePanel.open = true;
-  setTimeout(() => {
-    if (typeof loadCrystallizationHistory === 'function') loadCrystallizationHistory();
-  }, 100);
 }
 
 // data-action 集中绑定通过 window[action] 解析，需显式导出
@@ -8471,61 +8467,6 @@ document.addEventListener('DOMContentLoaded', function() {
   // 首页数据延迟加载，避免阻塞首屏渲染
   setTimeout(loadHomeData, 1200);
 });
-
-
-let crystallizationHistoryRequest = null;
-
-async function loadCrystallizationHistory() {
-  const timelineEl = document.getElementById('crystallization-timeline');
-  if (!timelineEl) return;
-  if (crystallizationHistoryRequest) crystallizationHistoryRequest.abort();
-  crystallizationHistoryRequest = new AbortController();
-  const signal = crystallizationHistoryRequest.signal;
-  timelineEl.innerHTML = '<div class="timeline-loading">正在加载结晶历史...</div>';
-
-  try {
-    await syncSidecarApiBase();
-    // v0.9.6 修复：数据源从审计事件改为合成记忆本身。
-    // 结晶的持久化产物就是 Synthesis 类型记忆（created_at 即结晶完成时间）。
-    // 原实现从 audit-trail 提取 synthesis_created 事件，但历史合成未落审计
-    // 事件（批量导入/早期版本），导致时间线永远显示"暂无结晶记录"。
-    const res = await fetchWithTimeout(
-      `${window.API_BASE}/v1/memories/synthesis-timeline?limit=10`,
-      { signal },
-      10000
-    );
-    const data = await safeJson(res);
-    if (data.lock_busy || data.degraded) {
-      throw new Error('后台正在处理记忆，请稍后刷新');
-    }
-    const items = Array.isArray(data.items) ? data.items : [];
-    if (items.length === 0) {
-      timelineEl.innerHTML = '<div class="timeline-empty">暂无结晶记录，完成一次知识结晶后会显示在这里。</div>';
-      return;
-    }
-    // v0.9.6 P1-1：展示来源记忆数/置信度，体现"记忆→结晶"成长链路
-    timelineEl.innerHTML = items.map(it => {
-      const sourceText = Number(it.source_count) > 0
-        ? `由 ${num(it.source_count)} 条相关记忆结晶而成`
-        : '';
-      const confText = Number(it.confidence) > 0
-        ? `置信度 ${(Number(it.confidence) * 100).toFixed(0)}%`
-        : '';
-      return `
-      <div class="crystallization-event">
-        <div class="crystallization-event-title">${htmlescape(truncateText(it.content, 24))}</div>
-        <div class="crystallization-event-time">${htmlescape(formatTimelineTime(it.created_at_ms))}</div>
-        <div class="crystallization-event-desc">${htmlescape(truncateText(it.content, 96))}${it.project ? `<span class="crystallization-event-project"> · ${htmlescape(truncateText(it.project, 24))}</span>` : ''}</div>
-        ${(sourceText || confText) ? `<div class="crystallization-event-meta">${sourceText}${sourceText && confText ? ' · ' : ''}${confText}</div>` : ''}
-      </div>
-    `;
-    }).join('');
-  } catch (err) {
-    if (err?.name === 'AbortError' || signal.aborted) return;
-    timelineEl.innerHTML = `<div class="timeline-error">结晶历史加载失败：${htmlescape(err.message || '服务暂不可用')} <button class="btn btn-ghost" data-action="loadCrystallizationHistory">重试</button></div>`;
-  }
-}
-window.loadCrystallizationHistory = loadCrystallizationHistory;
 
 function formatTimelineTime(timestamp) {
   const value = Number(timestamp);
@@ -8569,10 +8510,8 @@ function formatAnyTime(v) {
 }
 window.formatAnyTime = formatAnyTime;
 
-// 页面加载完成后初始化结晶历史加载
+// 页面加载完成后初始化
 document.addEventListener('DOMContentLoaded', function() {
-  // 延迟加载结晶历史，避免阻塞首屏渲染
-  setTimeout(loadCrystallizationHistory, 1500);
   // 初始化道同构度仪表盘
   setTimeout(loadDaoMetrics, 800);
   // v0.9.7 首页重构：演化时间线不再即时加载，改为 M5 折叠区首次展开时懒加载
