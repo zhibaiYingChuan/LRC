@@ -136,6 +136,26 @@ struct Neo4jError {
 ///
 /// 通过 HTTP API 与 Neo4j 图数据库通信，
 /// 使用 Cypher 查询语言操作记忆节点和关系边。
+///
+/// # 定位声明（v0.9.11 / G5 / CR-39 —— 把"遗漏"与"有意投影"区分开）
+///
+/// **本后端是「关系图投影」，不是记忆的权威源（authority source）。**
+/// - 节点只承载 [`create_memory_node`] 写入的**最小投影属性**（id / content /
+///   memory_type / importance / project / updated_at）—— 恰好够回答
+///   "谁和谁有关"（[`subgraph`] 只消费 `id` 与边类型）以及做人工查看；
+/// - 记忆的**完整字段**（29 项，见 `persistence::fields::MEMORY_FIELDS`）由
+///   JSON / Postgres / Qdrant 主后端承载。图库与主后端之间是"投影 ↔ 权威"关系，
+///   不是"两个权威互相同步"。
+/// - 因此**不存在**"图库重建不出完整记忆"的功能缺陷：本后端从未被要求承担该职责
+///   （它也不实现 `Persistence` trait，不参与写入/读取主管线）。
+///
+/// ## 若未来要把图库**提升为权威源**（前置条件，缺一不可）
+/// 1. 节点须改为存**整条记忆的 JSON**（属性名 `memory_json`），与 Qdrant 后端的
+///    做法一致 —— 用 serde 整体序列化/还原，而不是逐字段白名单：
+///    逐字段白名单正是 CR-07/CR-08/CR-17 那类"漏字段 ⇒ 静默假绿"的根源（见 G2）。
+/// 2. 节点须补 `privacy_level` / `user_id` / `session_id`，否则图查询无法做
+///    可见性过滤（会复现 CR-03 的跨用户泄漏形态）。
+/// 3. 须实现 `Persistence` trait 并接入写入/读取管线，同时补测试（现状 0 覆盖，见 CR-48）。
 #[cfg(feature = "neo4j")]
 pub struct Neo4jGraphStore {
     config: Neo4jConfig,
@@ -300,7 +320,15 @@ impl Neo4jGraphStore {
         Ok(tx_response)
     }
 
-    /// 创建记忆节点
+    /// 创建记忆节点（**关系图投影**，见 [`Neo4jGraphStore`] 的定位声明）
+    ///
+    /// 只写入 6 个**投影属性**（id / content / memory_type / importance / project /
+    /// updated_at）：目的是让人能看懂节点、让 [`subgraph`] 能按 `id` 与边类型遍历。
+    ///
+    /// **不要**把它当成"记忆持久化"来扩展字段白名单（CR-39 的教训）：
+    /// 逐字段白名单一旦成为权威源，漏一个字段就是**静默丢数据**
+    /// （CR-07/CR-08/CR-17 同源）。若确需权威源，请按上文的 3 条前置条件改为存
+    /// `memory_json` 整条 JSON。
     pub async fn create_memory_node(
         &self,
         id: &str,

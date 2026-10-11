@@ -3550,72 +3550,12 @@ code, pre, .code-block {
   line-height: 1.5;
 }
 
-/* ----- v0.6.0 结晶历史时间线 ----- */
-.crystallization-timeline {
-  position: relative;
-  padding-left: var(--space-6);
-  margin: var(--space-4) 0;
-}
-
-.crystallization-timeline::before {
-  content: '';
-  position: absolute;
-  left: 8px;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: var(--lrc-金色-200);
-}
-
-.crystallization-event {
-  position: relative;
-  padding: var(--space-3) 0;
-  margin-bottom: var(--space-2);
-}
-
-.crystallization-event::before {
-  content: '';
-  position: absolute;
-  left: -28px;
-  top: var(--space-4);
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: var(--lrc-金色-500);
-  border: 2px solid var(--lrc-宣纸-300);
-  box-shadow: 0 0 0 2px var(--lrc-金色-200);
-}
-
-.crystallization-event-title {
-  font-weight: 600;
-  color: var(--lrc-墨韵-500);
-  font-size: var(--type-body-size);
-  margin-bottom: var(--space-1);
-}
-
-.crystallization-event-time {
-  font-size: var(--type-body-sm-size);
-  color: var(--lrc-墨韵-300);
-  font-family: var(--font-mono);
-}
-
-.crystallization-event-desc {
-  font-size: var(--type-body-sm-size);
-  color: var(--lrc-墨韵-300);
-  line-height: 1.6;
-  margin-top: var(--space-1);
-}
-
-/* v0.9.6 P1-1：结晶成长链路（来源记忆数/置信度） */
-.crystallization-event-meta {
-  font-size: var(--type-body-sm-size);
-  color: var(--lrc-金色-500);
-  margin-top: var(--space-1);
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: var(--lrc-金色-100);
-}
+/* ----- v0.6.0 结晶历史时间线 -----
+   v0.9.11 / CR-57：以下 `.crystallization-*` 规则**已删除** ——
+   它们只服务于 `#crystallization-timeline` 时间线（该容器 v0.9.7 首页重构时已移除，
+   JS 侧对应函数 `loadCrystallizationHistory` 也已删除）。
+   注意：`.timeline-loading` / `.timeline-empty` / `.timeline-error` 是**共享**类
+   （演化时间线仍在使用），故不在本次删除范围内。 */
 
 /* v0.9.6 P1-2：最近联想与命中原因（人话解释） */
 .association-recent-list {

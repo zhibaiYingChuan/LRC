@@ -488,6 +488,58 @@ impl LuoShuEncoder {
     pub fn get_status(&self) -> EncoderStatus {
         EncoderStatus::default()
     }
+
+    // ============================================================
+    // **特性中立 API**（v0.9.11 / G9 / CR-27）
+    // ============================================================
+    //
+    // ## 问题
+    // `HybridLuoShuEncoder` 这个名字在两种 feature 配置下指向**两个不同的类型**：
+    //   - `feature = "ml"`   → `engine::luoshu_encoder_ml::HybridLuoShuEncoder`（结构体）
+    //   - `feature != "ml"`  → `engine::luoshu_encoder::LuoShuEncoder`（本类型，别名）
+    // 二者**方法集不同** ⇒ 同一段调用代码只在某一个配置下能编译，
+    // 差异只能在编译期（且只在该配置下）暴露。
+    //
+    // ## 本组方法的作用
+    // 在**非 ml 侧**补齐 ml 侧已有的、语义上"统计模式也有确定答案"的方法，
+    // 使两侧方法集**同构** ⇒ 上层代码不再需要为"这个配置有没有这个方法"做 cfg 分支。
+    // 语义：统计模式没有 ML，故一律给出诚实的"无"答案（false / None / (0,0) / no-op）。
+    //
+    // 由 `feature_neutral_encoder_api_is_uniform`（本文件测试）在**两种配置下**
+    // 各调用一次同名方法，任一侧缺方法即编译失败。
+
+    /// 创建统计模式编码器（与 ml 侧同名同签名；统计模式本就无模型）
+    pub fn new_statistical() -> Self {
+        Self::new()
+    }
+
+    /// 当前是否为 ML 语义模式（统计模式恒为 `false`）
+    pub fn is_ml_mode(&self) -> bool {
+        false
+    }
+
+    /// 编码为**完整句向量**（统计模式无此能力 ⇒ 恒 `None`，调用方回退标签匹配）
+    ///
+    /// 与 ml 侧签名逐字一致：`fn encode_embedding(&self, text: &str) -> Option<Vec<f32>>`。
+    pub fn encode_embedding(&self, _text: &str) -> Option<Vec<f32>> {
+        None
+    }
+
+    /// 是否处于"ML 降级"状态（统计模式无 ML，恒 `false`）
+    pub fn is_degraded(&self) -> bool {
+        false
+    }
+
+    /// 降级恢复进度 `(当前, 目标)`（统计模式恒 `(0, 0)`）
+    pub fn recovery_progress(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
+    /// 设置降级恢复阈值（统计模式为空操作，仅为 API 同构）
+    pub fn set_recovery_threshold(&self, _threshold: u32) {}
+
+    /// 记录一次降级（统计模式为空操作，仅为 API 同构）
+    pub fn record_degradation(&self, _reason: &str) {}
 }
 
 impl Default for LuoShuEncoder {
@@ -818,6 +870,48 @@ fn char_palace(ch: char) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★守卫（v0.9.11 / G9 / CR-27）：**`HybridLuoShuEncoder` 的 API 必须在两种 feature 配置下同构**。
+    ///
+    /// 做法：在两个 `cfg` 分支里**对同名类型调用同一组方法名**。
+    /// 若某一侧缺方法（例如只给 ml 侧加了新方法），则该配置下的 `cargo check/test`
+    /// **直接编译失败** ⇒ "同名类型、两套 API"不再能悄悄存在。
+    ///
+    /// 覆盖的即"特性中立最小集"：创建 / 编码 / 状态 / ML 能力查询。
+    #[test]
+    fn feature_neutral_encoder_api_is_uniform() {
+        #[cfg(not(feature = "ml"))]
+        {
+            use crate::engine::luoshu_encoder::LuoShuEncoder as Enc;
+            let enc = Enc::new_statistical();
+            assert_eq!(enc.encode_text("测试").values.len(), 9);
+            assert!(!enc.is_ml_mode(), "非 ml 构建下不得自称 ML 模式");
+            assert!(!enc.is_degraded(), "非 ml 构建下不存在降级态");
+            assert!(
+                enc.encode_embedding("测试").is_none(),
+                "无模型 ⇒ 句向量为 None"
+            );
+            assert_eq!(enc.recovery_progress(), (0, 0));
+            enc.set_recovery_threshold(3); // 空操作，但方法必须存在
+            enc.record_degradation("probe"); // 同上
+            let _ = enc.get_status();
+            let _ = enc.deviation_of("测试");
+        }
+        #[cfg(feature = "ml")]
+        {
+            use crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder as Enc;
+            let enc = Enc::new_statistical();
+            assert_eq!(enc.encode_text("测试").values.len(), 9);
+            assert!(!enc.is_ml_mode(), "统计模式实例不得自称 ML 模式");
+            let _ = enc.is_degraded();
+            let _ = enc.encode_embedding("测试");
+            let _ = enc.recovery_progress();
+            enc.set_recovery_threshold(3);
+            enc.record_degradation("probe");
+            let _ = enc.get_status();
+            let _ = enc.deviation_of("测试");
+        }
+    }
 
     /// 验证：编码器产生 9 维输出
     #[test]

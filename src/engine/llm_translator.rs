@@ -535,6 +535,36 @@ pub async fn translate_memory_query(config: &LlmApiConfig, query: &str) -> Vec<S
     }
 }
 
+/// 把「LLM 记忆查询翻译 + 关键词并入检索查询」收敛为**单一真源**。
+///
+/// ## 策略（与既有 MCP 调用点逐字一致）
+/// - LLM 未配置 / 翻译失败 / 结果为空 / 结果与原文相同 ⇒ **原样返回 `query`**（零行为变更）；
+/// - 否则返回 `"{关键词…} {原查询}"`（关键词在前，用于桥接"问 X 答 Y"的词汇鸿沟）。
+///
+/// ## 为什么必须抽成一处
+/// 该策略原先在 `server.rs` 的**两处** MCP handler 里各写一遍，而
+/// REST `POST /v1/memories/enrich` —— **AML 与桌面端实际使用的检索入口** ——
+/// **完全没有**这一步 ⇒ 同一个引擎、同一条查询，经 MCP 与经 REST 的检索质量不一致。
+/// 收敛为单一真源后三条入口共用同一策略；并以 `LlmApiConfig::None` 做**确定性**单测
+/// （未配置时必须逐字返回原查询）。
+///
+/// ## 时延与安全
+/// 底层 `translate_openai` / `translate_ollama` 各自带 5s / 10s **客户端超时**，
+/// 故本函数不会无限等待；任何失败都回退原查询，**绝不阻断检索**。
+/// 调用方须在**取存储锁之前**调用（网络等待不得发生在持锁期）。
+pub async fn enrich_query_for_retrieval(config: &LlmApiConfig, query: &str) -> String {
+    if !config.is_configured() {
+        return query.to_string();
+    }
+    let keywords = translate_memory_query(config, query).await;
+    let translated = keywords.join(" ");
+    if translated.is_empty() || translated.trim() == query {
+        query.to_string()
+    } else {
+        format!("{} {}", translated, query)
+    }
+}
+
 /// 通过 OpenAI 兼容 API 翻译查询
 ///
 /// v0.5.4 P2-11 修复：LLM 响应解析安全化
@@ -565,6 +595,18 @@ async fn translate_openai(
 
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
 
+    // ★ v0.9.12（2026-10-10）：**失败必须可见**（传输层错误此前完全不打日志）。
+    //
+    // 实测后果：端点不可达/限流时，查询扩展被**静默降级为空操作** ——
+    // 18/18 实例日志只剩调用方那句"记忆翻译失败，回退到原始查询"，**连状态码都没有**；
+    // 而配与不配 LLM，探针台 R_sim **逐位相同（0.7514）**，外部完全看不出该杠杆从未生效。
+    // 而这恰是命中"词汇鸿沟"（94.3% 召回缺口）的唯一手段 ⇒ 失败必须可见。
+    //
+    // ★ 同处做过的**有界重试（429/5xx）已实测无效果并回退**：本机 LLM 账户是
+    //   **持续性**限流（加重试后 llm 臂仍 11/18 失败，与加重试前逐位相同），退避重试
+    //   只能救"瞬时抖动"、救不了持续限流；而其代价是失败路径上多 ~400ms~5.4s 延迟。
+    //   ⇒ 按"实测无效者不合入"回退。**若线上真出现瞬时 429/5xx，再按需加回并配
+    //   mock（先 429 后 200）做一次可证伪验证。**
     let response = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", api_key))
@@ -572,7 +614,13 @@ async fn translate_openai(
         .json(&request)
         .send()
         .await
-        .map_err(|e| LrcError::network(format!("LLM 请求失败: {}", e)))?;
+        .map_err(|e| {
+            eprintln!(
+                "[LRC·LLM] 请求失败（传输层）: {} | endpoint={} | model={}",
+                e, url, model
+            );
+            LrcError::network(format!("LLM 请求失败: {}", e))
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -585,10 +633,12 @@ async fn translate_openai(
     }
 
     // v0.5.4 P2-11 修复：先获取原始文本，解析失败时可以记录用于调试
-    let raw_body = response
-        .text()
-        .await
-        .map_err(|e| LrcError::network(format!("读取 LLM 响应体失败: {}", e)))?;
+    let raw_body = response.text().await.map_err(|e| {
+        // ★ v0.9.12（2026-10-10）：**读响应体失败原也无日志** ⇒ 一并补齐。
+        // 只打错误与端点，**不打响应体**（沿用本文件既有的"响应体脱敏"策略）。
+        eprintln!("[LRC·LLM] 读取响应体失败: {} | endpoint={}", e, url);
+        LrcError::network(format!("读取 LLM 响应体失败: {}", e))
+    })?;
 
     let body: OpenAiChatResponse = serde_json::from_str(&raw_body).map_err(|e| {
         eprintln!(
@@ -616,7 +666,20 @@ async fn translate_openai(
         return Err(LrcError::network("LLM 返回空内容"));
     }
 
-    Ok(parse_keywords(&content))
+    // ★ v0.9.12（2026-10-10）：**解析为空也必须可见**。
+    // 响应非空却切不出关键词（内容只有逗号/空白）时，`parse_keywords` 返回空表，
+    // 调用方只打一句兜底文案 ⇒ 整条"查询扩展"链路会**静默空转**。
+    // 此处只打响应**字节数**，不打内容（沿用本文件"响应体脱敏"策略）。
+    let keywords = parse_keywords(&content);
+    if keywords.is_empty() {
+        eprintln!(
+            "[LRC·LLM] 关键词解析为空（响应 {} 字节）| endpoint={} | model={}",
+            content.len(),
+            url,
+            model
+        );
+    }
+    Ok(keywords)
 }
 
 /// 通过 Ollama 本地模型翻译查询
@@ -1074,5 +1137,18 @@ mod tests {
         let prompt = build_prompt(CODE_TRANSLATION_PROMPT, "处理用户登录");
         assert!(prompt.contains("处理用户登录"));
         assert!(prompt.contains("代码搜索助手"));
+    }
+
+    /// ★v0.9.11（能力对齐）确定性单测：**未配置 LLM 时，检索富化必须逐字返回原查询**。
+    ///
+    /// 这条是整个"能力对齐"的**零行为变更**保证：REST `enrich` 从"完全不翻译"
+    /// 变为"走同一富化函数"，只要 LLM 未配置，它就必须与改造前**逐字一致**。
+    /// （配置了 LLM 时才会追加关键词；那条路径依赖真实网络，故不在此做单测。）
+    #[tokio::test]
+    async fn enrich_query_is_identity_when_llm_not_configured() {
+        let cfg = LlmApiConfig::None;
+        let q = "What degree did I graduate with?";
+        assert_eq!(enrich_query_for_retrieval(&cfg, q).await, q);
+        assert_eq!(enrich_query_for_retrieval(&cfg, "").await, "");
     }
 }

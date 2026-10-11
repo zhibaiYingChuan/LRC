@@ -11,6 +11,12 @@ on:
         required: true
         type: string
 
+# v0.9.11（G6 / CR-46）：钉死 Rust 工具链版本（单一真源，与 ci.yml 同口径）。
+#   修前用滚动 `stable`，本地为 1.99.0 ⇒ 二者随时分叉，滚动 stable 引入的新 lint
+#   会在发布门禁上突然命中而本地不可见。
+env:
+  RUST_VERSION: 1.99.0
+
 # v0.8.23 S1-SEC-01：最小权限原则 — 每个 job 显式声明所需权限
 # 只有 release job 需要 contents: write，其他 job 只需要 contents: read
 jobs:
@@ -43,7 +49,7 @@ jobs:
             index.crates.io:443
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt, clippy
       # v0.8.33 HCSE R-02 双层缓存拆分：外部 crate 下载 vs 本项目编译产物
       # 外部依赖（registry / git）跨 tag 共享没问题，加速依赖下载
@@ -107,6 +113,9 @@ jobs:
         run: cargo clippy --features server -- -D warnings
       - name: Clippy check (all targets)
         run: cargo clippy --all-targets -- -D warnings
+      # v0.9.11（G6 / CR-59）：补上 server+ml 口径（此前从不被检查 ⇒ 告警静默漂移）
+      - name: Clippy check (server + ml features)
+        run: cargo clippy --all-targets --features server,ml -- -D warnings
 
       # 3. 编译检查：默认、无默认、全 feature 以及发布使用的 server+ml 必须一致
       - name: Compile feature matrix
@@ -130,11 +139,22 @@ jobs:
           cargo check --features server,neo4j
 
       # 6. 单元测试
+      # v0.9.11（G6 / CR-21）：口径统一为 `--test-threads=1`，与 ci.yml test job
+      #   及 `.githooks/pre-commit` 完全一致；修前此处并行 ⇒ 环境变量竞态
+      #   只在 CI 之外暴露（"CI 全绿却发布被偶发阻塞"）。
       - name: Unit tests
-        run: cargo test --features server
+        run: cargo test --features server -- --test-threads=1
+      # v0.9.11（G7 / CR-48）：可选持久化后端的用例入发布门禁（qdrant 无需外部服务）
+      - name: Unit tests (qdrant backend)
+        run: cargo test --features server,qdrant --lib -- --test-threads=1
 
       # 4.5 前端静态契约与语法门禁
       # v0.9.7 审查修复：补齐 ci.yml 已有的两个测试脚本语法检查，口径一致
+      # v0.9.11（G7 / CR-47）：补齐**第 6 个**套件 symbolic-layer-desktop-cdp.js
+      #   （此前 6 个套件里只有 5 个做了语法检查，符号层脚本连 `node --check` 都没有 ⇒
+      #    语法腐烂无人发现）。语法检查对全部 6 个套件都必须覆盖。
+      # 注：5 个 *-cdp.js 需要**真实桌面 WebView 的 CDP 9231**，CI 无法运行，
+      #   故 CI 只做语法门禁；真实运行见 ci.yml 的 playwright-smoke 与本地命令（见 ci.yml 注释）。
       - name: Frontend contract checks
         run: |
           node --check static/app.js
@@ -143,6 +163,7 @@ jobs:
           node --check tests/frontend/association-dashboard-cdp.js
           node --check tests/frontend/association-desktop-cdp.js
           node --check tests/frontend/association-user-view-check.js
+          node --check tests/frontend/symbolic-layer-desktop-cdp.js
           node scripts/validate_frontend_contract.js
 
       # 5. Tauri 配置验证（确保 targets 不是单一平台，防止 macOS/Linux 无 bundle）
@@ -395,7 +416,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo registry (external crates only)
@@ -693,7 +714,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo registry (external crates only)

@@ -13,8 +13,8 @@ use crate::memory_store::{
 };
 use crate::persistence::json::JsonPersistence;
 use crate::{
-    ChunkStats, CodeMemoryManager, EntityKind, EventEntity, Importance, LlmApiConfig, Memory,
-    MemoryType, PrivacyLevel, RecallResult, RetrievalResult,
+    ChunkStats, CodeMemoryManager, EntityKind, EventEntity, Importance, LlmApiConfig, MemoryType,
+    PrivacyLevel, RecallResult, RetrievalResult,
 };
 // v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：wizard.json 同步路径错误由不可判别的
 // `String` 收敛为带域分类的 [`crate::errors::LrcError`]（io / parse / config / crypto）。
@@ -380,6 +380,22 @@ fn make_response(id: Option<serde_json::Value>, result: serde_json::Value) -> Js
         result: Some(result),
         error: None,
     }
+}
+
+/// v0.9.11（G4 / CR-11）：MCP 通道的**有界取锁**（与 v1 路径统一 `LOCK_WAIT` 口径）。
+///
+/// ## 为什么必须
+/// v1 API 路径早已统一为"2s 有界等待 + `store_busy` 快速失败"，而 MCP 路径此前一律用
+/// **无上限**的 `state.memory_store.lock().await` ⇒ 后台长任务持锁时，MCP 请求会在锁上
+/// **无限排队**（既不失败也不返回），与 v1 口径明显不一致。
+///
+/// 返回 `None` 表示等待超时 ⇒ 调用方应回 `store_busy` 错误（**不得**无限排队）。
+async fn lock_store_bounded<P: crate::persistence::Persistence>(
+    store: &Arc<Mutex<crate::memory_store::MemoryStore<P>>>,
+) -> Option<tokio::sync::MutexGuard<'_, crate::memory_store::MemoryStore<P>>> {
+    tokio::time::timeout(crate::timeouts::LOCK_WAIT, store.lock())
+        .await
+        .ok()
 }
 
 fn make_error(id: Option<serde_json::Value>, code: i32, message: &str) -> JsonRpcResponse {
@@ -885,18 +901,8 @@ async fn handle_recall_enhanced(
     // 先完成可能发生网络等待的 LLM 翻译，再获取 memory_store 锁。
     // 这样网络超时不会阻塞其他记忆读写请求。
     let llm_config = state.llm_api.read().await.clone();
-    let enriched_query = if llm_config.is_configured() {
-        let keywords =
-            crate::engine::llm_translator::translate_memory_query(&llm_config, query).await;
-        let translated: String = keywords.join(" ");
-        if translated.is_empty() || translated.trim() == query {
-            query.to_string()
-        } else {
-            format!("{} {}", translated, query)
-        }
-    } else {
-        query.to_string()
-    };
+    let enriched_query =
+        crate::engine::llm_translator::enrich_query_for_retrieval(&llm_config, query).await;
 
     // 双路检索 + RRF 融合移入 spawn_blocking，避免持锁阻塞 Tokio worker；
     // 锁获取采用有界 try_lock 轮询（2 秒），锁被长期占用时快速返回忙态，
@@ -908,6 +914,9 @@ async fn handle_recall_enhanced(
     let mem_type = memory_type.clone();
     let proj = project.clone();
     let tag_list = tags.clone();
+    // v0.9.11（G3 / CR-02）：隐私上下文在**闭包外**构造并 `clone` 进入 `spawn_blocking`
+    // —— 闭包要求 `'static`，不能借用 `arguments`（借用会在编译期报 E0521）。
+    let privacy_scope = crate::privacy::scope_from_args(arguments);
     // 联想补全用的过滤条件（v0.9.8）：与检索**同一套可见性规则**，
     // 由下面两个 filter 复用同一份字段，避免"检索过滤了、联想没过滤"的越权口子。
     let filter_for_expand = RecallFilter {
@@ -916,7 +925,9 @@ async fn handle_recall_enhanced(
         tags: tag_list.clone(),
         min_importance: None,
         top_k: top_k * 2,
-        privacy_context: None,
+        // v0.9.11（G3 / CR-02）：**不再硬编码 `None`** —— 由工具参数构造（闭包外已构造）。
+        // 硬编码曾使用户写入的 `user_id`/`privacy_level` 在读取时被**完全忽略**。
+        privacy_context: privacy_scope.clone(),
         explore_pure: false,
         regression_query: None,
         read_only: false,
@@ -947,7 +958,7 @@ async fn handle_recall_enhanced(
                 tags: tag_list.clone(),
                 min_importance: None,
                 top_k: top_k * 2,
-                privacy_context: None,
+                privacy_context: privacy_scope.clone(),
                 explore_pure: false,
                 regression_query: None,
                 read_only: false,
@@ -963,7 +974,7 @@ async fn handle_recall_enhanced(
                 tags: tag_list,
                 min_importance: None,
                 top_k: top_k * 2,
-                privacy_context: None,
+                privacy_context: privacy_scope.clone(),
                 explore_pure: false,
                 regression_query: None,
                 read_only: false,
@@ -2003,7 +2014,7 @@ async fn handle_recall(
         tags,
         min_importance,
         top_k,
-        privacy_context: None,
+        privacy_context: crate::privacy::scope_from_args(arguments),
         explore_pure: false,
         regression_query: None,
         read_only: false,
@@ -2036,20 +2047,13 @@ async fn handle_recall(
     // 先完成可能发生网络等待的 LLM 翻译，再获取 memory_store 锁。
     // 这样网络超时不会阻塞其他记忆读写请求。
     let llm_config = state.llm_api.read().await.clone();
-    let enriched_query = if llm_config.is_configured() {
-        let keywords =
-            crate::engine::llm_translator::translate_memory_query(&llm_config, query).await;
-        let translated: String = keywords.join(" ");
-        if translated.is_empty() || translated.trim() == query {
-            query.to_string()
-        } else {
-            format!("{} {}", translated, query)
-        }
-    } else {
-        query.to_string()
-    };
+    let enriched_query =
+        crate::engine::llm_translator::enrich_query_for_retrieval(&llm_config, query).await;
 
-    let mut store = state.memory_store.lock().await;
+    // v0.9.11（G4 / CR-11）：有界取锁（此前无上限 ⇒ MCP 请求可无限排队）
+    let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
+        return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+    };
 
     // 根据 lrc_mode 选择检索方法（使用富化后的查询）
     let result = if lrc_mode == "deep" {
@@ -2058,7 +2062,9 @@ async fn handle_recall(
         match nav_signal {
             Some(sig) => {
                 match crate::engine::navigation::navigated_deep_recall(
-                    &mut store,
+                    // v0.9.11（G9 / CR-15）：泛型 `S: FocusRecall` 不做解引用强制，
+                    // 此处 `store` 是 MutexGuard，须显式解引用到 `MemoryStore`。
+                    &mut *store,
                     &enriched_query,
                     &filter,
                     focus_depth,
@@ -2222,6 +2228,23 @@ async fn handle_batch_remember(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // 批次级**归属**（v0.9.11，与 `batch_event_id` 同款对称设计）：
+    // 一次批量写入往往同属一个用户/会话，逐条优先、缺失时回退批次级
+    // ⇒ 消除机械重复，并修掉"批量路径无法声明归属"这一缺口
+    // （此前批量写入的记忆无 user_id，按用户级隔离的检索会判为不可见）。
+    let batch_privacy = arguments
+        .get("privacy_level")
+        .and_then(|v| v.as_str())
+        .and_then(PrivacyLevel::try_parse);
+    let batch_session_id = arguments
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let batch_user_id = arguments
+        .get("user_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let mut memories = Vec::with_capacity(memories_array.len());
     for item in memories_array {
         let content = match item.get("content").and_then(|v| v.as_str()) {
@@ -2258,30 +2281,65 @@ async fn handle_batch_remember(
             .map(|v| Importance::new(v as u8))
             .unwrap_or_default();
 
-        let memory = Memory::new(
+        // v0.9.11：批量路径同样走 `MemoryWriteInput`（**写入单一真源**）——
+        // 此前本处手写字段赋值，导致批量写入**无法声明归属**且缺源时间。
+        // 逐条字段优先，缺失时回退批次级（`event_id`/`privacy_level`/`session_id`/`user_id`）。
+        let input = crate::memory_write::MemoryWriteInput {
             content,
-            memory_type,
+            memory_type: Some(memory_type),
+            importance: Some(importance),
+            ttl_days: item
+                .get("ttl_days")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
             project,
             tags,
-            importance,
-            None, // ttl_days
-        );
-
-        // 事件维度（批量路径同样支持"共同经历"）
-        // 逐条的 event_id 优先；缺失时回退到批次级 event_id（避免逐个重复填写）
-        let mut memory = memory;
-        memory.event_id = item
-            .get("event_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .or_else(|| batch_event_id.clone());
-        memory.entities = parse_entities(item.get("entities"));
-
-        memories.push(memory);
+            privacy_level: item
+                .get("privacy_level")
+                .and_then(|v| v.as_str())
+                .and_then(PrivacyLevel::try_parse)
+                .or(batch_privacy),
+            session_id: item
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| batch_session_id.clone()),
+            user_id: item
+                .get("user_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| batch_user_id.clone()),
+            event_id: item
+                .get("event_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| batch_event_id.clone()),
+            entities: parse_entities(item.get("entities")),
+            source_timestamp: item
+                .get("source_timestamp_ms")
+                .and_then(|v| v.as_i64())
+                .and_then(crate::memory_write::ts_from_millis),
+            daoti_preview_gua: item
+                .get("daoti_preview_gua")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            daoti_preview_bagua: item
+                .get("daoti_preview_bagua")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            daoti_preview_version: item
+                .get("daoti_preview_version")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+        memories.push(input.into_memory());
     }
 
     let total = memories.len();
-    let mut store = state.memory_store.lock().await;
+    // v0.9.11（G4 / CR-11）：有界取锁
+    let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
+        return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+    };
     match store.remember_batch(memories) {
         Ok(saved) => {
             // 批量写入成功后，确保项目元信息存在（用于前端显示项目名而非指纹）
@@ -2391,10 +2449,13 @@ async fn handle_list_memories(
         order,
         limit,
         offset,
-        privacy_context: None,
+        privacy_context: crate::privacy::scope_from_args(arguments),
     };
 
-    let store = state.memory_store.lock().await;
+    // v0.9.11（G4 / CR-11）：有界取锁（只读路径同样不得无限排队）
+    let Some(store) = lock_store_bounded(&state.memory_store).await else {
+        return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+    };
     match store.list_memories(&filter) {
         Ok((memories, total)) => {
             let mut text = format!("记忆列表 (共 {} 条，本页 {} 条)\n\n", total, memories.len());
@@ -2551,24 +2612,34 @@ async fn handle_remember(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let memory = Memory::new(
-        content.to_string(),
-        memory_type,
+    // v0.9.11：所有写入入口共用 `MemoryWriteInput`（**写入单一真源**）——
+    // 此前本处手写字段赋值，既与 HTTP 端点各自维护字段集，也**缺少"源时间"**。
+    let input = crate::memory_write::MemoryWriteInput {
+        content: content.to_string(),
+        memory_type: Some(memory_type),
+        importance: Some(importance),
+        ttl_days,
         project,
         tags,
-        importance,
-        ttl_days,
-    )
-    .with_privacy(privacy_level, session_id, user_id);
+        privacy_level: Some(privacy_level),
+        session_id,
+        user_id,
+        event_id,
+        entities,
+        source_timestamp: arguments
+            .get("source_timestamp_ms")
+            .and_then(|v| v.as_i64())
+            .and_then(crate::memory_write::ts_from_millis),
+        daoti_preview_gua: preview_gua,
+        daoti_preview_bagua: preview_bagua,
+        daoti_preview_version: preview_version,
+    };
+    let memory = input.into_memory();
 
-    let mut memory = memory;
-    memory.event_id = event_id;
-    memory.entities = entities;
-    memory.daoti_preview_gua = preview_gua;
-    memory.daoti_preview_bagua = preview_bagua;
-    memory.daoti_preview_version = preview_version;
-
-    let mut store = state.memory_store.lock().await;
+    // v0.9.11（G4 / CR-11）：有界取锁
+    let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
+        return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+    };
     match store.remember(memory) {
         Ok(saved) => {
             // 写入成功后，确保项目元信息存在（用于前端显示项目名而非指纹）
@@ -2652,7 +2723,10 @@ async fn handle_tools_call(
                 None => return make_error(id, -32602, "缺少参数: memory_id"),
             };
 
-            let mut store = state.memory_store.lock().await;
+            // v0.9.11（G4 / CR-11）：有界取锁
+            let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
+                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+            };
             match store.forget(memory_id) {
                 Ok(true) => {
                     let text = format!("已删除记忆: {}", memory_id);
@@ -2692,7 +2766,10 @@ async fn handle_tools_call(
                 .and_then(|v| v.as_u64())
                 .map(|v| Importance::new(v as u8));
 
-            let mut store = state.memory_store.lock().await;
+            // v0.9.11（G4 / CR-11）：有界取锁
+            let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
+                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+            };
             match store.update_memory(memory_id, new_content, new_importance) {
                 Ok(Some(old)) => {
                     let text = format!(
@@ -2734,8 +2811,14 @@ async fn handle_tools_call(
             };
             let relation_filter = arguments.get("relation").and_then(|v| v.as_str());
 
-            let store = state.memory_store.lock().await;
-            match store.associations(memory_id) {
+            // v0.9.11（G4 / CR-11）：有界取锁
+            let Some(store) = lock_store_bounded(&state.memory_store).await else {
+                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+            };
+            // v0.9.11（G3 / CR-03）：MCP 侧同样按参数构造可见性作用域
+            //（此前后端直调未过滤版本 ⇒ 跨 user 泄漏 peer 内容预览）
+            match store.associations_scoped(memory_id, &crate::privacy::scope_from_args(&arguments))
+            {
                 Ok(all_assoc) => {
                     // hub 实体（泛化实体）清单：**让过滤可见**（§3.45.5）
                     let hubs = store.hub_entities().unwrap_or_default();
@@ -2817,8 +2900,16 @@ async fn handle_tools_call(
                 .unwrap_or(50)
                 .clamp(2, 500);
 
-            let store = state.memory_store.lock().await;
-            match store.association_graph(memory_id, max_nodes) {
+            // v0.9.11（G4 / CR-11）：有界取锁
+            let Some(store) = lock_store_bounded(&state.memory_store).await else {
+                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+            };
+            // v0.9.11（G3 / CR-03）：MCP 侧带可见性过滤
+            match store.association_graph_scoped(
+                memory_id,
+                max_nodes,
+                &crate::privacy::scope_from_args(&arguments),
+            ) {
                 Ok(g) => {
                     if g.nodes.is_empty() {
                         let text = "未找到该记忆，或它没有任何关联。\n\n\
@@ -2885,7 +2976,10 @@ async fn handle_tools_call(
         }
 
         "memory_stats" => {
-            let store = state.memory_store.lock().await;
+            // v0.9.11（G4 / CR-11）：有界取锁
+            let Some(store) = lock_store_bounded(&state.memory_store).await else {
+                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+            };
             match store.stats() {
                 Ok(stats) => {
                     let mut text = String::from("记忆库统计\n\n");
@@ -2990,7 +3084,10 @@ async fn handle_tools_call(
             }
         }
         "archive" => {
-            let mut store = state.memory_store.lock().await;
+            // v0.9.11（G4 / CR-11）：有界取锁
+            let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
+                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+            };
             match store.archive_expired() {
                 Ok(count) => {
                     let text = if count > 0 {
@@ -3197,7 +3294,10 @@ async fn handle_tools_call(
             };
             let reason = arguments.get("reason").and_then(|v| v.as_str());
 
-            let mut store = state.memory_store.lock().await;
+            // v0.9.11（G4 / CR-11）：有界取锁（用户修正属写路径，同样不得无限排队）
+            let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
+                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
+            };
             match store.correct_memory(memory_id, new_content, reason) {
                 Ok(Some(memory)) => {
                     let text = format!(
@@ -3770,9 +3870,16 @@ pub async fn update_llm_config(
             Ok(Ok(_)) => {}
         }
         // v0.5.5：更新 MemoryStore 的 LLM 配置状态
-        {
-            let store = memory_store.lock().await;
-            store.set_llm_configured(false);
+        // v0.9.11（G4 / CR-11 收尾）：本处此前是无上限 `memory_store.lock().await`
+        // （`update_llm_config` 的 2 处遗留点之一）。改为与 v1/MCP 同口径的**有界等待**；
+        // 拿不到锁**不阻断"配置已生效"**——`set_llm_configured` 仅是缓存标志，
+        // 下次配置读取会自收敛，故超时只记一行告警而非把成功结果改成失败。
+        match lock_store_bounded(memory_store).await {
+            Some(store) => store.set_llm_configured(false),
+            None => eprintln!(
+                "[配置] 清除 LLM 配置：等待记忆存储锁超时（{}s）—— 标志未即时同步，将在下次配置变更时收敛",
+                crate::timeouts::LOCK_WAIT.as_secs()
+            ),
         }
         return (
             StatusCode::OK,
@@ -3857,9 +3964,13 @@ pub async fn update_llm_config(
                 Ok(Ok(_)) => {}
             }
             // v0.5.5：更新 MemoryStore 的 LLM 配置状态
-            {
-                let store = memory_store.lock().await;
-                store.set_llm_configured(true);
+            // v0.9.11（G4 / CR-11 收尾）：同上一处 —— 有界等待 + 超时不阻断"配置已生效"。
+            match lock_store_bounded(memory_store).await {
+                Some(store) => store.set_llm_configured(true),
+                None => eprintln!(
+                    "[配置] 保存 LLM 配置：等待记忆存储锁超时（{}s）—— 标志未即时同步，将在下次配置变更时收敛",
+                    crate::timeouts::LOCK_WAIT.as_secs()
+                ),
             }
             (
                 StatusCode::OK,
@@ -4672,7 +4783,15 @@ pub async fn run_stdio(state: Arc<AppState>) {
 ///    与恶意软件本就可读取用户目录下的记忆数据，故"同机无认证"不额外扩大暴露面。
 /// 2. **风险场景**：若将服务**绑定到非回环地址**（`--host 0.0.0.0`）却未设置
 ///    `LRC_API_TOKEN`，则**局域网内任意主机可读写全部记忆**（含明文与归档）。
-///    此场景下必须显式设置 token。
+///    **v0.9.11（G6 / CR-19）起该场景不再只告警，而是直接拒绝启动**
+///    （见 [`ensure_authenticated_non_loopback`]）—— 从"建议设 token"变为"必须设 token"。
+///
+/// ## 多租户归属（v0.9.11 / CR-19）
+/// 启用 token 即为多租户域，此时**隔离键 `user_id` 由凭据派生**：
+/// 服务端把租户标识（token 的 SHA-256 前缀）与客户端 `user_id` 组合成
+/// `"{租户}::{user}"`（见 [`crate::privacy::namespace_owner`]），
+/// 客户端**无法**通过自报 `user_id` 跨出租户。单 token ⇒ 单租户；
+/// 真正的多租户需每租户独立凭据（业界一致结论）。
 /// 3. **强制保护手段**：设置 `LRC_API_TOKEN=<强随机串>` 即启用 Bearer 校验；
 ///    客户端须携带 `Authorization: Bearer <token>`。
 /// 4. **比较方式**：token 比对使用 [`constant_time_eq`]（常量时间），
@@ -4711,35 +4830,48 @@ async fn local_api_auth(
     }
 }
 
-/// 非回环绑定且未设 Token 时的启动告警
-///
-/// v0.9.7 新增（GLOBAL_CODE_REVIEW_REPORT P1 安全「认证默认策略」）：
-///   该函数把"默认无认证仅在回环下安全"这一文档约定，转为**启动期的可见告警**。
-///   判定逻辑刻意保守（宁可误报不可漏报）：
-///     - `host` 为 `127.0.0.1` / `::1` / `localhost` → 视为回环，不告警；
-///     - 其余（含 `0.0.0.0`、`::`、具体内网/公网 IP、主机名）→ 视为对外可达，
-///       若此时 `LRC_API_TOKEN` 未设置或为空，则打印多行醒目告警。
-///   仅告警、不阻断启动：强制手段是在环境变量中设置 `LRC_API_TOKEN`。
-fn warn_if_unauthenticated_non_loopback(host: &str) {
-    let is_loopback = matches!(
+/// 判定 host 是否为回环地址（保守：只有明确的回环写法才算）
+fn is_loopback_host(host: &str) -> bool {
+    matches!(
         host.trim().trim_start_matches('[').trim_end_matches(']'),
         "127.0.0.1" | "::1" | "localhost"
-    );
-    if is_loopback {
-        return;
+    )
+}
+
+/// 非回环绑定 + 未设 Token 时的启动**阻断**（v0.9.11 / G6 / CR-19）。
+///
+/// ## 为什么从"仅告警"升级为"拒绝启动"（行为变更，已获确认）
+/// 修前该场景只打印醒目告警、服务照常启动 ⇒ **局域网内任意主机可读写全部记忆**
+/// （含明文与归档）。"告警"依赖部署者读到并理解它，而默认端口一旦被 `--host 0.0.0.0`
+/// 暴露出去，攻击窗口立即打开 —— 属**fail-open**，与"隐私隔离必须 fail-closed"
+/// 的整体设计相矛盾。故此处改为**拒绝启动**：把"必须显式设 token"从建议变成强制。
+///
+/// ## 兼容边界（无一例外地保住了）
+/// - 回环绑定（`127.0.0.1` / `::1` / `localhost`）⇒ **完全不变**（桌面端、IDE、比赛口径）；
+/// - 非回环但**已设** `LRC_API_TOKEN` ⇒ 放行（这正是对外部署的正确姿势）。
+///
+/// 纯函数形态（`token_configured` 由调用方从环境读出）⇒ 可免环境单测。
+fn ensure_authenticated_non_loopback_with(
+    host: &str,
+    token_configured: bool,
+) -> Result<(), String> {
+    if is_loopback_host(host) || token_configured {
+        return Ok(());
     }
-    let token_missing = std::env::var("LRC_API_TOKEN")
-        .map(|t| t.trim().is_empty())
-        .unwrap_or(true);
-    if !token_missing {
-        return;
-    }
-    eprintln!("================================================================");
-    eprintln!("[安全告警] 服务绑定到非回环地址 '{host}'，且未设置 LRC_API_TOKEN。");
-    eprintln!("          当前状态下，能访问该地址的任意主机均可读写全部记忆数据。");
-    eprintln!("          若仅本机使用，请改绑 127.0.0.1；");
-    eprintln!("          若确需对外提供服务，请设置 LRC_API_TOKEN=<强随机串> 后再启动。");
-    eprintln!("================================================================");
+    Err(format!(
+        "服务绑定到非回环地址 '{host}'，但未设置 LRC_API_TOKEN。\n\
+         当前状态下，能访问该地址的任意主机均可读写全部记忆数据。\n\
+         若仅本机使用，请改绑 127.0.0.1；\n\
+         若确需对外提供服务，请设置 LRC_API_TOKEN=<强随机串> 后再启动。"
+    ))
+}
+
+/// [`ensure_authenticated_non_loopback_with`] 的环境封装。
+fn ensure_authenticated_non_loopback(host: &str) -> Result<(), String> {
+    let token_configured = std::env::var("LRC_API_TOKEN")
+        .map(|t| !t.trim().is_empty())
+        .unwrap_or(false);
+    ensure_authenticated_non_loopback_with(host, token_configured)
 }
 
 /// 常量时间字节串比较（防时序侧信道）
@@ -4767,12 +4899,15 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// 可嵌入到已有 axum 应用中，将 MCP 路由挂载到子路径。
 pub fn build_mcp_router(state: Arc<AppState>) -> Router {
     // 创建 v1 API 路由（通过闭包捕获共享状态，状态类型为 ()）
-    let v1_service = crate::v1_api::build_v1_router(
+    // v0.9.11（G3 / CR-01）：信任域由**既有**的 `LRC_API_TOKEN` 开关派生
+    // （启用 token＝对外提供服务 ⇒ 多租户域 ⇒ 读取入口强制要求 scope）。
+    let v1_service = crate::v1_api::build_v1_router_with_trust(
         state.memory_store.clone(),
         state.manager.clone(),
         state.llm_api.clone(),
         state.llm_configured_atomic.clone(),
         state.dev_mode,
+        crate::privacy::from_env(),
     )
     .into_service();
 
@@ -4862,7 +4997,8 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         //   注意：30s 超时足够 lock_busy 路径返回降级数据（<1ms），只拦截真正卡死的请求
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             axum::http::StatusCode::GATEWAY_TIMEOUT,
-            std::time::Duration::from_secs(30),
+            // v0.9.11（G4）：外层超时由**超时阶梯单一真源**给出（`crate::timeouts`）
+            crate::timeouts::HTTP_OUTER_TIMEOUT,
         ))
         .layer(tower::limit::ConcurrencyLimitLayer::new(100))
         .with_state(state)
@@ -4895,12 +5031,19 @@ pub async fn serve_on_listener(
     println!("   MCP 协议: POST http://{}/mcp", addr);
     println!("   状态检查: GET  http://{}/health", addr);
 
-    // v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P1 安全「认证默认策略」——强制保护）：
-    //   默认无认证仅在"绑定回环"时安全（见 local_api_auth 文档）。一旦绑定到非回环
-    //   地址（0.0.0.0 / :: / 局域网 IP）且未设置 LRC_API_TOKEN，则局域网内任意主机
-    //   可读写全部记忆。此处把该风险从"文档约定"升级为"启动即告警"，越明显越好。
-    //   注：告警而非拒绝启动——避免破坏既有内网自用部署；强制手段仍是设 token。
-    warn_if_unauthenticated_non_loopback(host);
+    // v0.9.11（G6 / CR-19）：把"默认无认证仅在回环下安全"从**文档约定**升级为**启动阻断** ——
+    //   非回环地址（0.0.0.0 / :: / 局域网 IP）且未设 `LRC_API_TOKEN` ⇒ 直接拒绝启动，
+    //   否则局域网内任意主机可读写全部记忆（fail-open，与整体 fail-closed 设计矛盾）。
+    //   回环绑定与"非回环但已设 token"两种情形完全放行（桌面端 / IDE / 比赛口径零变更）。
+    if let Err(reason) = ensure_authenticated_non_loopback(host) {
+        eprintln!("================================================================");
+        eprintln!("[安全阻断] 拒绝启动：{reason}");
+        eprintln!("================================================================");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("[安全阻断] {reason}"),
+        ));
+    }
 
     // v0.8.1：连接池与超时优化（修复 Bug #7：sidecar API 间歇性超时）
     //
@@ -4973,6 +5116,70 @@ async fn regulator_heartbeat_loop(state: Arc<AppState>) {
 mod tests {
     use super::*;
     use crate::CodeMemoryManager;
+
+    /// v0.9.11（G4 / CR-11 收尾）源码级守卫：MCP/配置路径**不得**再出现无上限的
+    /// `memory_store.lock().await`（应走 `lock_store_bounded`，超时回 `store_busy`）。
+    ///
+    /// 鉴别力：把 `update_llm_config` 的两处改回 `memory_store.lock().await` ⇒ 本用例失败。
+    #[test]
+    fn mcp_paths_must_not_use_unbounded_store_lock() {
+        // 只扫描**生产段**（截到测试模块之前），并跳过注释行 —— 文档注释里正当地
+        // 引用了这个反例写法，不能被算作违规。
+        let src = include_str!("server.rs");
+        let production = src
+            .find("#[cfg(test)]")
+            .map(|idx| &src[..idx])
+            .unwrap_or(src);
+        let offenders: Vec<&str> = production
+            .lines()
+            .filter(|line| {
+                let t = line.trim();
+                // 同时覆盖 `memory_store.lock().await` 与 `state.memory_store.lock().await`
+                // 两种写法；注释行（含文档注释里正当地引用的反例）不计。
+                !t.starts_with("//") && t.contains("memory_store.lock().await")
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "MCP/配置路径不得使用无上限 `memory_store.lock().await`，须改用 \
+             `lock_store_bounded`（超时 ⇒ store_busy）；发现: {offenders:?}"
+        );
+    }
+
+    // ════ v0.9.11（G6 / CR-19）：非回环 + 无 token ⇒ 拒绝启动 ════
+
+    /// 回环判定必须是**保守**的：只有明确的回环写法才算回环
+    #[test]
+    fn loopback_host_detection_is_conservative() {
+        for ok in ["127.0.0.1", "::1", "localhost", "[::1]", " 127.0.0.1 "] {
+            assert!(is_loopback_host(ok), "{ok} 应判定为回环");
+        }
+        for bad in ["0.0.0.0", "::", "192.168.1.10", "example.com", "10.0.0.1"] {
+            assert!(
+                !is_loopback_host(bad),
+                "{bad} 应判定为非回环（宁可误报不可漏报）"
+            );
+        }
+    }
+
+    /// 非回环 + 无 token ⇒ 必须拒绝启动；回环 或 已设 token ⇒ 必须放行
+    #[test]
+    fn non_loopback_without_token_must_refuse_startup() {
+        let err = ensure_authenticated_non_loopback_with("0.0.0.0", false)
+            .expect_err("非回环且无 token 必须拒绝启动（fail-closed）");
+        assert!(
+            err.contains("LRC_API_TOKEN"),
+            "拒绝信息必须告诉部署者如何修复，实际：{err}"
+        );
+        assert!(
+            ensure_authenticated_non_loopback_with("0.0.0.0", true).is_ok(),
+            "非回环 + 已设 token 必须放行（这是对外部署的正确姿势）"
+        );
+        assert!(
+            ensure_authenticated_non_loopback_with("127.0.0.1", false).is_ok(),
+            "回环必须无条件放行（桌面端 / IDE / 比赛口径零变更）"
+        );
+    }
 
     /// P2.5-1：fetch_daoti_navigation 在 daemon 在线时解析 NavigationSignal。
     /// 用本地 mock HTTP 服务模拟 daemon 的 /deduce 响应（不依赖外部进程）。
@@ -6587,9 +6794,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_logo_asset_valid_filename() {
-        // 有效文件名应返回 200 和 SVG 内容
+        // v0.9.11（G9 / CR-49）：**必须断言响应体与 MIME**，而不是只看状态码 ——
+        // 修前"返回 200 + 空体"也能通过（注释却声称"返回 200 和 SVG 内容"），
+        // 于是"图标/Logo 全白"这类真实故障在测试里不可见。
         let resp = logo_asset_handler(axum::extract::Path("logo-primary.svg".to_string())).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/svg+xml; charset=utf-8"),
+            "MIME 必须声明为 SVG，否则浏览器不渲染"
+        );
+        let body = resp.into_body();
+        assert!(!body.trim().is_empty(), "响应体不得为空");
+        assert!(
+            body.contains("<svg"),
+            "响应体必须是 SVG 文档，实际：{body:.120}"
+        );
     }
 
     #[tokio::test]
@@ -6616,8 +6838,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_icon_asset_valid_filename() {
-        // 有效图标文件名应返回 200
+        // v0.9.11（G9 / CR-49）：同 Logo 用例 —— 断言 MIME + 响应体为 SVG，
+        // 防止"200 + 空体"这种假绿（图标全白在测试中不可见）。
         let resp = icon_asset_handler(axum::extract::Path("icon-dashboard.svg".to_string())).await;
         assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/svg+xml; charset=utf-8"),
+            "MIME 必须声明为 SVG"
+        );
+        let body = resp.into_body();
+        assert!(!body.trim().is_empty(), "响应体不得为空");
+        assert!(
+            body.contains("<svg"),
+            "响应体必须是 SVG 文档，实际：{body:.120}"
+        );
     }
 }

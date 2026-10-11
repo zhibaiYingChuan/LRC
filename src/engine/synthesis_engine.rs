@@ -124,20 +124,32 @@ fn merge_undersized_bagua_groups(
     groups
 }
 
+/// 合成触发阈值的**单一真源**（v0.9.11 / G9 / CR-24）。
+///
+/// 修前该默认值 `3` 在 **8 个文件、13 处**各自硬编码
+/// （`memory_store.rs`、`consolidation.rs`、`bin/server.rs`、`arch_config.rs`、
+/// `engine/synthesis_engine.rs`、`engine/dao_regulator.rs` …）
+/// ⇒ 前台 `/consolidate` 与后台结晶一旦改漏一处，就会**静默分歧**：
+/// 同一份记忆在两条链路上被判定为"够不够合成"的结论不同，且没有任何报错。
+pub const DEFAULT_MIN_CLUSTER: usize = 3;
+
+/// 合成相似度阈值的**单一真源**（v0.9.11 / G9 / CR-24）。理由同 [`DEFAULT_MIN_CLUSTER`]。
+pub const DEFAULT_SIMILARITY: f32 = 0.4;
+
 /// 合成引擎配置
 #[derive(Debug, Clone)]
 pub struct SynthesisConfig {
-    /// 合成触发阈值：相似记忆数量达到此值时才触发合成（默认 3）
+    /// 合成触发阈值：相似记忆数量达到此值时才触发合成（默认 [`DEFAULT_MIN_CLUSTER`]）
     pub min_cluster: usize,
-    /// 合成相似度阈值：Jaccard 相似度超过此值归入同一簇（默认 0.4）
+    /// 合成相似度阈值：Jaccard 相似度超过此值归入同一簇（默认 [`DEFAULT_SIMILARITY`]）
     pub similarity: f32,
 }
 
 impl Default for SynthesisConfig {
     fn default() -> Self {
         Self {
-            min_cluster: 3,
-            similarity: 0.4,
+            min_cluster: DEFAULT_MIN_CLUSTER,
+            similarity: DEFAULT_SIMILARITY,
         }
     }
 }

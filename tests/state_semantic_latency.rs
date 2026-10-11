@@ -21,8 +21,12 @@ use code_memory::engine::luoshu_encoder_ml::LuoShuMlEncoder;
 #[ignore = "需本地 bge 权重；手动运行：$env:LRC_LUOSHU_MODEL_ID='BAAI/bge-base-zh'; cargo test --features server,ml --test state_semantic_latency -- --ignored --nocapture"]
 fn measure_single_embedding_latency() {
     let Some(enc) = LuoShuMlEncoder::load().ok() else {
-        eprintln!("[延迟精测] ML 编码器不可用，跳过");
-        return;
+        // v0.9.11（G7 / CR-47）：`#[ignore]` 的手动探针在 `--ignored` 下缺模型必须**失败**
+        // 而不是静默通过（否则等于"假覆盖"）。
+        panic!(
+            "本探针需要本地 bge 权重：请设置 LRC_LUOSHU_MODEL_ID（如 BAAI/bge-base-zh）\
+             并确认权重已下载；若不想跑本探针，请去掉 `--ignored`。（CR-47：禁止静默跳过）"
+        );
     };
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())

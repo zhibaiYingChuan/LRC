@@ -18,6 +18,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # v0.9.11（G6 / CR-46）：钉死 Rust 工具链版本（单一真源，与 ci.yml / release.yml 同口径）
+  RUST_VERSION: 1.99.0
 
 # v0.8.23 S1-SEC-04：最小权限原则 — 安全扫描只需要读取权限
 permissions:
@@ -95,7 +97,8 @@ jobs:
             static.rust-lang.org:443
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          # v0.9.11（G6 / CR-46）：钉死工具链版本，与 ci.yml / release.yml 同口径
+          toolchain: ${{ env.RUST_VERSION }}
 
       - name: Install cargo-license
         # v0.8.25 V3-07 修复：添加超时保护和重试机制，防止 cargo install 长时间挂起

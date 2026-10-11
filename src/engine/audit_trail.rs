@@ -104,6 +104,34 @@ impl AuditEventType {
     }
 }
 
+/// 单条审计事件的**体积预算**（v0.9.11 修复：审计日志体积爆炸）
+///
+/// ## 为什么需要（实测数据）
+/// AML 线上 `audit.jsonl` 长到 **1.41 GB**，而 `memories.json` 只有 **8.1 MB**。
+/// 单条事件长度：中位 **1,029,633** 字节、最大 **2,687,262** 字节 —— 因为调用方
+/// （`/v1/memories/enrich` 的 `RetrievalExecuted`）把"整条道体状态轨迹"与
+/// "每条检索结果的回归证据"都塞进了 `metadata`。
+///
+/// ## 后果
+/// ① 磁盘持续膨胀；② **每次启动都要全量扫描该文件** ⇒ 冷启动实测 40~90s
+/// （这直接导致部署时的健康检查误判与服务反复重启）。
+///
+/// ## 修法（在**唯一写入口**统一施加，任何调用点都无法再撑爆日志）
+/// 超限即截断并**标注原长**——保留"它曾很大"这一可排查事实；
+/// 审计的可复核性不依赖完整载荷（id/时间/类型/哈希链/截断标注都在）。
+pub const AUDIT_MAX_META_VALUE_CHARS: usize = 2 * 1024;
+/// 单条事件保留的受影响记忆 id 上限（超限截断并附计数标注）。
+pub const AUDIT_MAX_AFFECTED_IDS: usize = 50;
+/// 描述/原因文本上限。
+pub const AUDIT_MAX_TEXT_CHARS: usize = 2 * 1024;
+
+/// 把超长字符串截断到 `max` 个字符，并附"原长"标注（保留"它曾很大"这一事实）。
+fn truncate_with_note(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…(截断，原长 {total} 字符)")
+}
+
 /// 单条审计事件
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
@@ -386,7 +414,18 @@ fn canonical_hash_fields(
 #[derive(Debug)]
 pub struct AuditTrail {
     /// 事件列表（按时间倒序，最新的在前）
-    events: Vec<AuditEvent>,
+    ///
+    /// **v0.9.11（G5 / CR-12）：由 `Vec` 改为 `VecDeque`**。
+    ///
+    /// 为什么必须改：修前用 `Vec::insert(0, …)` 维持"最新在前"，而
+    /// `Vec::insert(0)` 每次都要**搬移整个数组** ⇒ 记录单条事件 O(n)、
+    /// 启动重放 n 条 O(n²)。这在功能测试下**完全看不出来**（结果全对，只是越来越慢），
+    /// 线上表现为 770MB 审计日志造成启动/检索严重拖慢。
+    ///
+    /// 为什么选 `VecDeque` 而非"改 push + 逆序读"：后者会改变**全部读取方**看到的顺序，
+    /// 属于语义变更（`first()` 语义、`verify_integrity` 的相邻元素假设等都会反向）。
+    /// `VecDeque::push_front` 是 O(1) 且**语义逐位不变** —— 改动面最小、风险最低。
+    events: std::collections::VecDeque<AuditEvent>,
     /// 事件计数器（用于生成自增 ID）
     counter: u64,
     /// 最大保留事件数
@@ -473,7 +512,7 @@ impl AuditTrail {
     /// 创建新的审计追踪器
     pub fn new() -> Self {
         Self {
-            events: Vec::with_capacity(10000),
+            events: std::collections::VecDeque::with_capacity(10000),
             counter: 0,
             max_events: 10000,
             persist_path: None,
@@ -894,7 +933,9 @@ impl AuditTrail {
                 }
                 loaded += 1;
                 // 插入到开头保持时间倒序
-                self.events.insert(0, event);
+                // v0.9.11（G5 / CR-12）：`insert(0, …)` 为 O(n) ⇒ 重放退化为 O(n²)。
+                // `push_front` 是 O(1)，且同样维持"最新在前"。
+                self.events.push_front(event);
             }
         }
 
@@ -1002,6 +1043,30 @@ impl AuditTrail {
         affected_memory_ids: Vec<String>,
         metadata: HashMap<String, String>,
     ) {
+        // ★v0.9.11 修复（审计日志体积爆炸）：**在唯一写入口对事件体积施加硬预算**。
+        // 详见 `AUDIT_MAX_META_VALUE_CHARS` 的文档（实测 1.41GB / 单条 1MB）。
+        // 必须在**计算哈希之前**归一化，否则 `verify_integrity` 重算会与落盘内容不一致。
+        let mut description = description;
+        let mut reason = reason;
+        let mut affected_memory_ids = affected_memory_ids;
+        let mut metadata = metadata;
+        if description.chars().count() > AUDIT_MAX_TEXT_CHARS {
+            description = truncate_with_note(&description, AUDIT_MAX_TEXT_CHARS);
+        }
+        if reason.chars().count() > AUDIT_MAX_TEXT_CHARS {
+            reason = truncate_with_note(&reason, AUDIT_MAX_TEXT_CHARS);
+        }
+        if affected_memory_ids.len() > AUDIT_MAX_AFFECTED_IDS {
+            let total = affected_memory_ids.len();
+            affected_memory_ids.truncate(AUDIT_MAX_AFFECTED_IDS);
+            affected_memory_ids.push(format!("…(共 {total} 条，已截断)"));
+        }
+        for value in metadata.values_mut() {
+            if value.chars().count() > AUDIT_MAX_META_VALUE_CHARS {
+                *value = truncate_with_note(value, AUDIT_MAX_META_VALUE_CHARS);
+            }
+        }
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1067,7 +1132,14 @@ impl AuditTrail {
         }
 
         // 插入到开头（最新在前）
-        self.events.insert(0, event);
+        //
+        // v0.9.11（G5 / CR-12）：**热路径**上的平方项 —— 修前用 `Vec::insert(0, …)`，
+        // 每次记录都搬移整个事件列表（即每次检索都 O(n)）。改用 `VecDeque::push_front`
+        // 后为 O(1)，且"最新在前"的语义逐位不变。
+        //
+        // 注：`VecDeque::insert(0, …)` 其实也是 O(1)（环形缓冲两端插入均 O(1)），
+        // 但 `push_front` 表意更直接、不依赖该实现细节。
+        self.events.push_front(event);
         self.total_written += 1;
 
         // 超出容量限制时移除最旧的
@@ -1185,7 +1257,7 @@ impl AuditTrail {
     ///
     /// 在 load_from_file 之后调用，确保后续新事件的哈希链连续。
     fn recover_last_hash(&mut self) {
-        if let Some(first) = self.events.first() {
+        if let Some(first) = self.events.front() {
             // 最新的在列表开头
             self.last_hash = first.event_hash.clone();
         }
@@ -1330,6 +1402,11 @@ impl AuditTrail {
     ///
     /// **失败不静默**：写盘失败会打印错误（隐藏集合丢失会导致"重启后复活"
     /// 这一用户可见缺陷重现，必须可诊断）。
+    ///
+    /// **原子写**（v0.9.11 / CR-44）：此前用 `std::fs::write` —— 覆盖写非原子，
+    /// 进程在写入中途崩溃可能留下**被截断**的文件 ⇒ 部分隐藏 ID 丢失、"部分记录
+    /// 重启后重新可见"这一缺陷重现。现改为委托 [`crate::atomic_file::write_atomic`]
+    /// （临时文件 → fsync → rename），与仓库其它持久化路径统一口径。
     fn persist_hidden(&self) {
         let Some(path) = self.hidden_path.as_ref() else {
             return;
@@ -1339,7 +1416,8 @@ impl AuditTrail {
             buf.push_str(id);
             buf.push('\n');
         }
-        if let Err(e) = std::fs::write(path, buf) {
+        if let Err(e) = crate::atomic_file::write_atomic(std::path::Path::new(path), buf.as_bytes())
+        {
             eprintln!(
                 "[LRC·审计] 隐藏集合写盘失败（重启后隐藏将失效）: {} - {}",
                 path, e
@@ -1769,6 +1847,51 @@ impl Default for AuditTrail {
 mod tests {
     use super::*;
 
+    /// ★守卫（v0.9.11 / G5 / CR-12）：**单条记录的耗时不得随历史长度增长**。
+    ///
+    /// ## 判据设计（关键：让固定成本自动抵消）
+    /// 取**同为 1000 条**的两批，分别在"列表尚短"与"列表已长"时测量：
+    /// - 两批的**固定成本**（哈希 + 分配 + 格式化）**完全相同**
+    /// - 唯一差异是**列表长度** ⇒ 差异只能来自"前插时的元素搬移"
+    ///
+    /// 故：O(1) 前插 ⇒ 比值≈1；O(n) 前插 ⇒ 后者显著更慢（≈8 倍量级，取阈值 4.0）。
+    ///
+    /// **为什么不用"总耗时随 n 的比值"**：那会被巨大的固定成本稀释而**漏判**
+    /// （本测试最初的版本即因此失效）。本设计只隔离"与列表长度相关的那一项"，
+    /// 无论固定成本多大都能分辨。
+    ///
+    /// ## 为什么这类测试不可省
+    /// 修前 `record()` 用 `Vec::insert(0, …)`，每次记录都搬移整个数组。
+    /// 功能上**完全正确**，任何功能断言都抓不住；线上表现为 770MB 审计日志拖慢启动与检索。
+    #[test]
+    fn record_cost_must_not_grow_with_history_size() {
+        let mut trail = AuditTrail::new();
+        let batch = |trail: &mut AuditTrail, from: usize, count: usize| -> u128 {
+            let t0 = std::time::Instant::now();
+            for i in from..from + count {
+                trail.record(
+                    AuditEventType::RegulationApplied,
+                    format!("事件 {i}"),
+                    String::new(),
+                    Vec::new(),
+                    HashMap::new(),
+                );
+            }
+            t0.elapsed().as_micros().max(1)
+        };
+
+        let _ = batch(&mut trail, 0, 500); // 预热
+        let early = batch(&mut trail, 500, 1_000); // 列表长度 ~500→1500
+        let _ = batch(&mut trail, 1_500, 6_000); // 填充至 ~7500（默认 max_events=10000，不触发截断）
+        let late = batch(&mut trail, 7_500, 1_000); // 列表长度 ~7500→8500
+
+        let ratio = late as f64 / early as f64;
+        assert!(
+            ratio < 4.0,
+            "单条审计记录耗时随历史长度增长（疑似退化为 O(n) 前插）：\n  早期批次(列表≈1k) = {early}µs\n  晚期批次(列表≈8k) = {late}µs\n  比值 = {ratio:.2}（O(1) 应≈1.0，O(n) 约 8.0）"
+        );
+    }
+
     fn make_event(trail: &mut AuditTrail, event_type: AuditEventType, desc: &str) {
         trail.record(
             event_type,
@@ -2057,7 +2180,7 @@ mod tests {
         }
 
         // 验证第一条事件的 previous_hash 为空（创世事件）
-        if let Some(first) = trail.events.last() {
+        if let Some(first) = trail.events.back() {
             assert!(
                 first.previous_hash.is_empty(),
                 "创世事件应有空的 previous_hash"
@@ -2447,7 +2570,7 @@ mod tests {
             },
         );
         let legacy_hash = trail.compute_hash(&legacy_input);
-        trail.events.push(AuditEvent {
+        trail.events.push_back(AuditEvent {
             id: "audit_legacy_1".to_string(),
             timestamp_ms: 1000,
             event_type: AuditEventType::RetrievalExecuted,
@@ -2633,7 +2756,7 @@ mod tests {
             hash_format: String::new(), // 旧格式事件：无版本标记
         };
         trail.events.clear();
-        trail.events.push(event);
+        trail.events.push_back(event);
         trail.recover_last_hash();
 
         // P0 修复语义：旧格式事件在未迁移前，canonical 重算失配 → 硬失败，
@@ -2965,5 +3088,57 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// ★v0.9.11 修复：**审计事件体积必须在唯一写入口被硬约束**。
+    ///
+    /// 实测缺陷：AML 线上 `audit.jsonl` = **1.41 GB**（而 `memories.json` 仅 8.1 MB），
+    /// 单条 `RetrievalExecuted` 中位长度 **1,029,633** 字节 / 最大 **2,687,262** 字节
+    /// —— 调用方把"整条道体状态轨迹"与"每条结果的回归证据"都塞进 `metadata`。
+    /// 后果：① 磁盘持续膨胀；② **每次启动全量扫描该文件** ⇒ 冷启动 40~90s
+    /// （实测导致部署健康检查误判、服务被反复重启）。
+    ///
+    /// 鉴别力：删掉 `record` 中的体积预算 ⇒ 断言 ① 失败（落盘行远超上限）。
+    #[test]
+    fn record_must_enforce_event_size_budget() {
+        let mut trail = AuditTrail::new();
+        let mut meta = HashMap::new();
+        meta.insert("trail".to_string(), "x".repeat(1_000_000)); // 单值 1 MB
+        meta.insert("regression_evidence".to_string(), "y".repeat(500_000));
+        let ids: Vec<String> = (0..200).map(|i| format!("mem-{i}")).collect();
+        trail.record(
+            AuditEventType::RetrievalExecuted,
+            "描述".repeat(5_000),
+            "原因".repeat(5_000),
+            ids,
+            meta,
+        );
+
+        let ev = trail.events.front().expect("应有事件");
+        let line = serde_json::to_string(ev).expect("应可序列化");
+        assert!(
+            line.len() < 20_000,
+            "单条审计事件必须被体积预算约束（修复前实测可达 2.6 MB），实际 {} 字节",
+            line.len()
+        );
+        assert!(
+            ev.metadata["trail"].ends_with("字符)"),
+            "超限的 metadata 值必须带截断标注（保留原长，便于排查）"
+        );
+        assert!(
+            ev.affected_memory_ids
+                .last()
+                .map(|s| s.contains("已截断"))
+                .unwrap_or(false),
+            "超限的 affected id 列表必须带计数标注，实际末项: {:?}",
+            ev.affected_memory_ids.last()
+        );
+        // ★ 关键不变量：截断发生在**哈希之前** ⇒ 完整性校验仍必须通过
+        let v = trail.verify_integrity();
+        assert!(
+            v.is_valid,
+            "截断后哈希链仍必须自洽（否则审计可信性被破坏）: {}",
+            v.details
+        );
     }
 }

@@ -11,6 +11,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # v0.9.11（G6 / CR-46）：钉死 Rust 工具链版本（单一真源）。
+  #   修前 CI 用滚动 `stable`，本地为 1.99.0 ⇒ 二者随时可能分叉，
+  #   历史故障模式（滚动 stable 引入的新 clippy lint 直接命中）会在 CI 上复现而本地不可见。
+  #   此处与本地实测版本对齐；升级时只改这一处，各 job 引用同一变量。
+  RUST_VERSION: 1.99.0
 
 # v0.8.23 S1-SEC-04：最小权限原则 — CI 只需要读取权限
 permissions:
@@ -43,7 +48,7 @@ jobs:
             static.rust-lang.org:443
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -77,7 +82,11 @@ jobs:
             github.com:443
             api.github.com:443
             objects.githubusercontent.com:443
-      - uses: actions/setup-python@v5
+      # v0.9.11（G10 / CR-53）：钉 SHA —— 此前是 `actions/setup-python@v5`（**可变标签**），
+      #   是全部 workflow 里唯一未钉 SHA 的 action，使 SECURITY.md「所有 Actions 均钉 SHA」
+      #   的声明**不成立**。以下 SHA = 官方 `v5` 标签在 2026-10-08 的 tip commit
+      #   （经 GitHub API `/repos/actions/setup-python/commits/v5` 取得）。
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.x'
       - name: 公开层算法泄露检测
@@ -90,7 +99,8 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     # v0.9.7 审查修复（P2-1）：补齐超时保护
-    timeout-minutes: 30
+    # v0.9.11（G6 / CR-59）：并入 server+ml 口径后编译量上升（candle 全家桶），预算放宽到 45 分钟
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -109,7 +119,7 @@ jobs:
             index.crates.io:443
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy
       - name: Cache Cargo deps
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -124,6 +134,11 @@ jobs:
         run: cargo clippy --features server -- -D warnings
       - name: Run clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
+      # v0.9.11（G6 / CR-59）：`--features server,ml` 的 clippy 口径**此前从不被检查**，
+      #   于是 `luoshu_encoder_ml.rs` 的 3 处告警长期潜伏（neg_cmp_op_on_partial_ord /
+      #   doc_lazy_continuation / needless_range_loop）。现并入门禁，防止再次静默漂移。
+      - name: Run clippy (server + ml features)
+        run: cargo clippy --all-targets --features server,ml -- -D warnings
 
   # ════════════════════════════════════════════════════════════
   # Job 3: 单元测试 + 集成测试
@@ -154,7 +169,7 @@ jobs:
             index.crates.io:443
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - name: Cache Cargo deps
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
@@ -183,6 +198,15 @@ jobs:
       #   postgres/qdrant/neo4j 需真实外部服务，暂不在此接入（见报告 P2-2 待跟踪项）。
       - name: Run tests (server + ml features)
         run: cargo test --features server,ml --verbose -- --test-threads=1
+      # v0.9.11（G7 / CR-48）：**可选持久化后端的用例此前从不被 CI 执行** ——
+      #   而 CR-07/CR-08/CR-17 正是"字段白名单漏字段 ⇒ 静默假绿"的已知故障模式，
+      #   发生在 qdrant / postgres 这些"CI 只 check 不 test"的后端上。
+      #   qdrant 的本轮新增用例（fallback WAL 重放/墓碑/Clear/压实）**不依赖外部服务**，
+      #   可以且必须纳入门禁。postgres / neo4j 的运行时往返需要真实服务，
+      #   由 Service container 或本地执行（见 docs 说明），其**结构性风险**
+      #   （字段清单 / SQL 生成）已由 `persistence::fields` 的 5 条**免连库**守卫按构造覆盖。
+      - name: Run tests (server + qdrant features)
+        run: cargo test --features server,qdrant --lib --verbose -- --test-threads=1
 
   # ════════════════════════════════════════════════════════════
   # Job 3b: 代码覆盖率门禁（v0.9.7 审查修复 P0-1）
@@ -214,7 +238,7 @@ jobs:
             static.rust-lang.org:443
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
           # cargo-llvm-cov 依赖 rustup 的 llvm-tools-preview 组件做插桩
           components: llvm-tools-preview
       - name: Cache Cargo deps
@@ -274,8 +298,7 @@ jobs:
             index.crates.io:443
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
-
+          toolchain: ${{ env.RUST_VERSION }}
       - name: Cache Cargo deps
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
@@ -514,7 +537,7 @@ jobs:
             archive.ubuntu.com:80
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - name: Cache Cargo deps
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
@@ -652,7 +675,7 @@ jobs:
             cdn.jsdelivr.net:443
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          toolchain: stable
+          toolchain: ${{ env.RUST_VERSION }}
       - name: Cache Cargo deps
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
@@ -690,6 +713,17 @@ jobs:
           npm install playwright
           npx playwright install --with-deps chromium
       - name: Run frontend static and contract checks
+        # v0.9.11（G7 / CR-47）：**6 个套件全部**做语法门禁。
+        #   修前只检查 5 个 —— 符号层专项 `symbolic-layer-desktop-cdp.js` 连 `node --check`
+        #   都没有，语法腐烂无人发现。
+        #   为什么其余 5 个 *-cdp.js 只做语法检查、不真实运行：它们需要
+        #   **真实桌面 WebView 的 CDP 9231/9230**（Tauri 开发态）或 `ws` 依赖，
+        #   GitHub ubuntu runner 无此环境 ⇒ 强行运行只会得到"环境不满足"的假红。
+        #   本地真实运行：
+        #     node tests/frontend/cdp-regression.js
+        #     node tests/frontend/association-{dashboard,desktop}-cdp.js
+        #     node tests/frontend/association-user-view-check.js
+        #     node tests/frontend/symbolic-layer-desktop-cdp.js
         run: |
           node --check static/app.js
           node --check tests/frontend/cdp-regression.js
@@ -697,6 +731,7 @@ jobs:
           node --check tests/frontend/association-dashboard-cdp.js
           node --check tests/frontend/association-desktop-cdp.js
           node --check tests/frontend/association-user-view-check.js
+          node --check tests/frontend/symbolic-layer-desktop-cdp.js
           node scripts/validate_frontend_contract.js
       - name: Run Chromium browser regression
         env:

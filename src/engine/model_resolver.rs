@@ -190,7 +190,6 @@ pub fn profile_for_model(model_id: &str) -> ModelFamilyProfile {
 #[cfg(test)]
 mod profile_tests {
     use super::*;
-    use std::sync::Mutex;
 
     /// 环境变量是**进程级全局状态**，而 cargo 默认多线程并行跑测试。
     /// `test_env_override_pooling_and_prefix` 会临时改写 `LRC_MODEL_POOLING` /
@@ -198,10 +197,9 @@ mod profile_tests {
     /// （实测：全量跑时 `test_unknown_family_uses_safe_default` 因读到 `cls` 而失败）。
     /// 故凡依赖这两个环境变量的用例，先取此锁串行执行。
     /// 用 `unwrap_or_else` 容忍持锁用例 panic 导致的毒化，避免连带失败。
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
+    // v0.9.11（G6 / CR-20）：**不再自持锁**，改用全 crate 唯一锁（理由同 state_matcher）
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_env::lock()
     }
 
     #[test]

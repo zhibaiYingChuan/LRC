@@ -159,13 +159,12 @@ pub fn export_memories(
 
     let export_data = ExportData {
         version: EXPORT_VERSION.to_string(),
-        exported_at: {
-            use std::time::SystemTime;
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs().to_string())
-                .unwrap_or_else(|_| "unknown".to_string())
-        },
+        // v0.9.11（CR-44）：此前此处写入的是 **Unix 秒数的字符串**，而本结构体字段
+        // 文档与文件格式说明（见本文件模块头 V2 格式）都声明为 **ISO 8601**，
+        // 前端 `static/app.js` 的同名字段也用 `new Date().toISOString()`（ISO 8601）
+        // —— 即"前后端同一字段、两种格式"。现统一为 RFC 3339（ISO 8601 的
+        // 互联网子集），与文档契约和前端产物一致。
+        exported_at: chrono::Utc::now().to_rfc3339(),
         fingerprint: fingerprint.clone(),
         canonical_path: canonical_path.clone(),
         source,
@@ -281,60 +280,73 @@ pub fn import_memories(
         .ensure()
         .map_err(|e| LrcError::io(format!("创建数据目录失败: {}", e)))?;
 
-    // 导入记忆数据（追加模式）
+    // ═══ v0.9.11（G5 / CR-38）：先**全部序列化**，再**逐文件原子写入** ═══
+    //
+    // 修前有两个层次的问题：
+    //  ① `fs::write` 对 `memories.json` 是**非原子的整文件重写** —— 写一半崩溃/断电即
+    //     留下**被截断的文件**，等于**全部记忆丢失**（导入通常伴随大文件，这不是理论风险）。
+    //  ② 三个文件**边序列化边写**：若 `chunks.json` 序列化失败，`memories.json` 已落盘
+    //     ⇒ 导入处于**半应用**状态且不回滚。
+    //
+    // 现改为：
+    //  ① **先构造三份完整载荷**（任何序列化失败都在**任何写入之前**中止 ⇒ 不再半应用）；
+    //  ② 再用 Layer 1 公共设施 [`crate::atomic_file::write_atomic`]（UUID 唯一临时名 +
+    //     原子替换 + 失败清理）逐个落盘 ⇒ 单文件损坏不再可能。
+    //
+    // **残留风险（明示）**：三个文件之间的 rename 序列本身**不是组原子**；理论上仍存在
+    // "A 已替换、B 未替换"的极小窗口。彻底消除需跨文件事务，超出本次范围。
+    let read_array = |path: &std::path::Path| -> serde_json::Value {
+        if path.exists() {
+            let content = fs::read_to_string(path).unwrap_or_default();
+            serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!([]))
+        } else {
+            serde_json::json!([])
+        }
+    };
+
+    // (目标路径, 序列化后的载荷)：先在内存中全部备好
+    let mut pending: Vec<(std::path::PathBuf, String)> = Vec::new();
+
     if memory_count > 0 {
-        let memories_path = data_path.join("memories.json");
-        let existing: serde_json::Value = if memories_path.exists() {
-            let content = fs::read_to_string(&memories_path).unwrap_or_default();
-            serde_json::from_str(&content).unwrap_or(serde_json::json!([]))
-        } else {
-            serde_json::json!([])
-        };
-
-        // 简单合并：将导入的记忆追加到现有数据
-        let merged = merge_arrays(&existing, &export_data.memories);
-        let merged_str = serde_json::to_string_pretty(&merged)
+        let merged = merge_arrays(
+            &read_array(&data_path.join("memories.json")),
+            &export_data.memories,
+        );
+        let payload = serde_json::to_string_pretty(&merged)
             .map_err(|e| LrcError::parse(format!("序列化合并后的记忆数据失败: {}", e)))?;
-        fs::write(&memories_path, merged_str)
-            .map_err(|e| LrcError::io(format!("写入 memories.json 失败: {}", e)))?;
-        result.memories_imported = memory_count;
+        pending.push((data_path.join("memories.json"), payload));
     }
 
-    // 导入代码片段
     if chunk_count > 0 {
-        let chunks_path = data_path.join("chunks.json");
-        let existing: serde_json::Value = if chunks_path.exists() {
-            let content = fs::read_to_string(&chunks_path).unwrap_or_default();
-            serde_json::from_str(&content).unwrap_or(serde_json::json!([]))
-        } else {
-            serde_json::json!([])
-        };
-
-        let merged = merge_arrays(&existing, &export_data.chunks);
-        let merged_str = serde_json::to_string_pretty(&merged)
+        let merged = merge_arrays(
+            &read_array(&data_path.join("chunks.json")),
+            &export_data.chunks,
+        );
+        let payload = serde_json::to_string_pretty(&merged)
             .map_err(|e| LrcError::parse(format!("序列化合并后的代码片段失败: {}", e)))?;
-        fs::write(&chunks_path, merged_str)
-            .map_err(|e| LrcError::io(format!("写入 chunks.json 失败: {}", e)))?;
-        result.chunks_imported = chunk_count;
+        pending.push((data_path.join("chunks.json"), payload));
     }
 
-    // 导入归档数据
     if archive_count > 0 {
-        let archive_path = data_path.join("archive.json");
-        let existing: serde_json::Value = if archive_path.exists() {
-            let content = fs::read_to_string(&archive_path).unwrap_or_default();
-            serde_json::from_str(&content).unwrap_or(serde_json::json!([]))
-        } else {
-            serde_json::json!([])
-        };
-
-        let merged = merge_arrays(&existing, &export_data.archive);
-        let merged_str = serde_json::to_string_pretty(&merged)
+        let merged = merge_arrays(
+            &read_array(&data_path.join("archive.json")),
+            &export_data.archive,
+        );
+        let payload = serde_json::to_string_pretty(&merged)
             .map_err(|e| LrcError::parse(format!("序列化合并后的归档数据失败: {}", e)))?;
-        fs::write(&archive_path, merged_str)
-            .map_err(|e| LrcError::io(format!("写入 archive.json 失败: {}", e)))?;
-        result.archive_imported = archive_count;
+        pending.push((data_path.join("archive.json"), payload));
     }
+
+    // 全部载荷就绪后才开始落盘；每个文件都是原子替换
+    for (path, payload) in &pending {
+        crate::atomic_file::write_atomic(path, payload.as_bytes())
+            .map_err(|e| LrcError::io(format!("写入 {} 失败: {}", path.display(), e)))?;
+    }
+
+    // 计数在**写入成功后**才置位（修前在写之前就赋值，失败时会给出误导性的"已导入"）
+    result.memories_imported = memory_count;
+    result.chunks_imported = chunk_count;
+    result.archive_imported = archive_count;
 
     result.details.push(format!(
         "导入完成: {} 记忆, {} 代码片段, {} 归档",
@@ -399,6 +411,37 @@ pub fn validate_export_file(path: &Path) -> LrcResult<ExportData> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★守卫（v0.9.11 / G5 / CR-38）：**数据文件不得被非原子写入**。
+    ///
+    /// ## 为什么必须
+    /// `import_memories` 对 `memories.json` / `chunks.json` / `archive.json` 做的是
+    /// **整文件重写**。若用 `fs::write` 直写，写一半崩溃/断电即留下**截断文件** ——
+    /// `memories.json` 损坏等于**全部记忆丢失**（导入通常伴随大文件，非理论风险）。
+    ///
+    /// 正确设施是 [`crate::atomic_file::write_atomic`]（UUID 唯一临时名 + 原子替换 + 失败清理）。
+    /// 本守卫以源码文本断言防止它被改回去（此前的 P3-3 修复已把 4 处原子写收敛到该设施，
+    /// 本处是遗漏的第 5 处）。
+    #[test]
+    fn import_must_not_use_non_atomic_write() {
+        let src = include_str!("export.rs");
+        let start = src
+            .find("pub fn import_memories(")
+            .expect("export.rs 必须存在 import_memories");
+        let rest = &src[start..];
+        // 截取到下一个顶层函数，避免把其它函数的写法误算进来
+        let end = rest.find("\nfn merge_arrays").unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        assert!(
+            !body.contains("fs::write("),
+            "import_memories 中不得出现非原子 `fs::write` —— 它会截断数据文件（CR-38）"
+        );
+        assert!(
+            body.contains("write_atomic"),
+            "import_memories 必须使用 atomic_file::write_atomic（UUID 临时名 + 原子替换）"
+        );
+    }
 
     /// 创建测试用数据目录
     fn setup_test_data_dir() -> (tempfile::TempDir, DataDir) {

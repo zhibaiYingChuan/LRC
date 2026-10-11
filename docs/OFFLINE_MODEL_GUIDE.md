@@ -181,7 +181,16 @@ external encoder loaded (hidden_size=768, device=CPU)
 
 ## 切换模型
 
-如果想使用其他 CodeBERT 系列模型，设置环境变量：
+> ⚠️ **两个环境变量不是一回事（v0.9.11 / CR-56：此前并列出现，极易误用）**
+>
+> | 环境变量 | 控制哪个子系统 | 代码位置 | 本文档中的位置 |
+> |---|---|---|---|
+> | `LRC_LUOSHU_MODEL_ID` | **主语义编码器**（记忆检索/联想用的句向量模型；也是 `selected_model_id()` 的覆盖入口） | `src/engine/model_resolver.rs`、`src/engine/embedder.rs` | 见本文开头「默认模型提示」 |
+> | `LRC_MODEL_ID` | **仅** 代码检索的旧版 CodeBERT 编码器（`ml` feature 下可选、向后兼容） | `src/engine/encoder_codebert.rs` | 本节 |
+>
+> 二者**互不覆盖**：改 `LRC_MODEL_ID` **不会**改变记忆检索所用的句向量模型。
+
+如果只想切换**代码检索**用的 CodeBERT 系列模型，设置：
 
 ```bash
 # 使用 CodeBERT（而非默认的 GraphCodeBERT）
@@ -190,6 +199,8 @@ export LRC_MODEL_ID=microsoft/codebert-base
 # 使用 CodeBERT MLM（掩码语言模型变体）
 export LRC_MODEL_ID=microsoft/codebert-base-mlm
 ```
+
+若要切换**记忆检索**用的主语义模型，请改用 `LRC_LUOSHU_MODEL_ID`（如 `BAAI/bge-base-zh`）。
 
 > 注意：切换模型后需要重新下载对应的模型文件。不同模型的缓存目录不同。
 

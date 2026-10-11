@@ -76,8 +76,12 @@ fn abstract_vs_concrete_root_cause() {
     let dir_str = dir.to_str().unwrap_or_default().to_string();
 
     let Some(store) = ml_store(&dir_str) else {
-        eprintln!("[根因三分探针] ML 编码器不可用，跳过");
-        return;
+        // v0.9.11（G7 / CR-47）：`#[ignore]` 的手动探针在 `--ignored` 下缺模型必须**失败**
+        // 而不是静默通过（否则等于"假覆盖"）。
+        panic!(
+            "本探针需要本地 bge 权重：请设置 LRC_LUOSHU_MODEL_ID（如 BAAI/bge-base-zh）\
+             并确认权重已下载；若不想跑本探针，请去掉 `--ignored`。（CR-47：禁止静默跳过）"
+        );
     };
 
     // ---- 组①：抽象锚点 ↔ 抽象记忆 ----

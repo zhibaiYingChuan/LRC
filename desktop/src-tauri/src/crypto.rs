@@ -130,7 +130,14 @@ fn dpapi_unprotect(data: &[u8]) -> Result<Vec<u8>, String> {
     };
 
     if result == 0 {
-        return Err("DPAPI 解密失败（密钥可能来自其他用户或机器）".into());
+        // v0.9.11（G9 / CR-33）：与主 crate `src/crypto.rs` 对齐 —— 原文案
+        //   "密钥可能来自其他用户或机器" 会让调用方**推断出密钥来源**，
+        //   属不必要的内部细节（可被用于攻击面画像）。
+        //   对外统一为**不可区分**的失败原因，详细诊断只走本地 stderr。
+        //   ⚠️ 本文件是主 crate `src/crypto.rs` 的**逐字副本**，此前已发生漂移
+        //   （主 crate 加固、桌面端未跟）—— 改动任一侧时必须同步另一侧。
+        eprintln!("[加密] DPAPI 解密失败（CryptUnprotectData 返回 0）");
+        return Err("密钥解密失败，请重新配置 API Key".into());
     }
 
     // SAFETY: data_out.pbData 由 CryptUnprotectData 分配并填充，大小与加密时一致
@@ -294,6 +301,28 @@ mod tests {
         // 解密后应恢复
         let decrypted = decrypt_api_key(&encrypted).expect("解密失败");
         assert_eq!(decrypted, original);
+    }
+
+    /// ★守卫（v0.9.11 / G9 / CR-33）：**DPAPI 解密失败文案不得泄露密钥来源**。
+    ///
+    /// 背景：本文件是主 crate `src/crypto.rs` 的逐字副本，两端曾**发生漂移** ——
+    /// 主 crate 已把文案改为不可区分的"密钥解密失败，请重新配置 API Key"，
+    /// 桌面端仍保留"密钥可能来自其他用户或机器"（可被用于推断密钥来源）。
+    /// 这里以**源码文本断言**钉住"不可区分"口径，防止再次漂移。
+    #[test]
+    fn dpapi_failure_message_must_not_leak_key_origin() {
+        let src = include_str!("crypto.rs");
+        // 用**拼接**构造旧文案（不写成字面量）：否则本测试源码自身会含该串，
+        // `include_str!` 便"自己匹配自己"，守卫要么恒真要么恒假。
+        let former = format!("DPAPI 解密失败（密钥{}）", "可能来自其他用户或机器");
+        assert!(
+            !src.contains(&former),
+            "DPAPI 失败文案不得再使用可推断密钥来源的旧文案（CR-33）"
+        );
+        assert!(
+            src.contains("密钥解密失败，请重新配置 API Key"),
+            "必须使用与主 crate 一致的不可区分失败文案（CR-33）"
+        );
     }
 
     /// TDD：空字符串加密解密（应返回空字符串，不进行实际加密）

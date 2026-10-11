@@ -8,6 +8,20 @@
 // 将记忆和代码片段存储为 JSON 文件。
 // 适用于轻量级部署（记忆数量 < 10,000 条）。
 // 大数据量场景建议使用 SQLite 后端（P1 计划）。
+//
+// ## ⚠️ 已知规模边界（v0.9.11 / G9 收尾 / CR-41：把隐患变成**显式量化声明**）
+//
+// **单条写入是"全量重写 JSON"** ⇒ 写放大为 `O(N)`/条、批量写 `O(N²)`。
+// 实测（仓库内既有剖析记录，**本轮未重跑**）：4,485 条规模下单次序列化
+// mean ≈ 308ms、p95 ≈ 324ms。
+//
+// - **这是被接受的设计取舍**，不是缺陷：本后端的定位就是**< 10,000 条**的轻量部署
+//   （语料规模上限已由上面两行声明）；
+// - **缓解措施已存在**：批量路径（`update_memories`）把 N 次磁盘 I/O 降为 1 次；
+//   查询路径不再逐条写（见 `last_accessed` 批量更新）；
+// - **超出该规模的正确做法是换后端**：`postgres` / `qdrant` / `neo4j` 已是内置
+//   feature，`sqlx` 路径按"字段清单单一真源"生成 SQL（见 `persistence::fields`）。
+//   **不要**在此文件上继续叠加"分片 JSON"这类自研方案 —— 那是在重造一个数据库。
 
 use super::{AssocFrequency, Persistence, PersistenceError};
 use crate::chunker::CodeChunk;
@@ -31,6 +45,8 @@ use std::time::{Duration, Instant};
 ///     ② JSON_WRITE_LOCK (Mutex<()>)                 —— 跨进程/跨实例文件写入串行化
 ///   另有独立于上述两把的进程级文件锁：
 ///     ③ self.acquire_process_write_guard()          —— 跨进程 flock（实现见下）
+///   以及一把**共享**的快照一致性读锁（顺序 ④，最后取）：
+///     ④ crate::atomic_file::writer_guard()          —— 与备份/恢复的独占快照区间互斥（CR-37）
 /// ```
 ///
 /// **为什么 JSON_WRITE_LOCK 是全局单例而非 per-instance**：
@@ -204,6 +220,14 @@ fn write_archived_memories(path: &Path, memories: &[Memory]) -> Result<(), Persi
 }
 
 impl Persistence for JsonPersistence {
+    /// 侧车文件定位用（`semantic_vectors.json` 等）。
+    ///
+    /// ★ 必须放在**本 trait impl 块内**：泛型上下文（`impl<P: Persistence>`）只认
+    /// trait 方法，放在固有块里会静默落到 trait 的默认实现（`None`）⇒ 功能不生效。
+    fn data_dir_path(&self) -> Option<&Path> {
+        Some(self.data_dir())
+    }
+
     fn load_memory_state(&self) -> Result<MemoryState, PersistenceError> {
         let path = self.data_dir.join("memory_state.json");
         if !path.exists() {
@@ -267,7 +291,6 @@ impl Persistence for JsonPersistence {
                 "内存缓存未初始化（refresh_cache_from_disk 未生效）".to_string(),
             )
         })?;
-        let previous = memories.clone();
 
         // 按 ID 查找并更新，或追加新记忆
         if let Some(existing) = memories.iter_mut().find(|m| m.id == memory.id) {
@@ -282,7 +305,12 @@ impl Persistence for JsonPersistence {
         let disk_start = std::time::Instant::now();
         let write_result = atomic_write(&self.memories_file, &json);
         if write_result.is_err() {
-            *memories = previous;
+            // v0.9.11（G9 收尾 / CR-35）：失败时**丢弃缓存**，而不是恢复一份全量深拷贝。
+            // 依据：`atomic_write` 是原子的 —— 失败时磁盘仍是旧状态，
+            // 下次读取从磁盘重载即得到与"恢复 previous"**完全等价**的结果；
+            // 而 `previous = memories.clone()` 会在每次写路径上多持有一份整库副本，
+            // 正是"峰值内存 3–4× 库大小"的主要来源之一。
+            *cache = None;
         }
         drop(cache); // 释放写锁
         write_result?;
@@ -371,7 +399,6 @@ impl Persistence for JsonPersistence {
                 "内存缓存未初始化（refresh_cache_from_disk 未生效）".to_string(),
             )
         })?;
-        let previous = existing.clone();
 
         // 构建 ID → 索引 映射，支持"已存在则更新，不存在则追加"
         // 使用 String 作为 key（拥有所有权），避免 &str 借用 existing 导致可变借用冲突
@@ -396,12 +423,14 @@ impl Persistence for JsonPersistence {
         let json = match serde_json::to_string_pretty(existing) {
             Ok(json) => json,
             Err(error) => {
-                *existing = previous;
+                // v0.9.11（G9 收尾 / CR-35）：同 `save_memory` —— 丢弃缓存而非深拷贝回滚。
+                // 序列化失败时磁盘未被触碰，重载即得旧状态。
+                *cache = None;
                 return Err(error.into());
             }
         };
         if let Err(error) = atomic_write(&self.memories_file, &json) {
-            *existing = previous;
+            *cache = None;
             return Err(error);
         }
         drop(cache); // 释放写锁
@@ -426,6 +455,23 @@ impl Persistence for JsonPersistence {
         let memories = self.load_all_memories_from_disk()?;
         *self.cache.write().unwrap_or_else(|e| e.into_inner()) = Some(memories.clone());
         Ok(memories)
+    }
+
+    /// 数据源指纹 = 记忆文件 `mtime`（纳秒）**长度混合**（v0.9.11 / G9 收尾 / CR-42）。
+    ///
+    /// 用途：让 `MemoryStore` 的外层缓存能发现"**别的进程**写了新数据"
+    /// （见 `Persistence::source_fingerprint` 文档的契约与已知边界）。
+    /// 取 `mtime` 而非内容哈希：本方法的**全部价值**就在于代价远低于全量读。
+    fn source_fingerprint(&self) -> Option<u64> {
+        let meta = fs::metadata(&self.memories_file).ok()?;
+        let nanos = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        // 旋转后再异或长度：避免仅"长度相同"或"时间戳低位相同"时碰撞
+        Some(nanos.rotate_left(16) ^ meta.len())
     }
 
     fn delete_memory(&self, id: &str) -> Result<bool, PersistenceError> {
@@ -585,24 +631,25 @@ impl Persistence for JsonPersistence {
 
 // === 原子写入辅助函数 ===
 
-/// 原子写入：先写临时文件，再重命名（同文件系统内是原子操作）
-/// 防止崩溃时产生损坏的 JSON 文件
+/// 原子**且持久**写入（v0.9.11 / G5 / CR-40：改为**委托**唯一实现）。
+///
+/// ## 为什么委托而不是各写一遍
+/// 修前本文件自带一份"临时文件 + rename"实现，与 `atomic_file::write_atomic` 重复；
+/// 两份实现意味着**加固只会做一半**（例如本轮补 fsync 时，只改一处就会漏掉主记忆写路径）。
+/// 现统一委托 Layer 1 公共设施：临时名带 UUID、失败清理、**写入 fsync 后再 rename**、
+/// rename 后同步父目录（Unix）—— 全部收敛到一处。
+///
+/// ## 锁序
+/// - 锁② `JSON_WRITE_LOCK`：此处获取（调用方须已按序持有锁① `cache` 写锁）；
+/// - 锁④ 快照一致性闸门：由 `atomic_file::write_atomic` 内部获取（**不在本函数重复取**，
+///   否则同线程递归取读锁在"有写者在等待"时可能死锁）。
 fn atomic_write(path: &Path, content: &str) -> Result<(), PersistenceError> {
     // 锁序②：见文件顶部「锁序契约」。调用方须已按序持有锁①（cache 写锁）。
     let _guard = JSON_WRITE_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let tmp_path = path.with_file_name(format!(
-        "{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("data"),
-        uuid::Uuid::new_v4()
-    ));
-    if let Err(error) = fs::write(&tmp_path, content).and_then(|_| fs::rename(&tmp_path, path)) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(error.into());
-    }
-    Ok(())
+    crate::atomic_file::write_atomic(path, content.as_bytes()).map_err(PersistenceError::from)
 }
 
 // === 测试 ===

@@ -6,7 +6,7 @@
   <!-- 之前完全未配置 CSP，XSS/数据注入防御缺失，HCSE 安全不变量 INV-01 违规 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.openai.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="version" content="0.9.10">
+  <meta name="version" content="0.9.11">
   <!-- v0.9.0 开发模式隔离：注入 sidecar 端口号，前端通过此标签获取正确的 API 端点 -->
   <!-- 开发版默认 3111，稳定版打包时替换为 3099 -->
   <meta name="lrc-sidecar-port" content="3111">
@@ -253,10 +253,12 @@
       </div>
       <div class="af-actions">
         <button class="btn btn-ghost btn-sm" data-action="gotoMemorySearch">查看全部记忆 →</button>
-        <!-- ★v0.9.9 修复：原按钮文案为「查看结晶历史 →」，但 `#crystallization-timeline`
-             容器在 v0.9.7 首页重构时已从 HTML 移除（`app.js:8310` 读该 id 时直接 return）
+        <!-- ★v0.9.9 修复 / v0.9.11（CR-57）更新：原按钮文案为「查看结晶历史 →」，但
+             `#crystallization-timeline` 容器在 v0.9.7 首页重构时已从 HTML 移除
              ⇒ 点击后页面只是滚到「结晶成果」卡，没有任何"历史"，也无提示，
-             用户会以为功能坏了。改文案为「查看结晶成果」以与实际展示一致。 -->
+             用户会以为功能坏了。改文案为「查看结晶成果」以与实际展示一致。
+             注：原注释引用 `app.js:8310` 属**行号引用**，会随代码增删漂移；
+             现改为按**函数名**引用（`loadCrystallizationHistory`），不再依赖行号。 -->
         <button class="btn btn-ghost btn-sm" data-action="gotoSynthesisHistory">查看结晶成果 →</button>
       </div>
     </section>
@@ -454,8 +456,11 @@
       <p class="text-sm text-dim" id="preset-scenario-info" style="display:none;margin-top:8px;"></p>
     </div>
 
-    <!-- 「结晶历史时间线」「最近记忆」「项目分布」已并入首屏 M3/M4d，避免重复展示；
-         对应的 loadCrystallizationHistory / loadRecentMemories / loadMemoryStats 函数保留（别处仍有引用） -->
+    <!-- 「结晶历史时间线」「最近记忆」「项目分布」已并入首屏 M3/M4d，避免重复展示。
+         v0.9.11（CR-57）：`loadCrystallizationHistory` 已**删除** —— 它读取的
+         `#crystallization-timeline` 容器早已不存在，函数首行即 `return`，属死代码
+         （该函数连同 3 处调用点、window 导出与专用 CSS 一并移除）。
+         `loadRecentMemories` / `loadMemoryStats` **保留**：它们的目标容器仍在页面上。 -->
 
     <!-- ==================== 洛书向量编码器（单一数据主题：文本→9维向量编码试验台） ==================== -->
     <div class="card">

@@ -14,7 +14,39 @@
 // ============================================================
 
 use crate::engine::mirror_trapezoid::bagua_name_to_index;
-use crate::memory_store::{RecallFilter, RecallResult};
+// v0.9.11（G9 / CR-15）：见 `engine/rrf.rs` 同款说明 —— 依赖纯数据契约而非存储实现。
+use crate::memory_store_types::{RecallFilter, RecallResult};
+
+/// **引擎侧声明的最小检索能力**（依赖倒置接口，v0.9.11 / G9 / CR-15）。
+///
+/// ## 为什么把接口定义在引擎侧（这是 CR-15 的核心修法）
+/// 修前签名是：
+/// ```text
+/// pub fn navigated_deep_recall<P>(store: &mut crate::memory_store::MemoryStore<P>, …)
+///     where P: crate::persistence::Persistence
+/// ```
+/// ⇒ engine（Layer 2）**直接依赖 Layer 1 的存储实现 `MemoryStore` 与持久化 trait
+/// `Persistence`**，而 Layer 1 本就依赖 engine 的编码器 ⇒ **两层成环**：
+/// 引擎无法独立于存储演进（也不能单独授权/打包）。
+///
+/// 现在引擎只声明"我需要一个能按 filter 做一次聚焦召回的东西"，
+/// 由 `MemoryStore` **反向实现**本 trait ⇒ 依赖方向反转为
+/// `MemoryStore（L1） → FocusRecall（引擎接口）`，环被打破。
+///
+/// ## 为什么用关联类型 `Error` 而不是具体错误类型
+/// 若写成 `Result<RecallResult, PersistenceError>`，引擎仍需 `use crate::persistence`，
+/// 反向依赖只是换了个名字。关联类型让错误类型由实现方决定。
+pub trait FocusRecall {
+    /// 实现方自己的错误类型（`MemoryStore` 用 `PersistenceError`）
+    type Error;
+    /// 按 `filter` 做一次"聚焦召回"（深度检索）
+    fn focus_recall(
+        &mut self,
+        query: &str,
+        filter: &RecallFilter,
+        depth: u32,
+    ) -> Result<RecallResult, Self::Error>;
+}
 
 /// 一次检索允许的最大导航视图数（含基线视图）。
 /// 防御失控输入：视图数 × 每视图 top_k 会线性放大检索成本。
@@ -119,29 +151,24 @@ impl NavigationSignal {
 /// 改变【候选集】而非权重的机制表达。
 ///
 /// 返回 None 表示导航未生效（信号为空/解析失败），调用方保持基线行为。
-pub fn navigated_deep_recall<P>(
-    store: &mut crate::memory_store::MemoryStore<P>,
+pub fn navigated_deep_recall<S: FocusRecall>(
+    store: &mut S,
     query: &str,
     base_filter: &RecallFilter,
     depth: u32,
     signal: &NavigationSignal,
-) -> Option<RecallResult>
-where
-    P: crate::persistence::Persistence,
-{
+) -> Option<RecallResult> {
     let probes = signal.probe_words();
     if probes.is_empty() {
         return None;
     }
     // 视图 0：基线
-    let base = store
-        .trapezoid_focus_recall(query, base_filter, depth)
-        .ok()?;
+    let base = store.focus_recall(query, base_filter, depth).ok()?;
     let mut views: Vec<RecallResult> = vec![base];
     for (_palace, word) in &probes {
         let probe_query = format!("{} {}", query, word);
         // 每视图取适度宽度（与基线 top_k 同量级，跨视图靠 RRF 收敛）
-        if let Ok(r) = store.trapezoid_focus_recall(&probe_query, base_filter, depth) {
+        if let Ok(r) = store.focus_recall(&probe_query, base_filter, depth) {
             views.push(r);
         }
     }
@@ -254,7 +281,7 @@ mod tests {
 
     #[test]
     fn rrf融合_跨视图共现记忆排名更高() {
-        use crate::memory_store::RecallResult;
+        use crate::memory_store_types::RecallResult;
         use crate::memory_types::{Importance, Memory, MemoryType};
         let mk = |id: &str, content: &str| {
             let mut m = Memory::new(

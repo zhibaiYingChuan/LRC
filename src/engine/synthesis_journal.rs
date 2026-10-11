@@ -49,24 +49,51 @@ pub struct SynthesisEvent {
 ///
 /// 线程安全的事件记录器，支持最多保留 1000 条历史记录。
 /// 提供质量反馈闭环：检索命中合成记忆时自动更新相关性评分。
+///
+/// ## 单一互斥（v0.9.11 / CR-44）
+///
+/// 修前用**三个独立 `Mutex`**（`events` / `total_synthesis` / `low_quality_count`），
+/// `snapshot()` 因此要分别取三次锁 ⇒ 三者可能来自**不同时刻**，对外暴露
+/// **自相矛盾**的统计（例如 `low_quality_count > total_synthesis`，或成功率与
+/// `recent_events` 不属于同一状态）。现收敛为**单一 `Mutex<JournalState>`**：
+/// 一次加锁即得到一个**内部一致**的状态视图，并顺带消除"events → low_quality"
+/// 的嵌套加锁。各公开方法的对外行为保持不变。
+///
+/// **注**：本日志是**进程内诊断/质量反馈**数据，不持久化（重启归零为既有设计，
+/// 见 `docs/GLOBAL_CODE_REVIEW_REPORT_v0.9.11.md` §六 FIX-33 的显式声明）。
 #[derive(Debug)]
 pub struct SynthesisJournal {
+    /// 全部可变态（事件窗口 + 两个累计计数）由**同一把锁**守护
+    state: Mutex<JournalState>,
+}
+
+/// [`SynthesisJournal`] 的受保护状态（单一互斥体的内容）。
+#[derive(Debug)]
+struct JournalState {
     /// 合成事件历史（FIFO 队列，最多 1000 条）
-    events: Mutex<VecDeque<SynthesisEvent>>,
+    events: VecDeque<SynthesisEvent>,
     /// 累计合成次数
-    total_synthesis: Mutex<u64>,
+    total_synthesis: u64,
     /// 被标记为低质量的合成次数
-    low_quality_count: Mutex<u64>,
+    low_quality_count: u64,
 }
 
 impl SynthesisJournal {
     /// 创建新的合成日志
     pub fn new() -> Self {
         Self {
-            events: Mutex::new(VecDeque::with_capacity(1000)),
-            total_synthesis: Mutex::new(0),
-            low_quality_count: Mutex::new(0),
+            state: Mutex::new(JournalState {
+                events: VecDeque::with_capacity(1000),
+                total_synthesis: 0,
+                low_quality_count: 0,
+            }),
         }
+    }
+
+    /// 取一致状态守卫（Mutex 中毒时取回内部值，与既有
+    /// `unwrap_or_else(|e| e.into_inner())` 同口径）。
+    fn lock(&self) -> std::sync::MutexGuard<'_, JournalState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 记录一次合成事件
@@ -103,25 +130,20 @@ impl SynthesisJournal {
             low_quality: false,
         };
 
-        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        if events.len() >= 1000 {
-            events.pop_front();
+        let mut state = self.lock();
+        if state.events.len() >= 1000 {
+            state.events.pop_front();
         }
-        events.push_back(event);
-
-        let mut total = self
-            .total_synthesis
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *total += 1;
+        state.events.push_back(event);
+        state.total_synthesis += 1;
     }
 
     /// 记录合成记忆被检索命中（质量反馈）
     ///
     /// 当检索结果中包含合成记忆时调用，更新其命中次数和相关性评分。
     pub fn record_hit(&self, synthesis_id: &str, relevance: f32) {
-        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        for event in events.iter_mut().rev() {
+        let mut state = self.lock();
+        for event in state.events.iter_mut().rev() {
             if event.synthesis_id == synthesis_id {
                 // 增量更新平均相关性
                 let total = event.hit_count as f32 * event.avg_relevance;
@@ -131,11 +153,7 @@ impl SynthesisJournal {
                 // 连续多次命中但相关性低 → 标记为低质量
                 if event.hit_count >= 3 && event.avg_relevance < 0.3 && !event.low_quality {
                     event.low_quality = true;
-                    let mut lq = self
-                        .low_quality_count
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    *lq += 1;
+                    state.low_quality_count += 1;
                 }
                 return;
             }
@@ -146,9 +164,9 @@ impl SynthesisJournal {
     ///
     /// 不伪造检索命中，直接置位 low_quality，避免污染检索统计。
     pub fn mark_low_quality(&self, synthesis_id: &str) {
-        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.lock();
         let mut changed = false;
-        for event in events.iter_mut() {
+        for event in state.events.iter_mut() {
             if event.synthesis_id == synthesis_id {
                 if !event.low_quality {
                     event.low_quality = true;
@@ -158,11 +176,7 @@ impl SynthesisJournal {
             }
         }
         if changed {
-            let mut lq = self
-                .low_quality_count
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *lq += 1;
+            state.low_quality_count += 1;
         }
     }
 
@@ -170,9 +184,9 @@ impl SynthesisJournal {
     ///
     /// 不伪造检索命中，直接清除 low_quality，避免污染检索统计。
     pub fn clear_low_quality(&self, synthesis_id: &str) {
-        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.lock();
         let mut changed = false;
-        for event in events.iter_mut() {
+        for event in state.events.iter_mut() {
             if event.synthesis_id == synthesis_id && event.low_quality {
                 event.low_quality = false;
                 changed = true;
@@ -180,17 +194,19 @@ impl SynthesisJournal {
             }
         }
         if changed {
-            let mut lq = self
-                .low_quality_count
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *lq = lq.saturating_sub(1);
+            state.low_quality_count = state.low_quality_count.saturating_sub(1);
         }
     }
 
     /// 获取合成触发频率（每分钟合成次数）
     pub fn synthesis_rate_per_minute(&self) -> f32 {
-        let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.lock();
+        Self::rate_per_minute(&state.events)
+    }
+
+    /// 由事件窗口计算每分钟合成频率（单一实现点，供 `snapshot()` 在**同一把锁内**
+    /// 复用，避免二次加锁破坏一致性；v0.9.11 / CR-44）。
+    fn rate_per_minute(events: &VecDeque<SynthesisEvent>) -> f32 {
         if events.len() < 2 {
             return 0.0;
         }
@@ -205,22 +221,23 @@ impl SynthesisJournal {
 
     /// 获取所有合成事件
     pub fn get_events(&self) -> Vec<SynthesisEvent> {
-        let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        events.iter().cloned().collect()
+        let state = self.lock();
+        state.events.iter().cloned().collect()
     }
 
     /// 获取最近 N 条合成事件
     pub fn get_recent_events(&self, n: usize) -> Vec<SynthesisEvent> {
-        let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        events.iter().rev().take(n).cloned().collect()
+        let state = self.lock();
+        state.events.iter().rev().take(n).cloned().collect()
     }
 
     /// 获取所有被标记为低质量的合成记忆 ID 列表
     ///
     /// 用于垃圾清理：找出需要被清理/降级的合成产物。
     pub fn get_low_quality_ids(&self) -> Vec<String> {
-        let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        events
+        let state = self.lock();
+        state
+            .events
             .iter()
             .filter(|e| e.low_quality)
             .map(|e| e.synthesis_id.clone())
@@ -229,19 +246,16 @@ impl SynthesisJournal {
 
     /// 清除指定合成事件的跟踪记录（记忆被清理后调用）
     pub fn remove_event(&self, synthesis_id: &str) {
-        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        let removed_low_quality = events
+        let mut state = self.lock();
+        let removed_low_quality = state
+            .events
             .iter()
             .any(|e| e.synthesis_id == synthesis_id && e.low_quality);
-        events.retain(|e| e.synthesis_id != synthesis_id);
+        state.events.retain(|e| e.synthesis_id != synthesis_id);
         // 口径一致：被删除的事件若为低质量，同步递减累计计数，
-        // 避免 remove_event/窗口淘汰后 low_quality_count 与窗口内容漂移。
+        // 避免 remove_event 后 low_quality_count 与窗口内容漂移。
         if removed_low_quality {
-            let mut count = self
-                .low_quality_count
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *count = count.saturating_sub(1);
+            state.low_quality_count = state.low_quality_count.saturating_sub(1);
         }
     }
 }
@@ -269,15 +283,15 @@ pub struct SynthesisJournalSnapshot {
 
 impl SynthesisJournal {
     /// 采集日志快照
+    ///
+    /// **单锁一致读**（v0.9.11 / CR-44）：全部字段在**同一把锁**内取值 ⇒
+    /// `total_synthesis` / `low_quality_count` / 成功率 / `recent_events`
+    /// 来自**同一时刻**的状态，不会互相矛盾（修前分三次独立取锁，
+    /// 可读到 `low_quality_count > total_synthesis` 这类自相矛盾的组合）。
     pub fn snapshot(&self) -> SynthesisJournalSnapshot {
-        let total = *self
-            .total_synthesis
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let low_quality = *self
-            .low_quality_count
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let state = self.lock();
+        let total = state.total_synthesis;
+        let low_quality = state.low_quality_count;
         let success_rate = if total > 0 {
             1.0 - (low_quality as f32 / total as f32)
         } else {
@@ -287,8 +301,8 @@ impl SynthesisJournal {
         SynthesisJournalSnapshot {
             total_synthesis: total,
             low_quality_count: low_quality,
-            synthesis_rate_per_minute: self.synthesis_rate_per_minute(),
-            recent_events: self.get_recent_events(10),
+            synthesis_rate_per_minute: Self::rate_per_minute(&state.events),
+            recent_events: state.events.iter().rev().take(10).cloned().collect(),
             success_rate,
         }
     }
@@ -411,5 +425,39 @@ mod tests {
         assert_eq!(journal.snapshot().low_quality_count, 0);
         journal.mark_low_quality("synth_bad");
         assert_eq!(journal.snapshot().low_quality_count, 1);
+    }
+
+    /// v0.9.11（CR-44）结构性守卫：`SynthesisJournal` 必须只持**一把**锁
+    ///（单一互斥体 `Mutex<JournalState>`），从而 `snapshot()` 能取到**内部一致**
+    /// 的状态视图。
+    ///
+    /// 鉴别力：改回修前的三个独立 `Mutex` 字段（`events` / `total_synthesis` /
+    /// `low_quality_count`）后本用例失败 —— 那正是"三次独立取锁可读到自相矛盾
+    /// 组合"的回归。
+    #[test]
+    fn synthesis_journal_must_use_single_lock() {
+        // 只扫描**生产段**：截到测试模块之前，避免守卫把自身断言串也扫进去。
+        let src = include_str!("synthesis_journal.rs");
+        let production = src
+            .find("#[cfg(test)]")
+            .map(|idx| &src[..idx])
+            .unwrap_or(src);
+
+        assert!(
+            production
+                .lines()
+                .any(|line| line.trim() == "state: Mutex<JournalState>,"),
+            "SynthesisJournal 必须只持一把锁：应存在字段 `state: Mutex<JournalState>,`"
+        );
+        for forbidden in [
+            "events: Mutex<",
+            "total_synthesis: Mutex<",
+            "low_quality_count: Mutex<",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "不得再出现独立互斥体字段 `{forbidden}`（会破坏 snapshot 的单锁一致读）"
+            );
+        }
     }
 }

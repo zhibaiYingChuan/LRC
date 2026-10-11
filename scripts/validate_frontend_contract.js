@@ -277,6 +277,88 @@ if (staleAllowlist.length) {
   );
 }
 
+// —— 检查 5：响应字段契约（v0.9.11 / G10 / CR-50）——
+// 目的：此前本脚本只对齐「路径 + HTTP 方法 + invoke 命令名」，**完全不校验响应字段**
+//   ⇒ `body.memories` vs `body.data` 这类**响应结构漂移在 CI 中不可见**
+//     （本项目历史上已多次发生：改了后端字段名/漏加 `#[serde(rename)]`，
+//      前端静默读到 undefined，页面表现为"空数据"而非报错）。
+// 做法（静态、确定性、无需起服务）：
+//   ① 解析 `src/v1_api.rs` 中响应结构体的**对外序列化字段**（尊重 `#[serde(rename)]`）；
+//   ② 对契约表里每个"前端确实消费的 key"，断言它仍是该结构体的对外字段；
+//   ③ 反向断言该 key **仍被前端消费** —— 否则说明契约表已腐化（前端改了、表没改）。
+// 三条断言共同保证：**后端改名 ⇒ 门禁红；前端弃用 ⇒ 门禁红**，漂移无处可藏。
+
+/** 解析 `pub struct X { … }` → Set<对外序列化字段名>（尊重 `#[serde(rename = "…")]`） */
+function parseSerdeStructFields(source) {
+  const structs = new Map();
+  const re = /pub struct (\w+)\s*\{([\s\S]*?)\n\}/g;
+  for (const match of source.matchAll(re)) {
+    const [, name, body] = match;
+    const fields = new Set();
+    let pendingRename = null;
+    for (const rawLine of body.split('\n')) {
+      const line = rawLine.trim();
+      const rename = line.match(/#\[serde\(rename\s*=\s*"([^"]+)"/);
+      if (rename) {
+        pendingRename = rename[1];
+        continue;
+      }
+      if (!line || line.startsWith('//') || line.startsWith('#[')) continue;
+      const field = line.match(/^pub\s+(\w+)\s*:/);
+      if (field) {
+        fields.add(pendingRename || field[1]);
+        pendingRename = null;
+      }
+    }
+    structs.set(name, fields);
+  }
+  return structs;
+}
+
+/** 前端是否确实读取了某个响应 key（`.key` / `['key']` / `["key"]` 三种写法） */
+function frontendReadsKey(jsSource, key) {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`[.\\['"]${escaped}\\b`).test(jsSource);
+}
+
+const serdeStructs = parseSerdeStructFields(v1ApiRs);
+
+/**
+ * 响应字段契约表：**只登记"前端确实在消费"的 key**（由 `frontendReadsKey` 反向验证）。
+ * 新增/修改前端消费的响应字段时，必须同步更新本表 —— 这正是门禁的意义。
+ */
+const RESPONSE_CONTRACT = [
+  { struct: 'EnrichResponse', keys: ['memories', 'explanation'] },
+  { struct: 'EnrichExplanation', keys: ['query', 'items'] },
+  { struct: 'AssociationExploreResponse', keys: ['nodes', 'edges'] },
+  { struct: 'UnfoldResponse', keys: ['sub_memories'] },
+];
+
+let responseFieldCount = 0;
+for (const { struct, keys } of RESPONSE_CONTRACT) {
+  const fields = serdeStructs.get(struct);
+  if (!fields) {
+    errors.push(`响应契约引用了不存在的结构体: ${struct}（后端已改名或删除，请同步本表）`);
+    continue;
+  }
+  for (const key of keys) {
+    if (!fields.has(key)) {
+      errors.push(
+        `响应字段契约漂移: ${struct} 已不含前端消费的字段 \`${key}\`` +
+          `（当前对外字段: ${[...fields].join(', ') || '（空）'}）`
+      );
+      continue;
+    }
+    if (!frontendReadsKey(js, key)) {
+      errors.push(
+        `响应契约表腐化: 前端已不再消费 \`${key}\`，请从 ${struct} 的契约中移除该项`
+      );
+      continue;
+    }
+    responseFieldCount++;
+  }
+}
+
 if (errors.length) {
   console.error(errors.map((error) => `ERROR: ${error}`).join('\n'));
   process.exit(1);
@@ -286,5 +368,6 @@ const apiPathCount = new Set(apiCalls.map((call) => call.routePath)).size;
 console.log(
   `前端契约通过：${new Set(tabs).size} 个导航、${ids.length} 个 DOM id、静态资源完整、` +
     `跨层契约 ${apiPathCount} 条 API 路径与 ${invokedCommands.length} 个 invoke 命令全部对齐、` +
+    `${responseFieldCount} 个响应字段与后端结构体对齐、` +
     `${orphans.length} 个孤儿命令已申报`
 );

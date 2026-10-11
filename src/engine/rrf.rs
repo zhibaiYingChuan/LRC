@@ -5,7 +5,11 @@
 // 用于将多路检索结果（快速通路 + 深度通路）合并为统一排序。
 // ============================================================
 
-use crate::memory_store::RecallResult;
+// v0.9.11（G9 / CR-15）：改从**纯数据契约模块** `memory_store_types` 取类型，
+// 而不是从存储实现模块 `memory_store`（后者只是 `pub use` 再导出同一类型）。
+// 目的：切断 engine（Layer 2）→ memory_store（Layer 1 实现）的反向依赖边，
+// 使引擎不再耦合于"存储怎么实现"，只依赖"数据长什么样"。
+use crate::memory_store_types::RecallResult;
 use crate::memory_types::Memory;
 use std::collections::{HashMap, HashSet};
 
@@ -40,6 +44,19 @@ pub fn query_path_weights(query: &str) -> (f32, f32) {
     } else if specific == 1 {
         (1.0, 1.4)
     } else {
+        // ★ 已标定（v0.9.12，LongMemEval oracle；库=306/top_k=100；生产配置 + 一致性加成）：
+        //
+        //   | (fast, deep) | R_sim | P_noise |
+        //   |---|---|---|
+        //   | **(1.0, 1.0) 现行** | **0.7486** | 0.8556 |
+        //   | (2.0, 1.0) 偏向 BM25 | 0.7090 | 0.8633 |
+        //   | (3.0, 1.0) | 0.7119 | 0.8633 |
+        //   | (1.0, 2.0) 偏向 deep | 0.7147 | 0.8622 |
+        //   | (0.5, 1.0) | 0.7147 | 0.8622 |
+        //
+        // ⇒ **等权已是局部最优**：任何偏移都掉 3.4~4.0pp。
+        //   两个方向都被否证 ⇒ ①"把权重挪给 BM25"不成立（deep 在 BM25 之上确有增量）；
+        //   ②"更偏 deep"也不成立。**已试过，勿再调**（旋钮已移除，保持源码=线上行为）。
         (1.0, 1.0)
     }
 }
@@ -239,7 +256,7 @@ pub fn rrf_fuse_weighted(
 #[cfg(test)]
 mod tests {
     use super::{fusion_key, query_path_weights, rrf_fuse_weighted, RRF_DEFAULT_K};
-    use crate::memory_store::RecallResult;
+    use crate::memory_store_types::RecallResult;
     use crate::memory_types::{Importance, Memory, MemoryType};
 
     fn make_memory(id: &str, content: &str, source: Option<&str>, project: Option<&str>) -> Memory {

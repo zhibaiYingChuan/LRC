@@ -22,6 +22,100 @@ use crate::persistence::{Persistence, PersistenceError};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+// ═══════════════════════════════════════════════════════════════════
+// v0.9.11（G5 / CR-18）：Qdrant 兜底存储的**落盘 WAL**
+// ═══════════════════════════════════════════════════════════════════
+//
+// ## 修的是什么
+// 修前 `fallback_memories` 是**纯进程内 `Mutex<Vec<Memory>>`，从不落盘**。
+// 于是"Qdrant 不可用 / 集合为空"期间写入的记忆**只存在于内存**，重启即全部丢失 ——
+// 而"兜底"的全部意义正是"主存储不可用时也不丢数据"。这是**功能承诺与实现不符**，
+// 不是性能问题。
+//
+// ## 设计：追加式 WAL + 加载期重放/压实
+// - 每次变更**追加一行**（O(1)），不重写整个文件（否则兜底会变成热路径瓶颈）
+// - 加载时按顺序**重放**：`Memory`（同 id 后写者胜）/ `Delete`（墓碑）/ `Clear`
+// - 重放后若行数 ≠ 结果数（有重复/墓碑/损坏行），则**原子压实**一次，使文件有界
+//
+// ## 为什么需要墓碑（`Delete`）
+// 只追加 `Memory` 记录的话，**删除会丢失**：重启后重放会把已删记忆**复活**。
+// 因此删除也必须进 WAL（墓碑），`Clear` 同理。
+//
+// 纯函数 [`replay_fallback_wal`] / [`compact_fallback_wal`] 与磁盘无关，
+// 可在**默认 feature**（无需 Qdrant 服务）下直接单测。
+
+/// 兜底 WAL 的默认文件名（可用 `LRC_QDRANT_FALLBACK_PATH` 覆盖）
+pub const DEFAULT_FALLBACK_PATH: &str = "lrc_qdrant_fallback.jsonl";
+
+/// 兜底 WAL 的一条记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FallbackRecord {
+    /// 写入或更新一条记忆（同一 id **后写者胜**）
+    Memory(Box<Memory>),
+    /// 删除一条记忆（**墓碑**：缺它则重启后被删记忆会复活）
+    Delete { id: String },
+    /// 清空全部（其前的记录全部作废）
+    Clear,
+}
+
+/// 纯函数：把 WAL 文本**重放**为记忆集合。
+///
+/// 语义（顺序敏感）：
+/// - `Memory` ⇒ 插入或覆盖（同 id 后写者胜）
+/// - `Delete` ⇒ 移除该 id
+/// - `Clear`   ⇒ 清空此前累计的全部
+/// - **损坏行 ⇒ 跳过**（与"锚点恢复失败告警而非整体作废"同策略：
+///   不因单行损坏丢掉整个兜底库）
+///
+/// 返回顺序 = **首次出现的插入顺序**（不依赖 `HashMap` 迭代序，保证结果确定可比）。
+pub fn replay_fallback_wal(text: &str) -> Vec<Memory> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, Memory> = std::collections::HashMap::new();
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<FallbackRecord>(line) {
+            Ok(FallbackRecord::Memory(m)) => {
+                let m = *m;
+                if !by_id.contains_key(&m.id) {
+                    order.push(m.id.clone());
+                }
+                by_id.insert(m.id.clone(), m);
+            }
+            Ok(FallbackRecord::Delete { id }) => {
+                by_id.remove(&id);
+            }
+            Ok(FallbackRecord::Clear) => {
+                by_id.clear();
+                order.clear();
+            }
+            Err(_) => {} // 损坏行：跳过
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect()
+}
+
+/// 纯函数：把记忆集合序列化为 WAL 文本（**压实**用：每条一行 `Memory` 记录）。
+///
+/// 压实后**不再含墓碑**，故重放结果与输入集合等价（见单测）。
+pub fn compact_fallback_wal(memories: &[Memory]) -> String {
+    let mut out = String::new();
+    for m in memories {
+        if let Ok(json) = serde_json::to_string(&FallbackRecord::Memory(Box::new(m.clone()))) {
+            out.push_str(&json);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Qdrant 连接配置
 #[derive(Debug, Clone)]
 pub struct QdrantConfig {
@@ -35,6 +129,13 @@ pub struct QdrantConfig {
     pub timeout_secs: u64,
     /// 是否在启动时自动创建集合
     pub auto_create: bool,
+    /// 兜底记忆的**落盘 WAL 路径**（v0.9.11 / G5 / CR-18）。
+    ///
+    /// - `Some(path)`：兜底写入会**追加落盘**，启动时重放恢复（默认为
+    ///   [`DEFAULT_FALLBACK_PATH`]）—— 这才是"兜底"应有的语义
+    /// - `None`：退回旧行为（仅内存，重启即丢）；可用 `LRC_QDRANT_FALLBACK_PATH=""`
+    ///   显式关闭
+    pub fallback_path: Option<String>,
 }
 
 impl Default for QdrantConfig {
@@ -45,6 +146,9 @@ impl Default for QdrantConfig {
             vector_size: 9,
             timeout_secs: 10,
             auto_create: true,
+            // v0.9.11（G5 / CR-18）：默认**开启**落盘兜底 —— 否则"兜底不落盘"
+            // 这个缺陷会继续以默认配置存在。
+            fallback_path: Some(DEFAULT_FALLBACK_PATH.to_string()),
         }
     }
 }
@@ -61,9 +165,18 @@ impl QdrantConfig {
         let collection =
             std::env::var("LRC_QDRANT_COLLECTION").unwrap_or_else(|_| "lrc_memories".to_string());
 
+        // v0.9.11（G5 / CR-18）：兜底 WAL 路径。
+        // 显式设为**空字符串**即退回"仅内存"模式（旧行为）；未设置则用默认文件名。
+        let fallback_path = match std::env::var("LRC_QDRANT_FALLBACK_PATH") {
+            Ok(v) if v.trim().is_empty() => None,
+            Ok(v) => Some(v),
+            Err(_) => Some(DEFAULT_FALLBACK_PATH.to_string()),
+        };
+
         Self {
             endpoint,
             collection,
+            fallback_path,
             ..Default::default()
         }
     }
@@ -174,11 +287,92 @@ impl QdrantPersistence {
             fallback_memories: std::sync::Mutex::new(Vec::new()),
         };
 
+        // v0.9.11（G5 / CR-18）：**启动即从落盘 WAL 恢复兜底库**。
+        // 修前兜底只在内存 ⇒ 重启即丢，"兜底"名不副实。
+        this.restore_fallback_from_wal();
+
         if this.config.auto_create {
             this.ensure_collection().await?;
         }
 
         Ok(this)
+    }
+
+    /// 兜底 WAL 的路径（`None` ⇒ 保持旧的内存-only 行为）
+    fn fallback_file(&self) -> Option<&std::path::Path> {
+        self.config
+            .fallback_path
+            .as_deref()
+            .map(std::path::Path::new)
+    }
+
+    /// 从 WAL 恢复兜底记忆（v0.9.11 / G5 / CR-18）。
+    ///
+    /// 若 WAL 行数与重放结果数不等（存在重复行／墓碑／损坏行），则**原子压实**一次 ——
+    /// 否则追加式 WAL 会无界增长（每次更新都追加一行）。
+    fn restore_fallback_from_wal(&self) {
+        let Some(path) = self.fallback_file() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return; // 文件不存在 = 首次运行
+        };
+
+        let restored = replay_fallback_wal(&text);
+        let line_count = text.lines().filter(|l| !l.trim().is_empty()).count();
+        if line_count != restored.len() {
+            let compacted = compact_fallback_wal(&restored);
+            if let Err(e) = crate::atomic_file::write_atomic(path, compacted.as_bytes()) {
+                // 压实失败不影响数据可用性（内存中已恢复），故只告警
+                eprintln!("[LRC·Qdrant·兜底] 压实 WAL 失败（数据仍可用）: {e}");
+            }
+        }
+        if !restored.is_empty() {
+            eprintln!(
+                "[LRC·Qdrant·兜底] 从 WAL 恢复 {} 条记忆（{}）",
+                restored.len(),
+                path.display()
+            );
+        }
+        if let Ok(mut guard) = self.fallback_memories.lock() {
+            *guard = restored;
+        }
+    }
+
+    /// 追加一条 WAL 记录（O(1)）。
+    ///
+    /// **失败只告警不返回错误**：兜底是主存储的旁路，写兜底失败不应使业务写入失败。
+    fn append_fallback_wal(&self, record: &FallbackRecord) {
+        let Some(path) = self.fallback_file() else {
+            return;
+        };
+        let Ok(line) = serde_json::to_string(record) else {
+            return;
+        };
+        use std::io::Write;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{line}") {
+                    eprintln!("[LRC·Qdrant·兜底] 写 WAL 失败: {e}");
+                }
+            }
+            Err(e) => eprintln!("[LRC·Qdrant·兜底] 打开 WAL 失败（{}）: {e}", path.display()),
+        }
+    }
+
+    /// 用给定集合**原子重写** WAL（Qdrant 成功加载后对齐镜像时使用）
+    fn rewrite_fallback_wal(&self, memories: &[Memory]) {
+        let Some(path) = self.fallback_file() else {
+            return;
+        };
+        let payload = compact_fallback_wal(memories);
+        if let Err(e) = crate::atomic_file::write_atomic(path, payload.as_bytes()) {
+            eprintln!("[LRC·Qdrant·兜底] 重写 WAL 失败: {e}");
+        }
     }
 
     /// 确保集合存在（不存在则创建）
@@ -317,6 +511,19 @@ impl QdrantPersistence {
             _ => point.id.to_string(),
         };
 
+        // ═══ v0.9.11（G2）：**优先用完整 JSON 还原**（结构性修复 CR-17）═══
+        //
+        // 新写入的点都带 `memory_json`（整条记忆的序列化）。用它还原
+        // ⇒ 时间戳/归属/版本/来源等**一律原样保留**，不可能再"每次重载记忆变新"。
+        // 读不到 `memory_json` 时（v0.9.11 之前的旧点）才回退到下面的逐字段重建。
+        if let Some(full) = payload.get("memory_json") {
+            if let Ok(mut restored) = serde_json::from_value::<Memory>(full.clone()) {
+                // 向量列不随 payload 走，保持既有约定「载入时不带向量，由 save 时重算」。
+                restored.luoshu_vector = None;
+                return Ok(restored);
+            }
+        }
+
         let content = payload
             .get("content")
             .and_then(|v| v.as_str())
@@ -430,6 +637,8 @@ impl Persistence for QdrantPersistence {
                 guard.push(memory.clone());
             }
         }
+        // v0.9.11（G5 / CR-18）：**同时追加落盘** —— 否则兜底只活在内存里，重启即丢
+        self.append_fallback_wal(&FallbackRecord::Memory(Box::new(memory.clone())));
 
         // 如果有洛书向量，写入 Qdrant
         if let Some(lv) = memory.luoshu_vector.as_ref() {
@@ -443,6 +652,20 @@ impl Persistence for QdrantPersistence {
                 id: memory.id.clone(),
                 vector: lv.to_vec(),
                 payload: serde_json::json!({
+                    // ═══ v0.9.11（G2）：**整条记忆的 JSON**（结构性修复 CR-17）═══
+                    //
+                    // 修复前这里**只存 10 个字段**，读回时把 `created_at`/`updated_at`/
+                    // `last_accessed` **无条件重置为 `now()`**，并丢弃 `ttl_days`/`source`/
+                    // `source_ids`/`confidence`/`information_gain`/`resolution`/`session_id`/
+                    // `user_id`/`version`/`version_history` ⇒ 每次重载"记忆变新"、
+                    // 衰减与事件顺序推理全部失真。
+                    //
+                    // 现在把**整条记忆**序列化进 payload，读回时用 serde 还原
+                    // ⇒ 与 JSON 后端获得同一性质：**字段不可能因白名单不全而丢失**。
+                    "memory_json": memory,
+                    // ═══ 以下为 Qdrant 侧**索引/过滤**用的冗余字段（保持向后兼容）═══
+                    // 它们与 memory_json 冗余是**有意**的：Qdrant 需要用它们做原生过滤，
+                    // 而重建完整对象一律以 memory_json 为准。
                     "content": memory.content,
                     "memory_type": memory.memory_type.as_str(),
                     "importance": memory.importance.value(),
@@ -503,6 +726,9 @@ impl Persistence for QdrantPersistence {
                 if let Ok(mut guard) = self.fallback_memories.lock() {
                     *guard = memories.clone();
                 }
+                // v0.9.11（G5 / CR-18）：镜像与 WAL **对齐**（一次原子重写），
+                // 避免 WAL 保留与 Qdrant 不一致的陈旧内容
+                self.rewrite_fallback_wal(&memories);
                 return Ok(memories);
             }
             Ok(_) => {
@@ -562,6 +788,9 @@ impl Persistence for QdrantPersistence {
         if let Ok(mut guard) = self.fallback_memories.lock() {
             guard.retain(|m| m.id != id);
         }
+        // v0.9.11（G5 / CR-18）：删除必须写入**墓碑**。
+        // 若只追加 Memory 记录，重启重放会把已删记忆**复活**。
+        self.append_fallback_wal(&FallbackRecord::Delete { id: id.to_string() });
         Ok(found)
     }
 
@@ -611,6 +840,8 @@ impl Persistence for QdrantPersistence {
         if let Ok(mut guard) = self.fallback_memories.lock() {
             guard.clear();
         }
+        // v0.9.11（G5 / CR-18）：清空同样必须进 WAL，否则重启后兜底会把已清空的记忆**带回来**
+        self.append_fallback_wal(&FallbackRecord::Clear);
 
         Ok(())
     }
@@ -693,5 +924,120 @@ impl QdrantPersistence {
             std::io::ErrorKind::Unsupported,
             "Qdrant 后端未启用，请在编译时启用 `qdrant` feature",
         )))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v0.9.11（G5 / CR-18）：兜底 WAL 的**纯函数单测**
+// ═══════════════════════════════════════════════════════════════════
+//
+// 这些测试只依赖**与磁盘/网络无关的纯函数**（无需 Qdrant 服务即可运行）。
+//
+// ⚠️ 注意：整个 `qdrant` 模块受 `#[cfg(feature = "qdrant")]` 门控，故本模块需以
+// `cargo test --features server,qdrant --lib` 运行。**这本身是一处门禁盲区**：
+// 默认 CI 不覆盖该后端（见报告 G7 / CR-47），因此这里的验证依赖手动执行。
+#[cfg(test)]
+mod fallback_wal_tests {
+    use super::*;
+
+    fn mem(id: &str, content: &str) -> Memory {
+        let mut m = Memory::new(
+            content.to_string(),
+            MemoryType::Fact,
+            None,
+            Vec::new(),
+            Importance::new(5),
+            None,
+        );
+        m.id = id.to_string();
+        m
+    }
+
+    fn line(rec: &FallbackRecord) -> String {
+        serde_json::to_string(rec).expect("WAL 记录应可序列化")
+    }
+
+    /// 同一 id **后写者胜**（更新语义）
+    #[test]
+    fn replay_last_write_wins() {
+        let text = format!(
+            "{}\n{}\n",
+            line(&FallbackRecord::Memory(Box::new(mem("a", "旧")))),
+            line(&FallbackRecord::Memory(Box::new(mem("a", "新")))),
+        );
+        let got = replay_fallback_wal(&text);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].content, "新", "同一 id 应以最后写入为准");
+    }
+
+    /// ★核心：**墓碑必须生效** —— 否则重启后已删记忆会**复活**
+    #[test]
+    fn replay_delete_tombstone_removes_memory() {
+        let text = format!(
+            "{}\n{}\n{}\n",
+            line(&FallbackRecord::Memory(Box::new(mem("a", "甲")))),
+            line(&FallbackRecord::Memory(Box::new(mem("b", "乙")))),
+            line(&FallbackRecord::Delete {
+                id: "a".to_string()
+            }),
+        );
+        let got = replay_fallback_wal(&text);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "b", "被墓碑删除的 id 不得复活");
+    }
+
+    /// `Clear` 使其**前**的记录全部作废；其**后**的记录仍生效
+    #[test]
+    fn replay_clear_then_new_records() {
+        let text = format!(
+            "{}\n{}\n{}\n{}\n",
+            line(&FallbackRecord::Memory(Box::new(mem("a", "甲")))),
+            line(&FallbackRecord::Clear),
+            line(&FallbackRecord::Memory(Box::new(mem("b", "乙")))),
+            line(&FallbackRecord::Memory(Box::new(mem("c", "丙")))),
+        );
+        let ids: Vec<String> = replay_fallback_wal(&text)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    /// 损坏行被跳过，且**不影响其余记录**（不因单行损坏丢掉整个兜底库）
+    #[test]
+    fn replay_skips_corrupted_lines() {
+        let text = format!(
+            "{}\n这不是合法 JSON\n{}\n",
+            line(&FallbackRecord::Memory(Box::new(mem("a", "甲")))),
+            line(&FallbackRecord::Memory(Box::new(mem("b", "乙")))),
+        );
+        let got = replay_fallback_wal(&text);
+        assert_eq!(got.len(), 2, "单行损坏不应丢掉整库");
+    }
+
+    /// 压实是**无损**的：压实后行数 = 记录数，且重放结果与原集合等价
+    #[test]
+    fn compact_then_replay_is_equivalent() {
+        let memories = vec![mem("a", "甲"), mem("b", "乙")];
+        let compacted = compact_fallback_wal(&memories);
+        assert_eq!(
+            compacted.lines().count(),
+            memories.len(),
+            "压实后行数应为记录数（墓碑与重复行被消除）"
+        );
+        let mut ids: Vec<String> = replay_fallback_wal(&compacted)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// 空文本 / 空集合 ⇒ 空结果（首次运行的路径，不得 panic）
+    #[test]
+    fn replay_empty_input() {
+        assert!(replay_fallback_wal("").is_empty());
+        assert!(replay_fallback_wal("\n\n  \n").is_empty());
+        assert!(compact_fallback_wal(&[]).is_empty());
     }
 }

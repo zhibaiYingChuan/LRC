@@ -683,9 +683,157 @@ impl Default for CouplingTrendAnalysis {
     }
 }
 
+// ==================== 合成守卫阈值配置（v0.9.11）====================
+//
+// 背景：合成守卫用"信息增量阈值"过滤空洞抽象（见 synthesis_engine.rs 的
+// `[LRC·合成·守卫]` 日志）。该阈值此前恒为 0.01，而实测在长文本语料（AML 评测数据）
+// 上信息增量长期只有 0.0008~0.0009——差一个数量级 ⇒ 守卫把**全部**合成拦掉、
+// 合成产出恒为 0。此处将其改为可配置，默认值保持 0.01（**不改变既有行为**）。
+
+/// 合成守卫信息增量阈值的默认值（与历史行为严格一致）
+pub const DEFAULT_INFO_GAIN_THRESHOLD: f32 = 0.01;
+
+/// 环境变量名：覆盖合成守卫的信息增量阈值
+pub const ENV_INFO_GAIN_THRESHOLD: &str = "LRC_SYNTHESIS_INFO_GAIN_THRESHOLD";
+
+/// 解析合成守卫阈值。返回 `(阈值, 告警原因)`。
+///
+/// 契约（防御性，绝不 panic）：
+/// - 未设置 / 空串 → 默认值，无告警
+/// - 非法（非数字、NaN、无穷、超出 `[0.0, 1.0)`）→ 默认值 + 告警原因
+/// - `0.0` 合法：等价于"不拦截"（守卫关闭）
+fn resolve_info_gain_threshold(raw: Option<&str>) -> (f32, Option<String>) {
+    let Some(s) = raw else {
+        return (DEFAULT_INFO_GAIN_THRESHOLD, None);
+    };
+    let t = s.trim();
+    if t.is_empty() {
+        return (DEFAULT_INFO_GAIN_THRESHOLD, None);
+    }
+    match t.parse::<f32>() {
+        Ok(v) if v.is_finite() && (0.0..1.0).contains(&v) => (v, None),
+        Ok(v) => (
+            DEFAULT_INFO_GAIN_THRESHOLD,
+            Some(format!("值 {v} 超出允许范围 [0.0, 1.0)")),
+        ),
+        Err(e) => (
+            DEFAULT_INFO_GAIN_THRESHOLD,
+            Some(format!("无法解析为数值: {e}")),
+        ),
+    }
+}
+
+/// 由基线阈值推导调节器的最大偏离幅度。
+///
+/// 为什么需要：调节器只允许阈值在 `基线 ± max_threshold_deviation` 内浮动。
+/// 若偏离幅度恒为 0.05，则基线被下调到 0.001 时，调节器仍可把阈值顶回 0.051
+/// ⇒ 配置失效、守卫恢复全拦。故让偏离幅度**随基线缩放**（5 倍），
+/// 并夹在 `[0.001, 0.05]`：基线为默认 0.01 时结果恰为 0.05，
+/// 与历史行为逐位一致（零行为变更）。
+fn derived_max_threshold_deviation(baseline: f32) -> f32 {
+    (baseline * 5.0).clamp(0.001, 0.05)
+}
+
+#[cfg(test)]
+mod info_gain_threshold_tests {
+    //! v0.9.11 合成守卫阈值可配 —— 契约测试
+    //!
+    //! 关注点：① 未设置时**行为零变更**（默认 0.01）；② 合法值生效；
+    //! ③ 非法值**绝不 panic**、且必然回退默认；④ 偏离幅度随基线缩放，
+    //! 保证下调阈值不会被调节器顶回去。
+    use super::*;
+
+    #[test]
+    fn unset_uses_default_without_warning() {
+        assert_eq!(
+            resolve_info_gain_threshold(None),
+            (DEFAULT_INFO_GAIN_THRESHOLD, None)
+        );
+    }
+
+    #[test]
+    fn blank_string_uses_default_without_warning() {
+        assert_eq!(
+            resolve_info_gain_threshold(Some("   ")),
+            (DEFAULT_INFO_GAIN_THRESHOLD, None)
+        );
+    }
+
+    #[test]
+    fn valid_value_is_applied() {
+        let (v, warn) = resolve_info_gain_threshold(Some("0.001"));
+        assert!((v - 0.001).abs() < f32::EPSILON, "阈值应生效，实际 {v}");
+        assert!(warn.is_none(), "合法值不应产生告警");
+    }
+
+    #[test]
+    fn zero_is_valid_and_disables_guard() {
+        // 0.0 表示"信息增量恒不小于阈值" ⇒ 守卫不再拦截，属合法配置
+        let (v, warn) = resolve_info_gain_threshold(Some("0"));
+        assert_eq!(v, 0.0);
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn invalid_values_fall_back_with_warning_and_never_panic() {
+        for raw in ["abc", "-0.5", "1.0", "2", "NaN", "inf", "0.01abc"] {
+            let (v, warn) = resolve_info_gain_threshold(Some(raw));
+            assert_eq!(
+                v, DEFAULT_INFO_GAIN_THRESHOLD,
+                "非法值 {raw:?} 必须回退默认阈值"
+            );
+            assert!(warn.is_some(), "非法值 {raw:?} 必须给出告警原因");
+        }
+    }
+
+    #[test]
+    fn deviation_keeps_default_behavior_at_default_baseline() {
+        // 关键回归护栏：基线为默认 0.01 时，偏离幅度必须仍为 0.05（历史值）
+        assert!(
+            (derived_max_threshold_deviation(DEFAULT_INFO_GAIN_THRESHOLD) - 0.05).abs()
+                < f32::EPSILON
+        );
+    }
+
+    #[test]
+    fn deviation_scales_down_with_low_baseline() {
+        // 下调阈值时偏离幅度同步收缩，避免调节器把阈值顶回高位
+        assert!((derived_max_threshold_deviation(0.001) - 0.005).abs() < 1e-6);
+        assert!((derived_max_threshold_deviation(0.0) - 0.001).abs() < 1e-6);
+        // 上界仍夹在 0.05
+        assert!((derived_max_threshold_deviation(1.0) - 0.05).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn new_reads_threshold_from_env() {
+        // 该用例独占此环境变量（用互斥量串行），避免与其他用例并发互相干扰
+        // v0.9.11（G6 / CR-20）：改用**全 crate 唯一**的 env 锁（模块私锁互不排斥）
+        let _guard = crate::test_env::lock();
+
+        std::env::set_var(ENV_INFO_GAIN_THRESHOLD, "0.002");
+        let reg = DaoRegulator::new();
+        let applied = reg.information_gain_threshold;
+        std::env::remove_var(ENV_INFO_GAIN_THRESHOLD);
+
+        assert!(
+            (applied - 0.002).abs() < f32::EPSILON,
+            "调节器应读取环境变量，实际 {applied}"
+        );
+    }
+}
+
 impl DaoRegulator {
     /// 创建新的调节器
     pub fn new() -> Self {
+        // v0.9.11：从环境变量解析合成守卫阈值（未设置/非法 → 默认 0.01 并告警）
+        let (info_gain, warn) =
+            resolve_info_gain_threshold(std::env::var(ENV_INFO_GAIN_THRESHOLD).ok().as_deref());
+        if let Some(reason) = warn {
+            eprintln!(
+                "[LRC·调节] {} 配置无效（{}），已回退默认阈值 {:.4}",
+                ENV_INFO_GAIN_THRESHOLD, reason, DEFAULT_INFO_GAIN_THRESHOLD
+            );
+        }
         Self {
             last_regulation_ms: 0,
             regulation_interval_ms: 300_000, // 5 分钟
@@ -705,15 +853,20 @@ impl DaoRegulator {
             coupling_score: 0.0,
             coupling_history: Vec::new(),
             catastrophic_detector: CatastrophicEventDetector::new(),
-            synthesis_min_cluster_size: 3,    // 默认最小聚类大小
-            information_gain_threshold: 0.01, // 质疑一·活性：默认信息增量阈值，由调节器动态微调
+            synthesis_min_cluster_size: crate::engine::synthesis_engine::DEFAULT_MIN_CLUSTER,
+            // v0.9.11：阈值改为可配置（默认 0.01，行为不变）。
+            // 三个字段必须一起设：调节器的"均值回归"会把阈值拉回 threshold_baseline，
+            // 只改初始值会被逐步拽回 0.01。
+            information_gain_threshold: info_gain,
             // 质疑一·终极：防漂移机制初始化
-            threshold_baseline: 0.01,
-            threshold_ema: 0.01,
+            threshold_baseline: info_gain,
+            threshold_ema: info_gain,
             threshold_momentum: 0.3, // EMA 平滑因子：30% 新值 + 70% 旧值
             threshold_history: VecDeque::with_capacity(20),
-            max_threshold_deviation: 0.05, // 最大偏离基线 ±0.05（范围 [0.001, 0.06]）
-            reversion_rate: 0.001,         // 每次无调整周期向基线回归 0.001
+            // 最大偏离基线：随基线缩放（见 derived_max_threshold_deviation 说明）。
+            // 基线=0.01 时等于 0.05，与历史行为一致。
+            max_threshold_deviation: derived_max_threshold_deviation(info_gain),
+            reversion_rate: 0.001, // 每次无调整周期向基线回归 0.001
             cycles_since_last_threshold_adjustment: 0,
             reversion_trigger_cycles: 5, // 连续 5 次无调整后开始均值回归
             // 质疑三·责任鸿沟：决策日志初始化

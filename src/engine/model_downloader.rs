@@ -543,15 +543,14 @@ pub fn manual_download_guide(model_id: &str) -> String {
 mod tests {
     use super::*;
 
-    // v0.8.9 修复：并行测试环境变量竞争保护
-    // test_mirror_source_* 系列测试共享 LRC_MODEL_MIRROR 环境变量，
-    // 并行执行时会互相覆盖导致断言失败，用 Mutex 强制串行。
-    static MIRROR_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // v0.9.11（G6 / CR-20）：不再自持模块私锁，统一使用**全 crate 唯一** env 锁。
+    // 私锁的问题：模块之间互不排斥 ⇒ 跨模块改同一变量（如 LRC_STATE_BIAS、daoti 门控）
+    // 的竞态仍在，只是从必现退化为偶发（更难排查）。
 
     /// 测试：镜像源解析（默认值）
     #[test]
     fn test_mirror_source_default() {
-        let _lock = MIRROR_TEST_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::lock();
         // 未设置环境变量时默认为 HfMirror
         std::env::remove_var("LRC_MODEL_MIRROR");
         let mirror = MirrorSource::from_env();
@@ -561,7 +560,7 @@ mod tests {
     /// 测试：镜像源解析（modelscope）
     #[test]
     fn test_mirror_source_modelscope() {
-        let _lock = MIRROR_TEST_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::lock();
         std::env::set_var("LRC_MODEL_MIRROR", "modelscope");
         let mirror = MirrorSource::from_env();
         assert_eq!(mirror, MirrorSource::ModelScope);
@@ -571,7 +570,7 @@ mod tests {
     /// 测试：镜像源解析（auto）
     #[test]
     fn test_mirror_source_auto() {
-        let _lock = MIRROR_TEST_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::lock();
         std::env::set_var("LRC_MODEL_MIRROR", "AUTO");
         let mirror = MirrorSource::from_env();
         assert_eq!(mirror, MirrorSource::Auto);
@@ -581,7 +580,7 @@ mod tests {
     /// 测试：镜像源解析（无效值降级为默认）
     #[test]
     fn test_mirror_source_invalid() {
-        let _lock = MIRROR_TEST_MUTEX.lock().unwrap();
+        let _lock = crate::test_env::lock();
         std::env::set_var("LRC_MODEL_MIRROR", "invalid_mirror");
         let mirror = MirrorSource::from_env();
         assert_eq!(mirror, MirrorSource::HfMirror);

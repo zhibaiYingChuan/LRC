@@ -85,7 +85,7 @@ LRC 在相似度之外，额外建立了一层**由记录字段必然推导出�
 
 | 层 | 作用 | 可靠性 |
 |---|---|---|
-| **BGE 语义底座** | 无共同关键词时的语义邻近召回（`BAAI/bge-base-zh`，768 维） | 语义相近，**可能错** |
+| **BGE 语义底座** | 无共同关键词时的语义邻近召回（默认 `BAAI/bge-small-zh`，512 维；中文高精度可选 `BAAI/bge-base-zh`，768 维） | 语义相近，**可能错** |
 | **记录层确定性逻辑** | `event_id` / 共享实体 / 同项目时段等字段推导 | 记录必然成立，**不会错** |
 | **符号层结构算子** | 由图结构推导出的因果 / 时序 / 约束关系 | 结构推导，**可能不成立**，界面标注「结构推导」 |
 
@@ -247,10 +247,10 @@ LRC 在相似度之外，额外建立了一层**由记录字段必然推导出�
 
 ### 方式一：下载桌面端（推荐）
 
-1. 前往 [v0.9.9 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.9.9) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
-   - Windows：`lrc-desktop-v0.9.9-windows-x86_64-setup.exe`
-   - macOS：`lrc-desktop-v0.9.9-macos-arm64.dmg`
-   - Linux：`lrc-desktop-v0.9.9-linux-amd64.deb` 或 `lrc-desktop-v0.9.9-linux-x86_64.AppImage`
+1. 前往 [v0.9.10 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.9.10) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
+   - Windows：`lrc-desktop-v0.9.10-windows-x86_64-setup.exe`
+   - macOS：`lrc-desktop-v0.9.10-macos-arm64.dmg`
+   - Linux：`lrc-desktop-v0.9.10-linux-amd64.deb` 或 `lrc-desktop-v0.9.10-linux-x86_64.AppImage`
 2. 双击安装，启动 LRC Desktop
 3. 按向导选择项目、配置 LLM（可选）、连接 AI 工具
 4. 重启 IDE，AI 通过 MCP 自动发现并使用记忆与代码搜索能力
@@ -259,9 +259,11 @@ LRC 在相似度之外，额外建立了一层**由记录字段必然推导出�
 >
 > **端口说明**：稳定版默认使用 `3099`；开发实例端口约定见上文「质量与验证」一节。稳定版不会复用开发版 Sidecar。
 >
-> **注意**：Release 中 `lrc-v0.9.9-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（Sidecar 二进制），供开发者和脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
+> **注意**：Release 中 `lrc-v0.9.10-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（Sidecar 二进制），供开发者和脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
 >
-> **安装包体积说明**：桌面安装包仅数 MB 是设计使然——语义模型按需下载（首次约 100~400MB，自动走国内镜像），道体推演引擎为独立研究资产不随产品分发（见下方边界说明）。
+> **安装包体积说明**：桌面安装包仅数 MB 是设计使然——语义模型按需下载（首次约 100~400MB，自动走国内镜像），**独立的道体推演服务**（`daoti_daemon` / `daoti_assoc`，非本仓库代码）不随包分发。
+>
+> ⚠️ **术语澄清（v0.9.11 / CR-54）**：不随包分发的是**独立推演服务**；而 `src/engine/` 下的**道体源码**是 LRC 功能必需、**随包编译分发**（见下方「道体（Daoti）边界」）。此前本句写作"道体推演引擎不随产品分发"，与下方边界说明**相互矛盾**。
 
 ### 方式二：从源码编译
 
@@ -438,7 +440,7 @@ python .\scripts\dev-proxy.py 1420 --dev   # 开发代理：服务磁盘最新 s
 
 ---
 
-## 版本特性（v0.9.9）
+## 版本特性（v0.9.10）
 
 **本版本主题：交互可用性修复 + ML 模式联想超时根因 + 符号层证据性质分离。**
 

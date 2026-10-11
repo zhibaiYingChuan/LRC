@@ -475,7 +475,11 @@ impl LuoShuMlEncoder {
                     k
                 )));
             }
-            if !(v.values.iter().sum::<f32>() > 0.0) {
+            // v0.9.11（G6 / CR-59）：用 `partial_cmp` 显式表达"和不大于 0"，
+            // 替代 `!(sum > 0.0)`（`neg_cmp_op_on_partial_ord`）。
+            // 语义完全等价（含 NaN ⇒ true）；且上一步已排除非有限值。
+            let sum = v.values.iter().sum::<f32>();
+            if sum.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
                 return Err(LrcError::internal(
                     "模型加载后验证失败：测试编码退化（全零）。\
                      模型可能已损坏或与分词器不匹配"
@@ -944,7 +948,23 @@ impl LuoShuMlEncoder {
             .iter()
             .map(|&m| m as f32)
             .collect();
-        let seq_len = token_ids.len().min(512);
+        // 句向量路的**输入长度上限**（`LRC_ENCODE_MAX_TOKENS`，默认 512 = 既有行为）。
+        //
+        // 为什么加这个旋钮（2026-10-10 实测）：单条编码耗时随输入长度**平方**增长
+        // （注意力二次项），而本项目记忆是整段聊天消息 ⇒ 恒打满 512 ⇒ 回填只有
+        // **1.68 条/秒**（11k 条需 109 分钟，把 `LRC_SENTENCE_RANKING` 的 +2pp 挡在门外）；
+        // 同库正文截到 120 字后吞吐升到 **26.85 条/秒（16×）** ⇒ 收益随长度平方增长。
+        //
+        // **作用域与安全**：本旋钮**只影响句向量路**（`encode_embedding` →
+        // `LRC_SENTENCE_RANKING` 使用）；9 维洛书路走独立的 `encode_text_batch`，
+        // **不受影响** ⇒ 对现行线上检索（句向量路未启用）**零影响**。
+        // 默认 512 ⇒ 不设即与既有行为逐位一致。
+        let max_tokens = std::env::var("LRC_ENCODE_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v > 0 && *v <= 512)
+            .unwrap_or(512);
+        let seq_len = token_ids.len().min(max_tokens);
 
         let input_ids = Tensor::new(&token_ids[..seq_len], &self.device)
             .map_err(|e| LrcError::internal(format!("input_ids: {}", e)))?
@@ -1959,6 +1979,7 @@ mod tests {
     ///   - 余弦 P10/P50/P90（动态范围是否被拉开）
     ///   - 近义/无关分离度（判别力是否提升）
     ///   - argmax 分布命中度（表征是否仍分散，未塌缩回单类）
+    ///
     /// 结论用于选 `LRC_LUOSHU_CONTRAST_TEMP`（env 可覆盖，**不改产品源码**）。
     #[cfg(feature = "ml")]
     #[test]
@@ -2220,8 +2241,8 @@ mod tests {
                 .map(|j| (j, st[i].cosine_similarity(&st[j])))
                 .collect();
             by_struct.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            for k in 0..TOP_K.min(by_struct.len()) {
-                if let Some(&r) = rank_of.get(&by_struct[k].0) {
+            for (j, _) in by_struct.iter().take(TOP_K.min(by_struct.len())) {
+                if let Some(&r) = rank_of.get(j) {
                     struct_ranks.push(r);
                 }
             }

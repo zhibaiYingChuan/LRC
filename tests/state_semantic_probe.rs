@@ -74,8 +74,13 @@ fn bge_separates_state_anchor_from_unrelated_memories() {
     let dir_str = dir.to_str().unwrap_or_default().to_string();
 
     let Some(store) = ml_store(&dir_str) else {
-        eprintln!("[方向二探针] ML 编码器不可用（bge 权重缺失或未设 LRC_LUOSHU_MODEL_ID），跳过");
-        return;
+        // v0.9.11（G7 / CR-47）：本探针是 `#[ignore]` 的**手动探针** ——
+        // 既然调用方已显式请求（`--ignored`），"缺模型"**不是可接受的跳过**：
+        // 静默 `return` 会重演"no-op ⇒ 恒绿"的假覆盖。故改为带修复指引的**失败**。
+        panic!(
+            "本探针需要本地 bge 权重：请设置 LRC_LUOSHU_MODEL_ID（如 BAAI/bge-base-zh）\
+             并确认权重已下载；若不想跑本探针，请去掉 `--ignored`。（CR-47：禁止静默跳过）"
+        );
     };
 
     // (锚点, 相关记忆×3, 无关记忆×3)

@@ -3833,17 +3833,18 @@ mod api_contracts_tests {
     /// POST /associations/explore，逐请求记录状态码与墙钟。
     ///
     /// 为什么预期会看到兜底：`MemoryStore` 含 `RefCell`（持久化缓存）而为 `!Sync`，
-    /// 生产 handler 用 `Arc<Mutex<..>>` + `try_lock` 50ms 轮询取锁，故并发探索被
-    /// **全局串行化**——后到者在锁外排队，一旦排队超过外层 15s，`timeout` 会置取消
-    /// 标志并返回 503 `explore_timeout`。本用例的契约不是"必须全部 200"，而是
+    /// 生产 handler 用 `Arc<Mutex<..>>` + 有界取锁（`timeouts::LOCK_WAIT`）取锁，
+    /// 故并发探索被**全局串行化**——后到者在锁外排队，排队超过 `LOCK_WAIT`（2s）
+    /// 即返回 503 `search_busy`（v0.9.11 / CR-34 起：取锁循环有独立 deadline，
+    /// 不再一路自旋到外层 15s）。本用例的契约不是"必须全部 200"，而是
     /// **每个请求都必须在有限时间内拿到 200 或 503 的明确应答（无挂死）**。
     ///
     /// 用例分两段：
-    /// 1. **并发批**（N=8 真实并发）——量化排队现象，但 200/503 的分布依赖机器性能，
-    ///    本机实测 200=8/503=0（未触发兜底）；
-    /// 2. **确定性兜底段**——主动在外部独占 `shared` 的 tokio Mutex 直到底层 15s
-    ///    `timeout` 触发，**不依赖机器性能**地硬验证 503 `explore_timeout` 兜底路径
-    ///    （覆盖 HCSE"异常路径必须覆盖"要求）。
+    /// 1. **并发批**（N=8 真实并发）——量化排队现象，200/503 的分布依赖机器性能
+    ///    与串行化后的单次探索耗时；
+    /// 2. **确定性兜底段**——主动在外部独占 `shared` 的 tokio Mutex，硬验证取锁在
+    ///    `LOCK_WAIT` 内失败为 503 `search_busy`（**不依赖机器性能**；覆盖 HCSE
+    ///    "异常路径必须覆盖"要求）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[cfg(feature = "ml")]
     async fn test_assoc_p82p_concurrency_pressure() {
@@ -4024,11 +4025,12 @@ mod api_contracts_tests {
             "并发下至少一个请求须成功：全 503 意味着兜底把正常负载也拒了"
         );
 
-        // ---------- 确定性兜底段：外部独占锁 → 硬验证 503 explore_timeout ----------
-        // 第 1 段的 200/503 分布依赖机器性能（本机 503=0，兜底路径未被走过）。
-        // 这里主动在外部持锁：handler 的 try_lock 50ms 轮询会一直失败，
-        // 直到外层 15s timeout 触发并置取消标志 → 必然返回 503 explore_timeout。
-        // 该段不依赖机器性能，确定性覆盖 HCSE 要求的"超时/卡死异常路径"。
+        // ---------- 确定性兜底段：外部独占锁 → 硬验证**锁等待上限** ----------
+        // v0.9.11（CR-34）：本段**原**用于确定性触发 15s 外层超时——修前 explore 的
+        // 取锁循环无 deadline，锁被外部独占时会一路自旋到外层 15s 被丢弃。CR-34 修后
+        // 取锁循环补齐了独立 deadline（`timeouts::LOCK_WAIT`=2s）⇒ 本段改为硬验证
+        // **新的有界行为**：锁被独占时应在锁等待上限内快速失败为 503 `search_busy`
+        // （而非耗满 15s）。该段不依赖机器性能（只依赖"拿不到锁"这一确定事实）。
         let guard = probe_store.lock().await;
         let request = Request::builder()
             .method("POST")
@@ -4067,21 +4069,23 @@ mod api_contracts_tests {
 
         eprintln!(
             "[P8.2p][并发][兜底] 外部独占锁下：status={fallback_status} error={fallback_error} \
-             耗时 {fallback_secs:.3}s（预期 503 explore_timeout，耗时贴近 15s 外层超时）"
+             耗时 {fallback_secs:.3}s（预期 503 search_busy，耗时贴近锁等待上限 \
+             {:.1}s 而非外层超时 {HTTP_TIMEOUT_SECS}s）",
+            crate::timeouts::LOCK_WAIT.as_secs_f64()
         );
         assert_eq!(
             fallback_status, 503,
-            "外部独占锁时须返回 503（探索超时兜底），实测 {fallback_status}"
+            "外部独占锁时须返回 503（锁等待上限兜底），实测 {fallback_status}"
         );
         assert_eq!(
-            fallback_error, "explore_timeout",
-            "外部独占锁须走 15s 外层超时分支返回 explore_timeout，实测 {fallback_error}"
+            fallback_error, "search_busy",
+            "外部独占锁须在锁等待上限内失败为 search_busy，实测 {fallback_error}"
         );
+        // CR-34 的核心断言：耗时**必须有界**（远小于外层 15s）——修前该段会耗满 15s。
         assert!(
-            (HTTP_TIMEOUT_SECS - 1.0..=HTTP_TIMEOUT_SECS + TIMEOUT_TOLERANCE_SECS)
-                .contains(&fallback_secs),
-            "兜底段耗时须贴近 {HTTP_TIMEOUT_SECS}s 外层超时（容差 -1.0/+{TIMEOUT_TOLERANCE_SECS}s），\
-             实测 {fallback_secs:.3}s"
+            fallback_secs < HTTP_TIMEOUT_SECS,
+            "锁等待须有界（< 外层 {HTTP_TIMEOUT_SECS}s），实测 {fallback_secs:.3}s；\
+             逼近外层超时说明取锁循环又失去独立 deadline（CR-34 回归）"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4099,6 +4103,9 @@ mod api_contracts_tests {
         use crate::memory_types::{Importance, Memory, MemoryType};
         use std::sync::atomic::AtomicBool;
         use std::time::{SystemTime, UNIX_EPOCH};
+        // v0.9.11（G6 / CR-20）：本用例改 `LRC_ASSOC_EDGE_FEEDBACK`（进程级），
+        // 须持全 crate 唯一 env 锁，避免与其它改环境变量的用例并发串扰。
+        let _env_guard = crate::test_env::lock();
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -4227,6 +4234,9 @@ mod api_contracts_tests {
         use crate::memory_types::{Importance, Memory, MemoryType};
         use std::sync::atomic::AtomicBool;
         use std::time::{SystemTime, UNIX_EPOCH};
+        // v0.9.11（G6 / CR-20）：本用例改 `LRC_ASSOC_PATH_SCORE`（进程级），
+        // 须持全 crate 唯一 env 锁，避免与其它改环境变量的用例并发串扰。
+        let _env_guard = crate::test_env::lock();
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -5067,6 +5077,738 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// v0.9.11：富字段写入通路（`consolidate`）必须保留 `event_id` / `entities` /
+    /// **源时间**，且写入即受 `user` 级隔离约束。
+    ///
+    /// ## 为什么这条测试必须存在
+    /// AML 侧曾被迫在两条写入通路间**二选一**：
+    ///   - `consolidate` 有 `user_id`/`privacy_level`，但**没有** `event_id`/`entities`/源时间；
+    ///   - `remember` 有 `event_id`/`entities`，但**没有** `user_id`。
+    /// ⇒ 为守隔离红线只能走 `consolidate`，代价是记忆库里 `with_event=0 / with_entity=0`，
+    /// 导致「实体/角色/归因」「共同经历」「经验发现」三类能力整体为 0。
+    /// 本用例把「两者可兼得」固化为契约，防止任何一侧被回退。
+    ///
+    /// ## 为什么必须**直读磁盘**（而非读 store 内存缓存）
+    /// 持久层字段白名单漏字段时，内存读回会因缓存而**假绿**
+    /// （与 `test_record_layer_end_to_end_persist_and_associate` 同口径）。
+    #[tokio::test]
+    async fn test_rich_write_preserves_event_entities_source_time_and_isolates_users() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_rich_write_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared.clone(), manager, llm_api, llm_ready, false);
+
+        // 源时间固定为 2026-05-29（毫秒），与"摄入时刻"（今天）故意相隔很远，
+        // 使"是否真的保留了源时间"一眼可判。
+        const SRC_MS: i64 = 1_780_000_000_000;
+
+        let payload = serde_json::json!({
+            "memories": [{
+                "content": "和爸妈去杭州西湖，在苏堤上走了整整一下午",
+                "memory_type": "experience",
+                "importance": 7,
+                "project": "aml:aaa",
+                "privacy_level": "user",
+                "session_id": "sess-1",
+                "user_id": "user-A",
+                "event_id": "req-1",
+                "entities": [{"name": "西湖", "kind": "place"}],
+                "source_timestamp_ms": SRC_MS,
+            }]
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/consolidate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = app
+            .clone()
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("HTTP 层调用失败");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "consolidate 应返回 200，body={}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        // ---------- 直读磁盘：富字段与源时间都必须落盘 ----------
+        let reloaded = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let all = reloaded
+            .persistence()
+            .load_all_memories()
+            .expect("重载失败");
+        assert_eq!(all.len(), 1, "应落库 1 条，实际 {}", all.len());
+        let m = &all[0];
+        assert_eq!(
+            m.created_at,
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(SRC_MS).unwrap(),
+            "created_at 必须等于 AML 送来的**源时间**，而非摄入时刻"
+        );
+        assert_eq!(m.event_id.as_deref(), Some("req-1"), "event_id 必须落盘");
+        assert_eq!(m.entities.len(), 1, "entities 必须落盘：{:?}", m.entities);
+        assert_eq!(m.entities[0].name, "西湖");
+        assert_eq!(
+            m.entities[0].kind,
+            crate::memory_types::EntityKind::Place,
+            "实体类型必须原样保留"
+        );
+        assert_eq!(m.user_id.as_deref(), Some("user-A"), "user_id 必须落盘");
+        assert_eq!(
+            m.session_id.as_deref(),
+            Some("sess-1"),
+            "session_id 必须落盘"
+        );
+        assert_eq!(
+            m.privacy_level,
+            crate::memory_types::PrivacyLevel::User,
+            "privacy_level 必须落盘"
+        );
+
+        // 负向对照：字段必须**出现在磁盘文本**中（防序列化环节丢弃）
+        let raw = std::fs::read_to_string(dir.join("memories.json")).expect("读取落盘 JSON 失败");
+        assert!(raw.contains("\"event_id\""), "落盘 JSON 必须含 event_id 键");
+        assert!(raw.contains("req-1"), "落盘 JSON 必须含 event_id 值");
+        // 日期按**运行时计算**得出（不硬编码日期字符串，避免把"猜的日期"当成事实）
+        let expected_day = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(SRC_MS)
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(
+            raw.contains(&expected_day),
+            "落盘 JSON 的 created_at 必须是源时间（{expected_day}），实际：{raw}"
+        );
+
+        // ---------- 隔离红线：写入即隔离，跨 user 检索零泄漏 ----------
+        let payload_a = serde_json::json!({
+            "query": "西湖 苏堤",
+            "top_k": 10,
+            "user_id": "user-A",
+            "project": "aml:aaa",
+        });
+        let req_a = Request::builder()
+            .method("POST")
+            .uri("/memories/enrich")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload_a.to_string()))
+            .unwrap();
+        let resp_a = app
+            .clone()
+            .into_service()
+            .oneshot(req_a)
+            .await
+            .expect("HTTP 层调用失败");
+        assert_eq!(resp_a.status(), StatusCode::OK, "user-A 检索应返回 200");
+        let bytes_a = to_bytes(resp_a.into_body(), usize::MAX).await.unwrap();
+        let body_a: serde_json::Value = serde_json::from_slice(&bytes_a).unwrap();
+        let hits_a = body_a["memories"].as_array().map(|v| v.len()).unwrap_or(0);
+        assert!(hits_a >= 1, "user-A 应能检索到自己的记忆：{body_a}");
+
+        let payload_b = serde_json::json!({
+            "query": "西湖 苏堤",
+            "top_k": 10,
+            "user_id": "user-B",
+            "project": "aml:bbb",
+        });
+        let req_b = Request::builder()
+            .method("POST")
+            .uri("/memories/enrich")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload_b.to_string()))
+            .unwrap();
+        let resp_b = app
+            .clone()
+            .into_service()
+            .oneshot(req_b)
+            .await
+            .expect("HTTP 层调用失败");
+        assert_eq!(resp_b.status(), StatusCode::OK, "user-B 检索应返回 200");
+        let bytes_b = to_bytes(resp_b.into_body(), usize::MAX).await.unwrap();
+        let body_b: serde_json::Value = serde_json::from_slice(&bytes_b).unwrap();
+        let hits_b = body_b["memories"].as_array().map(|v| v.len()).unwrap_or(0);
+        assert_eq!(
+            hits_b, 0,
+            "user-B 不得看到 user-A 的记忆（隔离红线）：{body_b}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.11：`POST /memories/remember` 必须支持 `user_id` / `privacy_level` /
+    /// `session_id`（补齐 API 完备性缺口）。
+    ///
+    /// 此前 `remember` 支持 `event_id`/`entities` 却**不支持 `user_id`**
+    /// ⇒ 用它会写出"无归属"的记忆，而 `is_visible` 对 `(Some(uid), None)` 判为
+    /// `false` ⇒ 检索端**完全不可见**。本用例固化「带归属 + 富字段」同时成立。
+    #[tokio::test]
+    async fn test_remember_supports_user_scope_and_stays_isolated() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_remember_scope_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared.clone(), manager, llm_api, llm_ready, false);
+
+        let payload = serde_json::json!({
+            "content": "和爸妈去杭州西湖，在苏堤上走了整整一下午",
+            "memory_type": "experience",
+            "importance": 7,
+            "project": "aml:aaa",
+            "privacy_level": "user",
+            "session_id": "sess-1",
+            "user_id": "user-A",
+            "event_id": "req-2",
+            "entities": [{"name": "西湖", "kind": "place"}],
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/remember")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = app
+            .clone()
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("HTTP 层调用失败");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "remember 应返回 200，body={}",
+            String::from_utf8_lossy(&bytes)
+        );
+
+        // 直读磁盘：归属与富字段必须都落盘
+        let reloaded = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let all = reloaded
+            .persistence()
+            .load_all_memories()
+            .expect("重载失败");
+        assert_eq!(all.len(), 1, "应落库 1 条");
+        let m = &all[0];
+        assert_eq!(
+            m.user_id.as_deref(),
+            Some("user-A"),
+            "remember 必须支持并落盘 user_id"
+        );
+        assert_eq!(m.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(
+            m.privacy_level,
+            crate::memory_types::PrivacyLevel::User,
+            "privacy_level 必须可在 remember 上指定"
+        );
+        assert_eq!(
+            m.event_id.as_deref(),
+            Some("req-2"),
+            "event_id 不得因加 user_id 而丢失"
+        );
+        assert_eq!(m.entities.len(), 1, "entities 不得因加 user_id 而丢失");
+
+        // 隔离：user-A 可见，user-B 不可见
+        let hits = |uid: &'static str, proj: &'static str, app: axum::Router| async move {
+            let payload = serde_json::json!({
+                "query": "西湖 苏堤",
+                "top_k": 10,
+                "user_id": uid,
+                "project": proj,
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri("/memories/enrich")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap();
+            let resp = app
+                .into_service()
+                .oneshot(req)
+                .await
+                .expect("HTTP 层调用失败");
+            assert_eq!(resp.status(), StatusCode::OK, "检索应返回 200");
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            body["memories"].as_array().map(|v| v.len()).unwrap_or(0)
+        };
+        assert!(
+            hits("user-A", "aml:aaa", app.clone()).await >= 1,
+            "写入者本人必须能检索到"
+        );
+        assert_eq!(
+            hits("user-B", "aml:bbb", app.clone()).await,
+            0,
+            "跨 user 必须零泄漏"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.11 **契约一致性**：`remember` 与 `consolidate` 必须接受**同一**源时间字段与类型。
+    ///
+    /// 此前两条端点对"源时间"分别是 `created_at`(RFC3339 字符串) 与
+    /// `source_timestamp_ms`(毫秒整数)，属**同一语义两种契约** ⇒ 调用方需为两条端点
+    /// 分别编码。本用例把"统一为毫秒"钉死（若哪天有人只改回一条端点，此用例会红）。
+    #[tokio::test]
+    async fn test_remember_accepts_source_timestamp_ms_same_as_consolidate() {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_remember_srcts_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared.clone(), manager, llm_api, llm_ready, false);
+
+        const SRC_MS: i64 = 1_780_000_000_000;
+        let payload = serde_json::json!({
+            "content": "和爸妈去杭州西湖，在苏堤上走了整整一下午",
+            "memory_type": "experience",
+            "importance": 7,
+            "project": "aml:aaa",
+            "privacy_level": "user",
+            "user_id": "user-A",
+            "source_timestamp_ms": SRC_MS,
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/remember")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let response = app
+            .clone()
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("HTTP 层调用失败");
+        assert_eq!(response.status(), StatusCode::OK, "remember 应返回 200");
+
+        let reloaded = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let all = reloaded
+            .persistence()
+            .load_all_memories()
+            .expect("重载失败");
+        assert_eq!(all.len(), 1, "应落库 1 条");
+        assert_eq!(
+            all[0].created_at,
+            chrono::DateTime::<chrono::Utc>::from_timestamp_millis(SRC_MS).unwrap(),
+            "remember 的 source_timestamp_ms 必须与 consolidate 同口径地回填 created_at"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.11（G3 / CR-01）**信任域分层**的端到端证据。
+    ///
+    /// 多租户域（= 启用了 `LRC_API_TOKEN` 的部署）下，对外只读端点**必须**给出 scope；
+    /// 本地可信域（桌面单用户）保持既有行为。二者都是"**不能省略即全可见**"的分层落地。
+    #[tokio::test]
+    async fn test_read_endpoints_enforce_scope_by_trust_mode() {
+        use crate::privacy::TrustMode;
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_trust_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let make_app = |trust: TrustMode| {
+            let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+            let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+                Arc::new(Mutex::new(Box::new(NoopCodebase)));
+            let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+            let llm_ready = Arc::new(AtomicBool::new(false));
+            build_v1_router_with_trust(shared, manager, llm_api, llm_ready, false, trust)
+        };
+
+        let call = |method: &'static str, uri: &'static str, app: axum::Router| async move {
+            let mut b = Request::builder().method(method).uri(uri);
+            let body = if method == "POST" {
+                b = b.header(header::CONTENT_TYPE, "application/json");
+                Body::from("{}")
+            } else {
+                Body::empty()
+            };
+            let resp = app
+                .into_service()
+                .oneshot(b.body(body).unwrap())
+                .await
+                .expect("HTTP 层调用失败");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .unwrap_or(serde_json::Value::Null),
+            )
+        };
+
+        // ═══ 多租户域：缺 scope ⇒ 400 `scope_required` ═══
+        let mt = make_app(TrustMode::MultiTenant);
+        let (st, body) = call("POST", "/memories/list", mt.clone()).await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "多租户域下 /memories/list 缺 scope 必须 400：{body}"
+        );
+        assert_eq!(body["error"], "scope_required", "错误码必须可判别：{body}");
+
+        let (st_recent, _) = call("GET", "/memories/recent", mt.clone()).await;
+        assert_eq!(
+            st_recent,
+            StatusCode::BAD_REQUEST,
+            "recent 走查询参数，缺 scope 同样必须 400"
+        );
+
+        // 提供 user_id ⇒ 放行（不得把"有归属的合法调用"也拦掉）
+        let (st_ok, body_ok) = {
+            let app = mt.clone();
+            let req = Request::builder()
+                .method("POST")
+                .uri("/memories/list")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({"user_id": "u1"}).to_string()))
+                .unwrap();
+            let resp = app
+                .into_service()
+                .oneshot(req)
+                .await
+                .expect("HTTP 层调用失败");
+            let status = resp.status();
+            let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .unwrap_or(serde_json::Value::Null),
+            )
+        };
+        assert_eq!(st_ok, StatusCode::OK, "携带 user_id 必须放行：{body_ok}");
+
+        // ═══ 本地可信域：缺 scope 保持既有行为（200）═══
+        let local = make_app(TrustMode::LocalTrusted);
+        let (st_local, body_local) = call("POST", "/memories/list", local).await;
+        assert_eq!(
+            st_local,
+            StatusCode::OK,
+            "本地可信域不得改变既有行为：{body_local}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.11 **效果测试**（不只是功能）：新写入通路（`consolidate` + `event_id`）
+    /// 是否真的能让「共同经历」联想**补出**一条语义无关的兄弟记忆。
+    ///
+    /// ## 为什么必须有这条
+    /// `test_rich_write_preserves_...` 只证明**字段落盘**；这条要证明**能力真的被激活**——
+    /// 即"字段存在"能转化为"检索结果变好"。此前 `consolidate` **没有** `event_id` 字段，
+    /// 所以这条通路**从未被验证过**，而这正是适配层实际使用的通路。
+    ///
+    /// 断言采用"负向对照"：先确认目标记忆**没被主检索召回**（否则无法证明是"联想补的"）。
+    #[tokio::test]
+    async fn test_consolidate_event_id_actually_enables_same_event_association() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_assoc_effect_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared.clone(), manager, llm_api, llm_ready, false);
+
+        // 两条同属一次经历（event_id 相同），但内容在词面与语义上都**远离**：
+        // 「苏堤」与「充电宝」没有任何可共享的 token。
+        let payload = serde_json::json!({
+            "memories": [
+                {
+                    "content": "和爸妈去杭州西湖，在苏堤上走了整整一下午",
+                    "memory_type": "experience",
+                    "importance": 7,
+                    "project": "aml:eft",
+                    "privacy_level": "user",
+                    "session_id": "sess-1",
+                    "user_id": "u1",
+                    "event_id": "req-shared",
+                },
+                {
+                    "content": "回程的高铁上把充电宝忘在了座位底下",
+                    "memory_type": "experience",
+                    "importance": 3,
+                    "project": "aml:eft",
+                    "privacy_level": "user",
+                    "session_id": "sess-1",
+                    "user_id": "u1",
+                    "event_id": "req-shared",
+                }
+            ]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/memories/consolidate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let resp = app
+            .clone()
+            .into_service()
+            .oneshot(req)
+            .await
+            .expect("HTTP 层调用失败");
+        assert_eq!(resp.status(), StatusCode::OK, "consolidate 应返回 200");
+
+        // top_k=1：让「充电宝」那条必然**不在**主结果里
+        let req = Request::builder()
+            .method("POST")
+            .uri("/memories/enrich")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "query": "苏堤",
+                    "top_k": 1,
+                    "user_id": "u1",
+                    "project": "aml:eft",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let resp = app
+            .clone()
+            .into_service()
+            .oneshot(req)
+            .await
+            .expect("HTTP 层调用失败");
+        assert_eq!(resp.status(), StatusCode::OK, "enrich 应返回 200");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // 负向对照（防恒真）：目标记忆不得已被主检索召回
+        let main_has_target = body["memories"]
+            .as_array()
+            .map(|v| {
+                v.iter()
+                    .any(|m| m["content"].as_str().unwrap_or("").contains("充电宝"))
+            })
+            .unwrap_or(false);
+        assert!(
+            !main_has_target,
+            "前提不成立：『充电宝』若已被主检索召回，则本用例无法证明是联想补全的功劳：{body}"
+        );
+
+        let associated = body["associated"]
+            .as_array()
+            .unwrap_or_else(|| panic!("enrich 响应必须含 associated 分区: {body}"));
+        let hit = associated.iter().find(|a| {
+            a["content_preview"]
+                .as_str()
+                .unwrap_or("")
+                .contains("充电宝")
+        });
+        let hit = hit.unwrap_or_else(|| {
+            panic!(
+                "★效果未达成：consolidate 写入的 event_id 未能触发「共同经历」联想——\
+                 「充电宝」既不在主结果、也不在 associated。实际 associated={associated:?}"
+            )
+        });
+        assert_eq!(
+            hit["relation"], "same_event",
+            "该联想必须标注为『共同经历』: {hit}"
+        );
+        assert!(
+            hit["why"]
+                .as_str()
+                .is_some_and(|w| w.contains("req-shared")),
+            "依据须写出具体 event_id（可解释到具体对象）: {hit}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.11 **效果测试**（不只是功能）：`source_timestamp_ms` 是否真的让
+    /// **时间语义由源时间决定**，而不是由"摄入时刻"决定。
+    ///
+    /// ## 为什么必须有这条
+    /// 适配层是**批量整块写入**的，同一个块内所有 message 的摄入时刻几乎相同
+    /// ⇒ 若 `created_at` 仍是摄入时刻，那么"事件顺序"与"同一时段聚类"全部失真。
+    /// 本用例**故意让摄入顺序与事件顺序相反**（先写"晚发生"的，再写"早发生"的），
+    /// 因此若排序仍按摄入顺序，断言必然失败。
+    #[tokio::test]
+    async fn test_source_timestamp_actually_drives_temporal_order() {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_src_time_effect_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared.clone(), manager, llm_api, llm_ready, false);
+
+        // 事件时间：晚 = 2026-06-01，早 = 2026-01-01
+        const LATE_MS: i64 = 1_780_272_000_000; // 2026-06 前后
+        const EARLY_MS: i64 = 1_767_225_600_000; // 2026-01 前后
+        let late_day = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(LATE_MS)
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        let early_day = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(EARLY_MS)
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_ne!(late_day, early_day, "构造前提：两个源时间必须落在不同日期");
+
+        // ★摄入顺序与事件顺序**相反**：先写"晚发生的"
+        let payload = serde_json::json!({
+            "memories": [
+                {
+                    "content": "乙方验收报告已在周五正式提交归档",
+                    "memory_type": "fact",
+                    "importance": 5,
+                    "project": "aml:t",
+                    "privacy_level": "user",
+                    "user_id": "u1",
+                    "source_timestamp_ms": LATE_MS,
+                },
+                {
+                    "content": "甲方项目启动会定在三号会议室举行",
+                    "memory_type": "fact",
+                    "importance": 5,
+                    "project": "aml:t",
+                    "privacy_level": "user",
+                    "user_id": "u1",
+                    "source_timestamp_ms": EARLY_MS,
+                }
+            ]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/memories/consolidate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let resp = app
+            .clone()
+            .into_service()
+            .oneshot(req)
+            .await
+            .expect("HTTP 层调用失败");
+        assert_eq!(resp.status(), StatusCode::OK, "consolidate 应返回 200");
+
+        // 按 created_at 升序读取：若时间语义正确，**早发生**的必须排在前面
+        let guard = shared.lock().await;
+        let (list, _) = guard
+            .list_memories(&crate::memory_store::ListFilter {
+                limit: usize::MAX,
+                sort_by: crate::memory_store::SortBy::CreatedAt,
+                order: crate::memory_store::SortOrder::Asc,
+                ..crate::memory_store::ListFilter::new()
+            })
+            .expect("列出记忆失败");
+        assert_eq!(list.len(), 2, "应落库 2 条，实际 {}", list.len());
+        assert!(
+            list[0].content.contains("启动会"),
+            "★效果未达成：按 created_at 升序时，**早发生**的『启动会』应排在首位，\
+             实际首位是「{}」——说明时间语义仍由摄入顺序决定，source_timestamp_ms 未生效",
+            list[0].content
+        );
+        assert_eq!(
+            list[0].created_at.format("%Y-%m-%d").to_string(),
+            early_day,
+            "首位的 created_at 必须等于它的源时间（{early_day}）"
+        );
+        assert_eq!(
+            list[1].created_at.format("%Y-%m-%d").to_string(),
+            late_day,
+            "次位的 created_at 必须等于它的源时间（{late_day}）"
+        );
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 记录层异常路径：memory_id 不存在时返回空关联而非报错
     /// （HCSE 要求：异常输入必须有明确、可预期的应答，不得挂死或 500）。
     #[tokio::test]
@@ -5772,5 +6514,214 @@ mod api_contracts_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.11（CR-32）：请求体上限必须是**显式契约**且真的生效。
+    ///
+    /// 断言两点（都具备鉴别力）：
+    /// 1. 超过 `V1_MAX_REQUEST_BODY_BYTES` 的请求体在**进入 handler 之前**被拒为 413
+    ///    —— 修前若不显式设置 `DefaultBodyLimit`，该上限由 axum 框架默认值隐式决定，
+    ///    随手一次框架升级即可令此断言失效；
+    /// 2. 反面对照：正常大小的请求**不得**被体积门禁误杀（防"设得过小"的另一类回归）。
+    #[tokio::test]
+    async fn test_request_body_size_limit_is_explicit_and_enforced() {
+        use axum::body::Body;
+        use axum::http::{header, Request};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use tower::ServiceExt;
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_body_limit_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router(shared, manager, llm_api, llm_ready, false);
+
+        // 构造一个远超上限的 JSON body（上限 + 64 KiB 纯填充）。
+        let padding = "x".repeat(V1_MAX_REQUEST_BODY_BYTES + 64 * 1024);
+        let oversized = serde_json::json!({ "content": padding }).to_string();
+        assert!(
+            oversized.len() > V1_MAX_REQUEST_BODY_BYTES,
+            "测试前提：构造的请求体必须超过上限"
+        );
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/remember")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(oversized))
+            .unwrap();
+        let response = app
+            .clone()
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("HTTP 层调用失败");
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "超过 V1_MAX_REQUEST_BODY_BYTES 的请求体必须在进入 handler 前被拒为 413"
+        );
+
+        // 反面对照：正常大小的请求不得被体积门禁误杀。
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/list")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({ "limit": 1 }).to_string()))
+            .unwrap();
+        let response = app
+            .into_service()
+            .oneshot(request)
+            .await
+            .expect("HTTP 层调用失败");
+        assert_ne!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "正常大小的请求不得被体积门禁误杀"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.9.11（CR-32）源码级守卫：请求体上限必须以**显式** `DefaultBodyLimit`
+    /// 施加在路由上。
+    ///
+    /// 为什么需要它：上一条行为用例**无法**区分"显式设置"与"依赖框架默认值"
+    /// —— 两者的上限都是 2 MiB、超限都返回 413。CR-32 的诉求正是"把隐式契约
+    /// 变显式"，故这里直接钉住生产源码中存在该显式层。
+    ///
+    /// 鉴别力：删除 `build_v1_router_with_trust` 末尾的
+    /// `.layer(DefaultBodyLimit::max(V1_MAX_REQUEST_BODY_BYTES))` 后本用例失败。
+    #[test]
+    fn v1_router_must_explicitly_cap_request_body() {
+        // 只扫描**生产段**：截到测试模块之前，避免守卫把自己的断言字符串也扫进去
+        //（本仓历史上多次踩到"守卫自匹配 ⇒ 恒真"陷阱）。
+        let src = include_str!("v1_api.rs");
+        let production = src
+            .find("#[cfg(test)]")
+            .map(|idx| &src[..idx])
+            .unwrap_or(src);
+        // **逐行比对而非子串包含**：子串比对会被"注释掉该行"绕过
+        //（`// .layer(DefaultBodyLimit::max(...))` 仍含该子串）——本守卫要求它是
+        // 一行**真正的语句**（去掉首尾空白后与目标完全相等）。
+        let expected = ".layer(DefaultBodyLimit::max(V1_MAX_REQUEST_BODY_BYTES))";
+        assert!(
+            production.lines().any(|line| line.trim() == expected),
+            "build_v1_router_with_trust 必须显式施加一行 `{expected}`；\
+             缺失（含被注释掉）即意味着请求体上限重新变回『框架默认值的隐式契约』"
+        );
+    }
+
+    /// ★源码级守卫：`semantic-backfill` 必须（a）取**全量**而非默认分页，（b）钳住单次预算上限。
+    ///
+    /// 背景（实测定位的真实缺陷）：handler 原用 `ListFilter::new()`，其默认分页是
+    /// **`limit=20 / offset=0`**（见 memory_store_types.rs:326-327）⇒ 该端点
+    /// **永远只能看到前 20 条**：第一页缓存满后 `todo` 恒空，
+    /// `encoded` 恒为 0、耗时 0.0s、`total` 却报全量 —— 三者同时出现即该缺陷的指纹
+    /// （已在开发库 3189 条上复现：缓存永远停在 20）。
+    ///
+    /// 另：不钳预算时，单次持锁一旦超过网关超时（30s），外层 future 被丢弃而
+    /// blocking 任务**仍持锁跑完预算** ⇒ 后续请求全部 503（实测 budget_ms=60000 复现）。
+    ///
+    /// 两道约束都属于"少一行就静默退化"的类型，故用源码守卫钉死（与
+    /// `v1_router_must_explicitly_cap_request_body` 同款理由：行为用例无法在
+    /// 无 ML 编码器的测试 build 下区分"输入被分页截断"）。
+    #[test]
+    fn semantic_backfill_must_take_full_set_and_clamp_budget() {
+        // 只扫描**生产段**：截到测试模块之前，避免守卫把自己的断言字符串扫进去
+        let src = include_str!("v1_api.rs");
+        let production = src
+            .find("#[cfg(test)]")
+            .map(|idx| &src[..idx])
+            .unwrap_or(src);
+        // ★ 按**行**定位本 handler 的代码块。
+        //   不能直接 `find("/state/semantic-backfill")`：路由上方的注释行
+        //   `// POST /v1/state/semantic-backfill …` 出现在 `.route(...)` **之前**，
+        //   会让 find 落在注释上，截出的 block 不含实现（本守卫曾因此假红）。
+        let lines: Vec<&str> = production.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.contains("\"/state/semantic-backfill\", post("))
+            .expect("必须存在 semantic-backfill 路由");
+        let end = lines[start + 1..]
+            .iter()
+            .position(|l| l.trim_start().starts_with(".route("))
+            .map(|i| start + 1 + i)
+            .unwrap_or(lines.len());
+        let block = lines[start..end].join("\n");
+
+        assert!(
+            block.contains("limit: usize::MAX"),
+            "semantic-backfill 必须取**全量**（limit: usize::MAX）；\
+             退回默认分页（limit=20）会让端点永远只回填首页 20 条"
+        );
+        assert!(
+            block
+                .lines()
+                .any(|l| l.trim() == "let filter = crate::memory_store_types::ListFilter {"),
+            "必须显式构造带 limit 的 ListFilter（防被改回裸 `ListFilter::new()`）"
+        );
+        assert!(
+            block.contains(".min(SEMANTIC_BACKFILL_BUDGET_CAP_MS)"),
+            "semantic-backfill 必须把 budget_ms 钳到硬上限；\
+             否则调用方越过网关超时 ⇒ 触发『超时即弃锁不释放』⇒ 503 风暴"
+        );
+    }
+
+    /// ★源码级守卫（**安全红线**）：P8 关联补全的出口合并**必须**用带可见性过滤的取法。
+    ///
+    /// 背景：`MemoryStore::memories_by_ids` **只按 id 匹配、不做任何可见性判断**
+    /// （见其实现）。若 P8 用它把"联想补全"的结果并回检索出口，越权防线就只剩
+    /// "上游 `expand_associations` 已过滤"这**一个单点**；上游一旦被改坏或误配
+    /// `expand_filter`，出口会**静默带出其他 user/session 的私有记忆**。
+    ///
+    /// 故出口必须走 `memories_by_ids_visible`（内部对每条再判一次 `is_visible`）。
+    ///
+    /// 说明：`is_visible` 的过滤**语义**由既有隐私用例覆盖（含跨 user 负向对照）；
+    /// 本守卫只钉"**接线不得被换回裸取法**"——这正是"少一处调用就静默退化"的类型。
+    #[test]
+    fn assoc_into_results_must_use_visibility_filtered_lookup() {
+        let src = include_str!("v1_api.rs");
+        let production = src
+            .find("#[cfg(test)]")
+            .map(|idx| &src[..idx])
+            .unwrap_or(src);
+        assert!(
+            production.contains("store.memories_by_ids_visible("),
+            "P8 出口合并必须用 `memories_by_ids_visible`（带可见性过滤）；\
+             换回裸 `memories_by_ids` 会让越权防线退化为单点"
+        );
+    }
+
+    /// ★v0.9.11（能力对齐）源码级守卫：REST `enrich` **必须**走 LLM 查询富化的单一真源
+    /// `enrich_query_for_retrieval`。
+    ///
+    /// 背景：该富化原先只在 MCP `recall` 的两处 handler 内联实现，REST `enrich`
+    /// （AML 与桌面端实际使用的检索入口）**完全没有** ⇒ 同一引擎两条入口检索质量不一致。
+    /// 行为正确性由 `llm_translator` 的确定性单测保证（未配置 LLM ⇒ 逐字返回原查询）；
+    /// 本守卫只钉住"接线不得被摘掉"。
+    #[test]
+    fn enrich_endpoint_must_reuse_llm_query_enrichment() {
+        let src = include_str!("v1_api.rs");
+        let production = src
+            .find("#[cfg(test)]")
+            .map(|idx| &src[..idx])
+            .unwrap_or(src);
+        assert!(
+            production.contains("enrich_query_for_retrieval"),
+            "/v1/memories/enrich 必须复用 `enrich_query_for_retrieval`（否则 REST 与 MCP \
+             两条入口的检索能力再次分叉）"
+        );
     }
 }

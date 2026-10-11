@@ -994,6 +994,8 @@ mod tests {
     /// 测试: 环境变量 LRC_LLM_API 被正确读取
     #[test]
     fn test_llm_api_from_env() {
+        // v0.9.11（G6 / CR-20）：本用例改 `LRC_LLM_API`（进程级），须持全 crate 唯一 env 锁。
+        let _env_guard = crate::test_env::lock();
         // 注意: 这个测试在设置环境变量后需要清理，避免污染其他测试
         let test_key = "openai:sk-test123:gpt-4o-mini:https://api.openai.com/v1";
         std::env::set_var("LRC_LLM_API", test_key);
@@ -1012,6 +1014,8 @@ mod tests {
     /// 测试: CLI 参数优先于环境变量
     #[test]
     fn test_cli_overrides_env() {
+        // v0.9.11（G6 / CR-20）：本用例改 `LRC_LLM_API`（进程级），须持全 crate 唯一 env 锁。
+        let _env_guard = crate::test_env::lock();
         std::env::set_var(
             "LRC_LLM_API",
             "openai:sk-env:env-model:https://env.api.com/v1",

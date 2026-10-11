@@ -4,10 +4,15 @@
 //! 为 AI 助手提供跨项目、跨语言的永久记忆能力。
 //! 支持多语言代码和通用文档的自动切分与检索。
 //!
-//! 分层开源架构:
-//!   Layer 1 (Public)  — chunker.rs, server.rs, bin/server.rs → Apache 2.0
-//!   Layer 2 (Protected) — engine/ 子模块 → 专有研究许可
+//! 分层开源架构（v0.9.11 / CR-52：改为**目录级**定义，与 LICENSE §2.2 口径一致）:
+//!   Layer 1 (Public)  — `src/engine/` 目录**之外**的全部源码 → Apache 2.0
+//!                        （含 chunker.rs、server.rs、bin/server.rs、v1_api.rs、
+//!                          memory_store.rs、persistence/、privacy.rs 等）
+//!   Layer 2 (Protected) — `src/engine/` 目录（及经 `pub use` 的再导出）→ 专有研究许可
 //!   Layer 3 (Binary)  — 编译产物 → 二进制分发，Rust 编译天然混淆
+//!
+//! 注：`scripts/check_algorithm_leak.py` 的 `PUBLIC_FILES`（4 个文件）是**泄露扫描面**，
+//!     是公开层的显式子集，**不等于**公开层全集。
 //!
 //! 架构: Chunker（多语言切分）→ Encoder（语义编码）→ Retriever（向量检索）→ Manager（编排）
 //! 可选: Server（MCP HTTP/Stdio 服务）→ IDE 直接调用
@@ -24,7 +29,133 @@ pub mod memory_store_cache;
 /// 记忆存储数据契约类型（v0.9.7：从 memory_store.rs 外提，P2-2 God Object 拆分）
 pub mod memory_store_types;
 pub mod memory_types;
+#[cfg(test)]
+mod build_profile_tests {
+    //! 构建配置的**不变量守卫**（v0.9.11 / G8 / CR-06）
+
+    /// ★守卫：release 必须 `panic = "unwind"`。
+    ///
+    /// ## 为什么这是"不变量"而不只是配置偏好
+    /// 代码中大量隔离分支只在 unwind 下成立，例如
+    /// `catch_unwind`、`tokio::spawn_blocking` 的 `Err(join_error) =>
+    /// "…内部错误，服务已保持运行"`。若改回 `abort`：
+    /// ① 这些分支成为**死逻辑**（承诺失效但无人察觉）；
+    /// ② 一处 panic 即 abort 整个 sidecar，`Drop` 不执行 ⇒ 单例锁文件残留；
+    /// ③ `overflow-checks = true` 的整数溢出也会升级为"整进程退出"。
+    #[test]
+    fn release_profile_must_use_unwind() {
+        let manifest = include_str!("../Cargo.toml");
+        let after = manifest
+            .split("[profile.release]")
+            .nth(1)
+            .expect("Cargo.toml 必须包含 [profile.release] 段");
+        // 截取到下一个段落头为止，避免误读其它 profile
+        let section = after.split("\n[").next().unwrap_or(after);
+        assert!(
+            section.contains("panic = \"unwind\""),
+            "release profile 必须为 panic = \"unwind\"（否则全部 panic 隔离失效，CR-06）。\n实际：{section}"
+        );
+        assert!(
+            !section.contains("panic = \"abort\""),
+            "release profile 不得使用 panic = \"abort\"（会让隔离分支成为死逻辑）"
+        );
+    }
+}
+
+/// 超时阶梯的**单一真源**（v0.9.11 / G4）：各层超时集中于此，并用守卫测试断言
+/// "锁等待 < 内层 < 中层 < 外层"，防止"内层 ≥ 外层 ⇒ 取消失效"的不可达代码重现
+pub mod timeouts;
+
+/// **全 crate 唯一的测试环境变量锁**（v0.9.11 / G6 / CR-20）。
+///
+/// ## 为什么必须"唯一"
+/// Rust 测试默认**并行**运行，而 `std::env::set_var` 改的是**进程级共享**状态。
+/// 修前各模块各持一把自己的 `static LOCK: Mutex<()>`（`memory_state_machine`、
+/// `state_matcher`、`dao_regulator`）—— **它们互不排斥**，于是"跨模块改同一变量"的竞态
+/// 依然存在，且只表现为**偶发失败**（本会话实测到 `活性偏置门控必须默认关闭` 偶发失败）。
+/// 局部修只是把竞态缩小到模块边界内，**没有消除它**；本模块提供唯一那把锁。
+#[cfg(test)]
+pub mod test_env {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static GLOBAL_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    /// 取得**全 crate 唯一**的 env 锁。所有读写进程环境变量的用例都必须先取它。
+    ///
+    /// 用法：`let _guard = crate::test_env::lock();`（守卫存活期间互斥）
+    ///
+    /// 中毒（某用例 panic）时**不传播 panic**：否则一个失败会连带炸掉其余所有用 env 的用例，
+    /// 反而放大噪声、掩盖真实故障面。
+    pub fn lock() -> MutexGuard<'static, ()> {
+        GLOBAL_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// ★守卫（v0.9.11 / G6 / CR-20）：**env 锁必须全 crate 唯一**。
+    ///
+    /// ## 为什么必须
+    /// 修前 `memory_state_machine` / `state_matcher` / `dao_regulator` /
+    /// `model_downloader` 各持一把**模块私锁**。私锁只在**模块内**互斥，
+    /// **模块之间互不排斥** —— 而同一个变量会被多个模块的用例改写
+    /// （`LRC_STATE_BIAS` 既被 `memory_state_machine` 又被 `memory_store_tests` 改写）。
+    /// 于是"跨模块竞态"依旧存在，只从**必现**退化为**偶发**（更难定位）。
+    /// 单一真源要求：只允许一把锁，所有改进程环境变量的用例都取它。
+    ///
+    /// 本守卫以**源码文本**断言防止有人再引入模块私锁（回归防线）。
+    #[test]
+    fn env_lock_must_be_unique_across_crate() {
+        // 会改写**进程级**环境变量的全部测试源文件（相对 src/）。
+        let sources: &[(&str, &str)] = &[
+            ("state_matcher.rs", include_str!("state_matcher.rs")),
+            (
+                "memory_state_machine.rs",
+                include_str!("memory_state_machine.rs"),
+            ),
+            (
+                "engine/model_resolver.rs",
+                include_str!("engine/model_resolver.rs"),
+            ),
+            (
+                "engine/dao_regulator.rs",
+                include_str!("engine/dao_regulator.rs"),
+            ),
+            (
+                "engine/model_downloader.rs",
+                include_str!("engine/model_downloader.rs"),
+            ),
+            (
+                "memory_store_tests.rs",
+                include_str!("memory_store_tests.rs"),
+            ),
+            ("v1_api_tests.rs", include_str!("v1_api_tests.rs")),
+            ("process_guard.rs", include_str!("process_guard.rs")),
+            ("discovery.rs", include_str!("discovery.rs")),
+        ];
+        for (name, src) in sources {
+            assert!(
+                src.contains("crate::test_env::lock()"),
+                "{name} 会改进程环境变量，必须使用全 crate 唯一 env 锁 \
+                 `crate::test_env::lock()`（CR-20）"
+            );
+            // `Mutex::new(())` 是模块私锁（`static X: Mutex<()> = Mutex::new(())`）的
+            // 特征写法；一旦出现即说明私锁被重新引入 —— 模块间互不排斥，竞态回归。
+            assert!(
+                !src.contains("Mutex::new(())"),
+                "{name} 不得再声明模块私锁（`static ...: Mutex<()> = Mutex::new(())`）——\
+                 私锁模块间互不排斥，跨模块环境变量竞态仍在（CR-20）"
+            );
+        }
+    }
+}
+/// 记忆写入的**单一真源**（v0.9.11：统一入参 `MemoryWriteInput` 与合并语义 `apply_merge`，
+/// 消除"字段集按端点各自定义"与"合并规则散落内联"造成的静默丢字段）
+pub mod memory_write;
 pub mod persistence;
+/// 可见性作用域的**单一真源**（v0.9.11 / G3）：`scoped` / `scope_from_args` 统一构造隐私上下文，
+/// `TrustMode` + `require_scope` 实现"本地可信域保留、对外域强制"的分层隔离
+pub mod privacy;
 
 /// 运行时防护模块：反调试、完整性校验、防篡改
 pub mod guard;

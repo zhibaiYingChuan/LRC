@@ -166,3 +166,69 @@ pub fn create_statistical_encoder() -> HybridLuoShuEncoder {
 // 1. 每个模块设计遵循"内禀调节"原则，从系统动力学自然涌现
 // 2. 所有阈值参数均有严格的数学推导依据
 // 3. 架构设计在实用性与理论完整性之间保持平衡
+
+#[cfg(test)]
+mod layer_contract_tests {
+    /// ★守卫（v0.9.11 / G9 / CR-15）：**engine（Layer 2）不得依赖 Layer 1 的实现模块**。
+    ///
+    /// ## 为什么需要（这是"两层成环"的直接来源）
+    /// Layer 1 依赖 engine 的编码器（122 处，架构必需）；若 engine 又依赖 Layer 1 的
+    /// **实现模块**（`MemoryStore` / `v1_api` / `server` …），两层即成环 ⇒
+    /// 引擎无法独立于存储/接口演进，也无法单独授权打包。
+    ///
+    /// 本轮已消除的两条边（见 `navigation.rs` 的 `FocusRecall` 依赖倒置与
+    /// `rrf.rs`/`navigation.rs` 改依赖纯数据契约 `memory_store_types`）；
+    /// 本守卫的作用是**阻止反向依赖继续扩散**（目录扫描 ⇒ 新增文件自动纳入）。
+    ///
+    /// ## 已知残留（已登记，见审查报告 §十 CR-15）
+    /// `synthesis_engine.rs` 仍引 `crate::graph_store`（图存储类型）与
+    /// `crate::persistence`（`Persistence` trait）—— 其彻底解耦需再加一层抽象，
+    /// 属独立工程；故这两者**不在**本守卫的禁止清单内，以保持"残留显式可见"。
+    #[test]
+    fn engine_must_not_depend_on_layer1_implementations() {
+        // 禁止：Layer 1 的**实现模块**（契约与纯数据类型不在此列）。
+        // ⚠️ 只写模块名、用 `format!("crate::{m}::")` 拼出完整路径：
+        //    若把完整路径写成字面量，本测试源码自身即含该串 ⇒ 目录扫描会
+        //    "自己匹配自己"而恒失败（本会话第三次踩到同一坑）。
+        const FORBIDDEN_MODULES: &[&str] = &[
+            "memory_store",
+            "v1_api",
+            "server",
+            "consolidation",
+            "dashboard",
+            "export",
+            "backup",
+            "migration",
+        ];
+        let dir = std::path::Path::new("src/engine");
+        let entries =
+            std::fs::read_dir(dir).expect("测试 CWD 必须是 crate 根（cargo test 的默认行为）");
+        let mut offenders: Vec<String> = Vec::new();
+        for entry in entries {
+            let path = entry.expect("目录项可读").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("引擎源码可读");
+            for (lineno, line) in text.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // 注释行不参与判定：文档里的交叉引用不构成编译依赖
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for module in FORBIDDEN_MODULES {
+                    let needle = format!("crate::{module}::");
+                    if line.contains(&needle) {
+                        offenders.push(format!("{}:{} → {needle}", path.display(), lineno + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "engine（Layer 2）不得依赖 Layer 1 的实现模块（CR-15）。\n\
+             允许依赖：errors / memory_types / memory_store_types / chunker（契约与数据类型）。\n\
+             违规项：{offenders:#?}"
+        );
+    }
+}

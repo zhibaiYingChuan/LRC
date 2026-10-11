@@ -53,11 +53,21 @@ DaoTi Research License v1.0
 
 2.2 分层许可说明
 
-本项目采用分层许可架构：
-  - 公开层代码（src/chunker.rs, src/server.rs, src/bin/server.rs 等）
-    适用 Apache License 2.0（详见 LICENSE_CODE 文件）；
-  - 受保护层代码（src/engine/ 目录）适用本协议 (DaoTi Research License v1.0)；
-  - 项目编译产物中的受保护算法部分同样适用本协议。
+本项目采用**目录级**分层许可架构（v0.9.11 / CR-52：此前只举 3 个文件名，
+与 src/lib.rs 中十余个标记为「Layer 1 (Apache 2.0)」的模块、以及
+scripts/check_algorithm_leak.py 的 4 文件扫描面**三处口径互不重合**，故此处明确为目录级定义）：
+
+  - **公开层** = 仓库中 `src/engine/` 目录**之外**的全部源码
+    （包括但不限于 src/chunker.rs、src/server.rs、src/bin/server.rs、src/lib.rs、
+      src/v1_api.rs、src/memory_store.rs、src/persistence/、src/privacy.rs 等）
+    —— 适用 Apache License 2.0（详见 LICENSE_CODE 文件）；
+  - **受保护层** = `src/engine/` 目录（含其中所有文件，以及经 `pub use` 再导出的同名路径）
+    —— 适用本协议 (DaoTi Research License v1.0)；
+  - 项目**编译产物**中的受保护算法部分同样适用本协议。
+
+  > 注：`scripts/check_algorithm_leak.py` 的 `PUBLIC_FILES` 是**泄露扫描面**
+  > （公开层的一个显式子集，只挑"可能误引受保护术语"的文件逐行扫描），
+  > **不等于**公开层全集，也不构成许可边界的定义。
 
 2.3 衍生作品认定
 

@@ -21,6 +21,10 @@ use std::fmt;
 
 pub mod json;
 
+/// 记忆持久化字段的**单一真源**（v0.9.11 / G2）：字段清单 + 由清单派生的 SQL 片段生成器，
+/// 供各后端复用，并用守卫测试替代"各自手写白名单"（后者已造成 Postgres 只更新 10/29 列等静默丢字段）。
+pub mod fields;
+
 /// PostgreSQL 持久化后端（需 `postgres` feature）
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -175,6 +179,21 @@ impl AssocFrequency {
 /// **显式声明**本后端不支持状态持久化（不得让用户以为它生效了）。
 /// 参考实现：`json.rs`（文件）、`postgres.rs`（state kv 表）。
 pub trait Persistence: Send + Sync {
+    /// **数据目录**（用于定位侧车文件，如 `semantic_vectors.json`）。
+    ///
+    /// **默认实现返回 `None`** ⇒ 未实现的后端不做任何依赖侧车文件的能力
+    /// （与 `load_memory_state` 的"默认空状态"同款约定：**缺省即诚实降级**）。
+    ///
+    /// 为什么需要它：`MemoryStore` 的泛型方法（如 384 维句向量排序）需要在不依赖
+    /// 具体后端类型的前提下拿到目录 —— 此前 `data_dir()` 只存在于具体类型
+    /// `JsonPersistence` 上，泛型上下文调不到（编译期 `E0599`）。
+    ///
+    /// 命名刻意用 `data_dir_path` 而非 `data_dir`：避免与 `JsonPersistence` 的
+    /// **固有方法** `data_dir()` 同名而产生解析歧义。
+    fn data_dir_path(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// 保存一条记忆（新增或更新）
     fn save_memory(&self, memory: &Memory) -> Result<(), PersistenceError>;
 
@@ -207,6 +226,27 @@ pub trait Persistence: Send + Sync {
     ///   而不是让用户误以为"联想时好时坏"是随机现象
     fn supports_state_persistence(&self) -> bool {
         false
+    }
+
+    /// 数据源**指纹**：用于检测"**别的进程**改动了数据"（v0.9.11 / G9 收尾 / CR-42）。
+    ///
+    /// ## 为什么需要
+    /// `MemoryStore` 的缓存只在**自身**写操作后被标记为脏。多窗口桌面端 / CLI 与
+    /// sidecar 并存时，别的进程写入后本进程**不会**收到通知 ⇒ 可能**无限期读陈旧数据**
+    /// （用户看到"我明明刚记过，怎么搜不到"）。
+    ///
+    /// ## 实现契约
+    /// - 返回 `None`（默认）：本后端**不做**外部变更检测，调用方保持既有行为
+    ///   （后向兼容：不强求每个后端都能给出廉价指纹）。
+    /// - 返回 `Some(fp)`：**内容变化 ⇒ 指纹必须变化**，且获取代价应远低于全量读
+    ///   （如文件 `mtime + 长度`，而非内容哈希）。
+    ///
+    /// ## 已知边界（诚实声明）
+    /// 基于 `mtime + 长度` 的指纹**可能漏检**"同一时间刻度内、长度不变"的改写
+    /// （NTFS 时间戳精度 100ns，实际难以触发）；需要更强保证时应由后端
+    /// 改用内容哈希或版本号（代价是全量读/额外元数据）。
+    fn source_fingerprint(&self) -> Option<u64> {
+        None
     }
 
     /// 加载跨查询命中频次统计（P8.2o 状态化方案）。

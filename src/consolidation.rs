@@ -65,6 +65,20 @@ fn try_lock_with_deadline<P: Persistence>(
 
 // ==================== 配置类型 ====================
 
+/// 后台结晶流水线的合成阈值默认值（**本模块自有口径**）。
+///
+/// ## ⚠️ 它与引擎默认值**不同**，这是被显式登记的既有分歧（v0.9.11 / G9 / CR-24）
+/// - 引擎/存储侧默认：`engine::synthesis_engine::DEFAULT_MIN_CLUSTER = 3`；
+/// - **本后台流水线默认：5**（更保守 —— 后台合成会抢全局存储锁，阈值更高可减少触发频率）；
+/// - 而 sidecar 启动时（`bin/server.rs`）**显式覆写为 3**，与前台口径一致。
+///
+/// 修前这三个数字都是**散落的字面量**：`5`（此处）、`3`（server.rs）、`3`（store），
+/// 谁也无法一眼看出"哪个是笔误、哪个是有意" ⇒ 前台 `/consolidate` 与后台结晶
+/// 可能**静默分歧**且无人报警。现各自命名化，把"有意不同"变成**可读的声明**。
+///
+/// 若要统一（例如都取 3），这是**行为变更**，须单独评估并在此处改一处即可。
+pub const DEFAULT_CONSOLIDATION_THRESHOLD: usize = 5;
+
 /// 后台结晶流水线配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsolidationConfig {
@@ -72,9 +86,9 @@ pub struct ConsolidationConfig {
     pub poll_interval_secs: u64,
     /// 每轮最大处理记忆数，默认 100
     pub batch_size: usize,
-    /// 合成触发阈值：同类记忆达到此数量时触发递归合成，默认 5
+    /// 合成触发阈值：同类记忆达到此数量时触发递归合成，默认 [`DEFAULT_CONSOLIDATION_THRESHOLD`]
     pub synthesis_threshold: usize,
-    /// 合成相似度阈值：记忆相似度超过此值时纳入同一簇，默认 0.4
+    /// 合成相似度阈值：记忆相似度超过此值时纳入同一簇，默认 `DEFAULT_SIMILARITY`（0.4）
     pub synthesis_similarity: f32,
     /// 是否在启动时立即运行一次，默认 true
     pub run_on_start: bool,
@@ -89,8 +103,9 @@ impl Default for ConsolidationConfig {
         Self {
             poll_interval_secs: 300,
             batch_size: 100,
-            synthesis_threshold: 5,
-            synthesis_similarity: 0.4,
+            synthesis_threshold: DEFAULT_CONSOLIDATION_THRESHOLD,
+            // v0.9.11（G9 / CR-24）：相似度阈值改用单一真源
+            synthesis_similarity: crate::engine::synthesis_engine::DEFAULT_SIMILARITY,
             run_on_start: true,
             auto_synthesize: true,
             verbose: 1,
@@ -353,16 +368,60 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         }
 
         // 2. 逐条处理：洛书编码 → MirrorProject 分类 → 写入（Phase 1：持锁写入）
-        {
-            let mut store = self.store.lock().await;
+        //
+        // ═══ v0.9.11（G4 / CR-10）三处修复 ═══
+        //   ① **有界取锁**：此前用 `self.store.lock().await`（无上限）—— 后台任务可在锁上
+        //      无限排队，而前台请求只有 2s 预算，于是"后台等锁 → 前台全 503"。
+        //      现改为 `timeout(LOCK_WAIT, …)`：拿不到就让出本轮（`last_run` 不推进 ⇒ 下轮重试）。
+        //   ② **周期自查取消标志**：此前 120s 周期超时置位的 `cancel` 在**这段最慢的写循环里
+        //      从未被读取** ⇒ 超时对本段完全无效（"兜底"是假的）。
+        //   ③ **分批让锁**：每 `PHASE1_CHUNK` 条显式 `drop(guard)`，给前台请求插队机会，
+        //      避免一次性独占锁把并发请求全部挤成 503。
+        //
+        // 仍待做（已登记）：把**编码**移出锁 + 批量落盘（需要"保留合并语义的批量写"新 API，
+        // 不能直接用 `remember_batch`——它跳过相似合并，会改变语义）。
+        const PHASE1_CHUNK: usize = 16;
+        let mut chunk_start = 0usize;
+        while chunk_start < surface_memories.len() {
+            if cancel.load(Ordering::Acquire) {
+                if self.config.verbose >= 1 {
+                    eprintln!(
+                        "[LRC·结晶] 写阶段收到取消信号，剩余 {} 条留待下轮",
+                        surface_memories.len() - chunk_start
+                    );
+                }
+                break;
+            }
+            let chunk_end = (chunk_start + PHASE1_CHUNK).min(surface_memories.len());
+            let mut store = match timeout(crate::timeouts::LOCK_WAIT, self.store.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    eprintln!(
+                        "[LRC·结晶] 写阶段等待存储锁超时，剩余 {} 条留待下轮",
+                        surface_memories.len() - chunk_start
+                    );
+                    break;
+                }
+            };
 
-            for sm in &surface_memories {
+            for sm in &surface_memories[chunk_start..chunk_end] {
+                if cancel.load(Ordering::Acquire) {
+                    break;
+                }
                 let memory_type =
                     MemoryType::try_parse(&sm.memory_type).unwrap_or(MemoryType::Fact);
-                let privacy_level = PrivacyLevel::try_parse(
-                    sm.session_id.as_ref().map(|_| "session").unwrap_or("user"),
-                )
-                .unwrap_or_default();
+                // v0.9.11（G3 / CR-04）：级别按**实际给出的归属**推导。
+                //
+                // 修前的启发式（"有 session 就 session，否则一律 user"）会产生
+                // **悖论态**：`user_id`/`session_id` 皆空时得到 `User` 级但 `user_id=None`
+                // ⇒ 按 `is_visible` 对**任何** user 都不可见（写进去等于消失）。
+                // 现改为三分法：有 session ⇒ Session；仅 user ⇒ User；皆无 ⇒ Global
+                // （无约束即保持默认可见，与 `inherit_privacy` 的"Global 不构成约束"同口径）。
+                let privacy_level = match (sm.user_id.is_some(), sm.session_id.is_some()) {
+                    (_, true) => PrivacyLevel::Session,
+                    (true, false) => PrivacyLevel::User,
+                    (false, false) => PrivacyLevel::Global,
+                };
 
                 let memory = Memory::new(
                     sm.content.clone(),
@@ -392,7 +451,10 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                     }
                 }
             }
-        } // 自动释放锁
+            // 显式让出锁：前台请求可插队，避免长周期独占
+            drop(store);
+            chunk_start = chunk_end;
+        }
 
         // 3. 合成阶段
         let mut synthesis_completed = !self.config.auto_synthesize;
@@ -686,7 +748,34 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         let written = {
             let mut store = self.store.lock().await;
             let mut count = 0usize;
+            // v0.9.11（G3 / CR-04）：一次读全库建索引，供"来源隐私继承"使用。
+            // 合成摘要把多条来源的内容归纳进来 —— 必须在写入前算出继承后的可见性。
+            let by_id: std::collections::HashMap<String, Memory> = store
+                .list_memories(&crate::memory_store::ListFilter::new())
+                .map(|(v, _)| v)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| (m.id.clone(), m))
+                .collect();
             for (source_ids, summary, info_gain) in synthesis_results {
+                // **派生记忆必须继承来源隐私**（交集 = 最严）。
+                // 跨可见性域 ⇒ `None` ⇒ **放弃该合成产物**（不写库），
+                // 因为"跨用户摘要"本身即泄漏；绝不回退为全可见。
+                let sources: Vec<Memory> = source_ids
+                    .iter()
+                    .filter_map(|id| by_id.get(id).cloned())
+                    .collect();
+                let scope = match crate::privacy::inherit_privacy(&sources) {
+                    Some(s) => s,
+                    None => {
+                        if self.config.verbose >= 1 {
+                            eprintln!(
+                                "[LRC·结晶·LLM] 跳过跨可见性域的合成产物（来源分属不同 user/session）"
+                            );
+                        }
+                        continue;
+                    }
+                };
                 let mut memory = Memory::new(
                     summary,
                     MemoryType::Synthesis,
@@ -695,7 +784,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                     Importance::new(7), // 合成记忆重要性 7
                     None,
                 )
-                .with_source("llm_synthesis");
+                .with_source("llm_synthesis")
+                .with_privacy(scope.0, scope.1, scope.2);
                 memory.source_ids = source_ids;
                 memory.information_gain = Some(info_gain);
                 memory.confidence = Some(0.85); // LLM 合成置信度
@@ -868,7 +958,31 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         let written = {
             let mut store = self.store.lock().await;
             let mut count = 0usize;
+            // v0.9.11（G3 / CR-04）：同 LLM 合成路径 —— 派生记忆必须继承来源隐私
+            let by_id: std::collections::HashMap<String, Memory> = store
+                .list_memories(&crate::memory_store::ListFilter::new())
+                .map(|(v, _)| v)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| (m.id.clone(), m))
+                .collect();
             for (source_ids, summary, info_gain) in synthesis_results {
+                // **继承来源隐私（交集 = 最严）；跨可见性域 ⇒ 放弃该合成产物**
+                let sources: Vec<Memory> = source_ids
+                    .iter()
+                    .filter_map(|id| by_id.get(id).cloned())
+                    .collect();
+                let scope = match crate::privacy::inherit_privacy(&sources) {
+                    Some(s) => s,
+                    None => {
+                        if self.config.verbose >= 1 {
+                            eprintln!(
+                                "[LRC·结晶·Embed] 跳过跨可见性域的合成产物（来源分属不同 user/session）"
+                            );
+                        }
+                        continue;
+                    }
+                };
                 // 区分 LLM 合成和本地合成（用于审计与置信度）
                 let (source_tag, confidence) = if summarizer.is_some() {
                     ("llm_synthesis", 0.85)
@@ -883,7 +997,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                     Importance::new(7), // 合成记忆重要性 7
                     None,
                 )
-                .with_source(source_tag);
+                .with_source(source_tag)
+                .with_privacy(scope.0, scope.1, scope.2);
                 memory.source_ids = source_ids;
                 memory.information_gain = Some(info_gain);
                 memory.confidence = Some(confidence);

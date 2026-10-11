@@ -1084,6 +1084,9 @@ mod tests {
     /// 但 `produced` 与"额度充足时"同口径（机制能力不受展示纪律影响）。
     #[test]
     fn d4_cap_does_not_suppress_d1_production() {
+        // v0.9.11（G6 / CR-20）：本用例改 `LRC_ACTIVE_DISCOVERY`（进程级），
+        // 须持全 crate 唯一 env 锁，避免与其它改环境变量的用例并发串扰。
+        let _env_guard = crate::test_env::lock();
         let (dir, mut store) = make_store();
         // 预置一条"很久没看"的记忆，使之有机会成为候选
         let mut m = Memory::new(
