@@ -95,6 +95,70 @@ type EnrichBlockingResult = (
 /// "做了机制却无法验证它是否有效"（详见 `daoti/PREREG_MEMORY_ASSOCIATION.md` §3.10）。
 const ASSOC_EXPAND_MAX_HTTP: usize = 3;
 
+/// 关联补全在 `top_k` 中允许占用的**最大份额分母**（即最多占 `top_k / N`）。
+///
+/// # 依据
+///
+/// - 关联是**补充**通道，不得盖过主结果 ⇒ 必须给主结果留出多数名额；
+/// - 取 1/4 ⇒ 主结果在**任何** `top_k` 下都保有 `≥ 3/4` 名额（`top_k < 4` 时关联为 0）。
+///
+/// # 与 `ASSOC_EXPAND_MAX_HTTP` 的关系
+///
+/// 后者是**绝对上限**（最多补几条），本常量是**相对上限**（最多占几分之几）；
+/// 实际取两者之小（见 `assoc_slot_cap`）。
+///
+/// # 可配置（与同段 `LRC_ASSOC_MAX` / `LRC_DEEP_CANDIDATES` 同一约定）
+///
+/// 环境变量 `LRC_ASSOC_SLOT_DENOM` 可覆盖；**下限受 `ASSOC_SLOT_SHARE_DENOM_MIN` 约束**，
+/// 避免被配成"关联吃光全部名额"（即历史缺陷 `quota.min(top_k)` 的分母=1 形态）。
+///
+/// # 正式评测口径
+///
+/// AML 评测契约规定：`top_k` 为"结果数上限"，**正式外部评测固定使用 100**
+/// （该契约文档不在本仓库内，属外部评测方定义）
+/// ⇒ `min(20, 100 / 4) = 20`，与历史实测配置**逐位一致** ⇒ 对文本赛道/Full 无行为变更。
+const ASSOC_SLOT_SHARE_DENOM: usize = 4;
+
+/// 份额分母的**下限**：`top_k / 2` 即"关联不得超过主结果"。
+///
+/// 无此护栏时，把分母配成 1 会复现历史缺陷（`top_k ≤ quota` 时整段丢弃主结果）。
+const ASSOC_SLOT_SHARE_DENOM_MIN: usize = 2;
+
+/// 解析份额分母：`None` / 非法 / 低于下限 ⇒ 回落默认值。
+///
+/// 抽成**纯函数**是为了可测：避免测试修改进程级环境变量（`cargo test` 默认并行，
+/// 改动全局 env 会污染并发运行的其它用例）。
+fn parse_assoc_slot_share_denom(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v >= ASSOC_SLOT_SHARE_DENOM_MIN)
+        .unwrap_or(ASSOC_SLOT_SHARE_DENOM)
+}
+
+/// 读取份额分母（环境变量 `LRC_ASSOC_SLOT_DENOM`）。
+fn assoc_slot_share_denom() -> usize {
+    parse_assoc_slot_share_denom(std::env::var("LRC_ASSOC_SLOT_DENOM").ok().as_deref())
+}
+
+/// enrich 出口：**关联条目允许占用的槽位数**。
+///
+/// # ★ 必须与 `top_k` 挂钩（2026-10-14 线上根因修复）
+///
+/// 历史缺陷：出口用 `.take(quota.min(top_k))` 决定补入条数，**丢掉了设计意图里的
+/// `top_k / 4` 上限**（注释一直写着该意图，代码里从未实现过——二者同属提交 `6a9c546`）。
+/// 线上实测（`top_k` 逐档）：
+///
+/// | `top_k` | 5 | 8 | 10 | 20 | 30 | 100 |
+/// |---|---|---|---|---|---|---|
+/// | 补入条数（缺陷） | 5 | 8 | 10 | 20 | 20 | 20 |
+/// | 主结果保留（缺陷） | **0** | **0** | **0** | **0** | 10 | 80 |
+/// | 补入条数（本函数） | 1 | 2 | 2 | 5 | 7 | 20 |
+///
+/// ⇒ 任何 `top_k ≤ quota` 的请求，**整个结果集被关联条目替换**，相似度第一名被丢弃
+/// （AML 代码赛道实测：同一查询 `k=20` 时精确记录 MISS、`k=100` 时 rank=1）。
+fn assoc_slot_cap(top_k: usize, quota: usize, share_denom: usize) -> usize {
+    quota.min(top_k / share_denom)
+}
+
 /// 请求级取消标志守卫：Drop 时置位，通知阻塞任务提前退出
 struct CancellationFlag(Arc<AtomicBool>);
 
@@ -1991,6 +2055,14 @@ pub fn build_v1_router_with_trust(
             move |Json(req): Json<ConsolidateRequest>| {
                 let store = store.clone();
                 async move {
+                    // ★ v0.9.13 计时插桩（默认关闭，`LRC_TIMING=1` 时开启）。
+                    // 目的：定位"单次 Add 耗时随 本次条数 × 库内条数 增长"落在哪一段
+                    // （实测装置：live/lrc_write_sweep.py 固定库规模、只改单次条数）。
+                    let __t0 = std::time::Instant::now();
+                    let __n_in = req.memories.len();
+                    let __timing = std::env::var("LRC_TIMING")
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
                     // v0.8.22 P2-NEW-03 修复（interaction-resilience-auditor Round4）：
                     //   根因：consolidate handler 在 tokio worker 线程上持锁执行
                     //         luoshu_synthesize()（CPU 密集），与 P0-3 修复前的问题一致
@@ -2141,6 +2213,7 @@ pub fn build_v1_router_with_trust(
                     ))?;
 
                     // Phase 2：异步超时获取快照，锁外执行 CPU 聚类计算。
+                    let __t_pre_snap = std::time::Instant::now();
                     let snapshot = {
                         let store = lock_store_with_timeout(&store).await?;
                         let snap_result = if scoped_inline_synthesis {
@@ -2265,6 +2338,20 @@ pub fn build_v1_router_with_trust(
                         })?;
                         (synthesis_summaries, total)
                     }; // 锁释放
+
+                    // ★ v0.9.13 计时输出（仅 `LRC_TIMING=1`）：把"写入完成"与"快照+聚类"两段分开，
+                    // 用来证明修复点（合成禁用时后者应从数十秒降到毫秒级）。
+                    if __timing {
+                        let total = __t0.elapsed().as_secs_f64();
+                        let post = __t_pre_snap.elapsed().as_secs_f64();
+                        eprintln!(
+                            "[LRC·计时] n_in={} total={:.3}s 写入完成={:.3}s 快照+聚类={:.3}s",
+                            __n_in,
+                            total,
+                            total - post,
+                            post
+                        );
+                    }
 
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(ConsolidateResponse {
                         stored,
@@ -2620,6 +2707,8 @@ pub fn build_v1_router_with_trust(
                             // 为什么必须"替换"而不是"尾部追加"：`fused` 已按 `top_k` 截断，
                             // 追加后再截断 ⇒ 新追加的会被整体丢掉（等于没做）。
                             // 故先给主结果让出 `min(quota, top_k/4)` 个名额，再把关联条目补进去。
+                            // ★ 该 `top_k/4` 上限由 `assoc_slot_cap` 落实；**2026-10-14 曾丢失过它**
+                            //   （小 `top_k` 下整段挤掉主结果，见该函数文档），改动此处务必保持该不变量。
                             if std::env::var("LRC_ASSOC_INTO_RESULTS")
                                 .map(|v| v == "1")
                                 .unwrap_or(false)
@@ -2644,10 +2733,16 @@ pub fn build_v1_router_with_trust(
                                     //   ⇒ 白白丢掉 11 个主结果名额，其中 **3 条原本命中的记忆
                                     //   被截掉**（`A 命中、D 丢失 = 3`）。精确让位后只损失
                                     //   真正的补入条数（0 条时 `truncate(top_k)` 为无操作）。
+                                    // ★ 配额必须再过一层 `top_k/N` 份额上限（`assoc_slot_cap`）：
+                                    //   只按 `quota` 截断会让 `top_k ≤ quota` 的请求
+                                    //   把主结果整段截没（2026-10-14 线上根因，见该函数文档）。
+                                    //   分母可配（`LRC_ASSOC_SLOT_DENOM`，下限 2），默认 1/4。
+                                    let assoc_cap =
+                                        assoc_slot_cap(top_k, assoc_quota, assoc_slot_share_denom());
                                     let fresh: Vec<Memory> = resolved
                                         .into_iter()
                                         .filter(|m| seen.insert(m.id.clone()))
-                                        .take(assoc_quota.min(top_k))
+                                        .take(assoc_cap)
                                         .collect();
                                     let n_new = fresh.len();
                                     memories.truncate(top_k.saturating_sub(n_new));
