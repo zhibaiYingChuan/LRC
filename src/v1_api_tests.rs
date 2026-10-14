@@ -15,6 +15,105 @@
 // Behaviour impact: none. Test count, names and assertions are unchanged.
 
 #[cfg(test)]
+mod assoc_slot_cap_tests {
+    use crate::v1_api::*;
+
+    /// 生产默认份额分母（`ASSOC_SLOT_SHARE_DENOM`）。
+    const DENOM: usize = 4;
+
+    /// 2026-10-14 线上根因回归：关联补全**不得**吃掉主结果。
+    ///
+    /// 历史缺陷（`.take(quota.min(top_k))`）在 `top_k ≤ quota` 时让主结果保留 **0** 条
+    /// ⇒ 整个响应被关联条目替换，相似度第一名丢失（AML 代码赛道实测：
+    /// 同查询 `k=20` 精确记录 MISS、`k=100` rank=1）。
+    #[test]
+    fn assoc_quota_never_consumes_the_whole_result_set() {
+        let quota = 20usize; // 生产取值（LRC_ASSOC_MAX）
+
+        // ① 不变量：主结果在任何 top_k 下都保有多数名额（对每个合法分母都成立）
+        for denom in ASSOC_SLOT_SHARE_DENOM_MIN..=8 {
+            for k in 1usize..=200 {
+                let cap = assoc_slot_cap(k, quota, denom);
+                assert!(cap <= k, "配额不得超过 top_k（k={k}, denom={denom}）");
+                assert!(
+                    k - cap >= 1,
+                    "主结果至少保留 1 个名额（k={k}, denom={denom}）"
+                );
+                // denom=2（下限）时主结果恰保一半；denom 越大保留越多
+                assert!(
+                    k - cap >= k / denom,
+                    "主结果必须保有多数名额（k={k}, denom={denom}, cap={cap}）"
+                );
+            }
+        }
+
+        // ② 受害区间：k ≤ quota 时不得占满（这正是缺陷所在）
+        for k in [5usize, 8, 10, 20] {
+            let cap = assoc_slot_cap(k, quota, DENOM);
+            assert!(cap < k, "k={k} 时关联不得占满全部名额");
+            assert_eq!(cap, k / DENOM, "k={k} 时应为 top_k/denom");
+        }
+
+        // ③ 小 k：一个名额都不给（关联是补充，主结果优先）
+        assert_eq!(assoc_slot_cap(1, quota, DENOM), 0);
+        assert_eq!(assoc_slot_cap(3, quota, DENOM), 0);
+        assert_eq!(assoc_slot_cap(4, quota, DENOM), 1);
+
+        // ④ 正式评测口径（top_k=100）：与历史实测配置逐位一致 —— 这是"不动文本/Full"的硬保证
+        assert_eq!(assoc_slot_cap(100, quota, DENOM), 20);
+        assert_eq!(assoc_slot_cap(100, 3, DENOM), 3);
+        assert_eq!(assoc_slot_cap(80, quota, DENOM), 20);
+        assert_eq!(assoc_slot_cap(200, quota, DENOM), 20);
+
+        // ⑤ 边界：quota 大于 top_k/denom 时以 top_k/denom 为准
+        assert_eq!(assoc_slot_cap(40, 100, DENOM), 10);
+
+        // ⑥ 分母下限（防误配）：denom=1 会被 `assoc_slot_share_denom` 挡掉，
+        //    此处直接验证"下限取值"下仍不占满
+        assert_eq!(assoc_slot_cap(20, quota, ASSOC_SLOT_SHARE_DENOM_MIN), 10);
+        assert!(assoc_slot_cap(20, quota, ASSOC_SLOT_SHARE_DENOM_MIN) < 20);
+    }
+
+    /// 份额分母解析：未设 / 非法 / 越下限 / 合法 四种分支。
+    ///
+    /// 走**纯函数** `parse_assoc_slot_share_denom`，不修改进程级 env
+    /// （`cargo test` 默认并行，改全局 env 会污染并发用例）。
+    #[test]
+    fn assoc_slot_share_denom_parse_branches() {
+        // 未设置 ⇒ 默认
+        assert_eq!(parse_assoc_slot_share_denom(None), ASSOC_SLOT_SHARE_DENOM);
+
+        // 非法 ⇒ 默认
+        assert_eq!(
+            parse_assoc_slot_share_denom(Some("abc")),
+            ASSOC_SLOT_SHARE_DENOM
+        );
+        assert_eq!(
+            parse_assoc_slot_share_denom(Some("")),
+            ASSOC_SLOT_SHARE_DENOM
+        );
+
+        // 低于下限（1 会复现历史缺陷）⇒ 回落默认，**不得**被采纳
+        assert_eq!(
+            parse_assoc_slot_share_denom(Some("1")),
+            ASSOC_SLOT_SHARE_DENOM
+        );
+        assert_eq!(
+            parse_assoc_slot_share_denom(Some("0")),
+            ASSOC_SLOT_SHARE_DENOM
+        );
+
+        // 合法（含空白与下限本身）⇒ 采纳
+        assert_eq!(parse_assoc_slot_share_denom(Some("8")), 8);
+        assert_eq!(parse_assoc_slot_share_denom(Some(" 6 ")), 6);
+        assert_eq!(
+            parse_assoc_slot_share_denom(Some("2")),
+            ASSOC_SLOT_SHARE_DENOM_MIN
+        );
+    }
+}
+
+#[cfg(test)]
 mod version_tests {
     use crate::v1_api::*;
 

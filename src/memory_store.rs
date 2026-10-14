@@ -2951,7 +2951,36 @@ impl<P: Persistence> MemoryStore<P> {
     /// 合成快照（三阶段锁解耦·Phase 1）：持锁下快速读取全量记忆 + 配置
     ///
     /// 仅做磁盘读取，不执行 CPU 密集的聚类计算，锁持有时间极短。
+    ///
+    /// ## ★ v0.9.13：合成禁用时**不再全量读库 + 全库平方聚类**（AML 写入路径修复）
+    ///
+    /// **实测依据**（受控探针，2026-10-13，直连 LRC、固定库规模只改单次条数）：
+    /// 单次 Add 耗时随 **`本次条数 × 库内条数`** 增长 —— 固定库规模下 10/50/100 条
+    /// ⇒ 每次 2.09 / 14.01 / 22.40 s（**每条摊薄恒定 ≈200ms**）；库越大越慢。
+    ///
+    /// **根因**：本方法（每次调用 `load_all_memories()` **全量读库**）+ 紧随其后的
+    /// `plan_luoshu*` **对全库做 O(n²) 聚类**，而 `/v1/memories/consolidate` **每次 Add 都跑一遍**。
+    /// 而 `--disable-synthesis` 只把 `synthesis_min_cluster` 置为 `usize::MAX`
+    /// （见 `bin/server.rs`），**只阻止摘要写回，并不跳过这段计算** ⇒ 计算全白做却照付代价。
+    ///
+    /// **后果**：6285 条（Full 量级）时单次 Add 数十秒 ⇒ 30s 外层超时先丢弃 future、
+    /// 阻塞线程仍跑完并持锁 ⇒ 后续请求 2s 取锁失败 ⇒ **503 级联**（与 `DEPLOY` 附录 D
+    /// 及本文件既有记载的"一轮占锁 24~66 秒"一致）。
+    ///
+    /// **修复**：合成已禁用时返回**空快照** ⇒ 后续 `plan_luoshu*` 对空列表为 O(1)、
+    /// 产出空计划、`apply_synthesis_plan` 自然成为空操作 ⇒ **行为与"禁用合成"完全一致**，
+    /// 只是不再白算。
     pub fn synthesis_snapshot(&self) -> Result<SynthesisSnapshot, PersistenceError> {
+        if self.synthesis_min_cluster == usize::MAX {
+            return Ok(SynthesisSnapshot {
+                all: Vec::new(),
+                config: SynthesisConfig {
+                    min_cluster: self.synthesis_min_cluster,
+                    similarity: self.synthesis_similarity,
+                },
+                information_gain_threshold: self.dao_regulator.information_gain_threshold,
+            });
+        }
         let all = self.persistence.load_all_memories()?;
         Ok(SynthesisSnapshot {
             all,
