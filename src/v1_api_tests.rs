@@ -114,6 +114,41 @@ mod assoc_slot_cap_tests {
 }
 
 #[cfg(test)]
+mod enrich_timeout_tests {
+    use crate::timeouts::{HTTP_HANDLER_BUDGET, HTTP_OUTER_TIMEOUT, LOCK_WAIT};
+    use crate::v1_api::*;
+
+    /// 2026-10-14 线上事故回归：enrich 的两个上限**必须留在超时阶梯内**。
+    ///
+    /// 越界（曾把锁等待设成 45s、执行上限 55s，均 > `HTTP_OUTER_TIMEOUT`=30s）
+    /// 会让请求等满外层超时后被杀 ⇒ **504**，并把单请求的线程占用从 2s 拉长到 30s
+    /// ⇒ 级联比原来更糟（"拆东墙补西墙"的实例）。
+    #[test]
+    fn enrich_timeouts_stay_inside_the_documented_ladder() {
+        // ① 既有阶梯本身（与 timeouts.rs 文首一致）
+        assert!(LOCK_WAIT < HTTP_HANDLER_BUDGET, "阶梯：LOCK_WAIT 必须更小");
+        assert!(
+            HTTP_HANDLER_BUDGET < HTTP_OUTER_TIMEOUT,
+            "阶梯：handler 预算必须小于外层超时"
+        );
+
+        // ② 默认值直接取自阶梯常量 ⇒ 零行为变更
+        assert_eq!(DEFAULT_ENRICH_LOCK_WAIT, LOCK_WAIT);
+        assert_eq!(DEFAULT_ENRICH_TIMEOUT, HTTP_HANDLER_BUDGET);
+
+        // ③ 取值（未设环境变量）必须严格落在阶梯内
+        assert!(
+            enrich_lock_wait() < enrich_exec_timeout(),
+            "锁等待必须小于执行上限"
+        );
+        assert!(
+            enrich_exec_timeout() < HTTP_OUTER_TIMEOUT,
+            "执行上限必须小于外层超时（否则会返 504）"
+        );
+    }
+}
+
+#[cfg(test)]
 mod version_tests {
     use crate::v1_api::*;
 

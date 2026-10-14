@@ -411,6 +411,60 @@ fn assoc_slot_cap(top_k: usize, quota: usize, share_denom: usize) -> usize {
 
 ⇒ **下一步取决于实现验证**：跑下一轮（或 Full）后，若 `解题成功率` 起变化，则按此决策升级本地 + 推送。
 
+### ★★★ 线上事故：**超时阶梯被越界**（本次由我引入）⇒ 503 变 504；并定位文本 `F1=0` 的根因（2026-10-14）
+
+#### ① 事故链（我自己的错，含机制）
+
+平台在 **11:15–11:59** 每约 2:50 一次检索，**全部失败**；适配层日志逐字为
+`LRC transient error **504**: /v1/memories/enrich`。
+
+**根因**：项目本身有**明文超时阶梯**（[timeouts.rs](file:///g:/code-memory/src/timeouts.rs#L19-L26) 文首 + 编译期断言）：
+
+```text
+LOCK_WAIT(2s) < EXPLORE_INNER(10s) < HTTP_HANDLER_BUDGET(15s) < HTTP_OUTER_TIMEOUT(30s)
+```
+
+而我为"解 503 级联"，把 enrich 的锁等待设成 **45s**、执行上限 **55s** ⇒ **两者都越过 `HTTP_OUTER_TIMEOUT`(30s)**
+⇒ 请求先等 45s，**外层 30s 先把它杀掉 → 504**；且单请求线程占用从 2s 拉长到 30s ⇒ **级联比修前更糟**。
+⇒ 这是"**拆东墙补西墙**"的教科书实例，也印证：**改超时必须先读阶梯，而不是只读症状**。
+
+#### ② 处置（立即回滚到阶梯内）
+
+- 从 `run-lrc.cmd` / `run-lrc-fast.cmd` **删除**我加的两行（值回到内置的 `LOCK_WAIT` / `HTTP_HANDLER_BUDGET`），
+  备份 `.bak-revert-20261014-13xx`；**保留** `LRC_SCOPED_INLINE_SYNTHESIS=1`（见 ④，唯一变量）。
+- 复验：`add OK`、3 次检索 **0.14/0.16/0.13s 全 200**。
+
+#### ③ 代码硬化（**零硬编码**，防再次越界）
+
+`v1_api.rs` 的两个可配上限改为**直接引用既有阶梯常量**，并**夹取到阶梯内**：
+
+```rust
+const DEFAULT_ENRICH_LOCK_WAIT: Duration = crate::timeouts::LOCK_WAIT;              // 2s
+const DEFAULT_ENRICH_TIMEOUT:   Duration = crate::timeouts::HTTP_HANDLER_BUDGET;    // 15s
+const ENRICH_TIMEOUT_MARGIN:    Duration = Duration::from_secs(1);
+// 取值夹取：exec <.= HTTP_OUTER_TIMEOUT - margin；lock <.= exec - margin
+```
+
+- 不再自造 `2_000` / `15` 字面量；默认值 = 阶梯常量 ⇒ **零行为变更**；
+- 新增回归测试 `enrich_timeouts_stay_inside_the_documented_ladder`（断言阶梯本身 + 默认值来源 + 取值严格落于阶梯内），**已过**。
+
+#### ④ 文本 `F1=0 / G4=0` 的根因：那条**预注册改动从未生效**
+
+- 台账 `2026-10-13` 已预注册"下一轮唯一改动 = 打开分区内联合成（打 F1=0/G4=0）"并称已写入 `run-lrc.cmd`；
+- **核对线上：`LRC_SCOPED_INLINE_SYNTHESIS` 根本不在启动项里**（只有 `--disable-synthesis`）⇒ 摘要层不存在 ⇒ `F1=0/G4=0` 是必然结果；
+- 已按预注册执行：ML 实例加 `set LRC_SCOPED_INLINE_SYNTHESIS=1`（仅此一处）。
+  **机制预检通过**：`total 1495 → 1507`（输入 10 条，增量 12）；守卫日志
+  `[LRC·合成·守卫] 阻止八卦类别 N 的合成：信息增量 0.0002 低于阈值 0.0100`（产出率偏低，与台账标注一致）。
+
+#### ⑤ 本轮另做的两次清理与部署
+
+| 项 | 内容 |
+|---|---|
+| 库清理 | `C:\aml-data`(文本,3.03MB) 与 `C:\aml-data-code`(代码,38.21MB) **均已清空**（备份 `*.bak-purge-20261014-124741`）⇒ 给文本冒烟一个干净基线，并移除我预检留下的 12 条 |
+| 事故前判定 | 文本上一轮 `add=134/ok134 search=48/ok48 non2xx=0 route_ml=21 route_fast=0`；两库用户**零重叠**、FAST 库 10 用户全是代码赛道 ⇒ **文本的 57.78 与"送不到/路由错"无关** |
+| 代码赛道 | 上一轮 `search=55/ok15 non2xx=40`（73% 失败，**全部发生在 09:26 修复之前**）⇒ 那一轮的 0 分很大程度是我方级联所致；已建议下轮前清 FAST 库 |
+| 部署（阶梯硬化版） | ML `E0D658BD…` / FAST `DDED26C2…`，备份 `.bak-0.9.13-20261014-133845` |
+
 ### ★★★★ 适配层路由规则修正：**判据从"每条字节数"改为"消息条数"** —— 文本赛道此前被误判到非 ML 实例（2026-10-13）
 
 #### ① 发现的缺陷（线上实测）
