@@ -139,6 +139,51 @@ fn assoc_slot_share_denom() -> usize {
     parse_assoc_slot_share_denom(std::env::var("LRC_ASSOC_SLOT_DENOM").ok().as_deref())
 }
 
+/// enrich 检索的**锁等待上限**默认值 —— **直接沿用既有超时阶梯常量**（不另立字面量）。
+const DEFAULT_ENRICH_LOCK_WAIT: std::time::Duration = crate::timeouts::LOCK_WAIT;
+
+/// enrich 检索的**执行上限**默认值 —— **直接沿用既有超时阶梯常量**。
+const DEFAULT_ENRICH_TIMEOUT: std::time::Duration = crate::timeouts::HTTP_HANDLER_BUDGET;
+
+/// 越界保护余量：确保被覆盖的取值仍**严格小于**外层超时。
+const ENRICH_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// enrich 检索的**执行上限**（环境变量 `LRC_ENRICH_TIMEOUT_SECS` 可覆盖）。
+///
+/// # 不变量（必须保持）
+///
+/// 项目既有超时阶梯（见 `src/timeouts.rs` 文首与其中的编译期断言）：
+///
+/// ```text
+/// LOCK_WAIT < EXPLORE_INNER_BUDGET < HTTP_HANDLER_BUDGET < HTTP_OUTER_TIMEOUT
+/// ```
+///
+/// 本函数把可配值**夹取到 `HTTP_OUTER_TIMEOUT - 余量`**。
+/// 越界后果已线上实测（2026-10-14，台账 ⑬）：把"快速失败 503"变成
+/// "等满外层超时被杀掉的 **504**"，并为每次请求多占用一个线程 30 秒 ⇒ 级联更糟。
+fn enrich_exec_timeout() -> std::time::Duration {
+    let d = std::env::var("LRC_ENRICH_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_ENRICH_TIMEOUT);
+    d.min(crate::timeouts::HTTP_OUTER_TIMEOUT.saturating_sub(ENRICH_TIMEOUT_MARGIN))
+}
+
+/// enrich 检索的**锁等待上限**（环境变量 `LRC_ENRICH_LOCK_WAIT_MS` 可覆盖）。
+///
+/// 阶梯要求 `LOCK_WAIT < HTTP_HANDLER_BUDGET`，故本函数夹取到
+/// **严格小于执行上限**；默认即 `LOCK_WAIT`（零行为变更）。
+fn enrich_lock_wait() -> std::time::Duration {
+    let d = std::env::var("LRC_ENRICH_LOCK_WAIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_ENRICH_LOCK_WAIT);
+    d.min(enrich_exec_timeout().saturating_sub(ENRICH_TIMEOUT_MARGIN))
+}
+
 /// enrich 出口：**关联条目允许占用的槽位数**。
 ///
 /// # ★ 必须与 `top_k` 挂钩（2026-10-14 线上根因修复）
@@ -2399,17 +2444,21 @@ pub fn build_v1_router_with_trust(
                     let privacy_ctx_for_expand = privacy_ctx.clone();
 
                     // Phase 1+2：锁获取与 CPU 密集检索统一放入 spawn_blocking（阻塞上下文）。
-                    // 锁获取采用"有界 try_lock 轮询"（2 秒截止）——若锁被长期占用，
+                    // 锁获取采用"有界 try_lock 轮询"——若锁被长期占用，
                     // 阻塞线程自行放弃并返回 search_busy，不会无限阻塞线程池。
-                    // 外部 15s timeout 对"检索执行"阶段兜底（请求等待超时）。
+                    // 外部 timeout 对"检索执行"阶段兜底（请求等待超时）。
+                    // ★ 两个上限均可配（默认与改造前一致）：`LRC_ENRICH_LOCK_WAIT_MS` /
+                    //   `LRC_ENRICH_TIMEOUT_SECS`。Full 量级下单次检索达 7~10s ⇒
+                    //   必须把锁等待上限抬到 ≥ 最坏耗时，否则 503 级联（台账 ⑬）。
+                    let enrich_lock_wait = enrich_lock_wait();
                     let cancellation = Arc::new(AtomicBool::new(false));
                     let cancellation_for_task = cancellation.clone();
                     let result = tokio::time::timeout(
-                        std::time::Duration::from_secs(15),
+                        enrich_exec_timeout(),
                         tokio::task::spawn_blocking(move || -> Result<EnrichBlockingResult, &'static str> {
                             let _cancellation_guard = CancellationFlag(cancellation_for_task.clone());
-                            // 有界锁获取：轮询 try_lock，2 秒未获得则放弃
-                            let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                            // 有界锁获取：轮询 try_lock，超时未获得则放弃
+                            let lock_deadline = std::time::Instant::now() + enrich_lock_wait;
                             let mut store = loop {
                                 match store.try_lock() {
                                     Ok(guard) => break guard,
@@ -2420,7 +2469,10 @@ pub fn build_v1_router_with_trust(
                                         std::thread::sleep(std::time::Duration::from_millis(10));
                                     }
                                     Err(_) => {
-                                        eprintln!("[v1/enrich] 锁获取超时（2s），返回 search_busy");
+                                        eprintln!(
+                                            "[v1/enrich] 锁获取超时（{}ms），返回 search_busy",
+                                            enrich_lock_wait.as_millis()
+                                        );
                                         return Err("search_busy");
                                     }
                                 }
