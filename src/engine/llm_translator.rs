@@ -553,6 +553,18 @@ pub async fn translate_memory_query(config: &LlmApiConfig, query: &str) -> Vec<S
 /// 故本函数不会无限等待；任何失败都回退原查询，**绝不阻断检索**。
 /// 调用方须在**取存储锁之前**调用（网络等待不得发生在持锁期）。
 pub async fn enrich_query_for_retrieval(config: &LlmApiConfig, query: &str) -> String {
+    // ★ `LRC_LLM_TRANSLATE=0` ⇒ **只关"检索侧查询翻译"，保留合成的 LLM 能力**。
+    //
+    //   动机（2026-10-21 线上实测）：一旦配置 `LRC_LLM_API`，REST `enrich` 与 MCP
+    //   两条入口都会先做一次查询翻译（`translate_memory_query`，客户端 5s 超时）。
+    //   16 并发 Search 实测 **中位 1.15s → 14.0s、最坏 28.3s**（每条 1.2~1.5s，
+    //   上游串行返回）—— 而 AML 申报的 Search 并发正是 16，这个延迟有撞平台
+    //   超时的风险。而**结晶（合成）走的是另一条链路，不受本开关影响**。
+    //
+    //   默认**开**：不设该环境变量时行为与改造前逐字一致。
+    if !llm_translate_enabled() {
+        return query.to_string();
+    }
     if !config.is_configured() {
         return query.to_string();
     }
@@ -562,6 +574,46 @@ pub async fn enrich_query_for_retrieval(config: &LlmApiConfig, query: &str) -> S
         query.to_string()
     } else {
         format!("{} {}", translated, query)
+    }
+}
+
+/// 查询翻译开关的**纯函数**部分（不读环境变量，便于确定性的单测）。
+fn llm_translate_enabled_from(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(v) => {
+            let s = v.trim().to_ascii_lowercase();
+            !(s == "0" || s == "false" || s == "off" || s == "no")
+        }
+    }
+}
+
+/// 是否启用"检索侧 LLM 查询翻译"（`LRC_LLM_TRANSLATE=0/false/off/no` 关闭）。
+fn llm_translate_enabled() -> bool {
+    llm_translate_enabled_from(std::env::var("LRC_LLM_TRANSLATE").ok().as_deref())
+}
+
+#[cfg(test)]
+mod translate_gate_tests {
+    use super::llm_translate_enabled_from;
+
+    #[test]
+    fn unset_means_enabled() {
+        assert!(llm_translate_enabled_from(None));
+    }
+
+    #[test]
+    fn explicit_off_values_disable() {
+        for v in ["0", "false", "FALSE", " off ", "no"] {
+            assert!(!llm_translate_enabled_from(Some(v)), "value={v:?}");
+        }
+    }
+
+    #[test]
+    fn other_values_keep_enabled() {
+        for v in ["1", "true", "on", "yes", ""] {
+            assert!(llm_translate_enabled_from(Some(v)), "value={v:?}");
+        }
     }
 }
 
