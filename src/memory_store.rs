@@ -6135,9 +6135,14 @@ impl<P: Persistence> MemoryStore<P> {
         // 一次性统计 hub 实体（按**项目内**占比判定；见 `hub_entity_set` 与
         // `HUB_ENTITY_DF_RATIO` 的文档：全库分母会被其他项目稀释而漏判）
         let hub_set = self.hub_entity_set(&all);
+        // id → 记忆 的一次性索引（`associations_in` 内三处 id 查找原为 O(N)
+        // 线性扫描，其中两处在循环体内 ⇒ 逐候选 × 库规模。详见其文档。）
+        let by_id: std::collections::HashMap<&str, &Memory> =
+            all.iter().map(|m| (m.id.as_str(), m)).collect();
 
         Ok(Self::associations_in(
             &all,
+            &by_id,
             memory_id,
             &hub_set,
             &Self::auto_event_map(&all),
@@ -6337,14 +6342,39 @@ impl<P: Persistence> MemoryStore<P> {
     /// **为什么 `artifact_tabs` 也必须由调用方传入**（v0.9.8 同款理由）：
     /// artifact 的占比表与倒排表都是**全库统计量**（需遍历全库抽取 + 按项目聚合），
     /// 同理不能放进"每起点一次"的循环。
+    ///
+    /// # 为什么要传 `by_id`（2026-10-14）
+    ///
+    /// 本函数内部有**三处"按 id 取记忆"**，原写作 `all.iter().find(...)`
+    /// ⇒ O(N) 线性扫描，其中两处**位于循环体内**，单次调用退化为
+    /// `O(候选数 × 库规模)`：
+    ///
+    /// | 位置 | 原写法 | 复杂度 |
+    /// |---|---|---|
+    /// | 锚点 | `all.iter().find(m.id == memory_id)` | O(N) |
+    /// | ④ 自动事件 peer | `all.iter().find(...)`（**逐 peer**） | **O(peers × N)** |
+    /// | ⑥ 产物成员 | `all.iter().find(...)`（**逐成员**） | **O(members × N)** |
+    ///
+    /// 改为查表后三处均为 **O(1)**，且**结果逐字节一致**（id 唯一 ⇒ "首个匹配"
+    /// 与"表命中"必然同一条）。`by_id` 由调用方**一次性**构建，不在本函数内重建
+    /// （否则每次调用都要重建一次全库哈希表）。
+    ///
+    /// ⚠️ **如实留档（避免后人误判优先级）**：在 6,000 条预演库上，
+    /// 本次改动**没有**带来可测的收益——逐种子耗时改动前后均为 `0.131~0.143s`。
+    /// 也就是说，此处虽然**复杂度确实更差**，但在该数据规模下**不是**瓶颈
+    /// （真实库中 `auto_events` 的 peers 与其产物成员数都不大）。
+    /// 同一轮实测定位到的真正大头在**调用方**：`:expand_associations` 的分组排序
+    /// 在**比较器内重算** `content_words`（见该处注释，单一改动即 9×）。
+    /// 本改动**保留**是因为它是严格的复杂度改进，且在候选数增长时才会显形。
     fn associations_in(
         all: &[Memory],
+        by_id: &std::collections::HashMap<&str, &Memory>,
         memory_id: &str,
         hub_set: &std::collections::HashMap<(String, EntityKind), (usize, usize)>,
         auto_events: &std::collections::HashMap<String, Vec<(String, i64, String)>>,
         artifact_tabs: &ArtifactTables,
     ) -> Vec<MemoryAssociation> {
-        let Some(anchor) = all.iter().find(|m| m.id == memory_id) else {
+        let Some(anchor) = by_id.get(memory_id).copied() else {
             return Vec::new();
         };
 
@@ -6463,7 +6493,7 @@ impl<P: Persistence> MemoryStore<P> {
                 {
                     continue;
                 }
-                let Some(peer) = all.iter().find(|m| &m.id == peer_id) else {
+                let Some(peer) = by_id.get(peer_id.as_str()).copied() else {
                     continue;
                 };
                 // 时间间隔写进 why：这是用户**唯一能自行复核**的客观量
@@ -6574,7 +6604,7 @@ impl<P: Persistence> MemoryStore<P> {
                 if other == &anchor.id {
                     continue;
                 }
-                let Some(peer) = all.iter().find(|m| &m.id == other) else {
+                let Some(peer) = by_id.get(other.as_str()).copied() else {
                     continue;
                 };
                 // 去重：同一目标若已由更强的"人工实体"关联（②），不再重复加入
@@ -6875,6 +6905,9 @@ impl<P: Persistence> MemoryStore<P> {
         //  且是符号层边"，比并入段实际的门槛**宽**，会造成"预留了席位却
         //  并入 0 条"⇒ 净损失 1 条记录层联想。现移到判据可复用的位置。）
 
+        // ★ 分段计时（默认关闭，`LRC_TIMING=1` 时开启）：把"一次性建表"与
+        //   "逐种子关联"分开，用于定位本函数在 Full 量级下的成本归属。
+        let __a_t0 = std::time::Instant::now();
         // hub 实体一次性统计（与详情页关联同口径，见 `hub_entity_set`）
         let hub_set = self.hub_entity_set(&all);
         // 自动事件表一次性统计（同口径）：**必须提到循环外**，
@@ -6883,9 +6916,10 @@ impl<P: Persistence> MemoryStore<P> {
         // artifact 两张表一次性统计（同口径，v0.9.8）：同上，
         // 建表需遍历全库做形态抽取 + 按项目聚合，逐起点重建是 O(N × k)
         let artifact_tabs = ArtifactTables::build(&all);
-        // 起点记忆索引（用于填 via_* 溯源字段）
+        // 起点记忆索引（用于填 via_* 溯源字段，同时供 `associations_in` 做 O(1) id 查找）
         let by_id: std::collections::HashMap<&str, &Memory> =
             all.iter().map(|m| (m.id.as_str(), m)).collect();
+        let __a_tables = __a_t0.elapsed();
 
         // ★ 可见性判定：与检索路径**同一套规则**（复用谓词，非另写一份）
         // 顺序与 RecallFilter 字段一一对应，便于核对是否漏项。
@@ -6998,12 +7032,26 @@ impl<P: Persistence> MemoryStore<P> {
         // 每起点取 K 条时，联想总量保留 K=1→43% / K=2→68% / **K=3→81%**。
         // 本实现用"轮转"而非固定 K：等价于 K = max_out/通道数（动态），
         // 因此**不需要新阈值**——配额天然按通道数均分。
+        let __a_s0 = std::time::Instant::now();
+        // 逐种子阶段再拆两段：①`associations_in` 的候选生成；②分组+意外性排序。
+        // （累加器用 `Cell`：闭包以 `&` 捕获，不需要 `&mut`。）
+        let __acc_assoc = std::cell::Cell::new(0.0f64);
+        let __acc_sort = std::cell::Cell::new(0.0f64);
         let per_seed: Vec<(String, String, Vec<Vec<MemoryAssociation>>)> = seed_ids
             .iter()
             .filter_map(|seed| {
                 let seed_mem = by_id.get(seed.as_str())?;
-                let assocs =
-                    Self::associations_in(&all, seed, &hub_set, &auto_events, &artifact_tabs);
+                let __s1 = std::time::Instant::now();
+                let assocs = Self::associations_in(
+                    &all,
+                    &by_id,
+                    seed,
+                    &hub_set,
+                    &auto_events,
+                    &artifact_tabs,
+                );
+                __acc_assoc.set(__acc_assoc.get() + __s1.elapsed().as_secs_f64());
+                let __s2 = std::time::Instant::now();
                 // 按关系类型分组成通道
                 let seed_words = content_words(&seed_mem.content);
                 let mut by_rel: Vec<(u8, String, Vec<MemoryAssociation>)> = Vec::new();
@@ -7017,16 +7065,28 @@ impl<P: Persistence> MemoryStore<P> {
                 // 组内按"意外性"降序（代理相似度越低 ⇒ 越意外 ⇒ 越靠前）。
                 // 用 `total_cmp` 保证全序（`partial_cmp` 对 NaN 会退化为 Equal，
                 // 使排序结果依赖输入顺序 ⇒ 不可复现）。
+                //
+                // ★★ 装饰—排序—还原（2026-10-14 Full 量级预演实测）★★
+                // 原实现在**比较器内**重算两条 `content_words`（CJK bigram 全量
+                // 分词 + `to_lowercase` + 多个 HashSet 构建）⇒ 单通道代价 =
+                // **O(n log n) 次昂贵重算**。自动事件通道在真实数据里可达**数百**
+                // 候选（同项目同小时窗口），实测成为关联段的唯一大头：
+                // 6,000 条库、16 种子下 **0.131s/种子**（合计 2.1s）。
+                // 改为先算好键再排序 ⇒ O(n) 次重算 + O(n log n) 次数值比较。
+                // **排序结果逐位一致**（`sort_by` 稳定，键相同则相对次序不变）。
                 for (_, _, v) in by_rel.iter_mut() {
-                    v.sort_by(|x, y| {
-                        let wx = content_words(&x.content_preview);
-                        let wy = content_words(&y.content_preview);
-                        let sx = word_jaccard(&seed_words, &wx);
-                        let sy = word_jaccard(&seed_words, &wy);
-                        sx.total_cmp(&sy)
-                    });
+                    let mut keyed: Vec<(f32, MemoryAssociation)> = std::mem::take(v)
+                        .into_iter()
+                        .map(|a| {
+                            let s = word_jaccard(&seed_words, &content_words(&a.content_preview));
+                            (s, a)
+                        })
+                        .collect();
+                    keyed.sort_by(|x, y| x.0.total_cmp(&y.0));
+                    *v = keyed.into_iter().map(|(_, a)| a).collect();
                 }
                 by_rel.sort_by(|x, y| x.0.cmp(&y.0).then_with(|| x.1.cmp(&y.1)));
+                __acc_sort.set(__acc_sort.get() + __s2.elapsed().as_secs_f64());
                 Some((
                     seed.clone(),
                     seed_mem.content.chars().take(60).collect::<String>(),
@@ -7034,6 +7094,26 @@ impl<P: Persistence> MemoryStore<P> {
                 ))
             })
             .collect();
+        // ★ 分段计时输出（仅 `LRC_TIMING=1`）：把"一次性建表"与"逐种子关联"分开，
+        //   直接回答"关联段的成本落在建表还是落在逐种子"。
+        if std::env::var("LRC_TIMING")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            let __a_seeds = __a_s0.elapsed();
+            let n = per_seed.len().max(1);
+            eprintln!(
+                "[LRC·计时] expand_associations 候选种子={} 库={} 建表={:.3}s 逐种子={:.3}s（其中候选生成={:.3}s 分组排序={:.3}s；均 {:.4}s/种子） 合计={:.3}s",
+                per_seed.len(),
+                all.len(),
+                __a_tables.as_secs_f64(),
+                __a_seeds.as_secs_f64(),
+                __acc_assoc.get(),
+                __acc_sort.get(),
+                __a_seeds.as_secs_f64() / n as f64,
+                (__a_tables + __a_seeds).as_secs_f64()
+            );
+        }
 
         // 最大轮数 = 任一通道的最长长度（通道长度参差，短的跳过即可）
         let max_rounds = per_seed
@@ -7144,16 +7224,27 @@ impl<P: Persistence> MemoryStore<P> {
                     continue;
                 };
                 // 从中间节点再走一步（复用同一套记录层规则，不重写）
-                let step2 =
-                    Self::associations_in(&all, mid_id, &hub_set, &auto_events, &artifact_tabs);
+                let step2 = Self::associations_in(
+                    &all,
+                    &by_id,
+                    mid_id,
+                    &hub_set,
+                    &auto_events,
+                    &artifact_tabs,
+                );
                 // 组内按「意外性优先」排序（与 1 跳同口径：BGE 给不出的先给）
+                // ★ 同 1 跳：改为"先算键再排序"，避免在比较器内重算 `content_words`
                 let mid_words = content_words(&mid_mem.content);
-                let mut step2_sorted = step2;
-                step2_sorted.sort_by(|x, y| {
-                    let sx = word_jaccard(&mid_words, &content_words(&x.content_preview));
-                    let sy = word_jaccard(&mid_words, &content_words(&y.content_preview));
-                    sx.total_cmp(&sy)
-                });
+                let mut keyed2: Vec<(f32, MemoryAssociation)> = step2
+                    .into_iter()
+                    .map(|a| {
+                        let s = word_jaccard(&mid_words, &content_words(&a.content_preview));
+                        (s, a)
+                    })
+                    .collect();
+                keyed2.sort_by(|x, y| x.0.total_cmp(&y.0));
+                let step2_sorted: Vec<MemoryAssociation> =
+                    keyed2.into_iter().map(|(_, a)| a).collect();
                 for b in step2_sorted {
                     if out.len() >= max_out {
                         break 'outer;
@@ -7547,8 +7638,14 @@ impl<P: Persistence> MemoryStore<P> {
         let auto_events = Self::auto_event_map(&all);
         // artifact 两张表：全图构建期间只算一次（同 hub / auto_events 的理由）
         let artifact_tabs = ArtifactTables::build(&all);
-        let anchor_edges =
-            Self::associations_in(&all, memory_id, &hub_set, &auto_events, &artifact_tabs);
+        let anchor_edges = Self::associations_in(
+            &all,
+            &by_id,
+            memory_id,
+            &hub_set,
+            &auto_events,
+            &artifact_tabs,
+        );
 
         let mut edges: Vec<GraphEdge> = Vec::new();
         let mut node_ids: Vec<String> = vec![memory_id.to_string()];
@@ -7613,7 +7710,7 @@ impl<P: Persistence> MemoryStore<P> {
                 break;
             }
             let mid_edges =
-                Self::associations_in(&all, mid, &hub_set, &auto_events, &artifact_tabs);
+                Self::associations_in(&all, &by_id, mid, &hub_set, &auto_events, &artifact_tabs);
             for a2 in mid_edges {
                 if a2.memory_id == memory_id || a2.memory_id == *mid {
                     continue; // 回到根 or 自环：无信息量

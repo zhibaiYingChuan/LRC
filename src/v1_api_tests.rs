@@ -149,6 +149,59 @@ mod enrich_timeout_tests {
 }
 
 #[cfg(test)]
+mod assoc_seed_max_tests {
+    use crate::v1_api::*;
+
+    /// 2026-10-14 Full 量级（6k 库）根因回归：关联展开的**种子数必须封顶**。
+    ///
+    /// 历史缺陷：种子取**全部结果 id**（= `top_k`），而 `expand_associations`
+    /// 每个种子都要扫一遍全库 ⇒ 单次检索成本 `O(top_k × 库规模)`：
+    /// 6k 库实测 `top_k=100` ⇒ 16.0s（撞满 15s handler 预算 ⇒ 503 级联）。
+    ///
+    /// 不变量：**种子上限不得随 `top_k` 增长**，且必须远小于正式评测口径的 `top_k=100`。
+    #[test]
+    fn assoc_seed_max_is_bounded_and_independent_of_top_k() {
+        // ① 生产默认值：有界、且明显小于正式评测口径 top_k=100。
+        //    这是**编译期**不变量 ⇒ 用 const 断言（clippy::assertions_on_constants
+        //    要求常量断言写进 const block；且编译期失败比测试期失败更早）。
+        const _: () = assert!(
+            ASSOC_SEED_MAX_DEFAULT >= 1,
+            "种子上限至少为 1（否则关联通道形同关闭）"
+        );
+        const _: () = assert!(
+            ASSOC_SEED_MAX_DEFAULT < 100,
+            "种子上限必须远小于正式评测 top_k=100（否则成本重新变成 O(top_k × 库规模)）"
+        );
+
+        // ② 本值是无参函数 ⇒ 结构上不可能依赖 top_k（回归的硬保证）
+        assert_eq!(assoc_seed_max(), ASSOC_SEED_MAX_DEFAULT);
+    }
+
+    /// 种子上限解析：未设 / 空 / 非法 / 0 / 合法 五种分支。
+    ///
+    /// 走**纯函数** `parse_assoc_seed_max`，不修改进程级 env
+    /// （`cargo test` 默认并行，改全局 env 会污染并发用例）。
+    #[test]
+    fn assoc_seed_max_parse_branches() {
+        // 未设置 ⇒ 默认
+        assert_eq!(parse_assoc_seed_max(None), ASSOC_SEED_MAX_DEFAULT);
+
+        // 非法 / 空 ⇒ 默认
+        assert_eq!(parse_assoc_seed_max(Some("abc")), ASSOC_SEED_MAX_DEFAULT);
+        assert_eq!(parse_assoc_seed_max(Some("")), ASSOC_SEED_MAX_DEFAULT);
+        assert_eq!(parse_assoc_seed_max(Some("  ")), ASSOC_SEED_MAX_DEFAULT);
+
+        // 0 会关闭关联种子（等价于禁用关联通道）⇒ 回落默认，**不得**被采纳
+        assert_eq!(parse_assoc_seed_max(Some("0")), ASSOC_SEED_MAX_DEFAULT);
+
+        // 合法（含空白）⇒ 采纳
+        assert_eq!(parse_assoc_seed_max(Some("1")), 1);
+        assert_eq!(parse_assoc_seed_max(Some("8")), 8);
+        assert_eq!(parse_assoc_seed_max(Some(" 32 ")), 32);
+    }
+}
+
+#[cfg(test)]
 mod version_tests {
     use crate::v1_api::*;
 

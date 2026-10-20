@@ -11,6 +11,816 @@
 
 ### 0.9.13 同版本补充 · 2026-10-14
 
+### ★★★ 部署一致性审查 + 三项修复：仓库漂移、FAST 二进制过期、构建配方缺失（2026-10-15 下午）
+
+> 起因：用户要求"服务器部署的代码全面代码审查"。审查按"硬事实优先"推进
+> （哈希 / 真实命令行 / 生效配置），而不是先读代码。
+
+#### ① 部署一致性：**8 个部署物中 6 个与仓库不一致**
+
+| 文件 | 服务器 | 仓库 | 结论 |
+|---|---|---|---|
+| `adapter/app.py` | `3178FCF3A4C7FE7F` | 同 | ✅ 已一致 |
+| `adapter/lrc_client.py` | `F929269C7DE54449` | `A689075CD61D1B1D` | ❌ 服务器更新（`assert` → 显式 `raise`） |
+| `adapter/mapping.py` | `738507846CD7910C` | `9D3E72BE6C8DDBE2` | ❌ 服务器更新（把"AML 契约要求"改正为"**我方决策**"） |
+| `live/run-lrc.cmd` | `69D2D1EE430593E8` | `2EFAEC81A1441802` | ❌ 服务器多 4 行 AML 开关 |
+| `deploy/smoke-follower.ps1` | `69BB98F31327F746` | `4F961130F4EE6CE2` | ❌ 服务器含 BOM 修复 |
+| `live/run-lrc-fast.cmd` | `ECF3A24823EB6B9F` | **无** | ❌ 仓库缺失 |
+| `deploy/watchdog-keepalive.ps1` | `D20C1F9C2F405100` | **无** | ❌ 仓库缺失 |
+| `deploy/watchdog-loop.ps1` | `0686B186796F7CCA` | 同 | ✅ |
+
+- **处置**：方向判断为**服务器 → 仓库**（逐项 diff 确认服务器版都带修复/更正），
+  已全部拉取并验证 8/8 哈希一致；覆盖前的仓库版本另存为 `*.repo.bak`。
+- **风险等级**：高。此前若按仓库重新部署，会**回退掉服务器上的修复与诚实注释**。
+- **遗留**：两份配置模板仍是旧的 —— `deploy/config.server.json` 的
+  `strip_content_prefix_in_search=true`（与代码注释的设计结论相反），且模板**缺
+  `lrc_max_concurrency` 等键** ⇒ 按模板重部署会把并发闸门从 1 退回 4。**已修，见 ⑤**。
+
+#### ② 代码赛道二进制**落后一整天**（已重编并部署）
+
+- 现象：`code-memory-server-fast.exe` 停在 `10-14 13:37`（`DDED26C2A914C170`，8.74MB），
+  **不含**当日三项修复：`ASSOC_SEED_MAX=16` 种子封顶、`LOCK_WAIT` 6s、`opt-level=3`
+  ⇒ 代码赛道仍在跑"O(top_k×库规模) 检索 + 2s 取锁 + 并发大面积 503"的旧代码。
+- **处置**：重编为 `429039DED96951EB`（12,442,624B，v0.9.13），已部署并验证：
+  `/add` 200（32 条路由至 FAST，库 0→32）、`/search` 200 返回 10 条、邻居
+  `ml/fast/adapter/public` 全 200。探针数据与适配层状态**已按耦合规则一并归档清零**，
+  恢复"Full 前干净状态"（`ml_total=0`、`fast_total=0`）。
+- 回滚点：`C:\aml\bin\code-memory-server-fast.exe.pre-o3-20261015-130058`（sha `DDED26C2A914C170`）。
+
+#### ③ **构建配方此前从未被记录**（本次补记，命令如下）
+
+两个变体用**各自** `target` 目录（feature 集不同，共用会互相覆盖并反复整体重编）：
+
+```powershell
+$env:CARGO_PROFILE_RELEASE_OPT_LEVEL = '3'     # 关键：见下方"为什么不改 Cargo.toml"
+# 代码赛道（无 ML）
+cargo build --release --features server     --bin code-memory-server --target-dir target\aml-fast
+# 文本赛道（含语义编码器）
+cargo build --release --features server,ml  --bin code-memory-server --target-dir target\aml-ml
+```
+
+- **为什么不直接改 `Cargo.toml` 的 `[profile.release] opt-level`**：那里是 `"z"`，
+  是**产品发布**（GitHub Release 下载包）的体积取舍；比赛链路以**速度**优先
+  （实测 o3 比 z 快 1.14~1.27×，25 条长文本由 30.03s 504 变为 27.03s 200）。
+  用 `CARGO_PROFILE_RELEASE_OPT_LEVEL` 覆盖可**同时保住产品发布行为**。
+- **体积佐证覆盖生效**：o3 产物比 z 大约 42%（ML 18.18MB vs 旧值；FAST 12.44MB vs 8.74MB）。
+- 注：本次为可复现性补记，脚本文件未入库（用户已清理），命令以本节为准。
+
+#### ④ 审查发现的问题与处置（**A1/A2 已修复并部署**，A3/A4 与 C 类待修）
+
+- **A1（高·已修）配置缺失静默回落**：`app.py` 的 `main()` 曾用
+  `load_config(args.config if Path(args.config).exists() else None)` 把"文件不存在"折成
+  `None`，**绕过** `load_config` 的退出保护 ⇒ 无告警用 `DEFAULT_CONFIG` 起服务。
+  - **修复**：配置缺失 ⇒ **硬失败并退出**（附工作目录）；新增 `--allow-no-config` 供本地调试
+    显式声明意图；**新增启动自证日志**打印"并发闸门 / 双实例 / strip_prefix / date_only /
+    field_order / include_associated / health_requires_lrc"，且 `auth_token` 为空时打 **ERROR**。
+  - **验证**：`--config <不存在>` ⇒ 退出码 1 + 中文原因；`--allow-no-config` ⇒ 告警后启动，
+    自证行当场显示"并发闸门=4 双实例=False"并报 `auth_token 为空`（三个静默失效变可见）。
+  - **连带修正**：`tests/test_field_order_e2e.py` 原**依赖该缺陷**（不带 config.json 启动，
+    靠环境变量注入）⇒ 已显式加 `--allow-no-config`，把"偶然可用"变成"显式声明"。
+  - 部署 sha `64FC0284B1CDF7FD`；回滚 `adapter/app.py.pre-configfail-20261015-131223`。
+
+- **A2（高·已修）写路径把 500/504 当可安全重试 ⇒ 重复写入**：`TRANSIENT_STATUS` 含
+  500/502/504/524，而 504 时 LRC 的 `spawn_blocking` **杀不掉、会跑完并可能已落盘**
+  （台账实测"两种都出现过"）⇒ 重投同一批记忆即**重复写入**。
+  - **修复**：状态码拆为 `RETRY_SAFE_REJECTED={408,425,429,503}`（明确未执行，读写皆可重试）
+    与 `RETRY_MAYBE_EXECUTED={500,502,504,524}`（**仅只读路径**可重试）。`_post` 增 `write`
+    开关，`consolidate()` 传 `write=True`。
+  - **测试抓出的关键修正**：仅"不内部重投"会让这些码掉进 `>=400` 分支 ⇒ `transient=False`
+    ⇒ 适配层回 502（永久）⇒ 平台放弃重试 ⇒ **数据静默丢失**。正确行为是**不内部重投、但仍
+    以 `transient=True` 上报**（重试决策交给带 `request_id` 幂等的平台）。丢数据比重复写入更糟。
+  - **验证**：新增 3 个回归测试（写路径 4 个"可能已执行"码各只发 1 次请求且仍 transien；
+    写路径 503 仍重试；只读路径 504 仍重试）⇒ **58 passed + 4 subtests**。
+  - 部署 sha `0DB844FBAE8A5FC0`；回滚 `adapter/lrc_client.py.pre-retryfix-20261015-130739`。
+
+- **A3/A4（中·已修）幂等窗口**：`seen()` 与 `add()` 之间无锁（同 `request_id` 并发可双写）；
+  `done >= len ⇒ 归零` 且"清进度"早于"标记已见"（崩溃窗口内全量重写）。处置见 **⑤**。
+- **C 类"声明不生效"（已修）**：`route_default` 读了不用、`add_fast_avg_msg_bytes` 从不读取
+  （**已确认是有意保留的兼容键**，注释写明"已废弃，留键名以免旧配置报错"⇒ 不需修）、
+  `JSON_AS_ASCII` 写法与 Flask 版本强相关（见 **⑥**）、`date_only` 用了未声明、
+  `use_options_in_query` **开关不可达**（见 **⑤**）。
+- **配置模板漂移（已修）**：`deploy/config.server.json` 的
+  `strip_content_prefix_in_search=true`（与代码注释的设计结论相反）且模板**缺
+  `lrc_max_concurrency` 等键** ⇒ 按模板重部署会把并发闸门从 1 退回 4。处置见 **⑤**。
+- **已排除的两条**（用审计数据判定，非线上问题）：`strip_content_prefix_in_search`
+  线上实为 `false`、`lrc_max_concurrency` 线上实为 `1` —— 两者**只是模板隐患**。
+
+#### ⑤ A3/A4 幂等加固 + C 类死配置 + 配置模板对齐（**已部署并验证**；期间发生一次
+由我引入的线上停机，见文末"事故"）
+
+- **A3（中·已修）幂等窗口**：`seen()` 查询与 `add()` 标记之间**无锁** ⇒ 平台重投同一
+  `request_id` 时可**双写**。改为 `SeenRequestIds` **三态原子认领**：
+  `claim()` 返回 `done`（已写过，直接 200）/ `claimed`（本次认领，继续）/ `busy`
+  （同 id 正在处理中，回 503 让平台稍后重投）；写入失败时 `release()` 放弃认领，
+  使重投可重新进入。
+- **A4（中·已修）进度语义错**：原 `done >= len ⇒ 归零重传` 且"清进度"早于"标记已见"
+  ⇒ 崩溃窗口内会**全量重写**。改为：`done == len` 视为**幂等完成**（回 200）；
+  `done` 越界才归零；子批成功后**不再清进度**；末尾顺序改为**先 `seen.add` 再
+  `progress.clear`**；失败路径 `release()`。
+- **C 类"声明不生效"（已修）**：
+  - `route_default` **读了但从未被使用**（回落值被硬编码 `"ml"`）⇒ `/add` 与 `/search`
+    两处回落均改为 `route_default if dual else "ml"`，并在路由表缺失时打 WARNING。
+  - `JSON_AS_ASCII` 写法与 Flask 版本强相关 ⇒ 见文末事故（最终改为**能力探测**）。
+  - `date_only` 被读取却未在 `DEFAULT_CONFIG` 声明 ⇒ 已补声明（不手改 config.json 也生效）。
+  - `use_options_in_query` **开关不可达（已修）**：台账 §㉛ 记录该杠杆"已实现、默认关、未部署"
+    （配置键 + 环境变量 + `/search` 透传），但**当前 app.py 里这四处全都不在了** ——
+    只剩 `mapping.build_options_query` / `to_enrich_payload(use_options=...)` 与 6 条测试。
+    ⇒ 典型 **"测试全绿、功能是死的"**：`/search` 调用 `to_enrich_payload(req, lrc_mode=...)`
+    走默认 `use_options=False`，而 HTTP 链路**读不到任何能打开它的配置键**（两侧均已核实不存在）。
+    **处置 = 恢复透传、不改变线上行为**：补 `DEFAULT_CONFIG["use_options_in_query"]=False`
+    + 环境变量 `AML_ADAPTER_USE_OPTIONS_IN_QUERY` + `/search` 透传 + 纳入启动自证；
+    **默认仍为 `False` ⇒ 评测链路逐字节不变**。合规裁定权仍在用户（见 §㉛ 的灰区说明）。
+  - **新增"四向一致性"测试**（`test_every_switch_key_reaches_a_transmission_point`）：
+    对 6 个开关键（`use_options_in_query` / `strip_content_prefix_in_search` / `date_only` /
+    `field_order` / `include_associated` / `lrc_mode`）断言**声明 → 读取 → 透传**三段齐全。
+    只断言"声明了、读取了"抓不住本次这个缺陷 —— **值读到了却不往下传，一样是死的**。
+- **配置模板漂移（已修）**：`deploy/config.server.json` 补 9 个缺失键（`lrc_max_concurrency=1`、
+  `lrc_base_url_fast`、4 个拆批判据、2 个赛道判定、4 个状态路径），并把
+  `strip_content_prefix_in_search` 由 `true` 改回 `false`（与代码设计结论一致）。
+  此前**按模板重部署 = 并发闸门 1→4 + 双实例整体关闭**，属"重部署即倒退"。
+  另补 `use_options_in_query: false`（附§㉛ 实测数据与灰区说明，防止后人误开）。
+- **新增回归测试**（把上述不变量固化，共 **70 passed + 4 subtests**）：
+  - `tests/test_add_subbatch.py`：A3 三态认领、`release` 允许重投、进度已满视为完成。
+  - `tests/test_config_declarations.py`（新建）：**反向防线** —— 静态抽取 `cfg.get("k")`
+    的每个键，断言都在 `DEFAULT_CONFIG` 声明；模板必须覆盖 12 个"缺则静默回落"的关键键，
+    且取值不得把已知回归带回来；+ 上述"四向一致性（含透传）"。
+  - `tests/test_env_compat.py`（新建）：见下。
+- 部署 sha `B8C6FA7FE699B1FE`（53,245B，含 §㉛ 透传恢复；`use_options_in_query=False`）；
+  本项**未改**适配层库与状态（`C:\aml\state=0`、`C:\aml\adapter\state=0`，仍为 Full 前干净状态）。
+
+#### ⑥ ⚠️ 事故记录：**部署后适配层起不来（由我引入）** —— 根因是"声明↔运行环境"漂移
+
+- **现象**：⑤ 部署后适配层**拒绝启动**，`/health 000`、公网 `502`；而**同一台机器上两个
+  LRC 实例 `/health` 全 200**。邻居正常、只有自己挂 ⇒ 极易被误判为"网络/平台问题"。
+- **根因（日志逐字）**：
+
+```
+File "app.py", line 519, in create_app
+    app.json.ensure_ascii = False
+AttributeError: 'Flask' object has no attribute 'json'
+```
+
+  线上实测环境是 **Python 3.8.6 + Flask 2.0.3**（`has_app_json=False`），
+  而 `requirements.txt` 当时写着 `flask>=3.0` —— 我按**声明**写成 Flask≥2.2 才有的
+  `app.json.ensure_ascii`，于是**启动瞬间崩**。属"依据不可信的声明写代码"，
+  与我此前记过的 `LRC_SCOPED_INLINE_SYNTHESIS`/`date_only` 是同一类错误（**声明不可信**）。
+- **修复（三件套，不留单点）**：
+  1. **能力探测**：抽出 `_disable_json_ascii_escape(app)` —— 有 `app.json` 走 provider
+     （返回 `"provider"`），否则走 `config["JSON_AS_ASCII"]`（返回 `"legacy_config"`）。
+     **不写死任何版本号**。
+  2. **环境指纹自证**：启动打印 `运行环境: Flask=<ver> Python=<ver> JSON不转义分支=<branch>`
+     —— 让"声明与实跑是否一致"**可被日志取证**（此前不可见）。
+  3. **修正声明**：`requirements.txt` 下界由 `flask>=3.0` 降为 `flask>=2.0` 并显式声明
+     `python>=3.8`，与**实际能跑的环境**对齐；新增测试 `test_requirements_matches_actual_runtime_flask`
+     守住"声明下界不得高于实跑版本"。
+     版本取值改用 `importlib.metadata.version`（`flask.__version__` 在 3.2 起被移除，
+     自证手段本身不能是脆弱的）。
+- **部署方式**：改为**带回滚门禁的一键脚本** —— 安装后轮询 `/health`，**起不来则自动回滚**
+  到已知good `app.py.pre-a3a4-20261015-132423` 并重启（本次未触发）。
+- **部署后逐字证据**（日志三行，`C:\aml\logs\_selfevidence.txt`）：
+
+```
+Add 拆批判据: ML[条数上限=8 字符预算=12000]  FAST[条数上限=40 字符预算=0]
+生效配置: 并发闸门=1  双实例=True  路由默认=ml  strip_content_prefix_in_search=False
+          date_only=False  field_order=True  use_options_in_query=False
+          include_associated=False  health_requires_lrc=False
+运行环境: Flask=2.0.3  Python=3.8.6  JSON不转义分支=legacy_config
+```
+
+  `路由默认=ml` 即 C 类修复生效的直接证据（此前该键读了不用）；
+  `use_options_in_query=False` 即 §㉛ 透传已恢复、且**行为未变**的证据。
+- **门禁结果**：`/health 200`、`/search(无凭证) 401`、`/add(无凭证) 401`、
+  `ml/fast/public` 全 `200`、库 `ml_total=0 fast_total=0`、状态文件 0；
+  `traceback_after_last_start = NO`（此前看到的 Traceback 是**上一次崩溃的残留**，
+  已用"最后一次启动块"锚点排清，避免把旧故障当成新故障）。
+- 回滚点：`C:\aml\adapter\app.py.pre-jsonfix-20261015-133021`（即这次的坏版本）。
+- **两条工具教训（我操作层面的错，已固化）**：
+  1. **`.ps1` 必须纯 ASCII**：本次脚本混入中文，PS 5.1 按 GBK 解码**吞掉收尾引号** ⇒
+     整脚本解析失败（同一坑此前已犯过一次，这次是复发）。中文日志行改用 **ASCII 锚点**
+     （`ML[` / `Flask=` / `POST /add`）判定，输出不含 CJK。
+  2. **日志文件是 GBK，不是 UTF-8**：线上 Python 3.8 按 locale 写文件，我按 UTF-8 硬读
+     ⇒ 中文全碎 ⇒ **误报"配置自证行缺失"**。读取须自适应编码；
+     另：日志行带 `时间 INFO aml-adapter |` 前缀，**只能用子串匹配，不能用 `startswith`**
+     （本次同样误报过一次）。
+
+### ★★★ Full 前最终门禁核验（**全 PASS**）+ 定位"远程桌面 / RemoteApp"弹窗真因（2026-10-15）
+
+#### ① 门禁结果（硬事实，逐项可复现）
+
+| 项 | 期望 | 实测 | 判定 |
+|---|---|---|---|
+| `adapter/app.py` | `B8C6FA7FE699B1FE` | 同 | ✅ |
+| `adapter/lrc_client.py` | `0DB844FBAE8A5FC0` | 同 | ✅ |
+| `adapter/mapping.py` | `738507846CD7910C` | 同 | ✅ |
+| `bin/code-memory-server.exe`（ML） | `0E029527C6D13F99` | 同 | ✅ |
+| `bin/code-memory-server-fast.exe`（FAST） | `429039DED96951EB` | 同 | ✅ |
+| `watchdog-loop.ps1` | `0686B186796F7CCA` | 同 | ✅ |
+| HTTP ×4（adapter / ml / fast / 公网） | 200 | **全 200** | ✅ |
+| **库为空** | `memory.total = 0` | ml=0、fast=0；**且数据目录只剩 `.lrc.lock` + `audit.jsonl(.seal)`** ⇒ 走"文件系统"这条独立路径**再次证实为空** | ✅ |
+| 适配层状态文件 | 0 | `C:\aml\state = 0`、`C:\aml\adapter\state = 0` | ✅ |
+| 看门狗 | 无新错误 | 末尾 3 行 = `13:30:09 / 13:30:24 / 13:37:35 RESTART AML-Adapter: health probe failed` —— **全部是我那次自造停机的正确反应**，其后**无任何新行** | ✅ |
+
+- ML/FAST 均 `version 0.9.13`、`lock_busy=false`、`uptime` 66,129s / 47,507s。
+- ⚠️ 观察（非缺陷）：看门狗会在健康探活失败时**重启适配层** —— 这一点在 Full 期间会被用到：
+  适配层状态（`request_id` 幂等表 / 进度 / 路由）**全部落盘**，故重启后平台重投可被 A3/A4 正确接住。
+
+⇒ **Full 前置状态干净且可交付。**
+
+#### ② "远程桌面 / RemoteApp" 两个弹窗 —— 真因是**本机 WSLg**，与服务器、与压测无关
+
+> **更正**：我此前把它归因为"1 物理核 CPU 饥饿"（还据此把测试进程降优先级）——**是错判**。
+
+证据链（全部本机实测，可复现）：
+
+- 弹出的是**两个不同**的框：`无法加载远程桌面服务 ActiveX 控件。请确保 rdclientax.dll 在路径中。`
+  与 `RemoteApp：计算机无法连接到远程计算机`。
+- 本机 Win10 19045：`rdclientax.dll` 在 `System32` / `SysWOW64` / `WinSxS` **都不存在**。
+- 但 `C:\Program Files\WSL\` 里**有**：`rdclientax.dll`(13.3MB)、`msrdc.exe`、`wslg.exe`、
+  `wslg.rdp`、`WSLDVCPlugin.dll`、`rdpnanoTransport.dll`…，而**该目录不在 PATH 中**。
+- 抓到真实命令行（决定性）：
+
+```
+msrdc.exe /wslg /silent /v:<GUID> /hvsocketserviceid:... /plugin:WSLDVC_PACKAGE ... "C:\Program Files\WSL\wslg.rdp"
+```
+
+  ⇒ 就是 **WSLg 的 RemoteApp 客户端**；`wsl --version` 报 WSL 2.7.12.0、**WSLg 1.0.73.2**、
+  **MSRDC 1.2.7214**；实测**每次启动 WSL 发行版都会拉起它**（启动前后 `msrdc` 进程均常驻）。
+- **服务器侧排除**：`Test-Path 'C:\Program Files\WSL'` = **False**、无 `WslService`
+  ⇒ 服务端**不可能**产生这两个框（弹窗 100% 是客户端侧）。
+- 试过但**无效**：`.wslconfig` 的 `[wsl2] guiApplications=false` —— 微软文档明写该键
+  **"仅 Windows 11"**，实测开关前后 `msrdc` 均常驻（**该无效文件已删除**，不留误导性配置）。
+
+**修复（二选一，均需管理员；我当前无管理员令牌，沙箱也禁止写 System32）**：
+
+- **A（推荐）**：把 `C:\Program Files\WSL` 加入**系统 PATH** —— 最贴合报错原文"请确保 rdclientax.dll 在路径中"。
+- **B**：把 `C:\Program Files\WSL\rdclientax.dll` 复制到 `C:\Windows\System32` —— 微软 Q&A 同款案例的已验证修法。
+
+**零权限治标**：不启动 WSL 即不弹。本机 WSL 的唯一用途是 aarch64 交叉编译校验
+⇒ 按既有结论改到**原生 ARM 机器/CI** 构建，本机不再需要 WSL。
+
+#### ③ 工具教训：同一个坑第 2 次踩（**函数名撞内置别名**）
+
+门禁脚本里我把探针函数命名为 `H` —— 而 `h` 是 PowerShell 内置别名 `h` → `Get-History`
+⇒ 4 个 HTTP 探针**静默返回历史对象**，整段 `[3] http` 输出为空（**不报错、只是空**）。
+台账里已记过同款（审计第 1 轮哈希全失败，当时改名 `Get-Sha`）。
+⇒ 固化：**自定义函数名一律用 `Get-` 前缀或动词-名词，禁止单字母/单词缩写**。
+
+#### ④ 复核：**ML 编码器确实已加载**（同一次复核中我先误判、后自证推翻）
+
+- 我先用 `Loong Recall` 作"最后一次启动"的锚点，得到
+  `last_encoder_idx(5809) < last_start_idx(5861)` ⇒ 误判"当前 3099 进程没加载 e5 编码器"。
+- **错因（源码级）**：该字符串在源码里出现**两次** ——
+  `src/bin/server.rs:608` 的 **CLI banner**（形如 `Loong Recall (L-RC / 忆) v0.9.13`）
+  与 `src/server.rs:5027` 的 **运行时 banner**（形如 `Loong Recall (L-RC) 代码搜索 + 记忆服务`，**无版本号**）。
+  后者在启动的更晚阶段打印 ⇒ 锚点命中的是它，于是把"同一段启动"读成了"两次启动"。
+- **改用带版本号的 CLI banner（正则 `v\d+\.\d+\.\d+`）作锚点后，原文区间（5800~5845）逐行确认**：
+  当前 3099 进程（PID 4000）**配置完全正确**：
+
+```
+5800 |   Loong Recall (L-RC / 忆) v0.9.13
+5803 |    记忆数据目录: C:\aml-data
+5804 |    进程锁: 已获取 (PID: 4000, 窗口上限: 1)
+5805 | [LRC·洛书ML] 使用本地模型: C:\aml\bin\models\intfloat--multilingual-e5-small
+5806 | [LRC·洛书ML] 模型加载完成: 本地 (hidden_size=384, 池化=Mean, 前缀=passage:)
+5807 | [LRC·结构投影] 已构建 8 个卦象原型方向（dim=384）…
+5809 |   ✓ ML 语义编码器加载成功（Smart Match 已启用）
+5839 | [LRC·写入去重] 相似度阈值：LRC_SIMILARITY_THRESHOLD 覆盖为 0.950（默认 0.500）
+5840 |   ⚙ 合成引擎: 已禁用（基线 B：no_evolution）
+5845 |   编码器模式: ML 语义模式（本地模型已加载）
+```
+
+  ⇒ e5-small 已加载、`LRC_SIMILARITY_THRESHOLD` 与 `--disable-synthesis` 等**环境开关均按 run-lrc.cmd 生效**；
+  FAST（3097）全日志**零**编码器行 —— 与"非 ML 构建"的预期**一致**（互为对照）。
+- **教训固化**：**用日志锚点判定"某次启动"时，先确认该字符串在源码里是否唯一**；
+  含版本号的 banner 才是可靠的启动锚点。
+
+#### ⑤ 复核中的两条观察（非缺陷，但 Full 前应记住）
+
+- `AML-LRC` 计划任务 `state=Ready / lastResult=1`：该任务会周期性重触发，而运行中的实例已持有
+  **进程锁**（`窗口上限: 1`）⇒ 新实例取锁失败即退出，属**幂等保护生效**，不是故障。
+  换句话说：**单例保护已在，重复触发不会产生第二个 LRC**。
+- 资源水位：`RAM 1966MB 总 / 1095MB 空闲`、`C: 剩余 12.64GB`、`CPU 15%`；
+  `pagefile PeakUsage 7819 / 8192MB` 是**历史峰值**（来自那次 300 并发预演），当前无压力
+  ⇒ 但它是 Full 期间**唯一可能触顶**的资源项，需在 Full 时盯住。
+- 心跳新鲜度：`watchdog.heartbeat = 02:35:02`、`smoke-follower.heartbeat = 02:34:53`（复核时刻 02:35）
+  ⇒ 两个守护进程**正在按周期跑**。
+
+### ★★ 文本冒烟 #2（**58.62**）+ 残留清理（2026-10-21）
+
+#### ① 得分与上一次对比（**同配置、无改动**，所以差值只能是噪声）
+
+| 维度 | 冒烟 #1（10-16） | 冒烟 #2（10-21） | 差 |
+|---|---|---|---|
+| **总分** | 57.26 | **58.62** | **+1.36** |
+| A 显式事实召回 | 60.00 | 60.00 | 0（A1 33.33→33.33，A2 75.00→**50.00**） |
+| B 关系与多跳 | 100.00 | 100.00 | 0 |
+| **C 时间与事件序列** | 60.00 | **90.00** | **+30.00**（C1 46.67→**86.67**，C2 40.00→**60.00**） |
+| D 记忆治理 | 53.33 | 53.33 | 0 |
+| E 个性化与关怀 | 100.00 | 100.00 | 0 |
+| **F1 摘要与压缩** | 0.00 | **0.00** | 0（已知功能缺口） |
+| G 上下文学习 | 30.00 | 30.00 | 0（G2 20.00；**G4 0.00**） |
+| H 认识论安全 | 50.00 | 50.00 | 0 |
+| I 流式记忆 | 45.83 | 48.96 | +3.13 |
+
+⚠️ **这两轮之间线上没有任何代码/配置改动**（哈希 9/9 一致、配置自证行一致）。
+⇒ A2 掉 25 分、C 涨 30 分**只能是抖动**（同配置复测曾摆动 8.78）。**不做任何归因，也不据此调整。**
+
+#### ② 清理（与 10-16 同一套流程，库 + 两个 state 目录一起清）
+
+| 项 | 清理前 | 清理后 |
+|---|---|---|
+| ML 库 | `memory.total = 1496`；`memories.json` 2,188,808B 级（目录共 3,141,885B） | 空（仅 `.lrc.lock`） |
+| FAST 库 | `total = 0`，**allowlist 判定 unexpected=0** ⇒ 未动（`uptime` 4669s 连续） | 未动 |
+| 适配层状态 | `C:\aml\state` 1 文件（9,380B）+ `C:\aml\adapter\state` 3 文件（3,135B） | **两处均 0** |
+| 归档 | — | `C:\aml-data.post-smoke2-20261021-023807`、`C:\aml\state.post-smoke2-…`、`C:\aml\adapter\state.post-smoke2-…` |
+| 复验 | — | `ml_total=0` / `fast_total=0` / 公网 200 / 9 个哈希不变 / `app.py B8C6FA7F…` / 看门狗末行 `02:38:21 restart=False` / 心跳 `02:38:44`（查询 02:38:45）/ **ML 新启动段 `Smart Match=True`、`e5-small=True`** / 6 个任务全 `enabled=True` |
+
+#### ③ 我这次的脚本缺陷（**同类第 3 次**，必须改判定方式）
+
+在"纯 ASCII"脚本里我写了中文正则 `'成功|SUCCESS|success'` 去判断 `schtasks` 是否成功 ——
+这让脚本混进 **60 个非 ASCII 字节** ⇒ PS 5.1 按 GBK 解码把正则本身弄坏 ⇒
+`ok=False` 连续 4 次误报（实际全部成功，被端口/计数/任务状态这些**硬指标**反证）。
+
+⇒ **固化（比"记得别写中文"更可执行的规则）**：
+**不要用正则匹配本地化文本判断成败**。判定一律用
+① `$LASTEXITCODE`；② 硬指标（端口是否在听、进程是否在、计数是否变化、任务 `Settings.Enabled`/`State`）。
+这同时解释了为什么前两次"ASCII 纪律"屡守不住 —— 病根不是"忘了"，而是**设计上就不该依赖本地化输出**。
+
+### ★★★★ 硬件升级后全面复验（**4 vCPU / 16 GiB**）+ 新硬件容量实测（2026-10-21）
+
+> 变配：1 vCPU / 2 GiB → **4 vCPU / 16 GiB / 80 GiB ESSD**。环境变了 ⇒ 所有结论重验，不沿用旧读数。
+
+#### ① 硬件实证（有**一处**与申报规格不符）
+
+| 项 | 读数 | 判定 |
+|---|---|---|
+| `NumberOfCores / LogicalProcessors` | **2 / 4** | ✅ 4 vCPU 到位 |
+| `TotalVisibleMemorySize` | **15,854 MB** | ✅ 16 GiB 到位 |
+| `LastBootUpTime` | `2026-10-21 00:30:42` | ✅ 变配已重启生效 |
+| **`C:` 卷** | **40 GB 总 / 12.66 GB 可用** | ⚠️ **80 GiB 只在磁盘层，未扩到分区** |
+| `Get-Disk` | Disk0 = **80 GB**，`AllocatedSize` = 40 GB，分区结束于 40 GB | ⇒ **有 40 GB 未分配** |
+| PageFile | alloc 8192 MB / **peak 0 MB** | ✅ 旧峰值已随重启清零 |
+
+- **不阻塞 Full**：128 条记忆只占 380 KB（`memories.json` + `memory_state.json`），12.66 GB 余量绰绰有余。
+- 若要吃掉那 40 GB（**可选、在线、不重启**，需管理员）：
+  ```powershell
+  Resize-Partition -DriveLetter C -Size (Get-PartitionSupportedSize -DriveLetter C).SizeMax
+  ```
+
+#### ② 部署物 9/9 哈希一致（变配未动任何部署物）
+
+`app.py B8C6FA7FE699B1FE` · `lrc_client.py 0DB844FBAE8A5FC0` · `mapping.py 738507846CD7910C` ·
+`config.json 5C85686010622BD2` · `ML 0E029527C6D13F99` · `FAST 429039DED96951EB` ·
+`run-lrc.cmd 69D2D1EE430593E8` · `run-lrc-fast.cmd ECF3A24823EB6B9F` · `watchdog-loop.ps1 0686B186796F7CCA`
+
+#### ③ 启动配置逐行复验（**重启后必须重验，不能假设**）
+
+ML 侧（`lrc.out.log` 最后一次带版本号的 CLI banner 之后）：
+```
+Loong Recall (L-RC / 忆) v0.9.13
+  记忆数据目录: C:\aml-data
+  进程锁: 已获取 (PID: 3848, 窗口上限: 1)
+[LRC·洛书ML] 使用本地模型: C:\aml\bin\models\intfloat--multilingual-e5-small
+  ✓ ML 语义编码器加载成功（Smart Match 已启用）
+[LRC·写入去重] 相似度阈值被 LRC_SIMILARITY_THRESHOLD 覆盖为 0.950
+  ⚠ 合成引擎: 已禁用（基线 B：no_evolution）
+  编码器模式: ML 语义模式（本地模型已加载）
+```
+适配层侧（`adapter.out.log` 最后一次启动块）：
+```
+Add 拆批判据: ML[条数上限=8 字符预算=12000]  FAST[条数上限=40 字符预算=0]
+生效配置: 并发闸门=1  双实例=True  路由默认=ml  strip_content_prefix_in_search=False
+          date_only=False  field_order=True  use_options_in_query=False
+          include_associated=False  health_requires_lrc=False
+运行环境: Flask=2.0.3  Python=3.8.6  JSON不转义分支=legacy_config
+```
+⇒ 与变配前**完全一致**；`traceback_after_start = False`。
+
+#### ④ 新硬件容量实测（16 并发 = 平台申报值）
+
+装置：跑在服务器上直连 `127.0.0.1:8800`（避开公网抖动），token 只从 `config.json` 读、不打印。
+
+| 阶段 | 结果 |
+|---|---|
+| **16 并发 Add**（每片 8 条 × ~800B，n=8<30 ⇒ 路由 ML） | **16/16 = 200**；库 `0 → 128`（**精确 +128**）；墙钟 **57.9s**；延迟 3.62 / **中位 28.91** / 最大 **57.91s** |
+| **16 并发 Search**（`top_k=100`） | **16/16 = 200**；墙钟 **2.1s**；延迟 0.20 / **中位 1.15** / 最大 **2.07s**；**`search_busy = 0`** |
+
+**解读（重要，避免误读）**：
+- Add 的"最大 57.9s"是**排队时间**，不是单次执行失败：`lrc_max_concurrency=1` 把 16 个请求排成队，
+  第 16 个自然要等前 15 个。**排队不计入 LRC 的 60s 客户端超时**（闸门是在发请求之前获取的），
+  所以 57.9s 不会变成超时；台账里更早的 1 核实测"最坏 171.5s 仍全 200"也印证这一点。
+- **不再调高闸门**：LRC 用全局锁串行化，抬闸门只会把队列挪进 LRC 内部、更容易撞 `LOCK_WAIT`
+  ⇒ 变成 `search_busy`/503。现状 16/16 全 200、`search_busy=0`，**没有理由动它**（禁止拆东墙补西墙）。
+- Search 侧相对旧机（1 核）是**数量级改善**：16 并发 k=100 墙钟 2.1s、中位 1.15s。
+
+#### ⑤ ⚠️ 事故：变配重启后 **SSH 失联约 50 分钟**（22 端口超时）
+
+- 现象：公网 `443` 正常（`/aml/health` 200）、**`22` 连续 7 次 TIMEOUT**；`ping` 不通。
+- 排查顺序与结论：
+  1. 控制台确认 `sshd` = **Running / Automatic**，`0.0.0.0:22` 与 `[::]:22` 均 `Listen`
+     ⇒ **服务端没问题**。
+  2. 查 Windows 防火墙 TCP/22 规则：`AmlSshTemp = Allow/Enabled`、`OpenSSH Server (sshd) = Allow/Enabled`、
+     **没有任何 Block 规则** ⇒ **Windows 防火墙也不是阻塞点**（我加的那条 Allow 规则因此**没用**）。
+  3. ⇒ 只剩**网络层（阿里云安全组）**。放行后立即恢复（`SSH_OK`，22 三次 OPEN）。
+- **教训（对 Full 有直接影响）**：
+  - `TIMEOUT`（丢包）与 `REFUSED`（无监听）是两回事 —— 前者一律先怀疑**上游过滤**，别在服务端打转。
+  - **SSH 能连≠一直能连**：本机出口是**电信动态 IP**（当时 `49.65.128.162`）。安全组若按 IP 白名单，
+    IP 一变就失联。**Full 期间建议把 22 的来源临时放宽**，否则一旦掉线，出事无法介入、
+    也做不了"跑完立刻清库 + 复验"。
+  - 遗留待清：`AmlSshTemp` 这条临时防火墙规则与被禁用的 `OpenSSH SSH Server (sshd)` 应合并成一条规范规则。
+
+#### ⑥ 我自己的一个脚本缺陷（已修 + 固化）
+
+清理脚本用"**基线文件列表等值比较**"判断 FAST 库是否有数据，而基线里多写了一个
+`audit.jsonl.anchors.jsonl`（实际并不存在）⇒ 误判 `FAST dir dirty = True` ⇒ **无谓地停了/归档/重启了 FAST**。
+FAST 当时 `memory.total=0`，所以**无副作用**，但动作是多余的。
+⇒ **固化：判"目录是否干净"必须用「允许清单」语义（每个文件都在允许集内），不要用「精确等值」。**
+（本次同时落地两条上轮教训：数组拼接全加括号；打印的回滚命令用 `[ScriptBlock]::Create()` 自解析，
+输出 `rollback_parses = True`。）
+
+#### ⑦ 清理后最终快照（全绿）
+
+| 项 | 结果 |
+|---|---|
+| 清单 | `C:\aml-data` 1 文件、`C:\aml-data-code` 1 文件（均只 `.lrc.lock`）；两个 state 目录 **0** |
+| 库 | ML `memory.total=0`、FAST `total=0` |
+| 服务 | `3099/3097/8800` 全 LISTENING；4 个 HTTP 端点（含公网）全 **200** |
+| 任务 | 6 个 AML 任务全 `enabled=True`；`AML-LRC` 恢复为 `Running` |
+| 看门狗 | 心跳 `01:22:21` / `01:22:18`（查询时刻 01:22:22）；日志末行 `01:20:58 restart=False` |
+| 归档 | `C:\aml-data.post-loadtest-20261021-012048` 等 4 个目录（含 128 条测试数据） |
+
+**结论：Full 前置全部通过。** 唯一可选项是扩 C: 分区（吃掉 40 GB 未分配）与清理 SSH 规则。
+
+#### ⑧ 已执行的两项收尾（2026-10-21）
+
+**(a) C: 分区已扩容（在线、未重启）**
+
+```
+BEFORE: volume 40 GB / free 12.66 GB   partition 40 GB   disk 80 GB
+        Resize-Partition -DriveLetter C -Size (Get-PartitionSupportedSize -DriveLetter C).SizeMax
+        Resize-Partition: OK
+AFTER : volume 80 GB / free 52.66 GB   partition 80 GB   disk 80 GB   unallocated 0
+服务复验: ml 3099 / fast 3097 / adapter 8800 全 200
+```
+
+**(b) SSH 防火墙规则已合并为一条规范规则**
+
+| 规则 | 处理 |
+|---|---|
+| `OpenSSH-Server-In-TCP`（系统自带，**按程序限定** `C:\Windows\system32\OpenSSH\sshd.exe`） | **启用**（合并前先核对进程真实路径 = `C:\Windows\System32\OpenSSH\sshd.exe`，完全匹配） |
+| `AmlSshTemp`（GUID `20BB6D93-…`，遗留临时规则） | **禁用**（保留可回滚，未删除） |
+| `OpenSSH Server (sshd)`（GUID `fa3efc8e-…`，本次临时添加） | **禁用**（同上） |
+
+- 操作顺序刻意设计为"**先启用规范规则 → 打印全部规则 → 测试新建 SSH 连接 → 才禁用多余规则**"，
+  避免把自己锁在门外（每步都有一次全新 SSH 连接验证：`FRESH_SSH_OK` / `_2` / `_3`）。
+- 结果：TCP/22 的 **enabled_count = 1**。
+- ⚠️ 注意：`OpenSSH-Server-In-TCP` 带 `Program=` 限定**不是缺陷**，是最严写法。
+  我第一次的守卫把"任何 Program 限定"一律判为不安全 ⇒ 误 ABORT 一次；后来改为
+  **"规则里的程序路径 == 运行中 sshd 的真实路径"** 才算安全。**固化：校验严格性要看"是否匹配真实对象"，而不是"是否有约束"。**
+
+**(c) 风险 1（安全组放宽）需在阿里云控制台完成，且有一个前提**
+
+- 我无法从机器内部修改安全组（云控制面对象）。
+- 关键前提：`sshd_config` 里 `PasswordAuthentication` **未显式配置** ⇒ 取默认值 **yes**
+  （实际生效项只有 `AuthorizedKeysFile` / `Subsystem sftp` / `Match Group administrators` 三行）。
+  ⇒ **若把 22 放开到 `0.0.0.0/0`，等于把密码登录暴露到公网。**
+- 因此二选一：
+  - **A（首选）**：安全组 22 的来源保持/设为 `49.65.128.162/32`（当前出口 IP）。代价：出口 IP 一变就失联。
+  - **B**：`0.0.0.0/0` + **先把 `PasswordAuthentication no` 写进 `sshd_config` 的 `Match` 之前**
+    （注意：**追加到文件末尾会落进 `Match Group administrators` 块内，位置必须正确**），
+    再 `sshd -t` 校验、`Restart-Service sshd`，最后验证密钥登录仍可用。
+
+**(d) 已按方案 B 加固 sshd（2026-10-21 01:51，已生效并反向验证）**
+
+执行顺序（**每步都为"万一失联"留了后路**）：
+
+| 步 | 动作 | 结果 |
+|---|---|---|
+| 1 | 备份 `sshd_config` → `sshd_config.aml-bak`（2297B） | ✅ |
+| 2 | 在**第一个 `Match` 之前**（原第 86 行）插入 4 行 | ✅ 插入后：`line 88 PubkeyAuthentication yes` / `89 PasswordAuthentication no` / `90 KbdInteractiveAuthentication no` / **`92 Match Group administrators`** ⇒ 三个 `no/yes` 确实**在 Match 之外** |
+| 3 | 写入时用 **UTF8 无 BOM** | ✅（BOM 会让 sshd 解析失败） |
+| 4 | `sshd -t` 校验 | **exit 0**（失败则自动还原并中止） |
+| 5 | **先**建一次性 SYSTEM 自愈任务（T+6 分钟还原备份并重启 sshd） | ✅ 已建 |
+| 6 | 再 `Restart-Service sshd -Force` | ✅ 连接按预期断开（重启的就是承载本会话的服务） |
+| 7 | 全新连接验证（`BatchMode=yes`，**禁用任何交互式提示**） | **`FRESH_SSH_OK_4` / `KEY_OK`**，exit 0 |
+| 8 | **在自愈任务触发前删除它** | ✅ `task_exists_after = False` |
+| 9 | **反向验证**：禁用密钥、只允许 password+keyboard-interactive | **`Permission denied (publickey).`** ⇒ 服务端现在**只接受公钥** |
+
+- 现状：`sshd Running / Automatic`，`0.0.0.0:22` 与 `[::]:22` 均在监听（新实例 pid 3540）；
+  三个服务仍全 200。
+- ⇒ **风险 1 的前提已解除**：现在把安全组 22 放开到 `0.0.0.0/0` 只是暴露"密钥登录"，
+  不存在密码爆破面。
+- ⚠️ 若要回滚：`Copy-Item C:\ProgramData\ssh\sshd_config.aml-bak C:\ProgramData\ssh\sshd_config -Force; Restart-Service sshd -Force`。
+
+### ★★★ 文本冒烟（能力总分 57.26）+ **冒烟残留清理**（2026-10-16）
+
+#### ① 冒烟得分（数据点，不是结论）
+
+总分 **57.26**。分维度：A 60.00 · B 100.00 · **C 60.00** · D 53.33 · E 100.00 · **G 30.00** · H 50.00 · **I 45.83**。
+
+| 满分项 | A2 / B1 / B2 / B4 / C3 / E1 / E2 / E3 / G1 |
+|---|---|
+| **零分项** | **F1 摘要与压缩 0.00** · **G4 经验数据发现与模拟 0.00** |
+| 其余低分 | G2 20.00 · A1 33.33 · C2 40.00 · D2 40.00 · I1 45.24 · C1 46.67 · H2 50.00 · I2 50.00 |
+
+⚠️ **记账纪律**：同配置复测曾摆动 **8.78 分**（63.45 ↔ 72.23）⇒ **单轮冒烟无法 A/B 任何改动**，
+本轮分数只作数据点留档。（两次 0 分的 F1/G4 属"LRC 没有摘要器"这一**已知新功能缺失**，
+按既有裁定**不得夹带进 Full**。）
+
+#### ② 清理：冒烟残留（**库与适配层状态一起清**，全归档、可一键回滚）
+
+| 项 | 清理前（冒烟留下的） | 清理后 |
+|---|---|---|
+| ML 库 | `memory.total = 1495`；`memories.json` 2,188,808B + `graph_edges.json` 22,051B + `memory_state.json` 633,092B | 空（仅 `.lrc.lock`） |
+| FAST 库 | 仅基线 3 文件 ⇒ **文本冒烟未触碰** ⇒ 按"未动"处理 | 同（未动） |
+| 适配层状态 | `C:\aml\state` 1 文件（`seen_request_ids.json` 9,380B）；`C:\aml\adapter\state` 3 文件（`add_progress_v2` / `arrival_ordinals` / `user_route` 共 3,135B） | **两处均 0** |
+| 归档位置 | — | `C:\aml-data.post-smoke-20261016-040934`、`C:\aml\state.post-smoke-20261016-040934`、`C:\aml\adapter\state.post-smoke-20261016-040934` |
+| 停/起 | 停 ML 3099(pid 4000) + 适配层 8800(pid 4712)；**FAST 3097(3748) 全程未动** | 复起 ML pid **4908** / 适配层 pid **3388** |
+| 复启验证 | — | ML `uptime=1s`、`memory.total=0`；FAST `total=0`；适配层 `/health` 200；**公网 `/aml/health` 200** |
+| ML 编码器（关键） | — | 新启动段逐行确认**与清理前完全一致**：`✓ ML 语义编码器加载成功（Smart Match 已启用）`、`LRC_SIMILARITY_THRESHOLD 覆盖为 0.950`、`合成引擎已禁用（no_evolution）`、`编码器模式: ML 语义模式`、`进程锁 PID 4908` |
+| 看门狗 | 为避让竞态而**暂停**（`AML-LRC-Watchdog /disable`、`AML-Watchdog-Loop /end`） | **已恢复**：6 个 AML 任务全 `enabled=True` / `state=Running`，两个 heartbeat 均在 10s 内刷新 |
+
+**回滚（一次性，实测名称）**：
+
+```powershell
+Remove-Item 'C:\aml-data' -Recurse -Force
+Move-Item 'C:\aml-data.post-smoke-20261016-040934' 'C:\aml-data' -Force
+Remove-Item 'C:\aml\state' -Recurse -Force
+Move-Item 'C:\aml\state.post-smoke-20261016-040934' 'C:\aml\state' -Force
+Remove-Item 'C:\aml\adapter\state' -Recurse -Force
+Move-Item 'C:\aml\adapter\state.post-smoke-20261016-040934' 'C:\aml\adapter\state' -Force
+schtasks /end /tn AML-LRC ; schtasks /end /tn AML-Adapter ; schtasks /run /tn AML-LRC ; schtasks /run /tn AML-Adapter
+```
+
+**旁证（读取 `smoke-follower.alerts`，非缺陷）**：2026-10-16 03:04 有两条
+`Search 路由表缺失 user=u_e05…/u_299… ⇒ 按默认实例 ml 处理` —— 即 **Search 先于该 user 的路由固化到达**。
+`/search` 的**双实例兜底**（本实例无结果则补问另一实例）会兜住它 ⇒ **不丢记忆**。
+（另：该 alerts 文件里还完整留着我 10-15 那次 `AttributeError: 'Flask' object has no attribute 'json'` 停机，
+以及 10-14 平台侧 `python-httpx` 收到 503 的成片记录 —— 都是历史，已修。）
+
+#### ③ 我这次脚本的两个缺陷（已修 + 固化）
+
+1. **PowerShell 数组字面量里 `+` 被 `,` 抢优先级**：`@('a', 'b' + $TS)` 实际解析为 `('a','b') + $TS`
+   ⇒ **3 元素数组**，取 `[1]` 得到的是**没有时间戳**的 `'b'`
+   ⇒ 三个归档目录名都成了 `*.post-smoke-`（尾部一个孤零零的 `-`）。数据没丢，但**名字会与下次重置同名冲突**。
+   已重命名为带 `20261016-040934`。
+   ⇒ **固化：数组字面量内做字符串拼接必须加括号 —— `@('a', ('b' + $TS))`。**
+2. **我打印的"回滚命令"本身是坏的**（`Move-Item 'C:\aml-data.post-smoke-' 'C:\aml-data -Force` ——
+   目标路径缺闭合引号，且残留未展开的 `$TS`）。等于交付了一条**照抄就报错**的命令。
+   ⇒ **固化：脚本里"给人用的命令"必须自己先 parse 一次**（`[ScriptBlock]::Create(...)`）再打印。
+
+### ★★★ Full 前重置 + **平台规则核查（推翻我此前两条判断）**（2026-10-15）
+
+> 起因：用户提出"库是否需要清理"，并让我去查平台文档。仓库里已有平台规范原文
+> （`g:\aml-competition\01~05*.md` + `_raw/aml_rules.md`、`_raw/aml_competition.md`）。
+
+#### ① 平台规则核查 —— 两条我此前判断错的地方
+
+| 我此前的判断 | 平台原文 | 更正 |
+|---|---|---|
+| "平台并发未知，只能赌" | Full 检查清单：*"Capacity … is prepared for the selected track's Full evaluation scale and the **entered Add/Search concurrency limits**"*；`03` §3.6：*"**声明的并发数是上限，不是保证的请求速率**"* | **并发是"申报制"** —— `Max add concurrency` / `Search concurrency` 由参赛方申报，平台按所报值施压（`04-LRC适配分析.md` §9 亦写明"AML 会按声明值施加并发，虚报会直接导致失败"） |
+| "冒烟残留会污染 Full 结果" | `_raw/aml_rules.md`：*"**`user_id` 是 Search 接口唯一使用的检索范围标识**…**禁止跨 `user_id` 返回记忆**"* | 平台 `user_id` 形如 `eval:run_abc123:locomo:conv-0`（**含 run 标识**）⇒ 旧冒烟数据属**不同 user_id**，**Full 时永远检索不到** ⇒ 清理**非正确性必需**，属卫生/性能 |
+
+**另两条关键规则**（影响提交策略）：
+- **可从检查点续跑**：*"Continue the latest interrupted evaluation from its last compatible checkpoint"* ⇒ 续跑会**重投相同 `request_id`**。
+- **提交后至 2026-11-04 不得更改契约/鉴权/容量**（`02` §规则 4）⇒ **容量必须一次报对**。
+- Full 次数：**每赛道 2 次 + 30 天冷却**（`02:97`）—— 不是绝对一次，但仍极贵。
+
+#### ② ★ 操作约束：**清库与清幂等缓存必须同时做**（只清一个会永久丢数据）
+
+| 操作 | 后果 |
+|---|---|
+| 都清 | ✅ 全新开始；续跑会重写全部 |
+| 都不清 | ✅ 续跑安全（隔离保证旧数据不干扰） |
+| **只清库、留缓存** | ❌ **续跑时适配层认为"已写过"⇒ 返 200 不写入 ⇒ 该批数据永久丢失** |
+
+另：适配层状态**分散在两个目录**（`config.json` 混用绝对/相对路径）——
+`C:\aml\state\`（`dedupe_path`，绝对路径）与 `C:\aml\adapter\state\`（`route_map_path`/`arrival_ordinal_path`/`add_progress_path`，相对 `cwd`）⇒ **必须两处都清**。
+
+#### ③ 已执行：Full 前重置（`C:\aml\ops\_pre_full_reset.ps1`，全归档、可一键回滚）
+
+| 项 | 结果 |
+|---|---|
+| 预置动作 | **先暂停看门狗**（`AML-LRC-Watchdog` disable + `AML-Watchdog-Loop` end），避免它在我移动目录途中把 ML 拉起 |
+| 停服 | ML 3099 / 适配层 8800 已停（**FAST 3097 未动**）；适配层改为**按端口 8800 精确定位**进程（不再 `taskkill /IM python.exe`，避免误伤 btPanel 的 python） |
+| ML 库 | `memories.json` **2,192,528 字节（1499 条）** → 归档 `C:\aml-data.pre-full-20261015-075253`，新建空目录 |
+| 适配层状态 | `C:\aml\state`（3 文件）+ `C:\aml\adapter\state`（4 文件）→ 归档，**两处剩余均为 0** |
+| 复启验证 | ML `uptime 2s` / **`memory.total = 0`** ✓；FAST `total = 0` ✓；**公网 `/aml/health` = 200** ✓；适配层启动行确认 `ML[条数上限=8 字符预算=12000] FAST[条数上限=40 字符预算=0]` ✓；看门狗已恢复、心跳刷新 ✓ |
+| **回滚** | 把两个 `.pre-full-*` 目录移回原位 → 重启 `AML-LRC` + `AML-Adapter` |
+
+#### ④ 空库契约验证（只读，零污染）
+
+覆盖"**若注入失败、第一次 Search 打到空库**"这一路径：
+
+| 路径 | 结果 |
+|---|---|
+| 适配层直连 `127.0.0.1:8800/search` | **200 + `{"data":[]}`** ✓（`data` 存在且为数组 —— 契约硬项：**不得省略 `data`**） |
+| **公网全链路** `https://sfang.cc/aml/search` | **200 + `{"data":[]}`** ✓（nginx → 适配层 → LRC） |
+| LRC 直连 `/v1/memories/enrich` | 200 + `{"memories":[],"total":0}` ✓ 无 panic / 无 500 |
+
+> 凭据处理：探针在**服务端运行时**从 `config.json` 读取 token，**不在命令或文件中落地**（`curl -i` 只打印响应头）。
+
+#### ⑤ 据此得到的**容量申报依据**（`04-LRC适配分析.md` §9 要求"不得凭空声明"）
+
+| 申报项 | 建议值 | 依据 |
+|---|---|---|
+| `Search concurrency` | **3**（保守可报 2） | 本轮 Full 形状自检：`LOCK_WAIT=6s` 下 3 并发 k=100 的 `search_busy` 仅 **0.6%**；而 `LOCK_WAIT=2s` 时高达 **16.17%** |
+| `Max add concurrency` | **1** | Add 按 8 条子批顺序送、每批 ≈12s（实测 T(n)=0.4+1.17n），且写入阶段会持锁 |
+| `Search 超时` | ≥ 外层 30s 之下、`enrich` 15s 之上留余量 | `timeouts.rs` 阶梯：`LOCK_WAIT(6s) < EXPLORE(10s) < HANDLER(15s) < OUTER(30s)` |
+
+**仍未知**：Full 的"注入总量"与"总时限"平台文档未给具体数字（只有 `Mode: full/light/smoke/script` 与并发字段）⇒ **需在平台创建 Eval Job 时读取**。
+
+
+### ★★★★ Full 形状自检：修掉 **并发检索 16% 的隐式 503** + 看门狗数组除法缺陷（2026-10-15）
+
+> 用户裁定「按建议执行，直到自检 full 评估不存在任何问题」后的执行记录。
+> 装置：**预演链路的两端都镜像生产** —— LRC 用**与生产 ML 同一个二进制**，
+> 适配层用**与生产同一份代码**；库为副本镜像（生产数据目录不受影响）。
+
+#### ① 自检发现（4 项）
+
+| # | 发现 | 判定 |
+|---|---|---|
+| 1 | **写侧**：200 条真实长文本经适配层注入 ⇒ `/add` **200**、耗时 131s、库 **6115→6315（+200 精确）** | ✅ 通过 |
+| 2 | **读侧**：3 并发 `k=100` 时 **49/303 = 16.17%** 返回 `search_busy`(503) | ❌ 已修（见 ③） |
+| 3 | **看门狗**：多实例时 RSS 检查抛 `op_Division` ⇒ 该轮 **FAST 与适配层探活被整体跳过** | ❌ 已修（见 ②） |
+| 4 | **预演实例在重载下死亡**（2/2 复现），**无任何崩溃签名** | ⚠️ 未确证（见 ④） |
+
+**为什么之前没发现 #2**：上一轮稳定性预演只跑了 **15 次**并发（样本太小）；
+本次跑了 **300 次**才让"第三个请求的锁等待恰好压在 2.0s 边界"这一边缘状态现形
+（失败数与算术完全吻合：**50 轮 × 每轮 1 个 = 50 ≈ 49**）。
+
+**#2 的实际危害被重试掩盖**：那 16% **没有丢题**——适配层对瞬时状态码有有界重试
+（默认 5 次）兜住了。但代价是 ① 每次失败白等 0.6~8s 退避 ⇒ 延迟虚增；
+② 重试本身加剧拥塞。连续 5 次皆 503 的概率 ≈ `0.16^5 ≈ 1e-4` ⇒ 丢题风险很低但非零。
+
+#### ② 修复一：看门狗 v4.1（`C:\aml\watchdog-loop.ps1`，已部署并观测 150s）
+
+三个缺陷，全部有线上日志证据：
+
+| 缺陷 | 机理 | 修法 |
+|---|---|---|
+| (a) 数组除法 | `Get-Process -Name X` 在**同名多进程**时返回数组 ⇒ `$p.WorkingSet64 / 1MB` 抛 `op_Division`（预演实例同名，故必然触发） | 改为**按监听端口**定位实例，只对该 PID 取 RSS |
+| (b) 异常冒泡 | 异常发生在 `Watch-Lrc 3099` 内 ⇒ 冒泡到**唯一的外层 catch** ⇒ 同一轮的 `Watch-Lrc 3097`(FAST) 与适配层探活**全部被跳过**（日志 2026-10-14 16:22 ~ 10-15 06:43 反复出现） | **每个探针各自 try/catch**，互不影响 |
+| (c) 标量假设 | `$os.FreePhysicalMemory` 未做数组防御 | `@(...)[0]` |
+
+**验证**：`bak = watchdog-loop.ps1.pre-v41-20261015-065804`（sha `3AC3C496`）；新 sha `0686B186`；
+重启后观测 **150s（约 15 个循环）：新增日志 43 字节，新增 error 行 = 0**；心跳新鲜；ml/fast/adapter 探活全 200。
+**旁证**：`op_Division` 刷屏恰好在预演实例死亡（06:43）后停止 ⇒ 反证该错误确由"同名第二实例"触发。
+
+#### ③ 修复二：`LOCK_WAIT` 2s → 6s，并消除残留硬编码（已部署）
+
+- `src/timeouts.rs`：`LOCK_WAIT` 2s → **6s**（阶梯仍单调：6s < `EXPLORE_INNER_BUDGET` 10s；由既有
+  `timeout_ladder_is_monotonic` 测试守卫）。**不改变任何检索结果**——只是把"快速失败"换成"排队成功"。
+- **顺带消除真源漂移**（`timeouts.rs` 文件头正是为此而建）：`v1_api.rs` 两处（`consolidate` 阶段 1/3 取锁）
+  与 `consolidation.rs`（后台结晶周期）各自的硬编码 `from_secs(2)` 改为引用 `LOCK_WAIT`；
+  日志文案里的 `（2s）` 也改为动态输出。
+- **刻意未动**（不在 AML 评测路径上，改了无 Full 收益只增加变更面）：`v1_api.rs` 的 `forget`(5245)、
+  `/backup/restore`(6313)、`src/server.rs` 的 MCP 路径(940)。已记为**已知重复**。
+- **验证**：`cargo test --lib` **922 passed**；部署后 `/health` 200、库 1499 完好、并发 3 全 200。
+- **修复效果的实测**（同一 Full 形状负载）：
+
+  | | 修复前 | 修复后（中期读数，166 样本） |
+  |---|---|---|
+  | `search_busy`(503) | **49 / 303 = 16.17%** | **1 / 166 = 0.6%** |
+
+- 部署记录：`bak = code-memory-server.exe.pre-readfix-20261015-071648`（sha `6807970E`）；
+  新二进制 sha **`0E029527C6D13F99`**（`opt-level=3` + `LOCK_WAIT=6s`）。
+
+#### ④ 未确证：预演实例在重载下死亡（**仅预演环境，不影响生产形态**）
+
+- 现象：**2/2 复现** —— 3121 预演实例在 300 次并发搜索阶段消失（06:43、07:29 各一次）。
+- 已排除：**无任何软件层痕迹**（`panic`/栈溢出/`memory allocation ... failed`/`abort` 全部 0 条）
+  ⇒ 非 Rust 侧失败；**RADAR 假说已实测证伪**（`System` 日志 `Id=2004` **0 条**）。
+- 同时查到的旁证：`pagefile PeakUsage = 7819MB`（页文件仅 8192MB）⇒ **内存压力真实存在过**。
+- **为什么不影响 Full**：生产只跑**一个** LRC 实例；该现象只在"同一台 **1 核 2GB** 机器上再叠加
+  一个预演 LRC + 一个预演适配层 + 300 次并发"时出现 ⇒ 属**预演环境容量**问题。
+- 处置：自检改为**不与生产共用时期的轻量形态**，并作为已知项跟踪。
+
+
+### ★★★ 写入路径容量实测 + **一处我自己的结论更正** + 适配层拆批判据加固（2026-10-15）
+
+#### ① 直连 LRC 的写入容量（探针直连，**不是生产路径**）
+
+6k 库、**1 物理核**、e5-small、正文 400~1200B（确定性正文，两臂逐字符相同载荷）：
+
+| `opt-level` | 线性模型 | 受 30s 外层超时约束的**直连**安全上限 |
+|---|---|---|
+| `"z"`（现状） | `T(n) ≈ 1.2 + 1.33n` 秒 | **≈ 19~21 条** |
+| `3` | `T(n) ≈ 0.4 + 1.17n` 秒 | **≈ 25 条** |
+
+实测尾部：**40 条 ⇒ 30.01s 504**；25 条在 z 下 30.03s 504（但**数据仍落盘**）、在 o3 下 27.03s 200。
+
+⇒ **单条真实长文本成本 1.17~1.33 s/条**；而配置里沿用的历史依据是 **0.053 s/条（短文本）** ⇒ **相差 22~25 倍**。
+⇒ 另一条修正：**504 后是否落盘"不确定"**（编码阶段超时不写、编码完成后的落盘/响应阶段超时则已写）⇒ 平台重投**可能重复写入**。
+
+#### ② ⚠️ **结论更正（我此前的误判，必须留档）**
+
+我曾据①断言「**生产必然 504、记忆注入阶段会丢**」——**这是错的**：
+
+> 生产 `C:\aml\adapter\config.json`（mtime **2026-10-14 01:08**）早已是
+> **`add_sub_batch_size = 8`** ⇒ 8 条长文本 ≈ 12s，稳在 30s 内
+> ⇒ **生产路径不会因此 504**。①里的 504 **全部来自直连 LRC 的探针**。
+
+**教训**：「单点上限」≠「生产路径行为」——生产中间有适配层拆批，必须**读生产配置**再下结论。
+
+#### ③ `opt-level=3` A/B（两臂各一份相同库副本、逐字符相同载荷）
+
+| 条数 | arm z | arm o3 |
+|---|---|---|
+| 1 | 2.55s | 1.53s |
+| 4 | 5.74s | 4.84s |
+| 8 | 11.34s | 9.75s |
+| 15 | 21.16s | 17.89s |
+| **25** | **30.03s 504** | **27.03s 200** |
+| 40 | 30.10s 504 | 30.03s 504 |
+
+⇒ 写入提速 **1.14~1.27×**（**不是**旧记忆里的 1.43~1.47×；那条是 106 条小池 + 短文本，不可外推）。
+二进制 12.97MB → 18.18MB（+40%）。**唯一"翻档"证据：25 条从 504 变 200。**
+⇒ 结论：值得启用（零文件改动、环境变量覆盖、可回滚），但**不是解药**。
+
+#### ④ 已部署：适配层拆批判据加固（**防御性，非修复**）
+
+| 项 | 内容 |
+|---|---|
+| 判据 | `条数` → **`条数 + 正文字符预算`**（新增 `add_sub_batch_char_budget=12000`）；FAST 侧 `char_budget_fast=0` 保持不拆 |
+| 续传语义 | `已完成子批数` → **`已成功写入条数`**；进度文件换为 `state/add_progress_v2.json` |
+| 为什么必须改语义 | 判据一改，**同一批号会指向不同记忆** ⇒ 沿用旧进度续传会**静默漏写**（比重复写入更危险，因不可见） |
+| **当前是否改变行为** | **否（等价）**：8 条 × ~800 字符 = 6400 < 12000 ⇒ 预算不构成约束 |
+| 它移除的真实缺陷 | 「一旦有人调整 `add_sub_batch_size` ⇒ 重投静默漏写」——而"改子批以压缩 Full 注入总时长"正是**下一步最可能的优化** |
+| 部署前置 | 已核 `C:\aml\state` 下**无 `add_progress*.json`** ⇒ 零在途进度 ⇒ 换语义无风险 |
+| 部署后自证 | 启动日志新增一行：`Add 拆批判据: ML[条数上限=8 字符预算=12000] FAST[条数上限=40 字符预算=0]` |
+| 回滚点 | `C:\aml\adapter\app.py.pre-charbudget-20261015-062510`（sha 前 8 位 `31D30AC2`）+ 脚本 `C:\aml\ops\_deploy_adapter.ps1` |
+| 测试 | 适配层 **55 passed**（新增 5 条，含 ★「换拆批配置后重投不得漏写」回归 + `split_by_budget` 纯函数用例） |
+
+#### ⑤ Full 的**真实**剩余风险（重新定位）
+
+- **单请求写入已安全**（子批 8 ⇒ ≈12s）；
+- 但**注入总时长** ∝ `N/8 × ~12s`：`N=5000` ⇒ **≈2.1 小时** ⇒ **待向平台确认"注入总量"与"总时限"**；
+- **单条超长正文**（单条编码即 >30s）无法靠拆批解决 ⇒ 属单条规模问题。
+
+
+### ★★★★ Full 量级稳定性预演：**FAIL → PASS** —— 关联段 2.25s→0.32s，k=100 检索 16.4s→0.85s，并发零 5xx（2026-10-14/15）
+
+> 承接下方 `★★★★ Full 量级稳定性预演：FAIL`。按**预注册**判据「在修掉该成本并重跑预演至 PASS 之前，不上 Full」，
+> 本轮**只做读路径性能修复**：单变量、可一键回滚、**零硬编码**（所有上限走既有超时阶梯常量或 env 覆盖）。
+> 装置不变：**独立实例**（端口 3121、独立数据目录 `C:\aml-rehearsal\data`、6,000 条），镜像 ML 实例开关组；
+> **生产两实例全程未受影响**（收尾复核 ML `/health`：uptime 4.0e4s、`lock_busy=false`）。
+
+#### ① 根因定位：三刀，其中**一刀是被自己证伪的假设**
+
+| 序 | 改动 | 实测效果 | 判定 |
+|---|---|---|---|
+| 1 | **种子数封顶** `LRC_ASSOC_SEED_MAX`（默认 16）：`expand_associations` 的种子此前是**全部结果 id**（= `top_k`）⇒ 成本 `O(top_k × 库规模)` | 关联段 **15.995s → 2.25s**；k=100 总计 16.4s → 2.6s | ✅ 有效，但**未解决并发** |
+| 2 | `associations_in` 三处 id 查找（锚点 / ④ 自动事件 peer / ⑥ 产物成员）改 **O(1) 查表**（`by_id` 由调用方一次性构建） | 逐种子仍 **0.131~0.143s/种子**（**毫无变化**） | ❌ **假设被证伪**（改动正确但非瓶颈；如实留档） |
+| 3 | **装饰—排序—还原**：`sort_by` 原在**比较器内重算** `content_words`（CJK bigram 全分词 + `to_lowercase` + HashSet 构建）⇒ 单通道 `O(n log n)` 次昂贵重算 | 逐种子 **0.131s → 0.0145s（9×）**；关联段 2.25s → **0.32s** | ✅ **真凶** |
+
+**为什么真凶是第 3 刀**：自动事件通道在真实数据里可达**数百**候选（同项目 + 同小时窗口），
+而排序每次比较都要**重算两条** `content_words`（数百 × log 数百 × 2 次分词）。
+改为「先算键、再排序」后为 `O(n)` 次重算 + `O(n log n)` 次数值比较；
+`sort_by` 稳定 ⇒ **排序结果逐位一致**（922 项测试全通过佐证）。
+
+#### ② 结果（同一 6k 库 / 同一开关组 / 同一探测查询；独立实例）
+
+| 测量 | 修前 | 修后 |
+|---|---|---|
+| **k=100 单次检索** | 13.9~16.4s | **0.80~0.85s** |
+| **顺序 30 次**（混合 top_k） | p50 2.61s / max 2.94s | **p50 0.84s / max 0.93s**，`fails=0` |
+| **并发 3 × 5 轮** | **10/15 得 503**（后来者 2.02s 撞 `LOCK_WAIT`） | **15/15 全 200，零 5xx** |
+| 关联段分解 | 2.25s | **0.32s**（建表 0.088s + 逐种子 0.23s） |
+| **时延 vs 条数** | ∝ `top_k` | **解耦**（k=5 **0.68s** ↔ k=100 **0.84s**） |
+
+#### ③ 判据：**PASS**（CSCD 通过标准三条全中）
+
+零 503 / 零 504 ✓；所有时延落在既有阶梯内（max 0.93s ≪ 15s handler 预算）✓；并发不失败 ✓。
+
+#### ④ 诚实标注（**本 PASS 是必要非充分条件**）
+
+1. 剩余的关联成本**仍含与库规模相关的项**（建表 0.088s + 逐种子候选生成的 `O(N)` 扫描）
+   ⇒ **Full 库若显著大于 6k，须重跑本预演**；
+2. 预演规模 6k、并发 3；正式 Full 的实际库规模与并发度未知 ⇒ **未覆盖 >3 并发**；
+3. 本轮**未**验证「关掉关联通道」这一备选（用户此前裁定保留 `LRC_ASSOC_MAX=5`）——
+   即在保留技术独特性的前提下把成本压到阶梯内。
+
+#### ⑤ 回归保障
+
+- `cargo test --lib` **922 项全通过**（含关联配额 / 隐私可见性 / 符号层边预留等用例）；
+- 新增 2 项用例：`assoc_seed_max_*`（不变量：**种子上限不得依赖 `top_k`**——本值是无参函数，结构上不可能依赖）；
+- 计时插桩沿用既有 `LRC_TIMING=1` 约定（默认关闭）：`[LRC·计时] expand_associations …` 拆到"建表 / 候选生成 / 分组排序"三段。
+
+#### ⑥ 部署记录（**仅 ML 实例**，2026-10-15 03:28）
+
+| 项 | 值 |
+|---|---|
+| 目标 | ML 实例（3099，文本赛道）；**FAST（3097）刻意未动**（单变量纪律） |
+| 新二进制 sha256（前 16 位） | `6771555007262D0B` |
+| 备份点（回滚用） | `C:\aml\bin\code-memory-server.exe.pre-readfix-20261015-032847`（sha `E0D658BD854A94E0`） |
+| 部署脚本 | `C:\aml\ops\_ml_readfix_restart.ps1`（**先备份后换**：新二进制先上传为 `_staged_*`，避免备份点被覆盖） |
+| 回滚 | 把 `.pre-readfix-20261015-032847` 复制回 `code-memory-server.exe` 后重跑该脚本 |
+| 就位验证 | `/health` 200（`lock_busy=false`）；顺序 enrich ×3 全 200（~0.10s）；**并发 enrich ×3 全 200**（0.32~0.41s，**零 503**）；FAST 3097 监听未中断 |
+| 部署前置 | 已核 `nginx/access.log` **无在跑的 Smoke**（仅扫描器流量）⇒ 重启不会打断评测 |
+
+
 ### ★★★★ 代码赛道 Smoke 取证 + 路由判据再修：**`n≥100` 漏判 40~99 条代码分片** ⇒ 已改为 `n≥30`（2026-10-14）
 
 #### ① 本轮 Smoke 的事实（用户面板：相关/噪声各 1 题，得分 0.00 / 文件定位率 100.00 / 解题成功率 0.00）

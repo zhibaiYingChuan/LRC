@@ -40,7 +40,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{interval, timeout, Duration};
 
-const LOCK_DEADLINE: Duration = Duration::from_secs(2);
+// 取锁上限走**单一真源**：此前这里是独立的 `from_secs(2)`，与 `timeouts::LOCK_WAIT`
+// 各自为政 ⇒ 真源调整后后台周期不会跟随（已知漂移缺陷，2026-10-15 修正）。
+const LOCK_DEADLINE: Duration = crate::timeouts::LOCK_WAIT;
 const EMBEDDING_TIMEOUT: Duration = Duration::from_secs(60);
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(60);
 const CYCLE_TIMEOUT: Duration = Duration::from_secs(120);

@@ -204,6 +204,38 @@ fn assoc_slot_cap(top_k: usize, quota: usize, share_denom: usize) -> usize {
     quota.min(top_k / share_denom)
 }
 
+/// 关联展开的**种子数上限**默认值。
+///
+/// # 为什么必须限制"种子数"（2026-10-14 Full 量级预演实测）
+///
+/// `expand_associations` 的**每个种子都要扫一遍全库**（6,000 条库实测 ≈ **0.14s/种子**），
+/// 而此前传入的种子是**全部结果 id**（= `top_k`）⇒ 单次检索成本 **O(top_k × 库规模)**：
+/// 实测 `top_k=100` ⇒ **16.0s**（撞满 15s handler 预算 ⇒ 触发 503）、`top_k=50` ⇒ 6.6s、
+/// `top_k=20` ⇒ 2.8s。分段计时确认该成本**全部**落在 `expand_associations` 一处
+/// （快路 0.05s / 深路 0.27s 均与 `top_k` 无关）。
+///
+/// ⚠️ `LRC_ASSOC_MAX` 只限制**产出条数**、**不限制种子数** —— 这正是此前的漏点。
+/// 而补入条数本就由 [`assoc_slot_cap`]（≤ quota）封顶 ⇒ **再多给种子也不会多补几条**，
+/// 用最相关的**头部**结果作种子即可：**能力不减，成本与 `top_k` 及库规模解耦**。
+const ASSOC_SEED_MAX_DEFAULT: usize = 16;
+
+/// 解析种子数上限：`None` / 非法 / 0 ⇒ 回落默认值。
+///
+/// 抽成**纯函数**是为了可测：避免测试修改进程级环境变量（`cargo test` 默认并行，
+/// 改动全局 env 会污染并发运行的其它用例）。
+fn parse_assoc_seed_max(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(ASSOC_SEED_MAX_DEFAULT)
+}
+
+/// 关联展开的种子数上限（环境变量 `LRC_ASSOC_SEED_MAX` 可覆盖，下限 1）。
+///
+/// 不变量：本值**不得**依赖 `top_k`（否则成本重新变成 `O(top_k × 库规模)`）。
+fn assoc_seed_max() -> usize {
+    parse_assoc_seed_max(std::env::var("LRC_ASSOC_SEED_MAX").ok().as_deref())
+}
+
 /// 请求级取消标志守卫：Drop 时置位，通知阻塞任务提前退出
 struct CancellationFlag(Arc<AtomicBool>);
 
@@ -2196,8 +2228,10 @@ pub fn build_v1_router_with_trust(
 
                         // 阶段 1（**短暂持锁**）：仅取编码器句柄（克隆成本 ≈ 一个 bool）。
                         let encoder = {
+                            // 取锁上限走**单一真源**（此前这里硬编码 2s ⇒ 与 `timeouts::LOCK_WAIT`
+                            // 各自为政；真源调整后此处不会跟随 ⇒ 已知漂移缺陷，2026-10-15 修正）。
                             let lock_deadline =
-                                std::time::Instant::now() + std::time::Duration::from_secs(2);
+                                std::time::Instant::now() + crate::timeouts::LOCK_WAIT;
                             let store_guard = loop {
                                 match phase1_store.try_lock() {
                                     Ok(guard) => break guard,
@@ -2206,7 +2240,8 @@ pub fn build_v1_router_with_trust(
                                     }
                                     Err(_) => {
                                         eprintln!(
-                                            "[v1/consolidate] 取编码器句柄等待存储锁超时（2s），本次写入放弃"
+                                            "[v1/consolidate] 取编码器句柄等待存储锁超时（{}ms），本次写入放弃",
+                                            crate::timeouts::LOCK_WAIT.as_millis()
                                         );
                                         return None;
                                     }
@@ -2221,8 +2256,9 @@ pub fn build_v1_router_with_trust(
 
                         // 阶段 3（**短暂持锁**）：投影 + 一次落盘 + 索引维护。
                         let stored = {
+                            // 同上：取锁上限走单一真源，不再硬编码。
                             let lock_deadline =
-                                std::time::Instant::now() + std::time::Duration::from_secs(2);
+                                std::time::Instant::now() + crate::timeouts::LOCK_WAIT;
                             let mut store_guard = loop {
                                 match phase1_store.try_lock() {
                                     Ok(guard) => break guard,
@@ -2231,7 +2267,8 @@ pub fn build_v1_router_with_trust(
                                     }
                                     Err(_) => {
                                         eprintln!(
-                                            "[v1/consolidate] 写入阶段等待存储锁超时（2s），本次写入放弃（编码已白做）"
+                                            "[v1/consolidate] 写入阶段等待存储锁超时（{}ms），本次写入放弃（编码已白做）",
+                                            crate::timeouts::LOCK_WAIT.as_millis()
                                         );
                                         return None;
                                     }
@@ -2457,6 +2494,13 @@ pub fn build_v1_router_with_trust(
                         enrich_exec_timeout(),
                         tokio::task::spawn_blocking(move || -> Result<EnrichBlockingResult, &'static str> {
                             let _cancellation_guard = CancellationFlag(cancellation_for_task.clone());
+                            // ★ v0.9.13 计时插桩（默认关闭，`LRC_TIMING=1` 时开启）。
+                            // 目的：定位"单次检索耗时随 top_k 线性增长（6k 库下约 0.13s/条）"
+                            // 落在哪一段。实测装置：Full 量级预演实例（独立端口/独立数据目录）。
+                            let __t0 = std::time::Instant::now();
+                            let __timing = std::env::var("LRC_TIMING")
+                                .map(|v| v == "1")
+                                .unwrap_or(false);
                             // 有界锁获取：轮询 try_lock，超时未获得则放弃
                             let lock_deadline = std::time::Instant::now() + enrich_lock_wait;
                             let mut store = loop {
@@ -2477,6 +2521,7 @@ pub fn build_v1_router_with_trust(
                                     }
                                 }
                             };
+                            let __t_lock = __t0.elapsed();
 
                             let fast_filter = RecallFilter {
                                 memory_type: None,
@@ -2505,6 +2550,7 @@ pub fn build_v1_router_with_trust(
                                     RecallResult::basic(vec![], vec![], 0)
                                 }
                             };
+                            let __t_fast = __t0.elapsed();
 
                             // ★ P6（候选容量）：deep 路候选上限**可配**。
                             //
@@ -2563,6 +2609,7 @@ pub fn build_v1_router_with_trust(
                                     RecallResult::basic(vec![], vec![], 0)
                                 }
                             };
+                            let __t_deep = __t0.elapsed();
 
                             // RRF 融合：具体错误查询提高 Deep 路径权重。
                             let (fast_weight, deep_weight) =
@@ -2575,6 +2622,7 @@ pub fn build_v1_router_with_trust(
                                 fast_weight,
                                 deep_weight,
                             );
+                            let __t_fuse = __t0.elapsed();
 
                             // 阶段D 可观测性：LRC_RRF_TRACE=1 输出融合审计行（默认关闭）
                             if std::env::var("LRC_RRF_TRACE").map(|v| v == "1").unwrap_or(false) {
@@ -2625,6 +2673,7 @@ pub fn build_v1_router_with_trust(
                             let reasons = store
                                 .result_reasons(&owned_for_reasons)
                                 .unwrap_or_default();
+                            let __t_reasons = __t0.elapsed();
                             let mut memories: Vec<EnrichedMemory> = Vec::with_capacity(fused.memories.len());
                             let mut explanation_items: Vec<EnrichExplanationItem> =
                                 Vec::with_capacity(fused.memories.len());
@@ -2666,6 +2715,7 @@ pub fn build_v1_router_with_trust(
                                     hit_paths: contrib.hit_paths(),
                                 });
                             }
+                            let __t_build = __t0.elapsed();
 
                             // 阶段D：检索链路结构化审计（只观测，不参与排序决策）
                             // 记录两路权重、候选规模与每条结果的通路贡献分解，
@@ -2715,6 +2765,7 @@ pub fn build_v1_router_with_trust(
                                 explanation_items.len().to_string(),
                             );
                             let state_snapshot = store.memory_state_machine.snapshot();
+                            let __t_snap = __t0.elapsed();
                             let mut regression_evidence = fast_result.regression_evidence.clone();
                             for (id, evidence) in &deep_result.regression_evidence {
                                 regression_evidence.insert(id.clone(), evidence.clone());
@@ -2734,8 +2785,15 @@ pub fn build_v1_router_with_trust(
                             // 复用与检索**同一套可见性规则**（expand_filter 与
                             // fast_filter 字段同源），确保联想不会成为越权后门。
                             // 失败静默：联想是附加价值，不得影响主检索结果。
-                            let assoc_seeds: Vec<String> =
-                                explanation_items.iter().map(|i| i.id.clone()).collect();
+                            // ★ 种子数**必须封顶**：`expand_associations` 的每个种子都要扫全库
+                            //   ⇒ 用全部 `top_k` 条作种子会让单次检索变成 O(top_k × 库规模)
+                            //   （6k 库实测 k=100 ⇒ 16.0s，撞满 15s 预算 ⇒ 503）。
+                            //   补入条数另由 `assoc_slot_cap` 封顶，故多给种子并无收益。
+                            let assoc_seeds: Vec<String> = explanation_items
+                                .iter()
+                                .take(assoc_seed_max())
+                                .map(|i| i.id.clone())
+                                .collect();
                             // ★ P8（关联补全接出口）：配额可配。
                             //   实测依据：同一次 Add 请求内的记忆对（词面中位重叠仅 16.8%），
                             //   用其中一条去查另一条，命中率仅 **40%**；且**换 384 维排序 /
@@ -2826,6 +2884,7 @@ pub fn build_v1_router_with_trust(
                                     }
                                 }
                             }
+                            let __t_assoc = __t0.elapsed();
                             // 审计副本**有界**：只取前 N 条证据（本体仍原样进响应）
                             let evidence_json = serde_json::to_string(
                                 &regression_evidence
@@ -2864,6 +2923,27 @@ pub fn build_v1_router_with_trust(
                                 affected_ids,
                                 audit_meta,
                             );
+                            let __t_audit = __t0.elapsed();
+
+                            // ★ v0.9.13 计时输出（仅 `LRC_TIMING=1`）：把检索耗时拆到各段，
+                            // 用来定位"随 top_k 线性增长"的成本落在哪一段。
+                            if __timing {
+                                eprintln!(
+                                    "[LRC·计时] enrich top_k={} 命中={} 锁等待={:.3}s 快路={:.3}s 深路={:.3}s 融合={:.3}s 理由={:.3}s 构造={:.3}s 审计元数据={:.3}s 关联={:.3}s 审计={:.3}s 总计={:.3}s",
+                                    top_k,
+                                    memories.len(),
+                                    __t_lock.as_secs_f64(),
+                                    (__t_fast - __t_lock).as_secs_f64(),
+                                    (__t_deep - __t_fast).as_secs_f64(),
+                                    (__t_fuse - __t_deep).as_secs_f64(),
+                                    (__t_reasons - __t_fuse).as_secs_f64(),
+                                    (__t_build - __t_reasons).as_secs_f64(),
+                                    (__t_snap - __t_build).as_secs_f64(),
+                                    (__t_assoc - __t_snap).as_secs_f64(),
+                                    (__t_audit - __t_assoc).as_secs_f64(),
+                                    __t0.elapsed().as_secs_f64()
+                                );
+                            }
 
                             Ok((
                                 memories,
