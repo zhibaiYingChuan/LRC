@@ -16,8 +16,8 @@
 //!
 //! ## 分层约定
 //! ```text
-//! LOCK_WAIT(2s)  <  EXPLORE_INNER_BUDGET(10s)  <  HTTP_HANDLER_BUDGET(15s)  <  HTTP_OUTER_TIMEOUT(30s)
-//! LOCK_WAIT(2s)  <  CONSOLIDATE_INNER_TIMEOUT(20s) / BENCHMARKS_INNER_TIMEOUT(20s)  <  HTTP_OUTER_TIMEOUT(30s)
+//! LOCK_WAIT(6s)  <  EXPLORE_INNER_BUDGET(10s)  <  HTTP_HANDLER_BUDGET(15s)  <  HTTP_OUTER_TIMEOUT(30s)
+//! LOCK_WAIT(6s)  <  CONSOLIDATE_INNER_TIMEOUT(20s) / BENCHMARKS_INNER_TIMEOUT(20s)  <  HTTP_OUTER_TIMEOUT(30s)
 //! ```
 
 use std::time::Duration;
@@ -32,7 +32,26 @@ pub const HTTP_HANDLER_BUDGET: Duration = Duration::from_secs(15);
 pub const EXPLORE_INNER_BUDGET: Duration = Duration::from_secs(10);
 
 /// 全局存储锁的**等待上限**（所有取锁点统一；超时统一返回 `store_busy`）。
-pub const LOCK_WAIT: Duration = Duration::from_secs(2);
+///
+/// # 为什么由 2s 提到 6s（2026-10-15，6k 库 Full 形状自检实测）
+///
+/// 单次 `enrich`（`top_k=100`，1 物理核）**全程持锁 ≈1.0s**。因此 **3 并发**时
+/// 第三个请求的锁等待 ≈ **2×1.0 = 2.0s**，恰好压在旧的 2s 上限上 ⇒ 实测
+/// **49/303 = 16.17% 的请求返回 `search_busy`(503)**（`50 轮 × 每轮 1 个`，
+/// 与算术完全吻合）。
+///
+/// 那 16% 当时**并未丢题**——适配层对瞬时状态码有有界重试（默认 5 次）兜住了。
+/// 但代价是：① 每次失败白等 0.6~8s 退避后再重试 ⇒ 延迟虚增；② 重试本身加剧
+/// 拥塞，在高并发下会形成正反馈。
+///
+/// 提到 6s 后，串行化可容纳约 6 个并发请求（6×1.0s）而不失败。**阶梯仍单调**
+/// （6s < `EXPLORE_INNER_BUDGET` 10s），且**不改变任何检索结果**——只是把
+/// "快速失败"换成"排队成功"。语义上的代价仅为：锁真被长任务占用时，请求会
+/// 多等几秒才返回（外层 15s/30s 预算下完全容纳）。
+///
+/// ⚠️ 已知结构性约束（未修）：单次 `enrich` 全程持锁约 1s，故并发度显著高于
+/// ~6 时本上限仍会不足——那需要把只读阶段移出锁（结构性改动），不在本轮。
+pub const LOCK_WAIT: Duration = Duration::from_secs(6);
 
 /// 取锁轮询间隔（有界自旋的步长）。
 pub const LOCK_POLL: Duration = Duration::from_millis(10);
