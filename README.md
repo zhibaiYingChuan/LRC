@@ -42,7 +42,8 @@ LRC 在相似度之外，额外建立了一层**由记录字段必然推导出�
 
 ### 2. 记忆怎么写
 
-写入时可指定类型（`fact` / `preference` / `decision` / `code_context` / `conversation` / `experience` / `synthesis`）、重要性（1–10）与隐私级别，并支持**同一批语句重复出现时自动融合为「结晶」条目**（程序记忆）。
+写入时可指定类型（`fact` / `preference` / `decision` / `code_context` / `conversation` / `experience` / `synthesis`）、重要性（1–10）与隐私级别。
+语义相近的一批记忆会自动融合为一条「结晶」条目（程序记忆）：**聚类由本地语义模型完成（零 API 费用）**；若配置了 LLM，则由 LLM 归纳成摘要，未配置时退回本地洛书合成。
 
 ### 3. 联想怎么补（这是核心差异点）
 
@@ -196,7 +197,7 @@ LRC 在相似度之外，额外建立了一层**由记录字段必然推导出�
 | `bagua_index` 覆盖率 | 98.5% | 但仅 2 个取值、96.79% 同值 ⇒ **无区分度** |
 | dev 库 `event_id` 条数 | **0** | 开发端无法验证符号层（无 ground truth） |
 
-再看结晶（记忆融合）的门槛——代码里写死需要**至少 3 条相似记忆**（`min_cluster: 3`，相似度阈值 `similarity: 0.4`）才会触发合成。冷启动阶段库里只有零星几条记忆时，这个能力**在数学上就不会被触发**。
+再看结晶（记忆融合）的门槛——需要**至少 3 条语义相近的记忆**才会触发合成：洛书/Jaccard 通路的相似度阈值为 `0.4`；v0.9.14 起的本地句向量聚类阈值为 `0.75`（可用 `LRC_LOCAL_CLUSTER_SIM` 调整）。冷启动阶段库里只有零星几条记忆时，这个能力**在数学上就不会被触发**。
 
 **结论（请按此建立预期）**：
 
@@ -247,19 +248,19 @@ LRC 在相似度之外，额外建立了一层**由记录字段必然推导出�
 
 ### 方式一：下载桌面端（推荐）
 
-1. 前往 [v0.9.10 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.9.10) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
-   - Windows：`lrc-desktop-v0.9.10-windows-x86_64-setup.exe`
-   - macOS：`lrc-desktop-v0.9.10-macos-arm64.dmg`
-   - Linux：`lrc-desktop-v0.9.10-linux-amd64.deb` 或 `lrc-desktop-v0.9.10-linux-x86_64.AppImage`
+1. 前往 [v0.9.14 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.9.14) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
+   - Windows：`lrc-desktop-v0.9.14-windows-x86_64-setup.exe`
+   - macOS：`lrc-desktop-v0.9.14-macos-arm64.dmg`
+   - Linux：`lrc-desktop-v0.9.14-linux-amd64.deb` 或 `lrc-desktop-v0.9.14-linux-x86_64.AppImage`
 2. 双击安装，启动 LRC Desktop
-3. 按向导选择项目、配置 LLM（可选）、连接 AI 工具
+3. 按向导选择项目；**本地语义模型**按需下载（推荐），**LLM** 用于写摘要与理解查询——两者互补，建议都配
 4. 重启 IDE，AI 通过 MCP 自动发现并使用记忆与代码搜索能力
 
 > 桌面端自动完成所有配置：检测 AI 工具、写入 MCP 配置、写入 AI 规则文件。
 >
 > **端口说明**：稳定版默认使用 `3099`；开发实例端口约定见上文「质量与验证」一节。稳定版不会复用开发版 Sidecar。
 >
-> **注意**：Release 中 `lrc-v0.9.10-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（Sidecar 二进制），供开发者和脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
+> **注意**：Release 中 `lrc-v0.9.14-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（Sidecar 二进制），供开发者和脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
 >
 > **安装包体积说明**：桌面安装包仅数 MB 是设计使然——语义模型按需下载（首次约 100~400MB，自动走国内镜像），**独立的道体推演服务**（`daoti_daemon` / `daoti_assoc`，非本仓库代码）不随包分发。
 >
@@ -280,7 +281,9 @@ cargo build --release --features server
 
 ## 通用语义引擎
 
-默认嵌入模型为 **BGE-small-zh**（中文用户开箱最优）或 **MiniLM-L6-v2**（英文环境），并支持本地嵌入完成记忆结晶，无需 LLM API 即可享受记忆融合能力。
+默认嵌入模型为 **BGE-small-zh**（中文用户开箱最优）或 **MiniLM-L6-v2**（英文环境）。
+
+**分工（v0.9.14 起明确）**：`embedding` 由**本地语义模型**负责——写入、检索、结晶聚类全部在本机完成，**不产生任何 API 费用**；**LLM 只负责生成文本**（写摘要、理解查询）。两者互补，不是二选一。
 
 **模型管理 CLI**：
 
@@ -390,7 +393,9 @@ code-memory-server --src-dir ./src --port 3099
 | `LRC_MODEL_MIRROR` | `hf-mirror` | 模型镜像源：`hf` / `hf-mirror` / `modelscope` / `auto` |
 | `LRC_MODELS_DIR` | `~/.loong-recall/models/` | 本地模型权重存放目录 |
 | `LRC_LUOSHU_MODEL_ID` | 按系统语言判定 | 语义搜索使用的嵌入模型；中文环境 `BAAI/bge-small-zh`，其他 `sentence-transformers/all-MiniLM-L6-v2` |
-| `LRC_LLM_API` | 空（未设置） | LLM 查询翻译配置，格式见 [用户使用说明书](docs/USER_GUIDE.md) |
+| `LRC_LLM_API` | 空（未设置） | LLM 配置，用于**写摘要与理解查询**。LLM 不参与 embedding；格式见 [用户使用说明书](docs/USER_GUIDE.md) |
+| `LRC_LOCAL_CLUSTER_SIM` | `0.75` | 结晶聚类的最小余弦相似度（本地句向量）；更换模型或语料后可再标定 |
+| `LRC_SYNTH_MAX_CANDIDATES` | `300` | 每轮结晶最多参与聚类的记忆条数（按最近优先，取值 3~1000） |
 | `LRC_DEV_MODE` | 空（未设置） | 设为任意值即隔离开发环境：配置文件与向导存于 `dev/` 子目录、使用独立锁文件 `.lrc-dev.lock` |
 
 ---
@@ -415,7 +420,7 @@ LRC 提供配套的 [AI 规则文件](docs/USER_GUIDE.md)：会话开始先 `rec
 
 ## 质量与验证
 
-LRC 的核心功能通过 Rust 单元测试、集成测试、前端契约检查和桌面端 CDP 回归门禁持续验证（当前：`cargo test --features server` 790 passed / 0 failed；desktop crate 96 passed / 0 failed；clippy 干净；算法泄露检测通过）。
+LRC 的核心功能通过 Rust 单元测试、集成测试、前端契约检查和桌面端 CDP 回归门禁持续验证（当前：`cargo test --features server,ml` **928 passed / 0 failed**；集成与基准测试 **32 passed**；`clippy --features server,ml --all-targets` 干净；算法泄露检测通过；Release 工作流 7/7 jobs 全绿）。
 
 **启用提交前检查（推荐）**：仓库自带版本控制的 Git 钩子，克隆后执行一次即可启用（提交前自动跑 fmt / clippy / check / test / 算法泄露检测 5 项检查）：
 
@@ -440,17 +445,32 @@ python .\scripts\dev-proxy.py 1420 --dev   # 开发代理：服务磁盘最新 s
 
 ---
 
-## 版本特性（v0.9.10）
+## 版本特性（v0.9.14）
 
-**本版本主题：交互可用性修复 + ML 模式联想超时根因 + 符号层证据性质分离。**
+**本版本主题：让结晶真正用上本地语义模型 + 桌面端可用性修复。**
 
-- **修复「每次打开都要手动点启动服务」**：自动启动判据原为 `setup_complete`（是否走过向导），而正常使用不需要走向导（全局模式不选项目目录、不用 LLM）⇒ 该判据**永远为 false**，自动启动被永久跳过。改为按「**是否确有使用痕迹**」判定后，实测多次重开**全部自动拉起**。
-- **符号层接入界面（证据性质分离）**：联想的两类证据**分开显示**，不再混淆——「**记录关联**」（记录必成立）与「**结构推导**」（由结构算子推出，**可能不成立**）。后者带独立徽章，用户一眼可辨可信度。
-- **修复联想探索超时阶梯**：前端超时原与后端**完全相等**，导致后端的优雅收敛（返回部分结果 / 诚实空态）**不可达**、只能报超时。现改为单调阶梯，慢环境下也能拿到"已展示完成的部分"或"记忆库里还没有相关内容"。
-- **修复 ML 模式下开发端联想超时**：Cargo 默认对 dev profile 的依赖不做优化，ML 张量前向慢 2~4 倍而击穿超时。现只优化 **ML 链路依赖**（含易漏的 `gemm` 矩阵乘法后端），使 **debug 与 release 行为一致**——线上 CI 只需多编 13 个包。
-- **修复 `action_hints` 语义反转**：健康提示原会把「系统输出质量**良好**」升级成「请**优先处理**」；现只升级真正的 `warning`。
+### 结晶更强，而且不产生 embedding 费用
 
-> v0.9.8 及更早版本特性见 [CHANGELOG.md](CHANGELOG.md)；v0.9.7 联想能力的完整验证（含全部反例与边界）见 [基准测试报告](benchmarks/V0.9.7_BENCHMARK_REPORT.md)。
+- **聚类从 9 维升级到本地高维句向量**：判断"哪些记忆该融合"改由本地语义模型的完整句向量完成（实测同主题余弦 0.82 / 跨主题 0.70，阈值取 0.75），比原先 9 维洛书投影更有区分度。
+- **LLM 只写摘要**：配置 LLM 时由它把一组相关记忆归纳成一条摘要；未配置时退回本地洛书合成。两种情况下 embedding 都在本机完成，**不会调用任何付费 embedding 接口**。
+- **大库不卡**：每轮最多处理最近 300 条，并按 32 条分片编码，避免结晶与在线检索抢 CPU。
+
+### 桌面端：少点一次"重试"
+
+- **开机首次打开自动刷新**：首屏不再停在"暂时读不到数据"，sidecar 就绪后自动恢复（约 2 秒一次，最长约 90 秒）。
+- **7 类高级按钮修复**：打开桌面端设置、启动/停止项目 sidecar、扫描 IDE 项目、自动配置 Agent、保存 Agent 配置、查询项目目录、验证安装。
+- **低频管理默认折叠**：高风险操作收进折叠区，减少误触。
+
+### 配置更清楚：本地模型与 LLM 都要配
+
+- 本地语义模型负责**编码与检索**，LLM 负责**理解与摘要**；界面与帮助文档已改为"互补而非二选一"。
+
+### 稳定性修复（用户可感知）
+
+- 修复 Ollama 地址拼接与字段顺序错误：此前会让结晶每轮空转（日志中的 `builder error`）。
+- 修复"关闭 LLM 后仍被旧配置复活"以及"仪表盘保存 LLM 配置后被清空"。
+
+> v0.9.10 及更早版本特性见 [CHANGELOG.md](CHANGELOG.md)；v0.9.7 联想能力的完整验证（含全部反例与边界）见 [基准测试报告](benchmarks/V0.9.7_BENCHMARK_REPORT.md)。
 
 **道体（Daoti）边界**：LRC 本身即从道体体系延伸而来。**符号层的推理与状态机依赖道体代码参与编译**，因此 `src/engine/` 下的道体模块（洛书编码、镜像梯形、结构调整器、导航等）**会随安装包分发**——这是功能必需，否则符号层无法工作。
 
@@ -469,7 +489,7 @@ python .\scripts\dev-proxy.py 1420 --dev   # 开发代理：服务磁盘最新 s
 - 源代码索引驻留内存，不写磁盘
 - 记忆数据存储在 `~/.loong-recall/` 本地目录
 - 联想只在本机进行；联想过程记录仅存于 `~/.loong-recall/`
-- 仅当你配置 `--llm-api` 时，查询文本（**非源代码**）会发送到你的 LLM API
+- 仅当你配置 LLM 时，**查询文本与用于生成摘要的记忆内容**才会发送到你指定的 LLM；**embedding 始终在本机完成**，记忆向量与源代码不会因此外发
 
 ---
 
