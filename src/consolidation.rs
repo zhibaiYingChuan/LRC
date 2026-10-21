@@ -636,7 +636,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         let (candidates, local_encoder): (Vec<(String, String)>, Arc<HybridLuoShuEncoder>) = {
             let store = self.store.lock().await;
             let filter = ListFilter {
-                limit: 1000, // 加载足够多的记忆用于聚类
+                // 最近 300 条（默认按创建时间倒序）；见 LOCAL_SYNTH_MAX_CANDIDATES
+                limit: Self::synth_candidate_limit(),
                 ..ListFilter::new()
             };
             let (all, _) = store
@@ -839,6 +840,23 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         }
 
         Ok(written)
+    }
+
+    /// 本地句向量聚类一次最多处理的候选数（v0.9.14）
+    ///
+    /// 1000 条 × 最长 512 token 在 4 vCPU 上约需 20~30s，会与在线 Add/Search 抢 CPU。
+    /// 结晶按"最近优先"分批推进（每 300s 一轮），300 条已能覆盖一个周期的新增；
+    /// 更早的记忆在之前的周期里已经处理过。
+    /// 可用 `LRC_SYNTH_MAX_CANDIDATES`（3~1000）覆盖。
+    const LOCAL_SYNTH_MAX_CANDIDATES: usize = 300;
+
+    /// 本次结晶的候选上限（实测默认 300，可环境变量覆盖）
+    fn synth_candidate_limit() -> usize {
+        std::env::var("LRC_SYNTH_MAX_CANDIDATES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| (3..=1000).contains(v))
+            .unwrap_or(Self::LOCAL_SYNTH_MAX_CANDIDATES)
     }
 
     /// 本地句向量聚类的默认余弦阈值
