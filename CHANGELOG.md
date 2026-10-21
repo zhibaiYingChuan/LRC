@@ -305,6 +305,493 @@ msrdc.exe /wslg /silent /v:<GUID> /hvsocketserviceid:... /plugin:WSLDVC_PACKAGE 
 - 心跳新鲜度：`watchdog.heartbeat = 02:35:02`、`smoke-follower.heartbeat = 02:34:53`（复核时刻 02:35）
   ⇒ 两个守护进程**正在按周期跑**。
 
+### ★★★ Full 前最终门禁（只读）：**PASS**（2026-10-21 06:34）
+
+| 项 | 实测 | 判定 |
+|---|---|---|
+| 硬件 | 4 逻辑核 / **15.5GB** / C: **80GB（剩 52.6GB）** / boot 00:30:42 | ✅ |
+| ML 库 | `memory.total = 0`，目录仅 `.lrc.lock` + `audit.jsonl` + `.seal` | ✅ |
+| FAST 库 | `memory.total = 0`，目录仅 `.lrc.lock` | ✅ |
+| 适配层状态 | `C:\aml\state = 0`、`C:\aml\adapter\state = 0` | ✅ |
+| HTTP | 3099 / 3097 / 8800 / **公网** 全 **200**；LLM 代理无 key 时 **401**（存活且未裸奔） | ✅ |
+| ML 启动证据 | `encoder_after_start=True`（当前实例已加载编码器）、`llm_configured=true` | ✅ |
+| 适配层自证 | `Flask=2.0.3 Python=3.8.6 分支=legacy_config` | ✅ |
+| 配置生效值 | `lrc_max_concurrency=1`、`summary_enabled=False`、`add_sub_batch_size=8`、`add_fast_min_msgs=30`、`strip=False`、`field_order=True`、`date_only=False` | ✅ |
+| 环境变量 | `LRC_LLM_TRANSLATE=0`、`DS_EMBED_MODEL=text-embedding-v3`、`LRC_LLM_API`（指向本地代理） | ✅ |
+| 任务 | 8 个 AML 任务全 `enabled=True` | ✅ |
+| 心跳 | watchdog 9s / smoke-follower 20s（相对查询时刻） | ✅ |
+| 看门狗日志 | 末 4 行均为 **05:45~05:53** 我 A/B 期间的 RESTART，其后无新行 | ✅ |
+
+**当前哈希（变更后重新登记）**
+
+```
+app.py                 1EB66A6D42978682   （含摘要特性，但 config: summary_enabled=False）
+lrc_client.py          0DB844FBAE8A5FC0
+mapping.py             738507846CD7910C
+config.json            749CB27F7508504F
+code-memory-server.exe 14F4191D46DF084A
+...-fast.exe           429039DED96951EB
+run-lrc.cmd            14087F493A7B1F8D   ← 因 _assoc_toggle 整文件重写而变（内容已逐行核验）
+run-lrc-fast.cmd       ECF3A24823EB6B9F
+watchdog-loop.ps1      0686B186796F7CCA
+```
+
+**两处需留意但不阻塞**
+
+1. `run-lrc.cmd` 哈希变了：我翻转 `LRC_ASSOC_INTO_RESULTS` 时用 `WriteAllText` 整文件重写。
+   已逐行核验：**无 BOM、CRLF、20 行、8 条 `set` 全在、且未出现 `--disable-synthesis`** ⇒ 语义与之前一致。
+2. `add_sub_batch_char_budget` 在 config.json 中**缺失** ⇒ 走代码默认 **12000**（`DEFAULT_CONFIG` 声明，测试守护），非漂移。
+
+### ★★★ MCP 写操作报错定位并修复：**陈旧加密 LLM 配置**导致结晶周期长期持锁（2026-10-21）
+
+#### ① 表象
+
+Trae 调 `remember` / `batch_remember` 报：
+`invalid type: string "CLIENT_HTTP_NOT_IMPLEMENTED", expected i32 at line 1 column 102`
+
+#### ② 逐层排除（都有证据）
+
+| 检查 | 结果 |
+|---|---|
+| LRC 的 JSON-RPC 错误码 | 全是**整数**（`-32700/-32603/-32602/-32601`），`make_error(id, code: i32, ..)` |
+| 全仓库搜 `CLIENT_HTTP` | **0 处** ⇒ 不是 LRC 产出，是**客户端侧的报错序列化** |
+| `memory_stats` / `recall` | **正常** ⇒ 服务端活着 |
+| `remember` 只带 `content` | **成功** ⇒ 不是参数类型 |
+| 逐步加 `importance` / `memory_type` / `tags` / `event_id` / `entities` | **全部成功** |
+| ~1200 字长载荷 | **成功** ⇒ 不是体积 |
+| sidecar 日志里的写请求 | **一条都没有** ⇒ 请求死在**传输层**，没到 LRC |
+
+⇒ 那个字符串是**传输失败被客户端误序列化**的产物，不是 LRC 的协议缺陷。
+
+#### ③ 真因
+
+本地 sidecar 日志尾部长期是这个循环：
+
+```
+[LRC·结晶] LLM 合成失败，降级到洛书合成: LLM embedding 调用失败: Ollama Embedding 请求失败: builder error
+[LRC·结晶] 周期完成: 拉取=0, 写入=0, 合成=0, 失败=0, 耗时=35914ms
+[LRC·心跳] 调节器本轮结果: locked
+```
+
+- **1831 次** `Ollama ... builder error`（host 为空 ⇒ `http://` 非法）。
+- 每个结晶周期（**间隔 300s**）先尝试 LLM embedding → 立即失败 → 回退洛书合成 → **33~83 秒**，
+  期间长期持锁（`locked`），偶发 `结晶周期超时`。
+- 配置状态不一致：`wizard.json` 已是 `llm_type=none / llm_configured=false`，
+  但 **`config.json` 里 `encrypted_api_key` 仍有 72 字符**、`llm_api` 为空 ⇒
+  **daemon 模式仍从全局配置后备把它还原成 `ollama||<model>||`**。
+
+#### ④ 修复
+
+1. 备份并**清空** `%APPDATA%\LoongRecall\config.json` 的 `llm_api` 与 `encrypted_api_key`
+   （`config.json.bak-llmstale-20261021-061231`）。
+2. 用**桌面端** `lrc-desktop.exe` 重新拉起 sidecar（⚠️ **不能用 `Start-Process` 手工 spawn**：
+   Trae 终端结束会连带杀掉子进程 —— 本次因此**两次把用户本地 LRC 弄停**）。
+
+#### ⑤ 验证
+
+```
+编码器模式: ML 语义模式（本地模型已加载）
+第1位: Tier 1 — Fast Match（已就绪）
+[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，本地统计合成模式，建议配置 LLM）
+ollama 错误 = 0        /health: llm_configured = false
+```
+MCP **读（memory_stats/recall）、写（remember）、删（forget）全部正常**。
+
+#### ⑥ 由此暴露的两个**产品缺陷**（待修）
+
+1. **向导重置不会失效已加密保存的 LLM 配置**：`wizard` 改成 `none` 后，
+   `config.json` 的 `encrypted_api_key` 仍被 daemon 当作有效配置还原 ⇒ "已关闭"其实没关。
+2. **两处真相不一致**：`/health` 报 `llm_configured=false`，而结晶引擎仍在用 Ollama
+   ⇒ 健康检查无法反映 LLM 实际状态，排查时极易误判。
+
+#### ⑦ 副作用
+
+手工重启后 `src_dir` 变成 `C:\Users\Administrator\.loong-recall`（原为 `G:\code-memory`）
+—— 因为桌面端是在"无项目"上下文启动的；在应用里切换回项目即可，不影响记忆（全局库）。
+
+### ★★★ 缺陷修复（代码级）：Ollama URL 拼接 / 字段顺序 / 关闭后复活 / 状态分裂（2026-10-21）
+
+#### ① 对上一节「真因」的修正
+
+上一节推断"host 为空 ⇒ `http://` 非法"。逐行读码后**修正**为三个可证的代码缺陷，
+其中任一个都会必然产生 `builder error`：
+
+1. **Ollama URL 硬拼端口**：`embed_ollama` / `summarize_ollama` / `ollama_chat` 三处都写死
+   `format!("http://{host}:11434/api/...")`。当 host 已带端口（`127.0.0.1:11434`）
+   或已带协议（桌面端默认 `http://localhost:11434`）时，拼出
+   `http://127.0.0.1:11434:11434/...` / `http://http://localhost:11434:11434/...`
+   ⇒ 非法 URL ⇒ `reqwest` 直接 `builder error`（本地日志 1831 次）。
+   `parse` 的注释本身就写着"host 可能为 `192.168.1.109:11434`"，与实际拼接自相矛盾。
+2. **Ollama 字段顺序两端相反**：sidecar 约定 `ollama||host||model`
+   （单元测试与 `bin/server.rs` 的 `load_llm_from_wizard_json` 文档一致），
+   而桌面端 `WizardConfig::to_llm_api_string()` 输出 `ollama||model||host`
+   ⇒ 模型名被当成主机地址。
+3. **`save_llm_to_wizard_json` 用 `:` 切分 `||` 格式**：`splitn(4, ':')` 后 `parts[0]`
+   不等于 `openai`/`ollama`，直接落进"清除"分支 ⇒ 仪表盘保存成功、
+   `wizard.json` 的 LLM 配置却被清空（这正是"wizard=none 而 config.json 有密文"的成因）。
+
+#### ② 修复清单（单变量、可回滚）
+
+| 文件 | 改动 |
+|---|---|
+| [llm_translator.rs](file:///g:/code-memory/src/engine/llm_translator.rs) | 新增 `ollama_base_url()`：缺协议补 `http://`、authority 无端口才补 `:11434`、IPv6 字面量正确识别；三处拼接全部改用它 |
+| 同上 | `parse()` 的 ollama 分支做**窄归一化**：仅当第二段是带协议地址而第一段不是时交换，兼容历史 `model||host` |
+| [config.rs](file:///g:/code-memory/src/config.rs) | `decrypt_llm_api()` 增加前置判断：`wizard.json` 明确 `llm_configured=false` 时**不还原**，并自愈清空残留密文 |
+| [server.rs](file:///g:/code-memory/src/server.rs) | `save_llm_to_config(None)` 同时清空 `encrypted_api_key`（此前会把 load 还原出的旧密文原样写回盘）；`save_llm_to_wizard_json` 改用 `LlmApiConfig::parse`，不再手写切分 |
+| [server.rs（bin）](file:///g:/code-memory/src/bin/server.rs) | `load_llm_from_wizard_json` 输出统一为 `||` + host 在前；启动时**先解析再定状态**，`llm_api_configured = 解析成功`，解析失败降级为未配置而不再中断启动 |
+| [config_wizard.rs](file:///g:/code-memory/desktop/src-tauri/src/config_wizard.rs) | ollama 解析/输出统一为 host 在前，保留对历史 `model||host` 的兼容；单测同步更新 |
+
+#### ③ 验证
+
+```
+cargo test --features server,ml --lib llm        → 24 passed
+cargo test --features server,ml --lib config::   → 4 passed
+cargo check --features server,ml --all-targets   → Finished（0 error）
+desktop: cargo check --lib                       → Finished（0 error）
+```
+
+新增用例覆盖：`ollama||127.0.0.1:11434||bge-m3` 不再重复补端口（并断言拼出的
+完整 URL 可被 `Url::parse` 接受）、历史倒序自动归一化、桌面端往返一致性。
+
+未完成：桌面端单测**无法链接**——`G:` 盘剩余空间为 **0**（`LNK1180`），
+与代码无关；清理磁盘后可复跑 `cargo test --lib config_wizard`。
+
+### ★★★ 桌面端首屏自愈 + 高级管理按钮契约修复 + 配置建议文案（2026-10-21）
+
+#### ① 首屏"第一次打开不刷新、必须点重试"
+
+- 现象：开机后首次打开桌面端，价值卡停在"暂时读不到数据 + 重试"，手点后立刻正常。
+- 根因：`loadHomeData` 的 `getJson()` 把连接失败/非 2xx 一律吞成 `null`，
+  而是否重试只判断 `d && (d.lock_busy || d.degraded)` ⇒ 冷启动（sidecar 尚未监听）时
+  四个核心端点全为 `null`，`homeBusy=false` ⇒ **不调度任何重试**。
+- 修复：新增 `_scheduleHomeDataRetry()`；`核心端点全缺失` 与 `catch` 路径都走同一有界自愈
+  （2s×10 → 5s，预算 24 次 ≈ 90s）。真持锁才显示"整理中"，纯连不上保留错误态但自动重试。
+
+#### ② 高级管理按钮：前后端契约不一致（7 个按钮确认有缺陷）
+
+| 按钮 | 缺陷 | 修复 |
+|---|---|---|
+| 打开桌面端设置 | `open_settings` 返回 `Result<(), String>`，invoke 得 `undefined`；旧判断 `result && result.success !== false` 恒假 ⇒ **成功也弹"打开设置失败: 未知错误"**（截图） | 改为只有显式 `{success:false}` 才算失败 |
+| 设置项目目录 | 同上（`Result<(), String>`） | 同上 |
+| 标记向导完成 / 重置向导 | 同上 | 同上 |
+| 停止项目 sidecar | 参数名 `projectDir` ≠ Rust `project_key` ⇒ invalid args；且返回值是 `()` | 改传 `projectKey` |
+| 为项目启动 sidecar | 同上；返回的是 `u16` 端口号，旧代码读 `result.port` ⇒ 显示"端口未知" | 传 `projectKey/srcDir`，数值端口直接展示 |
+| 自动配置 Agent | 未传必填 `agent_ids` ⇒ invalid args；返回 `Vec<String>`，旧代码读 `configured_count` | 先 `detect_agents` 取已安装 ID，再按结果数组展示 |
+| 扫描 IDE 项目 | 未传必填 `ide_ids` ⇒ invalid args | 用已安装工具 ID 作为扫描范围 |
+| 保存 Agent 配置 | 未传必填 `agent_ids` ⇒ invalid args | 取 `get_wizard_state.configured_agents` 回写 |
+| 查询项目目录 | 返回 `Option<String>`（字符串），旧代码读 `result.project_dir` ⇒ 已设置也报"未设置" | 兼容裸字符串 |
+| 查询 LLM 配置 | 后端字段是 `llm_type`，旧代码读 `provider` ⇒ 恒"未设置" | 改读 `llm_type` |
+| 验证安装 | 读取 `sidecar_binary`/`config_file`/`agent_configured`（后端不存在）⇒ 恒显示两个"否" | 按 `VerifySetupResult` 真实字段渲染 |
+
+#### ③ 本地语义模型 × LLM：明确"互补，不是二选一"
+
+- 设置页两个区块的描述、帮助文档 2.1/2.2 改为：本地模型负责编码与检索，
+  LLM 负责理解/摘要/查询扩展，**建议同时开启**；LLM 标题由"（可选）"改为"查询翻译与摘要增强"。
+
+#### ④ 检查更新：实测已生效
+
+```
+GET http://127.0.0.1:3099/v1/version/check
+→ current=0.9.10  latest=0.9.10  update_available=false  check_error=null
+GitHub API /releases/latest → tag=v0.9.10
+```
+补充修复：GitHub 返回 404/限流（无 `tag_name`）时，旧逻辑会显示
+"已是最新版本（最新版本：v未知）"，现改为 `check_error` 明确提示。
+
+#### ⑤ 验证
+
+- `node --check static/app.js` → OK（无语法错误）
+- `cargo check --features server,ml --all-targets` → 0 error
+- ⚠️ 静态资源通过 `include_str!` **编译进 sidecar 二进制**，上述前端修复必须
+  重新构建 sidecar 才会在桌面端生效；当前 `G:` 剩余 0.01GB，无法编译（见下）。
+
+#### ⑥ 磁盘（阻塞项）
+
+`G:` 170GB 已满，可回收的大目录：`G:\rust-target` 28.9GB（构建缓存，可重建）、
+`G:\code-memory` 4.2GB（含 target）。需用户确认后再清理。
+
+
+
+> 动机：用户裁定「先看 F1/G4 什么情况」，随后改为「攻 G2/H2/D2」，并明确
+> **"冒烟只是熟悉规则、优化 LRC，不是为测评而改"**。故不猜题，改用**合成语料探针**直接测能力。
+
+#### ① 装置
+
+两个场景各 20 条（< `add_fast_min_messages=30` ⇒ 走 ML），**闲聊语料 18 条全不重复**
+（第一版把闲聊复制了两遍 ⇒ 18/20 是近重复，排名被污染，已重做）：
+
+- **G2 规则**：18 条闲聊 + 1 条硬规定（"部署只能工作日，周五与周末禁止发布"）
+- **D2 冲突**：8 条闲聊 + `报价 100 万` + 6 条闲聊 + `客户确认调整为 120 万，以这个为准` + 3 条闲聊
+
+#### ② 结果（top_k=100）
+
+| 场景 | 查询 | 决定性那条 | 排名 | score |
+|---|---|---|---|---|
+| G2 | 周五能上线吗（**精确**） | 规则 | **1** | 0.0328 |
+| G2 | 什么时候不能发布（**释义**） | 规则 | 15 | 0.0161 |
+| D2 | 报价是多少（**精确**） | **新值** | **7** | 0.0161 |
+| D2 | 报价是多少（**精确**） | **旧值** | **1** ⚠️ | 0.0328 |
+| D2 | 这个项目多少钱（**释义**） | **新值** | **1** | 0.0325 |
+| D2 | 这个项目多少钱（**释义**） | 旧值 | 15 | 0.0164 |
+
+#### ③ 三条结论
+
+1. **召回不是瓶颈**：规则能到 #1；新值在释义问法下也能到 #1 ⇒ G2=20 / D2=40 的损失
+   **大概率发生在平台 Answer/Judge 层**，而那一层我们改不了（官方明写平台控制答题与评测）。
+2. **★ 但暴露了一个真实的产品缺陷**：**精确词查询下，过时值压过最新值**
+   （"报价是 100 万"更短、词面更像 `报价是多少` ⇒ 旧值 #1、新值 #7）。
+   这是**记忆治理**该解决的事（"latest valid state"），与评测无关，属真实短板。
+3. **机制上有迹可循**：score 只有两档 —— **0.0328** 与 **0.016（≈其一半）**
+   ⇒ 说明最终分是**双路融合的"命中一路/两路"**计数式打分；旧值两路都命中、新值只命中一路。
+
+#### ③b 排除「联想通道」假说（用户提出，已实测否证）
+
+假设：`LRC_ASSOC_INTO_RESULTS=1` 会把记录层联想并入结果 ⇒ 旧值被"关联"放大。
+
+| 配置 | 返回条数 | 精确查询 旧值 | 精确查询 新值 | 释义查询 新值 |
+|---|---|---|---|---|
+| `LRC_ASSOC_INTO_RESULTS=1` | **27** | **#1**（0.0328） | #7（0.0161） | #1 |
+| `LRC_ASSOC_INTO_RESULTS=0` | **20** | **#1**（0.0328） | #7（0.0161） | #1 |
+
+- 关闭后条目 **27 → 20**（证明联想确实被并进了 `memories`），但**排名一格未变**
+  ⇒ **联想不是成因**；两档分来自**核心双路融合**（语义 + 关键词/洛书），与联想无关。
+- ⚠️ **我第一版 A/B 是无效的**：`-File` 的参数没传进脚本（`$args` 为空）⇒ 两次都跑在 `ASSOC=1` 上，
+  却"看起来"有差异（27 vs 20）—— 那是**新建 user 的联想图状态差异**，不是开关效果。
+  改用"翻转式脚本 + 打印 before/after"后复测（`changed=True`）才得到上表。
+  **固化：A/B 脚本必须打印"改前/改后 + changed 布尔"，否则无法证明单变量真的变了。**
+- 生产值已恢复 `LRC_ASSOC_INTO_RESULTS=1`（与台账 ㉗ 的裁定一致），探针数据已清空。
+
+#### ④ 处置（**Full 前不改排序**）
+
+- 修法方向明确：让"同一事实的新旧两值"在排序上**新者优先**（或对"两档融合分"做更细的融合）。
+  但这是**全局排序改动** ⇒ 影响面覆盖 A/B/C/D/E/G/H/I 全部维度，而 **Full 是一次性的**。
+- ⇒ **本轮不做**，记为 **backlog**，附可复现探针（`_probe2.py` 的逻辑）与验收判据：
+  「精确查询下 新值排名 < 旧值排名；且释义查询不变差；且冒烟无任何维度下降」。
+- Full 前的最后动作回到**验证**（门禁）而不是**改行为**。
+
+#### ⑤ 顺带确认：**F1/G4 在 smoke 里无法验证**
+
+官方 README 逐字：`Use the issued AML Key to run the **non-scored compatibility smoke test**.`
+中文公告：`小型测试数据集（Smoke）用于检查 Add/Search、鉴权及端到端链路`。
+官方能力分类只列 **6 条**（B / C·D1 / D / E / G2 / H2），**F1 与 G4 不在其中**。
+⇒ 冒烟不是计分评测、也不保证覆盖这两个子项 ⇒ **不要再在冒烟上追 F1/G4**（三次机制、四轮全 0 已验证）。
+
+### ★★★★ 冒烟 #5：**方案 A 判据未通过 ⇒ 已回滚**；"加一条摘要记忆"这条路到天花板（2026-10-21）
+
+#### ① 结果：分数与上一轮**逐格完全相同**
+
+| | 冒烟 #3 | 冒烟 #5 |
+|---|---|---|
+| 总分 | 58.49 | **58.49** |
+| A1 / A2 | 66.67 / 50.00 | **66.67 / 50.00** |
+| C / C1 / C2 | 65.00 / 53.33 / 60.00 | **65.00 / 53.33 / 60.00** |
+| D / D1 / D2 | 53.33 / 66.67 / 40.00 | **完全相同** |
+| **F1** | **0.00** | **0.00** |
+| G / G2 / G4 | 30.00 / 20.00 / 0.00 | **完全相同** |
+| H / I | 50.00 / 47.92 | **完全相同** |
+
+两轮之间唯一的差别是：这一轮库里有 **10 条按 user 生成的全局摘要（419~500 字）**。
+**分数一格没动** ⇒ 这些摘要**对任何一道被评测的题都没有产生影响**。
+
+#### ② 但摘要本身是**可检索**的（不是写不进去）
+
+对已生成摘要的 user 直接查 `enrich`（top_k=100）：
+
+| user 记忆数 | 摘要长度 | 三种"总结类"查询的排名 |
+|---|---|---|
+| 18 | 780 字 | **3 / 3 / 1** |
+| 62 | 965 字 | 26 / 30 / 13 |
+| 362 | 357 字 | 53 / 41 / **NOT_IN_TOP_K** |
+| 33（FAST） | 485 字 | 18 / 2 / 21 |
+
+⇒ 写入、落库、检索都正常；**问题在于 F1 的实际提问没有把它召进 top-100**（或召进了却没改变答案）。
+
+#### ③ 判据执行
+
+预注册写的是"F1 > 0，且任一维度不得下降；不合格 ⇒ 立即回滚"。
+**主判据未达成** ⇒ 已回滚：`summary_enabled=false`（代码保留，默认关）+ 重启适配层。
+残留清理：**两个数据目录都清**（`C:\aml-data`、`C:\aml-data-code`）+ 两个 state 目录，复验全 0。
+
+#### ④ 三次结构性尝试的汇总（F1 恒为 0）
+
+| # | 机制 | 结果 |
+|---|---|---|
+| 1 | LRC 周期结晶 + 全局嵌入聚类 | 1500 条/22 user 只出 **5 条**（0.33%），F1 = 0；且成本 O(库)/轮不可扩展 |
+| 2 | LRC 内 LLM 合成（配 `LRC_LLM_API`） | 摘要真实（364~617 字），但产出量极少；F1 = 0 |
+| 3 | **适配层按 user 全局摘要**（本轮） | 覆盖率大幅提升（10 条/7 个达标 user），**可检索（rank 1~53）**，但 **F1 仍 0 且全表不动** |
+
+⇒ **"再往库里加一条摘要记忆"这条路已经到天花板**，继续调阈值/长度只是换参数、不是换机制。
+
+#### ⑤ 下一步（不再盲试）
+
+先弄清 **F1 到底怎么问、金标长什么样、Judge 怎么判** —— 仓库里已有
+"离线端到端评测器（官方 Answer + Judge 提示词逐字复现）"，用它把 F1 的题面与判分口径摊开，
+再决定是"换机制"还是"承认不可达"。**在看清题面之前不再改线上。**
+
+#### ⑥ 本轮发现的一个缺陷（待修，功能已关所以不急）
+
+`SummaryState` 的"已完成"检查发生在**入队时**，同一 user 的两次 Add 可在第一条摘要完成前
+**同时通过检查** ⇒ 实测出现同一 user 两条摘要（`u_58b0…` 423→500、`u_e0bf…` 419→500）。
+修法：照 `SeenRequestIds.claim` 的三态做**在途认领**。
+
+### ★★★★ 方案 A 落地：**适配层按 user 的全局摘要**（2026-10-21，已部署并单点验证）
+
+#### ① 改了什么（只动 `app.py`，不碰 Rust 二进制）
+
+| 组件 | 作用 |
+|---|---|
+| `UserTranscripts` | 按 user 累计对话正文，**head 50% + tail 50%** 有界（默认 12,000 字/user、5,000 user），落盘 |
+| `SummaryState` | 按 user 记录进度：`0`=未尝试 / `n>0`=失败 n 次 / **`-1`=已完成**（允许有限重试，避免一次抖动永久失去该 user） |
+| `parse_llm_env()` | 直接解析 **`LRC_LLM_API`**（与 LRC 同一份，`openai||key||model||endpoint`）⇒ **不再把 key 抄到第二个文件** |
+| `summarize_user()` | 1 次 chat（`enable_thinking=false`、`max_tokens=800`、30s 超时）→ 用 **`mapping.to_consolidate_payload`** 构造（与普通记忆同一套隐私/事件字段）→ 写回**同一 user_id** |
+| 后台线程 ×2 | 队列异步执行；**异常就地吞掉**，绝不把失败带回 `/add` |
+| 触发 | 某 user 累计消息数 ≥ `summary_min_messages`（默认 **30**）且未成功过 |
+
+#### ② 单点验证（线上实测，不是推断）
+
+注入 32 条消息（1 个 user）⇒ 适配层日志逐字：
+
+```
+F1 全局摘要: 已启用（阈值=30 条/user，上限=500 字，尝试=3 次）
+生效配置: … health_requires_lrc=False  summary_enabled=True  summary_min_messages=30
+全局摘要已写入: user=u_sum-1792528634 chars=485 llm_s=0.0 total_s=4.3
+```
+
+- 库内 `total = 32 + 1`，第 33 条正文 **485 字**，`user_id` 与源记忆一致 ✔
+- ⚠️ 校验口径更正：该条 `memory_type` 是 **`preference`** 而不是 `synthesis` ——
+  因为 `to_consolidate_payload` 会**按正文推断类型**（`inferred or memory_type`）。
+  功能无影响；只是"按 type=synthesis 去数"会数不到。
+
+#### ③ 部署与回滚
+
+| 项 | 值 |
+|---|---|
+| `app.py` 备份 | `C:\aml\adapter\app.py.pre-summary-20261021-043707` |
+| `config.json` 备份 | `C:\aml\adapter\config.json.pre-summary-20261021-043707` |
+| 新增配置 | `summary_enabled=true`、`summary_min_messages=30`、`summary_max_chars=500`、两个 state 路径（`C:\aml\state\...`） |
+| **一键回滚** | 把 `config.json` 里的 `summary_enabled` 改回 `false` 并重启 `AML-Adapter`（代码留着不影响，默认关） |
+| 单测 | **79 passed**（新增 9 条：env 解析 / 有界裁剪 / 持久化 / 淘汰 / 进度语义 / 配置声明） |
+
+#### ④ 预注册判据（下一轮冒烟）
+
+**主判据**：`F1 > 0`。
+**保护判据**：A / B / C / D / E / G / H / I **任一维度不得下降**（同分或上升）。
+**不合格 ⇒ 立即回滚**（`summary_enabled=false`）。
+
+⚠️ 已知边界：
+- 只对 **≥30 条消息的 user** 生效；小对话不出摘要（阈值可调）。
+- 摘要只覆盖 head+tail（12k 字），超长会话的中段不进摘要。
+- **G4 是否同源，仍无证据** —— 本改动不宣称解决 G4。
+
+### ★★★★ 冒烟 #3（58.49，12m12s）：**LLM 结晶确实产出，但 F1 仍 0** —— 机制与规模的定量结论（2026-10-21）
+
+#### ① 事实（不是推断，全部来自 `memories.json` + 代理日志）
+
+| 项 | 值 |
+|---|---|
+| 库规模 / user 数 | **1500 条 / 22 个 user** |
+| **`type=synthesis`** | **5 条**（覆盖率 **0.33%**） |
+| 摘要正文长度 | **364 ~ 617 字**（真·LLM 压缩摘要，不是模板存根）|
+| 每个结晶周期 | `耗时 = 71,799ms / 67,852ms` ⇒ **约 70 秒/周期**，其中 embeddings 10 批 × ~5.5s、chat 7~8s |
+| 每周期产出 | **`合成=1`**（或 0）；同时 `放弃 8 条跨可见性域的合成产物` |
+| 周期间隔 | 300s |
+
+#### ② 为什么 F1 还是 0 —— 三个叠加原因
+
+1. **覆盖率 0.33%**：5 条摘要 vs 1500 条记忆。
+2. **每周期只出 1 条**：一个簇通过，其余（每轮 8 簇）被"跨可见性域"守卫丢弃。
+3. **F1 要的是"长历史全局综合"**，而现有产物是**按主题碎片**的 5 段摘要 —— 即使被召回，也拼不出"把整段历史说清楚"。
+
+#### ③ ★ 更关键的发现：这条路**不可扩展**
+
+嵌入聚类成本是 **O(库规模)/周期**：1000 条 ≈ 55s。按 Full 量级（万级）线性外推 ⇒
+**单周期 ≈ 550s > 300s 间隔** ⇒ 周期追不上库增长，LLM 账单也线性膨胀。
+⇒ **"周期 + 全局嵌入聚类"不是 Full 规模的正确机制**，与 F1 是否调参无关。
+
+#### ④ 真正的机制缺口（对齐 F1 的语义）
+
+F1 = *摘要与压缩 / 长历史全局综合*。而平台给每段对话一个独立 `user_id`
+⇒ 正确产物应是**"每个 user 一段全局摘要"**，而不是"全库按主题切 5 片"。
+
+#### ⑤ 三条候选路线（A 推荐，尚未实施）
+
+| | 做法 | 成本 | 覆盖率 | 改动面 |
+|---|---|---|---|---|
+| **A** | **适配层按 user 出全局摘要**：达到阈值（或首次 Search 前）调用一次 LLM，把该 user 的记忆压成 300~500 字，用同一 `user_id` 写回 | **每 user 1 次 chat**（22 个 user ≈ 30s），**与库规模无关** | 可到 **100%** | 只改 `app.py`（Python），不改 Rust、不重编二进制 |
+| B | 改 LRC 聚类为"按 user 分组后再聚类" | Rust 改动 + 重编 + 部署 | 仍受"每周期只出几条"限制 | 大，且 ③ 的扩展性问题仍在 |
+| C | 接受 F1/G4 = 0 | 0 | 0 | 0 |
+
+- A 的风险点（必须做）：**幂等**（同一 user 只写一次）、**长度上限**、**失败不影响主流程**、**单变量实测**。
+- ⚠️ **A 只针对 F1**；**G4（经验数据发现与模拟）是否同一机制，尚无证据**，不得假定同源。
+
+#### ⑥ 本轮清理
+
+`C:\aml-data` 1500 条 + 两个 state 目录 → 归档 `C:\aml-data.llmtest-20261021-042804` 等，
+复验 `memory.total = 0`、state 两处 0、`llm_configured: true`。
+
+### ★★★★ **LLM 接入打通**：合成可产出真实摘要 + 查询翻译已可单独关闭（2026-10-21）
+
+> 起因：用户提供百炼 key，要求用它解决 F1/G4。**榜别已确认：商业产品榜**（不限制 Add/Search 模型；
+> 开源方法榜才要求 Add 用 gpt-4o-mini）⇒ 用 deepseek 合规，且未触碰第 ⑧ 条"无操纵"（只做摘要，不改答案）。
+
+#### ① 结论先行
+
+| 项 | 结果 |
+|---|---|
+| **LLM 合成（F1/G4 的唯一抓手）** | ✅ **可用**：单 user、6 条相关但不重复的记忆 ⇒ 产出 **221 字真实压缩摘要**（非 26 字模板存根），同一 `user_id`，可被 Search 召回 |
+| **检索侧查询翻译的代价** | ⚠️ 配 LLM 会**连带开启**：16 并发 Search 中位 **1.15s → 14.0s**、最坏 **28.3s** |
+| **处置** | 新增 `LRC_LLM_TRANSLATE` 开关并置 0 ⇒ 16 并发 Search 回到 **中位 0.59s / max 1.55s**，合成不受影响 |
+| **库状态** | 已清回 `memory.total = 0`（两次测试残留均归档） |
+
+#### ② 打通的四个坑（全部有实测证据）
+
+| # | 坑 | 现象 | 解法 |
+|---|---|---|---|
+| 1 | **TLS** | 服务器 Python 3.8 用 `urllib` 报 `CERTIFICATE_VERIFY_FAILED` | 代理改用 `requests`+certifi（适配层已装） |
+| 2 | **推理模型吃 token** | `max_tokens=512`，而 reasoning 用了 **967** ⇒ `finish_reason=length`、正文被截断（4.88s） | 代理注入 `enable_thinking=false` ⇒ **0.94s、`finish=stop`、正文完整** |
+| 3 | **一个 model 名要服务两个端点** | `LlmApiConfig` 只有 `model` 一个字段；`/embeddings` 拿对话模型名 ⇒ 400 / 缺 `data` ⇒ **静默降级回模板** | 代理把 `/v1/embeddings` 的 model **改写**为 `text-embedding-v3`（1024 维） |
+| 4 | **批量上限 10** | `text-embedding-v3` 单次 ≤10 条，而 LRC `embed_openai_batch` 按 **100** 条切 ⇒ 库一超 10 条就 400 | 代理按 10 条**切分 + 合并 + 重排 index** |
+| 5 | **防跨用户泄漏守卫**（**正确设计**，非缺陷） | `[LRC·合成] 放弃 N 条跨可见性域的合成产物（来源分属不同 user/session）` | 测试数据必须**单 user**；真实 Full 每个会话一个 user ⇒ 天然通过 |
+
+另：信息增量守卫（<0.01 判为"空洞抽象"）会拦掉**同义反复**的簇 —— 这是对的，门槛**保持 0.01 不动**。
+
+#### ③ 代理（`C:\aml\llm-proxy.py`，127.0.0.1:8899）
+
+- **不保存 key**：把 LRC 带来的 `Authorization` 原样转发；key 只存在于**机器级环境变量** `LRC_LLM_API`。
+- **不记录正文**：日志只记状态码/耗时/长度（记忆内容不落盘）。
+- 计划任务：`AML-LLM-Proxy`（开机自启，SYSTEM）+ `AML-LLM-Proxy-Keepalive`（每分钟探测 8899，掉了就拉起）。
+- 配置：`LRC_LLM_API = openai||<key>||deepseek-v4.1-flash||http://127.0.0.1:8899/v1`
+  （`url_safety.rs` 明确放行回环地址，故 127.0.0.1 合法）。
+- ⚠️ 操作记录：`Start-Process` 从 SSH 会话起的进程会**随会话结束被回收** ⇒ 必须用计划任务。
+
+#### ④ 代码改动（已提交，未推送）
+
+`LRC_LLM_TRANSLATE` 落在**单一真源** `enrich_query_for_retrieval`（一处覆盖 REST `enrich` + MCP 两条），
+默认**开**（不设变量 ⇒ 逐字保持原行为）；`0/false/off/no` 关闭；新增 3 条**纯函数**单测（不读 env，避免并发污染）。
+
+#### ⑤ 实测对比（同一台机、16 并发、k=100）
+
+| 配置 | wall | 中位 | max | 5xx |
+|---|---|---|---|---|
+| LLM 关（基线，128 条库） | 2.1s | 1.15s | 2.07s | 0 |
+| LLM 开·翻译开（8 条库） | **28.3s** | **14.0s** | **28.3s** | 0 |
+| **LLM 开·翻译关（8 条库）** | **1.57s** | **0.59s** | 1.55s | 0 |
+
+#### ⑥ 部署记录
+
+| 项 | 值 |
+|---|---|
+| ML 二进制 | `0E029527C6D13F99` → **`14F4191D46DF084A`**（18,182,656B，opt-level=3 + `--features server,ml`） |
+| 回滚点 | `C:\aml\bin\code-memory-server.exe.pre-llmgate-20261021-040440` |
+| 环境变量（机器级） | `LRC_LLM_API`（含 key）、`LRC_LLM_TRANSLATE=0`、`DS_BASE`、`DS_EMBED_MODEL=text-embedding-v3` |
+| `run-lrc.cmd` | 已删 `--disable-synthesis`（备份 `.bak-llm`）；该文件**在仓库内**，故 key **绝不写进它** |
+| GitHub | `635e34e`（perf/assoc + 台账）、`4e4c9fc`（本开关）—— **均未 push**，预提交钩子全过 |
+| 残留清理 | `C:\aml-data.llmtest-20261021-034249`、`…-041032` 等归档 |
+
+#### ⑦ 安全提醒
+
+API key 已在对话中明文出现，**评测结束后应在百炼控制台轮换**。
+
 ### ★★ 文本冒烟 #2（**58.62**）+ 残留清理（2026-10-21）
 
 #### ① 得分与上一次对比（**同配置、无改动**，所以差值只能是噪声）
