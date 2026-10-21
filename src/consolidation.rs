@@ -287,9 +287,9 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
     /// v0.5.18 新增：创建带 LLM 配置的结晶流水线
     ///
-    /// 当 LLM 配置有效时，结晶周期会优先使用 LLM embedding 进行高维语义聚类
-    /// 和信息增量计算，绕过 9 维洛书向量的局限性。
-    /// LLM 调用失败时自动降级到洛书合成。
+    /// 当 LLM 配置有效时，结晶周期会使用**本地语义模型**做高维句向量聚类，
+    /// 再用 LLM 生成摘要文本（v0.9.14 起 embedding 不再走 LLM，零费用）。
+    /// 本地模型不可用或 LLM 调用失败时自动降级到洛书合成。
     pub fn new_with_llm(
         config: ConsolidationConfig,
         store: Arc<Mutex<MemoryStore<P>>>,
@@ -297,7 +297,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     ) -> Self {
         let has_llm = llm_config.is_configured();
         if has_llm {
-            eprintln!("[LRC·结晶] LLM embedding 合成已启用（高维语义聚类）");
+            eprintln!("[LRC·结晶] 本地语义聚类 + LLM 摘要合成已启用（embedding 零费用）");
         }
         Self {
             config,
@@ -617,19 +617,23 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         Ok(stats)
     }
 
-    // ==================== v0.5.18 LLM embedding 合成 ====================
+    // ==================== v0.5.18 语义合成（v0.9.14 改为本地聚类） ====================
 
-    /// v0.5.18 新增：LLM embedding 合成周期
+    /// 语义合成周期：**本地语义模型聚类 + LLM 写摘要**
+    ///
+    /// v0.9.14 更正分工（用户裁定）：`embedding` 属于本地语义模型的职责，
+    /// LLM 只负责生成文本。原实现用 `llm_config.embed_texts`（付费 `/v1/embeddings`）
+    /// 做聚类，一旦上游不提供或按策略关闭，整条路径失败并退回 9 维洛书合成。
     ///
     /// 遵循三阶段锁安全模式（参考项目硬约束）：
-    /// - Phase 1：持锁加载所有非 Synthesis 记忆的 (id, content)，释放锁（<1ms）
-    /// - Phase 2：无锁，LLM embedding + 聚类 + LLM 总结（I/O 密集，可能耗时数秒）
+    /// - Phase 1：持锁加载所有非 Synthesis 记忆的 (id, content) + 取编码器句柄（<1ms）
+    /// - Phase 2：无锁，本地句向量批量编码 + 聚类 + LLM 总结（可能耗时数秒）
     /// - Phase 3：持锁写入合成记忆，释放锁（<1ms）
     ///
     /// 失败时返回 Err，调用方应降级到洛书合成。
     async fn llm_synthesize_cycle(&self, llm_config: &LlmApiConfig) -> LrcResult<usize> {
-        // ===== Phase 1：持锁加载记忆列表 =====
-        let candidates: Vec<(String, String)> = {
+        // ===== Phase 1：持锁加载记忆列表 + 取本地编码器句柄（均 <1ms） =====
+        let (candidates, local_encoder): (Vec<(String, String)>, Arc<HybridLuoShuEncoder>) = {
             let store = self.store.lock().await;
             let filter = ListFilter {
                 limit: 1000, // 加载足够多的记忆用于聚类
@@ -638,10 +642,13 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             let (all, _) = store
                 .list_memories(&filter)
                 .map_err(|e| LrcError::io(format!("加载记忆列表失败: {}", e)))?;
-            all.into_iter()
+            let list = all
+                .into_iter()
                 .filter(|m| m.memory_type != MemoryType::Synthesis)
                 .map(|m| (m.id, m.content))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            // v0.9.14：句柄在短锁内取走，真正的编码放到锁外执行
+            (list, store.luoshu_encoder_handle())
         };
 
         if candidates.len() < self.config.synthesis_threshold {
@@ -662,12 +669,24 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             );
         }
 
-        // ===== Phase 2：无锁，LLM embedding + 聚类 + 总结 =====
-        let texts: Vec<&str> = candidates.iter().map(|(_, c)| c.as_str()).collect();
-        let embeddings = timeout(EMBEDDING_TIMEOUT, llm_config.embed_texts(&texts))
-            .await
-            .map_err(|_| LrcError::timeout("LLM embedding 调用超时（60 秒）"))?
-            .map_err(|e| LrcError::network(format!("LLM embedding 调用失败: {}", e)))?;
+        // ===== Phase 2：无锁，本地句向量聚类 + LLM 写摘要 =====
+        // v0.9.14 修复（分工纠正）：embedding 属于**本地语义模型**的职责，
+        // LLM 只负责生成文本。此前这里调用 `llm_config.embed_texts`
+        // （即付费的 /v1/embeddings），一旦上游不提供该端点或按策略关闭，
+        // 整条合成路径立即失败并退回 9 维洛书合成。
+        let texts_owned: Vec<String> = candidates.iter().map(|(_, c)| c.clone()).collect();
+        let embeddings = timeout(
+            EMBEDDING_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                Self::local_sentence_embeddings(local_encoder, texts_owned)
+            }),
+        )
+        .await
+        .map_err(|_| LrcError::timeout("本地语义编码超时（60 秒）"))?
+        .map_err(|e| LrcError::internal(format!("本地语义编码任务失败: {}", e)))?
+        .ok_or_else(|| {
+            LrcError::config("本地语义模型不可用（未加载或编码失败），本次跳过 LLM 合成")
+        })?;
 
         if embeddings.len() != candidates.len() {
             return Err(LrcError::internal(format!(
@@ -678,7 +697,17 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         }
 
         // 基于余弦相似度聚类（贪心法）
-        let clusters = self.cluster_by_embedding(&embeddings, self.config.synthesis_similarity);
+        // v0.9.14：本地句向量（bge 系）存在强各向异性——无关句对的余弦也有
+        // 0.70 左右，直接沿用 Jaccard 口径的 0.4 会把无关内容吞进同一簇。
+        // 阈值改由 `local_cluster_threshold` 给出（实测标定 + 可环境变量覆盖）。
+        let cluster_threshold = Self::local_cluster_threshold(self.config.synthesis_similarity);
+        if self.config.verbose >= 2 {
+            eprintln!(
+                "[LRC·结晶·LLM] 本地句向量聚类阈值 = {:.2}（配置基线 {:.2}）",
+                cluster_threshold, self.config.synthesis_similarity
+            );
+        }
+        let clusters = self.cluster_by_embedding(&embeddings, cluster_threshold);
 
         // 信息增量阈值：与 DaoRegulator 默认值一致（0.01）
         const INFO_GAIN_THRESHOLD: f32 = 0.01;
@@ -810,6 +839,51 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         }
 
         Ok(written)
+    }
+
+    /// 本地句向量聚类的默认余弦阈值
+    ///
+    /// v0.9.14 实测标定（bge-base-zh，768 维，6 条同主题 + 3 条无关）：
+    ///
+    /// - 同主题不同表述：avg=0.8242 / **min=0.7684**
+    /// - 跨主题无关：avg=0.7047 / **max=0.7449**
+    ///
+    /// 因此 0.75 落在可分区间内。bge 系各向异性强，若沿用 Jaccard 的 0.4，
+    /// 0.70 的无关内容也会被吞进同一簇。
+    ///
+    /// 可用环境变量 `LRC_LOCAL_CLUSTER_SIM` 覆盖（用于不同模型/语料再标定）。
+    const LOCAL_SENTENCE_CLUSTER_SIM: f32 = 0.75;
+
+    /// 结合配置基线与实测标定，得出本次本地句向量聚类阈值
+    fn local_cluster_threshold(base: f32) -> f32 {
+        let calibrated = std::env::var("LRC_LOCAL_CLUSTER_SIM")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| *v > 0.0 && *v <= 1.0)
+            .unwrap_or(Self::LOCAL_SENTENCE_CLUSTER_SIM);
+        // 取较大者：用户显式配了更高阈值时尊重用户
+        base.max(calibrated)
+    }
+
+    /// v0.9.14 新增：用本地语义模型批量编码完整句向量（未经 9 维投影）。
+    ///
+    /// 分工约定：**embedding 由本地语义模型负责，LLM 只负责生成文本**。
+    /// 非 `ml` 构建恒返回 `None` —— 调用方据此降级到洛书合成，
+    /// 绝不回退到付费的 LLM embedding。
+    fn local_sentence_embeddings(
+        encoder: Arc<HybridLuoShuEncoder>,
+        texts: Vec<String>,
+    ) -> Option<Vec<Vec<f32>>> {
+        #[cfg(feature = "ml")]
+        {
+            let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+            encoder.encode_embedding_batch(&refs)
+        }
+        #[cfg(not(feature = "ml"))]
+        {
+            let _ = (encoder, texts);
+            None
+        }
     }
 
     /// v0.6.0 新增：基于统一 Embedder 的结晶合成
@@ -1624,6 +1698,222 @@ mod tests {
         assert!(
             pipeline.llm_config.is_none(),
             "LlmApiConfig::None 时 llm_config 应为 None"
+        );
+    }
+
+    /// v0.9.14 验证：本地语义模型的高维句向量能真正驱动合成
+    ///
+    /// 判据（与生产路径同一套数值）：
+    ///   1. 相关句子的平均成对余弦 ≥ `synthesis_similarity`（默认 0.4）⇒ 会归入同一簇；
+    ///   2. 信息增量 `1 - 平均余弦` ≥ 0.01 ⇒ 不会被"空洞抽象"守卫拦掉。
+    ///
+    /// 模型不可用（无 ml feature / 未下载）时优雅跳过。
+    #[test]
+    #[cfg(feature = "ml")]
+    fn local_sentence_vectors_can_drive_synthesis() {
+        let (encoder, ml_loaded) = match crate::engine::create_smart_encoder() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[v0.9.14] 跳过：本地语义模型不可用（{e}）");
+                return;
+            }
+        };
+        if !ml_loaded {
+            eprintln!("[v0.9.14] 跳过：当前为统计编码器模式");
+            return;
+        }
+
+        // 6 条"同一规则的不同表述"——真实的结晶候选形态
+        let related = [
+            "项目部署只能安排在工作日进行",
+            "发布窗口限定为周一至周四的工作时段",
+            "周五和周末禁止上线任何版本",
+            "紧急修复也必须避开周五晚间与周末",
+            "上线操作需要提前一天提交审批",
+            "所有发布必须走工作日审批流程",
+        ];
+        // 3 条无关内容（对照）
+        let unrelated = [
+            "今天午饭吃了牛肉面",
+            "周末去公园散步看花",
+            "手机屏幕贴膜有气泡",
+        ];
+
+        let mut texts: Vec<&str> = related.to_vec();
+        texts.extend(unrelated.iter());
+        let vectors = encoder
+            .encode_embedding_batch(&texts)
+            .expect("本地批量句向量编码应成功");
+        assert_eq!(vectors.len(), texts.len(), "向量条数应与输入一致");
+
+        let dim = vectors[0].len();
+        assert!(
+            dim >= 384,
+            "句向量维度异常（{dim}），应来自 ML 编码器而非 9 维洛书"
+        );
+
+        // 1) 相关组平均成对余弦
+        let mut sum = 0.0f32;
+        let mut pairs = 0usize;
+        let mut min_related = f32::MAX;
+        for i in 0..related.len() {
+            for j in (i + 1)..related.len() {
+                let sim = cosine_similarity(&vectors[i], &vectors[j]);
+                min_related = min_related.min(sim);
+                sum += sim;
+                pairs += 1;
+            }
+        }
+        let avg_related = sum / pairs as f32;
+        let information_gain = 1.0 - avg_related;
+
+        // 2) 相关 vs 无关的对照余弦
+        let mut cross = 0.0f32;
+        let mut cross_pairs = 0usize;
+        let mut max_cross = f32::MIN;
+        for i in 0..related.len() {
+            for j in related.len()..texts.len() {
+                let sim = cosine_similarity(&vectors[i], &vectors[j]);
+                max_cross = max_cross.max(sim);
+                cross += sim;
+                cross_pairs += 1;
+            }
+        }
+        let avg_cross = cross / cross_pairs as f32;
+
+        eprintln!(
+            "[v0.9.14] dim={dim} avg_related={avg_related:.4} min_related={min_related:.4} avg_cross={avg_cross:.4} max_cross={max_cross:.4} info_gain={information_gain:.4}"
+        );
+
+        assert!(
+            min_related > ConsolidationPipeline::<JsonPersistence>::LOCAL_SENTENCE_CLUSTER_SIM,
+            "同主题最小余弦 {min_related:.4} 未高于聚类阈值，簇会碎掉"
+        );
+        assert!(
+            max_cross < ConsolidationPipeline::<JsonPersistence>::LOCAL_SENTENCE_CLUSTER_SIM,
+            "跨主题最大余弦 {max_cross:.4} 已越过聚类阈值，无关内容会被并入同簇"
+        );
+        assert!(
+            information_gain >= 0.01,
+            "信息增量 {information_gain:.4} < 0.01，合成会被守卫拦掉"
+        );
+        assert!(
+            avg_related > avg_cross,
+            "相关组余弦（{avg_related:.4}）未高于无关组（{avg_cross:.4}），本地向量无区分度"
+        );
+    }
+
+    /// v0.9.14 端到端：**本地聚类 + LLM 摘要**（mock 上游，零外网、零费用）
+    ///
+    /// 验证三件事：
+    ///   1. 聚类不再调用 LLM 的 `/v1/embeddings`（否则 mock 里没有该路由会直接失败）；
+    ///   2. 旧配置基线 0.4 会被标定逻辑抬到 0.75（bge 各向异性）；
+    ///   3. 产出 `source = llm_synthesis` 的合成记忆。
+    #[tokio::test]
+    #[cfg(all(feature = "ml", feature = "server"))]
+    async fn local_cluster_with_llm_summary_produces_synthesis_memory() {
+        use axum::{routing::post, Json, Router};
+
+        async fn mock_chat() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "id": "mock",
+                "object": "chat.completion",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "发布只能在周一至周四的工作时段进行，周五与周末禁止上线。"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock LLM 端口绑定失败");
+        let addr = listener.local_addr().expect("mock LLM 地址获取失败");
+        tokio::spawn(async move {
+            let app = Router::new().route("/v1/chat/completions", post(mock_chat));
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (encoder, ml_loaded) = match crate::engine::create_smart_encoder() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[v0.9.14-e2e] 跳过：本地语义模型不可用（{e}）");
+                return;
+            }
+        };
+        if !ml_loaded {
+            eprintln!("[v0.9.14-e2e] 跳过：当前为统计编码器模式");
+            return;
+        }
+
+        let dir = TempDir::new().expect("临时目录");
+        let p = create_json_persistence(dir.path().to_str().unwrap()).expect("持久化创建失败");
+        let store = Arc::new(Mutex::new(MemoryStore::new_with_encoder(p, encoder)));
+
+        let config = ConsolidationConfig {
+            poll_interval_secs: 3600,
+            batch_size: 20,
+            synthesis_threshold: 3,
+            // 故意沿用旧基线 0.4：验证标定逻辑会抬到 0.75
+            synthesis_similarity: 0.4,
+            run_on_start: false,
+            auto_synthesize: true,
+            verbose: 2,
+        };
+        let llm = crate::engine::llm_translator::LlmApiConfig::OpenAI {
+            api_key: "sk-mock".to_string(),
+            model: "mock-model".to_string(),
+            endpoint: format!("http://{addr}/v1"),
+        };
+        let mut pipeline = ConsolidationPipeline::new_with_llm(config, store.clone(), llm);
+
+        let mk = |content: &str| SurfaceMemory {
+            content: content.to_string(),
+            memory_type: "fact".into(),
+            importance: 7,
+            project: None,
+            tags: Vec::new(),
+            session_id: None,
+            user_id: Some("u-synth-test".into()),
+            timestamp: None, // 无时间戳 ⇒ 视为新记忆
+            source: "test".into(),
+        };
+        let source = InMemorySource::new(
+            "e2e",
+            vec![
+                mk("项目部署只能安排在工作日进行"),
+                mk("发布窗口限定为周一至周四的工作时段"),
+                mk("周五和周末禁止上线任何版本"),
+                mk("紧急修复也必须避开周五晚间与周末"),
+                mk("上线操作需要提前一天提交审批"),
+                mk("所有发布必须走工作日审批流程"),
+                mk("今天午饭吃了牛肉面"),
+                mk("手机屏幕贴膜有气泡"),
+            ],
+        );
+
+        let stats = pipeline.run_cycle(&source).await.expect("结晶周期应成功");
+        eprintln!(
+            "[v0.9.14-e2e] fetched={} stored={} synthesized={}",
+            stats.fetched, stats.stored, stats.synthesized
+        );
+        assert!(
+            stats.synthesized >= 1,
+            "应至少产出 1 条 LLM 合成记忆（实际 {}）",
+            stats.synthesized
+        );
+
+        let store = store.lock().await;
+        let (all, _) = store.list_memories(&ListFilter::new()).expect("列出记忆");
+        assert!(
+            all.iter().any(|m| m.memory_type == MemoryType::Synthesis
+                && m.source.as_deref() == Some("llm_synthesis")),
+            "库中应存在 source=llm_synthesis 的合成记忆"
         );
     }
 }

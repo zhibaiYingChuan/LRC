@@ -592,6 +592,47 @@ DashScope 侧该账号免费额度已耗尽（`AllocationQuota.FreeTierOnly`）�
 
 运行时经 `/api/config/llm` 热更新，**LRC 未重启**；回滚点 `llm-proxy.py.bak-provider-20261021`。
 
+### ★★★ 结晶合成纠正分工：本地语义聚类 + LLM 只写摘要（2026-10-21，本地验证完成，未部署）
+
+#### ① 问题（用户指出）
+
+`embedding` 本应是本地语义模型的职责，LLM 只负责生成文本。但
+[`llm_synthesize_cycle`](file:///g:/code-memory/src/consolidation.rs) 一直用
+`llm_config.embed_texts`（付费 `/v1/embeddings`）做聚类 ⇒ 付费 embedding 一关，
+整条合成路径失败、退回 9 维洛书合成，chat 能力完全用不上。
+
+#### ② 改动
+
+| 文件 | 改动 |
+|---|---|
+| `luoshu_encoder_ml.rs` | 把批量前向+池化抽成 `forward_pooled_batch`；`encode_text_batch` 改为"前向 + 9 维投影"；新增 `encode_embedding_batch`（原始高维句向量，未投影）；`HybridLuoShuEncoder::encode_embedding_batch` 批量入口 |
+| `consolidation.rs` | Phase 1 短锁取 `luoshu_encoder_handle()`；Phase 2 在 `spawn_blocking` 里做本地批量编码（锁外）；**删除对 `llm_config.embed_texts` 的依赖**；LLM 仅保留 `summarize_memories`。新增 `LOCAL_SENTENCE_CLUSTER_SIM = 0.75` 与 `LRC_LOCAL_CLUSTER_SIM` 覆盖开关；非 ml 构建返回 None ⇒ 明确降级洛书合成，绝不回退付费 embedding |
+
+#### ③ 阈值标定（实测，bge-base-zh 768 维）
+
+| 组 | avg 余弦 | min/max |
+|---|---|---|
+| 同主题 6 条不同表述 | 0.8242 | **min 0.7684** |
+| 跨主题无关 3 条 | 0.7047 | **max 0.7449** |
+
+⇒ 沿用 Jaccard 口径的 `0.4` 会把无关内容吞进同一簇；本地句向量路径取 **0.75**
+（落在 0.7449~0.7684 可分区间）。信息增量 `1 - 0.8242 = 0.1758`，远高于 0.01 守卫。
+
+#### ④ 验证（全部本地，零外网、零费用）
+
+```
+cargo test --features server,ml --lib consolidation  → 9 passed
+cargo test --features server,ml --lib luoshu         → 43 passed
+新增纯函数标定用例：dim=768 avg_related=0.8242 min=0.7684 max_cross=0.7449 info_gain=0.1758 ✅
+新增端到端用例（mock LLM）：阈值 0.40→0.75；簇大小 6；写入 1 条 llm_synthesis；周期 4.58s ✅
+cargo check --features server,ml --all-targets / --features server --lib → 0 error
+```
+
+#### ⑤ 未做
+
+- **未部署到线上**（Full 正在写入阶段），也未重启任何 LRC 实例。
+- 线上效果需 Full 结束后替换 sidecar 二进制复测；`LRC_LOCAL_CLUSTER_SIM` 可在不改代码的情况下再标定。
+
 
 
 > 动机：用户裁定「先看 F1/G4 什么情况」，随后改为「攻 G2/H2/D2」，并明确

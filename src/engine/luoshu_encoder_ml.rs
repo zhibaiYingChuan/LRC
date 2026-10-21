@@ -826,6 +826,26 @@ impl LuoShuMlEncoder {
         texts: &[&str],
         role: EncodeRole,
     ) -> LrcResult<Vec<LuoShuVector>> {
+        // v0.9.14：前向+池化抽到 forward_pooled_batch，供"9 维投影"与
+        // "原始高维句向量"两条路复用同一份实现，避免两份张量代码漂移。
+        let rows = self.forward_pooled_batch(texts, role)?;
+        Ok(rows.iter().map(|row| self.project_embedding(row)).collect())
+    }
+
+    /// 批量获取底层 BERT 句嵌入（**未经 9 维投影**）
+    ///
+    /// v0.9.14 新增：结晶合成需要"本地语义模型的原始向量"做聚类。
+    /// 9 维洛书向量是后验分布（各维非负、和固定），两两余弦恒在 0.99 以上，
+    /// 无法承担"信息增量"判据（实测被 0.01 阈值全部拦掉）；高维句向量才有区分度。
+    ///
+    /// 语义约定与 [`Self::encode_embedding`] 逐位一致（同样的前缀/池化/截断），
+    /// 差别只是把逐条前向合并为单次批量前向。
+    pub fn encode_embedding_batch(&self, texts: &[&str]) -> LrcResult<Vec<Vec<f32>>> {
+        self.forward_pooled_batch(texts, EncodeRole::Passage)
+    }
+
+    /// 单次批量前向 + 池化（内部实现，返回 [batch, hidden] 的原始句向量）
+    fn forward_pooled_batch(&self, texts: &[&str], role: EncodeRole) -> LrcResult<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -912,11 +932,11 @@ impl LuoShuMlEncoder {
             }
         };
 
-        // 6. [batch, hidden] → Vec<Vec<f32>>，逐行复用同一投影链路
+        // 6. [batch, hidden] → Vec<Vec<f32>>（调用方决定是否投影到 9 维）
         let rows: Vec<Vec<f32>> = pooled
             .to_vec2()
             .map_err(|e| LrcError::internal(format!("to_vec2: {}", e)))?;
-        Ok(rows.iter().map(|row| self.project_embedding(row)).collect())
+        Ok(rows)
     }
 
     /// 获取底层 BERT 编码器的句嵌入（未经投影，用于其他语义场景）
@@ -1371,6 +1391,32 @@ impl HybridLuoShuEncoder {
     /// 通路，绝不放宽标准。
     pub fn encode_embedding(&self, text: &str) -> Option<Vec<f32>> {
         self.ml_encoder.as_ref()?.encode_embedding(text).ok()
+    }
+
+    /// v0.9.14 新增：批量获取完整语义句向量（未经洛书投影）。
+    ///
+    /// 供结晶合成做"本地语义聚类"使用——零 API 费用。
+    /// ML 编码器未加载或整批编码失败时返回 None，调用方据此回退洛书合成。
+    pub fn encode_embedding_batch(&self, texts: &[&str]) -> Option<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Some(Vec::new());
+        }
+        let ml = self.ml_encoder.as_ref()?;
+        match ml.encode_embedding_batch(texts) {
+            Ok(vecs) if vecs.len() == texts.len() => Some(vecs),
+            Ok(vecs) => {
+                eprintln!(
+                    "[LRC·语义] 批量句向量返回 {} 条，期望 {} 条；本次不使用本地聚类",
+                    vecs.len(),
+                    texts.len()
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("[LRC·语义] 批量句向量编码失败: {}", e);
+                None
+            }
+        }
     }
 
     /// 检查是否处于降级状态（质疑一：监控用）
