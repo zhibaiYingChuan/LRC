@@ -562,6 +562,13 @@ please add funds or disable the "use free tier only" mode in the management cons
 因此本轮**未接入**该模型（避免又一次未经确认的模型使用）。若确需重排能力，
 须单独改造为"检索后重排"阶段，并请先明确授权。
 
+#### ⑥ 模型名变更（2026-10-21，用户指定）
+
+- 代理白名单改为 **`deepseek-v4-flash-0731`**（旧 `deepseek-v4.1-flash` 不再放行）。
+- 运行时用 `/api/config/llm` 热更新，**LRC 未重启**；机器级 `LRC_LLM_API` 同步更新为新模型名。
+- 实测：新模型 `200 / finish=stop / 1.20s`；`deepseek-v4.1-flash`、`gpt-4o-mini`、
+  `qwen3.7-text-rerank` 均被本地 **400** 拒绝；`/v1/models` 仅返回新模型；embedding 仍 **501**。
+
 
 
 > 动机：用户裁定「先看 F1/G4 什么情况」，随后改为「攻 G2/H2/D2」，并明确
