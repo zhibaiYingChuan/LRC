@@ -569,6 +569,29 @@ please add funds or disable the "use free tier only" mode in the management cons
 - 实测：新模型 `200 / finish=stop / 1.20s`；`deepseek-v4.1-flash`、`gpt-4o-mini`、
   `qwen3.7-text-rerank` 均被本地 **400** 拒绝；`/v1/models` 仅返回新模型；embedding 仍 **501**。
 
+#### ⑦ 更换上游与服务商（2026-10-21，用户指定）
+
+DashScope 侧该账号免费额度已耗尽（`AllocationQuota.FreeTierOnly`），按用户提供的新凭据改为：
+
+| 项 | 值 |
+|---|---|
+| 上游 base（`DS_BASE`） | `https://api.commandcode.ai/provider/v1` |
+| 模型（唯一白名单） | `deepseek/deepseek-v4.1-flash` |
+| 代理地址 | 仍为本机 `http://127.0.0.1:8899/v1`（LRC 不需感知上游变化） |
+| thinking 守卫 | 改为**仅 dashscope 上游**注入 `enable_thinking`；该服务商忽略该参数，不再发送 |
+
+实测（经代理）：
+
+| 请求 | 结果 |
+|---|---|
+| chat（新模型，`max_tokens=8`） | **200 / finish=stop / content="ok" / 2.03s** |
+| chat（新模型，`max_tokens=300`） | **200 / finish=stop / content="ok" / 1.77s**（无 reasoning 抢占） |
+| chat（旧模型 `deepseek-v4-flash-0731`） | **400** 本地拒绝 |
+| embeddings | **501** 本地拦截（上游本身也是 404，双重保证零费用） |
+| `/v1/models` | 仅返回新模型 |
+
+运行时经 `/api/config/llm` 热更新，**LRC 未重启**；回滚点 `llm-proxy.py.bak-provider-20261021`。
+
 
 
 > 动机：用户裁定「先看 F1/G4 什么情况」，随后改为「攻 G2/H2/D2」，并明确
