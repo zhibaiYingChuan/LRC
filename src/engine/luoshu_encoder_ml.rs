@@ -2482,9 +2482,9 @@ mod tests {
             .expect("批量句向量编码失败");
         assert_eq!(batch.len(), refs.len(), "分片后条数必须与输入一致");
 
-        let single_first = enc.encode_embedding(&refs[0]).expect("单条第 0 条编码失败");
+        let single_first = enc.encode_embedding(refs[0]).expect("单条第 0 条编码失败");
         let single_last = enc
-            .encode_embedding(&refs[39])
+            .encode_embedding(refs[39])
             .expect("单条第 39 条编码失败");
         assert_eq!(batch[0].len(), single_first.len(), "维度不一致");
         assert_eq!(batch[39].len(), single_last.len(), "维度不一致");
