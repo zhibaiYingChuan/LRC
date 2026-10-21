@@ -510,6 +510,58 @@ GitHub API /releases/latest → tag=v0.9.10
 `G:` 170GB 已满，可回收的大目录：`G:\rust-target` 28.9GB（构建缓存，可重建）、
 `G:\code-memory` 4.2GB（含 target）。需用户确认后再清理。
 
+> 处置（同日）：经用户确认已删除 `G:\rust-target` 与 `g:\code-memory\target`，`G:` 剩余 **65.2GB**。
+
+### ★★★ 线上 LLM 成本闸门：禁用付费 embedding + 单一模型白名单（2026-10-21）
+
+#### ① 背景与责任说明
+
+上一轮为解决"一个 model 名同时服务 chat 与 embeddings"的问题，代理里把
+`/v1/embeddings` 的 model **私自改写为 `text-embedding-v3`（付费）**。
+这是**未经确认的模型选择**，责任在实现方。现按用户裁定改为"只用 `deepseek-v4.1-flash`"。
+
+#### ② 线上改动（`C:\aml\llm-proxy.py`，127.0.0.1:8899）
+
+| 项 | 改动 |
+|---|---|
+| `/v1/embeddings` | **本地直接 501**（`embeddings_disabled`），**不产生任何上游请求** ⇒ 零费用 |
+| `/v1/chat/completions` | **模型白名单**：仅 `deepseek-v4.1-flash`；其它型号本地 400，绝不转发 |
+| `/v1/models` | 改为静态返回（仅白名单型号），不再调用上游 |
+| 机器级环境变量 | 删除 `DS_EMBED_MODEL`（默认值也从代码中移除，避免再次被改写） |
+| 回滚点 | `C:\aml\llm-proxy.py.bak-noembed-20261021`；新文件 SHA256 `7B051CA6…484BE5` |
+
+#### ③ 实测（服务器本机）
+
+| 请求 | 结果 |
+|---|---|
+| `POST /v1/embeddings`（`text-embedding-v3`） | **501**（本地拦截，日志 `embeddings BLOCKED locally`） |
+| `POST /v1/embeddings`（`deepseek-v4.1-flash`） | **501**（embedding 通道整体关闭） |
+| `POST /v1/chat/completions`（`deepseek-v4.1-flash`） | 403（**上游配额耗尽**，见 ④） |
+| `POST /v1/chat/completions`（`gpt-4o-mini`） | **400**（本地拒绝） |
+| `GET /v1/models` | 仅 `deepseek-v4.1-flash` |
+| LRC 3099 / 3097 | 均 **200**（未重启，Full 未受影响） |
+
+#### ④ 新发现（需用户决策，非代码缺陷）
+
+`deepseek-v4.1-flash` 上游返回：
+
+```
+403 AllocationQuota.FreeTierOnly
+Free quota exhausted. To continue accessing the model on a paid basis,
+please add funds or disable the "use free tier only" mode in the management console.
+```
+
+⇒ **该 key 的免费额度已用尽**，线上 LLM 合成当前实际工作在"上游 403 → 本地洛书合成"的降级路径。
+若要恢复 F1/G4 的 LLM 合成，需在百炼控制台关闭"仅免费额度"或充值（属用户侧决策）。
+
+#### ⑤ 关于 `qwen3.7-text-rerank`
+
+它是 **rerank（重排）模型**，走 DashScope 的 `text-rerank` 端点、输入 `query + documents`、
+输出**相关性分数**，**不产生向量**；LRC 的 LLM embedding 通道需要 OpenAI 兼容
+`/v1/embeddings` 返回向量 ⇒ 两者不可互换。
+因此本轮**未接入**该模型（避免又一次未经确认的模型使用）。若确需重排能力，
+须单独改造为"检索后重排"阶段，并请先明确授权。
+
 
 
 > 动机：用户裁定「先看 F1/G4 什么情况」，随后改为「攻 G2/H2/D2」，并明确
