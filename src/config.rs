@@ -125,25 +125,54 @@ impl LrcConfig {
         }
     }
 
+    /// 读取 wizard.json 的 LLM 启用意图
+    ///
+    /// 返回 `Some(false)` 表示向导明确声明"未配置"（用户在界面关闭了 LLM）；
+    /// `Some(true)` 表示向导已配置；`None` 表示无法判断（文件不存在/损坏/字段缺失）。
+    fn wizard_llm_enabled() -> Option<bool> {
+        let config_path = Self::get_config_path().ok()?;
+        let wizard_path = config_path.with_file_name("wizard.json");
+        let content = fs::read_to_string(wizard_path).ok()?;
+        let wizard: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let configured = wizard.get("llm_configured")?.as_bool()?;
+        let llm_type = wizard
+            .get("llm_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        Some(configured && !llm_type.is_empty() && llm_type != "none")
+    }
+
     /// 从加密存储恢复 llm_api（P2-06 修复）
     ///
     /// 优先使用 encrypted_api_key 解密恢复。
     /// 如果已有明文 llm_api（旧版本配置），保持不变。
     fn decrypt_llm_api(&mut self) {
-        if let Some(ref encrypted) = self.encrypted_api_key {
-            if !encrypted.is_empty() {
-                match crate::crypto::decrypt_api_key(encrypted) {
-                    Ok(plain) => {
-                        self.llm_api = Some(plain);
-                        eprintln!("[配置] API Key 已从加密存储解密恢复");
-                    }
-                    Err(e) => {
-                        self.llm_config_invalid = true;
-                        self.llm_api = None;
-                        self.parsed_llm_api = None;
-                        eprintln!("[配置] 解密 API Key 失败，已标记为不可用: {}", e);
-                    }
-                }
+        let encrypted = match self.encrypted_api_key.clone() {
+            Some(value) if !value.is_empty() => value,
+            _ => return,
+        };
+
+        // v0.9.14 修复（缺陷：关闭 LLM 后仍被 daemon 后备还原）：
+        // wizard.json 是界面层唯一意图来源。它明确声明"未配置"时，
+        // 不得用历史密文把 LLM 复活，同时自愈清除残留密文，
+        // 否则 config.json 里的旧密文会一直被 load() 还原成幽灵配置。
+        if Self::wizard_llm_enabled() == Some(false) {
+            eprintln!("[配置] 向导已关闭 LLM，忽略并清除历史加密凭据");
+            self.llm_api = None;
+            self.encrypted_api_key = None;
+            return;
+        }
+
+        match crate::crypto::decrypt_api_key(&encrypted) {
+            Ok(plain) => {
+                self.llm_api = Some(plain);
+                eprintln!("[配置] API Key 已从加密存储解密恢复");
+            }
+            Err(e) => {
+                self.llm_config_invalid = true;
+                self.llm_api = None;
+                self.parsed_llm_api = None;
+                eprintln!("[配置] 解密 API Key 失败，已标记为不可用: {}", e);
             }
         }
     }

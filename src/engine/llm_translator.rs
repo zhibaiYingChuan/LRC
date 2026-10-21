@@ -83,20 +83,30 @@ impl LlmApiConfig {
                 })
             }
             "ollama" => {
-                let host = parts
-                    .get(1)
-                    .filter(|s| !s.is_empty())
-                    .ok_or(LrcError::invalid_input(
-                        "ollama 模式需要主机地址: ollama:localhost:model",
-                    ))?
-                    .to_string();
-                let model = parts
-                    .get(2)
-                    .filter(|s| !s.is_empty())
-                    .ok_or(LrcError::invalid_input(
-                        "ollama 模式需要模型名: ollama:localhost:llama3",
-                    ))?
-                    .to_string();
+                // v0.9.14 修复：桌面端旧版本按 `ollama||model||host` 顺序拼接，
+                // 与本模块约定的 `ollama||host||model` 相反，导致模型名被当成主机地址。
+                // 这里做一次窄归一化：仅当第二段是带协议的地址、第一段不是时交换，
+                // 不影响任何既有正确配置。
+                let raw_host = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                let raw_model = parts.get(2).map(|s| s.trim()).unwrap_or("");
+                let swapped = is_http_url(raw_model) && !is_http_url(raw_host);
+                let (host, model) = if swapped {
+                    (raw_model, raw_host)
+                } else {
+                    (raw_host, raw_model)
+                };
+                if host.is_empty() {
+                    return Err(LrcError::invalid_input(
+                        "ollama 模式需要主机地址: ollama||localhost:11434||llama3",
+                    ));
+                }
+                if model.is_empty() {
+                    return Err(LrcError::invalid_input(
+                        "ollama 模式需要模型名: ollama||localhost:11434||llama3",
+                    ));
+                }
+                let host = host.to_string();
+                let model = model.to_string();
 
                 // SSRF 防护：Ollama host 构造 http://host 统一校验
                 // host 可能为 "localhost"、"192.168.1.109"、"192.168.1.109:11434"
@@ -287,7 +297,7 @@ async fn summarize_ollama(host: &str, model: &str, prompt: &str) -> LrcResult<St
         stream: false,
     };
 
-    let url = format!("http://{}:11434/api/chat", host);
+    let url = format!("{}/api/chat", ollama_base_url(host));
 
     let response = client
         .post(&url)
@@ -760,7 +770,7 @@ async fn translate_ollama(
         stream: false,
     };
 
-    let url = format!("http://{}:11434/api/chat", host);
+    let url = format!("{}/api/chat", ollama_base_url(host));
 
     let response = client
         .post(&url)
@@ -983,6 +993,48 @@ async fn embed_openai_batch(
     Ok(all_embeddings)
 }
 
+/// 是否为带协议的 HTTP(S) 地址
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+/// 归一化 Ollama 基础地址（协议 + 主机 + 端口）
+///
+/// v0.9.14 修复：此前三处调用点直接拼接 `http://{host}:11434`，
+/// 当 host 已带端口（如 `127.0.0.1:11434`）或已带协议（如 `http://localhost:11434`）时，
+/// 会生成 `http://127.0.0.1:11434:11434/...` 这类非法 URL，
+/// reqwest 直接返回 `builder error`（本地日志累计 1831 次，结晶流水线退化为洛书合成）。
+///
+/// 规则：缺少协议补 `http://`；authority 未显式带端口时补 `:11434`；去掉尾部斜杠。
+fn ollama_base_url(host: &str) -> String {
+    let trimmed = host.trim().trim_end_matches('/');
+    let base = if is_http_url(trimmed) {
+        trimmed.to_string()
+    } else {
+        format!("http://{}", trimmed)
+    };
+
+    // authority = 协议之后、第一个斜杠之前的部分
+    let authority = base
+        .split("://")
+        .nth(1)
+        .unwrap_or_default()
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    // IPv6 字面量（[::1]）的方括号内冒号不算端口分隔符
+    let host_part = match authority.rfind(']') {
+        Some(idx) => &authority[idx + 1..],
+        None => authority,
+    };
+
+    if host_part.contains(':') {
+        base
+    } else {
+        format!("{}:11434", base)
+    }
+}
+
 /// 通过 Ollama 获取单条文本的 embedding
 async fn embed_ollama(host: &str, model: &str, text: &str) -> LrcResult<Vec<f32>> {
     let client = reqwest::Client::builder()
@@ -995,7 +1047,7 @@ async fn embed_ollama(host: &str, model: &str, text: &str) -> LrcResult<Vec<f32>
         prompt: text.to_string(),
     };
 
-    let url = format!("http://{}:11434/api/embeddings", host);
+    let url = format!("{}/api/embeddings", ollama_base_url(host));
 
     let response = client
         .post(&url)
@@ -1169,6 +1221,54 @@ mod tests {
             }
             _ => panic!("应为 Ollama 配置"),
         }
+    }
+
+    #[test]
+    fn test_parse_config_ollama_accepts_legacy_inverted_order() {
+        // 桌面端旧版本按 `ollama||model||host` 拼接，解析侧必须归一化为 host 在前
+        let config = LlmApiConfig::parse("ollama||llama3||http://localhost:11434").unwrap();
+        match config {
+            LlmApiConfig::Ollama { host, model } => {
+                assert_eq!(host, "http://localhost:11434");
+                assert_eq!(model, "llama3");
+            }
+            _ => panic!("应为 Ollama 配置"),
+        }
+    }
+
+    #[test]
+    fn test_parse_config_ollama_host_first_unchanged() {
+        let config = LlmApiConfig::parse("ollama||127.0.0.1:11434||bge-m3").unwrap();
+        match config {
+            LlmApiConfig::Ollama { host, model } => {
+                assert_eq!(host, "127.0.0.1:11434");
+                assert_eq!(model, "bge-m3");
+            }
+            _ => panic!("应为 Ollama 配置"),
+        }
+    }
+
+    #[test]
+    fn test_ollama_base_url_normalization() {
+        // 裸主机：补协议 + 默认端口
+        assert_eq!(ollama_base_url("localhost"), "http://localhost:11434");
+        // 已带端口：不重复追加（此前会拼成 http://127.0.0.1:11434:11434 ⇒ builder error）
+        assert_eq!(ollama_base_url("127.0.0.1:11434"), "http://127.0.0.1:11434");
+        // 已带协议：不重复补协议、不重复补端口
+        assert_eq!(
+            ollama_base_url("http://localhost:11434/"),
+            "http://localhost:11434"
+        );
+        // 自定义端口保留
+        assert_eq!(
+            ollama_base_url("http://0.0.0.0:8080"),
+            "http://0.0.0.0:8080"
+        );
+        // IPv6 字面量：方括号内冒号不算端口
+        assert_eq!(ollama_base_url("[::1]"), "http://[::1]:11434");
+        // 拼接后的完整路径必须是合法 URL
+        let full = format!("{}/api/embeddings", ollama_base_url("127.0.0.1:11434"));
+        assert!(reqwest::Url::parse(&full).is_ok(), "URL 非法: {full}");
     }
 
     #[test]

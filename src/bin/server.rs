@@ -856,8 +856,7 @@ async fn try_run() -> LrcResult<()> {
     // ╔═══════════════════════════════════════════════════════════════╗
     // ║  第2位 — Tier 2: 配置 LLM API Key（优先引导）               ║
     // ╚═══════════════════════════════════════════════════════════════╝
-    let mut llm_api_configured = llm_api_raw.is_some();
-    if !stdio_mode && !daemon_mode && !llm_api_configured {
+    if !stdio_mode && !daemon_mode && llm_api_raw.is_none() {
         if ask_user_confirmation("  是否现在配置 LLM API Key？") {
             use std::io::{self, Write};
             print!("  > ");
@@ -867,17 +866,37 @@ async fn try_run() -> LrcResult<()> {
                 let trimmed = api_input.trim().to_string();
                 if !trimmed.is_empty() {
                     llm_api_raw = Some(trimmed);
-                    llm_api_configured = true;
                     log("  ✓ LLM API Key 已配置，查询翻译将在搜索时自动启用");
                 }
             }
-            if !llm_api_configured {
+            if llm_api_raw.is_none() {
                 log("  → 输入为空，保持 Tier 1 Fast Match");
             }
         } else {
             log("  → 跳过 LLM API 配置（可稍后在仪表盘「设置」页面配置）");
         }
     }
+
+    // v0.9.14 修复：以"解析成功"作为"LLM 已配置"的唯一事实来源。
+    // 修复前先按 `llm_api_raw.is_some()` 置位、直到下一段才 parse，
+    // 造成 /health、日志与实际生效能力可能互相矛盾；
+    // 且 parse 失败会 `?` 直接中断启动——一个可选的增强项不该让服务起不来。
+    let (llm_api, llm_api_configured) = match llm_api_raw {
+        Some(ref raw) => match LlmApiConfig::parse(raw) {
+            Ok(config) => {
+                let configured = config.is_configured();
+                (config, configured)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[配置] LLM API 配置解析失败，已降级为未配置模式（不影响服务启动）: {}",
+                    e
+                );
+                (LlmApiConfig::None, false)
+            }
+        },
+        None => (LlmApiConfig::None, false),
+    };
 
     if llm_api_configured {
         log("  搜索增强: Tier 2 LLM API 已启用 ✓");
@@ -897,13 +916,6 @@ async fn try_run() -> LrcResult<()> {
         }
     }
 
-    // 解析 LLM API 配置
-    let llm_api = match llm_api_raw {
-        Some(ref raw) => LlmApiConfig::parse(raw).map_err(|e| {
-            LrcError::config(format!("错误: LLM API 配置解析失败: {e}\n提示: 格式为 openai:sk-xxx:model 或 ollama:host:model"))
-        })?,
-        None => LlmApiConfig::None,
-    };
     match &llm_api {
         LlmApiConfig::OpenAI { model, .. } => {
             log(&format!("   LLM 增强: OpenAI ({model}) → 查询翻译已启用"));
@@ -1239,6 +1251,9 @@ fn load_llm_from_wizard_json() -> Option<String> {
     };
 
     // 构造完整的 LLM API 字符串
+    // v0.9.14 修复：统一为 `||` 分隔 + Ollama 采用 host 在前，
+    // 与 LlmApiConfig::parse 的约定一致（旧代码按 `ollama:model:host` 拼接，
+    // 模型名会被当成主机地址，请求 URL 变成 http://<model>:11434 ⇒ builder error）。
     let llm_api_str = match llm_type {
         "openai" => {
             let model = wizard
@@ -1249,7 +1264,7 @@ fn load_llm_from_wizard_json() -> Option<String> {
                 .get("llm_base_url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("https://api.openai.com/v1");
-            format!("openai:{}:{}:{}", api_key, model, base_url)
+            format!("openai||{}||{}||{}", api_key, model, base_url)
         }
         "ollama" => {
             let model = wizard
@@ -1260,7 +1275,7 @@ fn load_llm_from_wizard_json() -> Option<String> {
                 .get("llm_base_url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("http://localhost:11434");
-            format!("ollama:{}:{}", model, host)
+            format!("ollama||{}||{}", host, model)
         }
         _ => return None,
     };

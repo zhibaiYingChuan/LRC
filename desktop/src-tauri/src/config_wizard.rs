@@ -66,11 +66,11 @@ impl WizardConfig {
     ///
     /// 格式（推荐，使用 || 分隔符，支持 API Key 中包含冒号）：
     ///   "openai||sk-xxx||gpt-4o||https://api.openai.com/v1"
-    ///   "ollama||llama3||http://localhost:11434"
+    ///   "ollama||http://localhost:11434||llama3"
     ///
     /// 向后兼容：若输入不含 ||，则按旧格式（冒号分隔）解析并记录警告日志：
     ///   "openai:sk-xxx:gpt-4o:https://api.openai.com/v1"
-    ///   "ollama:llama3:http://localhost:11434"
+    ///   "ollama:localhost:llama3"
     ///
     /// API Key 使用 AES-256-GCM 加密后存储（L1-02），
     /// 原始 Key 不会以明文形式写入磁盘。
@@ -123,17 +123,25 @@ impl WizardConfig {
                 self.llm_configured = true;
                 // Ollama 不需要 API Key
                 self.encrypted_api_key = String::new();
-                // parts: [ollama, model, host]
-                if let Some(model) = parts.get(1) {
-                    if !model.is_empty() {
-                        self.llm_model = Some(model.to_string());
-                    }
+                // v0.9.14 修复：统一为 `ollama||host||model`（与 sidecar 的
+                // LlmApiConfig::parse 一致）。旧顺序 `model||host` 会让 sidecar
+                // 把模型名当主机地址，请求 URL 变成 http://<model>:11434 ⇒ builder error。
+                let first = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                let second = parts.get(2).map(|s| s.trim()).unwrap_or("");
+                // 兼容历史输入：第二段是带协议地址、第一段不是 ⇒ 仍是 model 在前
+                let legacy_order = (second.starts_with("http://")
+                    || second.starts_with("https://"))
+                    && !(first.starts_with("http://") || first.starts_with("https://"));
+                let (host, model) = if legacy_order {
+                    (second, first)
+                } else {
+                    (first, second)
+                };
+                if !host.is_empty() {
+                    self.llm_base_url = Some(host.to_string());
                 }
-                // 存储 Ollama host（用户可能自定义地址）
-                if let Some(host) = parts.get(2) {
-                    if !host.is_empty() {
-                        self.llm_base_url = Some(host.to_string());
-                    }
+                if !model.is_empty() {
+                    self.llm_model = Some(model.to_string());
                 }
             }
             _ => {
@@ -184,7 +192,7 @@ impl WizardConfig {
     ///
     /// 格式与 parse_llm_config 推荐格式一致（使用 || 分隔符）：
     ///   "openai||sk-xxx||gpt-4o||https://api.openai.com/v1"
-    ///   "ollama||llama3||http://localhost:11434"
+    ///   "ollama||http://localhost:11434||llama3"
     ///
     /// 返回 None 表示 LLM 未配置。
     pub fn to_llm_api_string(&self) -> Option<String> {
@@ -211,7 +219,8 @@ impl WizardConfig {
                     .llm_base_url
                     .as_deref()
                     .unwrap_or("http://localhost:11434");
-                Some(format!("ollama||{}||{}", model, host))
+                // v0.9.14 修复：host 在前，与 sidecar 解析约定一致
+                Some(format!("ollama||{}||{}", host, model))
             }
             _ => None,
         }
@@ -778,27 +787,56 @@ mod tests {
     fn test_llm_config_parsing_ollama() {
         let mut config = WizardConfig::default();
         config
-            .parse_llm_config("ollama:llama3:http://localhost:11434")
+            .parse_llm_config("ollama:localhost:llama3")
             .expect("解析失败");
         assert!(config.llm_configured);
         assert_eq!(config.llm_type, "ollama");
         assert_eq!(config.llm_model, Some("llama3".into()));
+        assert_eq!(config.llm_base_url, Some("localhost".into()));
         // Ollama 不需要 API Key
         assert!(config.encrypted_api_key.is_empty());
         assert!(config.get_api_key().is_none());
     }
 
-    /// TDD：测试 Ollama 新格式 || 分隔符解析
+    /// TDD：测试 Ollama 新格式 || 分隔符解析（host 在前）
     #[test]
     fn test_llm_config_parsing_ollama_new_format() {
         let mut config = WizardConfig::default();
         config
-            .parse_llm_config("ollama||llama3||http://localhost:11434")
+            .parse_llm_config("ollama||http://localhost:11434||llama3")
             .expect("解析失败");
         assert!(config.llm_configured);
         assert_eq!(config.llm_type, "ollama");
         assert_eq!(config.llm_model, Some("llama3".into()));
+        assert_eq!(config.llm_base_url, Some("http://localhost:11434".into()));
         assert!(config.encrypted_api_key.is_empty());
         assert!(config.get_api_key().is_none());
+    }
+
+    /// TDD：Ollama 往返一致性 —— 输出格式必须能被自身与 sidecar 正确解析
+    #[test]
+    fn test_ollama_roundtrip_keeps_host_and_model() {
+        let mut config = WizardConfig::default();
+        config
+            .parse_llm_config("ollama||127.0.0.1:11434||bge-m3")
+            .expect("解析失败");
+        let api_string = config.to_llm_api_string().expect("应返回 LLM API 字符串");
+        assert_eq!(api_string, "ollama||127.0.0.1:11434||bge-m3");
+
+        let mut config2 = WizardConfig::default();
+        config2.parse_llm_config(&api_string).expect("往返解析失败");
+        assert_eq!(config2.llm_model, Some("bge-m3".into()));
+        assert_eq!(config2.llm_base_url, Some("127.0.0.1:11434".into()));
+    }
+
+    /// TDD：兼容历史 `ollama||model||host` 输入（旧桌面端顺序）
+    #[test]
+    fn test_llm_config_parsing_ollama_legacy_order() {
+        let mut config = WizardConfig::default();
+        config
+            .parse_llm_config("ollama||llama3||http://localhost:11434")
+            .expect("解析失败");
+        assert_eq!(config.llm_model, Some("llama3".into()));
+        assert_eq!(config.llm_base_url, Some("http://localhost:11434".into()));
     }
 }

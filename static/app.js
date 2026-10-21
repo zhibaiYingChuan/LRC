@@ -6302,8 +6302,9 @@ async function resetWizardState() {
   if (!confirmed) return;
   try {
     const result = await postMessageToParent('lrc-reset-wizard', {}, 10000);
-    if (result && result.success !== false) {
-      showToast('向导已重置，' + (result.message || '下次启动将重新进入向导'), 'success');
+    // v0.9.14：reset_wizard 返回 Result<(), String>（成功时 undefined）
+    if (!result || result.success !== false) {
+      showToast('向导已重置，' + (result?.message || '下次启动将重新进入向导'), 'success');
     } else {
       showToast('重置向导失败: ' + (result?.message || '未知错误'), 'error');
     }
@@ -6326,11 +6327,12 @@ async function getLlmConfig() {
   try {
     const result = await postMessageToParent('lrc-get-llm-config', {}, 10000);
     if (result) {
-      const hasConfig = result.llm_api || result.configured;
+      const hasConfig = result.configured === true || result.llm_api;
       const lines = [
         'LLM 配置状态:',
         '• 已配置: ' + (hasConfig ? '是' : '否'),
-        '• 提供商: ' + (result.provider || '（未设置）'),
+        // v0.9.14 修复：LlmConfigResponse 字段是 llm_type，旧代码读 provider 恒为空
+        '• 提供商: ' + (result.llm_type || '（未设置）'),
         '• 模型: ' + (result.model || '（未设置）'),
       ];
       // v0.8.2：用 showInfoModal 替代多行 alert
@@ -6442,9 +6444,10 @@ async function setProjectDir() {
   const trimmedDir = projectDir.trim();
   try {
     const result = await postMessageToParent('lrc-set-project-dir', { projectDir: trimmedDir }, 10000);
-    if (result && result.success !== false) {
+    // v0.9.14：set_project_dir 返回 Result<(), String>（成功时 undefined），按同一契约判定
+    if (!result || result.success !== false) {
       // v0.8.2：用 showToast 替代 alert
-      showToast('项目目录已设置: ' + (result.project_dir || trimmedDir), 'success');
+      showToast('项目目录已设置: ' + (result?.project_dir || trimmedDir), 'success');
     } else {
       showToast('设置项目目录失败: ' + (result?.message || '未知错误'), 'error');
     }
@@ -6462,9 +6465,13 @@ async function setProjectDir() {
 async function getProjectDir() {
   try {
     const result = await postMessageToParent('lrc-get-project-dir', {}, 10000);
-    if (result && (result.project_dir || result.path)) {
+    // v0.9.14 修复：get_project_dir 返回 Result<Option<String>, String>，
+    // invoke 解析结果是字符串或 null（不是 { project_dir } 对象），
+    // 旧判断把已设置的项目目录误报为"未设置"。
+    const dir = typeof result === 'string' ? result : (result?.project_dir || result?.path || '');
+    if (dir) {
       // v0.8.2：用 showToast 替代 alert
-      showToast('当前项目目录: ' + (result.project_dir || result.path), 'info');
+      showToast('当前项目目录: ' + dir, 'info');
     } else {
       showToast('当前未设置项目目录（使用默认全局模式）', 'info');
     }
@@ -6498,10 +6505,18 @@ async function startSidecarForProject() {
   try {
     // v0.8.10 L3-01：超时从 60s 延长到 120s，与 handleStartServiceClick 对齐
     // spawn_and_wait 最坏 40s 健康检查 + 索引期间 HTTP 慢响应，60s 余量不足
-    const result = await postMessageToParent('lrc-start-sidecar-for-project', { projectDir: trimmedDir }, 120000);
-    if (result && (result.port || result.success !== false)) {
+    // v0.9.14 修复：命令签名是 (project_key, src_dir, port, multi_window)，
+    // 旧参数名 projectDir 与 Rust 侧不匹配 ⇒ invalid args，按钮必然报错。
+    // 返回值是端口号（u16），不是 { success } 对象。
+    const result = await postMessageToParent(
+      'lrc-start-sidecar-for-project',
+      { projectKey: trimmedDir, srcDir: trimmedDir },
+      120000
+    );
+    const startedPort = typeof result === 'number' ? result : (result?.port || null);
+    if (startedPort || !result || result.success !== false) {
       // v0.8.2：用 showInfoModal 替代多行 alert
-      showInfoModal('sidecar 已启动', '项目 sidecar 已启动\n项目: ' + (result.project_dir || trimmedDir) + '\n端口: ' + (result.port || '未知'));
+      showInfoModal('sidecar 已启动', '项目 sidecar 已启动\n项目: ' + (result?.project_dir || trimmedDir) + '\n端口: ' + (startedPort || '未知'));
       // v0.8.10 L3-03：启动成功后主动触发健康检查，加速状态栏更新
       setTimeout(() => {
         loadDashboard();
@@ -6536,10 +6551,12 @@ async function stopSidecarForProject() {
     return;
   }
   try {
-    const result = await postMessageToParent('lrc-stop-sidecar-for-project', { projectDir: trimmedDir }, 30000);
-    if (result && result.success !== false) {
+    // v0.9.14 修复：命令参数名是 project_key（旧代码传 projectDir ⇒ invalid args），
+    // 且返回 Result<(), String>（成功时 undefined），不能再用 `result &&` 判定。
+    const result = await postMessageToParent('lrc-stop-sidecar-for-project', { projectKey: trimmedDir }, 30000);
+    if (!result || result.success !== false) {
       // v0.8.2：用 showToast 替代 alert
-      showToast('项目 sidecar 已停止，' + (result.message || ''), 'success');
+      showToast('项目 sidecar 已停止，' + (result?.message || ''), 'success');
     } else {
       showToast('停止项目 sidecar 失败: ' + (result?.message || '未知错误'), 'error');
     }
@@ -6671,12 +6688,23 @@ async function configureAgents() {
   if (!confirmed) return;
   try {
     await syncSidecarApiBase();
+    // v0.9.14 修复：configure_agents 必须传 agent_ids（旧代码只传 port ⇒ invalid args，
+    // 按钮必然失败）。这里先取"已安装"的工具 ID，再按命令契约提交。
+    const detected = await postMessageToParent('lrc-detect-agents', {}, 30000);
+    const agentIds = Array.isArray(detected)
+      ? detected.filter(a => a && a.installed && a.id).map(a => a.id)
+      : [];
+    if (agentIds.length === 0) {
+      showToast('未检测到已安装的 AI 工具，请先在向导中检测', 'warning');
+      return;
+    }
     const sidecarPort = Number(new URL(API_BASE).port || 3099);
-    const result = await postMessageToParent('lrc-configure-agents', { port: sidecarPort }, 60000);
-    if (result && result.success !== false) {
-      const configured = result.configured_count || result.count || 0;
-      // v0.8.2：用 showInfoModal 替代多行 alert
-      showInfoModal('Agent 配置完成', '已配置: ' + configured + ' 个\n' + (result.message || ''));
+    const result = await postMessageToParent('lrc-configure-agents', { agentIds, port: sidecarPort }, 60000);
+    if (!result || result.success !== false) {
+      // 命令返回每个工具的配置结果文本数组（Vec<String>）
+      const lines = Array.isArray(result) ? result : [];
+      const head = lines.slice(0, 8).map(l => '• ' + l).join('\n');
+      showInfoModal('Agent 配置完成', '已处理 ' + (lines.length || agentIds.length) + ' 个工具\n' + (head || ''));
     } else {
       showToast('Agent 配置失败: ' + (result?.message || '未知错误'), 'error');
     }
@@ -6696,10 +6724,14 @@ async function saveConfiguredAgents() {
   const confirmed = await showConfirm('确定要保存当前已配置的 Agent 列表吗？', '保存 Agent 配置');
   if (!confirmed) return;
   try {
-    const result = await postMessageToParent('lrc-save-configured-agents', {}, 10000);
-    if (result && result.success !== false) {
+    // v0.9.14 修复：save_configured_agents 必须传 agent_ids（旧代码传空对象 ⇒ invalid args），
+    // 且返回 Result<(), String>（成功时 undefined）。这里保存"当前已配置列表"本身。
+    const state = await postMessageToParent('lrc-get-wizard-state', {}, 10000);
+    const agentIds = Array.isArray(state?.configured_agents) ? state.configured_agents : [];
+    const result = await postMessageToParent('lrc-save-configured-agents', { agentIds }, 10000);
+    if (!result || result.success !== false) {
       // v0.8.2：用 showToast 替代 alert
-      showToast('已保存 Agent 配置，' + (result.message || ''), 'success');
+      showToast('已保存 Agent 配置（' + agentIds.length + ' 个）', 'success');
     } else {
       showToast('保存 Agent 配置失败: ' + (result?.message || '未知错误'), 'error');
     }
@@ -6722,7 +6754,17 @@ async function scanIdeProjects() {
   );
   if (!confirmed) return;
   try {
-    const result = await postMessageToParent('lrc-scan-ide-projects', {}, 60000);
+    // v0.9.14 修复：scan_ide_projects 必须传 ide_ids（旧代码传空对象 ⇒ invalid args）。
+    // 用已安装工具 ID 作为扫描范围；后端只扫描 id 命中的检测器。
+    const detected = await postMessageToParent('lrc-detect-agents', {}, 30000);
+    const ideIds = Array.isArray(detected)
+      ? detected.filter(a => a && a.installed && a.id).map(a => a.id)
+      : [];
+    if (ideIds.length === 0) {
+      showToast('未检测到已安装的 AI 工具/IDE，无可扫描范围', 'warning');
+      return;
+    }
+    const result = await postMessageToParent('lrc-scan-ide-projects', { ideIds }, 60000);
     if (Array.isArray(result)) {
       const count = result.length;
       const details = result.slice(0, 10).map(p => `• ${p.name || p.path || '未知'}`).join('\n');
@@ -6745,7 +6787,11 @@ async function scanIdeProjects() {
 async function openSettings() {
   try {
     const result = await postMessageToParent('lrc-open-settings', {}, 10000);
-    if (result && result.success !== false) {
+    // v0.9.14 修复：open_settings 的 Rust 返回类型是 Result<(), String>，
+    // invoke 成功时解析为 undefined ⇒ 旧判断 `result && ...` 恒假，
+    // 即使设置面板已打开也会弹"打开设置失败: 未知错误"。
+    // 约定：只有显式 { success: false } 才算失败，其余（含 undefined/number/array）均为成功。
+    if (!result || result.success !== false) {
       // 设置窗口已打开，无需额外提示
       console.log('桌面端设置窗口已打开');
     } else {
@@ -6772,9 +6818,10 @@ async function markComplete() {
   if (!confirmed) return;
   try {
     const result = await postMessageToParent('lrc-mark-complete', {}, 10000);
-    if (result && result.success !== false) {
+    // v0.9.14：mark_complete 返回 Result<(), String>（成功时 undefined）
+    if (!result || result.success !== false) {
       // v0.8.2：用 showToast 替代 alert
-      showToast('向导已标记完成，' + (result.message || ''), 'success');
+      showToast('向导已标记完成，' + (result?.message || ''), 'success');
       setTimeout(() => loadDashboard(), 500);
     } else {
       showToast('标记完成失败: ' + (result?.message || '未知错误'), 'error');
@@ -6794,19 +6841,35 @@ async function verifySetup() {
   try {
     const result = await postMessageToParent('lrc-verify-setup', {}, 30000);
     if (result) {
+      // v0.9.14 修复：按 VerifySetupResult 的真实字段渲染。
+      // 旧代码读 sidecar_binary / config_file / agent_configured（后端不存在这些字段），
+      // 导致"验证安装"永远显示两行"否"。
       const lines = [
         '安装验证结果:',
-        '• sidecar 二进制: ' + (result.sidecar_binary ? '是' : '否'),
-        '• 配置文件: ' + (result.config_file ? '是' : '否'),
-        '• LLM 配置: ' + (result.llm_configured ? '是' : '否'),
-        '• Agent 配置: ' + (result.agent_configured ? '是' : '否'),
+        '• sidecar 服务: ' + (result.sidecar_running
+          ? '运行中（端口 ' + (result.sidecar_port || '未知') + '）'
+          : '未运行'),
+        '• LLM 配置: ' + (result.llm_configured ? '已配置' : '未配置'),
+        '• AI 工具配置: ' + (result.agents_configured
+          ? '已配置 ' + (result.agents_count || 0) + ' 个'
+          : '未配置'),
+        '• 项目目录: ' + (result.project_configured ? '已设置' : '未设置（全局模式）'),
       ];
-      if (result.issues && result.issues.length > 0) {
-        lines.push('\n存在的问题:');
-        result.issues.forEach(issue => lines.push('• ' + issue));
+      const details = [
+        result.sidecar_message,
+        result.llm_message,
+        result.agents_message,
+        result.project_message,
+      ].filter(Boolean);
+      if (details.length) {
+        lines.push('');
+        details.forEach(m => lines.push('· ' + m));
+      }
+      if (result.suggestion) {
+        lines.push('', '建议: ' + result.suggestion);
       }
       // v0.8.2：用 showInfoModal 替代多行 alert
-      showInfoModal('安装验证结果', lines.join('\n'));
+      showInfoModal(result.all_ok ? '安装验证通过' : '安装验证结果', lines.join('\n'));
     } else {
       showToast('验证通过', 'success');
     }
@@ -7358,6 +7421,22 @@ function _homeDataRetryDelay() {
   return _homeDataRetryCount <= 10 ? 2000 : 5000;
 }
 
+/**
+ * v0.9.14 修复（冷启动首屏不刷新）：
+ * 统一的自愈调度入口。此前只有"拿到响应但 lock_busy"才调度重试，
+ * 而开机后首次打开时 sidecar 尚未监听（连接被拒），每个请求都返回 null，
+ * homeBusy 恒为 false ⇒ 不重试 ⇒ 首屏永久停在"暂时读不到数据 + 重试"，
+ * 必须用户手点重试。改为"响应全缺失"也算暂时态，与 catch 路径共用本入口。
+ */
+function _scheduleHomeDataRetry() {
+  if (_homeDataRetryCount >= HOME_DATA_MAX_RETRIES || _homeDataRetryTimer) return;
+  _homeDataRetryCount++;
+  _homeDataRetryTimer = setTimeout(() => {
+    _homeDataRetryTimer = null;
+    loadHomeData(true);
+  }, _homeDataRetryDelay());
+}
+
 /** 价值卡骨架态（首屏初始 / 重新加载时） */
 function renderValueHeroSkeleton() {
   const body = document.getElementById('value-hero-content');
@@ -7879,8 +7958,13 @@ async function loadHomeData(isRetry) {
     // 处理 busy/null 态），只要还有关键端点 busy 就调度整页重试，让所有模块
     // 一起收敛到真实数据（退避见 _homeDataRetryDelay，总预算约 90s）。
     // 避免旧方案"只补 M1、M2/M3/M4 永久滞留"。
-    const homeBusy = [recentData, statsData, actData, synthData]
+    // v0.9.14 修复：四个核心端点全部拿不到数据（典型场景：开机后 sidecar 还没监听，
+    // 连接被拒 ⇒ getJson 静默返回 null）必须按"暂时态"处理并自愈重试，
+    // 否则首屏永远停在"暂时读不到数据"，必须用户手点重试。
+    const coreMissing = [recentData, statsData, actData, synthData].every(d => d === null);
+    const anyBusy = [recentData, statsData, actData, synthData]
       .some(d => d && (d.lock_busy || d.degraded));
+    const homeBusy = coreMissing || anyBusy;
 
     // --- M1 价值陈述卡（stats 为 lock_busy 判据，act/synth 为辅助口径） ---
     renderValueHero(statsData, actData, synthData);
@@ -7925,17 +8009,12 @@ async function loadHomeData(isRetry) {
     // --- v2.0 状态驱动发现：同样独立、失败静默（门控关闭时后端返回 executed=false） ---
     loadStateDiscovery();
 
-    // 所有模块基于当前数据即时渲染后，若仍有核心端点 busy，则调度整页重试收敛
+    // 所有模块基于当前数据即时渲染后，若仍有核心端点 busy（或全部缺失），则调度整页重试收敛
     if (homeBusy) {
-      // 后台整理中：每次调度都刷新 M1/M2 占位，让重试进度可见
-      renderValueHeroBusy();
-      if (_homeDataRetryCount < HOME_DATA_MAX_RETRIES && !_homeDataRetryTimer) {
-        _homeDataRetryCount++;
-        _homeDataRetryTimer = setTimeout(() => {
-          _homeDataRetryTimer = null;
-          loadHomeData(true);
-        }, _homeDataRetryDelay());
-      }
+      // 真·后台持锁才展示"整理中"；纯冷启动连不上时保留错误态文案 + 自动重试，
+      // 避免把"服务还没起来"误报成"正在整理"。
+      if (anyBusy) renderValueHeroBusy();
+      _scheduleHomeDataRetry();
     } else {
       _homeDataRetryCount = 0;
       if (_homeDataRetryTimer) {
@@ -7946,6 +8025,9 @@ async function loadHomeData(isRetry) {
   } catch (err) {
     if (err?.name === 'AbortError' || signal.aborted) return;
     console.error('[loadHomeData] 首页数据加载失败:', err);
+    // v0.9.14：异常（含 sidecar 尚未就绪导致 syncSidecarApiBase 抛错）同样走有界自愈，
+    // 不再要求用户手点"重试"。
+    _scheduleHomeDataRetry();
     if (assocList) {
       assocList.innerHTML = '<div class="text-center text-dim" style="padding:16px;">首页数据暂时不可用，请稍后刷新。</div>';
     }

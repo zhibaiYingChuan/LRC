@@ -4014,6 +4014,13 @@ async fn config_llm_handler(
 fn save_llm_to_config(llm_api: Option<&str>) -> crate::errors::LrcResult<()> {
     let mut cfg = crate::config::LrcConfig::load();
     cfg.llm_api = llm_api.map(|s| s.to_string());
+    if cfg.llm_api.is_none() {
+        // v0.9.14 修复：清除语义必须同时清空密文。
+        // 修复前 save() 只在 llm_api 为 Some 时覆盖 encrypted_api_key，
+        // 传入 None 时会把 load() 还原出的历史密文原样写回磁盘 ⇒
+        // 下次 daemon 启动又从 config.json 后备还原成"已关闭"的 LLM 配置。
+        cfg.encrypted_api_key = None;
+    }
     // v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：LrcConfig::save 已返回 LrcError，
     // 此处直接上浮，不再降级为 String。
     cfg.save()
@@ -4050,16 +4057,25 @@ fn save_llm_to_wizard_json(llm_api: &str) -> LrcResult<()> {
     };
 
     // 解析 LLM API 字符串并更新 wizard.json
-    // 格式：openai:sk-xxx:gpt-4o:https://api.openai.com/v1
-    //       ollama:llama3:http://localhost:11434
-    let parts: Vec<&str> = llm_api.splitn(4, ':').collect();
-
-    match parts.first() {
-        Some(&"openai") => {
-            wizard["llm_configured"] = serde_json::json!(true);
-            wizard["llm_type"] = serde_json::json!("openai");
-            // API Key 加密存储
-            if let Some(api_key) = parts.get(1) {
+    // v0.9.14 修复：改为复用 LlmApiConfig::parse（唯一事实来源）。
+    // 修复前这里用 `splitn(4, ':')` 切分，遇到桌面端推荐的 `||` 分隔格式时
+    // parts[0] 不等于 "openai"/"ollama"，直接落进 `_` 分支把 wizard.json 的
+    // LLM 配置整段清空 ⇒ 仪表盘保存成功、向导却显示"未配置"（状态分裂）。
+    let trimmed = llm_api.trim();
+    if trimmed.is_empty() {
+        wizard["llm_configured"] = serde_json::json!(false);
+        wizard["llm_type"] = serde_json::json!("none");
+        wizard["encrypted_api_key"] = serde_json::json!("");
+    } else {
+        match LlmApiConfig::parse(trimmed) {
+            Ok(LlmApiConfig::OpenAI {
+                api_key,
+                model,
+                endpoint,
+            }) => {
+                wizard["llm_configured"] = serde_json::json!(true);
+                wizard["llm_type"] = serde_json::json!("openai");
+                // API Key 清洗 + 加密存储（沿用原有行为）
                 let cleaned_key: String = api_key
                     .trim()
                     .chars()
@@ -4070,38 +4086,28 @@ fn save_llm_to_wizard_json(llm_api: &str) -> LrcResult<()> {
                         .map_err(|e| LrcError::crypto(format!("加密 API Key 失败: {}", e)))?;
                     wizard["encrypted_api_key"] = serde_json::json!(encrypted);
                 }
+                wizard["llm_model"] = serde_json::json!(model);
+                wizard["llm_base_url"] = serde_json::json!(endpoint);
             }
-            if let Some(model) = parts.get(2) {
-                if !model.is_empty() {
-                    wizard["llm_model"] = serde_json::json!(model);
-                }
+            Ok(LlmApiConfig::Ollama { host, model }) => {
+                wizard["llm_configured"] = serde_json::json!(true);
+                wizard["llm_type"] = serde_json::json!("ollama");
+                wizard["encrypted_api_key"] = serde_json::json!("");
+                wizard["llm_model"] = serde_json::json!(model);
+                wizard["llm_base_url"] = serde_json::json!(host);
             }
-            if let Some(base_url) = parts.get(3) {
-                if !base_url.is_empty() {
-                    wizard["llm_base_url"] = serde_json::json!(base_url);
-                }
+            Ok(LlmApiConfig::None) => {
+                wizard["llm_configured"] = serde_json::json!(false);
+                wizard["llm_type"] = serde_json::json!("none");
+                wizard["encrypted_api_key"] = serde_json::json!("");
             }
-        }
-        Some(&"ollama") => {
-            wizard["llm_configured"] = serde_json::json!(true);
-            wizard["llm_type"] = serde_json::json!("ollama");
-            wizard["encrypted_api_key"] = serde_json::json!("");
-            if let Some(model) = parts.get(1) {
-                if !model.is_empty() {
-                    wizard["llm_model"] = serde_json::json!(model);
-                }
+            Err(e) => {
+                // 解析失败不静默清空既有配置，明确报错由调用方决定
+                return Err(LrcError::invalid_input(format!(
+                    "同步 wizard.json 失败：LLM 配置无法解析: {}",
+                    e
+                )));
             }
-            if let Some(host) = parts.get(2) {
-                if !host.is_empty() {
-                    wizard["llm_base_url"] = serde_json::json!(host);
-                }
-            }
-        }
-        _ => {
-            // 清除 LLM 配置
-            wizard["llm_configured"] = serde_json::json!(false);
-            wizard["llm_type"] = serde_json::json!("none");
-            wizard["encrypted_api_key"] = serde_json::json!("");
         }
     }
 

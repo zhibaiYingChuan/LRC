@@ -940,8 +940,12 @@
     <div class="card">
       <div class="card-title"><img src="/assets/icons/icon-config.svg" alt="" width="18" height="18"> 二、配置指南</div>
 
-      <h4 style="margin: 12px 0 6px; color: var(--ink);">2.1 LLM 配置（可选）</h4>
-      <p style="line-height: 1.7; color: var(--text);">配置 LLM 可启用自然语言搜索代码功能。LRC 支持以下国产模型：</p>
+      <h4 style="margin: 12px 0 6px; color: var(--ink);">2.1 LLM 配置（建议与本地语义模型同时开启）</h4>
+      <p style="line-height: 1.7; color: var(--text);">
+        <strong>本地语义模型和 LLM 不是二选一</strong>：本地模型负责把文本编码成向量、承担检索；
+        LLM 负责理解语义、生成摘要、扩展查询词。两者同时开启才能获得最好的记忆效果。
+        配置 LLM 后还可以用自然语言搜索代码。LRC 支持以下国产模型：
+      </p>
       <div class="table-wrap">
         <table>
           <thead>
@@ -962,7 +966,9 @@
 
       <h4 style="margin: 12px 0 6px; color: var(--ink);">2.2 本地语义模型（内置，无需配置）</h4>
       <p style="line-height: 1.7; color: var(--text);">
-        LRC 内置本地小模型用于代码语义搜索，<strong>无需任何配置即可使用</strong>。默认根据系统语言自动选择：
+        LRC 内置本地小模型用于代码语义搜索，<strong>无需任何配置即可使用</strong>。
+        它与 2.1 的 LLM 是<strong>互补关系</strong>（本地模型做编码与检索，LLM 做理解与摘要），
+        建议两者都启用。默认根据系统语言自动选择：
       </p>
       <ul style="line-height: 1.8; padding-left: 22px; color: var(--text);">
         <li><strong>中文环境</strong>：<code>BAAI/bge-small-zh</code>（512 维，约 95MB，中文 SOTA）</li>
@@ -1966,10 +1972,13 @@
               <button class="btn btn-outline" data-action="getProjectDir">查询项目目录</button>
             </div>
           </div>
-          <!-- 第三批: 低频管理命令 -->
-          <div>
-            <div style="color: var(--lrc-墨韵-700); font-size: 0.9em; margin-bottom: 8px; font-weight: 600;">低频管理</div>
-            <div style="display: flex; flex-wrap: wrap; gap: 12px;">
+          <!-- v0.9.14：低频管理整组默认折叠（原生 details，无需额外 JS），
+               避免普通用户误触"停止 sidecar / 保存 Agent 配置"等高风险操作 -->
+          <details id="advanced-low-frequency" style="margin-top: 4px;">
+            <summary style="cursor: pointer; color: var(--lrc-墨韵-700); font-size: 0.9em; font-weight: 600; padding: 6px 0;">
+              低频管理（修改配置前请确认）
+            </summary>
+            <div style="display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px;">
               <button class="btn btn-outline" data-action="startSidecarForProject">为项目启动 sidecar</button>
               <button class="btn btn-outline" data-action="stopSidecarForProject">停止项目 sidecar</button>
               <button class="btn btn-outline" data-action="getAgentConfigGuide">Agent 配置指南</button>
@@ -1981,10 +1990,10 @@
               <button class="btn btn-outline" data-action="markComplete">标记向导完成</button>
               <button class="btn btn-outline" style="color: var(--lrc-玉色-600); border-color: var(--lrc-玉色-400);" data-action="verifySetup">验证安装</button>
             </div>
-          </div>
-          <span style="display: block; width: 100%; color: var(--lrc-墨韵-500); font-size: 0.85em; margin-top: 12px;">
-            <img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">这些按钮仅在桌面端可用,浏览器环境会提示错误
-          </span>
+            <span style="display: block; width: 100%; color: var(--lrc-墨韵-500); font-size: 0.85em; margin-top: 12px;">
+              <img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">这些按钮仅在桌面端可用，浏览器环境会提示错误
+            </span>
+          </details>
         </div>
       </div>
     </div>
@@ -2003,7 +2012,7 @@
                   <span class="tooltip-content">将文本转换为向量的AI模型，用于语义理解和相似度检索。龙忆（LRC）使用它将代码和记忆编码为向量，实现智能搜索。</span>
                 </span>
               </h3>
-              <p class="settings-section-desc">本地小模型，用于代码语义翻译与向量编码，决定记忆检索精度</p>
+              <p class="settings-section-desc">本地小模型，用于代码语义翻译与向量编码，决定记忆检索精度（与 LLM 互补：建议两者都配置）</p>
             </div>
           </div>
         </div>
@@ -2127,11 +2136,11 @@
             <div>
               <h3 class="settings-section-title">
                 <span class="term-tooltip">LLM
-                  <span class="tooltip-content">大语言模型（Large Language Model），如 DeepSeek、通义千问等。龙忆（LRC）可选配置，用于将自然语言查询翻译为代码检索关键词，提升搜索体验。</span>
+                  <span class="tooltip-content">大语言模型（Large Language Model），如 DeepSeek、通义千问等。龙忆（LRC）建议与本地语义模型同时配置：LLM 负责理解语义、生成摘要与扩展查询词，本地模型负责向量编码与检索。</span>
                 </span>
-                 查询翻译（可选）
+                 查询翻译与摘要增强
               </h3>
-              <p class="settings-section-desc">配置 LLM API 后，可以用自然语言搜索代码</p>
+              <p class="settings-section-desc">本地语义模型负责「编码与检索」，LLM 负责「理解、摘要与查询扩展」；两者互补而非二选一，建议都开启以获得最佳记忆效果</p>
             </div>
           </div>
           <span id="llm-status-badge" class="badge badge-info">未配置</span>

@@ -6065,6 +6065,14 @@ pub fn build_v1_router_with_trust(
 
                                     // 比较版本号
                                     update_available = compare_versions(&latest_version, current_version);
+                                } else {
+                                    // v0.9.14 修复：GitHub 返回 404（仓库尚无 Release）或限流时
+                                    // 没有 tag_name，此前会静默展示"已是最新版本（最新版本：v未知）"，
+                                    // 让用户误以为检查成功。改为明确报错。
+                                    check_error = Some(
+                                        "GitHub 未返回版本标签（仓库可能还没有 Release，或 API 触发限流）"
+                                            .to_string(),
+                                    );
                                 }
                             }
                         }
