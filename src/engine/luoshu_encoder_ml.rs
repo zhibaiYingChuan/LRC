@@ -28,6 +28,13 @@ use candle_core::{Device, Tensor};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// 句向量批量编码的分片大小（v0.9.14）
+///
+/// 单次前向内存 ≈ `chunk × max_len × hidden × 4B` + 注意力矩阵
+/// `chunk × max_len² × 4B`。取 32 时约 50MB + 33MB，可安全承载上千条候选的分片编码；
+/// 过大（如一次性 1000 条）会 OOM。
+const EMBEDDING_BATCH_CHUNK: usize = 32;
+
 // ============================================================
 // 默认模型语言检测（v0.6.0 通用语义引擎）
 // ============================================================
@@ -839,9 +846,17 @@ impl LuoShuMlEncoder {
     /// 无法承担"信息增量"判据（实测被 0.01 阈值全部拦掉）；高维句向量才有区分度。
     ///
     /// 语义约定与 [`Self::encode_embedding`] 逐位一致（同样的前缀/池化/截断），
-    /// 差别只是把逐条前向合并为单次批量前向。
+    /// 差别只是把逐条前向合并为批量前向。
+    ///
+    /// **分片执行**：单次前向的显存/内存约为 `batch × max_len × hidden × 4B`
+    /// （1000×512×768×4 ≈ 1.5GB），必须按 [`EMBEDDING_BATCH_CHUNK`] 切片，
+    /// 否则结晶一次处理上千条记忆会直接 OOM。输出顺序与输入严格一致。
     pub fn encode_embedding_batch(&self, texts: &[&str]) -> LrcResult<Vec<Vec<f32>>> {
-        self.forward_pooled_batch(texts, EncodeRole::Passage)
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(EMBEDDING_BATCH_CHUNK) {
+            out.extend(self.forward_pooled_batch(chunk, EncodeRole::Passage)?);
+        }
+        Ok(out)
     }
 
     /// 单次批量前向 + 池化（内部实现，返回 [batch, hidden] 的原始句向量）
@@ -2442,6 +2457,54 @@ mod tests {
             assert_eq!(v.values.len(), 9);
             assert!(v.values.iter().all(|x| x.is_finite()), "向量含非有限值");
         }
+    }
+
+    /// 测试：批量句向量分片编码与逐条编码逐位一致、顺序不变（v0.9.14）
+    ///
+    /// 40 条 > `EMBEDDING_BATCH_CHUNK`(32)，覆盖"跨分片边界"的顺序与数值一致性。
+    #[test]
+    fn test_encode_embedding_batch_chunk_order() {
+        let enc = match LuoShuMlEncoder::load() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[句向量分片] 跳过：ML 模型不可用（{}）", e);
+                return;
+            }
+        };
+
+        let texts: Vec<String> = (0..40)
+            .map(|i| format!("第 {} 条：项目部署只能在工作日进行，周五与周末禁止发布", i))
+            .collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+
+        let batch = enc
+            .encode_embedding_batch(&refs)
+            .expect("批量句向量编码失败");
+        assert_eq!(batch.len(), refs.len(), "分片后条数必须与输入一致");
+
+        let single_first = enc.encode_embedding(&refs[0]).expect("单条第 0 条编码失败");
+        let single_last = enc
+            .encode_embedding(&refs[39])
+            .expect("单条第 39 条编码失败");
+        assert_eq!(batch[0].len(), single_first.len(), "维度不一致");
+        assert_eq!(batch[39].len(), single_last.len(), "维度不一致");
+
+        let max_diff = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter()
+                .zip(b.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max)
+        };
+        assert!(
+            max_diff(&batch[0], &single_first) < 1e-4,
+            "第 0 条分片/单条不一致: {}",
+            max_diff(&batch[0], &single_first)
+        );
+        assert!(
+            max_diff(&batch[39], &single_last) < 1e-4,
+            "跨分片边界（第 39 条）不一致: {}",
+            max_diff(&batch[39], &single_last)
+        );
     }
 
     /// 测试：跨线程并行编码的**工作线程数解析契约**（纯函数，无副作用）

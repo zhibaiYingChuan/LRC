@@ -639,6 +639,14 @@ cargo check --features server,ml --all-targets / --features server --lib → 0 e
 - **未部署到线上**（Full 正在写入阶段），也未重启任何 LRC 实例。
 - 线上效果需 Full 结束后替换 sidecar 二进制复测；`LRC_LOCAL_CLUSTER_SIM` 可在不改代码的情况下再标定。
 
+#### ⑥ 自审补充（同一版本内修复）
+
+| 问题 | 修复 |
+|---|---|
+| 一次性编码 1000 条 ⇒ 张量约 `1000×512×768×4 ≈ 1.5GB`，有 OOM 风险 | `encode_embedding_batch` 按 `EMBEDDING_BATCH_CHUNK = 32` 分片（约 50MB/片） |
+| 每 300s 重编码 1000 条会与在线 Add/Search 抢 4 vCPU | 候选上限降到 **300**（`LRC_SYNTH_MAX_CANDIDATES` 可调），按"最近优先"分批推进 |
+| 分片后顺序/数值是否漂移 | 新增用例：40 条（跨分片边界）与逐条编码比对，`max_diff < 1e-4` ✅ |
+
 
 
 > 动机：用户裁定「先看 F1/G4 什么情况」，随后改为「攻 G2/H2/D2」，并明确
