@@ -244,6 +244,31 @@ mod version_tests {
 mod api_contracts_tests {
     use crate::v1_api::*;
 
+    /// 读取数据目录的**落盘文本**（基文件 `memories.json` ∪ 增量日志 `memories.journal.jsonl`）。
+    ///
+    /// ★ 2026-10-28（本轮 full 评测缺陷 13 的测试侧修正）：
+    /// 增量持久化（B-1）落地后，热路径写入的是追加日志，只有"压实"时才整库重写
+    /// `memories.json`（阈值 `LRC_JOURNAL_MAX_BYTES`，默认 64MB）。
+    /// 因此"字段是否在序列化环节被丢弃"这一**负向对照**必须对两份文件的并集断言：
+    /// 只查基文件会漏掉后续批次写入的条目（假红），只查日志会漏掉已压实的历史条目（假绿）。
+    fn read_disk_text(dir: &std::path::Path) -> String {
+        let mut text = String::new();
+        for name in ["memories.json", "memories.journal.jsonl"] {
+            let path = dir.join(name);
+            if path.exists() {
+                let part = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("读取落盘文件 {name} 失败: {e}"));
+                text.push_str(&part);
+                text.push('\n');
+            }
+        }
+        assert!(
+            !text.is_empty(),
+            "落盘文本为空：memories.json 与 memories.journal.jsonl 都不存在"
+        );
+        text
+    }
+
     // ===== 1. 纯函数测试：default_* 系列确保默认值稳定 =====
 
     #[test]
@@ -4963,7 +4988,9 @@ mod api_contracts_tests {
         // 负向对照（方法论 74）：断言字段**确实出现在磁盘文本中**。
         // 若仅断言"内存读回正确"，当 JSON 序列化漏掉 skip_serializing 字段时
         // 测试仍可能因缓存而通过；直接查磁盘文本可堵住该假绿。
-        let raw = std::fs::read_to_string(dir.join("memories.json")).expect("读取落盘 JSON 失败");
+        // ★ 缺陷 13（2026-10-28）：增量持久化下基文件 ∪ 日志共同构成"落盘事实"，
+        // 故读 `read_disk_text`（两者都读）而非只读 `memories.json`。
+        let raw = read_disk_text(&dir);
         assert!(
             raw.contains("\"event_id\""),
             "落盘 JSON 文本必须含 event_id 键——不在则字段在序列化环节被丢弃"
@@ -5375,7 +5402,9 @@ mod api_contracts_tests {
         );
 
         // 负向对照：字段必须**出现在磁盘文本**中（防序列化环节丢弃）
-        let raw = std::fs::read_to_string(dir.join("memories.json")).expect("读取落盘 JSON 失败");
+        // ★ 缺陷 13（2026-10-28）：增量持久化下基文件 ∪ 日志共同构成"落盘事实"，
+        // 故读 `read_disk_text`（两者都读）而非只读 `memories.json`。
+        let raw = read_disk_text(&dir);
         assert!(raw.contains("\"event_id\""), "落盘 JSON 必须含 event_id 键");
         assert!(raw.contains("req-1"), "落盘 JSON 必须含 event_id 值");
         // 日期按**运行时计算**得出（不硬编码日期字符串，避免把"猜的日期"当成事实）

@@ -31,7 +31,7 @@ use std::time::Duration;
 // v0.9.1 三阶段锁解耦：consolidate handler 在锁外执行聚类计算
 use crate::engine::synthesis_engine::SynthesisEngine;
 use crate::engine::user_feedback::{FeedbackTarget, FeedbackType};
-use crate::memory_store::{ListFilter, MemoryStore, RecallFilter};
+use crate::memory_store::{MemoryStore, RecallFilter};
 use crate::memory_types::{EventEntity, Importance, Memory, MemoryType, PrivacyLevel};
 use crate::persistence::json::JsonPersistence;
 use crate::persistence::Persistence;
@@ -141,6 +141,75 @@ fn assoc_slot_share_denom() -> usize {
 
 /// enrich 检索的**锁等待上限**默认值 —— **直接沿用既有超时阶梯常量**（不另立字面量）。
 const DEFAULT_ENRICH_LOCK_WAIT: std::time::Duration = crate::timeouts::LOCK_WAIT;
+
+/// **写入路径**（`/v1/memories/consolidate`）的取锁等待上限。
+///
+/// # 为什么需要单独一个可配项（2026-10-28 线上证据）
+///
+/// 检索阶段里，平台维持 2 路并发题流，每路在**存储锁内**跑 ~36s（快路+深路+关联），
+/// 两路交替持锁 ⇒ 锁**几乎无空窗**。而写入沿用的 `LOCK_WAIT` 只有 6s
+/// ⇒ 每条 Add 都在 6s 内拿不到锁而返回 503，实测 Add 成功率 **0%**
+/// （23 点 1/11、00 点 0/6），并持续累积失败重试（10-21 曾因此中止评测）。
+///
+/// 现允许把**写入**的取锁等待放宽（`LRC_WRITE_LOCK_WAIT_MS`），让写入"排队等锁"
+/// 而不是立刻失败。因为写入只在锁内做一次日志追加（毫秒级），放宽等待**不会拖慢检索**。
+///
+/// # 不变量
+/// * 默认值 = `timeouts::LOCK_WAIT` ⇒ 不设环境变量时**行为逐字节不变**（阶梯守卫测试仍成立）；
+/// * 取值必须 < `HTTP_OUTER_TIMEOUT`(120s)，并给编码/落盘留余量 ⇒ 上限 90s。
+fn write_lock_wait() -> std::time::Duration {
+    std::env::var("LRC_WRITE_LOCK_WAIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v >= 1_000 && *v <= 90_000)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(crate::timeouts::LOCK_WAIT)
+}
+
+// ============================================================
+// 写优先闸门（v0.9.13）
+// ============================================================
+
+/// 当前**正在等待存储锁**的写入请求数（进程级）。
+///
+/// # 为什么必须是进程级静态量，而不是 `MemoryStore` 的字段
+///
+/// 检索路径要在**取锁之前**判断"是否有写入在等"；而那一刻它还没拿到存储锁，
+/// 根本读不到锁内的字段。sidecar 进程内只有一个 `MemoryStore`，
+/// 因此进程级计数与"该存储的写入等待者"是一一对应的。
+///
+/// # 它解决的是什么（线上实测）
+///
+/// 检索阶段维持 2~4 路并发题流，每路在**锁内**跑 30~40 秒。任何时刻只要有一路
+/// 检索在跑，锁就几乎无空窗：写入（只需毫秒级）在 45s 内仍可能一次都抢不到，
+/// 实测 Add 成功率 0%（`LRC budget exhausted before`）。
+/// 让"新到的检索"在有写入等待时**主动让行 10ms**，写入即可在≤一个轮询周期内拿到锁，
+/// 而检索只是晚 10~几十 ms 拿到锁 —— 不改变任何检索结果。
+static WRITE_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 写入等待标记的 RAII 守卫：构造即登记，析构即注销（panic 也不会泄漏计数）。
+///
+/// 作用域应当**只覆盖"等待锁"这一段**（取到锁即可释放）：这样检索只需在
+/// 写入真正排队时让行，而不会在写入漫长的锁外编码阶段被白白压制。
+struct WriteWaitGuard;
+
+impl WriteWaitGuard {
+    fn new() -> Self {
+        WRITE_WAITERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for WriteWaitGuard {
+    fn drop(&mut self) {
+        WRITE_WAITERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 是否有写入正在等待存储锁（供长读路径让行）
+fn write_waiting() -> bool {
+    WRITE_WAITERS.load(std::sync::atomic::Ordering::SeqCst) > 0
+}
 
 /// enrich 检索的**执行上限**默认值 —— **直接沿用既有超时阶梯常量**。
 const DEFAULT_ENRICH_TIMEOUT: std::time::Duration = crate::timeouts::HTTP_HANDLER_BUDGET;
@@ -2231,7 +2300,10 @@ pub fn build_v1_router_with_trust(
                             // 取锁上限走**单一真源**（此前这里硬编码 2s ⇒ 与 `timeouts::LOCK_WAIT`
                             // 各自为政；真源调整后此处不会跟随 ⇒ 已知漂移缺陷，2026-10-15 修正）。
                             let lock_deadline =
-                                std::time::Instant::now() + crate::timeouts::LOCK_WAIT;
+                                std::time::Instant::now() + write_lock_wait();
+                            // ★ 写优先（v0.9.13）：登记"写入在等锁"，
+                            //   使新到的检索主动让行（见 `WRITE_WAITERS` 文档）。
+                            let _write_wait = WriteWaitGuard::new();
                             let store_guard = loop {
                                 match phase1_store.try_lock() {
                                     Ok(guard) => break guard,
@@ -2241,7 +2313,7 @@ pub fn build_v1_router_with_trust(
                                     Err(_) => {
                                         eprintln!(
                                             "[v1/consolidate] 取编码器句柄等待存储锁超时（{}ms），本次写入放弃",
-                                            crate::timeouts::LOCK_WAIT.as_millis()
+                                            write_lock_wait().as_millis()
                                         );
                                         return None;
                                     }
@@ -2258,7 +2330,9 @@ pub fn build_v1_router_with_trust(
                         let stored = {
                             // 同上：取锁上限走单一真源，不再硬编码。
                             let lock_deadline =
-                                std::time::Instant::now() + crate::timeouts::LOCK_WAIT;
+                                std::time::Instant::now() + write_lock_wait();
+                            // ★ 写优先（v0.9.13）：同阶段 1，登记等待使检索让行。
+                            let _write_wait = WriteWaitGuard::new();
                             let mut store_guard = loop {
                                 match phase1_store.try_lock() {
                                     Ok(guard) => break guard,
@@ -2268,7 +2342,7 @@ pub fn build_v1_router_with_trust(
                                     Err(_) => {
                                         eprintln!(
                                             "[v1/consolidate] 写入阶段等待存储锁超时（{}ms），本次写入放弃（编码已白做）",
-                                            crate::timeouts::LOCK_WAIT.as_millis()
+                                            write_lock_wait().as_millis()
                                         );
                                         return None;
                                     }
@@ -2396,21 +2470,25 @@ pub fn build_v1_router_with_trust(
                         store.apply_synthesis_plan(synthesized_plan)
                     };
 
-                    // Phase 3：重新持锁，列出记忆和获取总数（快速操作）
+                    // Phase 3：重新持锁，取合成摘要与总数（**O(1)/O(N) 无深拷贝**）
+                    //
+                    // ★ 2026-10-27（性能修复）：原实现先 `list_memories(&ListFilter::new())`
+                    //   再 `total_count()`，两者各自**深拷贝整库**（28 万条 / 432MB 库上
+                    //   实测 Phase 3 占 11~13 秒且全程持锁）。而这里真正需要的只是
+                    //   ① 合成类记忆的摘要文本（合成禁用时恒为空）
+                    //   ② 总条数。
+                    //   改用零拷贝访问器后，Phase 3 从"秒级 + 长持锁"降到毫秒级。
+                    //   这也是 600s 长尾的主要放大器：长持锁会把后续 Add 的取锁等待
+                    //   （LOCK_WAIT 6s）推成 503，再被适配层内部重试放大。
                     let (synthesis_summaries, total) = {
                         let store = lock_store_with_timeout(&store).await?;
-                        let filter = ListFilter::new();
-                        let all_memories = store.list_memories(&filter).map_err(|e| {
-                            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                                "error": "list_memories_failed",
-                                "message": format!("列出记忆失败: {}", e)
-                            })))
-                        })?;
-                        let synthesis_summaries: Vec<String> = all_memories.0
-                            .iter()
-                            .filter(|m| m.memory_type == MemoryType::Synthesis)
-                            .map(|m| m.summary())
-                            .collect();
+                        let synthesis_summaries =
+                            store.synthesis_summary_texts().map_err(|e| {
+                                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                                    "error": "list_memories_failed",
+                                    "message": format!("列出记忆失败: {}", e)
+                                })))
+                            })?;
 
                         let total = store.total_count().map_err(|e| {
                             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
@@ -2504,8 +2582,41 @@ pub fn build_v1_router_with_trust(
                             // 有界锁获取：轮询 try_lock，超时未获得则放弃
                             let lock_deadline = std::time::Instant::now() + enrich_lock_wait;
                             let mut store = loop {
+                                // ★ 写优先（v0.9.13）：若有写入正在等锁，本检索**让行**。
+                                //
+                                // 为什么需要：检索单次持锁 30~40s，2~4 路并发时锁几乎无空窗，
+                                // 写入（毫秒级）即使排 45s 也抢不到 ⇒ Add 恒 503（线上实测 0%）。
+                                // 这里只多等一个轮询步长（10ms），**不改变任何检索结果**。
+                                if write_waiting() {
+                                    if std::time::Instant::now() >= lock_deadline {
+                                        eprintln!(
+                                            "[v1/enrich] 锁获取超时（{}ms，含写优先让行），返回 search_busy",
+                                            enrich_lock_wait.as_millis()
+                                        );
+                                        return Err("search_busy");
+                                    }
+                                    if cancellation_for_task.load(Ordering::Acquire) {
+                                        return Err("cancelled");
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                    continue;
+                                }
                                 match store.try_lock() {
-                                    Ok(guard) => break guard,
+                                    Ok(guard) => {
+                                        // ★ 写优先·**交接**（v0.9.13）：刚拿到锁时若发现写入在等，
+                                        //   立即释放并让行一轮。
+                                        //
+                                        // 为什么"取锁前的让行"还不够：写入登记时，可能已有若干检索
+                                        // 请求排在 `try_lock` 循环里（它们登记早于写入）⇒ 它们仍会
+                                        // 逐个拿到锁并各持 10~20s，写入要等完这一整轮（实测仍会撞
+                                        // 45s 上限而丢写）。交接把写入的等待压到"当前持锁者结束"为止。
+                                        if write_waiting() {
+                                            drop(guard);
+                                            std::thread::sleep(std::time::Duration::from_millis(10));
+                                            continue;
+                                        }
+                                        break guard;
+                                    }
                                     Err(_) if std::time::Instant::now() < lock_deadline => {
                                         if cancellation_for_task.load(Ordering::Acquire) {
                                             return Err("cancelled");
@@ -3131,7 +3242,7 @@ pub fn build_v1_router_with_trust(
                             // 在锁忙时**重新可达**（修前锁等待不计入内部预算、可耗尽整段 15s，
                             // 优雅收敛不可达）。
                             let lock_deadline =
-                                std::time::Instant::now() + crate::timeouts::LOCK_WAIT;
+                                std::time::Instant::now() + write_lock_wait();
                             let mut store = loop {
                                 match store.try_lock() {
                                     Ok(guard) => break guard,

@@ -16,14 +16,23 @@
 //!
 //! ## 分层约定
 //! ```text
-//! LOCK_WAIT(6s)  <  EXPLORE_INNER_BUDGET(10s)  <  HTTP_HANDLER_BUDGET(15s)  <  HTTP_OUTER_TIMEOUT(30s)
-//! LOCK_WAIT(6s)  <  CONSOLIDATE_INNER_TIMEOUT(20s) / BENCHMARKS_INNER_TIMEOUT(20s)  <  HTTP_OUTER_TIMEOUT(30s)
+//! LOCK_WAIT(6s)  <  EXPLORE_INNER_BUDGET(10s)  <  HTTP_HANDLER_BUDGET(15s)  <  HTTP_OUTER_TIMEOUT(120s)
+//! LOCK_WAIT(6s)  <  CONSOLIDATE_INNER_TIMEOUT(20s) / BENCHMARKS_INNER_TIMEOUT(20s)  <  HTTP_OUTER_TIMEOUT(120s)
 //! ```
+//!
+//! ## 2026-10-25 调整：外层 30s → 120s（评测现场证据驱动）
+//!
+//! AML 文本赛道续跑实测（库 298 MB / 14.6 万条）：单次 `/v1/memories/consolidate`
+//! 的全量 JSON 重写已达 25~35 秒，**越过原 30 秒外层超时** ⇒ 路由层直接返回 504；
+//! 适配层对写路径不重试 504（防重复写），只能把 503 抛给平台 ⇒ 平台每 1~3 分钟收到
+//! 一条 `ADD_SERVICE_UNAVAILABLE`，累计到阈值后终止评测（2026-10-25 00:46）。
+//! 提到 120 秒后链路为「LRC 120s < adapter 180s < nginx 600s」，余量 5 倍。
+//! 内层预算未改（编码/推理仍按 20s 收敛），本次只放宽"排队 + 全量重写"这一段。
 
 use std::time::Duration;
 
 /// **外层**：路由 `TimeoutLayer`。超过即断开连接（`504`）。
-pub const HTTP_OUTER_TIMEOUT: Duration = Duration::from_secs(30);
+pub const HTTP_OUTER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// **中层**：单请求的业务处理预算（`enrich` / MCP `search` 等 handler 内层）。
 pub const HTTP_HANDLER_BUDGET: Duration = Duration::from_secs(15);

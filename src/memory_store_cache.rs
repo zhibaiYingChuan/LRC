@@ -27,6 +27,7 @@ use crate::memory_types::Memory;
 use crate::persistence::AssocFrequency;
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// 记忆文档特征（recall 文本缓存项）
 ///
@@ -51,7 +52,16 @@ pub(crate) type BigramIndex = HashMap<String, HashSet<String>>;
 ///   4. 跨查询命中频次统计（`assoc`）
 pub(crate) struct MemoryStoreCache {
     /// 全量记忆增量缓存（避免每次操作都 O(N) 全量加载）
-    memory: RefCell<Vec<Memory>>,
+    ///
+    /// ★ v0.9.13（建议二）：由 `Vec<Memory>` 改为 `Arc<Vec<Memory>>`。
+    /// 修前 `snapshot()` 每次都 `clone()` 整库（`Memory` 含正文/实体/卦象字符串），
+    /// 而一次 enrich 里 `recall`（快路 + 深路 + 联想扩散的每个节点）与
+    /// `expand_associations` 都会各取一次快照 ⇒ 同一请求内把整库深拷贝十几遍，
+    /// 全部发生在存储锁内，是"单次 enrich 持锁 20~25s"的主要结构性成本。
+    /// 改为 `Arc` 后，同版本的多次快照共享同一份不可变数据（只增引用计数），
+    /// **读取路径零拷贝**；写入走 `Arc::make_mut`（写时复制），
+    /// 因写路径与读路径同受外层 `Mutex` 串行化，快照不会跨锁存活 ⇒ 实际不发生拷贝。
+    memory: RefCell<Arc<Vec<Memory>>>,
     /// 缓存脏标记：任何写操作后置 true，读操作前检查
     dirty: Cell<bool>,
     /// 加载本缓存时数据源的指纹（v0.9.11 / CR-42）：
@@ -62,6 +72,16 @@ pub(crate) struct MemoryStoreCache {
     index: RefCell<BigramIndex>,
     /// 索引脏标记
     index_dirty: Cell<bool>,
+    /// 数据版本号（v0.9.13）：**任何**数据变更（写入/删除/外部重载）后单调递增。
+    ///
+    /// 用途：让"从全库派生的统计表"（hub 实体表、自动事件表、artifact 表）
+    /// 能以**版本相等**判定缓存是否仍与当前数据同源，从而跳过每次检索都
+    /// 重建 O(N) 表的代价（实测 449k 条库上建表需 17s）。
+    ///
+    /// 为什么放在本模块而不是 `MemoryStore`：所有写入路径最终都会经过本模块的
+    /// `invalidate` / `mark_dirty_preserving_index` / `append_new` / `store`
+    /// 四个入口之一 ⇒ 在此递增是**唯一不会漏**的位置。
+    data_version: Cell<u64>,
     /// recall 文本特征缓存，按 Memory ID 复用规范化正文和文档长度
     documents: RefCell<HashMap<String, RecallDocument>>,
     /// 跨查询命中频次统计（独立文件持久化，`Memory` 零改动）
@@ -72,14 +92,26 @@ impl MemoryStoreCache {
     /// 构造空缓存（全部标记为脏，首次读取时惰性加载/重建）
     pub(crate) fn new(assoc_frequency: AssocFrequency) -> Self {
         Self {
-            memory: RefCell::new(Vec::new()),
+            memory: RefCell::new(Arc::new(Vec::new())),
             dirty: Cell::new(true), // 初始为脏，首次读取时加载
             source_fingerprint: Cell::new(None),
             index: RefCell::new(HashMap::new()),
             index_dirty: Cell::new(true),
+            data_version: Cell::new(0),
             documents: RefCell::new(HashMap::new()),
             assoc: RefCell::new(assoc_frequency),
         }
+    }
+
+    /// 当前数据版本号（每次数据变更后递增；语义见字段文档）
+    pub(crate) fn data_version(&self) -> u64 {
+        self.data_version.get()
+    }
+
+    /// 递增数据版本号（所有失效入口都必须调用）
+    fn bump_data_version(&self) {
+        self.data_version
+            .set(self.data_version.get().wrapping_add(1));
     }
 
     // ---------- 全量记忆快照 ----------
@@ -105,14 +137,26 @@ impl MemoryStoreCache {
 
     /// 用新加载的全量记忆替换缓存并清除脏标记，同时记录数据源指纹
     pub(crate) fn store(&self, memories: Vec<Memory>, source_fingerprint: Option<u64>) {
-        *self.memory.borrow_mut() = memories;
+        *self.memory.borrow_mut() = Arc::new(memories);
         self.source_fingerprint.set(source_fingerprint);
         self.dirty.set(false);
+        self.bump_data_version();
     }
 
-    /// 返回缓存副本（调用方持有独立所有权，不占用 borrow）
-    pub(crate) fn snapshot(&self) -> Vec<Memory> {
-        self.memory.borrow().clone()
+    /// 返回缓存快照（`Arc` 共享，**不做整库深拷贝**）
+    ///
+    /// ★ v0.9.13（建议二）：修前返回 `Vec<Memory>` 的深拷贝，每取一次快照就
+    /// 付一次全库克隆；调用方都是"只读扫描"（`recall` 过滤打分、
+    /// `expand_associations` 建索引表），从不修改快照内容 ⇒ 共享 `Arc` 即可，
+    /// 语义（"调用方拿到一份独立于后续写入的稳定视图"）完全不变：
+    /// 后续任何写入都会 `Arc::make_mut` 造出新副本，旧快照照样看到写入前的内容。
+    ///
+    /// # 为什么调用方不能拿到 `Ref`
+    ///
+    /// 调用期间可能**再次**取快照/取表（如 `recall` 内部取活跃记忆、
+    /// `expand_associations` 内部建三张全库统计表），返回 `Ref` 会自锁。
+    pub(crate) fn snapshot(&self) -> Arc<Vec<Memory>> {
+        Arc::clone(&self.memory.borrow())
     }
 
     /// 仅判断指定 ID 是否存在（**不克隆**任何 `Memory`）
@@ -124,6 +168,53 @@ impl MemoryStoreCache {
         self.memory.borrow().iter().any(|m| m.id == id)
     }
 
+    /// 缓存中的记忆条数（O(1)，**不克隆**）
+    pub(crate) fn len(&self) -> usize {
+        self.memory.borrow().len()
+    }
+
+    /// 收集合成类记忆的摘要文本（**不克隆整库**）
+    ///
+    /// 为什么需要：`/v1/memories/consolidate` 的 Phase 3 原先先
+    /// `list_memories()`（整库深拷贝）再 `total_count()`（又一次整库深拷贝），
+    /// 在 28 万条库上实测白付 11~13 秒并长时间持锁。这里只按类型过滤后
+    /// 克隆命中的摘要字符串（通常为 0 条）。
+    pub(crate) fn synthesis_summaries(&self) -> Vec<String> {
+        self.memory
+            .borrow()
+            .iter()
+            .filter(|m| m.memory_type == crate::memory_types::MemoryType::Synthesis)
+            .map(|m| m.summary())
+            .collect()
+    }
+
+    /// 增量同步：把**刚落盘的新记忆**并入缓存并保持"不脏"
+    ///
+    /// 前置条件（由 [`crate::memory_store::MemoryStore::remember_batch_preencoded`] 保证）：
+    /// `new` 中的每条记忆都带**新生成的 UUID**（`Memory::new`），因此并入即等价于
+    /// upsert；不需要逐条查重（逐条查重是 O(N·k)，正是本改动要消除的成本）。
+    ///
+    /// `source_fingerprint` 必须传入**写入之后**的数据源指纹 —— 否则下一次
+    /// `needs_reload()` 会因"磁盘指纹变了"而把整个库重新解析一遍（等于没优化）。
+    ///
+    /// 为什么必须这样做：写完 `mark_dirty_preserving_index()` 会让下一次
+    /// `ensure_cache_loaded()` 重新**从磁盘解析 400MB+ JSON**——这曾是单次 Add
+    /// 白付 4~6 秒的直接原因（见 v1_api Phase 3 注释）。
+    pub(crate) fn append_new(&self, new: &[Memory], source_fingerprint: Option<u64>) {
+        if new.is_empty() {
+            return;
+        }
+        // ★ v0.9.13（建议二）：写时复制。若此刻恰有快照在外（正常不会——
+        //   读写同受外层 Mutex 串行化），`make_mut` 才会整库克隆一次；
+        //   否则原地追加，代价与修前一致。
+        Arc::make_mut(&mut self.memory.borrow_mut()).extend_from_slice(new);
+        // 新增条目的文本特征尚未计算；清空后按需惰性重建（不影响正确性）。
+        self.documents.borrow_mut().clear();
+        self.source_fingerprint.set(source_fingerprint);
+        self.dirty.set(false);
+        self.bump_data_version();
+    }
+
     // ---------- 失效 ----------
 
     /// 全量失效：任何写操作（保存/删除/修改）后调用
@@ -133,6 +224,7 @@ impl MemoryStoreCache {
         self.dirty.set(true);
         self.index_dirty.set(true);
         self.documents.borrow_mut().clear();
+        self.bump_data_version();
     }
 
     /// 部分失效：仅失效全量快照与文本特征，**保留**倒排索引
@@ -142,6 +234,7 @@ impl MemoryStoreCache {
     pub(crate) fn mark_dirty_preserving_index(&self) {
         self.dirty.set(true);
         self.documents.borrow_mut().clear();
+        self.bump_data_version();
     }
 
     // ---------- recall 文本特征 ----------
@@ -337,5 +430,71 @@ impl MemoryStoreCache {
         } else {
             HashSet::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory_types::{Importance, MemoryType};
+
+    /// 构造一条最小可用的测试记忆
+    fn make_memory(content: &str) -> Memory {
+        Memory::new(
+            content.to_string(),
+            MemoryType::Fact,
+            None,
+            Vec::new(),
+            Importance::new(3),
+            None,
+        )
+    }
+
+    /// 建议二（v0.9.13）：同版本多次取快照必须共享同一份分配（零拷贝）。
+    ///
+    /// 修前 `snapshot()` 每次都 `clone()` 整库；一次 enrich 内会取十余次，
+    /// 全在存储锁内。这里用 `Arc::ptr_eq` 锁定"不再逐次深拷贝"这一性质，
+    /// 一旦有人把 `snapshot()` 改回克隆，本测试立刻失败。
+    #[test]
+    fn 同版本快照共享同一份分配() {
+        let cache = MemoryStoreCache::new(AssocFrequency::default());
+        cache.store(vec![make_memory("甲"), make_memory("乙")], None);
+
+        let first = cache.snapshot();
+        let second = cache.snapshot();
+
+        assert_eq!(first.len(), 2, "快照应包含全部两条记忆");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "同版本快照必须共享同一份分配（回归：又变回逐次整库深拷贝）"
+        );
+        assert_eq!(first[0].content, second[0].content, "共享分配内容必须一致");
+    }
+
+    /// 建议二（v0.9.13）：写入必须走写时复制——
+    /// 旧快照保持写入前的内容（快照隔离语义与修前完全一致），
+    /// 新快照能看到新增条目，且与旧快照不共享分配。
+    #[test]
+    fn 写入后旧快照不受影响且新快照可见新条目() {
+        let cache = MemoryStoreCache::new(AssocFrequency::default());
+        cache.store(vec![make_memory("甲")], None);
+
+        let before = cache.snapshot();
+        let version_before = cache.data_version();
+        cache.append_new(&[make_memory("乙")], None);
+
+        assert!(
+            cache.data_version() != version_before,
+            "追加新记忆必须推进 data_version（关联三表缓存依赖它失效）"
+        );
+
+        let after = cache.snapshot();
+        assert_eq!(before.len(), 1, "旧快照不应看到写入后的新条目");
+        assert_eq!(after.len(), 2, "新快照必须包含新增条目");
+        assert_eq!(after[1].content, "乙");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "写入后应产生新分配（写时复制），否则旧快照会被写入污染"
+        );
     }
 }

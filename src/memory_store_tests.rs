@@ -36,7 +36,7 @@ mod tests {
     /// 修后：`source_fingerprint`（mtime + 长度）变化即触发重载 ⇒ 看到 2 条。
     #[test]
     fn cache_sees_writes_made_by_another_process() {
-        use std::fs;
+        use crate::persistence::Persistence;
         let (dir, mut store) = make_store();
         store
             .remember(make_test_memory("本进程写入", MemoryType::Fact))
@@ -47,15 +47,14 @@ mod tests {
             "前置：先有 1 条"
         );
 
-        // —— 模拟另一进程：直接改磁盘文件（复制既有对象，保证字段完整可反序列化）——
-        let path = dir.path().join("memories.json");
-        let raw = fs::read_to_string(&path).expect("数据文件应存在");
-        let mut arr: Vec<serde_json::Value> = serde_json::from_str(&raw).expect("应是 JSON 数组");
-        let mut external = arr[0].clone();
-        external["id"] = serde_json::json!("external-proc-1");
-        external["content"] = serde_json::json!("另一进程写入的记忆");
-        arr.push(external);
-        fs::write(&path, serde_json::to_string(&arr).expect("应可序列化")).expect("外部写入应成功");
+        // —— 模拟另一进程：另起一个 persistence 实例写入 ——
+        // ★ B-1 后热路径写的是**追加日志**（memories.journal.jsonl），
+        //   因此"改 memories.json 文件"不再等价于"另一个进程写入"，改为用独立实例写。
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let external = create_json_persistence(&data_dir).expect("应成功创建");
+        external
+            .save_memory(&make_test_memory("另一进程写入的记忆", MemoryType::Fact))
+            .expect("外部写入应成功");
 
         assert_eq!(
             store.total_count().expect("应取到总数"),
@@ -1174,21 +1173,23 @@ mod tests {
         // ③ 反向确认：把 b 改为未过期后，边应能读回
         //    （否则上面的断言可能只是因为"边没写进去"而通过）
         //
-        // 做法：直接改盘文件里的 `expire_at` 再重载 store ——
-        // 与 `test_expand_associations_skips_dangling_stored_edges` 同款
-        // （那里也是改盘再重载）。**不新增生产 API 仅为测试服务**。
+        // 做法：用独立 persistence 读出全部记忆，把 b 的 `ttl_days` 改为 0（永不过期），
+        //       再整体替换落盘，然后重载 store ——
+        // ★ B-1 后不能再直接改 `memories.json`（热路径写的是追加日志），
+        //   改为"读出 → 修改 → replace_all"（等价于一次整库压实）。
         let data_dir = _dir.path().to_string_lossy().to_string();
-        let mem_path = format!("{}/memories.json", data_dir);
-        let raw = std::fs::read_to_string(&mem_path).expect("应能读取记忆库");
-        let mut arr: Vec<serde_json::Value> =
-            serde_json::from_str(&raw).expect("记忆库应是 JSON 数组");
-        for m in arr.iter_mut() {
-            if m.get("id").and_then(|v| v.as_str()) == Some(b.id.as_str()) {
-                // ttl_days = 0 ⇒ `is_expired` 恒为 false（永不过期）
-                m["ttl_days"] = serde_json::json!(0);
+        {
+            use crate::persistence::Persistence;
+            let p_edit = create_json_persistence(&data_dir).expect("应成功创建");
+            let mut all = p_edit.load_all_memories().expect("应能读取记忆库");
+            for m in all.iter_mut() {
+                if m.id == b.id {
+                    // ttl_days = 0 ⇒ `is_expired` 恒为 false（永不过期）
+                    m.ttl_days = Some(0);
+                }
             }
+            p_edit.replace_all_memories(&all).expect("写盘应成功");
         }
-        std::fs::write(&mem_path, serde_json::to_string(&arr).unwrap()).expect("写盘应成功");
 
         // 重载 store（模拟重启后读到未过期的 b）
         let mut graph2 = crate::graph_store::GraphMemoryStore::new(&data_dir);
@@ -4394,21 +4395,23 @@ mod tests {
         }; // store 与 persistence 随作用域释放
 
         // 直接读磁盘文件：2 条都在，更新生效——无 clear 中间态清空痕迹
-        let on_disk: Vec<Memory> = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join("memories.json")).expect("磁盘文件应存在"),
-        )
-        .expect("磁盘 JSON 应可解析");
-        assert_eq!(on_disk.len(), 2, "update 后磁盘必须保留 2 条，不得清空");
-        assert_eq!(
-            on_disk.iter().find(|m| m.id == s1_id).unwrap().content,
-            "第一条已更新",
-            "被更新条目应已落盘"
-        );
-        assert_eq!(
-            on_disk.iter().find(|m| m.id == s2_id).unwrap().content,
-            "第二条内容",
-            "未更新条目应原样保留"
-        );
+        // ★ B-1 后磁盘事实源 = 基文件 + 追加日志，故用独立 persistence 实例读取。
+        {
+            use crate::persistence::Persistence;
+            let p_read = create_json_persistence(&data_dir).expect("应成功创建");
+            let on_disk = p_read.load_all_memories().expect("磁盘数据应可加载");
+            assert_eq!(on_disk.len(), 2, "update 后磁盘必须保留 2 条，不得清空");
+            assert_eq!(
+                on_disk.iter().find(|m| m.id == s1_id).unwrap().content,
+                "第一条已更新",
+                "被更新条目应已落盘"
+            );
+            assert_eq!(
+                on_disk.iter().find(|m| m.id == s2_id).unwrap().content,
+                "第二条内容",
+                "未更新条目应原样保留"
+            );
+        }
 
         // 同一 data_dir 新建实例重载：磁盘=缓存一致
         let p2 = create_json_persistence(&data_dir).expect("应成功创建");

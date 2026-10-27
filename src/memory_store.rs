@@ -432,66 +432,101 @@ fn normalize_artifact(tok: &str) -> Option<String> {
     Some(lower)
 }
 
-/// 计算 artifact 的**项目内占比**表：`artifact -> 最大项目内占比`
+/// artifact 抽取缓存项：内容指纹 + 该正文的 artifact 列表（Arc 便于零拷贝复用）
+type ArtifactExtractCache = std::collections::HashMap<String, (u64, std::sync::Arc<Vec<String>>)>;
+
+/// 正文指纹（FNV-1a 64 位）：只用于判断"同一条记忆的正文是否变过"
 ///
-/// **为什么要抽成独立函数**：hub 判定依赖"分母按项目分层"（§3.49 的教训），
-/// 而占比需遍历全库统计。检索主路径要复用该表（避免每起点重算 O(N)）。
-fn artifact_project_ratio(all: &[Memory]) -> std::collections::HashMap<String, (usize, usize)> {
+/// 为什么用指纹而不是"写入时主动失效"：正文可能被 merge/合成/重分类等多条路径修改，
+/// 逐路径挂钩必然漏（漏一处即产生"用旧正文算出的 artifact 关联"这种静默错误）。
+/// 指纹校验把正确性收敛到"内容相同 ⇒ 复用"，与哪条路径改的无关。
+fn artifact_content_hash(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// 单次遍历构建 artifact 两张表（并复用 `cache` 中"正文未变"的抽取结果）
+///
+/// # 为什么必须是**单次**遍历
+///
+/// 修前两张表各扫一遍全库（`artifact_project_ratio` + `artifact_members`），
+/// 每次都要对全部正文跑 `extract_artifacts`（逐字符状态机 + 字符串分配）。
+/// 线上实测（449,431 条 / 632MB）：一次建表 **17.0 秒**，其中大部分是这**两遍**
+/// 抽取。合并为一遍后抽取只做一次，且正文未变的记忆直接命中缓存。
+///
+/// # 为什么结果与拆分版逐字节一致
+///
+/// 两张表的插入顺序仍严格是"按 `all` 顺序、按每条记忆内 artifact 出现顺序"，
+/// 与拆分版完全相同 ⇒ 后续对 `per_proj` 的 HashMap 迭代顺序、
+/// `members` 的 ID 顺序、以及占比并列时的"先到先得"规则都不变。
+///
+/// 返回 `(两张表, 缓存命中数)`；缓存命中数仅用于计时日志。
+fn build_artifact_tables(
+    all: &[Memory],
+    cache: &mut ArtifactExtractCache,
+) -> (ArtifactTables, usize) {
     use std::collections::{HashMap, HashSet};
 
     // 各项目的记忆总数（分母）
     let mut proj_total: HashMap<String, usize> = HashMap::new();
-    for m in all {
-        *proj_total
-            .entry(m.project.as_deref().unwrap_or("_global_").to_string())
-            .or_insert(0) += 1;
-    }
-
     // (项目, artifact) -> 该 artifact 在该项目内出现的记忆 id 集合
     let mut per_proj: HashMap<(String, String), HashSet<String>> = HashMap::new();
+    // artifact -> 出现过它的记忆 ID 列表
+    let mut members: HashMap<String, Vec<String>> = HashMap::new();
+    // 下一版缓存：只保留当前库中仍存在的记忆（删除的记忆自然被淘汰）
+    let mut next: ArtifactExtractCache = HashMap::with_capacity(all.len());
+    let mut hits = 0usize;
+
     for m in all {
         let proj = m.project.as_deref().unwrap_or("_global_").to_string();
-        for a in extract_artifacts(&m.content) {
+        *proj_total.entry(proj.clone()).or_insert(0) += 1;
+
+        let fingerprint = artifact_content_hash(&m.content);
+        let arts = match cache.get(&m.id) {
+            Some((cached_fp, list)) if *cached_fp == fingerprint => {
+                hits += 1;
+                std::sync::Arc::clone(list)
+            }
+            _ => std::sync::Arc::new(extract_artifacts(&m.content)),
+        };
+
+        for a in arts.iter() {
             per_proj
-                .entry((proj.clone(), a))
+                .entry((proj.clone(), a.clone()))
                 .or_default()
                 .insert(m.id.clone());
+            members.entry(a.clone()).or_default().push(m.id.clone());
         }
+        next.insert(m.id.clone(), (fingerprint, arts));
     }
+    *cache = next;
 
     // 取"任一项目内占比最大"的那次（与 hub_entity_set 同口径）
-    let mut out: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut ratio: HashMap<String, (usize, usize)> = HashMap::new();
     for ((proj, a), ids) in per_proj {
         let total = proj_total.get(&proj).copied().unwrap_or(0);
         let df = ids.len();
-        let ratio = if total == 0 {
+        let ratio_value = if total == 0 {
             0.0
         } else {
             df as f32 / total as f32
         };
-        let entry = out.entry(a).or_insert((df, total));
+        let entry = ratio.entry(a).or_insert((df, total));
         let cur_ratio = if entry.1 == 0 {
             0.0
         } else {
             entry.0 as f32 / entry.1 as f32
         };
-        if ratio > cur_ratio {
+        if ratio_value > cur_ratio {
             *entry = (df, total);
         }
     }
-    out
-}
 
-/// artifact → 出现过它的记忆 ID 集合（供关联展开查表）
-fn artifact_members(all: &[Memory]) -> std::collections::HashMap<String, Vec<String>> {
-    use std::collections::HashMap;
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    for m in all {
-        for a in extract_artifacts(&m.content) {
-            out.entry(a).or_default().push(m.id.clone());
-        }
-    }
-    out
+    (ArtifactTables { ratio, members }, hits)
 }
 
 /// artifact 维度的两张全库统计表（一次构建，多次复用）
@@ -509,14 +544,6 @@ struct ArtifactTables {
 }
 
 impl ArtifactTables {
-    /// 一次遍历构建两张表（供检索主路径与详情页复用）
-    fn build(all: &[Memory]) -> Self {
-        Self {
-            ratio: artifact_project_ratio(all),
-            members: artifact_members(all),
-        }
-    }
-
     /// 该 artifact 是否应被跳过（过泛化、或成员不足 2 条而无关联可言）
     fn is_skipped(&self, artifact: &str) -> bool {
         let (df, total) = self.ratio.get(artifact).copied().unwrap_or((0, 0));
@@ -531,6 +558,27 @@ impl ArtifactTables {
             Some(ids) => ids.len() < 2,
         }
     }
+}
+
+/// 全库派生的联想统计表（v0.9.13 缓存化）
+///
+/// **为什么需要缓存**：hub 实体表 / 自动事件表 / artifact 两张表都是**全库统计量**，
+/// 每次检索都重建一次。线上实测（449,431 条 / 632MB）：`expand_associations`
+/// 的「建表」一段需 **17.0 秒**，而这段产出**只取决于数据内容**——两次检索之间
+/// 若没有写入，结果必然逐字节相同。
+///
+/// **失效口径**：`version` 记录建表时的 [`crate::memory_store_cache::MemoryStoreCache::data_version`]。
+/// 任何写入（含别的进程写入导致的重载）都会让版本递增 ⇒ 下次取表时版本不等 ⇒ 自动重建。
+/// 这保证了"缓存命中 ⇔ 数据未变"，不会读到陈旧统计。
+struct AssocTables {
+    /// 建表时所依据的数据版本
+    version: u64,
+    /// hub 实体集合（判定口径见 `hub_entity_set`）
+    hub_set: std::collections::HashMap<(String, EntityKind), (usize, usize)>,
+    /// 自动事件表（口径见 `auto_event_map`）
+    auto_event_map: std::collections::HashMap<String, Vec<(String, i64, String)>>,
+    /// artifact 两张表（口径见 [`ArtifactTables`]）
+    artifact_tabs: ArtifactTables,
 }
 
 /// 判定某个"同项目 + 同窗口"分组是否构成**自动事件**
@@ -866,6 +914,21 @@ pub struct MemoryStore<P: Persistence> {
     /// bigram_index_dirty / recall_documents / assoc_frequency）及其全部纯缓存逻辑
     /// 已外提至 [`crate::memory_store_cache::MemoryStoreCache`]，此处只保留单一字段。
     cache: crate::memory_store_cache::MemoryStoreCache,
+    /// v0.9.13：全库派生的联想统计表缓存（hub / 自动事件 / artifact）。
+    ///
+    /// 只在 `MemoryStore` 被存储锁独占时访问（`&self` / `&mut self` 皆可），
+    /// 用 `RefCell` 是因为 `associations()` 等只读入口也需惰性建表并写回缓存。
+    /// 缓存以 [`crate::memory_store_cache::MemoryStoreCache::data_version`] 失效，
+    /// 语义与正确性论证见 [`AssocTables`]。
+    assoc_tables_cache: std::cell::RefCell<Option<std::sync::Arc<AssocTables>>>,
+    /// v0.9.13：artifact 抽取缓存（记忆 ID → 正文指纹 + artifact 列表）。
+    ///
+    /// 为什么需要：artifact 两张表每次重建都要对 449k 条正文跑 `extract_artifacts`，
+    /// 线上实测单次 17.0 秒。写入（Add）会按版本让 `assoc_tables_cache` 失效，
+    /// 但**绝大多数记忆的正文并未改变** ⇒ 以"正文指纹相同即复用"避免重算，
+    /// 使写入后的重建代价从 17s 降到亚秒级。正确性由指纹保证（见
+    /// [`artifact_content_hash`] 的文档：不依赖"哪条写路径改的正文"）。
+    artifact_cache: std::cell::RefCell<ArtifactExtractCache>,
     /// v0.5.5 P1-1：LLM 是否已配置
     /// LLM 配置后替代本地 ML 模型提供语义理解能力，编码器不再视为"降级"
     /// 通过 set_llm_configured() 在 sidecar 启动后设置
@@ -994,7 +1057,7 @@ impl<P: Persistence> MemoryGraphQuery for MemoryStore<P> {
 
         // 收集所有引用此记忆的其他记忆（source_ids 反向查找）
         let mut neighbors = Vec::new();
-        for m in &all {
+        for m in all.iter() {
             if m.source_ids.contains(&memory_id.to_string()) {
                 neighbors.push(AffectedMemoryInfo {
                     memory_id: m.id.clone(),
@@ -1052,7 +1115,7 @@ impl<P: Persistence> MemoryGraphQuery for MemoryStore<P> {
         // 收集所有受影响记忆的 source_ids，去重后统计合成链数
         let mut affected_chains = std::collections::HashSet::new();
         for target_id in memory_ids {
-            for m in &all {
+            for m in all.iter() {
                 if m.source_ids.contains(target_id) {
                     // 每条合成边代表一条链
                     affected_chains.insert(format!("{}->{}", target_id, m.id));
@@ -1741,6 +1804,10 @@ impl<P: Persistence> MemoryStore<P> {
             },
             // v0.5.4 增量缓存初始化（v0.9.7：整体委托 MemoryStoreCache）
             cache: crate::memory_store_cache::MemoryStoreCache::new(assoc_frequency),
+            // v0.9.13：联想统计表缓存初始为空，首次检索时惰性建表
+            assoc_tables_cache: std::cell::RefCell::new(None),
+            // v0.9.13：artifact 抽取缓存初始为空，首次建表时逐条填充
+            artifact_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             // v0.5.5 P1-1：LLM 默认未配置，由 sidecar 启动后通过 set_llm_configured() 设置
             llm_configured: std::sync::atomic::AtomicBool::new(false),
             // v0.6.0+ 参赛扩展：探索日志默认禁用
@@ -2176,12 +2243,22 @@ impl<P: Persistence> MemoryStore<P> {
     // v0.5.4 增量缓存辅助方法
     // ============================================================
 
-    /// 确保缓存有效并返回记忆列表的克隆
+    /// 确保缓存有效并返回全量记忆快照
     ///
     /// v0.9.7（GLOBAL_CODE_REVIEW_REPORT P2-2）：缓存的存储与惰性加载已外提至
     /// [`crate::memory_store_cache::MemoryStoreCache`]，本方法仅保留"脏则先从持久层
     /// 加载，再取副本"的编排与性能剖析埋点，行为与拆分前逐字节一致。
-    fn load_cached(&self) -> Result<Vec<Memory>, PersistenceError> {
+    ///
+    /// ★ v0.9.13（建议二）：返回值由 `Vec<Memory>` 改为 `Arc<Vec<Memory>>`。
+    /// 修前每次调用都深拷贝整库，而一次 enrich 内会调用十余次
+    /// （快路 recall、深路 recall、联想扩散的每个节点、`expand_associations`、
+    /// 关联三表建表……），这些拷贝全在存储锁内，是锁等待与 503 的结构性成本。
+    /// 改为 `Arc` 后**读取路径零拷贝**：同一次请求里的所有读取共享同一份不可变视图，
+    /// 写入路径走 `Arc::make_mut`（写时复制），语义上"快照不受后续写入影响"不变。
+    ///
+    /// 需要可变副本的调用方（过滤/排序/回写）显式 `(*snapshot).clone()` 或
+    /// `Arc::make_mut`——这与修前"拿到的本来就是独立副本"的代价相同。
+    fn load_cached(&self) -> Result<Arc<Vec<Memory>>, PersistenceError> {
         let load_start = std::time::Instant::now();
         // v0.9.11（G9 收尾 / CR-42）：除"自身脏"外，还要看**数据源指纹**是否变了 ——
         // 多窗口桌面端 / CLI 与 sidecar 并存时，别的进程写入不会通知本进程，
@@ -2253,10 +2330,12 @@ impl<P: Persistence> MemoryStore<P> {
             return Vec::new();
         }
         let wanted: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+        // ★ v0.9.13（建议二）：快照是共享的 `Arc`，只克隆命中的少数几条（修前克隆整库）
         self.load_cached()
             .unwrap_or_default()
-            .into_iter()
+            .iter()
             .filter(|m| wanted.contains(m.id.as_str()))
+            .cloned()
             .collect()
     }
 
@@ -3019,7 +3098,9 @@ impl<P: Persistence> MemoryStore<P> {
         min_cluster: usize,
         similarity: f32,
     ) -> Result<SynthesisSnapshot, PersistenceError> {
-        let mut all = self.load_cached()?;
+        // ★ v0.9.13（建议二）：快照是共享 `Arc`；`SynthesisSnapshot` 需要持有
+        //   整个生命周期并可能被过滤，故此处显式克隆成独立 `Vec`（与修前同价）。
+        let mut all: Vec<Memory> = (*self.load_cached()?).clone();
         if project.is_some() || user_id.is_some() {
             all.retain(|m| {
                 project
@@ -3303,7 +3384,7 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 计算八卦分布
         let mut bagua_counts = [0usize; 8];
-        for m in &all {
+        for m in all.iter() {
             if let Some(idx) = m.bagua_index {
                 if (idx as usize) < 8 {
                     bagua_counts[idx as usize] += 1;
@@ -3615,7 +3696,7 @@ impl<P: Persistence> MemoryStore<P> {
             Ok(m) => m,
             Err(_) => return,
         };
-        for mem in &all {
+        for mem in all.iter() {
             if mem.memory_type == MemoryType::Synthesis {
                 let positive = self.user_feedback.get_positive_feedback_count(&mem.id);
                 if positive >= 2 {
@@ -4268,8 +4349,15 @@ impl<P: Persistence> MemoryStore<P> {
         self.synthesis_pending
             .store(true, std::sync::atomic::Ordering::Release);
 
-        // 批量写入后仅刷新记忆快照，保留已完成的增量索引。
-        self.mark_cache_dirty_preserving_index();
+        // 批量写入后做**增量**缓存同步：把刚写入的条目并入缓存。
+        //
+        // ★ 2026-10-27（性能修复）：原实现是 `mark_cache_dirty_preserving_index()`，
+        //   会把缓存标记为脏 ⇒ 紧随其后的 Phase 3（`total_count` / 合成摘要）
+        //   触发**从磁盘重新解析 400MB+ JSON**，实测每次 Add 白付 4~6 秒。
+        //   本批条目 ID 均为新建 UUID（见 `MemoryWriteInput::into_memory`），
+        //   并入即等价于 upsert；倒排索引已在上面逐条增量维护，故不需要重建。
+        self.cache
+            .append_new(&results, self.persistence.source_fingerprint());
 
         Ok(results)
     }
@@ -4549,8 +4637,8 @@ impl<P: Persistence> MemoryStore<P> {
             vec_refs.iter().map(|(i, _)| *i).collect()
         };
 
-        // 5. 从匹配索引还原记忆
-        let all: Vec<Memory> = all_memories;
+        // 5. 从匹配索引还原记忆（★ v0.9.13 建议二：快照是共享 `Arc`，按下标取用）
+        let all = all_memories;
         let mut memories: Vec<Memory> = matched_indices
             .iter()
             .filter_map(|&idx| all.get(idx).cloned())
@@ -4665,7 +4753,7 @@ impl<P: Persistence> MemoryStore<P> {
             {
                 let all = self.load_cached().unwrap_or_default();
                 let mut bridge_text = String::new();
-                for m in &all {
+                for m in all.iter() {
                     if active_whitelist.contains(&m.id) {
                         bridge_text.push_str(&m.content);
                         bridge_text.push(' ');
@@ -4843,7 +4931,7 @@ impl<P: Persistence> MemoryStore<P> {
             let bridge_words: Vec<String> = {
                 let all = self.load_cached().unwrap_or_default();
                 let mut bridge_text = String::new();
-                for m in &all {
+                for m in all.iter() {
                     if active_whitelist.contains(&m.id) {
                         bridge_text.push_str(&m.content);
                         bridge_text.push(' ');
@@ -5109,7 +5197,7 @@ impl<P: Persistence> MemoryStore<P> {
                     let id_set: std::collections::HashSet<&str> =
                         active_ids.iter().map(|s| s.as_str()).collect();
                     let mut bridge_text = String::new();
-                    for m in &all {
+                    for m in all.iter() {
                         if id_set.contains(m.id.as_str()) {
                             bridge_text.push_str(&m.content);
                             bridge_text.push(' ');
@@ -5542,8 +5630,9 @@ impl<P: Persistence> MemoryStore<P> {
     pub fn forget(&mut self, id: &str) -> Result<bool, PersistenceError> {
         let old = self
             .load_cached()?
-            .into_iter()
-            .find(|memory| memory.id == id);
+            .iter()
+            .find(|memory| memory.id == id)
+            .cloned();
         let result = self.persistence.delete_memory(id)?;
         if result {
             if let Some(old) = old.as_ref() {
@@ -5600,7 +5689,8 @@ impl<P: Persistence> MemoryStore<P> {
         let mut found: Option<Memory> = None;
 
         let updated: Vec<Memory> = all
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|mut m| {
                 if m.id == id {
                     let old = m.clone();
@@ -5635,7 +5725,9 @@ impl<P: Persistence> MemoryStore<P> {
         &self,
         filter: &ListFilter,
     ) -> Result<(Vec<Memory>, usize), PersistenceError> {
-        let mut all = self.load_cached()?;
+        // ★ v0.9.13（建议二）：过滤/排序需要可变所有权，显式克隆一次（与修前同价）；
+        //   本接口是管理面，不在 enrich 热路径上。
+        let mut all: Vec<Memory> = (*self.load_cached()?).clone();
         let privacy_ctx = filter.privacy_context.clone();
 
         // 过滤
@@ -5770,7 +5862,7 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 重分类前分布：仅统计有效的八卦下标（0..8）
         let mut before = [0usize; 8];
-        for m in &all {
+        for m in all.iter() {
             if let Some(idx) = m.bagua_index {
                 let i = idx as usize;
                 if i < 8 {
@@ -5857,7 +5949,7 @@ impl<P: Persistence> MemoryStore<P> {
     pub fn bagua_distribution(&self) -> Result<(usize, [usize; 8]), PersistenceError> {
         let all = self.load_cached()?;
         let mut dist = [0usize; 8];
-        for m in &all {
+        for m in all.iter() {
             if let Some(idx) = m.bagua_index {
                 let i = idx as usize;
                 if i < 8 {
@@ -5887,14 +5979,17 @@ impl<P: Persistence> MemoryStore<P> {
         offset: usize,
         limit: usize,
     ) -> Result<BaguaReclassifyBatch, PersistenceError> {
-        let mut all = self.load_cached()?;
-        // 确定性稳定全序：先按创建时间，再按 id（UUID 唯一，构成全序）
-        all.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.id.cmp(&b.id))
+        // ★ v0.9.13（建议二）：只对下标排序（按创建时间 + id 全序），
+        //   避免为了取一个分块而对整库做深拷贝；`snapshot` 是共享 `Arc`。
+        let snapshot = self.load_cached()?;
+        let mut order: Vec<usize> = (0..snapshot.len()).collect();
+        order.sort_by(|&a, &b| {
+            snapshot[a]
+                .created_at
+                .cmp(&snapshot[b].created_at)
+                .then_with(|| snapshot[a].id.cmp(&snapshot[b].id))
         });
-        let total = all.len();
+        let total = order.len();
         let start = offset.min(total);
         let end = if limit == 0 {
             total
@@ -5911,7 +6006,8 @@ impl<P: Persistence> MemoryStore<P> {
         let mut updated: Vec<Memory> = Vec::with_capacity(end - start);
 
         // v0.9.10：先对切片做分块批量编码（单次前向摊薄开销），再逐条投影与统计
-        let slice: Vec<&Memory> = all.iter().take(end).skip(start).collect();
+        // ★ v0.9.13（建议二）：按排好的下标切片，不再需要整库可变副本
+        let slice: Vec<&Memory> = order[start..end].iter().map(|&i| &snapshot[i]).collect();
         let results = self.recompute_bagua_fields_batch(&slice);
         for (m, r) in slice.iter().zip(results) {
             let m: &Memory = m;
@@ -5971,9 +6067,10 @@ impl<P: Persistence> MemoryStore<P> {
     ) -> Result<Vec<Memory>, PersistenceError> {
         let all = self.load_cached()?;
         let mut hits: Vec<Memory> = all
-            .into_iter()
+            .iter()
             .filter(|m| m.event_id.as_deref() == Some(event_id))
             .filter(|m| exclude_id != Some(m.id.as_str()))
+            .cloned()
             .collect();
         hits.sort_by_key(|m| m.created_at);
         Ok(hits)
@@ -5986,7 +6083,7 @@ impl<P: Persistence> MemoryStore<P> {
     pub fn event_index(&self) -> Result<Vec<(String, usize)>, PersistenceError> {
         let all = self.load_cached()?;
         let mut cnt: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for m in &all {
+        for m in all.iter() {
             if let Some(ref e) = m.event_id {
                 *cnt.entry(e.clone()).or_insert(0) += 1;
             }
@@ -6008,13 +6105,14 @@ impl<P: Persistence> MemoryStore<P> {
     ) -> Result<Vec<Memory>, PersistenceError> {
         let all = self.load_cached()?;
         let mut hits: Vec<Memory> = all
-            .into_iter()
+            .iter()
             .filter(|m| {
                 m.entities
                     .iter()
                     .any(|e| e.name == name && kind.map(|k| e.kind == k).unwrap_or(true))
             })
             .filter(|m| exclude_id != Some(m.id.as_str()))
+            .cloned()
             .collect();
         hits.sort_by_key(|m| std::cmp::Reverse(m.created_at));
         Ok(hits)
@@ -6108,6 +6206,60 @@ impl<P: Persistence> MemoryStore<P> {
         Ok(out)
     }
 
+    /// 取（或按数据版本重建）全库联想统计表的缓存（v0.9.13）
+    ///
+    /// # 前置条件（调用方必须满足）
+    ///
+    /// `all` 必须是 [`Self::load_cached`] 刚取出的全量快照。本方法用
+    /// [`crate::memory_store_cache::MemoryStoreCache::data_version`] 判断缓存的表是否
+    /// 与该快照同源：版本相等 ⇒ 中间没有任何写入 ⇒ 表的内容与"基于 `all` 重建"
+    /// **逐字节一致**（三张表都是 `all` 的纯函数）。
+    ///
+    /// # 为什么返回 `Arc`
+    ///
+    /// 调用点需要同时持有三张表的引用；直接返回 `Ref<'_, AssocTables>` 会让
+    /// 「借出期间再次取表」自锁。`Arc` 克隆是常数成本，且允许在持表期间继续写缓存。
+    fn assoc_tables(&self, all: &[Memory]) -> std::sync::Arc<AssocTables> {
+        let version = self.cache.data_version();
+        if let Some(cached) = self.assoc_tables_cache.borrow().as_ref() {
+            if cached.version == version {
+                return std::sync::Arc::clone(cached);
+            }
+        }
+        let built = std::sync::Arc::new(AssocTables {
+            version,
+            hub_set: self.hub_entity_set(all),
+            auto_event_map: Self::auto_event_map(all),
+            artifact_tabs: self.artifact_tables(all),
+        });
+        *self.assoc_tables_cache.borrow_mut() = Some(std::sync::Arc::clone(&built));
+        built
+    }
+
+    /// 取（或重建）artifact 两张表，并复用按正文指纹缓存的抽取结果
+    ///
+    /// 与 [`build_artifact_tables`] 的区别仅在于"缓存由谁持有"：
+    /// 抽取结果挂在 `MemoryStore::artifact_cache` 上，跨检索/跨写入存活，
+    /// 只有正文真正变化的那几条会重新抽取。
+    fn artifact_tables(&self, all: &[Memory]) -> ArtifactTables {
+        let started = std::time::Instant::now();
+        let mut cache = self.artifact_cache.borrow_mut();
+        let (tables, hits) = build_artifact_tables(all, &mut cache);
+        if std::env::var("LRC_TIMING")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "[LRC·计时] artifact_tables 库={} 复用={} 重算={} 耗时={:.3}s",
+                all.len(),
+                hits,
+                all.len().saturating_sub(hits),
+                started.elapsed().as_secs_f64()
+            );
+        }
+        tables
+    }
+
     /// 记忆的关联图谱：以一条记忆为起点，推导它的多类型关联
     ///
     /// 返回 **结构化关联**（非排序列表）：每条关联带 `relation` 类型与 `why` 解释。
@@ -6132,9 +6284,9 @@ impl<P: Persistence> MemoryStore<P> {
     ) -> Result<Vec<MemoryAssociation>, PersistenceError> {
         let all = self.load_cached()?;
 
-        // 一次性统计 hub 实体（按**项目内**占比判定；见 `hub_entity_set` 与
-        // `HUB_ENTITY_DF_RATIO` 的文档：全库分母会被其他项目稀释而漏判）
-        let hub_set = self.hub_entity_set(&all);
+        // 三张全库统计表走**按数据版本失效**的缓存（v0.9.13）：
+        // 数据未变时不再每次重建（449k 条库上建表需 17s），且内容逐字节一致。
+        let tables = self.assoc_tables(&all);
         // id → 记忆 的一次性索引（`associations_in` 内三处 id 查找原为 O(N)
         // 线性扫描，其中两处在循环体内 ⇒ 逐候选 × 库规模。详见其文档。）
         let by_id: std::collections::HashMap<&str, &Memory> =
@@ -6144,9 +6296,9 @@ impl<P: Persistence> MemoryStore<P> {
             &all,
             &by_id,
             memory_id,
-            &hub_set,
-            &Self::auto_event_map(&all),
-            &ArtifactTables::build(&all),
+            &tables.hub_set,
+            &tables.auto_event_map,
+            &tables.artifact_tabs,
         ))
     }
 
@@ -6908,14 +7060,13 @@ impl<P: Persistence> MemoryStore<P> {
         // ★ 分段计时（默认关闭，`LRC_TIMING=1` 时开启）：把"一次性建表"与
         //   "逐种子关联"分开，用于定位本函数在 Full 量级下的成本归属。
         let __a_t0 = std::time::Instant::now();
-        // hub 实体一次性统计（与详情页关联同口径，见 `hub_entity_set`）
-        let hub_set = self.hub_entity_set(&all);
-        // 自动事件表一次性统计（同口径）：**必须提到循环外**，
-        // 否则每条起点都要重建一次全库分组（O(N) × k）
-        let auto_events = Self::auto_event_map(&all);
-        // artifact 两张表一次性统计（同口径，v0.9.8）：同上，
-        // 建表需遍历全库做形态抽取 + 按项目聚合，逐起点重建是 O(N × k)
-        let artifact_tabs = ArtifactTables::build(&all);
+        // 三张全库统计表走**按数据版本失效**的缓存（v0.9.13）：
+        //   命中时这一段从 17.0s 降到 ~0（449k 条库实测），内容与重建逐字节一致。
+        //   失效口径见 [`Self::assoc_tables`]：任何写入都会让版本递增 ⇒ 自动重建。
+        let __tables = self.assoc_tables(&all);
+        let hub_set = &__tables.hub_set;
+        let auto_events = &__tables.auto_event_map;
+        let artifact_tabs = &__tables.artifact_tabs;
         // 起点记忆索引（用于填 via_* 溯源字段，同时供 `associations_in` 做 O(1) id 查找）
         let by_id: std::collections::HashMap<&str, &Memory> =
             all.iter().map(|m| (m.id.as_str(), m)).collect();
@@ -7042,14 +7193,8 @@ impl<P: Persistence> MemoryStore<P> {
             .filter_map(|seed| {
                 let seed_mem = by_id.get(seed.as_str())?;
                 let __s1 = std::time::Instant::now();
-                let assocs = Self::associations_in(
-                    &all,
-                    &by_id,
-                    seed,
-                    &hub_set,
-                    &auto_events,
-                    &artifact_tabs,
-                );
+                let assocs =
+                    Self::associations_in(&all, &by_id, seed, hub_set, auto_events, artifact_tabs);
                 __acc_assoc.set(__acc_assoc.get() + __s1.elapsed().as_secs_f64());
                 let __s2 = std::time::Instant::now();
                 // 按关系类型分组成通道
@@ -7228,9 +7373,9 @@ impl<P: Persistence> MemoryStore<P> {
                     &all,
                     &by_id,
                     mid_id,
-                    &hub_set,
-                    &auto_events,
-                    &artifact_tabs,
+                    hub_set,
+                    auto_events,
+                    artifact_tabs,
                 );
                 // 组内按「意外性优先」排序（与 1 跳同口径：BGE 给不出的先给）
                 // ★ 同 1 跳：改为"先算键再排序"，避免在比较器内重算 `content_words`
@@ -7634,17 +7779,15 @@ impl<P: Persistence> MemoryStore<P> {
         // 加入自动事件后，这里从"2 次全库扫描/邻居"恶化到"3 次"，
         // 大簇场景（实测同经历簇可达 20+ 节点）会明显变慢。
         // 本方法已持有 `all`，故两张表**在全图构建期间只算一次**。
-        let hub_set = self.hub_entity_set(&all);
-        let auto_events = Self::auto_event_map(&all);
-        // artifact 两张表：全图构建期间只算一次（同 hub / auto_events 的理由）
-        let artifact_tabs = ArtifactTables::build(&all);
+        // 三张全库统计表走**按数据版本失效**的缓存（v0.9.13，同 `associations`）。
+        let tables = self.assoc_tables(&all);
         let anchor_edges = Self::associations_in(
             &all,
             &by_id,
             memory_id,
-            &hub_set,
-            &auto_events,
-            &artifact_tabs,
+            &tables.hub_set,
+            &tables.auto_event_map,
+            &tables.artifact_tabs,
         );
 
         let mut edges: Vec<GraphEdge> = Vec::new();
@@ -7709,8 +7852,14 @@ impl<P: Persistence> MemoryStore<P> {
             if truncated {
                 break;
             }
-            let mid_edges =
-                Self::associations_in(&all, &by_id, mid, &hub_set, &auto_events, &artifact_tabs);
+            let mid_edges = Self::associations_in(
+                &all,
+                &by_id,
+                mid,
+                &tables.hub_set,
+                &tables.auto_event_map,
+                &tables.artifact_tabs,
+            );
             for a2 in mid_edges {
                 if a2.memory_id == memory_id || a2.memory_id == *mid {
                     continue; // 回到根 or 自环：无信息量
@@ -7801,7 +7950,7 @@ impl<P: Persistence> MemoryStore<P> {
         // v0.9.6：近 7 天新增按创建时间真实统计（替代"今日新增=累计编码次数"的误导口径）
         let recent_cutoff = chrono::Utc::now() - chrono::Duration::days(7);
 
-        for m in &all {
+        for m in all.iter() {
             *stats
                 .by_type
                 .entry(m.memory_type.as_str().to_string())
@@ -7833,7 +7982,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 事件簇数：不同 event_id 的个数（与 event_index 的分组口径一致）
         {
             let mut seen = std::collections::HashSet::new();
-            for m in &all {
+            for m in all.iter() {
                 if let Some(ref e) = m.event_id {
                     seen.insert(e.as_str());
                 }
@@ -7847,9 +7996,23 @@ impl<P: Persistence> MemoryStore<P> {
     }
 
     /// 获取记忆总数
+    ///
+    /// ★ 2026-10-27（性能修复）：原实现走 `load_cached()` ⇒ **整个库深拷贝一次**。
+    /// `/v1/memories/consolidate` 的 Phase 3 每次 Add 都调用本方法，28 万条库上
+    /// 实测单次白付数秒并长时间持锁（与 `list_memories` 叠加成 11~13 秒）。
+    /// 现改为"确保缓存可用 + O(1) 取长度"，语义不变。
     pub fn total_count(&self) -> Result<usize, PersistenceError> {
-        let all = self.load_cached()?;
-        Ok(all.len())
+        self.ensure_cache_loaded()?;
+        Ok(self.cache.len())
+    }
+
+    /// 取合成类记忆的摘要文本（**不克隆整库**）
+    ///
+    /// ★ 2026-10-27：供 `/v1/memories/consolidate` 的 Phase 3 使用，替代此前
+    /// 的 `list_memories(&ListFilter::new())` 全量深拷贝（28 万条库实测 11~13 秒）。
+    pub fn synthesis_summary_texts(&self) -> Result<Vec<String>, PersistenceError> {
+        self.ensure_cache_loaded()?;
+        Ok(self.cache.synthesis_summaries())
     }
 
     /// 道枢映射: 坤卦·地 (☷) — 厚德载物，归档如大地之收藏与沉淀
@@ -7862,9 +8025,10 @@ impl<P: Persistence> MemoryStore<P> {
     pub fn archive_expired(&mut self) -> Result<usize, PersistenceError> {
         let all = self.load_cached()?;
 
-        // 筛选过期记忆与活跃记忆
+        // 筛选过期记忆与活跃记忆（★ v0.9.13 建议二：只克隆需要的条目归属，
+        //   分卷集合本身必须拥有数据，与修前同样一次全库克隆）
         let (expired, active): (Vec<Memory>, Vec<Memory>) =
-            all.into_iter().partition(|m| m.is_expired());
+            all.iter().cloned().partition(|m| m.is_expired());
 
         if expired.is_empty() {
             return Ok(0);
@@ -7919,7 +8083,7 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 计算八卦分布
         let mut bagua_counts = [0usize; 8];
-        for m in &all {
+        for m in all.iter() {
             if let Some(idx) = m.bagua_index {
                 bagua_counts[idx as usize] += 1;
             }
@@ -7958,7 +8122,7 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 计算八卦分布
         let mut bagua_distribution = [0usize; 8];
-        for m in &all {
+        for m in all.iter() {
             if let Some(idx) = m.bagua_index {
                 if (idx as usize) < 8 {
                     bagua_distribution[idx as usize] += 1;
@@ -8158,7 +8322,8 @@ impl<P: Persistence> MemoryStore<P> {
         let mut found: Option<Memory> = None;
 
         let updated: Vec<Memory> = all
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|mut m| {
                 if m.id == id {
                     // 使用版本追踪更新（自动保存历史版本）
@@ -8225,7 +8390,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 采集道同构度快照
         let mut bagua_counts = [0usize; 8];
         let mut vectors: Vec<[f32; 9]> = Vec::new();
-        for m in &all {
+        for m in all.iter() {
             if let Some(idx) = m.bagua_index {
                 if (idx as usize) < 8 {
                     bagua_counts[idx as usize] += 1;
