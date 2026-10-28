@@ -2296,6 +2296,9 @@ pub fn build_v1_router_with_trust(
                         }
 
                         // 阶段 1（**短暂持锁**）：仅取编码器句柄（克隆成本 ≈ 一个 bool）。
+                        // ★ 2026-10-28 分段计时：与阶段 3 一起，用来把"取锁等待"从
+                        //   "真正的工作"里剥离出来（写入 17s 的构成必须实测）。
+                        let __p1_t0 = std::time::Instant::now();
                         let encoder = {
                             // 取锁上限走**单一真源**（此前这里硬编码 2s ⇒ 与 `timeouts::LOCK_WAIT`
                             // 各自为政；真源调整后此处不会跟随 ⇒ 已知漂移缺陷，2026-10-15 修正）。
@@ -2321,12 +2324,25 @@ pub fn build_v1_router_with_trust(
                             };
                             store_guard.luoshu_encoder_handle()
                         };
+                        let __p1_s = __p1_t0.elapsed().as_secs_f64();
+                        if __timing {
+                            eprintln!("[LRC·计时] write 阶段1取编码器锁={:.3}s", __p1_s);
+                        }
 
                         // 阶段 2（**不持锁**）：最昂贵的编码阶段。
+                        let __p2_t0 = std::time::Instant::now();
                         let luoshu_vecs =
                             crate::memory_store::encode_luoshu_batch(&encoder, &batch);
+                        if __timing {
+                            eprintln!(
+                                "[LRC·计时] write 阶段2洛书编码 n={} {:.3}s",
+                                batch.len(),
+                                __p2_t0.elapsed().as_secs_f64()
+                            );
+                        }
 
                         // 阶段 3（**短暂持锁**）：投影 + 一次落盘 + 索引维护。
+                        let __p3_t0 = std::time::Instant::now();
                         let stored = {
                             // 同上：取锁上限走单一真源，不再硬编码。
                             let lock_deadline =
@@ -2356,6 +2372,13 @@ pub fn build_v1_router_with_trust(
                                 }
                             }
                         };
+                        if __timing {
+                            eprintln!(
+                                "[LRC·计时] write 阶段3持锁+落盘+索引 stored={} {:.3}s",
+                                stored,
+                                __p3_t0.elapsed().as_secs_f64()
+                            );
+                        }
                         Some(stored)
                     })
                     .await

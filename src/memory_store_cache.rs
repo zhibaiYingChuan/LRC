@@ -208,8 +208,16 @@ impl MemoryStoreCache {
         //   读写同受外层 Mutex 串行化），`make_mut` 才会整库克隆一次；
         //   否则原地追加，代价与修前一致。
         Arc::make_mut(&mut self.memory.borrow_mut()).extend_from_slice(new);
-        // 新增条目的文本特征尚未计算；清空后按需惰性重建（不影响正确性）。
-        self.documents.borrow_mut().clear();
+        // ★ 2026-10-28（实测修正）：**不再清空**全库文本特征。
+        //
+        // 修前此处 `documents.clear()`，理由是"新增条目的文本特征尚未计算"。但：
+        //   · 本方法的前置条件已保证 `new` 全带**新 UUID** ⇒ 缓存里本就不存在
+        //     它们的条目，`recall_document()` 会按需惰性补算（幂等）；
+        //   · 追加**不会改动**任何既有记忆的正文 ⇒ 既有条目的特征仍然有效。
+        // 因此清空的唯一效果是"让下一次检索把 449k 条全部重新 lowercase + 计数"——
+        // 线上实测该重建与「快路 4.8s + 深路 7.8s」中的主要部分重合，并使写入在
+        // 每次检索后都被迫重付一次。改为**不清空**后，缓存只增不减地覆盖到全库，
+        // 检索侧首次全量计算后即可长期复用。
         self.source_fingerprint.set(source_fingerprint);
         self.dirty.set(false);
         self.bump_data_version();
@@ -495,6 +503,62 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&before, &after),
             "写入后应产生新分配（写时复制），否则旧快照会被写入污染"
+        );
+    }
+
+    /// 2026-10-28：追加新记忆**不得**清空既有文本特征缓存。
+    ///
+    /// 修前 `append_new` 会 `documents.clear()`，使下一次检索把全库重新
+    /// lowercase + 计数（449k 条库上是「快路/深路」的主要耗时之一）。
+    /// 新条目带新 UUID，缺失特征由 `recall_document()` 惰性补算即可。
+    #[test]
+    fn 追加新记忆不清空既有文本特征() {
+        let cache = MemoryStoreCache::new(AssocFrequency::default());
+        let a = make_memory("甲");
+        let b = make_memory("乙");
+        let id_a = a.id.clone();
+        let id_b = b.id.clone();
+        cache.store(vec![a, b], None);
+
+        // 触发一次惰性计算，填充两条的特征
+        let all = cache.snapshot();
+        for m in all.iter() {
+            let doc = cache.recall_document(m);
+            assert!(!doc.normalized_content.is_empty(), "特征不应为空");
+        }
+        let cached_before = cache.documents.borrow().len();
+        assert_eq!(cached_before, 2, "两条记忆的特征都应已缓存");
+
+        let c = make_memory("丙");
+        let id_c = c.id.clone();
+        cache.append_new(&[c], None);
+
+        assert_eq!(
+            cache.documents.borrow().len(),
+            cached_before,
+            "追加新记忆不得清空既有特征缓存（回归：又变回每写一次就全库重算）"
+        );
+        assert!(
+            cache.documents.borrow().contains_key(&id_a)
+                && cache.documents.borrow().contains_key(&id_b),
+            "既有记忆的特征必须仍在缓存中"
+        );
+        assert!(
+            !cache.documents.borrow().contains_key(&id_c),
+            "新条目特征应留待惰性计算，而不是被写入路径清空整表"
+        );
+
+        // 惰性补算：新条目取特征时自动填入，且与独立计算的语义一致
+        let all_after = cache.snapshot();
+        let new_mem = all_after
+            .iter()
+            .find(|m| m.id == id_c)
+            .expect("新条目应存在");
+        let doc = cache.recall_document(new_mem);
+        assert_eq!(doc.normalized_content, "丙", "新条目特征应按正文计算");
+        assert!(
+            cache.documents.borrow().contains_key(&id_c),
+            "惰性计算后新条目特征应写入缓存"
         );
     }
 }

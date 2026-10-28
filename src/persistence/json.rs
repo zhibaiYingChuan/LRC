@@ -623,7 +623,11 @@ impl Persistence for JsonPersistence {
         let _process_guard = self.acquire_process_write_guard()?;
         // ★ B1：这是 /add 的热路径 —— 原无条件整库重读在 400MB 库上单次多付一次全量读，
         //   直接导致请求越过 120s 外层超时。改为指纹门控。
+        // ★ 2026-10-28 分段计时（`LRC_TIMING=1`）：量出"指纹门控是否失效 → 整库重读"、
+        //   "450k 条 ID 索引表构建"、"追加日志/压实"三段各占多少。
+        let __st_t0 = std::time::Instant::now();
         self.refresh_cache_if_changed()?;
+        let __st_refresh = __st_t0.elapsed().as_secs_f64();
         let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
         // v0.9.7 修复：同上，消除库路径 panic 面（原为 .expect("缓存已通过磁盘刷新初始化")）
         let existing = cache.as_mut().ok_or_else(|| {
@@ -634,11 +638,13 @@ impl Persistence for JsonPersistence {
 
         // 构建 ID → 索引 映射，支持"已存在则更新，不存在则追加"
         // 使用 String 作为 key（拥有所有权），避免 &str 借用 existing 导致可变借用冲突
+        let __st_t1 = std::time::Instant::now();
         let mut index_map: std::collections::HashMap<String, usize> =
             std::collections::HashMap::with_capacity(existing.len() + memories.len());
         for (i, m) in existing.iter().enumerate() {
             index_map.insert(m.id.clone(), i);
         }
+        let __st_idmap = __st_t1.elapsed().as_secs_f64();
 
         for m in memories {
             match index_map.get(&m.id) {
@@ -662,6 +668,7 @@ impl Persistence for JsonPersistence {
         // 崩溃安全：追加是"整行 + flush"，进程被杀最多留下截断尾行，重放时跳过。
         // ★ 2026-10-28：基文件缺失时也压实（见 `needs_compact`）。
         let compact = self.needs_compact();
+        let __st_t2 = std::time::Instant::now();
         let write_result = if compact {
             // ★ B2：紧凑 JSON（省约 12% 字节与序列化时间；读路径不依赖缩进）。
             match serde_json::to_string(existing) {
@@ -692,6 +699,19 @@ impl Persistence for JsonPersistence {
         drop(cache); // 释放写锁
                      // ★ B1：记录写盘后的新指纹（含日志），下一次写操作可跳过整库重读。
         *self.loaded_fp.write().unwrap_or_else(|e| e.into_inner()) = self.disk_fingerprint();
+        if std::env::var("LRC_TIMING")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "[LRC·计时] write 落盘 n={} refresh={:.3}s idmap={:.3}s write={:.3}s compact={}",
+                memories.len(),
+                __st_refresh,
+                __st_idmap,
+                __st_t2.elapsed().as_secs_f64(),
+                compact
+            );
+        }
         Ok(())
     }
 

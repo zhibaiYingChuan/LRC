@@ -4333,10 +4333,16 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         // 批量写入只执行一次全量序列化和磁盘写入。
+        // ★ 2026-10-28 分段计时（`LRC_TIMING=1`）：把落盘、索引维护、缓存并入分开量，
+        //   用于回答"写入 17s 到底花在哪一段"（此前只有总数，没有分解）。
+        let __wt_t0 = std::time::Instant::now();
         self.persistence.save_memories(&results)?;
+        let __wt_persist = __wt_t0.elapsed().as_secs_f64();
+        let __wt_t1 = std::time::Instant::now();
         for result in &results {
             self.add_memory_to_index(result);
         }
+        let __wt_index = __wt_t1.elapsed().as_secs_f64();
 
         // 注意：此处不在关键路径内执行合成（luoshu_synthesize），因为：
         // 1. 合成操作（簇发现、摘要生成）在大批量数据下耗时巨大（O(N^2) 级别）
@@ -4358,6 +4364,19 @@ impl<P: Persistence> MemoryStore<P> {
         //   并入即等价于 upsert；倒排索引已在上面逐条增量维护，故不需要重建。
         self.cache
             .append_new(&results, self.persistence.source_fingerprint());
+
+        if std::env::var("LRC_TIMING")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "[LRC·计时] write 内部 n={} persist={:.3}s index={:.3}s append_new={:.3}s",
+                results.len(),
+                __wt_persist,
+                __wt_index,
+                __wt_t1.elapsed().as_secs_f64() - __wt_index
+            );
+        }
 
         Ok(results)
     }
