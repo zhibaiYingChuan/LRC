@@ -10,6 +10,19 @@ use std::collections::HashMap;
 const MAX_ACTIVE_MEMORIES: usize = 32;
 const MAX_ASSOCIATION_DEPTH: u8 = 4;
 const DECAY_PER_STEP: f32 = 0.85;
+/// 联想链（`trail`）保留的最近步数上限。
+///
+/// **为什么必须有上限**（2026-10-28 实测）：`trail` 此前只 push 不裁剪，而
+/// `bake_activation → populate_state → transition` 在**每次检索**无条件执行
+/// （绕过了 `should_continue` 的 `len < 4` 判断）⇒ 每检索一次追加 `top_k` 步。
+/// 线上 `memory_state.json` 因此长到 **218MB**，且每次检索都要把这份文件
+/// **整份重写两次**（快路、深路各一次，均在存储锁内、含 fsync）。
+///
+/// **为什么取 16 是安全的**：`trail` 只有两个读取方——
+/// `transition()` 看最后一步是否重复、`should_continue()` 判断 `len < 4`；
+/// 两者都只依赖最近的少数几步。上限必须 ≥ 4，否则 `len < 4` 会重新成立、
+/// 改变 `should_continue` 的既有结论（现网因无界增长恒为 false）。取 16 留出余量。
+const TRAIL_KEEP_STEPS: usize = 16;
 
 /// 当前记忆联想的运行状态。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,7 +135,23 @@ impl MemoryStateMachine {
             .map(|entry| entry.last_step)
             .max()
             .unwrap_or(0);
-        Self { state, step }
+        let mut machine = Self { state, step };
+        // ★ 2026-10-28：加载时也裁剪。历史遗留的无界 trail（线上 218MB ≈ 136 万步）
+        //   若原样带回，会在下一次检索时被整份重写，因而永远缩不回去。
+        //   裁剪只丢弃"永不被读取"的陈旧步，语义不变（见 `TRAIL_KEEP_STEPS`）。
+        machine.trim_trail();
+        machine
+    }
+
+    /// 只保留最近 [`TRAIL_KEEP_STEPS`] 步联想链。
+    ///
+    /// 两个调用点缺一不可：`transition()`（防止运行期无界增长）与
+    /// `from_state()`（把历史遗留的超大文件收回来）。
+    fn trim_trail(&mut self) {
+        let len = self.state.trail.len();
+        if len > TRAIL_KEEP_STEPS {
+            self.state.trail.drain(0..len - TRAIL_KEEP_STEPS);
+        }
     }
 
     /// 衰减旧活性，并激活本轮召回的记忆。
@@ -182,6 +211,9 @@ impl MemoryStateMachine {
         } else {
             self.state.stable_steps = self.state.stable_steps.saturating_add(1);
         }
+        // ★ 2026-10-28：裁剪到最近 TRAIL_KEEP_STEPS 步。
+        //   此处是检索热路径（每次召回 top_k 步），不裁剪会让状态文件无限增长。
+        self.trim_trail();
         changed
     }
 
@@ -448,6 +480,56 @@ mod tests {
         assert!(machine.transition(Some("a"), "b", 0.6, 2));
         assert_eq!(machine.state.trail.len(), 2);
         assert_eq!(machine.state.trail[1].depth, 2);
+    }
+
+    /// 2026-10-28：联想链必须有上限（线上 memory_state.json 曾因此长到 218MB）。
+    #[test]
+    fn 联想链在运行期裁剪到上限() {
+        let mut machine = MemoryStateMachine::new();
+        for i in 0..100 {
+            machine.transition(None, &format!("m{i}"), 0.5, 1);
+        }
+        assert_eq!(
+            machine.state.trail.len(),
+            TRAIL_KEEP_STEPS,
+            "联想链必须裁剪到 TRAIL_KEEP_STEPS，否则状态文件会无限增长"
+        );
+        // 保留的必须是**最近**的步，而不是最早的步
+        assert_eq!(
+            machine.state.trail.last().map(|s| s.to_id.as_str()),
+            Some("m99"),
+            "裁剪后最后一步应是最新写入的转移"
+        );
+        // 上限必须 ≥ `should_continue` 依赖的阈值（4），否则会改变其既有结论
+        assert!(
+            TRAIL_KEEP_STEPS >= MAX_ASSOCIATION_DEPTH as usize,
+            "TRAIL_KEEP_STEPS 不得小于 should_continue 依赖的深度阈值"
+        );
+    }
+
+    /// 2026-10-28：加载历史遗留的超大状态时也必须裁剪，否则文件永远缩不回来。
+    #[test]
+    fn 加载历史超大联想链时裁剪() {
+        let mut legacy = MemoryState::default();
+        for i in 0..5000 {
+            legacy.trail.push(AssociationStep {
+                from_id: None,
+                to_id: format!("old{i}"),
+                score: 0.5,
+                depth: 1,
+            });
+        }
+        let machine = MemoryStateMachine::from_state(legacy);
+        assert_eq!(
+            machine.state.trail.len(),
+            TRAIL_KEEP_STEPS,
+            "加载时应裁剪历史无界联想链（这是 218MB 状态文件的根因）"
+        );
+        assert_eq!(
+            machine.state.trail.last().map(|s| s.to_id.as_str()),
+            Some("old4999"),
+            "裁剪后应保留最近的一批转移"
+        );
     }
 
     #[test]
