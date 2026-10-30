@@ -763,6 +763,24 @@ async fn try_run() -> LrcResult<()> {
     );
     let memory_store = Arc::new(Mutex::new(store));
 
+    // ★ 2026-10-30（内存优化）：语义模型空闲卸载。
+    //
+    // 背景（实测）：`bge-base-zh` 的 f32 权重 390MB 由 `safetensors::load` 全量读进
+    // 堆并永久常驻 —— 侧车空闲时实测 682MB，其中 57% 是这份权重。
+    // 这里每 60 秒检查一次：超过阈值（`LRC_MODEL_IDLE_UNLOAD_SECS`，默认 600 秒）
+    // 没有语义编码请求就释放模型；下次检索由 `encode_*` 路径惰性重载（本地读盘 1~2 秒）。
+    // 检索结果与向量完全不变，只是把"常驻成本"换成"空闲后首次使用的一次加载"。
+    #[cfg(feature = "ml")]
+    if ml_loaded {
+        let idle_encoder = memory_store.lock().await.luoshu_encoder_handle();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                idle_encoder.unload_ml_if_idle();
+            }
+        });
+    }
+
     // ╔═══════════════════════════════════════════════════════════════╗
     // ║ v0.6.0+ 参赛扩展：应用参照系实验 CLI 参数                   ║
     // ║ 设计原则：默认启用所有功能，由 flag 显式禁用                ║
