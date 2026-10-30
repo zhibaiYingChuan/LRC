@@ -1079,10 +1079,25 @@ async fn try_run() -> LrcResult<()> {
         // ════════════════════════════════════════════════════════════
         // HTTP 模式：端口绑定 + axum HTTP 服务启动
         // ════════════════════════════════════════════════════════════
-        log("\n🚀 HTTP 服务启动中（端口自适应）...");
+        log("\n🚀 HTTP 服务启动中...");
         log(&format!("   从端口 {} 开始尝试绑定...", port));
 
-        let (listener, actual_port) = process_guard::find_available_port(&host, port, 100)
+        // ★ 2026-10-30：默认**严格绑定**指定端口，不再静默顺延。
+        //
+        // 为什么改：0.9.15 实测出现「3099 被占用 → 静默退到 3100」，
+        // 而 3100 是前端 dev server 的高频端口（本机就被 G:\TL 占用），
+        // 桌面端又会把实际端口写进 MCP 配置 ⇒ 配置永久漂移到 3100，
+        // 表现为「LRC 的 MCP 启动失败，重启也没用」，且极难定位。
+        //
+        // 现在：端口被占 ⇒ 直接报错并提示占用原因，由用户/桌面端处理；
+        // 需要旧的"顺延"行为时显式设置 LRC_PORT_AUTO=1（测试/多实例场景）。
+        let port_auto = std::env::var("LRC_PORT_AUTO")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let attempts: u16 = if port_auto { 100 } else { 1 };
+        log(&format!("   绑定端口 {}（顺延={}）...", port, port_auto));
+
+        let (listener, actual_port) = process_guard::find_available_port(&host, port, attempts)
             .await
             .map_err(|e| {
                 LrcError::network(format!(

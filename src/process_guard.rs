@@ -540,8 +540,12 @@ fn is_process_matches_sidecar(pid: u32) -> bool {
 ///
 /// 工作机制：
 ///   1. 尝试 base_port (默认 3099)
-///   2. 被占用则尝试 base_port + 1 (3100)
-///   3. 继续递增直到找到可用端口或达到 max_attempts 次尝试
+///   2. 被占用则尝试 base_port + 1，继续递增直到找到可用端口或达到 max_attempts 次
+///
+/// ⚠ 2026-10-30：**默认调用方（`src/bin/server.rs`）已改为 max_attempts=1**，
+/// 即严格绑定、被占即报错；只有显式设置 `LRC_PORT_AUTO=1` 才恢复顺延。
+/// 原因：顺延会让桌面端把实际端口写进 MCP 配置，形成"配置漂移到 3100"的故障。
+/// 本函数保留 max_attempts 参数，供测试（如 3111 起的端口段）显式使用。
 ///
 /// # 返回
 /// - `Ok(port)`: 成功找到可用端口，返回实际绑定的 TcpListener
@@ -568,11 +572,17 @@ pub async fn find_available_port(
                 return Ok((listener, port));
             }
             Err(e) => {
-                eprintln!(
-                    "[进程守护] 端口 {} 不可用 ({}), 尝试下一个...",
-                    port,
-                    e.kind()
-                );
+                // 仅当确实还有下一个候选端口时才提示"尝试下一个"，
+                // 否则 max_attempts=1（严格绑定）下的这句会误导用户。
+                if offset + 1 < max_attempts {
+                    eprintln!(
+                        "[进程守护] 端口 {} 不可用 ({}), 尝试下一个...",
+                        port,
+                        e.kind()
+                    );
+                } else {
+                    eprintln!("[进程守护] 端口 {} 不可用 ({})", port, e.kind());
+                }
             }
         }
     }
