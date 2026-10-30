@@ -1,0 +1,4 @@
+[submodule "core/lrc-algo"]
+	path = core/lrc-algo
+	url = https://github.com/zhibaiYingChuan/LRC-core.git
+	branch = master

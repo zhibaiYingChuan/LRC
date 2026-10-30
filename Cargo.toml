@@ -116,6 +116,41 @@ name = "code-memory-benchmark"
 path = "src/bin/benchmark.rs"
 required-features = ["server"]
 
+# ★ 2026-10-30：受保护层的算法行为测试随源码迁入私有子模块 `core/lrc-algo`。
+#   它们断言的是核心引擎的行为（状态机、语义探针、锚点/缺口分解、基准），
+#   内容不宜公开；这里用显式 `[[test]]` 目标继续让 CI 编译并运行。
+[[test]]
+name = "benchmarks"
+path = "core/lrc-algo/tests/benchmarks.rs"
+
+[[test]]
+name = "memory_state_machine_e2e"
+path = "core/lrc-algo/tests/memory_state_machine_e2e.rs"
+
+[[test]]
+name = "state_anchor_form"
+path = "core/lrc-algo/tests/state_anchor_form.rs"
+
+[[test]]
+name = "state_gap_decompose"
+path = "core/lrc-algo/tests/state_gap_decompose.rs"
+
+[[test]]
+name = "state_semantic_latency"
+path = "core/lrc-algo/tests/state_semantic_latency.rs"
+
+[[test]]
+name = "state_semantic_probe"
+path = "core/lrc-algo/tests/state_semantic_probe.rs"
+
+[[test]]
+name = "state_semantic_whiten"
+path = "core/lrc-algo/tests/state_semantic_whiten.rs"
+
+[[test]]
+name = "luoshu_invariants"
+path = "core/lrc-algo/tests/luoshu_invariants.rs"
+
 [build-dependencies]
 sha2 = "0.10"
 

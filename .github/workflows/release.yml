@@ -1,4 +1,4 @@
-name: Release
+﻿name: Release
 
 on:
   push:
@@ -33,6 +33,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          token: ${{ secrets.CORE_REPO_TOKEN }}
+          submodules: recursive
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
@@ -291,6 +294,9 @@ jobs:
       - name: Checkout
         id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          token: ${{ secrets.CORE_REPO_TOKEN }}
+          submodules: recursive
         continue-on-error: true
       - name: Checkout (retry on failure)
         if: steps.checkout.outcome == 'failure'
@@ -577,6 +583,9 @@ jobs:
       - name: Checkout
         id: checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          token: ${{ secrets.CORE_REPO_TOKEN }}
+          submodules: recursive
         continue-on-error: true
       - name: Checkout (retry on failure)
         if: steps.checkout.outcome == 'failure'
@@ -1094,6 +1103,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          token: ${{ secrets.CORE_REPO_TOKEN }}
+          submodules: recursive
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:
@@ -1260,6 +1272,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          token: ${{ secrets.CORE_REPO_TOKEN }}
+          submodules: recursive
       - name: Harden Runner
         uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
         with:

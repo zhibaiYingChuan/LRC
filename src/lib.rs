@@ -114,16 +114,17 @@ pub mod test_env {
                 include_str!("memory_state_machine.rs"),
             ),
             (
-                "engine/model_resolver.rs",
-                include_str!("engine/model_resolver.rs"),
+                // 2026-10-30：受保护层源码已迁入私有子模块，路径随之改变
+                "core/lrc-algo/src/engine/model_resolver.rs",
+                include_str!("../core/lrc-algo/src/engine/model_resolver.rs"),
             ),
             (
-                "engine/dao_regulator.rs",
-                include_str!("engine/dao_regulator.rs"),
+                "core/lrc-algo/src/engine/dao_regulator.rs",
+                include_str!("../core/lrc-algo/src/engine/dao_regulator.rs"),
             ),
             (
-                "engine/model_downloader.rs",
-                include_str!("engine/model_downloader.rs"),
+                "core/lrc-algo/src/engine/model_downloader.rs",
+                include_str!("../core/lrc-algo/src/engine/model_downloader.rs"),
             ),
             (
                 "memory_store_tests.rs",
@@ -255,6 +256,11 @@ pub mod state_matcher;
 pub mod reclassify_job;
 
 // === Layer 2: 受保护核心引擎（专有研究许可） ===
+// ⚠️ 2026-10-30 起核心引擎源码**不再随公开仓库分发**：
+//   受保护层代码已迁入私有仓库，公开仓库通过 git submodule（`core/lrc-algo`）
+//   以 `#[path]` 挂载编译。没有该子模块时本 crate 无法编译 ——
+//   外部用户只能通过官方安装包使用本产品。
+#[path = "../core/lrc-algo/src/engine/mod.rs"]
 pub mod engine;
 
 // === Layer 1: MCP 服务层 (Apache 2.0) ===
