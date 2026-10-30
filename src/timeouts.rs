@@ -71,6 +71,15 @@ pub const CONSOLIDATE_INNER_TIMEOUT: Duration = Duration::from_secs(20);
 /// **内层**：`benchmarks/report` 的执行预算（必须严格小于外层，CR-14）。
 pub const BENCHMARKS_INNER_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// **内层**：`consolidate` 的**编码阶段**预算（锁外长任务）。
+///
+/// P1-5（2026-10-30）：编码在锁外执行，1 核实测 65~71 条分片需 70~100s。
+/// 若外层 [`HTTP_OUTER_TIMEOUT`] 已丢弃 future（连接已断），编码线程仍会跑完并
+/// 继续取锁落盘 ⇒ "用户收到 504、数据却写进去了"的**幽灵写入**，
+/// 且适配层对写路径不重试 504，平台侧会看到"失败但数据存在"的矛盾状态。
+/// 预算取 100s（< 外层 120s，留 20s 给取锁与落盘），超预算即放弃落盘。
+pub const CONSOLIDATE_ENCODE_BUDGET: Duration = Duration::from_secs(100);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +118,16 @@ mod tests {
         assert!(
             BENCHMARKS_INNER_TIMEOUT < HTTP_OUTER_TIMEOUT,
             "benchmarks 内层必须 < 外层（CR-14）"
+        );
+        // P1-5：编码预算同样必须严格小于外层，否则"超预算即放弃"与
+        // "外层已断开"这两个时刻会错位，幽灵写入重新出现。
+        assert!(
+            CONSOLIDATE_INNER_TIMEOUT < CONSOLIDATE_ENCODE_BUDGET,
+            "聚类内层预算必须 < 编码预算"
+        );
+        assert!(
+            CONSOLIDATE_ENCODE_BUDGET < HTTP_OUTER_TIMEOUT,
+            "编码预算必须 < 外层超时（P1-5 幽灵写入防线）"
         );
     }
 

@@ -27,6 +27,7 @@ use super::{AssocFrequency, Persistence, PersistenceError};
 use crate::chunker::CodeChunk;
 // v0.9.7（P0-2 依赖倒置修复）：原为 `crate::engine::memory_state_machine::MemoryState`，
 // 现指向 Layer 1 中立层，消除 Layer 1 → Layer 2 反向依赖。
+use crate::lifecycle::LifecycleTable;
 use crate::memory_state_machine::MemoryState;
 use crate::memory_types::Memory;
 use std::fs::{self, OpenOptions};
@@ -223,16 +224,50 @@ impl JsonPersistence {
         }
         file.write_all(buf.as_bytes())?;
         file.flush()?;
+        // P0-3：`flush()` 只把数据交给内核，掉电/强杀仍可能丢最后一批；
+        // 追加日志是"已确认写入"的唯一副本，必须真正落盘。
+        file.sync_data()?;
         Ok(())
     }
 
+    /// 日志作废标记：`truncate_journal` 删除失败时写入，加载侧见到即跳过重放。
+    fn journal_invalidated_marker(&self) -> PathBuf {
+        self.journal_file.with_extension("jsonl.invalidated")
+    }
+
     /// 清空日志（整库重写 / 删除 / 清空之后调用）
+    ///
+    /// ★ P0-3（2026-10-30）：`fs::remove_file` 失败时**不能静默忽略**。
+    /// 删除路径先原子重写基文件、再清日志；若清日志失败（Windows 上文件被
+    /// 其它进程持有、杀毒扫描等），残留日志会在下次启动被 `replay_journal`
+    /// 重放 ⇒ **已删除的记忆复活**，而接口当时已返回成功。
+    /// 兜底：删除失败则写"日志作废"标记，加载侧见标记即跳过重放并清理残留。
     fn truncate_journal(&self) {
-        let _ = fs::remove_file(&self.journal_file);
+        if fs::remove_file(&self.journal_file).is_ok() {
+            let _ = fs::remove_file(self.journal_invalidated_marker());
+            return;
+        }
+        if self.journal_file.exists() {
+            let marker = self.journal_invalidated_marker();
+            if let Err(error) = atomic_write(&marker, "1") {
+                eprintln!(
+                    "[LRC·持久化] ⚠ 日志清空失败且作废标记写入失败：{}（残留日志可能使已删记忆复活，下次启动务必核查）",
+                    error
+                );
+            }
+        }
     }
 
     /// 把日志重放到 `base`：同 id 覆盖，未知 id 追加（后写胜出）
     fn replay_journal(&self, base: &mut Vec<Memory>) {
+        // P0-3：日志已被判定作废（truncate 失败兜底）⇒ 以基文件为唯一事实源，
+        // 绝不重放，并清理残留，避免已删记忆复活。
+        let marker = self.journal_invalidated_marker();
+        if marker.exists() {
+            let _ = fs::remove_file(&self.journal_file);
+            let _ = fs::remove_file(&marker);
+            return;
+        }
         if !self.journal_file.exists() {
             return;
         }
@@ -455,6 +490,31 @@ impl Persistence for JsonPersistence {
         self.ensure_data_dir()?;
         let path = self.data_dir.join("assoc_frequency.json");
         let json = serde_json::to_string_pretty(state)?;
+        atomic_write(&path, &json)?;
+        Ok(())
+    }
+
+    /// 生命周期表加载（独立文件 `lifecycle.json`）。
+    ///
+    /// 文件不存在或为空 ⇒ 返回空表（等价于"全部 Active 且不衰减"），
+    /// 与改造前行为一致，不需要迁移。
+    fn load_lifecycle(&self) -> Result<LifecycleTable, PersistenceError> {
+        let path = self.data_dir.join("lifecycle.json");
+        if !path.exists() {
+            return Ok(LifecycleTable::default());
+        }
+        let content = fs::read_to_string(path)?;
+        if content.trim().is_empty() {
+            return Ok(LifecycleTable::default());
+        }
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    /// 生命周期表保存（原子写，独立于 `memories.json`）。
+    fn save_lifecycle(&self, table: &LifecycleTable) -> Result<(), PersistenceError> {
+        self.ensure_data_dir()?;
+        let path = self.data_dir.join("lifecycle.json");
+        let json = serde_json::to_string_pretty(table)?;
         atomic_write(&path, &json)?;
         Ok(())
     }
@@ -973,6 +1033,78 @@ mod tests {
             .join("memories.json")
             .to_string_lossy()
             .contains("memories"));
+    }
+
+    // ===== P0-1 / P0-2：生命周期表必须独立于 memories.json =====
+
+    #[test]
+    fn lifecycle_roundtrip_is_separate_from_memories_json() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = JsonPersistence::new(&data_dir).expect("应成功创建");
+
+        let mut table = LifecycleTable::default();
+        table.touch("m1", 1_000);
+        p.save_lifecycle(&table).expect("应成功保存生命周期表");
+
+        assert!(dir.path().join("lifecycle.json").exists(), "必须写独立文件");
+        assert!(
+            !dir.path().join("memories.json").exists(),
+            "寿命状态不得顺带创建/重写基文件（回滚安全 + 防全库写）"
+        );
+
+        let p2 = JsonPersistence::new(&data_dir).expect("应成功创建第二个实例");
+        let loaded = p2.load_lifecycle().expect("应成功加载");
+        assert_eq!(loaded.get("m1").map(|e| e.hit_count), Some(1));
+    }
+
+    #[test]
+    fn lifecycle_missing_file_is_empty_and_harmless() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let p = JsonPersistence::new(dir.path().to_string_lossy().as_ref()).expect("应成功创建");
+        let table = p.load_lifecycle().expect("缺失文件应返回空表而不是报错");
+        assert!(table.entries.is_empty(), "缺失即等价于全部 Active 且不衰减");
+    }
+
+    // ===== P0-3：日志清空失败时的作废标记必须阻止重放 =====
+
+    #[test]
+    fn invalidated_journal_is_not_replayed() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = JsonPersistence::new(&data_dir).expect("应成功创建");
+        p.save_memory(&make_test_memory("keep", "保留的记忆"))
+            .expect("应成功保存");
+
+        // 模拟"删除后清日志失败"：日志里残留一条本应被删掉的记忆
+        let ghost = make_test_memory("ghost", "本应被删除的记忆");
+        p.append_journal(std::slice::from_ref(&ghost))
+            .expect("应成功追加日志");
+
+        // 前置（负向对照）：没有标记时，日志确实会被重放
+        let p2 = JsonPersistence::new(&data_dir).expect("应成功创建读实例");
+        let with_replay = p2.load_all_memories().expect("应成功加载");
+        assert!(
+            with_replay.iter().any(|m| m.id == "ghost"),
+            "前置：未作废时日志重放应带出 ghost（证明对照有效）"
+        );
+
+        // 放置作废标记后：必须跳过重放，并清理残留
+        atomic_write(&p.journal_invalidated_marker(), "1").expect("应成功写标记");
+        let p3 = JsonPersistence::new(&data_dir).expect("应成功创建读实例");
+        let after = p3.load_all_memories().expect("应成功加载");
+        assert!(
+            !after.iter().any(|m| m.id == "ghost"),
+            "标记存在时不得重放 —— 否则已删除的记忆会复活"
+        );
+        assert!(
+            !p.journal_invalidated_marker().exists(),
+            "清理完成后作废标记应被移除"
+        );
+        assert!(
+            after.iter().any(|m| m.id == "keep"),
+            "基文件里的记忆必须保留"
+        );
     }
 
     #[test]

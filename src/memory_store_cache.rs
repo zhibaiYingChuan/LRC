@@ -35,7 +35,14 @@ use std::sync::Arc;
 /// 做 `to_lowercase` 与分词——这两步是检索热路径上最常复用的纯计算。
 pub(crate) struct RecallDocument {
     /// 小写规范化后的正文
-    pub(crate) normalized_content: String,
+    ///
+    /// ★ 2026-10-30（性能回归修复）：由 `String` 改为 `Arc<str>`。
+    ///
+    /// 修前每次 `recall_document()` 命中缓存都要**深拷贝整条正文**，而快路
+    /// 的文档频率统计是「查询词数 × 全库候选数」次调用（46.7 万条库、20 个
+    /// 查询词 ⇒ 约 930 万次克隆），单次检索因此多付数 GB 的内存拷贝与分配，
+    /// 实测把快路从 1.6s 拖到 12s。改为共享 `Arc<str>` 后取用只增引用计数。
+    pub(crate) normalized_content: Arc<str>,
     /// 文档长度（token 数，与评分口径一致）
     pub(crate) token_count: usize,
 }
@@ -141,6 +148,26 @@ impl MemoryStoreCache {
         self.source_fingerprint.set(source_fingerprint);
         self.dirty.set(false);
         self.bump_data_version();
+        // P1-6（2026-10-30）：整库替换后，旧索引与文本特征不再覆盖新数据，理论上
+        // 应同步失效（否则别的进程写入的新条目会静默漏召回）。
+        //
+        // **但默认关闭**：线上实测（46.7 万条 + ML 编码器）发现，重载后清空文本特征
+        // 会把快路 1.65s→12.2s、深路 1.7s→4.8s、关联 0.7s→4.1s（三段同时变慢），
+        // 因为每次检索都要重新小写化整库正文并重建关联表。
+        // 需要修复"跨进程新条目漏召回"时显式开启：
+        //   set LRC_CACHE_INVALIDATE_ON_RELOAD=1
+        // 默认关闭时行为与改造前**逐字节一致**。
+        if Self::invalidate_on_reload_enabled() {
+            self.index_dirty.set(true);
+            self.documents.borrow_mut().clear();
+        }
+    }
+
+    /// P1-6 开关：整库替换时是否同步失效索引与文本特征缓存（默认关闭）。
+    pub(crate) fn invalidate_on_reload_enabled() -> bool {
+        std::env::var("LRC_CACHE_INVALIDATE_ON_RELOAD")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     }
 
     /// 返回缓存快照（`Arc` 共享，**不做整库深拷贝**）
@@ -248,28 +275,33 @@ impl MemoryStoreCache {
     // ---------- recall 文本特征 ----------
 
     /// 取（或惰性计算并缓存）指定记忆的文本特征
+    ///
+    /// 缓存命中时**只复制 `Arc` 引用**，不再深拷贝正文（见 `RecallDocument`
+    /// 的字段文档：修前此处每次命中都克隆整条正文，是检索热路径的主要成本）。
     pub(crate) fn recall_document(&self, memory: &Memory) -> RecallDocument {
         let mut documents = self.documents.borrow_mut();
         if let Some(document) = documents.get(&memory.id) {
             return RecallDocument {
-                normalized_content: document.normalized_content.clone(),
+                normalized_content: Arc::clone(&document.normalized_content),
                 token_count: document.token_count,
             };
         }
-        let normalized_content = memory.content.to_lowercase();
-        let token_count = crate::memory_store::doc_token_count(&normalized_content);
-        let document = RecallDocument {
-            normalized_content,
-            token_count,
-        };
+        let normalized = memory.content.to_lowercase();
+        let token_count = crate::memory_store::doc_token_count(&normalized);
+        let normalized_content: Arc<str> = Arc::from(normalized);
+        let token_count_cached = token_count;
+        let content_cached = Arc::clone(&normalized_content);
         documents.insert(
             memory.id.clone(),
             RecallDocument {
-                normalized_content: document.normalized_content.clone(),
-                token_count: document.token_count,
+                normalized_content: content_cached,
+                token_count: token_count_cached,
             },
         );
-        document
+        RecallDocument {
+            normalized_content,
+            token_count,
+        }
     }
 
     // ---------- 倒排索引 ----------
@@ -555,7 +587,7 @@ mod tests {
             .find(|m| m.id == id_c)
             .expect("新条目应存在");
         let doc = cache.recall_document(new_mem);
-        assert_eq!(doc.normalized_content, "丙", "新条目特征应按正文计算");
+        assert_eq!(&*doc.normalized_content, "丙", "新条目特征应按正文计算");
         assert!(
             cache.documents.borrow().contains_key(&id_c),
             "惰性计算后新条目特征应写入缓存"

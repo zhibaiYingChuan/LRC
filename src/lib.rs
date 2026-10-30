@@ -227,6 +227,13 @@ pub mod atomic_file;
 ///         路径（36 处引用），`engine/mod.rs` 保留 `pub use` 再导出。
 pub mod memory_state_machine;
 
+/// 记忆生命周期（取代 / 衰减 / 抑制）的独立持久状态（Layer 1）。
+///
+/// 刻意**不放进** `Memory` 结构：旧版 exe 读到未知字段会静默丢弃，并在下一次
+/// 全量写入时抹掉（回滚变单向门）；且 `memories.json` 的整库压实是全量重写，
+/// 检索命中不应触发它（线上已有 503 风暴前例）。因此单独存 `lifecycle.json`。
+pub mod lifecycle;
+
 /// 三层基准测试框架（可被 CLI、仪表盘 API、CI/CD 复用）
 pub mod benchmark;
 

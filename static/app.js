@@ -8187,12 +8187,31 @@ async function submitQuickAddMemory() {
 
 // 记忆写入/删除成功后刷新首页、全部记忆列表、统计
 function refreshAfterMemoryWrite() {
-  // 首页（当前上下文、最近沉淀、记忆总览）
-  if (typeof loadHomeData === 'function') loadHomeData();
-  // 全部记忆列表（若当前处于搜索页会立即重新加载）
-  if (typeof debouncedMemorySearch === 'function') debouncedMemorySearch();
-  // 统计（项目分布等）
-  if (typeof loadMemoryStats === 'function') loadMemoryStats();
+  // P2-14（2026-10-30）：写入/删除是"整库重写 + 长持锁"（forget 实测约 10s）。
+  // 此前在成功回调里**立即并发**发起 3 个请求 ⇒ 撞写锁 → 503 → 列表被渲染成
+  // "记忆正在后台整理中"的空态，用户误以为数据丢了（"写成功后自伤"）。
+  // 改为：延后 1.5s 再刷（让写操作先释放锁），且三个刷新**串行**执行。
+  if (refreshAfterMemoryWrite._timer) {
+    clearTimeout(refreshAfterMemoryWrite._timer);
+  }
+  refreshAfterMemoryWrite._timer = setTimeout(async () => {
+    refreshAfterMemoryWrite._timer = null;
+    try {
+      // 首页（当前上下文、最近沉淀、记忆总览）
+      if (typeof loadHomeData === 'function') await loadHomeData();
+      // 全部记忆列表（若当前处于搜索页会立即重新加载）
+      if (typeof debouncedMemorySearch === 'function') {
+        debouncedMemorySearch();
+        // 等防抖把请求发出去，避免与下一个请求同时抢锁
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+      // 统计（项目分布等）
+      if (typeof loadMemoryStats === 'function') await loadMemoryStats();
+    } catch (error) {
+      // 刷新失败不影响已成功的数据变更，仅记录
+      console.warn('[refreshAfterMemoryWrite] 刷新失败（不影响数据）', error);
+    }
+  }, 1500);
 }
 
 /* ============================================================
@@ -9154,13 +9173,15 @@ async function searchMemories() {
     `;
     try {
       await syncSidecarApiBase();
-      // v0.9.6 G6：list 接口返回全量记忆（限制 500 条避免页面过载），created_at_ms → ISO 供筛选复用
+      // P2-13（2026-10-30）：原 limit=50000 + 10s 超时，在 45 万条库上响应体积
+      // 巨大且收不完 ⇒ 必然显示"加载失败"（原注释写"限制 500 条"与代码不符）。
+      // 列表页无需全量：上限降到 2000，超时抬到 35s（与检索一致，覆盖冷启动）。
       const response = await fetchWithTimeout(`${window.API_BASE}/v1/memories/list`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ limit: 50000 }),
+        body: JSON.stringify({ limit: 2000 }),
         signal: listSignal
-      }, 10000);
+      }, 35000);
       if (listSignal.aborted) {
         console.log('[searchMemories] 全部记忆请求被 abort，静默退出');
         return;
@@ -9227,7 +9248,10 @@ async function searchMemories() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ query, top_k: 20 }),
       signal: currentSignal // v0.8.4 Step 11 / G037：传入 signal 支持取消
-    }, 10000);
+      // P2-12（2026-10-30）：原 10s 低于后端 15s handler 预算，更远低于冷启动首查
+      // （首次把全库正文小写化，实测约 30s）⇒ 重启后第一次检索 100% 显示"超时"。
+      // 抬到 35s（> 冷启动 30s，留 5s 余量）；用户仍可用取消按钮中断。
+    }, 35000);
 
     // v0.8.4 Step 11 / G037：检查是否已被新的请求 abort
     if (currentSignal.aborted) {

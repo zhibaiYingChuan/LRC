@@ -572,13 +572,20 @@ mod tests {
 
     #[test]
     fn test_cleanup_removes_snapshot_directories() {
-        let temp = std::env::temp_dir().join("lrc_backup_test_snapshot_dirs");
+        // 用进程 ID 隔离：固定目录名在"上次运行残留 / 并行运行"时会命中
+        // AlreadyExists（Windows 上 remove_dir_all 可能因句柄占用静默失败），
+        // 属测试自身的卫生缺陷，与被测逻辑无关。
+        let temp = std::env::temp_dir().join(format!(
+            "lrc_backup_test_snapshot_dirs_{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&temp);
         fs::create_dir_all(&temp).unwrap();
 
         for i in 0..6 {
             let snapshot = temp.join(format!("memories_2026010{}.snapshot", i));
-            fs::create_dir(&snapshot).unwrap();
+            // create_dir_all 幂等：即使有残留也不会因 AlreadyExists 直接 panic。
+            fs::create_dir_all(&snapshot).unwrap();
             fs::write(snapshot.join("memories.json"), "[]").unwrap();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

@@ -12,6 +12,7 @@ use crate::chunker::CodeChunk;
 // v0.9.7（P0-2 依赖倒置修复）：原为 `crate::engine::memory_state_machine::MemoryState`——
 // Layer 1 反向依赖 Layer 2。该类型已上提至 Layer 1 顶层（`crate::memory_state_machine`），
 // 本处改为指向中立层，消除 Layer 1 → Layer 2 的依赖倒置。
+use crate::lifecycle::LifecycleTable;
 use crate::memory_state_machine::MemoryState;
 use crate::memory_types::Memory;
 use serde::{Deserialize, Serialize};
@@ -258,6 +259,21 @@ pub trait Persistence: Send + Sync {
     /// 保存跨查询命中频次统计（P8.2o 状态化方案）。
     /// 未实现的后端默认忽略，具体后端可提供原子持久化。
     fn save_assoc_frequency(&self, _state: &AssocFrequency) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+
+    /// 加载记忆生命周期表（取代 / 衰减 / 抑制）。
+    ///
+    /// **默认实现返回空表** ⇒ 本后端下三类寿命语义退化为不生效，行为与改造前一致
+    /// （与 `load_memory_state` 同款"缺省即诚实降级"约定）。
+    fn load_lifecycle(&self) -> Result<LifecycleTable, PersistenceError> {
+        Ok(LifecycleTable::default())
+    }
+
+    /// 保存记忆生命周期表。
+    ///
+    /// **默认实现忽略保存** ⇒ 寿命状态只在进程内有效，重启归零。
+    fn save_lifecycle(&self, _table: &LifecycleTable) -> Result<(), PersistenceError> {
         Ok(())
     }
 

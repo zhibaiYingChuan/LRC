@@ -65,6 +65,46 @@ mod tests {
         assert_eq!(store.total_count().expect("应取到总数"), 2);
     }
 
+    /// ★P1-6：别的进程写入的新条目，**倒排索引也必须跟着失效**。
+    ///
+    /// 修前 `cache.store()` 整库替换后既不置 `index_dirty` 也不清 `documents` ⇒
+    /// 本进程的索引仍指向旧快照，新条目不会被索引召回；而代码只在"候选为空"
+    /// 时才回退全库 ⇒ 候选非空时**静默漏召回**（用户表现为"刚记的搜不到"）。
+    #[test]
+    fn recall_finds_memory_written_by_another_process() {
+        use crate::persistence::Persistence;
+        let (dir, mut store) = make_store();
+        store
+            .remember(make_test_memory("本进程的旧记忆", MemoryType::Fact))
+            .expect("写入应成功");
+        // 先检索一次：建立倒排索引与文本特征缓存
+        let _ = store
+            .recall("本进程的旧记忆", &RecallFilter::new())
+            .expect("首次检索应成功");
+
+        // 另一进程写入（本进程收不到任何通知）
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let external = create_json_persistence(&data_dir).expect("应成功创建");
+        external
+            .save_memory(&make_test_memory(
+                "外部进程写入的记忆 关键词ZZTOP",
+                MemoryType::Fact,
+            ))
+            .expect("外部写入应成功");
+
+        // 本进程检索新条目：必须命中（索引陈旧时必须重建，不得静默漏召回）
+        let result = store
+            .recall("关键词ZZTOP", &RecallFilter::new())
+            .expect("检索应成功");
+        assert!(
+            result
+                .memories
+                .iter()
+                .any(|m| m.content.contains("关键词ZZTOP")),
+            "跨进程写入的新条目必须可被召回（P1-6：索引必须随整库替换失效）"
+        );
+    }
+
     /// 创建带有图存储的 MemoryStore（v0.9.8：记录层关系图化测试用）
     ///
     /// **为什么要单独一个辅助函数**：`make_store()` 不带图存储
@@ -4662,7 +4702,7 @@ mod tests {
         store.persistence.save_memory(&memory).expect("更新应成功");
         store.invalidate_cache();
         let updated = store.recall_document(&memory);
-        assert_eq!(updated.normalized_content, "feature cache updated");
+        assert_eq!(&*updated.normalized_content, "feature cache updated");
     }
 
     #[test]
@@ -7011,6 +7051,36 @@ mod tests {
                 Some(expected_idx),
                 "落盘后分类应与当前编码器一致（内容：{}）",
                 m.content
+            );
+        }
+    }
+
+    /// 2026-10-30（性能回归修复的等价性锁定）：
+    /// 快路把「DF 用 `contains_word`、TF 用 `count_word_occurrences`」的两遍扫描
+    /// 合并为「一遍 `count_word_occurrences`，DF 用 `count > 0`」。
+    /// 本测试锁定二者的判定**必须同源**——否则 DF/IDF 会与改造前不一致，
+    /// 排序结果随之改变（违反"检索结果确定性/可 A/B 比对"这条不变量）。
+    #[test]
+    fn test_词频计数与包含判定同源() {
+        let samples = [
+            ("数据库连接配置", "据库"),
+            ("数据库连接配置", "连接"),
+            ("数据库连接配置", "数据"),
+            ("The cat sat on the concatenate mat", "cat"),
+            ("concatenate", "cat"),
+            ("rust rusty trust", "rust"),
+            ("Rust 语言", "rust"),
+            ("短词 ru", "ru"),
+            ("", "cat"),
+            ("只有中文没有英文", "rust"),
+        ];
+        for (content, word) in samples {
+            assert_eq!(
+                crate::memory_store::contains_word(content, word),
+                crate::memory_store::count_word_occurrences(content, word) > 0,
+                "contains_word 与 count_word_occurrences>0 必须一致：content={:?} word={:?}",
+                content,
+                word
             );
         }
     }

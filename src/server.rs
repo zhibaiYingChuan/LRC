@@ -4923,11 +4923,10 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
     let protected_routes = Router::new()
         .route("/mcp", post(mcp_handler))
         .nest_service("/v1", v1_service) // 将 v1 API 嵌套在 /v1 路径下
-        // 仪表盘路由：静态文件 + 重定向
-        .route("/dashboard", get(dashboard_handler))
-        .route("/dashboard/", get(dashboard_handler))
-        // 根路径重定向到仪表盘（方便桌面端直接加载）
-        .route("/", get(root_redirect_handler))
+        // P2-11（2026-10-30）：仪表盘页面与根重定向**移入公开路由**。
+        // 此前它们与 /v1 共用同一 route_layer ⇒ 一旦设置 LRC_API_TOKEN
+        // （对外部署的唯一正确姿势），/dashboard 直接 401，仪表盘 100% 不可用。
+        // 页面本身不含数据（数据仍走受保护的 /v1），公开它不降低安全性。
         // 配置 API：仪表盘设置页面用
         // v0.8.1：以下路由保留向后兼容，新代码应使用 /v1/config 和 /v1/config/llm
         .route("/api/config", get(config_handler)) // deprecated, use /v1/config
@@ -4948,6 +4947,10 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
     // 公开路由：健康检查与静态资源（不涉及敏感数据，无需认证）
     let public_routes = Router::new()
         .route("/health", get(health_handler))
+        // P2-11：仪表盘静态页与根重定向（不含数据，数据仍走受保护 /v1）
+        .route("/dashboard", get(dashboard_handler))
+        .route("/dashboard/", get(dashboard_handler))
+        .route("/", get(root_redirect_handler))
         .route("/app.js", get(app_js_handler))
         .route("/app.css", get(app_css_handler))
         // v0.6.0 龙忆设计系统：设计系统 CSS 资源

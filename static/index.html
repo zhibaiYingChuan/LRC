@@ -2570,7 +2570,10 @@
 </nav>
 
 <!-- ==================== JavaScript ==================== -->
-<script src="app.js"></script>
+<!-- P2-15（2026-10-30）：改用绝对路径。原为相对 "app.js"，当页面以
+     /dashboard/（带尾斜杠）或反代子路径访问时会解析成 /dashboard/app.js ⇒ 404，
+     表现为"有样式、零交互"的空白页。其余资源（CSS/图标）本就是绝对路径。 -->
+<script src="/app.js"></script>
 
 </body>
 </html>

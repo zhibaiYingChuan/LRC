@@ -1827,6 +1827,22 @@ pub struct ForgetRequest {
     pub memory_id: String,
 }
 
+/// /v1/memories/lifecycle 请求体。
+///
+/// **边界约定**：判定归调用方，LRC 只负责执行与持久化。这里刻意不做
+/// "哪条新值取代哪条旧值"的自动推断 —— 那会滑向"自动改写记忆"（agent 化），
+/// 与产品定位冲突。生命周期状态独立存 `lifecycle.json`，不改写 `memories.json`。
+#[derive(Debug, Deserialize)]
+pub struct LifecycleRequest {
+    /// 操作：`mark_superseded` | `mark_suppressed` | `clear` | `query`
+    pub op: String,
+    /// 目标记忆 ID
+    pub memory_id: String,
+    /// 仅 `mark_superseded` 需要：取代它的新记忆 ID
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+}
+
 /// /v1/memories/associations 请求体
 ///
 /// 返回一条记忆在**记录层**上的多类型关联（不是相似度排序）。
@@ -2240,7 +2256,7 @@ pub fn build_v1_router_with_trust(
                         .unwrap_or(false);
                     let mem_inputs = req.memories;
                     let phase1_store = store.clone();
-                    let stored = tokio::task::spawn_blocking(move || -> Option<usize> {
+                    let stored = tokio::task::spawn_blocking(move || -> Option<Result<usize, String>> {
                         // 有界 try_lock 轮询（2s）由下面三个阶段**各自**执行：
                         // 在阻塞线程中自旋，不饥饿 HTTP worker，也不无限占用阻塞线程。
                         //
@@ -2265,6 +2281,8 @@ pub fn build_v1_router_with_trust(
                         //   现按"三阶段锁安全模式"拆开：**锁内只做取句柄与落盘，锁外做编码**。
                         //   编码链路是纯函数（编码器只依赖文本，ML 模型为全局单例），
                         //   因此锁外编码与锁内编码**逐位等价**。
+                        // P1-5：记录本批次起点，用于编码阶段的预算检查（防止幽灵写入）。
+                        let phase_start = std::time::Instant::now();
                         let mut batch = Vec::with_capacity(mem_inputs.len());
                         for mem in &mem_inputs {
                             // v0.9.11：所有写入入口共用 `MemoryWriteInput`（**写入单一真源**），
@@ -2333,6 +2351,18 @@ pub fn build_v1_router_with_trust(
                         let __p2_t0 = std::time::Instant::now();
                         let luoshu_vecs =
                             crate::memory_store::encode_luoshu_batch(&encoder, &batch);
+
+                        // P1-5：编码是锁外长任务（1 核实测 70~100s）。若外层 120s 已丢弃
+                        // future（客户端已收到 504），此处继续取锁落盘就会造成
+                        // "失败却写进去了"的幽灵写入 ⇒ 超预算直接放弃。
+                        if phase_start.elapsed() >= crate::timeouts::CONSOLIDATE_ENCODE_BUDGET {
+                            eprintln!(
+                                "[v1/consolidate] 编码耗时 {:.1}s 超出预算 {}s，放弃落盘（避免幽灵写入）",
+                                phase_start.elapsed().as_secs_f64(),
+                                crate::timeouts::CONSOLIDATE_ENCODE_BUDGET.as_secs()
+                            );
+                            return Some(Err("encode_budget_exceeded".to_string()));
+                        }
                         if __timing {
                             eprintln!(
                                 "[LRC·计时] write 阶段2洛书编码 n={} {:.3}s",
@@ -2364,32 +2394,58 @@ pub fn build_v1_router_with_trust(
                                     }
                                 }
                             };
-                            match store_guard.remember_batch_preencoded(batch, luoshu_vecs) {
-                                Ok(v) => v.len(),
-                                Err(e) => {
-                                    eprintln!("[v1/consolidate] 批量写入失败: {}", e);
-                                    0
-                                }
+                            let write_outcome =
+                                match store_guard.remember_batch_preencoded(batch, luoshu_vecs) {
+                                    Ok(v) => Ok(v.len()),
+                                    Err(e) => {
+                                        eprintln!("[v1/consolidate] 批量写入失败: {}", e);
+                                        Err(e.to_string())
+                                    }
+                                };
+                            // P0-2 闭环：顺带按节流（60s 最多一次）把生命周期表落盘。
+                            // 失败不影响本次写入结果 —— 寿命状态只是排序乘子，不是数据本体。
+                            if let Err(e) = store_guard.flush_lifecycle_if_due(false) {
+                                eprintln!(
+                                    "[v1/consolidate] 生命周期表落盘失败（不影响写入）: {}",
+                                    e
+                                );
                             }
+                            write_outcome
                         };
                         if __timing {
                             eprintln!(
                                 "[LRC·计时] write 阶段3持锁+落盘+索引 stored={} {:.3}s",
-                                stored,
+                                stored.as_ref().map(|v| *v).unwrap_or(0),
                                 __p3_t0.elapsed().as_secs_f64()
                             );
                         }
                         Some(stored)
                     })
                     .await
-                    .unwrap_or(None)
-                    .ok_or((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(serde_json::json!({
-                            "error": "store_busy",
-                            "message": "记忆服务繁忙，请稍后重试"
-                        })),
-                    ))?;
+                    .unwrap_or(None);
+
+                    // 锁超时 → 503 store_busy（保持原语义）；落盘失败 → 500 + 机器可读原因。
+                    let stored = match stored {
+                        None => {
+                            return Err((
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "error": "store_busy",
+                                    "message": "记忆服务繁忙，请稍后重试"
+                                })),
+                            ))
+                        }
+                        Some(Ok(n)) => n,
+                        Some(Err(msg)) => {
+                            return Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "consolidation_write_failed",
+                                    "message": msg
+                                })),
+                            ))
+                        }
+                    };
 
                     // Phase 2：异步超时获取快照，锁外执行 CPU 聚类计算。
                     let __t_pre_snap = std::time::Instant::now();
@@ -5386,14 +5442,19 @@ pub fn build_v1_router_with_trust(
                                 Err(_) => return Err("store_busy"),
                             }
                         };
-                        match store.forget(&memory_id_for_task) {
+                        let forget_outcome = match store.forget(&memory_id_for_task) {
                             Ok(true) => Ok(()),
                             Ok(false) => Err("not_found"),
                             Err(e) => {
                                 eprintln!("[v1/forget] 删除记忆失败: {}", e);
                                 Err("forget_failed")
                             }
+                        };
+                        // P0-2 闭环：删除后按节流把生命周期表落盘（失败不影响删除结果）。
+                        if let Err(e) = store.flush_lifecycle_if_due(false) {
+                            eprintln!("[v1/forget] 生命周期表落盘失败（不影响删除）: {}", e);
                         }
+                        forget_outcome
                     })
                     .await;
 
@@ -5402,14 +5463,21 @@ pub fn build_v1_router_with_trust(
                             serde_json::json!({
                                 "success": true,
                                 "memory_id": memory_id,
+                                "deleted": true,
                             })
                         )),
-                        Ok(Err("not_found")) => Err((
-                            StatusCode::NOT_FOUND,
-                            Json(serde_json::json!({
-                                "error": "memory_not_found",
-                                "message": format!("未找到记忆: {}", memory_id)
-                            })),
+                        // P1-10（2026-10-30）：删除**幂等**语义。
+                        // 此前二次删除返回 404 memory_not_found，调用方无法区分
+                        // "重复删了一次" 与 "这条记忆从未存在"，重试被误判为失败
+                        // （评测适配层按失败重试，放大 5xx）。删除是幂等的：
+                        // 目标状态已达成即成功，用 `deleted:false` 表达"本次未删任何东西"。
+                        Ok(Err("not_found")) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                            serde_json::json!({
+                                "success": true,
+                                "memory_id": memory_id,
+                                "deleted": false,
+                                "already_deleted": true,
+                            })
                         )),
                         Ok(Err("store_busy")) => Err((
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -5432,6 +5500,100 @@ pub fn build_v1_router_with_trust(
                                 Json(serde_json::json!({
                                     "error": "forget_failed",
                                     "message": "删除任务异常终止"
+                                })),
+                            ))
+                        }
+                    }
+                }
+            }
+        }))
+        // POST /v1/memories/lifecycle — 显式标记"取代 / 抑制"或查询寿命状态。
+        //
+        // 边界：**判定归调用方，LRC 只执行与持久化**。不在此做"新值是否取代旧值"
+        // 的自动推断（那会滑向自动改写记忆 = agent 化）。状态独立存 `lifecycle.json`，
+        // 不改写 `memories.json`（回滚安全 + 不触发全库重写）。
+        .route("/memories/lifecycle", post({
+            let store = metrics_store.clone();
+            move |Json(req): Json<LifecycleRequest>| {
+                let store = store.clone();
+                async move {
+                    let op = req.op.clone();
+                    let memory_id = req.memory_id.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let deadline = std::time::Instant::now() + crate::timeouts::LOCK_WAIT;
+                        let mut guard = loop {
+                            match store.try_lock() {
+                                Ok(guard) => break guard,
+                                Err(_) if std::time::Instant::now() < deadline => {
+                                    std::thread::sleep(crate::timeouts::LOCK_POLL);
+                                }
+                                Err(_) => return Err("store_busy"),
+                            }
+                        };
+                        let now = crate::lifecycle::now_ms();
+                        // 注意：这里用 req.op（借用），不要用外层的 op —— 后者要在响应里使用。
+                        let changed = match req.op.as_str() {
+                            "mark_superseded" => {
+                                let Some(new_id) = req.superseded_by.clone() else {
+                                    return Err("missing_superseded_by");
+                                };
+                                if new_id.is_empty() {
+                                    return Err("missing_superseded_by");
+                                }
+                                guard.mark_lifecycle_superseded(&req.memory_id, &new_id, now)
+                            }
+                            "mark_suppressed" => guard.mark_lifecycle_suppressed(&req.memory_id, now),
+                            "clear" => guard.clear_lifecycle(&req.memory_id),
+                            "query" => false,
+                            _ => return Err("unsupported_op"),
+                        };
+                        // 寿命状态是元数据（体积小），直接落盘；失败不影响响应语义。
+                        let _ = guard.flush_lifecycle_if_due(true);
+                        Ok((changed, guard.lifecycle().get(&req.memory_id).cloned()))
+                    })
+                    .await;
+
+                    match outcome {
+                        Ok(Ok((changed, entry))) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+                            Json(serde_json::json!({
+                                "success": true,
+                                "op": op,
+                                "memory_id": memory_id,
+                                "changed": changed,
+                                "state": entry
+                                    .as_ref()
+                                    .map(|e| match e.state {
+                                        crate::lifecycle::LifecycleState::Active => "active",
+                                        crate::lifecycle::LifecycleState::Superseded => "superseded",
+                                        crate::lifecycle::LifecycleState::Suppressed => "suppressed",
+                                    })
+                                    .unwrap_or("active"),
+                                "superseded_by": entry.as_ref().and_then(|e| e.superseded_by.clone()),
+                                "last_hit_at_ms": entry.as_ref().map(|e| e.last_hit_at_ms).unwrap_or(0),
+                                "hit_count": entry.as_ref().map(|e| e.hit_count).unwrap_or(0),
+                            })),
+                        ),
+                        Ok(Err("store_busy")) => Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({
+                                "error": "store_busy",
+                                "message": "记忆服务繁忙，请稍后重试"
+                            })),
+                        )),
+                        Ok(Err(reason)) => Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": reason,
+                                "message": format!("寿命操作被拒绝: {}", reason)
+                            })),
+                        )),
+                        Err(join_error) => {
+                            eprintln!("[v1/lifecycle] spawn_blocking panic: {}", join_error);
+                            Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "lifecycle_failed",
+                                    "message": "寿命操作异常终止"
                                 })),
                             ))
                         }
