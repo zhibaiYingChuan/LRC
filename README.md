@@ -248,10 +248,10 @@ LRC 在相似度之外，额外建立了一层**由记录字段必然推导出�
 
 ### 方式一：下载桌面端（推荐）
 
-1. 前往 [v0.9.14 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.9.14) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
-   - Windows：`lrc-desktop-v0.9.14-windows-x86_64-setup.exe`
-   - macOS：`lrc-desktop-v0.9.14-macos-arm64.dmg`
-   - Linux：`lrc-desktop-v0.9.14-linux-amd64.deb` 或 `lrc-desktop-v0.9.14-linux-x86_64.AppImage`
+1. 前往 [v0.9.15 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.9.15) 下载**桌面安装包**（注意文件名，勿下载 CLI 二进制）：
+   - Windows：`lrc-desktop-v0.9.15-windows-x86_64-setup.exe`
+   - macOS：`lrc-desktop-v0.9.15-macos-arm64.dmg`
+   - Linux：`lrc-desktop-v0.9.15-linux-amd64.deb` 或 `lrc-desktop-v0.9.15-linux-x86_64.AppImage`
 2. 双击安装，启动 LRC Desktop
 3. 按向导选择项目；**本地语义模型**按需下载（推荐），**LLM** 用于写摘要与理解查询——两者互补，建议都配
 4. 重启 IDE，AI 通过 MCP 自动发现并使用记忆与代码搜索能力
@@ -260,7 +260,7 @@ LRC 在相似度之外，额外建立了一层**由记录字段必然推导出�
 >
 > **端口说明**：稳定版默认使用 `3099`；开发实例端口约定见上文「质量与验证」一节。稳定版不会复用开发版 Sidecar。
 >
-> **注意**：Release 中 `lrc-v0.9.14-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（Sidecar 二进制），供开发者和脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
+> **注意**：Release 中 `lrc-v0.9.15-windows-x86_64.exe` 等文件是 **CLI 命令行工具**（Sidecar 二进制），供开发者和脚本调用，**不是安装包**，双击无法安装。安装请使用 `lrc-desktop-*` 开头的安装包。
 >
 > **安装包体积说明**：桌面安装包仅数 MB 是设计使然——语义模型按需下载（首次约 100~400MB，自动走国内镜像），**独立的道体推演服务**（`daoti_daemon` / `daoti_assoc`，非本仓库代码）不随包分发。
 >
@@ -444,6 +444,23 @@ python .\scripts\dev-proxy.py 1420 --dev   # 开发代理：服务磁盘最新 s
 > `tests/frontend/` 下的 CDP 测试优先经 `localhost:1420` 验证磁盘最新前端；dev-proxy 未启动时自动回退原地重载并告警。
 
 ---
+
+## 版本特性（v0.9.15）
+
+**本版本主题：把检索时延拉回可用区间 + 补上存储可靠性缺口。**
+
+### 检索更快（46.7 万条库实测）
+
+- 快路 10.5~12.6s → **4.1~5.3s**，深路 3.4~3.9s → **2.7~2.9s**，关联 3.8~4.1s → **0.14~0.42s**。
+- 消除三处重复全库扫描：正文缓存改共享 `Arc<str>`；快路改成「一遍算特征（TF/DF/整句命中）+ 一遍纯算术」；关联段改用事件/实体/来源三张反向索引，去重由线性扫改集合。
+- **检索结果逐条不变**：与冻结基线的 A/B 比对 5/5 集合与位次一致（有单测锁定「词频计数 >0」与「词面包含」判定同源）。
+
+### 存储更可靠
+
+- **生命周期状态独立存 `lifecycle.json`**：不进 `memories.json`，旧版 exe 回滚也不会把它抹掉。
+- **journal 作废标记**：清空失败时写标记 + `sync_data`，已删除的记忆重启后不再被重放复活。
+- **`consolidate` 落盘失败返回 500**：不再 `200 + stored=0` 的假成功；`forget` 二次删除幂等。
+- 新增 `POST /v1/memories/lifecycle` 端点；寿命相关的检索侧行为均为**默认关闭**的开关，默认值与 0.9.14 逐字节一致。
 
 ## 版本特性（v0.9.14）
 
