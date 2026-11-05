@@ -4,7 +4,7 @@ exclude = ["desktop/src-tauri"]
 
 [package]
 name = "code-memory"
-version = "0.9.15"
+version = "0.9.16"
 edition = "2021"
 # v0.9.11（G10 / CR-56）：本包有两个 `[[bin]]`，却未声明 `default-run`
 #   ⇒ `cargo run --features server,ml -- ...` 会以
