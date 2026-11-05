@@ -216,6 +216,12 @@ struct InitializeResult {
     protocolVersion: String,
     capabilities: ServerCapabilities,
     serverInfo: ServerInfo,
+    /// MCP 2024-11-05 的 `instructions` 字段：服务端主动下发给宿主的强制规则。
+    ///
+    /// 这是**唯一**由服务端注入、且宿主会拼进 system prompt 的通道。
+    /// 相比在用户规则文件里写"建议使用"，这里的约束力更强（见 P0-1）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -396,6 +402,37 @@ fn make_error(id: Option<serde_json::Value>, code: i32, message: &str) -> JsonRp
     }
 }
 
+/// MCP 初始化时下发给宿主的强制规则（P0-1）。
+///
+/// 设计依据：MCP 协议 2024-11-05 的 `InitializeResult.instructions` 是
+/// **唯一**由服务端主动注入、且宿主必须转述给模型的通道。相比在用户规则
+/// 文件里写"建议使用"，这里的约束力更强（宿主会把它拼进 system prompt）。
+///
+/// 写作原则（与 `integrations/rules/` 保持一致）：
+///   · 用"禁止 / 必须 / 视为失败"三类强约束词，不用"建议 / 尽量"；
+///   · 每条规则给出**可判定的动作**（调哪个工具、什么时机）；
+///   · 保留回退路径，避免模型在 LRC 未命中时卡死。
+fn context_instructions() -> String {
+    r#"【LRC 强制规则 · 不可跳过】
+
+1. 任何涉及「项目历史 / 用户偏好 / 之前做过的决定 / 上次怎么改的」的查询，
+   禁止直接使用内置全文搜索（Read / Grep / 文件遍历），必须先调用
+   `recall` 工具。若跳过该工具，本次任务视为失败。
+
+2. 完成任何代码修改后，必须调用 `remember` 记录：新增模块、API 端点、
+   架构变更、关键决策。这是任务的自然收尾，不需要用户提醒。
+
+3. 用户表达技术偏好（"用 pnpm"）、做出选型决策（"数据库选 PostgreSQL"）、
+   或产生跨会话约定时，立即 `remember`，不要等到会话结束。
+
+4. 上下文接近窗口上限时，先调用 `recall` 取回关键决策，再继续；
+   不要依赖宿主的自动摘要（它会丢失约束与指代锚点）。
+
+5. 检索结果为空时，才允许回退到内置搜索；回退时必须在回复中说明
+   "LRC 未命中，已回退内置搜索"。"#
+        .to_string()
+}
+
 fn handle_initialize(id: Option<serde_json::Value>) -> JsonRpcResponse {
     let result = InitializeResult {
         protocolVersion: "2024-11-05".into(),
@@ -406,6 +443,7 @@ fn handle_initialize(id: Option<serde_json::Value>) -> JsonRpcResponse {
             name: "loong-recall".into(),
             version: env!("CARGO_PKG_VERSION").into(),
         },
+        instructions: Some(context_instructions()),
     };
     make_response(id, to_json_value_safe(&result))
 }
@@ -6141,6 +6179,35 @@ mod tests {
         assert_eq!(json["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(json["result"]["serverInfo"]["name"], "loong-recall");
         assert!(json["result"]["capabilities"]["tools"].is_object());
+    }
+
+    /// P0-1：`initialize` 必须下发 `instructions`（服务端主动注入强制规则的唯一通道）。
+    ///
+    /// 断言三件事，缺一不可：
+    ///   1. 字段存在（宿主据此拼进 system prompt）；
+    ///   2. 长度 > 200 字符（过短说明规则被误删，约束力归零）；
+    ///   3. 含关键强约束词（"禁止直接使用内置全文搜索"），防止文案被弱化成"建议"。
+    #[test]
+    fn test_initialize_includes_instructions() {
+        let resp = handle_initialize(Some(serde_json::Value::Number(1.into())));
+        let json = to_json(&resp);
+
+        let instructions = json["result"]["instructions"]
+            .as_str()
+            .expect("initialize 响应必须包含 instructions 字段（P0-1）");
+        assert!(
+            instructions.chars().count() > 200,
+            "instructions 过短（{} 字符），强制规则可能被误删",
+            instructions.chars().count()
+        );
+        assert!(
+            instructions.contains("禁止直接使用内置全文搜索"),
+            "instructions 缺少核心强约束：禁止直接使用内置全文搜索"
+        );
+        assert!(
+            instructions.contains("recall") && instructions.contains("remember"),
+            "instructions 必须点名 recall / remember 两个工具"
+        );
     }
 
     // ---- 工具列表 ----
