@@ -31,6 +31,10 @@ mod tests {
     /// 判据（结构性质，不测语义）：
     /// 1) 存量库非空时，store 的编码器与"无 IDF 的新编码器"对同一文本编码不同；
     /// 2) `rebuild_encoder_idf` 返回参与统计的条数。
+    ///
+    /// ★ 仅非 ml 构建：ml 下编码器是 `HybridLuoShuEncoder`，未接入 IDF
+    ///   （`init_encoder_idf` 在 ml 下为空实现），本判据不适用。
+    #[cfg(not(feature = "ml"))]
     #[test]
     fn store_builds_encoder_idf_from_existing_corpus() {
         use crate::engine::luoshu_encoder::LuoShuEncoder;
