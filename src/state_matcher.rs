@@ -1145,9 +1145,8 @@ pub fn match_semantic_core(
 /// 调用方应回退到标签路径。
 ///
 /// **为什么把回填放在这里**（而非独立后台线程）：
-///   - `MemoryStore` 因持久化缓存含 `RefCell` 而 `!Sync`，后台线程无法共享它；
-///   - 而本通道本身是"低频、非用户可见"的后台检查（前端 8s 超时内），
-///     把回填搭在这条路径上，无需引入跨线程共享，也不额外增加常驻开销。
+///   - 本通道本身是"低频、非用户可见"的后台检查（前端 8s 超时内），
+///     把回填搭在这条路径上，无需引入额外常驻线程，也不额外增加常驻开销。
 ///
 /// 代价：回填速率受调用频率限制（每次调用受时间预算约束，见
 /// `semantic_backfill_budget_ms`）。这是**刻意的**：
@@ -1781,18 +1780,18 @@ mod tests {
     fn does_not_touch_state_machine_contrast() {
         let _g = env_guard();
         std::env::set_var("LRC_STATE_DRIVEN_DISCOVERY", "1");
-        let (dir, mut store) = make_store();
+        let (dir, store) = make_store();
         store
             .remember(mem_with_bagua("m1", "坎域记忆", None, 30))
             .expect("应成功记住");
         // 先用一次正常 recall 建立活跃上下文（否则活跃集本就为空，对照无意义）
         let _ = store.recall("坎域记忆", &crate::memory_store_types::RecallFilter::new());
-        let before = store.memory_state_machine.active_ids(64);
+        let before = store.memory_state_machine.read().unwrap().active_ids(64);
 
         let snap = snapshot_with(dist_focused(5, 0.9), false);
         let _ = run_state_driven_cycle(&store, &snap, dir.path());
 
-        let after = store.memory_state_machine.active_ids(64);
+        let after = store.memory_state_machine.read().unwrap().active_ids(64);
         assert_eq!(
             before, after,
             "原则一：状态驱动匹配绝不写回状态机（本模块不调用 recall）"
@@ -2358,7 +2357,7 @@ mod tests {
     fn missing_anchor_text_falls_back_to_label_path() {
         let _g = env_guard();
         std::env::set_var("LRC_STATE_DRIVEN_DISCOVERY", "1");
-        let (dir, mut store) = make_store();
+        let (dir, store) = make_store();
         store
             .remember(mem_with_bagua("m1", "坎域记忆", None, 30))
             .expect("应成功记住");
@@ -2542,7 +2541,7 @@ mod tests {
     /// 正是此降级路径的真实触发条件。
     #[test]
     fn backfill_without_encoder_degrades_without_touching_disk() {
-        let (dir, mut store) = make_store();
+        let (dir, store) = make_store();
         store
             .remember(mem_aged("m1", "待补记忆", 30))
             .expect("应成功记住");

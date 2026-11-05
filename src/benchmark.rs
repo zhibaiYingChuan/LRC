@@ -164,7 +164,7 @@ pub struct LayerReport {
 
 pub fn run_benchmark_l1_retrieval_latency() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store()?;
+    let (_dir, store) = make_store()?;
     let memories = generate_test_memories(1000, "latency", Importance::new(5));
     for m in &memories {
         store.remember(m.clone())?;
@@ -200,7 +200,7 @@ pub fn run_benchmark_l1_retrieval_latency() -> Result<BenchmarkResult, Benchmark
 
 pub fn run_benchmark_l1_recall_precision() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store()?;
+    let (_dir, store) = make_store()?;
     let mut golden = Memory::new(
         "项目 Loong Recall 使用 Rust 编写，记忆核心基于洛书编码器的 9 维向量空间".to_string(),
         MemoryType::Fact,
@@ -242,7 +242,7 @@ pub fn run_benchmark_l1_recall_precision() -> Result<BenchmarkResult, BenchmarkE
 
 pub fn run_benchmark_l1_session_recall() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store()?;
+    let (_dir, store) = make_store()?;
     let conversations = vec![
         ("用户: 我叫张三，目前在北京工作", "fact", "high"),
         ("用户: 我使用 Python 和 Rust 进行开发", "fact", "high"),
@@ -329,7 +329,7 @@ pub fn run_benchmark_l1_session_recall() -> Result<BenchmarkResult, BenchmarkErr
 
 pub fn run_benchmark_l2_decay() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store()?;
+    let (_dir, store) = make_store()?;
     let high = generate_test_memories(50, "high", Importance::new(8));
     let low = generate_test_memories(50, "low", Importance::new(2));
     for m in &high {
@@ -371,7 +371,7 @@ pub fn run_benchmark_l2_decay() -> Result<BenchmarkResult, BenchmarkError> {
 
 pub fn run_benchmark_l2_synthesis() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store()?;
+    let (_dir, store) = make_store()?;
     // 写入相似的数据库连接故障记忆，测试合成引擎是否能自动提炼规律
     let db_memories = generate_db_connection_memories(10);
     for m in &db_memories {
@@ -385,6 +385,8 @@ pub fn run_benchmark_l2_synthesis() -> Result<BenchmarkResult, BenchmarkError> {
     // 计算前两条记忆的 Jaccard 相似度（验证它们确实相似）
     let jaccard = store
         .synthesis_engine
+        .read()
+        .unwrap()
         .compute_jaccard(&db_memories[0].content, &db_memories[1].content);
 
     // 实际触发洛书合成（核心测试：碎片信息自动提炼为标准方案）
@@ -439,7 +441,7 @@ pub fn run_benchmark_l2_synthesis() -> Result<BenchmarkResult, BenchmarkError> {
 
 pub fn run_benchmark_l2_yin_yang() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store()?;
+    let (_dir, store) = make_store()?;
     let mut snapshots: Vec<DaoMetricsSnapshot> = Vec::new();
     for batch in 0..5 {
         let memories = generate_test_memories(100, &format!("batch-{}", batch), Importance::new(5));
@@ -479,7 +481,7 @@ pub fn run_benchmark_l2_yin_yang() -> Result<BenchmarkResult, BenchmarkError> {
 
 pub fn run_benchmark_l2_anti_pollution() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store()?;
+    let (_dir, store) = make_store()?;
     let core = generate_test_memories(80, "core", Importance::new(8));
     let noise = generate_noise_memories(20);
     for m in &core {
@@ -534,7 +536,7 @@ pub fn run_benchmark_l2_anti_pollution() -> Result<BenchmarkResult, BenchmarkErr
 
 pub fn run_benchmark_l3_data_localization() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (dir, mut store) = make_store()?;
+    let (dir, store) = make_store()?;
     let mut sensitive = Memory::new(
         "用户隐私数据：身份证号 110101199001011234".to_string(),
         MemoryType::Fact,
@@ -572,7 +574,7 @@ pub fn run_benchmark_l3_data_localization() -> Result<BenchmarkResult, Benchmark
 
 pub fn run_benchmark_l3_audit_tamper() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store()?;
+    let (_dir, store) = make_store()?;
     let mut m1 = Memory::new(
         "测试记忆 1".to_string(),
         MemoryType::Fact,
@@ -593,13 +595,13 @@ pub fn run_benchmark_l3_audit_tamper() -> Result<BenchmarkResult, BenchmarkError
     m2.privacy_level = PrivacyLevel::Global;
     store.remember(m1)?;
     store.remember(m2)?;
-    let total = store.audit_trail.total_count();
-    let integrity = store.audit_trail.verify_integrity();
-    let anchors = store.audit_trail.get_anchors();
+    let total = store.audit_trail.read().unwrap().total_count();
+    let integrity = store.audit_trail.read().unwrap().verify_integrity();
+    let anchors = store.audit_trail.read().unwrap().get_anchors().to_vec();
     let anchor_valid = if anchors.is_empty() {
         true
     } else {
-        store.audit_trail.verify_anchor_chain()
+        store.audit_trail.read().unwrap().verify_anchor_chain()
     };
     let passed = integrity.is_valid && anchor_valid;
     let score = if passed { 1.0 } else { 0.5 };
@@ -623,7 +625,7 @@ pub fn run_benchmark_l3_audit_tamper() -> Result<BenchmarkResult, BenchmarkError
 
 pub fn run_benchmark_l3_privacy_isolation() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store()?;
+    let (_dir, store) = make_store()?;
     let mut session_mem = Memory::new(
         "会话私有记忆".to_string(),
         MemoryType::Fact,
@@ -699,7 +701,7 @@ pub fn run_benchmark_l3_privacy_isolation() -> Result<BenchmarkResult, Benchmark
 
 pub fn run_benchmark_l3_complexity_redline() -> Result<BenchmarkResult, BenchmarkError> {
     let start = Instant::now();
-    let (_dir, mut store) = make_store()?;
+    let (_dir, store) = make_store()?;
     for i in 0..5 {
         let mut mem = Memory::new(
             format!("红线测试记忆 {}", i),
@@ -712,8 +714,12 @@ pub fn run_benchmark_l3_complexity_redline() -> Result<BenchmarkResult, Benchmar
         mem.privacy_level = PrivacyLevel::Global;
         store.remember(mem)?;
     }
-    let redline = store.complexity_budget.red_line_check();
-    let score = store.complexity_budget.maintainability_score();
+    let redline = store.complexity_budget.read().unwrap().red_line_check();
+    let score = store
+        .complexity_budget
+        .read()
+        .unwrap()
+        .maintainability_score();
     let passed = redline.passed && score >= 0.3;
 
     Ok(BenchmarkResult {

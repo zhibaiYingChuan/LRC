@@ -192,6 +192,165 @@ pub fn apply_merge(incoming: &Memory, existing: &mut Memory) -> MergeOutcome {
     MergeOutcome { content_changed }
 }
 
+// ════════════════════════════════════════════════════════════════════
+// S3.5 后半（2026-11-03）：写入路径的「遗忘指令」识别
+// ════════════════════════════════════════════════════════════════════
+//
+// ## 为什么必须放在写入路径
+//
+// 文本赛道 D3「删除 / 遗忘 / 抑制」是全表最低项。检索侧的硬过滤（`lifecycle_allows`）
+// 已经落地，但**没有任何通路**把用户说的"请忘记 X"变成抑制标记 ⇒ 旧记忆原样保留、
+// 继续被检索。本模块补的就是这条通路。
+//
+// ## 两条不可退让的约束
+//
+// 1. **指令本身不得入库**：指令正文里**含有被遗忘目标的原文**
+//    （"请忘记我的电话号码是 138…"），若当作普通记忆写入，检索该目标时
+//    会命中这条指令 ⇒ 等于没忘。故识别为指令的条目**不写入**。
+// 2. **不得误伤普通记忆**：日常叙述里"忘记"极常见（"我忘记带钥匙了"）。
+//    因此触发词必须**位于句首**、正文必须**足够短**（会话块不是指令），
+//    且对"…了"这类陈述句做否定判定。宁可漏判（旧记忆继续存在），
+//    不可错判（把正常记忆丢掉且抑制无关记忆）。
+
+/// 遗忘指令的识别结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgetIntent {
+    /// 要遗忘的目标文本（已去掉触发词、引号与首尾标点）。
+    pub target: String,
+}
+
+/// 指令正文的最大字符数：超过即视为普通记忆（会话块），不当作指令。
+///
+/// 依据：真实指令是"一句话"（实测常见 6~20 字）；而 `/add` 收到的会话块
+/// 通常数百字。用长度做粗筛，避免把"会话里提到请忘记"整块当成指令丢掉。
+const FORGET_INSTRUCTION_MAX_CHARS: usize = 60;
+
+/// 目标文本的最小字符数：过短会误伤大量记忆（如"我"）。
+const FORGET_TARGET_MIN_CHARS: usize = 2;
+
+/// 中文触发词（**按长度降序**，避免"删除记忆"被更短的"删除"抢先匹配）。
+const ZH_TRIGGERS: &[&str] = &[
+    "请不要再记得",
+    "请别再记得",
+    "不要再记得",
+    "别再记得",
+    "不要记得",
+    "请删除这条记忆",
+    "请删除记忆",
+    "删除这条记忆",
+    "删除记忆",
+    "请移除记忆",
+    "移除记忆",
+    "请清除记忆",
+    "清除记忆",
+    "请忘记",
+    "请忘掉",
+    "忘记",
+    "忘掉",
+];
+
+/// 英文触发词（**小写比较**，均以空格结尾以要求词边界）。
+const EN_TRIGGERS: &[&str] = &[
+    "please forget ",
+    "please delete the memory ",
+    "please delete memory ",
+    "forget ",
+    "delete the memory ",
+    "delete memory ",
+    "do not remember ",
+    "don't remember ",
+    "dont remember ",
+];
+
+/// 客套前缀：识别前剥掉，不影响目标文本。
+const POLITE_PREFIXES: &[&str] = &["麻烦你", "麻烦", "请帮我", "帮我"];
+
+/// 陈述句否定判定用的"显式指令标记"：出现任一即认为用户确实在下指令。
+const EXPLICIT_MARKERS: &[&str] = &[
+    "请", "麻烦", "帮我", "记忆", "记录", "信息", "关于", "这条", "那条", "这个", "那个",
+];
+
+/// 目标文本开头若为这些字，说明"忘记"是**状态**而非指令（"忘记带钥匙了"）。
+const TARGET_REJECT_PREFIXES: &[char] = &['了', '过'];
+
+/// 去掉目标文本首尾的引号与标点。
+fn trim_target(raw: &str) -> &str {
+    const LEADING: &[char] = &[
+        ' ', '\t', '：', ':', '，', ',', '、', '"', '\'', '“', '”', '‘', '’', '「', '」', '《',
+        '》', '（', '(', '【', '[',
+    ];
+    const TRAILING: &[char] = &[
+        ' ', '\t', '。', '．', '.', '！', '!', '？', '?', '，', ',', '；', ';', '：', ':', '"',
+        '\'', '“', '”', '‘', '’', '」', '》', '）', ')', '】', ']',
+    ];
+    raw.trim_matches(|c: char| LEADING.contains(&c) || TRAILING.contains(&c))
+}
+
+/// 识别一条写入内容是否为「遗忘 / 删除记忆」指令。
+///
+/// 返回 `Some` 表示**这是指令**：调用方**不得**把它当记忆写入，
+/// 而应按 `target` 去抑制匹配的旧记忆（见 `MemoryStore::suppress_matching_memories`）。
+/// 返回 `None` 表示普通记忆，必须原样写入。
+///
+/// 纯函数：不读环境变量、不读时钟 ⇒ 同一输入恒给同一结果（可测、可 A/B）。
+pub fn parse_forget_intent(content: &str) -> Option<ForgetIntent> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > FORGET_INSTRUCTION_MAX_CHARS {
+        return None;
+    }
+    // 剥客套前缀（只影响识别，不进入目标文本；可叠加，如"麻烦你帮我…"）
+    let mut body = trimmed;
+    loop {
+        let mut stripped = false;
+        for p in POLITE_PREFIXES {
+            if let Some(rest) = body.strip_prefix(p) {
+                body = rest.trim_start();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+
+    // ① 英文触发词（大小写不敏感；触发词全为 ASCII，按字节切片安全）
+    let lower = body.to_lowercase();
+    for t in EN_TRIGGERS {
+        if lower.starts_with(t) {
+            let target = trim_target(&body[t.len()..]);
+            return finish_intent(target, false, body);
+        }
+    }
+
+    // ② 中文触发词
+    for t in ZH_TRIGGERS {
+        if let Some(rest) = body.strip_prefix(t) {
+            let target = trim_target(rest);
+            return finish_intent(target, true, body);
+        }
+    }
+    None
+}
+
+/// 目标文本的最终校验（长度、陈述句否定判定）。
+fn finish_intent(target: &str, chinese: bool, body: &str) -> Option<ForgetIntent> {
+    if target.chars().count() < FORGET_TARGET_MIN_CHARS {
+        return None;
+    }
+    if target.starts_with(TARGET_REJECT_PREFIXES) {
+        return None;
+    }
+    // 陈述句否定：中文里"忘记…了"多为叙述（"忘记密码了"），
+    // 除非**整句**含显式指令标记（"请/麻烦/记忆/关于…"）。
+    if chinese && target.ends_with('了') && !EXPLICIT_MARKERS.iter().any(|m| body.contains(m)) {
+        return None;
+    }
+    Some(ForgetIntent {
+        target: target.to_string(),
+    })
+}
+
 /// 把 `src` 中**尚不存在**的元素追加到 `dst`（并集去重，保持既有顺序）
 fn push_unique<T: PartialEq + Clone>(dst: &mut Vec<T>, src: &[T]) {
     for item in src {
@@ -420,5 +579,70 @@ mod tests {
         assert_eq!(existing.version, 2);
         assert_eq!(existing.version_history.len(), 1);
         assert_eq!(existing.version_history[0].content, "旧内容");
+    }
+
+    // ════ S3.5 后半：遗忘指令识别 ════
+
+    /// 正例：常见中文指令必须识别，且目标文本不含触发词与标点
+    #[test]
+    fn forget_intent_recognizes_chinese_instructions() {
+        let cases = [
+            ("请忘记我的电话号码", "我的电话号码"),
+            ("麻烦你帮我忘掉 西湖之行", "西湖之行"),
+            ("删除记忆：项目使用 MySQL", "项目使用 MySQL"),
+            ("不要再记得我的生日", "我的生日"),
+            ("请忘记「张三的住址」。", "张三的住址"),
+        ];
+        for (input, expect) in cases {
+            let got = parse_forget_intent(input)
+                .unwrap_or_else(|| panic!("应识别为遗忘指令：{:?}", input));
+            assert_eq!(got.target, expect, "输入 {:?}", input);
+        }
+    }
+
+    /// 正例：英文指令（大小写不敏感）
+    #[test]
+    fn forget_intent_recognizes_english_instructions() {
+        assert_eq!(
+            parse_forget_intent("Forget my phone number")
+                .expect("应识别")
+                .target,
+            "my phone number"
+        );
+        assert_eq!(
+            parse_forget_intent("please forget that I live in Beijing")
+                .expect("应识别")
+                .target,
+            "that I live in Beijing"
+        );
+    }
+
+    /// 反例：日常叙述里的"忘记"**不得**被当成指令（否则会丢记忆 + 误抑制）
+    #[test]
+    fn forget_intent_rejects_ordinary_statements() {
+        for input in [
+            "我忘记带钥匙了",
+            "忘记带钥匙了",
+            "忘记密码了",
+            "今天忘记吃药了，明天要记得",
+            "他忘记了我们的约定",
+        ] {
+            assert!(
+                parse_forget_intent(input).is_none(),
+                "普通叙述不得识别为指令：{:?}",
+                input
+            );
+        }
+    }
+
+    /// 反例：目标过短 / 正文过长（会话块）都不得识别
+    #[test]
+    fn forget_intent_rejects_short_target_and_long_block() {
+        assert!(parse_forget_intent("请忘记我").is_none(), "目标过短应拒绝");
+        let long = format!("请忘记{}", "很长的会话内容".repeat(20));
+        assert!(
+            parse_forget_intent(&long).is_none(),
+            "会话块（超长正文）不得当作指令"
+        );
     }
 }

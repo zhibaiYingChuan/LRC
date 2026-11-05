@@ -66,6 +66,13 @@ mod build_profile_tests {
 /// "锁等待 < 内层 < 中层 < 外层"，防止"内层 ≥ 外层 ⇒ 取消失效"的不可达代码重现
 pub mod timeouts;
 
+/// 观测工具（v0.9.16）：日志时间戳、锁统计、写优先闸门。
+///
+/// 三者同处一个模块的理由：它们服务同一个问题——"锁竞争为什么发生、
+/// 谁在等、等了多久"。日志时间戳给出**时刻**，锁统计给出**账本**，
+/// 写优先闸门给出**干预手段**；拆开会让排查时来回跳文件。
+pub mod obs;
+
 /// **全 crate 唯一的测试环境变量锁**（v0.9.11 / G6 / CR-20）。
 ///
 /// ## 为什么必须"唯一"
@@ -248,6 +255,11 @@ pub mod discovery;
 // state_matcher 依赖 discovery（复用其账本/门控辅助），故同样按 server feature 门控。
 #[cfg(feature = "server")]
 pub mod state_matcher;
+
+// 语义向量索引与后台编码服务（v0.9.17）：把 bge 句向量从"联想旁路"提升为
+// 一等检索基础设施。依赖 ML 编码器，故按 ml feature 门控。
+#[cfg(feature = "ml")]
+pub mod semantic_index;
 
 // v0.9.10 塔缩修复·第 2 层：历史重分类的异步任务与进度状态机（依赖 v1_api 的 SharedStore）。
 // 命名说明：模块与文件采用中性命名 `reclassify_job`，使**公开层**（本文件）

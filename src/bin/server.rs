@@ -25,7 +25,7 @@ use code_memory::consolidation::{
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 // 进程守护：单例锁避免僵尸进程、端口自适应避免冲突、优雅关闭自动清理
 use code_memory::process_guard::{self, SingletonLock};
@@ -761,7 +761,147 @@ async fn try_run() -> LrcResult<()> {
         MemoryStore::new(persistence).with_graph_store(graph_store),
         false,
     );
-    let memory_store = Arc::new(Mutex::new(store));
+    let memory_store = Arc::new(RwLock::new(store));
+
+    // ╔═══════════════════════════════════════════════════════════════╗
+    // ║ v0.9.17：语义索引服务初始化（写入时编码 + 存量回填）            ║
+    // ╚═══════════════════════════════════════════════════════════════╝
+    //
+    // 为什么在启动时做：语义向量是**检索第三路**的基础设施，必须常驻内存
+    // （紧凑二进制索引），而不是每次检索解析 JSON 侧车。存量记忆的回填
+    // 交给后台线程（批量编码、可断点续跑），不阻塞服务启动。
+    #[cfg(feature = "ml")]
+    {
+        {
+            // 外层 `RwLock` 读锁：语义索引初始化只读快照。
+            let guard = memory_store.read().await;
+            let encoder = guard.luoshu_encoder_handle();
+            let snapshot: Vec<(String, String)> = guard
+                .list_memories(&code_memory::memory_store_types::ListFilter {
+                    limit: usize::MAX,
+                    ..code_memory::memory_store_types::ListFilter::new()
+                })
+                .map(|(memories, _)| {
+                    memories
+                        .into_iter()
+                        .map(|m| (m.id, m.content))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            drop(guard);
+            code_memory::semantic_index::init(
+                encoder,
+                std::path::PathBuf::from(&data_dir),
+                snapshot,
+            );
+        }
+    }
+
+    // ╔═══════════════════════════════════════════════════════════════╗
+    // ║ v0.9.16：图落盘移出读路径（后台 flush）                        ║
+    // ╚═══════════════════════════════════════════════════════════════╝
+    //
+    // 背景（实测根因）：`expand_associations` 每次检索都会产出记录层边，
+    // 此前走 `add_edges_batch` ⇒ 每次检索在**全局存储锁内**序列化并重写
+    // 52MB 的 `graph_edges.json`，单次检索因此被拉长到秒级，写入被饿死
+    // （实测连续 81 秒 busy、期间写入 3/12 成功）。
+    //
+    // ╔═══════════════════════════════════════════════════════════════╗
+    // ║ v0.9.18（B1/B2）：读路径副作用后台写回                          ║
+    // ╚═══════════════════════════════════════════════════════════════╝
+    //
+    // 检索（enrich）现在**全程只持读锁**：审计事件、状态机激活/转移、生命周期命中、
+    // 记录层图边都只入队，不写共享状态。本任务每 500ms 尝试一次写锁，把队列统一应用：
+    //   · 用 `try_write`（**不排队**）⇒ 绝不阻塞读者，也绝不把读端点降级；
+    //   · 拿不到就跳过本轮（500ms 后再试），队列有上限、退出时强制 flush。
+    {
+        let flush_store = memory_store.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+            ticker.tick().await; // 跳过启动瞬间
+            loop {
+                ticker.tick().await;
+                // 短重试：连续 5 次（约 100ms）拿不到就跳过，避免与读争抢。
+                for _ in 0..5 {
+                    if let Ok(store) = flush_store.try_write() {
+                        store.flush_recall_side_effects();
+                        store.flush_pending_audit();
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        });
+    }
+
+    // 现在读路径只置脏标记，本任务每 `GRAPH_FLUSH_INTERVAL_SECS` 秒：
+    //   ① 短暂持锁取一份快照（纯内存克隆，毫秒级）；
+    //   ② **释放锁之后**才序列化 + 原子写盘（数百毫秒，不阻塞任何请求）。
+    // 脏标记在取快照时清掉；快照期间的新写入会重新置脏 ⇒ 下一轮再写，不丢边。
+    {
+        let flush_store = memory_store.clone();
+        tokio::spawn(async move {
+            let secs = std::env::var("LRC_GRAPH_FLUSH_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v >= 5)
+                .unwrap_or(code_memory::graph_store::GRAPH_FLUSH_INTERVAL_SECS);
+            let mut ticker = {
+                let period = std::time::Duration::from_secs(secs);
+                let mut t = tokio::time::interval(period);
+                // interval 的第一拍立即返回：跳过，避免启动瞬间就写一次盘
+                t.tick().await;
+                t
+            };
+            loop {
+                ticker.tick().await;
+                let lock_started = std::time::Instant::now();
+                // 等锁单独计量：`hold_ms_max` 此前把"排队等锁"算成了"持锁"，
+                // 实测出现过 279,974ms 的假持锁（真实原因是排在长读后面）。
+                // 两者必须分开，否则会把"锁被读占住"误读成"flush 自己很慢"。
+                let wait_timer = code_memory::obs::LockTimer::start("graph.flush");
+                let snapshot = {
+                    let store = flush_store.write().await;
+                    wait_timer.ok();
+                    let held = std::time::Instant::now();
+                    let snap = store.take_graph_snapshot();
+                    code_memory::obs::record_hold("graph.flush", held.elapsed());
+                    snap
+                };
+                let Some(snapshot) = snapshot else {
+                    continue;
+                };
+                let edges = snapshot.edge_count();
+                let compaction = snapshot.is_compaction();
+                match snapshot.write() {
+                    Ok(()) => eprintln!(
+                        "{} [LRC·图] {}: {} 条边（合计 {:.0}ms）",
+                        code_memory::obs::ts(),
+                        if compaction {
+                            "压实完成"
+                        } else {
+                            "增量落盘"
+                        },
+                        edges,
+                        lock_started.elapsed().as_secs_f64() * 1000.0
+                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "{} [LRC·图] ⚠ 落盘失败（已恢复待写边，下轮重试）: {}",
+                            code_memory::obs::ts(),
+                            e
+                        );
+                        // 快照阶段已清脏 ⇒ 失败必须**补回**，否则这批边要等
+                        // 下一次检索重新产出才可能落盘（可能永不发生）
+                        flush_store
+                            .write()
+                            .await
+                            .restore_graph_pending(snapshot.pending_edges().to_vec());
+                    }
+                }
+            }
+        });
+    }
 
     // ★ 2026-10-30（内存优化）：语义模型空闲卸载。
     //
@@ -772,7 +912,7 @@ async fn try_run() -> LrcResult<()> {
     // 检索结果与向量完全不变，只是把"常驻成本"换成"空闲后首次使用的一次加载"。
     #[cfg(feature = "ml")]
     if ml_loaded {
-        let idle_encoder = memory_store.lock().await.luoshu_encoder_handle();
+        let idle_encoder = memory_store.luoshu_encoder_handle();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -786,7 +926,8 @@ async fn try_run() -> LrcResult<()> {
     // ║ 设计原则：默认启用所有功能，由 flag 显式禁用                ║
     // ╚═══════════════════════════════════════════════════════════════╝
     {
-        let mut store = memory_store.lock().await;
+        // 外层 `RwLock` 写锁：启动期配置注入需要独占修改。
+        let store = memory_store.write().await;
 
         // --exploration-log <path>：注入探索日志记录器
         if let Some(ref log_path) = exploration_log_path {
@@ -831,17 +972,23 @@ async fn try_run() -> LrcResult<()> {
         // --disable-synthesis：禁用合成引擎（基线 B）
         // 通过设置 synthesis_min_cluster 为 usize::MAX，使合成永远不会触发
         if disable_synthesis {
-            store.synthesis_min_cluster = usize::MAX;
+            store
+                .synthesis_min_cluster
+                .store(usize::MAX, std::sync::atomic::Ordering::Release);
             // 关键：必须同时告知调节器"合成已禁用"。否则调节器会把
             // "合成永不发生"误判为待改善的异常，反复建议降低合成阈值，
             // 并在连续 10 轮后被冻结保护误触发（system_mode=frozen）。
-            store.dao_regulator.set_synthesis_enabled(false);
+            store
+                .dao_regulator
+                .write()
+                .unwrap()
+                .set_synthesis_enabled(false);
             log("   ⚠ 合成引擎: 已禁用（基线 B：no_evolution）");
         }
 
         // --disable-dao-regulator：禁用道同构度调节器（基线 B）
         if disable_dao_regulator {
-            store.dao_regulator.auto_regulate = false;
+            store.dao_regulator.write().unwrap().auto_regulate = false;
             log("   ⚠ 道同构度调节器: 已禁用（基线 B：no_evolution）");
         }
 
@@ -855,7 +1002,12 @@ async fn try_run() -> LrcResult<()> {
         // 阶段D：检索链路审计落盘（JSONL，重启不丢失）
         // 与记忆数据同目录存储，初始化失败时降级为内存审计模式
         let audit_path = format!("{}/audit.jsonl", data_dir);
-        match store.audit_trail.set_persist_path(&audit_path) {
+        match store
+            .audit_trail
+            .write()
+            .unwrap()
+            .set_persist_path(&audit_path)
+        {
             Ok(()) => log(&format!("   检索审计落盘: 已启用 → {audit_path}")),
             Err(e) => log(&format!(
                 "   ⚠ 检索审计落盘初始化失败（继续内存审计模式）: {e}"
@@ -865,7 +1017,12 @@ async fn try_run() -> LrcResult<()> {
         // 阶段D：联想级反馈落盘（JSONL，重启不丢失）
         // 与记忆数据同目录存储，初始化失败时降级为纯内存模式
         let feedback_path = format!("{}/feedback.jsonl", data_dir);
-        match store.user_feedback.set_persist_path(&feedback_path) {
+        let feedback_result = store
+            .user_feedback
+            .read()
+            .unwrap()
+            .set_persist_path(&feedback_path);
+        match feedback_result {
             Ok(()) => log(&format!("   反馈落盘: 已启用 → {feedback_path}")),
             Err(e) => log(&format!("   ⚠ 反馈落盘初始化失败（继续纯内存模式）: {e}")),
         }
@@ -923,7 +1080,7 @@ async fn try_run() -> LrcResult<()> {
     // v0.5.5 P1-1：设置 MemoryStore 的 LLM 配置状态
     // LLM 配置后替代本地 ML 模型提供语义理解能力，编码器不再视为"降级"
     {
-        let store_guard = memory_store.lock().await;
+        let store_guard = memory_store.write().await;
         store_guard.set_llm_configured(llm_api_configured);
         if llm_api_configured {
             log("  编码器模式: LLM 增强模式（语义理解由 LLM 提供）");
@@ -1199,6 +1356,31 @@ async fn try_run() -> LrcResult<()> {
 
     // v0.5.4 P2-10 修复：通知后台结晶流水线停止
     let _ = consolidation_shutdown_tx.send(true);
+
+    // v0.9.16：退出前把读路径攒下的图边落盘。
+    //
+    // 读路径（`expand_associations`）不再逐次写盘，改由后台每 30 秒 flush 一次；
+    // 若不在这里补一次，进程退出时最近一个周期内的派生边会丢（虽可重算，
+    // 但重算要等下次检索命中同一种子，可能很久）。
+    // 取锁加 5s 上限：退出流程不能被一个长检索拖住。
+    // 外层 `RwLock` 写锁：退出前强制 flush 需要独占。
+    {
+        let store = memory_store.write().await;
+        // ★ 2026-11-05（B1/B2）：退出前把读路径累积的副作用与审计队列强制写回，
+        //   保证不丢最后一个后台窗口（状态机激活 / 生命周期命中 / 审计事件）。
+        let effects = store.flush_recall_side_effects();
+        let audits = store.flush_pending_audit();
+        if effects > 0 || audits > 0 {
+            log(&format!(
+                "  读路径副作用已写回（批次={effects}，审计={audits}）"
+            ));
+        }
+        match store.flush_graph_if_dirty() {
+            Ok(true) => log("  图边已落盘（退出前 flush）"),
+            Ok(false) => {}
+            Err(e) => log(&format!("  ⚠ 图边落盘失败（退出前 flush）: {e}")),
+        }
+    }
 
     Ok(())
 }

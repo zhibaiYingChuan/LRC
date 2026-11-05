@@ -11,23 +11,23 @@
 //!   / `recall_documents` / `assoc_frequency`）与随之而来的全部纯缓存逻辑
 //!   外提为独立子系统，使 `MemoryStore` 只保留一个 `cache` 字段。
 //!
-//! **关于"RefCell → Sync 前置条件"的更正（v0.9.7 实测）**：
-//!   报告原判「字段级拆分需先完成 `RefCell → Sync` 并发模型改造」。实测全仓
-//!   `MemoryStore` 的共享方式**全部 8 处**均为 `Arc<Mutex<MemoryStore<P>>>`；
-//!   `Mutex<T>: Sync` 只要求 `T: Send`（`RefCell`/`Cell` 均为 `Send`），
-//!   **并不要求 `T: Sync`**。故该"前置条件"不成立，字段级拆分可独立完成。
-//!   本模块因此**保留** `RefCell`/`Cell` 的内部可变性设计——它正是让 `&self`
-//!   方法（如 `load_cached`）能惰性刷新缓存的手段，外层 `Mutex` 已提供互斥。
+//! **并发模型（2026-11-05 改造）**：
+//!   本模块原用 `RefCell`/`Cell` 做内部可变性，依赖外层 `Mutex<MemoryStore>`
+//!   提供互斥。压测显示单一全局写锁使 16 并发读的 P95 达 6s（锁等待超时 503），
+//!   故改为**内部线程安全**：数据字段用 `RwLock`（读多写少，允许并发读），
+//!   标量标记用 `AtomicBool`/`AtomicU64`。这样 `MemoryStoreCache: Sync`，
+//!   外层即可用 `Arc<RwLock<MemoryStore>>` 让多个读请求真正并行。
 //!
 //! 不负责：
 //!   - 持久化读写（由 `MemoryStore` 持有的 `Persistence` 负责）
 //!   - 检索评分（由 `MemoryStore` 的召回路径负责）
 
+use crate::engine::synthesis_engine::JaccardTerms;
 use crate::memory_types::Memory;
 use crate::persistence::AssocFrequency;
-use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// 记忆文档特征（recall 文本缓存项）
 ///
@@ -50,6 +50,11 @@ pub(crate) struct RecallDocument {
 /// 候选索引类型：term → 记忆 ID 集合
 pub(crate) type BigramIndex = HashMap<String, HashSet<String>>;
 
+/// 八卦桶索引：`(data_version, 8 个桶的 position 列表)`
+///
+/// 抽成别名是为了让 `bagua_buckets` 字段的类型可读（clippy::type_complexity）。
+pub(crate) type BaguaBuckets = (u64, Arc<[Vec<usize>; 8]>);
+
 /// `MemoryStore` 的内存缓存子系统
 ///
 /// 持有叠加在持久层之上的四类缓存：
@@ -66,19 +71,28 @@ pub(crate) struct MemoryStoreCache {
     /// `expand_associations` 都会各取一次快照 ⇒ 同一请求内把整库深拷贝十几遍，
     /// 全部发生在存储锁内，是"单次 enrich 持锁 20~25s"的主要结构性成本。
     /// 改为 `Arc` 后，同版本的多次快照共享同一份不可变数据（只增引用计数），
-    /// **读取路径零拷贝**；写入走 `Arc::make_mut`（写时复制），
-    /// 因写路径与读路径同受外层 `Mutex` 串行化，快照不会跨锁存活 ⇒ 实际不发生拷贝。
-    memory: RefCell<Arc<Vec<Memory>>>,
+    /// **读取路径零拷贝**；写入走 `Arc::make_mut`（写时复制）。
+    /// 外层 `RwLock` 允许读并发，故快照可能被多个读者同时持有 ⇒ 写时复制
+    /// 只复制指针（见下），不复制 `Memory` 本体。
+    ///
+    /// ★ 2026-11-05（读并发改造）：内层元素由 `Memory` 改为 `Arc<Memory>`。
+    ///
+    /// **为什么**：读并发后，读者会**长期持有**快照 `Arc`（整个检索期间），
+    /// 写者 `Arc::make_mut` 必然触发整库克隆。实测 7149 条（25MB）单次克隆
+    /// **424ms**（`commit` P50 从 19.8ms 暴增到 424ms），混合负载写 P95 达 20.6s。
+    /// 改为 `Vec<Arc<Memory>>` 后，克隆只复制 **7149 个指针（57KB）**，
+    /// 单次 ~0.1ms，且 `Memory` 本体仍共享（读者与写者看到同一份不可变数据）。
+    memory: RwLock<Arc<Vec<Arc<Memory>>>>,
     /// 缓存脏标记：任何写操作后置 true，读操作前检查
-    dirty: Cell<bool>,
+    dirty: AtomicBool,
     /// 加载本缓存时数据源的指纹（v0.9.11 / CR-42）：
     /// 与持久层当前指纹不符 ⇒ 说明**别的进程**改过数据，必须重载。
     /// `None` 表示后端不提供指纹（则只看 `dirty`，行为与修前一致）。
-    source_fingerprint: Cell<Option<u64>>,
+    source_fingerprint: Mutex<Option<u64>>,
     /// 候选 term 倒排索引（默认启用域候选索引；最终仍由 Jaccard 判定）
-    index: RefCell<BigramIndex>,
+    index: RwLock<BigramIndex>,
     /// 索引脏标记
-    index_dirty: Cell<bool>,
+    index_dirty: AtomicBool,
     /// 数据版本号（v0.9.13）：**任何**数据变更（写入/删除/外部重载）后单调递增。
     ///
     /// 用途：让"从全库派生的统计表"（hub 实体表、自动事件表、artifact 表）
@@ -88,37 +102,77 @@ pub(crate) struct MemoryStoreCache {
     /// 为什么放在本模块而不是 `MemoryStore`：所有写入路径最终都会经过本模块的
     /// `invalidate` / `mark_dirty_preserving_index` / `append_new` / `store`
     /// 四个入口之一 ⇒ 在此递增是**唯一不会漏**的位置。
-    data_version: Cell<u64>,
+    data_version: AtomicU64,
     /// recall 文本特征缓存，按 Memory ID 复用规范化正文和文档长度
-    documents: RefCell<HashMap<String, RecallDocument>>,
+    documents: RwLock<HashMap<String, RecallDocument>>,
     /// 跨查询命中频次统计（独立文件持久化，`Memory` 零改动）
-    assoc: RefCell<AssocFrequency>,
+    assoc: RwLock<AssocFrequency>,
+    /// 八卦桶索引（P3 / M.T.R. 传输层）：`bagua_index → 快照内 position 列表`。
+    ///
+    /// 用途：`find_similar` 的全库扫描按"查询桶 → 相邻桶 → 其余桶"的顺序路由，
+    /// 让 M.T.R. 只负责**传输顺序**（不判断语义），召回仍由桶内 Jaccard + 回退保证。
+    ///
+    /// 以 `data_version` 失效：任何写入/重载后版本递增，下次取桶时重建。
+    bagua_buckets: RwLock<Option<BaguaBuckets>>,
+    /// 每条记忆的 **Jaccard 预计算集合**（2026-11-05）。
+    ///
+    /// **为什么需要**：相似检查的剩余全库扫描里，单次比较的成本几乎全在
+    /// `JaccardTerms::new(&m.content)`——它每次都要 `to_lowercase` + 收集字符 +
+    /// 建 `HashSet`（实测 ~3µs/条）。预计算后单次比较只剩集合交集（~0.3µs）。
+    ///
+    /// **维护方式**：与 `documents` 同生命周期——
+    ///   · `store()`（冷加载/外部重载）一次性为全库预计算；
+    ///   · `append_new()` / `upsert()` 增量补算新增或改写的条目；
+    ///   · `invalidate()` / `mark_dirty_preserving_index()` 清空（正文可能已变）。
+    ///
+    /// 用 `Arc<HashMap>` 而非 `HashMap`：`prepare_remember` 需要把一份**只读快照**
+    /// 交给锁外的 `analyze`（`RememberPrepData` 必须可跨线程），克隆 `Arc` 是 O(1)。
+    /// 写路径用 `Arc::make_mut`：正常时序下（analyze 在 commit 前结束）引用计数为 1，
+    /// 原地修改；仅当确有并发快照在外时才整表克隆一次（安全方向）。
+    jaccard_terms: RwLock<Arc<HashMap<String, Arc<JaccardTerms>>>>,
+    /// 记忆 ID → 快照内 position 的映射（2026-11-05）。
+    ///
+    /// **为什么需要**：`build_candidates` 每次查询都要把倒排索引命中的 id 换算成
+    /// 快照下标。修前每次都 `all.iter().enumerate().collect::<HashMap>()`——
+    /// 即**每次查询 O(N) 建表**（7048 条约 0.5ms），把索引剪枝省下的时间又还回去。
+    ///
+    /// **维护方式**（与快照严格对齐）：
+    ///   · `store()` 全量重建；
+    ///   · `append_new()` 追加（既有 position 不变）；
+    ///   · `upsert()` 原地替换（position 不变）或追加（position = len-1）；
+    ///   · `invalidate()` / `mark_dirty_preserving_index()` 清空（下次 `store()` 重建）。
+    ///
+    /// 删除路径走 `mark_dirty_preserving_index` ⇒ 下次读整库重载并重建，
+    /// 因此**不存在**"删除后 position 前移"的失效问题。
+    id_positions: RwLock<Arc<HashMap<String, usize>>>,
 }
 
 impl MemoryStoreCache {
     /// 构造空缓存（全部标记为脏，首次读取时惰性加载/重建）
     pub(crate) fn new(assoc_frequency: AssocFrequency) -> Self {
         Self {
-            memory: RefCell::new(Arc::new(Vec::new())),
-            dirty: Cell::new(true), // 初始为脏，首次读取时加载
-            source_fingerprint: Cell::new(None),
-            index: RefCell::new(HashMap::new()),
-            index_dirty: Cell::new(true),
-            data_version: Cell::new(0),
-            documents: RefCell::new(HashMap::new()),
-            assoc: RefCell::new(assoc_frequency),
+            memory: RwLock::new(Arc::new(Vec::new())),
+            dirty: AtomicBool::new(true), // 初始为脏，首次读取时加载
+            source_fingerprint: Mutex::new(None),
+            index: RwLock::new(HashMap::new()),
+            index_dirty: AtomicBool::new(true),
+            data_version: AtomicU64::new(0),
+            documents: RwLock::new(HashMap::new()),
+            assoc: RwLock::new(assoc_frequency),
+            bagua_buckets: RwLock::new(None),
+            jaccard_terms: RwLock::new(Arc::new(HashMap::new())),
+            id_positions: RwLock::new(Arc::new(HashMap::new())),
         }
     }
 
     /// 当前数据版本号（每次数据变更后递增；语义见字段文档）
     pub(crate) fn data_version(&self) -> u64 {
-        self.data_version.get()
+        self.data_version.load(Ordering::Acquire)
     }
 
     /// 递增数据版本号（所有失效入口都必须调用）
     fn bump_data_version(&self) {
-        self.data_version
-            .set(self.data_version.get().wrapping_add(1));
+        self.data_version.fetch_add(1, Ordering::AcqRel);
     }
 
     // ---------- 全量记忆快照 ----------
@@ -132,10 +186,11 @@ impl MemoryStoreCache {
     ///
     /// 后端不提供指纹（`current == None`）时只按 `dirty` 判定 ⇒ 与修前行为一致。
     pub(crate) fn needs_reload(&self, current: Option<u64>) -> bool {
-        if self.dirty.get() {
+        if self.dirty.load(Ordering::Acquire) {
             return true;
         }
-        match (current, self.source_fingerprint.get()) {
+        let loaded = *self.source_fingerprint.lock().unwrap();
+        match (current, loaded) {
             (Some(now), Some(loaded)) => now != loaded,
             (Some(_), None) => true, // 首次拿到指纹（此前未记录）⇒ 保守重载一次
             _ => false,
@@ -144,9 +199,21 @@ impl MemoryStoreCache {
 
     /// 用新加载的全量记忆替换缓存并清除脏标记，同时记录数据源指纹
     pub(crate) fn store(&self, memories: Vec<Memory>, source_fingerprint: Option<u64>) {
-        *self.memory.borrow_mut() = Arc::new(memories);
-        self.source_fingerprint.set(source_fingerprint);
-        self.dirty.set(false);
+        // 冷加载/外部重载：一次性为全库预计算 Jaccard 集合（只发生一次，不在写热路径）。
+        // 先整体替换为空表，避免旧库已删除条目的条目残留。
+        *self.jaccard_terms.write().unwrap() = Arc::new(HashMap::new());
+        self.fill_jaccard_terms(&memories);
+        // ID → position 全量重建（与快照严格对齐）。
+        let positions: HashMap<String, usize> = memories
+            .iter()
+            .enumerate()
+            .map(|(position, memory)| (memory.id.clone(), position))
+            .collect();
+        *self.id_positions.write().unwrap() = Arc::new(positions);
+        // ★ 2026-11-05（读并发改造）：元素包 `Arc`，使后续写时复制只复制指针。
+        *self.memory.write().unwrap() = Arc::new(memories.into_iter().map(Arc::new).collect());
+        *self.source_fingerprint.lock().unwrap() = source_fingerprint;
+        self.dirty.store(false, Ordering::Release);
         self.bump_data_version();
         // P1-6（2026-10-30）：整库替换后，旧索引与文本特征不再覆盖新数据，理论上
         // 应同步失效（否则别的进程写入的新条目会静默漏召回）。
@@ -158,8 +225,8 @@ impl MemoryStoreCache {
         //   set LRC_CACHE_INVALIDATE_ON_RELOAD=1
         // 默认关闭时行为与改造前**逐字节一致**。
         if Self::invalidate_on_reload_enabled() {
-            self.index_dirty.set(true);
-            self.documents.borrow_mut().clear();
+            self.index_dirty.store(true, Ordering::Release);
+            self.documents.write().unwrap().clear();
         }
     }
 
@@ -182,8 +249,69 @@ impl MemoryStoreCache {
     ///
     /// 调用期间可能**再次**取快照/取表（如 `recall` 内部取活跃记忆、
     /// `expand_associations` 内部建三张全库统计表），返回 `Ref` 会自锁。
-    pub(crate) fn snapshot(&self) -> Arc<Vec<Memory>> {
-        Arc::clone(&self.memory.borrow())
+    pub(crate) fn snapshot(&self) -> Arc<Vec<Arc<Memory>>> {
+        Arc::clone(&self.memory.read().unwrap())
+    }
+
+    /// 取八卦桶索引（P3 / M.T.R. 传输层，按 `data_version` 缓存）。
+    ///
+    /// 返回 `Arc<[Vec<usize>; 8]>`：每个桶存快照内的 position 列表。
+    /// 桶号 = `bagua_index % 8`；无 `bagua_index` 的记忆归入桶 0（保守）。
+    ///
+    /// **只负责路由，不判断语义**：调用方按"查询桶 → 相邻桶 → 其余桶"的顺序
+    /// 扫描，召回仍由桶内 Jaccard + 回退保证。
+    pub(crate) fn bagua_buckets(&self) -> Arc<[Vec<usize>; 8]> {
+        let version = self.data_version.load(Ordering::Acquire);
+        {
+            let cached = self.bagua_buckets.read().unwrap();
+            if let Some((v, buckets)) = cached.as_ref() {
+                if *v == version {
+                    return Arc::clone(buckets);
+                }
+            }
+        }
+        let mut buckets: [Vec<usize>; 8] = std::array::from_fn(|_| Vec::new());
+        {
+            let memories = self.memory.read().unwrap();
+            for (pos, m) in memories.iter().enumerate() {
+                let b = m.bagua_index.map(|x| x as usize % 8).unwrap_or(0);
+                buckets[b].push(pos);
+            }
+        }
+        let arc = Arc::new(buckets);
+        *self.bagua_buckets.write().unwrap() = Some((version, Arc::clone(&arc)));
+        arc
+    }
+
+    /// 取 Jaccard 预计算集合的只读快照（`Arc` 共享，O(1)）
+    ///
+    /// 供 `find_similar`（锁内）与 `prepare_remember`（交给锁外 `analyze`）使用。
+    /// 未命中的 id 由调用方按需现算（见 `scan_candidates`），不影响正确性。
+    pub(crate) fn jaccard_terms_snapshot(&self) -> Arc<HashMap<String, Arc<JaccardTerms>>> {
+        Arc::clone(&self.jaccard_terms.read().unwrap())
+    }
+
+    /// 取 ID → position 映射的只读快照（`Arc` 共享，O(1)）
+    ///
+    /// 供 `build_candidates` 把倒排索引命中的 id 换算成快照下标，
+    /// 避免每次查询都 O(N) 重建映射表。
+    pub(crate) fn id_positions_snapshot(&self) -> Arc<HashMap<String, usize>> {
+        Arc::clone(&self.id_positions.read().unwrap())
+    }
+
+    /// 为一批记忆补算 Jaccard 预计算集合（幂等）
+    fn fill_jaccard_terms(&self, memories: &[Memory]) {
+        if memories.is_empty() {
+            return;
+        }
+        let mut guard = self.jaccard_terms.write().unwrap();
+        let map = Arc::make_mut(&mut guard);
+        for memory in memories {
+            map.insert(
+                memory.id.clone(),
+                Arc::new(JaccardTerms::new(&memory.content)),
+            );
+        }
     }
 
     /// 仅判断指定 ID 是否存在（**不克隆**任何 `Memory`）
@@ -192,12 +320,12 @@ impl MemoryStoreCache {
     /// 深拷贝整库（`Memory` 含正文字符串、实体列表、卦象等），在**逐条**执行的
     /// 存在性校验路径上是纯浪费的内存抖动与锁持有时间。
     pub(crate) fn contains_id(&self, id: &str) -> bool {
-        self.memory.borrow().iter().any(|m| m.id == id)
+        self.memory.read().unwrap().iter().any(|m| m.id == id)
     }
 
     /// 缓存中的记忆条数（O(1)，**不克隆**）
     pub(crate) fn len(&self) -> usize {
-        self.memory.borrow().len()
+        self.memory.read().unwrap().len()
     }
 
     /// 收集合成类记忆的摘要文本（**不克隆整库**）
@@ -208,7 +336,8 @@ impl MemoryStoreCache {
     /// 克隆命中的摘要字符串（通常为 0 条）。
     pub(crate) fn synthesis_summaries(&self) -> Vec<String> {
         self.memory
-            .borrow()
+            .read()
+            .unwrap()
             .iter()
             .filter(|m| m.memory_type == crate::memory_types::MemoryType::Synthesis)
             .map(|m| m.summary())
@@ -231,10 +360,25 @@ impl MemoryStoreCache {
         if new.is_empty() {
             return;
         }
-        // ★ v0.9.13（建议二）：写时复制。若此刻恰有快照在外（正常不会——
-        //   读写同受外层 Mutex 串行化），`make_mut` 才会整库克隆一次；
-        //   否则原地追加，代价与修前一致。
-        Arc::make_mut(&mut self.memory.borrow_mut()).extend_from_slice(new);
+        // ★ v0.9.13（建议二）：写时复制。读并发下快照可能被多个读者持有，
+        //   `make_mut` 会克隆一次（只复制指针，见下）；否则原地追加。
+        let base_len = {
+            let mut guard = self.memory.write().unwrap();
+            let base_len = guard.len();
+            // ★ 2026-11-05（读并发改造）：元素是 `Arc<Memory>`，`make_mut` 只复制指针。
+            Arc::make_mut(&mut guard).extend(new.iter().map(|m| Arc::new(m.clone())));
+            base_len
+        };
+        // 新增条目补算 Jaccard 预计算集合（既有条目正文未变，无需重算）。
+        self.fill_jaccard_terms(new);
+        // 追加条目的 position 从 base_len 起（既有条目 position 不变）。
+        {
+            let mut guard = self.id_positions.write().unwrap();
+            let map = Arc::make_mut(&mut guard);
+            for (offset, memory) in new.iter().enumerate() {
+                map.insert(memory.id.clone(), base_len + offset);
+            }
+        }
         // ★ 2026-10-28（实测修正）：**不再清空**全库文本特征。
         //
         // 修前此处 `documents.clear()`，理由是"新增条目的文本特征尚未计算"。但：
@@ -245,20 +389,99 @@ impl MemoryStoreCache {
         // 线上实测该重建与「快路 4.8s + 深路 7.8s」中的主要部分重合，并使写入在
         // 每次检索后都被迫重付一次。改为**不清空**后，缓存只增不减地覆盖到全库，
         // 检索侧首次全量计算后即可长期复用。
-        self.source_fingerprint.set(source_fingerprint);
-        self.dirty.set(false);
+        *self.source_fingerprint.lock().unwrap() = source_fingerprint;
+        self.dirty.store(false, Ordering::Release);
         self.bump_data_version();
     }
 
     // ---------- 失效 ----------
 
+    /// 单条写入后的**增量**缓存同步（upsert）。
+    ///
+    /// 与 [`Self::append_new`] 的区别：本方法支持**同 ID 替换**（`remember`
+    /// 的合并路径会改写已有记忆），并只失效该条的 recall 文本特征。
+    ///
+    /// **为什么需要**：单条 `remember` 原用 [`Self::mark_dirty_preserving_index`]，
+    /// 会让下一次读**从磁盘重载整库**（7048 条实测每次约 50ms），且清空**全部**
+    /// 文本特征缓存（下次检索要重新 lowercase 整库）。改为 upsert 后：
+    ///   · 快照原地并入/替换，`dirty=false` ⇒ 下一次读零重载；
+    ///   · 只移除被改写那条的文本特征，其余条目继续复用。
+    ///
+    /// 前置条件：调用方已完成持久化，并传入**写入之后**的数据源指纹
+    /// （否则下一次 `needs_reload` 会因指纹变化而重载整库）。
+    pub(crate) fn upsert(&self, memory: &Memory, source_fingerprint: Option<u64>) {
+        let appended_position = {
+            let mut guard = self.memory.write().unwrap();
+            // 写时复制：无并发读者时引用计数为 1，原地修改；否则只复制指针。
+            let memories = Arc::make_mut(&mut guard);
+            if let Some(slot) = memories.iter_mut().find(|m| m.id == memory.id) {
+                *slot = Arc::new(memory.clone());
+                None
+            } else {
+                let position = memories.len();
+                memories.push(Arc::new(memory.clone()));
+                Some(position)
+            }
+        };
+        // 新增条目才需要补 position（原地替换的 position 不变）。
+        if let Some(position) = appended_position {
+            Arc::make_mut(&mut self.id_positions.write().unwrap())
+                .insert(memory.id.clone(), position);
+        }
+        // 正文可能已变 ⇒ 只失效该条的文本特征（其余条目不受影响）
+        self.documents.write().unwrap().remove(&memory.id);
+        // 同步刷新该条的 Jaccard 预计算集合（合并路径会改写正文）。
+        self.fill_jaccard_terms(std::slice::from_ref(memory));
+        *self.source_fingerprint.lock().unwrap() = source_fingerprint;
+        self.dirty.store(false, Ordering::Release);
+        self.bump_data_version();
+    }
+
+    /// 单条删除后的**增量**缓存同步（2026-11-05）。
+    ///
+    /// **为什么需要**：`forget` 原用 [`Self::mark_dirty_preserving_index`]，
+    /// 会把缓存标脏 ⇒ 下一次 `load_cached()` **整库重解析**（7137 条实测 ~100ms）。
+    /// 16 并发删除时每次删除都触发一次全库重载，是压测中删除 P50 撞满 6s 锁等待的根因。
+    ///
+    /// 持久化侧早已是 O(1) 追加墓碑（见 `json.rs::delete_memory`），
+    /// 本方法把**内存缓存侧**也对齐为增量删除：从快照移除该条、重建 id→position、
+    /// 清掉该条的文本特征与 Jaccard 集合，并保持 `dirty=false`。
+    ///
+    /// 前置条件：调用方已完成持久化，并传入**删除之后**的数据源指纹。
+    pub(crate) fn remove(&self, id: &str, source_fingerprint: Option<u64>) {
+        let snapshot = {
+            let mut guard = self.memory.write().unwrap();
+            let memories = Arc::make_mut(&mut guard);
+            let before = memories.len();
+            memories.retain(|m| m.id != id);
+            if memories.len() == before {
+                return; // 缓存里本就没有该条
+            }
+            Arc::clone(&guard)
+        };
+        // 删除会使后续 position 前移 ⇒ 全量重建映射（O(N)，但只在本条删除时发生一次）。
+        let positions: HashMap<String, usize> = snapshot
+            .iter()
+            .enumerate()
+            .map(|(position, memory)| (memory.id.clone(), position))
+            .collect();
+        *self.id_positions.write().unwrap() = Arc::new(positions);
+        self.documents.write().unwrap().remove(id);
+        Arc::make_mut(&mut self.jaccard_terms.write().unwrap()).remove(id);
+        *self.source_fingerprint.lock().unwrap() = source_fingerprint;
+        self.dirty.store(false, Ordering::Release);
+        self.bump_data_version();
+    }
+
     /// 全量失效：任何写操作（保存/删除/修改）后调用
     ///
     /// 同时清空 recall 文本特征（正文可能已变）。
     pub(crate) fn invalidate(&self) {
-        self.dirty.set(true);
-        self.index_dirty.set(true);
-        self.documents.borrow_mut().clear();
+        self.dirty.store(true, Ordering::Release);
+        self.index_dirty.store(true, Ordering::Release);
+        self.documents.write().unwrap().clear();
+        *self.jaccard_terms.write().unwrap() = Arc::new(HashMap::new());
+        *self.id_positions.write().unwrap() = Arc::new(HashMap::new());
         self.bump_data_version();
     }
 
@@ -267,8 +490,10 @@ impl MemoryStoreCache {
     /// 适用于"增删单条记忆且索引已增量同步"的路径——此时索引仍正确，
     /// 重建代价（O(N) 全量分词）可省。
     pub(crate) fn mark_dirty_preserving_index(&self) {
-        self.dirty.set(true);
-        self.documents.borrow_mut().clear();
+        self.dirty.store(true, Ordering::Release);
+        self.documents.write().unwrap().clear();
+        *self.jaccard_terms.write().unwrap() = Arc::new(HashMap::new());
+        *self.id_positions.write().unwrap() = Arc::new(HashMap::new());
         self.bump_data_version();
     }
 
@@ -279,8 +504,10 @@ impl MemoryStoreCache {
     /// 缓存命中时**只复制 `Arc` 引用**，不再深拷贝正文（见 `RecallDocument`
     /// 的字段文档：修前此处每次命中都克隆整条正文，是检索热路径的主要成本）。
     pub(crate) fn recall_document(&self, memory: &Memory) -> RecallDocument {
-        let mut documents = self.documents.borrow_mut();
-        if let Some(document) = documents.get(&memory.id) {
+        // ★ 2026-11-05（P1 并发）：命中路径只取**读锁**。
+        //   修前整个函数持写锁 ⇒ 16 并发检索时该锁成为全局串行点
+        //   （每次检索对每个候选都要取一次），实测只读 P50 仍近 1s。
+        if let Some(document) = self.documents.read().unwrap().get(&memory.id) {
             return RecallDocument {
                 normalized_content: Arc::clone(&document.normalized_content),
                 token_count: document.token_count,
@@ -289,13 +516,19 @@ impl MemoryStoreCache {
         let normalized = memory.content.to_lowercase();
         let token_count = crate::memory_store::doc_token_count(&normalized);
         let normalized_content: Arc<str> = Arc::from(normalized);
-        let token_count_cached = token_count;
-        let content_cached = Arc::clone(&normalized_content);
+        let mut documents = self.documents.write().unwrap();
+        // 双检：并发下可能已被其它线程填入（幂等，取先到者即可）。
+        if let Some(document) = documents.get(&memory.id) {
+            return RecallDocument {
+                normalized_content: Arc::clone(&document.normalized_content),
+                token_count: document.token_count,
+            };
+        }
         documents.insert(
             memory.id.clone(),
             RecallDocument {
-                normalized_content: content_cached,
-                token_count: token_count_cached,
+                normalized_content: Arc::clone(&normalized_content),
+                token_count,
             },
         );
         RecallDocument {
@@ -308,20 +541,20 @@ impl MemoryStoreCache {
 
     /// 索引是否待重建
     pub(crate) fn index_is_dirty(&self) -> bool {
-        self.index_dirty.get()
+        self.index_dirty.load(Ordering::Acquire)
     }
 
     /// 借用倒排索引（只读）
-    pub(crate) fn borrow_index(&self) -> Ref<'_, BigramIndex> {
-        self.index.borrow()
+    pub(crate) fn borrow_index(&self) -> RwLockReadGuard<'_, BigramIndex> {
+        self.index.read().unwrap()
     }
 
     /// 增量加入一条记忆的 term
     pub(crate) fn add_to_index(&self, memory: &Memory) {
-        if self.index_dirty.get() {
+        if self.index_dirty.load(Ordering::Acquire) {
             return;
         }
-        let mut index = self.index.borrow_mut();
+        let mut index = self.index.write().unwrap();
         for term in Self::index_terms_for_memory(memory) {
             index.entry(term).or_default().insert(memory.id.clone());
         }
@@ -329,10 +562,10 @@ impl MemoryStoreCache {
 
     /// 增量移除一条记忆的 term
     pub(crate) fn remove_from_index(&self, memory: &Memory) {
-        if self.index_dirty.get() {
+        if self.index_dirty.load(Ordering::Acquire) {
             return;
         }
-        let mut index = self.index.borrow_mut();
+        let mut index = self.index.write().unwrap();
         for term in Self::index_terms_for_memory(memory) {
             if let Some(ids) = index.get_mut(&term) {
                 ids.remove(&memory.id);
@@ -341,40 +574,39 @@ impl MemoryStoreCache {
                 }
             }
         }
+        // 同步移除该条的 Jaccard 预计算集合（删除后不再参与相似检查）。
+        Arc::make_mut(&mut self.jaccard_terms.write().unwrap()).remove(&memory.id);
     }
 
     /// 增量替换一条记忆在索引中的 term
     pub(crate) fn replace_in_index(&self, old: &Memory, new: &Memory) {
-        if self.index_dirty.get() {
+        if self.index_dirty.load(Ordering::Acquire) {
             return;
         }
         self.remove_from_index(old);
         self.add_to_index(new);
     }
 
-    /// 全量重建倒排索引
-    pub(crate) fn rebuild_index(&self, all: &[Memory]) {
+    /// **仅在索引脏时**重建（并发安全：拿到写锁后二次检查）
+    ///
+    /// ## 为什么需要二次检查（2026-11-05 压测归因）
+    ///
+    /// 调用方 `build_candidates` 在**锁外**判断 `index_is_dirty()`，随后才进入本函数
+    /// 排队等 `index.write()`。16 并发纯写实测：16 个写者同时看到 `dirty=true`
+    /// （启动初值），全部进入重建并串行排队 ⇒ **重复全量重建 16 次**，
+    /// 单次耗时从 814ms 累积到 15208ms，直接构成写路径 P99 的 15s 尾部。
+    ///
+    /// 修复：先到者重建完成后置 `dirty=false`，后到者拿到锁**重新检查**后立即返回。
+    /// 重建次数 16 → 1，语义不变（索引内容与"重建一次"逐位一致）。
+    pub(crate) fn rebuild_index_if_dirty(&self, all: &[Arc<Memory>]) {
         let index_start = std::time::Instant::now();
-        let mut index = self.index.borrow_mut();
-        index.clear();
-        let use_domain_index = Self::domain_index_enabled();
-        for memory in all {
-            let terms = if use_domain_index {
-                Self::content_index_terms(&memory.content)
-            } else {
-                if !memory.content.chars().any(|c| {
-                    let code = c as u32;
-                    (0x4E00..=0x9FFF).contains(&code)
-                }) {
-                    continue;
-                }
-                Self::content_bigrams(&memory.content)
-            };
-            for term in terms {
-                index.entry(term).or_default().insert(memory.id.clone());
-            }
+        let mut index = self.index.write().unwrap();
+        if !self.index_dirty.load(Ordering::Acquire) {
+            return;
         }
-        self.index_dirty.set(false);
+        index.clear();
+        Self::fill_index(&mut index, all, &[]);
+        self.index_dirty.store(false, Ordering::Release);
         if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
             crate::memory_store::emit_remember_profile(format!(
                 "[LRC_PROFILING] rebuild_index_ms={:.3} index_terms={} memory_count={}",
@@ -385,6 +617,48 @@ impl MemoryStoreCache {
         }
     }
 
+    /// 把一批记忆的 term 写入倒排索引（调用方须已持有 `index` 写锁）
+    fn fill_index(index: &mut BigramIndex, base: &[Arc<Memory>], extra: &[Memory]) {
+        for memory in base.iter().map(|m| m.as_ref()).chain(extra.iter()) {
+            for term in Self::index_terms_for_memory(memory) {
+                index.entry(term).or_default().insert(memory.id.clone());
+            }
+        }
+    }
+
+    /// 用「已加载快照 + 额外一批记忆」重建倒排索引
+    ///
+    /// 为什么需要"额外一批"：批量写入路径（`remember_batch_preencoded`）在
+    /// `append_new` 之前就要把索引修好——否则 `add_to_index` 会因索引脏而直接
+    /// no-op，读侧的候选裁剪将**永远拿不到可用索引**。而为了建索引触发一次
+    /// 整库 JSON 重解析（400MB 级，4~6 秒）正是 `append_new` 要消除的成本，
+    /// 故这里直接用内存快照 + 本批新增条目，不读盘。
+    pub(crate) fn rebuild_index_with_extra(&self, base: &[Arc<Memory>], extra: &[Memory]) {
+        let index_start = std::time::Instant::now();
+        let mut index = self.index.write().unwrap();
+        index.clear();
+        // ★ S6（2026-11-02）：term 提取统一走 `index_terms_for_memory`。
+        //   修前这里内联了一份同样的判断，与增量维护（add/remove）各写一遍
+        //   ⇒ 一旦只改一处，全量重建与增量更新就会产出不同的索引（静默漏召回）。
+        Self::fill_index(&mut index, base, extra);
+        self.index_dirty.store(false, Ordering::Release);
+        if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
+            crate::memory_store::emit_remember_profile(format!(
+                "[LRC_PROFILING] rebuild_index_ms={:.3} index_terms={} memory_count={}",
+                index_start.elapsed().as_secs_f64() * 1000.0,
+                index.len(),
+                base.len() + extra.len()
+            ));
+        }
+    }
+
+    /// 全量记忆是否已在内存中（`false` = 尚未加载，或刚被整体失效）
+    ///
+    /// 供写路径判断"能否用内存快照建索引而不读盘"。
+    pub(crate) fn is_loaded(&self) -> bool {
+        !self.dirty.load(Ordering::Acquire)
+    }
+
     // ---------- 跨查询频次 ----------
 
     /// 借用跨查询统计（只读）
@@ -392,18 +666,18 @@ impl MemoryStoreCache {
     /// 仅供 `ml` feature 下的语义压制路径使用，故同步门控以避免
     /// 默认 feature 构建出现 dead_code 告警（`-D warnings` 下为错误）。
     #[cfg(feature = "ml")]
-    pub(crate) fn borrow_assoc(&self) -> Ref<'_, AssocFrequency> {
-        self.assoc.borrow()
+    pub(crate) fn borrow_assoc(&self) -> RwLockReadGuard<'_, AssocFrequency> {
+        self.assoc.read().unwrap()
     }
 
     /// 借用跨查询统计（可写）
-    pub(crate) fn borrow_assoc_mut(&self) -> RefMut<'_, AssocFrequency> {
-        self.assoc.borrow_mut()
+    pub(crate) fn borrow_assoc_mut(&self) -> RwLockWriteGuard<'_, AssocFrequency> {
+        self.assoc.write().unwrap()
     }
 
     /// 取跨查询统计快照（用于持久化）
     pub(crate) fn assoc_snapshot(&self) -> AssocFrequency {
-        self.assoc.borrow().clone()
+        self.assoc.read().unwrap().clone()
     }
 
     // ---------- 纯函数辅助 ----------
@@ -459,18 +733,99 @@ impl MemoryStoreCache {
     }
 
     /// 单条记忆的索引 term 集合
+    ///
+    /// 三种模式（与修前一致的部分保持不变）：
+    /// - 域候选索引开启（默认）：`tokenize_query` 口径 + **检索可达 term 补齐**（见
+    ///   [`Self::recall_reachable_terms`]）。补齐不删任何既有 term，故
+    ///   `find_similar` 的候选集只增不减，最终仍由 Jaccard 判定，行为不变。
+    /// - 域候选索引关闭且正文含 CJK：字符级 bigram（旧口径）。
+    /// - 域候选索引关闭且正文不含 CJK：空集（旧口径，跳过英文记忆）。
     pub(crate) fn index_terms_for_memory(memory: &Memory) -> HashSet<String> {
-        if Self::domain_index_enabled() {
-            Self::content_index_terms(&memory.content)
-        } else if memory.content.chars().any(|c| {
-            let code = c as u32;
-            (0x4E00..=0x9FFF).contains(&code)
-        }) {
-            Self::content_bigrams(&memory.content)
-        } else {
-            HashSet::new()
+        if !Self::domain_index_enabled() {
+            return if memory.content.chars().any(|c| is_cjk_char(&c)) {
+                Self::content_bigrams(&memory.content)
+            } else {
+                HashSet::new()
+            };
+        }
+        let lower = memory.content.to_lowercase();
+        let mut terms: HashSet<String> = crate::memory_store::tokenize_query(&lower)
+            .into_iter()
+            .collect();
+        Self::recall_reachable_terms(&lower, &mut terms);
+        terms
+    }
+
+    /// 补齐"评分侧可达、但 `tokenize_query` 未产出"的索引 term（S6）
+    ///
+    /// ## 为什么必须补齐
+    ///
+    /// 快路候选裁剪的等价性前提是「索引 term 命中」⊇「`count_word_occurrences > 0`」。
+    /// 但两套口径并不天然同源，实测有两类漏召回：
+    ///
+    /// 1. **低 CJK 比例的长文本里的中文段**：`tokenize_query` 对 CJK 比例 <30% 的
+    ///    文本走空格分词（`技术文档` 不产 bigram），而评分对 CJK token 用**子串**匹配
+    ///    ⇒ 查询 bigram `技术` 能在正文里命中，索引里却不存在该 term。
+    /// 2. **字母数字连写**：评分对长度 ≥3 的 ASCII 词用**词边界**判定，而
+    ///    `is_alpha_byte` 只把 ASCII 字母视为"词内字符"⇒ `abc123` 中的 `abc`
+    ///    会被判为命中，但索引里只有整词 `abc123`。
+    ///
+    /// 本函数只**加** term（幂等），不改变任何既有 term，因此：
+    /// - 候选裁剪不会再漏掉打分 >0 的记忆；
+    /// - 索引变成打分口径的**超集**，交集操作只会多算不会少算。
+    fn recall_reachable_terms(lower: &str, terms: &mut HashSet<String>) {
+        // 1) ASCII 词的字母/数字分段（数字在 `is_alpha_byte` 中被视为词边界）
+        let mut pieces: Vec<String> = Vec::new();
+        for term in terms.iter() {
+            let is_ascii_run = !term.is_empty()
+                && term
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            if !is_ascii_run {
+                continue;
+            }
+            let has_digit = term.chars().any(|c| c.is_ascii_digit());
+            let has_alpha = term.chars().any(|c| c.is_ascii_alphabetic());
+            if !(has_digit && has_alpha) {
+                continue;
+            }
+            let mut piece = String::new();
+            let mut prev_digit: Option<bool> = None;
+            for c in term.chars() {
+                let is_digit = c.is_ascii_digit();
+                if prev_digit.is_some_and(|pd| pd != is_digit) && !piece.is_empty() {
+                    pieces.push(std::mem::take(&mut piece));
+                }
+                piece.push(c);
+                prev_digit = Some(is_digit);
+            }
+            if !piece.is_empty() {
+                pieces.push(piece);
+            }
+        }
+        terms.extend(pieces);
+
+        // 2) 低 CJK 比例文本：补 CJK 相邻字符 bigram。
+        //    比例 ≥30% 时 `tokenize_query` 已走 bigram 分支、这些 term 已存在，
+        //    再全量扫一遍只会重复分配 ⇒ 直接跳过。
+        if crate::memory_store::cjk_ratio(lower) >= 0.3 {
+            return;
+        }
+        let chars: Vec<char> = lower.chars().collect();
+        for window in chars.windows(2) {
+            if is_cjk_char(&window[0]) && is_cjk_char(&window[1]) {
+                terms.insert(format!("{}{}", window[0], window[1]));
+            }
         }
     }
+}
+
+/// 是否 CJK 字符（与 `cjk_ratio` / `contains_word` 的判定范围一致）
+fn is_cjk_char(c: &char) -> bool {
+    let cp = *c as u32;
+    (0x4E00..=0x9FFF).contains(&cp)
+        || (0x3400..=0x4DBF).contains(&cp)
+        || (0xF900..=0xFAFF).contains(&cp)
 }
 
 #[cfg(test)]
@@ -538,6 +893,51 @@ mod tests {
         );
     }
 
+    /// 2026-11-05（压测根因）：单条删除必须**增量**更新缓存，不得标脏。
+    ///
+    /// 修前 `forget` 走 `mark_dirty_preserving_index()` ⇒ 下一次 `load_cached()`
+    /// 整库重解析；16 并发删除时每次删除都触发一次全库重载（P50 撞满 6s）。
+    /// 本测试锁定"删除后缓存仍为已加载状态、且该条已从快照/映射/特征中移除"。
+    #[test]
+    fn 单条删除后缓存保持已加载且条目被移除() {
+        let cache = MemoryStoreCache::new(AssocFrequency::default());
+        let a = make_memory("甲");
+        let b = make_memory("乙");
+        let id_a = a.id.clone();
+        let id_b = b.id.clone();
+        cache.store(vec![a, b], None);
+        // 触发一次惰性特征计算，确保删除要清理它
+        let all = cache.snapshot();
+        for m in all.iter() {
+            let _ = cache.recall_document(m);
+        }
+        assert!(cache.is_loaded(), "store 后应为已加载");
+
+        cache.remove(&id_a, None);
+
+        assert!(
+            cache.is_loaded(),
+            "增量删除后缓存必须仍为已加载（回归：又变回标脏 ⇒ 下次整库重载）"
+        );
+        let after = cache.snapshot();
+        assert_eq!(after.len(), 1, "快照应只剩一条");
+        assert_eq!(after[0].id, id_b, "应保留未被删除的那条");
+        assert!(!cache.contains_id(&id_a), "被删条目不应再存在");
+        assert!(
+            !cache.documents.read().unwrap().contains_key(&id_a),
+            "被删条目的文本特征应被清理"
+        );
+        assert!(
+            !cache.id_positions_snapshot().contains_key(&id_a),
+            "被删条目不应残留在 id→position 映射中"
+        );
+        assert_eq!(
+            cache.id_positions_snapshot().get(&id_b).copied(),
+            Some(0),
+            "删除后剩余条目的 position 必须前移并重建"
+        );
+    }
+
     /// 2026-10-28：追加新记忆**不得**清空既有文本特征缓存。
     ///
     /// 修前 `append_new` 会 `documents.clear()`，使下一次检索把全库重新
@@ -558,7 +958,7 @@ mod tests {
             let doc = cache.recall_document(m);
             assert!(!doc.normalized_content.is_empty(), "特征不应为空");
         }
-        let cached_before = cache.documents.borrow().len();
+        let cached_before = cache.documents.read().unwrap().len();
         assert_eq!(cached_before, 2, "两条记忆的特征都应已缓存");
 
         let c = make_memory("丙");
@@ -566,17 +966,17 @@ mod tests {
         cache.append_new(&[c], None);
 
         assert_eq!(
-            cache.documents.borrow().len(),
+            cache.documents.read().unwrap().len(),
             cached_before,
             "追加新记忆不得清空既有特征缓存（回归：又变回每写一次就全库重算）"
         );
         assert!(
-            cache.documents.borrow().contains_key(&id_a)
-                && cache.documents.borrow().contains_key(&id_b),
+            cache.documents.read().unwrap().contains_key(&id_a)
+                && cache.documents.read().unwrap().contains_key(&id_b),
             "既有记忆的特征必须仍在缓存中"
         );
         assert!(
-            !cache.documents.borrow().contains_key(&id_c),
+            !cache.documents.read().unwrap().contains_key(&id_c),
             "新条目特征应留待惰性计算，而不是被写入路径清空整表"
         );
 
@@ -589,7 +989,7 @@ mod tests {
         let doc = cache.recall_document(new_mem);
         assert_eq!(&*doc.normalized_content, "丙", "新条目特征应按正文计算");
         assert!(
-            cache.documents.borrow().contains_key(&id_c),
+            cache.documents.read().unwrap().contains_key(&id_c),
             "惰性计算后新条目特征应写入缓存"
         );
     }

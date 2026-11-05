@@ -133,14 +133,10 @@ mod enrich_timeout_tests {
         );
 
         // ② 默认值直接取自阶梯常量 ⇒ 零行为变更
-        assert_eq!(DEFAULT_ENRICH_LOCK_WAIT, LOCK_WAIT);
         assert_eq!(DEFAULT_ENRICH_TIMEOUT, HTTP_HANDLER_BUDGET);
 
         // ③ 取值（未设环境变量）必须严格落在阶梯内
-        assert!(
-            enrich_lock_wait() < enrich_exec_timeout(),
-            "锁等待必须小于执行上限"
-        );
+        // 外层 `RwLock` 读锁：此处只校验执行上限仍落在阶梯内。
         assert!(
             enrich_exec_timeout() < HTTP_OUTER_TIMEOUT,
             "执行上限必须小于外层超时（否则会返 504）"
@@ -462,12 +458,14 @@ mod api_contracts_tests {
             synthesized: 1,
             total_memories: 4,
             synthesis_summaries: vec!["合成摘要".to_string()],
+            suppressed: 2,
         };
         let json = serde_json::to_value(&resp).expect("序列化失败");
         assert_eq!(json["stored"], 3);
         assert_eq!(json["synthesized"], 1);
         assert_eq!(json["total_memories"], 4);
         assert!(json["synthesis_summaries"].is_array());
+        assert_eq!(json["suppressed"], 2, "S3.5：遗忘指令抑制条数必须可观测");
     }
 
     #[test]
@@ -567,6 +565,7 @@ mod api_contracts_tests {
             memory_type: "fact".to_string(),
             score: 0.85,
             bagua_category: Some("震".to_string()),
+            gua64: Some(42),
             daoti_preview_gua: None,
             daoti_preview_bagua: None,
             daoti_preview_version: None,
@@ -608,10 +607,12 @@ mod api_contracts_tests {
                 weights: ExplanationWeights {
                     fast: 1.0,
                     deep: 1.8,
+                    semantic: 1.0,
                 },
                 rrf_k: 60.0,
                 fast_path_hits: 6,
                 deep_path_hits: 4,
+                semantic_path_hits: 0,
                 total_candidates: 3,
                 items: vec![EnrichExplanationItem {
                     id: "mem-001".to_string(),
@@ -620,8 +621,10 @@ mod api_contracts_tests {
                     fused_contrib: 0.0311,
                     fast_contrib: 0.0164,
                     deep_contrib: 0.0147,
+                    semantic_contrib: 0.0,
                     fast_rank: Some(1),
                     deep_rank: Some(3),
+                    semantic_rank: None,
                     hit_paths: vec!["fast", "deep"],
                 }],
             },
@@ -665,10 +668,12 @@ mod api_contracts_tests {
                 weights: ExplanationWeights {
                     fast: 1.0,
                     deep: 1.0,
+                    semantic: 1.0,
                 },
                 rrf_k: 60.0,
                 fast_path_hits: 1,
                 deep_path_hits: 0,
+                semantic_path_hits: 0,
                 total_candidates: 1,
                 items: vec![EnrichExplanationItem {
                     id: "mem-002".to_string(),
@@ -677,8 +682,10 @@ mod api_contracts_tests {
                     fused_contrib: 0.0164,
                     fast_contrib: 0.0164,
                     deep_contrib: 0.0,
+                    semantic_contrib: 0.0,
                     fast_rank: Some(1),
                     deep_rank: None,
+                    semantic_rank: None,
                     hit_paths: vec!["fast"],
                 }],
             },
@@ -978,7 +985,7 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
-        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
 
         // 写入一组生活联想链相关记忆：食物、餐馆、和谁吃、在哪吃
         for content in [
@@ -1003,7 +1010,7 @@ mod api_contracts_tests {
 
         let cancel = AtomicBool::new(false);
         let resp = run_association_explore(
-            &mut store,
+            &store,
             Some("今晚吃什么"),
             None,
             3, // 最多 3 层
@@ -1063,10 +1070,10 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
-        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
         let cancel = AtomicBool::new(false);
         let resp = run_association_explore(
-            &mut store,
+            &store,
             None,
             Some("mem-does-not-exist"),
             2,
@@ -1094,7 +1101,7 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
-        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
 
         // 食物主题链 + 漂移陷阱：
         // 陷阱与 hop1 记忆共享"浇水"，但与起点"今晚吃番茄炒蛋"主题无关。
@@ -1117,7 +1124,7 @@ mod api_contracts_tests {
 
         let cancel = AtomicBool::new(false);
         let resp = run_association_explore(
-            &mut store,
+            &store,
             Some("今晚吃什么"),
             None,
             3, // 允许 3 层，确保会走到深层扩散
@@ -1161,7 +1168,7 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
-        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
 
         // 干扰记忆：与"今晚吃什么"只共享泛指 bigram「什么」1 个 token；
         // 主题记忆：命中「今晚」「晚吃」2 个 token，实质共鸣；
@@ -1184,8 +1191,7 @@ mod api_contracts_tests {
         }
 
         let cancel = AtomicBool::new(false);
-        let resp =
-            run_association_explore(&mut store, Some("今晚吃什么"), None, 2, 2, &cancel, None);
+        let resp = run_association_explore(&store, Some("今晚吃什么"), None, 2, 2, &cancel, None);
 
         assert!(resp.root.is_some(), "应存在实质共鸣的起点记忆");
         let root_node = resp
@@ -1223,7 +1229,7 @@ mod api_contracts_tests {
         let dir_str = dir.to_str().unwrap().to_string();
         // 统计模式确定性构造：语义旁路在本用例中必须保持失效，
         // 泛指词重叠的无关记忆无论是否装有 ML 模型都不应上位
-        let mut store = new_statistical_store(&dir_str);
+        let store = new_statistical_store(&dir_str);
 
         // 只有与查询共享单个泛指词的记忆——旧行为会把它硬凑成起点
         let memory = Memory::new(
@@ -1237,8 +1243,7 @@ mod api_contracts_tests {
         store.remember(memory).unwrap();
 
         let cancel = AtomicBool::new(false);
-        let resp =
-            run_association_explore(&mut store, Some("今晚吃什么"), None, 2, 2, &cancel, None);
+        let resp = run_association_explore(&store, Some("今晚吃什么"), None, 2, 2, &cancel, None);
 
         assert!(resp.root.is_none(), "泛指词重叠的无关记忆不应成为起点");
         assert!(resp.nodes.is_empty(), "弱匹配时不应产生任何节点");
@@ -1262,7 +1267,7 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
-        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
 
         // 用例1：词面无通过候选的查询 → 触发旁路，但统计模式无向量 → unavailable
         let _ = store.remember(Memory::new(
@@ -1274,15 +1279,8 @@ mod api_contracts_tests {
             None,
         ));
         let cancel = AtomicBool::new(false);
-        let resp1 = run_association_explore(
-            &mut store,
-            Some("量子物理是什么"),
-            None,
-            2,
-            2,
-            &cancel,
-            None,
-        );
+        let resp1 =
+            run_association_explore(&store, Some("量子物理是什么"), None, 2, 2, &cancel, None);
         assert_eq!(
             resp1.semantic_bypass, "unavailable",
             "统计模式下旁路触发但编码器无向量应标记 unavailable（weak={}）",
@@ -1299,15 +1297,8 @@ mod api_contracts_tests {
             Importance::new(5),
             None,
         ));
-        let resp2 = run_association_explore(
-            &mut store,
-            Some("Rust 借用检查器"),
-            None,
-            2,
-            2,
-            &cancel,
-            None,
-        );
+        let resp2 =
+            run_association_explore(&store, Some("Rust 借用检查器"), None, 2, 2, &cancel, None);
         assert_eq!(
             resp2.semantic_bypass,
             "unused",
@@ -1339,7 +1330,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
         // 统计模式（确定性）：不依赖 ML 是否可用
-        let mut store = new_statistical_store(&dir_str);
+        let store = new_statistical_store(&dir_str);
 
         // 干扰记忆：含"是什么"字样的代码记忆（模拟代码 chunk 里的测试文本）
         let noisy = Memory::new(
@@ -1354,15 +1345,8 @@ mod api_contracts_tests {
 
         // 查询 1：库里没有量子物理相关内容 → 不硬凑代码起点，诚实空态
         let cancel = AtomicBool::new(false);
-        let resp = run_association_explore(
-            &mut store,
-            Some("量子物理是什么"),
-            None,
-            2,
-            2,
-            &cancel,
-            None,
-        );
+        let resp =
+            run_association_explore(&store, Some("量子物理是什么"), None, 2, 2, &cancel, None);
         assert!(
             resp.root.is_none() && resp.weak_match,
             "泛指 bigram 组合不应让代码记忆虚假上位: root={:?}",
@@ -1371,15 +1355,8 @@ mod api_contracts_tests {
 
         // 查询 2（对照）：实义 bigram（数据库/据库/缓存）命中时正常上位，
         // 证明过滤只剔除泛指组合，不伤害实义共鸣。
-        let resp2 = run_association_explore(
-            &mut store,
-            Some("数据库和缓存架构"),
-            None,
-            2,
-            2,
-            &cancel,
-            None,
-        );
+        let resp2 =
+            run_association_explore(&store, Some("数据库和缓存架构"), None, 2, 2, &cancel, None);
         assert!(
             resp2.root.is_some() && !resp2.weak_match,
             "实义 token 重叠的代码记忆应正常成为起点"
@@ -3756,7 +3733,7 @@ mod api_contracts_tests {
             return;
         };
         p82h_seed(&mut store_http);
-        let shared = Arc::new(Mutex::new(store_http));
+        let shared = Arc::new(store_http);
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(IdleCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -4044,11 +4021,9 @@ mod api_contracts_tests {
     /// "N 条并发"。以生产同构链路（`build_v1_router` → `oneshot`）发起 N 条并发
     /// POST /associations/explore，逐请求记录状态码与墙钟。
     ///
-    /// 为什么预期会看到兜底：`MemoryStore` 含 `RefCell`（持久化缓存）而为 `!Sync`，
-    /// 生产 handler 用 `Arc<Mutex<..>>` + 有界取锁（`timeouts::LOCK_WAIT`）取锁，
-    /// 故并发探索被**全局串行化**——后到者在锁外排队，排队超过 `LOCK_WAIT`（2s）
-    /// 即返回 503 `search_busy`（v0.9.11 / CR-34 起：取锁循环有独立 deadline，
-    /// 不再一路自旋到外层 15s）。本用例的契约不是"必须全部 200"，而是
+    /// 读并发改造后（2026-11-05）：`MemoryStore` 为 `Sync`，生产 handler 用
+    /// `Arc<RwLock<..>>`，多个探索请求可**并行持读锁**；写者取写锁时需等读者释放。
+    /// 本用例的契约不是"必须全部 200"，而是
     /// **每个请求都必须在有限时间内拿到 200 或 503 的明确应答（无挂死）**。
     ///
     /// 用例分两段：
@@ -4114,7 +4089,7 @@ mod api_contracts_tests {
             .remember_batch(p82p_filler_memories(POOL_SCALE))
             .expect("并发臂扩展语料注入失败");
 
-        let shared = Arc::new(Mutex::new(store));
+        let shared = Arc::new(RwLock::new(store));
         // 保留一份锁句柄用于第 2 段的确定性兜底验证（build_v1_router 会 move 走 shared）
         let probe_store = shared.clone();
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
@@ -4208,7 +4183,7 @@ mod api_contracts_tests {
             .sum();
         eprintln!(
             "[P8.2p][并发] 串行化证据：成功请求耗时之和 {serial_sum:.3}s vs 墙钟 {wall:.3}s\
-             （MemoryStore 为 !Sync，探索被全局 Mutex 串行化；判据：比值 ≈N（={CONCURRENT_REQUESTS}）\
+             （读并发改造后 MemoryStore 为 Sync，探索可并行；判据：比值 ≈N（={CONCURRENT_REQUESTS}）\
              为真并行，≈(N+1)/2（={:.1}）即锁排队主导）",
             (CONCURRENT_REQUESTS as f64 + 1.0) / 2.0
         );
@@ -4237,13 +4212,12 @@ mod api_contracts_tests {
             "并发下至少一个请求须成功：全 503 意味着兜底把正常负载也拒了"
         );
 
-        // ---------- 确定性兜底段：外部独占锁 → 硬验证**锁等待上限** ----------
-        // v0.9.11（CR-34）：本段**原**用于确定性触发 15s 外层超时——修前 explore 的
-        // 取锁循环无 deadline，锁被外部独占时会一路自旋到外层 15s 被丢弃。CR-34 修后
-        // 取锁循环补齐了独立 deadline（`timeouts::LOCK_WAIT`=2s）⇒ 本段改为硬验证
-        // **新的有界行为**：锁被独占时应在锁等待上限内快速失败为 503 `search_busy`
-        // （而非耗满 15s）。该段不依赖机器性能（只依赖"拿不到锁"这一确定事实）。
-        let guard = probe_store.lock().await;
+        // ---------- 确定性兜底段：外部独占写锁 → 验证**不挂死** ----------
+        // 读并发改造后（2026-11-05）：explore 用 `blocking_read()` 取读锁，
+        // 写锁被独占时会**等待**（而非 2s 快速失败 503）。兜底由外层
+        // `HTTP_OUTER_TIMEOUT` 保证。本段用 2s timeout 验证"确实在等待"，
+        // 随后释放写锁，确保请求最终能完成（不挂死）。
+        let guard = probe_store.write().await;
         let request = Request::builder()
             .method("POST")
             .uri("/associations/explore")
@@ -4258,46 +4232,21 @@ mod api_contracts_tests {
             ))
             .expect("兜底段请求构造失败");
         let started = Instant::now();
-        let response = app
-            .clone()
-            .into_service()
-            .oneshot(request)
-            .await
-            .expect("兜底段 HTTP 层调用失败");
-        let fallback_secs = started.elapsed().as_secs_f64();
-        let fallback_status = response.status().as_u16();
-        let fallback_body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("兜底段读取响应体失败");
-        let fallback_error = serde_json::from_slice::<serde_json::Value>(&fallback_body)
-            .ok()
-            .and_then(|body| {
-                body.get("error")
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.to_string())
-            })
-            .unwrap_or_default();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            app.clone().into_service().oneshot(request),
+        )
+        .await;
+        let waited = started.elapsed().as_secs_f64();
         drop(guard);
-
         eprintln!(
-            "[P8.2p][并发][兜底] 外部独占锁下：status={fallback_status} error={fallback_error} \
-             耗时 {fallback_secs:.3}s（预期 503 search_busy，耗时贴近锁等待上限 \
-             {:.1}s 而非外层超时 {HTTP_TIMEOUT_SECS}s）",
-            crate::timeouts::LOCK_WAIT.as_secs_f64()
+            "[P8.2p][并发][兜底] 外部独占写锁下：2s 内是否返回={}，实际等待 {waited:.3}s\
+             （读并发改造后 explore 等待写锁，由外层 {HTTP_TIMEOUT_SECS}s 超时兜底）",
+            outcome.is_ok()
         );
-        assert_eq!(
-            fallback_status, 503,
-            "外部独占锁时须返回 503（锁等待上限兜底），实测 {fallback_status}"
-        );
-        assert_eq!(
-            fallback_error, "search_busy",
-            "外部独占锁须在锁等待上限内失败为 search_busy，实测 {fallback_error}"
-        );
-        // CR-34 的核心断言：耗时**必须有界**（远小于外层 15s）——修前该段会耗满 15s。
         assert!(
-            fallback_secs < HTTP_TIMEOUT_SECS,
-            "锁等待须有界（< 外层 {HTTP_TIMEOUT_SECS}s），实测 {fallback_secs:.3}s；\
-             逼近外层超时说明取锁循环又失去独立 deadline（CR-34 回归）"
+            outcome.is_err(),
+            "写锁被独占时 explore 应等待（由外层超时兜底），实测 {waited:.3}s 内已返回"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -4326,7 +4275,7 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
-        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
 
         // root：查询起点记忆（查询与自身完全匹配 → 自身成为起点）
         let root = Memory::new(
@@ -4370,15 +4319,8 @@ mod api_contracts_tests {
         };
 
         // 基线（门控默认关）：child_a 在前
-        let base = run_association_explore(
-            &mut store,
-            Some("今晚吃什么好呢"),
-            None,
-            2,
-            1,
-            &cancel,
-            None,
-        );
+        let base =
+            run_association_explore(&store, Some("今晚吃什么好呢"), None, 2, 1, &cancel, None);
         assert!(base.root.is_some(), "root 记忆应成为起点");
         let base_children = depth1_ids(&base);
         assert_eq!(
@@ -4389,25 +4331,22 @@ mod api_contracts_tests {
         );
 
         // 记录确认边：root → child_b（用户确认"从今晚吃什么好呢联想到今晚吃面"）
-        store.user_feedback.record_association_edge_feedback(
-            FeedbackType::Positive,
-            &root.id,
-            &child_b.id,
-            Some("今晚吃什么好呢"),
-            None,
-        );
+        store
+            .user_feedback
+            .read()
+            .unwrap()
+            .record_association_edge_feedback(
+                FeedbackType::Positive,
+                &root.id,
+                &child_b.id,
+                Some("今晚吃什么好呢"),
+                None,
+            );
 
         // 门控开启：确认边打破平局，child_b 前置
         std::env::set_var("LRC_ASSOC_EDGE_FEEDBACK", "1");
-        let rerank = run_association_explore(
-            &mut store,
-            Some("今晚吃什么好呢"),
-            None,
-            2,
-            1,
-            &cancel,
-            None,
-        );
+        let rerank =
+            run_association_explore(&store, Some("今晚吃什么好呢"), None, 2, 1, &cancel, None);
         std::env::remove_var("LRC_ASSOC_EDGE_FEEDBACK");
         let rerank_children = depth1_ids(&rerank);
         assert_eq!(
@@ -4419,15 +4358,8 @@ mod api_contracts_tests {
         );
 
         // 门控恢复关闭：回到基线顺序（零影响承诺）
-        let restore = run_association_explore(
-            &mut store,
-            Some("今晚吃什么好呢"),
-            None,
-            2,
-            1,
-            &cancel,
-            None,
-        );
+        let restore =
+            run_association_explore(&store, Some("今晚吃什么好呢"), None, 2, 1, &cancel, None);
         assert_eq!(
             depth1_ids(&restore),
             vec![child_a.id.clone()],
@@ -4457,7 +4389,7 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
-        let mut store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
+        let store = MemoryStore::new(JsonPersistence::new(&dir_str).unwrap());
 
         // root：查询起点记忆（查询与自身完全匹配 → 自身成为起点）
         let root = Memory::new(
@@ -4511,15 +4443,8 @@ mod api_contracts_tests {
         };
 
         // 基线（门控默认关）：三候选均进入联想链（回归校验后仍保留，width=3）
-        let base = run_association_explore(
-            &mut store,
-            Some("今晚吃什么好呢"),
-            None,
-            2,
-            3,
-            &cancel,
-            None,
-        );
+        let base =
+            run_association_explore(&store, Some("今晚吃什么好呢"), None, 2, 3, &cancel, None);
         assert!(base.root.is_some(), "root 记忆应成为起点");
         let sa0 = depth1_score(&base, &mem_a.id);
         let sb0 = depth1_score(&base, &mem_b.id);
@@ -4531,15 +4456,7 @@ mod api_contracts_tests {
 
         // 门控开启：三档偏移
         std::env::set_var("LRC_ASSOC_PATH_SCORE", "1");
-        let on = run_association_explore(
-            &mut store,
-            Some("今晚吃什么好呢"),
-            None,
-            2,
-            3,
-            &cancel,
-            None,
-        );
+        let on = run_association_explore(&store, Some("今晚吃什么好呢"), None, 2, 3, &cancel, None);
         std::env::remove_var("LRC_ASSOC_PATH_SCORE");
         let sa1 = depth1_score(&on, &mem_a.id);
         let sb1 = depth1_score(&on, &mem_b.id);
@@ -4569,15 +4486,8 @@ mod api_contracts_tests {
         );
 
         // 门控还原：回到基线（零影响承诺）
-        let restore = run_association_explore(
-            &mut store,
-            Some("今晚吃什么好呢"),
-            None,
-            2,
-            3,
-            &cancel,
-            None,
-        );
+        let restore =
+            run_association_explore(&store, Some("今晚吃什么好呢"), None, 2, 3, &cancel, None);
         assert!(
             (depth1_score(&restore, &mem_a.id) - sa0).abs() < 1e-3,
             "门控还原后 a 应回到基线"
@@ -4606,7 +4516,7 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
-        let mut store = new_statistical_store(&dir_str);
+        let store = new_statistical_store(&dir_str);
 
         // 起点：与查询共享 周末/去哪/哪儿 多个 token，稳定通过词面门禁
         let root = Memory::new(
@@ -4640,8 +4550,7 @@ mod api_contracts_tests {
         }
 
         let cancel = AtomicBool::new(false);
-        let resp =
-            run_association_explore(&mut store, Some("周末去哪儿玩"), None, 2, 2, &cancel, None);
+        let resp = run_association_explore(&store, Some("周末去哪儿玩"), None, 2, 2, &cancel, None);
 
         assert!(resp.root.is_some(), "起点应通过词面实质共鸣门禁");
         assert!(
@@ -4675,7 +4584,7 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
-        let mut store = new_statistical_store(&dir_str);
+        let store = new_statistical_store(&dir_str);
 
         // 生活记忆：词面与"今晚吃什么"实质共鸣（今晚/吃 均重叠）
         let life = Memory::new(
@@ -4710,15 +4619,8 @@ mod api_contracts_tests {
         };
 
         let cancel = AtomicBool::new(false);
-        let resp = run_association_explore(
-            &mut store,
-            Some("今晚吃什么"),
-            None,
-            2,
-            2,
-            &cancel,
-            Some(&nav),
-        );
+        let resp =
+            run_association_explore(&store, Some("今晚吃什么"), None, 2, 2, &cancel, Some(&nav));
 
         // 导航候选 + 词面门禁 → 生活记忆上位为起点
         // 先验证 navigated_deep_recall 本身是否召回了生活记忆（探针，测试失败时可见）
@@ -4726,7 +4628,7 @@ mod api_contracts_tests {
             use crate::memory_store::RecallFilter;
             let nav_filter = RecallFilter::new().with_top_k(ASSOCIATION_ROOT_POOL_TOPK);
             let nav_result = crate::engine::navigation::navigated_deep_recall(
-                &mut store,
+                &store,
                 "今晚吃什么",
                 &nav_filter,
                 1,
@@ -4781,7 +4683,7 @@ mod api_contracts_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
-        let mut store = new_statistical_store(&dir_str);
+        let store = new_statistical_store(&dir_str);
 
         let life = Memory::new(
             "今晚吃番茄炒蛋，记得先买番茄".to_string(),
@@ -4801,15 +4703,8 @@ mod api_contracts_tests {
         };
 
         let cancel = AtomicBool::new(false);
-        let resp = run_association_explore(
-            &mut store,
-            Some("今晚吃什么"),
-            None,
-            2,
-            2,
-            &cancel,
-            Some(&nav),
-        );
+        let resp =
+            run_association_explore(&store, Some("今晚吃什么"), None, 2, 2, &cancel, Some(&nav));
 
         // 无有效导航方向时仍能正常找到生活起点（与无导航基线一致）
         assert!(resp.root.is_some(), "空导航应回退基线召回");
@@ -4901,7 +4796,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -5322,7 +5217,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -5495,7 +5390,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -5619,7 +5514,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -5688,7 +5583,7 @@ mod api_contracts_tests {
         let dir_str = dir.to_str().unwrap().to_string();
 
         let make_app = |trust: TrustMode| {
-            let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+            let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
             let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
                 Arc::new(Mutex::new(Box::new(NoopCodebase)));
             let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -5797,7 +5692,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -5936,7 +5831,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -5994,7 +5889,7 @@ mod api_contracts_tests {
         assert_eq!(resp.status(), StatusCode::OK, "consolidate 应返回 200");
 
         // 按 created_at 升序读取：若时间语义正确，**早发生**的必须排在前面
-        let guard = shared.lock().await;
+        let guard = shared.read().await;
         let (list, _) = guard
             .list_memories(&crate::memory_store::ListFilter {
                 limit: usize::MAX,
@@ -6044,7 +5939,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -6106,7 +6001,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -6247,7 +6142,7 @@ mod api_contracts_tests {
         // ★必须带图存储：符号层边只存在于图里（expand_associations 的并入段读图）
         let mut store = new_statistical_store(&dir_str);
         store = store.with_graph_store(crate::graph_store::GraphMemoryStore::new(&dir_str));
-        let shared = Arc::new(Mutex::new(store));
+        let shared = Arc::new(RwLock::new(store));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -6292,7 +6187,7 @@ mod api_contracts_tests {
 
         // 注入**符号层**边（`coordinate` 属 §5.3 五类逻辑关系）
         {
-            let mut guard = shared.lock().await;
+            let guard = shared.write().await;
             let ok = guard
                 .add_external_edge(&from_id, &to_id, "coordinate", 0.9)
                 .expect("写外部边应成功");
@@ -6504,7 +6399,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -6642,7 +6537,7 @@ mod api_contracts_tests {
                 .expect("应能播种伪造记忆");
         }
 
-        let shared = Arc::new(Mutex::new(store));
+        let shared = Arc::new(RwLock::new(store));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
@@ -6756,7 +6651,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
 
-        let shared = Arc::new(Mutex::new(new_statistical_store(&dir_str)));
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));

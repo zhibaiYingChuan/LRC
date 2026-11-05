@@ -268,6 +268,8 @@ where
 {
     let active_ids = store
         .memory_state_machine
+        .read()
+        .unwrap()
         .active_ids(DISCOVERY_CONTEXT_ACTIVE_LIMIT);
     if active_ids.is_empty() {
         return None;
@@ -391,7 +393,7 @@ fn base_outcome(
 ///
 /// 返回：DiscoveryOutcome（含跳过原因，供可观测性）
 pub fn run_discovery_check<P>(
-    store: &mut MemoryStore<P>,
+    store: &MemoryStore<P>,
     drift: &DriftStateResponse,
 ) -> DiscoveryOutcome
 where
@@ -555,7 +557,7 @@ pub fn skipped_outcome(reason: &str) -> DiscoveryOutcome {
 /// 说明：`MemoryStore<P>` 对 `P` 泛型，而 HTTP 层只用 `JsonPersistence`。
 /// 单独提供一个非泛型入口可避免调用点到处写泛型参数。
 pub fn run_discovery_check_json(
-    store: &mut MemoryStore<JsonPersistence>,
+    store: &MemoryStore<JsonPersistence>,
     drift: &DriftStateResponse,
 ) -> DiscoveryOutcome {
     run_discovery_check(store, drift)
@@ -780,7 +782,7 @@ pub fn save_ledger(data_dir: &Path, ledger: &DiscoveryLedger) {
 ///   3. 步骤二：执行发现检查（**不因 D4 额度耗尽而跳过**，见下文注释）
 ///   4. 步骤三：按剩余额度裁剪展示，并把展示记入账本
 pub fn run_discovery_cycle(
-    store: &mut MemoryStore<JsonPersistence>,
+    store: &MemoryStore<JsonPersistence>,
     drift: &DriftStateResponse,
     data_dir: &Path,
 ) -> DiscoveryOutcome {
@@ -896,7 +898,7 @@ mod tests {
     /// 无漂移事件 → 不制造空检查（触发源强度为零时不该有任何动作）。
     #[test]
     fn no_drift_events_produces_no_candidates() {
-        let (_d, mut store) = make_store();
+        let (_d, store) = make_store();
         let drift = DriftStateResponse {
             last_drift: 0.0,
             drift_total: 0.0,
@@ -906,7 +908,7 @@ mod tests {
             active_palace: None,
             pending_events: vec![],
         };
-        let out = run_discovery_check(&mut store, &drift);
+        let out = run_discovery_check(&store, &drift);
         assert!(out.executed);
         assert_eq!(out.skip_reason.as_deref(), Some("no_drift_events"));
         assert!(out.candidates.is_empty());
@@ -958,7 +960,7 @@ mod tests {
     /// 若这里失败，说明发现通道会污染用户查询路径的活性偏置——D3 必然不成立。
     #[test]
     fn read_only_recall_does_not_touch_state_machine() {
-        let (_d, mut store) = make_store();
+        let (_d, store) = make_store();
         store
             .remember(Memory::new(
                 "离".to_string(),
@@ -970,11 +972,11 @@ mod tests {
             ))
             .expect("应成功记住");
 
-        let before = store.memory_state_machine.snapshot();
+        let before = store.memory_state_machine.read().unwrap().snapshot();
         let mut filter = RecallFilter::new();
         filter.read_only = true;
         let _ = store.recall("离", &filter).expect("只读检索应成功");
-        let after = store.memory_state_machine.snapshot();
+        let after = store.memory_state_machine.read().unwrap().snapshot();
 
         assert_eq!(
             format!("{:?}", before),
@@ -989,7 +991,7 @@ mod tests {
     /// （说明该场景下本来就不会写状态，测不出 read_only 的作用）。
     #[test]
     fn normal_recall_does_touch_state_machine_contrast() {
-        let (_d, mut store) = make_store();
+        let (_d, store) = make_store();
         store
             .remember(Memory::new(
                 "离".to_string(),
@@ -1001,11 +1003,11 @@ mod tests {
             ))
             .expect("应成功记住");
 
-        let before = store.memory_state_machine.snapshot();
+        let before = store.memory_state_machine.read().unwrap().snapshot();
         let _ = store
             .recall("离", &RecallFilter::new())
             .expect("检索应成功");
-        let after = store.memory_state_machine.snapshot();
+        let after = store.memory_state_machine.read().unwrap().snapshot();
 
         assert_ne!(
             format!("{:?}", before),
@@ -1066,11 +1068,11 @@ mod tests {
     /// 门控关闭时 run_discovery_cycle 必须直接跳过（默认关，绝不误开）。
     #[test]
     fn cycle_skips_when_gate_off() {
-        let (dir, mut store) = make_store();
+        let (dir, store) = make_store();
         let drift = drift_with("离", "坎", 0.5);
         // 门控默认关闭（除非外部显式设置环境变量）
         assert!(!active_discovery_enabled(), "测试前提：门控默认关");
-        let out = run_discovery_cycle(&mut store, &drift, dir.path());
+        let out = run_discovery_cycle(&store, &drift, dir.path());
         assert!(!out.executed);
         assert_eq!(out.skip_reason.as_deref(), Some("gate_off"));
         assert!(out.candidates.is_empty());
@@ -1087,7 +1089,7 @@ mod tests {
         // v0.9.11（G6 / CR-20）：本用例改 `LRC_ACTIVE_DISCOVERY`（进程级），
         // 须持全 crate 唯一 env 锁，避免与其它改环境变量的用例并发串扰。
         let _env_guard = crate::test_env::lock();
-        let (dir, mut store) = make_store();
+        let (dir, store) = make_store();
         // 预置一条"很久没看"的记忆，使之有机会成为候选
         let mut m = Memory::new(
             "离离状态相关的旧记忆内容".to_string(),
@@ -1103,7 +1105,7 @@ mod tests {
         let drift = drift_with("离", "坎", 0.9);
 
         // 额度充足时：记录基准产出
-        let baseline = run_discovery_check(&mut store, &drift);
+        let baseline = run_discovery_check(&store, &drift);
         // M9 门禁有效性：若基准产出为 0，则"额度耗尽不影响 produced"是**空洞成立**
         // （0 == 0），测不出耦合。必须先证明本构造确实能产出候选。
         assert!(
@@ -1119,7 +1121,7 @@ mod tests {
 
         // 门控在本测试内显式打开（避免依赖外部环境）
         std::env::set_var("LRC_ACTIVE_DISCOVERY", "1");
-        let capped = run_discovery_cycle(&mut store, &drift, dir.path());
+        let capped = run_discovery_cycle(&store, &drift, dir.path());
         std::env::remove_var("LRC_ACTIVE_DISCOVERY");
 
         assert!(
@@ -1157,7 +1159,7 @@ mod tests {
         let query = "今晚吃什么好呢";
 
         let build = || {
-            let (dir, mut store) = make_store();
+            let (dir, store) = make_store();
             for c in corpus {
                 store
                     .remember(Memory::new(
@@ -1198,7 +1200,7 @@ mod tests {
 
         // 组 B：先做一次真实主动发现检查（read_only），再跑同样的用户查询
         let drift = drift_with("离", "坎", 0.9);
-        let _ = run_discovery_check(&mut store_b, &drift);
+        let _ = run_discovery_check(&store_b, &drift);
         let sig_b = run_user_queries(&mut store_b);
 
         assert_eq!(
@@ -1219,13 +1221,27 @@ mod tests {
     /// （方案C 产出的语义文本）必须给出不同的候选集。
     #[test]
     fn trigger_source_must_change_candidates() {
-        let (_d, mut store) = make_store();
-        // 两类记忆分别呼应两个不同的触发源语义（取自方案C 的词典词）
+        let (_d, store) = make_store();
+        // 两类记忆分别呼应两个不同的触发源语义（取自方案C 的词典词）。
+        //
+        // ★ 2026-11-05（门③移除后修正）：八卦硬剪除移除后，候选集合由**词面**
+        //   决定，原 4 条语料被两个触发源同时覆盖 ⇒ 集合相同、仅排序不同，
+        //   构造有效性检验失败。现扩为"报错域 4 条 + 交流域 4 条 + 干扰 2 条"，
+        //   使两个触发源在**集合成员**上真正分化。
         for c in [
+            // 报错域（呼应坎：危险/困境/艰难）
             "排查线上报错：服务异常崩溃，需要看 traceback 定位失败原因",
-            "危险与困境：这条记录讲的是陷入低谷时的情绪",
-            "准备汇报材料：需要做数据分析与统计报告",
+            "错误日志分析：异常堆栈与失败原因定位",
+            "故障排查：服务崩溃与报错追踪",
+            "线上事故：异常与失败根因分析",
+            // 交流域（呼应兑：喜悦/交流/沟通）
             "沟通交流：会议讨论中如何表达与谈判",
+            "团队沟通：会议表达与协商技巧",
+            "交流技巧：讨论中的表达与倾听",
+            "谈判沟通：会议协商与表达方式",
+            // 干扰项
+            "准备汇报材料：需要做数据分析与统计报告",
+            "危险与困境：这条记录讲的是陷入低谷时的情绪",
         ] {
             let mut m = Memory::new(
                 c.to_string(),
@@ -1272,8 +1288,8 @@ mod tests {
         // build_context_query 返回 None，拼接退化，测不出淹没问题。
         let _ = store.recall("沟通交流 会议讨论", &RecallFilter::new());
 
-        let out_a = run_discovery_check(&mut store, &drift_a);
-        let out_b = run_discovery_check(&mut store, &drift_b);
+        let out_a = run_discovery_check(&store, &drift_a);
+        let out_b = run_discovery_check(&store, &drift_b);
         assert!(
             !out_a.produced.is_empty() && !out_b.produced.is_empty(),
             "构造有效性前提：两个触发源都必须产出候选（否则差异断言无意义）"
@@ -1313,7 +1329,7 @@ mod tests {
     /// 作为"为什么必须分路检索"的**证据留档**，防止有人把新实现改回拼接式。
     #[test]
     fn legacy_concatenated_query_drowns_short_signal() {
-        let (_d, mut store) = make_store();
+        let (_d, store) = make_store();
         for c in ["离相关的内容：今晚想吃火锅", "坎相关的内容：明天要去爬山"]
         {
             let mut m = Memory::new(

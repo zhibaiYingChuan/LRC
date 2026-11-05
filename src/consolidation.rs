@@ -37,31 +37,37 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::time::{interval, timeout, Duration};
 
-// 取锁上限走**单一真源**：此前这里是独立的 `from_secs(2)`，与 `timeouts::LOCK_WAIT`
-// 各自为政 ⇒ 真源调整后后台周期不会跟随（已知漂移缺陷，2026-10-15 修正）。
-const LOCK_DEADLINE: Duration = crate::timeouts::LOCK_WAIT;
 const EMBEDDING_TIMEOUT: Duration = Duration::from_secs(60);
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(60);
 const CYCLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-fn try_lock_with_deadline<P: Persistence>(
-    store: &Arc<Mutex<MemoryStore<P>>>,
-) -> Result<tokio::sync::MutexGuard<'_, MemoryStore<P>>, PersistenceError> {
-    let deadline = std::time::Instant::now() + LOCK_DEADLINE;
-    loop {
-        match store.try_lock() {
-            Ok(guard) => return Ok(guard),
-            Err(_) if std::time::Instant::now() >= deadline => {
-                return Err(PersistenceError::Io(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "获取结晶存储锁超时，待处理状态保留以便重试",
-                )))
-            }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+/// 在 async 上下文里安全执行"可能阻塞"的同步代码（S0.2，2026-11-03）。
+///
+/// 背景：`store.remember()` 内部会走跨进程写守卫 `acquire_process_write_guard`，
+/// 该守卫被占用时用 `std::thread::sleep` 自旋最长 5s。若在 async handler 里同步调用，
+/// 会占死 tokio worker（实测 CPU 0.00s、`/health` 被拖慢），并使其它任务的
+/// `lock().await` 长时间得不到轮询——这正是 S0.2「5 分钟降级」的候选机制。
+///
+/// 多线程运行时用 `block_in_place` 把当前 worker 让出来；单线程运行时（测试）直接执行，
+/// 避免 `block_in_place` 在 current_thread 上 panic。
+///
+/// **2026-11-03 回退说明**：实测在 264 条批量注入时出现挂起（65 条正常），
+/// 怀疑 `block_in_place` 与 `tokio::sync::MutexGuard` 跨阻塞段持有相互作用。
+/// 该修复暂不启用（保留函数供后续用 `spawn_blocking` 重构时复用），
+/// 结晶写回恢复为直接调用，优先保证写入不挂起。
+#[allow(dead_code)]
+fn run_blocking<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
         }
+        _ => f(),
     }
 }
 
@@ -257,7 +263,10 @@ pub struct ConsolidationPipeline<P: Persistence> {
     /// 配置参数
     config: ConsolidationConfig,
     /// FIX-007：改用 RwLock 避免 spawn_blocking + blocking_lock 竞争
-    store: Arc<Mutex<MemoryStore<P>>>,
+    ///
+    /// 并发模型：`RwLock` 让多个读请求并行（改造前为 `Mutex`，读也串行）。
+    /// ArcSwap 实验因全库快照过大而劣化，已回退到本类型。
+    store: Arc<RwLock<MemoryStore<P>>>,
     /// 洛书编码器（保留供未来直接编码使用）
     ///
     /// v0.9.7 核实：移除实验证明该 allow 非冗余（仍报 `field 'luoshu_encoder' is never read`）。
@@ -274,7 +283,7 @@ pub struct ConsolidationPipeline<P: Persistence> {
 
 impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     /// 创建新的结晶流水线
-    pub fn new(config: ConsolidationConfig, store: Arc<Mutex<MemoryStore<P>>>) -> Self {
+    pub fn new(config: ConsolidationConfig, store: Arc<RwLock<MemoryStore<P>>>) -> Self {
         Self {
             config,
             store,
@@ -292,7 +301,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     /// 本地模型不可用或 LLM 调用失败时自动降级到洛书合成。
     pub fn new_with_llm(
         config: ConsolidationConfig,
-        store: Arc<Mutex<MemoryStore<P>>>,
+        store: Arc<RwLock<MemoryStore<P>>>,
         llm_config: LlmApiConfig,
     ) -> Self {
         let has_llm = llm_config.is_configured();
@@ -395,16 +404,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 break;
             }
             let chunk_end = (chunk_start + PHASE1_CHUNK).min(surface_memories.len());
-            let mut store = match timeout(crate::timeouts::LOCK_WAIT, self.store.lock()).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    eprintln!(
-                        "[LRC·结晶] 写阶段等待存储锁超时，剩余 {} 条留待下轮",
-                        surface_memories.len() - chunk_start
-                    );
-                    break;
-                }
-            };
+            // 写阶段：持写锁完成本批写入（外层 `RwLock` 已恢复）。
+            let store = self.store.write().await;
 
             for sm in &surface_memories[chunk_start..chunk_end] {
                 if cancel.load(Ordering::Acquire) {
@@ -440,7 +441,10 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                     sm.user_id.clone(),
                 );
 
-                match store.remember(memory) {
+                // S0.2：remember 内部可能自旋跨进程写守卫（最长 5s）。
+                // 2026-11-03 回退：block_in_place 在批量注入时挂起，恢复直接调用。
+                let remember_result = store.remember(memory);
+                match remember_result {
                     Ok(_) => {
                         stats.stored += 1;
                         stats.encoded += 1; // remember 内部自动完成洛书编码
@@ -500,16 +504,14 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 //   （含数秒~数十秒的聚类计算）"导致的读接口 lock_busy。
                 let result =
                     tokio::task::spawn_blocking(move || -> Result<usize, PersistenceError> {
-                        // Phase 1：持锁读快照 + 临时设置阈值（快速）
-                        let (snapshot, old_threshold, old_similarity) = {
-                            let mut store = try_lock_with_deadline(&store_arc)?;
-                            let old_threshold = store.synthesis_min_cluster;
-                            let old_similarity = store.synthesis_similarity;
-                            store.synthesis_min_cluster = threshold;
-                            store.synthesis_similarity = similarity;
-                            let snapshot = store.synthesis_snapshot()?;
-                            (snapshot, old_threshold, old_similarity)
-                        }; // 锁在此释放
+                        // Phase 1：读快照（显式传入本轮阈值，不再临时改写全局配置）
+                        //
+                        // 读并发改造后，`synthesis_similarity` 为普通字段、无法经 `&self` 改写，
+                        //   故改用 `synthesis_snapshot_scoped` 显式传参 —— 语义等价
+                        //   （快照仍使用本轮 threshold/similarity），且不再需要"恢复"。
+                        let snapshot = store_arc
+                            .blocking_read()
+                            .synthesis_snapshot_scoped(None, None, threshold, similarity)?;
 
                         // Phase 2：锁外 CPU 密集计算（可取消）
                         let engine = SynthesisEngine::new(snapshot.config);
@@ -528,40 +530,17 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                             cancelled = jaccard_cancelled;
                         }
 
-                        // Phase 3：持锁写回 + 恢复阈值（快速）
-                        // v0.9.7 审查修复（HCSE-P0）：写回锁获取失败时绝不能直接
-                        // `?` 返回——否则 Phase 1 设置的临时阈值永不恢复，且下一轮
-                        // Phase 1 会把临时值当作 old_threshold 捕获，污染被永久固化。
-                        // 失败时降级为 blocking_lock 仅做恢复（该操作为纯内存赋值，毫秒级）。
-                        let synthesized = match try_lock_with_deadline(&store_arc) {
-                            Ok(mut store) => {
-                                store.synthesis_min_cluster = old_threshold;
-                                store.synthesis_similarity = old_similarity;
-                                if cancelled {
-                                    // 取消路径：阈值已恢复，丢弃**不完整计划**，
-                                    // 且返回 TimedOut 而非 Ok(0)——调用方的 Ok 分支会清除
-                                    // `synthesis_pending`，而"被取消"意味着本轮未完成，
-                                    // 必须保留待重试标记交由下轮重跑。
-                                    Err(PersistenceError::Io(std::io::Error::new(
-                                        std::io::ErrorKind::TimedOut,
-                                        "合成计算被协作式取消，待处理状态保留以便重试",
-                                    )))
-                                } else {
-                                    Ok(store.apply_synthesis_plan(plan))
-                                }
-                            }
-                            Err(e) => {
-                                // 恢复阈值是无毒化 Mutex 的纯内存赋值，blocking_lock
-                                // 仅可能因持锁者 panic 而阻塞（此处持锁方均正常释放）
-                                let mut store = store_arc.blocking_lock();
-                                store.synthesis_min_cluster = old_threshold;
-                                store.synthesis_similarity = old_similarity;
-                                drop(store);
-                                Err(e)
-                            }
-                        }?;
-
-                        Ok(synthesized)
+                        // Phase 3：写回（写者由外层 `RwLock` 写锁串行）
+                        if cancelled {
+                            // 取消路径：丢弃**不完整计划**，且返回 TimedOut 而非 Ok(0)
+                            // —— 调用方的 Ok 分支会清除 `synthesis_pending`，而"被取消"
+                            // 意味着本轮未完成，必须保留待重试标记交由下轮重跑。
+                            return Err(PersistenceError::Io(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "合成计算被协作式取消，待处理状态保留以便重试",
+                            )));
+                        }
+                        Ok(store_arc.blocking_write().apply_synthesis_plan(plan))
                     })
                     .await;
 
@@ -587,7 +566,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
         // 仅在完整成功时清除待合成标记；超时或失败必须保留以便下轮重试。
         if synthesis_completed {
-            let store = self.store.lock().await;
+            let store = self.store.write().await;
+            let _hold = crate::obs::HoldTimer::new("consolidate");
             store
                 .synthesis_pending
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -634,7 +614,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     async fn llm_synthesize_cycle(&self, llm_config: &LlmApiConfig) -> LrcResult<usize> {
         // ===== Phase 1：持锁加载记忆列表 + 取本地编码器句柄（均 <1ms） =====
         let (candidates, local_encoder): (Vec<(String, String)>, Arc<HybridLuoShuEncoder>) = {
-            let store = self.store.lock().await;
+            let store = self.store.read().await;
+            let _hold = crate::obs::HoldTimer::new("consolidate");
             let filter = ListFilter {
                 // 最近 300 条（默认按创建时间倒序）；见 LOCAL_SYNTH_MAX_CANDIDATES
                 limit: Self::synth_candidate_limit(),
@@ -778,7 +759,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
         // ===== Phase 3：持锁写入合成记忆 =====
         let written = {
-            let mut store = self.store.lock().await;
+            let store = self.store.write().await;
+            let _hold = crate::obs::HoldTimer::new("consolidate");
             let mut count = 0usize;
             // v0.9.11（G3 / CR-04）：一次读全库建索引，供"来源隐私继承"使用。
             // 合成摘要把多条来源的内容归纳进来 —— 必须在写入前算出继承后的可见性。
@@ -823,7 +805,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 memory.confidence = Some(0.85); // LLM 合成置信度
                 memory.resolution = "synthesized".to_string();
 
-                match store.remember(memory) {
+                let remember_result = store.remember(memory);
+                match remember_result {
                     Ok(_) => count += 1,
                     Err(e) => {
                         if self.config.verbose >= 1 {
@@ -929,7 +912,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     ) -> LrcResult<usize> {
         // ===== Phase 1：持锁加载记忆列表 =====
         let candidates: Vec<(String, String)> = {
-            let store = self.store.lock().await;
+            let store = self.store.read().await;
+            let _hold = crate::obs::HoldTimer::new("consolidate");
             let filter = ListFilter {
                 limit: 1000, // 加载足够多的记忆用于聚类
                 ..ListFilter::new()
@@ -1050,7 +1034,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
         // ===== Phase 3：持锁写入合成记忆 =====
         let written = {
-            let mut store = self.store.lock().await;
+            let store = self.store.write().await;
+            let _hold = crate::obs::HoldTimer::new("consolidate");
             let mut count = 0usize;
             // v0.9.11（G3 / CR-04）：同 LLM 合成路径 —— 派生记忆必须继承来源隐私
             let by_id: std::collections::HashMap<String, Memory> = store
@@ -1098,7 +1083,8 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 memory.confidence = Some(confidence);
                 memory.resolution = "synthesized".to_string();
 
-                match store.remember(memory) {
+                let remember_result = store.remember(memory);
+                match remember_result {
                     Ok(_) => count += 1,
                     Err(e) => {
                         if self.config.verbose >= 1 {
@@ -1280,51 +1266,76 @@ pub async fn run_consolidation_loop<P: Persistence + Send + 'static>(
     let run_on_start = pipeline.config.run_on_start;
 
     eprintln!(
-        "[LRC·结晶] 后台流水线已启动 (间隔={}s, 批大小={}, 阈值={})",
+        "{} [LRC·结晶] 后台流水线已启动 (间隔={}s, 批大小={}, 阈值={})",
+        crate::obs::ts(),
         pipeline.config.poll_interval_secs,
         pipeline.config.batch_size,
         pipeline.config.synthesis_threshold
     );
 
     // 启动时立即运行一次
-    if run_on_start {
+    //
+    // ★v0.9.16：同样先检查"是否有写入在等锁"。启动瞬间侧车往往立刻收到
+    // 一批记忆写入（桌面端启动流程），此时结晶抢锁没有意义。
+    if run_on_start && !crate::obs::write_waiting() {
         match pipeline.run_cycle(source.as_ref()).await {
             Ok(stats) => {
                 eprintln!(
-                    "[LRC·结晶] 初始周期完成: 处理 {} 条, 合成 {} 条",
-                    stats.stored, stats.synthesized
+                    "{} [LRC·结晶] 初始周期完成: 处理 {} 条, 合成 {} 条",
+                    crate::obs::ts(),
+                    stats.stored,
+                    stats.synthesized
                 );
             }
             Err(e) => {
-                eprintln!("[LRC·结晶] 初始周期失败: {}", e);
+                eprintln!("{} [LRC·结晶] 初始周期失败: {}", crate::obs::ts(), e);
             }
         }
     }
 
     let mut ticker = interval(poll_duration);
+    // ★v0.9.16：`interval` 默认是 `Burst`——一旦某轮超时（120s）超过周期（300s 之外的
+    //   短周期配置、或 tick 堆积），接下来会**连续补发**错过的 tick，即"失败后立即重试"。
+    //   而失败原因恰恰是"拿不到锁"，立即重试只会继续撞锁、把锁竞争放大。
+    //   改为 `Delay`：错过的 tick 合并为一拍，从本轮结束起重新计时。
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             // 检查关闭信号
             _ = shutdown_signal.changed() => {
                 if *shutdown_signal.borrow() {
-                    eprintln!("[LRC·结晶] 收到关闭信号，停止流水线");
+                    eprintln!("{} [LRC·结晶] 收到关闭信号，停止流水线", crate::obs::ts());
                     break;
                 }
             }
             // 定时触发
             _ = ticker.tick() => {
+                // ★v0.9.16（写优先）：有写入在排队等锁时，后台结晶**主动让行**。
+                //
+                // 结晶是纯后台的维护工作（合成 / 重分类），晚一轮没有任何正确性影响；
+                // 而它一旦抢到锁就是数十秒的 CPU 密集段，会把本可在毫秒级完成的写入
+                // 饿到超时（实测 `获取结晶存储锁超时` 20 次 / 周期超时 163 次）。
+                // `last_run` 不推进 ⇒ 下一拍仍会处理这批表层记忆，不丢数据。
+                if crate::obs::write_waiting() {
+                    eprintln!(
+                        "{} [LRC·结晶] 有写入在等锁，本轮让行（跳过，不推进 last_run）",
+                        crate::obs::ts()
+                    );
+                    continue;
+                }
                 match pipeline.run_cycle(source.as_ref()).await {
                     Ok(stats) => {
                         if pipeline.config.verbose >= 1 && stats.fetched > 0 {
                             eprintln!(
-                                "[LRC·结晶] 定时周期完成: 处理 {} 条",
+                                "{} [LRC·结晶] 定时周期完成: 处理 {} 条",
+                                crate::obs::ts(),
                                 stats.stored
                             );
                         }
                     }
                     Err(e) => {
-                        eprintln!("[LRC·结晶] 定时周期失败: {}", e);
+                        eprintln!("{} [LRC·结晶] 定时周期失败: {}", crate::obs::ts(), e);
                     }
                 }
             }
@@ -1333,8 +1344,11 @@ pub async fn run_consolidation_loop<P: Persistence + Send + 'static>(
 
     // 停止前输出累积统计
     eprintln!(
-        "[LRC·结晶] 流水线已停止。累积统计: 拉取={}, 存储={}, 合成={}",
-        pipeline.total_stats.fetched, pipeline.total_stats.stored, pipeline.total_stats.synthesized
+        "{} [LRC·结晶] 流水线已停止。累积统计: 拉取={}, 存储={}, 合成={}",
+        crate::obs::ts(),
+        pipeline.total_stats.fetched,
+        pipeline.total_stats.stored,
+        pipeline.total_stats.synthesized
     );
 }
 
@@ -1357,7 +1371,7 @@ mod tests {
 
     /// 创建测试用结晶流水线
     fn make_pipeline(
-        store: Arc<Mutex<MemoryStore<JsonPersistence>>>,
+        store: Arc<RwLock<MemoryStore<JsonPersistence>>>,
     ) -> ConsolidationPipeline<JsonPersistence> {
         let config = ConsolidationConfig {
             poll_interval_secs: 3600, // 测试中用不到
@@ -1375,7 +1389,7 @@ mod tests {
     #[tokio::test]
     async fn test_consolidation_cycle_basic() {
         let (_dir, store) = make_store();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(RwLock::new(store));
         let mut pipeline = make_pipeline(store.clone());
 
         let source = InMemorySource::new(
@@ -1412,7 +1426,7 @@ mod tests {
         assert_eq!(stats.failed, 0);
 
         // 验证记忆已存储（不含合成记忆）
-        let store = store.lock().await;
+        let store = store.read().await;
         let all = store
             .list_memories(&crate::memory_store::ListFilter::new())
             .unwrap();
@@ -1433,7 +1447,7 @@ mod tests {
     #[tokio::test]
     async fn test_consolidation_triggers_synthesis() {
         let (_dir, store) = make_store();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(RwLock::new(store));
         let mut pipeline = make_pipeline(store.clone());
 
         // 准备 3 条关于数据库的相似记忆（应触发合成）
@@ -1462,7 +1476,7 @@ mod tests {
         assert_eq!(stats.stored, 3);
 
         // 应触发了合成（3 条相似 PostgresSQL 记忆）
-        let store = store.lock().await;
+        let store = store.read().await;
         let all = store
             .list_memories(&crate::memory_store::ListFilter::new())
             .unwrap();
@@ -1552,7 +1566,7 @@ mod tests {
     #[test]
     fn test_cluster_by_embedding() {
         let (_dir, store) = make_store();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(RwLock::new(store));
         let pipeline = make_pipeline(store);
 
         // 构造两组语义相似的 embedding：
@@ -1589,7 +1603,7 @@ mod tests {
     #[test]
     fn test_average_pairwise_similarity() {
         let (_dir, store) = make_store();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(RwLock::new(store));
         let pipeline = make_pipeline(store);
 
         let embeddings: Vec<Vec<f32>> = vec![
@@ -1632,7 +1646,7 @@ mod tests {
     #[tokio::test]
     async fn test_llm_not_configured_fallback_to_luoshu() {
         let (_dir, store) = make_store();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(RwLock::new(store));
 
         // 使用 new（不传 LLM 配置）创建 pipeline
         let config = ConsolidationConfig {
@@ -1704,7 +1718,7 @@ mod tests {
     #[test]
     fn test_new_with_llm_none_config() {
         let (_dir, store) = make_store();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(RwLock::new(store));
 
         let config = ConsolidationConfig::default();
         let pipeline = ConsolidationPipeline::new_with_llm(
@@ -1871,7 +1885,7 @@ mod tests {
 
         let dir = TempDir::new().expect("临时目录");
         let p = create_json_persistence(dir.path().to_str().unwrap()).expect("持久化创建失败");
-        let store = Arc::new(Mutex::new(MemoryStore::new_with_encoder(p, encoder)));
+        let store = Arc::new(RwLock::new(MemoryStore::new_with_encoder(p, encoder)));
 
         let config = ConsolidationConfig {
             poll_interval_secs: 3600,
@@ -1926,7 +1940,7 @@ mod tests {
             stats.synthesized
         );
 
-        let store = store.lock().await;
+        let store = store.read().await;
         let (all, _) = store.list_memories(&ListFilter::new()).expect("列出记忆");
         assert!(
             all.iter().any(|m| m.memory_type == MemoryType::Synthesis

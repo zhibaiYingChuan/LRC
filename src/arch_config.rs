@@ -215,10 +215,13 @@ impl ArchConfig {
         store: &mut crate::memory_store::MemoryStore<P>,
     ) {
         // 衰减曲线
-        store.decay_config = self.decay.clone();
+        *store.decay_config.write().unwrap() = self.decay.clone();
 
         // 合成参数
-        store.synthesis_min_cluster = self.synthesis.min_cluster;
+        store.synthesis_min_cluster.store(
+            self.synthesis.min_cluster,
+            std::sync::atomic::Ordering::Release,
+        );
         store.synthesis_similarity = self.synthesis.similarity_threshold;
     }
 }
@@ -292,8 +295,13 @@ mod tests {
         };
 
         config.apply_to_store(&mut store);
-        assert_eq!(store.decay_config.decay_rate, 0.15);
-        assert_eq!(store.synthesis_min_cluster, 5);
+        assert_eq!(store.decay_config.read().unwrap().decay_rate, 0.15);
+        assert_eq!(
+            store
+                .synthesis_min_cluster
+                .load(std::sync::atomic::Ordering::Acquire),
+            5
+        );
         assert_eq!(store.synthesis_similarity, 0.6);
     }
 }

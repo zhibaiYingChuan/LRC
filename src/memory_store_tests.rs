@@ -26,6 +26,53 @@ mod tests {
         (dir, MemoryStore::new(p))
     }
 
+    /// A+B+D 接入验证：store 在**构造期**用存量语料定型 IDF 表。
+    ///
+    /// 判据（结构性质，不测语义）：
+    /// 1) 存量库非空时，store 的编码器与"无 IDF 的新编码器"对同一文本编码不同；
+    /// 2) `rebuild_encoder_idf` 返回参与统计的条数。
+    #[test]
+    fn store_builds_encoder_idf_from_existing_corpus() {
+        use crate::engine::luoshu_encoder::LuoShuEncoder;
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = create_json_persistence(&data_dir).expect("应成功创建");
+        let store = MemoryStore::new(p);
+
+        let bases = [
+            "数据库连接池参数调优：最大连接数与空闲超时设置",
+            "西湖边散步，看晚霞映在湖面上，风很轻",
+            "Rust 所有权与借用检查器：生命周期与可变借用冲突",
+            "比特币协议中的工作量证明与全网难度调整机制",
+            "会议室预定：周三下午三点，需要投影仪",
+        ];
+        let mems: Vec<Memory> = (0..20)
+            .map(|i| {
+                make_test_memory(
+                    &format!("{}（样本 {}）", bases[i % bases.len()], i),
+                    MemoryType::Fact,
+                )
+            })
+            .collect();
+        store.remember_batch(mems).expect("批量写入应成功");
+
+        // 用同一份持久层重建 store：构造期应读到存量语料并定型 IDF
+        let p2 = create_json_persistence(&data_dir).expect("应成功创建");
+        let store2 = MemoryStore::new(p2);
+        let sample = "数据库连接池参数调优：最大连接数与空闲超时设置（样本 0）";
+        let with_idf = store2.luoshu_encoder.encode_text(sample);
+        let without_idf = LuoShuEncoder::new().encode_text(sample);
+        assert!(
+            with_idf
+                .values
+                .iter()
+                .zip(without_idf.values.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6),
+            "存量库非空时，store 编码器应已注入 IDF（与无 IDF 编码器不同）"
+        );
+        assert_eq!(store2.rebuild_encoder_idf(), 20, "重建应覆盖全部 20 条");
+    }
+
     /// ★CR-42：**别的进程写入后，本进程必须能看到**（不能无限期读陈旧缓存）。
     ///
     /// 模拟方式：绕过 store 的缓存与失效机制，**直接改磁盘上的 `memories.json`
@@ -37,7 +84,7 @@ mod tests {
     #[test]
     fn cache_sees_writes_made_by_another_process() {
         use crate::persistence::Persistence;
-        let (dir, mut store) = make_store();
+        let (dir, store) = make_store();
         store
             .remember(make_test_memory("本进程写入", MemoryType::Fact))
             .expect("写入应成功");
@@ -73,7 +120,7 @@ mod tests {
     #[test]
     fn recall_finds_memory_written_by_another_process() {
         use crate::persistence::Persistence;
-        let (dir, mut store) = make_store();
+        let (dir, store) = make_store();
         store
             .remember(make_test_memory("本进程的旧记忆", MemoryType::Fact))
             .expect("写入应成功");
@@ -127,7 +174,7 @@ mod tests {
     /// 用户看不到任何错误，而所有依赖图的能力（多跳/关系统计）都静默失效。
     #[test]
     fn test_expand_associations_writes_record_edges_to_graph() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let ev = "ev-graph-write";
         let a = store
             .remember(
@@ -150,12 +197,15 @@ mod tests {
         let out = store
             .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 8)
             .expect("联想补全应成功");
+        // ★ 2026-11-05：图写入已改为延后副作用，需显式 flush 后才可见。
+        store.flush_recall_side_effects();
         assert!(
             out.iter().any(|x| x.memory_id == b.id),
             "前提：应先产出 same_event 关联"
         );
 
-        let edges = store.graph_store_ref().expect("图应已启用").all_edges();
+        let graph_guard = store.graph_store_ref().expect("图应已启用");
+        let edges = graph_guard.all_edges();
         assert!(
             edges.iter().any(|e| {
                 (e.source_id == a.id || e.target_id == a.id)
@@ -190,7 +240,7 @@ mod tests {
     /// 的新增写入"，用**预先在图里的符号层边**做对照：它必须保持原样（不被重写）。
     #[test]
     fn test_graph_write_back_is_record_layer_only() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory(
                 "周末去杭州看桂花，满城都是香味",
@@ -290,7 +340,7 @@ mod tests {
     /// 多跳遍历时同一节点被反复展开，路径数指数膨胀。
     #[test]
     fn test_symmetric_relation_edges_are_deduplicated() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let ev = "ev-sym";
         // ★内容必须**不相似**：`remember` 会在相似度 ≥ 0.5 时合并为同一条记忆，
         //   若两条内容相近（如"行程记录甲/乙"），会被合并 ⇒ 只剩一条 ⇒ 无边可测。
@@ -316,6 +366,8 @@ mod tests {
         store
             .expand_associations(std::slice::from_ref(&b.id), &RecallFilter::new(), 8)
             .expect("应成功");
+        // ★ 2026-11-05：图写入已改为延后副作用，需显式 flush 后才可见。
+        store.flush_recall_side_effects();
 
         let g = store.graph_store_ref().expect("图应已启用");
         let same_event_edges: Vec<_> = g
@@ -392,7 +444,7 @@ mod tests {
     /// 而重启后边全丢——只断言返回值会让这类失效完全不可见。
     #[test]
     fn test_add_external_edge_writes_to_graph() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory(
                 "道体结构算子产出候选关系",
@@ -413,7 +465,8 @@ mod tests {
         assert!(added, "首次写入应返回 true");
 
         // 落盘证据：不信任返回值，直接查图
-        let edges = store.graph_store_ref().expect("图应已启用").all_edges();
+        let graph_guard = store.graph_store_ref().expect("图应已启用");
+        let edges = graph_guard.all_edges();
         let hit: Vec<_> = edges
             .iter()
             .filter(|e| e.edge_type == crate::graph_store::EdgeType::Coordinate)
@@ -424,6 +477,8 @@ mod tests {
             "权重应保留传入值 0.7，实际 {}",
             hit[0].weight
         );
+        // 释放图读锁，后续需要可变借用 store 再写一次边
+        drop(graph_guard);
 
         // 幂等：再写一次不应新增
         let again = store
@@ -444,7 +499,7 @@ mod tests {
     /// 未来新增一种拒绝原因时容易漏改其中一处。
     #[test]
     fn test_add_external_edge_rejects_invalid() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory(
                 "校验用例甲：结构算子候选",
@@ -511,7 +566,7 @@ mod tests {
         .iter()
         .enumerate()
         {
-            let (d2, mut s2) = make_store_with_graph();
+            let (d2, s2) = make_store_with_graph();
             let _ = i;
             let x = s2
                 .remember(make_test_memory(
@@ -674,7 +729,7 @@ mod tests {
     /// ★v0.9.8：有向外部边**不得**被对称化（`temporal` 的方向即语义）
     #[test]
     fn test_add_external_edge_keeps_direction_for_directed() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory(
                 "方向用例甲：先做的事",
@@ -692,7 +747,8 @@ mod tests {
         assert!(store
             .add_external_edge(&a.id, &b.id, "TEMPORAL", 0.6)
             .expect("写入应成功"));
-        let edges = store.graph_store_ref().unwrap().all_edges();
+        let graph_guard = store.graph_store_ref().unwrap();
+        let edges = graph_guard.all_edges();
         assert_eq!(edges.len(), 1);
         assert_eq!(
             (&edges[0].source_id, &edges[0].target_id),
@@ -723,7 +779,7 @@ mod tests {
     /// `query_stored_edges`——后者过了也证明不了检索能看到边。
     #[test]
     fn test_expand_associations_reads_stored_edges() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         // 两条记忆**无任何记录层关联**（无 event_id / 无共享实体 / 无共同字词）
         // ⇒ 若联想结果出现乙，只可能来自图上的落盘边
         let a = store
@@ -896,7 +952,7 @@ mod tests {
     #[test]
     fn test_expand_associations_stored_edges_respect_privacy() {
         use crate::memory_types::PrivacyLevel;
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory("甲：公开记忆", MemoryType::Fact))
             .expect("写入应成功");
@@ -955,7 +1011,7 @@ mod tests {
     /// **在库里根本不存在的 memory_id**——调用方后续取内容必然失败。
     #[test]
     fn test_expand_associations_skips_dangling_stored_edges() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory("甲：仍在库中", MemoryType::Fact))
             .expect("写入应成功");
@@ -979,7 +1035,7 @@ mod tests {
         let p = create_json_persistence(&data_dir).expect("应成功创建");
         let mut graph = crate::graph_store::GraphMemoryStore::new(&data_dir);
         graph.load().expect("加载应成功");
-        let mut store2 = MemoryStore::new(p).with_graph_store(graph);
+        let store2 = MemoryStore::new(p).with_graph_store(graph);
 
         let assoc = store2
             .expand_associations(std::slice::from_ref(&a.id), &RecallFilter::new(), 5)
@@ -1019,7 +1075,7 @@ mod tests {
 
         // 建两条边：一条以 a 为源、一条以 a 为目标（两种方向都要被清）
         {
-            let graph = store.graph_store_mut_for_test().expect("应启用图存储");
+            let mut graph = store.graph_store_mut_for_test().expect("应启用图存储");
             graph
                 .add_edges_batch(&[
                     (
@@ -1089,7 +1145,7 @@ mod tests {
             ))
             .expect("写入应成功");
         {
-            let graph = store.graph_store_mut_for_test().expect("应启用图存储");
+            let mut graph = store.graph_store_mut_for_test().expect("应启用图存储");
             graph
                 .add_edges_batch(&[(
                     a.id.clone(),
@@ -1124,7 +1180,7 @@ mod tests {
     /// 只测写入会漏掉"写进去了但读不出"这一整类失效。
     #[test]
     fn test_query_stored_edges_reads_external_edges() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory(
                 "读取用例甲：写入的边要能读出",
@@ -1174,7 +1230,7 @@ mod tests {
     /// （如只过滤根、漏了对端），返回值仍可能"看起来正常"。
     #[test]
     fn test_query_stored_edges_excludes_expired_memories() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory(
                 "过期用例甲：根记忆仍然有效",
@@ -1257,7 +1313,7 @@ mod tests {
     #[test]
     fn test_query_stored_edges_respects_privacy_context() {
         use crate::memory_types::{Memory, PrivacyLevel};
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory("隐私用例甲：公开可见", MemoryType::Fact))
             .expect("写入应成功");
@@ -1322,7 +1378,7 @@ mod tests {
     /// ⇒ **测不出**饿死。故必须造一个"记录层候选很多"的场景。
     #[test]
     fn test_symbolic_edges_get_reserved_seat_under_quota_pressure() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let ev = "ev-g5a-quota";
         // 造一个关联密集的簇（同一 event_id ⇒ 记录层会产出大量 1 跳候选）
         let seed = store
@@ -1397,7 +1453,7 @@ mod tests {
     /// 故必须锁定"没有落盘边 ⇒ 配额不压缩 ⇒ 行为与改动前一致"。
     #[test]
     fn test_no_seat_reserved_when_no_graph_edges() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let ev = "ev-g5a-noseat";
         let seed = store
             .remember(
@@ -1450,7 +1506,7 @@ mod tests {
     ///（`exclude` 即 seed_ids 全体）⇒ 该边物理上不可能被并入。
     #[test]
     fn test_unreadable_symbolic_edge_must_not_reserve_seat() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let ev = "ev-review2-unreadable";
         // 造一个关联密集的簇（记录层能填满配额 3）
         let seed = store
@@ -1522,7 +1578,7 @@ mod tests {
     /// 修法：`record_cap = max_out.saturating_sub(1).max(1)`。
     #[test]
     fn test_max_out_one_still_yields_record_layer() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let ev = "ev-review5-starve";
         let seed = store
             .remember(
@@ -1568,7 +1624,7 @@ mod tests {
     /// 会**拿到全部边并以为过滤生效**——错误被结果掩盖，是最难发现的一类。
     #[test]
     fn test_query_stored_edges_filter_semantics() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory(
                 "过滤用例甲：类型名打错不该拿到全部",
@@ -1615,7 +1671,7 @@ mod tests {
     /// ★v0.9.8：多跳遍历 + γ 衰减 + hops 上限 3
     #[test]
     fn test_query_stored_edges_multihop_and_clamp() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         // 三段链：a -coordinate- b -cause- c（有向：b 引发 c）
         let a = store
             .remember(make_test_memory("多跳用例甲：链的起点", MemoryType::Fact))
@@ -1772,7 +1828,7 @@ mod tests {
     /// 而不可达 ⇒ 多跳 + 过滤组合下静默丢结果。
     #[test]
     fn test_query_stored_edges_filter_does_not_block_traversal() {
-        let (_dir, mut store) = make_store_with_graph();
+        let (_dir, store) = make_store_with_graph();
         let a = store
             .remember(make_test_memory("过滤遍历用例甲：起点", MemoryType::Fact))
             .expect("写入应成功");
@@ -1867,7 +1923,7 @@ mod tests {
         let _env_guard = crate::test_env::lock();
         // 关掉相似合并（阈值 1.0），保证条数可精确断言
         std::env::set_var("LRC_SIMILARITY_THRESHOLD", "1.0");
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         for (uid, proj) in [("u-a", "proj-a"), ("u-b", "proj-a"), ("u-c", "proj-c")] {
             for i in 0..3 {
                 let mut m =
@@ -1923,7 +1979,7 @@ mod tests {
         use crate::engine::synthesis_engine::SynthesisPlan;
         use crate::memory_types::{Importance, PrivacyLevel};
 
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let uid = "u-synth-1";
 
         let mut ids = Vec::new();
@@ -1998,7 +2054,7 @@ mod tests {
     #[test]
     fn test_memory_event_fields_roundtrip_persistence() {
         // 记录层核心：event_id / entities 必须能落盘并读回（不丢字段）
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let m = make_test_memory("周五和家人去吃潮汕牛肉火锅", MemoryType::Experience)
             .with_event(Some("ev-2026-0911-dinner".to_string()))
             .with_entities(vec![
@@ -2044,7 +2100,7 @@ mod tests {
     #[test]
     fn test_memories_by_event_finds_same_experience() {
         // **共同经历联想的判据**：同 event_id 的多条记忆应能被反查出来
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let ev = "ev-0911-walk";
         let a = store
             .remember(
@@ -2089,7 +2145,7 @@ mod tests {
     #[test]
     fn test_associations_scoped_no_cross_user_leak() {
         use crate::memory_types::PrivacyLevel;
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // alice 与 bob 共享同一 `event_id` ⇒ 二者之间存在 same_event 关联
         let alice = store
@@ -2153,7 +2209,7 @@ mod tests {
     fn test_associations_multi_type_coexist() {
         // **联想判据：多类型关联并存** —— 同一条记忆同时产出
         // same_event（共同经历）与 shared_entity（共享实体），二者不被压成单一分数
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use crate::memory_types::{EntityKind, EventEntity};
 
         // 锚点：一次吃饭经历
@@ -2223,7 +2279,7 @@ mod tests {
     /// 避免用户把"过滤后的稀疏结果"误读为"没有关联"。
     #[test]
     fn test_hub_entity_filtered_from_shared_entity() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use crate::memory_types::{EntityKind, EventEntity};
 
         // 构造 6 条记忆，全部带泛化实体「项目」（df=6/6=100% ⇒ hub）
@@ -2305,7 +2361,7 @@ mod tests {
     /// 占比 67% 会被误判为 hub，导致小库关联被清空。
     #[test]
     fn test_hub_filter_does_not_misfire_in_tiny_store() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use crate::memory_types::{EntityKind, EventEntity};
 
         // 仅 3 条记忆，2 条共享「小美」（df=2/3=67% 占比高，但绝对频次 2 < 5）
@@ -2341,7 +2397,7 @@ mod tests {
     fn test_merge_preserves_event_dimension() {
         // **关键陷阱**：相似内容合并时，事件维度不能被静默丢弃
         // （若丢弃，同一次经历的记忆会失去 event_id，"共同经历"信息永久丢失）
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use crate::memory_types::{EntityKind, EventEntity};
 
         let first = store
@@ -2379,7 +2435,7 @@ mod tests {
     #[test]
     fn test_associations_empty_for_isolated_memory() {
         // 无事件维度、无共享实体的孤立记忆 ⇒ 关联应为空（不产生虚假关联）
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let m = store
             .remember(make_test_memory("一条完全孤立的记忆", MemoryType::Fact))
             .expect("应写入成功");
@@ -2400,7 +2456,7 @@ mod tests {
     /// 正例：同项目 + 时间分散（跨度/条数 ≥60s）⇒ 推断为"同一次经历"
     #[test]
     fn test_auto_event_infers_from_temporal_cooccurrence() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use chrono::TimeZone;
 
         // 固定基准时刻：不依赖"当前时间"，保证可复现
@@ -2410,7 +2466,7 @@ mod tests {
         // 用块作用域释放闭包对 `&mut store` 的借用
         // （不用 `drop(add)`：闭包不实现 Drop，clippy::drop_non_drop 会拒绝）
         let (a, b, c, d) = {
-            let mut add = |content: &str, offset: i64| {
+            let add = |content: &str, offset: i64| {
                 let mut m = make_test_memory(content, MemoryType::Experience);
                 m.project = Some("proj-auto-positive".to_string());
                 m.created_at = base + Duration::seconds(offset);
@@ -2487,7 +2543,7 @@ mod tests {
     /// 结果必须相反。若无此对照，"有产出"可能来自任何别的原因。
     #[test]
     fn test_auto_event_excludes_batch_written_bucket() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use chrono::TimeZone;
 
         let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
@@ -2497,7 +2553,7 @@ mod tests {
         //   相似合并压成一条（桶内不足 2 条 ⇒ 测试变"假绿"）。
         //   本测试的鉴别力依赖"3 条独立记忆处于同一秒"，故必须先保证它们独立。
         let (a, b, c) = {
-            let mut add = |content: &str| {
+            let add = |content: &str| {
                 let mut m = make_test_memory(content, MemoryType::Fact);
                 m.project = Some("proj-auto-batch".to_string());
                 m.created_at = base;
@@ -2531,12 +2587,12 @@ mod tests {
     /// 否则用户会看到两条依据强度不同的边指向同一条记忆，无法判断该信哪个。
     #[test]
     fn test_auto_event_deduped_by_manual_event_id() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use chrono::TimeZone;
 
         let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         let a = {
-            let mut add = |content: &str, offset: i64| {
+            let add = |content: &str, offset: i64| {
                 let mut m = make_test_memory(content, MemoryType::Experience)
                     .with_event(Some("ev-shared".to_string()));
                 m.project = Some("proj-auto-dedup".to_string());
@@ -2576,7 +2632,7 @@ mod tests {
     /// 这正是道体式的"结构化推理"，与语义相似度无关。
     #[test]
     fn test_association_graph_yields_indirect_link() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use crate::memory_types::{EntityKind, EventEntity};
 
         // A 与 B：同一次经历（event_id=e-meal），但**无共享实体**
@@ -2677,7 +2733,7 @@ mod tests {
     /// 且"直接关联"会被"间接关联"重复表达（降低可读性）。
     #[test]
     fn test_association_graph_excludes_self_loops_and_redundant_indirect() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 三条**同一次经历**：任意两条都直接相连 ⇒ 不应产生任何间接边
         let mut ids = Vec::new();
@@ -2732,7 +2788,7 @@ mod tests {
     /// 否则用户会把"被截断的图"误认为"完整的图"。
     #[test]
     fn test_association_graph_marks_truncation() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 同一个 event_id 下放 5 条，用 max_nodes=3 构图 ⇒ 必须截断
         let mut ids = Vec::new();
@@ -2770,7 +2826,7 @@ mod tests {
     /// 关联图：不存在记忆 ⇒ 空图而非错误（异常路径不打断调用方）
     #[test]
     fn test_association_graph_unknown_root_returns_empty() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         store
             .remember(make_test_memory("一条普通的记忆", MemoryType::Fact))
             .expect("应写入成功");
@@ -2792,7 +2848,7 @@ mod tests {
     /// 两者都是必须立刻查清的问题（承方法论 91：反直觉先查实现）。
     #[test]
     fn test_graph_same_event_does_not_yield_indirect_edges() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 4 条同一经历：两两直接相连 ⇒ 不可能有 same_event→same_event 的间接边
         let mut ids = Vec::new();
@@ -2845,7 +2901,7 @@ mod tests {
     /// 使调用方能区分"共同经历传递"与"经由同一实体桥接"（二者含义不同）。
     #[test]
     fn test_indirect_edge_explains_actual_entity_and_path_type() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use crate::memory_types::{EntityKind, EventEntity};
 
         // A、B 同经历；B、C 共享具体产物实体「commands.rs」
@@ -2924,7 +2980,7 @@ mod tests {
     /// 本测试构造同样的结构：实体在 A 项目内高度泛化，但被 B 项目稀释。
     #[test]
     fn test_hub_uses_project_scoped_denominator() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use crate::memory_types::{EntityKind, EventEntity};
 
         // A 项目 6 条：其中 5 条带「app.js」（df/项目 = 5/6 = 83% ⇒ hub）
@@ -2991,7 +3047,7 @@ mod tests {
     /// 本测试固化"联想确实进入检索出口"这一行为。
     #[test]
     fn test_expand_associations_surfaces_unsimilar_same_event_memory() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let ev = "trip-hangzhou-2026-09";
         let a = store
             .remember(
@@ -3048,7 +3104,7 @@ mod tests {
     /// 已在结果中的记忆不得重复补入（否则是重复而非联想）
     #[test]
     fn test_expand_associations_excludes_already_recalled() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let ev = "ev-dedup";
         let a = store
             .remember(
@@ -3087,13 +3143,13 @@ mod tests {
     /// 若改回"一个起点取完再下一个"，本测试立即失败。
     #[test]
     fn test_expand_associations_rotates_across_seeds() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use chrono::TimeZone;
 
         let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         // 大桶：seed_big 所在项目 + 时间分散 ⇒ 3 个同伴
         let (seed_big, seed_small, small_peer) = {
-            let mut add = |content: &str, proj: &str, offset: i64| {
+            let add = |content: &str, proj: &str, offset: i64| {
                 let mut m = make_test_memory(content, MemoryType::Experience);
                 m.project = Some(proj.to_string());
                 m.created_at = base + Duration::seconds(offset);
@@ -3144,7 +3200,7 @@ mod tests {
     /// 覆盖面损失 4.1 倍（global：93 条 2.07% → 383 条 8.54%）。
     #[test]
     fn test_associations_source_link_is_bidirectional() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         // 两条来源记忆
         let src1 = store
             .remember(make_test_memory(
@@ -3200,7 +3256,7 @@ mod tests {
     /// 会产生海量假关联。本测试与上一测试构成对照，鉴别该规则是否精确。
     #[test]
     fn test_crystallized_into_not_emitted_without_real_source_link() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let lone = store
             .remember(make_test_memory(
                 "一条与任何合成都无关的独立记录",
@@ -3226,7 +3282,7 @@ mod tests {
     /// 只在极少数手动修正的记忆上生效（全库仅 15 条）。
     #[test]
     fn test_merge_archives_old_version() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         // 同主题两条 ⇒ 触发相似合并；内容不同 ⇒ 必须留痕
         let a = store
             .remember(make_test_memory(
@@ -3273,7 +3329,7 @@ mod tests {
     /// 重复填满，真正有信息量的旧版本反而被挤出"最近 5 版"之外。
     #[test]
     fn test_merge_does_not_version_on_identical_content() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let text = "配置项 LRC_TIMEOUT 默认 15 秒";
         let a = store
             .remember(make_test_memory(text, MemoryType::Fact))
@@ -3305,13 +3361,13 @@ mod tests {
     /// 若改回"按类型顺序取完再取下一类"，本测试立即失败。
     #[test]
     fn test_expand_associations_covers_multiple_relation_dimensions() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use chrono::TimeZone;
 
         let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         // 起点所在项目 + 时间分散 ⇒ 产出多条 same_event_auto（同类多候选）
         let seed = {
-            let mut add = |content: &str, proj: &str, offset: i64| {
+            let add = |content: &str, proj: &str, offset: i64| {
                 let mut m = make_test_memory(content, MemoryType::Experience);
                 m.project = Some(proj.to_string());
                 m.created_at = base + Duration::seconds(offset);
@@ -3361,7 +3417,7 @@ mod tests {
     /// 用户在检索时就能看到本不该看到的 Session 级记忆。
     #[test]
     fn test_expand_associations_respects_privacy_filter() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         use crate::memory_types::PrivacyLevel;
         let ev = "ev-privacy";
 
@@ -3424,7 +3480,7 @@ mod tests {
     /// P7 零伤害承诺：`read_only` 检索不得做任何联想补全
     #[test]
     fn test_expand_associations_skipped_when_read_only() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let ev = "ev-readonly";
         let a = store
             .remember(
@@ -3455,7 +3511,7 @@ mod tests {
     /// 无任何记录（无 event_id / entities / source_ids）时不得产出假联想
     #[test]
     fn test_expand_associations_without_records_yields_nothing() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let a = store
             .remember(make_test_memory("第一条无记录的记忆", MemoryType::Fact))
             .expect("写入应成功");
@@ -3476,7 +3532,7 @@ mod tests {
     /// 联想补全必须遵守 `max_out` 上限（防大簇淹没主结果）
     #[test]
     fn test_expand_associations_respects_max_out() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let ev = "ev-big";
         let a = store
             .remember(
@@ -3535,7 +3591,7 @@ mod tests {
     /// 若 `path` 长度与 `hops` 不一致，则说明二者口径漂移。
     #[test]
     fn test_expand_associations_produces_two_hop_indirect() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         // 构造 A(起点) —B(中间)— C(两跳终点)：
         //   A 与 B 共同经历（ev1）
         //   B 与 C 共享实体（entity）
@@ -3620,7 +3676,7 @@ mod tests {
     /// 使"改动前行为逐字节一致"成为可验证的契约而非口头承诺。
     #[test]
     fn test_expand_associations_two_hop_never_squeezes_one_hop() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let ev = "ev-squeeze";
         let a = store
             .remember(
@@ -3673,7 +3729,7 @@ mod tests {
 
     #[test]
     fn test_recall_with_cancel_stops_before_work() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let cancel = std::sync::atomic::AtomicBool::new(true);
         let result = store.recall_with_cancel("取消查询", &RecallFilter::new(), Some(&cancel));
         assert!(matches!(
@@ -3684,7 +3740,7 @@ mod tests {
 
     #[test]
     fn test_trapezoid_recall_with_cancel_stops_before_work() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let cancel = std::sync::atomic::AtomicBool::new(true);
         let result = store.trapezoid_focus_recall_with_cancel(
             "取消查询",
@@ -3700,7 +3756,7 @@ mod tests {
 
     #[test]
     fn test_remember_and_recall() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         let m = make_test_memory("用户偏好使用 pnpm 作为包管理器", MemoryType::Preference);
         let saved = store.remember(m).expect("应成功记住");
@@ -3751,7 +3807,7 @@ mod tests {
     /// v8 检索质量修复：混合语言 query 能整词匹配英文标识符，top1 返回正确记忆
     #[test]
     fn test_recall_mixed_language_identifier_top1() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         store
             .remember(make_test_memory(
                 "所有try_lock()读操作改为try_read()（rwlock 并发保护）",
@@ -3784,7 +3840,7 @@ mod tests {
     ///   新逻辑 BM25 饱和项按 avgdl 归一，长文档精确短语命中不再被稀释。
     #[test]
     fn test_recall_bm25_prefers_dense_short_match() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         // 长文档：完整命中查询词（"数据/据库/库连/连接" 各 1 次），但被大量无关节选文本稀释
         store
             .remember(make_test_memory(
@@ -3808,24 +3864,31 @@ mod tests {
         );
     }
 
-    /// v0.8.50 检索质量修复（A/B 后回滚）：deep 路恢复八卦硬剪除
+    /// 2026-11-05 定位修正：deep 路**不再**做八卦硬剪除
     ///
-    /// 场景还原（t7 A/B：3111 旧 vs 3122 BM25+八卦降权，deep top1 均 2/32）：
-    /// 八卦降权对 deep 命中零改进，且把卦近/跨卦无关记忆顶上 top1、污染 RRF，
-    /// 故按方案 §3.5 恢复原硬剪除（仅保留同卦/相邻卦候选）。
-    /// 本测试验证：跨卦记忆（环形距离 3）被剪除、相邻卦（距离 1）保留、同卦优先。
+    /// 洛书的定位是标签/组织/可视化/存储路由，不是检索剪枝。
+    /// 实测（LongMemEval 带标注探针，6 实例/116 gold）单独关 ③ 对 R_sim 的
+    /// 效应为 **0.0pp**（0.8879→0.8879），而剪除的损失**物理不可恢复**
+    /// （文档 §1.24/§1.25：64 卦硬剪枝只保留 8.3% 目标）。
+    ///
+    /// 本测试验证：跨卦记忆（环形距离 3）**保留**、评分仍为纯余弦（不降权）。
     #[test]
-    fn test_trapezoid_recall_prunes_cross_bagua_candidates() {
-        let (_dir, mut store) = make_store();
+    fn test_trapezoid_recall_keeps_cross_bagua_candidates() {
+        // 本用例断言"默认不剪枝"，必须与显式开启剪枝的对照用例串行，
+        // 否则并行执行时会读到对方设置的 LRC_DEEP_BAGUA_PRUNE=1。
+        let _env_guard = crate::test_env::lock();
+        let prev_prune = std::env::var_os("LRC_DEEP_BAGUA_PRUNE");
+        std::env::remove_var("LRC_DEEP_BAGUA_PRUNE");
+        let (_dir, store) = make_store();
         // 确定查询向量的天然八卦分类
         let qv = store.luoshu_encoder.encode_text("数据库连接池参数调优");
         let qproj = mirror_project(&qv);
         let qbagua = qproj.best_index as u8;
 
         // 三条记忆的洛书向量均指向查询方向（基础余弦相同），仅八卦分类不同：
-        // - 跨卦记忆 A：环形距离 3，预期被硬剪除
-        // - 相邻卦记忆 C：环形距离 1（相邻卦），预期保留
-        // - 同卦记忆 B：bagua_index = qbagua，预期保留且优先
+        // - 跨卦记忆 A：环形距离 3（旧实现会剪除，现应保留）
+        // - 同卦记忆 B：bagua_index = qbagua
+        // - 相邻卦记忆 C：环形距离 1
         let mut ma = make_test_memory("跨卦候选记忆：数据库连接池参数调优经验", MemoryType::Fact);
         ma.luoshu_vector = Some(qv.values);
         ma.bagua_index = Some((qbagua + 3) % 8);
@@ -3863,20 +3926,20 @@ mod tests {
             )
             .expect("应成功检索");
 
-        // 1) 跨卦记忆（环形距离 3）被硬剪除，不应出现在结果中
+        let contents: Vec<&str> = result.memories.iter().map(|m| m.content.as_str()).collect();
+
+        // 1) 跨卦记忆（环形距离 3）不再被剪除
         assert!(
-            !result
-                .memories
-                .iter()
-                .any(|m| m.content.contains("跨卦候选")),
-            "跨卦记忆应被硬剪除（A/B 证实降权仅引入 RRF 污染）: {:?}",
-            result
-                .memories
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<_>>()
+            contents.iter().any(|c| c.contains("跨卦候选")),
+            "跨卦记忆不应被剪除（洛书不进入检索剪枝）: {:?}",
+            contents
         );
-        // 2) 同卦与相邻卦均保留，且同卦排第一（基础余弦相同）
+        // 2) 同卦与相邻卦同样保留
+        let idx_a = result
+            .memories
+            .iter()
+            .position(|m| m.content.contains("跨卦候选"))
+            .expect("跨卦记忆应在结果中");
         let idx_b = result
             .memories
             .iter()
@@ -3887,14 +3950,19 @@ mod tests {
             .iter()
             .position(|m| m.content.contains("相邻卦候选"))
             .expect("相邻卦记忆应在结果中");
-        assert_eq!(idx_b, 0, "同卦记忆应排第一");
-        // 3) 同卦与相邻卦基础余弦相同 → 分数应相等（不再降权）
+        // 3) 三条基础余弦相同 → 分数应相等（纯余弦，不按卦象降权）
         assert!(
-            (result.scores[idx_b] - result.scores[idx_c]).abs() < 1e-6,
-            "同卦与相邻卦不应有评分差异（已恢复纯余弦），B={} C={}",
+            (result.scores[idx_b] - result.scores[idx_c]).abs() < 1e-6
+                && (result.scores[idx_b] - result.scores[idx_a]).abs() < 1e-6,
+            "三条记忆不应有评分差异（纯余弦，不按卦象降权）: A={} B={} C={}",
+            result.scores[idx_a],
             result.scores[idx_b],
             result.scores[idx_c]
         );
+        match prev_prune {
+            Some(value) => std::env::set_var("LRC_DEEP_BAGUA_PRUNE", value),
+            None => std::env::remove_var("LRC_DEEP_BAGUA_PRUNE"),
+        }
     }
 
     /// 阶段三 b2：预判元数据接入候选剪枝（**v0.9.8 起默认关闭**，
@@ -3919,7 +3987,11 @@ mod tests {
         use crate::engine::mirror_trapezoid::BAGUA_NAMES;
         // v0.9.11（G6 / CR-20）：本用例改进程级环境变量，须持全 crate 唯一 env 锁。
         let _env_guard = crate::test_env::lock();
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
+        // 2026-11-05：门③ 默认已移除（环形距离只影响排序）。本用例验证的是
+        // **对照模式**下"道体预判作为第二证据"的行为，故显式开启旧硬剪除。
+        let prev_prune = std::env::var_os("LRC_DEEP_BAGUA_PRUNE");
+        std::env::set_var("LRC_DEEP_BAGUA_PRUNE", "1");
         // 本测试聚焦八卦剪除语义：显式关闭联想导航（活性偏置），
         // 否则活跃记忆白名单会豁免跨卦候选，干扰剪除断言。
         // （v0.9.8 起活性偏置默认即关，此处仍显式设置以隔离并行测试的串扰。）
@@ -4063,6 +4135,10 @@ mod tests {
             Some(value) => std::env::set_var("LRC_STATE_BIAS", value),
             None => std::env::remove_var("LRC_STATE_BIAS"),
         }
+        match prev_prune {
+            Some(value) => std::env::set_var("LRC_DEEP_BAGUA_PRUNE", value),
+            None => std::env::remove_var("LRC_DEEP_BAGUA_PRUNE"),
+        }
     }
 
     /// v0.9.8 门控默认值契约：`LRC_DAOTI_PREVIEW_PRUNE` **必须默认关闭**。
@@ -4137,7 +4213,7 @@ mod tests {
     /// 测试中文 bigram 分词是否能正确检索到包含相关关键词的记忆
     #[test]
     fn test_recall_chinese_bigram() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 写入多条中文记忆
         store
@@ -4320,7 +4396,7 @@ mod tests {
     /// 写入内容相同的记忆（不同 ID），检索时应只返回一条
     #[test]
     fn test_recall_deduplication() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 写入 3 条内容完全相同的记忆（模拟用户重复写入场景）
         for _ in 0..3 {
@@ -4368,7 +4444,7 @@ mod tests {
 
     #[test]
     fn test_forget() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         let m = make_test_memory("测试记忆", MemoryType::Fact);
         let saved = store.remember(m).expect("应成功记住");
@@ -4383,7 +4459,7 @@ mod tests {
 
     #[test]
     fn test_update_memory() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         let m = make_test_memory("旧内容", MemoryType::Fact);
         let saved = store.remember(m).expect("应成功记住");
@@ -4404,7 +4480,7 @@ mod tests {
 
     #[test]
     fn test_update_nonexistent() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         let result = store
             .update_memory("nonexistent", "新", None)
@@ -4420,7 +4496,7 @@ mod tests {
         let data_dir = dir.path().to_string_lossy().to_string();
         let (s1_id, s2_id) = {
             let p = create_json_persistence(&data_dir).expect("应成功创建");
-            let mut store = MemoryStore::new(p);
+            let store = MemoryStore::new(p);
             let s1 = store
                 .remember(make_test_memory("第一条内容", MemoryType::Fact))
                 .expect("应成功记住");
@@ -4464,7 +4540,7 @@ mod tests {
 
     #[test]
     fn test_list_memories() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         store
             .remember(make_test_memory("Frontend uses React", MemoryType::Fact))
@@ -4489,7 +4565,7 @@ mod tests {
 
     #[test]
     fn test_list_filter_by_type() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         store
             .remember(make_test_memory("事实记忆", MemoryType::Fact))
@@ -4508,7 +4584,7 @@ mod tests {
 
     #[test]
     fn test_stats() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         store
             .remember(make_test_memory("事实1", MemoryType::Fact))
@@ -4526,7 +4602,7 @@ mod tests {
 
     #[test]
     fn test_stats_recent_added_excludes_old_memories() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let mut old = make_test_memory("历史记忆", MemoryType::Fact);
         old.created_at = Utc::now() - Duration::days(8);
         store.remember(old).expect("应成功记住历史记忆");
@@ -4541,7 +4617,7 @@ mod tests {
 
     #[test]
     fn test_recall_filter_by_type() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         store
             .remember(make_test_memory("Fact content", MemoryType::Fact))
@@ -4564,7 +4640,7 @@ mod tests {
 
     #[test]
     fn test_recall_does_not_persist_last_accessed() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         let mut m = make_test_memory("测试衰减更新", MemoryType::Fact);
         // 模拟 10 天前的访问
@@ -4586,7 +4662,7 @@ mod tests {
     }
     #[test]
     fn test_recall_min_importance() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         let mut m1 = make_test_memory("高重要性内容", MemoryType::Fact);
         m1.importance = Importance::new(9);
@@ -4607,7 +4683,7 @@ mod tests {
     /// 持久化闭环测试：写入 → 查总数 → 确认非零
     #[test]
     fn test_persistence_roundtrip() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         store
             .remember(make_test_memory("持久化测试", MemoryType::Fact))
@@ -4688,7 +4764,7 @@ mod tests {
 
     #[test]
     fn test_recall_document_reuses_and_invalidates_content_features() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let mut memory = make_test_memory("Feature cache original", MemoryType::Fact);
         let saved = store.remember(memory.clone()).expect("写入应成功");
 
@@ -4707,7 +4783,7 @@ mod tests {
 
     #[test]
     fn test_remember_auto_merge_similar() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 写入第一条记忆
         let m1 = store
@@ -4739,7 +4815,7 @@ mod tests {
     fn test_domain_candidate_index_finds_same_project_language_candidate() {
         // v0.9.11（G6 / CR-20）：本用例改进程级环境变量，须持全 crate 唯一 env 锁。
         let _env_guard = crate::test_env::lock();
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let previous = std::env::var_os("LRC_DOMAIN_CANDIDATE_INDEX");
         std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX", "1");
 
@@ -4765,7 +4841,7 @@ mod tests {
     fn test_domain_candidate_index_fallback_matches_full_scan() {
         // v0.9.11（G6 / CR-20）：本用例改进程级环境变量，须持全 crate 唯一 env 锁。
         let _env_guard = crate::test_env::lock();
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         store
             .remember(make_test_memory(
                 "唯一回退候选：数据库连接超时",
@@ -4787,10 +4863,14 @@ mod tests {
             .expect("索引检索应成功")
             .map(|memory| memory.content);
         std::env::remove_var("LRC_DOMAIN_CANDIDATE_INDEX");
+        // ★ 2026-11-05：`find_similar` 现在也走域候选索引，故"全量扫描"对照
+        //   必须显式关闭索引，否则两侧都是索引路径、对照失效。
+        std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX_OFF", "1");
         let full_scan = store
             .find_similar(query)
             .expect("全量检索应成功")
             .map(|memory| memory.content);
+        std::env::remove_var("LRC_DOMAIN_CANDIDATE_INDEX_OFF");
         match previous {
             Some(value) => std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX", value),
             None => std::env::remove_var("LRC_DOMAIN_CANDIDATE_INDEX"),
@@ -4806,7 +4886,7 @@ mod tests {
         // （is_cjk=false）。两者通过 'of'/'on' 等两字母词 term 进入同一倒排并集，
         // 但普通 domain 分桶用 memory_is_cjk == scope_is_cjk 把它们剪掉导致漏检。
         // NOLANG（无语言剪枝）开关下同项目记忆直接进入 primary，应恢复精确召回。
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let previous = std::env::var_os("LRC_DOMAIN_CANDIDATE_INDEX_NOLANG");
         std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX_NOLANG", "1");
 
@@ -4851,7 +4931,7 @@ mod tests {
 
     #[test]
     fn test_remember_no_merge_dissimilar() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         store
             .remember(make_test_memory(
@@ -4874,7 +4954,7 @@ mod tests {
 
     #[test]
     fn test_remember_merge_updates_daoti_preview_metadata() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let mut first = make_test_memory("预判元数据测试内容", MemoryType::Fact);
         first.daoti_preview_gua = Some("乾为天".into());
         first.daoti_preview_bagua = Some("乾".into());
@@ -4895,7 +4975,7 @@ mod tests {
 
     #[test]
     fn test_memory_without_daoti_preview_remains_compatible() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let saved = store
             .remember(make_test_memory("无预判字段的旧记忆", MemoryType::Fact))
             .expect("旧格式记忆应成功写入");
@@ -4906,7 +4986,7 @@ mod tests {
 
     #[test]
     fn test_remember_merge_tags() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 使用英文内容确保 Jaccard ≥ 阈值
         let mut m1 = make_test_memory("Frontend uses React framework", MemoryType::Fact);
@@ -4933,7 +5013,7 @@ mod tests {
 
     #[test]
     fn test_archive_expired_moves_to_cold_storage() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 创建过期记忆（2天前创建，ttl=1天）
         let mut expired = Memory::new(
@@ -4976,7 +5056,7 @@ mod tests {
 
     #[test]
     fn test_archive_expired_no_expired_returns_zero() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         let m = Memory::new(
             "活跃记忆".to_string(),
@@ -4995,7 +5075,7 @@ mod tests {
 
     #[test]
     fn test_archive_expired_preserves_unexpired() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 创建过期记忆
         let mut expired = Memory::new(
@@ -5043,7 +5123,7 @@ mod tests {
     /// 验证：写入 3 条相似记忆后自动触发递归合成
     #[test]
     fn test_synthesis_triggered_on_remember() {
-        let (_dir, mut store) = make_store_with_threshold(0.9);
+        let (_dir, store) = make_store_with_threshold(0.9);
 
         // 写入 3 条关于项目技术栈的相似记忆（Jaccard 约 0.5-0.8，不会被合并但会被聚类）
         store
@@ -5086,7 +5166,7 @@ mod tests {
     /// v0.9.0 Fix-02 验证：结晶合成时记录审计事件（SynthesisCreated）
     #[test]
     fn test_audit_trail_records_synthesis() {
-        let (_dir, mut store) = make_store_with_threshold(0.9);
+        let (_dir, store) = make_store_with_threshold(0.9);
 
         // 写入 3 条相似记忆触发合成
         store
@@ -5112,7 +5192,7 @@ mod tests {
         store.run_pending_synthesis().expect("合成应成功");
 
         // 验证审计事件已记录（total_count > 0）
-        let count = store.audit_trail.total_count();
+        let count = store.audit_trail.read().unwrap().total_count();
         assert!(count > 0, "合成后审计事件数应 > 0，实际: {}", count);
 
         // 验证事件类型为 SynthesisCreated
@@ -5123,14 +5203,15 @@ mod tests {
             memory_id: None,
             limit: None,
         };
-        let events = store.audit_trail.query(&query);
+        let audit_guard = store.audit_trail.read().unwrap();
+        let events = audit_guard.query(&query);
         assert!(!events.is_empty(), "应包含 SynthesisCreated 审计事件");
     }
 
     /// 验证：洛书合成基于 MirrorProject 分类，不同八卦类别的记忆不触发合成
     #[test]
     fn test_synthesis_not_triggered_dissimilar() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         store
             .remember(make_test_memory(
@@ -5167,7 +5248,7 @@ mod tests {
     /// 场景：模拟合成记忆被标记为低质量后，系统自动隔离到归档区
     #[test]
     fn test_cleanup_low_quality_synthesis() {
-        let (_dir, mut store) = make_store_with_threshold(0.9);
+        let (_dir, store) = make_store_with_threshold(0.9);
 
         // 写入 3 条相似记忆触发合成
         store
@@ -5204,13 +5285,21 @@ mod tests {
 
         // 模拟低质量命中（连续 3 次低相关性）
         for sid in &synth_ids {
-            store.synthesis_journal.record_hit(sid, 0.1);
-            store.synthesis_journal.record_hit(sid, 0.15);
-            store.synthesis_journal.record_hit(sid, 0.2);
+            store.synthesis_journal.read().unwrap().record_hit(sid, 0.1);
+            store
+                .synthesis_journal
+                .read()
+                .unwrap()
+                .record_hit(sid, 0.15);
+            store.synthesis_journal.read().unwrap().record_hit(sid, 0.2);
         }
 
         // 验证低质量标记
-        let low_quality = store.synthesis_journal.get_low_quality_ids();
+        let low_quality = store
+            .synthesis_journal
+            .read()
+            .unwrap()
+            .get_low_quality_ids();
         assert!(!low_quality.is_empty(), "应有低质量合成记忆被标记");
 
         let before_count = store.total_count().unwrap();
@@ -5247,7 +5336,11 @@ mod tests {
         );
 
         // 验证日志记录已同步清理
-        let remaining_low_quality = store.synthesis_journal.get_low_quality_ids();
+        let remaining_low_quality = store
+            .synthesis_journal
+            .read()
+            .unwrap()
+            .get_low_quality_ids();
         assert!(
             remaining_low_quality.is_empty(),
             "隔离后不应再有低质量标记记录"
@@ -5257,7 +5350,7 @@ mod tests {
     /// 验证：隔离区渐进式淘汰（阶段3：过期后永久删除）
     #[test]
     fn test_quarantine_purge_expired() {
-        let (_dir, mut store) = make_store_with_threshold(0.9);
+        let (_dir, store) = make_store_with_threshold(0.9);
 
         // 写入相似记忆触发合成
         store
@@ -5292,9 +5385,9 @@ mod tests {
         }
 
         for sid in &synth_ids {
-            store.synthesis_journal.record_hit(sid, 0.1);
-            store.synthesis_journal.record_hit(sid, 0.1);
-            store.synthesis_journal.record_hit(sid, 0.1);
+            store.synthesis_journal.read().unwrap().record_hit(sid, 0.1);
+            store.synthesis_journal.read().unwrap().record_hit(sid, 0.1);
+            store.synthesis_journal.read().unwrap().record_hit(sid, 0.1);
         }
 
         // 阶段1：隔离
@@ -5321,7 +5414,7 @@ mod tests {
     /// 验证：无低质量记忆时清理不产生副作用
     #[test]
     fn test_cleanup_no_low_quality() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         store
             .remember(make_test_memory("正常记忆", MemoryType::Fact))
@@ -5340,7 +5433,7 @@ mod tests {
     /// 验证：合成记忆被隔离后不再参与后续检索和合成（污染防护）
     #[test]
     fn test_cleanup_prevents_pollution() {
-        let (_dir, mut store) = make_store_with_threshold(0.9);
+        let (_dir, store) = make_store_with_threshold(0.9);
 
         // 写入相似记忆触发合成
         for i in 0..5 {
@@ -5365,9 +5458,9 @@ mod tests {
 
         // 标记为低质量
         for sid in &synth_ids {
-            store.synthesis_journal.record_hit(sid, 0.1);
-            store.synthesis_journal.record_hit(sid, 0.1);
-            store.synthesis_journal.record_hit(sid, 0.1);
+            store.synthesis_journal.read().unwrap().record_hit(sid, 0.1);
+            store.synthesis_journal.read().unwrap().record_hit(sid, 0.1);
+            store.synthesis_journal.read().unwrap().record_hit(sid, 0.1);
         }
 
         // 隔离（阶段1：移入归档，从活跃存储中移除）
@@ -5409,7 +5502,7 @@ mod tests {
     /// 场景：验证 health_report 方法能正确聚合所有子系统的状态
     #[test]
     fn test_health_report_end_to_end() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 写入几条记忆
         store
@@ -5454,7 +5547,7 @@ mod tests {
 
     #[test]
     fn test_synthesis_metadata() {
-        let (_dir, mut store) = make_store_with_threshold(0.9);
+        let (_dir, store) = make_store_with_threshold(0.9);
 
         store
             .remember(make_test_memory(
@@ -5490,17 +5583,23 @@ mod tests {
         assert!(!s.source_ids.is_empty(), "合成记忆应有 source_ids");
         assert!(s.source_ids.len() >= 3, "source_ids 应包含源记忆");
         assert!(s.confidence.is_some(), "合成记忆应有 confidence");
-        assert_eq!(
-            s.source.as_deref(),
-            Some("luoshu_recursive_compose"),
-            "source 应为 luoshu_recursive_compose"
+        // 编码改动（bigram+IDF）后，3 条测试记忆可能不再同卦 ⇒ 洛书聚类为空、
+        // 降级到 Jaccard 合成（source = "recursive_synthesis"）。两者都是合法路径，
+        // 本用例只验证"合成记忆带有来源标记"，不锁定具体引擎。
+        assert!(
+            matches!(
+                s.source.as_deref(),
+                Some("luoshu_recursive_compose") | Some("recursive_synthesis")
+            ),
+            "source 应为洛书合成或 Jaccard 降级标记，实际: {:?}",
+            s.source
         );
     }
 
     /// 验证：合成记忆在 recall 中获得优先返回
     #[test]
     fn test_synthesis_priority_in_recall() {
-        let (_dir, mut store) = make_store_with_threshold(0.9);
+        let (_dir, store) = make_store_with_threshold(0.9);
 
         // 先写入合成记忆已经存在的场景——通过 3 条相似记忆触发合成
         store
@@ -5555,7 +5654,7 @@ mod tests {
     /// 6. 验证道同构度调节器可运行
     #[test]
     fn test_e2e_encode_synthesize_recall_feedback() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         // 第一阶段：写入 10 条同一项目的技术决策记忆
         let decisions = [
@@ -5678,7 +5777,7 @@ mod tests {
         assert!(!result.memories.is_empty(), "检索应返回结果");
 
         // 第六阶段：验证合成日志记录了事件
-        let journal_snapshot = store.synthesis_journal.snapshot();
+        let journal_snapshot = store.synthesis_journal.read().unwrap().snapshot();
         assert!(
             journal_snapshot.total_synthesis >= 1,
             "合成日志应记录至少 1 次合成: 实际 {}",
@@ -5842,7 +5941,9 @@ mod tests {
 
         // v0.5.4 合成移出关键路径，需手动触发待合成的任务
         // 跨领域稀疏场景下降低合成阈值，确保系统在稀疏场景下也能合成
-        store.synthesis_min_cluster = 2;
+        store
+            .synthesis_min_cluster
+            .store(2, std::sync::atomic::Ordering::Release);
         store.synthesis_similarity = 0.3;
         store.run_pending_synthesis().expect("合成应成功");
 
@@ -5954,7 +6055,7 @@ mod tests {
         }
 
         // 第六阶段：验证合成日志记录
-        let journal_snapshot = store.synthesis_journal.snapshot();
+        let journal_snapshot = store.synthesis_journal.read().unwrap().snapshot();
         assert!(
             journal_snapshot.total_synthesis >= 1,
             "合成日志应记录合成事件: 实际 {}",
@@ -5992,7 +6093,7 @@ mod tests {
             let synth_hit = result.memories.iter().any(|m| synth_ids.contains(&m.id));
             if synth_hit {
                 // 如果合成记忆被命中，验证质量反馈已更新
-                let events = store.synthesis_journal.get_events();
+                let events = store.synthesis_journal.read().unwrap().get_events();
                 let hit_events: Vec<_> = events
                     .iter()
                     .filter(|e| synth_ids.contains(&e.synthesis_id) && e.hit_count > 0)
@@ -6012,10 +6113,10 @@ mod tests {
     /// P1.4-1：regulate() 后心跳状态被记录（时间戳>0、run_count 递增、动作非空）
     #[test]
     fn test_regulator_heartbeat_records_run() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         // 首次 regulate：should_regulate 初始满足（last_regulation_ms=0），应返回 Some/None 但心跳必然更新
         let action = store.regulate();
-        let hb = &store.regulator_heartbeat;
+        let hb = store.regulator_heartbeat.read().unwrap();
         assert!(
             hb.run_count >= 1,
             "心跳计数应至少为 1，实际 {}",
@@ -6040,13 +6141,13 @@ mod tests {
     /// P1.4-2：NoAction（未到间隔/空库）时心跳仍记录 no_action，保证"调节器在转"可观测
     #[test]
     fn test_regulator_heartbeat_no_action_observable() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         // 空旷库上运行：无记忆可统计，DaoRegulator 可能给出 no_action 或调整动作，
         // 但心跳必须持续更新（无论什么动作都算一次心跳）
         store.regulate();
-        let first = store.regulator_heartbeat.run_count;
+        let first = store.regulator_heartbeat.read().unwrap().run_count;
         store.regulate();
-        let second = store.regulator_heartbeat.run_count;
+        let second = store.regulator_heartbeat.read().unwrap().run_count;
         // 第二次调用即使被 should_regulate 冷却拦截（返回 None），也应走到记录逻辑
         // 注：regulate() 在 should_regulate() 短路时直接返回 None，心跳仅在实际执行时更新
         // 因此这里只断言第一次必然记录
@@ -6059,17 +6160,16 @@ mod tests {
     #[test]
     fn test_regulator_audit_events_recordable() {
         use crate::engine::audit_trail::AuditEventType;
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         store.regulate();
-        let events = store
-            .audit_trail
-            .query(&crate::engine::audit_trail::AuditQuery {
-                from_ms: None,
-                to_ms: None,
-                event_types: Some(vec![AuditEventType::RegulationApplied]),
-                memory_id: None,
-                limit: Some(50),
-            });
+        let audit_guard = store.audit_trail.read().unwrap();
+        let events = audit_guard.query(&crate::engine::audit_trail::AuditQuery {
+            from_ms: None,
+            to_ms: None,
+            event_types: Some(vec![AuditEventType::RegulationApplied]),
+            memory_id: None,
+            limit: Some(50),
+        });
         // regulate() 内部对具体动作已 write audit；NoAction 时可能无 RegulationApplied 事件，
         // 因此这里只验证"可查询不 panic"，动作级审计由具体分支测试覆盖
         assert!(events.len() <= 50, "审计查询应受 limit 约束");
@@ -6420,7 +6520,7 @@ mod tests {
     /// 一条与起点**零重叠**（BGE 给不出）⇒ 后者必须排在前面。
     #[test]
     fn test_expand_associations_prefers_unexpected_first() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         // 起点与"常规条"共享大量实词；与"意外条"完全不共享
         let mut seed = make_test_memory(
             "数据库连接池参数调优方案：maxPoolSize 与 idleTimeout 配置",
@@ -6481,7 +6581,7 @@ mod tests {
     /// 顺序会随 HashMap 迭代序漂移 ⇒ 用户两次看到不同联想顺序。
     #[test]
     fn test_unexpected_order_is_deterministic() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
         let mut seed = make_test_memory(
             "核心主题词：缓存穿透 布隆过滤器 兜底",
             MemoryType::CodeContext,
@@ -6987,7 +7087,7 @@ mod tests {
     /// （若 zip 错位，落盘向量将属于别的内容，重算时 `field_changed` 会翻为 true）。
     #[test]
     fn test_remember_batch_derived_fields_match_encoder() {
-        let (_dir, mut store) = make_store();
+        let (_dir, store) = make_store();
 
         let bases = [
             "数据库连接池参数调优：最大连接数与空闲超时设置",
@@ -7083,5 +7183,1277 @@ mod tests {
                 word
             );
         }
+    }
+
+    /// ★S3.5（2026-11-01）：**被抑制 / 被取代的记忆不得出现在检索结果里**。
+    ///
+    /// 背景：文本赛道 D3「删除、遗忘与抑制」仅 5.00 分。代码层根因是
+    /// `LifecycleState::{Suppressed, Superseded}` 此前**只参与分数衰减**
+    /// （抑制额外 ×0.5），从不过滤 ⇒ 被"抑制"的记忆仍会挤进 top_k，
+    /// 对"不得再出现"这类判据等于完全失效。
+    ///
+    /// 本用例锁定"排除"语义：若有人把过滤改回"仅降权"，此用例必须失败。
+    #[test]
+    fn suppressed_and_superseded_memories_are_excluded_from_recall() {
+        let (_dir, store) = make_store();
+        let keep = make_test_memory("保留的记忆：项目使用 PostgreSQL 作为主库", MemoryType::Fact);
+        let sup = make_test_memory("被抑制的记忆：项目使用 MySQL 作为主库", MemoryType::Fact);
+        let old = make_test_memory("被取代的旧值：服务端口 8080", MemoryType::Fact);
+        let (keep_id, sup_id, old_id) = (keep.id.clone(), sup.id.clone(), old.id.clone());
+        for m in [keep, sup, old] {
+            store.remember(m).expect("写入应成功");
+        }
+
+        let now = 1_700_000_000_000u64;
+        assert!(
+            store.mark_lifecycle_suppressed(&sup_id, now),
+            "标记抑制应生效"
+        );
+        assert!(
+            store.mark_lifecycle_superseded(&old_id, "new-1", now),
+            "标记取代应生效"
+        );
+
+        let result = store
+            .recall("项目 主库 端口", &RecallFilter::new())
+            .expect("检索应成功");
+        let ids: Vec<&str> = result.memories.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            ids.contains(&keep_id.as_str()),
+            "正常记忆必须保留（否则过滤过度）：{:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&sup_id.as_str()),
+            "被抑制的记忆不得出现在结果里：{:?}",
+            ids
+        );
+        assert!(
+            !ids.contains(&old_id.as_str()),
+            "被取代的记忆不得出现在结果里：{:?}",
+            ids
+        );
+    }
+
+    /// ★S3.5 后半（2026-11-03）：**"请忘记 X" 必须真的让 X 不再出现**。
+    ///
+    /// 端到端锁定三件事：
+    /// 1. 按目标文本抑制匹配的旧记忆；
+    /// 2. 无关记忆**不得**被误伤（否则等于把库删了）；
+    /// 3. 抑制后检索结果里不再出现该记忆（依赖 `lifecycle_allows` 的硬过滤）。
+    #[test]
+    fn forget_instruction_suppresses_matching_memories_end_to_end() {
+        let (_dir, store) = make_store();
+        let phone = make_test_memory("我的电话号码是公司分机", MemoryType::Fact);
+        let other = make_test_memory("项目使用 PostgreSQL 作为主库", MemoryType::Fact);
+        let (phone_id, other_id) = (phone.id.clone(), other.id.clone());
+        for m in [phone, other] {
+            store.remember(m).expect("写入应成功");
+        }
+
+        let now = 1_700_000_000_000u64;
+        let n = store.suppress_matching_memories("我的电话号码", None, None, now);
+        assert_eq!(n, 1, "只应抑制包含目标文本的那一条");
+
+        let result = store
+            .recall("电话号码 主库", &RecallFilter::new())
+            .expect("检索应成功");
+        let ids: Vec<&str> = result.memories.iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            !ids.contains(&phone_id.as_str()),
+            "被遗忘的记忆不得出现在结果里：{:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&other_id.as_str()),
+            "无关记忆必须保留（否则是误伤）：{:?}",
+            ids
+        );
+    }
+
+    /// ★S3.5 后半：`user_id` 是隔离边界 —— 指令不得跨用户抑制。
+    #[test]
+    fn forget_instruction_respects_user_scope() {
+        let (_dir, store) = make_store();
+        let mut mine = make_test_memory("我的电话号码是公司分机", MemoryType::Fact);
+        mine.user_id = Some("u-a".into());
+        let mut theirs = make_test_memory("他的电话号码是家庭座机", MemoryType::Fact);
+        theirs.user_id = Some("u-b".into());
+        let (mine_id, theirs_id) = (mine.id.clone(), theirs.id.clone());
+        for m in [mine, theirs] {
+            store.remember(m).expect("写入应成功");
+        }
+
+        let now = 1_700_000_000_000u64;
+        // 指令来自 u-a：只能抑制 u-a 自己的记忆
+        let n = store.suppress_matching_memories("电话号码", Some("u-a"), None, now);
+        assert_eq!(n, 1, "只应抑制同用户的记忆");
+        let state_of = |id: &str| store.lifecycle().get(id).map(|e| e.state);
+        assert_eq!(
+            state_of(&mine_id),
+            Some(crate::lifecycle::LifecycleState::Suppressed),
+            "本用户记忆应被抑制"
+        );
+        assert_ne!(
+            state_of(&theirs_id),
+            Some(crate::lifecycle::LifecycleState::Suppressed),
+            "其他用户的记忆不得被抑制"
+        );
+    }
+
+    // ==================== S6（2026-11-02）：快路候选生成索引化 ====================
+
+    /// ★S6：`is_index_safe_term` 的口径必须与 `count_word_occurrences` 同源。
+    ///
+    /// 放宽任何一条都会让候选裁剪**漏召回**（把 3 字中文当 bigram term，
+    /// 或允许 `nginx.conf` 这类带标点的词）⇒ 本用例失败。
+    #[test]
+    fn s6_index_safe_term_matches_scoring_semantics() {
+        // CJK：索引对中文段只产相邻两字 bigram ⇒ 只有"恰好两字"可等价
+        assert!(is_index_safe_term("数据"), "两字中文与 bigram 索引同口径");
+        assert!(
+            !is_index_safe_term("数据库"),
+            "三字中文不是索引 term（索引只产 bigram）"
+        );
+        assert!(
+            !is_index_safe_term("锁"),
+            "单字中文在打分侧是子串匹配，无法反查 bigram 索引"
+        );
+        // ASCII：长度 ≥3 且字符集与 `tokenize_cjk` 的 ASCII 整词一致
+        assert!(is_index_safe_term("nginx"));
+        assert!(is_index_safe_term("abc123"));
+        assert!(is_index_safe_term("e5-small"));
+        assert!(!is_index_safe_term("ab"), "短 ASCII 词在打分侧是子串匹配");
+        assert!(
+            !is_index_safe_term("nginx.conf"),
+            "含标点的词会被分词切开 ⇒ 索引与打分不同源"
+        );
+        assert!(!is_index_safe_term("don't"), "撇号会被分词切开");
+        assert!(!is_index_safe_term(""), "空词必须判不安全");
+    }
+
+    /// ★S6：候选裁剪必须覆盖"索引 term 与打分口径不同源"的两类记忆。
+    ///
+    /// 鉴别力：删掉 `MemoryStoreCache::recall_reachable_terms` 里
+    /// ① 低 CJK 比例文本的中文 bigram 补齐，或 ② 字母/数字分段补齐，本用例立刻失败。
+    #[test]
+    fn s6_candidate_slots_cover_cross_tokenizer_memories() {
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var("LRC_FAST_CANDIDATE_INDEX").ok();
+        std::env::set_var("LRC_FAST_CANDIDATE_INDEX", "1");
+
+        // ① 低 CJK 比例长正文里的中文段：`tokenize_query` 只按空格切，不产 bigram
+        let cross = "the deployment guide says 证书配置 must be renewed before release";
+        // ② 字母数字连写：打分把数字视为词边界 ⇒ `abc` 可命中，索引里只有 `abc123`
+        let alnum = "the production cluster runs nginx with an abc123 certificate";
+        let chinese = "数据库连接配置：PostgreSQL，端口 5432";
+
+        let slots = {
+            let (_dir, store) = make_store();
+            for content in [cross, alnum, chinese] {
+                store
+                    .remember(make_test_memory(content, MemoryType::Fact))
+                    .expect("写入应成功");
+            }
+            let all = store.load_cached().expect("应能取到快照");
+            let candidates: Vec<&Memory> = all.iter().map(|m| m.as_ref()).collect();
+            let mut out: Vec<(String, Option<Vec<usize>>)> = Vec::new();
+            for query in ["证书 配置", "abc nginx", "数据 端口"] {
+                let tokens = tokenize_query(query);
+                let words: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+                out.push((
+                    query.to_string(),
+                    store.fast_candidate_slots(&candidates, &words, tokens.len(), 1),
+                ));
+            }
+            // 把槽位换算成内容，便于在 env 恢复后断言
+            out.into_iter()
+                .map(|(query, slots)| {
+                    (
+                        query,
+                        slots.map(|slots| {
+                            slots
+                                .into_iter()
+                                .map(|slot| candidates[slot].content.clone())
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        match previous {
+            Some(value) => std::env::set_var("LRC_FAST_CANDIDATE_INDEX", value),
+            None => std::env::remove_var("LRC_FAST_CANDIDATE_INDEX"),
+        }
+
+        let expect = [
+            ("证书 配置", cross),
+            ("abc nginx", alnum),
+            ("数据 端口", chinese),
+        ];
+        for ((query, slots), (_, expected)) in slots.iter().zip(expect.iter()) {
+            let slots = slots
+                .as_ref()
+                .unwrap_or_else(|| panic!("查询 `{query}` 应启用候选裁剪（索引口径已补齐）"));
+            assert!(
+                slots.iter().any(|content| content.as_str() == *expected),
+                "查询 `{query}` 的候选集必须包含 `{expected}`，实际：{slots:?}"
+            );
+        }
+    }
+
+    /// ★S6：开关打开后，检索结果必须与全量扫描**逐条一致**（同参数同库）。
+    ///
+    /// 鉴别力：把 `fast_candidate_slots` 的"命中数 < top_k 回退"去掉，
+    /// 或去掉单 token 查询的回退 ⇒ 零命中/单 token 两组的填充结果会变化，本用例失败。
+    #[test]
+    fn s6_pruned_recall_matches_full_scan() {
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var("LRC_FAST_CANDIDATE_INDEX").ok();
+        std::env::remove_var("LRC_FAST_CANDIDATE_INDEX");
+
+        let (_dir, mut store) = make_store();
+        let contents = [
+            "数据库连接配置：PostgreSQL，端口 5432",
+            "数据库迁移方案：先备份再切换主库",
+            "项目使用 Rust 语言开发，采用 Actix-web 框架",
+            "前端使用 React 框架，状态管理用 Redux",
+            "the production cluster runs nginx with an abc123 certificate",
+            "the deployment guide says 证书配置 must be renewed before release",
+            "rolling back a release requires the previous image tag",
+            "the service listens on port 8080 and restarts at 03:00",
+            "向量检索与相似度计算使用洛书编码",
+        ];
+        for content in contents {
+            store
+                .remember(make_test_memory(content, MemoryType::Fact))
+                .expect("写入应成功");
+        }
+
+        // (查询, top_k)；前三组会真正触发裁剪，后三组必须回退（单 token / 零命中 / 命中不足）
+        let queries = [
+            ("数据库 迁移", 1usize),
+            ("证书 配置", 1),
+            ("abc nginx", 1),
+            ("release", 1),
+            ("zzzz qqqq", 1),
+            ("数据库 迁移", 3),
+        ];
+        let recall_ids = |store: &mut MemoryStore<crate::persistence::json::JsonPersistence>,
+                          query: &str,
+                          k: usize| {
+            store
+                .recall(query, &RecallFilter::new().with_top_k(k))
+                .expect("检索应成功")
+                .memories
+                .iter()
+                .map(|m| m.id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let baseline: Vec<Vec<String>> = queries
+            .iter()
+            .map(|(query, k)| recall_ids(&mut store, query, *k))
+            .collect();
+
+        std::env::set_var("LRC_FAST_CANDIDATE_INDEX", "1");
+        let pruned: Vec<Vec<String>> = queries
+            .iter()
+            .map(|(query, k)| recall_ids(&mut store, query, *k))
+            .collect();
+        match previous {
+            Some(value) => std::env::set_var("LRC_FAST_CANDIDATE_INDEX", value),
+            None => std::env::remove_var("LRC_FAST_CANDIDATE_INDEX"),
+        }
+
+        for (i, (query, k)) in queries.iter().enumerate() {
+            assert_eq!(
+                pruned[i], baseline[i],
+                "候选裁剪后结果必须与全量扫描逐条一致：query=`{query}` top_k={k}"
+            );
+        }
+    }
+
+    /// P3 压测：单条 `remember` 的耗时构成（生产库规模 7048 条）。
+    ///
+    /// 目的：量化两个 O(N) 点——
+    ///   1. 每次 `remember` 后 `mark_cache_dirty_preserving_index` 让缓存全量失效
+    ///      ⇒ 下一次读要**从磁盘重载整库**；
+    ///   2. 索引无命中时 `fallback_triggered` ⇒ **全库 Jaccard 扫描**。
+    ///
+    /// 运行：
+    ///   cargo test --release --lib p3_remember_pressure -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn p3_remember_pressure() {
+        let _env_guard = crate::test_env::lock();
+        let (_dir, store) = make_store();
+
+        // 1. 注入 7048 条（快路径，跳过相似检查）
+        let n = 7048usize;
+        let mems: Vec<Memory> = (0..n)
+            .map(|i| {
+                make_test_memory(
+                    &format!(
+                        "压测记忆 {}：数据库连接池参数调优与空闲超时设置，样本编号 {}，内容用于分布统计",
+                        i, i
+                    ),
+                    MemoryType::Fact,
+                )
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        store.remember_batch(mems).expect("批量注入应成功");
+        println!(
+            "[P3] 注入 {} 条：{:.1} ms",
+            n,
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+
+        // 2. 连续 remember 100 条（内容唯一，避免合并）
+        let mut lat: Vec<f64> = Vec::new();
+        for i in 0..100 {
+            let m = make_test_memory(
+                &format!(
+                    "P3 新增记忆 {}：完全不同的主题用于避免相似合并，编号 {}",
+                    i, i
+                ),
+                MemoryType::Fact,
+            );
+            let t = std::time::Instant::now();
+            store.remember(m).expect("单条写入应成功");
+            lat.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
+        println!(
+            "[P3] remember 100 条：P50 {:.1} ms，P95 {:.1} ms，P99 {:.1} ms，max {:.1} ms",
+            pct(0.5),
+            pct(0.95),
+            pct(0.99),
+            lat[lat.len() - 1]
+        );
+
+        // 3. find_similar 100 次（查询与库内不同 ⇒ 索引无命中 ⇒ fallback 全库扫描）
+        let mut sim_lat: Vec<f64> = Vec::new();
+        for i in 0..100 {
+            let q = format!("P3 查询 {}：与库内内容完全无关的检索词，编号 {}", i, i);
+            let t = std::time::Instant::now();
+            let _ = store.find_similar(&q).expect("相似检查应成功");
+            sim_lat.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        sim_lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct2 = |q: f64| sim_lat[((sim_lat.len() - 1) as f64 * q) as usize];
+        println!(
+            "[P3] find_similar 100 次：P50 {:.1} ms，P95 {:.1} ms，P99 {:.1} ms，max {:.1} ms",
+            pct2(0.5),
+            pct2(0.95),
+            pct2(0.99),
+            sim_lat[sim_lat.len() - 1]
+        );
+
+        // 4. 桶路由回归：对比开启/关闭桶路由的 find_similar 结果 id
+        let queries: Vec<String> = (0..100)
+            .map(|i| {
+                let k = i * 70;
+                format!(
+                    "压测记忆 {}：数据库连接池参数调优与空闲超时设置，样本编号 {}，内容用于分布统计",
+                    k, k
+                )
+            })
+            .collect();
+        let on_ids: Vec<Option<String>> = queries
+            .iter()
+            .map(|q| store.find_similar(q).expect("应成功").map(|m| m.id))
+            .collect();
+        std::env::set_var("LRC_BUCKET_ROUTING_OFF", "1");
+        let off_ids: Vec<Option<String>> = queries
+            .iter()
+            .map(|q| store.find_similar(q).expect("应成功").map(|m| m.id))
+            .collect();
+        std::env::remove_var("LRC_BUCKET_ROUTING_OFF");
+        let same = on_ids
+            .iter()
+            .zip(off_ids.iter())
+            .filter(|(a, b)| a == b)
+            .count();
+        println!(
+            "[P3] 桶路由回归：{}/{} 结果 id 一致（差异为同桶优先导致的等价相似记忆）",
+            same,
+            queries.len()
+        );
+
+        // 5. 三阶段锁解耦：分别测量"锁内阶段 1"与"锁外阶段 2"的耗时
+        //
+        // 目的：验证"持锁时长"确实从「扫描 + 编码 + 落盘」降为「取快照 + 落盘」。
+        // 锁内总时长 = prepare + commit；analyze 在锁外执行。
+        let mut prep_lat: Vec<f64> = Vec::new();
+        let mut analyze_lat: Vec<f64> = Vec::new();
+        let mut commit_lat: Vec<f64> = Vec::new();
+        for i in 0..100 {
+            let m = make_test_memory(
+                &format!("P3 阶段拆分 {}：另一组完全不同的主题，编号 {}", i, i),
+                MemoryType::Fact,
+            );
+            let t0 = std::time::Instant::now();
+            let prep = store.prepare_remember(m).expect("阶段 1 应成功");
+            let t1 = std::time::Instant::now();
+            let analysis = prep.analyze();
+            let t2 = std::time::Instant::now();
+            store.commit_remember(analysis).expect("阶段 3 应成功");
+            let t3 = std::time::Instant::now();
+            prep_lat.push((t1 - t0).as_secs_f64() * 1000.0);
+            analyze_lat.push((t2 - t1).as_secs_f64() * 1000.0);
+            commit_lat.push((t3 - t2).as_secs_f64() * 1000.0);
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        println!(
+            "[P3] 三阶段 P50：prepare(锁内) {:.1} ms，analyze(锁外) {:.1} ms，commit(锁内) {:.1} ms",
+            med(&mut prep_lat),
+            med(&mut analyze_lat),
+            med(&mut commit_lat)
+        );
+    }
+
+    /// P3 后续评估：并发写入是否仍需要"按 id 分片存储"。
+    ///
+    /// 判据：在 8/16/32 并发写线程下，单次 `remember` 的 P95 是否仍远低于
+    /// 写锁等待上限（默认 2s）。若远低于上限 ⇒ 单锁足够，无需分片。
+    #[test]
+    #[ignore]
+    fn p3_concurrent_write_pressure() {
+        let _env_guard = crate::test_env::lock();
+        let (_dir, store) = make_store();
+        // 预注入 7048 条，模拟生产库规模
+        let mems: Vec<Memory> = (0..7048)
+            .map(|i| {
+                make_test_memory(
+                    &format!("并发压测基库 {}：数据库连接池参数调优与空闲超时设置", i),
+                    MemoryType::Fact,
+                )
+            })
+            .collect();
+        store.remember_batch(mems).expect("批量注入应成功");
+        let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+
+        for threads in [8usize, 16, 32] {
+            let lat = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+            let mut handles = Vec::new();
+            for t in 0..threads {
+                let store = std::sync::Arc::clone(&store);
+                let lat = std::sync::Arc::clone(&lat);
+                handles.push(std::thread::spawn(move || {
+                    for i in 0..20 {
+                        let m = make_test_memory(
+                            &format!("并发写入 t{} i{}：完全不同的主题 {}", t, i, t * 100 + i),
+                            MemoryType::Fact,
+                        );
+                        let t0 = std::time::Instant::now();
+                        // 与 HTTP handler 同口径：三阶段锁解耦（锁内 prepare → 锁外 analyze → 锁内 commit）
+                        let prep = {
+                            let s = store.lock().unwrap();
+                            s.prepare_remember(m).expect("阶段 1 应成功")
+                        };
+                        let analysis = prep.analyze();
+                        {
+                            let s = store.lock().unwrap();
+                            s.commit_remember(analysis).expect("阶段 3 应成功");
+                        }
+                        lat.lock()
+                            .unwrap()
+                            .push(t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("写线程不应 panic");
+            }
+            let mut v = lat.lock().unwrap().clone();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |q: f64| v[((v.len() - 1) as f64 * q) as usize];
+            println!(
+                "[P3-并发] {} 线程 × 20 写：P50 {:.1} ms，P95 {:.1} ms，max {:.1} ms",
+                threads,
+                pct(0.5),
+                pct(0.95),
+                v[v.len() - 1]
+            );
+        }
+    }
+
+    /// 分片小验证（2026-11-05）：**不改生产代码**，只验证"分片能否解决并发排队"。
+    ///
+    /// 构造：N 个独立 `MemoryStore`（各自独立锁 + 独立持久化），按 `idx % N` 路由写入。
+    /// 对比单锁与 4 分片在 16 线程 × 20 写下的 P50/P95。
+    ///
+    /// 判据：
+    /// 1. 分片后 P95 显著低于单锁（预期接近 1/N 的排队）。
+    /// 2. 正确性：所有写入都能按总数读回（无丢失）。
+    #[test]
+    #[ignore]
+    fn p3_shard_validation() {
+        // 关闭相似合并（阈值 1.0），否则并发写入的模板化内容会被合并，无法核对条数。
+        let _env_guard = crate::test_env::lock();
+        let prev_thr = std::env::var_os("LRC_SIMILARITY_THRESHOLD");
+        std::env::set_var("LRC_SIMILARITY_THRESHOLD", "1.0");
+
+        const TOTAL: usize = 7048;
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 20;
+        const SHARDS: usize = 4;
+
+        /// 跑 T 线程 × W 写，返回排序后的延迟（毫秒）
+        fn run_concurrent<F>(threads: usize, per_thread: usize, write: F) -> Vec<f64>
+        where
+            F: Fn(usize) + Send + Sync + 'static,
+        {
+            let write = std::sync::Arc::new(write);
+            let lat = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f64>::new()));
+            let mut handles = Vec::new();
+            for t in 0..threads {
+                let write = std::sync::Arc::clone(&write);
+                let lat = std::sync::Arc::clone(&lat);
+                handles.push(std::thread::spawn(move || {
+                    for i in 0..per_thread {
+                        let idx = t * per_thread + i;
+                        let t0 = std::time::Instant::now();
+                        write(idx);
+                        lat.lock()
+                            .unwrap()
+                            .push(t0.elapsed().as_secs_f64() * 1000.0);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("写线程不应 panic");
+            }
+            let mut v = lat.lock().unwrap().clone();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v
+        }
+
+        fn report(label: &str, v: &[f64]) {
+            let pct = |q: f64| v[((v.len() - 1) as f64 * q) as usize];
+            println!(
+                "[分片验证] {}：P50 {:.1} ms，P95 {:.1} ms，max {:.1} ms",
+                label,
+                pct(0.5),
+                pct(0.95),
+                v[v.len() - 1]
+            );
+        }
+
+        // ---------- 基线：单锁 ----------
+        let (_dir, single) = make_store();
+        let base: Vec<Memory> = (0..TOTAL)
+            .map(|i| {
+                make_test_memory(
+                    &format!("分片验证基库 {}：数据库连接池参数调优与空闲超时设置", i),
+                    MemoryType::Fact,
+                )
+            })
+            .collect();
+        single.remember_batch(base).expect("单锁基库注入应成功");
+        let single = std::sync::Arc::new(std::sync::Mutex::new(single));
+        let single_stats = run_concurrent(THREADS, PER_THREAD, move |idx| {
+            let m = make_test_memory(
+                &format!("单锁并发 {}：完全不同的主题 {}", idx, idx),
+                MemoryType::Fact,
+            );
+            let prep = {
+                let s = single.lock().unwrap();
+                s.prepare_remember(m).expect("阶段 1 应成功")
+            };
+            let analysis = prep.analyze();
+            {
+                let s = single.lock().unwrap();
+                s.commit_remember(analysis).expect("阶段 3 应成功");
+            }
+        });
+        report("单锁", &single_stats);
+
+        // ---------- 4 分片 ----------
+        let mut _dirs = Vec::new();
+        let mut shards = Vec::new();
+        for shard in 0..SHARDS {
+            let (d, s) = make_store();
+            let base: Vec<Memory> = (0..TOTAL / SHARDS)
+                .map(|i| {
+                    make_test_memory(
+                        &format!(
+                            "分片验证基库 s{} {}：数据库连接池参数调优与空闲超时设置",
+                            shard, i
+                        ),
+                        MemoryType::Fact,
+                    )
+                })
+                .collect();
+            s.remember_batch(base).expect("分片基库注入应成功");
+            _dirs.push(d);
+            shards.push(std::sync::Arc::new(std::sync::Mutex::new(s)));
+        }
+        let shards = std::sync::Arc::new(shards);
+        let shard_stats = {
+            let shards = std::sync::Arc::clone(&shards);
+            run_concurrent(THREADS, PER_THREAD, move |idx| {
+                let m = make_test_memory(
+                    &format!("分片并发 {}：完全不同的主题 {}", idx, idx),
+                    MemoryType::Fact,
+                );
+                let shard = &shards[idx % shards.len()];
+                let prep = {
+                    let s = shard.lock().unwrap();
+                    s.prepare_remember(m).expect("阶段 1 应成功")
+                };
+                let analysis = prep.analyze();
+                {
+                    let s = shard.lock().unwrap();
+                    s.commit_remember(analysis).expect("阶段 3 应成功");
+                }
+            })
+        };
+        report("4 分片", &shard_stats);
+
+        // ---------- 正确性：所有写入都能读回 ----------
+        let expected = TOTAL + THREADS * PER_THREAD;
+        let actual: usize = shards
+            .iter()
+            .map(|s| s.lock().unwrap().load_cached().expect("应能取快照").len())
+            .sum();
+        // 允许极少数合并（并发写入下相似检查仍可能命中），但不得成规模丢失
+        let lost = expected.saturating_sub(actual);
+        assert!(
+            lost <= 5,
+            "分片后丢失 {} 条（>5），需排查：actual={} expected={}",
+            lost,
+            actual,
+            expected
+        );
+        println!(
+            "[分片验证] 正确性：{} / {} 条（合并/丢失 {}）",
+            actual, expected, lost
+        );
+        match prev_thr {
+            Some(v) => std::env::set_var("LRC_SIMILARITY_THRESHOLD", v),
+            None => std::env::remove_var("LRC_SIMILARITY_THRESHOLD"),
+        }
+    }
+
+    /// 写入落盘分解实验（2026-11-05）：确认 append-only journal 是否已是瓶颈。
+    ///
+    /// **背景（重要）**：`JsonPersistence` **已实现** `memories.journal.jsonl` 追加写
+    /// （`save_memory` 仅在 `needs_compact()` 时全量重写）。因此"改 append-only journal"
+    /// 不是待做项，而是**已完成项**。本实验直接测 `save_memory` 单次耗时，
+    /// 判断"落盘"是否仍是并发写入的瓶颈。
+    #[test]
+    #[ignore]
+    fn p3_save_memory_breakdown() {
+        let _env_guard = crate::test_env::lock();
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = create_json_persistence(&data_dir).expect("应成功创建");
+
+        // 预注入 7048 条（批量写，建立基文件 + 缓存）
+        let base: Vec<Memory> = (0..7048)
+            .map(|i| {
+                make_test_memory(
+                    &format!("落盘分解基库 {}：数据库连接池参数调优", i),
+                    MemoryType::Fact,
+                )
+            })
+            .collect();
+        p.save_memories(&base).expect("批量写入应成功");
+
+        // 100 次单条写入（唯一内容，避免合并）
+        let mut lat = Vec::new();
+        for i in 0..100 {
+            let m = make_test_memory(
+                &format!("落盘分解新增 {}：完全不同的主题 {}", i, i),
+                MemoryType::Fact,
+            );
+            let t0 = std::time::Instant::now();
+            p.save_memory(&m).expect("单条写入应成功");
+            lat.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
+        let journal = dir.path().join("memories.journal.jsonl");
+        println!(
+            "[落盘分解] save_memory 100 次：P50 {:.2} ms，P95 {:.2} ms，max {:.2} ms；journal 存在={} 大小={} bytes",
+            pct(0.5),
+            pct(0.95),
+            lat[lat.len() - 1],
+            journal.exists(),
+            std::fs::metadata(&journal).map(|m| m.len()).unwrap_or(0)
+        );
+    }
+
+    /// 删除 tombstone 小验证（2026-11-05）。
+    ///
+    /// **用户模型**：删除 = 把书从书架移到"遗忘桶"，不是重写整个图书馆。
+    /// 本实验对比"旧实现（全量重写 `memories.json`）"与"新实现（追加 tombstone）"
+    /// 的单次耗时，用于确认删除代价不再随库规模线性增长。
+    #[test]
+    #[ignore]
+    fn p3_delete_tombstone_validation() {
+        let _env_guard = crate::test_env::lock();
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let p = create_json_persistence(&data_dir).expect("应成功创建");
+
+        let base: Vec<Memory> = (0..7048)
+            .map(|i| {
+                make_test_memory(
+                    &format!("删除验证基库 {}：数据库连接池参数调优", i),
+                    MemoryType::Fact,
+                )
+            })
+            .collect();
+        p.save_memories(&base).expect("批量写入应成功");
+
+        // 1) 旧实现模拟：每次删除都整库序列化 + 重写基文件
+        let mut rewrite_lat = Vec::new();
+        for m in base.iter().take(20) {
+            let t0 = std::time::Instant::now();
+            let remaining: Vec<&Memory> = base.iter().filter(|x| x.id != m.id).collect();
+            let json = serde_json::to_string_pretty(&remaining).expect("应能序列化");
+            std::fs::write(dir.path().join("memories.json"), json).expect("应能重写");
+            rewrite_lat.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        // 2) 新实现：追加 tombstone（O(1)）
+        let mut tomb_lat = Vec::new();
+        for m in base.iter().skip(20).take(20) {
+            let t0 = std::time::Instant::now();
+            p.delete_memory(&m.id).expect("删除应成功");
+            tomb_lat.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        let stat = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |q: f64| v[((v.len() - 1) as f64 * q) as usize];
+            (pct(0.5), pct(0.95), v[v.len() - 1])
+        };
+        let (r50, r95, rmax) = stat(&mut rewrite_lat);
+        let (t50, t95, tmax) = stat(&mut tomb_lat);
+        println!(
+            "[删除验证] 全量重写：P50 {:.2} ms，P95 {:.2} ms，max {:.2} ms",
+            r50, r95, rmax
+        );
+        println!(
+            "[删除验证] tombstone 追加：P50 {:.2} ms，P95 {:.2} ms，max {:.2} ms",
+            t50, t95, tmax
+        );
+        println!(
+            "[删除验证] 加速比（P50）：{:.1}×",
+            if t50 > 0.0 { r50 / t50 } else { 0.0 }
+        );
+    }
+
+    /// 候选索引验证（2026-11-05）。
+    ///
+    /// **目的**：确认"域候选索引"（默认开启）相对"全库扫描"（`LRC_DOMAIN_CANDIDATE_INDEX_OFF=1`）
+    /// 既**不改变合并决策**（红线：相似检查结果 id 完全一致），又能显著降低 analyze 耗时。
+    ///
+    /// 运行：
+    ///   cargo test --release --lib p3_candidate_index_validation -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn p3_candidate_index_validation() {
+        let _env_guard = crate::test_env::lock();
+        let (_dir, store) = make_store();
+
+        let n = 7048usize;
+        // 多样化语料：每条记忆由 2 个主题词组合而成（40 个主题），
+        // 使 term 分布接近真实库（而非全部共享同一模板）。
+        let topics = [
+            "数据库连接池参数调优",
+            "西湖边散步看晚霞",
+            "Rust 所有权与借用检查",
+            "比特币工作量证明机制",
+            "会议室预定与投影仪",
+            "前端构建缓存失效",
+            "分布式锁与租约续期",
+            "日志轮转与磁盘配额",
+            "向量检索召回率评估",
+            "用户登录鉴权流程",
+            "消息队列积压告警",
+            "容器镜像分层优化",
+            "索引重建与冷启动",
+            "网络超时与重试策略",
+            "内存泄漏排查记录",
+            "灰度发布回滚预案",
+            "数据迁移一致性校验",
+            "定时任务调度冲突",
+            "文件句柄泄漏修复",
+            "接口幂等性设计",
+            "缓存穿透与布隆过滤",
+            "分库分表路由规则",
+            "链路追踪埋点规范",
+            "配置中心热更新",
+            "压测脚本参数标定",
+            "证书过期自动续签",
+            "跨域请求预检失败",
+            "长连接心跳保活",
+            "批量导入性能瓶颈",
+            "事务隔离级别选择",
+            "序列化协议兼容性",
+            "限流熔断阈值调整",
+            "冷热数据分层存储",
+            "多租户数据隔离",
+            "离线任务资源抢占",
+            "监控指标口径统一",
+            "灰度流量染色规则",
+            "依赖版本冲突解决",
+            "构建产物签名校验",
+            "备份恢复演练记录",
+        ];
+        // 确定性伪随机 nonce（splitmix64 ×2 = 32 hex）：保证每条记忆内容唯一、
+        // 无共享前缀，且 nonce 在内容中占比足够大，使"同主题不同 nonce"的记忆
+        // Jaccard 明显低于阈值（否则多条记忆同时达标，扫描顺序差异会被误判为回归）。
+        let nonce = |i: usize| -> String {
+            let mix = |seed: u64| -> u64 {
+                let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            };
+            format!(
+                "{:016x}{:016x}",
+                mix(i as u64),
+                mix((i as u64) ^ 0xA5A5_A5A5_A5A5_A5A5)
+            )
+        };
+        let mems: Vec<Memory> = (0..n)
+            .map(|i| {
+                make_test_memory(
+                    &format!(
+                        "{}：{}，唯一标识 {}",
+                        topics[i % topics.len()],
+                        topics[(i * 7 + 3) % topics.len()],
+                        nonce(i)
+                    ),
+                    MemoryType::Fact,
+                )
+            })
+            .collect();
+        store.remember_batch(mems).expect("批量注入应成功");
+
+        // 查询集：一半是库内精确内容（应命中唯一一条），一半完全无关（应不命中）。
+        let mut queries: Vec<String> = Vec::new();
+        for i in 0..30 {
+            let k = i * 201;
+            queries.push(format!(
+                "{}：{}，唯一标识 {}",
+                topics[k % topics.len()],
+                topics[(k * 7 + 3) % topics.len()],
+                nonce(k)
+            ));
+        }
+        for i in 0..30 {
+            queries.push(format!(
+                "完全无关的查询 {}：量子纠缠与超导材料实验，编号 {}",
+                i, i
+            ));
+        }
+
+        let run = |store: &MemoryStore<crate::persistence::json::JsonPersistence>| {
+            let t0 = std::time::Instant::now();
+            let ids: Vec<Option<String>> = queries
+                .iter()
+                .map(|q| store.find_similar(q).expect("相似检查应成功").map(|m| m.id))
+                .collect();
+            (ids, t0.elapsed().as_secs_f64() * 1000.0)
+        };
+
+        // 1) 索引开（默认）
+        let (on_ids, on_ms) = run(&store);
+        // 2) 索引关（全库扫描）
+        std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX_OFF", "1");
+        let (off_ids, off_ms) = run(&store);
+        std::env::remove_var("LRC_DOMAIN_CANDIDATE_INDEX_OFF");
+
+        let same = on_ids
+            .iter()
+            .zip(off_ids.iter())
+            .filter(|(a, b)| a == b)
+            .count();
+        for (i, (a, b)) in on_ids.iter().zip(off_ids.iter()).enumerate() {
+            if a != b {
+                println!(
+                    "[候选索引] 差异 #{}：query={:?} 索引开={:?} 索引关={:?}",
+                    i, queries[i], a, b
+                );
+            }
+        }
+        let hits = on_ids.iter().filter(|x| x.is_some()).count();
+        println!(
+            "[候选索引] find_similar {} 次：索引开 {:.1} ms，索引关 {:.1} ms，加速 {:.1}×",
+            queries.len(),
+            on_ms,
+            off_ms,
+            if on_ms > 0.0 { off_ms / on_ms } else { 0.0 }
+        );
+        println!(
+            "[候选索引] 合并决策一致：{}/{}（命中 {} 条）",
+            same,
+            queries.len(),
+            hits
+        );
+        assert_eq!(same, queries.len(), "红线：索引不得改变相似检查结果");
+
+        // 3) analyze 阶段耗时（prepare + analyze，不 commit，避免污染库）
+        //    两种场景：
+        //    a) 全新主题（与库内无词面重合）—— 空候选可安全跳过；
+        //    b) 已有主题 + 新 nonce（真实写入最常见）—— 候选非空，仍需 Jaccard 判定。
+        let measure_analyze = |store: &MemoryStore<crate::persistence::json::JsonPersistence>,
+                               novel: bool| {
+            let mut lat = Vec::new();
+            for i in 0..50 {
+                let content = if novel {
+                    format!("候选索引 analyze {}：另一组完全不同的主题，编号 {}", i, i)
+                } else {
+                    format!(
+                        "{}：{}，唯一标识 {}",
+                        topics[i % topics.len()],
+                        topics[(i * 7 + 3) % topics.len()],
+                        nonce(100_000 + i)
+                    )
+                };
+                let m = make_test_memory(&content, MemoryType::Fact);
+                let t0 = std::time::Instant::now();
+                let prep = store.prepare_remember(m).expect("阶段 1 应成功");
+                let _ = prep.analyze();
+                lat.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            lat[lat.len() / 2]
+        };
+        for (label, novel) in [("全新主题", true), ("已有主题", false)] {
+            let on_analyze = measure_analyze(&store, novel);
+            std::env::set_var("LRC_DOMAIN_CANDIDATE_INDEX_OFF", "1");
+            let off_analyze = measure_analyze(&store, novel);
+            std::env::remove_var("LRC_DOMAIN_CANDIDATE_INDEX_OFF");
+            println!(
+                "[候选索引] analyze P50（{}）：索引开 {:.2} ms，索引关 {:.2} ms，加速 {:.1}×",
+                label,
+                on_analyze,
+                off_analyze,
+                if on_analyze > 0.0 {
+                    off_analyze / on_analyze
+                } else {
+                    0.0
+                }
+            );
+        }
+    }
+
+    /// 快路候选索引验证（2026-11-05）。
+    ///
+    /// **目的**：评估 `LRC_FAST_CANDIDATE_INDEX=1`（快路 BM25 的候选裁剪）
+    /// 在 7048 条库上的收益与红线（检索结果 id 必须与全量扫描逐条一致）。
+    ///
+    /// 运行：
+    ///   cargo test --release --lib p3_fast_path_index_validation -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn p3_fast_path_index_validation() {
+        let _env_guard = crate::test_env::lock();
+        let (_dir, mut store) = make_store();
+
+        let topics = [
+            "数据库连接池参数调优",
+            "西湖边散步看晚霞",
+            "Rust 所有权与借用检查",
+            "比特币工作量证明机制",
+            "会议室预定与投影仪",
+            "前端构建缓存失效",
+            "分布式锁与租约续期",
+            "日志轮转与磁盘配额",
+            "向量检索召回率评估",
+            "用户登录鉴权流程",
+            "消息队列积压告警",
+            "容器镜像分层优化",
+            "索引重建与冷启动",
+            "网络超时与重试策略",
+            "内存泄漏排查记录",
+            "灰度发布回滚预案",
+            "数据迁移一致性校验",
+            "定时任务调度冲突",
+            "文件句柄泄漏修复",
+            "接口幂等性设计",
+        ];
+        let n: usize = std::env::var("LRC_P3_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7048);
+        let mems: Vec<Memory> = (0..n)
+            .map(|i| {
+                make_test_memory(
+                    &format!(
+                        "{}：{}，样本编号 {}",
+                        topics[i % topics.len()],
+                        topics[(i * 7 + 3) % topics.len()],
+                        i
+                    ),
+                    MemoryType::Fact,
+                )
+            })
+            .collect();
+        store.remember_batch(mems).expect("批量注入应成功");
+
+        let queries = [
+            "数据库 连接池 调优",
+            "西湖 晚霞 散步",
+            "Rust 所有权 借用",
+            "比特币 工作量 证明",
+            "会议室 投影仪 预定",
+            "前端 构建 缓存",
+            "分布式 锁 租约",
+            "日志 轮转 磁盘",
+            "向量 检索 召回",
+            "用户 登录 鉴权",
+            "消息 队列 积压",
+            "容器 镜像 分层",
+            "索引 重建 冷启动",
+            "网络 超时 重试",
+            "内存 泄漏 排查",
+            "灰度 发布 回滚",
+            "数据 迁移 一致性",
+            "定时 任务 调度",
+            "文件 句柄 泄漏",
+            "接口 幂等 设计",
+        ];
+        let recall_ids = |store: &mut MemoryStore<crate::persistence::json::JsonPersistence>| {
+            let t0 = std::time::Instant::now();
+            let ids: Vec<Vec<String>> = queries
+                .iter()
+                .map(|q| {
+                    store
+                        .recall(q, &RecallFilter::new().with_top_k(10))
+                        .expect("检索应成功")
+                        .memories
+                        .iter()
+                        .map(|m| m.id.clone())
+                        .collect()
+                })
+                .collect();
+            (ids, t0.elapsed().as_secs_f64() * 1000.0)
+        };
+
+        std::env::remove_var("LRC_FAST_CANDIDATE_INDEX");
+        let (full_ids, full_ms) = recall_ids(&mut store);
+        std::env::set_var("LRC_FAST_CANDIDATE_INDEX", "1");
+        let (fast_ids, fast_ms) = recall_ids(&mut store);
+        std::env::remove_var("LRC_FAST_CANDIDATE_INDEX");
+
+        let same = full_ids
+            .iter()
+            .zip(fast_ids.iter())
+            .filter(|(a, b)| a == b)
+            .count();
+        println!(
+            "[快路索引] recall {} 次：全量 {:.1} ms，裁剪 {:.1} ms，加速 {:.1}×",
+            queries.len(),
+            full_ms,
+            fast_ms,
+            if fast_ms > 0.0 {
+                full_ms / fast_ms
+            } else {
+                0.0
+            }
+        );
+        println!("[快路索引] 结果 id 一致：{}/{}", same, queries.len());
+        assert_eq!(same, queries.len(), "红线：快路裁剪不得改变检索结果");
+    }
+
+    /// 语义暴力余弦的规模标定（2026-11-05）。
+    ///
+    /// **目的**：决定是否接线 HNSW。`SemanticIndex::search` 目前对全库向量做
+    /// 点积（精确 top-k）。本实验测 N = 1k / 10k / 50k / 100k 的单次检索耗时，
+    /// 若在目标规模下已足够快，则**不接线**（HNSW 是近似检索，会牺牲召回）。
+    ///
+    /// 运行：
+    ///   cargo test --release --lib p3_semantic_bruteforce_scaling -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn p3_semantic_bruteforce_scaling() {
+        // 说明：`semantic_index` 模块按 `ml` feature 门控，默认构建不可用。
+        // 这里用等价的"归一化向量 + 点积 + 排序"复现 `SemanticIndex::search`
+        // 的计算量（其成本几乎全在 N×dim 次乘加），无需引入 ML 依赖。
+        let dim = 512usize;
+        let normalize = |mut v: Vec<f32>| -> Vec<f32> {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+            }
+            v
+        };
+        let dot = |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+
+        for n in [1_000usize, 10_000, 50_000, 100_000] {
+            let vectors: Vec<Vec<f32>> = (0..n)
+                .map(|i| {
+                    normalize(
+                        (0..dim)
+                            .map(|d| {
+                                let x = ((i as f32) * 0.017 + (d as f32) * 0.031).sin();
+                                x + ((i * 7 + d * 13) as f32 * 0.001).cos()
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+
+            let mut lat = Vec::new();
+            for q in 0..20 {
+                let query = normalize(
+                    (0..dim)
+                        .map(|d| ((q as f32) * 0.11 + (d as f32) * 0.023).cos())
+                        .collect(),
+                );
+                let t0 = std::time::Instant::now();
+                let mut scored: Vec<(usize, f32)> = vectors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i, dot(&query, v)))
+                    .collect();
+                scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                scored.truncate(10);
+                lat.push(t0.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(scored.len(), 10, "N={n} 应返回 top-10");
+            }
+            lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |q: f64| lat[((lat.len() - 1) as f64 * q) as usize];
+            println!(
+                "[语义暴力] N={} dim={} P50={:.2}ms P95={:.2}ms max={:.2}ms",
+                n,
+                dim,
+                pct(0.5),
+                pct(0.95),
+                lat[lat.len() - 1]
+            );
+        }
+    }
+
+    /// M.T.R. 传输透明性实验（2026-11-05）。
+    ///
+    /// **目的**：验证"按 M.T.R. 桶顺序传输数据"**不改变结果集合**——传输层只负责
+    /// 搬运，不判断载荷语义。这是"语义数据也可以走 M.T.R."的前提。
+    ///
+    /// **判据**：
+    /// 1. **透明性红线**：桶顺序全量扫描的 top-k id 集合 == 扁平扫描（必须逐位一致）。
+    /// 2. **覆盖率**：桶顺序必须覆盖全部带向量的记忆（不丢任何一条）。
+    /// 3. **早停代价**（仅报告，不作断言）：只扫查询桶 + 环距 1 时的 top-k 召回。
+    #[test]
+    fn test_mtr_transport_transparency() {
+        use crate::engine::mirror_trapezoid::{bagua_ring_distance, mirror_project};
+
+        let (_dir, store) = make_store();
+        let n = 1000usize;
+        let mems: Vec<Memory> = (0..n)
+            .map(|i| {
+                make_test_memory(
+                    &format!("传输透明性样本 {}：主题 {} 的配置与排查记录", i, i % 37),
+                    MemoryType::Fact,
+                )
+            })
+            .collect();
+        store.remember_batch(mems).expect("批量注入应成功");
+
+        let all = store.load_cached().expect("应能取快照");
+        let query = "传输透明性样本 42：主题 5 的配置与排查记录";
+        let qv = store.luoshu_encoder.encode_text(query);
+        let qbagua = mirror_project(&qv).best_index as u8;
+
+        let k = 10usize;
+        let cos = |v: &[f32; 9]| -> f32 {
+            crate::engine::luoshu_encoder::LuoShuVector { values: *v }.cosine_similarity(&qv)
+        };
+
+        // 1) 扁平扫描
+        let mut flat: Vec<(usize, f32)> = all
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| m.luoshu_vector.map(|v| (i, cos(&v))))
+            .collect();
+        flat.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let flat_ids: std::collections::HashSet<String> = flat
+            .iter()
+            .take(k)
+            .map(|(i, _)| all[*i].id.clone())
+            .collect();
+
+        // 2) M.T.R. 桶顺序全量扫描（查询桶 → 环距 1 → 2 → 3 → 4）
+        let mut buckets: [Vec<usize>; 8] = std::array::from_fn(|_| Vec::new());
+        for (i, m) in all.iter().enumerate() {
+            if m.luoshu_vector.is_some() {
+                buckets[m.bagua_index.map(|b| b as usize % 8).unwrap_or(0)].push(i);
+            }
+        }
+        let mut order: Vec<usize> = Vec::with_capacity(all.len());
+        order.extend(buckets[qbagua as usize].iter().copied());
+        for d in 1..=4u8 {
+            order.extend(buckets[((qbagua + d) % 8) as usize].iter().copied());
+            if d != 4 {
+                order.extend(buckets[((qbagua + 8 - d) % 8) as usize].iter().copied());
+            }
+        }
+        let with_vec = all.iter().filter(|m| m.luoshu_vector.is_some()).count();
+        assert_eq!(
+            order.len(),
+            with_vec,
+            "桶顺序必须覆盖全部带向量的记忆（不丢任何一条）"
+        );
+
+        let mut routed: Vec<(usize, f32)> = order
+            .iter()
+            .filter_map(|&i| all[i].luoshu_vector.map(|v| (i, cos(&v))))
+            .collect();
+        routed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let routed_ids: std::collections::HashSet<String> = routed
+            .iter()
+            .take(k)
+            .map(|(i, _)| all[*i].id.clone())
+            .collect();
+
+        assert_eq!(
+            flat_ids, routed_ids,
+            "M.T.R. 桶顺序全量扫描必须与扁平扫描结果一致（传输透明）"
+        );
+
+        // 3) 早停：只扫查询桶 + 环距 1（仅报告）
+        let mut early: Vec<(usize, f32)> = order
+            .iter()
+            .filter(|&&i| {
+                all[i]
+                    .bagua_index
+                    .map(|b| bagua_ring_distance(b, qbagua) <= 1)
+                    .unwrap_or(true)
+            })
+            .filter_map(|&i| all[i].luoshu_vector.map(|v| (i, cos(&v))))
+            .collect();
+        early.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let early_ids: std::collections::HashSet<String> = early
+            .iter()
+            .take(k)
+            .map(|(i, _)| all[*i].id.clone())
+            .collect();
+        let hit = flat_ids.intersection(&early_ids).count();
+        println!(
+            "[MTR-透明] 全量一致={} 覆盖={}/{} 早停召回={}/{}（候选 {} 条）",
+            flat_ids == routed_ids,
+            order.len(),
+            with_vec,
+            hit,
+            k,
+            early.len()
+        );
     }
 }

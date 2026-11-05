@@ -61,6 +61,8 @@ type EnrichBlockingResult = (
     Vec<EnrichExplanationItem>,
     f32,
     f32,
+    f32,
+    usize,
     usize,
     usize,
     usize,
@@ -139,77 +141,28 @@ fn assoc_slot_share_denom() -> usize {
     parse_assoc_slot_share_denom(std::env::var("LRC_ASSOC_SLOT_DENOM").ok().as_deref())
 }
 
-/// enrich 检索的**锁等待上限**默认值 —— **直接沿用既有超时阶梯常量**（不另立字面量）。
-const DEFAULT_ENRICH_LOCK_WAIT: std::time::Duration = crate::timeouts::LOCK_WAIT;
-
-/// **写入路径**（`/v1/memories/consolidate`）的取锁等待上限。
+/// 从记忆的洛书向量派生 64 卦索引（标签/组织用，**不参与检索排序**）。
 ///
-/// # 为什么需要单独一个可配项（2026-10-28 线上证据）
-///
-/// 检索阶段里，平台维持 2 路并发题流，每路在**存储锁内**跑 ~36s（快路+深路+关联），
-/// 两路交替持锁 ⇒ 锁**几乎无空窗**。而写入沿用的 `LOCK_WAIT` 只有 6s
-/// ⇒ 每条 Add 都在 6s 内拿不到锁而返回 503，实测 Add 成功率 **0%**
-/// （23 点 1/11、00 点 0/6），并持续累积失败重试（10-21 曾因此中止评测）。
-///
-/// 现允许把**写入**的取锁等待放宽（`LRC_WRITE_LOCK_WAIT_MS`），让写入"排队等锁"
-/// 而不是立刻失败。因为写入只在锁内做一次日志追加（毫秒级），放宽等待**不会拖慢检索**。
-///
-/// # 不变量
-/// * 默认值 = `timeouts::LOCK_WAIT` ⇒ 不设环境变量时**行为逐字节不变**（阶梯守卫测试仍成立）；
-/// * 取值必须 < `HTTP_OUTER_TIMEOUT`(120s)，并给编码/落盘留余量 ⇒ 上限 90s。
-fn write_lock_wait() -> std::time::Duration {
-    std::env::var("LRC_WRITE_LOCK_WAIT_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|v| *v >= 1_000 && *v <= 90_000)
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(crate::timeouts::LOCK_WAIT)
+/// 派生而非持久化：`luoshu_vector` 已落盘，64 卦可由它确定性重算，
+/// 避免再冻结一个会随编码器漂移的派生字段（§2.5 的不变量）。
+fn gua64_of(m: &Memory) -> Option<u8> {
+    m.luoshu_vector.map(|values| {
+        crate::engine::mirror_trapezoid::gua64_index(&crate::engine::luoshu_encoder::LuoShuVector {
+            values,
+        })
+    })
 }
 
 // ============================================================
-// 写优先闸门（v0.9.13）
+// 写优先闸门（v0.9.13 引入 / v0.9.16 上移到 `obs`）
 // ============================================================
-
-/// 当前**正在等待存储锁**的写入请求数（进程级）。
-///
-/// # 为什么必须是进程级静态量，而不是 `MemoryStore` 的字段
-///
-/// 检索路径要在**取锁之前**判断"是否有写入在等"；而那一刻它还没拿到存储锁，
-/// 根本读不到锁内的字段。sidecar 进程内只有一个 `MemoryStore`，
-/// 因此进程级计数与"该存储的写入等待者"是一一对应的。
-///
-/// # 它解决的是什么（线上实测）
-///
-/// 检索阶段维持 2~4 路并发题流，每路在**锁内**跑 30~40 秒。任何时刻只要有一路
-/// 检索在跑，锁就几乎无空窗：写入（只需毫秒级）在 45s 内仍可能一次都抢不到，
-/// 实测 Add 成功率 0%（`LRC budget exhausted before`）。
-/// 让"新到的检索"在有写入等待时**主动让行 10ms**，写入即可在≤一个轮询周期内拿到锁，
-/// 而检索只是晚 10~几十 ms 拿到锁 —— 不改变任何检索结果。
-static WRITE_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// 写入等待标记的 RAII 守卫：构造即登记，析构即注销（panic 也不会泄漏计数）。
-///
-/// 作用域应当**只覆盖"等待锁"这一段**（取到锁即可释放）：这样检索只需在
-/// 写入真正排队时让行，而不会在写入漫长的锁外编码阶段被白白压制。
-struct WriteWaitGuard;
-
-impl WriteWaitGuard {
-    fn new() -> Self {
-        WRITE_WAITERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for WriteWaitGuard {
-    fn drop(&mut self) {
-        WRITE_WAITERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// 是否有写入正在等待存储锁（供长读路径让行）
-fn write_waiting() -> bool {
-    WRITE_WAITERS.load(std::sync::atomic::Ordering::SeqCst) > 0
-}
+//
+// 定义已移至 [`crate::obs`]：MCP 通道（`server.rs`）与后台结晶
+// （`consolidation.rs`）现在共用同一套登记/让行语义。
+// 此前只有本文件持有定义，导致"写优先"只在 v1 通道成立——
+// 而实测的写入失败相当一部分来自 MCP（见 `obs` 模块的锁统计说明）。
+// 回退后：外层 `RwLock` 读并发，v1 通道**不再使用**写优先让行——
+// 实测（16R+16W）让行反而降低吞吐并触发 503，故读路径直接取读锁。
 
 /// enrich 检索的**执行上限**默认值 —— **直接沿用既有超时阶梯常量**。
 const DEFAULT_ENRICH_TIMEOUT: std::time::Duration = crate::timeouts::HTTP_HANDLER_BUDGET;
@@ -238,19 +191,6 @@ fn enrich_exec_timeout() -> std::time::Duration {
         .map(std::time::Duration::from_secs)
         .unwrap_or(DEFAULT_ENRICH_TIMEOUT);
     d.min(crate::timeouts::HTTP_OUTER_TIMEOUT.saturating_sub(ENRICH_TIMEOUT_MARGIN))
-}
-
-/// enrich 检索的**锁等待上限**（环境变量 `LRC_ENRICH_LOCK_WAIT_MS` 可覆盖）。
-///
-/// 阶梯要求 `LOCK_WAIT < HTTP_HANDLER_BUDGET`，故本函数夹取到
-/// **严格小于执行上限**；默认即 `LOCK_WAIT`（零行为变更）。
-fn enrich_lock_wait() -> std::time::Duration {
-    let d = std::env::var("LRC_ENRICH_LOCK_WAIT_MS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(std::time::Duration::from_millis)
-        .unwrap_or(DEFAULT_ENRICH_LOCK_WAIT);
-    d.min(enrich_exec_timeout().saturating_sub(ENRICH_TIMEOUT_MARGIN))
 }
 
 /// enrich 出口：**关联条目允许占用的槽位数**。
@@ -322,30 +262,6 @@ static BENCHMARK_CACHE: std::sync::LazyLock<
 
 /// 基准测试缓存有效期：1 小时
 const BENCHMARK_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-
-/// 统一 API 错误响应类型
-type ApiError = (StatusCode, Json<serde_json::Value>);
-
-/// 全局 memory_store 锁获取超时。v0.9.3 修复：任何 handler 卡死都不能无限持有
-/// 全局锁阻塞所有其它请求（搜索/健康检查），超时后返回 503。
-async fn lock_store_with_timeout<T>(
-    store: &Arc<Mutex<T>>,
-) -> Result<tokio::sync::MutexGuard<'_, T>, ApiError> {
-    // v0.9.11（G4 / CR-23）：引用**超时真源**，不再硬编码 2s。
-    // 此前这里与 `timeouts::LOCK_WAIT` 是两个独立的 2s —— 一旦真源调整，
-    // v1 与 MCP 两条通道的口径就会静默分叉（CR-11 的同类根因）。
-    tokio::time::timeout(crate::timeouts::LOCK_WAIT, store.lock())
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "store_busy",
-                    "message": "记忆服务繁忙，请稍后重试"
-                })),
-            )
-        })
-}
 
 // ==================== 请求/响应类型 ====================
 
@@ -432,6 +348,11 @@ pub struct ConsolidateResponse {
     pub synthesized: usize,
     pub total_memories: usize,
     pub synthesis_summaries: Vec<String>,
+    /// S3.5 后半（2026-11-03）：本次因「遗忘指令」被抑制的旧记忆条数。
+    ///
+    /// 指令本身**不入库**（正文含被遗忘目标原文），故 `stored` 不含它。
+    #[serde(default)]
+    pub suppressed: usize,
 }
 
 /// /v1/memories/enrich 请求体
@@ -615,17 +536,21 @@ pub struct EnrichExplanation {
     pub fast_path_hits: usize,
     /// 深度路径候选数
     pub deep_path_hits: usize,
+    /// 语义路径候选数（v0.9.17 第三路；不可用时为 0）
+    pub semantic_path_hits: usize,
     /// 融合后唯一候选桶数（与响应体 total 一致）
     pub total_candidates: usize,
     /// 每条结果的通路贡献明细（与 memories 平行）
     pub items: Vec<EnrichExplanationItem>,
 }
 
-/// RRF 两路检索权重
+/// RRF 多路检索权重
 #[derive(Debug, Serialize)]
 pub struct ExplanationWeights {
     pub fast: f32,
     pub deep: f32,
+    /// 语义路径权重（v0.9.17）
+    pub semantic: f32,
 }
 
 /// 单条联想结果的通路贡献明细
@@ -636,15 +561,19 @@ pub struct EnrichExplanationItem {
     pub rank: usize,
     /// 展示分（与 EnrichedMemory.score 一致）
     pub score: f32,
-    /// 真实融合贡献分 = fast_contrib + deep_contrib
+    /// 真实融合贡献分 = fast_contrib + deep_contrib + semantic_contrib
     pub fused_contrib: f32,
     pub fast_contrib: f32,
     pub deep_contrib: f32,
+    /// 语义路径贡献分（v0.9.17）
+    pub semantic_contrib: f32,
     /// 在快速路径结果中的排名（未命中为 None）
     pub fast_rank: Option<usize>,
     /// 在深度路径结果中的排名（未命中为 None）
     pub deep_rank: Option<usize>,
-    /// 命中的检索通路，如 ["fast"] / ["deep"] / ["fast","deep"]
+    /// 在语义路径结果中的排名（未命中为 None）
+    pub semantic_rank: Option<usize>,
+    /// 命中的检索通路，如 ["fast"] / ["deep"] / ["fast","semantic"]
     pub hit_paths: Vec<&'static str>,
 }
 
@@ -656,6 +585,11 @@ pub struct EnrichedMemory {
     pub memory_type: String,
     pub score: f32,
     pub bagua_category: Option<String>,
+    /// 64 卦索引（上卦 × 8 + 下卦，0..64）——**标签/组织**用，不参与检索排序。
+    ///
+    /// 由已落盘的 `luoshu_vector` 确定性派生（见 `gua64_index`），
+    /// 不新增持久化字段，避免"冻结派生字段与编码器漂移"（§2.5 的不变量）。
+    pub gua64: Option<u8>,
     pub daoti_preview_gua: Option<String>,
     pub daoti_preview_bagua: Option<String>,
     pub daoti_preview_version: Option<String>,
@@ -882,7 +816,7 @@ fn assoc_suppress_lambda() -> Option<f32> {
 /// 探索本身复用 LRC 的 recall 入口，因此每一跳都会经过内置道体状态机、
 /// 联想导航和回归校验，而不是在 API 层另造一套排序逻辑。
 fn run_association_explore(
-    store: &mut MemoryStore<JsonPersistence>,
+    store: &MemoryStore<JsonPersistence>,
     query: Option<&str>,
     memory_id: Option<&str>,
     max_depth: u8,
@@ -1188,7 +1122,7 @@ fn run_association_explore(
             width,
             nodes,
             edges,
-            trail: store.memory_state_machine.snapshot().trail,
+            trail: store.memory_state_machine.read().unwrap().snapshot().trail,
             total_expanded,
             interrupted,
             // 连起点都召不回（召回为空，或没有候选通过根节点实质共鸣门禁），
@@ -1275,7 +1209,7 @@ fn run_association_explore(
     // 关闭时为空表，候选顺序与现状逐字节一致（零影响承诺）。
     let edge_adjust: std::collections::HashMap<(String, String), f32> =
         if assoc_edge_feedback_enabled() {
-            store.user_feedback.get_edge_adjustments()
+            store.user_feedback.read().unwrap().get_edge_adjustments()
         } else {
             std::collections::HashMap::new()
         };
@@ -1440,13 +1374,16 @@ fn run_association_explore(
     // 不算弱匹配，照常展示起点与确认按钮，绝不把有效结果整个隐藏。
     let weak_match = nodes.is_empty();
 
+    // ★ 2026-11-05：应用读路径累积的副作用（图边 / 状态机 / 生命周期）。
+    store.flush_recall_side_effects();
+
     AssociationExploreResponse {
         root,
         depth: max_depth,
         width,
         nodes,
         edges,
-        trail: store.memory_state_machine.snapshot().trail,
+        trail: store.memory_state_machine.read().unwrap().snapshot().trail,
         total_expanded,
         interrupted,
         weak_match,
@@ -1737,7 +1674,18 @@ pub struct UnfoldedSubMemory {
 }
 
 /// 共享状态类型别名（避免过长的类型签名）
-pub type SharedStore = Arc<Mutex<MemoryStore<JsonPersistence>>>;
+///
+/// 并发模型：`RwLock` 让多个读请求并行（改造前为 `Mutex`，读也串行）。
+///
+/// 曾尝试进一步改为 `Arc<MemoryStore>`（读者无锁 + 写者内部串行），实测**全面劣化**：
+/// 混合负载（16R+16W）写 P95 6063→14726ms、读 P95 841→9666ms、吞吐 27.5→7.0 req/s。
+/// 根因：检索本身 CPU 密集（P50 727ms），16 并发已饱和；去掉外层锁后写者与读者
+/// 竞争内部细粒度锁（cache 的多个 RwLock/Mutex），比外层锁更糟——外层锁至少保证
+/// "写者等待时读者不受影响"。RCU 适用于"读多写少 + 快照小"，本项目全库 25MB 不适用。
+///
+/// 保留的优化：`MemoryStoreCache` 快照元素改为 `Arc<Memory>`（写时复制只复制指针），
+/// 以及 `rebuild_index_if_dirty` 的锁内二次检查（消除 16 次重复全量重建）。
+pub type SharedStore = Arc<RwLock<MemoryStore<JsonPersistence>>>;
 
 /// v0.5.4 P1-7 新增：/v1/memories/recent 查询参数
 ///
@@ -2256,7 +2204,7 @@ pub fn build_v1_router_with_trust(
                         .unwrap_or(false);
                     let mem_inputs = req.memories;
                     let phase1_store = store.clone();
-                    let stored = tokio::task::spawn_blocking(move || -> Option<Result<usize, String>> {
+                    let stored = tokio::task::spawn_blocking(move || -> Option<Result<(usize, usize), String>> {
                         // 有界 try_lock 轮询（2s）由下面三个阶段**各自**执行：
                         // 在阻塞线程中自旋，不饥饿 HTTP worker，也不无限占用阻塞线程。
                         //
@@ -2283,8 +2231,28 @@ pub fn build_v1_router_with_trust(
                         //   因此锁外编码与锁内编码**逐位等价**。
                         // P1-5：记录本批次起点，用于编码阶段的预算检查（防止幽灵写入）。
                         let phase_start = std::time::Instant::now();
-                        let mut batch = Vec::with_capacity(mem_inputs.len());
+                        // ★ S3.5 后半（2026-11-03）：先分离「遗忘指令」。
+                        //
+                        // 两条硬约束（见 `memory_write::parse_forget_intent` 文档）：
+                        // 1. 指令**不得入库**——它的正文里含有被遗忘目标的原文，
+                        //    写进去等于"忘了又记回来"；
+                        // 2. 指令要转成对旧记忆的**抑制**，否则"请忘记 X"没有任何效果。
+                        let mut forget_ops: Vec<(String, Option<String>, Option<String>)> =
+                            Vec::new();
+                        let mut normal_inputs: Vec<&ConsolidateMemory> =
+                            Vec::with_capacity(mem_inputs.len());
                         for mem in &mem_inputs {
+                            match crate::memory_write::parse_forget_intent(&mem.content) {
+                                Some(intent) => forget_ops.push((
+                                    intent.target,
+                                    mem.user_id.clone(),
+                                    mem.project.clone(),
+                                )),
+                                None => normal_inputs.push(mem),
+                            }
+                        }
+                        let mut batch = Vec::with_capacity(normal_inputs.len());
+                        for mem in normal_inputs {
                             // v0.9.11：所有写入入口共用 `MemoryWriteInput`（**写入单一真源**），
                             // 避免"字段集按端点各自定义"与"新增字段只改一路径"。
                             batch.push(
@@ -2314,34 +2282,8 @@ pub fn build_v1_router_with_trust(
                         }
 
                         // 阶段 1（**短暂持锁**）：仅取编码器句柄（克隆成本 ≈ 一个 bool）。
-                        // ★ 2026-10-28 分段计时：与阶段 3 一起，用来把"取锁等待"从
-                        //   "真正的工作"里剥离出来（写入 17s 的构成必须实测）。
                         let __p1_t0 = std::time::Instant::now();
-                        let encoder = {
-                            // 取锁上限走**单一真源**（此前这里硬编码 2s ⇒ 与 `timeouts::LOCK_WAIT`
-                            // 各自为政；真源调整后此处不会跟随 ⇒ 已知漂移缺陷，2026-10-15 修正）。
-                            let lock_deadline =
-                                std::time::Instant::now() + write_lock_wait();
-                            // ★ 写优先（v0.9.13）：登记"写入在等锁"，
-                            //   使新到的检索主动让行（见 `WRITE_WAITERS` 文档）。
-                            let _write_wait = WriteWaitGuard::new();
-                            let store_guard = loop {
-                                match phase1_store.try_lock() {
-                                    Ok(guard) => break guard,
-                                    Err(_) if std::time::Instant::now() < lock_deadline => {
-                                        std::thread::sleep(std::time::Duration::from_millis(10));
-                                    }
-                                    Err(_) => {
-                                        eprintln!(
-                                            "[v1/consolidate] 取编码器句柄等待存储锁超时（{}ms），本次写入放弃",
-                                            write_lock_wait().as_millis()
-                                        );
-                                        return None;
-                                    }
-                                }
-                            };
-                            store_guard.luoshu_encoder_handle()
-                        };
+                        let encoder = phase1_store.blocking_read().luoshu_encoder_handle();
                         let __p1_s = __p1_t0.elapsed().as_secs_f64();
                         if __timing {
                             eprintln!("[LRC·计时] write 阶段1取编码器锁={:.3}s", __p1_s);
@@ -2374,48 +2316,60 @@ pub fn build_v1_router_with_trust(
                         // 阶段 3（**短暂持锁**）：投影 + 一次落盘 + 索引维护。
                         let __p3_t0 = std::time::Instant::now();
                         let stored = {
-                            // 同上：取锁上限走单一真源，不再硬编码。
-                            let lock_deadline =
-                                std::time::Instant::now() + write_lock_wait();
-                            // ★ 写优先（v0.9.13）：同阶段 1，登记等待使检索让行。
-                            let _write_wait = WriteWaitGuard::new();
-                            let mut store_guard = loop {
-                                match phase1_store.try_lock() {
-                                    Ok(guard) => break guard,
-                                    Err(_) if std::time::Instant::now() < lock_deadline => {
-                                        std::thread::sleep(std::time::Duration::from_millis(10));
-                                    }
-                                    Err(_) => {
-                                        eprintln!(
-                                            "[v1/consolidate] 写入阶段等待存储锁超时（{}ms），本次写入放弃（编码已白做）",
-                                            write_lock_wait().as_millis()
-                                        );
-                                        return None;
-                                    }
-                                }
-                            };
+                            // 阶段 3 全程持写锁：写入 + 遗忘抑制 + 生命周期落盘必须原子。
+                            let __hold_t0 = std::time::Instant::now();
+                            let store = phase1_store.blocking_write();
                             let write_outcome =
-                                match store_guard.remember_batch_preencoded(batch, luoshu_vecs) {
+                                match store.remember_batch_preencoded(batch, luoshu_vecs) {
                                     Ok(v) => Ok(v.len()),
                                     Err(e) => {
-                                        eprintln!("[v1/consolidate] 批量写入失败: {}", e);
+                                        eprintln!(
+                                            "{} [v1/consolidate] 批量写入失败: {}",
+                                            crate::obs::ts(),
+                                            e
+                                        );
                                         Err(e.to_string())
                                     }
                                 };
+                            // ★ S3.5 后半（2026-11-03）：把「遗忘指令」转成抑制标记。
+                            // 与写入同处一次持锁内完成：指令与它要遗忘的旧记忆通常
+                            // 属于同一批 Add，分两次取锁会留下"指令已生效、旧记忆还在"的窗口。
+                            let mut suppressed = 0usize;
+                            if write_outcome.is_ok() && !forget_ops.is_empty() {
+                                let now = crate::lifecycle::now_ms();
+                                for (target, user, project) in &forget_ops {
+                                    suppressed += store.suppress_matching_memories(
+                                        target,
+                                        user.as_deref(),
+                                        project.as_deref(),
+                                        now,
+                                    );
+                                }
+                                if suppressed > 0 {
+                                    eprintln!(
+                                        "{} [v1/consolidate] 遗忘指令生效：抑制 {} 条旧记忆",
+                                        crate::obs::ts(),
+                                        suppressed
+                                    );
+                                }
+                            }
                             // P0-2 闭环：顺带按节流（60s 最多一次）把生命周期表落盘。
                             // 失败不影响本次写入结果 —— 寿命状态只是排序乘子，不是数据本体。
-                            if let Err(e) = store_guard.flush_lifecycle_if_due(false) {
+                            // 有抑制时必须**立即**落盘（force），否则进程重启会丢掉"已遗忘"。
+                            if let Err(e) = store.flush_lifecycle_if_due(suppressed > 0) {
                                 eprintln!(
-                                    "[v1/consolidate] 生命周期表落盘失败（不影响写入）: {}",
+                                    "{} [v1/consolidate] 生命周期表落盘失败（不影响写入）: {}",
+                                    crate::obs::ts(),
                                     e
                                 );
                             }
-                            write_outcome
+                            crate::obs::record_hold("store.write", __hold_t0.elapsed());
+                            write_outcome.map(|n| (n, suppressed))
                         };
                         if __timing {
                             eprintln!(
                                 "[LRC·计时] write 阶段3持锁+落盘+索引 stored={} {:.3}s",
-                                stored.as_ref().map(|v| *v).unwrap_or(0),
+                                stored.as_ref().map(|v| v.0).unwrap_or(0),
                                 __p3_t0.elapsed().as_secs_f64()
                             );
                         }
@@ -2425,7 +2379,7 @@ pub fn build_v1_router_with_trust(
                     .unwrap_or(None);
 
                     // 锁超时 → 503 store_busy（保持原语义）；落盘失败 → 500 + 机器可读原因。
-                    let stored = match stored {
+                    let (stored, suppressed) = match stored {
                         None => {
                             return Err((
                                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2435,7 +2389,7 @@ pub fn build_v1_router_with_trust(
                                 })),
                             ))
                         }
-                        Some(Ok(n)) => n,
+                        Some(Ok(v)) => v,
                         Some(Err(msg)) => {
                             return Err((
                                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2450,7 +2404,7 @@ pub fn build_v1_router_with_trust(
                     // Phase 2：异步超时获取快照，锁外执行 CPU 聚类计算。
                     let __t_pre_snap = std::time::Instant::now();
                     let snapshot = {
-                        let store = lock_store_with_timeout(&store).await?;
+                        let store = store.read().await;
                         let snap_result = if scoped_inline_synthesis {
                             // 分区内合成（F1）：~65 条/用户 ⇒ 平方聚类可忽略；
                             // 详见 `MemoryStore::synthesis_snapshot_scoped` 的实测依据。
@@ -2545,7 +2499,7 @@ pub fn build_v1_router_with_trust(
                         }?
                     };
                     let synthesized = {
-                        let mut store = lock_store_with_timeout(&store).await?;
+                        let store = store.write().await;
                         store.apply_synthesis_plan(synthesized_plan)
                     };
 
@@ -2560,7 +2514,7 @@ pub fn build_v1_router_with_trust(
                     //   这也是 600s 长尾的主要放大器：长持锁会把后续 Add 的取锁等待
                     //   （LOCK_WAIT 6s）推成 503，再被适配层内部重试放大。
                     let (synthesis_summaries, total) = {
-                        let store = lock_store_with_timeout(&store).await?;
+                        let store = store.read().await;
                         let synthesis_summaries =
                             store.synthesis_summary_texts().map_err(|e| {
                                 (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
@@ -2597,6 +2551,7 @@ pub fn build_v1_router_with_trust(
                         synthesized,
                         total_memories: total,
                         synthesis_summaries,
+                        suppressed,
                     }))
                 }
             }
@@ -2644,7 +2599,6 @@ pub fn build_v1_router_with_trust(
                     // ★ 两个上限均可配（默认与改造前一致）：`LRC_ENRICH_LOCK_WAIT_MS` /
                     //   `LRC_ENRICH_TIMEOUT_SECS`。Full 量级下单次检索达 7~10s ⇒
                     //   必须把锁等待上限抬到 ≥ 最坏耗时，否则 503 级联（台账 ⑬）。
-                    let enrich_lock_wait = enrich_lock_wait();
                     let cancellation = Arc::new(AtomicBool::new(false));
                     let cancellation_for_task = cancellation.clone();
                     let result = tokio::time::timeout(
@@ -2658,61 +2612,15 @@ pub fn build_v1_router_with_trust(
                             let __timing = std::env::var("LRC_TIMING")
                                 .map(|v| v == "1")
                                 .unwrap_or(false);
-                            // 有界锁获取：轮询 try_lock，超时未获得则放弃
-                            let lock_deadline = std::time::Instant::now() + enrich_lock_wait;
-                            let mut store = loop {
-                                // ★ 写优先（v0.9.13）：若有写入正在等锁，本检索**让行**。
-                                //
-                                // 为什么需要：检索单次持锁 30~40s，2~4 路并发时锁几乎无空窗，
-                                // 写入（毫秒级）即使排 45s 也抢不到 ⇒ Add 恒 503（线上实测 0%）。
-                                // 这里只多等一个轮询步长（10ms），**不改变任何检索结果**。
-                                if write_waiting() {
-                                    if std::time::Instant::now() >= lock_deadline {
-                                        eprintln!(
-                                            "[v1/enrich] 锁获取超时（{}ms，含写优先让行），返回 search_busy",
-                                            enrich_lock_wait.as_millis()
-                                        );
-                                        return Err("search_busy");
-                                    }
-                                    if cancellation_for_task.load(Ordering::Acquire) {
-                                        return Err("cancelled");
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                    continue;
-                                }
-                                match store.try_lock() {
-                                    Ok(guard) => {
-                                        // ★ 写优先·**交接**（v0.9.13）：刚拿到锁时若发现写入在等，
-                                        //   立即释放并让行一轮。
-                                        //
-                                        // 为什么"取锁前的让行"还不够：写入登记时，可能已有若干检索
-                                        // 请求排在 `try_lock` 循环里（它们登记早于写入）⇒ 它们仍会
-                                        // 逐个拿到锁并各持 10~20s，写入要等完这一整轮（实测仍会撞
-                                        // 45s 上限而丢写）。交接把写入的等待压到"当前持锁者结束"为止。
-                                        if write_waiting() {
-                                            drop(guard);
-                                            std::thread::sleep(std::time::Duration::from_millis(10));
-                                            continue;
-                                        }
-                                        break guard;
-                                    }
-                                    Err(_) if std::time::Instant::now() < lock_deadline => {
-                                        if cancellation_for_task.load(Ordering::Acquire) {
-                                            return Err("cancelled");
-                                        }
-                                        std::thread::sleep(std::time::Duration::from_millis(10));
-                                    }
-                                    Err(_) => {
-                                        eprintln!(
-                                            "[v1/enrich] 锁获取超时（{}ms），返回 search_busy",
-                                            enrich_lock_wait.as_millis()
-                                        );
-                                        return Err("search_busy");
-                                    }
-                                }
-                            };
+                            // 读并发模型下直接取读锁：多个读者可并行，无需让行。
+                            // （写优先让行是 Mutex 时代的设计，RwLock 下反而降低吞吐。）
+                            let store = store.blocking_read();
                             let __t_lock = __t0.elapsed();
 
+                            // S3 前置测量（2026-11-01）：记录 enrich 在**锁内**的实际时长
+                            // （含快路/深路/联想三段）。与 `store` 同作用域 ⇒ 正常返回与
+                            // 任何提前 return 都会入账，作为"读快照"改造前的基线。
+                            let _read_hold = crate::obs::HoldTimer::new("store.read");
                             let fast_filter = RecallFilter {
                                 memory_type: None,
                                 project: req.project.clone(),
@@ -2763,7 +2671,7 @@ pub fn build_v1_router_with_trust(
                                 tags: req.tags.clone(),
                                 min_importance: None,
                                 top_k: deep_candidates,
-                                privacy_context: privacy_ctx,
+                                privacy_context: privacy_ctx.clone(),
                                 explore_pure: false,
                                 regression_query: None,
                                 read_only: false,
@@ -2801,17 +2709,82 @@ pub fn build_v1_router_with_trust(
                             };
                             let __t_deep = __t0.elapsed();
 
+                            // ═══ v0.9.17 第三路：语义稠密检索（bge 句向量）═══
+                            //
+                            // **为什么必须是独立一路，而不是深路池内重排**：
+                            // 深路的候选池先经八卦环形距离 + ROI 几何聚焦，而这两道门
+                            // 不读语义（实测打乱字符顺序分类不变）。若语义只做池内重排，
+                            // 正确记忆可能从未进入候选池——召回上限被几何门锁死。
+                            // 本路只施加与 fast 同源的基础过滤，对**全库已索引向量**排序。
+                            //
+                            // **诚实降级**：索引为空 / ML 编码器不可用 ⇒ 返回空结果，
+                            // 融合退回两路，行为与未引入本路时一致。
+                            let semantic_enabled = std::env::var("LRC_SEMANTIC_PATH")
+                                .map(|v| v != "0")
+                                .unwrap_or(true);
+                            let semantic_candidates = std::env::var("LRC_SEMANTIC_CANDIDATES")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .filter(|v| *v > 0)
+                                .unwrap_or(top_k.saturating_mul(4).max(top_k));
+                            let semantic_result = if semantic_enabled {
+                                let semantic_filter = RecallFilter {
+                                    memory_type: None,
+                                    project: req.project.clone(),
+                                    tags: req.tags.clone(),
+                                    min_importance: None,
+                                    top_k: semantic_candidates,
+                                    privacy_context: privacy_ctx.clone(),
+                                    explore_pure: false,
+                                    regression_query: None,
+                                    read_only: false,
+                                };
+                                match store.semantic_recall(
+                                    // 语义路用**原查询**：LLM 关键词富化是为词面匹配服务的，
+                                    // 对稠密向量反而会稀释语义焦点。
+                                    &req.query,
+                                    &semantic_filter,
+                                    semantic_candidates,
+                                ) {
+                                    Ok(result) => result,
+                                    Err(_e) => {
+                                        eprintln!(
+                                            "[v1/enrich] 语义路径检索失败，已降级为两路融合"
+                                        );
+                                        RecallResult::basic(vec![], vec![], 0)
+                                    }
+                                }
+                            } else {
+                                RecallResult::basic(vec![], vec![], 0)
+                            };
+                            let __t_semantic = __t0.elapsed();
+
                             // RRF 融合：具体错误查询提高 Deep 路径权重。
-                            let (fast_weight, deep_weight) =
-                                crate::engine::rrf::query_path_weights(&query);
-                            let fused = crate::engine::rrf::rrf_fuse_weighted(
-                                &fast_result,
-                                &deep_result,
-                                top_k,
-                                crate::engine::rrf::RRF_DEFAULT_K,
-                                fast_weight,
-                                deep_weight,
-                            );
+                            // 语义可用时深度路默认降为 0（冷启动兜底），见 `fused_weights`。
+                            let semantic_available = !semantic_result.memories.is_empty();
+                            let (fast_weight, deep_weight, semantic_weight) =
+                                crate::engine::rrf::fused_weights(&query, semantic_available);
+                            let fused = if semantic_result.memories.is_empty() {
+                                crate::engine::rrf::rrf_fuse_weighted(
+                                    &fast_result,
+                                    &deep_result,
+                                    top_k,
+                                    crate::engine::rrf::RRF_DEFAULT_K,
+                                    fast_weight,
+                                    deep_weight,
+                                )
+                            } else {
+                                crate::engine::rrf::rrf_fuse_three(
+                                    &fast_result,
+                                    &deep_result,
+                                    &semantic_result,
+                                    top_k,
+                                    crate::engine::rrf::RRF_DEFAULT_K,
+                                    fast_weight,
+                                    deep_weight,
+                                    semantic_weight,
+                                )
+                            };
                             let __t_fuse = __t0.elapsed();
 
                             // 阶段D 可观测性：LRC_RRF_TRACE=1 输出融合审计行（默认关闭）
@@ -2846,6 +2819,7 @@ pub fn build_v1_router_with_trust(
                             let total = fused.total_candidates;
                             let fast_hits = fast_result.memories.len();
                             let deep_hits = deep_result.memories.len();
+                            let semantic_hits = semantic_result.memories.len();
                             // ★v0.9.8：为本次结果集计算「为什么这条会出现」的记录层理由。
                             //
                             // **为什么在检索出口做**：用户对道体的定位裁定是
@@ -2879,6 +2853,7 @@ pub fn build_v1_router_with_trust(
                                     memory_type: m.memory_type.as_str().to_string(),
                                     score,
                                     bagua_category: m.bagua_category.clone(),
+                                    gua64: gua64_of(m),
                                     daoti_preview_gua: m.daoti_preview_gua.clone(),
                                     daoti_preview_bagua: m.daoti_preview_bagua.clone(),
                                     daoti_preview_version: m.daoti_preview_version.clone(),
@@ -2900,8 +2875,10 @@ pub fn build_v1_router_with_trust(
                                     fused_contrib: contrib.fused_contrib(),
                                     fast_contrib: contrib.fast_contrib,
                                     deep_contrib: contrib.deep_contrib,
+                                    semantic_contrib: contrib.semantic_contrib,
                                     fast_rank: contrib.fast_rank,
                                     deep_rank: contrib.deep_rank,
+                                    semantic_rank: contrib.semantic_rank,
                                     hit_paths: contrib.hit_paths(),
                                 });
                             }
@@ -2917,8 +2894,16 @@ pub fn build_v1_router_with_trust(
                             );
                             audit_meta.insert("fast_weight".to_string(), fast_weight.to_string());
                             audit_meta.insert("deep_weight".to_string(), deep_weight.to_string());
+                            audit_meta.insert(
+                                "semantic_weight".to_string(),
+                                semantic_weight.to_string(),
+                            );
                             audit_meta.insert("fast_hits".to_string(), fast_hits.to_string());
                             audit_meta.insert("deep_hits".to_string(), deep_hits.to_string());
+                            audit_meta.insert(
+                                "semantic_hits".to_string(),
+                                semantic_hits.to_string(),
+                            );
                             audit_meta.insert("total_candidates".to_string(), total.to_string());
                             // ★v0.9.11 修复（审计日志体积爆炸 / 热路径浪费）：**审计只写有限切片**。
                             //
@@ -2943,8 +2928,10 @@ pub fn build_v1_router_with_trust(
                                         "fused_contrib": item.fused_contrib,
                                         "fast_contrib": item.fast_contrib,
                                         "deep_contrib": item.deep_contrib,
+                                        "semantic_contrib": item.semantic_contrib,
                                         "fast_rank": item.fast_rank,
                                         "deep_rank": item.deep_rank,
+                                        "semantic_rank": item.semantic_rank,
                                         "hit_paths": item.hit_paths,
                                     })
                                 })
@@ -2954,7 +2941,8 @@ pub fn build_v1_router_with_trust(
                                 "items_total".to_string(),
                                 explanation_items.len().to_string(),
                             );
-                            let state_snapshot = store.memory_state_machine.snapshot();
+                            let state_snapshot =
+                                store.memory_state_machine.read().unwrap().snapshot();
                             let __t_snap = __t0.elapsed();
                             let mut regression_evidence = fast_result.regression_evidence.clone();
                             for (id, evidence) in &deep_result.regression_evidence {
@@ -2962,6 +2950,7 @@ pub fn build_v1_router_with_trust(
                             }
                             let filtered_count = fast_hits
                                 .saturating_add(deep_hits)
+                                .saturating_add(semantic_hits)
                                 .saturating_sub(total);
                             let affected_ids =
                                 explanation_items.iter().map(|item| item.id.clone()).collect();
@@ -2995,6 +2984,8 @@ pub fn build_v1_router_with_trust(
                                 .and_then(|v| v.trim().parse::<usize>().ok())
                                 .filter(|v| *v > 0)
                                 .unwrap_or(ASSOC_EXPAND_MAX_HTTP);
+                            // ★ 2026-11-05（P1）：联想补全已改为 `&self`（图写入延后），
+                            //   仍在读锁内执行；写锁只用于最后的审计 + 状态写回。
                             let associated = store
                                 .expand_associations(
                                     &assoc_seeds,
@@ -3060,6 +3051,7 @@ pub fn build_v1_router_with_trust(
                                             // 的结果之下
                                             score: assoc_score,
                                             bagua_category: m.bagua_category.clone(),
+                                            gua64: gua64_of(&m),
                                             daoti_preview_gua: m.daoti_preview_gua.clone(),
                                             daoti_preview_bagua: m.daoti_preview_bagua.clone(),
                                             daoti_preview_version: m.daoti_preview_version.clone(),
@@ -3100,32 +3092,39 @@ pub fn build_v1_router_with_trust(
                                 serde_json::to_string(&state_snapshot.trail[trail_cut..])
                                     .unwrap_or_else(|_| "[]".to_string()),
                             );
-                            store.audit_trail.record(
+                            // ★ 2026-11-05（B1）：审计改为**延后入队**，读路径全程不取写锁。
+                            //   由后台 flusher（写优先闸门 + 有界等待）统一记录；
+                            //   状态写回（激活/生命周期/图边）同样由后台 flusher 应用。
+                            store.queue_audit(
                                 AuditEventType::RetrievalExecuted,
                                 format!(
-                                    "联想检索执行：查询「{}」，融合 {} 条候选（fast={}，deep={}）",
+                                    "联想检索执行：查询「{}」，融合 {} 条候选（fast={}，deep={}，semantic={}）",
                                     query.chars().take(40).collect::<String>(),
                                     total,
                                     fast_hits,
-                                    deep_hits
+                                    deep_hits,
+                                    semantic_hits
                                 ),
                                 "阶段D 联想解释观测：记录检索链路权重与每条结果的通路贡献分解，供结构化审计，不参与排序".to_string(),
                                 affected_ids,
                                 audit_meta,
                             );
+                            drop(store);
+                            drop(_read_hold);
                             let __t_audit = __t0.elapsed();
 
                             // ★ v0.9.13 计时输出（仅 `LRC_TIMING=1`）：把检索耗时拆到各段，
                             // 用来定位"随 top_k 线性增长"的成本落在哪一段。
                             if __timing {
                                 eprintln!(
-                                    "[LRC·计时] enrich top_k={} 命中={} 锁等待={:.3}s 快路={:.3}s 深路={:.3}s 融合={:.3}s 理由={:.3}s 构造={:.3}s 审计元数据={:.3}s 关联={:.3}s 审计={:.3}s 总计={:.3}s",
+                                    "[LRC·计时] enrich top_k={} 命中={} 锁等待={:.3}s 快路={:.3}s 深路={:.3}s 语义={:.3}s 融合={:.3}s 理由={:.3}s 构造={:.3}s 审计元数据={:.3}s 关联={:.3}s 审计={:.3}s 总计={:.3}s",
                                     top_k,
                                     memories.len(),
                                     __t_lock.as_secs_f64(),
                                     (__t_fast - __t_lock).as_secs_f64(),
                                     (__t_deep - __t_fast).as_secs_f64(),
-                                    (__t_fuse - __t_deep).as_secs_f64(),
+                                    (__t_semantic - __t_deep).as_secs_f64(),
+                                    (__t_fuse - __t_semantic).as_secs_f64(),
                                     (__t_reasons - __t_fuse).as_secs_f64(),
                                     (__t_build - __t_reasons).as_secs_f64(),
                                     (__t_snap - __t_build).as_secs_f64(),
@@ -3140,8 +3139,10 @@ pub fn build_v1_router_with_trust(
                                 explanation_items,
                                 fast_weight,
                                 deep_weight,
+                                semantic_weight,
                                 fast_hits,
                                 deep_hits,
+                                semantic_hits,
                                 total,
                                 filtered_count,
                                 state_snapshot.trail,
@@ -3152,7 +3153,7 @@ pub fn build_v1_router_with_trust(
                     ).await;
 
                     match result {
-                        Ok(Ok(Ok((memories, explanation_items, fast_weight, deep_weight, fast_hits, deep_hits, total, filtered_count, trail, regression_evidence, associated)))) => {
+                        Ok(Ok(Ok((memories, explanation_items, fast_weight, deep_weight, semantic_weight, fast_hits, deep_hits, semantic_hits, total, filtered_count, trail, regression_evidence, associated)))) => {
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(EnrichResponse {
                                 memories,
                                 fast_path_hits: fast_hits,
@@ -3167,10 +3168,12 @@ pub fn build_v1_router_with_trust(
                                     weights: ExplanationWeights {
                                         fast: fast_weight,
                                         deep: deep_weight,
+                                        semantic: semantic_weight,
                                     },
                                     rrf_k: crate::engine::rrf::RRF_DEFAULT_K,
                                     fast_path_hits: fast_hits,
                                     deep_path_hits: deep_hits,
+                                    semantic_path_hits: semantic_hits,
                                     total_candidates: total,
                                     items: explanation_items,
                                 },
@@ -3320,24 +3323,10 @@ pub fn build_v1_router_with_trust(
                             // = 12s < 外层 15s，使 v0.9.9 设计的"到点优雅收敛（200 + interrupted）"
                             // 在锁忙时**重新可达**（修前锁等待不计入内部预算、可耗尽整段 15s，
                             // 优雅收敛不可达）。
-                            let lock_deadline =
-                                std::time::Instant::now() + write_lock_wait();
-                            let mut store = loop {
-                                match store.try_lock() {
-                                    Ok(guard) => break guard,
-                                    Err(_) => {
-                                        if cancellation_for_task.load(Ordering::Acquire) {
-                                            return Err("search_busy");
-                                        }
-                                        if std::time::Instant::now() >= lock_deadline {
-                                            return Err("search_busy");
-                                        }
-                                        std::thread::sleep(crate::timeouts::LOCK_POLL);
-                                    }
-                                }
-                            };
+                            // 阻塞线程内直接取读锁（spawn_blocking 中安全）
+                            let store = store.blocking_read();
                             Ok(run_association_explore(
-                                &mut store,
+                                &store,
                                 query.as_deref().and_then(|q| {
                                     let t = q.trim();
                                     if t.is_empty() { None } else { Some(t) }
@@ -3442,11 +3431,7 @@ pub fn build_v1_router_with_trust(
                 let store = store.clone();
                 async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        let guard = match store.try_lock() {
-                            Ok(g) => g,
-                            Err(_) => return Vec::new(),
-                        };
-                        build_association_suggestions(&guard)
+                        build_association_suggestions(&store.blocking_read())
                     })
                     .await;
                     let items = result.unwrap_or_default();
@@ -3481,20 +3466,11 @@ pub fn build_v1_router_with_trust(
                     // 此前这里**无界自旋**（只 `sleep` 无 deadline）⇒ 锁被长任务持有时该阻塞
                     // 线程**永不返回**；与仓库其它取锁点"统一 2s 有界等待"的口径明显不一致。
                     let result = tokio::task::spawn_blocking(move || -> Option<LrcResult<bool>> {
-                        let deadline = std::time::Instant::now() + crate::timeouts::LOCK_WAIT;
-                        let mut guard = loop {
-                            match blocking_store.try_lock() {
-                                Ok(g) => break g,
-                                Err(_) if std::time::Instant::now() < deadline => {
-                                    std::thread::sleep(crate::timeouts::LOCK_POLL);
-                                }
-                                Err(_) => return None,
-                            }
-                        };
                         // confirm_memory 的错误为 PersistenceError；本闭包错误仅用于
                         // 上位统一映射为 500 字符串响应，故按「内部」域收敛。
                         Some(
-                            guard
+                            blocking_store
+                                .blocking_write()
                                 .confirm_memory(&confirm_id)
                                 .map_err(|e| LrcError::internal(e.to_string())),
                         )
@@ -3504,13 +3480,13 @@ pub fn build_v1_router_with_trust(
                     match result {
                         Ok(Some(Ok(true))) => {
                             // 结构化审计：记录用户确认行为（可观测，不参与排序）
-                            if let Ok(mut guard) = store.try_lock() {
+                            {
                                 let mut meta = std::collections::HashMap::new();
                                 meta.insert(
                                     "query".to_string(),
                                     query.unwrap_or_default(),
                                 );
-                                guard.audit_trail.record(
+                                store.read().await.audit_trail.write().unwrap().record(
                                     AuditEventType::AssociationConfirmed,
                                     format!("用户确认联想：「{}」", memory_id),
                                     "用户在联想探索中确认该记忆与意图相关，写入活跃锚点".to_string(),
@@ -3523,8 +3499,14 @@ pub fn build_v1_router_with_trust(
                             // 门控关闭时行为与现状逐字节一致（仅激活记忆，零影响）。
                             if let Some(from) = req.from_id.as_deref() {
                                 if !from.trim().is_empty() && assoc_edge_feedback_enabled() {
-                                    if let Ok(guard) = store.try_lock() {
-                                        guard.user_feedback.record_association_edge_feedback(
+                                    {
+                                        store
+                                            .read()
+                                            .await
+                                            .user_feedback
+                                            .read()
+                                            .unwrap()
+                                            .record_association_edge_feedback(
                                             FeedbackType::Positive,
                                             from.trim(),
                                             &memory_id,
@@ -3574,18 +3556,18 @@ pub fn build_v1_router_with_trust(
                     // 避免守卫自旋占死 HTTP worker。
                     let memory_id = req.memory_id.clone();
                     let memory_id_for_task = memory_id.clone();
-                    let outcome = tokio::task::spawn_blocking(move || match store.try_lock() {
-                        Ok(mut store) => {
-                            match store.correct_memory(&memory_id_for_task, &req.content, req.reason.as_deref()) {
-                                Ok(Some(memory)) => Ok((memory.id, memory.version, memory.version_history.len())),
-                                Ok(None) => Err("not_found"),
-                                Err(e) => {
-                                    eprintln!("[v1/correct] 修正失败: {}", e);
-                                    Err("write_failed")
-                                }
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        match store
+                            .blocking_write()
+                            .correct_memory(&memory_id_for_task, &req.content, req.reason.as_deref())
+                        {
+                            Ok(Some(memory)) => Ok((memory.id, memory.version, memory.version_history.len())),
+                            Ok(None) => Err("not_found"),
+                            Err(e) => {
+                                eprintln!("[v1/correct] 修正失败: {}", e);
+                                Err("write_failed")
                             }
                         }
-                        Err(_) => Err("store_busy"),
                     })
                     .await;
 
@@ -3642,8 +3624,11 @@ pub fn build_v1_router_with_trust(
                     // v0.9.6 P1 修复：unfold_memory 走跨进程写守卫，移入 spawn_blocking
                     let memory_id = req.memory_id;
                     let memory_id_for_task = memory_id.clone();
-                    let outcome = tokio::task::spawn_blocking(move || match store.try_lock() {
-                        Ok(mut store) => match store.unfold_memory(&memory_id_for_task, req.min_activation) {
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        match store
+                            .blocking_write()
+                            .unfold_memory(&memory_id_for_task, req.min_activation)
+                        {
                             Ok(Some((sub_memories, fidelity))) => {
                                 let sub_count = sub_memories.len();
                                 let unfolded: Vec<UnfoldedSubMemory> = sub_memories
@@ -3662,8 +3647,7 @@ pub fn build_v1_router_with_trust(
                                 eprintln!("[v1/unfold] 拆解失败: {}", e);
                                 Err("write_failed")
                             }
-                        },
-                        Err(_) => Err("store_busy"),
+                        }
                     })
                     .await;
 
@@ -3721,39 +3705,7 @@ pub fn build_v1_router_with_trust(
                 async move {
                     // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
                     // v0.8.22 P1-02：lock_busy 时返回降级数据而非 503
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            // v0.8.22 P1-02：lock_busy 时返回降级数据而非 503
-                            // v0.8.22 P3-NEW-06 修复：active_memories/crystallized_memories 改为 null，
-                            //   避免外部 API 消费者将 0 误认为"系统无记忆"。
-                            //   前端已有 hasLockBusy200 检查（P1-NEW-01），不会渲染降级数据。
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "ok": true,
-                                "data": {
-                                    "yin_yang_balance": 0.0,
-                                    "luoshu_deviation": 100.0,
-                                    "bagua_balance": 0.0,
-                                    "synthesis_ratio": 0.0,
-                                    "dao_isomorphism_score": 0.0,
-                                    "active_memories": null,
-                                    "crystallized_memories": null,
-                                    "status": "loading"
-                                },
-                                "raw": {
-                                    "bagua_entropy": 1.0,
-                                    "archived_memories": 0,
-                                    "encodings_total": 0,
-                                    "compositions_total": 0,
-                                    "recalls_total": 0,
-                                    "corrections_total": 0
-                                },
-                                "lock_busy": true,
-                                "degraded": true,
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
                     match store.dao_metrics_snapshot() {
                         Ok(snapshot) => {
                             let status = if snapshot.dao_isomorphism_score < 0.3 {
@@ -3783,7 +3735,9 @@ pub fn build_v1_router_with_trust(
                                     crystallized_memories: snapshot.crystallized_memories,
                                     status: status.to_string(),
                                     // P1 调节器心跳：随 dao 指标一起暴露（前端 loadDaoMetrics 直接读取）
-                                    regulator_heartbeat: Some(store.regulator_heartbeat.clone()),
+                                    regulator_heartbeat: Some(
+                                        store.regulator_heartbeat.read().unwrap().clone(),
+                                    ),
                                 },
                                 raw: DaoMetricsRaw {
                                     bagua_entropy: snapshot.bagua_entropy,
@@ -3821,58 +3775,7 @@ pub fn build_v1_router_with_trust(
                 let store = store.clone();
                 let dv = dev_mode;
                 async move {
-                    // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
-                    // v0.8.22 P1-02：lock_busy 时返回降级数据而非 503
-                    let mut store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            // v0.8.48 修复：lock_busy 降级时返回完整的系统状态框架
-                            //   前端会在 loadDashboard 中检测 lock_busy 并渲染降级数据
-                            //   系统浮窗需要 encoder / system_mode / memory_stats 字段，
-                            //   不能返回 null，否则前端显示 "--"
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "ok": true,
-                                "lock_busy": true,
-                                "degraded": true,
-                                "dev_mode": dv,
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载",
-                                "system_mode": "healthy",
-                                "system_mode_description": "后台合成中，数据稍后刷新",
-                                "encoder": {
-                                    "mode": "statistical",
-                                    "model_name": null,
-                                    "hidden_size": null,
-                                    "degradation_reason": "系统合成中",
-                                    "total_encodings": 0,
-                                    "last_encoding_ms": 0,
-                                    "capability_description": "系统合成中",
-                                    "quality_score": 0.0
-                                },
-                                "memory_stats": {
-                                    "total_memories": 0,
-                                    "active_memories": 0,
-                                    "synthesis_memories": 0,
-                                    "expired_memories": 0,
-                                    "low_quality_synthesis": 0,
-                                    "bagua_distribution": [0, 0, 0, 0, 0, 0, 0, 0]
-                                },
-                                "dao_metrics": {
-                                    "active_memories": 0,
-                                    "crystallized_memories": 0,
-                                    "archived_memories": 0,
-                                    "encodings_total": 0,
-                                    "compositions_total": 0,
-                                    "recalls_total": 0,
-                                    "corrections_total": 0,
-                                    "yin_yang_balance": 0.0,
-                                    "luoshu_deviation": 0.0,
-                                    "bagua_balance": 0.0,
-                                    "synthesis_ratio": 0.0,
-                                    "dao_isomorphism_score": 0.0
-                                }
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
                     match store.health_report() {
                         Ok(report) => {
                             // v0.8.23 CI 修复：始终添加 lock_busy 和 degraded 字段，
@@ -3891,6 +3794,12 @@ pub fn build_v1_router_with_trust(
                                 ));
                                 // v0.9.0：新增 dev_mode 标志（前端据此显示开发模式 UI）
                                 obj.insert("dev_mode".to_string(), serde_json::Value::Bool(dv));
+                                // v0.9.16：锁账本（等锁次数/累计等待/最长等待/超时次数/最长持锁）
+                                //
+                                // 为什么放在健康报告里而不是单独端点：锁账本必须与
+                                // `lock_busy` 同一时刻快照才有解释力——分开取会导致
+                                // "降级了但账本显示一切正常"的错位。
+                                obj.insert("lock_stats".to_string(), crate::obs::lock_stats_json());
                                 // v0.9.0：新增 consolidation 结晶状态（前端可观测结晶引擎）
                                 obj.insert("consolidation".to_string(), serde_json::json!({
                                     "status": "active",
@@ -3905,7 +3814,7 @@ pub fn build_v1_router_with_trust(
                                 // 前端系统状态卡据此展示"调节器心跳"（最近运行时间/最近动作）
                                 obj.insert(
                                     "regulator_heartbeat".to_string(),
-                                    serde_json::to_value(&store.regulator_heartbeat)
+                                    serde_json::to_value(&*store.regulator_heartbeat.read().unwrap())
                                         .unwrap_or_else(|_| serde_json::json!({})),
                                 );
                             }
@@ -3940,32 +3849,20 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
-                    // v0.8.21 P0-01：try_lock 避免 lock().await 阻塞 10s
-                    // v0.8.22 P1-02：lock_busy 时返回降级数据而非 503
-                    let mut store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            // 返回 200 + 降级数据，避免前端 503 处理
-                            // v0.8.22 P3-NEW-06：添加 degraded 标记，与 dao_metrics/system 保持一致
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "health": null,
-                                "coupling_trend": [],
-                                "catastrophic_events": [],
-                                "gc_candidates": [],
-                                "pending_user_actions": [],
-                                "lock_busy": true,
-                                "degraded": true,
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
                     match store.health_report() {
                         Ok(report) => {
                             // 补充调节器耦合趋势分析（仅详细端点提供）
-                            let coupling_trend = store.dao_regulator.analyze_coupling_trend();
-                            let catastrophic_events = store.dao_regulator.get_catastrophic_events();
-                            let gc_candidates = store.memory_gc.get_candidates();
-                            let pending_actions = store.user_feedback.get_pending_actions();
+                            let coupling_trend =
+                                store.dao_regulator.read().unwrap().analyze_coupling_trend();
+                            let catastrophic_events = store
+                                .dao_regulator
+                                .read()
+                                .unwrap()
+                                .get_catastrophic_events();
+                            let gc_candidates = store.memory_gc.read().unwrap().get_candidates();
+                            let pending_actions =
+                                store.user_feedback.read().unwrap().get_pending_actions();
 
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                                 "health": report,
@@ -4034,8 +3931,14 @@ pub fn build_v1_router_with_trust(
                                 }
                             };
 
-                            let store = lock_store_with_timeout(&store).await?;
-                            match store.user_feedback.confirm_action(assessment_id) {
+                            let store = store.read().await;
+                            let confirm_result = store
+                                .user_feedback
+                                .read()
+                                .unwrap()
+                                .confirm_action(assessment_id);
+                            match confirm_result
+                            {
                                 Ok(memory_ids) => {
                                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                                         "success": true,
@@ -4071,8 +3974,14 @@ pub fn build_v1_router_with_trust(
                                 }
                             };
 
-                            let store = lock_store_with_timeout(&store).await?;
-                            match store.user_feedback.cancel_pending(assessment_id) {
+                            let store = store.read().await;
+                            let cancel_result = store
+                                .user_feedback
+                                .read()
+                                .unwrap()
+                                .cancel_pending(assessment_id);
+                            match cancel_result
+                            {
                                 Ok(_) => Ok(Json(serde_json::json!({
                                     "success": true,
                                     "action": "cancel",
@@ -4125,13 +4034,17 @@ pub fn build_v1_router_with_trust(
                                 ));
                             }
 
-                            let store = lock_store_with_timeout(&store).await?;
+                            let store = store.read().await;
                             // MemoryStore 需要实现 MemoryGraphQuery trait
-                            let assessment = store.user_feedback.request_impact_assessment(
-                                crate::engine::user_feedback::PendingActionType::Isolate,
-                                &memory_ids,
-                                &*store,
-                            );
+                            let assessment = store
+                                .user_feedback
+                                .read()
+                                .unwrap()
+                                .request_impact_assessment(
+                                    crate::engine::user_feedback::PendingActionType::Isolate,
+                                    &memory_ids,
+                                    &*store,
+                                );
 
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                                 "action": "request_isolate",
@@ -4157,7 +4070,7 @@ pub fn build_v1_router_with_trust(
                             let query = body.get("query").and_then(|v| v.as_str());
                             let note = body.get("note").and_then(|v| v.as_str());
 
-                            let store = lock_store_with_timeout(&store).await?;
+                            let store = store.read().await;
 
                             // 阶段D：联想级反馈——解析联想上下文（排名、命中的检索通路）
                             // P7.2：新增 from_id（联想起点，可选）——携带时记录 (from→to) 边反馈
@@ -4180,35 +4093,47 @@ pub fn build_v1_router_with_trust(
                                 match from_id {
                                     // 边级反馈：携带联想起点（P7.2 联想边反馈闭环）
                                     Some(from) if !from.is_empty() => {
-                                        store.user_feedback.record_association_edge_feedback(
-                                            feedback_type.clone(),
-                                            &from,
-                                            &memory_id,
-                                            query,
-                                            note,
-                                        )
+                                        store
+                                            .user_feedback
+                                            .read()
+                                            .unwrap()
+                                            .record_association_edge_feedback(
+                                                feedback_type.clone(),
+                                                &from,
+                                                &memory_id,
+                                                query,
+                                                note,
+                                            )
                                     }
                                     // 兼容旧调用：无起点 → 仍按记忆级联想反馈记录（只观测）
-                                    _ => store.user_feedback.record_association_feedback(
-                                        feedback_type.clone(),
-                                        &memory_id,
-                                        query,
-                                        rank,
-                                        hit_paths,
-                                        note,
-                                    ),
+                                    _ => store
+                                        .user_feedback
+                                        .read()
+                                        .unwrap()
+                                        .record_association_feedback(
+                                            feedback_type.clone(),
+                                            &memory_id,
+                                            query,
+                                            rank,
+                                            hit_paths,
+                                            note,
+                                        ),
                                 }
                             } else {
-                                store.user_feedback.record_feedback(
-                                    feedback_type.clone(),
-                                    target_type.clone(),
-                                    &memory_id,
-                                    query,
-                                    note,
-                                )
+                                store
+                                    .user_feedback
+                                    .read()
+                                    .unwrap()
+                                    .record_feedback(
+                                        feedback_type.clone(),
+                                        target_type.clone(),
+                                        &memory_id,
+                                        query,
+                                        note,
+                                    )
                             };
 
-                            let stats = store.user_feedback.get_stats();
+                            let stats = store.user_feedback.read().unwrap().get_stats();
 
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                                 "success": true,
@@ -4254,20 +4179,9 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "total": 0,
-                                "stats": [],
-                                "lock_busy": true,
-                                "degraded": true,
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
 
-                    let stats = store.user_feedback.get_association_stats();
+                    let stats = store.user_feedback.read().unwrap().get_association_stats();
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "total": stats.len(),
                         "stats": stats,
@@ -4287,17 +4201,7 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "total_executions": 0,
-                                "lock_busy": true,
-                                "degraded": true,
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
 
                     let q = AuditQuery {
                         from_ms: None,
@@ -4306,7 +4210,8 @@ pub fn build_v1_router_with_trust(
                         memory_id: None,
                         limit: Some(1000),
                     };
-                    let events = store.audit_trail.query(&q);
+                    let audit_guard = store.audit_trail.read().unwrap();
+                    let events = audit_guard.query(&q);
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
                         aggregate_association_activity(&events),
                     ))
@@ -4320,15 +4225,7 @@ pub fn build_v1_router_with_trust(
             move |Query(params): Query<HashMap<String, String>>| {
                 let store = store.clone();
                 async move {
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "records": [], "total": 0, "lock_busy": true, "degraded": true,
-                                "message": "记忆系统正在执行后台任务，记录稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
                     let from_ms = params.get("from_ms").and_then(|v| v.parse::<u64>().ok());
                     let to_ms = params.get("to_ms").and_then(|v| v.parse::<u64>().ok());
                     let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(50).clamp(1, 100);
@@ -4340,7 +4237,8 @@ pub fn build_v1_router_with_trust(
                         event_types: Some(vec![AuditEventType::RetrievalExecuted]),
                         memory_id: None, limit: Some(1000),
                     };
-                    let events = store.audit_trail.query(&query);
+                    let audit_guard = store.audit_trail.read().unwrap();
+                    let events = audit_guard.query(&query);
                     let filtered: Vec<&AuditEvent> = events.into_iter().filter(|event| {
                         let trail_len = event.metadata.get("trail").and_then(|v| serde_json::from_str::<Vec<serde_json::Value>>(v).ok()).map(|v| v.len()).unwrap_or(0);
                         let has_evidence = event.metadata.get("regression_evidence").map(|v| v != "{}" && v != "null").unwrap_or(false);
@@ -4385,17 +4283,16 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
-                    let mut store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => return Err((StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
-                            "error": "store_busy", "message": "记忆服务繁忙，请稍后重试"
-                        })))),
-                    };
-                    let hidden = store.audit_trail.hide_matching(|event| event.event_type == AuditEventType::RetrievalExecuted);
+                    let store = store.write().await;
+                    let hidden = store
+                        .audit_trail
+                        .write()
+                        .unwrap()
+                        .hide_matching(|event| event.event_type == AuditEventType::RetrievalExecuted);
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "success": true,
                         "cleared": hidden,
-                        "hidden_total": store.audit_trail.hidden_count(),
+                        "hidden_total": store.audit_trail.read().unwrap().hidden_count(),
                         "message": "联想记录已隐藏（审计完整性不受影响，重启后仍不显示）"
                     })))
                 }
@@ -4434,14 +4331,10 @@ pub fn build_v1_router_with_trust(
                     };
                     let consumed = drift.pending_events.len();
                     let outcome = tokio::task::spawn_blocking(move || {
-                        let mut guard = match store.try_lock() {
-                            Ok(g) => g,
-                            // 锁忙（用户查询/合成持有）→ 跳过本轮，下轮再试
-                            Err(_) => return None,
-                        };
-                        let data_dir = guard.persistence().data_dir().to_path_buf();
+                        let store = store.blocking_read();
+                        let data_dir = store.persistence().data_dir().to_path_buf();
                         Some(crate::discovery::run_discovery_cycle(
-                            &mut guard, &drift, &data_dir,
+                            &store, &drift, &data_dir,
                         ))
                     })
                     .await
@@ -4516,18 +4409,7 @@ pub fn build_v1_router_with_trust(
                         .unwrap_or("")
                         .to_string();
                     // data_dir 从持久化层取（与 memories.json 同目录）
-                    let data_dir = match store.try_lock() {
-                        Ok(guard) => guard.persistence().data_dir().to_path_buf(),
-                        Err(_) => {
-                            return Err((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(serde_json::json!({
-                                    "error": "store_busy",
-                                    "message": "记忆服务繁忙，请稍后重试"
-                                })),
-                            ));
-                        }
-                    };
+                    let data_dir = store.read().await.persistence().data_dir().to_path_buf();
                     let ledger = tokio::task::spawn_blocking(move || {
                         crate::discovery::record_feedback_and_save(
                             &data_dir, &memory_id, &gua, kind,
@@ -4589,14 +4471,10 @@ pub fn build_v1_router_with_trust(
                         )));
                     };
                     let outcome = tokio::task::spawn_blocking(move || {
-                        let guard = match store.try_lock() {
-                            Ok(g) => g,
-                            // 锁忙（用户查询/合成持有）→ 跳过本轮，下轮再试
-                            Err(_) => return None,
-                        };
-                        let data_dir = guard.persistence().data_dir().to_path_buf();
+                        let store = store.blocking_read();
+                        let data_dir = store.persistence().data_dir().to_path_buf();
                         Some(crate::state_matcher::run_state_driven_cycle(
-                            &guard, &snapshot, &data_dir,
+                            &*store, &snapshot, &data_dir,
                         ))
                     })
                     .await
@@ -4647,9 +4525,8 @@ pub fn build_v1_router_with_trust(
                         .unwrap_or_else(crate::state_matcher::semantic_backfill_budget_ms)
                         .min(SEMANTIC_BACKFILL_BUDGET_CAP_MS);
                     let result = tokio::task::spawn_blocking(move || {
-                        // 锁忙（用户查询/合成持有）→ 跳过本轮，返回降级（与 state-driven 同款）
-                        let guard = store.try_lock().ok()?;
-                        let data_dir = guard.persistence().data_dir().to_path_buf();
+                        let store = store.blocking_read();
+                        let data_dir = store.persistence().data_dir().to_path_buf();
                         // ★ 缺陷修复（实测定位）：此处原为 `ListFilter::new()`，
                         //   而 `ListFilter::new()` 的默认分页是 **limit=20 / offset=0**
                         //   （见 memory_store_types.rs:326-327）。
@@ -4664,11 +4541,11 @@ pub fn build_v1_router_with_trust(
                             limit: usize::MAX,
                             ..crate::memory_store_types::ListFilter::new()
                         };
-                        let Ok((memories, total)) = guard.list_memories(&filter) else {
+                        let Ok((memories, total)) = store.list_memories(&filter) else {
                             return Some((0usize, 0usize));
                         };
                         let encoded = crate::state_matcher::backfill_semantic_cache(
-                            &guard,
+                            &*store,
                             &memories,
                             &data_dir,
                             batch,
@@ -4739,8 +4616,7 @@ pub fn build_v1_router_with_trust(
                         let baseline = {
                             let store = store.clone();
                             tokio::task::spawn_blocking(move || {
-                                let guard = store.try_lock().ok()?;
-                                guard.bagua_distribution().ok()
+                                store.blocking_read().bagua_distribution().ok()
                             })
                             .await
                             .ok()
@@ -4796,10 +4672,9 @@ pub fn build_v1_router_with_trust(
                         ));
                     }
 
-                    // 同步路径（向后兼容）：一次性全量/限量重分类，锁忙时降级 503
+                    // 同步路径（向后兼容）：一次性全量/限量重分类
                     let result = tokio::task::spawn_blocking(move || {
-                        let guard = store.try_lock().ok()?;
-                        guard.reclassify_bagua(limit).ok()
+                        store.blocking_write().reclassify_bagua(limit).ok()
                     })
                     .await
                     .ok()
@@ -4874,20 +4749,7 @@ pub fn build_v1_router_with_trust(
                 async move {
                     // v0.8.22 HCSE 修复：改用 try_lock，避免 lock_busy 期间超时
                     // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与 /health/system 一致）
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "total": 0,
-                                "total_all": 0,
-                                "type_statistics": {},
-                                "events": [],
-                                "lock_busy": true,
-                                "degraded": true,
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
 
                     let from_ms = params.get("from_ms").and_then(|v| v.parse::<u64>().ok());
                     let to_ms = params.get("to_ms").and_then(|v| v.parse::<u64>().ok());
@@ -4928,12 +4790,13 @@ pub fn build_v1_router_with_trust(
                         limit,
                     };
 
-                    let events = store.audit_trail.query(&query);
-                    let stats = store.audit_trail.type_statistics();
+                    let audit_guard = store.audit_trail.read().unwrap();
+                    let events = audit_guard.query(&query);
+                    let stats = audit_guard.type_statistics();
 
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "total": events.len(),
-                        "total_all": store.audit_trail.total_count(),
+                        "total_all": audit_guard.total_count(),
                         "type_statistics": stats,
                         "events": events,
                     })))
@@ -4948,21 +4811,7 @@ pub fn build_v1_router_with_trust(
                 async move {
                     // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
                     // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与 /health/system 一致）
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "total_memories": null,
-                                "expired_count": null,
-                                "storage_size_bytes": null,
-                                "by_type": {},
-                                "by_project": {},
-                                "lock_busy": true,
-                                "degraded": true,
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
                     match store.stats() {
                         Ok(stats) => {
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
@@ -5025,19 +4874,7 @@ pub fn build_v1_router_with_trust(
                     //   根因：原实现 lock().await 在结晶持锁时阻塞等待，前端 fetchWithTimeout 8s 超时
                     //         显示"加载失败"，而非 v0.8.45 前端预期的"后台合成中"降级提示
                     // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与 /health/system 一致）
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "memories": [],
-                                "total": null,
-                                "returned": 0,
-                                "lock_busy": true,
-                                "degraded": true,
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
 
                     // v0.9.11（G3 / CR-01）：同上 —— 该端点同样缺 `user_id` 参数
                     let scope = match crate::privacy::resolve(
@@ -5126,18 +4963,7 @@ pub fn build_v1_router_with_trust(
                     let limit = params.limit.unwrap_or(10000).clamp(1, 50000);
                     // v0.8.45 修复：改用 try_read，避免 lock_busy 期间挂起超时（与 /memories/recent 一致）
                     // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与 /health/system 一致）
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "memories": [],
-                                "total": null,
-                                "lock_busy": true,
-                                "degraded": true,
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
 
                     // v0.9.11（G3 / CR-01）：解析并按信任域强制 scope
                     //（此前该端点连 `user_id` 参数都没有 ⇒ 恒以 None 列出全库并返回**完整 content**）
@@ -5216,19 +5042,7 @@ pub fn build_v1_router_with_trust(
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(10);
 
-                    // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与其他端点一致）
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "items": [],
-                                "total": null,
-                                "lock_busy": true,
-                                "degraded": true,
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
 
                     // 只在存储层过滤 Synthesis，减少传输量；纯函数内二次过滤保证契约
                     let filter = crate::memory_store::ListFilter {
@@ -5266,7 +5080,7 @@ pub fn build_v1_router_with_trust(
                 let store = store.clone();
                 async move {
                     // v0.9.3 修复：锁获取超时保护
-                    let store = lock_store_with_timeout(&store).await?;
+                    let store = store.read().await;
 
                     // 通过持久层加载归档记忆
                     match store.persistence().load_archived_memories() {
@@ -5340,17 +5154,6 @@ pub fn build_v1_router_with_trust(
                     // 修复：移入 spawn_blocking 阻塞线程，用 blocking_lock 有界等待，
                     //   守卫自旋只占用阻塞线程池，不再饥饿 HTTP worker。
                     let blocking = tokio::task::spawn_blocking(move || {
-                        let lock_deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(2);
-                        let mut store = loop {
-                            match store.try_lock() {
-                                Ok(guard) => break guard,
-                                Err(_) if std::time::Instant::now() < lock_deadline => {
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                }
-                                Err(_) => return Err("store_busy"),
-                            }
-                        };
                         // v0.9.11：所有写入入口共用 `MemoryWriteInput`（**写入单一真源**）
                         let memory = crate::memory_write::MemoryWriteInput {
                             content: params.content,
@@ -5376,7 +5179,40 @@ pub fn build_v1_router_with_trust(
                             daoti_preview_version: None,
                         }
                         .into_memory();
-                        match store.remember(memory) {
+
+                        // ★ P3 三阶段锁解耦：把 Jaccard 全库扫描与洛书编码移出存储锁。
+                        //   阶段 1（锁内）：取快照 + 构建候选；阶段 2（锁外）：编码 + 扫描；
+                        //   阶段 3（锁内）：合并/落盘。取锁等待口径与批量写入一致。
+                        let profile = std::env::var_os("LRC_PROFILE_REMEMBER").is_some();
+                        let t_phase1 = std::time::Instant::now();
+                        let prep = {
+                            match store.blocking_read().prepare_remember(memory) {
+                                Ok(prep) => prep,
+                                Err(e) => {
+                                    eprintln!("[v1/remember] 记忆写入失败: {}", e);
+                                    return Err("remember_failed");
+                                }
+                            }
+                        };
+                        let phase1_ms = t_phase1.elapsed().as_secs_f64() * 1000.0;
+                        let t_analyze = std::time::Instant::now();
+                        let analysis = prep.analyze();
+                        let analyze_ms = t_analyze.elapsed().as_secs_f64() * 1000.0;
+                        let t_phase3 = std::time::Instant::now();
+                        let store = store.blocking_write();
+                        let lock3_ms = t_phase3.elapsed().as_secs_f64() * 1000.0;
+                        let t_commit = std::time::Instant::now();
+                        let result = store.commit_remember(analysis);
+                        if profile {
+                            eprintln!(
+                                "[LRC_PROFILING] remember_phase phase1_ms={:.3} analyze_ms={:.3} lock3_ms={:.3} commit_ms={:.3}",
+                                phase1_ms,
+                                analyze_ms,
+                                lock3_ms,
+                                t_commit.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        match result {
                             Ok(saved) => Ok(saved.id),
                             Err(e) => {
                                 eprintln!("[v1/remember] 记忆写入失败: {}", e);
@@ -5432,16 +5268,7 @@ pub fn build_v1_router_with_trust(
                     let memory_id = req.memory_id;
                     let memory_id_for_task = memory_id.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
-                        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-                        let mut store = loop {
-                            match store.try_lock() {
-                                Ok(guard) => break guard,
-                                Err(_) if std::time::Instant::now() < deadline => {
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                }
-                                Err(_) => return Err("store_busy"),
-                            }
-                        };
+                        let store = store.blocking_write();
                         let forget_outcome = match store.forget(&memory_id_for_task) {
                             Ok(true) => Ok(()),
                             Ok(false) => Err("not_found"),
@@ -5520,16 +5347,7 @@ pub fn build_v1_router_with_trust(
                     let op = req.op.clone();
                     let memory_id = req.memory_id.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
-                        let deadline = std::time::Instant::now() + crate::timeouts::LOCK_WAIT;
-                        let mut guard = loop {
-                            match store.try_lock() {
-                                Ok(guard) => break guard,
-                                Err(_) if std::time::Instant::now() < deadline => {
-                                    std::thread::sleep(crate::timeouts::LOCK_POLL);
-                                }
-                                Err(_) => return Err("store_busy"),
-                            }
-                        };
+                        let guard = store.blocking_write();
                         let now = crate::lifecycle::now_ms();
                         // 注意：这里用 req.op（借用），不要用外层的 op —— 后者要在响应里使用。
                         let changed = match req.op.as_str() {
@@ -5549,7 +5367,8 @@ pub fn build_v1_router_with_trust(
                         };
                         // 寿命状态是元数据（体积小），直接落盘；失败不影响响应语义。
                         let _ = guard.flush_lifecycle_if_due(true);
-                        Ok((changed, guard.lifecycle().get(&req.memory_id).cloned()))
+                        let entry = guard.lifecycle().get(&req.memory_id).cloned();
+                        Ok((changed, entry))
                     })
                     .await;
 
@@ -5611,7 +5430,7 @@ pub fn build_v1_router_with_trust(
             move |Json(req): Json<MemoryAssociationsRequest>| {
                 let store = store.clone();
                 async move {
-                    let store = lock_store_with_timeout(&store).await?;
+                    let store = store.read().await;
                     // v0.9.11（G3 / CR-03）：解析并按信任域强制 scope。
                     // 此前该端点直调存储层的 `associations()`（**不做可见性判断**）⇒
                     // 其他 user/session 的记忆会以 `content_preview` 泄漏。
@@ -5704,7 +5523,7 @@ pub fn build_v1_router_with_trust(
                         Ok(s) => s,
                         Err(_) => return Err(scope_required_error()),
                     };
-                    let store = lock_store_with_timeout(&store).await?;
+                    let store = store.read().await;
                     let g = match store.association_graph_scoped(&req.memory_id, max_nodes, &scope) {
                         Ok(v) => v,
                         Err(e) => {
@@ -5740,7 +5559,7 @@ pub fn build_v1_router_with_trust(
                 let store = store.clone();
                 async move {
                     let weight = req.weight.unwrap_or(0.5).clamp(0.0, 1.0);
-                    let mut store = lock_store_with_timeout(&store).await?;
+                    let store = store.write().await;
                     match store.add_external_edge(&req.from_id, &req.to_id, &req.rel_type, weight) {
                         Ok(added) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
                             serde_json::json!({
@@ -5779,7 +5598,7 @@ pub fn build_v1_router_with_trust(
                 let store = store.clone();
                 async move {
                     let hops = req.hops.unwrap_or(1);
-                    let store = lock_store_with_timeout(&store).await?;
+                    let store = store.read().await;
                     // ★隐私上下文（2026-09-18 审查 G2 修复）
                     //
                     // 此前硬编码 `&None` ⇒ `is_visible` 的 User/Session 分支
@@ -5839,13 +5658,7 @@ pub fn build_v1_router_with_trust(
                 async move {
                     // v0.9.1 修复：data-location 只读磁盘文件，不依赖内存 store 状态。
                     // lock_busy 时用全局路径兜底（for_global），不再返回 503。
-                    let data_dir = match store.try_lock() {
-                        Ok(guard) => guard.persistence().data_dir().to_path_buf(),
-                        Err(_) => {
-                            // 锁被持有时，用全局数据目录兜底（不持锁，仅读静态路径）
-                            crate::data_dir::DataDir::for_global().data_path().to_path_buf()
-                        }
-                    }; // 锁在此释放，后续不再持锁
+                    let data_dir = store.read().await.persistence().data_dir().to_path_buf();
                     // 获取记忆文件实际路径
                     let memory_file = data_dir.join("memories.json");
                     // v0.7.1 P2-1 修复：用 spawn_blocking 包裹同步文件 I/O
@@ -5974,37 +5787,12 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
-                    // v0.9.1 修复：lock_busy 时返回 200 降级数据而非 503（与 /health/system 一致）
-                    let store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                            match store.try_lock() {
-                                Ok(guard) => guard,
-                                Err(_) => {
-                                    return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                        "total_events": null,
-                                        "hash_chain_valid": null,
-                                        "hash_chain_status": "验证延迟 — 后台合成中，稍后自动加载",
-                                        "hash_chain_details": "",
-                                        "anchor_count": null,
-                                        "anchor_chain_valid": null,
-                                        "anchor_chain_status": "验证延迟 — 后台合成中，稍后自动加载",
-                                        "last_anchor_at": null,
-                                        "tamper_proof": null,
-                                        "verification_note": "后台合成中，完整性验证稍后自动加载",
-                                        "lock_busy": true,
-                                        "degraded": true,
-                                        "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                                    })));
-                                }
-                            }
-                        }
-                    };
-                    let total_events = store.audit_trail.total_count();
-                    let integrity = store.audit_trail.verify_integrity();
-                    let anchors = store.audit_trail.get_anchors();
-                    let anchor_chain_valid = store.audit_trail.verify_anchor_chain();
+                    let store = store.read().await;
+                    let audit_guard = store.audit_trail.read().unwrap();
+                    let total_events = audit_guard.total_count();
+                    let integrity = audit_guard.verify_integrity();
+                    let anchors = audit_guard.get_anchors();
+                    let anchor_chain_valid = audit_guard.verify_anchor_chain();
 
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "total_events": total_events,
@@ -6028,25 +5816,13 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
-                    // v0.9.1 修复：lock_busy 时返回 200 降级数据而非 503（与 /health/system 一致）
-                    let mut store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                                "ok": true,
-                                "lock_busy": true,
-                                "degraded": true,
-                                "report": "[等待] 记忆系统正在执行后台合成，船长日志稍后自动加载...",
-                                "message": "记忆系统正在执行后台合成，数据稍后自动加载"
-                            })));
-                        }
-                    };
+                    let store = store.read().await;
 
                     // 收集系统健康数据
                     let health = store.health_report().ok();
                     let dao_snapshot = store.dao_metrics_snapshot().ok();
                     let stats = store.stats().ok();
-                    let audit_stats = store.audit_trail.type_statistics();
+                    let audit_stats = store.audit_trail.read().unwrap().type_statistics();
 
                     // 生成船长日志报告
                     let mut report = String::new();
@@ -6400,24 +6176,11 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
-                    let mut store = match store.try_lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            return Err::<_, (StatusCode, Json<serde_json::Value>)>((
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                Json(serde_json::json!({
-                                    "ok": false,
-                                    "error": "lock_busy",
-                                    "lock_busy": true,
-                                    "message": "记忆系统正在执行后台合成，请稍后重试"
-                                })),
-                            ));
-                        }
-                    };
+                    let store = store.write().await;
 
-                    let was_frozen = store.dao_regulator.is_frozen();
+                    let was_frozen = store.dao_regulator.read().unwrap().is_frozen();
                     if was_frozen {
-                        store.dao_regulator.unfreeze();
+                        store.dao_regulator.write().unwrap().unfreeze();
                         // 记录审计：调节器手动解冻（用户干预行为的可回溯记录）
                         store.record_audit(
                             AuditEventType::RegulatorUnfrozen,
@@ -6427,7 +6190,7 @@ pub fn build_v1_router_with_trust(
                         );
                     }
 
-                    let state = store.dao_regulator.get_state();
+                    let state = store.dao_regulator.read().unwrap().get_state();
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "ok": true,
                         "was_frozen": was_frozen,
@@ -6613,28 +6376,12 @@ pub fn build_v1_router_with_trust(
             let restore_store = restore_store.clone();
             move |body: Json<serde_json::Value>| async move {
             let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            // 有界获取 store 锁（最多等待 5s）
-            let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let guard = loop {
-                match restore_store.try_lock() {
-                    Ok(g) => break g,
-                    Err(_) if std::time::Instant::now() < lock_deadline => {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                    Err(_) => {
-                        return Err((StatusCode::CONFLICT, Json(serde_json::json!({
-                            "success": false,
-                            "error": "restore_busy",
-                            "message": "记忆系统正忙（合成/写入中），请稍后重试恢复"
-                        }))));
-                    }
-                }
-            };
             let result = tokio::task::spawn_blocking(move || crate::backup::restore_backup(std::path::Path::new(&path))).await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"success": false, "error": e.to_string()}))))?;
             match result {
                 Ok(()) => {
                     // 失效缓存并立即从磁盘重载，保证后续读取看到恢复后的数据
+                    let guard = restore_store.write().await;
                     guard.invalidate_cache_after_external_restore();
                     let restored_count = guard.total_count().unwrap_or(0);
                     drop(guard);
@@ -6644,7 +6391,6 @@ pub fn build_v1_router_with_trust(
                     })))
                 }
                 Err(e) => {
-                    drop(guard);
                     // restore_backup 已返回 LrcError（P1-6）；HTTP 响应体需字符串，
                     // Display 只输出 message，故前端可见文案与改造前一致。
                     Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"success": false, "error": e.to_string()}))))

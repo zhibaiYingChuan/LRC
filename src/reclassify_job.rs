@@ -228,7 +228,7 @@ pub fn run_reclassify_job(
 
     loop {
         // 取锁：成功即重置退避计数；失败则退避后重试，超限判失败
-        let guard = match store.try_lock() {
+        let guard = match store.try_write() {
             Ok(g) => {
                 busy_retries = 0;
                 g

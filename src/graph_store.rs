@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// **为什么要有这一组**：`associations_in` 的产出此前只存在于内存（一次检索的
 /// 返回值），检索结束即消失；图化后关系**跨会话累积**，才可能做多跳与关系统计。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeType {
     /// 矛盾关系：两条记忆内容冲突
@@ -248,11 +248,41 @@ pub struct GraphQueryResult {
 ///
 /// 在持久化层之上管理记忆之间的关系边。
 /// 使用 JSON 文件持久化边数据。
+///
+/// # 落盘策略（v0.9.16：脏标记 + 后台 flush）
+///
+/// 图文件此前**每加一条边就整体重写一次**（`add_edge` / `add_edges_batch`），
+/// 而 `expand_associations` 会在**每次检索**里写入记录层边 ⇒ 读路径每轮都要
+/// 序列化并重写 52MB 的 `graph_edges.json`，且**全程持有全局存储锁**。
+/// 实测这是"连续 81 秒 lock_busy、写入 3/12 成功"的最大突发源。
+///
+/// 现在分两条通道：
+/// * **读路径**（`expand_associations`）走 [`Self::add_edges_batch_deferred`]：
+///   只改内存 + 置脏标记，**不碰磁盘**；后台任务每 [`crate::graph_store::GRAPH_FLUSH_INTERVAL_SECS`]
+///   秒把内存图整体落盘一次。
+/// * **写路径**（`remember` / `forget` / `/external-edge`）仍走
+///   [`Self::add_edges_batch`] 等**立即落盘**的方法，保持"写成功即持久化"的既有语义。
+///
+/// 代价：读路径产生的边最多延迟一个 flush 周期落盘；进程若在此期间被杀，
+/// 这批边会丢失——但它们是**可从记忆记录重新推导**的派生数据（下次检索会再写入），
+/// 故可接受。
 pub struct GraphMemoryStore {
     /// 所有关系边
     edges: Vec<MemoryEdge>,
     /// 边持久化文件路径（相对于数据目录）
     edges_file: String,
+    /// 增量日志文件路径（追加写，压实后清空）
+    journal_file: String,
+    /// 是否有**尚未落盘**的内存变更（仅由 deferred 通道置位）
+    dirty: bool,
+    /// 自上次落盘以来**新增**的边（deferred 通道用；flush 时只追加这些）
+    pending: Vec<MemoryEdge>,
+    /// 去重索引：`(source, target, edge_type)`。
+    ///
+    /// 为什么需要：`merge_edges` 原实现逐条线性扫描 `edges`（O(E)）。
+    /// 图规模到 10 万条时，单次检索写入 10 条边就是 100 万次比较；
+    /// 到百万条时单次检索会被拖到百毫秒级。索引把去重降到 O(1)。
+    edge_keys: std::collections::HashSet<(String, String, EdgeType)>,
 }
 
 impl GraphMemoryStore {
@@ -261,6 +291,108 @@ impl GraphMemoryStore {
         Self {
             edges: Vec::new(),
             edges_file: format!("{}/graph_edges.json", data_dir),
+            journal_file: format!("{}/graph_edges.journal.jsonl", data_dir),
+            dirty: false,
+            pending: Vec::new(),
+            edge_keys: std::collections::HashSet::new(),
+        }
+    }
+
+    /// 重建去重索引（加载 / 删除 / 清空之后调用）。
+    fn rebuild_edge_keys(&mut self) {
+        self.edge_keys.clear();
+        self.edge_keys.reserve(self.edges.len());
+        for e in &self.edges {
+            self.edge_keys.insert((
+                e.source_id.clone(),
+                e.target_id.clone(),
+                e.edge_type.clone(),
+            ));
+        }
+    }
+
+    /// 增量日志的字节上限（超过即触发一次整图压实）。
+    ///
+    /// 默认 64MB，与主库 `LRC_JOURNAL_MAX_BYTES` 同口径；可用
+    /// `LRC_GRAPH_JOURNAL_MAX_BYTES` 覆盖（下限 1MB）。
+    fn journal_max_bytes() -> u64 {
+        std::env::var("LRC_GRAPH_JOURNAL_MAX_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|v| *v >= 1024 * 1024)
+            .unwrap_or(64 * 1024 * 1024)
+    }
+
+    fn journal_len(&self) -> u64 {
+        std::fs::metadata(&self.journal_file)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// 本次落盘是否必须"整图压实"（写 `graph_edges.json` 并清空日志）。
+    ///
+    /// 与主库同纪律：基文件缺失时一律压实（首次写入即建基文件），
+    /// 之后按日志阈值触发。
+    fn needs_compact(&self) -> bool {
+        !std::path::Path::new(&self.edges_file).exists()
+            || self.journal_len() >= Self::journal_max_bytes()
+    }
+
+    /// 把一批边追加到日志（每条一行紧凑 JSON）。
+    ///
+    /// 追加是 O(1)，不随图规模增长——这是本模块要解决的核心成本。
+    fn append_journal(&self, edges: &[MemoryEdge]) -> Result<(), PersistenceError> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.journal_file)
+            .map_err(PersistenceError::Io)?;
+        let mut buf = String::new();
+        for edge in edges {
+            buf.push_str(&serde_json::to_string(edge).map_err(PersistenceError::Serialization)?);
+            buf.push('\n');
+        }
+        file.write_all(buf.as_bytes())
+            .map_err(PersistenceError::Io)?;
+        file.flush().map_err(PersistenceError::Io)?;
+        // 追加日志是"已确认写入"的唯一副本，必须真正落盘。
+        file.sync_data().map_err(PersistenceError::Io)?;
+        Ok(())
+    }
+
+    /// 清空日志（整图压实 / 删除 / 清空之后调用）。
+    fn truncate_journal(&self) {
+        let _ = std::fs::remove_file(&self.journal_file);
+    }
+
+    /// 重放日志：把日志里的边合入内存（去重）。
+    ///
+    /// 日志行损坏时**跳过该行**而非整体失败——日志是派生数据，
+    /// 单行损坏不应让整张图不可用（基文件仍是事实源）。
+    fn replay_journal(&mut self) {
+        let Ok(content) = std::fs::read_to_string(&self.journal_file) else {
+            return;
+        };
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(edge) = serde_json::from_str::<MemoryEdge>(line) else {
+                continue;
+            };
+            let key = (
+                edge.source_id.clone(),
+                edge.target_id.clone(),
+                edge.edge_type.clone(),
+            );
+            if self.edge_keys.insert(key) {
+                self.edges.push(edge);
+            }
         }
     }
 
@@ -274,15 +406,22 @@ impl GraphMemoryStore {
                     self.edges =
                         serde_json::from_str(&content).map_err(PersistenceError::Serialization)?;
                 }
-                Ok(())
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(PersistenceError::Io(e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(PersistenceError::Io(e)),
         }
+        // ★先为基文件建索引，再重放日志（重放时靠索引去重）。
+        self.rebuild_edge_keys();
+        // ★增量日志重放：基文件是快照，日志是自上次压实以来的增量。
+        //   两者合并才是完整状态（与主库 `memories.json` + journal 同纪律）。
+        self.replay_journal();
+        Ok(())
     }
 
     /// 持久化边到文件
-    pub fn save(&self) -> Result<(), PersistenceError> {
+    ///
+    /// `&mut self` 是因为成功落盘后要清掉 [`Self::dirty`]（v0.9.16）。
+    pub fn save(&mut self) -> Result<(), PersistenceError> {
         let json =
             serde_json::to_string_pretty(&self.edges).map_err(PersistenceError::Serialization)?;
         // ★原子写（2026-09-18 审查修复）
@@ -304,7 +443,103 @@ impl GraphMemoryStore {
         //   ⇒ 收敛到唯一实现，避免"同一个仓库两套写法"。
         crate::atomic_file::write_atomic(std::path::Path::new(&self.edges_file), json.as_bytes())
             .map_err(PersistenceError::Io)?;
+        // ★整图已落盘 ⇒ 日志里的增量已被吸收，清空日志（否则下次启动会重复重放）。
+        self.truncate_journal();
+        // 已整体落盘 ⇒ 内存与磁盘一致
+        self.dirty = false;
+        self.pending.clear();
         Ok(())
+    }
+
+    /// 是否有尚未落盘的变更。
+    pub fn has_pending_writes(&self) -> bool {
+        self.dirty
+    }
+
+    /// 重新置脏（后台 flush 写盘失败时补回）。
+    ///
+    /// [`Self::take_dirty_snapshot`] 在返回快照时就清了脏标记；若随后的写盘
+    /// 失败，必须由调用方把它补回来，否则这批边会一直留在内存、等下一次
+    /// 检索重新产出才可能落盘（而那次可能永不发生）。
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// 若存在未落盘变更则落盘一次；返回是否真的写了盘。
+    ///
+    /// 供后台 flush 任务（`bin/server.rs`）与关停路径调用。
+    /// 无变更时**不产生任何 I/O**（这是本模块要解决的核心成本）。
+    pub fn flush_if_dirty(&mut self) -> Result<bool, PersistenceError> {
+        if !self.dirty {
+            return Ok(false);
+        }
+        self.save()?;
+        Ok(true)
+    }
+
+    /// 取一份**脏快照**并清掉脏标记（由调用方在**锁外**序列化 + 写盘）。
+    ///
+    /// # 为什么不在锁内直接 `save()`
+    ///
+    /// 图文件 52MB，序列化 + 写盘实测需数百毫秒。后台 flush 若全程持存储锁，
+    /// 就只是把"每次检索写一次盘"换成"每 30 秒卡住一次"，写入仍会被阻塞。
+    /// 故这里只做一次内存克隆（边是普通结构体，克隆在毫秒级），
+    /// 真正的 I/O 交给 [`GraphSnapshot::write`] 在锁外完成。
+    ///
+    /// # 竞态说明
+    ///
+    /// 快照期间若有新的 deferred 写入，它会重新置脏 ⇒ 下一轮 flush 会再写一次，
+    /// 不会丢边。若期间恰好有**写路径的立即落盘**（`add_edge` 等），
+    /// 可能被这份较旧的快照覆盖——但两者都是派生数据，下一轮检索会重新写入，
+    /// 属可接受的自愈代价（不为它引入全局序号 / 二次锁）。
+    pub fn take_dirty_snapshot(&mut self) -> Option<GraphSnapshot> {
+        if !self.dirty {
+            return None;
+        }
+        self.dirty = false;
+        Some(GraphSnapshot {
+            path: std::path::PathBuf::from(&self.edges_file),
+            edges: self.edges.clone(),
+        })
+    }
+
+    /// 取一份**增量快照**并清掉脏标记（由调用方在**锁外**追加日志）。
+    ///
+    /// 与 [`Self::take_dirty_snapshot`] 的区别：本方法只带走**自上次落盘以来
+    /// 新增的边**（`pending`），flush 时追加到日志即可，**不整图重写**。
+    /// 只有当日志达到阈值（或基文件缺失）时，才附带一份整图快照用于压实。
+    ///
+    /// # 失败恢复
+    ///
+    /// 若调用方写盘失败，必须调用 [`Self::restore_pending`] 把边放回，
+    /// 否则这批边会留在内存却永不落盘（直到下一次压实）。
+    pub fn take_pending_snapshot(&mut self) -> Option<GraphPending> {
+        if !self.dirty {
+            return None;
+        }
+        self.dirty = false;
+        let pending = std::mem::take(&mut self.pending);
+        let compact = if self.needs_compact() {
+            Some((
+                std::path::PathBuf::from(&self.edges_file),
+                self.edges.clone(),
+            ))
+        } else {
+            None
+        };
+        Some(GraphPending {
+            journal_path: std::path::PathBuf::from(&self.journal_file),
+            pending,
+            compact,
+        })
+    }
+
+    /// 写盘失败时把增量边放回（配合 [`Self::take_pending_snapshot`]）。
+    pub fn restore_pending(&mut self, edges: Vec<MemoryEdge>) {
+        if !edges.is_empty() {
+            self.pending.extend(edges);
+            self.dirty = true;
+        }
     }
 
     /// 添加一条关系边
@@ -317,20 +552,38 @@ impl GraphMemoryStore {
         edge_type: EdgeType,
         weight: f32,
     ) -> Result<(), PersistenceError> {
-        // 去重检查
-        let exists = self.edges.iter().any(|e| {
-            e.source_id == source_id && e.target_id == target_id && e.edge_type == edge_type
-        });
-
-        if !exists {
+        // 去重检查（O(1) 索引）
+        let key = (
+            source_id.to_string(),
+            target_id.to_string(),
+            edge_type.clone(),
+        );
+        if !self.edge_keys.contains(&key) {
             let edge = MemoryEdge::new(
                 source_id.to_string(),
                 target_id.to_string(),
                 edge_type,
                 weight,
             );
-            self.edges.push(edge);
-            self.save()?;
+            self.edge_keys.insert(key);
+            self.edges.push(edge.clone());
+            // ★增量写：追加日志（O(1)），不再整图重写。
+            //   基文件缺失或日志超阈值时改为整图压实（与主库同纪律）。
+            //   失败时回滚内存，保证"返回 Err ⇔ 未写入"。
+            let result = if self.needs_compact() {
+                self.save()
+            } else {
+                self.append_journal(std::slice::from_ref(&edge))
+            };
+            if let Err(e) = result {
+                self.edges.pop();
+                self.edge_keys.remove(&(
+                    edge.source_id.clone(),
+                    edge.target_id.clone(),
+                    edge.edge_type.clone(),
+                ));
+                return Err(e);
+            }
         }
 
         Ok(())
@@ -342,6 +595,7 @@ impl GraphMemoryStore {
         self.edges.retain(|e| e.id != edge_id);
         let removed = self.edges.len() < len_before;
         if removed {
+            self.rebuild_edge_keys();
             self.save()?;
         }
         Ok(removed)
@@ -372,12 +626,43 @@ impl GraphMemoryStore {
             .retain(|e| e.source_id != memory_id && e.target_id != memory_id);
         let removed = len_before - self.edges.len();
         if removed > 0 {
+            self.rebuild_edge_keys();
             self.save()?;
         }
         Ok(removed)
     }
 
-    /// 批量添加边（**只在末尾保存一次**）
+    /// 把一批边合入内存（去重 + 对称规范化的**唯一实现**）。
+    ///
+    /// 返回**新增**的边（已存在的边不返回）。**不落盘、不置脏**——两条通道
+    /// （立即落盘 / deferred）各自在调用后处理持久化，避免把两种策略写两份。
+    fn merge_edges(&mut self, edges: &[(String, String, EdgeType, f32)]) -> Vec<MemoryEdge> {
+        let mut added: Vec<MemoryEdge> = Vec::new();
+        for (source, target, etype, weight) in edges {
+            // 对称关系规范化：让 (A,B) 与 (B,A) 落到同一个去重键
+            let (s, t) = if etype.is_symmetric() && source.as_str() > target.as_str() {
+                (target, source)
+            } else {
+                (source, target)
+            };
+            // 自环无信息量（`evolved_from` 是自指关系，需排除）
+            if s == t {
+                continue;
+            }
+            let exists = self
+                .edge_keys
+                .contains(&(s.clone(), t.clone(), etype.clone()));
+            if !exists {
+                let edge = MemoryEdge::new(s.clone(), t.clone(), etype.clone(), *weight);
+                self.edge_keys.insert((s.clone(), t.clone(), etype.clone()));
+                self.edges.push(edge.clone());
+                added.push(edge);
+            }
+        }
+        added
+    }
+
+    /// 批量添加边（**立即落盘**，只在末尾保存一次）
     ///
     /// # 为什么需要它
     ///
@@ -400,51 +685,58 @@ impl GraphMemoryStore {
         &mut self,
         edges: &[(String, String, EdgeType, f32)],
     ) -> Result<usize, PersistenceError> {
-        let mut added = 0usize;
-        for (source, target, etype, weight) in edges {
-            // 对称关系规范化：让 (A,B) 与 (B,A) 落到同一个去重键
-            let (s, t) = if etype.is_symmetric() && source.as_str() > target.as_str() {
-                (target, source)
-            } else {
-                (source, target)
-            };
-            // 自环无信息量（`evolved_from` 是自指关系，需排除）
-            if s == t {
-                continue;
-            }
-            let exists = self
-                .edges
-                .iter()
-                .any(|e| e.source_id == *s && e.target_id == *t && e.edge_type == *etype);
-            if !exists {
-                self.edges.push(MemoryEdge::new(
-                    s.clone(),
-                    t.clone(),
-                    etype.clone(),
-                    *weight,
-                ));
-                added += 1;
-            }
-        }
-        if added > 0 {
+        let added = self.merge_edges(edges);
+        if !added.is_empty() {
             // ★★2026-09-18 审查修复：保存失败时**回滚内存**，保证
             //   "返回 Err ⇔ 未写入"这一语义成立。
             //
             // 原实现先 `push` 再 `save()?`：若 save 失败（磁盘满/权限），
-            // 边已留在 self.edges 里，而函数返回 Err ⇒ 调用方（
-            // `/v1/memories/external-edge` 返回 500；Python 侧记 `skipped`）
-            // 认为"没写成"，**进程内却已生效**，并会在下次任意成功的
-            // `save()` 时被一起落盘 —— 形成"报失败却最终落盘"的时序反转。
+            //   边已留在 self.edges 里，而函数返回 Err ⇒ 调用方（
+            //   `/v1/memories/external-edge` 返回 500；Python 侧记 `skipped`）
+            //   认为"没写成"，**进程内却已生效**，并会在下次任意成功的
+            //   `save()` 时被一起落盘 —— 形成"报失败却最终落盘"的时序反转。
             //
             // 回滚方式：记录本次批次的起始长度，失败时截断回去。
             // 这比"先写盘再入内存"简单，且不引入临时副本。
-            let before = self.edges.len() - added;
-            if let Err(e) = self.save() {
+            let before = self.edges.len() - added.len();
+            // ★增量写：追加日志（O(1)），不再整图重写。
+            //   基文件缺失或日志超阈值时改为整图压实（与主库同纪律）。
+            let result = if self.needs_compact() {
+                self.save()
+            } else {
+                self.append_journal(&added)
+            };
+            if let Err(e) = result {
                 self.edges.truncate(before);
+                // ★ 回滚 edge_keys：`merge_edges` 已把本批新增键插入索引，
+                //   若不回滚，重试同一批边会被判"已存在"而返回 Ok(0) 且不写盘
+                //   ⇒ 边永久丢失（审查 P1-2）。
+                self.rebuild_edge_keys();
                 return Err(e);
             }
         }
-        Ok(added)
+        Ok(added.len())
+    }
+
+    /// 批量添加边（**只改内存**，置脏标记，由后台 flush 统一落盘）。
+    ///
+    /// # 为什么读路径必须用它（v0.9.16）
+    ///
+    /// `expand_associations` 在**每次检索**里写记录层边。走 [`Self::add_edges_batch`]
+    /// 就意味着每次检索都要序列化并重写整个图文件（线上 52MB），
+    /// 而且发生在**全局存储锁内** ⇒ 单次检索的锁占用被拉长到秒级，
+    /// 写入被饿死（实测 81 秒 busy / 写入 3/12 成功）。
+    ///
+    /// 本方法只做内存合入（微秒级），磁盘交给后台任务。
+    /// 返回**新增**边数。
+    pub fn add_edges_batch_deferred(&mut self, edges: &[(String, String, EdgeType, f32)]) -> usize {
+        let added = self.merge_edges(edges);
+        if !added.is_empty() {
+            // ★只记录"新增的边"，flush 时只追加这些（不再整图重写）。
+            self.pending.extend(added.iter().cloned());
+            self.dirty = true;
+        }
+        added.len()
     }
 
     /// 查询与指定记忆相关的所有边
@@ -527,7 +819,97 @@ impl GraphMemoryStore {
     /// 清空所有边
     pub fn clear(&mut self) -> Result<(), PersistenceError> {
         self.edges.clear();
+        self.edge_keys.clear();
+        self.pending.clear();
         self.save()
+    }
+}
+
+/// 图落盘的默认周期（秒）。
+///
+/// 取值理由：图是**派生数据**，延迟一个周期落盘只影响"进程被杀后重算"的成本；
+/// 而周期太短会让 52MB 的整图重写重新变成常态写入。30 秒是两条约束的交点。
+/// 环境变量 `LRC_GRAPH_FLUSH_SECS` 可覆盖（下限 5 秒，防止把磁盘写满）。
+pub const GRAPH_FLUSH_INTERVAL_SECS: u64 = 30;
+
+/// 待落盘的图快照（在**锁外**完成序列化与写盘）。
+///
+/// 见 [`GraphMemoryStore::take_dirty_snapshot`] 的"为什么不在锁内 save"。
+pub struct GraphSnapshot {
+    path: std::path::PathBuf,
+    edges: Vec<MemoryEdge>,
+}
+
+impl GraphSnapshot {
+    /// 快照中的边数（供日志）。
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    /// 序列化并原子写盘。
+    pub fn write(&self) -> Result<(), PersistenceError> {
+        let json =
+            serde_json::to_string_pretty(&self.edges).map_err(PersistenceError::Serialization)?;
+        crate::atomic_file::write_atomic(&self.path, json.as_bytes()).map_err(PersistenceError::Io)
+    }
+}
+
+/// 待落盘的**增量**图快照（在锁外追加日志；必要时整图压实）。
+///
+/// 见 [`GraphMemoryStore::take_pending_snapshot`]。
+pub struct GraphPending {
+    journal_path: std::path::PathBuf,
+    pending: Vec<MemoryEdge>,
+    /// `Some((基文件路径, 全量边))` 表示本轮需要整图压实。
+    compact: Option<(std::path::PathBuf, Vec<MemoryEdge>)>,
+}
+
+impl GraphPending {
+    /// 本轮待追加的边数（供日志）。
+    pub fn edge_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// 本轮是否触发整图压实。
+    pub fn is_compaction(&self) -> bool {
+        self.compact.is_some()
+    }
+
+    /// 取回待追加的边（写盘失败时用于 [`GraphMemoryStore::restore_pending`]）。
+    pub fn pending_edges(&self) -> &[MemoryEdge] {
+        &self.pending
+    }
+
+    /// 落盘：需要压实时整图重写 + 清空日志；否则只追加日志。
+    pub fn write(&self) -> Result<(), PersistenceError> {
+        if let Some((path, edges)) = &self.compact {
+            let json =
+                serde_json::to_string_pretty(edges).map_err(PersistenceError::Serialization)?;
+            crate::atomic_file::write_atomic(path, json.as_bytes())
+                .map_err(PersistenceError::Io)?;
+            // 整图已吸收全部增量 ⇒ 清空日志。
+            let _ = std::fs::remove_file(&self.journal_path);
+            return Ok(());
+        }
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.journal_path)
+            .map_err(PersistenceError::Io)?;
+        let mut buf = String::new();
+        for edge in &self.pending {
+            buf.push_str(&serde_json::to_string(edge).map_err(PersistenceError::Serialization)?);
+            buf.push('\n');
+        }
+        file.write_all(buf.as_bytes())
+            .map_err(PersistenceError::Io)?;
+        file.flush().map_err(PersistenceError::Io)?;
+        file.sync_data().map_err(PersistenceError::Io)?;
+        Ok(())
     }
 }
 
@@ -607,26 +989,32 @@ mod tests {
     ///
     /// # 构造手法
     ///
-    /// 把目标路径做成一个**目录**（而非文件）⇒ `rename` 必失败，
-    /// 从而在**不依赖"磁盘满"这种不可造条件**的前提下触发 save 失败。
+    /// 把**日志路径**做成一个**目录**（而非文件）⇒ 追加必失败，
+    /// 从而在**不依赖"磁盘满"这种不可造条件**的前提下触发写盘失败。
+    ///
+    /// ★v3 更新：持久化从"整图重写"改为"追加日志"，故失败注入点从
+    /// `graph_edges.json` 移到 `graph_edges.journal.jsonl`。不变量不变：
+    /// 返回 Err ⇔ 内存已回滚。
     #[test]
     fn test_add_edges_batch_rolls_back_on_save_failure() {
         let dir = TempDir::new().expect("应创建临时目录");
         let data_dir = dir.path().to_string_lossy().to_string();
         let mut store = GraphMemoryStore::new(&data_dir);
 
-        // 先正常写一条并落盘（确认基础路径可用）
+        // 先正常写一条并落盘（确认基础路径可用；首次写入会建基文件）
         store
             .add_edge("base-a", "base-b", EdgeType::RelatedTo, 0.5)
             .expect("应成功");
         let before = store.edge_count();
 
-        // 把 edges 文件替换成一个**目录** ⇒ 后续 rename 必失败
-        let edges_file = dir.path().join("graph_edges.json");
-        std::fs::remove_file(&edges_file).expect("应能删除该文件");
-        std::fs::create_dir(&edges_file).expect("应能建同名目录");
+        // 把**日志**路径替换成一个**目录** ⇒ 后续追加必失败
+        let journal_file = dir.path().join("graph_edges.journal.jsonl");
+        if journal_file.exists() {
+            std::fs::remove_file(&journal_file).expect("应能删除日志");
+        }
+        std::fs::create_dir(&journal_file).expect("应能建同名目录");
 
-        // 批量添加：save 会因 rename 到目录而失败
+        // 批量添加：append_journal 会因目标是目录而失败
         let batch = vec![(
             "x-1".to_string(),
             "x-2".to_string(),
@@ -635,7 +1023,7 @@ mod tests {
         )];
         let res = store.add_edges_batch(&batch);
 
-        assert!(res.is_err(), "★save 失败时 add_edges_batch 必须返回 Err");
+        assert!(res.is_err(), "★写盘失败时 add_edges_batch 必须返回 Err");
         assert_eq!(
             store.edge_count(),
             before,
@@ -649,6 +1037,75 @@ mod tests {
                 .any(|e| e.target_id == "x-2"),
             "★失败的边不得残留在内存图中"
         );
+    }
+
+    /// ★v3：增量日志的往返一致性——基文件 + 日志重放 = 完整状态。
+    #[test]
+    fn test_journal_roundtrip() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let mut store = GraphMemoryStore::new(&data_dir);
+
+        // 首次写入建基文件（needs_compact 为真）
+        store
+            .add_edge("a", "b", EdgeType::RelatedTo, 0.5)
+            .expect("应成功");
+        // 后续写入走日志追加
+        store
+            .add_edge("c", "d", EdgeType::RelatedTo, 0.5)
+            .expect("应成功");
+        store
+            .add_edges_batch(&[("e".to_string(), "f".to_string(), EdgeType::Cause, 0.9f32)])
+            .expect("应成功");
+        assert_eq!(store.edge_count(), 3);
+
+        // 重新加载：基文件 + 日志重放
+        let mut reloaded = GraphMemoryStore::new(&data_dir);
+        reloaded.load().expect("应能加载");
+        assert_eq!(
+            reloaded.edge_count(),
+            3,
+            "★基文件 + 日志重放必须还原完整边集"
+        );
+    }
+
+    /// ★v3：deferred 通道只把**新增边**放进 pending，flush 后追加日志。
+    #[test]
+    fn test_deferred_pending_appends_only_new_edges() {
+        let dir = TempDir::new().expect("应创建临时目录");
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let mut store = GraphMemoryStore::new(&data_dir);
+        // 先建基文件
+        store
+            .add_edge("base-a", "base-b", EdgeType::RelatedTo, 0.5)
+            .expect("应成功");
+
+        let added = store.add_edges_batch_deferred(&[
+            (
+                "x".to_string(),
+                "y".to_string(),
+                EdgeType::SameEvent,
+                0.9f32,
+            ),
+            (
+                "x".to_string(),
+                "z".to_string(),
+                EdgeType::SameEvent,
+                0.9f32,
+            ),
+        ]);
+        assert_eq!(added, 2);
+        assert!(store.has_pending_writes());
+
+        let pending = store.take_pending_snapshot().expect("应有增量快照");
+        assert_eq!(pending.edge_count(), 2, "只应带走新增的 2 条边");
+        assert!(!pending.is_compaction(), "日志未超阈值时不应压实");
+        pending.write().expect("应能追加日志");
+
+        // 重新加载：基文件 1 条 + 日志 2 条
+        let mut reloaded = GraphMemoryStore::new(&data_dir);
+        reloaded.load().expect("应能加载");
+        assert_eq!(reloaded.edge_count(), 3);
     }
 
     #[test]
@@ -703,5 +1160,59 @@ mod tests {
         let mut store2 = GraphMemoryStore::new(&data_dir);
         store2.load().unwrap();
         assert_eq!(store2.edge_count(), 2);
+    }
+
+    /// ★v0.9.16：deferred 通道**不得**在加边时碰磁盘，flush 之后才落盘。
+    ///
+    /// 这条断言锁定的是 P1 的**全部收益来源**：`expand_associations` 在每次检索里
+    /// 调它，若这里仍然写盘，就还是"每轮检索在锁内重写 52MB 图文件"。
+    #[test]
+    fn test_deferred_batch_does_not_write_disk_until_flush() {
+        let (dir, mut store) = make_graph_store();
+        let added = store.add_edges_batch_deferred(&[(
+            "a".to_string(),
+            "b".to_string(),
+            EdgeType::RelatedTo,
+            0.5,
+        )]);
+        assert_eq!(added, 1);
+        assert!(store.has_pending_writes(), "deferred 后应置脏");
+
+        // ① 未 flush：文件都不存在（更谈不上被重写）
+        assert!(
+            !dir.path().join("graph_edges.json").exists(),
+            "★deferred 通道不得产生任何磁盘写入"
+        );
+
+        // ② flush 一次 ⇒ 落盘且清脏
+        assert!(store.flush_if_dirty().unwrap(), "有脏标记时应真的写盘");
+        assert!(!store.has_pending_writes(), "落盘后脏标记必须清掉");
+        assert!(
+            !store.flush_if_dirty().unwrap(),
+            "无变更时不得再写盘（否则定时 flush 会变成常态写入）"
+        );
+
+        // ③ 内容完整可解析
+        let mut reloaded = GraphMemoryStore::new(&dir.path().to_string_lossy());
+        reloaded.load().expect("应能加载回图");
+        assert_eq!(reloaded.edge_count(), 1);
+    }
+
+    /// ★v0.9.16：快照取走后脏标记清空；若写盘失败可经 `mark_dirty` 补回。
+    #[test]
+    fn test_take_snapshot_then_restore_dirty() {
+        let (_dir, mut store) = make_graph_store();
+        store.add_edges_batch_deferred(&[("x".to_string(), "y".to_string(), EdgeType::Cause, 0.6)]);
+        let snapshot = store.take_dirty_snapshot().expect("应有快照");
+        assert_eq!(snapshot.edge_count(), 1);
+        assert!(!store.has_pending_writes(), "取快照即清脏");
+        assert!(
+            store.take_dirty_snapshot().is_none(),
+            "无新变更时不得重复取快照"
+        );
+
+        // 模拟写盘失败后的补回
+        store.mark_dirty();
+        assert!(store.has_pending_writes(), "mark_dirty 后必须重新置脏");
     }
 }

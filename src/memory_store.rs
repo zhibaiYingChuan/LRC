@@ -59,7 +59,9 @@ use crate::engine::memory_state_machine::MemoryStateMachine;
 use crate::engine::mirror_trapezoid::{
     bagua_name_to_index, bagua_ring_distance, mirror_project, recursive_unfold, TrapezoidROI,
 };
-use crate::engine::synthesis_engine::{SynthesisConfig, SynthesisEngine, SynthesisPlan};
+use crate::engine::synthesis_engine::{
+    jaccard_with_terms, JaccardTerms, SynthesisConfig, SynthesisEngine, SynthesisPlan,
+};
 use crate::engine::synthesis_journal::SynthesisJournal;
 use crate::engine::user_feedback::{
     AffectedMemoryInfo, ImplicitSignal, MemoryGraphQuery, UserFeedback,
@@ -123,26 +125,27 @@ const LEX_DOMAIN_WEIGHT: f32 = 0.25;
 ///
 /// ⇒ 故只改 ④：ROI 仍按几何密度**优先**占据候选预算前排，但**不再排除**
 /// 未被它选中的合格候选——它们按（环形距离就近、其次洛书余弦）补足预算。
-/// ③（八卦硬剪除，环形距离 >2）语义**保持不变**：实测它没有召回代价，
-/// 且是道体八卦机制的一部分，无理由放宽。
+///
+/// ## 2026-11-05 追加：门③（八卦硬剪除）也已移除
+///
+/// 用户裁定 + 实验依据：**洛书的定位是标签/组织/可视化/存储路由，不是检索剪枝**。
+/// 上表已显示 ③ 的召回效应为 0.0pp；文档 §1.24/§1.25 进一步证明 64 卦硬剪枝
+/// 只保留 8.3% 目标、软加权把 top1 从 0.633 打到 0.183 ⇒ 结构编码在检索路径上
+/// 两种用法都不可行。现环形距离只作**排序优先级**，不再排除任何候选。
 ///
 /// （该判定由 CSCD 四阶推理给出：删除语义 → 非破坏性降权；并以 top-1 命中率
 /// 作为回归门禁，防止 v0.8.50「跨卦记忆顶掉 top1」的污染事故重演。
-/// 本次变更不放宽 ③ 且保留词面域/活性偏置/道体再校验，故 top1 风险面未扩大。）
+/// 本次变更保留词面域/活性偏置/道体再校验，故 top1 风险面未扩大。）
 ///
 /// **本常量现在的含义**：候选池绝对下限（防 `top_k=0` 等退化输入导致空池）；
 /// 真实预算 = `filter.top_k`，由调用方决定（deep 路传 `top_k × 2`）。
 const MIN_DEEP_CANDIDATES: usize = 2;
 
-/// 预算回填允许的最大环形距离（v0.9.10，v0.9.12 保留语义）。
+/// 对照模式（`LRC_DEEP_BAGUA_PRUNE=1`）下，预算回填允许的最大环形距离。
 ///
-/// 门③（八卦硬剪除）保留环形距离 ≤1 的候选；回填作为「④ 聚焦掉太多」时的
-/// 补足通道，只向外放宽**一环**（≤2），绝不把 ③ 明确拒绝的远端跨卦候选
-/// （环形距离 3/4）重新拉回——否则等于否定 ③ 本身。
-///
-/// **为什么不连 ③ 一起放宽**：实测（LongMemEval 带标注探针，6 实例/116 gold）
-/// 单独关闭 ③ 对 R_sim 的效应是 **0.0pp**（0.8879 → 0.8879），
-/// 即 ③ 并不构成召回代价；而它承载着道体八卦机制与两条 A/B 锁用例的契约。
+/// 默认路径**不使用**本常量（门③ 已移除，回填不排除任何候选）。
+/// 仅在显式开启旧硬剪除做 A/B 对照时，回填才沿用旧语义（≤2），
+/// 以免把 ③ 明确拒绝的远端跨卦候选经回填重新拉回、使对照失真。
 const DEEP_BACKFILL_MAX_RING: u8 = 2;
 
 /// hub 实体判定·文档频率占比阈值（v0.9.7，PREREG §3.45.5）
@@ -186,6 +189,25 @@ const HUB_ENTITY_DF_RATIO: f32 = 0.20;
 /// 取值 5：低于 5 条记忆共享的实体，其关联对最多 C(4,2)=6 对，
 /// 规模上不构成"噪声淹没信号"的问题，无需过滤。
 const HUB_ENTITY_MIN_DF: usize = 5;
+
+/// 候选索引的 **hub term** 判定·文档频率占比阈值（2026-11-05）
+///
+/// **问题**：候选索引按 term 取并集，只要查询里有一个"几乎每条记忆都有"的
+/// 高频词（如模板词、项目名），候选集就等于全库 ⇒ 索引完全失去剪枝能力。
+/// 实测（7048 条合成库）：查询含共享短语时，索引路径 66ms vs 全库扫描 54ms，
+/// 索引反而更慢（多付了索引查询与 id→position 映射）。
+///
+/// **做法**：把 posting 规模超过 `占比阈值 × 库规模` 的 term 判为 hub，
+/// **不参与候选生成**。这不是启发式——有可证明的无损条件（见
+/// [`MemoryStore::hub_filter_is_lossless`]）：若查询中 hub term 的数量
+/// `< 阈值 × 查询的 Jaccard token 数`，则任何 Jaccard ≥ 阈值的记忆
+/// 必然共享至少一个非 hub term ⇒ 排除 hub term 不会漏召回。
+///
+/// 取值 0.20 与 [`HUB_ENTITY_DF_RATIO`] 一致（同一"泛化词"直觉，便于解释）。
+const HUB_TERM_DF_RATIO: f32 = 0.20;
+
+/// hub term 判定·文档频率绝对下限（小库保护，理由同 [`HUB_ENTITY_MIN_DF`]）
+const HUB_TERM_MIN_DF: usize = 5;
 
 /// 间接关联（2 跳）的**中间节点数上限**
 ///
@@ -466,7 +488,7 @@ fn artifact_content_hash(text: &str) -> u64 {
 ///
 /// 返回 `(两张表, 缓存命中数)`；缓存命中数仅用于计时日志。
 fn build_artifact_tables(
-    all: &[Memory],
+    all: &[Arc<Memory>],
     cache: &mut ArtifactExtractCache,
 ) -> (ArtifactTables, usize) {
     use std::collections::{HashMap, HashSet};
@@ -884,7 +906,9 @@ pub struct MemoryStore<P: Persistence> {
     /// 高于此阈值的记忆将被视为重复并自动合并
     similarity_threshold: f32,
     /// 合成触发阈值：相似记忆数量达到此值时触发递归合成（默认 3）
-    pub synthesis_min_cluster: usize,
+    ///
+    /// ★ 2026-11-05（读并发改造）：改为 `AtomicUsize`，使 `regulate(&self)` 可写。
+    pub synthesis_min_cluster: std::sync::atomic::AtomicUsize,
     /// 合成相似度阈值：记忆相似度超过此值时纳入同一簇（默认 0.4）
     pub synthesis_similarity: f32,
     /// 洛书编码器（用于记忆的 9 维坐标编码 + 八卦分类）
@@ -895,25 +919,29 @@ pub struct MemoryStore<P: Persistence> {
     /// （见 `luoshu_encoder_handle` 与 `encode_luoshu_batch`）。
     luoshu_encoder: Arc<HybridLuoShuEncoder>,
     /// 道同构度指标（L5 监控仪表）
+    ///
+    /// 内部全为 `AtomicU64`，所有方法均为 `&self` ⇒ 无需外层锁。
     pub dao_metrics: DaoMetrics,
     /// 合成日志：记录每次合成事件，支持质量反馈闭环
-    pub synthesis_journal: SynthesisJournal,
+    ///
+    /// ★ 2026-11-05（读并发改造）：包 `RwLock`，使写方法可改 `&self`。
+    pub synthesis_journal: std::sync::RwLock<SynthesisJournal>,
     /// 道同构度调节器：从感知到行动的闭环
-    pub dao_regulator: DaoRegulator,
+    pub dao_regulator: std::sync::RwLock<DaoRegulator>,
     /// P1 调节器心跳：记录最近一次 regulate() 的执行状态（供 /v1/health/system 与前端展示）
-    pub regulator_heartbeat: RegulatorHeartbeat,
+    pub regulator_heartbeat: std::sync::RwLock<RegulatorHeartbeat>,
     /// 合成引擎：记忆簇发现与递归合成
-    pub synthesis_engine: SynthesisEngine,
+    pub synthesis_engine: std::sync::RwLock<SynthesisEngine>,
     /// 衰减曲线配置（可外部化，控制记忆衰减行为）
-    pub decay_config: DecayConfig,
+    pub decay_config: std::sync::RwLock<DecayConfig>,
     /// 可选图存储（用于自动建立冲突/演进关系边）
-    graph_store: Option<GraphMemoryStore>,
+    graph_store: std::sync::RwLock<Option<GraphMemoryStore>>,
     /// LRC 内置道体状态机：跟踪当前活跃记忆与联想转移
-    pub memory_state_machine: MemoryStateMachine,
+    pub memory_state_machine: std::sync::RwLock<MemoryStateMachine>,
     /// 用户反馈回路：将人类判断力注入系统演化（解决质疑四）
-    pub user_feedback: UserFeedback,
+    pub user_feedback: std::sync::RwLock<UserFeedback>,
     /// 自主记忆垃圾回收器：定期清理低质量、长期未用的记忆
-    pub memory_gc: MemoryGarbageCollector,
+    pub memory_gc: std::sync::RwLock<MemoryGarbageCollector>,
     /// GC 延迟执行标记（质疑三：避免 GC 阻塞用户请求关键路径）
     /// v0.8.48 P0 修复：改为 AtomicBool 解决竞态条件
     /// 多个后台任务并发检查时，使用原子 CAS 操作确保 GC 恰好执行一次
@@ -924,11 +952,11 @@ pub struct MemoryStore<P: Persistence> {
     /// 多个后台任务并发检查时，使用原子 CAS 操作确保合成恰好执行一次
     pub synthesis_pending: std::sync::atomic::AtomicBool,
     /// 审计追踪：记录系统所有自主行为（质疑五：透明度与信任）
-    pub audit_trail: AuditTrail,
+    pub audit_trail: std::sync::RwLock<AuditTrail>,
     /// 提示升级追踪器：防止 ActionHint 重复警告的"狼来了"效应（质疑一）
-    pub hint_escalation: HintEscalationTracker,
+    pub hint_escalation: std::sync::RwLock<HintEscalationTracker>,
     /// 复杂度预算（质疑五·终极：防止系统超出人类可理解范围）
-    pub complexity_budget: ComplexityBudget,
+    pub complexity_budget: std::sync::RwLock<ComplexityBudget>,
     /// v0.5.4 增量缓存 + v0.9.7 结构化拆分（GLOBAL_CODE_REVIEW_REPORT P2-2）：
     /// 本地缓存子系统，原 6 个缓存字段（memory_cache / cache_dirty / bigram_index /
     /// bigram_index_dirty / recall_documents / assoc_frequency）及其全部纯缓存逻辑
@@ -937,10 +965,11 @@ pub struct MemoryStore<P: Persistence> {
     /// v0.9.13：全库派生的联想统计表缓存（hub / 自动事件 / artifact）。
     ///
     /// 只在 `MemoryStore` 被存储锁独占时访问（`&self` / `&mut self` 皆可），
-    /// 用 `RefCell` 是因为 `associations()` 等只读入口也需惰性建表并写回缓存。
+    /// 用 `Mutex` 是因为 `associations()` 等只读入口也需惰性建表并写回缓存，
+    /// 且 `MemoryStore` 需满足 `Sync`（外层 `RwLock` 并发读）。
     /// 缓存以 [`crate::memory_store_cache::MemoryStoreCache::data_version`] 失效，
     /// 语义与正确性论证见 [`AssocTables`]。
-    assoc_tables_cache: std::cell::RefCell<Option<std::sync::Arc<AssocTables>>>,
+    assoc_tables_cache: std::sync::Mutex<Option<std::sync::Arc<AssocTables>>>,
     /// v0.9.13：artifact 抽取缓存（记忆 ID → 正文指纹 + artifact 列表）。
     ///
     /// 为什么需要：artifact 两张表每次重建都要对 449k 条正文跑 `extract_artifacts`，
@@ -948,24 +977,114 @@ pub struct MemoryStore<P: Persistence> {
     /// 但**绝大多数记忆的正文并未改变** ⇒ 以"正文指纹相同即复用"避免重算，
     /// 使写入后的重建代价从 17s 降到亚秒级。正确性由指纹保证（见
     /// [`artifact_content_hash`] 的文档：不依赖"哪条写路径改的正文"）。
-    artifact_cache: std::cell::RefCell<ArtifactExtractCache>,
+    artifact_cache: std::sync::Mutex<ArtifactExtractCache>,
     /// v0.5.5 P1-1：LLM 是否已配置
     /// LLM 配置后替代本地 ML 模型提供语义理解能力，编码器不再视为"降级"
     /// 通过 set_llm_configured() 在 sidecar 启动后设置
     llm_configured: std::sync::atomic::AtomicBool,
     /// v0.6.0+ 参赛扩展：探索日志记录器（默认禁用，由 sidecar 启动时注入）
     /// 用于记录科学探索过程的结构化日志（JSON Lines 格式）
-    exploration_logger: crate::engine::exploration_log::ExplorationLogger,
+    exploration_logger: std::sync::RwLock<crate::engine::exploration_log::ExplorationLogger>,
     /// 记忆生命周期表（取代 / 衰减 / 抑制），持久化到独立的 `lifecycle.json`。
     ///
     /// **为什么不放进 `Memory`**：旧版 exe 无 `deny_unknown_fields`，读到未知字段会
     /// 静默丢弃并在下次全量写入时抹掉（回滚变单向门）；且整库压实是全量重写
     /// （632MB 级），检索命中若写它会触发 503 风暴。因此只维护内存副本，按节流合并。
-    lifecycle: crate::lifecycle::LifecycleTable,
+    lifecycle: std::sync::RwLock<crate::lifecycle::LifecycleTable>,
     /// 生命周期表是否有未落盘的变更
-    lifecycle_dirty: bool,
+    lifecycle_dirty: std::sync::atomic::AtomicBool,
     /// 上次落盘时刻（节流用）
-    lifecycle_flushed_at: std::time::Instant,
+    lifecycle_flushed_at: std::sync::Mutex<std::time::Instant>,
+    /// 读路径（`&self`）产生的状态写回队列（2026-11-05 并发改造）。
+    ///
+    /// **为什么需要**：`recall_with_cancel` / `trapezoid_focus_recall_with_cancel`
+    /// 改为 `&self` 后，可在外层 `RwLock` 的**读锁**下并发执行。但检索命中需要
+    /// 写回道体状态机（激活/转移）与生命周期表——这些是共享可变状态，若在读锁下
+    /// 直接写会数据竞争（且 `save_memory_state` 并发写同一文件会损坏数据）。
+    ///
+    /// 故读路径只把"要写什么"追加到本队列（`Mutex` 保护，临界区仅一次 push），
+    /// 由调用方在**释放读锁后**调用 [`Self::flush_recall_side_effects`]（需 `&mut self`，
+    /// 即写锁）统一应用。语义与改造前逐条一致：激活顺序、转移顺序、落盘时机不变。
+    pending_recall_effects: std::sync::Mutex<Vec<RecallSideEffect>>,
+    /// 读路径待写入的审计事件（2026-11-05，B1）。
+    ///
+    /// **为什么需要**：`audit_trail` 是 `RwLock`，`record` 需取写锁；读路径若直接
+    /// 记录会与其它读者争抢内部写锁。审计是**可观测性**数据，不参与检索结果，
+    /// 故改为入队 + 后台写锁下统一记录。
+    /// 队列上限 [`PENDING_AUDIT_CAP`]，防止后台长期拿不到锁时无限增长。
+    pending_audit: std::sync::Mutex<Vec<PendingAuditEvent>>,
+}
+
+/// 图存储只读守卫：`RwLock<Option<GraphMemoryStore>>` 的映射视图。
+///
+/// 为什么需要：`graph_store` 改为 `RwLock` 后无法再返回 `&GraphMemoryStore`
+/// （引用会逃逸出锁守卫），而 `MappedRwLockReadGuard` 在当前工具链仍不稳定。
+/// 本类型持有守卫并 `Deref` 到内部图存储，保持既有调用点（测试）不变。
+pub struct GraphStoreReadGuard<'a>(std::sync::RwLockReadGuard<'a, Option<GraphMemoryStore>>);
+
+impl std::ops::Deref for GraphStoreReadGuard<'_> {
+    type Target = GraphMemoryStore;
+
+    fn deref(&self) -> &GraphMemoryStore {
+        self.0
+            .as_ref()
+            .expect("GraphStoreReadGuard 仅在 Some 时构造")
+    }
+}
+
+/// 图存储可变守卫（测试用），语义同 [`GraphStoreReadGuard`]。
+pub struct GraphStoreWriteGuard<'a>(std::sync::RwLockWriteGuard<'a, Option<GraphMemoryStore>>);
+
+impl std::ops::Deref for GraphStoreWriteGuard<'_> {
+    type Target = GraphMemoryStore;
+
+    fn deref(&self) -> &GraphMemoryStore {
+        self.0
+            .as_ref()
+            .expect("GraphStoreWriteGuard 仅在 Some 时构造")
+    }
+}
+
+impl std::ops::DerefMut for GraphStoreWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut GraphMemoryStore {
+        self.0
+            .as_mut()
+            .expect("GraphStoreWriteGuard 仅在 Some 时构造")
+    }
+}
+
+/// 读路径待写入的审计事件（见 [`MemoryStore::pending_audit`]）。
+pub struct PendingAuditEvent {
+    pub event_type: AuditEventType,
+    pub description: String,
+    pub reason: String,
+    pub affected_memory_ids: Vec<String>,
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
+/// 待写审计队列上限（超出时丢弃最旧的一条并告警）。
+const PENDING_AUDIT_CAP: usize = 4096;
+
+/// 读路径副作用队列上限（审查 P2-3）。
+///
+/// 与 [`PENDING_AUDIT_CAP`] 同口径：后台 flusher 用 `try_write`（不排队），
+/// 长读持续时可能长期拿不到写锁 ⇒ 队列必须有界。满时丢弃最旧批次。
+const PENDING_RECALL_EFFECTS_CAP: usize = 4096;
+
+/// 读路径待写回的状态变更（见 [`MemoryStore::pending_recall_effects`]）。
+enum RecallSideEffect {
+    /// 道体状态机激活 + 转移（对应原 `bake_activation`）
+    Activation { memories: Vec<(String, f32)> },
+    /// 生命周期命中（对应原 `record_lifecycle_hits`）
+    LifecycleHits { ids: Vec<String> },
+    /// 记录层关联边写入图存储（对应原 `expand_associations` 尾部的直接写图）。
+    ///
+    /// **为什么可以延后**：同一次检索里"读回"的只有**符号层**边
+    /// （`is_symbolic_edge_type`），而这里产出的是**记录层**边
+    /// （`is_record_edge_type`），两者集合不相交 ⇒ 延后不改变本次响应。
+    GraphEdges {
+        pending: Vec<(String, String, EdgeType, f32)>,
+    },
 }
 
 /// 洛书八卦历史重分类报告（v0.9.10 塔缩修复·第 2 层）
@@ -1051,12 +1170,12 @@ impl<P: Persistence> crate::engine::navigation::FocusRecall for MemoryStore<P> {
     type Error = PersistenceError;
 
     fn focus_recall(
-        &mut self,
+        &self,
         query: &str,
         filter: &RecallFilter,
         depth: u32,
     ) -> Result<RecallResult, Self::Error> {
-        self.trapezoid_focus_recall(query, filter, depth)
+        self.trapezoid_focus_recall_with_cancel(query, filter, depth, None)
     }
 }
 
@@ -1099,7 +1218,7 @@ impl<P: Persistence> MemoryGraphQuery for MemoryStore<P> {
             }
         }
         // 如果图存储可用，也查询图中的边关系
-        if let Some(ref graph) = self.graph_store {
+        if let Some(ref graph) = *self.graph_store.read().unwrap() {
             for edge in graph.query_edges(memory_id) {
                 let other = if edge.source_id == memory_id {
                     &edge.target_id
@@ -1199,13 +1318,15 @@ impl<P: Persistence> MemoryInfoQuery for MemoryStore<P> {
 
     fn is_low_quality_synthesis(&self, memory_id: &str) -> bool {
         self.synthesis_journal
+            .read()
+            .unwrap()
             .get_low_quality_ids()
             .contains(&memory_id.to_string())
     }
 
     fn get_quality_score(&self, memory_id: &str) -> f32 {
         // 从合成日志中获取质量评分（通过命中记录计算）
-        let events = self.synthesis_journal.get_events();
+        let events = self.synthesis_journal.read().unwrap().get_events();
         for event in &events {
             if event.synthesis_id == memory_id {
                 return event.avg_relevance;
@@ -1216,7 +1337,10 @@ impl<P: Persistence> MemoryInfoQuery for MemoryStore<P> {
     }
 
     fn get_negative_feedback_count(&self, memory_id: &str) -> usize {
-        self.user_feedback.get_negative_feedback_count(memory_id)
+        self.user_feedback
+            .read()
+            .unwrap()
+            .get_negative_feedback_count(memory_id)
     }
 
     fn get_all_memory_ids(&self) -> Vec<String> {
@@ -1256,7 +1380,7 @@ impl<P: Persistence> MemoryInfoQuery for MemoryStore<P> {
 /// 计算 CJK 字符在文本中的比例（0.0 ~ 1.0）
 ///
 /// 当 CJK 字符比例超过 30% 时，应使用 bigram 分词策略。
-fn cjk_ratio(text: &str) -> f32 {
+pub(crate) fn cjk_ratio(text: &str) -> f32 {
     let total = text.chars().filter(|c| !c.is_whitespace()).count();
     if total == 0 {
         return 0.0;
@@ -1360,7 +1484,7 @@ pub fn is_generic_bigram(token: &str) -> bool {
 /// 修复前引入的缺陷：混合文本被整体按字符切 bigram，英文标识符被切碎
 /// （try_read → tr/ry/y_/_r/re/ea/ad），`contains_word` 对 2 字符英文仅做
 /// 子串匹配，DF 高、IDF 低，正确记忆与大量无关文档同分甚至落榜。
-fn tokenize_cjk(text: &str) -> Vec<String> {
+pub(crate) fn tokenize_cjk(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
 
     if chars.is_empty() {
@@ -1425,6 +1549,52 @@ fn tokenize_cjk(text: &str) -> Vec<String> {
 /// 而非 `split_whitespace().count()`（对中文无效）。
 pub(crate) fn doc_token_count(text: &str) -> usize {
     tokenize_query(text).len().max(1)
+}
+
+/// S6（2026-11-02）：快路"候选生成索引化"开关（**默认关闭**）。
+///
+/// 开启后，`recall` 用既有 `BigramIndex` 的 postings 并集作为评分候选集，
+/// 只对"含查询词"的记忆做全文扫描。**关闭时行为与改造前逐字节一致**
+/// （`active` 恒为全量、所有统计量口径不变）。
+///
+/// 为什么默认关闭：判据要求"结果集合与全量扫描一致 + 20k 库 P95 达标"，
+/// 须先用 `scripts/s6_n_scaling.py --indexed` 复测通过，才允许翻默认。
+pub(crate) fn fast_candidate_index_enabled() -> bool {
+    std::env::var("LRC_FAST_CANDIDATE_INDEX")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// 该查询词能否用倒排索引**等价替代** `count_word_occurrences > 0` 的判定。
+///
+/// 候选裁剪的正确性前提是「索引 term 命中」⟺「打分命中」。两套口径并不天然同源
+/// （索引见 `MemoryStoreCache::index_terms_for_memory`，打分见
+/// `count_word_occurrences`），只有满足下列条件的词才等价：
+///
+/// - **CJK**：打分做子串匹配，而索引对 CJK 段只产**相邻两字** bigram ⇒
+///   仅"恰好 2 个 CJK 字符"的词等价；单字词（子串可命中更长中文段）不安全。
+/// - **纯 ASCII**：打分对长度 ≥3 做词边界匹配、<3 做子串匹配 ⇒ 仅
+///   `[a-z0-9_-]{3,}`（即 `tokenize_cjk` 的 ASCII 整词字符集）才可用索引；
+///   短词、含标点（`nginx.conf`、`don't`）、含非 ASCII 字母的词一律不安全。
+///
+/// 不安全的词会让**整次检索**回退到全量扫描——宁可慢，不可漏召回。
+pub(crate) fn is_index_safe_term(word: &str) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    if chars.is_empty() {
+        return false;
+    }
+    if chars.iter().any(|c| {
+        let cp = *c as u32;
+        (0x4E00..=0x9FFF).contains(&cp)
+            || (0x3400..=0x4DBF).contains(&cp)
+            || (0xF900..=0xFAFF).contains(&cp)
+    }) {
+        return chars.len() == 2;
+    }
+    chars.len() >= 3
+        && chars
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
 }
 
 /// v0.5.5 修复二：词边界感知的子串匹配
@@ -1705,8 +1875,9 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// 返回 `(每候选向量, 是否产生新回填)`，顺序与 `memories` 严格一致。
 ///
-/// 并发说明：`MemoryStore` 因持久化缓存字段含 `RefCell` 而 `!Sync`，跨线程只能
-/// 共享**编码闭包**（`F: Sync` ⇒ `&F: Send`），与历史并行编码范式一致。
+/// 并发说明：本函数只共享**编码闭包**（`F: Sync` ⇒ `&F: Send`），
+/// 不跨线程共享 `MemoryStore` 本身（读并发改造后它已是 `Sync`，
+/// 但此处按"纯函数 + 闭包"范式并行，避免在编码阶段持存储锁）。
 #[cfg(feature = "ml")]
 fn resolve_candidate_vectors<F>(
     memories: &[&Memory],
@@ -1776,6 +1947,260 @@ where
     (out, dirty)
 }
 
+/// 相似检查的候选集合（P3 分层锁：**锁内**构建，**锁外**扫描）
+///
+/// 拆分的唯一目的：把 `remember` 的 Jaccard 全库扫描（7048 条实测约 50ms）
+/// 移出存储锁。候选集合本身只依赖索引查询与快照，构建成本远低于扫描。
+struct CandidateSet {
+    /// 候选在快照中的 position（已排序去重）
+    positions: Vec<usize>,
+    /// 是否启用了候选索引（关闭时等价全库扫描）
+    index_enabled: bool,
+    /// 索引为空时是否回退到全库
+    fallback_triggered: bool,
+    /// 索引命中的 position 数（剖析用）
+    indexed_position_count: usize,
+    /// 同项目候选数（剖析用）
+    primary_candidate_count: usize,
+    /// 同语言候选数（剖析用）
+    same_language_count: usize,
+    /// 回退候选数（剖析用）
+    fallback_candidate_count: usize,
+    /// 同项目命中数（剖析用）
+    same_project_count: usize,
+    /// 索引模式名（剖析用）
+    index_mode: &'static str,
+    /// 查询内容是否含 CJK（剖析用）
+    content_is_cjk: bool,
+    /// 候选构建耗时（毫秒，剖析用）
+    candidate_build_ms: f64,
+}
+
+impl CandidateSet {
+    /// 把 position 重映射为"候选子集内的 0..len"（2026-11-05 实验）。
+    ///
+    /// 子集按原 `positions` 升序构建，因此扫描顺序与原来一致（仅去掉桶路由）。
+    fn into_subset(mut self, len: usize) -> Self {
+        self.positions = (0..len).collect();
+        self
+    }
+
+    /// 是否启用 M.T.R. 桶路由（只改扫描顺序，不改候选集合）
+    fn use_bucket_routing(&self) -> bool {
+        let is_full_scan = !self.index_enabled || self.fallback_triggered;
+        is_full_scan
+            && self.positions.len() > 64
+            && std::env::var_os("LRC_BUCKET_ROUTING_OFF").is_none()
+    }
+}
+
+/// 扫描候选并返回第一条相似记忆（P3 分层锁：**锁外**执行，纯 CPU）
+///
+/// 与 [`MemoryStore::build_candidates`] 配对：候选集合在锁内构建，本函数在锁外执行，
+/// 从而把 `remember` 的 Jaccard 全库扫描移出存储锁。
+#[allow(clippy::too_many_arguments)]
+fn scan_candidates(
+    all: &[Arc<Memory>],
+    candidates: &CandidateSet,
+    query_jaccard_terms: &JaccardTerms,
+    similarity_threshold: f32,
+    privacy_context: &Option<PrivacyScope>,
+    buckets: Option<&[Vec<usize>; 8]>,
+    query_bagua: Option<usize>,
+    scope_project: Option<&str>,
+    cached_terms: Option<&std::collections::HashMap<String, Arc<JaccardTerms>>>,
+) -> Option<Memory> {
+    let candidate_count = candidates.positions.len();
+    let mut comparisons = 0usize;
+    let similarity_start = std::time::Instant::now();
+    // P3 / M.T.R. 传输层：全库扫描时按"查询桶 → 相邻桶 → 其余桶"路由。
+    //
+    // 只改变**扫描顺序**，不改变候选集合（仍覆盖全部候选）⇒ 召回不变；
+    // 相似记忆大概率落在同桶/相邻桶，命中即返回，从而减少实际比较次数。
+    // 关闭开关：LRC_BUCKET_ROUTING_OFF=1（回归对照用）。
+    let scan_positions: Vec<usize> = match (buckets, query_bagua) {
+        (Some(buckets), Some(query_bagua)) => {
+            let mut order = Vec::with_capacity(candidates.positions.len());
+            order.extend(buckets[query_bagua].iter().copied());
+            for d in 1..=4 {
+                order.extend(buckets[(query_bagua + d) % 8].iter().copied());
+                if d != 4 {
+                    order.extend(buckets[(query_bagua + 8 - d) % 8].iter().copied());
+                }
+            }
+            order
+        }
+        _ => candidates.positions.clone(),
+    };
+    for position in &scan_positions {
+        let m = &all[*position];
+        if m.is_expired() {
+            continue;
+        }
+        // 隐私隔离：跳过对调用方不可见的记忆（不参与相似合并）
+        if !is_visible(m, privacy_context) {
+            continue;
+        }
+        comparisons += 1;
+        // ★ 2026-11-05：优先用缓存好的 Jaccard 预计算集合（省掉 to_lowercase +
+        //   建 HashSet 的 ~3µs/条）；未命中时现算，结果逐位一致。
+        let sim = match cached_terms.and_then(|terms| terms.get(&m.id)) {
+            Some(cached) => jaccard_with_terms(query_jaccard_terms, cached),
+            None => jaccard_with_terms(query_jaccard_terms, &JaccardTerms::new(&m.content)),
+        };
+        if sim >= similarity_threshold {
+            if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
+                emit_remember_profile(format!(
+                    "[LRC_PROFILING] remember candidates={} indexed_positions={} primary_candidates={} same_language_candidates={} fallback_candidates={} fallback_triggered={} fallback_comparisons={} same_project={} jaccard_comparisons={} index_mode={} query_is_cjk={} scope_project={:?} candidate_build_ms={:.3} similarity_ms={:.3} hit=true",
+                    candidate_count,
+                    candidates.indexed_position_count,
+                    candidates.primary_candidate_count,
+                    candidates.same_language_count,
+                    candidates.fallback_candidate_count,
+                    candidates.fallback_triggered,
+                    if candidates.fallback_triggered { comparisons } else { 0 },
+                    candidates.same_project_count,
+                    comparisons,
+                    candidates.index_mode,
+                    candidates.content_is_cjk,
+                    scope_project,
+                    candidates.candidate_build_ms,
+                    similarity_start.elapsed().as_secs_f64() * 1000.0
+                ));
+            }
+            return Some(m.as_ref().clone());
+        }
+    }
+
+    if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
+        emit_remember_profile(format!(
+            "[LRC_PROFILING] remember candidates={} indexed_positions={} primary_candidates={} same_language_candidates={} fallback_candidates={} fallback_triggered={} fallback_comparisons={} same_project={} jaccard_comparisons={} index_mode={} query_is_cjk={} scope_project={:?} candidate_build_ms={:.3} similarity_ms={:.3}",
+            candidate_count,
+            candidates.indexed_position_count,
+            candidates.primary_candidate_count,
+            candidates.same_language_count,
+            candidates.fallback_candidate_count,
+            candidates.fallback_triggered,
+            if candidates.fallback_triggered { comparisons } else { 0 },
+            candidates.same_project_count,
+            comparisons,
+            candidates.index_mode,
+            candidates.content_is_cjk,
+            scope_project,
+            candidates.candidate_build_ms,
+            similarity_start.elapsed().as_secs_f64() * 1000.0
+        ));
+    }
+    None
+}
+
+/// `remember` 三阶段锁解耦·阶段 1 产物（**锁内**构建，**锁外**分析）
+///
+/// 目的：把 `remember` 的 Jaccard 全库扫描与洛书编码移出存储锁，
+/// 使单次写入的持锁时长从「扫描 + 编码 + 落盘」降为「取快照 + 落盘」。
+pub enum RememberPrep {
+    /// `LRC_DISABLE_MEMORY` 命中：不落盘，直接返回该记忆
+    /// （Box 化：`Memory` 约 504 字节，与 `Ready` 的 8 字节差距过大）
+    NoOp(Box<Memory>),
+    /// 正常路径
+    Ready(Box<RememberPrepData>),
+}
+
+/// 正常路径的锁内快照与候选（字段全部为只读数据，可安全跨线程）
+pub struct RememberPrepData {
+    memory: Memory,
+    /// **候选子集**（2026-11-05 实验）：只含 `candidates.positions` 指向的条目。
+    ///
+    /// 修前这里是整库快照 `Arc<Vec<Memory>>`，被 `analyze()` 持有到提交前；
+    /// 16 并发写时提交侧 `Arc::make_mut` 因引用计数 > 1 而**整库克隆**。
+    /// 改为子集后，整库 Arc 在 `prepare_remember` 返回时即释放 ⇒ 提交可原地修改。
+    snapshot: Vec<Arc<Memory>>,
+    candidates: CandidateSet,
+    query_terms: JaccardTerms,
+    threshold: f32,
+    privacy: Option<PrivacyScope>,
+    buckets: Option<Arc<[Vec<usize>; 8]>>,
+    scope_project: Option<String>,
+    snapshot_version: u64,
+    encoder: Arc<HybridLuoShuEncoder>,
+    started_at: std::time::Instant,
+    mem_type_str: String,
+    mem_importance: u8,
+    mem_tags: Vec<String>,
+    /// 候选子集的 Jaccard 预计算集合（2026-11-05 实验）。
+    ///
+    /// 修前是整库 `Arc<HashMap>`，被 `analyze()` 持有到提交前 ⇒ 提交侧
+    /// `fill_jaccard_terms` 的 `Arc::make_mut` 会整表克隆。改为子集后不再持有整表。
+    cached_terms: std::collections::HashMap<String, Arc<JaccardTerms>>,
+}
+
+/// `remember` 三阶段锁解耦·阶段 2 产物（**锁外**分析完成）
+pub enum RememberAnalysis {
+    NoOp(Box<Memory>),
+    Ready(Box<RememberAnalysisData>),
+}
+
+/// 锁外分析结果：相似记忆 + 洛书向量
+pub struct RememberAnalysisData {
+    memory: Memory,
+    similar: Option<Memory>,
+    luoshu_vec: LuoShuVector,
+    encoded_content: String,
+    snapshot_version: u64,
+    privacy: Option<PrivacyScope>,
+    started_at: std::time::Instant,
+    mem_type_str: String,
+    mem_importance: u8,
+    mem_tags: Vec<String>,
+}
+
+impl RememberPrep {
+    /// 阶段 2：**锁外**执行编码与候选扫描（纯 CPU，不触碰存储）
+    pub fn analyze(self) -> RememberAnalysis {
+        match self {
+            RememberPrep::NoOp(memory) => RememberAnalysis::NoOp(memory),
+            RememberPrep::Ready(data) => {
+                let data = *data;
+                let similarity_start = std::time::Instant::now();
+                let query_bagua = data.buckets.as_ref().map(|_| {
+                    mirror_project(&data.encoder.encode_text(&data.memory.content)).best_index % 8
+                });
+                let similar = scan_candidates(
+                    &data.snapshot,
+                    &data.candidates,
+                    &data.query_terms,
+                    data.threshold,
+                    &data.privacy,
+                    data.buckets.as_deref(),
+                    query_bagua,
+                    data.scope_project.as_deref(),
+                    Some(&data.cached_terms),
+                );
+                if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
+                    eprintln!(
+                        "[LRC_PROFILING] remember similarity_lookup_ms={:.3} found={}",
+                        similarity_start.elapsed().as_secs_f64() * 1000.0,
+                        similar.is_some()
+                    );
+                }
+                let luoshu_vec = data.encoder.encode_text(&data.memory.content);
+                RememberAnalysis::Ready(Box::new(RememberAnalysisData {
+                    encoded_content: data.memory.content.clone(),
+                    memory: data.memory,
+                    similar,
+                    luoshu_vec,
+                    snapshot_version: data.snapshot_version,
+                    privacy: data.privacy,
+                    started_at: data.started_at,
+                    mem_type_str: data.mem_type_str,
+                    mem_importance: data.mem_importance,
+                    mem_tags: data.mem_tags,
+                }))
+            }
+        }
+    }
+}
+
 impl<P: Persistence> MemoryStore<P> {
     /// 创建新的记忆存储器（相似度阈值默认 0.5，可用 LRC_SIMILARITY_THRESHOLD 覆盖）
     pub fn new(persistence: P) -> Self {
@@ -1806,48 +2231,61 @@ impl<P: Persistence> MemoryStore<P> {
             crate::engine::user_feedback::UserFeedback::privacy_manifest()
         );
 
-        Self {
+        let mut store = Self {
             persistence,
             similarity_threshold: similarity_threshold_from_env(),
             // v0.9.11（G9 / CR-24）：改用合成阈值的**单一真源**（修前此处硬编码 3 / 0.4）
-            synthesis_min_cluster: crate::engine::synthesis_engine::DEFAULT_MIN_CLUSTER,
+            synthesis_min_cluster: std::sync::atomic::AtomicUsize::new(
+                crate::engine::synthesis_engine::DEFAULT_MIN_CLUSTER,
+            ),
             synthesis_similarity: crate::engine::synthesis_engine::DEFAULT_SIMILARITY,
             luoshu_encoder: Arc::new(HybridLuoShuEncoder::default()),
             dao_metrics: DaoMetrics::new(),
-            synthesis_journal: SynthesisJournal::new(),
-            dao_regulator: DaoRegulator::new(),
-            regulator_heartbeat: RegulatorHeartbeat::default(),
-            synthesis_engine: SynthesisEngine::new(SynthesisConfig::default()),
-            decay_config: DecayConfig::default(),
-            graph_store: None,
-            memory_state_machine: MemoryStateMachine::from_state(memory_state),
-            user_feedback: UserFeedback::new(),
-            memory_gc: MemoryGarbageCollector::default(),
+            synthesis_journal: std::sync::RwLock::new(SynthesisJournal::new()),
+            dao_regulator: std::sync::RwLock::new(DaoRegulator::new()),
+            regulator_heartbeat: std::sync::RwLock::new(RegulatorHeartbeat::default()),
+            synthesis_engine: std::sync::RwLock::new(SynthesisEngine::new(
+                SynthesisConfig::default(),
+            )),
+            decay_config: std::sync::RwLock::new(DecayConfig::default()),
+            graph_store: std::sync::RwLock::new(None),
+            memory_state_machine: std::sync::RwLock::new(MemoryStateMachine::from_state(
+                memory_state,
+            )),
+            user_feedback: std::sync::RwLock::new(UserFeedback::new()),
+            memory_gc: std::sync::RwLock::new(MemoryGarbageCollector::default()),
             gc_pending: std::sync::atomic::AtomicBool::new(false),
             synthesis_pending: std::sync::atomic::AtomicBool::new(false), // v0.5.4 初始无待合成任务
-            audit_trail: AuditTrail::new(),
-            hint_escalation: HintEscalationTracker::new(),
+            audit_trail: std::sync::RwLock::new(AuditTrail::new()),
+            hint_escalation: std::sync::RwLock::new(HintEscalationTracker::new()),
             // 质疑五·终极：初始化复杂度预算
             // 当前系统: ~20 个核心模块, ~200 个 pub fn, ~40 个跨模块依赖, 最深因果链 5 层
-            complexity_budget: {
+            complexity_budget: std::sync::RwLock::new({
                 let mut budget = ComplexityBudget::new();
                 budget.update(20, 200, 40, 5);
                 budget
-            },
+            }),
             // v0.5.4 增量缓存初始化（v0.9.7：整体委托 MemoryStoreCache）
             cache: crate::memory_store_cache::MemoryStoreCache::new(assoc_frequency),
             // v0.9.13：联想统计表缓存初始为空，首次检索时惰性建表
-            assoc_tables_cache: std::cell::RefCell::new(None),
+            assoc_tables_cache: std::sync::Mutex::new(None),
             // v0.9.13：artifact 抽取缓存初始为空，首次建表时逐条填充
-            artifact_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            artifact_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             // v0.5.5 P1-1：LLM 默认未配置，由 sidecar 启动后通过 set_llm_configured() 设置
             llm_configured: std::sync::atomic::AtomicBool::new(false),
             // v0.6.0+ 参赛扩展：探索日志默认禁用
-            exploration_logger: crate::engine::exploration_log::ExplorationLogger::disabled(),
-            lifecycle,
-            lifecycle_dirty: false,
-            lifecycle_flushed_at: std::time::Instant::now(),
-        }
+            exploration_logger: std::sync::RwLock::new(
+                crate::engine::exploration_log::ExplorationLogger::disabled(),
+            ),
+            lifecycle: std::sync::RwLock::new(lifecycle),
+            lifecycle_dirty: std::sync::atomic::AtomicBool::new(false),
+            lifecycle_flushed_at: std::sync::Mutex::new(std::time::Instant::now()),
+            pending_recall_effects: std::sync::Mutex::new(Vec::new()),
+            pending_audit: std::sync::Mutex::new(Vec::new()),
+        };
+        // A+B+D：构造期用存量语料定型 IDF 表（编码器此后不再自动变更）
+        store.init_encoder_idf();
+        store
     }
 
     /// 创建使用统计编码器的 MemoryStore（跳过 ML 模型下载，适合基准测试）
@@ -1869,8 +2307,10 @@ impl<P: Persistence> MemoryStore<P> {
         }
         // ②/③ P8.2o 状态化方案：统计模式构造点**不加载磁盘状态与统计**，以空态起步。
         // （`new()` 会先加载再用，这里覆写为空；语义与修前一致，仅多一次磁盘读。）
-        store.memory_state_machine = MemoryStateMachine::new();
+        *store.memory_state_machine.write().unwrap() = MemoryStateMachine::new();
         store.cache = crate::memory_store_cache::MemoryStoreCache::new(AssocFrequency::default());
+        // 编码器已被替换 ⇒ 用存量语料重新定型 IDF（A+B+D）
+        store.rebuild_encoder_idf();
         store
     }
 
@@ -1882,6 +2322,8 @@ impl<P: Persistence> MemoryStore<P> {
     pub fn new_with_encoder(persistence: P, luoshu_encoder: HybridLuoShuEncoder) -> Self {
         let mut store = Self::new(persistence);
         store.luoshu_encoder = Arc::new(luoshu_encoder);
+        // 编码器已被替换 ⇒ 用存量语料重新定型 IDF（A+B+D）
+        store.rebuild_encoder_idf();
         store
     }
 
@@ -1987,8 +2429,8 @@ impl<P: Persistence> MemoryStore<P> {
         // 候选逐条串行前向（每条 ~2s）会在 root 召回阶段耗尽外层 15s
         // 超时，把"诚实空态"变成 503 错误。std::thread::scope 并发前向，
         // 墙钟时间压缩到单条耗时量级。
-        // 注意：MemoryStore 因持久化缓存字段含 RefCell 而 !Sync，跨线程
-        // 只共享编码器字段（HybridLuoShuEncoder 本身 Sync）。
+        // 注意：跨线程只共享编码器字段（HybridLuoShuEncoder 本身 Sync），
+        // 不共享 MemoryStore 本身——编码阶段不持存储锁。
         let encoder = &self.luoshu_encoder;
         let vectors: Vec<Option<Vec<f32>>> = std::thread::scope(|scope| {
             let handles: Vec<_> = memories
@@ -2158,7 +2600,7 @@ impl<P: Persistence> MemoryStore<P> {
             return (vec![None; memories.len()], false, 0);
         }
         let dim = q.len();
-        // 跨线程只共享编码器字段（MemoryStore 因 RefCell 而 !Sync）。
+        // 跨线程只共享编码器字段（编码阶段不持存储锁）。
         let encoder = &self.luoshu_encoder;
         let (vectors, dirty) = resolve_candidate_vectors(
             memories,
@@ -2215,7 +2657,7 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 持久化失败不阻塞检索/探索——跨查询统计是增强项，与 `bake_activation`
     /// 对 `save_memory_state` 的容错同一范式（`let _ =`）。
-    pub fn record_assoc_query(&mut self, pool_contents: &[String]) {
+    pub fn record_assoc_query(&self, pool_contents: &[String]) {
         if pool_contents.is_empty() {
             // 与离线探针口径一致：空池不计数（探针见空池直接 continue）
             return;
@@ -2232,10 +2674,10 @@ impl<P: Persistence> MemoryStore<P> {
     /// 由 sidecar 启动时根据 `--exploration-log <path>` 参数注入
     /// 未调用此方法时，所有日志调用为空操作（disabled 模式）
     pub fn set_exploration_logger(
-        &mut self,
+        &self,
         logger: crate::engine::exploration_log::ExplorationLogger,
     ) {
-        self.exploration_logger = logger;
+        *self.exploration_logger.write().unwrap() = logger;
     }
 
     /// v0.5.5 P1-1：设置 LLM 配置状态
@@ -2293,7 +2735,7 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 需要可变副本的调用方（过滤/排序/回写）显式 `(*snapshot).clone()` 或
     /// `Arc::make_mut`——这与修前"拿到的本来就是独立副本"的代价相同。
-    fn load_cached(&self) -> Result<Arc<Vec<Memory>>, PersistenceError> {
+    fn load_cached(&self) -> Result<Arc<Vec<Arc<Memory>>>, PersistenceError> {
         let load_start = std::time::Instant::now();
         // v0.9.11（G9 收尾 / CR-42）：除"自身脏"外，还要看**数据源指纹**是否变了 ——
         // 多窗口桌面端 / CLI 与 sidecar 并存时，别的进程写入不会通知本进程，
@@ -2314,6 +2756,77 @@ impl<P: Persistence> MemoryStore<P> {
             );
         }
         Ok(result)
+    }
+
+    /// 构造期一次性初始化编码器的 bigram IDF 表（A+B+D 的 B 部分）。
+    ///
+    /// **为什么需要**：身份通道此前用"文档内逆频率"（A+D），只能压制**单篇内**
+    /// 的高频 bigram，压不住**跨文档**的通用组合（如英文 "th"、中文 "的"）。
+    /// 语料级 IDF 才能把"全库都有的组合"降权，实测最大落宫占比 62.1% → 24.7%。
+    ///
+    /// **为什么必须在构造期定型**：IDF 是语料级统计量，一旦变化，**已落盘的
+    /// `bagua_index` 就会与当前编码器不一致**（存量记忆是用旧 IDF 编码的）。
+    /// 因此编码器必须在 store 可用之前定型，整个生命周期不再自动变更；
+    /// 需要刷新统计量时走显式入口 [`Self::rebuild_encoder_idf`]，
+    /// 并配合 `reclassify_bagua` 重算存量派生字段。
+    ///
+    /// 同时把语料装入缓存，避免首次访问重复解析整库。
+    #[cfg(not(feature = "ml"))]
+    fn init_encoder_idf(&mut self) {
+        if let Ok(mems) = self.persistence.load_all_memories() {
+            if !mems.is_empty() {
+                let texts: Vec<&str> = mems.iter().map(|m| m.content.as_str()).collect();
+                self.apply_idf_from_texts(&texts);
+            }
+            let fingerprint = self.persistence.source_fingerprint();
+            self.cache.store(mems, fingerprint);
+        }
+    }
+
+    /// 从语料构建并注入 IDF 表；语料无区分度（单篇 / 所有 bigram 全库通用）时
+    /// 放弃注入、保持 A+D，避免身份通道被整体归零。
+    ///
+    /// 返回是否真正注入。
+    #[cfg(not(feature = "ml"))]
+    fn apply_idf_from_texts(&self, texts: &[&str]) -> bool {
+        let idf = HybridLuoShuEncoder::build_idf(texts);
+        if idf.is_empty() || idf.max_weight() <= 0.0 {
+            return false;
+        }
+        self.luoshu_encoder.set_idf(idf);
+        true
+    }
+
+    /// ml 构建下编码器是 ML 语义模型，IDF 表不适用（空实现，保持调用点同构）。
+    #[cfg(feature = "ml")]
+    fn init_encoder_idf(&mut self) {}
+
+    /// 用当前全库语料重建编码器 IDF 表（A+B+D 的 B 部分）。
+    ///
+    /// 供压测/基准在批量导入后刷新统计量。**注意**：重建会改变编码口径，
+    /// 存量记忆的 `bagua_index` 随之过期，需配合 `reclassify_bagua` 重算。
+    /// 返回参与统计的记忆条数（0 表示库为空、未构建）。
+    pub fn rebuild_encoder_idf(&self) -> usize {
+        #[cfg(not(feature = "ml"))]
+        {
+            if self.ensure_cache_loaded().is_err() {
+                return 0;
+            }
+            let snapshot = self.cache.snapshot();
+            if snapshot.is_empty() {
+                return 0;
+            }
+            let texts: Vec<&str> = snapshot.iter().map(|m| m.content.as_str()).collect();
+            if self.apply_idf_from_texts(&texts) {
+                snapshot.len()
+            } else {
+                0
+            }
+        }
+        #[cfg(feature = "ml")]
+        {
+            0
+        }
     }
 
     /// 标记缓存为脏：任何写操作（保存/删除/修改）后调用
@@ -2370,7 +2883,7 @@ impl<P: Persistence> MemoryStore<P> {
             .unwrap_or_default()
             .iter()
             .filter(|m| wanted.contains(m.id.as_str()))
-            .cloned()
+            .map(|m| m.as_ref().clone())
             .collect()
     }
 
@@ -2443,20 +2956,26 @@ impl<P: Persistence> MemoryStore<P> {
     /// 禁用时，仅依赖用户的显式反馈指令。
     /// 数据仅留在本地，不会上传到任何外部服务器。
     pub fn set_implicit_feedback_enabled(&self, enabled: bool) {
-        self.user_feedback.set_implicit_feedback_enabled(enabled);
+        self.user_feedback
+            .read()
+            .unwrap()
+            .set_implicit_feedback_enabled(enabled);
     }
 
     /// 检查隐式反馈是否启用（质疑二·隐私）
     pub fn is_implicit_feedback_enabled(&self) -> bool {
-        self.user_feedback.is_implicit_feedback_enabled()
+        self.user_feedback
+            .read()
+            .unwrap()
+            .is_implicit_feedback_enabled()
     }
 
     /// 设置图存储（用于自动建立冲突/演进/合成关系边）
     ///
     /// 启用后，写入冲突时会自动创建 Contradicts/Evolves 边，
     /// 递归合成时会自动创建 SynthesizesFrom 边。
-    pub fn with_graph_store(mut self, graph_store: GraphMemoryStore) -> Self {
-        self.graph_store = Some(graph_store);
+    pub fn with_graph_store(self, graph_store: GraphMemoryStore) -> Self {
+        *self.graph_store.write().unwrap() = Some(graph_store);
         self
     }
 
@@ -2466,8 +2985,13 @@ impl<P: Persistence> MemoryStore<P> {
     /// 暴露只读引用是为了让测试能**直接断言图的真实内容**，
     /// 而不是只断言返回值（返回值写图失败时仍可能正确，
     /// 只断言返回值会让"图化失效"静默通过）。
-    pub fn graph_store_ref(&self) -> Option<&GraphMemoryStore> {
-        self.graph_store.as_ref()
+    pub fn graph_store_ref(&self) -> Option<GraphStoreReadGuard<'_>> {
+        let guard = self.graph_store.read().unwrap();
+        if guard.is_some() {
+            Some(GraphStoreReadGuard(guard))
+        } else {
+            None
+        }
     }
 
     /// 测试用：可变访问图存储，以便**直接写入特定类型的边**。
@@ -2481,8 +3005,50 @@ impl<P: Persistence> MemoryStore<P> {
     /// **为什么只给测试**：生产代码**不应**绕过 `add_external_edge` 的白名单
     /// 直写图（那正是 S3 要防的）。故此处显式标注 `_for_test` 并仅由单测调用。
     #[cfg(test)]
-    pub fn graph_store_mut_for_test(&mut self) -> Option<&mut GraphMemoryStore> {
-        self.graph_store.as_mut()
+    pub fn graph_store_mut_for_test(&mut self) -> Option<GraphStoreWriteGuard<'_>> {
+        let guard = self.graph_store.write().unwrap();
+        if guard.is_some() {
+            Some(GraphStoreWriteGuard(guard))
+        } else {
+            None
+        }
+    }
+
+    /// 若图存在**未落盘变更**则立即落盘一次（供关停路径/测试调用）。
+    ///
+    /// 读路径（`expand_associations`）产生的边走 deferred 通道，只有这里
+    /// 或后台 flush 任务把它们写到磁盘。返回是否真的写了盘。
+    pub fn flush_graph_if_dirty(&self) -> Result<bool, PersistenceError> {
+        match self.graph_store.write().unwrap().as_mut() {
+            Some(graph) => graph.flush_if_dirty(),
+            None => Ok(false),
+        }
+    }
+
+    /// 取一份**增量**图快照（脏标记已清），调用方在**锁外**追加日志。
+    ///
+    /// 后台 flush 任务用它把增量追加挪出全局存储锁；只有日志达到阈值时
+    /// 才附带整图快照用于压实（具体理由见 `GraphMemoryStore::take_pending_snapshot`）。
+    pub fn take_graph_snapshot(&self) -> Option<crate::graph_store::GraphPending> {
+        self.graph_store
+            .write()
+            .unwrap()
+            .as_mut()
+            .and_then(|g| g.take_pending_snapshot())
+    }
+
+    /// 重新置图脏标记（后台 flush 写盘失败时补回）。
+    pub fn mark_graph_dirty(&self) {
+        if let Some(graph) = self.graph_store.write().unwrap().as_mut() {
+            graph.mark_dirty();
+        }
+    }
+
+    /// 写盘失败时把增量边放回图存储（配合 [`Self::take_graph_snapshot`]）。
+    pub fn restore_graph_pending(&self, edges: Vec<crate::graph_store::MemoryEdge>) {
+        if let Some(graph) = self.graph_store.write().unwrap().as_mut() {
+            graph.restore_pending(edges);
+        }
     }
 
     /// 写入一条**外部推导的**关系边（v0.9.8，承《记忆联想系统设计文档》§5.4）
@@ -2512,7 +3078,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// `Ok(true)` 表示新写入；`Ok(false)` 表示已存在（去重）或校验不通过被跳过。
     /// 校验不通过**不报错**——外部推导的候选本就允许被过滤（宁缺勿错）。
     pub fn add_external_edge(
-        &mut self,
+        &self,
         from_id: &str,
         to_id: &str,
         rel_type: &str,
@@ -2559,7 +3125,7 @@ impl<P: Persistence> MemoryStore<P> {
         if !self.has_memory_id(from_id)? || !self.has_memory_id(to_id)? {
             return Ok(false);
         }
-        let Some(ref mut graph) = self.graph_store else {
+        let Some(ref mut graph) = *self.graph_store.write().unwrap() else {
             return Ok(false); // 未启用图存储：静默跳过（图是增强能力）
         };
         let before = graph.edge_count();
@@ -2651,8 +3217,9 @@ impl<P: Persistence> MemoryStore<P> {
             return Ok(Vec::new());
         }
         let by_id: std::collections::HashMap<&str, &Memory> =
-            all.iter().map(|m| (m.id.as_str(), m)).collect();
-        let Some(graph) = self.graph_store.as_ref() else {
+            all.iter().map(|m| (m.id.as_str(), m.as_ref())).collect();
+        let graph_guard = self.graph_store.read().unwrap();
+        let Some(graph) = graph_guard.as_ref() else {
             return Ok(Vec::new()); // 未启用图存储：降态为空（图是增强能力）
         };
 
@@ -2764,7 +3331,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 对于中文文本（无空格分词），使用字符级 bigram 比较。
     /// 对于英文文本，使用空格分词比较。
     fn compute_jaccard(&self, a: &str, b: &str) -> f32 {
-        self.synthesis_engine.compute_jaccard(a, b)
+        self.synthesis_engine.read().unwrap().compute_jaccard(a, b)
     }
 
     fn content_bigrams(content: &str) -> std::collections::HashSet<String> {
@@ -2794,6 +3361,96 @@ impl<P: Persistence> MemoryStore<P> {
         crate::memory_store_cache::MemoryStoreCache::domain_index_nolang_enabled()
     }
 
+    /// 判断"索引无候选 ⇒ Jaccard 必低于阈值"是否成立（用于安全跳过全库回退扫描）。
+    ///
+    /// ## 为什么需要
+    ///
+    /// `build_candidates` 在索引无命中时会回退到**全库扫描**（防御索引不完整）。
+    /// 但"全新记忆"（内容与库内无任何词面重合）恰恰是最常见的写入场景，
+    /// 每次都全库扫描 ⇒ 7048 条库单次 ~16ms，这正是 analyze 的主要成本。
+    ///
+    /// ## 判据（可证明，不是启发式）
+    ///
+    /// 索引 term 与 Jaccard 口径的关系：
+    /// - **非 CJK**：Jaccard 用空格词集，索引 term 是同一批词去首尾标点 ⇒
+    ///   共享任一词必然共享索引 term ⇒ 恒安全。
+    /// - **含 CJK**：Jaccard 用**全部相邻字符 bigram**（含标点/空格跨越），
+    ///   而索引只收 **CJK 连续段内**的 bigram。二者差集 = 至少含一个非 CJK 字符的
+    ///   相邻对（"不安全对"）。
+    ///
+    /// 若某记忆与查询的 Jaccard ≥ t，则交集 ≥ t × 并集 ≥ t × 查询 bigram 总数。
+    /// 若它只共享"不安全对"，交集 ≤ 不安全对总数 ⇒ 只要
+    /// `不安全对 / 查询 bigram 总数 < t`，就不可能仅靠不安全对达标
+    /// ⇒ 必然共享至少一个 CJK-CJK bigram ⇒ 必然共享索引 term ⇒ 候选集不可能为空。
+    ///
+    /// 因此该比值 < 阈值时，空候选可以安全地判定为"无相似"，无需全库回退。
+    fn index_terms_cover_jaccard(content: &str, threshold: f32) -> bool {
+        let lower = content.to_lowercase();
+        let is_cjk = |c: char| {
+            let cp = c as u32;
+            (0x4E00..=0x9FFF).contains(&cp)
+                || (0x3400..=0x4DBF).contains(&cp)
+                || (0xF900..=0xFAFF).contains(&cp)
+        };
+        if !lower.chars().any(is_cjk) {
+            return true;
+        }
+        let chars: Vec<char> = lower.chars().collect();
+        if chars.len() < 2 {
+            return true;
+        }
+        let total = chars.len() - 1;
+        let unsafe_pairs = chars
+            .windows(2)
+            .filter(|w| !(is_cjk(w[0]) && is_cjk(w[1])))
+            .count();
+        (unsafe_pairs as f32) / (total as f32) < threshold
+    }
+
+    /// 查询文本的 **Jaccard token 数**（与 `JaccardTerms` 的口径一致）
+    ///
+    /// 含 CJK ⇒ 全部相邻字符 bigram（`chars-1`）；否则 ⇒ 空格词数。
+    /// 用于 hub term 过滤的无损判据（见 [`Self::hub_filter_is_lossless`]）。
+    fn jaccard_token_count(content: &str) -> usize {
+        let lower = content.to_lowercase();
+        let has_cjk = lower.chars().any(|c| {
+            let cp = c as u32;
+            (0x4E00..=0x9FFF).contains(&cp)
+        });
+        if has_cjk {
+            lower.chars().count().saturating_sub(1)
+        } else {
+            lower.split_whitespace().count()
+        }
+    }
+
+    /// 该索引 term 是否同时是 Jaccard token（仅 CJK bigram 满足）
+    fn is_cjk_bigram(term: &str) -> bool {
+        let mut chars = term.chars();
+        match (chars.next(), chars.next(), chars.next()) {
+            (Some(a), Some(b), None) => {
+                let is_cjk = |c: char| {
+                    let cp = c as u32;
+                    (0x4E00..=0x9FFF).contains(&cp)
+                        || (0x3400..=0x4DBF).contains(&cp)
+                        || (0xF900..=0xFAFF).contains(&cp)
+                };
+                is_cjk(a) && is_cjk(b)
+            }
+            _ => false,
+        }
+    }
+
+    /// hub term 过滤是否**可证明无损**
+    ///
+    /// 设查询的 Jaccard token 集为 A（|A| = n），其中 hub token 数为 h。
+    /// 若某记忆 B 与 A 的 Jaccard ≥ t，则 `|A∩B| ≥ t·|A∪B| ≥ t·n`。
+    /// 若 B 只共享 hub token，则 `|A∩B| ≤ h` ⇒ 只要 `h < t·n`，
+    /// B 必然共享至少一个**非 hub** token ⇒ 排除 hub term 不会漏掉 B。
+    fn hub_filter_is_lossless(hub_count: usize, jaccard_tokens: usize, threshold: f32) -> bool {
+        (hub_count as f32) < threshold * (jaccard_tokens as f32)
+    }
+
     fn add_memory_to_index(&self, memory: &Memory) {
         self.cache.add_to_index(memory);
     }
@@ -2808,7 +3465,7 @@ impl<P: Persistence> MemoryStore<P> {
 
     fn verify_candidate_equivalence(
         &self,
-        all: &[Memory],
+        all: &[Arc<Memory>],
         candidate_positions: &[usize],
         content: &str,
     ) -> (usize, usize) {
@@ -2835,8 +3492,68 @@ impl<P: Persistence> MemoryStore<P> {
         (missing, extra)
     }
 
-    fn rebuild_bigram_index(&self, all: &[Memory]) {
-        self.cache.rebuild_index(all);
+    fn rebuild_bigram_index(&self, all: &[Arc<Memory>]) {
+        // ★ 2026-11-05：改用"仅脏时重建"（锁内二次检查）。
+        //   调用方在锁外判断 `index_is_dirty()`，并发写者会同时进入本函数排队；
+        //   若在此无条件重建，16 并发纯写会重复全量重建 16 次（实测 0.8s→15.2s）。
+        self.cache.rebuild_index_if_dirty(all);
+    }
+
+    /// S6：按倒排索引计算快路的**评分候选槽位**（`None` = 不裁剪，回退全量扫描）
+    ///
+    /// 调用方（`recall_with_cancel`）只在返回 `Some` 时把全文扫描收缩到这些槽位；
+    /// 返回 `None` 的一切情形都必须保持"与改造前逐字节一致"。
+    ///
+    /// 裁剪条件（缺一不可）：
+    /// 1. 开关 `LRC_FAST_CANDIDATE_INDEX=1` 打开；
+    /// 2. 域候选索引开启（否则索引 term 口径与打分不同源，英文/混合文本会漏召回）；
+    /// 3. 索引干净 —— **读路径不重建**：重建是 O(N) 分词且持锁，冷启动/合成后
+    ///    一次可达数秒，会把已修复的读超时风险重新引回来；
+    /// 4. **原查询**词 ≥2 个，且每个参与统计的词都满足 [`is_index_safe_term`]；
+    ///    （单 token 查询存在"整句子串命中但词边界不命中"：查询 `cat`、正文
+    ///    `category` 得 +0.4，而索引里没有 `cat` 这个 term ⇒ 会被错误裁掉）
+    /// 5. 命中槽位数 ≥ `top_k` —— 否则结果需要靠零命中的元数据分填充。
+    fn fast_candidate_slots(
+        &self,
+        candidates: &[&Memory],
+        count_words: &[&str],
+        query_token_count: usize,
+        top_k: usize,
+    ) -> Option<Vec<usize>> {
+        if !fast_candidate_index_enabled()
+            || !Self::domain_index_enabled()
+            || self.cache.index_is_dirty()
+            || query_token_count < 2
+            || count_words.len() < 2
+            || !count_words.iter().all(|w| is_index_safe_term(w))
+        {
+            return None;
+        }
+        let slot_by_id: std::collections::HashMap<&str, usize> = candidates
+            .iter()
+            .enumerate()
+            .map(|(slot, memory)| (memory.id.as_str(), slot))
+            .collect();
+        let mut keep_slots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        {
+            let index = self.cache.borrow_index();
+            for word in count_words {
+                if let Some(ids) = index.get(*word) {
+                    for id in ids {
+                        if let Some(slot) = slot_by_id.get(id.as_str()) {
+                            keep_slots.insert(*slot);
+                        }
+                    }
+                }
+            }
+        }
+        if keep_slots.len() < top_k.max(1) {
+            return None;
+        }
+        // 排序：让候选顺序与 HashMap 遍历顺序无关，保证同分并列时的输出可复现。
+        let mut slots: Vec<usize> = keep_slots.into_iter().collect();
+        slots.sort_unstable();
+        Some(slots)
     }
 
     /// 查找与给定内容高度相似的已有记忆。
@@ -2867,6 +3584,59 @@ impl<P: Persistence> MemoryStore<P> {
         privacy_context: &Option<(PrivacyLevel, Option<String>, Option<String>)>,
     ) -> Result<Option<Memory>, PersistenceError> {
         let all = self.load_cached()?;
+        Ok(self.find_similar_in_snapshot(&all, content, scope, privacy_context))
+    }
+
+    /// 在**给定快照**上做相似检查（不触发 `load_cached` 的指纹重载）。
+    ///
+    /// ★ 2026-11-05（读并发改造）：`commit_remember` 的乐观并发分支必须用本函数。
+    ///
+    /// **为什么**：该分支在 `save_memory` **之后**执行，此时磁盘指纹已变、而 cache 的
+    /// `source_fingerprint` 尚未更新 ⇒ `load_cached()` 会判定 `needs_reload` 并
+    /// **整库重解析 25MB JSON**。16 并发写下几乎每次 commit 都进入该分支，
+    /// 实测 `commit` P50 从 19.8ms 暴增到 650ms、P99 达 90s。
+    /// 写路径已持外层写锁，`cache.snapshot()` 就是最新一致视图，无需重载。
+    fn find_similar_in_snapshot(
+        &self,
+        all: &[Arc<Memory>],
+        content: &str,
+        scope: Option<&Memory>,
+        privacy_context: &Option<(PrivacyLevel, Option<String>, Option<String>)>,
+    ) -> Option<Memory> {
+        // P3：查询侧集合只算一次（全库扫描时不再重复 lowercase + 建集合）
+        let query_jaccard_terms = JaccardTerms::new(content);
+        let candidates = self.build_candidates(all, content, scope);
+        // P3 / M.T.R. 传输层：全库扫描时按"查询桶 → 相邻桶 → 其余桶"路由。
+        // 只改变**扫描顺序**，不改变候选集合（仍覆盖全部候选）⇒ 召回不变。
+        let buckets = if candidates.use_bucket_routing() {
+            Some(self.cache.bagua_buckets())
+        } else {
+            None
+        };
+        let query_bagua = buckets
+            .as_ref()
+            .map(|_| mirror_project(&self.luoshu_encoder.encode_text(content)).best_index % 8);
+        let cached_terms = self.cache.jaccard_terms_snapshot();
+        scan_candidates(
+            all,
+            &candidates,
+            &query_jaccard_terms,
+            self.similarity_threshold,
+            privacy_context,
+            buckets.as_deref(),
+            query_bagua,
+            scope.and_then(|memory| memory.project.as_deref()),
+            Some(&cached_terms),
+        )
+    }
+
+    /// 构建相似检查的候选集合（P3 分层锁：**锁内**执行，只查索引，不做 Jaccard）
+    fn build_candidates(
+        &self,
+        all: &[Arc<Memory>],
+        content: &str,
+        scope: Option<&Memory>,
+    ) -> CandidateSet {
         let candidate_start = std::time::Instant::now();
         let use_index = std::env::var_os("LRC_BIGRAM_CANDIDATE_INDEX").is_some();
         let use_rare_index = std::env::var_os("LRC_RARE_BIGRAM_CANDIDATE_INDEX").is_some();
@@ -2890,12 +3660,20 @@ impl<P: Persistence> MemoryStore<P> {
         let mut indexed_position_count = 0usize;
         let mut fallback_triggered = false;
         let mut same_project_count = 0usize;
+        // hub term 过滤是否已按无损判据生效（生效时空候选可证明"无相似"）
+        let mut hub_filter_applied = false;
 
         let content_is_cjk = content.chars().any(|c| {
             let code = c as u32;
             (0x4E00..=0x9FFF).contains(&code)
         });
-        let index_enabled = use_index || use_rare_index || (use_domain_index && scope.is_some());
+        // ★ 2026-11-05：域候选索引开启时**不再要求 `scope.is_some()`**。
+        //   修前 `find_similar(content)`（无 scope）会退化为全库扫描——
+        //   实测 7048 条库单次 ~16ms，且这是 `commit_remember` 乐观并发分支
+        //   与外部 API 的公共路径。索引 term 是 Jaccard 口径的超集
+        //   （见 `index_terms_for_memory` 的 `recall_reachable_terms` 补齐），
+        //   最终仍由 Jaccard 判定 ⇒ 候选集只增不减，合并决策不变。
+        let index_enabled = use_index || use_rare_index || use_domain_index;
         let query_terms = if use_domain_index {
             Self::content_index_terms(content)
         } else {
@@ -2903,9 +3681,37 @@ impl<P: Persistence> MemoryStore<P> {
         };
         if index_enabled && (!query_terms.is_empty()) && (content_is_cjk || use_domain_index) {
             if self.cache.index_is_dirty() {
-                self.rebuild_bigram_index(&all);
+                self.rebuild_bigram_index(all);
             }
             let index = self.cache.borrow_index();
+            // ★ 2026-11-05：hub term 过滤（可证明无损，见 `hub_filter_is_lossless`）。
+            //   没有它，查询里只要有一个"几乎每条记忆都有"的高频词，
+            //   候选集就等于全库，索引完全失去剪枝能力。
+            let hub_limit = ((all.len() as f32) * HUB_TERM_DF_RATIO) as usize;
+            let jaccard_tokens = Self::jaccard_token_count(content);
+            let mut hub_count = 0usize;
+            let mut non_hub_terms: Vec<&str> = Vec::new();
+            for term in &query_terms {
+                let size = index.get(term).map_or(0, std::collections::HashSet::len);
+                let is_hub = size >= HUB_TERM_MIN_DF && size > hub_limit;
+                if is_hub {
+                    // 只有"同时是 Jaccard token"的 hub term 才计入 h（判据口径）
+                    if !content_is_cjk || Self::is_cjk_bigram(term) {
+                        hub_count += 1;
+                    }
+                } else {
+                    non_hub_terms.push(term.as_str());
+                }
+            }
+            // 仅域候选索引路径适用：其 term 口径与 Jaccard 同源（`tokenize_query`）。
+            // 实验性的 bigram/rare 模式 term 口径不同，不套用本判据。
+            hub_filter_applied = use_domain_index
+                && !use_rare_index
+                && Self::hub_filter_is_lossless(
+                    hub_count,
+                    jaccard_tokens,
+                    self.similarity_threshold,
+                );
             let selected_bigrams = if use_rare_index && content_is_cjk {
                 let mut ranked = query_terms
                     .iter()
@@ -2922,6 +3728,8 @@ impl<P: Persistence> MemoryStore<P> {
                     .take(4)
                     .map(|(bigram, _)| bigram.as_str())
                     .collect::<Vec<_>>()
+            } else if hub_filter_applied {
+                non_hub_terms
             } else {
                 query_terms.iter().map(String::as_str).collect()
             };
@@ -2931,11 +3739,10 @@ impl<P: Persistence> MemoryStore<P> {
                     candidate_ids.extend(found.iter().cloned());
                 }
             }
-            let positions_by_id = all
-                .iter()
-                .enumerate()
-                .map(|(position, memory)| (memory.id.as_str(), position))
-                .collect::<std::collections::HashMap<_, _>>();
+            // ★ 2026-11-05：ID → position 映射由缓存增量维护，不再每次查询 O(N) 重建。
+            //   缓存与快照严格对齐（store/append_new/upsert 同步更新），
+            //   删除走 mark_dirty_preserving_index ⇒ 下次读整库重载并重建。
+            let positions_by_id = self.cache.id_positions_snapshot();
             let positions = candidate_ids
                 .iter()
                 .filter_map(|id| positions_by_id.get(id.as_str()).copied())
@@ -2952,7 +3759,11 @@ impl<P: Persistence> MemoryStore<P> {
             let scope_project = scope.and_then(|memory| memory.project.as_deref());
             let same_project = |memory: &Memory| memory.project.as_deref() == scope_project;
             for position in positions {
-                let memory = &all[position];
+                // ★ 防御（审查 P2-2）：快照与 `id_positions` 非原子发布，
+                //   并发重载时旧 position 可能越界 ⇒ 用 `get` 跳过而非 panic。
+                let Some(memory) = all.get(position) else {
+                    continue;
+                };
                 if use_domain_index && same_project(memory) {
                     // 项目优先桶：同项目即入（NOLANG 模式不按语言剪枝，
                     // 普通 domain 模式仍要求语言一致，见下方同语言并入条件）。
@@ -2978,13 +3789,21 @@ impl<P: Persistence> MemoryStore<P> {
         if !index_enabled {
             candidate_positions = fallback_candidates.clone();
         } else if candidate_positions.is_empty() {
-            fallback_triggered = true;
-            candidate_positions = fallback_candidates.clone();
+            // ★ 2026-11-05：索引干净且"无候选 ⇒ 无相似"可证明时，不再回退全库扫描。
+            //   两条独立依据：
+            //   ① hub 过滤已按无损判据生效 ⇒ 任何达标记忆必共享非 hub term；
+            //   ② 查询的 Jaccard 口径被索引覆盖（见 `index_terms_cover_jaccard`）。
+            let provably_no_match = hub_filter_applied
+                || Self::index_terms_cover_jaccard(content, self.similarity_threshold);
+            if !provably_no_match {
+                fallback_triggered = true;
+                candidate_positions = fallback_candidates.clone();
+            }
         }
 
         if std::env::var_os("LRC_CANDIDATE_INDEX_VERIFY").is_some() && index_enabled {
             let (missing, extra) =
-                self.verify_candidate_equivalence(&all, &candidate_positions, content);
+                self.verify_candidate_equivalence(all, &candidate_positions, content);
             eprintln!(
                 "[LRC_VERIFY] index_mode={} candidates={} missing_exact_matches={} extra_candidates={}",
                 index_mode,
@@ -2994,72 +3813,23 @@ impl<P: Persistence> MemoryStore<P> {
             );
         }
 
-        let candidate_count = candidate_positions.len();
-        let candidate_build_ms = candidate_start.elapsed().as_secs_f64() * 1000.0;
-        let primary_candidate_count = primary_candidates.len();
-        let same_language_count = same_language_candidates.len();
-        let fallback_candidate_count = if fallback_triggered {
-            fallback_candidates.len()
-        } else {
-            0
-        };
-        let mut comparisons = 0usize;
-        let similarity_start = std::time::Instant::now();
-        for position in &candidate_positions {
-            let m = &all[*position];
-            if m.is_expired() {
-                continue;
-            }
-            // 隐私隔离：跳过对调用方不可见的记忆（不参与相似合并）
-            if !is_visible(m, privacy_context) {
-                continue;
-            }
-            comparisons += 1;
-            let sim = self.compute_jaccard(content, &m.content);
-            if sim >= self.similarity_threshold {
-                if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
-                    emit_remember_profile(format!(
-                        "[LRC_PROFILING] remember candidates={} indexed_positions={} primary_candidates={} same_language_candidates={} fallback_candidates={} fallback_triggered={} fallback_comparisons={} same_project={} jaccard_comparisons={} index_mode={} query_is_cjk={} scope_project={:?} candidate_build_ms={:.3} similarity_ms={:.3} hit=true",
-                        candidate_count,
-                        indexed_position_count,
-                        primary_candidate_count,
-                        same_language_count,
-                        fallback_candidate_count,
-                        fallback_triggered,
-                        if fallback_triggered { comparisons } else { 0 },
-                        same_project_count,
-                        comparisons,
-                        index_mode,
-                        content_is_cjk,
-                        scope.and_then(|memory| memory.project.as_deref()),
-                        candidate_build_ms,
-                        similarity_start.elapsed().as_secs_f64() * 1000.0
-                    ));
-                }
-                return Ok(Some(m.clone()));
-            }
+        CandidateSet {
+            positions: candidate_positions,
+            index_enabled,
+            fallback_triggered,
+            indexed_position_count,
+            primary_candidate_count: primary_candidates.len(),
+            same_language_count: same_language_candidates.len(),
+            fallback_candidate_count: if fallback_triggered {
+                fallback_candidates.len()
+            } else {
+                0
+            },
+            same_project_count,
+            index_mode,
+            content_is_cjk,
+            candidate_build_ms: candidate_start.elapsed().as_secs_f64() * 1000.0,
         }
-
-        if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
-            emit_remember_profile(format!(
-                "[LRC_PROFILING] remember candidates={} indexed_positions={} primary_candidates={} same_language_candidates={} fallback_candidates={} fallback_triggered={} fallback_comparisons={} same_project={} jaccard_comparisons={} index_mode={} query_is_cjk={} scope_project={:?} candidate_build_ms={:.3} similarity_ms={:.3}",
-                candidate_count,
-                indexed_position_count,
-                primary_candidate_count,
-                same_language_count,
-                fallback_candidate_count,
-                fallback_triggered,
-                if fallback_triggered { comparisons } else { 0 },
-                same_project_count,
-                comparisons,
-                index_mode,
-                content_is_cjk,
-                scope.and_then(|memory| memory.project.as_deref()),
-                candidate_build_ms,
-                similarity_start.elapsed().as_secs_f64() * 1000.0
-            ));
-        }
-        Ok(None)
     }
 
     /// 合成快照（三阶段锁解耦·Phase 1）：持锁下快速读取全量记忆 + 配置
@@ -3085,24 +3855,35 @@ impl<P: Persistence> MemoryStore<P> {
     /// 产出空计划、`apply_synthesis_plan` 自然成为空操作 ⇒ **行为与"禁用合成"完全一致**，
     /// 只是不再白算。
     pub fn synthesis_snapshot(&self) -> Result<SynthesisSnapshot, PersistenceError> {
-        if self.synthesis_min_cluster == usize::MAX {
+        let min_cluster = self
+            .synthesis_min_cluster
+            .load(std::sync::atomic::Ordering::Acquire);
+        if min_cluster == usize::MAX {
             return Ok(SynthesisSnapshot {
                 all: Vec::new(),
                 config: SynthesisConfig {
-                    min_cluster: self.synthesis_min_cluster,
+                    min_cluster,
                     similarity: self.synthesis_similarity,
                 },
-                information_gain_threshold: self.dao_regulator.information_gain_threshold,
+                information_gain_threshold: self
+                    .dao_regulator
+                    .read()
+                    .unwrap()
+                    .information_gain_threshold,
             });
         }
         let all = self.persistence.load_all_memories()?;
         Ok(SynthesisSnapshot {
             all,
             config: SynthesisConfig {
-                min_cluster: self.synthesis_min_cluster,
+                min_cluster,
                 similarity: self.synthesis_similarity,
             },
-            information_gain_threshold: self.dao_regulator.information_gain_threshold,
+            information_gain_threshold: self
+                .dao_regulator
+                .read()
+                .unwrap()
+                .information_gain_threshold,
         })
     }
 
@@ -3135,7 +3916,11 @@ impl<P: Persistence> MemoryStore<P> {
     ) -> Result<SynthesisSnapshot, PersistenceError> {
         // ★ v0.9.13（建议二）：快照是共享 `Arc`；`SynthesisSnapshot` 需要持有
         //   整个生命周期并可能被过滤，故此处显式克隆成独立 `Vec`（与修前同价）。
-        let mut all: Vec<Memory> = (*self.load_cached()?).clone();
+        let mut all: Vec<Memory> = self
+            .load_cached()?
+            .iter()
+            .map(|m| m.as_ref().clone())
+            .collect();
         if project.is_some() || user_id.is_some() {
             all.retain(|m| {
                 project
@@ -3152,7 +3937,11 @@ impl<P: Persistence> MemoryStore<P> {
                 min_cluster,
                 similarity,
             },
-            information_gain_threshold: self.dao_regulator.information_gain_threshold,
+            information_gain_threshold: self
+                .dao_regulator
+                .read()
+                .unwrap()
+                .information_gain_threshold,
         })
     }
 
@@ -3160,10 +3949,11 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 将 Phase 2 无锁计算产出的 SynthesisPlan 写回：磁盘 + 图 + 日志 + 指标 + 审计。
     /// 返回实际写入的合成记忆数量。
-    pub fn apply_synthesis_plan(&mut self, plan: SynthesisPlan) -> usize {
+    pub fn apply_synthesis_plan(&self, plan: SynthesisPlan) -> usize {
         if plan.batch.is_empty() {
             return 0;
         }
+        // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
 
         // ★v0.9.11 修复（**派生记忆可达性**）：合成产物必须继承来源的可见性归属。
         //
@@ -3257,7 +4047,7 @@ impl<P: Persistence> MemoryStore<P> {
             if !kept_ids.contains(synthesis_id.as_str()) {
                 continue;
             }
-            if let Some(ref mut graph) = self.graph_store {
+            if let Some(ref mut graph) = *self.graph_store.write().unwrap() {
                 for sid in source_ids {
                     let _ =
                         graph.add_edge(synthesis_id, sid, EdgeType::SynthesizesFrom, *confidence);
@@ -3270,7 +4060,7 @@ impl<P: Persistence> MemoryStore<P> {
             if !kept_ids.contains(entry.synthesis_id.as_str()) {
                 continue;
             }
-            self.synthesis_journal.record_synthesis(
+            self.synthesis_journal.read().unwrap().record_synthesis(
                 entry.synthesis_id.clone(),
                 &entry.trigger_source,
                 &entry.bagua_category,
@@ -3314,12 +4104,14 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 三阶段锁解耦（v0.9.1）：此兼容接口内部已拆分为 snapshot → plan → apply，
     /// 真正的锁外计算由 consolidation / v1_api 的三阶段调用实现。
-    pub fn luoshu_synthesize(&mut self) -> Result<usize, PersistenceError> {
+    pub fn luoshu_synthesize(&self) -> Result<usize, PersistenceError> {
         let synthesize_start = std::time::Instant::now();
 
         // 同步引擎配置（确保 consolidation 等外部调用者设置的阈值生效）
-        self.synthesis_engine = SynthesisEngine::new(SynthesisConfig {
-            min_cluster: self.synthesis_min_cluster,
+        *self.synthesis_engine.write().unwrap() = SynthesisEngine::new(SynthesisConfig {
+            min_cluster: self
+                .synthesis_min_cluster
+                .load(std::sync::atomic::Ordering::Acquire),
             similarity: self.synthesis_similarity,
         });
 
@@ -3340,7 +4132,7 @@ impl<P: Persistence> MemoryStore<P> {
         let result = self.apply_synthesis_plan(plan);
 
         // v0.6.0+ 参赛扩展：探索日志记录
-        self.exploration_logger.log(
+        self.exploration_logger.read().unwrap().log(
             crate::engine::exploration_log::ExplorationEventType::Synthesize,
             serde_json::json!({
                 "engine": engine_kind,
@@ -3377,7 +4169,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 多个后台任务并发调用时，合成恰好执行一次（Leader Election 模式）。
     ///
     /// 返回合成的记忆数量，无待合成任务时返回 0。
-    pub fn run_pending_synthesis(&mut self) -> Result<usize, PersistenceError> {
+    pub fn run_pending_synthesis(&self) -> Result<usize, PersistenceError> {
         // 原子 CAS：如果当前值为 true，设为 false 并返回 Ok(true) 表示"本线程获取执行权"
         // 如果当前值已为 false，返回 Err(...) 表示"已有其他线程在执行或无需执行"
         use std::sync::atomic::Ordering;
@@ -3398,8 +4190,8 @@ impl<P: Persistence> MemoryStore<P> {
     /// 基于 DaoMetrics + SynthesisJournal 的数据，
     /// 自动检测系统健康状态并生成调节动作。
     /// 返回调节动作的描述，供上层决策使用。
-    pub fn regulate(&mut self) -> Option<RegulationAction> {
-        if !self.dao_regulator.should_regulate() {
+    pub fn regulate(&self) -> Option<RegulationAction> {
+        if !self.dao_regulator.read().unwrap().should_regulate() {
             return None;
         }
 
@@ -3435,23 +4227,29 @@ impl<P: Persistence> MemoryStore<P> {
         let snapshot =
             self.dao_metrics
                 .snapshot(total, crystallized, archived, avg_deviation, &bagua_counts);
-        let journal_snapshot = self.synthesis_journal.snapshot();
+        let journal_snapshot = self.synthesis_journal.read().unwrap().snapshot();
 
         // v0.9.1 深度接线：记录调节前的灾难事件数与冻结状态，用于事后对比审计
-        let catastrophic_before = self.dao_regulator.get_catastrophic_events().len();
-        let was_frozen = self.dao_regulator.is_frozen();
+        let catastrophic_before = self
+            .dao_regulator
+            .read()
+            .unwrap()
+            .get_catastrophic_events()
+            .len();
+        let was_frozen = self.dao_regulator.read().unwrap().is_frozen();
 
         // v0.6.0+ 参赛扩展：探索日志埋点（regulate 事件）
         let regulate_start = std::time::Instant::now();
 
-        let action = self.dao_regulator.regulate(
+        let action = self.dao_regulator.write().unwrap().regulate(
             snapshot.dao_isomorphism_score,
             snapshot.bagua_entropy,
             snapshot.synthesis_ratio,
             avg_deviation,
             journal_snapshot.synthesis_rate_per_minute,
-            self.decay_config.decay_rate,
-            self.synthesis_min_cluster,
+            self.decay_config.read().unwrap().decay_rate,
+            self.synthesis_min_cluster
+                .load(std::sync::atomic::Ordering::Acquire),
         );
 
         // v0.6.0+ 参赛扩展：探索日志记录（regulate 事件）
@@ -3468,7 +4266,7 @@ impl<P: Persistence> MemoryStore<P> {
                 "suggest_comprehensive_rebalance"
             }
         };
-        self.exploration_logger.log_regulate(
+        self.exploration_logger.read().unwrap().log_regulate(
             snapshot.dao_isomorphism_score,
             snapshot.bagua_entropy,
             snapshot.synthesis_ratio,
@@ -3480,8 +4278,8 @@ impl<P: Persistence> MemoryStore<P> {
         // 执行调节动作（并记录审计：系统自主调节需可回溯）
         match &action {
             RegulationAction::AdjustDecayRate { new_rate, reason } => {
-                let old_rate = self.decay_config.decay_rate;
-                self.decay_config.decay_rate = *new_rate;
+                let old_rate = self.decay_config.read().unwrap().decay_rate;
+                self.decay_config.write().unwrap().decay_rate = *new_rate;
                 eprintln!(
                     "[LRC·调节] 衰减速率已调整: {:.2} → {:.2}（{}）",
                     old_rate, new_rate, reason
@@ -3498,7 +4296,9 @@ impl<P: Persistence> MemoryStore<P> {
                 reason,
                 ..
             } => {
-                let old_cluster = self.synthesis_min_cluster;
+                let old_cluster = self
+                    .synthesis_min_cluster
+                    .load(std::sync::atomic::Ordering::Acquire);
                 // 防御性兜底：上游若发生 usize 下溢（如 2^64-11），会污染合成配置，
                 // 导致合成永久无法触发、调节器误判"连续无效"并冻结整个系统。
                 let clamped = (*new_min_cluster).clamp(2, 10);
@@ -3508,9 +4308,10 @@ impl<P: Persistence> MemoryStore<P> {
                         new_min_cluster, clamped
                     );
                 }
-                self.synthesis_min_cluster = clamped;
+                self.synthesis_min_cluster
+                    .store(clamped, std::sync::atomic::Ordering::Release);
                 // 同步更新合成引擎配置
-                self.synthesis_engine = SynthesisEngine::new(SynthesisConfig {
+                *self.synthesis_engine.write().unwrap() = SynthesisEngine::new(SynthesisConfig {
                     min_cluster: clamped,
                     similarity: self.synthesis_similarity,
                 });
@@ -3548,8 +4349,15 @@ impl<P: Persistence> MemoryStore<P> {
                 new_threshold,
                 reason,
             } => {
-                let old = self.dao_regulator.information_gain_threshold;
-                self.dao_regulator.information_gain_threshold = *new_threshold;
+                let old = self
+                    .dao_regulator
+                    .read()
+                    .unwrap()
+                    .information_gain_threshold;
+                self.dao_regulator
+                    .write()
+                    .unwrap()
+                    .information_gain_threshold = *new_threshold;
                 eprintln!(
                     "[LRC·调节] 信息增量阈值已调整: {:.4} → {:.4}，原因: {}",
                     old, new_threshold, reason
@@ -3580,7 +4388,7 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         // 灾难性/慢性恶化事件审计（系统自主守护行为的可回溯记录）
-        let catastrophic_events = self.dao_regulator.get_catastrophic_events();
+        let catastrophic_events = self.dao_regulator.read().unwrap().get_catastrophic_events();
         for event in catastrophic_events.iter().skip(catastrophic_before) {
             let is_chronic = event.last_action_before_crash == "chronic_degradation";
             let event_type = if is_chronic {
@@ -3600,7 +4408,7 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         // 调节器冻结审计（连续无效调节触发冻结保护）
-        if !was_frozen && self.dao_regulator.is_frozen() {
+        if !was_frozen && self.dao_regulator.read().unwrap().is_frozen() {
             self.record_audit(
                 AuditEventType::RegulatorFrozen,
                 "调节器已冻结（连续无效调节达到阈值）",
@@ -3632,7 +4440,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 自主记忆垃圾回收：标记为待执行，避免阻塞用户请求关键路径
         // 质疑三核心修复：GC 不在 regulate 中同步执行，而是设置延迟标记。
         // 实际的 GC 工作在 run_gc_if_pending() 中由外部调度触发。
-        if self.memory_gc.should_run() {
+        if self.memory_gc.read().unwrap().should_run() {
             // v0.8.48 P0 修复：原子写入，Release 语义确保此前的写操作对执行 GC 的线程可见
             self.gc_pending
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -3640,7 +4448,10 @@ impl<P: Persistence> MemoryStore<P> {
 
         // P1 调节器心跳：记录本次调节执行状态（类型 + 原因 + 时间戳 + 计数）
         // 无论 NoAction 还是真实动作都计入心跳，便于前端展示"调节器在运转"
-        self.regulator_heartbeat.record(Some(&action));
+        self.regulator_heartbeat
+            .write()
+            .unwrap()
+            .record(Some(&action));
 
         Some(action)
     }
@@ -3654,13 +4465,17 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 这是"文档总评 3. 引入用户反馈回路"的实现：
     /// 将人的判断力注入到系统的自主演化中，形成人机协同。
-    fn process_user_feedback(&mut self) {
+    fn process_user_feedback(&self) {
         // 1. 处理隔离恢复请求（用户标记被误隔离的记忆）
         // TOCTOU 防护（2026-09-01 改进）：基于"快照 record_id 精确标记"，
         // 不依赖墙上时钟（系统时钟回拨不会导致已恢复反馈永久无法标记）。
         // 先取 (memory_id, record_id) 精确快照，恢复成功后只标记快照内的记录；
         // 快照后新到的恢复请求不在快照内，保持未处理，下一周期再处理。
-        let override_snapshot = self.user_feedback.get_quarantine_override_snapshot();
+        let override_snapshot = self
+            .user_feedback
+            .read()
+            .unwrap()
+            .get_quarantine_override_snapshot();
         if !override_snapshot.is_empty() {
             let override_memory_ids: Vec<String> = override_snapshot
                 .iter()
@@ -3679,6 +4494,8 @@ impl<P: Persistence> MemoryStore<P> {
                     let record_ids: Vec<String> =
                         override_snapshot.into_iter().map(|(_, id)| id).collect();
                     self.user_feedback
+                        .read()
+                        .unwrap()
                         .mark_override_processed_by_records(&record_ids);
                 }
                 Err(e) => {
@@ -3689,7 +4506,7 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         // 2. 处理用户负面反馈 → 主动标记低质量合成
-        let stats = self.user_feedback.get_stats();
+        let stats = self.user_feedback.read().unwrap().get_stats();
         if stats.negative_count > 0 {
             let all = match self.load_cached() {
                 Ok(m) => m,
@@ -3699,18 +4516,27 @@ impl<P: Persistence> MemoryStore<P> {
             let synth_memories: Vec<&Memory> = all
                 .iter()
                 .filter(|m| m.memory_type == MemoryType::Synthesis)
+                .map(|m| m.as_ref())
                 .collect();
 
             let mut flagged_ids: Vec<String> = Vec::new();
             for mem in synth_memories {
-                if self.user_feedback.should_quarantine_by_user(&mem.id) {
+                if self
+                    .user_feedback
+                    .read()
+                    .unwrap()
+                    .should_quarantine_by_user(&mem.id)
+                {
                     // 用户多次负面反馈 → 主动标记为低质量
                     eprintln!(
                         "[LRC·反馈] 用户负面反馈触发：合成记忆 {} 将被标记为低质量",
                         &mem.id[..16.min(mem.id.len())]
                     );
                     // 显式标记低质量（不伪造检索命中，避免污染检索统计）
-                    self.synthesis_journal.mark_low_quality(&mem.id);
+                    self.synthesis_journal
+                        .read()
+                        .unwrap()
+                        .mark_low_quality(&mem.id);
                     flagged_ids.push(mem.id.clone());
                 }
             }
@@ -3733,11 +4559,17 @@ impl<P: Persistence> MemoryStore<P> {
         };
         for mem in all.iter() {
             if mem.memory_type == MemoryType::Synthesis {
-                let positive = self.user_feedback.get_positive_feedback_count(&mem.id);
+                let positive = self
+                    .user_feedback
+                    .read()
+                    .unwrap()
+                    .get_positive_feedback_count(&mem.id);
                 if positive >= 2 {
                     // 用户确认合成质量好 → 提升合成日志中的质量评分
                     if self
                         .synthesis_journal
+                        .read()
+                        .unwrap()
                         .get_events()
                         .iter()
                         .any(|e| e.synthesis_id == mem.id && e.low_quality)
@@ -3747,7 +4579,10 @@ impl<P: Persistence> MemoryStore<P> {
                             &mem.id[..16.min(mem.id.len())]
                         );
                         // 显式撤销低质量标记（不伪造检索命中，避免污染检索统计）
-                        self.synthesis_journal.clear_low_quality(&mem.id);
+                        self.synthesis_journal
+                            .read()
+                            .unwrap()
+                            .clear_low_quality(&mem.id);
                     }
                 }
             }
@@ -3762,7 +4597,10 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 这些隐式信号作为调节器和合成器的软标签，持续校准系统。
     pub fn record_implicit_signal(&self, signal: ImplicitSignal) {
-        self.user_feedback.record_implicit_signal(signal);
+        self.user_feedback
+            .read()
+            .unwrap()
+            .record_implicit_signal(signal);
     }
 
     /// 获取基于隐式信号的记忆质量调整建议
@@ -3770,7 +4608,10 @@ impl<P: Persistence> MemoryStore<P> {
     /// 返回 (memory_id, quality_adjustment) 的列表。
     /// 正值表示用户隐式认可该记忆，负值表示隐式否定。
     pub fn get_implicit_quality_adjustments(&self) -> Vec<(String, f32)> {
-        self.user_feedback.get_implicit_quality_adjustments()
+        self.user_feedback
+            .read()
+            .unwrap()
+            .get_implicit_quality_adjustments()
     }
 
     /// 记录审计事件（封装 audit_trail.record()，降低各调用点的重复代码）
@@ -3778,13 +4619,13 @@ impl<P: Persistence> MemoryStore<P> {
     /// 用于系统自主行为（GC 清理、合成、调节等）的可回溯审计。
     /// 事件通过哈希链防篡改，并异步持久化到审计日志文件。
     pub fn record_audit(
-        &mut self,
+        &self,
         event_type: AuditEventType,
         description: impl Into<String>,
         reason: impl Into<String>,
         affected_memory_ids: Vec<String>,
     ) {
-        self.audit_trail.record(
+        self.audit_trail.write().unwrap().record(
             event_type,
             description.into(),
             reason.into(),
@@ -3808,7 +4649,7 @@ impl<P: Persistence> MemoryStore<P> {
     ///   - 下次 remember/recall 操作前调用（非关键路径）
     ///
     /// 返回 Some(stats) 表示本次执行了 GC，None 表示无需执行。
-    pub fn run_gc_if_pending(&mut self) -> Option<GcStats> {
+    pub fn run_gc_if_pending(&self) -> Option<GcStats> {
         // 原子 CAS：如果当前值为 true，设为 false 并返回 Ok(true) 表示"本线程获取执行权"
         // 如果当前值已为 false，返回 Err(...) 表示"已有其他线程在执行或无需执行"
         use std::sync::atomic::Ordering;
@@ -3826,9 +4667,12 @@ impl<P: Persistence> MemoryStore<P> {
         let snapshots = MemorySnapshot::collect_all(self);
         let elapsed_ms = start.elapsed().as_millis() as f64;
         // 阶段二：GC 计算候选和待删除列表（仅可变借用 self.memory_gc）
-        let (gc_stats, to_delete) = self.memory_gc.collect_garbage(&snapshots);
+        let (gc_stats, to_delete) = self.memory_gc.write().unwrap().collect_garbage(&snapshots);
         // 记录性能基线（质疑三：动态警告阈值，替代固定 500ms）
-        self.memory_gc.record_timing(elapsed_ms, snapshots.len());
+        self.memory_gc
+            .write()
+            .unwrap()
+            .record_timing(elapsed_ms, snapshots.len());
         // 阶段三：执行删除（可变借用 self.persistence）
         for id in &to_delete {
             // P1-8（2026-10-30）：改为走 `forget` 而非直连持久层。
@@ -3874,7 +4718,7 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 返回恢复的记忆数量。
     pub fn recover_from_quarantine(
-        &mut self,
+        &self,
         memory_ids: &[String],
     ) -> Result<usize, PersistenceError> {
         let archived = self
@@ -3942,8 +4786,8 @@ impl<P: Persistence> MemoryStore<P> {
     /// 给系统留出自我纠错和外部干预的窗口。
     ///
     /// 返回被隔离的记忆数量。
-    pub fn clean_low_quality_synthesis(&mut self) -> Result<usize, PersistenceError> {
-        let low_quality_ids = self.synthesis_journal.get_low_quality_ids();
+    pub fn clean_low_quality_synthesis(&self) -> Result<usize, PersistenceError> {
+        let low_quality_ids = self.synthesis_journal.read().unwrap().get_low_quality_ids();
         if low_quality_ids.is_empty() {
             return Ok(0);
         }
@@ -3970,7 +4814,7 @@ impl<P: Persistence> MemoryStore<P> {
                         if let Err(e) = self.forget(id) {
                             eprintln!("[LRC·隔离区] 归档后从活跃库删除 {} 失败: {}", id, e);
                         }
-                        self.synthesis_journal.remove_event(id);
+                        self.synthesis_journal.read().unwrap().remove_event(id);
                         quarantined += 1;
                         quarantined_ids.push(id.clone());
                     }
@@ -3981,7 +4825,7 @@ impl<P: Persistence> MemoryStore<P> {
                 }
             } else {
                 // 记忆已不存在，仅清理日志
-                self.synthesis_journal.remove_event(id);
+                self.synthesis_journal.read().unwrap().remove_event(id);
             }
         }
 
@@ -4011,7 +4855,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 默认保留期限：3 个调节周期（约 15 分钟），给系统留出观察窗口。
     ///
     /// 返回被永久删除的记忆数量。
-    pub fn purge_quarantine(&mut self) -> Result<usize, PersistenceError> {
+    pub fn purge_quarantine(&self) -> Result<usize, PersistenceError> {
         let archived = self
             .persistence
             .load_archived_memories()
@@ -4088,9 +4932,19 @@ impl<P: Persistence> MemoryStore<P> {
     /// 2. MirrorProject 分类：自动判定记忆的先天八卦类别
     /// 3. 可选道体预判：仅在 pilot 开关开启时附加独立的卦类元数据
     /// 4. 递归合成：若记忆库中相似记忆数 ≥ 3 条，则自动生成合成记忆
-    pub fn remember(&mut self, memory: Memory) -> Result<Memory, PersistenceError> {
-        // v0.6.0+ 参赛扩展：探索日志埋点（remember 事件）
-        let remember_start = std::time::Instant::now();
+    pub fn remember(&self, memory: Memory) -> Result<Memory, PersistenceError> {
+        let prep = self.prepare_remember(memory)?;
+        let analysis = prep.analyze();
+        self.commit_remember(analysis)
+    }
+
+    /// `remember` 三阶段锁解耦·阶段 1（**锁内**）：取快照 + 构建候选
+    ///
+    /// 只做索引查询与快照引用，不做 Jaccard 扫描、不做洛书编码 ⇒ 持锁时间极短。
+    /// 调用方应在释放存储锁后调用 [`RememberPrep::analyze`]，
+    /// 再重新取锁调用 [`Self::commit_remember`]。
+    pub fn prepare_remember(&self, memory: Memory) -> Result<RememberPrep, PersistenceError> {
+        let started_at = std::time::Instant::now();
         let mem_type_str = memory.memory_type.as_str().to_string();
         let mem_importance = memory.importance.value();
         let mem_tags = memory.tags.clone();
@@ -4099,26 +4953,24 @@ impl<P: Persistence> MemoryStore<P> {
         // 当 --disable-memory 启用时，remember 直接返回原始记忆但不持久化
         // 用于对照实验：验证"记忆系统"本身的价值
         if std::env::var("LRC_DISABLE_MEMORY").is_ok() {
-            let mut no_op_memory = memory.clone();
+            let mut no_op_memory = memory;
             no_op_memory.id = format!("zero_memory_{}", chrono::Utc::now().timestamp_millis());
             // 记录探索日志但不实际存储
-            self.exploration_logger.log_remember(
+            self.exploration_logger.read().unwrap().log_remember(
                 &mem_type_str,
                 mem_importance,
                 &mem_tags,
-                remember_start.elapsed().as_millis() as u64,
+                started_at.elapsed().as_millis() as u64,
             );
-            return Ok(no_op_memory);
+            return Ok(RememberPrep::NoOp(Box::new(no_op_memory)));
         }
 
-        // 检查是否有相似记忆
-        let similarity_start = std::time::Instant::now();
         // 隐私隔离：从待写入记忆自身派生隐私上下文，相似检查只合并
         // 对当前上下文可见的记忆，避免跨 session/user 污染。
         // 注意：仅当记忆携带真实归属标识（session_id/user_id）时才启用过滤——
         // 无标识的匿名记忆（含默认 User 级但未设 user_id）保持既有合并行为，
         // 避免默认配置下自动合并功能被隐私过滤意外禁用（回归）。
-        let remember_privacy = if memory.session_id.is_none() && memory.user_id.is_none() {
+        let privacy = if memory.session_id.is_none() && memory.user_id.is_none() {
             None
         } else {
             Some((
@@ -4127,22 +4979,99 @@ impl<P: Persistence> MemoryStore<P> {
                 memory.user_id.clone(),
             ))
         };
-        let similar = if Self::domain_index_enabled() {
-            self.find_similar_scoped_with_privacy(
-                &memory.content,
-                Some(&memory),
-                &remember_privacy,
-            )?
+        let snapshot = self.load_cached()?;
+        let domain_index = Self::domain_index_enabled();
+        let scope_project = if domain_index {
+            memory.project.clone()
         } else {
-            self.find_similar_scoped_with_privacy(&memory.content, None, &remember_privacy)?
+            None
         };
-        if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
-            eprintln!(
-                "[LRC_PROFILING] remember similarity_lookup_ms={:.3} found={}",
-                similarity_start.elapsed().as_secs_f64() * 1000.0,
-                similar.is_some()
-            );
-        }
+        let scope = if domain_index { Some(&memory) } else { None };
+        let candidates = self.build_candidates(&snapshot, &memory.content, scope);
+        // ★ 2026-11-05 实验：只把**候选子集**交给锁外 analyze。
+        //   这样整库快照 Arc 在本函数返回时即释放，提交侧 `Arc::make_mut`
+        //   不再因并发分析者持有引用而整库克隆。
+        let subset: Vec<Arc<Memory>> = candidates
+            .positions
+            .iter()
+            .map(|&position| snapshot[position].clone())
+            .collect();
+        let candidates = candidates.into_subset(subset.len());
+        // 子集对应的 Jaccard 预计算集合：只克隆命中的 Arc，不持有整表。
+        let full_terms = self.cache.jaccard_terms_snapshot();
+        let cached_terms: std::collections::HashMap<String, Arc<JaccardTerms>> = subset
+            .iter()
+            .filter_map(|m| {
+                full_terms
+                    .get(&m.id)
+                    .map(|terms| (m.id.clone(), Arc::clone(terms)))
+            })
+            .collect();
+        // 子集模式下桶路由的 position 已失效 ⇒ 关闭（只影响扫描顺序，不影响候选集合）。
+        let buckets = None;
+        Ok(RememberPrep::Ready(Box::new(RememberPrepData {
+            query_terms: JaccardTerms::new(&memory.content),
+            memory,
+            snapshot: subset,
+            candidates,
+            threshold: self.similarity_threshold,
+            privacy,
+            buckets,
+            scope_project,
+            snapshot_version: self.cache.data_version(),
+            encoder: Arc::clone(&self.luoshu_encoder),
+            started_at,
+            mem_type_str,
+            mem_importance,
+            mem_tags,
+            cached_terms,
+        })))
+    }
+
+    /// `remember` 三阶段锁解耦·阶段 3（**锁内**）：合并/新建 + 落盘 + 索引 + 缓存
+    pub fn commit_remember(&self, analysis: RememberAnalysis) -> Result<Memory, PersistenceError> {
+        // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
+        let data = match analysis {
+            RememberAnalysis::NoOp(no_op_memory) => return Ok(*no_op_memory),
+            RememberAnalysis::Ready(data) => *data,
+        };
+        let RememberAnalysisData {
+            memory,
+            similar: analyzed_similar,
+            luoshu_vec,
+            encoded_content,
+            snapshot_version,
+            privacy,
+            started_at,
+            mem_type_str,
+            mem_importance,
+            mem_tags,
+            ..
+        } = data;
+
+        // 乐观并发：锁外分析期间若有其它写入，快照已过期 ⇒ 锁内重算相似，
+        // 保证"相似即合并"的语义与全程持锁时**逐位一致**（该分支仅在并发写入时触发）。
+        //
+        // ★ 2026-11-05 实验结论：曾尝试改为"只扫快照之后的增量"，实测**更慢**
+        //   （纯写 P50 98ms → 467ms）。原因：本函数走 `build_candidates` 的
+        //   **候选索引剪枝**，实际扫描量远小于全库；而增量方案要先 O(N) 建
+        //   id→正文映射再 O(N) 求差集，反而把成本抬到全库量级。故保留原实现。
+        let similar = if self.cache.data_version() != snapshot_version {
+            let scope = if Self::domain_index_enabled() {
+                Some(&memory)
+            } else {
+                None
+            };
+            // ★ 2026-11-05（读并发改造）：用**内存快照**而非 `load_cached()`。
+            //   本分支在 `save_memory` 之后执行，磁盘指纹已变而 cache 指纹未更新，
+            //   `load_cached()` 会整库重解析 25MB（实测 commit P50 650ms、P99 90s）。
+            //   写路径已持外层写锁，`cache.snapshot()` 即最新一致视图。
+            let all = self.cache.snapshot();
+            self.find_similar_in_snapshot(&all, &memory.content, scope, &privacy)
+        } else {
+            analyzed_similar
+        };
+
         let result = if let Some(existing) = similar.as_ref() {
             // 构建合并后的记忆
             let mut merged = existing.clone();
@@ -4192,7 +5121,7 @@ impl<P: Persistence> MemoryStore<P> {
             // ⇒ 顺序改为「先落盘记忆，再写图」：记忆一定存在，边不会悬空。
             //   实现上把这批边**收集起来**，在 `save_memory` 之后统一写。
             let mut pending_edges: Vec<(EdgeType, f32)> = Vec::new();
-            if self.graph_store.is_some() {
+            if self.graph_store.read().unwrap().is_some() {
                 let jaccard = self.compute_jaccard(&old_content, &merged.content);
                 // 内容实质不同的合并 → Contradicts 边（需要后续解决）
                 if jaccard < 0.9 {
@@ -4212,7 +5141,12 @@ impl<P: Persistence> MemoryStore<P> {
 
         // 洛书编码 + 八卦分类（透明地附加到每条记忆）
         {
-            let luoshu_vec = self.luoshu_encoder.encode_text(&result.content);
+            // 锁外已按输入内容编码；仅当合并改写了内容时才在锁内重算
+            let luoshu_vec = if result.content == encoded_content {
+                luoshu_vec
+            } else {
+                self.luoshu_encoder.encode_text(&result.content)
+            };
             let proj = mirror_project(&luoshu_vec);
 
             result.luoshu_vector = Some(luoshu_vec.values);
@@ -4239,7 +5173,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 已经保存成功，再返回错误会让用户误以为"没记住"——那是更严重的误导）。
         if !pending_edges.is_empty() {
             if let Some(existing) = similar.as_ref() {
-                if let Some(ref mut graph) = self.graph_store {
+                if let Some(ref mut graph) = *self.graph_store.write().unwrap() {
                     for (etype, weight) in &pending_edges {
                         if let Err(e) =
                             graph.add_edge(&result.id, &existing.id, etype.clone(), *weight)
@@ -4259,6 +5193,12 @@ impl<P: Persistence> MemoryStore<P> {
             self.add_memory_to_index(&result);
         }
 
+        // 语义向量：写入后**异步入队**编码（不阻塞写路径、不持锁编码）。
+        // 这是"缓存随库增长"的唯一入口——没有它，语义索引只能靠回填追赶，
+        // 而回填速率结构性追不上持续写入（历史缺陷的根因）。
+        #[cfg(feature = "ml")]
+        crate::semantic_index::enqueue(&result.id, &result.content);
+
         // 记录指标：编码 + 1
         self.dao_metrics.record_encoding();
 
@@ -4268,26 +5208,33 @@ impl<P: Persistence> MemoryStore<P> {
         self.synthesis_pending
             .store(true, std::sync::atomic::Ordering::Release);
 
-        // 写入后仅刷新记忆快照，保留已完成的增量索引。
-        self.mark_cache_dirty_preserving_index();
+        // 写入后**增量**同步缓存（upsert），而不是全量失效。
+        //
+        // ★ P3（2026-11-05）：原实现 `mark_cache_dirty_preserving_index()` 会把
+        //   缓存标记为脏 ⇒ 下一次读（含下一次 `remember` 的相似检查）**从磁盘
+        //   重载整库**，并清空**全部** recall 文本特征。7048 条实测每次约 50ms，
+        //   且文本特征重建更贵。本方法已保证 `result` 已落盘、索引已增量维护，
+        //   故直接并入/替换即可；只失效被改写那条的文本特征。
+        self.cache
+            .upsert(&result, self.persistence.source_fingerprint());
 
         // v0.6.0+ 参赛扩展：探索日志记录（remember 事件）
-        self.exploration_logger.log_remember(
+        self.exploration_logger.read().unwrap().log_remember(
             &mem_type_str,
             mem_importance,
             &mem_tags,
-            remember_start.elapsed().as_millis() as u64,
+            started_at.elapsed().as_millis() as u64,
         );
 
         // LRC 内置道体状态机：新写入的记忆代表"当前语境"，以重要性激活，
         // 让后续检索能感知"用户刚刚在记什么"，形成跨调用的话题延续。
-        self.memory_state_machine.activate(
+        self.memory_state_machine.write().unwrap().activate(
             &result.id,
             (result.importance.value() as f32 / 10.0).clamp(0.0, 1.0),
         );
         let _ = self
             .persistence
-            .save_memory_state(&self.memory_state_machine.snapshot());
+            .save_memory_state(&self.memory_state_machine.read().unwrap().snapshot());
 
         Ok(result)
     }
@@ -4303,10 +5250,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 4. 保留洛书编码（L2 层 trapezoid_focus_recall 几何检索仍可使用）
     ///
     /// 适用于 LongMemEval 等需要大量注入独立会话历史的场景。
-    pub fn remember_batch(
-        &mut self,
-        memories: Vec<Memory>,
-    ) -> Result<Vec<Memory>, PersistenceError> {
+    pub fn remember_batch(&self, memories: Vec<Memory>) -> Result<Vec<Memory>, PersistenceError> {
         if memories.is_empty() {
             return Ok(vec![]);
         }
@@ -4323,6 +5267,7 @@ impl<P: Persistence> MemoryStore<P> {
         // v0.9.12：编码与写入拆成两步（`encode_luoshu_batch` + `remember_batch_preencoded`），
         // 使调用方能**在存储锁之外**完成昂贵的编码阶段。此处保持"两步连调"，
         // 行为与拆分前逐位一致。
+        // A+B+D：IDF 表已在构造期定型（见 init_encoder_idf），此处直接编码
         let luoshu_vecs = encode_luoshu_batch(&self.luoshu_encoder, &memories);
         self.remember_batch_preencoded(memories, luoshu_vecs)
     }
@@ -4343,13 +5288,14 @@ impl<P: Persistence> MemoryStore<P> {
     /// 编码阶段挪到**不持锁**的时段——线上 1 核机器上，65~71 条分片的编码需 70~100 秒，
     /// 若全程持锁会饿死所有前台请求，使评测的「记忆注入」阶段恒为 0%。
     pub fn remember_batch_preencoded(
-        &mut self,
+        &self,
         memories: Vec<Memory>,
         luoshu_vecs: Vec<LuoShuVector>,
     ) -> Result<Vec<Memory>, PersistenceError> {
         if memories.is_empty() {
             return Ok(vec![]);
         }
+        // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
         // 长度契约防御：绝不静默错位。
         if memories.len() != luoshu_vecs.len() {
             return Err(PersistenceError::Io(std::io::Error::other(format!(
@@ -4382,8 +5328,37 @@ impl<P: Persistence> MemoryStore<P> {
         self.persistence.save_memories(&results)?;
         let __wt_persist = __wt_t0.elapsed().as_secs_f64();
         let __wt_t1 = std::time::Instant::now();
+        // ★ S6（2026-11-02）：写路径负责让倒排索引保持可用。
+        //   读路径刻意**不重建**（那会把 O(N) 分词塞进持锁的检索里），因此批量
+        //   写入必须在 `append_new` 之前补一次整库重建——否则 `add_memory_to_index`
+        //   会因索引脏而直接 no-op，索引将一直为空，候选裁剪永远退化成全量扫描。
+        //   只在本进程已持有全量快照时重建：为了建索引触发整库 JSON 重解析
+        //   （400MB 级、4~6 秒）正是 `append_new` 要消除的成本，此处不为它回退。
+        if self.cache.index_is_dirty() && self.cache.is_loaded() {
+            let snapshot = self.cache.snapshot();
+            self.cache.rebuild_index_with_extra(&snapshot, &results);
+        }
         for result in &results {
             self.add_memory_to_index(result);
+        }
+        // 语义向量：批量写入后编码。
+        //
+        // 中小批量**同步**编码并落盘（保证"写入返回即索引可用"——评测/导入
+        // 的典型流程是注入后立即查询，异步编码会赶不上）；超大批量退回异步，
+        // 避免长时间占用写路径。
+        #[cfg(feature = "ml")]
+        {
+            if results.len() <= crate::semantic_index::SYNC_ENCODE_MAX {
+                let items: Vec<(String, String)> = results
+                    .iter()
+                    .map(|m| (m.id.clone(), m.content.clone()))
+                    .collect();
+                crate::semantic_index::encode_batch_sync(&items);
+            } else {
+                for result in &results {
+                    crate::semantic_index::enqueue(&result.id, &result.content);
+                }
+            }
         }
         let __wt_index = __wt_t1.elapsed().as_secs_f64();
 
@@ -4509,16 +5484,20 @@ impl<P: Persistence> MemoryStore<P> {
     /// - `filter`: 召回过滤条件
     /// - `depth`: 梯形细分深度（0=全量，1=4分，2=16分）
     pub fn trapezoid_focus_recall(
-        &mut self,
+        &self,
         query: &str,
         filter: &RecallFilter,
         depth: u32,
     ) -> Result<RecallResult, PersistenceError> {
-        self.trapezoid_focus_recall_with_cancel(query, filter, depth, None)
+        let result = self.trapezoid_focus_recall_with_cancel(query, filter, depth, None);
+        // ★ 2026-11-05：`&self` 入口立即应用读路径累积的状态写回，
+        //   保持"直接调用 recall 会更新状态机/生命周期"的既有语义。
+        self.flush_recall_side_effects();
+        result
     }
 
     pub fn trapezoid_focus_recall_with_cancel(
-        &mut self,
+        &self,
         query: &str,
         filter: &RecallFilter,
         depth: u32,
@@ -4577,6 +5556,8 @@ impl<P: Persistence> MemoryStore<P> {
         let active_whitelist: std::collections::HashSet<String> =
             if crate::engine::memory_state_machine::state_bias_enabled() {
                 self.memory_state_machine
+                    .read()
+                    .unwrap()
                     .active_ids(16)
                     .into_iter()
                     .collect()
@@ -4626,29 +5607,27 @@ impl<P: Persistence> MemoryStore<P> {
             .map(|(i, m)| (i, m.bagua_index))
             .collect();
 
-        // 八卦硬剪除：仅保留同卦或相邻卦候选，其余剪除（活跃记忆白名单豁免）。
-        // v0.8.50 检索质量修复 A/B（3111 旧 vs 3122 BM25+八卦降权）后回滚：
-        // 八卦降权（0.6~1.0 惩罚）对 deep 命中零改进（top1 2/32 持平），
-        // 且把卦近/跨卦的无关全局记忆顶上 top1、污染 RRF top1 命中
-        // （model_file_missing/orig、port_binding/rewrite 各退回 1 处）。
-        // 按方案 §3.5「预判元数据只做观测、不接入默认排序」，恢复原硬剪除：
-        // 仅保留同卦或相邻卦候选，其余剪除。
-        // 阶段三 b2：接入道体预判卦（daoti_preview_bagua）作为候选保留的
-        // 第二证据——LRC 自分类与道体预判不一致（跨域）时，任一证据命中
-        // 即保留，修正跨域污染误剪；仅影响召回候选、不改 RRF 评分权重。
-        // ★ 诊断/消融开关（默认开 ⇒ 维持既有行为，零影响）：
-        //   门③「八卦硬剪除」此前**无开关**，导致它的独立代价无法量化
-        //   （CSCD 分析的结论是"瓶颈可能在③④而非⑤，但③④无开关 ⇒ 无法验证"）。
-        //   本开关只用于测量/消融，不改变默认行为。
+        // 门③「八卦硬剪除」已移除（2026-11-05 用户裁定 + 实验依据）。
+        //
+        // **为什么移除**：洛书的定位是"标签/组织/可视化/存储路由"，不是检索剪枝。
+        // 实测（LongMemEval 带标注探针，6 实例/116 gold）：
+        //   · 单独关 ③ 对 R_sim 的效应为 **0.0pp**（0.8879→0.8879）⇒ ③ 不买召回；
+        //   · 而 ③ 的损失**物理不可恢复**（剪掉即不再被任何判据评估）。
+        // 文档 §1.24/§1.25 进一步证明：64 卦硬剪枝只保留 8.3% 目标，软加权把
+        // top1 从 0.633 打到 0.183 ⇒ 结构编码在检索路径上两种用法都不可行。
+        //
+        // **现在的语义**：环形距离只作为**排序优先级**（近卦优先占据预算前排），
+        // 不再排除任何候选。`LRC_DEEP_BAGUA_PRUNE=1` 可复现旧的硬剪除行为（对照用）。
         let bagua_prune_on = std::env::var("LRC_DEEP_BAGUA_PRUNE")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let indexed: Vec<(usize, LuoShuVector)> = eligible
             .iter()
             .filter(|(i, mem_bagua)| {
                 if !bagua_prune_on {
-                    return true; // 消融：关闭八卦硬剪除，全候选直通
+                    return true; // 默认：不剪枝，环形距离只影响排序
                 }
+                // 对照模式：复现旧硬剪除（环形距离 ≤1 保留）
                 let m = &all_memories[*i];
                 // 活跃记忆白名单：无论卦象一律保留（联想导航锚点，防记忆丢失）
                 if active_whitelist.contains(&m.id) {
@@ -4681,7 +5660,7 @@ impl<P: Persistence> MemoryStore<P> {
                     .map(|v| (*i, LuoShuVector { values: v }))
             })
             .collect();
-        // 阶段D 审计：八卦硬剪除后的候选规模
+        // 阶段D 审计：进入 ROI 前的候选规模
         let trace_candidates = indexed.len();
 
         // 4. 执行梯形聚焦检索
@@ -4704,22 +5683,22 @@ impl<P: Persistence> MemoryStore<P> {
         let all = all_memories;
         let mut memories: Vec<Memory> = matched_indices
             .iter()
-            .filter_map(|&idx| all.get(idx).cloned())
+            .filter_map(|&idx| all.get(idx).map(|m| m.as_ref().clone()))
             .collect();
         // 阶段D 审计：ROI 聚焦原始召回数（词面域过滤前）
         let trace_roi = memories.len();
 
-        // 5b. 候选池预算回填（v0.9.12：门④ ROI 由「限定成员」改为「只影响优先级」）
+        // 5b. 候选池预算回填（v0.9.12 门④；2026-11-05 门③ 同步改为只影响优先级）
         //
         // 旧语义（v0.9.10）：仅在候选被剪到 < 2 条时才回补近卦候选
         //   ⇒ ROI 聚焦掉的候选**物理不可恢复**（它在任何判据介入前就被删了）。
         // 新语义：预算 = `filter.top_k`（deep 路调用方传 top_k×2）；ROI 命中的仍在最前，
-        //   未被 ROI 选中但 ③ 允许（环形距离 ≤2）的合格候选按（环形距离就近、
-        //   其次洛书余弦）**补足预算**。
+        //   未被 ROI 选中的合格候选按（环形距离就近、其次洛书余弦）**补足预算**。
         //
-        // 依据见 `MIN_DEEP_CANDIDATES` 文档的实测表：单独关 ④ 得 +5.2pp R_sim
-        // （且 P_noise 0.8283→0.8183 反而略优）；单独关 ③ 的效应为 0.0pp，
-        // 故 ③ 的剪除语义在此**原样保留**。
+        // ★ 2026-11-05：门③ 已移除，回填**不再按环形距离排除**任何候选——
+        //   环形距离只作排序键（近卦优先），远端跨卦候选仍可在预算未满时补入。
+        //   依据：单独关 ③ 对 R_sim 的效应为 0.0pp（0.8879→0.8879），
+        //   即 ③ 不构成召回收益，却造成物理不可恢复的损失。
         let budget = filter.top_k.max(MIN_DEEP_CANDIDATES);
         if memories.len() < budget {
             let present: std::collections::HashSet<usize> =
@@ -4729,15 +5708,15 @@ impl<P: Persistence> MemoryStore<P> {
                 .filter(|(i, _)| !present.contains(i))
                 .filter_map(|(i, mem_bagua)| {
                     let lv = all.get(*i)?.luoshu_vector?;
-                    // 环形距离（无卦象者 None：本就被 ③ 默认保留，允许回补）
+                    // 环形距离只作排序键：近卦优先，但**不排除**远端候选
                     let ring = mem_bagua.map(|b| bagua_ring_distance(b, query_bagua));
-                    // ★ ③ 的语义**保持不变**：远端跨卦候选（环形距离 3/4）是 ③ 明确
-                    //   拒绝的对象，不得经回补回流。实测（LongMemEval 探针，6 实例）：
-                    //   单独关 ③ 对 R_sim 的效应为 **0.0pp**（0.8879→0.8879），
-                    //   即 ③ 不构成召回代价 ⇒ 无理由放宽它。
-                    if let Some(r) = ring {
-                        if r > DEEP_BACKFILL_MAX_RING {
-                            return None;
+                    // 对照模式（显式开启旧硬剪除）下沿用旧语义：远端跨卦候选不得经回填回流，
+                    // 否则 A/B 对照会因回填而失真。默认路径不做此排除。
+                    if bagua_prune_on {
+                        if let Some(r) = ring {
+                            if r > DEEP_BACKFILL_MAX_RING {
+                                return None;
+                            }
                         }
                     }
                     // 无卦象者置于最末（u8::MAX），避免抢占近卦候选的预算名额。
@@ -4755,7 +5734,7 @@ impl<P: Persistence> MemoryStore<P> {
                     break;
                 }
                 if let Some(m) = all.get(i) {
-                    memories.push(m.clone());
+                    memories.push(m.as_ref().clone());
                 }
             }
         }
@@ -4916,6 +5895,8 @@ impl<P: Persistence> MemoryStore<P> {
         if crate::engine::memory_state_machine::state_bias_enabled() && !memories.is_empty() {
             let active_map: std::collections::HashMap<String, f32> = self
                 .memory_state_machine
+                .read()
+                .unwrap()
                 .active_context(usize::MAX)
                 .into_iter()
                 .collect();
@@ -5004,7 +5985,11 @@ impl<P: Persistence> MemoryStore<P> {
         if crate::lifecycle::decay_enabled() {
             let now = crate::lifecycle::now_ms();
             for (idx, score) in scored.iter_mut() {
-                *score *= self.lifecycle.decay_factor(&memories[*idx].id, now);
+                *score *= self
+                    .lifecycle
+                    .read()
+                    .unwrap()
+                    .decay_factor(&memories[*idx].id, now);
             }
         }
 
@@ -5024,34 +6009,48 @@ impl<P: Persistence> MemoryStore<P> {
         //   重合）时一并启用校验；查询与全池零词面重合（纯语义检索，
         //   `trace_lex_max == 0`）时保持关闭，以免误伤"词不相邻而义相邻"的召回。
         let recheck_active = !active_whitelist.is_empty() || trace_lex_max > 0.0;
-        if recheck_active {
-            let original_tokens = tokenize_query(query);
-            let bridge_words: Vec<String> = {
-                let all = self.load_cached().unwrap_or_default();
-                let mut bridge_text = String::new();
-                for m in all.iter() {
-                    if active_whitelist.contains(&m.id) {
-                        bridge_text.push_str(&m.content);
-                        bridge_text.push(' ');
-                    }
+        // ★ S6（2026-11-02）：再次校验 + 生命周期 + 去重合并为**一次有界遍历**。
+        //   修前校验对深路候选池**全量**执行（20k 库实测单轮剔除 1.5 万条，
+        //   每次要做「原查询词 + 桥词」次 `contains_word`），而最终只需要 top_k 条
+        //   ⇒ 边过滤边收满 top_k 即停，输出与"全量过滤后取前 top_k"逐条一致。
+        let original_tokens: Vec<String> = if recheck_active {
+            tokenize_query(query)
+        } else {
+            Vec::new()
+        };
+        let bridge_words: Vec<String> = if recheck_active {
+            let all = self.load_cached().unwrap_or_default();
+            let mut bridge_text = String::new();
+            for m in all.iter() {
+                if active_whitelist.contains(&m.id) {
+                    bridge_text.push_str(&m.content);
+                    bridge_text.push(' ');
                 }
-                tokenize_query(&bridge_text)
-            };
-            let mut rejected: usize = 0;
-            // 收集回归证据：索引 → 证据标签（供联想链输出可观测）
-            let mut evidence_by_idx: std::collections::HashMap<usize, String> =
-                std::collections::HashMap::new();
-            let kept_indices: Vec<usize> = scored
-                .iter()
-                .map(|(i, _)| *i)
-                .filter(|&i| {
-                    use crate::engine::memory_state_machine::regression_recheck;
-                    let m = &memories[i];
-                    // 白名单活跃记忆：联想锚点，直接保留
-                    if active_whitelist.contains(&m.id) {
-                        evidence_by_idx.insert(i, "活跃锚点".to_string());
-                        return true;
-                    }
+            }
+            tokenize_query(&bridge_text)
+        } else {
+            Vec::new()
+        };
+        let mut rejected: usize = 0;
+        // 收集回归证据：索引 → 证据标签（供联想链输出可观测）
+        let mut evidence_by_idx: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
+        let mut seen_content: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let top_k = filter.top_k.min(scored.len());
+        let mut top_indices: Vec<usize> = Vec::with_capacity(top_k);
+        for (i, _) in scored.iter() {
+            let i = *i;
+            // S3.5：被抑制/被取代的记忆**不得出现**在结果里（此前只做分数衰减）
+            if !self.lifecycle_allows(&memories[i].id) {
+                continue;
+            }
+            if recheck_active {
+                use crate::engine::memory_state_machine::regression_recheck;
+                let m = &memories[i];
+                // 白名单活跃记忆：联想锚点，直接保留
+                if active_whitelist.contains(&m.id) {
+                    evidence_by_idx.insert(i, "活跃锚点".to_string());
+                } else {
                     // ★ 2026-10-30（性能回归修复）：改用缓存正文，避免逐候选小写化分配
                     let content_lower = self.recall_document(m).normalized_content;
                     let original_overlap = original_tokens
@@ -5065,7 +6064,17 @@ impl<P: Persistence> MemoryStore<P> {
                     let tag_hits = m
                         .tags
                         .iter()
-                        .filter(|t| original_tokens.iter().any(|w| t.to_lowercase().contains(w)))
+                        .filter(|t| {
+                            // 与快路同口径：只在含大写时才分配小写副本
+                            let lowered;
+                            let tag_text: &str = if t.chars().any(char::is_uppercase) {
+                                lowered = t.to_lowercase();
+                                lowered.as_str()
+                            } else {
+                                t.as_str()
+                            };
+                            original_tokens.iter().any(|w| tag_text.contains(w))
+                        })
                         .count();
                     // P5（判据同源）：把召回阶段算出的**纯语义余弦**作为第五证据传入。
                     // 此前这里恒传 None ⇒ 验收只有词面判据，语义候选存活率被锁到 3~23%。
@@ -5076,44 +6085,33 @@ impl<P: Persistence> MemoryStore<P> {
                         None,
                         semantic_sims.get(i).copied(),
                     );
-                    if verdict.keep {
-                        evidence_by_idx.insert(i, verdict.evidence.to_string());
-                    } else {
+                    if !verdict.keep {
                         rejected += 1;
+                        continue;
                     }
-                    verdict.keep
-                })
-                .collect();
-            if rejected > 0 {
-                eprintln!("[LRC-STATE] deep 道体再次校验剔除 {} 条发散噪声", rejected);
+                    evidence_by_idx.insert(i, verdict.evidence.to_string());
+                }
             }
-            // 用校验后的索引重建 scored
-            let kept: std::collections::HashSet<usize> = kept_indices.iter().copied().collect();
-            scored.retain(|(i, _)| kept.contains(i));
-            // 将证据映射到最终输出的记忆 id
-            deep_evidence = kept_indices
-                .iter()
-                .filter_map(|&i| {
-                    evidence_by_idx
-                        .get(&i)
-                        .map(|e| (memories[i].id.clone(), e.clone()))
-                })
-                .collect();
+            // v0.5.4 P2-12 修复：按 content 去重，保留匹配度最高的那条
+            let content_key = memories[i].content.trim().to_lowercase();
+            if !seen_content.insert(content_key) {
+                continue;
+            }
+            top_indices.push(i);
+            if top_indices.len() >= top_k {
+                break;
+            }
         }
-
-        // v0.5.4 P2-12 修复：按 content 哈希去重，保留匹配度最高的那条
-        // 在排序后、截取 top_k 前进行去重，确保深度检索结果中不会出现内容相同的记忆
-        let mut seen_content: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let top_k = filter.top_k.min(scored.len());
-        let top_indices: Vec<usize> = scored
-            .iter()
-            .filter(|(i, _)| {
-                let content_key = memories[*i].content.trim().to_lowercase();
-                seen_content.insert(content_key)
-            })
-            .take(top_k)
-            .map(|(i, _)| *i)
-            .collect();
+        if rejected > 0 {
+            eprintln!("[LRC-STATE] deep 道体再次校验剔除 {} 条发散噪声", rejected);
+        }
+        // 将证据映射到最终输出的记忆 id（只覆盖被返回的结果集）
+        // 用 `extend` 而非重新赋值：初始为空表，语义等价，且避免"赋值后未读"警告。
+        deep_evidence.extend(top_indices.iter().filter_map(|&i| {
+            evidence_by_idx
+                .get(&i)
+                .map(|e| (memories[i].id.clone(), e.clone()))
+        }));
 
         memories = top_indices.iter().map(|&i| memories[i].clone()).collect();
         scores = top_indices.iter().map(|&i| scores[i]).collect();
@@ -5158,7 +6156,10 @@ impl<P: Persistence> MemoryStore<P> {
         // 质量反馈闭环：记录合成记忆被检索命中的相关性
         for (mem, score) in memories.iter().zip(scores.iter()) {
             if mem.memory_type == MemoryType::Synthesis {
-                self.synthesis_journal.record_hit(&mem.id, *score);
+                self.synthesis_journal
+                    .read()
+                    .unwrap()
+                    .record_hit(&mem.id, *score);
             }
         }
 
@@ -5176,14 +6177,20 @@ impl<P: Persistence> MemoryStore<P> {
 
         // LRC 内置道体状态机：激活本次召回的记忆、记录联想轨迹并持久化。
         // 这样下一次检索可感知"近期在想什么"，让信息从"查询依赖"变为"上下文依赖"。
-        self.bake_activation(&memories, &scores);
+        // ★ 2026-11-05：读路径只入队，由调用方在释放读锁后 flush（见
+        //   `pending_recall_effects` 的文档）。
+        self.queue_activation(&memories, &scores);
 
         // 生命周期：记录本次命中（只改内存，不触发整库重写）。
         // 位于 read_only 提前返回之后，遵守"只读检索零状态写回"承诺。
-        self.record_lifecycle_hits(&memories);
+        self.queue_lifecycle_hits(&memories);
 
         // v0.5.4 检索后合成标记移出关键路径：由后台运行
-        if memories.len() >= self.synthesis_min_cluster {
+        if memories.len()
+            >= self
+                .synthesis_min_cluster
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             // v0.8.48 P0 修复：原子写入，Release 语义确保此前的写操作对执行合成的线程可见
             self.synthesis_pending
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -5197,31 +6204,184 @@ impl<P: Persistence> MemoryStore<P> {
         })
     }
     /// 将召回结果写入内置道体状态机的活性与联想轨迹。
-    fn populate_state(
-        &mut self,
-        memories: &[Memory],
-        scores: &[f32],
-    ) -> Result<(), PersistenceError> {
+    fn populate_state(&self, memories: &[(String, f32)]) -> Result<(), PersistenceError> {
         let mut previous = None;
-        for (memory, score) in memories.iter().zip(scores.iter()) {
+        for (id, score) in memories.iter() {
             self.memory_state_machine
-                .transition(previous, &memory.id, *score, 1);
-            previous = Some(memory.id.as_str());
+                .write()
+                .unwrap()
+                .transition(previous, id, *score, 1);
+            previous = Some(id.as_str());
         }
         self.persistence
-            .save_memory_state(&self.memory_state_machine.snapshot())
+            .save_memory_state(&self.memory_state_machine.read().unwrap().snapshot())
     }
 
     /// LRC 内置道体状态机·激活快照：
     /// 激活本次召回的记忆、记录联想轨迹并持久化。
     /// 快照写入失败不阻塞检索："记忆活性"是增强项，不应影响主路径。
-    fn bake_activation(&mut self, memories: &[Memory], scores: &[f32]) {
-        for (mem, score) in memories.iter().zip(scores.iter()) {
-            self.memory_state_machine.activate(&mem.id, *score);
+    fn bake_activation(&self, memories: &[(String, f32)]) {
+        for (id, score) in memories.iter() {
+            self.memory_state_machine
+                .write()
+                .unwrap()
+                .activate(id, *score);
         }
         if !memories.is_empty() {
-            let _ = self.populate_state(memories, scores);
+            let _ = self.populate_state(memories);
         }
+    }
+
+    /// 读路径：把"激活 + 转移"追加到待写回队列（**不触碰共享可变状态**）。
+    ///
+    /// 语义与 [`Self::bake_activation`] 完全一致，只是延后到
+    /// [`Self::flush_recall_side_effects`] 在写锁下执行。
+    fn queue_activation(&self, memories: &[Memory], scores: &[f32]) {
+        if memories.is_empty() {
+            return;
+        }
+        let batch: Vec<(String, f32)> = memories
+            .iter()
+            .zip(scores.iter())
+            .map(|(m, s)| (m.id.clone(), *s))
+            .collect();
+        let mut queue = self.pending_recall_effects.lock().unwrap();
+        // ★ 上限保护（审查 P2-3）：后台 flusher 用 `try_write`，长读持续时可能
+        //   长期拿不到写锁 ⇒ 队列无界增长。满时丢弃**最旧**批次（激活是"最近"
+        //   语义，旧批次价值最低），与 `pending_audit` 同口径。
+        if queue.len() >= PENDING_RECALL_EFFECTS_CAP {
+            queue.remove(0);
+        }
+        queue.push(RecallSideEffect::Activation { memories: batch });
+    }
+
+    /// 读路径：把生命周期命中追加到待写回队列（语义同 [`Self::record_lifecycle_hits`]）。
+    fn queue_lifecycle_hits(&self, memories: &[Memory]) {
+        if !crate::lifecycle::hits_enabled() || memories.is_empty() {
+            return;
+        }
+        let ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+        let mut queue = self.pending_recall_effects.lock().unwrap();
+        if queue.len() >= PENDING_RECALL_EFFECTS_CAP {
+            queue.remove(0);
+        }
+        queue.push(RecallSideEffect::LifecycleHits { ids });
+    }
+
+    /// 应用读路径累积的状态写回。
+    ///
+    /// # 调用契约（审查 P1-1 修正）
+    ///
+    /// 本方法**可在读锁下调用**（`recall` / `trapezoid_focus_recall` 即如此），
+    /// 因为：
+    ///   · `pending_recall_effects` 用 `Mutex::take` 原子取走，同一批次不会被重复应用；
+    ///   · `bake_activation` 内部对状态机是**读-改-写**（`write()` 串行），
+    ///     并发读者不会互相覆盖；
+    ///   · `save_memory_state` 写的是**完整快照**（非增量），后写胜出仍是完整状态。
+    /// 代价：并发 flush 时 `trail` 的转移顺序由交错决定（"最近激活"语义可接受），
+    /// 且可能重复写同一文件（性能浪费，非正确性问题）。
+    ///
+    /// 返回实际应用的批次数（0 表示无待写回，调用方可据此跳过写锁）。
+    pub fn flush_recall_side_effects(&self) -> usize {
+        let effects: Vec<RecallSideEffect> = {
+            let mut queue = self.pending_recall_effects.lock().unwrap();
+            if queue.is_empty() {
+                return 0;
+            }
+            std::mem::take(&mut *queue)
+        };
+        let applied = effects.len();
+        for effect in effects {
+            match effect {
+                RecallSideEffect::Activation { memories } => {
+                    self.bake_activation(&memories);
+                }
+                RecallSideEffect::LifecycleHits { ids } => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let mut changed = false;
+                    for id in &ids {
+                        if self.lifecycle.write().unwrap().touch(id, now_ms) {
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.lifecycle_dirty
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                RecallSideEffect::GraphEdges { pending } => {
+                    if let Some(graph) = self.graph_store.write().unwrap().as_mut() {
+                        graph.add_edges_batch_deferred(&pending);
+                    }
+                }
+            }
+        }
+        applied
+    }
+
+    /// 是否存在待写回的读路径副作用（供调用方决定是否需要取写锁）。
+    pub fn has_pending_recall_effects(&self) -> bool {
+        !self.pending_recall_effects.lock().unwrap().is_empty()
+    }
+
+    /// 读路径：把审计事件追加到待写队列（**不触碰 `audit_trail`**）。
+    ///
+    /// 语义与 `audit_trail.record` 一致，只是延后到
+    /// [`Self::flush_pending_audit`] 在写锁下执行。
+    pub fn queue_audit(
+        &self,
+        event_type: AuditEventType,
+        description: String,
+        reason: String,
+        affected_memory_ids: Vec<String>,
+        metadata: std::collections::HashMap<String, String>,
+    ) {
+        let mut queue = self.pending_audit.lock().unwrap();
+        if queue.len() >= PENDING_AUDIT_CAP {
+            // 防御：后台长期拿不到锁时不无限增长；丢弃最旧一条并告警。
+            queue.remove(0);
+            eprintln!(
+                "[LRC·审计] 待写队列已达上限 {}，丢弃最旧一条（后台 flush 落后）",
+                PENDING_AUDIT_CAP
+            );
+        }
+        queue.push(PendingAuditEvent {
+            event_type,
+            description,
+            reason,
+            affected_memory_ids,
+            metadata,
+        });
+    }
+
+    /// 应用待写审计事件（**必须在写锁下调用**）。返回实际写入条数。
+    pub fn flush_pending_audit(&self) -> usize {
+        let events: Vec<PendingAuditEvent> = {
+            let mut queue = self.pending_audit.lock().unwrap();
+            if queue.is_empty() {
+                return 0;
+            }
+            std::mem::take(&mut *queue)
+        };
+        let count = events.len();
+        for event in events {
+            self.audit_trail.write().unwrap().record(
+                event.event_type,
+                event.description,
+                event.reason,
+                event.affected_memory_ids,
+                event.metadata,
+            );
+        }
+        count
+    }
+
+    /// 是否存在待写审计事件。
+    pub fn has_pending_audit(&self) -> bool {
+        !self.pending_audit.lock().unwrap().is_empty()
     }
 
     /// 联想确认（v0.9.7：用户在联想探索中点击"就是这个"）。
@@ -5229,7 +6389,8 @@ impl<P: Persistence> MemoryStore<P> {
     /// 用户确认某条记忆与当前意图相关：以最高激活强度（1.0）写入道体
     /// 状态机活跃锚点并持久化，下次联想/检索时该记忆优先呈现。
     /// 返回 Ok(true) 表示记忆存在且已确认；Ok(false) 表示记忆不存在。
-    pub fn confirm_memory(&mut self, memory_id: &str) -> Result<bool, PersistenceError> {
+    pub fn confirm_memory(&self, memory_id: &str) -> Result<bool, PersistenceError> {
+        // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
         let exists = self
             .load_cached()?
             .iter()
@@ -5238,13 +6399,102 @@ impl<P: Persistence> MemoryStore<P> {
             return Ok(false);
         }
         // 用户显式确认 = 最高激活强度；轨迹记录一次确认转移并持久化快照
-        self.memory_state_machine.activate(memory_id, 1.0);
         self.memory_state_machine
+            .write()
+            .unwrap()
+            .activate(memory_id, 1.0);
+        self.memory_state_machine
+            .write()
+            .unwrap()
             .transition(None, memory_id, 1.0, 1);
         let _ = self
             .persistence
-            .save_memory_state(&self.memory_state_machine.snapshot());
+            .save_memory_state(&self.memory_state_machine.read().unwrap().snapshot());
         Ok(true)
+    }
+
+    /// 语义稠密检索（第三路）：对**全库合格候选**按 bge 句向量余弦排序。
+    ///
+    /// # 为什么必须是"全库"而不是"深路候选池内重排"
+    ///
+    /// 深路（`trapezoid_focus_recall`）的候选池先经八卦环形距离与 ROI 几何聚焦，
+    /// 而这两道门**不读语义**（实测打乱字符顺序分类不变）。若语义只做池内重排，
+    /// 正确记忆可能**从未进入候选池**——召回上限被几何门锁死，重排再准也无用。
+    /// 故本通路独立于深路：只施加与 fast 路同源的**基础过滤**（过期/类型/项目/
+    /// 标签/重要性/隐私），然后对全库已索引向量做余弦排序。
+    ///
+    /// # 诚实降级
+    ///
+    /// 服务未初始化 / ML 编码器不可用 / 索引为空 ⇒ 返回空结果（`total` 仍如实
+    /// 报告合格候选数），调用方据此跳过第三路，行为与未引入本通路时一致。
+    #[cfg(feature = "ml")]
+    pub fn semantic_recall(
+        &self,
+        query: &str,
+        filter: &RecallFilter,
+        top_k: usize,
+    ) -> Result<RecallResult, PersistenceError> {
+        let Some(service) = crate::semantic_index::service() else {
+            return Ok(RecallResult::basic(Vec::new(), Vec::new(), 0));
+        };
+        if !service.is_ready() || top_k == 0 {
+            return Ok(RecallResult::basic(Vec::new(), Vec::new(), 0));
+        }
+        let all_memories = self.load_cached()?;
+        let privacy_ctx = filter.privacy_context.clone();
+        // 过滤口径与 `recall_with_cancel` 的候选过滤**逐条一致**（隐私红线同源）。
+        let candidates: Vec<&Memory> = all_memories
+            .iter()
+            .map(|m| m.as_ref())
+            .filter(|m| !m.is_expired())
+            .filter(|m| {
+                if let Some(ref mt) = filter.memory_type {
+                    if m.memory_type != *mt {
+                        return false;
+                    }
+                }
+                if let Some(ref proj) = filter.project {
+                    if m.project.as_deref() != Some(proj.as_str()) {
+                        return false;
+                    }
+                }
+                if !filter.tags.is_empty() && !filter.tags.iter().any(|t| m.tags.contains(t)) {
+                    return false;
+                }
+                if let Some(min_imp) = filter.min_importance {
+                    if m.importance < min_imp {
+                        return false;
+                    }
+                }
+                is_visible(m, &privacy_ctx)
+            })
+            .collect();
+        let total = candidates.len();
+        let Some(hits) = service.search(query, &candidates, top_k) else {
+            return Ok(RecallResult::basic(Vec::new(), Vec::new(), total));
+        };
+        let by_id: std::collections::HashMap<&str, &Memory> =
+            candidates.iter().map(|m| (m.id.as_str(), *m)).collect();
+        let mut memories = Vec::with_capacity(hits.len());
+        let mut scores = Vec::with_capacity(hits.len());
+        for (id, score) in hits {
+            if let Some(memory) = by_id.get(id.as_str()) {
+                memories.push((*memory).clone());
+                scores.push(score);
+            }
+        }
+        Ok(RecallResult::basic(memories, scores, total))
+    }
+
+    /// 非 ml 构建：语义通路恒不可用（返回空结果，调用方回退两路融合）。
+    #[cfg(not(feature = "ml"))]
+    pub fn semantic_recall(
+        &self,
+        _query: &str,
+        _filter: &RecallFilter,
+        _top_k: usize,
+    ) -> Result<RecallResult, PersistenceError> {
+        Ok(RecallResult::basic(Vec::new(), Vec::new(), 0))
     }
 
     /// 道枢映射: 道枢·检索 — 记忆召回是系统的核心能力，如道枢之"环中"应对无穷
@@ -5253,15 +6503,18 @@ impl<P: Persistence> MemoryStore<P> {
     /// 当前使用文本匹配算法（关键词提取 + 子串匹配 + 词频评分）。
     /// 检索到的记忆会自动更新 `last_accessed` 字段，使衰减模型正确工作。
     pub fn recall(
-        &mut self,
+        &self,
         query: &str,
         filter: &RecallFilter,
     ) -> Result<RecallResult, PersistenceError> {
-        self.recall_with_cancel(query, filter, None)
+        let result = self.recall_with_cancel(query, filter, None);
+        // ★ 2026-11-05：`&self` 入口立即应用读路径累积的状态写回。
+        self.flush_recall_side_effects();
+        result
     }
 
     pub fn recall_with_cancel(
-        &mut self,
+        &self,
         query: &str,
         filter: &RecallFilter,
         cancel: Option<&std::sync::atomic::AtomicBool>,
@@ -5291,7 +6544,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 探索语义完全由原查询主导。
         let (query_words, expansion_boost) =
             if crate::engine::memory_state_machine::state_bias_enabled() && !filter.explore_pure {
-                let active_ids = self.memory_state_machine.active_ids(8);
+                let active_ids = self.memory_state_machine.read().unwrap().active_ids(8);
                 if active_ids.is_empty() {
                     (query_words, Vec::<(String, f32)>::new())
                 } else {
@@ -5345,6 +6598,10 @@ impl<P: Persistence> MemoryStore<P> {
             std::collections::HashMap::new();
 
         // 用不可变引用评分和排序（只读：不在热路径更新 last_accessed 或同步重写文件）
+        let mut __pre_s: f64 = 0.0;
+        let mut __prep_s: f64 = 0.0;
+        let mut __am_s: f64 = 0.0;
+        let mut __loop_s: f64 = 0.0;
         let (memories, scores) = {
             // 过滤记忆
             let privacy_ctx = filter.privacy_context.clone();
@@ -5380,6 +6637,7 @@ impl<P: Persistence> MemoryStore<P> {
                     }
                     true
                 })
+                .map(|m| m.as_ref())
                 .collect();
 
             // 计算匹配分数（使用 TF-IDF 加权，替代简单的关键词匹配）
@@ -5416,21 +6674,80 @@ impl<P: Persistence> MemoryStore<P> {
                 }
                 let n_words = count_words.len();
                 let n_cand = candidates.len();
-                let mut counts: Vec<u32> = vec![0; n_cand * n_words];
+
+                // ========== S6：候选生成索引化（默认关闭，`LRC_FAST_CANDIDATE_INDEX=1` 启用）==========
+                //
+                // **为什么**：本循环的成本是"每条候选 × 每个查询词"的全串扫描，实测
+                // N=20k 时占 enrich 总耗时 58%（N 从 1k→20k 增长 69×）。库里已有一份由
+                // 写路径维护的 `BigramIndex`（term → ids），这里取查询词的 postings 并集
+                // 作为**评分候选集**，把全文扫描收缩到"确实含查询词"的记忆上。
+                //
+                // 裁剪条件与回退语义集中在 [`Self::fast_candidate_slots`]；返回 `None`
+                // 时 `active` 即全量候选，统计口径与改造前完全一致。
+                //
+                // ⚠ 分数的**等价性**要求 BM25 的两个全局统计量（`n_docs`、`avgdl`）
+                // 仍按**全量候选**计算——它们不是"候选集内统计"，而是语料统计。
+                // 若按裁剪集算，所有候选的 IDF 与长度归一都会漂移，top-k 边界于是
+                // 改变（实测 20k 库上结果集合平均 Jaccard 只有 0.88，最小的仅 0.72）。
+                // 因此这里的三处口径固定为：
+                //   · `doc_freq` 在裁剪集上统计——**等价于全量**：被裁掉的候选对
+                //     每个查询词的命中数恒为 0（索引是打分口径的超集，见
+                //     `MemoryStoreCache::recall_reachable_terms`）；
+                //   · `n_docs` 与 `avgdl` 仍取全量（avgdl 只多取一次缓存的文档长度）；
+                //   · 打分循环仍遍历**全部候选**（元数据分/零命中填充不能被裁掉），
+                //     只是未命中者的词频恒为 0，省掉的是全文扫描而不是候选本身。
+                let active: Option<Vec<usize>> = self.fast_candidate_slots(
+                    &candidates,
+                    &count_words,
+                    query_word_refs.len(),
+                    filter.top_k,
+                );
+                let pruned = active.is_some();
+                let n_active = active.as_ref().map_or(n_cand, |slots| slots.len());
+                // 裁剪时建立"候选下标 → 分数槽位"的反查表；未裁剪时槽位就是下标
+                let slot_of: Option<Vec<usize>> = active.as_ref().map(|slots| {
+                    let mut map = vec![usize::MAX; n_cand];
+                    for (slot, &candidate_index) in slots.iter().enumerate() {
+                        map[candidate_index] = slot;
+                    }
+                    map
+                });
+                let mut counts: Vec<u32> = vec![0; n_active * n_words];
                 let mut token_counts: Vec<u32> = vec![0; n_cand];
-                let mut exact: Vec<bool> = vec![false; n_cand];
+                let mut exact: Vec<bool> = vec![false; n_active];
                 let mut doc_freq: Vec<usize> = vec![0; n_words];
                 let mut total_tokens: usize = 0;
-                for (i, m) in candidates.iter().enumerate() {
+                // (1) 裁剪时先补齐**全量**文档长度（avgdl 的分母必须与全量同源）。
+                //     命中文本特征缓存时这是 O(1)；未命中才会分词——而全量路径本来
+                //     也要为每条候选分词一次，故不构成新的成本。
+                if pruned {
+                    for (i, m) in candidates.iter().enumerate() {
+                        if cancel
+                            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+                        {
+                            return Err(PersistenceError::Other("enrich_cancelled".to_string()));
+                        }
+                        let token_count = self.recall_document(m).token_count;
+                        total_tokens += token_count;
+                        token_counts[i] = token_count as u32;
+                    }
+                }
+                // (2) 内容统计只扫需要打分的候选（未裁剪时即全量）
+                let scan_len = n_active;
+                for slot in 0..scan_len {
                     if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
                         return Err(PersistenceError::Other("enrich_cancelled".to_string()));
                     }
+                    let candidate_index = active.as_ref().map_or(slot, |slots| slots[slot]);
+                    let m = candidates[candidate_index];
                     let document = self.recall_document(m);
-                    total_tokens += document.token_count;
-                    token_counts[i] = document.token_count as u32;
+                    if !pruned {
+                        total_tokens += document.token_count;
+                        token_counts[candidate_index] = document.token_count as u32;
+                    }
                     let content_lower = &document.normalized_content;
-                    exact[i] = content_lower.contains(&query_lower);
-                    let base = i * n_words;
+                    exact[slot] = content_lower.contains(&query_lower);
+                    let base = slot * n_words;
                     for (j, word) in count_words.iter().enumerate() {
                         // v0.5.5 修复二：词边界计数替代子串匹配
                         let c = count_word_occurrences(content_lower, word);
@@ -5442,6 +6759,9 @@ impl<P: Persistence> MemoryStore<P> {
                 }
 
                 // 计算 IDF（逆文档频率）: 稀有词获得更高权重
+                //
+                // S6：`doc_freq` 在裁剪集上统计，但因被裁候选的词频恒为 0，
+                // 其值**等于**全量统计；`n_docs` 保持全量口径（见上方注释）。
                 let n_docs = n_cand.max(1) as f32;
                 let idf: Vec<f32> = doc_freq
                     .iter()
@@ -5453,6 +6773,7 @@ impl<P: Persistence> MemoryStore<P> {
 
                 // v0.8.50 BM25 检索质量修复：候选集合平均文档长度（token 数），
                 // 供 BM25 饱和归一使用。复用第一遍统计的总 token 数（结果逐位相同）。
+                // S6：分母恒为**全量候选数**（avgdl 是语料统计，不是裁剪集统计）。
                 let avgdl: f32 = total_tokens as f32 / n_cand.max(1) as f32;
 
                 // 桥词权重（按词表槽位）：非扩展词为 1.0
@@ -5472,37 +6793,65 @@ impl<P: Persistence> MemoryStore<P> {
                     .unwrap_or(false)
                 {
                     eprintln!(
-                        "[LRC·计时] recall 预处理 候选={} 词数={} 合计={:.3}s",
+                        "[LRC·计时] recall 预处理 候选={} 评分候选={} 裁剪={} 词数={} 前置={:.3}s 合计={:.3}s",
                         n_cand,
+                        n_active,
+                        pruned as u8,
                         query_word_refs.len(),
+                        __t_prep.duration_since(recall_start).as_secs_f64(),
                         __t_prep.elapsed().as_secs_f64()
                     );
                 }
+                __pre_s = __t_prep.duration_since(recall_start).as_secs_f64();
+                __prep_s = __t_prep.elapsed().as_secs_f64();
 
                 // LRC 内置道体状态机·活性偏置：
                 // 将"近期活跃记忆"预构建为 id->激活强度 映射，供后续逐候选 O(1) 查询，
                 // 避免在 N×M 打分循环中反复构造活跃列表。
+                // ★ S6 实测根因（2026-11-02）：`state_bias_enabled()` 内部是
+                //   `std::env::var`（Windows 上每次要遍历整个环境块，实测约 30µs）。
+                //   它原先写在**逐候选**的分支条件里 ⇒ 20k 库上每轮检索白付
+                //   0.6~0.8s（占快路的 85%）。环境变量在进程生命周期内不变，
+                //   必须在循环外取值一次。
+                let state_bias_on = crate::engine::memory_state_machine::state_bias_enabled()
+                    && !filter.explore_pure;
+                let __t_am = std::time::Instant::now();
                 let active_map: std::collections::HashMap<String, f32> = self
                     .memory_state_machine
+                    .read()
+                    .unwrap()
                     .active_context(usize::MAX)
                     .into_iter()
                     .collect();
+                __am_s = __t_am.elapsed().as_secs_f64();
+                let __t_loop = std::time::Instant::now();
 
-                candidates
+                let scored_inner: Vec<(f32, &Memory)> = candidates
                     .iter()
                     .enumerate()
-                    .map(|(i, m)| {
+                    .map(|(candidate_index, m)| {
+                        let m = *m;
                         if cancel
                             .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
                         {
-                            return (0.0, *m);
+                            return (0.0, m);
                         }
                         // ★ 2026-10-30：正文扫描已在第一遍完成，这里只做算术。
-                        let base = i * n_words;
+                        // S6：未命中任何查询词的候选仍参与打分（元数据分/零命中填充），
+                        // 它们的词频恒为 0，故只需把槽位指向"无内容统计"。
+                        let content_slot = slot_of
+                            .as_ref()
+                            .map_or(candidate_index, |map| map[candidate_index]);
+                        let content_hit = content_slot != usize::MAX;
+                        let base = if content_hit {
+                            content_slot * n_words
+                        } else {
+                            0
+                        };
                         let mut score: f32 = 0.0;
 
                         // 完全匹配加分（精确匹配整句查询时额外加分）
-                        if exact[i] {
+                        if content_hit && exact[content_slot] {
                             score += 0.4;
                         }
                         // TF-IDF 词匹配加分（替代原 0.1/词的固定权重）
@@ -5513,15 +6862,23 @@ impl<P: Persistence> MemoryStore<P> {
                         // 对 CJK 文本基于 bigram 数量计算文档长度
                         // v0.5.5 修复二：使用 contains_word + count_word_occurrences
                         // 替代 contains + matches().count()，避免子串误匹配
-                        let doc_len = token_counts[i] as f32;
+                        let doc_len = token_counts[candidate_index] as f32;
                         // 原查询词重叠计数：>0 表示该记忆本就与查询直接相关，
                         // 此时扩展词不应加分（原查询主导，防发散稀释）。
-                        let original_overlap: usize = orig_slots
-                            .iter()
-                            .filter(|&&slot| counts[base + slot] > 0)
-                            .count();
+                        let original_overlap: usize = if content_hit {
+                            orig_slots
+                                .iter()
+                                .filter(|&&word_slot| counts[base + word_slot] > 0)
+                                .count()
+                        } else {
+                            0
+                        };
                         for (j, _word) in query_word_refs.iter().enumerate() {
-                            let tf = counts[base + j] as f32;
+                            let tf = if content_hit {
+                                counts[base + j] as f32
+                            } else {
+                                0.0
+                            };
                             if tf > 0.0 {
                                 // 联想桥扩展词的权重（0.20）；原查询词权重为 1.0。
                                 // 回归约束：仅当该记忆与原查询零重叠时才给扩展分——
@@ -5543,16 +6900,33 @@ impl<P: Persistence> MemoryStore<P> {
 
                         // 标签匹配加分（标签是用户主动标注的元数据，具有高信息量）
                         // v0.5.4 P1-9 修复：使用 query_word_refs 支持中文标签匹配
+                        //
+                        // ★ S6 实测根因（2026-11-02）：修前每次都 `tag.to_lowercase()`
+                        //   ⇒ 每条记忆的每个标签都要分配一个新 String。真实库实测
+                        //   标签均值 **77.7 个/条**（最大 5512），20k 候选 × 78 标签 ×
+                        //   4~6 个查询词 ≈ 780 万次分配，单轮检索白付 0.5~0.8s。
+                        //   这里只在标签**含大写字符**时才分配；否则直接借用原串。
+                        //   语义与 `tag.to_lowercase().contains(word)` 完全一致
+                        //   （中文不受小写化影响，只有 ASCII 大写需要改写）。
                         for tag in &m.tags {
+                            let lowered;
+                            let tag_text: &str = if tag.chars().any(char::is_uppercase) {
+                                lowered = tag.to_lowercase();
+                                lowered.as_str()
+                            } else {
+                                tag.as_str()
+                            };
                             for word in &query_word_refs {
-                                if tag.to_lowercase().contains(word) {
+                                if tag_text.contains(word) {
                                     score += 0.15;
                                 }
                             }
                         }
 
                         // 重要性加权（含衰减因子，使用可配置衰减曲线）
-                        score += m.decayed_importance_with_config(&self.decay_config) * 0.01;
+                        score += m
+                            .decayed_importance_with_config(&self.decay_config.read().unwrap())
+                            * 0.01;
 
                         // LRC 内置道体状态机·活性偏置：
                         // 仅当该记忆当前处于活跃状态（近期被召回）时，才依据其
@@ -5562,9 +6936,7 @@ impl<P: Persistence> MemoryStore<P> {
                         // 设 0 可精确回退到旧行为。
                         // v0.9.7：explore_pure（联想探索）模式下跳过，探索排序
                         // 不受"近期语境"牵引。
-                        if crate::engine::memory_state_machine::state_bias_enabled()
-                            && !filter.explore_pure
-                        {
+                        if state_bias_on {
                             let activation = active_map.get(&m.id).copied().unwrap_or(0.0);
                             if activation > 0.0 {
                                 // 活性偏置上限 0.25，避免盖过内容匹配主导地位。
@@ -5632,9 +7004,11 @@ impl<P: Persistence> MemoryStore<P> {
                             } // 坎
                         }
 
-                        (score, *m)
+                        (score, m)
                     })
-                    .collect()
+                    .collect();
+                __loop_s = __t_loop.elapsed().as_secs_f64();
+                scored_inner
             };
 
             // P1-9（2026-10-30）：生命周期衰减（**默认关闭**，`LRC_LIFECYCLE_DECAY=1` 启用）。
@@ -5642,99 +7016,121 @@ impl<P: Persistence> MemoryStore<P> {
             if crate::lifecycle::decay_enabled() {
                 let now = crate::lifecycle::now_ms();
                 for (score, memory) in scored.iter_mut() {
-                    *score *= self.lifecycle.decay_factor(&memory.id, now);
+                    *score *= self.lifecycle.read().unwrap().decay_factor(&memory.id, now);
                 }
             }
 
             // 按分数降序排序
+            let __t_sort = std::time::Instant::now();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let __sort_s = __t_sort.elapsed().as_secs_f64();
+            let __score_s =
+                __t_sort.duration_since(recall_start).as_secs_f64() - __pre_s - __prep_s - __sort_s;
+            let __t_post = std::time::Instant::now();
 
-            // LRC 内置道体状态机·道体再次校验（回归验证层）：
-            // 联想扩散把候选拉进 top_k 后，必须在输出前验证它是否真的回应了
-            // 原始查询——"发散之后能否收束回主题"，防止碰巧共享联想桥词的
-            // 噪声混入结果。判定信号：
-            //   1. 原查询词面命中（直接相关）
-            //   2. 联想桥强关联（≥2 个活跃记忆专属词命中 → 真联想边）
-            //   3. 标签共鸣（用户主动标注的语义证据）
-            // 三种证据皆无 → 判定为发散噪声，剔除。
-            // 仅当联想导航开启且存在联想桥词时执行；否则跳过（旧行为零影响）。
-            // v0.9.7：explore_pure（联想探索）模式下的处理分两级——
-            //   · 扩散跳（regression_query=Some）：必须校验，且锚定起点主题，
-            //     防止多跳扩散随父内容漂移；
-            //   · 根节点召回（regression_query=None）：不得在此词面预筛——
-            //     词面零重叠但语义强相关的候选（如"重要日子"↔"结婚纪念日"）
-            //     会在这里被提前剔除，根门禁的语义旁路就永远看不到它们。
-            //     起点是否实质共鸣交给 API 层根门禁（词面重叠 + 语义余弦）裁决。
+            // ══ 道体再次校验 + 生命周期过滤 + 内容去重：**一次有界遍历** ══
+            //
+            // ★ S6 实测根因（2026-11-02，20k 库）：修前这三步各自遍历**全部**候选，
+            // 其中"道体再次校验"要对每条正文做「原查询词 + 桥词(≤16)」次
+            // `contains_word`（≈20 次全串扫描 × 20k 条），实测 0.5~0.7s，
+            // 占快路总耗时的 **85%**——而 BM25 预处理（含 4~6 个查询词的全串计数）
+            // 只有 0.03~0.05s。即真正的瓶颈是"对全量候选做后置校验"，
+            // 不是"候选生成"。
+            //
+            // 为什么可以只做有界遍历：最终只需要 `top_k` 条，且这三个过滤都是
+            // **保序**的逐条判定 ⇒ "全量过滤后取前 top_k" 与 "边过滤边收满 top_k
+            // 即停"逐条一致。被丢弃候选的校验结果没有任何消费方
+            // （`regression_evidence` 只有被返回的记忆才被上游读取）。
+            //
+            // 判据（先写后做）：同参数同库下，返回的 id 序列与修前**逐条一致**；
+            // 20k 库 top_k=100 的快路耗时降到预处理量级（≤0.1s）。
             let skip_pure_recheck = filter.explore_pure && filter.regression_query.is_none();
-            if !expansion_boost.is_empty() || (filter.explore_pure && !skip_pure_recheck) {
-                let bridge_words: Vec<&str> =
-                    expansion_boost.iter().map(|(w, _)| w.as_str()).collect();
-                let mut rejected: usize = 0;
-                // 收集回归证据：memory_id → 证据标签（供联想链输出可观测）
-                let mut evidence: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
-                scored = scored
-                    .into_iter()
-                    .filter(|(_, m)| {
-                        use crate::engine::memory_state_machine::regression_recheck;
-                        let content_lower = self.recall_document(m).normalized_content;
-                        // 证据1：原查询词面命中数
-                        let original_overlap = original_query_refs
-                            .iter()
-                            .filter(|w| contains_word(&content_lower, w))
-                            .count();
-                        // 证据2：联想桥词命中数（活跃记忆专属词）
-                        let bridge_hits = bridge_words
-                            .iter()
-                            .filter(|w| contains_word(&content_lower, w))
-                            .count();
-                        // 证据3：标签与原查询词共鸣
-                        let tag_hits = m
-                            .tags
-                            .iter()
-                            .filter(|t| {
-                                original_query_refs
-                                    .iter()
-                                    .any(|w| t.to_lowercase().contains(w))
-                            })
-                            .count();
-                        let verdict =
-                            regression_recheck(original_overlap, bridge_hits, tag_hits, None, None);
-                        if verdict.keep {
-                            // 记录证据标签：联想桥强关联是联想导航的产物，
-                            // 标注它让调用方看到"这条记忆为何被联想回来"
-                            evidence.insert(m.id.clone(), verdict.evidence.to_string());
-                        } else {
-                            rejected += 1;
-                        }
-                        verdict.keep
-                    })
-                    .collect::<Vec<_>>();
-                if rejected > 0 {
-                    eprintln!(
-                        "[LRC-STATE] 道体再次校验剔除 {} 条发散噪声（联想桥拉回但无共鸣信号）",
-                        rejected
-                    );
-                }
-                // 校验证据随结果返回（仅保留 top_k 截取前的证据即可，
-                // 去重/截取不会改变记忆 id 集合）
-                regression_evidence = evidence;
-            }
-
-            // v0.5.4 P2-12 修复：按 content 哈希去重，保留匹配度最高的那条
-            // 在排序后、截取 top_k 前进行去重，确保结果中不会出现内容相同的记忆
-            // 使用规范化内容（trim + lowercase）作为去重键，捕获大小写/空白差异的重复
+            let do_recheck =
+                !expansion_boost.is_empty() || (filter.explore_pure && !skip_pure_recheck);
+            let bridge_words: Vec<&str> = expansion_boost.iter().map(|(w, _)| w.as_str()).collect();
+            let top_k = filter.top_k.min(scored.len());
+            let mut kept: Vec<(f32, &Memory)> = Vec::with_capacity(top_k);
             let mut seen_content: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            let top_k = filter.top_k.min(scored.len());
-            let scored: Vec<(f32, &Memory)> = scored
-                .into_iter()
-                .filter(|(_, m)| {
-                    let content_key = m.content.trim().to_lowercase();
-                    seen_content.insert(content_key)
-                })
-                .take(top_k)
-                .collect();
+            let mut rejected: usize = 0;
+            let mut evidence: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (score, m) in scored.into_iter() {
+                // S3.5：被抑制/被取代的记忆**不得出现**在结果里（此前只做分数衰减）
+                if !self.lifecycle_allows(&m.id) {
+                    continue;
+                }
+                if do_recheck {
+                    use crate::engine::memory_state_machine::regression_recheck;
+                    let content_lower = self.recall_document(m).normalized_content;
+                    // 证据1：原查询词面命中数
+                    let original_overlap = original_query_refs
+                        .iter()
+                        .filter(|w| contains_word(&content_lower, w))
+                        .count();
+                    // 证据2：联想桥词命中数（活跃记忆专属词）
+                    let bridge_hits = bridge_words
+                        .iter()
+                        .filter(|w| contains_word(&content_lower, w))
+                        .count();
+                    // 证据3：标签与原查询词共鸣
+                    let tag_hits = m
+                        .tags
+                        .iter()
+                        .filter(|t| {
+                            original_query_refs
+                                .iter()
+                                .any(|w| t.to_lowercase().contains(w))
+                        })
+                        .count();
+                    let verdict =
+                        regression_recheck(original_overlap, bridge_hits, tag_hits, None, None);
+                    if !verdict.keep {
+                        // 记录证据标签：联想桥强关联是联想导航的产物，
+                        // 标注它让调用方看到"这条记忆为何被联想回来"
+                        rejected += 1;
+                        continue;
+                    }
+                    evidence.insert(m.id.clone(), verdict.evidence.to_string());
+                }
+                // v0.5.4 P2-12 修复：按 content 去重，保留匹配度最高的那条。
+                // 使用规范化内容（trim + lowercase）作为去重键，捕获大小写/空白差异的重复。
+                if !seen_content.insert(m.content.trim().to_lowercase()) {
+                    continue;
+                }
+                kept.push((score, m));
+                if kept.len() >= top_k {
+                    break;
+                }
+            }
+            if rejected > 0 {
+                eprintln!(
+                    "[LRC-STATE] 道体再次校验剔除 {} 条发散噪声（联想桥拉回但无共鸣信号）",
+                    rejected
+                );
+            }
+            if do_recheck {
+                // 校验证据随结果返回（只需覆盖被返回的结果集）
+                regression_evidence = evidence;
+            }
+            scored = kept;
+            if std::env::var("LRC_TIMING")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+            {
+                eprintln!(
+                    "[LRC·计时] recall 后置 前置={:.3}s 评分={:.3}s (活跃表={:.3}s 循环={:.3}s) 排序={:.3}s 过滤={:.3}s 校验={} 输出={} 剔除={}",
+                    __pre_s,
+                    __score_s,
+                    __am_s,
+                    __loop_s,
+                    __sort_s,
+                    __t_post.elapsed().as_secs_f64(),
+                    do_recheck as u8,
+                    scored.len(),
+                    rejected
+                );
+            }
 
             if cancel.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
                 return Err(PersistenceError::Other("enrich_cancelled".to_string()));
@@ -5767,7 +7163,7 @@ impl<P: Persistence> MemoryStore<P> {
 
         // v0.6.0+ 参赛扩展：探索日志记录（recall 事件）
         let recall_result_count = memories.len();
-        self.exploration_logger.log_recall(
+        self.exploration_logger.read().unwrap().log_recall(
             query,
             recall_top_k,
             recall_result_count,
@@ -5776,10 +7172,11 @@ impl<P: Persistence> MemoryStore<P> {
 
         // LRC 内置道体状态机：激活本次召回的记忆、记录联想轨迹并持久化。
         // 与 deep 路径 (trapezoid_focus_recall) 保持一致。
-        self.bake_activation(&memories, &scores);
+        // ★ 2026-11-05：读路径只入队，由调用方在释放读锁后 flush。
+        self.queue_activation(&memories, &scores);
 
         // 生命周期：记录本次命中（只改内存，不触发整库重写）。
-        self.record_lifecycle_hits(&memories);
+        self.queue_lifecycle_hits(&memories);
 
         Ok(RecallResult {
             memories,
@@ -5789,59 +7186,136 @@ impl<P: Persistence> MemoryStore<P> {
         })
     }
 
-    /// 记录本次检索命中的记忆（**只改内存**，绝不写 `memories.json`）。
-    ///
-    /// 与既有纪律一致：检索热路径不同步落盘。命中信息在内存累积，由
-    /// [`Self::flush_lifecycle_if_due`] 按节流间隔合并到独立的 `lifecycle.json`。
-    fn record_lifecycle_hits(&mut self, memories: &[Memory]) {
-        // 默认关闭（`LRC_LIFECYCLE_HITS=1` 开启）：这是唯一落在检索热路径上的
-        // 新增逻辑，默认关闭可保证检索行为与改造前完全一致。
-        if !crate::lifecycle::hits_enabled() || memories.is_empty() {
-            return;
-        }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let mut changed = false;
-        for memory in memories {
-            if self.lifecycle.touch(&memory.id, now_ms) {
-                changed = true;
-            }
-        }
-        if changed {
-            self.lifecycle_dirty = true;
-        }
-    }
-
     /// 生命周期表只读视图（供检索降权与诊断使用）。
-    pub fn lifecycle(&self) -> &crate::lifecycle::LifecycleTable {
-        &self.lifecycle
+    pub fn lifecycle(&self) -> std::sync::RwLockReadGuard<'_, crate::lifecycle::LifecycleTable> {
+        self.lifecycle.read().unwrap()
     }
 
     /// 标记旧记忆被新记忆取代（`superseded`）。返回 `true` 表示状态确有变化。
-    pub fn mark_lifecycle_superseded(&mut self, old_id: &str, new_id: &str, now_ms: u64) -> bool {
-        let changed = self.lifecycle.mark_superseded(old_id, new_id, now_ms);
+    pub fn mark_lifecycle_superseded(&self, old_id: &str, new_id: &str, now_ms: u64) -> bool {
+        let changed = self
+            .lifecycle
+            .write()
+            .unwrap()
+            .mark_superseded(old_id, new_id, now_ms);
         if changed {
-            self.lifecycle_dirty = true;
+            self.lifecycle_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         changed
     }
 
     /// 标记一条记忆被抑制（`suppressed`）。
-    pub fn mark_lifecycle_suppressed(&mut self, memory_id: &str, now_ms: u64) -> bool {
-        let changed = self.lifecycle.mark_suppressed(memory_id, now_ms);
+    pub fn mark_lifecycle_suppressed(&self, memory_id: &str, now_ms: u64) -> bool {
+        let changed = self
+            .lifecycle
+            .write()
+            .unwrap()
+            .mark_suppressed(memory_id, now_ms);
         if changed {
-            self.lifecycle_dirty = true;
+            self.lifecycle_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         changed
     }
 
+    /// 按「遗忘指令」的目标文本抑制匹配的记忆（S3.5 后半，2026-11-03）。
+    ///
+    /// # 为什么需要
+    ///
+    /// 检索侧的硬过滤（[`Self::lifecycle_allows`]）只解决"标记了就不返回"，
+    /// 但此前**没有任何通路**把用户说的"请忘记 X"变成标记 ⇒ 旧记忆原样保留。
+    /// 本方法补上这条通路：写入路径识别出指令后，按目标文本找到旧记忆并抑制。
+    ///
+    /// # 语义
+    ///
+    /// * **抑制而非硬删**：抑制可逆（`clear_lifecycle`），且不触发整库重写；
+    /// * **匹配口径**：正文**包含**目标文本（大小写不敏感），不做语义推断；
+    /// * **作用域**：`user_id` 是隔离边界，必须**完全一致**（含"都为 None"）；
+    ///   `project` 只在指令带项目时收窄（记忆无项目视为同域）；
+    /// * **幂等**：已排除（抑制/取代）的记忆跳过，不重复计数。
+    ///
+    /// 返回本次**新增**抑制的条数。
+    pub fn suppress_matching_memories(
+        &self,
+        target: &str,
+        scope_user: Option<&str>,
+        scope_project: Option<&str>,
+        now_ms: u64,
+    ) -> usize {
+        let needle = target.trim().to_lowercase();
+        if needle.chars().count() < 2 {
+            return 0;
+        }
+        let all = match self.load_cached() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[LRC-S3.5] 遗忘指令：读取记忆失败，跳过抑制: {}", e);
+                return 0;
+            }
+        };
+        let mut matched: Vec<String> = Vec::new();
+        for m in all.iter() {
+            if !self.lifecycle_allows(&m.id) {
+                continue;
+            }
+            if m.user_id.as_deref() != scope_user {
+                continue;
+            }
+            if let Some(p) = scope_project {
+                if m.project.as_deref().is_some_and(|mp| mp != p) {
+                    continue;
+                }
+            }
+            if m.content.to_lowercase().contains(&needle) {
+                matched.push(m.id.clone());
+            }
+        }
+        let mut suppressed = 0usize;
+        for id in matched {
+            if self.mark_lifecycle_suppressed(&id, now_ms) {
+                suppressed += 1;
+            }
+        }
+        suppressed
+    }
+
+    /// 该记忆是否允许出现在检索结果中（S3.5，2026-11-01）。
+    ///
+    /// # 为什么需要（文本赛道 D3「删除/遗忘/抑制」仅 5.00 分）
+    ///
+    /// 根因在代码层：`Suppressed` / `Superseded` 此前**只参与分数衰减**
+    /// （`lifecycle.rs::decay_factor` 对抑制额外 ×0.5），**从不过滤结果**。
+    /// 于是"被抑制/被取代的记忆"仍会出现在 top_k 里，只是分数低一些——
+    /// 对"不得再出现"这类判据而言等于完全失效。
+    ///
+    /// # 语义（严格沿用 `LifecycleTable` 既有定义）
+    ///
+    /// * 无记录 ⇒ 视为 Active（不惩罚未知，与 `decay_factor` 一致）；
+    /// * `Active` ⇒ 保留；
+    /// * `Superseded` / `Suppressed` ⇒ 排除。
+    ///
+    /// 只读判定，不改状态；调用方在**去重与截取 top_k 之前**用它过滤，
+    /// 这样被排除的记忆不会占用名额。
+    fn lifecycle_allows(&self, memory_id: &str) -> bool {
+        match self
+            .lifecycle
+            .read()
+            .unwrap()
+            .get(memory_id)
+            .map(|e| e.state)
+        {
+            Some(crate::lifecycle::LifecycleState::Active) | None => true,
+            Some(_) => false,
+        }
+    }
+
     /// 清除一条记忆的寿命记录（恢复为 Active 且不再衰减）。
-    pub fn clear_lifecycle(&mut self, memory_id: &str) -> bool {
-        let changed = self.lifecycle.clear_entry(memory_id);
+    pub fn clear_lifecycle(&self, memory_id: &str) -> bool {
+        let changed = self.lifecycle.write().unwrap().clear_entry(memory_id);
         if changed {
-            self.lifecycle_dirty = true;
+            self.lifecycle_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         changed
     }
@@ -5849,24 +7323,35 @@ impl<P: Persistence> MemoryStore<P> {
     /// 按节流间隔把生命周期表落盘（`force=true` 时忽略间隔，用于退出/测试）。
     ///
     /// 返回 `true` 表示本次确实写了盘。
-    pub fn flush_lifecycle_if_due(&mut self, force: bool) -> Result<bool, PersistenceError> {
-        if !self.lifecycle_dirty {
+    pub fn flush_lifecycle_if_due(&self, force: bool) -> Result<bool, PersistenceError> {
+        if !self
+            .lifecycle_dirty
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Ok(false);
         }
         if !force
-            && self.lifecycle_flushed_at.elapsed().as_millis()
+            && self
+                .lifecycle_flushed_at
+                .lock()
+                .unwrap()
+                .elapsed()
+                .as_millis()
                 < crate::lifecycle::DEFAULT_HIT_FLUSH_INTERVAL_MS as u128
         {
             return Ok(false);
         }
-        self.persistence.save_lifecycle(&self.lifecycle)?;
-        self.lifecycle_dirty = false;
-        self.lifecycle_flushed_at = std::time::Instant::now();
+        self.persistence
+            .save_lifecycle(&self.lifecycle.read().unwrap())?;
+        self.lifecycle_dirty
+            .store(false, std::sync::atomic::Ordering::Release);
+        *self.lifecycle_flushed_at.lock().unwrap() = std::time::Instant::now();
         Ok(true)
     }
 
     /// 删除一条记忆
-    pub fn forget(&mut self, id: &str) -> Result<bool, PersistenceError> {
+    pub fn forget(&self, id: &str) -> Result<bool, PersistenceError> {
+        // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
         let old = self
             .load_cached()?
             .iter()
@@ -5877,7 +7362,12 @@ impl<P: Persistence> MemoryStore<P> {
             if let Some(old) = old.as_ref() {
                 self.remove_memory_from_index(old);
             }
-            self.mark_cache_dirty_preserving_index();
+            // ★ 2026-11-05（压测根因）：改为**增量**缓存删除。
+            //   修前 `mark_cache_dirty_preserving_index()` 会把缓存标脏 ⇒ 下一次
+            //   `load_cached()` 整库重解析；16 并发删除时每次删除都触发一次全库重载，
+            //   使删除 P50 撞满 6s 锁等待（151/268 失败）。
+            //   持久化侧本就是 O(1) 追加墓碑，此处把内存侧也对齐。
+            self.cache.remove(id, self.persistence.source_fingerprint());
             // ═══ ★清理该记忆在图上的边（2026-09-18 审查 G3 修复）═══
             //
             // **修的是什么**：图此前**只增不减**——`remove_edge` / `clear`
@@ -5892,7 +7382,7 @@ impl<P: Persistence> MemoryStore<P> {
             // **失败策略：显式告警但不阻断**（与 `expand_associations` 写图的
             // 静默策略一致——图是增强能力，删记忆这个主操作不该因图失败而失败）。
             // 但**不能静默**：残留边会持续占用遍历成本，用户需要知道。
-            if let Some(ref mut graph) = self.graph_store {
+            if let Some(ref mut graph) = *self.graph_store.write().unwrap() {
                 match graph.remove_edges_of_memory(id) {
                     Ok(n) if n > 0 => {
                         eprintln!("[LRC-GRAPH] 已随记忆删除清理 {} 条关联边（id={}）", n, id);
@@ -5919,17 +7409,18 @@ impl<P: Persistence> MemoryStore<P> {
     /// 不再使用 clear_memories + save_memories 两端点——避免 clear 成功、
     /// save 前崩溃导致磁盘全库丢失的间隙窗口（持久化评估 C05）。
     pub fn update_memory(
-        &mut self,
+        &self,
         id: &str,
         new_content: &str,
         new_importance: Option<Importance>,
     ) -> Result<Option<Memory>, PersistenceError> {
+        // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
         let all = self.load_cached()?;
         let mut found: Option<Memory> = None;
 
         let updated: Vec<Memory> = all
             .iter()
-            .cloned()
+            .map(|m| m.as_ref().clone())
             .map(|mut m| {
                 if m.id == id {
                     let old = m.clone();
@@ -5966,7 +7457,11 @@ impl<P: Persistence> MemoryStore<P> {
     ) -> Result<(Vec<Memory>, usize), PersistenceError> {
         // ★ v0.9.13（建议二）：过滤/排序需要可变所有权，显式克隆一次（与修前同价）；
         //   本接口是管理面，不在 enrich 热路径上。
-        let mut all: Vec<Memory> = (*self.load_cached()?).clone();
+        let mut all: Vec<Memory> = self
+            .load_cached()?
+            .iter()
+            .map(|m| m.as_ref().clone())
+            .collect();
         let privacy_ctx = filter.privacy_context.clone();
 
         // 过滤
@@ -6123,7 +7618,7 @@ impl<P: Persistence> MemoryStore<P> {
         let mut updated: Vec<Memory> = Vec::with_capacity(take);
 
         // v0.9.10：先对切片做分块批量编码（单次前向摊薄开销），再逐条投影与统计
-        let slice: Vec<&Memory> = all.iter().take(take).collect();
+        let slice: Vec<&Memory> = all.iter().take(take).map(|m| m.as_ref()).collect();
         let results = self.recompute_bagua_fields_batch(&slice);
         for (m, r) in slice.iter().zip(results) {
             let m: &Memory = m;
@@ -6246,7 +7741,10 @@ impl<P: Persistence> MemoryStore<P> {
 
         // v0.9.10：先对切片做分块批量编码（单次前向摊薄开销），再逐条投影与统计
         // ★ v0.9.13（建议二）：按排好的下标切片，不再需要整库可变副本
-        let slice: Vec<&Memory> = order[start..end].iter().map(|&i| &snapshot[i]).collect();
+        let slice: Vec<&Memory> = order[start..end]
+            .iter()
+            .map(|&i| snapshot[i].as_ref())
+            .collect();
         let results = self.recompute_bagua_fields_batch(&slice);
         for (m, r) in slice.iter().zip(results) {
             let m: &Memory = m;
@@ -6309,7 +7807,7 @@ impl<P: Persistence> MemoryStore<P> {
             .iter()
             .filter(|m| m.event_id.as_deref() == Some(event_id))
             .filter(|m| exclude_id != Some(m.id.as_str()))
-            .cloned()
+            .map(|m| m.as_ref().clone())
             .collect();
         hits.sort_by_key(|m| m.created_at);
         Ok(hits)
@@ -6351,7 +7849,7 @@ impl<P: Persistence> MemoryStore<P> {
                     .any(|e| e.name == name && kind.map(|k| e.kind == k).unwrap_or(true))
             })
             .filter(|m| exclude_id != Some(m.id.as_str()))
-            .cloned()
+            .map(|m| m.as_ref().clone())
             .collect();
         hits.sort_by_key(|m| std::cmp::Reverse(m.created_at));
         Ok(hits)
@@ -6369,7 +7867,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 同一条记忆内重复出现的同一实体只计 1 次（df 语义是"文档数"而非"出现次数"）。
     fn entity_df_map(
         &self,
-        all: &[Memory],
+        all: &[Arc<Memory>],
     ) -> std::collections::HashMap<((String, String), EntityKind), usize> {
         let mut df: std::collections::HashMap<((String, String), EntityKind), usize> =
             std::collections::HashMap::new();
@@ -6397,7 +7895,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// `df / 该项目记忆数 >= HUB_ENTITY_DF_RATIO` 即视为 hub。
     fn hub_entity_set(
         &self,
-        all: &[Memory],
+        all: &[Arc<Memory>],
     ) -> std::collections::HashMap<(String, EntityKind), (usize, usize)> {
         use std::collections::HashMap;
         // 各项目的记忆总数（分母）
@@ -6458,9 +7956,9 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 调用点需要同时持有三张表的引用；直接返回 `Ref<'_, AssocTables>` 会让
     /// 「借出期间再次取表」自锁。`Arc` 克隆是常数成本，且允许在持表期间继续写缓存。
-    fn assoc_tables(&self, all: &[Memory]) -> std::sync::Arc<AssocTables> {
+    fn assoc_tables(&self, all: &[Arc<Memory>]) -> std::sync::Arc<AssocTables> {
         let version = self.cache.data_version();
-        if let Some(cached) = self.assoc_tables_cache.borrow().as_ref() {
+        if let Some(cached) = self.assoc_tables_cache.lock().unwrap().as_ref() {
             if cached.version == version {
                 return std::sync::Arc::clone(cached);
             }
@@ -6503,7 +8001,7 @@ impl<P: Persistence> MemoryStore<P> {
                 artifact_tabs: self.artifact_tables(all),
             }
         });
-        *self.assoc_tables_cache.borrow_mut() = Some(std::sync::Arc::clone(&built));
+        *self.assoc_tables_cache.lock().unwrap() = Some(std::sync::Arc::clone(&built));
         built
     }
 
@@ -6512,9 +8010,9 @@ impl<P: Persistence> MemoryStore<P> {
     /// 与 [`build_artifact_tables`] 的区别仅在于"缓存由谁持有"：
     /// 抽取结果挂在 `MemoryStore::artifact_cache` 上，跨检索/跨写入存活，
     /// 只有正文真正变化的那几条会重新抽取。
-    fn artifact_tables(&self, all: &[Memory]) -> ArtifactTables {
+    fn artifact_tables(&self, all: &[Arc<Memory>]) -> ArtifactTables {
         let started = std::time::Instant::now();
-        let mut cache = self.artifact_cache.borrow_mut();
+        let mut cache = self.artifact_cache.lock().unwrap();
         let (tables, hits) = build_artifact_tables(all, &mut cache);
         if std::env::var("LRC_TIMING")
             .map(|v| v == "1")
@@ -6561,7 +8059,7 @@ impl<P: Persistence> MemoryStore<P> {
         // id → 记忆 的一次性索引（`associations_in` 内三处 id 查找原为 O(N)
         // 线性扫描，其中两处在循环体内 ⇒ 逐候选 × 库规模。详见其文档。）
         let by_id: std::collections::HashMap<&str, &Memory> =
-            all.iter().map(|m| (m.id.as_str(), m)).collect();
+            all.iter().map(|m| (m.id.as_str(), m.as_ref())).collect();
 
         Ok(Self::associations_in(&all, &by_id, memory_id, &tables))
     }
@@ -6589,8 +8087,10 @@ impl<P: Persistence> MemoryStore<P> {
             return Ok(all);
         }
         let memories = self.load_cached()?;
-        let by_id: std::collections::HashMap<&str, &Memory> =
-            memories.iter().map(|m| (m.id.as_str(), m)).collect();
+        let by_id: std::collections::HashMap<&str, &Memory> = memories
+            .iter()
+            .map(|m| (m.id.as_str(), m.as_ref()))
+            .collect();
         // anchor 不可见（或不存在）⇒ 空结果
         match by_id.get(memory_id) {
             Some(anchor) if is_visible(anchor, scope) => {}
@@ -6623,8 +8123,10 @@ impl<P: Persistence> MemoryStore<P> {
             return Ok(graph);
         }
         let memories = self.load_cached()?;
-        let by_id: std::collections::HashMap<&str, &Memory> =
-            memories.iter().map(|m| (m.id.as_str(), m)).collect();
+        let by_id: std::collections::HashMap<&str, &Memory> = memories
+            .iter()
+            .map(|m| (m.id.as_str(), m.as_ref()))
+            .collect();
         if !by_id
             .get(memory_id)
             .map(|m| is_visible(m, scope))
@@ -6691,7 +8193,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 它们确像"某次工作会话产出的结论"），故**不按类型限制**，
     /// 否则会把绝大多数真实候选排除在外。类型由调用方的 filter 决定。
     fn auto_event_map(
-        all: &[Memory],
+        all: &[Arc<Memory>],
     ) -> std::collections::HashMap<String, Vec<(String, i64, String)>> {
         use std::collections::HashMap;
         /// 自动事件 ID 前缀：与手填 `event_id` **显式区分**
@@ -6783,7 +8285,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 在**比较器内重算** `content_words`（见该处注释，单一改动即 9×）。
     /// 本改动**保留**是因为它是严格的复杂度改进，且在候选数增长时才会显形。
     fn associations_in(
-        all: &[Memory],
+        all: &[Arc<Memory>],
         by_id: &std::collections::HashMap<&str, &Memory>,
         memory_id: &str,
         tables: &AssocTables,
@@ -6878,16 +8380,14 @@ impl<P: Persistence> MemoryStore<P> {
             //   `by_id` 只是哈希表，取不到下标；这里用"指针在 `all` 数组内的偏移"
             //   还原下标（纯整数运算，不解引用、不越界），再升序排序
             //   ⇒ 产出顺序与原「按 `all` 顺序过滤」逐条一致。
-            let base = all.as_ptr() as usize;
-            let stride = std::mem::size_of::<Memory>();
+            // ★ 2026-11-05（读并发改造）：`all` 元素已由 `Memory` 改为 `Arc<Memory>`，
+            //   原"指针偏移 / size_of::<Memory>()"的下标还原失效（`by_id` 存的是
+            //   `&Memory`，指向 Arc 内部堆地址，不在 `all` 数组内）。
+            //   改用 id 线性查找还原下标：`source_ids` 通常 <10 条，O(N×k) 可接受。
             let mut idxs: Vec<usize> = anchor
                 .source_ids
                 .iter()
-                .filter_map(|sid| {
-                    by_id
-                        .get(sid.as_str())
-                        .map(|m| ((*m as *const Memory as usize).saturating_sub(base)) / stride)
-                })
+                .filter_map(|sid| all.iter().position(|m| m.id == *sid))
                 .collect();
             idxs.sort_unstable();
             for idx in idxs {
@@ -7299,14 +8799,13 @@ impl<P: Persistence> MemoryStore<P> {
     /// - `filter`：**复用检索的过滤条件**（隐私/项目/类型/标签/重要性）
     /// - `max_out`：补入上限（防大簇把输出撑爆）
     ///
-    /// # 为什么是 `&mut self`（v0.9.8 改）
+    /// # 为什么是 `&self`（v0.9.8 改，2026-11-05 读并发后确认）
     ///
-    /// 本方法现在会把产出的关系**写入图存储**（见函数尾部），故需可变借用。
-    /// 三个生产调用点均已持有 `&mut MemoryStore`（server 的 recall 在
-    /// `spawn_blocking` 内持锁、`run_association_explore` 形参即 `&mut`），
-    /// 故此次签名变更不引入新的锁竞争。
+    /// 本方法产出的记录层关系会**延后**写入图存储（见函数尾部），
+    /// 因此可在 `&self`（读锁）下执行；实际写图由
+    /// [`Self::flush_recall_side_effects`] 在写锁下统一应用。
     pub fn expand_associations(
-        &mut self,
+        &self,
         seed_ids: &[String],
         filter: &RecallFilter,
         max_out: usize,
@@ -7395,7 +8894,7 @@ impl<P: Persistence> MemoryStore<P> {
         let __tables = self.assoc_tables(&all);
         // 起点记忆索引（用于填 via_* 溯源字段，同时供 `associations_in` 做 O(1) id 查找）
         let by_id: std::collections::HashMap<&str, &Memory> =
-            all.iter().map(|m| (m.id.as_str(), m)).collect();
+            all.iter().map(|m| (m.id.as_str(), m.as_ref())).collect();
         let __a_tables = __a_t0.elapsed();
 
         // ★ 可见性判定：与检索路径**同一套规则**（复用谓词，非另写一份）
@@ -7573,7 +9072,8 @@ impl<P: Persistence> MemoryStore<P> {
             let __a_seeds = __a_s0.elapsed();
             let n = per_seed.len().max(1);
             eprintln!(
-                "[LRC·计时] expand_associations 候选种子={} 库={} 建表={:.3}s 逐种子={:.3}s（其中候选生成={:.3}s 分组排序={:.3}s；均 {:.4}s/种子） 合计={:.3}s",
+                "{} [LRC·计时] expand_associations 候选种子={} 库={} 建表={:.3}s 逐种子={:.3}s（其中候选生成={:.3}s 分组排序={:.3}s；均 {:.4}s/种子） 合计={:.3}s",
+                crate::obs::ts(),
                 per_seed.len(),
                 all.len(),
                 __a_tables.as_secs_f64(),
@@ -7788,7 +9288,7 @@ impl<P: Persistence> MemoryStore<P> {
         //    因为符号层边**本就不该**由本段写入（它有自己的写入口
         //    `/v1/memories/external-edge`）。
         // ② 显式跳过自指，并**说明为什么**——避免下一位读者以为漏了 `evolved_from`。
-        if let Some(ref mut graph) = self.graph_store {
+        if self.graph_store.read().unwrap().is_some() {
             let mut pending: Vec<(String, String, EdgeType, f32)> = Vec::with_capacity(out.len());
             for a in &out {
                 // ★只写记录层：符号层边已在图中（本段是从图里读出来的）
@@ -7818,7 +9318,18 @@ impl<P: Persistence> MemoryStore<P> {
                 ));
             }
             if !pending.is_empty() {
-                let _ = graph.add_edges_batch(&pending);
+                // ★v0.9.16：读路径**不再落盘**（只改内存 + 置脏），
+                //   磁盘交给后台 flush。此前这里走 `add_edges_batch`，
+                //   等于每次检索都在**全局存储锁内**重写 52MB 的图文件，
+                //   是把写入饿死的最大突发源（见 `graph_store.rs` 文首）。
+                //
+                // ★ 2026-11-05（P1）：进一步改为**延后副作用**——本方法因此可
+                //   在 `&self`（读锁）下执行，enrich 尾部不再需要写锁。
+                //   记录层边与同次检索读回的符号层边集合不相交，故不影响本次响应。
+                self.pending_recall_effects
+                    .lock()
+                    .unwrap()
+                    .push(RecallSideEffect::GraphEdges { pending });
             }
         }
 
@@ -7867,7 +9378,8 @@ impl<P: Persistence> MemoryStore<P> {
         //   **尾部**（纯记录层条目）等量让位。
         //   ⇒ 并入 0 条则让位 0 次（无收益必无损失）；有并入才让位（不空占席位）。
         let mut sym_merged: Vec<AssociatedMemory> = Vec::new();
-        if let Some(graph) = self.graph_store.as_ref() {
+        let graph_guard = self.graph_store.read().unwrap();
+        if let Some(graph) = graph_guard.as_ref() {
             // 只取种子节点**直接相邻**的边：多跳留给下次检索，
             // 避免一次检索把所有可达节点都拉进来（CP 成本 + 淹没主结果）。
             let seed_set: std::collections::HashSet<&str> =
@@ -8073,7 +9585,7 @@ impl<P: Persistence> MemoryStore<P> {
     ) -> Result<AssociationGraph, PersistenceError> {
         let all = self.load_cached()?;
         let by_id: std::collections::HashMap<&str, &Memory> =
-            all.iter().map(|m| (m.id.as_str(), m)).collect();
+            all.iter().map(|m| (m.id.as_str(), m.as_ref())).collect();
 
         let empty = |root: &str| AssociationGraph {
             root: root.to_string(),
@@ -8326,13 +9838,16 @@ impl<P: Persistence> MemoryStore<P> {
     /// 归档的记忆不会丢失，但不再参与检索、列表和统计。
     ///
     /// 返回归档的记忆数量，若无可归档记忆则返回 0。
-    pub fn archive_expired(&mut self) -> Result<usize, PersistenceError> {
+    pub fn archive_expired(&self) -> Result<usize, PersistenceError> {
+        // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
         let all = self.load_cached()?;
 
         // 筛选过期记忆与活跃记忆（★ v0.9.13 建议二：只克隆需要的条目归属，
         //   分卷集合本身必须拥有数据，与修前同样一次全库克隆）
-        let (expired, active): (Vec<Memory>, Vec<Memory>) =
-            all.iter().cloned().partition(|m| m.is_expired());
+        let (expired, active): (Vec<Memory>, Vec<Memory>) = all
+            .iter()
+            .map(|m| m.as_ref().clone())
+            .partition(|m| m.is_expired());
 
         if expired.is_empty() {
             return Ok(0);
@@ -8409,7 +9924,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 生成统一的诊断视图。解决质疑四"可解释性下降"问题。
     ///
     /// 返回结构化的 SystemHealthReport，可序列化为 JSON 通过 API 暴露。
-    pub fn health_report(&mut self) -> Result<SystemHealthReport, PersistenceError> {
+    pub fn health_report(&self) -> Result<SystemHealthReport, PersistenceError> {
         let all = self.load_cached()?;
         let _archived = self
             .persistence
@@ -8451,32 +9966,41 @@ impl<P: Persistence> MemoryStore<P> {
         );
 
         // 合成日志快照
-        let journal_snapshot = self.synthesis_journal.snapshot();
+        let journal_snapshot = self.synthesis_journal.read().unwrap().snapshot();
 
         // 调节器状态
-        let regulator_state = self.dao_regulator.get_state();
+        let regulator_state = self.dao_regulator.read().unwrap().get_state();
 
         // 低质量合成记忆数
-        let low_quality = self.synthesis_journal.get_low_quality_ids().len();
+        let low_quality = self
+            .synthesis_journal
+            .read()
+            .unwrap()
+            .get_low_quality_ids()
+            .len();
 
         // 垃圾回收器统计（质疑五：运维可观测性）
-        let gc_stats = self.memory_gc.get_stats();
+        let gc_stats = self.memory_gc.read().unwrap().get_stats();
 
         // 用户反馈统计（质疑五：运维可观测性）
-        let feedback_stats = self.user_feedback.get_stats();
+        let feedback_stats = self.user_feedback.read().unwrap().get_stats();
 
         // 复杂度预算（质疑五·终极：防止系统超出人类可理解范围）
         // 每次生成健康报告时更新复杂度预算，确保指标反映当前状态
-        self.complexity_budget.update(
+        let max_causal_depth = self
+            .complexity_budget
+            .read()
+            .unwrap()
+            .causal_chains
+            .iter()
+            .map(|c| c.depth)
+            .max()
+            .unwrap_or(5);
+        self.complexity_budget.write().unwrap().update(
             20, // 核心模块数（src/engine/*.rs + src/memory_store.rs + src/memory_types.rs）
             self.count_public_api_surface(),
             self.count_cross_module_dependencies(),
-            self.complexity_budget
-                .causal_chains
-                .iter()
-                .map(|c| c.depth)
-                .max()
-                .unwrap_or(5),
+            max_causal_depth,
         );
 
         // v0.9.1 三阶段锁解耦：健康检查是读关键路径，绝不再持锁执行合成。
@@ -8499,8 +10023,8 @@ impl<P: Persistence> MemoryStore<P> {
             bagua_distribution,
             gc_stats,
             feedback_stats,
-            self.complexity_budget.clone(),
-            &mut self.hint_escalation,
+            self.complexity_budget.read().unwrap().clone(),
+            &mut self.hint_escalation.write().unwrap(),
             // v0.5.5 P1-1：传入 LLM 配置状态，LLM 配置后编码器不再视为降级
             llm_configured,
         ))
@@ -8538,7 +10062,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// - `id`: 要拆解的合成记忆 ID
     /// - `min_activation`: 激活阈值（低于此值的九宫格位置不生成子记忆，默认 0.1）
     pub fn unfold_memory(
-        &mut self,
+        &self,
         id: &str,
         min_activation: f32,
     ) -> Result<Option<(Vec<Memory>, f32)>, PersistenceError> {
@@ -8617,17 +10141,18 @@ impl<P: Persistence> MemoryStore<P> {
     /// 创建新版本而非直接覆盖，保留修正历史。
     /// 返回修正后的记忆。
     pub fn correct_memory(
-        &mut self,
+        &self,
         id: &str,
         new_content: &str,
         reason: Option<&str>,
     ) -> Result<Option<Memory>, PersistenceError> {
+        // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
         let all = self.load_cached()?;
         let mut found: Option<Memory> = None;
 
         let updated: Vec<Memory> = all
             .iter()
-            .cloned()
+            .map(|m| m.as_ref().clone())
             .map(|mut m| {
                 if m.id == id {
                     // 使用版本追踪更新（自动保存历史版本）
@@ -8682,7 +10207,12 @@ impl<P: Persistence> MemoryStore<P> {
             .iter()
             .filter(|m| m.memory_type == MemoryType::Synthesis)
             .count();
-        let quarantined_count = self.synthesis_journal.get_low_quality_ids().len();
+        let quarantined_count = self
+            .synthesis_journal
+            .read()
+            .unwrap()
+            .get_low_quality_ids()
+            .len();
 
         // 计算合成比率
         let synthesis_ratio = if active > 0 {
@@ -8712,9 +10242,9 @@ impl<P: Persistence> MemoryStore<P> {
             avg_deviation,
             &bagua_counts,
         );
-        let journal_snapshot = self.synthesis_journal.snapshot();
-        let feedback_stats = self.user_feedback.stats();
-        let regulator_state = self.dao_regulator.get_state();
+        let journal_snapshot = self.synthesis_journal.read().unwrap().snapshot();
+        let feedback_stats = self.user_feedback.read().unwrap().stats();
+        let regulator_state = self.dao_regulator.read().unwrap().get_state();
 
         // 计算综合健康评分
         let bagua_health = (snapshot.bagua_entropy / 3.0).min(1.0);
@@ -8759,11 +10289,11 @@ impl<P: Persistence> MemoryStore<P> {
         };
 
         // 审计状态
-        let audit_chain_verification = self.audit_trail.verify_integrity();
+        let audit_chain_verification = self.audit_trail.read().unwrap().verify_integrity();
         let audit_chain_valid = audit_chain_verification.is_valid;
 
         // 灾难性事件
-        let catastrophic_events = self.dao_regulator.get_catastrophic_events();
+        let catastrophic_events = self.dao_regulator.read().unwrap().get_catastrophic_events();
         let catastrophic_event_count = catastrophic_events.len();
         let last_catastrophic_event = catastrophic_events.last().map(|e| e.diagnosis.clone());
 
@@ -8780,24 +10310,34 @@ impl<P: Persistence> MemoryStore<P> {
             is_drifting: regulator_state.is_drifting,
             is_frozen: regulator_state.is_frozen,
             coupling_score: regulator_state.coupling_score,
-            information_gain_threshold: self.dao_regulator.information_gain_threshold,
-            threshold_baseline: self.dao_regulator.threshold_baseline(),
-            threshold_ema: self.dao_regulator.threshold_ema(),
-            synthesis_min_cluster: self.synthesis_min_cluster,
+            information_gain_threshold: self
+                .dao_regulator
+                .read()
+                .unwrap()
+                .information_gain_threshold,
+            threshold_baseline: self.dao_regulator.read().unwrap().threshold_baseline(),
+            threshold_ema: self.dao_regulator.read().unwrap().threshold_ema(),
+            synthesis_min_cluster: self
+                .synthesis_min_cluster
+                .load(std::sync::atomic::Ordering::Acquire),
             synthesis_ratio,
             synthesis_rate_per_minute: journal_snapshot.synthesis_rate_per_minute,
             synthesis_count,
             quarantined_count,
             total_feedback: feedback_stats.total_feedback,
             positive_feedback_ratio: feedback_stats.positive_ratio,
-            implicit_feedback_enabled: self.user_feedback.is_implicit_feedback_enabled(),
-            consent_granted: self.user_feedback.is_consent_granted(),
-            total_audit_events: self.audit_trail.total_events(),
+            implicit_feedback_enabled: self
+                .user_feedback
+                .read()
+                .unwrap()
+                .is_implicit_feedback_enabled(),
+            consent_granted: self.user_feedback.read().unwrap().is_consent_granted(),
+            total_audit_events: self.audit_trail.read().unwrap().total_events(),
             audit_chain_valid,
-            audit_persistence_enabled: self.audit_trail.has_persistence(),
-            audit_seal_verified: self.audit_trail.seal_verified(),
+            audit_persistence_enabled: self.audit_trail.read().unwrap().has_persistence(),
+            audit_seal_verified: self.audit_trail.read().unwrap().seal_verified(),
             gc_pending: self.gc_pending.load(std::sync::atomic::Ordering::Relaxed),
-            gc_last_run_ms: self.memory_gc.last_run_ms(),
+            gc_last_run_ms: self.memory_gc.read().unwrap().last_run_ms(),
             synthesis_pending: self
                 .synthesis_pending
                 .load(std::sync::atomic::Ordering::Relaxed), // v0.5.4
@@ -8806,7 +10346,7 @@ impl<P: Persistence> MemoryStore<P> {
             total_memories: total,
             active_memories: active,
             expired_memories: expired,
-            decay_rate: self.decay_config.decay_rate,
+            decay_rate: self.decay_config.read().unwrap().decay_rate,
         }
     }
 }

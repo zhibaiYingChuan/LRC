@@ -348,7 +348,9 @@ struct MemoryBrief {
 pub struct AppState {
     /// FIX-006: manager 保持 Mutex（dyn IndexedCodebase 不满足 Sync，无法用 RwLock）
     pub manager: Arc<Mutex<Box<dyn IndexedCodebase>>>,
-    pub memory_store: Arc<Mutex<MemoryStore<JsonPersistence>>>,
+    /// 并发模型：`RwLock` 让多个读请求并行（改造前为 `Mutex`，读也串行）。
+    /// ArcSwap 实验因全库快照过大而劣化，已回退到本类型（详见 `v1_api::SharedStore`）。
+    pub memory_store: Arc<RwLock<MemoryStore<JsonPersistence>>>,
     pub src_dir: String,
     /// 记忆数据目录（供 /health 暴露给桌面端做身份校验）
     pub data_dir: String,
@@ -380,22 +382,6 @@ fn make_response(id: Option<serde_json::Value>, result: serde_json::Value) -> Js
         result: Some(result),
         error: None,
     }
-}
-
-/// v0.9.11（G4 / CR-11）：MCP 通道的**有界取锁**（与 v1 路径统一 `LOCK_WAIT` 口径）。
-///
-/// ## 为什么必须
-/// v1 API 路径早已统一为"2s 有界等待 + `store_busy` 快速失败"，而 MCP 路径此前一律用
-/// **无上限**的 `state.memory_store.lock().await` ⇒ 后台长任务持锁时，MCP 请求会在锁上
-/// **无限排队**（既不失败也不返回），与 v1 口径明显不一致。
-///
-/// 返回 `None` 表示等待超时 ⇒ 调用方应回 `store_busy` 错误（**不得**无限排队）。
-async fn lock_store_bounded<P: crate::persistence::Persistence>(
-    store: &Arc<Mutex<crate::memory_store::MemoryStore<P>>>,
-) -> Option<tokio::sync::MutexGuard<'_, crate::memory_store::MemoryStore<P>>> {
-    tokio::time::timeout(crate::timeouts::LOCK_WAIT, store.lock())
-        .await
-        .ok()
 }
 
 fn make_error(id: Option<serde_json::Value>, code: i32, message: &str) -> JsonRpcResponse {
@@ -584,8 +570,8 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                     },
                     "lrc_mode": {
                         "type": "string",
-                        "description": "检索模式: fast（关键词匹配，默认）| deep（深度语义检索）",
-                        "default": "fast"
+                        "description": "检索模式: 缺省=三路融合（关键词+深度+语义）| fast（仅关键词）| deep（仅深度语义）",
+                        "default": "fused"
                     },
                     "focus_depth": {
                         "type": "integer",
@@ -907,10 +893,11 @@ async fn handle_recall_enhanced(
     // 双路检索 + RRF 融合移入 spawn_blocking，避免持锁阻塞 Tokio worker；
     // 锁获取采用有界 try_lock 轮询（2 秒），锁被长期占用时快速返回忙态，
     // 不再让 async 上下文无限等待全局 Store 锁。
-    // RRF 权重不依赖锁，提前在闭包外计算。
-    let (fast_weight, deep_weight) = crate::engine::rrf::query_path_weights(query);
+    // RRF 权重在闭包内计算（需要先知道语义路是否可用，见 `fused_weights`）。
     let store_arc = state.memory_store.clone();
     let enrich_query = enriched_query.clone();
+    // 语义路用**原查询**（LLM 关键词富化只服务词面匹配，对稠密向量会稀释语义焦点）
+    let original_query = query.to_string();
     let mem_type = memory_type.clone();
     let proj = project.clone();
     let tag_list = tags.clone();
@@ -936,20 +923,8 @@ async fn handle_recall_enhanced(
     let retrieval_result = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         tokio::task::spawn_blocking(move || {
-            // 有界锁获取：轮询 try_lock，2 秒未获得则放弃
-            let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            let mut store = loop {
-                match store_arc.try_lock() {
-                    Ok(guard) => break guard,
-                    Err(_) if std::time::Instant::now() < lock_deadline => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(_) => {
-                        eprintln!("[recall_enhanced] 锁获取超时（2s），返回忙态");
-                        return None;
-                    }
-                }
-            };
+            // 阻塞线程内直接取读锁（spawn_blocking 中安全）
+            let store = store_arc.blocking_read();
 
             // 快速通路：关键词匹配，使用富化查询
             let fast_filter = RecallFilter {
@@ -969,9 +944,9 @@ async fn handle_recall_enhanced(
 
             // 深度通路：深度语义检索，使用富化查询
             let deep_filter = RecallFilter {
-                memory_type: mem_type,
-                project: proj,
-                tags: tag_list,
+                memory_type: mem_type.clone(),
+                project: proj.clone(),
+                tags: tag_list.clone(),
                 min_importance: None,
                 top_k: top_k * 2,
                 privacy_context: privacy_scope.clone(),
@@ -983,15 +958,50 @@ async fn handle_recall_enhanced(
                 .trapezoid_focus_recall(&enrich_query, &deep_filter, 1)
                 .unwrap_or(RecallResult::basic(vec![], vec![], 0));
 
+            // ═══ v0.9.17 第三路：语义稠密检索（bge 句向量，全库候选）═══
+            // 与 REST `/v1/memories/enrich` 同源同口径：只施加基础过滤，
+            // 对全库已索引向量排序；索引不可用时返回空结果并退回两路融合。
+            let semantic_filter = RecallFilter {
+                memory_type: mem_type,
+                project: proj,
+                tags: tag_list,
+                min_importance: None,
+                top_k: top_k.saturating_mul(4).max(top_k),
+                privacy_context: privacy_scope.clone(),
+                explore_pure: false,
+                regression_query: None,
+                read_only: false,
+            };
+            let semantic_result = store
+                .semantic_recall(&original_query, &semantic_filter, semantic_filter.top_k)
+                .unwrap_or(RecallResult::basic(vec![], vec![], 0));
+
             // 倒数排名融合 (RRF, Reciprocal Rank Fusion) — 使用共享 rrf_fuse
-            let fused = crate::engine::rrf::rrf_fuse_weighted(
-                &fast_result,
-                &deep_result,
-                top_k,
-                crate::engine::rrf::RRF_DEFAULT_K,
-                fast_weight,
-                deep_weight,
-            );
+            // 语义可用时深度路默认降为 0（冷启动兜底），见 `fused_weights`。
+            let semantic_available = !semantic_result.memories.is_empty();
+            let (fast_weight, deep_weight, semantic_weight) =
+                crate::engine::rrf::fused_weights(&enrich_query, semantic_available);
+            let fused = if semantic_result.memories.is_empty() {
+                crate::engine::rrf::rrf_fuse_weighted(
+                    &fast_result,
+                    &deep_result,
+                    top_k,
+                    crate::engine::rrf::RRF_DEFAULT_K,
+                    fast_weight,
+                    deep_weight,
+                )
+            } else {
+                crate::engine::rrf::rrf_fuse_three(
+                    &fast_result,
+                    &deep_result,
+                    &semantic_result,
+                    top_k,
+                    crate::engine::rrf::RRF_DEFAULT_K,
+                    fast_weight,
+                    deep_weight,
+                    semantic_weight,
+                )
+            };
 
             // ═══ 记录层联想补全（v0.9.8）═══
             // 与 handle_recall 同源同口径：复用 SearchData.expand_associations。
@@ -1000,6 +1010,8 @@ async fn handle_recall_enhanced(
             let associated = store
                 .expand_associations(&seed_ids, &filter_for_expand, ASSOCIATION_EXPAND_MAX)
                 .unwrap_or_default();
+            // ★ 2026-11-05：应用读路径累积的副作用（图边 / 状态机 / 生命周期）。
+            store.flush_recall_side_effects();
 
             Some((
                 fused.memories,
@@ -1954,7 +1966,7 @@ fn append_one_association(
 
 /// 处理 recall 工具调用 — 关键词匹配 / 深度语义检索
 ///
-/// 支持 lrc_mode: "fast"（关键词匹配，默认）或 "deep"（深度语义检索）
+/// 支持 lrc_mode: 缺省（三路融合）或 "fast"（仅关键词）/"deep"（仅深度语义）
 /// 若配置了 LLM API，自动将查询翻译为答案关键词以桥接语义鸿沟。
 /// v0.9.8 起，结果尾部追加「记录层联想」分区（见 [`append_associated_memories`]）。
 async fn handle_recall(
@@ -1972,11 +1984,17 @@ async fn handle_recall(
         .unwrap_or(5)
         .clamp(1, 100) as usize;
 
-    // 检索模式：fast（关键词匹配）或 deep（深度语义检索）
-    let lrc_mode = arguments
+    // 检索模式：fast（关键词匹配）或 deep（深度语义检索）。
+    //
+    // ★ v0.9.17：**未显式指定** `lrc_mode` 时改用三路融合（fast + deep + semantic），
+    // 与 REST `/v1/memories/enrich` 同源。显式传 `fast`/`deep` 仍保持单路语义
+    // （向后兼容，供对照实验与调用方精确控制）。
+    // `LRC_RECALL_MODE` 可在**未显式传参**时覆盖默认模式（A/B 对照用）。
+    let env_mode = std::env::var("LRC_RECALL_MODE").ok();
+    let lrc_mode_arg = arguments
         .get("lrc_mode")
         .and_then(|v| v.as_str())
-        .unwrap_or("fast");
+        .or(env_mode.as_deref());
     let focus_depth = arguments
         .get("focus_depth")
         .and_then(|v| v.as_u64())
@@ -2051,34 +2069,85 @@ async fn handle_recall(
         crate::engine::llm_translator::enrich_query_for_retrieval(&llm_config, query).await;
 
     // v0.9.11（G4 / CR-11）：有界取锁（此前无上限 ⇒ MCP 请求可无限排队）
-    let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
-        return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-    };
+    // ★ 2026-11-05（P1）：本 handler 末尾的 `expand_associations` 需 `&mut`（写图存储），
+    //   故取写锁；HTTP enrich 已改为"读锁检索 + 写锁联想"两段式。
+    let store = state.memory_store.write().await;
 
     // 根据 lrc_mode 选择检索方法（使用富化后的查询）
-    let result = if lrc_mode == "deep" {
-        // 导航信号在场时：多视图 deep 检索 + N 路 RRF（改变候选集，非重排）；
-        // 导航内部已含基线视图，返回 None（信号无有效方向）时回退单查询 deep。
-        match nav_signal {
-            Some(sig) => {
-                match crate::engine::navigation::navigated_deep_recall(
-                    // v0.9.11（G9 / CR-15）：泛型 `S: FocusRecall` 不做解引用强制，
-                    // 此处 `store` 是 MutexGuard，须显式解引用到 `MemoryStore`。
-                    &mut *store,
-                    &enriched_query,
-                    &filter,
-                    focus_depth,
-                    &sig,
-                ) {
-                    Some(rr) => Ok(rr),
-                    None => store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth),
+    let result = match lrc_mode_arg {
+        Some("deep") => {
+            // 导航信号在场时：多视图 deep 检索 + N 路 RRF（改变候选集，非重排）；
+            // 导航内部已含基线视图，返回 None（信号无有效方向）时回退单查询 deep。
+            match nav_signal {
+                Some(sig) => {
+                    match crate::engine::navigation::navigated_deep_recall(
+                        // v0.9.11（G9 / CR-15）：泛型 `S: FocusRecall` 不做解引用强制，
+                        // 此处 `store` 是 `RwLockReadGuard`，须显式解引用到 `MemoryStore`。
+                        &*store,
+                        &enriched_query,
+                        &filter,
+                        focus_depth,
+                        &sig,
+                    ) {
+                        Some(rr) => Ok(rr),
+                        None => store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth),
+                    }
                 }
+                None => store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth),
             }
-            None => store.trapezoid_focus_recall(&enriched_query, &filter, focus_depth),
         }
-    } else {
-        store.recall(&enriched_query, &filter)
+        Some("fast") => store.recall(&enriched_query, &filter),
+        _ => {
+            // 默认：三路融合（与 REST enrich 同源同口径）
+            // 快/深两路各取 2×top_k 候选，给 RRF 留出融合空间（与 enrich 一致）。
+            let mut fused_filter = filter.clone();
+            fused_filter.top_k = top_k.saturating_mul(2);
+            let fast_result = store
+                .recall(&enriched_query, &fused_filter)
+                .unwrap_or(RecallResult::basic(vec![], vec![], 0));
+            let deep_result = store
+                .trapezoid_focus_recall(&enriched_query, &fused_filter, focus_depth)
+                .unwrap_or(RecallResult::basic(vec![], vec![], 0));
+            // 语义路用**原查询**（LLM 关键词富化只服务词面匹配）
+            let semantic_result = store
+                .semantic_recall(query, &filter, top_k.saturating_mul(4).max(top_k))
+                .unwrap_or(RecallResult::basic(vec![], vec![], 0));
+            // 语义可用时深度路默认降为 0（冷启动兜底），见 `fused_weights`。
+            let semantic_available = !semantic_result.memories.is_empty();
+            let (fast_weight, deep_weight, semantic_weight) =
+                crate::engine::rrf::fused_weights(query, semantic_available);
+            let fused = if semantic_result.memories.is_empty() {
+                crate::engine::rrf::rrf_fuse_weighted(
+                    &fast_result,
+                    &deep_result,
+                    top_k,
+                    crate::engine::rrf::RRF_DEFAULT_K,
+                    fast_weight,
+                    deep_weight,
+                )
+            } else {
+                crate::engine::rrf::rrf_fuse_three(
+                    &fast_result,
+                    &deep_result,
+                    &semantic_result,
+                    top_k,
+                    crate::engine::rrf::RRF_DEFAULT_K,
+                    fast_weight,
+                    deep_weight,
+                    semantic_weight,
+                )
+            };
+            Ok(RecallResult::basic(
+                fused.memories,
+                fused.scores,
+                fused.total_candidates,
+            ))
+        }
     };
+
+    // ★ 2026-11-05（P1）：应用读路径累积的状态写回（导航路径走 `&self` 检索，
+    //   不会自动 flush；此处统一在写锁内应用，语义与改造前一致）。
+    store.flush_recall_side_effects();
 
     match result {
         Ok(result) => {
@@ -2086,10 +2155,10 @@ async fn handle_recall(
                 "记忆检索结果 (共 {} 条匹配，记忆库共 {} 条，模式: {})\n\n",
                 result.memories.len(),
                 result.total,
-                if lrc_mode == "deep" {
-                    "深度语义检索"
-                } else {
-                    "关键词匹配"
+                match lrc_mode_arg {
+                    Some("deep") => "深度语义检索",
+                    Some("fast") => "关键词匹配",
+                    _ => "三路融合（关键词+深度+语义）",
                 }
             );
 
@@ -2337,9 +2406,7 @@ async fn handle_batch_remember(
 
     let total = memories.len();
     // v0.9.11（G4 / CR-11）：有界取锁
-    let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
-        return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-    };
+    let store = state.memory_store.write().await;
     match store.remember_batch(memories) {
         Ok(saved) => {
             // 批量写入成功后，确保项目元信息存在（用于前端显示项目名而非指纹）
@@ -2453,9 +2520,7 @@ async fn handle_list_memories(
     };
 
     // v0.9.11（G4 / CR-11）：有界取锁（只读路径同样不得无限排队）
-    let Some(store) = lock_store_bounded(&state.memory_store).await else {
-        return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-    };
+    let store = state.memory_store.read().await;
     match store.list_memories(&filter) {
         Ok((memories, total)) => {
             let mut text = format!("记忆列表 (共 {} 条，本页 {} 条)\n\n", total, memories.len());
@@ -2637,9 +2702,7 @@ async fn handle_remember(
     let memory = input.into_memory();
 
     // v0.9.11（G4 / CR-11）：有界取锁
-    let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
-        return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-    };
+    let store = state.memory_store.write().await;
     match store.remember(memory) {
         Ok(saved) => {
             // 写入成功后，确保项目元信息存在（用于前端显示项目名而非指纹）
@@ -2724,9 +2787,7 @@ async fn handle_tools_call(
             };
 
             // v0.9.11（G4 / CR-11）：有界取锁
-            let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
-                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-            };
+            let store = state.memory_store.write().await;
             match store.forget(memory_id) {
                 Ok(true) => {
                     let text = format!("已删除记忆: {}", memory_id);
@@ -2767,9 +2828,7 @@ async fn handle_tools_call(
                 .map(|v| Importance::new(v as u8));
 
             // v0.9.11（G4 / CR-11）：有界取锁
-            let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
-                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-            };
+            let store = state.memory_store.write().await;
             match store.update_memory(memory_id, new_content, new_importance) {
                 Ok(Some(old)) => {
                     let text = format!(
@@ -2812,9 +2871,7 @@ async fn handle_tools_call(
             let relation_filter = arguments.get("relation").and_then(|v| v.as_str());
 
             // v0.9.11（G4 / CR-11）：有界取锁
-            let Some(store) = lock_store_bounded(&state.memory_store).await else {
-                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-            };
+            let store = state.memory_store.read().await;
             // v0.9.11（G3 / CR-03）：MCP 侧同样按参数构造可见性作用域
             //（此前后端直调未过滤版本 ⇒ 跨 user 泄漏 peer 内容预览）
             match store.associations_scoped(memory_id, &crate::privacy::scope_from_args(&arguments))
@@ -2901,9 +2958,7 @@ async fn handle_tools_call(
                 .clamp(2, 500);
 
             // v0.9.11（G4 / CR-11）：有界取锁
-            let Some(store) = lock_store_bounded(&state.memory_store).await else {
-                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-            };
+            let store = state.memory_store.read().await;
             // v0.9.11（G3 / CR-03）：MCP 侧带可见性过滤
             match store.association_graph_scoped(
                 memory_id,
@@ -2977,9 +3032,7 @@ async fn handle_tools_call(
 
         "memory_stats" => {
             // v0.9.11（G4 / CR-11）：有界取锁
-            let Some(store) = lock_store_bounded(&state.memory_store).await else {
-                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-            };
+            let store = state.memory_store.read().await;
             match store.stats() {
                 Ok(stats) => {
                     let mut text = String::from("记忆库统计\n\n");
@@ -3065,7 +3118,7 @@ async fn handle_tools_call(
                         // 优先显示可读名（命中映射表时），未命中时按原值显示
                         let display = project_map.get(proj).map(|s| s.as_str()).unwrap_or(proj);
                         // 若可读名与原值不同，附带显示原指纹（便于调试与跨 IDE 一致性校验）
-                        if display != proj.as_str() {
+                        if display != proj {
                             text.push_str(&format!("- `{} ({})`: {} 条\n", display, proj, count));
                         } else {
                             text.push_str(&format!("- `{}`: {} 条\n", display, count));
@@ -3085,9 +3138,7 @@ async fn handle_tools_call(
         }
         "archive" => {
             // v0.9.11（G4 / CR-11）：有界取锁
-            let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
-                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-            };
+            let store = state.memory_store.write().await;
             match store.archive_expired() {
                 Ok(count) => {
                     let text = if count > 0 {
@@ -3216,19 +3267,7 @@ async fn handle_tools_call(
 
         // === 系统健康监控 ===
         "system_health" => {
-            let store = match state.memory_store.try_lock() {
-                Ok(store) => store,
-                Err(_) => {
-                    return make_response(
-                        id,
-                        serde_json::json!({
-                            "status": "degraded",
-                            "lock_busy": true,
-                            "message": "记忆库正在后台更新，请稍后重试",
-                        }),
-                    );
-                }
-            };
+            let store = state.memory_store.read().await;
             match store.dao_metrics_snapshot() {
                 Ok(snapshot) => {
                     let mut text = String::from("═══════════════════════════════════\n");
@@ -3295,9 +3334,7 @@ async fn handle_tools_call(
             let reason = arguments.get("reason").and_then(|v| v.as_str());
 
             // v0.9.11（G4 / CR-11）：有界取锁（用户修正属写路径，同样不得无限排队）
-            let Some(mut store) = lock_store_bounded(&state.memory_store).await else {
-                return make_error(id, -32000, "记忆服务繁忙（store_busy），请稍后重试");
-            };
+            let store = state.memory_store.write().await;
             match store.correct_memory(memory_id, new_content, reason) {
                 Ok(Some(memory)) => {
                     let text = format!(
@@ -3398,12 +3435,17 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         (None, None)
     };
 
-    // 获取记忆库统计（try_read，获取不到返回 0）
-    // v0.8.21 P0-06：同时检测锁是否被持有，设置 lock_busy 标志
-    let (memory_total, memory_lock_busy) = match state.memory_store.try_lock() {
-        Ok(store) => (store.stats().map(|s| s.total_memories).unwrap_or(0), false),
-        Err(_) => (0, true), // 锁被长任务持有，返回 0 + lock_busy=true
-    };
+    // 获取记忆库统计（读锁）
+    let (memory_total, memory_lock_busy) = (
+        state
+            .memory_store
+            .read()
+            .await
+            .stats()
+            .map(|s| s.total_memories)
+            .unwrap_or(0),
+        false,
+    );
 
     lock_busy |= memory_lock_busy;
 
@@ -3831,7 +3873,7 @@ async fn config_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 /// 请求体: `{ "llm_api": "openai:sk-xxx:gpt-4o-mini" }`
 /// 保存到全局配置文件，并立即生效用于后续查询翻译。
 pub async fn update_llm_config(
-    memory_store: &Arc<Mutex<MemoryStore<JsonPersistence>>>,
+    memory_store: &Arc<RwLock<MemoryStore<JsonPersistence>>>,
     llm_api: &Arc<RwLock<LlmApiConfig>>,
     llm_configured_atomic: &Arc<AtomicBool>,
     body: serde_json::Value,
@@ -3874,13 +3916,7 @@ pub async fn update_llm_config(
         // （`update_llm_config` 的 2 处遗留点之一）。改为与 v1/MCP 同口径的**有界等待**；
         // 拿不到锁**不阻断"配置已生效"**——`set_llm_configured` 仅是缓存标志，
         // 下次配置读取会自收敛，故超时只记一行告警而非把成功结果改成失败。
-        match lock_store_bounded(memory_store).await {
-            Some(store) => store.set_llm_configured(false),
-            None => eprintln!(
-                "[配置] 清除 LLM 配置：等待记忆存储锁超时（{}s）—— 标志未即时同步，将在下次配置变更时收敛",
-                crate::timeouts::LOCK_WAIT.as_secs()
-            ),
-        }
+        memory_store.write().await.set_llm_configured(false);
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -3965,13 +4001,7 @@ pub async fn update_llm_config(
             }
             // v0.5.5：更新 MemoryStore 的 LLM 配置状态
             // v0.9.11（G4 / CR-11 收尾）：同上一处 —— 有界等待 + 超时不阻断"配置已生效"。
-            match lock_store_bounded(memory_store).await {
-                Some(store) => store.set_llm_configured(true),
-                None => eprintln!(
-                    "[配置] 保存 LLM 配置：等待记忆存储锁超时（{}s）—— 标志未即时同步，将在下次配置变更时收敛",
-                    crate::timeouts::LOCK_WAIT.as_secs()
-                ),
-            }
+            memory_store.write().await.set_llm_configured(true);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -5100,18 +5130,13 @@ async fn regulator_heartbeat_loop(state: Arc<AppState>) {
     loop {
         ticker.tick().await;
         let store = state.memory_store.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
-            let mut guard = match store.try_lock() {
-                Ok(g) => g,
-                Err(_) => return "locked", // 其他线程持锁（如后台合成），本轮跳过
-            };
-            match guard.regulate() {
+        let outcome =
+            tokio::task::spawn_blocking(move || match store.blocking_write().regulate() {
                 Some(_) => "regulated",
                 None => "no_action",
-            }
-        })
-        .await
-        .unwrap_or("panic");
+            })
+            .await
+            .unwrap_or("panic");
         // 心跳状态与审计已在 regulate() 内记录，此处仅输出调试日志
         if outcome != "no_action" {
             eprintln!("[LRC·心跳] 调节器本轮结果: {outcome}");
@@ -5126,8 +5151,9 @@ mod tests {
     use super::*;
     use crate::CodeMemoryManager;
 
-    /// v0.9.11（G4 / CR-11 收尾）源码级守卫：MCP/配置路径**不得**再出现无上限的
-    /// `memory_store.lock().await`（应走 `lock_store_bounded`，超时回 `store_busy`）。
+    /// v0.9.11（G4 / CR-11 收尾）源码级守卫：MCP/配置路径**不得**再出现
+    /// `memory_store.lock().await`（`Mutex` 时代写法；现为 `RwLock`，
+    /// 应走 `read().await` / `write().await`）。
     ///
     /// 鉴别力：把 `update_llm_config` 的两处改回 `memory_store.lock().await` ⇒ 本用例失败。
     #[test]
@@ -5150,8 +5176,8 @@ mod tests {
             .collect();
         assert!(
             offenders.is_empty(),
-            "MCP/配置路径不得使用无上限 `memory_store.lock().await`，须改用 \
-             `lock_store_bounded`（超时 ⇒ store_busy）；发现: {offenders:?}"
+            "MCP/配置路径不得使用 `memory_store.lock().await`（Mutex 时代写法），\
+             须改用 `read().await` / `write().await`；发现: {offenders:?}"
         );
     }
 
@@ -6008,7 +6034,7 @@ mod tests {
         let data_dir = tmp.path().to_string_lossy().to_string();
         let persistence =
             crate::persistence::create_json_persistence(&data_dir).expect("持久化创建失败");
-        let memory_store = Arc::new(Mutex::new(MemoryStore::new(persistence)));
+        let memory_store = Arc::new(RwLock::new(MemoryStore::new(persistence)));
 
         Arc::new(AppState {
             manager: Arc::new(Mutex::new(Box::new(manager))),
@@ -6771,9 +6797,12 @@ mod tests {
         );
         expired_memory.created_at = Utc::now() - Duration::days(2);
 
-        let mut store = state.memory_store.lock().await;
-        store.remember(expired_memory).expect("应成功写入过期记忆");
-        drop(store); // 释放锁
+        state
+            .memory_store
+            .write()
+            .await
+            .remember(expired_memory)
+            .expect("应成功写入过期记忆");
 
         let params = serde_json::json!({
             "name": "archive",
