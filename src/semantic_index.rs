@@ -778,11 +778,11 @@ fn chunk_text(content: &str) -> Vec<String> {
     windows.push(head);
     let mid_start = (chars.len() - CHUNK_CHARS) / 2;
     let mid: String = chars[mid_start..mid_start + CHUNK_CHARS].iter().collect();
-    if !windows.iter().any(|w| *w == mid) {
+    if !windows.contains(&mid) {
         windows.push(mid);
     }
     let tail: String = chars[chars.len() - CHUNK_CHARS..].iter().collect();
-    if !windows.iter().any(|w| *w == tail) {
+    if !windows.contains(&tail) {
         windows.push(tail);
     }
     windows

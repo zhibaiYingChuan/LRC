@@ -912,7 +912,7 @@ async fn try_run() -> LrcResult<()> {
     // 检索结果与向量完全不变，只是把"常驻成本"换成"空闲后首次使用的一次加载"。
     #[cfg(feature = "ml")]
     if ml_loaded {
-        let idle_encoder = memory_store.luoshu_encoder_handle();
+        let idle_encoder = memory_store.read().await.luoshu_encoder_handle();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;

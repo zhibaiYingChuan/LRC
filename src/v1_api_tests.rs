@@ -1484,7 +1484,7 @@ mod api_contracts_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir_str = dir.to_str().unwrap().to_string();
         // 显式加载 ML 编码器（默认构造恒为统计模式，不会加载模型）
-        let Some(mut store) = new_ml_capable_store(&dir_str) else {
+        let Some(store) = new_ml_capable_store(&dir_str) else {
             eprintln!("[语义旁路] ML 编码器不可用，本用例仅在 ml 环境执行");
             return;
         };
@@ -1501,7 +1501,7 @@ mod api_contracts_tests {
 
         let cancel = AtomicBool::new(false);
         let resp = run_association_explore(
-            &mut store,
+            &store,
             Some("我以前记过什么重要日子？"),
             None,
             2,
@@ -3699,8 +3699,7 @@ mod api_contracts_tests {
             for &query in &queries {
                 let cancel = StdAtomicBool::new(false);
                 let started = Instant::now();
-                let resp =
-                    run_association_explore(&mut store, Some(query), None, 4, 3, &cancel, None);
+                let resp = run_association_explore(&store, Some(query), None, 4, 3, &cancel, None);
                 fn_lat.push(started.elapsed().as_secs_f64());
                 // P8.2o：两臂各自独立建库（防跨查询状态串扰），记忆 UUID
                 // 必然不同，故以**起点内容**为对照口径而非 root 记忆 ID。
@@ -3733,7 +3732,7 @@ mod api_contracts_tests {
             return;
         };
         p82h_seed(&mut store_http);
-        let shared = Arc::new(store_http);
+        let shared = Arc::new(RwLock::new(store_http));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(IdleCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
