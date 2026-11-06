@@ -376,7 +376,7 @@ dependencies = [
 
 [[package]]
 name = "code-memory"
-version = "0.9.16"
+version = "0.10.0"
 dependencies = [
  "aes-gcm",
  "async-trait",

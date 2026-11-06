@@ -5505,14 +5505,20 @@ pub fn build_v1_router_with_trust(
                                 }
                                 .into_memory();
 
-                                match store.blocking_read().prepare_remember(memory) {
-                                    Ok(prep) => analyses.push(prep.analyze()),
+                                // ★ 必须先绑定 prep 再 analyze：若写成
+                                //   `match store.blocking_read().prepare_remember(..) { Ok(p) => p.analyze() }`，
+                                //   match 的临时读锁会活到整个 match 结束 ⇒ 昂贵的编码在**持读锁**时执行，
+                                //   正好破坏三阶段"编码在锁外"的设计。
+                                let prep = match store.blocking_read().prepare_remember(memory) {
+                                    Ok(prep) => prep,
                                     Err(e) => {
                                         eprintln!("[v1/context/migrate] 准备失败: {}", e);
                                         failed += 1;
                                         processed += 1;
+                                        continue;
                                     }
-                                }
+                                };
+                                analyses.push(prep.analyze());
                             }
 
                             // 阶段 2：**一次写锁**提交整块，把持锁时长压到一块的量级。
