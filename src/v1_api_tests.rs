@@ -6835,3 +6835,339 @@ mod api_contracts_tests {
         );
     }
 }
+
+// ============================================================
+// P1-1（2026-11-06）：上下文接管三接口的端到端契约
+//
+// 覆盖推进文档「六、新增 HTTP 接口」的三条：
+//   POST /v1/context/distill  — 提炼（不写库）
+//   POST /v1/context/migrate  — 批量写入（**幂等**）
+//   GET  /v1/context/index    — 归档索引
+//
+// 鉴别力说明：
+//   · `migrate_is_idempotent` 第二次写入必须 `merged=1` —— 若把合并路径改成
+//     "无条件新增"，该断言立刻失败（记忆库会随重复迁移膨胀）；
+//   · `distill_rejects_transcript_path_in_multitenant` 钉住"多租户域不得按路径读文件"
+//     这条安全边界 —— 去掉 trust_mode 判断即变成任意文件读取。
+// ============================================================
+#[cfg(test)]
+mod context_endpoints_tests {
+    use crate::v1_api::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{header, Request, StatusCode};
+    use std::sync::atomic::AtomicBool;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tower::ServiceExt;
+
+    /// 记录层用例专用代码库桩（本组端点不触碰代码库）。
+    struct NoopCodebase;
+
+    impl IndexedCodebase for NoopCodebase {
+        fn search(&self, query: &str, _top_k: usize) -> crate::RetrievalResult {
+            crate::RetrievalResult {
+                query: query.to_string(),
+                returned: 0,
+                total_indexed: 0,
+                results: Vec::new(),
+            }
+        }
+
+        fn multi_keyword_search(
+            &self,
+            _keywords: &[String],
+            _top_k: usize,
+        ) -> crate::RetrievalResult {
+            crate::RetrievalResult {
+                query: String::new(),
+                returned: 0,
+                total_indexed: 0,
+                results: Vec::new(),
+            }
+        }
+
+        fn get_stats(&self) -> crate::ChunkStats {
+            crate::ChunkStats {
+                file_count: 0,
+                total_chunks: 0,
+                type_counts: std::collections::HashMap::new(),
+                language_counts: std::collections::HashMap::new(),
+                avg_lines: 0.0,
+            }
+        }
+
+        fn recent_chunks(&self, _top_k: usize) -> crate::RetrievalResult {
+            crate::RetrievalResult {
+                query: String::new(),
+                returned: 0,
+                total_indexed: 0,
+                results: Vec::new(),
+            }
+        }
+    }
+
+    /// 统计模式（确定性）记忆库：ML 模型存在与否不影响本组用例的预期。
+    fn new_statistical_store(dir_str: &str) -> MemoryStore<JsonPersistence> {
+        #[cfg(feature = "ml")]
+        {
+            MemoryStore::new_with_encoder(
+                JsonPersistence::new(dir_str).unwrap(),
+                crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder::new_statistical(),
+            )
+        }
+        #[cfg(not(feature = "ml"))]
+        {
+            MemoryStore::new(JsonPersistence::new(dir_str).unwrap())
+        }
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_{tag}_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_app(dir: &str, trust: crate::privacy::TrustMode) -> axum::Router {
+        let shared = Arc::new(RwLock::new(new_statistical_store(dir)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        build_v1_router_with_trust(shared, manager, llm_api, llm_ready, false, trust)
+    }
+
+    async fn post_json(
+        app: axum::Router,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.into_service().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    async fn get_json(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.into_service().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// 提炼：给定对话原文，应产出结构化条目 + 索引行，且**不写库**。
+    #[tokio::test]
+    async fn distill_returns_items_and_index_line() {
+        let dir = temp_dir("ctx_distill");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/context/distill",
+            serde_json::json!({
+                "text": "我们决定用 pnpm 替代 npm。\n不要用 unwrap，禁止在请求路径上 panic。",
+                "project": "demo"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "提炼应成功：{body}");
+        assert_eq!(body["count"], 2, "应产出 2 条：{body}");
+        assert!(
+            body["index_line"].as_str().unwrap_or("").contains("2 条"),
+            "索引行应报告条数：{body}"
+        );
+        let items = body["items"].as_array().expect("items 应为数组");
+        assert_eq!(items[0]["memory_type"], "decision", "{body}");
+        assert_eq!(items[1]["memory_type"], "preference", "{body}");
+
+        // 提炼**不写库**：记忆数应仍为 0
+        let (_, stats) = get_json(app, "/memories/stats").await;
+        assert_eq!(
+            stats["total_memories"].as_u64().unwrap_or(0),
+            0,
+            "distill 不得写库：{stats}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 提炼：两个输入字段都缺 ⇒ 400，且错误码可判别。
+    #[tokio::test]
+    async fn distill_rejects_missing_input() {
+        let dir = temp_dir("ctx_distill_empty");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, body) = post_json(app, "/context/distill", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_input", "{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 安全边界：多租户域禁止按路径读文件（否则等于开放任意文件读取）。
+    #[tokio::test]
+    async fn distill_rejects_transcript_path_in_multitenant() {
+        let dir = temp_dir("ctx_distill_mt");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::MultiTenant);
+
+        let (status, body) = post_json(
+            app,
+            "/context/distill",
+            serde_json::json!({ "transcript_path": "Cargo.toml" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"], "transcript_path_forbidden", "{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 迁移**幂等**：同一批条目写两次，第二次必须走合并而非新增。
+    #[tokio::test]
+    async fn migrate_is_idempotent() {
+        let dir = temp_dir("ctx_migrate");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let payload = serde_json::json!({
+            "project": "demo",
+            "items": [{
+                "content": "[决策] 用 pnpm 替代 npm",
+                "memory_type": "decision",
+                "tags": ["decision", "distilled"],
+                "importance": 7,
+                "source_turns": [0, 0]
+            }]
+        });
+
+        let (status, first) = post_json(app.clone(), "/context/migrate", payload.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["written"], 1, "首次应写入 1 条：{first}");
+        assert_eq!(first["merged"], 0, "首次不应合并：{first}");
+
+        let (status2, second) = post_json(app.clone(), "/context/migrate", payload).await;
+        assert_eq!(status2, StatusCode::OK, "{second}");
+        assert_eq!(second["written"], 1, "重复迁移仍应成功：{second}");
+        assert_eq!(
+            second["merged"], 1,
+            "重复迁移必须走合并（否则记忆库随重复迁移膨胀）：{second}"
+        );
+
+        // 库内仍只有 1 条
+        let (_, stats) = get_json(app, "/memories/stats").await;
+        assert_eq!(
+            stats["total_memories"].as_u64().unwrap_or(0),
+            1,
+            "幂等迁移后库内应仍为 1 条：{stats}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 迁移条数上限：超过 200 条必须 400，而不是长时间占住写锁。
+    #[tokio::test]
+    async fn migrate_rejects_too_many_items() {
+        let dir = temp_dir("ctx_migrate_cap");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let items: Vec<serde_json::Value> = (0..201)
+            .map(|i| {
+                serde_json::json!({
+                    "content": format!("[决策] 第 {} 条", i),
+                    "memory_type": "decision",
+                    "tags": ["decision"],
+                    "importance": 5,
+                    "source_turns": [0, 0]
+                })
+            })
+            .collect();
+
+        let (status, body) = post_json(
+            app,
+            "/context/migrate",
+            serde_json::json!({ "project": "demo", "items": items }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "too_many_items", "{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 归档索引：只返回带 `archived` 标签的记忆。
+    #[tokio::test]
+    async fn index_lists_only_archived_memories() {
+        let dir = temp_dir("ctx_index");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        // 一条归档、一条普通
+        let (_, _) = post_json(
+            app.clone(),
+            "/context/migrate",
+            serde_json::json!({
+                "project": "demo",
+                "items": [
+                    {
+                        "content": "[归档] 前序对话已迁移",
+                        "memory_type": "code_context",
+                        "tags": ["archived", "pre-compact"],
+                        "importance": 4,
+                        "source_turns": [0, 0]
+                    },
+                    {
+                        "content": "[决策] 用 pnpm 替代 npm",
+                        "memory_type": "decision",
+                        "tags": ["decision"],
+                        "importance": 7,
+                        "source_turns": [1, 1]
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let (status, body) = get_json(app, "/context/index?project=demo&limit=10").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["count"], 1, "只应返回归档条目：{body}");
+        assert!(
+            body["index_line"].as_str().unwrap_or("").contains("1 条"),
+            "索引行应报告条数：{body}"
+        );
+        let items = body["items"].as_array().expect("items 应为数组");
+        assert!(
+            items[0]["content_preview"]
+                .as_str()
+                .unwrap_or("")
+                .contains("归档"),
+            "返回的应是归档条目：{body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

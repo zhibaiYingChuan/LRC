@@ -2154,6 +2154,19 @@ pub struct RememberAnalysisData {
     mem_tags: Vec<String>,
 }
 
+impl RememberAnalysis {
+    /// 本次写入是否会**合并**进已有记忆（相似度命中 `similar`）。
+    ///
+    /// 只读判定，不改变任何写入行为。供 `/v1/context/migrate` 统计 `merged` 用：
+    /// 迁移必须幂等，调用方需要区分"新增一条"与"合并进已有条目"。
+    pub fn is_merge(&self) -> bool {
+        match self {
+            RememberAnalysis::NoOp(_) => false,
+            RememberAnalysis::Ready(data) => data.similar.is_some(),
+        }
+    }
+}
+
 impl RememberPrep {
     /// 阶段 2：**锁外**执行编码与候选扫描（纯 CPU，不触碰存储）
     pub fn analyze(self) -> RememberAnalysis {

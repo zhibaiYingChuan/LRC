@@ -275,6 +275,11 @@ pub mod reclassify_job;
 #[path = "../core/lrc-algo/src/engine/mod.rs"]
 pub mod engine;
 
+// === Layer 1: 对话提炼规则引擎（Apache 2.0，P1-1） ===
+// 纯规则、零外部依赖、不写库：输入对话文本，输出待写入的结构化记忆。
+// 与 `memory_write::parse_forget_intent` 同属"规则式意图解析"范式。
+pub mod context_distill;
+
 // === Layer 1: MCP 服务层 (Apache 2.0) ===
 #[cfg(feature = "server")]
 pub mod server;

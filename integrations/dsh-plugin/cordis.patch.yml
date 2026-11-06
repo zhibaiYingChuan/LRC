@@ -1,0 +1,32 @@
+# 把本插件插入 DSH 的插件树。
+#
+# 安装后可用 `dsh --profile web --dump-config | grep dsh-plugin-lrc` 确认它真的进了树。
+- insert:
+    - id: dsh-plugin-lrc
+      name: dsh-plugin-lrc
+      # 端口纪律：3099 = 本地正式；开发联调改成 http://127.0.0.1:3111
+      baseUrl: http://127.0.0.1:3099
+      # 服务端设置了 LRC_API_TOKEN 时填这里；留空则不带 Authorization
+      token: ''
+      # 单次迁移最多条数
+      maxItems: 40
+
+# ────────────────────────────────────────────────────────────────
+# 可选：用 LRC 压缩后端替换官方 basic 后端
+#
+# 效果：每次 /compact 或自动压缩时，先把待压缩区间迁移进 LRC，再产出摘要。
+# 前提：本插件已安装（上面的 insert 生效）。
+#
+# 用法：把下面这段**追加**到 cordis.patch.yml 末尾，并删掉 profile 里原有的
+#       `@deepseek-ai/dsh-compaction-basic` 那一行（同一 context 只能有一个
+#       `ctx.compaction` 实现，两个都挂会冲突）。
+#
+# LRC 参数走环境变量：LRC_BASE / LRC_TOKEN / LRC_PROJECT / LRC_MAX_ITEMS
+# ────────────────────────────────────────────────────────────────
+# - insert:
+#     - id: dsh-plugin-lrc-compaction
+#       name: dsh-plugin-lrc/src/compaction-backend.ts
+#       # 以下字段与官方 basic 后端同名同义，按需覆盖
+#       auto: true
+#       thresholdRatio: 0.8
+#       retainRatio: 0.2

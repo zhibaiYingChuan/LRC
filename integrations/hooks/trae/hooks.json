@@ -1,0 +1,12 @@
+{
+  "$schema_note": "Trae hooks 配置模板（P0-2）。Trae 各版本对 hooks.json 的支持不一致，安装前先看 README 的『适用版本』。",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "type": "command",
+        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"%USERPROFILE%\\.trae\\hooks\\lrc-user-prompt-submit.ps1\"",
+        "timeout": 10
+      }
+    ]
+  }
+}

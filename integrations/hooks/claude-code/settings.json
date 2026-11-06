@@ -1,0 +1,38 @@
+{
+  "$schema_note": "Claude Code hooks 配置模板（P0-2）。合并到 ~/.claude/settings.json 的 hooks 字段，不要整体覆盖。",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/lrc-session-start.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/lrc-pre-compact.sh",
+            "timeout": 60
+          }
+        ]
+      },
+      {
+        "matcher": "manual",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/lrc-pre-compact.sh",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

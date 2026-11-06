@@ -1775,6 +1775,82 @@ pub struct ForgetRequest {
     pub memory_id: String,
 }
 
+// ════════════════════════════════════════════════════════════════════
+// P1-1（2026-11-06）：上下文接管三接口的请求体
+// ════════════════════════════════════════════════════════════════════
+
+/// `POST /v1/context/migrate` 单次最多接受的条数。
+///
+/// 每条都要走一次"读锁准备 + 写锁提交"，不设上限时一个超大请求会长时间占住写锁。
+/// 200 与 MCP `batch_remember` 的上限保持一致。
+const CONTEXT_MIGRATE_MAX_ITEMS: usize = 200;
+
+/// `POST /v1/context/distill` 请求体。
+///
+/// `text` 与 `transcript_path` 二选一：
+/// - `text`：直接给对话原文（多租户域**只能**用这个）；
+/// - `transcript_path`：给 Claude Code 的 JSONL 路径，由服务端读取。
+///   仅本地可信域允许 —— 否则等于开放任意文件读取。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextDistillRequest {
+    /// 对话原文（与 `transcript_path` 二选一）
+    #[serde(default)]
+    pub text: Option<String>,
+    /// transcript 文件路径（仅本地可信域）
+    #[serde(default)]
+    pub transcript_path: Option<String>,
+    /// 单次最多产出条数（默认 40）
+    #[serde(default)]
+    pub max_items: Option<usize>,
+    /// 归属项目（用于生成索引行）
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// `POST /v1/context/migrate` 请求体。
+///
+/// `items` 直接复用 `/v1/context/distill` 的响应数组，便于 Hook 管道直传。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextMigrateRequest {
+    /// 待写入的提炼结果
+    #[serde(default)]
+    pub items: Vec<crate::context_distill::DistilledItem>,
+    /// 归属项目（缺省不归属）
+    #[serde(default)]
+    pub project: Option<String>,
+}
+
+/// `GET /v1/context/index` 查询参数。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextIndexParams {
+    /// 归属项目
+    #[serde(default)]
+    pub project: Option<String>,
+    /// 返回条数（默认 20，上限 50）
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// 读取 transcript 文件，带大小上限。
+///
+/// **为什么必须有上限**：`transcript_path` 由调用方给出，不设上限时一个
+/// 指向大文件的路径就能把服务端内存打满。8 MB 足够覆盖一次长会话的 JSONL。
+fn read_transcript_file(path: &str) -> Result<String, String> {
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    let meta = std::fs::metadata(path).map_err(|e| format!("无法读取文件元信息: {}", e))?;
+    if !meta.is_file() {
+        return Err("transcript_path 不是普通文件".to_string());
+    }
+    if meta.len() > MAX_BYTES {
+        return Err(format!(
+            "transcript 超过 {} MB 上限（实际 {} 字节）",
+            MAX_BYTES / 1024 / 1024,
+            meta.len()
+        ));
+    }
+    std::fs::read_to_string(path).map_err(|e| format!("读取失败: {}", e))
+}
+
 /// /v1/memories/lifecycle 请求体。
 ///
 /// **边界约定**：判定归调用方，LRC 只负责执行与持久化。这里刻意不做
@@ -2119,6 +2195,8 @@ pub fn build_v1_router_with_trust(
     let discovery_store = store.clone();
     // v0.9.10 塔缩修复·第 2 层：洛书八卦历史重分类（用当前编码器重算存量记忆）
     let reclassify_store = store.clone();
+    // P1-1（2026-11-06）：上下文接管三接口（distill / migrate / index）
+    let context_store = store.clone();
 
     // P0-1: 编码器创建一次，所有请求复用（避免每次请求都加载 ML 模型）
     let encode_encoder = std::sync::Arc::new(HybridLuoShuEncoder::default());
@@ -5253,6 +5331,267 @@ pub fn build_v1_router_with_trust(
                                 })),
                             ))
                         }
+                    }
+                }
+            }
+        }))
+        // ════════════════════════════════════════════════════════════
+        // P1-1（2026-11-06）：上下文接管三接口
+        // ════════════════════════════════════════════════════════════
+        //
+        // POST /v1/context/distill — 从对话文本提炼结构化记忆（**不写库**）
+        .route("/context/distill", post({
+            move |Json(req): Json<ContextDistillRequest>| {
+                async move {
+                    let project = req.project.unwrap_or_else(|| "全局".to_string());
+                    let max_items = req.max_items.unwrap_or(40).clamp(1, 200);
+
+                    // ① 取文本：text 优先；transcript_path 仅本地可信域可用。
+                    //    多租户域放开路径读取 = 开放任意文件读取，故直接拒绝。
+                    let text = match (req.text, req.transcript_path) {
+                        (Some(t), _) => t,
+                        (None, Some(path)) => {
+                            if trust_mode != crate::privacy::TrustMode::LocalTrusted {
+                                return Err((
+                                    StatusCode::FORBIDDEN,
+                                    Json(serde_json::json!({
+                                        "error": "transcript_path_forbidden",
+                                        "message": "多租户域禁止按路径读取文件，请改用 text 字段"
+                                    })),
+                                ));
+                            }
+                            match tokio::task::spawn_blocking(move || read_transcript_file(&path))
+                                .await
+                            {
+                                Ok(Ok(t)) => t,
+                                Ok(Err(msg)) => {
+                                    return Err((
+                                        StatusCode::BAD_REQUEST,
+                                        Json(serde_json::json!({
+                                            "error": "transcript_unreadable",
+                                            "message": msg
+                                        })),
+                                    ))
+                                }
+                                Err(e) => {
+                                    return Err((
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        Json(serde_json::json!({
+                                            "error": "distill_failed",
+                                            "message": format!("读取任务异常终止: {}", e)
+                                        })),
+                                    ))
+                                }
+                            }
+                        }
+                        (None, None) => {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_input",
+                                    "message": "text 与 transcript_path 至少提供一个"
+                                })),
+                            ))
+                        }
+                    };
+
+                    // ② 提炼：纯 CPU，放阻塞线程池，避免占死 HTTP worker。
+                    let config = crate::context_distill::DistillConfig {
+                        max_items,
+                        ..Default::default()
+                    };
+                    let items = tokio::task::spawn_blocking(move || {
+                        crate::context_distill::distill_transcript(&text, &config)
+                    })
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "distill_failed",
+                                "message": format!("提炼任务异常终止: {}", e)
+                            })),
+                        )
+                    })?;
+
+                    let count = items.len();
+                    let index_line = crate::context_distill::build_index_line(&items, &project);
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                        "items": items,
+                        "count": count,
+                        "index_line": index_line,
+                    })))
+                }
+            }
+        }))
+        // POST /v1/context/migrate — 批量写入（**幂等**：同内容走相似合并）
+        .route("/context/migrate", post({
+            let store = context_store.clone();
+            move |Json(req): Json<ContextMigrateRequest>| {
+                let store = store.clone();
+                async move {
+                    if req.items.is_empty() {
+                        return Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                            serde_json::json!({"written": 0, "merged": 0, "failed": 0}),
+                        ));
+                    }
+                    // 单次迁移条数上限：每条都要走一次"读锁准备 + 写锁提交"，
+                    // 不设上限时一个超大请求会长时间占住写锁，拖垮其他请求。
+                    // 200 与 MCP `batch_remember` 的上限一致。
+                    if req.items.len() > CONTEXT_MIGRATE_MAX_ITEMS {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "too_many_items",
+                                "message": format!(
+                                    "单次迁移最多 {} 条，实际 {} 条；请分批提交",
+                                    CONTEXT_MIGRATE_MAX_ITEMS,
+                                    req.items.len()
+                                )
+                            })),
+                        ));
+                    }
+                    let project = req.project;
+                    let items = req.items;
+
+                    // 逐条走既有 remember 三阶段路径（prepare → analyze → commit），
+                    // 不新增存储层；相似度命中即合并，因此重复迁移不会膨胀记忆库。
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let mut written = 0usize;
+                        let mut merged = 0usize;
+                        let mut failed = 0usize;
+                        for item in items {
+                            let memory = crate::memory_write::MemoryWriteInput {
+                                content: item.content,
+                                memory_type: MemoryType::try_parse(&item.memory_type),
+                                importance: Some(Importance::new(item.importance)),
+                                ttl_days: None,
+                                project: project.clone(),
+                                tags: item.tags,
+                                privacy_level: None,
+                                session_id: None,
+                                user_id: None,
+                                event_id: None,
+                                entities: Vec::new(),
+                                source_timestamp: None,
+                                daoti_preview_gua: None,
+                                daoti_preview_bagua: None,
+                                daoti_preview_version: None,
+                            }
+                            .into_memory();
+
+                            let prep = match store.blocking_read().prepare_remember(memory) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    eprintln!("[v1/context/migrate] 准备失败: {}", e);
+                                    failed += 1;
+                                    continue;
+                                }
+                            };
+                            let analysis = prep.analyze();
+                            let is_merge = analysis.is_merge();
+                            let guard = store.blocking_write();
+                            match guard.commit_remember(analysis) {
+                                Ok(_) => {
+                                    written += 1;
+                                    if is_merge {
+                                        merged += 1;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[v1/context/migrate] 提交失败: {}", e);
+                                    failed += 1;
+                                }
+                            }
+                        }
+                        (written, merged, failed)
+                    })
+                    .await;
+
+                    match outcome {
+                        Ok((written, merged, failed)) => {
+                            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                                serde_json::json!({
+                                    "written": written,
+                                    "merged": merged,
+                                    "failed": failed,
+                                }),
+                            ))
+                        }
+                        Err(e) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "migrate_failed",
+                                "message": format!("迁移任务异常终止: {}", e)
+                            })),
+                        )),
+                    }
+                }
+            }
+        }))
+        // GET /v1/context/index — 取归档索引（`tags` 含 `archived` 的最近记忆）
+        .route("/context/index", get({
+            let store = context_store.clone();
+            move |Query(params): Query<ContextIndexParams>| {
+                let store = store.clone();
+                async move {
+                    let limit = params.limit.unwrap_or(20).clamp(1, 50);
+                    let project = params.project;
+                    let store = store.read().await;
+                    let filter = crate::memory_store::ListFilter {
+                        project: project.clone(),
+                        tags: vec!["archived".to_string()],
+                        sort_by: crate::memory_store::SortBy::CreatedAt,
+                        order: crate::memory_store::SortOrder::Desc,
+                        limit,
+                        offset: 0,
+                        ..Default::default()
+                    };
+
+                    match store.list_memories(&filter) {
+                        Ok((memories, total)) => {
+                            let previews: Vec<serde_json::Value> = memories
+                                .iter()
+                                .map(|m| {
+                                    let preview = if m.content.chars().count() > 100 {
+                                        let truncated: String =
+                                            m.content.chars().take(100).collect();
+                                        format!("{}...", truncated)
+                                    } else {
+                                        m.content.clone()
+                                    };
+                                    serde_json::json!({
+                                        "id": m.id,
+                                        "content_preview": preview,
+                                        "memory_type": m.memory_type.as_str(),
+                                        "created_at_ms": m.created_at.timestamp_millis(),
+                                    })
+                                })
+                                .collect();
+
+                            let project_label = project.as_deref().unwrap_or("全局");
+                            let index_line = if memories.is_empty() {
+                                format!("LRC 归档区暂无记录（项目：{}）", project_label)
+                            } else {
+                                format!("LRC 归档区 {} 条（项目：{}）", total, project_label)
+                            };
+
+                            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                                serde_json::json!({
+                                    "index_line": index_line,
+                                    "count": memories.len(),
+                                    "total": total,
+                                    "items": previews,
+                                }),
+                            ))
+                        }
+                        Err(e) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "index_failed",
+                                "message": format!("归档索引获取失败: {}", e)
+                            })),
+                        )),
                     }
                 }
             }

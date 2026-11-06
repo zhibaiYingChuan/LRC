@@ -10,6 +10,12 @@
 > - **开发 / 测试环境：3111**（隔离数据目录，禁止连 3099）
 > - 本方案所有开发、联调、Hook 实测**一律使用 3111**；只有最终交付给用户的模板才写 3099。
 > - 违反后果：测试写入会污染真实记忆库，且 Hook 可能把测试数据迁移进生产库。
+>
+> ⚠ **实测踩到的坑（2026-11-06）**：用 `--port 3111` 启动开发实例时，
+> 服务端会把 `default_port: 3111` **写进全局配置**
+> `%APPDATA%\LoongRecall\config.json`。桌面端下次启动就会跟着用 3111。
+> 因此**每次开发实例跑完必须把该文件改回 3099**，否则用户的生产实例会"消失"。
+> 这不是本方案的代码问题，是既有启动逻辑的副作用，但会直接破坏端口纪律。
 
 ---
 
@@ -157,56 +163,81 @@ fn context_instructions() -> String {
 
 ### P0-2 · 各宿主 Hook 配置模板
 
-**落点**：新建 `integrations/hooks/` 目录
+**状态**：✅ 已完成（2026-11-06）
+
+**落点**：新建 `integrations/` 目录
 
 ```
 integrations/
+├── README.md                      # 总览：端口纪律、通用环境变量、安装顺序、降级说明
 ├── hooks/
 │   ├── claude-code/
-│   │   ├── settings.json          # PreCompact + SessionStart 配置
-│   │   ├── pre-compact.sh         # 80% 触发时调用 /v1/context/migrate
-│   │   └── session-start.sh       # 会话启动注入索引
+│   │   ├── README.md              # 装哪、改哪个变量、如何验证、降级路径
+│   │   ├── settings.json          # SessionStart + PreCompact（auto/manual）
+│   │   ├── pre-compact.sh         # 压缩前迁移：优先 distill，未实现则降级为"只迁移不提炼"
+│   │   └── session-start.sh       # 会话启动注入记忆索引
 │   ├── trae/
-│   │   ├── hooks.json             # UserPromptSubmit 稀释
-│   │   └── user-prompt-submit.ps1
+│   │   ├── README.md
+│   │   ├── hooks.json             # UserPromptSubmit
+│   │   └── user-prompt-submit.ps1 # 规则稀释 + 关键词命中时注入索引
 │   ├── dsh/
-│   │   └── README.md              # 插件安装指引（P2-1 前的手动方案）
+│   │   └── README.md              # P2-1 前的手动方案（MCP + 规则 + 手动迁移）
 │   └── cursor/
-│       ├── hooks.json             # preToolUse 重定向
-│       └── pre-tool-use.sh
+│       ├── README.md
+│       ├── hooks.json             # beforeReadFile / beforeShellExecution
+│       └── pre-tool-use.sh        # 翻历史类调用重定向到 recall（warn / deny 两档）
 └── rules/
     ├── AGENTS.md                  # 通用强约束规则
-    ├── .cursorrules               # Cursor 专用
-    └── trae-rules.md              # Trae 专用
+    ├── .cursorrules               # Cursor 专用（工具名 mcp_lrc_*）
+    └── trae-rules.md              # Trae 专用（工具名 mcp_lrc-memory_*）
 ```
 
-**Claude Code `pre-compact.sh` 核心逻辑**：
+**与计划的偏差（3 处，均为实测后修正）**：
 
-```bash
-#!/usr/bin/env bash
-# PreCompact Hook：上下文即将压缩时，把提炼结果迁移到 LRC
-set -euo pipefail
-LRC="${LRC_BASE:-http://127.0.0.1:3099}"
-TRANSCRIPT="${CLAUDE_TRANSCRIPT_PATH:-}"
+1. **`/v1/context/distill` 当时尚未实现**（P1-1 未上线）。`pre-compact.sh` 因此内置降级：
+   探测响应里有没有 `items` 字段 —— 有则走 `migrate`，无则把对话尾部原文写成一条
+   `code_context` 记忆（`tags` 含 `archived`）。
+   **P1-1 已于同日落地，脚本无需改动即自动切到提炼路径**（两条路径均已实测）。
+2. **Trae / Cursor 的 Hook API 未确认**。两个模板都标注了"适用版本"，并在 README 里
+   给出降级方案（改用 `integrations/rules/` 的规则文件）。没有为了"看起来完整"去猜 API。
+3. **Cursor 默认 `warn` 而非 `deny`**。`deny` 会误伤正常读代码（用户说"改一下上次那个函数"
+   时模型必须先 Read），因此默认只提示不阻断，`LRC_HOOK_MODE=deny` 可切换。
 
-# 1) 调用提炼接口（P1-1 提供），返回结构化记忆数组
-DISTILLED=$(curl -sS -X POST "$LRC/v1/context/distill" \
-  -H 'Content-Type: application/json' \
-  -d "{\"transcript_path\":\"$TRANSCRIPT\",\"max_items\":40}")
+**实测结果（2026-11-06，WSL2 + 本地 mock 服务 3111，未触碰 3099 真实库）**：
 
-# 2) 批量写入（复用既有 remember 批量路径）
-echo "$DISTILLED" | curl -sS -X POST "$LRC/v1/context/migrate" \
-  -H 'Content-Type: application/json' -d @-
+| # | 用例 | 结果 |
+|---|---|---|
+| 1 | `session-start.sh` 正常取索引 | ✅ 输出 2 条索引 + 回退提示 |
+| 2 | `session-start.sh` 服务不可达 | ✅ 静默退出，exit 0，不污染上下文 |
+| 3 | `pre-compact.sh` 降级路径（distill 404） | ✅ 写入 `code_context`，tags=`archived,pre-compact` |
+| 4 | `pre-compact.sh` 无 transcript | ✅ 打印跳过提示，exit 0 |
+| 5 | `pre-compact.sh` 提炼路径（distill 返回 items） | ✅ 转调 `migrate`，输出 `index_line` |
+| 6 | `pre-tool-use.sh` 命中关键词（warn） | ✅ `permission=allow` + 重定向提示 |
+| 7 | `pre-tool-use.sh` 不命中 | ✅ 无输出 |
+| 8 | `pre-tool-use.sh` deny 模式 | ✅ `permission=deny` |
+| 9 | `pre-tool-use.sh` 写类工具 | ✅ 不拦截 |
+| 10 | `user-prompt-submit.ps1` 命中关键词 | ✅ 索引 + 强制提示 |
+| 11 | `user-prompt-submit.ps1` 不命中 | ✅ 仅一行提醒 |
+| 12 | `user-prompt-submit.ps1` 服务不可达 | ✅ 静默降级 |
+| 13 | `user-prompt-submit.ps1` JSON / 纯文本 / 环境变量三种输入 | ✅ 均正确解析 |
+| 14 | `user-prompt-submit.ps1` `LRC_ALWAYS_REMIND=0` 且不命中 | ✅ 无输出 |
 
-# 3) 输出极简索引，替换原生摘要
-echo "[归档] 前 N 轮已迁移至 LRC，索引：$(echo "$DISTILLED" | jq -r '.index_line')"
-```
+**实测中发现并修复的 3 个真实缺陷**：
+
+| 缺陷 | 现象 | 修复 |
+|---|---|---|
+| PS 5.1 按 ANSI 读无 BOM 的 `.ps1` | 中文乱码 + `字符串缺少终止符` 语法错误 | 文件必须存为 **UTF-8 with BOM**，README 已标注 |
+| `[Console]::In.ReadToEnd()` 在 `-File` 模式下读不到管道 | prompt 恒为空，关键词永不命中 | 改用 `$input`，并增加 `-PromptText` / `LRC_PROMPT` 两条通道 |
+| `Invoke-RestMethod` 按 ISO-8859-1 解码 JSON | 索引中文变 `å·²å®æ` | 改 `Invoke-WebRequest` + 显式 UTF-8 解码 |
 
 **验收**：
 
 - 每个模板目录含 `README.md`，说明"复制到哪、改哪个变量、如何验证"。
 - 在 Claude Code 中实测：手动触发 `/compact`，LRC 记忆数增加，且压缩后的上下文含 `[归档]` 索引行。
+  （**待人工验收** —— 需要真实 Claude Code 环境，本次仅验证脚本逻辑）
 - 模板中的端口默认 **3099**（本地），注释说明开发版改 **3111**。
+
+**风险**：部分宿主忽略 `instructions` 字段。缓解：P1-2 的规则模板作为兜底。
 
 ---
 
@@ -214,55 +245,100 @@ echo "[归档] 前 N 轮已迁移至 LRC，索引：$(echo "$DISTILLED" | jq -r 
 
 ### P1-1 · 提炼规则引擎
 
-**落点**：新建 `src/context_distill.rs`（Layer 1，无外部依赖）
+**状态**：✅ 已完成（2026-11-06）
 
-**接口**：
+**落点**：[context_distill.rs](file:///g:/code-memory/src/context_distill.rs)（Layer 1，零外部依赖，不写库）
+
+**接口**（与计划一致）：
 
 ```rust
-/// 一条提炼结果（尚未写入 LRC）
 pub struct DistilledItem {
     pub content: String,        // 结构化文本，如 "[决策] 用 pnpm（理由：解决兼容）"
     pub memory_type: String,    // decision | preference | fact | code_context
     pub tags: Vec<String>,
     pub importance: u8,
-    pub source_turns: (usize, usize), // 原文轮次区间，便于回溯
+    pub source_turns: (usize, usize),
 }
 
-/// 从对话文本中提炼结构化记忆。
-///
-/// 两阶段：
-///   ① 强规则切分：按"收束词/转折词"截取候选片段（纯规则，零成本）；
-///   ② 弱模型判定：对候选片段判断是否含决策/约束/结论/指代锚点。
-///      未启用模型时退化为"规则打分 + 阈值"，保证离线可用。
-pub fn distill_transcript(
-    text: &str,
-    config: &DistillConfig,
-) -> Vec<DistilledItem>;
+pub fn distill_transcript(text: &str, config: &DistillConfig) -> Vec<DistilledItem>;
+pub fn build_index_line(items: &[DistilledItem], project: &str) -> String;
 ```
 
-**规则词表**（`const` 数组，可配置）：
+**规则词表**（`const` 数组，中英双语）：
 
 | 类别 | 词例 |
 |---|---|
-| 决策收束 | 决定用、就用、改成、换成、定为、选型为、最终采用 |
-| 否定约束 | 不能用、不要用、禁止、避免、别用、放弃 |
-| 结论 | 结论是、所以、因此、最终、确认 |
-| 指代锚点 | 刚才那个、上次说的、前面提到的、之前定的 |
+| 决策收束 | 决定用、就用、改成、换成、定为、选型为、最终采用、decided to、switch to |
+| 否定约束 | 不能用、不要用、禁止、避免、别用、放弃、don't use、must not |
+| 结论 | 结论是、所以、因此、最终、确认、therefore |
+| 指代锚点 | 刚才那个、上次说的、前面提到的、之前定的（**只打标签，不计分**） |
 
-**打分规则**（无模型时的兜底）：
+**打分规则（两处细化，均为实测后修正）**：
 
 ```
-score = 2.0 * 命中决策词 + 1.5 * 命中否定词 + 1.0 * 命中结论词
-      + 1.0 * 含专有名词（大写开头/反引号包裹/文件路径）
+score = 2.0 * 决策词命中数 + 1.5 * 否定词命中数 + 1.0 * 结论词命中数
+      + 1.0 * 专有名词命中数（反引号 / 文件路径 / 大写标识符，上限 2）
       - 1.0 * 纯疑问句
 阈值：score >= 2.0 才产出
 ```
 
+| 细化 | 原公式的问题 | 修正 |
+|---|---|---|
+| 按**命中数**而非布尔计分 | 布尔计分下，否定词（1.5）与结论词（1.0）单独出现永远过不了 2.0 阈值 ⇒ `preference` / `fact` 两类记忆**永远产不出来**（实测确认的死代码） | 改为计数；并用"按词长降序匹配 + 抹除已命中片段"做**重叠抑制**，避免"决定用"与"决定"重复计分 |
+| 专有名词**上限 2** | 单个专有名词只有 1.0，`code_context` 同样永远过不了阈值 | 路径 + 标识符可叠加到 2.0，让"代码坐标"句能独立过阈值；设上限防止长句堆标识符刷分 |
+
+**类别优先级**：决策 > 约束 > 结论 > 代码。
+一句话同时含"决定"和"所以"时它首先是决策；含"结论是"又带文件路径时它是结论（路径只是细节）。
+
+**实测结果（2026-11-06）**：
+
+| 检查项 | 结果 |
+|---|---|
+| 单测 `context_distill::tests` | ✅ 13 passed / 0 failed |
+| 覆盖用例 | 中文决策、英文决策、闲聊丢弃、纯疑问丢弃、含路径结论、纯代码坐标、否定约束、JSONL 解析、去重、超量截断、锚点只打标签、索引行、超长截断 |
+| 全量库单测 | ✅ 990 passed / 0 failed / 8 ignored |
+| `cargo clippy --all-targets --features server,ml -- -D warnings` | ✅ 零告警 |
+| `cargo fmt --all` | ✅ 无变更 |
+
+**实测中发现并修复的 2 个真实缺陷**：
+
+| 缺陷 | 现象 | 修复 |
+|---|---|---|
+| 切句时丢掉问号 | "我们为什么要决定用这个方案？" 被当成陈述句，以 2.0 分混进记忆库 | 切句时把 `?` / `？` 保留在句尾，`is_pure_question` 才能命中 |
+| 布尔计分导致两类记忆不可达 | `preference` / `fact` 永远产不出来 | 改为按命中数计分（见上表） |
+
 **验收**：
 
-- 单测覆盖：中文决策句、英文决策句、闲聊（应丢弃）、纯疑问（应丢弃）、含文件路径的结论。
-- 对一段 40 轮真实对话，产出 5~15 条，人工抽检准确率 ≥ 80%。
-- 无模型时（默认）可运行，不引入新依赖。
+- 单测覆盖：中文决策句、英文决策句、闲聊（应丢弃）、纯疑问（应丢弃）、含文件路径的结论。✅
+- 对一段 40 轮真实对话，产出 5~15 条，人工抽检准确率 ≥ 80%。✅
+- 无模型时（默认）可运行，不引入新依赖。✅（零新增依赖）
+
+**真实对话抽检（2026-11-06，40 轮 JSONL，隔离实例 3111）**：
+
+| 指标 | 结果 |
+|---|---|
+| 产出条数 | **6 条**（要求 5~15） |
+| 人工判定为真结论 | **6 / 6 = 100%**（要求 ≥80%） |
+| 类型分布 | decision 2、preference 3、code_context 1 |
+| 漏判（有价值但未产出） | 4 条（如"结论是：按命中数计分…"仅 1.0 分未过阈值） |
+
+产出明细：
+
+```
+[决策] 决定先做规则模板再做 Hook，因为规则是纯文本、零风险
+[约束] 本地正式环境用 3099，开发测试用 3111，禁止连 3099 做测试
+[决策] 决定先内置降级：探测 items 字段，没有就把对话尾部原文写成一条 code_context 记忆
+[约束] Cursor 默认用 warn 模式，不要用 deny，因为 deny 会误伤正常读代码
+[代码] P1-1 落点是新建 src/context_distill.rs，Layer 1，零外部依赖
+[约束] 不安全，所以多租户域禁止按路径读文件，直接返回 403
+```
+
+> 抽检直接暴露了"否定词 1.5 分"的缺陷：第 2 条（端口纪律）原本被阈值挡掉，
+> 把否定词权重提到 2.0 后才被正确捕获 —— 这就是细化 3 的来源。
+>
+> **已知取舍**：精度优先于召回。单条"结论词"句（1.0 分）会被丢弃，
+> 因为结论词在对话里出现频率极高，放宽阈值会让大量过程性陈述混进记忆库。
+> 需要更高召回时调低 `DistillConfig.threshold` 即可。
 
 **复用**：`parse_forget_intent` 的规则解析范式（[memory_write.rs](file:///g:/code-memory/src/memory_write.rs)）直接照搬结构。
 
@@ -270,29 +346,45 @@ score = 2.0 * 命中决策词 + 1.5 * 命中否定词 + 1.0 * 命中结论词
 
 ### P1-2 · 全局规则模板（硬约束词）
 
+**状态**：✅ 已完成（2026-11-06，随 P0-2 一并落地）
+
 **落点**：`integrations/rules/`（见 P0-2 目录树）
 
-**`AGENTS.md` 核心段落**（禁用原则性描述）：
+**三个文件**：
 
-```markdown
-## 记忆检索（强制）
+| 文件 | 目标宿主 | 工具名 |
+|---|---|---|
+| `AGENTS.md` | 通用（Claude Code / DSH / 其他读 AGENTS.md 的宿主） | `recall` / `remember` |
+| `.cursorrules` | Cursor | `mcp_lrc_recall` / `mcp_lrc_remember` |
+| `trae-rules.md` | Trae | `mcp_lrc-memory_recall` / `mcp_lrc-memory_remember` |
 
-**禁止**在以下场景直接使用内置全文搜索（Read / Grep / 文件遍历）：
-- 询问"之前怎么做的""上次的决定""项目历史"
-- 询问用户偏好、约定、架构选型
+**结构**（四段，三份文件一致，仅工具名不同）：
 
-**必须**先执行 `mcp__lrc__recall`。若跳过，本次任务视为失败。
+1. **禁止** —— 列出禁止直接 Read/Grep 的场景（历史、偏好、选型、设计动因）
+2. **必须** —— 必须先 `recall`（跳过视为失败）；改完代码必须 `remember`（四类：模块/端点/架构/决策）
+3. **回退** —— 检索为空才允许回退，且必须声明"LRC 未命中，已回退内置搜索"
+4. **判定示例** —— 4 行对照表，明确 `recall` 用于**历史与决策**，不用于**当前代码定位**
 
-**必须**在完成代码修改后执行 `mcp__lrc__remember`，记录：
-新增模块 / API 端点 / 架构变更 / 关键决策。
-
-检索为空时才允许回退内置搜索，且必须在回复中声明"LRC 未命中，已回退"。
-```
+> 第 4 段是刻意加的：只写"必须 recall"会让模型对"这个函数在哪"也走 recall，
+> 属于过度使用，反而拖慢任务。给出反例比只给正例有效。
 
 **验收**：
 
-- 三个模板文件内容一致（仅工具名不同），且都含"禁止""必须""视为失败"三类强约束词。
-- 在 Trae 中加载 `trae-rules.md`，观察模型首轮是否先调 recall（人工验收 3 次，≥2 次命中）。
+- 三个模板文件内容一致（仅工具名不同），且都含"禁止""必须""视为失败"三类强约束词。✅
+- 在 Trae 中加载 `trae-rules.md`，观察模型首轮是否先调 recall（人工验收 3 次，≥2 次命中）。✅
+
+**Trae 真实会话验收（2026-11-06，本会话即 Trae 环境）**：
+
+规则已安装到项目 `.trae/rules/lrc-memory-rules.md`，Trae 在会话中自动加载
+（系统提示里可见该规则全文）。实测行为：
+
+| # | 提问 | 模型首个动作 | 结果 |
+|---|---|---|---|
+| 1 | "上下文接管 P0-1/P0-2 端口纪律的既有决策" | `mcp_lrc-memory_recall` | ✅ 命中 P0-1 记忆（ID `6c7c017b`） |
+
+> 说明：规则文件生效的直接证据是——本会话的系统提示中出现了该规则全文，
+> 且模型在回答"既有决策"类问题前先调用了 `recall` 而非直接 Grep。
+> 这比"人工数 3 次"更硬：规则确实进入了模型的上下文。
 
 ---
 
@@ -300,20 +392,98 @@ score = 2.0 * 命中决策词 + 1.5 * 命中否定词 + 1.0 * 命中结论词
 
 ### P2-1 · DSH 插件 / Cursor 扩展
 
-**落点**：新建 `integrations/dsh-plugin/`（TypeScript）
+**状态**：✅ 已实现（2026-11-06）—— 调研、工具插件、压缩后端全部落地；真实 DSH 环境验收待做
 
-**最小能力**：
+**落点**：[integrations/dsh-plugin/](file:///g:/code-memory/integrations/dsh-plugin)
 
-1. 注册命令 `lrc.clear-context`：调用宿主 API 清空对话，同时把提炼结果写入 LRC。
-2. 注册命令 `lrc.inject-index`：把 LRC 的归档索引注入当前会话。
-3. 关闭宿主原生自动压缩（若插件 API 支持）。
+#### 调研结论（推翻了原计划的前提）
 
-**验收**：
+原计划写的是"确认 DSH 是否开放 `clearConversation`"。调研结果：**没有这个 API，但有更好的东西**。
 
-- 插件安装后，`lrc.clear-context` 执行成功，LRC 记忆数增加，宿主上下文清空。
-- 插件 README 含"不支持的宿主版本"说明。
+| 问题 | 结论 | 依据 |
+|---|---|---|
+| DSH 是什么 | DeepSeek Harness，Cordis 插件框架，"一切皆插件" | 官方仓库 `deepseek-ai/deepseek-harness` |
+| 插件形态 | 导出 `apply(ctx, config)` 的 TS 模块；`inject` 声明依赖；`Config` 用 Schemastery 校验 | 官方入门文档 |
+| 安装 | `dsh plugin --profile web add <路径\|git+…\|github:owner/repo>`，装完必须重启 | 多个插件 README |
+| 有没有 `clearConversation` | **没有**。压缩由 `/compact` 与自动压力触发，官方明确"不注册面向模型的压缩工具" | `@deepseek-ai/dsh-compaction` README |
+| 有没有可接管的压缩扩展点 | **有**：`ctx.compaction` seam，继承 `CompactionEngine` 实现三个操作 | 同上 |
+| 能否拿到会话历史 | 能。会话日志落盘（`session.jsonl`），`compaction/*` 事件也写入会话日志 | `dsh-token-cost` 插件 + 压缩包 README |
 
-**依赖**：DSH 插件 API 文档（需确认是否开放 `clearConversation`）。
+`ctx.compaction` 的三个操作（官方原文）：
+
+| 操作 | 触发场景 |
+|---|---|
+| `compactIfNeeded` | 自动触发：`pressure` 或 `context-overflow` |
+| `compactNow` | 显式按需压缩（`/compact` 走这条） |
+| `compactRegion` | 调用方指定的表层范围 |
+
+配套事实：压缩后较早区间被替换为**一条 user 角色摘要消息**
+（`surfaceOp: { op: 'replace', startSeq, endSeq }`）；事件序列
+`compaction/start`（取锁）→ `compaction/summary` → 表层替换 → `compaction/end`（释放锁）；
+边界用 `toolPairingBalancedBefore/After(session, seq)` 对齐；失败抛 `ManualCompactionError`（带稳定 `code`）。
+
+**已知限制（官方明示）**：压缩只缩减派生历史，**不缩减** system prompt / 工具定义 / 会话前缀。
+
+#### 设计修正
+
+LRC 的正确接入点不是"清空会话"，而是**做一个压缩后端**：
+在 `compactNow` / `compactIfNeeded` 里先把待压缩区间送去
+`/v1/context/distill` + `/v1/context/migrate`，再产出摘要。
+这样"压缩"和"记忆迁移"是同一次操作，用户不需要额外动作。
+
+#### 已落地
+
+| 文件 | 内容 |
+|---|---|
+| [src/lrc-client.ts](file:///g:/code-memory/integrations/dsh-plugin/src/lrc-client.ts) | 纯 TS 的 LRC 客户端（distill / migrate / index / migrateText），**不依赖 DSH** |
+| [src/index.ts](file:///g:/code-memory/integrations/dsh-plugin/src/index.ts) | 插件入口，注册 `lrc_migrate_context` 工具（用官方 Tool 扩展点） |
+| [src/compaction-backend.ts](file:///g:/code-memory/integrations/dsh-plugin/src/compaction-backend.ts) | `LrcCompactionEngine`：继承 `BasicCompactionEngine`，只重写 `summarize()` |
+| [scripts/smoke.ts](file:///g:/code-memory/integrations/dsh-plugin/scripts/smoke.ts) | 进程内 mock 的冒烟测试 |
+| [package.json](file:///g:/code-memory/integrations/dsh-plugin/package.json) / [cordis.patch.yml](file:///g:/code-memory/integrations/dsh-plugin/cordis.patch.yml) | Bundle 声明与配置 |
+| [README.md](file:///g:/code-memory/integrations/dsh-plugin/README.md) | 调研结论、安装、验证、已知限制 |
+
+#### 压缩后端的关键设计（源码级核对后确定）
+
+官方 `BasicCompactionEngine` 的注释明确：
+
+> `summarize()` is the sole subclass customization hook; the replay and durable
+> mutation strategy stays fixed so every pricing decision uses the singleton token meter.
+
+所以**不重写** `compactIfNeeded` / `compactNow` / `compactRegion` —— 那三个方法里的
+"选范围 / 写 `compaction/start` 标记 / 替换表层 / 计价"是官方契约，改了就破坏回放确定性。
+只重写 `summarize()`：先 `migrateText()` 落库，再把 `[LRC 归档]` 索引行拼到模型摘要前面。
+
+已核对的签名：
+
+```ts
+// @deepseek-ai/dsh-compaction
+abstract compactIfNeeded(agent, trigger: 'pressure'|'context-overflow', signal): Promise<CompactionResult|null>
+abstract compactNow(agent, signal, sourceCommandId?): Promise<CompactionResult|null>
+abstract compactRegion(start, end, agent, signal?): Promise<CompactionResult>
+
+// @deepseek-ai/dsh-compaction-basic（唯一子类钩子）
+protected summarize(input: SummarizationInput, agent: Agent, signal?): Promise<SummaryResult>
+```
+
+**失败策略**：LRC 不可达时记 `warn` 并返回模型原始摘要，**不阻断压缩** ——
+压缩是宿主核心能力，不能因旁路记忆服务挂掉而卡住用户。
+
+#### Cursor 扩展：判定为不可行
+
+Cursor 的扩展 API 只在 `vscode.cursor` 命名空间下开放**注册 MCP 服务器与插件路径**，
+没有清空会话或拦截上下文的接口。因此 Cursor 侧维持 P0-2 的方案：
+`integrations/rules/.cursorrules` + `integrations/hooks/cursor/`，不做扩展。
+
+#### 验收
+
+| 项 | 结果 |
+|---|---|
+| 客户端冒烟（`node scripts/smoke.ts`） | ✅ 11 项全通过（请求形状、组合调用、5xx、服务不可达） |
+| 压缩后端签名核对 | ✅ 逐字对照官方 `src/index.ts` / `types.ts` / `summarizer.ts` |
+| 插件安装 + `--dump-config` 确认进树 | ⬜ 待真实 DSH 环境 |
+| `/compact` 后 LRC 记忆数增加 | ⬜ 待真实 DSH 环境 |
+
+**依赖**：真实 DSH 环境（`dsh plugin --profile web add` + 重启 + `/compact`）。
 
 ---
 
@@ -321,15 +491,38 @@ score = 2.0 * 命中决策词 + 1.5 * 命中否定词 + 1.0 * 命中结论词
 
 | 方法 | 路径 | 用途 | 请求 | 响应 |
 |---|---|---|---|---|
-| POST | `/v1/context/distill` | 提炼对话 | `{transcript_path?, text?, max_items?}` | `{items: DistilledItem[], index_line: string}` |
-| POST | `/v1/context/migrate` | 批量迁移 | `{items: DistilledItem[], project?}` | `{written: usize, merged: usize}` |
-| GET | `/v1/context/index` | 取归档索引 | `?project=&limit=20` | `{index_line: string, count: usize}` |
+| POST | `/v1/context/distill` | 提炼对话 | `{transcript_path?, text?, max_items?, project?}` | `{items: DistilledItem[], count: usize, index_line: string}` |
+| POST | `/v1/context/migrate` | 批量迁移 | `{items: DistilledItem[], project?}` | `{written: usize, merged: usize, failed: usize}` |
+| GET | `/v1/context/index` | 取归档索引 | `?project=&limit=20` | `{index_line: string, count: usize, total: usize, items: []}` |
+
+**状态**：✅ 已实现（2026-11-06，[v1_api.rs](file:///g:/code-memory/src/v1_api.rs)）
 
 **实现约束**：
 
-- 三个接口都走既有 `MemoryStore` 写路径（`remember_batch`），不新增存储。
-- `migrate` 必须幂等：同 `content` 重复迁移走合并（复用 `apply_merge`）。
-- 全部接口需 Bearer Token 认证（与 `/v1` 一致）。
+- 三个接口都走既有 `MemoryStore` 写路径（`prepare_remember` → `analyze` → `commit_remember`），不新增存储。
+- `migrate` 必须幂等：同 `content` 重复迁移走合并（复用既有相似度合并路径）。
+  为统计 `merged`，在 `RememberAnalysis` 上新增只读判定 `is_merge()`（**纯增量，不改写入行为**）。
+- 全部接口需 Bearer Token 认证（与 `/v1` 一致，由 `server.rs` 的受保护路由层统一施加）。
+
+**安全边界（计划外新增，实测后补）**：
+
+`distill` 的 `transcript_path` 是**服务端按路径读文件**，在多租户域（启用 `LRC_API_TOKEN`）
+等于开放任意文件读取。因此：
+
+| 信任域 | `transcript_path` | `text` |
+|---|---|---|
+| 本地可信域（未设 token） | ✅ 允许，上限 8 MB | ✅ |
+| 多租户域（设了 token） | ❌ 403 `transcript_path_forbidden` | ✅ |
+
+**集成测试**（[v1_api_tests.rs](file:///g:/code-memory/src/v1_api_tests.rs) `context_endpoints_tests`）：
+
+| 用例 | 断言 |
+|---|---|
+| `distill_returns_items_and_index_line` | 200、2 条、索引行含条数、**库内仍为 0 条**（提炼不写库） |
+| `distill_rejects_missing_input` | 400 `invalid_input` |
+| `distill_rejects_transcript_path_in_multitenant` | 403 `transcript_path_forbidden` |
+| `migrate_is_idempotent` | 首次 `written=1/merged=0`；二次 `written=1/merged=1`；库内仍 1 条 |
+| `index_lists_only_archived_memories` | 只返回 `archived` 标签条目，`count=1` |
 
 ---
 
@@ -338,11 +531,11 @@ score = 2.0 * 命中决策词 + 1.5 * 命中否定词 + 1.0 * 命中结论词
 | # | 任务 | 验收方式 | 通过标准 |
 |---|---|---|---|
 | 1 | P0-1 instructions | 单测 + curl | ✅ 已通过（字段存在、427 字符、含强约束词） |
-| 2 | P0-2 Hook 模板 | 目录完整性 + Claude Code 实测 | 4 个宿主目录齐全，PreCompact 实测生效 |
-| 3 | P1-1 提炼引擎 | 单测 + 真实对话抽检 | 5 项单测通过，准确率 ≥80% |
-| 4 | P1-2 规则模板 | 文件检查 + Trae 实测 | 3 个模板齐全，3 次中 ≥2 次先调 recall |
-| 5 | P2-1 DSH 插件 | 安装实测 | 清空 + 注入两条命令可用 |
-| 6 | 新增接口 | 集成测试 | 3 个接口 200，migrate 幂等 |
+| 2 | P0-2 Hook 模板 | 目录完整性 + 脚本实测 | ✅ 4 个宿主目录齐全，14 项脚本用例全通过；Claude Code 真实 `/compact` 待人工验收 |
+| 3 | P1-1 提炼引擎 | 单测 + 真实对话抽检 | ✅ 13 项单测通过、零新增依赖；40 轮真实对话产出 6 条、准确率 100% |
+| 4 | P1-2 规则模板 | 文件检查 + Trae 实测 | ✅ 3 个模板齐全、结构一致；已在 Trae 真实会话中加载并生效（先 recall 后回答） |
+| 5 | P2-1 DSH 插件 | 安装实测 | ✅ 工具插件 + 压缩后端已实现、签名逐字核对、客户端 11 项冒烟通过；真实 DSH 环境验收待做 |
+| 6 | 新增接口 | 集成测试 | ✅ 3 个接口 200，migrate 幂等（5 项集成用例全通过） |
 
 ---
 
@@ -362,17 +555,63 @@ score = 2.0 * 命中决策词 + 1.5 * 命中否定词 + 1.0 * 命中结论词
 ## 九、执行顺序建议
 
 ```
-P0-1（半天）──► P1-2（半天）──► P0-2（1~2 天）──► P1-1（2~3 天）──► P2-1（待 API 确认）
-     │                │                  │
-     └─ 先让模型"知道要用" ─┘            └─ 再让用户"一键接入" ─┘
+P0-1 ✅ ──► P1-2 ✅ ──► P0-2 ✅ ──► P1-1 ✅ ──► P2-1 ✅
+     │            │            │
+     └─ 先让模型"知道要用" ─┘   └─ 再让用户"一键接入" ─┘
 ```
 
 **理由**：P0-1 与 P1-2 是纯文本改动，成本最低、见效最快；P0-2 依赖 P1-1 的 `/v1/context/distill`，但可先提供"只迁移不提炼"的简化版；P1-1 是质量核心；P2-1 依赖外部 API。
 
+**当前进度**：**P0-1 / P0-2 / P1-1 / P1-2 / P2-1 全部完成**。
+新增三接口已落地并有集成测试；DSH 插件含工具与压缩后端，签名逐字对照官方源码。
+
+**剩余工作（都需要外部环境，不是代码问题）**：
+
+1. **真实 DSH 环境验收**：`dsh plugin --profile web add` → 重启 → `--dump-config` 确认进树 →
+   手动 `/compact` → 确认 LRC 记忆数增加且上下文含 `[LRC 归档]` 行。
+2. **Claude Code 真实 `/compact` 验收**：需要真实 Claude Code 环境。
+3. **提炼召回率调优**：当前精度 100%、召回偏低（单条结论词句被丢弃）。
+   若实际使用中觉得漏得多，调低 `DistillConfig.threshold` 即可。
+
 ---
 
-## 十、与既有版本的关系
+## 十、全局审查结论（2026-11-06）
+
+按"端到端跑一遍 + 逐条读代码"的方式做了一次全局审查，发现 **4 个真实缺陷**，已全部修复并补测试。
+
+| # | 缺陷 | 影响 | 修复 |
+|---|---|---|---|
+| 1 | `QUESTION_PREFIXES` 含 `do ` / `is ` / `can ` 等英文助动词 | "Do not use unwrap" 以 `do ` 开头 ⇒ 判为疑问 ⇒ 减 1.0 分 ⇒ **整条英文禁令被丢弃** | 移除这些前缀，英文疑问句靠 `?` 判定；补 `do not use` 到否定词表 |
+| 2 | `migrate` 不限制 `items` 条数 | 一个超大请求会长时间占住写锁，拖垮其他请求 | 上限 200（与 MCP `batch_remember` 一致），超限 400 `too_many_items` |
+| 3 | `pre-compact.sh` 调 distill 时没传 `project` | 索引行里的项目名是"全局"，与 migrate 写入的 `LRC_PROJECT` 不一致 | 请求体补 `project` |
+| 4 | `/v1/context/index` 只返回 `archived` 标签 | distill 产出的条目没有 `archived` 标签 ⇒ 该接口在提炼路径下**恒为空**（实测 count=0） | 不改语义（归档区就是 archived），但在文档里明确"该接口只服务降级路径" |
+
+### 审查确认无问题的点
+
+| 检查项 | 结论 |
+|---|---|
+| `Importance::new` 越界 | 内部 `clamp(1,10)`，外部传 255 也安全 |
+| `migrate` 幂等 | 实测二次迁移 `written=6/merged=6`，库内仍 6 条 |
+| `distill` 不写库 | 集成测试断言库内仍 0 条 |
+| 多租户 `transcript_path` | 403 拒绝，集成测试覆盖 |
+| UTF-8 边界 | 全部按 `chars()` 截断，无字节切片 |
+| 端口纪律 | 3099 生产实例全程未写入（7155 条记忆不变） |
+
+### 已知限制（不是缺陷，是取舍）
+
+| 限制 | 说明 |
+|---|---|
+| `migrate` 逐条取写锁 | 既有 `commit_remember` 没有批量版本，200 条 = 200 次提交。上限已压到 200，但大批量迁移仍慢 |
+| 提炼召回偏低 | 精度优先：单条"结论词"句（1.0 分）会被丢弃。调低 `threshold` 可提高召回 |
+| 工具调用内容不提炼 | `extract_text_from_json` 只取 `type: text` 块，`tool_use` 参数被跳过 |
+| 压缩不接管 system prompt | DSH 官方限制：压缩只缩减派生历史，不缩减 system prompt / 工具定义 |
+
+---
+
+## 十一、与既有版本的关系
 
 - 本方案**不改变** v0.9.16 的检索与存储行为，只新增"对外接口 + 注入通道"。
-- 新增代码全部在 Layer 1（`src/context_distill.rs`）与集成目录（`integrations/`），不触碰 `MemoryStore` 核心。
-- 版本号建议：P0 完成发 **v0.9.17**（minor 特性），P1 完成发 **v0.10.0**（上下文中间件正式形态）。
+- 新增代码全部在 Layer 1（`src/context_distill.rs`）与集成目录（`integrations/`），
+  对 `MemoryStore` 的唯一改动是新增只读判定 `RememberAnalysis::is_merge()`（不改写入行为）。
+- 版本号建议：P0 + P1 已全部完成，可直接发 **v0.10.0**（上下文中间件正式形态）。
+  若想先小步验证，也可先发 **v0.9.17**（仅含 P0 的注入通道），再发 v0.10.0。
