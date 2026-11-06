@@ -534,6 +534,26 @@ jobs:
           fi
         shell: bash
 
+      # v0.10.0：为 dsh-plugin-lrc 产出**稳定命名**的 sidecar 别名。
+      # 插件按 `lrc-sidecar-<platform>-<arch>` 下载，不依赖带版本号的文件名，
+      # 这样插件侧只需更新 SHA256 清单，不必跟着改 URL 结构。
+      - name: Publish plugin sidecar alias
+        run: |
+          case "${{ matrix.target }}" in
+            x86_64-pc-windows-msvc)   ALIAS="lrc-sidecar-windows-x64.exe" ;;
+            aarch64-apple-darwin)     ALIAS="lrc-sidecar-darwin-arm64" ;;
+            x86_64-unknown-linux-gnu) ALIAS="lrc-sidecar-linux-x64" ;;
+            *) echo "无插件别名（${{ matrix.target }}）"; exit 0 ;;
+          esac
+          cp "$BIN_NAME" "$ALIAS"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            certutil -hashfile "$ALIAS" SHA256 > "$ALIAS.sha256"
+          else
+            sha256sum "$ALIAS" > "$ALIAS.sha256"
+          fi
+          echo "已生成插件别名：$ALIAS"
+        shell: bash
+
       - name: Upload sidecar artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -541,6 +561,7 @@ jobs:
           path: |
             ${{ env.BIN_NAME }}
             ${{ env.BIN_NAME }}.sha256
+            lrc-sidecar-*
 
   # ════════════════════════════════════════════════════════════
   # Job 2: 编译桌面端安装包（Tauri 桌面应用）
