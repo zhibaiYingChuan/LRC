@@ -1785,6 +1785,19 @@ pub struct ForgetRequest {
 /// 200 与 MCP `batch_remember` 的上限保持一致。
 const CONTEXT_MIGRATE_MAX_ITEMS: usize = 200;
 
+/// 迁移分块大小：每块内"准备全部 → 一次写锁提交全部"。
+///
+/// 为什么分块而不是一次性提交全部：`commit_remember` 每条都会落盘，
+/// 200 条一次性持写锁会让其他请求排队数秒。分块把**单次持锁时长**压到
+/// 约 20 条的量级，块与块之间释放锁，前台请求可以插进来。
+const CONTEXT_MIGRATE_CHUNK: usize = 20;
+
+/// 单次迁移的总时间预算（毫秒）。
+///
+/// 超预算就停止并返回已完成部分（`truncated: true`），
+/// 保证 Hook 在上下文压缩这种"必须尽快返回"的场景里不会卡住。
+const CONTEXT_MIGRATE_BUDGET_MS: u128 = 10_000;
+
 /// `POST /v1/context/distill` 请求体。
 ///
 /// `text` 与 `transcript_path` 二选一：
@@ -5454,67 +5467,90 @@ pub fn build_v1_router_with_trust(
                     let project = req.project;
                     let items = req.items;
 
-                    // 逐条走既有 remember 三阶段路径（prepare → analyze → commit），
-                    // 不新增存储层；相似度命中即合并，因此重复迁移不会膨胀记忆库。
+                    // 分块迁移：每块内"读锁准备全部 → 一次写锁提交全部"。
+                    // 不新增存储层，仍走既有 prepare → analyze → commit 路径，
+                    // 因此相似度命中即合并，重复迁移不会膨胀记忆库。
                     let outcome = tokio::task::spawn_blocking(move || {
+                        let started = std::time::Instant::now();
                         let mut written = 0usize;
                         let mut merged = 0usize;
                         let mut failed = 0usize;
-                        for item in items {
-                            let memory = crate::memory_write::MemoryWriteInput {
-                                content: item.content,
-                                memory_type: MemoryType::try_parse(&item.memory_type),
-                                importance: Some(Importance::new(item.importance)),
-                                ttl_days: None,
-                                project: project.clone(),
-                                tags: item.tags,
-                                privacy_level: None,
-                                session_id: None,
-                                user_id: None,
-                                event_id: None,
-                                entities: Vec::new(),
-                                source_timestamp: None,
-                                daoti_preview_gua: None,
-                                daoti_preview_bagua: None,
-                                daoti_preview_version: None,
-                            }
-                            .into_memory();
+                        let mut processed = 0usize;
 
-                            let prep = match store.blocking_read().prepare_remember(memory) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    eprintln!("[v1/context/migrate] 准备失败: {}", e);
-                                    failed += 1;
-                                    continue;
+                        for chunk in items.chunks(CONTEXT_MIGRATE_CHUNK) {
+                            // 超预算就停：返回已完成部分，由调用方决定是否续传。
+                            if started.elapsed().as_millis() >= CONTEXT_MIGRATE_BUDGET_MS {
+                                break;
+                            }
+
+                            // 阶段 1：逐条准备（每条一次短暂读锁，编码与候选扫描在锁外）。
+                            let mut analyses = Vec::with_capacity(chunk.len());
+                            for item in chunk {
+                                let memory = crate::memory_write::MemoryWriteInput {
+                                    content: item.content.clone(),
+                                    memory_type: MemoryType::try_parse(&item.memory_type),
+                                    importance: Some(Importance::new(item.importance)),
+                                    ttl_days: None,
+                                    project: project.clone(),
+                                    tags: item.tags.clone(),
+                                    privacy_level: None,
+                                    session_id: None,
+                                    user_id: None,
+                                    event_id: None,
+                                    entities: Vec::new(),
+                                    source_timestamp: None,
+                                    daoti_preview_gua: None,
+                                    daoti_preview_bagua: None,
+                                    daoti_preview_version: None,
                                 }
-                            };
-                            let analysis = prep.analyze();
-                            let is_merge = analysis.is_merge();
-                            let guard = store.blocking_write();
-                            match guard.commit_remember(analysis) {
-                                Ok(_) => {
-                                    written += 1;
-                                    if is_merge {
-                                        merged += 1;
+                                .into_memory();
+
+                                match store.blocking_read().prepare_remember(memory) {
+                                    Ok(prep) => analyses.push(prep.analyze()),
+                                    Err(e) => {
+                                        eprintln!("[v1/context/migrate] 准备失败: {}", e);
+                                        failed += 1;
+                                        processed += 1;
                                     }
                                 }
-                                Err(e) => {
-                                    eprintln!("[v1/context/migrate] 提交失败: {}", e);
-                                    failed += 1;
+                            }
+
+                            // 阶段 2：**一次写锁**提交整块，把持锁时长压到一块的量级。
+                            if !analyses.is_empty() {
+                                let guard = store.blocking_write();
+                                for analysis in analyses {
+                                    let is_merge = analysis.is_merge();
+                                    match guard.commit_remember(analysis) {
+                                        Ok(_) => {
+                                            written += 1;
+                                            if is_merge {
+                                                merged += 1;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[v1/context/migrate] 提交失败: {}", e);
+                                            failed += 1;
+                                        }
+                                    }
+                                    processed += 1;
                                 }
                             }
                         }
-                        (written, merged, failed)
+
+                        let remaining = items.len().saturating_sub(processed);
+                        (written, merged, failed, remaining)
                     })
                     .await;
 
                     match outcome {
-                        Ok((written, merged, failed)) => {
+                        Ok((written, merged, failed, remaining)) => {
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
                                 serde_json::json!({
                                     "written": written,
                                     "merged": merged,
                                     "failed": failed,
+                                    "remaining": remaining,
+                                    "truncated": remaining > 0,
                                 }),
                             ))
                         }

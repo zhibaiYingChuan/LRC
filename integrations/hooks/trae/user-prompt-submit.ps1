@@ -1,4 +1,4 @@
-﻿# LRC UserPromptSubmit Hook（Trae / Windows PowerShell）
+﻿﻿# LRC UserPromptSubmit Hook（Trae / Windows PowerShell）
 #
 # 触发时机：用户每次提交 prompt 之前。
 # 职责（"稀释"）：把 LRC 的强制规则重新推到模型注意力里，避免长会话中

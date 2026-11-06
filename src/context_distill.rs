@@ -72,6 +72,8 @@ pub struct DistillConfig {
     pub min_chars: usize,
     /// 片段最长字符数（默认 300，超长截断）
     pub max_chars: usize,
+    /// 单次最多留存几条"整轮报错日志"（默认 10）
+    pub max_error_blocks: usize,
 }
 
 impl Default for DistillConfig {
@@ -81,6 +83,7 @@ impl Default for DistillConfig {
             max_items: 40,
             min_chars: 6,
             max_chars: 300,
+            max_error_blocks: 10,
         }
     }
 }
@@ -110,20 +113,68 @@ const DECISION_WORDS: &[&str] = &[
 ];
 
 /// 否定约束词：出现即说明"这条路被排除了"。
+///
+/// 代码场景里 `Don't` / `shouldn't` / `never` 常单独出现（不带 `use`），
+/// 早期词表只收 `don't use`，导致 "Don't commit secrets" 这类高危约束被漏掉。
 const NEGATION_WORDS: &[&str] = &[
     "不能用",
     "不要用",
+    "不要",
+    "不能",
     "禁止",
+    "严禁",
+    "切勿",
+    "不得",
     "避免",
     "别用",
     "放弃",
     "不允许",
     "不再",
-    "don't use",
-    "do not use",
-    "avoid",
+    "杜绝",
+    "don't",
+    "do not",
+    "shouldn't",
+    "should not",
+    "mustn't",
     "must not",
-    "never use",
+    "never",
+    "avoid",
+    "not allowed",
+    "forbidden",
+    "prohibited",
+    "deprecated",
+];
+
+/// 强报错标记：出现即说明这一轮里有**真实的错误日志**，必须留存。
+///
+/// 刻意只收"无歧义"的标记（`panic` / `traceback` / `error:` 等），
+/// 不收 `error` / `失败` 这类泛词 —— 它们在开发对话里出现频率太高，
+/// 收进来会把记忆库刷成噪声。
+const ERROR_MARKERS: &[&str] = &[
+    // 刻意用 `panic:` / `panicked` / `panic at` 而不是裸 `panic`：
+    // 裸词会把 "Avoid panics inside the handler" 这类**约束句**误判成报错日志。
+    "panic:",
+    "panicked",
+    "panic at",
+    "traceback",
+    "stack trace",
+    "stacktrace",
+    "segmentation fault",
+    "segfault",
+    "error:",
+    "exception:",
+    "assertion failed",
+    "assertion `left",
+    "exit code",
+    "exit status",
+    "报错",
+    "崩溃",
+    "异常退出",
+    "编译错误",
+    "运行时错误",
+    "错误信息",
+    "堆栈",
+    "调用栈",
 ];
 
 /// 结论词：出现即说明"这是本轮得出的判断"。
@@ -191,6 +242,31 @@ pub fn distill_transcript(text: &str, config: &DistillConfig) -> Vec<DistilledIt
     let mut scored: Vec<(f32, usize, DistilledItem)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
+    // ① 轮次级：整块报错日志 → **整块**留存。
+    //
+    // 为什么不在句级做：报错日志天然跨多行（`panic: ...` 后面跟调用栈），
+    // 逐句切会把上下文切碎，留下的每一行都不可读。整块留存才有回溯价值。
+    for (line_idx, block) in extract_error_blocks(text, config.max_error_blocks, config.max_chars) {
+        let key = normalize_key(&block);
+        if seen.iter().any(|k| k == &key) {
+            continue;
+        }
+        seen.push(key);
+        scored.push((
+            4.0,
+            line_idx,
+            DistilledItem {
+                content: format!("[{}] {}", Kind::Error.label(), block),
+                memory_type: Kind::Error.memory_type().to_string(),
+                tags: vec![Kind::Error.tag().to_string(), "distilled".to_string()],
+                // 报错是排障的第一手证据，固定给高分
+                importance: 8,
+                source_turns: (line_idx, line_idx),
+            },
+        ));
+    }
+
+    // ② 句级：决策 / 约束 / 结论 / 代码坐标
     for (turn_idx, turn) in turns.iter().enumerate() {
         for sentence in split_sentences(turn) {
             let trimmed = sentence.trim();
@@ -263,6 +339,8 @@ enum Kind {
     Constraint,
     Conclusion,
     CodeContext,
+    /// 整轮报错日志（由 `ERROR_MARKERS` 在轮次级识别，不走逐句打分）
+    Error,
 }
 
 impl Kind {
@@ -272,6 +350,7 @@ impl Kind {
             Kind::Constraint => "约束",
             Kind::Conclusion => "结论",
             Kind::CodeContext => "代码",
+            Kind::Error => "报错",
         }
     }
 
@@ -281,6 +360,7 @@ impl Kind {
             Kind::Constraint => "constraint",
             Kind::Conclusion => "conclusion",
             Kind::CodeContext => "code",
+            Kind::Error => "error",
         }
     }
 
@@ -290,6 +370,8 @@ impl Kind {
             Kind::Constraint => "preference",
             Kind::Conclusion => "fact",
             Kind::CodeContext => "code_context",
+            // 报错是客观事实，且需要能被"上次那个报错"检索到
+            Kind::Error => "fact",
         }
     }
 }
@@ -420,6 +502,43 @@ fn split_sentences(turn: &str) -> Vec<String> {
     }
     if !buf.trim().is_empty() {
         out.push(buf.trim().to_string());
+    }
+    out
+}
+
+/// 从原文中抽取"报错块"：命中标记的行 + 其后最多 11 行（遇到空行即止）。
+///
+/// 返回 `(起始行号, 块文本)`，行号用于 `source_turns` 回溯。
+///
+/// 为什么按行而不是按"轮"：纯文本输入下 `split_turns` 是逐行切的，
+/// 一条 `panic:` 加三行调用栈会被切成四个"轮"，按轮取只能拿到第一行。
+fn extract_error_blocks(text: &str, max_blocks: usize, max_chars: usize) -> Vec<(usize, String)> {
+    const MAX_BLOCK_LINES: usize = 12;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+
+    while i < lines.len() && out.len() < max_blocks {
+        let lower = lines[i].to_lowercase();
+        if !contains_any(&lower, ERROR_MARKERS) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut block = String::new();
+        let mut j = i;
+        while j < lines.len() && j < start + MAX_BLOCK_LINES {
+            if j > start && lines[j].trim().is_empty() {
+                break;
+            }
+            if !block.is_empty() {
+                block.push('\n');
+            }
+            block.push_str(lines[j]);
+            j += 1;
+        }
+        out.push((start, truncate_chars(block.trim(), max_chars)));
+        i = j.max(start + 1);
     }
     out
 }
@@ -617,6 +736,82 @@ mod tests {
             assert_eq!(items.len(), 1, "英文禁令应产出：{:?} -> {:?}", text, items);
             assert_eq!(items[0].memory_type, "preference", "输入 {:?}", text);
         }
+    }
+
+    /// 代码场景的短否定（不带 `use`）必须被捕获。
+    ///
+    /// 回归背景：词表原只有 `don't use`，导致 "Don't commit secrets" 这类
+    /// 高危约束整条漏掉。
+    #[test]
+    fn short_negations_are_captured() {
+        for text in [
+            "Don't commit secrets to the repo.",
+            "You shouldn't log the API key.",
+            "Never hardcode the token.",
+            "严禁把密钥写进代码。",
+            "不得跳过鉴权中间件。",
+        ] {
+            let items = distill_transcript(text, &cfg());
+            assert_eq!(items.len(), 1, "短否定应产出：{:?} -> {:?}", text, items);
+            assert_eq!(items[0].memory_type, "preference", "输入 {:?}", text);
+        }
+    }
+
+    /// 报错日志：整轮留存，且固定高重要性。
+    #[test]
+    fn keeps_error_log_as_whole_turn() {
+        let text =
+            "panic: index out of bounds\nnote: run with RUST_BACKTRACE=1\n  at src/main.rs:12";
+        let items = distill_transcript(text, &cfg());
+        assert_eq!(items.len(), 1, "整轮报错应产出 1 条，实际 {:?}", items);
+        assert_eq!(items[0].memory_type, "fact");
+        assert!(items[0].content.starts_with("[报错]"));
+        assert_eq!(items[0].importance, 8);
+        assert!(items[0].tags.contains(&"error".to_string()));
+        // 整轮留存：三行都在
+        assert!(items[0].content.contains("RUST_BACKTRACE"));
+        assert!(items[0].content.contains("src/main.rs:12"));
+    }
+
+    /// 中英文报错标记都要能识别。
+    #[test]
+    fn recognizes_error_markers_both_languages() {
+        for text in [
+            "Traceback (most recent call last):\n  File \"a.py\", line 3",
+            "报错：E0382 use of moved value",
+            "编译错误：cannot find value `x` in this scope",
+            "Error: connection refused",
+        ] {
+            let items = distill_transcript(text, &cfg());
+            assert!(
+                items.iter().any(|i| i.tags.contains(&"error".to_string())),
+                "应识别为报错：{:?} -> {:?}",
+                text,
+                items
+            );
+        }
+    }
+
+    /// 报错块数量受 `max_error_blocks` 限制，防止刷屏。
+    ///
+    /// 注意：**连续**的报错行会被合并成一块（调用栈就是这样），
+    /// 所以这里用空行把 20 条报错隔开，才能验证"块数上限"。
+    #[test]
+    fn caps_error_blocks() {
+        let mut text = String::new();
+        for i in 0..20 {
+            text.push_str(&format!("panic: boom {}\n\n", i));
+        }
+        let config = DistillConfig {
+            max_error_blocks: 3,
+            ..DistillConfig::default()
+        };
+        let items = distill_transcript(&text, &config);
+        let errors = items
+            .iter()
+            .filter(|i| i.tags.contains(&"error".to_string()))
+            .count();
+        assert_eq!(errors, 3, "报错块应被限制为 3 条，实际 {:?}", items);
     }
 
     /// JSONL transcript：应能取出 message.content 的文本。

@@ -167,6 +167,9 @@ fn context_instructions() -> String {
 
 **落点**：新建 `integrations/` 目录
 
+> 配套用户手册：[integrations/LRC_接管指南.md](file:///g:/code-memory/integrations/LRC_接管指南.md)
+> —— 面向使用者，讲清"装哪个文件、怎么验证、出问题怎么查"，不含实现细节。
+
 ```
 integrations/
 ├── README.md                      # 总览：端口纪律、通用环境变量、安装顺序、降级说明
@@ -198,8 +201,13 @@ integrations/
    探测响应里有没有 `items` 字段 —— 有则走 `migrate`，无则把对话尾部原文写成一条
    `code_context` 记忆（`tags` 含 `archived`）。
    **P1-1 已于同日落地，脚本无需改动即自动切到提炼路径**（两条路径均已实测）。
-2. **Trae / Cursor 的 Hook API 未确认**。两个模板都标注了"适用版本"，并在 README 里
-   给出降级方案（改用 `integrations/rules/` 的规则文件）。没有为了"看起来完整"去猜 API。
+2. **Trae 的 Hook API 已核实支持**（2026-11-06 更正）。官方文档
+   [Hook 配置详解](https://docs.trae.cn/ide_hook-configuration-reference) 明确：
+   配置文件为 `%userprofile%/.trae-cn/hooks.json`（全局）或 `<项目>/.trae/hooks.json`（项目级），
+   支持 `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop`，
+   stdin 传 JSON、stdout 回上下文，且能直接读 Claude Code 的 Hook 配置。
+   早期本文档写的"Trae 可能不支持 hooks"是错的，已更正。
+   **Cursor 仍为未确认**，模板保留"适用版本"标注与规则文件降级方案。
 3. **Cursor 默认 `warn` 而非 `deny`**。`deny` 会误伤正常读代码（用户说"改一下上次那个函数"
    时模型必须先 Read），因此默认只提示不阻断，`LRC_HOOK_MODE=deny` 可切换。
 
@@ -229,6 +237,20 @@ integrations/
 | PS 5.1 按 ANSI 读无 BOM 的 `.ps1` | 中文乱码 + `字符串缺少终止符` 语法错误 | 文件必须存为 **UTF-8 with BOM**，README 已标注 |
 | `[Console]::In.ReadToEnd()` 在 `-File` 模式下读不到管道 | prompt 恒为空，关键词永不命中 | 改用 `$input`，并增加 `-PromptText` / `LRC_PROMPT` 两条通道 |
 | `Invoke-RestMethod` 按 ISO-8859-1 解码 JSON | 索引中文变 `å·²å®æ` | 改 `Invoke-WebRequest` + 显式 UTF-8 解码 |
+
+**Trae 真实环境实测（2026-11-06，本机 Trae + 3099 真实库）**：
+
+已按官方文档把 Hook 装到项目级 `.trae/hooks.json`（脚本在 `.trae/hooks/`），实测：
+
+| 用例 | 结果 |
+|---|---|
+| `hooks.json` 解析 | ✅ 事件 `SessionStart, UserPromptSubmit` |
+| `SessionStart` 输出记忆索引 | ✅ 8 条 + 回退提示 |
+| `UserPromptSubmit` 命中关键词 | ✅ 索引 + `【LRC 强制】…` |
+| `UserPromptSubmit` 不命中 | ✅ 仅一行提醒 |
+
+> `.trae/` 在 `.gitignore` 里，所以这套配置是**本机生效、不入库**；
+> 可复制的模板在 `integrations/hooks/trae/`。
 
 **验收**：
 
@@ -339,6 +361,27 @@ score = 2.0 * 决策词命中数 + 1.5 * 否定词命中数 + 1.0 * 结论词命
 > **已知取舍**：精度优先于召回。单条"结论词"句（1.0 分）会被丢弃，
 > 因为结论词在对话里出现频率极高，放宽阈值会让大量过程性陈述混进记忆库。
 > 需要更高召回时调低 `DistillConfig.threshold` 即可。
+
+**召回补强（2026-11-06 第二轮，针对代码场景）**：
+
+首轮抽检暴露两类高危信息被漏掉，已修：
+
+| 漏掉什么 | 原因 | 修法 |
+|---|---|---|
+| 短否定（`Don't commit secrets` / `shouldn't` / `never` / `严禁` / `不得`） | 词表只有 `don't use`，不带 `use` 的否定全部漏掉 | 否定词表扩到 26 个，含 `don't` / `do not` / `shouldn't` / `never` / `forbidden` / `deprecated` / `严禁` / `切勿` / `不得` / `杜绝` |
+| 工具报错日志（`panic:` / `Traceback` / `报错`） | 逐句打分，报错行本身不含决策/约束词，全部被丢弃 | 新增**轮次级报错块识别**：命中 `ERROR_MARKERS` 的行 + 其后最多 11 行整块留存，`importance` 固定 8，`tags` 含 `error` |
+
+两个设计细节：
+
+- **`ERROR_MARKERS` 刻意不收裸 `panic`**，只收 `panic:` / `panicked` / `panic at`。
+  裸词会把 "Avoid panics inside the handler" 这类**约束句**误判成报错日志（实测踩过）。
+- **报错块按行抽取，不按"轮"**。纯文本输入下 `split_turns` 是逐行切的，
+  一条 `panic:` 加三行调用栈会被切成四个"轮"，按轮取只能拿到第一行。
+- 报错块数量受 `max_error_blocks`（默认 10）限制，防止刷屏。
+
+新增 5 项单测：`short_negations_are_captured`、`keeps_error_log_as_whole_turn`、
+`recognizes_error_markers_both_languages`、`caps_error_blocks`、`english_imperative_is_not_a_question`。
+`context_distill` 单测从 13 项增至 **19 项**。
 
 **复用**：`parse_forget_intent` 的规则解析范式（[memory_write.rs](file:///g:/code-memory/src/memory_write.rs)）直接照搬结构。
 
@@ -532,7 +575,7 @@ Cursor 的扩展 API 只在 `vscode.cursor` 命名空间下开放**注册 MCP �
 |---|---|---|---|
 | 1 | P0-1 instructions | 单测 + curl | ✅ 已通过（字段存在、427 字符、含强约束词） |
 | 2 | P0-2 Hook 模板 | 目录完整性 + 脚本实测 | ✅ 4 个宿主目录齐全，14 项脚本用例全通过；Claude Code 真实 `/compact` 待人工验收 |
-| 3 | P1-1 提炼引擎 | 单测 + 真实对话抽检 | ✅ 13 项单测通过、零新增依赖；40 轮真实对话产出 6 条、准确率 100% |
+| 3 | P1-1 提炼引擎 | 单测 + 真实对话抽检 | ✅ 19 项单测通过、零新增依赖；40 轮真实对话产出 6 条、准确率 100%；短否定与报错日志已补强 |
 | 4 | P1-2 规则模板 | 文件检查 + Trae 实测 | ✅ 3 个模板齐全、结构一致；已在 Trae 真实会话中加载并生效（先 recall 后回答） |
 | 5 | P2-1 DSH 插件 | 安装实测 | ✅ 工具插件 + 压缩后端已实现、签名逐字核对、客户端 11 项冒烟通过；真实 DSH 环境验收待做 |
 | 6 | 新增接口 | 集成测试 | ✅ 3 个接口 200，migrate 幂等（5 项集成用例全通过） |
