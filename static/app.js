@@ -11960,6 +11960,13 @@ function selectEmbedderModel(modelId) {
     activeCard = document.querySelector(`[data-embedder="${modelId}"]`);
   }
   if (activeCard) {
+    // ★2026-11-07：标记为「需后续版本支持」的模型不可选，给出明确提示。
+    // 这些模型（Granite ModernBERT / Qwen3）当前 Candle 加载器只支持 BERT 架构，
+    // 选中后无法加载，故只做信息展示，不写入 embedder-model。
+    if (activeCard.dataset.unsupported === '1') {
+      showToast('该模型需要 LRC 后续版本支持（当前加载器仅支持 BERT 架构），暂不可用', 'warning', 5000);
+      return;
+    }
     activeCard.classList.add('active');
   } else {
     console.warn('[LRC v' + APP_VERSION + ']selectEmbedderModel 未找到匹配卡片:', modelId);

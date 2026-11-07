@@ -2043,48 +2043,115 @@
             选择模型
           </div>
           <!-- 隐藏输入，存储当前选中的模型 ID，供 testEmbedderConnection 等函数读取 -->
-          <input type="hidden" id="embedder-model" value="BAAI/bge-small-zh">
+          <input type="hidden" id="embedder-model" value="BAAI/bge-small-zh-v1.5">
           <div class="provider-grid">
-            <div class="provider-card active" data-embedder="bge-small-zh" data-action="selectEmbedderModel" data-arg="BAAI/bge-small-zh" role="button" tabindex="0" aria-label="选择嵌入模型：BGE-small-zh（中文首选）">
+            <!-- 1. BGE-small-zh-v1.5：省内存首选 -->
+            <div class="provider-card active" data-embedder="bge-small-zh-v1.5" data-action="selectEmbedderModel" data-arg="BAAI/bge-small-zh-v1.5" role="button" tabindex="0" aria-label="选择嵌入模型：BGE-small-zh-v1.5（省内存首选）">
               <div class="provider-card-header">
-                <span class="provider-name">BGE-small-zh</span>
-                <span class="provider-recommended">中文首选</span>
+                <span class="provider-name">BGE-small-zh-v1.5</span>
+                <span class="provider-recommended">省内存首选</span>
               </div>
-              <p class="provider-card-desc">中文通用，512维，~100MB，精度高速度快</p>
+              <p class="provider-card-desc">
+                <strong>能做什么：</strong>中文语义检索、记忆联想。<br>
+                <strong>性能：</strong>中文小模型第一梯队（C-MTEB 57.8）。<br>
+                <strong>代价：</strong>约 96MB；英文代码检索偏弱。
+              </p>
             </div>
-            <div class="provider-card" data-embedder="minilm-l6" data-action="selectEmbedderModel" data-arg="sentence-transformers/all-MiniLM-L6-v2" role="button" tabindex="0" aria-label="选择嵌入模型：MiniLM-L6-v2">
+
+            <!-- 2. BGE-base-zh：中文高精度 -->
+            <div class="provider-card" data-embedder="bge-base-zh" data-action="selectEmbedderModel" data-arg="BAAI/bge-base-zh" role="button" tabindex="0" aria-label="选择嵌入模型：BGE-base-zh（中文高精度）">
+              <div class="provider-card-header">
+                <span class="provider-name">BGE-base-zh</span>
+                <span style="font-size: 0.75em; padding: 2px 8px; background: var(--lrc-宣纸-500); border-radius: 12px; color: var(--lrc-墨韵-500);">中文高精度</span>
+              </div>
+              <p class="provider-card-desc">
+                <strong>能做什么：</strong>中文语义检索，精度最高。<br>
+                <strong>性能：</strong>C-MTEB 63.1，比 small 高约 8%。<br>
+                <strong>代价：</strong>约 390MB，内存占用大。
+              </p>
+            </div>
+
+            <!-- 3. MiniLM-L6-v2：英文轻量 -->
+            <div class="provider-card" data-embedder="minilm-l6" data-action="selectEmbedderModel" data-arg="sentence-transformers/all-MiniLM-L6-v2" role="button" tabindex="0" aria-label="选择嵌入模型：MiniLM-L6-v2（英文轻量）">
               <div class="provider-card-header">
                 <span class="provider-name">MiniLM-L6-v2</span>
               </div>
-              <p class="provider-card-desc">英文通用，384维，~80MB，轻量快速</p>
+              <p class="provider-card-desc">
+                <strong>能做什么：</strong>英文语义检索。<br>
+                <strong>性能：</strong>英文轻量模型，速度快。<br>
+                <strong>代价：</strong>约 80MB；中文能力弱。
+              </p>
             </div>
-            <div class="provider-card" data-embedder="multilingual-e5" data-action="selectEmbedderModel" data-arg="intfloat/multilingual-e5-small" role="button" tabindex="0" aria-label="选择嵌入模型：multilingual-e5">
+
+            <!-- 4. multilingual-e5-small：多语言 -->
+            <div class="provider-card" data-embedder="multilingual-e5" data-action="selectEmbedderModel" data-arg="intfloat/multilingual-e5-small" role="button" tabindex="0" aria-label="选择嵌入模型：multilingual-e5-small（多语言）">
               <div class="provider-card-header">
-                <span class="provider-name">multilingual-e5</span>
+                <span class="provider-name">multilingual-e5-small</span>
               </div>
-              <p class="provider-card-desc">多语言，384维，~120MB，支持100+语言</p>
+              <p class="provider-card-desc">
+                <strong>能做什么：</strong>100+ 语言混合检索。<br>
+                <strong>性能：</strong>多语言均衡，中文一般。<br>
+                <strong>代价：</strong>约 470MB；代码检索弱。
+              </p>
             </div>
-            <div class="provider-card" data-embedder="bge-base-zh" data-action="selectEmbedderModel" data-arg="BAAI/bge-base-zh" role="button" tabindex="0" aria-label="选择嵌入模型：BGE-base-zh（高精度）">
+
+            <!-- 5. Granite 97M Multilingual R2：中英代码（需后续版本） -->
+            <div class="provider-card" data-embedder="granite-97m" data-action="selectEmbedderModel" data-arg="ibm-granite/granite-embedding-97m-multilingual-r2" data-unsupported="1" role="button" tabindex="0" aria-label="Granite 97M Multilingual R2（中英代码，需后续版本支持）">
               <div class="provider-card-header">
-                <span class="provider-name">BGE-base-zh</span>
-                <span style="font-size: 0.75em; padding: 2px 8px; background: var(--lrc-宣纸-500); border-radius: 12px; color: var(--lrc-墨韵-500);">高精度</span>
+                <span class="provider-name">Granite 97M Multilingual R2</span>
+                <span style="font-size: 0.75em; padding: 2px 8px; background: var(--lrc-宣纸-500); border-radius: 12px; color: var(--lrc-墨韵-500);">中英代码 · 需后续版本</span>
               </div>
-              <p class="provider-card-desc">中文高精度，768维，~400MB，效果最佳</p>
+              <p class="provider-card-desc">
+                <strong>能做什么：</strong>中文 + 英文 + 代码统一检索。<br>
+                <strong>性能：</strong>200+ 语言 + 代码，32K 上下文。<br>
+                <strong>代价：</strong>约 388MB；当前加载器仅支持 BERT，需后续版本支持。
+              </p>
+            </div>
+
+            <!-- 6. Qwen3-Embedding-0.6B：质量优先（需后续版本） -->
+            <div class="provider-card" data-embedder="qwen3-0.6b" data-action="selectEmbedderModel" data-arg="Qwen/Qwen3-Embedding-0.6B" data-unsupported="1" role="button" tabindex="0" aria-label="Qwen3-Embedding-0.6B（质量优先，需后续版本支持）">
+              <div class="provider-card-header">
+                <span class="provider-name">Qwen3-Embedding-0.6B</span>
+                <span style="font-size: 0.75em; padding: 2px 8px; background: var(--lrc-宣纸-500); border-radius: 12px; color: var(--lrc-墨韵-500);">质量优先 · 需后续版本</span>
+              </div>
+              <p class="provider-card-desc">
+                <strong>能做什么：</strong>中文 + 英文 + 代码，质量最强。<br>
+                <strong>性能：</strong>100+ 语言 + 代码，32K 上下文。<br>
+                <strong>代价：</strong>约 1.2GB；当前加载器仅支持 BERT，需后续版本支持。
+              </p>
             </div>
           </div>
         </div>
 
-        <!-- 操作说明 -->
-        <div style="background: var(--lrc-宣纸-300); border-radius: var(--radius-md); padding: 16px 20px; margin-bottom: 20px; border-left: 4px solid var(--lrc-水蓝-400);">
+        <!-- 怎么选 -->
+        <div style="background: var(--lrc-宣纸-300); border-radius: var(--radius-md); padding: 16px 20px; margin-bottom: 16px; border-left: 4px solid var(--lrc-水蓝-400);">
           <div style="display: flex; align-items: flex-start; gap: 10px;">
-            <img src="/assets/icons/icon-info.svg" alt="" width="22" height="22" style="flex-shrink: 0; margin-top: 2px; color: var(--lrc-水蓝-500);">
+            <img src="/assets/icons/icon-info.svg" alt="" width="22" height="22" style="flex-shrink: 0; margin-top: 2px;">
             <div>
-              <div style="font-weight: 600; color: var(--lrc-墨韵-700); margin-bottom: 6px;">操作说明</div>
-              <ol style="margin: 0; padding-left: 20px; color: var(--lrc-墨韵-600); font-size: 0.9em; line-height: 1.8;">
-                <li>选择一个模型（推荐 BGE-small-zh）</li>
-                <li>点击「下载并安装」，模型将从国内镜像下载到本地</li>
-                <li>安装完成后自动生效，所有记忆将使用新模型重新编码</li>
-              </ol>
+              <div style="font-weight: 600; color: var(--lrc-墨韵-700); margin-bottom: 6px;">怎么选？</div>
+              <ul style="margin: 0; padding-left: 20px; color: var(--lrc-墨韵-600); font-size: 0.9em; line-height: 1.8;">
+                <li><strong>只想省内存：</strong>选 BGE-small-zh-v1.5（约 96MB）。</li>
+                <li><strong>中文精度优先：</strong>选 BGE-base-zh（约 390MB）。</li>
+                <li><strong>英文为主：</strong>选 MiniLM-L6-v2（约 80MB）。</li>
+                <li><strong>中英混合：</strong>选 multilingual-e5-small（约 470MB）。</li>
+                <li><strong>中文 + 英文代码：</strong>Granite 97M / Qwen3-Embedding-0.6B（需后续版本支持）。</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <!-- 切换模型的代价 -->
+        <div style="background: var(--lrc-宣纸-300); border-radius: var(--radius-md); padding: 16px 20px; margin-bottom: 20px; border-left: 4px solid var(--lrc-朱砂-400);">
+          <div style="display: flex; align-items: flex-start; gap: 10px;">
+            <img src="/assets/icons/icon-warning.svg" alt="" width="22" height="22" style="flex-shrink: 0; margin-top: 2px;">
+            <div>
+              <div style="font-weight: 600; color: var(--lrc-墨韵-700); margin-bottom: 6px;">切换模型前，请先了解代价</div>
+              <ul style="margin: 0; padding-left: 20px; color: var(--lrc-墨韵-600); font-size: 0.9em; line-height: 1.8;">
+                <li><strong>要重新编码：</strong>切换后，所有记忆会用新模型重新算一遍向量。记忆越多越久，通常几分钟到几十分钟。</li>
+                <li><strong>旧向量会失效：</strong>新旧模型的向量不能混用，切换后旧向量不再参与检索。</li>
+                <li><strong>建议先备份：</strong>切换前点一次「立即备份」，出问题可以回滚。</li>
+                <li><strong>什么时候切换：</strong>建议在你不使用 LRC 的时候（比如晚上或周末）切换，避免编码期间检索变慢。</li>
+              </ul>
             </div>
           </div>
         </div>

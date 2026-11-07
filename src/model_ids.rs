@@ -21,6 +21,12 @@
 /// 中文默认嵌入模型（~100MB，512 维）
 pub const MODEL_BGE_SMALL_ZH: &str = "BAAI/bge-small-zh";
 
+/// 中文轻量嵌入模型 v1.5（~96MB，512 维，C-MTEB 57.82）
+///
+/// v0.10.2 新增：v1.5 相比 v1.0 优化了相似度分布、增强了无指令检索，
+/// 是同体积下更稳的「省内存」选择。
+pub const MODEL_BGE_SMALL_ZH_V15: &str = "BAAI/bge-small-zh-v1.5";
+
 /// 中文高精度嵌入模型（~400MB，768 维）
 pub const MODEL_BGE_BASE_ZH: &str = "BAAI/bge-base-zh";
 
@@ -41,6 +47,7 @@ pub const MODEL_GRAPHCODEBERT_BASE: &str = "microsoft/graphcodebert-base";
 /// 顺序即前端/仪表盘的展示顺序（默认模型在前）。
 pub const AVAILABLE_EMBEDDER_MODELS: &[&str] = &[
     MODEL_BGE_SMALL_ZH,
+    MODEL_BGE_SMALL_ZH_V15,
     MODEL_ALL_MINILM_L6_V2,
     MODEL_MULTILINGUAL_E5_SMALL,
     MODEL_BGE_BASE_ZH,
@@ -48,11 +55,11 @@ pub const AVAILABLE_EMBEDDER_MODELS: &[&str] = &[
 
 /// 根据语言代码选择默认嵌入模型 ID
 ///
-/// - 中文（`zh_*`）→ [`MODEL_BGE_SMALL_ZH`]（中文 SOTA）
+/// - 中文（`zh_*`）→ [`MODEL_BGE_SMALL_ZH_V15`]（中文小模型第一梯队，~96MB）
 /// - 其他 → [`MODEL_ALL_MINILM_L6_V2`]（多语言轻量）
 pub fn detect_default_model_by_lang(lang: &str) -> &'static str {
     if lang.to_lowercase().starts_with("zh") {
-        MODEL_BGE_SMALL_ZH
+        MODEL_BGE_SMALL_ZH_V15
     } else {
         MODEL_ALL_MINILM_L6_V2
     }

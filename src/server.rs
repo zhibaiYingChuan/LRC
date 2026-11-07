@@ -4234,7 +4234,7 @@ static EMBEDDER_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 ///         Layer 2 引擎亦可引用，避免 Layer 2 反向依赖本模块造成 feature 耦合）。
 pub use crate::model_ids::{
     AVAILABLE_EMBEDDER_MODELS, MODEL_ALL_MINILM_L6_V2, MODEL_BGE_BASE_ZH, MODEL_BGE_SMALL_ZH,
-    MODEL_MULTILINGUAL_E5_SMALL,
+    MODEL_BGE_SMALL_ZH_V15, MODEL_MULTILINGUAL_E5_SMALL,
 };
 
 // ---------- 请求 / 响应结构体 ----------

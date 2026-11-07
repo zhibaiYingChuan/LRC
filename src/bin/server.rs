@@ -1977,6 +1977,11 @@ fn run_benchmark_mode(json_output: bool) {
 ///         复制粘贴去下载，会被白名单直接拒绝（"不支持的 model_id"）。
 ///   修复：改为引用 `server` 模块的单一真源常量，消除展示值与白名单分歧。
 const RECOMMENDED_MODELS: &[(&str, &str, &str)] = &[
+    (
+        server::MODEL_BGE_SMALL_ZH_V15,
+        "512",
+        "中文轻量 v1.5（~96MB，省内存首选）",
+    ),
     (server::MODEL_BGE_SMALL_ZH, "512", "中文默认（~100MB）"),
     (server::MODEL_BGE_BASE_ZH, "768", "中文高精度（~400MB）"),
     (
