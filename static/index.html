@@ -6,7 +6,7 @@
   <!-- 之前完全未配置 CSP，XSS/数据注入防御缺失，HCSE 安全不变量 INV-01 违规 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.openai.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="version" content="0.10.0">
+  <meta name="version" content="0.10.2">
   <!-- v0.9.0 开发模式隔离：注入 sidecar 端口号，前端通过此标签获取正确的 API 端点 -->
   <!-- 开发版默认 3111，稳定版打包时替换为 3099 -->
   <meta name="lrc-sidecar-port" content="3111">
@@ -821,10 +821,14 @@
           <button class="btn btn-outline btn-sm" data-action="triggerFileInput" data-target="trust-import-file">
             <img src="/assets/icons/icon-import.svg" alt="" width="14" height="14"> 导入记忆
           </button>
+          <button class="btn btn-outline btn-sm" data-action="listBackupSnapshots">
+            <img src="/assets/icons/icon-import.svg" alt="" width="14" height="14"> 从快照恢复
+          </button>
           <input type="file" id="trust-import-file" style="display:none" accept=".json" data-input-action="importMemories" data-input-event="change" data-pass-event="1">
         </div>
         <div class="verify-result" id="trust-backup-result"></div>
         <div class="verify-result" id="backup-result-trust"></div>
+        <div class="verify-result" id="trust-backup-snapshots" style="display:none"></div>
         <p class="text-sm text-dim mt-2">
           「立即备份」在本地创建快照（保留最近 4 份）；「导出」下载 JSON 文件到本地；「导入」从 JSON 文件恢复。
         </p>
@@ -2346,10 +2350,48 @@
             <div class="backup-title">导入记忆</div>
             <div class="backup-desc">从备份文件中恢复记忆数据</div>
           </button>
+          <button class="backup-action-card" data-action="listBackupSnapshots">
+            <div class="backup-icon" style="background: rgba(192, 57, 43, 0.1);">
+              <img src="/assets/icons/icon-import.svg" alt="" width="32" height="32" style="filter: brightness(0) saturate(100%) invert(35%) sepia(60%) saturate(500%) hue-rotate(330deg) brightness(85%) contrast(90%);">
+            </div>
+            <div class="backup-title">从快照恢复</div>
+            <div class="backup-desc">从本地快照（最多 4 份）恢复记忆库</div>
+          </button>
         </div>
         <div id="backup-result" class="form-result" style="display:none"></div>
+        <div id="backup-snapshots" class="form-result" style="display:none"></div>
         <p class="form-hint" style="text-align: center; margin-top: 16px; font-size: 12px;">
           <img src="/assets/icons/icon-info.svg" alt="" width="12" height="12" style="vertical-align: middle; margin-right: 4px; opacity: 0.6;"> 也可以通过命令行操作：<code>code-memory-server --export backup.json</code> 和 <code>code-memory-server --import backup.json</code>
+        </p>
+      </div>
+    </div>
+
+    <!-- ★2026-11-07：记忆维护（八卦重分类） -->
+    <div class="section" id="maintenance-section">
+      <div class="narrative-card">
+        <div class="settings-section-header">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <div class="settings-icon-badge" style="background: linear-gradient(135deg, var(--lrc-墨韵-400), var(--lrc-墨韵-600));">
+              <img src="/assets/icons/icon-bagua.svg" alt="" width="24" height="24" style="filter: brightness(0) invert(1);">
+            </div>
+            <div>
+              <h3 class="settings-section-title">记忆维护</h3>
+              <p class="settings-section-desc">按当前编码器重新计算全部记忆的八卦分类（后台执行，可离开本页）</p>
+            </div>
+          </div>
+        </div>
+        <div class="backup-actions-grid">
+          <button class="backup-action-card" data-action="startReclassifyBagua">
+            <div class="backup-icon" style="background: rgba(76, 164, 156, 0.1);">
+              <img src="/assets/icons/icon-bagua.svg" alt="" width="32" height="32">
+            </div>
+            <div class="backup-title">重新分类八卦</div>
+            <div class="backup-desc">扫描全库并按当前编码器重算八卦标签</div>
+          </button>
+        </div>
+        <div id="reclassify-result" class="form-result" style="display:none"></div>
+        <p class="form-hint" style="text-align: center; margin-top: 16px; font-size: 12px;">
+          <img src="/assets/icons/icon-info.svg" alt="" width="12" height="12" style="vertical-align: middle; margin-right: 4px; opacity: 0.6;"> 适用于更换编码器或模型后标签漂移的场景；任务在后台分批执行，不会阻塞检索。
         </p>
       </div>
     </div>

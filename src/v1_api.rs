@@ -450,6 +450,9 @@ pub struct ExploreNode {
     /// 所处的联想层（起点为 0）
     pub depth: u8,
     pub score: f32,
+    /// 展示用相关度（0–1，相对 top1 归一化，方案 A）。
+    /// 起点恒为 1.0；`score` 保留原始量纲供诊断。
+    pub score_norm: f32,
     /// 节点来源：root（起点）/ expanded（相似度扩散）/ **record**（记录层联想
     /// —— 由记录字段必然成立）/ **symbolic**（符号层联想 —— 由结构算子推导，
     /// **可能不成立**，v0.9.8 2026-09-18 补）
@@ -495,6 +498,23 @@ pub struct ExploreEdge {
 fn default_top_k() -> usize {
     5
 }
+
+/// 把一组原始分归一化为「相对 top1」的 0–1 相关度（方案 A，2026-11-07 用户裁定）。
+///
+/// # 为什么需要
+///
+/// 同一套 UI 的「匹配度」标签此前套用了三套量纲：RRF 融合分 0.01–0.05、
+/// fast BM25 无上界 0–20+、洛书余弦 0–1。直接 `score * 100` 会渲染出
+/// 「2000%」与「3%」并存，用户无法理解。
+///
+/// # 口径
+///
+/// 第一名恒为 100%，其余按 `score / top1` 比例缩放；全为 0/非有限值时全 0。
+/// 这是**展示口径**，不改变任何排序（排序仍用原始分）。
+///
+/// ★2026-11-07（代码审查 #8）：实现已上移到 crate 根（`crate::normalize_scores_relative`），
+/// 与 `state_matcher` 共用，避免两处口径漂移。此处 re-export 供本模块与测试使用。
+pub(crate) use crate::normalize_scores_relative;
 
 /// /v1/memories/enrich 响应体
 #[derive(Debug, Serialize)]
@@ -584,6 +604,12 @@ pub struct EnrichedMemory {
     pub content: String,
     pub memory_type: String,
     pub score: f32,
+    /// 展示用相关度（0–1，相对 top1 归一化，方案 A）。
+    /// 第一名恒为 1.0；`score` 保留原始量纲（RRF 融合分）供诊断。
+    pub score_norm: f32,
+    /// 原始分的量纲标识（当前恒为 "rrf"）。
+    /// 供诊断与未来展示使用；当前前端未消费该字段。
+    pub score_kind: &'static str,
     pub bagua_category: Option<String>,
     /// 64 卦索引（上卦 × 8 + 下卦，0..64）——**标签/组织**用，不参与检索排序。
     ///
@@ -1140,6 +1166,7 @@ fn run_association_explore(
         content: root_memory.content.clone(),
         depth: 0,
         score: root_score,
+        score_norm: 0.0,
         source,
         evidence,
         // 起点本身来自召回（相似度/词面），不是记录层血缘
@@ -1194,6 +1221,7 @@ fn run_association_explore(
                 content: a.content_preview.clone(),
                 depth: 1,
                 score: 0.0,
+                score_norm: 0.0,
                 // ★按边类型区分证据来源（2026-09-18 修 S4 的 UI 侧复现）：
                 //   `expand_associations` 也会产出符号层（结构推导，可能不成立）
                 //   的边，一律标 "record" 会让前端把它渲染成"记录关联"。
@@ -1315,6 +1343,7 @@ fn run_association_explore(
                 content: memory.content.clone(),
                 depth: next_depth,
                 score: child_score,
+                score_norm: 0.0,
                 source: "expanded".to_string(),
                 evidence,
                 relation: None,
@@ -1355,6 +1384,7 @@ fn run_association_explore(
                         content: a.content_preview.clone(),
                         depth: next_depth,
                         score: 0.0,
+                        score_norm: 0.0,
                         // ★同起点：按边类型区分（见 `explore_source_of` 文档）
                         source: explore_source_of(&a.relation).to_string(),
                         evidence: None,
@@ -1376,6 +1406,17 @@ fn run_association_explore(
 
     // ★ 2026-11-05：应用读路径累积的副作用（图边 / 状态机 / 生命周期）。
     store.flush_recall_side_effects();
+
+    // ★方案 A（2026-11-07）：为探索节点计算「相对 top1」的展示相关度。
+    //   记录层/符号层节点原始分为 0（证据性质不同，不参与相似度排序），
+    //   归一化后同样为 0，前端据此不展示百分比。
+    {
+        let raw: Vec<f32> = nodes.iter().map(|n| n.score).collect();
+        let norms = normalize_scores_relative(&raw);
+        for (n, v) in nodes.iter_mut().zip(norms) {
+            n.score_norm = v;
+        }
+    }
 
     AssociationExploreResponse {
         root,
@@ -2943,6 +2984,8 @@ pub fn build_v1_router_with_trust(
                                     content: m.content.clone(),
                                     memory_type: m.memory_type.as_str().to_string(),
                                     score,
+                                    score_norm: 0.0,
+                                    score_kind: "rrf",
                                     bagua_category: m.bagua_category.clone(),
                                     gua64: gua64_of(m),
                                     daoti_preview_gua: m.daoti_preview_gua.clone(),
@@ -3141,6 +3184,8 @@ pub fn build_v1_router_with_trust(
                                             // 明确其证据性质为"记录必然成立"，故排在相似度可比
                                             // 的结果之下
                                             score: assoc_score,
+                                            score_norm: 0.0,
+                                            score_kind: "rrf",
                                             bagua_category: m.bagua_category.clone(),
                                             gua64: gua64_of(&m),
                                             daoti_preview_gua: m.daoti_preview_gua.clone(),
@@ -3158,6 +3203,16 @@ pub fn build_v1_router_with_trust(
                                 }
                             }
                             let __t_assoc = __t0.elapsed();
+                            // ★方案 A（2026-11-07）：为最终结果集（含记录层补全）计算
+                            //   「相对 top1」的展示相关度。必须在补全之后统一算，
+                            //   否则补全条目的 0.99×最低分 会破坏归一化基准。
+                            {
+                                let raw: Vec<f32> = memories.iter().map(|m| m.score).collect();
+                                let norms = normalize_scores_relative(&raw);
+                                for (m, n) in memories.iter_mut().zip(norms) {
+                                    m.score_norm = n;
+                                }
+                            }
                             // 审计副本**有界**：只取前 N 条证据（本体仍原样进响应）
                             let evidence_json = serde_json::to_string(
                                 &regression_evidence
@@ -5571,7 +5626,11 @@ pub fn build_v1_router_with_trust(
                 }
             }
         }))
-        // GET /v1/context/index — 取归档索引（`tags` 含 `archived` 的最近记忆）
+        // GET /v1/context/index — 取归档索引（`tags` 含 `distilled` 的最近记忆）
+        //
+        // 口径必须与 `distill` 产出的标签一致：提炼引擎给每条都打 `distilled`，
+        // 而这里原先查的是 `archived` —— 全仓没有任何生产路径写这个标签，
+        // 导致索引恒为空（项目里有 2 条记忆，index 仍返回 total: 0）。
         .route("/context/index", get({
             let store = context_store.clone();
             move |Query(params): Query<ContextIndexParams>| {
@@ -5582,7 +5641,7 @@ pub fn build_v1_router_with_trust(
                     let store = store.read().await;
                     let filter = crate::memory_store::ListFilter {
                         project: project.clone(),
-                        tags: vec!["archived".to_string()],
+                        tags: vec!["distilled".to_string()],
                         sort_by: crate::memory_store::SortBy::CreatedAt,
                         order: crate::memory_store::SortOrder::Desc,
                         limit,
@@ -6369,10 +6428,17 @@ pub fn build_v1_router_with_trust(
                     let stats = stats.get_stats();
 
                     // 格式化为前端友好的 JSON 结构
-                    let results: Vec<serde_json::Value> = result.results.iter().map(|r| {
+                    // ★方案 A（2026-11-07）：BM25 原始分无上界（实测可达 20+），
+                    //   直接 ×100 会渲染成「2000%」。此处补 `score_norm`（相对 top1）
+                    //   供展示，`score` 保留原始分供诊断。
+                    let raw_scores: Vec<f32> = result.results.iter().map(|r| r.score).collect();
+                    let norms = normalize_scores_relative(&raw_scores);
+                    let results: Vec<serde_json::Value> = result.results.iter().enumerate().map(|(i, r)| {
                         serde_json::json!({
                             "rank": r.rank,
                             "score": r.score,
+                            "score_norm": norms.get(i).copied().unwrap_or(0.0),
+                            "score_kind": "bm25",
                             "file_path": r.chunk.file_path,
                             "name": r.chunk.name,
                             "language": r.chunk.language,

@@ -2203,12 +2203,27 @@ async fn handle_recall(
             if result.memories.is_empty() {
                 text.push_str("未找到相关记忆。使用 remember 工具添加新记忆。\n");
             } else {
+                // ★方案 A（2026-11-07）：MCP 文本此前把三套量纲（RRF 0.01–0.05 /
+                //   BM25 0–20+ / 余弦 0–1）统一 ×100 渲染，出现「2000%」与「3%」并存。
+                //   改为「相关度（相对 top1）+ 原始分」，量纲不再混淆。
+                let max_score = result
+                    .scores
+                    .iter()
+                    .copied()
+                    .filter(|s| s.is_finite())
+                    .fold(0.0f32, f32::max);
                 for (i, m) in result.memories.iter().enumerate() {
                     let score = result.scores.get(i).unwrap_or(&0.0);
                     let mem_num = i + 1;
+                    let rel = if max_score > 0.0 && score.is_finite() && *score > 0.0 {
+                        (score / max_score).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
                     text.push_str(&format!(
-                        "（记忆 #{mem_num} · 匹配度 {:.1}%）\n",
-                        score * 100.0
+                        "（记忆 #{mem_num} · 相关度 {:.1}% · 原始分 {:.3}）\n",
+                        rel * 100.0,
+                        score
                     ));
                     text.push_str(&format!("内容: {}\n", m.content));
                     if let Some(ref cat) = m.bagua_category {

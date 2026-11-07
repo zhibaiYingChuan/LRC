@@ -4604,6 +4604,72 @@ mod tests {
         assert_eq!(stats.recent_added, 2, "刚写入的记忆应计入近7天新增");
     }
 
+    /// 项目名大小写不敏感归并：`YL` 与 `Yl` 不得同时出现在 `by_project` 里。
+    ///
+    /// 回归背景：两者作为 JSON 对象的两个 key 是合法的，但大小写不敏感的解析器
+    /// （PowerShell 的 ConvertFrom-Json、部分 JS 库）会直接报
+    /// `DuplicateKeysInJsonString`，导致整个 `/v1/memories/stats` 响应解析失败。
+    #[test]
+    fn stats_merges_project_names_case_insensitively() {
+        // 环境变量（LRC_DISABLE_MEMORY / LRC_SIMILARITY_THRESHOLD）是进程级的，
+        // 并行测试会互相污染，必须持锁。
+        let _env_guard = crate::test_env::lock();
+        let (_dir, store) = make_store();
+        let mut a = make_test_memory("数据库选 PostgreSQL，因为需要事务支持", MemoryType::Fact);
+        a.project = Some("YL".to_string());
+        let mut b = make_test_memory("禁止在请求路径上使用 unwrap", MemoryType::Fact);
+        b.project = Some("Yl".to_string());
+        store.remember(a).expect("应成功记住");
+        store.remember(b).expect("应成功记住");
+
+        let stats = store.stats().expect("应获取统计");
+        assert_eq!(
+            stats.by_project.len(),
+            1,
+            "大小写不同的同名项目应归并：{:?}",
+            stats.by_project
+        );
+        assert_eq!(stats.by_project.values().next(), Some(&2));
+    }
+
+    /// 相似合并必须**项目隔离**：跨项目内容相似也不得合并。
+    ///
+    /// 回归背景：候选集里同时有同项目与同语言的其他项目，跨项目命中会让
+    /// 调用方看到"写入成功但项目里查不到" —— 记忆被静默搬进了别的项目。
+    #[test]
+    fn merge_is_project_isolated() {
+        let _env_guard = crate::test_env::lock();
+        let (_dir, store) = make_store();
+        let content = "决定用 pnpm 替代 npm，因为依赖解析更快";
+
+        let mut a = make_test_memory(content, MemoryType::Decision);
+        a.project = Some("proj-a".to_string());
+        store.remember(a).expect("应成功记住");
+
+        let mut b = make_test_memory(content, MemoryType::Decision);
+        b.project = Some("proj-b".to_string());
+        store.remember(b).expect("应成功记住");
+
+        let (list_a, _) = store
+            .list_memories(&ListFilter {
+                project: Some("proj-a".to_string()),
+                ..ListFilter::new()
+            })
+            .expect("应列出 proj-a");
+        let (list_b, _) = store
+            .list_memories(&ListFilter {
+                project: Some("proj-b".to_string()),
+                ..ListFilter::new()
+            })
+            .expect("应列出 proj-b");
+        assert_eq!(list_a.len(), 1, "proj-a 应有自己的记忆");
+        assert_eq!(
+            list_b.len(),
+            1,
+            "proj-b 应有自己的记忆，不得被合并进 proj-a"
+        );
+    }
+
     #[test]
     fn test_stats_recent_added_excludes_old_memories() {
         let (_dir, store) = make_store();

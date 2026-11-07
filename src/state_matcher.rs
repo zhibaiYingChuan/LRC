@@ -224,6 +224,11 @@ pub struct StateMatchCandidate {
     pub content_preview: String,
     /// 匹配度（0-1；8 维分布与该记忆母卦的对齐强度）
     pub match_score: f32,
+    /// 展示用相关度（0–1，相对 top1 归一化，方案 A）。
+    ///
+    /// `match_score` 在相对口径下是 z 值（可 >1 或为负），直接展示会误导；
+    /// 本字段恒为 0–1，第一名恒为 1.0，供前端统一渲染百分比。
+    pub score_norm: f32,
     /// 距上次访问天数
     pub days_since_last_access: i64,
     /// 该记忆的母卦索引（0-7）与名称，便于用户核对依据
@@ -258,6 +263,10 @@ pub struct StateDrivenOutcome {
     /// 被判据过滤掉的候选数（可观测性）
     pub filtered_out: usize,
     pub match_min_used: f32,
+    /// `match_score` 的量纲标识："absolute"（0–1 绝对）/
+    /// "relative_z"（相对 z 值）/ "semantic"（语义余弦 0–1）。
+    /// 供诊断与未来展示使用；当前前端未消费该字段。
+    pub score_kind: &'static str,
     pub stale_days_used: i64,
     /// 本日已展示条数（复用 discovery 账本，D4 同口径）
     pub shown_today: usize,
@@ -288,6 +297,7 @@ fn base_outcome(executed: bool, skip_reason: Option<&str>) -> StateDrivenOutcome
         candidates: Vec::new(),
         filtered_out: 0,
         match_min_used: state_match_min(),
+        score_kind: "absolute",
         stale_days_used: state_stale_days(),
         shown_today: 0,
         daily_cap: crate::discovery::discovery_daily_cap(),
@@ -300,6 +310,11 @@ fn base_outcome(executed: bool, skip_reason: Option<&str>) -> StateDrivenOutcome
 pub fn skipped_outcome(reason: &str) -> StateDrivenOutcome {
     base_outcome(false, Some(reason))
 }
+
+/// 把一组原始分归一化为「相对 top1」的 0–1 相关度（方案 A，2026-11-07）。
+///
+/// ★2026-11-07（代码审查 #8）：实现已上移到 crate 根，与 `v1_api` 共用。
+use crate::normalize_scores_relative;
 
 /// 生成内容摘要（按 char 边界截断，避免 UTF-8 字节切裂）。
 fn preview_of(content: &str) -> String {
@@ -652,6 +667,7 @@ pub fn match_memories_core(memories: &[Memory], snapshot: &StateSnapshot) -> Sta
             memory_id: m.id.clone(),
             content_preview: preview_of(&m.content),
             match_score: score,
+            score_norm: 0.0,
             days_since_last_access: days,
             bagua_index: mem_bagua,
             bagua_name: mem_name.clone(),
@@ -665,12 +681,22 @@ pub fn match_memories_core(memories: &[Memory], snapshot: &StateSnapshot) -> Sta
         });
     }
 
+    // ★方案 A（2026-11-07）：相对 top1 归一化，供前端统一渲染百分比。
+    {
+        let raw: Vec<f32> = candidates.iter().map(|c| c.match_score).collect();
+        let norms = normalize_scores_relative(&raw);
+        for (c, n) in candidates.iter_mut().zip(norms) {
+            c.score_norm = n;
+        }
+    }
+
     StateDrivenOutcome {
         executed: true,
         skip_reason: None,
         candidates,
         filtered_out,
         match_min_used: match_min,
+        score_kind: if relative { "relative_z" } else { "absolute" },
         stale_days_used: stale_days,
         shown_today: 0,
         daily_cap: crate::discovery::discovery_daily_cap(),
@@ -1107,6 +1133,7 @@ pub fn match_semantic_core(
             memory_id: m.id.clone(),
             content_preview: preview_of(&m.content),
             match_score: sim,
+            score_norm: 0.0,
             days_since_last_access: days,
             bagua_index: m.bagua_index.unwrap_or(0),
             bagua_name: m
@@ -1125,12 +1152,22 @@ pub fn match_semantic_core(
         });
     }
 
+    // ★方案 A（2026-11-07）：相对 top1 归一化，供前端统一渲染百分比。
+    {
+        let raw: Vec<f32> = candidates.iter().map(|c| c.match_score).collect();
+        let norms = normalize_scores_relative(&raw);
+        for (c, n) in candidates.iter_mut().zip(norms) {
+            c.score_norm = n;
+        }
+    }
+
     StateDrivenOutcome {
         executed: true,
         skip_reason: None,
         candidates,
         filtered_out,
         match_min_used: match_min,
+        score_kind: "semantic",
         stale_days_used: stale_days,
         shown_today: 0,
         daily_cap: crate::discovery::discovery_daily_cap(),

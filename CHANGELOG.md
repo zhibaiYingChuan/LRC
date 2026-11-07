@@ -7,6 +7,83 @@
 > 同一版本内**分日期的补充说明**一律用 `###` 子标题，例如 `### 0.9.8 同版本补充 · 2026-09-17`。
 > （历史欠账：`[0.9.8]` 曾出现 3 次、`[0.8.23]` 曾出现 2 次，已按本约定降级为子标题。）
 
+## [0.10.2] - 2026-11-07
+
+> 本版摘要：**提炼与合并的语义修正** —— 行首显式声明（`决策：/约束：/结论：`）
+> 直接采信；项目名大小写不敏感归并；相似合并改为**项目隔离**。
+
+### 修复
+
+- **行首显式声明被关键词劫持**：`结论：itemsFromTag 按行分类，约束→preference`
+  因为正文里出现「约束」二字被判成约束；`决策：…` 因为词表里只有「决定」被整条丢弃。
+  新增 `explicit_kind()`：行首 `决策：/决定：/约束：/结论：/结论是：`（支持 `- ` 列表前缀
+  与全角/半角冒号）直接判定类别并给 3.0 分，高于 2.0 阈值。
+  同时补词表：`DECISION_WORDS` 加「决策」，`CONCLUSION_WORDS` 加「结论」。
+  回归测试 `explicit_prefix_wins_over_keywords`。
+
+- **`/v1/memories/stats` 的 `by_project` 键大小写冲突**：库里同时存在 `YL` 与 `Yl` 时，
+  JSON 对象有两个 key 是合法的，但大小写不敏感的解析器（PowerShell `ConvertFrom-Json`、
+  部分 JS 库）会直接报 `DuplicateKeysInJsonString`，整个响应解析失败。
+  改为按小写归并、保留首次出现的写法。语义定义：**项目身份对大小写不敏感**。
+  回归测试 `stats_merges_project_names_case_insensitively`。
+
+- **跨项目相似合并**：候选集里同时有同项目与同语言的其他项目，跨项目命中会让调用方
+  看到"写入成功但项目里查不到" —— 记忆被静默搬进了别的项目。
+  改为**项目隔离**：只在同项目内做相似合并；无项目的记忆只与无项目的合并。
+  回归测试 `merge_is_project_isolated`。
+
+### 新增
+
+- **评分口径统一（方案 A）**：所有检索分数新增 `score_norm`（0–1，相对 top1 归一化，
+  第一名恒 100%）与 `score_kind` 量纲标识。修复同一「匹配度」标签混用
+  RRF 0.01–0.05 / BM25 0–20+ / 洛书余弦 0–1 三套量纲、渲染出「2000%」与「3%」并存的问题。
+  覆盖 MCP recall 文本、`/v1/memories/enrich`、`/v1/code/search`、
+  `/v1/discovery/state-driven`、`/v1/associations/explore`；
+  前端代码检索、向导 enrich、状态发现三处改用 `score_norm`。
+
+- **快照恢复**：信任中心与设置页新增「从快照恢复」，接入 `GET /v1/backups` 与
+  `POST /v1/backup/restore`，补齐「只能备份不能回滚」的缺口。
+
+- **八卦重分类**：设置页新增「记忆维护」，接入异步重分类任务与进度轮询
+  （`POST /v1/memories/reclassify-bagua` + `GET .../progress`）。
+
+### 改进
+
+- **自动刷新白名单**：从「只刷新 dashboard / trust-center」扩展为
+  dashboard / trust-center / system-status / association-center，并加防重入；
+  排除 memory-search / settings / benchmarks / project-switch。
+
+- **代码审查修复**：项目隔离改为大小写不敏感（与 stats 归并口径一致）；
+  编号列表项放行约定词；弱约定词（必须/应当/must/always）降权为 +1.0；
+  表格判定增加「行首或行尾为竖线」约束；`normalize_scores_relative` 上移到 crate 根
+  消除重复；重分类轮询加 10 分钟上限；快照恢复结果区保留基础样式类。
+
+## [0.10.1] - 2026-11-06
+
+> 本版摘要：**陈述式约定不再被漏掉** —— 「端口纪律是 3099 正式、3111 测试」这类
+> 不带"决定 / 禁止"字样的约定，现在也能被提炼进记忆。
+
+### 修复
+
+- **陈述式约定召回为 0**：打分公式只有决策词 / 否定词 / 结论词 / 专有名词四类信号，
+  「LRC 的端口纪律是 3099 正式、3111 测试」只命中专有名词 1.0 分，被 2.0 阈值挡掉，
+  用户必须把话说成「决策 / 约束」结构才能被记住。
+  新增 `CONVENTION_WORDS` 词表（纪律 / 约定 / 规范 / 口径 / 原则 / 一律 / 规定 /
+  默认是 / 默认用 / 默认值 / 默认端口 / 统一为 / 固定为 / 必须 / 应当 / 要求是 /
+  convention / by default / must / always），权重 2.0，与决策词同级。
+  刻意不收裸 `标准` / `规则`，避免 `标准库`、`规则引擎` 被误收。
+  回归测试 `declarative_convention_passes_threshold` 覆盖中英文四种陈述式约定；
+  单测 20 passed / 0 failed，`drops_small_talk` / `drops_pure_question` 精度用例仍通过。
+
+- **Markdown 排版被当成结论**：真实对话里 AI 会输出报告式排版，规则式提炼把
+  `| 1 | LRC 服务连通 | ✅ |` 判成「代码」、把 `[index.ts](D:/...)` 判成「代码」，
+  一次沉淀 40 条里大半是这类噪声。新增 `is_markdown_noise()`，剔除表格行 / 标题 /
+  引用块 / 分隔线 / 代码围栏 / 纯链接行；刻意**不**过滤列表项（`- xxx` 里常装真约束）。
+
+- **归档索引恒为空**：`GET /v1/context/index` 查的是 `tags` 含 `archived` 的记忆，
+  但提炼引擎给每条都打 `distilled`，全仓没有任何生产路径写 `archived` ——
+  项目里有 2 条记忆，索引仍返回 `total: 0`。改为查 `distilled`，与产出方口径一致。
+
 ## [0.10.0] - 2026-11-06
 
 > 本版摘要：**LRC 从"一个可选的记忆工具"变成"上下文中间件"** ——

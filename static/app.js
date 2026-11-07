@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.10.0';
+const APP_VERSION = '0.10.2';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -3868,7 +3868,7 @@ async function wizardStep1Search() {
         html += '<div class="code-result" style="margin:6px 0;padding:6px;background:#1a1a2e;border-radius:4px;font-size:11px">' +
           '<span style="color:#f1c40f">#' + r.rank + '</span> ' +
           '<span style="color:#2ecc71">' + htmlescape(r.file_path) + ':' + r.start_line + '</span> ' +
-          '<span style="color:#e74c3c">' + ((r.score || 0) * 100).toFixed(0) + '%</span><br>' +
+          '<span style="color:#e74c3c">' + ((r.score_norm != null ? r.score_norm : 0) * 100).toFixed(0) + '%</span><br>' +
           '<code style="color:#ddd">' + htmlescape(codePreview) + '</code>' +
           '</div>';
       }
@@ -3955,7 +3955,7 @@ async function wizardStep3Search() {
       const items = data.memories.slice(0, 3).map(m => {
         const memContent = m.content || '';
         return '<img class="inline-icon" src="/assets/icons/icon-memory.svg" width="14" height="14" alt="">' + htmlescape(memContent.length > 60 ? memContent.slice(0, 60) + '...' : memContent) +
-        ' (' + ((m.score || 0) * 100).toFixed(0) + '%)'
+        ' (' + ((m.score_norm != null ? m.score_norm : 0) * 100).toFixed(0) + '%)'
       }).join('<br>');
       result.innerHTML = '<img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">检索成功！找到 ' + htmlescape(String(data.total)) + ' 条相关记忆：<br>' + items;
     } else {
@@ -3970,6 +3970,28 @@ async function wizardStep3Search() {
 // ============================================================
 // 自动刷新
 // ============================================================
+// ★2026-11-07（前后端一致性审计）：自动刷新白名单。
+//   此前只刷新 dashboard / trust-center，联想中心与系统状态页数据会一直陈旧。
+//   这里改为白名单映射：只刷新"只读展示型"标签页；
+//   排除 memory-search（用户可能正在输入/阅读）、settings（表单状态）、
+//   benchmarks（重计算）、project-switch（切换上下文）。
+const AUTO_REFRESH_LOADERS = {
+  'tab-dashboard': () => loadDashboard()
+    .then(() => (typeof loadDaoMetrics === 'function' ? loadDaoMetrics() : null))
+    .then(() => (typeof loadHomeData === 'function' ? loadHomeData() : null)),
+  'tab-trust-center': () => loadTrustCenter(),
+  'tab-system-status': () => {
+    if (typeof loadSysStatusFloat === 'function') loadSysStatusFloat();
+    if (typeof loadSystemStatusPage === 'function') return loadSystemStatusPage();
+  },
+  // 联想中心只刷新"观测面板"，不重载记录列表（避免打断用户选择/滚动）
+  'tab-association-center': () => {
+    if (typeof loadAssociationCenterObservation === 'function') return loadAssociationCenterObservation();
+  },
+};
+// 防重入：上一轮刷新未完成时跳过本轮，避免慢接口叠加
+let _autoRefreshBusy = false;
+
 function startAutoRefresh() {
   if (refreshTimer) clearInterval(refreshTimer);
   refreshTimer = setInterval(() => {
@@ -3981,20 +4003,21 @@ function startAutoRefresh() {
       && SidecarHealthMonitor.isIndexing();
     if (isIndexing) {
       console.log('[LRC]Sidecar 索引中，跳过自动刷新');
-    } else {
-      // 仅刷新当前激活的标签页
+    } else if (!_autoRefreshBusy) {
+      // 仅刷新当前激活的标签页（白名单内）
       const activeTab = document.querySelector('.tab-content.active');
-      if (activeTab) {
-        const tabId = activeTab.id;
+      const loader = activeTab ? AUTO_REFRESH_LOADERS[activeTab.id] : null;
+      if (typeof loader === 'function') {
+        _autoRefreshBusy = true;
         // v0.8.3 Step 12 / G016：自动刷新保留滚动位置（避免打断阅读）
-        // 保存滚动位置 → 加载完成后恢复
-        if (tabId === 'tab-dashboard') {
-          const savedScroll = _saveMainScroll();
-          loadDashboard().finally(() => _restoreMainScroll(savedScroll));
-        } else if (tabId === 'tab-trust-center') {
-          const savedScroll = _saveMainScroll();
-          loadTrustCenter().finally(() => _restoreMainScroll(savedScroll));
-        }
+        const savedScroll = _saveMainScroll();
+        Promise.resolve()
+          .then(loader)
+          .catch((e) => console.warn('[LRC] 自动刷新失败:', e && e.message))
+          .finally(() => {
+            _restoreMainScroll(savedScroll);
+            _autoRefreshBusy = false;
+          });
       }
     }
     // 始终更新运行时长
@@ -4962,6 +4985,177 @@ async function createBackup() {
     // v0.9.0 修复 L-1 / v0.9.6 修复：无论成功/失败都恢复备份按钮与锁
     if (backupBtn) backupBtn.disabled = false;
     _createBackupBusy = false;
+  }
+}
+
+// ============================================================
+// ★2026-11-07（前后端一致性审计）：从本地快照恢复
+//   此前「立即备份」会创建服务端快照（保留 4 份），但 UI 没有任何入口
+//   能列出/恢复这些快照 —— 只能备份不能回滚。此处补齐：
+//     GET  /v1/backups          → 列出快照
+//     POST /v1/backup/restore   → 按 path 恢复
+// ============================================================
+function _backupSnapshotContainers() {
+  return [$('trust-backup-snapshots'), $('backup-snapshots')].filter(Boolean);
+}
+
+function _renderBackupSnapshots(html, cls) {
+  _backupSnapshotContainers().forEach(el => {
+    el.style.display = '';
+    // 保留容器原有基础类（信任中心 verify-result / 设置页 form-result），
+    // 仅追加状态修饰类，避免覆盖后样式丢失。
+    const base = el.id === 'trust-backup-snapshots' ? 'verify-result' : 'form-result';
+    el.className = cls ? base + ' ' + cls : base;
+    el.innerHTML = html;
+  });
+}
+
+async function listBackupSnapshots() {
+  const containers = _backupSnapshotContainers();
+  if (containers.length === 0) return;
+  _renderBackupSnapshots('<span class="loading-spinner" style="width:14px;height:14px;border-width:1.5px"></span> 正在读取本地快照...');
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/backups', {}, 10000);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const list = Array.isArray(data.backups) ? data.backups : [];
+    if (list.length === 0) {
+      _renderBackupSnapshots('暂无本地快照。先点「立即备份」创建一份。');
+      return;
+    }
+    const rows = list.map(b => {
+      const when = b.modified_timestamp
+        ? new Date(b.modified_timestamp * 1000).toLocaleString('zh-CN')
+        : '未知时间';
+      return `<div class="result-row" style="display:flex;align-items:center;gap:8px;justify-content:space-between;flex-wrap:wrap;">
+        <span class="result-label">${htmlescape(when)} · ${htmlescape(b.size_human || '')}</span>
+        <button class="btn btn-outline btn-sm" data-action="restoreBackupSnapshot" data-arg="${htmlescape(b.path)}">恢复此快照</button>
+      </div>`;
+    }).join('');
+    _renderBackupSnapshots(
+      `<div class="text-sm text-dim" style="margin-bottom:6px;">共 ${list.length} 份快照（最多保留 4 份）</div>${rows}`
+    );
+    if (typeof bindAllActions === 'function') bindAllActions();
+  } catch (e) {
+    _renderBackupSnapshots('读取快照失败：' + htmlescape(e.message), 'form-result-error');
+  }
+}
+
+async function restoreBackupSnapshot(path) {
+  if (!path) return;
+  const confirmed = await showConfirm(
+    '确认从该快照恢复？\n\n' + path + '\n\n恢复会覆盖当前记忆库，且不可撤销。',
+    '确认恢复快照'
+  );
+  if (!confirmed) return;
+  _renderBackupSnapshots('<span class="loading-spinner" style="width:14px;height:14px;border-width:1.5px"></span> 正在恢复，请勿关闭页面...');
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/backup/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    }, 60000);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.success === false) {
+      throw new Error(data.error || ('HTTP ' + res.status));
+    }
+    _renderBackupSnapshots(
+      '恢复成功，当前记忆 ' + (data.restored_memories != null ? data.restored_memories : '--') + ' 条。',
+      'form-result-success'
+    );
+    showToast('快照恢复成功', 'success', 4000);
+    // 恢复后刷新首页与数据位置信息，避免界面继续显示旧数据
+    setTimeout(() => {
+      if (typeof loadDashboard === 'function') loadDashboard();
+      if (typeof verifyDataLocation === 'function') verifyDataLocation();
+    }, 800);
+  } catch (e) {
+    _renderBackupSnapshots('恢复失败：' + htmlescape(e.message), 'form-result-error');
+  }
+}
+
+// ============================================================
+// ★2026-11-07（前后端一致性审计）：八卦重分类（异步任务 + 进度轮询）
+//   POST /v1/memories/reclassify-bagua { async: true } → 202 + task_id
+//   GET  /v1/memories/reclassify-bagua/progress        → status/processed/total/percent
+// ============================================================
+let _reclassifyPollTimer = null;
+// 最大轮询次数：1.5s × 400 ≈ 10 分钟，防止后端长期停在 running 时无限轮询
+const RECLASSIFY_MAX_POLLS = 400;
+let _reclassifyPollCount = 0;
+
+function _renderReclassify(text, cls) {
+  const el = $('reclassify-result');
+  if (!el) return;
+  el.style.display = '';
+  el.className = cls || 'form-result';
+  el.textContent = text;
+}
+
+async function startReclassifyBagua() {
+  const btn = document.querySelector('[data-action="startReclassifyBagua"]');
+  if (btn) btn.disabled = true;
+  _renderReclassify('正在启动重分类任务...');
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/memories/reclassify-bagua', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ async: true }),
+    }, 30000);
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 409) {
+      // 已有任务在跑：直接跟踪进度，不重复启动
+      showToast('已有重分类任务在运行，正在跟踪进度', 'warning', 4000);
+      pollReclassifyProgress();
+      return;
+    }
+    if (!res.ok || data.success === false) {
+      throw new Error(data.message || data.error || ('HTTP ' + res.status));
+    }
+    _renderReclassify('已启动，共 ' + (data.total != null ? data.total : '--') + ' 条，后台处理中...');
+    _reclassifyPollCount = 0;
+    pollReclassifyProgress();
+  } catch (e) {
+    _renderReclassify('启动失败：' + e.message, 'form-result form-result-error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function pollReclassifyProgress() {
+  if (_reclassifyPollTimer) {
+    clearTimeout(_reclassifyPollTimer);
+    _reclassifyPollTimer = null;
+  }
+  // 轮询上限：避免后端任务卡在 running 时前端无限请求
+  if (_reclassifyPollCount >= RECLASSIFY_MAX_POLLS) {
+    _renderReclassify('进度跟踪已超时（约 10 分钟），请稍后重新打开本页查看结果。', 'form-result form-result-warning');
+    return;
+  }
+  _reclassifyPollCount++;
+  try {
+    const res = await fetchWithTimeout(API_BASE + '/v1/memories/reclassify-bagua/progress', {}, 10000);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const status = data.status;
+    if (status === 'running') {
+      const percent = Number(data.percent || 0).toFixed(0);
+      _renderReclassify('重分类中... ' + (data.processed || 0) + '/' + (data.total || 0) + '（' + percent + '%）');
+      _reclassifyPollTimer = setTimeout(pollReclassifyProgress, 1500);
+    } else if (status === 'completed') {
+      _renderReclassify(
+        '重分类完成：扫描 ' + (data.total || 0) + ' 条，已处理 ' + (data.processed || 0) +
+        ' 条，变更 ' + (data.changed || 0) + ' 条。',
+        'form-result form-result-success'
+      );
+      showToast('八卦重分类完成', 'success', 4000);
+    } else if (status === 'failed') {
+      _renderReclassify('重分类失败：' + (data.error || '未知错误'), 'form-result form-result-error');
+    } else {
+      _renderReclassify('当前没有运行中的重分类任务。');
+    }
+  } catch (e) {
+    _renderReclassify('读取进度失败：' + e.message, 'form-result form-result-error');
   }
 }
 
@@ -6920,6 +7114,12 @@ window.migrateData = migrateData;
 window.createBackup = createBackup;
 // v0.8.0 "归一"：数据操作日志
 window.loadDataLogs = loadDataLogs;
+// ★2026-11-07：本地快照列表与恢复
+window.listBackupSnapshots = listBackupSnapshots;
+window.restoreBackupSnapshot = restoreBackupSnapshot;
+// ★2026-11-07：八卦重分类（异步任务 + 进度）
+window.startReclassifyBagua = startReclassifyBagua;
+window.pollReclassifyProgress = pollReclassifyProgress;
 // v0.8.0 "归一"：规则文件状态查询与重试
 window.loadRulesStatus = loadRulesStatus;
 window.retryWriteRules = retryWriteRules;
@@ -8297,7 +8497,7 @@ function renderDiscovery() {
       <div class="discovery-item" data-memory-id="${mid}">
         <div class="discovery-head">
           <span class="badge info">${num(days)} 天没看</span>
-          <span class="text-sm text-dim">相关度 ${htmlescape(score.toFixed(2))}</span>
+          <span class="text-sm text-dim">相关度 ${htmlescape((score * 100).toFixed(0))}%</span>
         </div>
         <div class="discovery-preview" role="button" tabindex="0"
              data-action="openDiscoveryMemory" data-arg="${mid}"
@@ -8450,7 +8650,7 @@ function renderStateDiscovery() {
   listEl.innerHTML = shown.map((c) => {
     const reason = c && c.reason ? c.reason : {};
     const why = reason.human_readable || '这条记忆与你当前的状态同属一个方向';
-    const score = Number(c.match_score || 0);
+    const score = Number(c.score_norm != null ? c.score_norm : 0);
     const days = Number(c.days_since_last_access || 0);
     const preview = c.content_preview || '';
     const mid = htmlescape(String(c.memory_id || ''));
@@ -8459,7 +8659,7 @@ function renderStateDiscovery() {
       <div class="discovery-item" data-memory-id="${mid}">
         <div class="discovery-head">
           <span class="badge info">${num(days)} 天没看</span>
-          <span class="text-sm text-dim">匹配度 ${htmlescape(score.toFixed(2))}${
+          <span class="text-sm text-dim">相关度 ${htmlescape((score * 100).toFixed(0))}%${
             bagua ? ' · ' + htmlescape(bagua) : ''}</span>
         </div>
         <div class="discovery-preview" role="button" tabindex="0"

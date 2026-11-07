@@ -102,6 +102,7 @@ const DECISION_WORDS: &[&str] = &[
     "选型为",
     "最终采用",
     "决定",
+    "决策",
     "采用",
     "改用",
     "统一用",
@@ -111,6 +112,40 @@ const DECISION_WORDS: &[&str] = &[
     "go with",
     "we'll use",
 ];
+
+/// 约定词：陈述"我们这里就是这么定的"，不带决策动词也不带否定。
+///
+/// 为什么需要单独一张表：真实对话里大量约定是**陈述句**——
+/// 「LRC 的端口纪律是 3099 正式、3111 测试」既没有"决定/采用"，
+/// 也没有"禁止/不要"，按旧打分只有专有名词 1.0 分，被 2.0 阈值挡掉。
+/// 这类句子恰恰是跨会话最该记住的东西，故与决策词同权重。
+///
+/// 刻意不收裸 `标准` / `规则`：`标准库`、`规则引擎` 会把普通技术名词拉进来。
+const CONVENTION_WORDS: &[&str] = &[
+    "纪律",
+    "约定",
+    "规范",
+    "口径",
+    "原则",
+    "一律",
+    "规定",
+    "默认是",
+    "默认用",
+    "默认值",
+    "默认端口",
+    "统一为",
+    "固定为",
+    "要求是",
+    "convention",
+    "by default",
+];
+
+/// 弱约定词：语义上确实表达"约定"，但在技术文本里出现频率极高
+/// （"必须注意"、"always check"），单独命中不足以证明这是一条可复用约定。
+///
+/// 故与强约定词分开计权（+1.0 而非 +2.0）：单独出现时仍需专有名词等
+/// 其它信号才能过阈值，避免把普通技术句大量收进记忆库。
+const WEAK_CONVENTION_WORDS: &[&str] = &["必须", "应当", "must", "always"];
 
 /// 否定约束词：出现即说明"这条路被排除了"。
 ///
@@ -180,6 +215,7 @@ const ERROR_MARKERS: &[&str] = &[
 /// 结论词：出现即说明"这是本轮得出的判断"。
 const CONCLUSION_WORDS: &[&str] = &[
     "结论是",
+    "结论",
     "所以",
     "因此",
     "最终",
@@ -274,7 +310,29 @@ pub fn distill_transcript(text: &str, config: &DistillConfig) -> Vec<DistilledIt
             if char_count < config.min_chars {
                 continue;
             }
-            let (score, kind) = score_sentence(trimmed);
+            // 排版噪声先剔掉：表格行 / 标题 / 引用块 / 分隔线 / 纯链接行。
+            // 规则式提炼分不清「结论」和「报告里的引用块」，实测一次沉淀
+            // 40 条里大半是 markdown 表格行和链接。
+            if is_markdown_noise(trimmed) {
+                continue;
+            }
+            // 编号列表项（`1. …` / `2) …`）默认视为待办/选项清单，不是结论。
+            // 例外：含强否定词或约定词的编号项仍保留
+            //（"1. 禁止把密钥写进代码" / "1. 必须用 pnpm"）。
+            if is_numbered_list_item(trimmed)
+                && !has_strong_negation(trimmed)
+                && count_hits(&trimmed.to_lowercase(), CONVENTION_WORDS) == 0
+                && count_hits(&trimmed.to_lowercase(), WEAK_CONVENTION_WORDS) == 0
+            {
+                continue;
+            }
+            // 打分前先剥掉 markdown 链接：链接里的路径会被算成"专有名词"，
+            // 让 `见 [index.ts](G:/...)` 这类行凭空多 1 分。
+            let mut scoring_text = strip_markdown_links(trimmed);
+            if scoring_text.trim().is_empty() {
+                scoring_text = trimmed.to_string();
+            }
+            let (score, kind) = score_sentence(&scoring_text);
             if score < config.threshold {
                 continue;
             }
@@ -376,14 +434,141 @@ impl Kind {
     }
 }
 
+/// Markdown 排版噪声：表格行、标题、引用块、分隔线、代码围栏、纯链接行。
+///
+/// 为什么需要：真实对话里 AI 会输出大量报告式排版，规则式提炼分不清
+/// 「结论」和「报告里的引用块」—— 实测一次沉淀 40 条里大半是
+/// `| 1 | LRC 服务连通 | ✅ |` 这类表格行和 `[index.ts](D:/...)` 这类链接。
+///
+/// 刻意**不**过滤列表项（`- xxx` / `1. xxx`）：列表里经常装着真正的约束。
+fn is_markdown_noise(sentence: &str) -> bool {
+    let t = sentence.trim();
+    if t.is_empty() {
+        return true;
+    }
+    // 标题 / 引用块 / 代码围栏
+    if t.starts_with('#') || t.starts_with('>') || t.starts_with("```") {
+        return true;
+    }
+    // 表格行：至少两个竖线，且**行首或行尾**也是竖线。
+    //
+    // 只数竖线会把 `cat a | grep b | wc -l` 这类 shell 管道句误判成表格，
+    // 而真正的 markdown 表格行几乎都以 `|` 开头或结尾。
+    if t.matches('|').count() >= 2 && (t.starts_with('|') || t.ends_with('|')) {
+        return true;
+    }
+    // 分隔线：只由 - * _ 和空格组成，且长度 >= 3
+    if t.chars().count() >= 3 && t.chars().all(|c| matches!(c, '-' | '*' | '_' | ' ')) {
+        return true;
+    }
+    // 纯链接行：去掉 markdown 链接后几乎没有文字
+    if t.contains("](") {
+        let stripped = strip_markdown_links(t);
+        if stripped.chars().filter(|c| c.is_alphanumeric()).count() < 4 {
+            return true;
+        }
+    }
+    false
+}
+
+/// 编号列表项：`1. xxx` / `2) xxx` / `3、xxx`。
+///
+/// 报告里的编号列表绝大多数是"待办 / 选项 / 步骤"，不是可复用结论。
+/// 实测一次沉淀 40 条里 12 条是这类片段。
+fn is_numbered_list_item(s: &str) -> bool {
+    let t = s.trim_start();
+    let digits: String = t.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return false;
+    }
+    let rest = &t[digits.len()..];
+    let mut it = rest.chars();
+    match it.next() {
+        Some('.') | Some(')') | Some('、') => it.next().map_or(true, |c| c.is_whitespace()),
+        _ => false,
+    }
+}
+
+/// 强否定词：编号列表项里出现这些词时仍按约束保留。
+fn has_strong_negation(s: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "禁止",
+        "严禁",
+        "不得",
+        "不要",
+        "不能",
+        "切勿",
+        "杜绝",
+        "不允许",
+    ];
+    WORDS.iter().any(|w| s.contains(w))
+}
+
+/// 去掉 `[text](url)` 形式的链接，只留链接文字之外的正文。
+fn strip_markdown_links(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            if let Some(close) = (i..chars.len()).find(|&j| chars[j] == ']') {
+                if close + 1 < chars.len() && chars[close + 1] == '(' {
+                    if let Some(end) = (close + 2..chars.len()).find(|&j| chars[j] == ')') {
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// 行首显式声明：`决策：…` / `约束：…` / `结论：…`。
+///
+/// 这是作者主动打的标签，比关键词猜测可靠得多 —— 一句话里出现"约束"二字
+/// 不代表它是约束，但行首写"约束："就是明确声明。
+/// 支持列表前缀（`- ` / `* ` / `+ `）与全角/半角冒号。
+fn explicit_kind(sentence: &str) -> Option<Kind> {
+    let t = sentence
+        .trim_start()
+        .trim_start_matches(['-', '*', '+'])
+        .trim_start();
+    for (prefix, kind) in [
+        ("决策", Kind::Decision),
+        ("决定", Kind::Decision),
+        ("约束", Kind::Constraint),
+        ("结论是", Kind::Conclusion),
+        ("结论", Kind::Conclusion),
+    ] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let rest = rest.trim_start();
+            if rest.starts_with('：') || rest.starts_with(':') {
+                return Some(kind);
+            }
+        }
+    }
+    None
+}
+
 /// 打分并判定类别。
 ///
 /// 类别优先级：决策 > 约束 > 结论 > 代码。
 /// 理由：一句话同时含"决定"和"所以"时，它首先是决策，结论只是修饰；
 /// 含"结论是"又带文件路径时，它是结论（路径只是细节）。
 fn score_sentence(sentence: &str) -> (f32, Kind) {
+    // 行首显式声明优先：作者已经标了类别，不再靠关键词猜。
+    // 固定给 3.0（高于阈值 2.0），避免"结论：…"因为只有一个结论词被挡掉。
+    if let Some(kind) = explicit_kind(sentence) {
+        return (3.0, kind);
+    }
+
     let lower = sentence.to_lowercase();
     let decision_hits = count_hits(&lower, DECISION_WORDS);
+    let convention_hits = count_hits(&lower, CONVENTION_WORDS);
+    let weak_convention_hits = count_hits(&lower, WEAK_CONVENTION_WORDS);
     let negation_hits = count_hits(&lower, NEGATION_WORDS);
     let conclusion_hits = count_hits(&lower, CONCLUSION_WORDS);
     let proper_hits = count_proper_nouns(sentence);
@@ -391,6 +576,9 @@ fn score_sentence(sentence: &str) -> (f32, Kind) {
 
     let mut score = 0.0_f32;
     score += 2.0 * decision_hits as f32;
+    score += 2.0 * convention_hits as f32;
+    // 弱约定词降权：单独出现不足以过阈值（见 WEAK_CONVENTION_WORDS 文档）
+    score += 1.0 * weak_convention_hits as f32;
     score += 2.0 * negation_hits as f32;
     score += 1.0 * conclusion_hits as f32;
     score += 1.0 * proper_hits as f32;
@@ -400,7 +588,7 @@ fn score_sentence(sentence: &str) -> (f32, Kind) {
 
     let kind = if decision_hits > 0 {
         Kind::Decision
-    } else if negation_hits > 0 {
+    } else if negation_hits > 0 || convention_hits > 0 || weak_convention_hits > 0 {
         Kind::Constraint
     } else if conclusion_hits > 0 {
         Kind::Conclusion
@@ -719,6 +907,117 @@ mod tests {
         let items = distill_transcript(text, &cfg());
         assert_eq!(items.len(), 1, "单条禁令应产出，实际 {:?}", items);
         assert_eq!(items[0].memory_type, "preference");
+    }
+
+    /// 陈述式约定必须能过阈值。
+    ///
+    /// 回归背景：真实 DSH 对话里「LRC 的端口纪律是 3099 正式、3111 测试」
+    /// 既无决策动词也无否定词，旧打分只有专有名词 1.0 分 ⇒ 被 2.0 阈值挡掉，
+    /// 用户必须把话说成「决策 / 约束」结构才能被记住。
+    #[test]
+    fn declarative_convention_passes_threshold() {
+        for text in [
+            "LRC 的端口纪律是 3099 正式、3111 测试。",
+            "默认端口是 3099。",
+            "提交信息一律用中文。",
+            "By default we keep the cache under ~/.loong-recall.",
+        ] {
+            let items = distill_transcript(text, &cfg());
+            assert_eq!(
+                items.len(),
+                1,
+                "陈述式约定应产出：{:?} -> {:?}",
+                text,
+                items
+            );
+            assert_eq!(items[0].memory_type, "preference", "输入 {:?}", text);
+        }
+    }
+
+    /// Markdown 排版噪声不得被当成结论。
+    ///
+    /// 回归背景：真实 DSH 会话里 AI 输出报告式排版，规则式提炼把
+    /// `| 1 | LRC 服务连通 | ✅ |` 判成「代码」、把 `[index.ts](D:/...)` 判成「代码」，
+    /// 一次沉淀 40 条里大半是这类噪声。
+    #[test]
+    fn drops_markdown_noise() {
+        for text in [
+            "| 1 | LRC 服务连通 | ✅ | `3099/health` → 200 |",
+            "## 四、要不要动手",
+            "> 引用块里的结论",
+            "---",
+            "[index.ts](D:/Users/.dsh/profiles/desktop/node_modules/dsh-plugin-lrc/src/index.ts#L63)",
+        ] {
+            let items = distill_transcript(text, &cfg());
+            assert!(items.is_empty(), "排版噪声不应产出：{:?} -> {:?}", text, items);
+        }
+    }
+
+    /// 列表项里的真实约束不能被误杀。
+    #[test]
+    fn keeps_list_item_constraints() {
+        let text = "- 禁止在 3099 上跑测试数据。";
+        let items = distill_transcript(text, &cfg());
+        assert_eq!(items.len(), 1, "列表项里的约束应保留：{:?}", items);
+    }
+
+    /// 编号列表项默认丢弃，但含强否定词的保留。
+    ///
+    /// 回归背景：真实 DSH 会话一次沉淀 40 条里 12 条是 `1. …` `2. …` 这类
+    /// 待办/选项片段，写进库后完全不可复用。
+    #[test]
+    fn drops_numbered_list_items_except_constraints() {
+        for text in [
+            "3. `index` 那处建议先在 LRC 侧确认语义再动",
+            "2. 顺手把 `snapshotItems`、提取粒度调一调，避免一次写满 40 条",
+            "1. 把 `config.baseUrl` 接入 `LrcRuntime`，让端口切换真正生效",
+        ] {
+            let items = distill_transcript(text, &cfg());
+            assert!(
+                items.is_empty(),
+                "编号待办不应产出：{:?} -> {:?}",
+                text,
+                items
+            );
+        }
+        let kept = distill_transcript("1. 禁止把密钥写进代码。", &cfg());
+        assert_eq!(kept.len(), 1, "编号项里的强约束应保留：{:?}", kept);
+    }
+
+    /// 行首显式声明必须直接采信，不能被正文关键词劫持。
+    ///
+    /// 回归背景：`结论：itemsFromTag 按行分类，约束→preference` 因为正文里
+    /// 出现「约束」二字被误判成约束；`决策：…` 因为词表里只有「决定」被整条丢弃。
+    #[test]
+    fn explicit_prefix_wins_over_keywords() {
+        let items = distill_transcript(
+            "结论：itemsFromTag 按行分类，约束→preference、决策→decision",
+            &cfg(),
+        );
+        assert_eq!(items.len(), 1, "行首「结论：」应保留：{:?}", items);
+        assert!(items[0].content.starts_with("[结论]"), "{:?}", items);
+        assert_eq!(items[0].memory_type, "fact");
+
+        let items = distill_transcript("决策：本次仅为连通性测试", &cfg());
+        assert_eq!(items.len(), 1, "行首「决策：」应保留：{:?}", items);
+        assert!(items[0].content.starts_with("[决策]"), "{:?}", items);
+
+        let items = distill_transcript("- 约束：禁止连 3099 做测试", &cfg());
+        assert_eq!(
+            items.len(),
+            1,
+            "列表前缀 + 行首「约束：」应保留：{:?}",
+            items
+        );
+        assert!(items[0].content.starts_with("[约束]"), "{:?}", items);
+    }
+
+    /// 行内 markdown 链接不应把普通句子抬过阈值。
+    #[test]
+    fn inline_link_does_not_inflate_score() {
+        let text = "见 [index.ts](G:/dsh-plugin-lrc/src/index.ts#L63)";
+        let items = distill_transcript(text, &cfg());
+        assert!(items.is_empty(), "纯链接引用不应产出：{:?}", items);
     }
 
     /// 英文祈使禁令不得被误判为疑问句。

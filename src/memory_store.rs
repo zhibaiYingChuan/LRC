@@ -2032,6 +2032,18 @@ fn scan_candidates(
         }
         _ => candidates.positions.clone(),
     };
+    // **项目隔离**：只在同项目内做相似合并。
+    //
+    // 为什么：候选集里同时有同项目（`primary_candidates`）与同语言的其他项目
+    // （`same_language_candidates`）。跨项目合并会让调用方看到
+    // "写入成功但项目里查不到" —— 记忆被静默搬进了别的项目。
+    // 记忆归属是用户显式指定的，不能因为内容相似就改归属。
+    //
+    // 无项目的记忆（`_global_`）只与同样无项目的记忆合并。
+    //
+    // ★2026-11-07（代码审查 #1）：项目身份按**大小写不敏感**比较，
+    //   与 `stats()` 的 `by_project` 归并口径保持一致（`YL` 与 `Yl` 视为同一项目）。
+    let scope_project_lower = scope_project.map(|s| s.to_lowercase());
     for position in &scan_positions {
         let m = &all[*position];
         if m.is_expired() {
@@ -2039,6 +2051,15 @@ fn scan_candidates(
         }
         // 隐私隔离：跳过对调用方不可见的记忆（不参与相似合并）
         if !is_visible(m, privacy_context) {
+            continue;
+        }
+        // 项目隔离：跨项目不参与相似合并（大小写不敏感）
+        let same_project = match (m.project.as_deref(), scope_project_lower.as_deref()) {
+            (Some(a), Some(b)) => a.to_lowercase() == b,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_project {
             continue;
         }
         comparisons += 1;
@@ -9779,6 +9800,16 @@ impl<P: Persistence> MemoryStore<P> {
         // v0.9.6：近 7 天新增按创建时间真实统计（替代"今日新增=累计编码次数"的误导口径）
         let recent_cutoff = chrono::Utc::now() - chrono::Duration::days(7);
 
+        // 项目名按**大小写不敏感**归并。
+        //
+        // 为什么：库里可能同时存在 `YL` 与 `Yl`（同一项目不同写法）。它们作为
+        // JSON 对象的两个 key 是合法的，但大小写不敏感的解析器（PowerShell 的
+        // ConvertFrom-Json、部分 JS 库）会直接报 `DuplicateKeysInJsonString`，
+        // 整个 `/v1/memories/stats` 响应都解析失败。
+        // 归并时保留首次出现的写法，计数累加。
+        let mut project_counts: std::collections::HashMap<String, (String, usize)> =
+            std::collections::HashMap::new();
+
         for m in all.iter() {
             *stats
                 .by_type
@@ -9786,7 +9817,10 @@ impl<P: Persistence> MemoryStore<P> {
                 .or_insert(0) += 1;
 
             let proj = m.project.as_deref().unwrap_or("_global_");
-            *stats.by_project.entry(proj.to_string()).or_insert(0) += 1;
+            let entry = project_counts
+                .entry(proj.to_lowercase())
+                .or_insert_with(|| (proj.to_string(), 0));
+            entry.1 += 1;
 
             if m.is_expired() {
                 stats.expired_count += 1;
@@ -9807,6 +9841,20 @@ impl<P: Persistence> MemoryStore<P> {
                 stats.experience_count += 1;
             }
         }
+
+        // 项目名按**大小写不敏感**归并（循环内已按小写聚合，这里落回展示名）。
+        //
+        // 为什么：库里可能同时存在 `YL` 与 `Yl`（同一项目不同写法）。它们作为
+        // JSON 对象的两个 key 是合法的，但大小写不敏感的解析器（PowerShell 的
+        // ConvertFrom-Json、部分 JS 库）会直接报 `DuplicateKeysInJsonString`，
+        // 导致整个 `/v1/memories/stats` 响应解析失败。
+        //
+        // 语义定义：**项目身份对大小写不敏感**（与 Windows 路径、包名一致）。
+        // 归并时保留首次出现的写法用于展示，计数累加。
+        stats.by_project = project_counts
+            .into_iter()
+            .map(|(_, (name, count))| (name, count))
+            .collect();
 
         // 事件簇数：不同 event_id 的个数（与 event_index 的分组口径一致）
         {

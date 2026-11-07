@@ -330,3 +330,31 @@ pub use engine::pooling::PoolingStrategy;
 pub use engine::luoshu_encoder_ml::{HybridLuoShuEncoder, LuoShuMlEncoder};
 
 // === 持久化后端重导出 ===
+
+/// 把一组原始分归一化为「相对 top1」的 0–1 相关度（方案 A，2026-11-07）。
+///
+/// 第一名恒为 1.0，其余按 `score / top1` 缩放；全为 0/非有限值时全 0。
+/// 仅用于展示，不改变排序。
+///
+/// ★2026-11-07（代码审查 #8）：`v1_api` 与 `state_matcher` 共用此实现，
+/// 避免两处口径漂移。
+pub(crate) fn normalize_scores_relative(scores: &[f32]) -> Vec<f32> {
+    let max = scores
+        .iter()
+        .copied()
+        .filter(|s| s.is_finite())
+        .fold(0.0f32, f32::max);
+    if max <= 0.0 {
+        return vec![0.0; scores.len()];
+    }
+    scores
+        .iter()
+        .map(|s| {
+            if s.is_finite() && *s > 0.0 {
+                (s / max).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}

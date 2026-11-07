@@ -564,6 +564,8 @@ mod api_contracts_tests {
             content: "内容".to_string(),
             memory_type: "fact".to_string(),
             score: 0.85,
+            score_norm: 1.0,
+            score_kind: "rrf",
             bagua_category: Some("震".to_string()),
             gua64: Some(42),
             daoti_preview_gua: None,
@@ -912,6 +914,7 @@ mod api_contracts_tests {
                     content: "起点记忆".into(),
                     depth: 0,
                     score: 1.0,
+                    score_norm: 1.0,
                     source: "root".into(),
                     evidence: None,
                     relation: None,
@@ -922,6 +925,7 @@ mod api_contracts_tests {
                     content: "联想记忆".into(),
                     depth: 1,
                     score: 0.7,
+                    score_norm: 0.7,
                     source: "expanded".into(),
                     evidence: Some("联想桥强关联".into()),
                     relation: None,
@@ -7119,9 +7123,12 @@ mod context_endpoints_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 归档索引：只返回带 `archived` 标签的记忆。
+    /// 归档索引：只返回带 `distilled` 标签的记忆。
+    ///
+    /// 回归背景：索引原先查 `archived`，但提炼引擎给每条都打 `distilled`，
+    /// 全仓没有任何生产路径写 `archived` ⇒ 索引恒为空。
     #[tokio::test]
-    async fn index_lists_only_archived_memories() {
+    async fn index_lists_only_distilled_memories() {
         let dir = temp_dir("ctx_index");
         let dir_str = dir.to_str().unwrap().to_string();
         let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
@@ -7136,7 +7143,7 @@ mod context_endpoints_tests {
                     {
                         "content": "[归档] 前序对话已迁移",
                         "memory_type": "code_context",
-                        "tags": ["archived", "pre-compact"],
+                        "tags": ["distilled", "pre-compact"],
                         "importance": 4,
                         "source_turns": [0, 0]
                     },
@@ -7169,5 +7176,41 @@ mod context_endpoints_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod score_normalization_tests {
+    use crate::v1_api::*;
+
+    /// 方案 A 契约（2026-11-07 用户裁定）：第一名恒为 100%，其余按比例。
+    ///
+    /// 覆盖三套真实量纲：RRF 融合分 0.01–0.05 / BM25 0–20+ / 洛书余弦 0–1。
+    /// 修复前它们被统一 ×100，渲染出「2000%」与「3%」并存。
+    #[test]
+    fn top1_is_always_full_scale() {
+        for raw in [
+            vec![0.05f32, 0.03, 0.01],
+            vec![20.0f32, 6.0, 0.6],
+            vec![0.9f32, 0.45, 0.09],
+        ] {
+            let norms = normalize_scores_relative(&raw);
+            assert!((norms[0] - 1.0).abs() < 1e-6, "top1 必须为 1.0");
+            assert!(norms.iter().all(|n| (0.0..=1.0).contains(n)));
+            assert!(
+                (norms[1] - raw[1] / raw[0]).abs() < 1e-6,
+                "其余条目必须保持与 top1 的比例"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_and_non_finite_scores_degrade_to_zero() {
+        assert!(normalize_scores_relative(&[]).is_empty());
+        assert_eq!(normalize_scores_relative(&[0.0, 0.0]), vec![0.0, 0.0]);
+        let norms = normalize_scores_relative(&[f32::NAN, 2.0, f32::INFINITY]);
+        assert_eq!(norms[0], 0.0);
+        assert!((norms[1] - 1.0).abs() < 1e-6);
+        assert_eq!(norms[2], 0.0);
     }
 }
