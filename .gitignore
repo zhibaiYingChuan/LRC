@@ -520,3 +520,34 @@ docs/SYMBOLIC_LAYER_INTEGRATION_ACCEPTANCE.md
 docs/SYMBOLIC_LAYER_INTEGRATION_RESULT.md
 docs/SYMBOLIC_LAYER_TWO_CRITERIA_MEASUREMENT.md
 docs/V099_INTERACTION_USABILITY.md
+
+# ============================================================
+# v0.10.2 发布清理（2026-11-07）：docs/ 与 scripts/ 改为**白名单**
+#
+# 根因（为什么这条硬约束反复失守）：
+#   此前是"黑名单"——逐条列出要忽略的文件名/前缀。每新增一个本地文档或实验脚本
+#   就要补一条规则；漏补一次，本地文件就会出现在 `git status` 里，看起来像
+#   "仓库里又混进了开发文件"。靠人记规则，必然反复失守。
+#
+# 处置：默认忽略 docs/ 与 scripts/ 下的**全部**文件，只放行已跟踪的交付文件。
+#   新增交付文件时必须显式加一条 `!` 规则 —— 这是有意的摩擦：
+#   "要进仓库"必须是一个主动决定，而不是默认结果。
+#
+# 顺序约束：本块必须位于文件**末尾**，否则会被上方更早的规则覆盖。
+# ============================================================
+docs/*
+!docs/DEPLOY-DOWNLOADS.md
+!docs/LRC_上下文接管推进计划_v1.0.md
+!docs/OFFLINE_MODEL_GUIDE.md
+!docs/USER_GUIDE.md
+!docs/USE_CASES.md
+
+scripts/*
+!scripts/check_algorithm_leak.py
+!scripts/enable_git_hooks.ps1
+!scripts/install.ps1
+!scripts/install.sh
+!scripts/validate_frontend_contract.js
+
+# 运行时备份目录（本地数据，不入库）
+backups/
