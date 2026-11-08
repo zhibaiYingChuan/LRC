@@ -24,14 +24,14 @@ AI 本身不会跨会话记住这些；LRC 就是给它补上这块记忆。
 
 **使用 LRC 只有一种方式：下载安装包。**
 
-1. 到 [v0.10.0 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.10.0) 下载对应平台的**桌面安装包**：
-   - Windows：`lrc-desktop-v0.10.0-windows-x86_64-setup.exe`
-   - macOS：`lrc-desktop-v0.10.0-macos-arm64.dmg`
-   - Linux：`lrc-desktop-v0.10.0-linux-amd64.deb` 或 `lrc-desktop-v0.10.0-linux-x86_64.AppImage`
+1. 到 [v0.10.3 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.10.3) 下载对应平台的**桌面安装包**：
+   - Windows：`lrc-desktop-v0.10.3-windows-x86_64-setup.exe`
+   - macOS：`lrc-desktop-v0.10.3-macos-arm64.dmg`
+   - Linux：`lrc-desktop-v0.10.3-linux-amd64.deb` 或 `lrc-desktop-v0.10.3-linux-x86_64.AppImage`
 2. 双击安装并打开，按向导选一个项目目录。
 3. 首次会自动下载**本地语义模型**（约 100~400MB，可走国内镜像），下载完就能用。
 
-> Release 里以 `lrc-v0.10.0-...exe` 命名的文件是**命令行工具**，不是安装包，双击装不上。
+> Release 里以 `lrc-v0.10.3-...exe` 命名的文件是**命令行工具**，不是安装包，双击装不上。
 
 ---
 
@@ -93,7 +93,7 @@ AI 本身不会跨会话记住这些；LRC 就是给它补上这块记忆。
 
 | 模型 | 维度 | 体积 | 适合 |
 |---|---|---|---|
-| `BAAI/bge-small-zh`（默认） | 512 | ~100MB | 中文日常使用 |
+| `BAAI/bge-small-zh-v1.5`（默认） | 512 | ~96MB | 中文日常使用 |
 | `sentence-transformers/all-MiniLM-L6-v2` | 384 | ~80MB | 英文环境 |
 | `BAAI/bge-base-zh` | 768 | ~400MB | 中文高精度 |
 | `multilingual-e5-small` | 384 | ~120MB | 多语言混用 |
