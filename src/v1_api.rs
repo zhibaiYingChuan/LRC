@@ -598,7 +598,7 @@ pub struct EnrichExplanationItem {
 }
 
 /// 增强记忆条目
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EnrichedMemory {
     pub id: String,
     pub content: String,
@@ -640,6 +640,192 @@ pub struct EnrichedMemory {
     /// `None` = **本条确无可复核的记录理由**（不编造弱理由填充，承 §3.53）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub why: Option<String>,
+}
+
+/// 召回时近重复折叠：按语义向量余弦相似度去重。
+///
+/// ## 为什么需要
+///
+/// 写入去重用的是 Jaccard 词集相似度（阈值 0.5），拦不住「同义改写」。
+/// 实测同一结论会以 5 种措辞入库，召回 top5 里 3~4 条在说同一件事。
+/// 词面折叠（字符二元组 / 关键词包含度）也折不动——实验里阈值 0.6~0.85
+/// 全部保留 10 条，因为改写句的字面重叠本来就低。
+///
+/// 语义向量能识别改写：用一条记忆的正文当查询，其余近重复稳定排在 #2~#6。
+/// 向量入库时已归一化，点积即余弦，K² 次点积（K≤100）成本可忽略。
+///
+/// ## 保守策略
+///
+/// 没有向量的记忆**不折叠**（宁可留重复，不可误杀）。
+///
+/// @param memories - 已按相关度排好序的召回结果
+/// @param threshold - 余弦阈值，达到即视为重复
+/// @param vector_of - 取某条记忆语义向量的函数（便于单测注入）
+/// @returns 折叠后的结果 + 保留的 id 列表（供 explanation 同步过滤）
+#[cfg(any(feature = "ml", test))]
+pub(crate) fn dedup_near_duplicates_with<F>(
+    memories: Vec<EnrichedMemory>,
+    threshold: f32,
+    vector_of: F,
+) -> (Vec<EnrichedMemory>, Vec<String>)
+where
+    F: Fn(&str) -> Option<Vec<f32>>,
+{
+    let ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
+    let keep = dedup_keep_indices_with(&ids, threshold, vector_of);
+    let mut kept: Vec<EnrichedMemory> = Vec::with_capacity(keep.len());
+    let mut kept_ids: Vec<String> = Vec::with_capacity(keep.len());
+    for index in keep {
+        kept_ids.push(ids[index].clone());
+        kept.push(memories[index].clone());
+    }
+    (kept, kept_ids)
+}
+
+/// 近重复折叠的**唯一实现**：返回应保留的下标（保持原顺序）。
+///
+/// 与具体结果类型解耦，REST `enrich` 与 MCP `recall` 共用同一套判定，
+/// 避免两条入口的召回质量再次分叉。
+#[cfg(any(feature = "ml", test))]
+pub(crate) fn dedup_keep_indices_with<F>(ids: &[String], threshold: f32, vector_of: F) -> Vec<usize>
+where
+    F: Fn(&str) -> Option<Vec<f32>>,
+{
+    // 校准开关：`LRC_RECALL_DEDUP_DEBUG=1` 时打印每条与已保留条目的最大余弦，
+    // 用于在真实数据上确定阈值（默认关闭，生产零开销）。
+    let debug = std::env::var("LRC_RECALL_DEDUP_DEBUG").as_deref() == Ok("1");
+    let mut kept: Vec<usize> = Vec::with_capacity(ids.len());
+    let mut kept_vectors: Vec<Vec<f32>> = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        let vector = vector_of(id);
+        let mut max_cosine = 0.0f32;
+        let duplicate = match &vector {
+            Some(v) => {
+                for k in &kept_vectors {
+                    max_cosine = max_cosine.max(cosine(k, v));
+                }
+                max_cosine >= threshold
+            }
+            None => false,
+        };
+        if debug {
+            eprintln!(
+                "[LRC·召回折叠] #{} id={} 最大余弦={:.3} 阈值={:.2} 折叠={}",
+                index + 1,
+                id,
+                max_cosine,
+                threshold,
+                duplicate
+            );
+        }
+        if duplicate {
+            continue;
+        }
+        kept_vectors.push(vector.unwrap_or_default());
+        kept.push(index);
+    }
+    kept
+}
+
+/// 归一化向量的点积 = 余弦相似度；维度不一致返回 0（不折叠）。
+#[cfg(any(feature = "ml", test))]
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// 召回折叠阈值（环境变量 `LRC_RECALL_DEDUP_THRESHOLD`，默认 0.90）。
+///
+/// 0.90 是保守档：只折叠「几乎同一句话的不同措辞」，不折叠「同一主题的不同侧面」。
+#[cfg(feature = "ml")]
+fn recall_dedup_threshold() -> f32 {
+    const DEFAULT: f32 = 0.90;
+    match std::env::var("LRC_RECALL_DEDUP_THRESHOLD") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|v| (0.0..=1.0).contains(v))
+            .unwrap_or(DEFAULT),
+        Err(_) => DEFAULT,
+    }
+}
+
+/// 对召回结果做近重复折叠（语义索引可用时）。
+///
+/// `semantic_index` 在 `ml` feature 下才编译；未启用时原样返回，
+/// 行为与引入折叠前逐字一致。
+#[cfg(feature = "ml")]
+fn dedup_recall_results(memories: Vec<EnrichedMemory>) -> (Vec<EnrichedMemory>, Vec<String>) {
+    match crate::semantic_index::service() {
+        Some(service) => dedup_near_duplicates_with(memories, recall_dedup_threshold(), |id| {
+            service.vector_of(id)
+        }),
+        None => {
+            let ids = memories.iter().map(|m| m.id.clone()).collect();
+            (memories, ids)
+        }
+    }
+}
+
+/// 未启用 `ml` feature：没有语义向量，原样返回。
+#[cfg(not(feature = "ml"))]
+fn dedup_recall_results(memories: Vec<EnrichedMemory>) -> (Vec<EnrichedMemory>, Vec<String>) {
+    let ids = memories.iter().map(|m| m.id.clone()).collect();
+    (memories, ids)
+}
+
+/// 对 MCP `recall` 的结果做近重复折叠（与 REST `enrich` 共用同一判定）。
+///
+/// 两条入口必须同源：AI 实际走 MCP `recall`，若只改 REST，用户感知不到改善。
+#[cfg(feature = "ml")]
+pub(crate) fn dedup_recall_result(
+    result: crate::memory_store_types::RecallResult,
+) -> crate::memory_store_types::RecallResult {
+    let ids: Vec<String> = result.memories.iter().map(|m| m.id.clone()).collect();
+    let keep = dedup_keep_indices(&ids);
+    if keep.len() == ids.len() {
+        return result;
+    }
+    let mut memories = Vec::with_capacity(keep.len());
+    let mut scores = Vec::with_capacity(keep.len());
+    for index in keep {
+        memories.push(result.memories[index].clone());
+        scores.push(result.scores.get(index).copied().unwrap_or(0.0));
+    }
+    crate::memory_store_types::RecallResult {
+        memories,
+        scores,
+        total: result.total,
+        regression_evidence: result.regression_evidence,
+    }
+}
+
+/// 未启用 `ml` feature：原样返回。
+#[cfg(not(feature = "ml"))]
+pub(crate) fn dedup_recall_result(
+    result: crate::memory_store_types::RecallResult,
+) -> crate::memory_store_types::RecallResult {
+    result
+}
+
+/// 便捷入口：用全局语义索引对一组 id 做近重复折叠，返回保留的下标。
+#[cfg(feature = "ml")]
+pub(crate) fn dedup_keep_indices(ids: &[String]) -> Vec<usize> {
+    match crate::semantic_index::service() {
+        Some(service) => {
+            dedup_keep_indices_with(ids, recall_dedup_threshold(), |id| service.vector_of(id))
+        }
+        None => (0..ids.len()).collect(),
+    }
+}
+
+/// 未启用 `ml` feature：全部保留。
+#[cfg(not(feature = "ml"))]
+pub(crate) fn dedup_keep_indices(ids: &[String]) -> Vec<usize> {
+    (0..ids.len()).collect()
 }
 
 /// 联想探索·根节点最小实质重叠 token 数（v0.9.7 精确度门禁）。
@@ -3300,6 +3486,17 @@ pub fn build_v1_router_with_trust(
 
                     match result {
                         Ok(Ok(Ok((memories, explanation_items, fast_weight, deep_weight, semantic_weight, fast_hits, deep_hits, semantic_hits, total, filtered_count, trail, regression_evidence, associated)))) => {
+                            // ★2026-11-08：召回时近重复折叠。
+                            // 写入去重（Jaccard 0.5）拦不住同义改写，同一结论会以多种措辞入库；
+                            // 这里用已入库的语义向量做余弦折叠，只保留信息量最高的一条。
+                            let (memories, kept_ids) = dedup_recall_results(memories);
+                            // explanation 与 memories 平行，必须同步过滤，否则前端解释块会指向已折叠的条目
+                            let kept_set: std::collections::HashSet<&str> =
+                                kept_ids.iter().map(|s| s.as_str()).collect();
+                            let explanation_items: Vec<EnrichExplanationItem> = explanation_items
+                                .into_iter()
+                                .filter(|item| kept_set.contains(item.id.as_str()))
+                                .collect();
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(EnrichResponse {
                                 memories,
                                 fast_path_hits: fast_hits,

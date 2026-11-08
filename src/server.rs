@@ -1081,6 +1081,23 @@ async fn handle_recall_enhanced(
         }
     };
 
+    // ★2026-11-08：召回时近重复折叠（与 handle_recall / REST enrich 同源）
+    let (result_memories, result_scores) = {
+        let ids: Vec<String> = result_memories.iter().map(|m| m.id.clone()).collect();
+        let keep = crate::v1_api::dedup_keep_indices(&ids);
+        if keep.len() == ids.len() {
+            (result_memories, result_scores)
+        } else {
+            let mut memories = Vec::with_capacity(keep.len());
+            let mut scores = Vec::with_capacity(keep.len());
+            for index in keep {
+                memories.push(result_memories[index].clone());
+                scores.push(result_scores.get(index).copied().unwrap_or(0.0));
+            }
+            (memories, scores)
+        }
+    };
+
     let mut text = format!(
         "双路检索增强结果 (共 {} 条候选，返回 {} 条)\n\
          ═══════════════════════════════════\n\
@@ -2189,6 +2206,10 @@ async fn handle_recall(
 
     match result {
         Ok(result) => {
+            // ★2026-11-08：召回时近重复折叠（与 REST enrich 同源）。
+            // 写入去重拦不住同义改写，同一结论会以多种措辞入库；
+            // 这里用已入库的语义向量做余弦折叠，只保留信息量最高的一条。
+            let result = crate::v1_api::dedup_recall_result(result);
             let mut text = format!(
                 "记忆检索结果 (共 {} 条匹配，记忆库共 {} 条，模式: {})\n\n",
                 result.memories.len(),

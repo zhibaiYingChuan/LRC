@@ -304,6 +304,38 @@ pub fn distill_transcript(text: &str, config: &DistillConfig) -> Vec<DistilledIt
 
     // ② 句级：决策 / 约束 / 结论 / 代码坐标
     for (turn_idx, turn) in turns.iter().enumerate() {
+        // 显式声明（`结论：`/`决策：`/`约束：`）整行作为一个单元，**不切句**。
+        //
+        // 切句会把「结论：A？B」拆成「结论：A？」+「B」，后者因无关键词被丢弃；
+        // 「结论：A。B」同理。显式声明是作者主动打的标签，整行都应保留，
+        // 否则正文兜底路径会静默丢失后半段（实测 DSH 损失 40-55% 字符）。
+        if let Some(kind) = explicit_kind(turn) {
+            let trimmed = turn.trim();
+            let char_count = trimmed.chars().count();
+            if char_count >= config.min_chars && !is_markdown_noise(trimmed) {
+                let key = normalize_key(trimmed);
+                if !seen.iter().any(|k| k == &key) {
+                    seen.push(key);
+                    let body = truncate_chars(trimmed, config.max_chars);
+                    let mut tags = vec![kind.tag().to_string(), "distilled".to_string()];
+                    if contains_any(trimmed, ANCHOR_WORDS) {
+                        tags.push("anchor".to_string());
+                    }
+                    scored.push((
+                        3.0,
+                        turn_idx,
+                        DistilledItem {
+                            content: format!("[{}] {}", kind.label(), body),
+                            memory_type: kind.memory_type().to_string(),
+                            tags,
+                            importance: importance_from_score(3.0),
+                            source_turns: (turn_idx, turn_idx),
+                        },
+                    ));
+                }
+            }
+            continue;
+        }
         for sentence in split_sentences(turn) {
             let trimmed = sentence.trim();
             let char_count = trimmed.chars().count();
@@ -397,6 +429,8 @@ enum Kind {
     Constraint,
     Conclusion,
     CodeContext,
+    /// 客观事实（含「过程叙述冒充结论」被降级的条目）
+    Fact,
     /// 整轮报错日志（由 `ERROR_MARKERS` 在轮次级识别，不走逐句打分）
     Error,
 }
@@ -408,6 +442,7 @@ impl Kind {
             Kind::Constraint => "约束",
             Kind::Conclusion => "结论",
             Kind::CodeContext => "代码",
+            Kind::Fact => "事实",
             Kind::Error => "报错",
         }
     }
@@ -418,6 +453,7 @@ impl Kind {
             Kind::Constraint => "constraint",
             Kind::Conclusion => "conclusion",
             Kind::CodeContext => "code",
+            Kind::Fact => "fact",
             Kind::Error => "error",
         }
     }
@@ -428,6 +464,7 @@ impl Kind {
             Kind::Constraint => "preference",
             Kind::Conclusion => "fact",
             Kind::CodeContext => "code_context",
+            Kind::Fact => "fact",
             // 报错是客观事实，且需要能被"上次那个报错"检索到
             Kind::Error => "fact",
         }
@@ -526,6 +563,44 @@ fn strip_markdown_links(s: &str) -> String {
     out
 }
 
+/// 过程叙述词：出现这些词说明句子在描述「接下来要做什么」，不是已完成的结论。
+///
+/// 实测 DSH 会话里 AI 会把「接下来我要确认工具参数存放在哪里」写成 `- 结论：…`，
+/// 抽取器按行首标签直接挂 `[结论]`，导致结论计数约 10% 虚高。
+const PROCESS_NARRATION_WORDS: &[&str] = &[
+    "接下来",
+    "下一步",
+    "我要",
+    "待确认",
+    "待验证",
+    "还需要",
+    "准备",
+    "打算",
+    "将要",
+];
+
+/// 完成时态词：出现这些词说明句子已经得出结论，即使含过程词也不降级。
+const COMPLETION_WORDS: &[&str] = &[
+    "已完成",
+    "已确认",
+    "已验证",
+    "已修复",
+    "结论是",
+    "因此",
+    "所以",
+    "说明",
+    "表明",
+];
+
+/// 是否是「过程叙述冒充结论」：含过程词且不含完成词。
+fn is_process_narration(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    if !PROCESS_NARRATION_WORDS.iter().any(|w| lower.contains(w)) {
+        return false;
+    }
+    !COMPLETION_WORDS.iter().any(|w| lower.contains(w))
+}
+
 /// 行首显式声明：`决策：…` / `约束：…` / `结论：…`。
 ///
 /// 这是作者主动打的标签，比关键词猜测可靠得多 —— 一句话里出现"约束"二字
@@ -546,6 +621,11 @@ fn explicit_kind(sentence: &str) -> Option<Kind> {
         if let Some(rest) = t.strip_prefix(prefix) {
             let rest = rest.trim_start();
             if rest.starts_with('：') || rest.starts_with(':') {
+                let body = rest.trim_start_matches(['：', ':']).trim();
+                // 「结论：接下来我要…」是过程叙述，不是结论 → 降级为事实
+                if kind == Kind::Conclusion && is_process_narration(body) {
+                    return Some(Kind::Fact);
+                }
                 return Some(kind);
             }
         }
@@ -680,10 +760,17 @@ fn split_sentences(turn: &str) -> Vec<String> {
             }
             '？' | '?' => {
                 buf.push(ch);
-                if !buf.trim().is_empty() {
+                // 只有「以疑问词开头」的段才在问号处切分。
+                //
+                // 陈述句里出现的问号（如「结论：A？B」）**不切**：切了会把后半段
+                // 当成独立句，因无关键词被丢弃，导致显式声明的后半段静默丢失
+                // （实测 DSH 正文兜底路径损失 40-55% 字符）。
+                // 纯疑问句（「为什么 X？」）仍会被 `is_pure_question` 在打分时识别并降分。
+                let head = buf.trim_end_matches(['？', '?']).trim().to_lowercase();
+                if QUESTION_PREFIXES.iter().any(|p| head.starts_with(p)) {
                     out.push(buf.trim().to_string());
+                    buf.clear();
                 }
-                buf.clear();
             }
             _ => buf.push(ch),
         }
@@ -1010,6 +1097,76 @@ mod tests {
             items
         );
         assert!(items[0].content.starts_with("[约束]"), "{:?}", items);
+    }
+
+    /// 回归：AI 把「接下来我要…」写成 `- 结论：…` 时，必须降级为事实，
+    /// 否则结论计数虚高（实测约 10%）。
+    #[test]
+    fn process_narration_under_conclusion_prefix_downgrades_to_fact() {
+        let items = distill_transcript(
+            "- 结论：接下来我要确认工具参数和推理内容究竟存放在哪里",
+            &cfg(),
+        );
+        assert_eq!(items.len(), 1, "{:?}", items);
+        assert!(items[0].content.starts_with("[事实]"), "{:?}", items);
+        assert_eq!(items[0].memory_type, "fact");
+
+        // 含完成时态词时不降级
+        let items = distill_transcript("- 结论：已完成迁移，因此必须分块", &cfg());
+        assert_eq!(items.len(), 1, "{:?}", items);
+        assert!(items[0].content.starts_with("[结论]"), "{:?}", items);
+
+        // 过程词 + 完成词同时出现：以完成词为准，不降级
+        let items = distill_transcript("- 结论：接下来我要验证，已验证通过", &cfg());
+        assert_eq!(items.len(), 1, "{:?}", items);
+        assert!(items[0].content.starts_with("[结论]"), "{:?}", items);
+    }
+
+    /// 回归：显式声明整行保留，不因句末标点被切掉后半段。
+    ///
+    /// 实测 DSH 正文兜底路径：`结论：A？B` 被切成 `结论：A？` + `B`，
+    /// `B` 因无关键词被丢弃，真实句式下损失 40-55% 字符。
+    #[test]
+    fn explicit_prefix_preserves_whole_line_across_punctuation() {
+        // 问号：后半段必须保留
+        let items = distill_transcript("结论：为什么选 A？因为 B 更稳定 TAILQ1", &cfg());
+        assert_eq!(items.len(), 1, "{:?}", items);
+        assert!(
+            items[0].content.contains("TAILQ1"),
+            "问号后内容丢失：{:?}",
+            items
+        );
+
+        // 句号：后半段必须保留
+        let items = distill_transcript("结论：方案 A 可行。补充说明 TAILP2", &cfg());
+        assert_eq!(items.len(), 1, "{:?}", items);
+        assert!(
+            items[0].content.contains("TAILP2"),
+            "句号后内容丢失：{:?}",
+            items
+        );
+
+        // 分号：后半段必须保留
+        let items = distill_transcript("决策：用 pnpm；理由 TAILS3", &cfg());
+        assert_eq!(items.len(), 1, "{:?}", items);
+        assert!(
+            items[0].content.contains("TAILS3"),
+            "分号后内容丢失：{:?}",
+            items
+        );
+    }
+
+    /// 回归：陈述句里的问号不应把句子切开（无显式前缀时）。
+    #[test]
+    fn question_mark_mid_statement_does_not_split() {
+        // 无显式前缀，但含「决定」关键词，整句应作为一个单元保留
+        let items = distill_transcript("我们决定用 A？因为 B 更稳定 TAILQ9", &cfg());
+        assert_eq!(items.len(), 1, "{:?}", items);
+        assert!(
+            items[0].content.contains("TAILQ9"),
+            "问号后内容丢失：{:?}",
+            items
+        );
     }
 
     /// 行内 markdown 链接不应把普通句子抬过阈值。

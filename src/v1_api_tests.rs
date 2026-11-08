@@ -7214,3 +7214,103 @@ mod score_normalization_tests {
         assert_eq!(norms[2], 0.0);
     }
 }
+
+/// 召回时近重复折叠（2026-11-08）。
+///
+/// 背景：写入去重是 Jaccard 0.5，拦不住同义改写；词面折叠实验（字符二元组 /
+/// 关键词包含度）在 0.6~0.85 全部保留 10 条。改用已入库的语义向量做余弦折叠。
+#[cfg(test)]
+mod recall_dedup_tests {
+    use crate::v1_api::*;
+
+    fn mem(id: &str, content: &str) -> EnrichedMemory {
+        EnrichedMemory {
+            id: id.to_string(),
+            content: content.to_string(),
+            memory_type: "fact".to_string(),
+            score: 0.5,
+            score_norm: 1.0,
+            score_kind: "rrf",
+            bagua_category: None,
+            gua64: None,
+            daoti_preview_gua: None,
+            daoti_preview_bagua: None,
+            daoti_preview_version: None,
+            importance: 5,
+            topological_depth: 0.0,
+            version: 1,
+            created_at: "2026-11-08T00:00:00Z".to_string(),
+            event_id: None,
+            entities: Vec::new(),
+            why: None,
+        }
+    }
+
+    #[test]
+    fn folds_identical_vectors() {
+        let items = vec![mem("a", "同一句话"), mem("b", "同一句话的改写")];
+        let (kept, ids) = dedup_near_duplicates_with(items, 0.90, |id| {
+            if id == "a" || id == "b" {
+                Some(vec![1.0, 0.0, 0.0])
+            } else {
+                None
+            }
+        });
+        assert_eq!(kept.len(), 1, "余弦 1.0 应折叠成一条");
+        assert_eq!(ids, vec!["a".to_string()], "保留排序更靠前的那条");
+    }
+
+    #[test]
+    fn keeps_orthogonal_vectors() {
+        let items = vec![mem("a", "主题甲"), mem("b", "主题乙")];
+        let (kept, ids) = dedup_near_duplicates_with(items, 0.90, |id| {
+            if id == "a" {
+                Some(vec![1.0, 0.0])
+            } else {
+                Some(vec![0.0, 1.0])
+            }
+        });
+        assert_eq!(kept.len(), 2, "余弦 0 不应折叠");
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn keeps_items_without_vectors() {
+        let items = vec![mem("a", "有向量"), mem("b", "没向量")];
+        let (kept, _) = dedup_near_duplicates_with(items, 0.90, |id| {
+            if id == "a" {
+                Some(vec![1.0, 0.0])
+            } else {
+                None
+            }
+        });
+        assert_eq!(kept.len(), 2, "没有向量时宁可留重复，不可误杀");
+    }
+
+    #[test]
+    fn threshold_is_inclusive() {
+        // 余弦 0.9 恰好等于阈值 → 折叠
+        let items = vec![mem("a", "甲"), mem("b", "乙")];
+        let (kept, _) = dedup_near_duplicates_with(items, 0.90, |id| {
+            if id == "a" {
+                Some(vec![1.0, 0.0])
+            } else {
+                Some(vec![0.9, (1.0f32 - 0.81).sqrt()])
+            }
+        });
+        assert_eq!(kept.len(), 1, "余弦等于阈值应折叠");
+    }
+
+    #[test]
+    fn dimension_mismatch_never_folds() {
+        let items = vec![mem("a", "甲"), mem("b", "乙")];
+        let (kept, _) = dedup_near_duplicates_with(items, 0.90, |id| {
+            if id == "a" {
+                Some(vec![1.0, 0.0])
+            } else {
+                Some(vec![1.0, 0.0, 0.0])
+            }
+        });
+        assert_eq!(kept.len(), 2, "维度不一致时余弦按 0 处理，不折叠");
+    }
+}

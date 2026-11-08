@@ -462,6 +462,14 @@ impl SemanticService {
         self.enabled && self.indexed() > 0
     }
 
+    /// 取某条记忆的语义向量（未索引返回 None）。
+    ///
+    /// 向量在入库时已归一化，因此两向量点积即余弦相似度。
+    /// 供「召回时近重复折叠」使用：只读、不触发编码，成本可忽略。
+    pub fn vector_of(&self, id: &str) -> Option<Vec<f32>> {
+        self.index.read().ok()?.get(id).map(|v| v.to_vec())
+    }
+
     /// 全库语义检索。
     ///
     /// 返回 `None` 表示**本通路不可用**（编码器不可用 / 索引为空 / 查询编码失败），
