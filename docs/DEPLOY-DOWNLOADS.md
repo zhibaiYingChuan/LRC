@@ -1,7 +1,7 @@
 # 国内下载页部署说明（sfang.cc/longyi）
 
 > 目标：把桌面端三个安装包放到自有服务器，国内用户直连下载。
-> 状态：**v0.10.2 已执行完成（2026-11-07）**。
+> 状态：**v0.10.3 已执行完成（2026-11-08）**。
 
 ---
 
@@ -30,13 +30,13 @@ location /xd/downloads/ {
 
 ---
 
-## 二、已上传的文件（v0.10.2）
+## 二、已上传的文件（v0.10.3）
 
 | 平台 | 文件名 | 字节 |
 |---|---|---:|
-| Windows | `lrc-desktop-v0.10.2-windows-x86_64-setup.exe` | 6,786,683 |
-| macOS (Apple Silicon) | `lrc-desktop-v0.10.2-macos-arm64.dmg` | 8,423,588 |
-| Linux | `lrc-desktop-v0.10.2-linux-amd64.deb` | 9,732,484 |
+| Windows | `lrc-desktop-v0.10.3-windows-x86_64-setup.exe` | 6,798,462 |
+| macOS (Apple Silicon) | `lrc-desktop-v0.10.3-macos-arm64.dmg` | 8,430,879 |
+| Linux | `lrc-desktop-v0.10.3-linux-amd64.deb` | 9,742,260 |
 
 每个文件旁都有同名 `.sha256`。
 
