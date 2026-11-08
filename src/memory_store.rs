@@ -5307,6 +5307,45 @@ impl<P: Persistence> MemoryStore<P> {
         // 使调用方能**在存储锁之外**完成昂贵的编码阶段。此处保持"两步连调"，
         // 行为与拆分前逐位一致。
         // A+B+D：IDF 表已在构造期定型（见 init_encoder_idf），此处直接编码
+        // v0.10.4（P3）：一次前向双产出——洛书 9 维 + 高维句向量。
+        // 修前写入路径与语义索引各跑一遍 BERT 前向；合并后只跑一遍。
+        #[cfg(feature = "ml")]
+        {
+            // 仅当**整批都是短文本**（≤ CHUNK_CHARS，语义索引走单窗口）时才走
+            // 双产出路径：此时写入路径算出的句向量与语义索引后台编码结果同源，
+            // 可直接复用。长文本需分窗（首/中/尾），句向量不可复用，
+            // 走双产出反而多算一次全文本前向 —— 实测慢约 14%，故明确排除。
+            let all_short = memories
+                .iter()
+                .all(|m| m.content.chars().count() <= crate::semantic_index::CHUNK_CHARS);
+            if all_short {
+                let texts: Vec<&str> = memories.iter().map(|m| m.content.as_str()).collect();
+                let __p3_t0 = std::time::Instant::now();
+                let pairs = self.luoshu_encoder.encode_both_batch(&texts);
+                if std::env::var_os("LRC_TIMING").is_some() {
+                    eprintln!(
+                        "[LRC_TIMING] remember_batch encode_both_batch ok={} n={} elapsed={:.2}s",
+                        pairs.is_some(),
+                        texts.len(),
+                        __p3_t0.elapsed().as_secs_f64()
+                    );
+                }
+                if let Some(pairs) = pairs {
+                    let mut luoshu_vecs = Vec::with_capacity(pairs.len());
+                    let mut embeddings = Vec::with_capacity(pairs.len());
+                    for (luoshu, emb) in pairs {
+                        luoshu_vecs.push(luoshu);
+                        embeddings.push(Some(emb));
+                    }
+                    return self.remember_batch_preencoded_with_embeddings(
+                        memories,
+                        luoshu_vecs,
+                        embeddings,
+                    );
+                }
+            }
+        }
+        // 非 ML 或双产出失败：回退既有路径（洛书批量编码 + 后台语义编码）
         let luoshu_vecs = encode_luoshu_batch(&self.luoshu_encoder, &memories);
         self.remember_batch_preencoded(memories, luoshu_vecs)
     }
@@ -5331,6 +5370,35 @@ impl<P: Persistence> MemoryStore<P> {
         memories: Vec<Memory>,
         luoshu_vecs: Vec<LuoShuVector>,
     ) -> Result<Vec<Memory>, PersistenceError> {
+        self.remember_batch_preencoded_inner(memories, luoshu_vecs, None)
+    }
+
+    /// 批量写入**已预先编码**的记忆，并携带**已算好的高维句向量**。
+    ///
+    /// v0.10.4（P3）：写入路径用 `encode_both_batch` 一次前向同时拿到
+    /// 洛书 9 维与高维句向量；本入口把句向量直接交给语义索引，
+    /// 省掉后台对同一段文本的第二次前向。
+    ///
+    /// **契约**：`embeddings[i]` 必须与 `memories[i]` 一一对应；`None` 表示
+    /// 该条没有可用句向量（长文本或编码失败），回退到既有后台编码路径。
+    pub fn remember_batch_preencoded_with_embeddings(
+        &self,
+        memories: Vec<Memory>,
+        luoshu_vecs: Vec<LuoShuVector>,
+        embeddings: Vec<Option<Vec<f32>>>,
+    ) -> Result<Vec<Memory>, PersistenceError> {
+        self.remember_batch_preencoded_inner(memories, luoshu_vecs, Some(embeddings))
+    }
+
+    fn remember_batch_preencoded_inner(
+        &self,
+        memories: Vec<Memory>,
+        luoshu_vecs: Vec<LuoShuVector>,
+        embeddings: Option<Vec<Option<Vec<f32>>>>,
+    ) -> Result<Vec<Memory>, PersistenceError> {
+        // 非 ML 构建不使用句向量（语义索引整体关闭），显式消费避免 unused 警告。
+        #[cfg(not(feature = "ml"))]
+        let _ = &embeddings;
         if memories.is_empty() {
             return Ok(vec![]);
         }
@@ -5387,15 +5455,42 @@ impl<P: Persistence> MemoryStore<P> {
         // 避免长时间占用写路径。
         #[cfg(feature = "ml")]
         {
-            if results.len() <= crate::semantic_index::SYNC_ENCODE_MAX {
-                let items: Vec<(String, String)> = results
-                    .iter()
-                    .map(|m| (m.id.clone(), m.content.clone()))
-                    .collect();
-                crate::semantic_index::encode_batch_sync(&items);
-            } else {
-                for result in &results {
-                    crate::semantic_index::enqueue(&result.id, &result.content);
+            // v0.10.4（P3）：写入路径若已带句向量（一次前向双产出），
+            // 短文本直接插入索引，省掉后台对同一段文本的第二次前向；
+            // 长文本（> CHUNK_CHARS，需分窗）与缺失项仍走既有编码路径。
+            let mut precomputed: Vec<(String, Vec<f32>)> = Vec::new();
+            let mut fallback: Vec<(String, String)> = Vec::new();
+            match embeddings.as_ref() {
+                Some(embs) => {
+                    for (m, emb) in results.iter().zip(embs.iter()) {
+                        match emb {
+                            Some(v)
+                                if m.content.chars().count()
+                                    <= crate::semantic_index::CHUNK_CHARS =>
+                            {
+                                precomputed.push((m.id.clone(), v.clone()));
+                            }
+                            _ => fallback.push((m.id.clone(), m.content.clone())),
+                        }
+                    }
+                }
+                None => {
+                    fallback = results
+                        .iter()
+                        .map(|m| (m.id.clone(), m.content.clone()))
+                        .collect();
+                }
+            }
+            if !precomputed.is_empty() {
+                crate::semantic_index::insert_precomputed_sync(&precomputed);
+            }
+            if !fallback.is_empty() {
+                if fallback.len() <= crate::semantic_index::SYNC_ENCODE_MAX {
+                    crate::semantic_index::encode_batch_sync(&fallback);
+                } else {
+                    for (id, content) in &fallback {
+                        crate::semantic_index::enqueue(id, content);
+                    }
                 }
             }
         }

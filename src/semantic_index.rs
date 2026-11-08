@@ -126,7 +126,7 @@ pub struct SemanticIndex {
 /// 40 字 ≈ 0.25s/条、200 字 ≈ 4.4s/条（25×，与平方项一致）。
 /// 取 **160 字**：既覆盖一段完整语义（约 1~2 句），又把单窗口成本压到
 /// 200 字的约 0.64 倍。配合"首/中/尾"三窗口，长记忆仍能覆盖两端与中段。
-const CHUNK_CHARS: usize = 160;
+pub const CHUNK_CHARS: usize = 160;
 
 impl SemanticIndex {
     /// 向量维度（0 表示空索引）。
@@ -422,6 +422,8 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 enum Job {
     /// 写入时编码（新记忆）
     Encode(Vec<(String, String)>),
+    /// 写入时**已带向量**（一次前向双产出的产物），直接插入，不再编码
+    Insert(Vec<(String, Vec<f32>)>),
     /// 存量回填（启动时一次性投递）
     Backfill(Vec<(String, String)>),
 }
@@ -530,6 +532,32 @@ impl SemanticService {
             .send(Job::Encode(vec![(id.to_string(), content.to_string())]));
     }
 
+    /// 新记忆入队（**已带高维句向量**，跳过后台编码）。
+    ///
+    /// 供写入路径「一次前向双产出」使用：洛书编码时已顺带算出高维句向量，
+    /// 直接插入索引即可，避免后台对同一段文本再跑一遍前向。
+    ///
+    /// **调用方契约**：传入的向量必须与 [`Self::enqueue`] 后台编码的结果同源
+    /// （同一 `forward_pooled_batch` + 同一 `EncodeRole::Passage`），且文本长度
+    /// 不超过 [`CHUNK_CHARS`]（单窗口）。长文本仍走 [`Self::enqueue`] 的分窗路径。
+    pub fn enqueue_with_vector(&self, id: &str, vector: Vec<f32>) {
+        if !self.enabled || vector.is_empty() {
+            return;
+        }
+        if self
+            .index
+            .read()
+            .map(|i| i.get(id).is_some())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.total.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .tx
+            .send(Job::Insert(vec![(id.to_string(), normalize(vector))]));
+    }
+
     /// 立即落盘（供测试/关闭时调用）。
     ///
     /// ★v3：只追加**新增向量**到日志（O(新增条数)）；仅当日志达到阈值
@@ -585,6 +613,35 @@ pub fn service() -> Option<&'static Arc<SemanticService>> {
 pub fn enqueue(id: &str, content: &str) {
     if let Some(service) = SERVICE.get() {
         service.enqueue(id, content);
+    }
+}
+
+/// 同步插入一批**已编码**的向量（写入路径「一次前向双产出」的产物）。
+///
+/// 与 [`encode_batch_sync`] 对称：同样受时间预算约束，超预算的部分交回异步队列。
+/// 供 `remember_batch` 在已拿到句向量时跳过第二次前向。
+pub fn insert_precomputed_sync(items: &[(String, Vec<f32>)]) {
+    let Some(service) = SERVICE.get() else {
+        return;
+    };
+    if !service.enabled || items.is_empty() {
+        return;
+    }
+    const SYNC_BUDGET: Duration = Duration::from_secs(15);
+    let started = std::time::Instant::now();
+    let mut done = 0usize;
+    for chunk in items.chunks(ENCODE_BATCH) {
+        if started.elapsed() >= SYNC_BUDGET {
+            break;
+        }
+        insert_precomputed(service, chunk);
+        done += chunk.len();
+    }
+    if done > 0 {
+        service.flush();
+    }
+    for (id, vector) in &items[done..] {
+        service.enqueue_with_vector(id, vector.clone());
     }
 }
 
@@ -714,6 +771,10 @@ fn spawn_worker(service: Arc<SemanticService>, rx: Receiver<Job>) {
                         while items.len() < ENCODE_BATCH {
                             match rx.try_recv() {
                                 Ok(Job::Encode(more)) => items.extend(more),
+                                Ok(Job::Insert(more)) => {
+                                    // 已编码向量：直接插入，不参与本批编码
+                                    since_flush += insert_precomputed(&service, &more);
+                                }
                                 Ok(Job::Backfill(backfill)) => {
                                     // 回填任务不插队：放回队列，稍后处理
                                     let _ = service.tx.send(Job::Backfill(backfill));
@@ -723,6 +784,9 @@ fn spawn_worker(service: Arc<SemanticService>, rx: Receiver<Job>) {
                             }
                         }
                         since_flush += encode_and_insert(&service, &items);
+                    }
+                    Ok(Job::Insert(items)) => {
+                        since_flush += insert_precomputed(&service, &items);
                     }
                     Ok(Job::Backfill(items)) => {
                         let total = items.len();
@@ -926,6 +990,50 @@ fn encode_and_insert(service: &SemanticService, items: &[(String, String)]) -> u
         service.dirty.store(true, Ordering::Release);
     }
     inserted_ids.len()
+}
+
+/// 插入一批**已编码**的向量（写入路径「一次前向双产出」的产物）。
+///
+/// 与 [`encode_and_insert`] 的差别：不展开窗口、不调用编码器，直接落索引。
+/// 维度变更清空、已索引跳过、增量日志记录三条契约与编码路径逐位一致。
+fn insert_precomputed(service: &SemanticService, items: &[(String, Vec<f32>)]) -> usize {
+    if items.is_empty() {
+        return 0;
+    }
+    let first_dim = items.first().map(|(_, v)| v.len()).unwrap_or(0);
+    if first_dim == 0 {
+        return 0;
+    }
+    let Ok(mut index) = service.index.write() else {
+        return 0;
+    };
+    // 维度变更（换模型）⇒ 旧索引整体失效，先清空再重建（与编码路径同口径）
+    if index.dim() != 0 && index.dim() != first_dim {
+        eprintln!(
+            "[LRC·语义索引] ⚠ 向量维度变化（{} → {}），清空旧索引重建",
+            index.dim(),
+            first_dim
+        );
+        index.clear();
+        let _ = index.save(&service.data_dir);
+    }
+    let mut new_vectors: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut inserted = 0usize;
+    for (id, vector) in items {
+        if vector.len() != first_dim || index.get(id).is_some() {
+            continue;
+        }
+        index.insert(id.clone(), vector.clone());
+        new_vectors.push((id.clone(), vector.clone()));
+        inserted += 1;
+    }
+    drop(index);
+    if !new_vectors.is_empty() {
+        let mut p = service.pending.lock().unwrap_or_else(|e| e.into_inner());
+        p.extend(new_vectors);
+        service.dirty.store(true, Ordering::Release);
+    }
+    inserted
 }
 
 #[cfg(test)]
