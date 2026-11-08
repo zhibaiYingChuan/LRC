@@ -2196,9 +2196,15 @@ impl RememberPrep {
             RememberPrep::Ready(data) => {
                 let data = *data;
                 let similarity_start = std::time::Instant::now();
-                let query_bagua = data.buckets.as_ref().map(|_| {
-                    mirror_project(&data.encoder.encode_text(&data.memory.content)).best_index % 8
-                });
+                // v0.10.4（P0）：同一段文本只编码一次。
+                // 修前此处对 `data.memory.content` 调了两次 `encode_text`——
+                // 一次算八卦（桶路由），一次算洛书向量（落盘字段）。输入与函数完全相同，
+                // 纯属重复计算；ML 编码器下单条写入因此白花一倍时间。
+                let luoshu_vec = data.encoder.encode_text(&data.memory.content);
+                let query_bagua = data
+                    .buckets
+                    .as_ref()
+                    .map(|_| mirror_project(&luoshu_vec).best_index % 8);
                 let similar = scan_candidates(
                     &data.snapshot,
                     &data.candidates,
@@ -2217,7 +2223,6 @@ impl RememberPrep {
                         similar.is_some()
                     );
                 }
-                let luoshu_vec = data.encoder.encode_text(&data.memory.content);
                 RememberAnalysis::Ready(Box::new(RememberAnalysisData {
                     encoded_content: data.memory.content.clone(),
                     memory: data.memory,
