@@ -6,7 +6,7 @@
 |---|---|---|
 | `hooks/` | 各宿主的生命周期钩子：会话启动注入索引、上下文压缩前迁移记忆 | P0-2 |
 | `rules/` | 各宿主的全局规则文件：强制模型先 `recall` 再搜索 | P1-2 |
-| `dsh-plugin/` | DeepSeek Harness 插件：注册 `lrc_migrate_context` 工具（压缩后端待签名核对） | P2-1 |
+| `dsh-plugin/` | DeepSeek Harness 插件：**已独立成仓**，见 https://github.com/zhibaiYingChuan/dsh-plugin-lrc（npm `dsh-plugin-lrc`） | P2-1 |
 
 ## 端口纪律（强制）
 
