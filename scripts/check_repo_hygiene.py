@@ -36,6 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # 新增交付文件时必须在这里显式加一行 —— 这是有意的摩擦：
 # 「要进仓库」必须是一个主动决定，而不是默认结果。
 DOCS_ALLOW = {
+    "docs/BENCHMARK_v0.10.3.md",
     "docs/OFFLINE_MODEL_GUIDE.md",
     "docs/USER_GUIDE.md",
     "docs/USE_CASES.md",
