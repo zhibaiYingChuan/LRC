@@ -4992,7 +4992,7 @@ returned=100   total=255   filtered_count=23   fast_path_hits=200   deep_path_hi
 
 范式与既有 `lock_busy` 修复（本文件 §"lock_busy 根因修复：三阶段锁解耦"）一致。
 
-#### 部署（2026-10-11，服务器 139.224.231.170）
+#### 部署（2026-10-11，生产服务器）
 
 - 二进制 SHA256 `9D2DF36F71CA78BE48F5CD940BA246F588D9D78AB58923DA5811DA623274F5CC`（`--features server,ml`）；
   覆盖前备份 `C:\aml\bin\code-memory-server.exe.bak-pre-3phase`；覆盖后服务器侧复核 hash **match**。

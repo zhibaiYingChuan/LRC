@@ -536,14 +536,13 @@ docs/V099_INTERACTION_USABILITY.md
 # 顺序约束：本块必须位于文件**末尾**，否则会被上方更早的规则覆盖。
 # ============================================================
 docs/*
-!docs/DEPLOY-DOWNLOADS.md
-!docs/LRC_上下文接管推进计划_v1.0.md
 !docs/OFFLINE_MODEL_GUIDE.md
 !docs/USER_GUIDE.md
 !docs/USE_CASES.md
 
 scripts/*
 !scripts/check_algorithm_leak.py
+!scripts/check_repo_hygiene.py
 !scripts/enable_git_hooks.ps1
 !scripts/install.ps1
 !scripts/install.sh
@@ -554,3 +553,6 @@ backups/
 
 # 营销资产目录（本地营销仓，含字体/图片等大文件，不随产品仓库交付）
 marketing/
+
+# 设计草稿（非交付资产，本地保留）
+static/assets/logo/LRC桌面端Logo设计-*.png

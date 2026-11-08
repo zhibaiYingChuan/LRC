@@ -99,6 +99,36 @@ jobs:
         run: python scripts/check_algorithm_leak.py
 
   # ════════════════════════════════════════════════════════════
+  # Job 1.5: 仓库卫生门禁（本地开发/测试文件与敏感信息不得入库）
+  # 背景：.gitignore 只对未跟踪文件生效，已跟踪的本地文件不会被自动移除；
+  #       docs/ 与 scripts/ 已改白名单，但 tests/、integrations/、static/ 等
+  #       目录仍无约束，且白名单本身也可能被误加（如含服务器地址的运维文档）。
+  # ════════════════════════════════════════════════════════════
+  repo-hygiene:
+    name: Repo Hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          token: ${{ secrets.CORE_REPO_TOKEN }}
+          submodules: recursive
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.x'
+      - name: 仓库卫生检查
+        run: python scripts/check_repo_hygiene.py
+
+  # ════════════════════════════════════════════════════════════
   # Job 2: Clippy 静态检查（拒绝 warnings）
   # ════════════════════════════════════════════════════════════
   clippy:
