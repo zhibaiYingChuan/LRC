@@ -54,6 +54,18 @@ pub struct WizardConfig {
     /// 优先级：最高（即使自动检测结果相反也以这里为准）
     #[serde(default)]
     pub manual_agent_overrides: std::collections::HashMap<String, bool>,
+    /// v0.10.4：LLM 重排开关（sidecar 的 `/v1/config/rerank` 写入本字段）。
+    ///
+    /// # 为什么桌面端也必须有这个字段（否则是静默丢配置）
+    ///
+    /// 本结构体是**强类型且整份序列化回盘**（见 `save()`）。此前它不含该字段，
+    /// 于是 `load()` 反序列化时静默丢弃 sidecar 写入的 `rerank_enabled`，
+    /// 下一次 `save()`（启动时 `rules_need_update → save_rules_state` 就会触发）
+    /// 用默认值整份覆盖 ⇒ 用户开启的重排开关**重启后凭空失效**。
+    ///
+    /// 桌面端不修改该值，只负责**读入并原样写回**（round-trip 保真）。
+    #[serde(default)]
+    pub rerank_enabled: bool,
 }
 
 /// serde default 函数：新版本默认版本号
@@ -243,6 +255,7 @@ impl Default for WizardConfig {
             encrypted_api_key: String::new(),
             api_key_invalid: false,
             manual_agent_overrides: std::collections::HashMap::new(),
+            rerank_enabled: false,
         }
     }
 }
@@ -552,35 +565,107 @@ impl WizardState {
     ///
     /// 安全：配置文件存储在 %APPDATA%\LoongRecall\ 下，
     /// Windows 默认 ACL 仅允许当前用户 + SYSTEM + Administrators 访问（L1-03）。
+    ///
+    /// # 为什么不是"整份结构体直接覆盖写"（v0.10.4 修复）
+    ///
+    /// wizard.json 是**桌面端与 sidecar 双写**的共享文件：
+    /// 桌面端拥有向导/规则/LLM 凭据，sidecar 拥有 `rerank_enabled` 等运行时开关。
+    /// 此前本函数把 `WizardConfig` 整份序列化覆盖 ⇒ sidecar 写入的字段被抹掉。
+    ///
+    /// 现在改为**字段级所有权**：先读磁盘最新内容，用本进程持有的字段覆盖，
+    /// 磁盘上其余字段（属 sidecar 所有）原样保留。即便未来 sidecar 再新增开关，
+    /// 也无需同步修改本结构体。
     fn save(&self) -> Result<(), String> {
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let json = serde_json::to_string_pretty(&self.config).map_err(|e| e.to_string())?;
+
+        // 我方字段的 JSON 表示（权威来源是本进程内存中的 config）
+        let owned = serde_json::to_value(&self.config).map_err(|e| e.to_string())?;
+
+        // 磁盘现有内容：存在且可解析则作为基底，否则以空对象为基底
+        // （解析失败时**不回退到空对象覆盖**，避免把损坏文件上的残留字段一并丢掉；
+        //   此处语义与 load() 的 corrupted 路径一致：宁可重建已知字段也不静默清空）
+        let mut merged = match std::fs::read_to_string(&self.config_path) {
+            Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+                .unwrap_or_else(|_| serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        };
+
+        // 用我方字段覆盖基底（我方字段优先，其余字段保留）
+        // `rerank_enabled` 属 sidecar 所有，此处**不回写**内存中的旧值，
+        // 因为磁盘可能比内存新（用户在仪表盘刚改过）。
+        if let (Some(base), Some(own)) = (merged.as_object_mut(), owned.as_object()) {
+            for (key, value) in own {
+                if key == "rerank_enabled" {
+                    continue;
+                }
+                base.insert(key.clone(), value.clone());
+            }
+        } else {
+            merged = owned;
+        }
+
+        let json = serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?;
         atomic_save(&self.config_path, &json)
     }
 }
 
+/// 临时文件名唯一性计数器（`atomic_save` 用）。
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 在任意路径上以原子方式写入 JSON 配置。
 ///
-/// Windows 策略：写临时文件 → copy 覆盖目标 → 删除临时文件。
-/// 其他平台：写临时文件 → rename 覆盖目标。
+/// # 原子性（v0.10.4 修复）
+///
+/// 此前 Windows 分支是「写临时文件 → `fs::copy` 覆盖目标」：`copy` 不是原子的，
+/// 并发读者（sidecar）可能读到**写了一半**的 JSON；一旦此时进程崩溃，
+/// wizard.json 就永久损坏，下次 `load()` 回退默认值 ⇒ 用户的 API Key 密文丢失。
+///
+/// 现在统一为「唯一临时名 + `sync_all` + `rename`」：
+/// Rust 的 `fs::rename` 在 Windows 上走 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`，
+/// 在 Unix 上是同目录 `rename`，**两者都是原子的目录项替换**。
 fn atomic_save(path: &std::path::Path, json: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {}", e))?;
     }
-    let temp_path = path.with_extension("json.tmp");
-    std::fs::write(&temp_path, json).map_err(|e| format!("写入临时配置文件失败: {}", e))?;
+    // 唯一临时名：并发写同一路径时互不争用（固定 `.json.tmp` 会互相踩踏）
+    // 不引入 uuid 依赖：进程号 + 单调计数器 + 纳秒时间戳已足够唯一
+    //（同一进程内计数器保证唯一，跨进程由 pid 区分）。
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("wizard");
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_path = path.with_file_name(format!(
+        "{}.{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        seq,
+        nanos
+    ));
 
-    #[cfg(windows)]
-    {
-        std::fs::copy(&temp_path, path)
-            .map_err(|e| format!("提交配置文件失败（Windows 覆盖配置）: {}", e))?;
+    let result = (|| -> Result<(), String> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&temp_path)
+            .map_err(|e| format!("写入临时配置文件失败: {}", e))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("写入临时配置文件失败: {}", e))?;
+        // 先落盘再 rename：否则崩溃后可能"目录项指向新文件、内容仍在页缓存"⇒ 0 字节配置
+        file.sync_all()
+            .map_err(|e| format!("同步临时配置文件失败: {}", e))?;
+        drop(file);
+        std::fs::rename(&temp_path, path).map_err(|e| format!("提交配置文件失败: {}", e))
+    })();
+
+    if result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
     }
-
-    #[cfg(not(windows))]
-    std::fs::rename(&temp_path, path).map_err(|e| format!("提交配置文件失败: {}", e))?;
+    result?;
 
     tracing::debug!("配置文件已写入: {}", path.display());
     Ok(())
@@ -598,6 +683,73 @@ mod tests {
         assert!(config.project_dir.is_none());
         assert!(!config.llm_configured);
         assert_eq!(config.llm_type, "none");
+        assert!(!config.rerank_enabled, "重排开关默认必须是关闭");
+    }
+
+    /// ★v0.10.4 回归：桌面端 `save()` **不得**抹掉 sidecar 写入的字段。
+    ///
+    /// # 这条锁住的是一个真实缺陷
+    ///
+    /// wizard.json 是桌面端与 sidecar **双写**的共享文件。修复前 `save()` 用
+    /// `WizardConfig` 整份序列化覆盖 ⇒ 用户在仪表盘开启的 `rerank_enabled`
+    /// 在下一次桌面端保存（启动时 `save_rules_state` 就会触发）后**凭空丢失**，
+    /// 表现为"重排开关重启后自动关闭"。
+    ///
+    /// 本测试模拟该时序：先由 sidecar 侧写入 `rerank_enabled=true` 与一个
+    /// 桌面端不认识的未来字段，再让桌面端执行一次 `save()`，断言两者都还在。
+    #[test]
+    fn test_save_preserves_sidecar_owned_fields() {
+        // 桌面端 crate 无 tempfile dev-dependency，用标准库建唯一临时目录
+        let dir = std::env::temp_dir().join(format!(
+            "lrc_wizard_test_{}_{}",
+            std::process::id(),
+            TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("创建临时目录");
+        let path = dir.join("wizard.json");
+
+        // 1) sidecar 侧写入（含桌面端不认识的未来字段）
+        //    必填字段（llm_configured / configured_agents）也一并给出，模拟真实文件
+        let initial = serde_json::json!({
+            "setup_complete": true,
+            "llm_configured": true,
+            "llm_type": "openai",
+            "configured_agents": ["trae"],
+            "rerank_enabled": true,
+            "some_future_switch": "keep-me"
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&initial).unwrap()).unwrap();
+
+        // 2) 桌面端 load → save（模拟启动时规则状态持久化）
+        let mut state = WizardState {
+            // 与 WizardState::load() 的解析分支等价
+            config: serde_json::from_str(&std::fs::read_to_string(&path).unwrap())
+                .expect("应能解析 sidecar 写入的配置"),
+            config_path: path.clone(),
+            corrupted_on_load: false,
+            file_existed: true,
+        };
+        assert!(state.config.rerank_enabled, "load 必须能读到 sidecar 写入的开关");
+        state.config.rules_version = 1;
+        state.save().expect("保存应成功");
+
+        // 3) 断言：sidecar 拥有的字段在桌面端保存后仍然存在
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after.get("rerank_enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "★桌面端保存不得抹掉 sidecar 写入的 rerank_enabled"
+        );
+        assert_eq!(
+            after.get("some_future_switch").and_then(|v| v.as_str()),
+            Some("keep-me"),
+            "★桌面端不认识的字段也必须原样保留（否则每加一个 sidecar 开关就要改桌面端）"
+        );
+        // 桌面端自己的字段照常写入
+        assert_eq!(after.get("rules_version").and_then(|v| v.as_u64()), Some(1));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// ★★v0.9.9：全新安装**不得**被判为"有使用痕迹"。

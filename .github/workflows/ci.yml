@@ -602,7 +602,11 @@ jobs:
         run: |
           cargo check --no-default-features
           cargo check --features server
-          cargo check --all-features
+          # 不用 --all-features：它会连带 `cuda`（candle CUDA 后端），
+          # 而 CI runner 无 CUDA Toolkit（nvcc）⇒ 必然失败。
+          # `cuda` 是用户本地可选加速，不属于本项目 CI 口径；
+          # 下面逐项列举其余 feature，覆盖度与 all-features 等价。
+          cargo check --features server,ml,postgres,qdrant,neo4j
           cargo check --features server,ml
           cargo check --features server,postgres
           cargo check --features server,qdrant

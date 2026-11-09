@@ -1099,6 +1099,19 @@ async fn handle_recall_enhanced(
         }
     };
 
+    // ═══ LLM 重排（方案 B，门控 `LRC_RERANK` / 运行时开关，默认关）═══
+    //
+    // 与 `handle_recall`、REST `enrich` **同源同口径**：三条入口若只两条接重排，
+    // 同一查询会因所用工具不同而得到不同排序（用户可见的不一致）。
+    //
+    // 重排只动顺序、不动召回集合；失败/超时/未配置 ⇒ 原样返回。
+    // 此处已脱离 store 锁（`spawn_blocking` 内释放），网络等待不持锁。
+    let (result_memories, result_scores) = {
+        let deduped = RecallResult::basic(result_memories, result_scores, total);
+        let reranked = crate::v1_api::rerank_recall_result(&llm_config, query, deduped).await;
+        (reranked.memories, reranked.scores)
+    };
+
     let mut text = format!(
         "双路检索增强结果 (共 {} 条候选，返回 {} 条)\n\
          ═══════════════════════════════════\n\
@@ -4294,9 +4307,14 @@ fn save_llm_to_wizard_json(llm_api: &str) -> LrcResult<()> {
     }
 
     // 写入 wizard.json
+    //
+    // 用原子写（临时文件 + fsync + rename）：wizard.json 是桌面端与 sidecar 的
+    // **共享文件**，直接 `std::fs::write` 会先截断再写 —— 此时若桌面端读取或
+    // 进程崩溃，会留下损坏 JSON；桌面端 `load()` 解析失败即回退默认配置，
+    // 随后 `save_rules_state` 把默认值写回 ⇒ 用户的 API Key 密文被永久抹除。
     let json_str = serde_json::to_string_pretty(&wizard)
         .map_err(|e| LrcError::parse(format!("序列化 wizard.json 失败: {}", e)))?;
-    std::fs::write(&wizard_path, json_str)
+    crate::atomic_file::write_atomic(&wizard_path, json_str.as_bytes())
         .map_err(|e| LrcError::io(format!("写入 wizard.json 失败: {}", e)))?;
 
     eprintln!(
@@ -4328,7 +4346,8 @@ fn save_rerank_to_wizard_json(enabled: bool) -> LrcResult<()> {
     }
     let json_str = serde_json::to_string_pretty(&wizard)
         .map_err(|e| LrcError::parse(format!("序列化 wizard.json 失败: {}", e)))?;
-    std::fs::write(&wizard_path, json_str)
+    // 原子写：与 `save_llm_to_wizard_json` 同一纪律（共享文件不得先截断再写）
+    crate::atomic_file::write_atomic(&wizard_path, json_str.as_bytes())
         .map_err(|e| LrcError::io(format!("写入 wizard.json 失败: {}", e)))?;
     Ok(())
 }

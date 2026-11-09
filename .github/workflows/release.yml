@@ -121,11 +121,16 @@ jobs:
         run: cargo clippy --all-targets --features server,ml -- -D warnings
 
       # 3. 编译检查：默认、无默认、全 feature 以及发布使用的 server+ml 必须一致
+      #
+      # ⚠ `--all-features` 会连带 `cuda`（candle 的 CUDA 后端），而 runner 上没有
+      #   CUDA Toolkit（nvcc）⇒ 链接/编译会失败，直接卡死发布门禁。
+      #   `cuda` 是**用户可选**的本地加速能力，不属于发布产物口径
+      #   （发布只用 server,ml），故此处显式排除，其余 feature 仍全量覆盖。
       - name: Compile feature matrix
         run: |
           cargo check --no-default-features
           cargo check --features server
-          cargo check --all-features
+          cargo check --features server,ml,postgres,qdrant,neo4j
           cargo check --features server,ml
 
       # 4. 显式验证所有发布 bin（required-features 不能掩盖漏编译）
