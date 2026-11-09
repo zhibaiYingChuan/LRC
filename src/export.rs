@@ -120,7 +120,10 @@ pub fn export_memories(
     let memories: serde_json::Value = if memories_path.exists() {
         let content = fs::read_to_string(&memories_path)
             .map_err(|e| LrcError::io(format!("读取 memories.json 失败: {}", e)))?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!([]))
+        // 存在但解析失败 ⇒ 报错中止，绝不静默导出空数组（否则用户拿到"成功但为空"的假导出）
+        serde_json::from_str(&content).map_err(|e| {
+            LrcError::parse(format!("解析 memories.json 失败（文件可能损坏）: {}", e))
+        })?
     } else {
         serde_json::json!([])
     };
@@ -130,7 +133,8 @@ pub fn export_memories(
     let chunks: serde_json::Value = if chunks_path.exists() {
         let content = fs::read_to_string(&chunks_path)
             .map_err(|e| LrcError::io(format!("读取 chunks.json 失败: {}", e)))?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!([]))
+        serde_json::from_str(&content)
+            .map_err(|e| LrcError::parse(format!("解析 chunks.json 失败（文件可能损坏）: {}", e)))?
     } else {
         serde_json::json!([])
     };
@@ -140,7 +144,9 @@ pub fn export_memories(
     let archive: serde_json::Value = if archive_path.exists() {
         let content = fs::read_to_string(&archive_path)
             .map_err(|e| LrcError::io(format!("读取 archive.json 失败: {}", e)))?;
-        serde_json::from_str(&content).unwrap_or(serde_json::json!([]))
+        serde_json::from_str(&content).map_err(|e| {
+            LrcError::parse(format!("解析 archive.json 失败（文件可能损坏）: {}", e))
+        })?
     } else {
         serde_json::json!([])
     };
@@ -295,12 +301,21 @@ pub fn import_memories(
     //
     // **残留风险（明示）**：三个文件之间的 rename 序列本身**不是组原子**；理论上仍存在
     // "A 已替换、B 未替换"的极小窗口。彻底消除需跨文件事务，超出本次范围。
-    let read_array = |path: &std::path::Path| -> serde_json::Value {
+    let read_array = |path: &std::path::Path| -> LrcResult<serde_json::Value> {
         if path.exists() {
-            let content = fs::read_to_string(path).unwrap_or_default();
-            serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!([]))
+            let content = fs::read_to_string(path)
+                .map_err(|e| LrcError::io(format!("读取 {} 失败: {}", path.display(), e)))?;
+            // 存在但解析失败 ⇒ 报错中止，绝不当作空数组
+            // （否则导入会把"损坏的原有数据"覆盖成"仅导入数据"，静默丢弃原库）
+            serde_json::from_str(&content).map_err(|e| {
+                LrcError::parse(format!(
+                    "解析 {} 失败（文件可能损坏，已中止导入以避免覆盖）: {}",
+                    path.display(),
+                    e
+                ))
+            })
         } else {
-            serde_json::json!([])
+            Ok(serde_json::json!([]))
         }
     };
 
@@ -309,7 +324,7 @@ pub fn import_memories(
 
     if memory_count > 0 {
         let merged = merge_arrays(
-            &read_array(&data_path.join("memories.json")),
+            &read_array(&data_path.join("memories.json"))?,
             &export_data.memories,
         );
         let payload = serde_json::to_string_pretty(&merged)
@@ -319,7 +334,7 @@ pub fn import_memories(
 
     if chunk_count > 0 {
         let merged = merge_arrays(
-            &read_array(&data_path.join("chunks.json")),
+            &read_array(&data_path.join("chunks.json"))?,
             &export_data.chunks,
         );
         let payload = serde_json::to_string_pretty(&merged)
@@ -329,7 +344,7 @@ pub fn import_memories(
 
     if archive_count > 0 {
         let merged = merge_arrays(
-            &read_array(&data_path.join("archive.json")),
+            &read_array(&data_path.join("archive.json"))?,
             &export_data.archive,
         );
         let payload = serde_json::to_string_pretty(&merged)
@@ -492,6 +507,51 @@ mod tests {
         let data: ExportData = serde_json::from_str(&content).unwrap();
         assert_eq!(data.version, "2.0");
         assert_eq!(data.source, "global");
+    }
+
+    /// 回归：源 memories.json 损坏时必须报错，绝不静默导出空数组。
+    #[test]
+    fn test_export_corrupt_memories_errors() {
+        let (tmp, dd) = setup_test_data_dir();
+        let data_path = dd.data_path();
+        fs::write(data_path.join("memories.json"), b"{ this is not json").unwrap();
+        let output = tmp.path().join("export.json");
+        let err =
+            export_memories(&dd, Some(&output), None).expect_err("损坏的 memories.json 必须报错");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("memories.json"),
+            "错误应指明 memories.json: {msg}"
+        );
+        assert!(!output.exists(), "报错时不应产出导出文件");
+    }
+
+    /// 回归：导入时若目标库已有 memories.json 且损坏，必须报错中止，绝不覆盖丢弃原数据。
+    #[test]
+    fn test_import_corrupt_existing_errors() {
+        // 先从一个干净目录导出一份合法文件
+        let (src_tmp, src_dd) = setup_test_data_dir();
+        let export_file = src_tmp.path().join("export.json");
+        export_memories(&src_dd, Some(&export_file), None).expect("导出应成功");
+
+        // 目标目录：已有 memories.json 但损坏
+        let (_dst_tmp, dst_dd) = setup_test_data_dir();
+        let dst_mem = dst_dd.data_path().join("memories.json");
+        let corrupt = b"{ broken".to_vec();
+        fs::write(&dst_mem, &corrupt).unwrap();
+
+        let err =
+            import_memories(&export_file, &dst_dd, false).expect_err("目标库损坏时必须报错中止");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("memories.json"),
+            "错误应指明 memories.json: {msg}"
+        );
+        assert_eq!(
+            fs::read(&dst_mem).unwrap(),
+            corrupt,
+            "损坏的原文件不得被覆盖"
+        );
     }
 
     /// 测试: 导出到默认路径

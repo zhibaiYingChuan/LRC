@@ -812,6 +812,87 @@ pub(crate) fn dedup_recall_result(
     result
 }
 
+/// 对 MCP `recall` 的结果做 LLM 重排（方案 B）。
+///
+/// # 行为
+///
+/// - 门控 `LRC_RERANK=1` 且 LLM 已配置时才执行；
+/// - 只重排头部候选（`LRC_RERANK_CANDIDATES`，默认 20）；
+/// - 任何失败/超时/解析失败 ⇒ **原样返回**（零行为变更）。
+///
+/// # 为什么在出口做
+///
+/// 重排是**精度层**：不改变召回集合，只改变"先给哪条"。
+/// 放在出口可同时服务 MCP 与 REST 两条入口，且不侵入检索内核。
+pub(crate) async fn rerank_recall_result(
+    config: &LlmApiConfig,
+    query: &str,
+    mut result: crate::memory_store_types::RecallResult,
+) -> crate::memory_store_types::RecallResult {
+    if !crate::engine::llm_rerank::rerank_enabled() || !config.is_configured() {
+        return result;
+    }
+    let contents: Vec<String> = result.memories.iter().map(|m| m.content.clone()).collect();
+    let Some(order) = crate::engine::llm_rerank::rerank_order(config, query, &contents, 0).await
+    else {
+        return result;
+    };
+
+    let mut memories = Vec::with_capacity(result.memories.len());
+    let mut scores = Vec::with_capacity(result.scores.len());
+    for idx in order {
+        memories.push(result.memories[idx].clone());
+        scores.push(result.scores.get(idx).copied().unwrap_or(0.0));
+    }
+    result.memories = memories;
+    result.scores = scores;
+    result
+}
+
+/// 对 REST `enrich` 的结果做 LLM 重排（方案 B）。
+///
+/// `memories` 与 `explanation` 平行，必须同步重排并更新 `rank`，
+/// 否则前端解释块会指向错误的条目。
+async fn rerank_enriched(
+    config: &LlmApiConfig,
+    query: &str,
+    memories: &mut Vec<EnrichedMemory>,
+    explanation: &mut Vec<EnrichExplanationItem>,
+) {
+    if !crate::engine::llm_rerank::rerank_enabled() || !config.is_configured() {
+        return;
+    }
+    let contents: Vec<String> = memories.iter().map(|m| m.content.clone()).collect();
+    let Some(order) = crate::engine::llm_rerank::rerank_order(config, query, &contents, 0).await
+    else {
+        return;
+    };
+
+    // 重排主结果（用 Option 取出，避免 clone 大对象）
+    let mut slots: Vec<Option<EnrichedMemory>> = memories.drain(..).map(Some).collect();
+    let mut reordered = Vec::with_capacity(slots.len());
+    for idx in order {
+        if let Some(m) = slots.get_mut(idx).and_then(|slot| slot.take()) {
+            reordered.push(m);
+        }
+    }
+    *memories = reordered;
+
+    // 解释块按 id 跟随重排，并刷新 rank
+    let mut by_id: HashMap<String, EnrichExplanationItem> = explanation
+        .drain(..)
+        .map(|item| (item.id.clone(), item))
+        .collect();
+    let mut reordered_expl = Vec::with_capacity(by_id.len());
+    for (rank, m) in memories.iter().enumerate() {
+        if let Some(mut item) = by_id.remove(&m.id) {
+            item.rank = rank + 1;
+            reordered_expl.push(item);
+        }
+    }
+    *explanation = reordered_expl;
+}
+
 /// 便捷入口：用全局语义索引对一组 id 做近重复折叠，返回保留的下标。
 #[cfg(feature = "ml")]
 pub(crate) fn dedup_keep_indices(ids: &[String]) -> Vec<usize> {
@@ -3555,14 +3636,28 @@ pub fn build_v1_router_with_trust(
                             // ★2026-11-08：召回时近重复折叠。
                             // 写入去重（Jaccard 0.5）拦不住同义改写，同一结论会以多种措辞入库；
                             // 这里用已入库的语义向量做余弦折叠，只保留信息量最高的一条。
-                            let (memories, kept_ids) = dedup_recall_results(memories);
+                            let (mut memories, kept_ids) = dedup_recall_results(memories);
                             // explanation 与 memories 平行，必须同步过滤，否则前端解释块会指向已折叠的条目
                             let kept_set: std::collections::HashSet<&str> =
                                 kept_ids.iter().map(|s| s.as_str()).collect();
-                            let explanation_items: Vec<EnrichExplanationItem> = explanation_items
+                            let mut explanation_items: Vec<EnrichExplanationItem> = explanation_items
                                 .into_iter()
                                 .filter(|item| kept_set.contains(item.id.as_str()))
                                 .collect();
+                            // ═══ LLM 重排（方案 B，门控 `LRC_RERANK=1`，默认关）═══
+                            // 只重排头部候选，失败/超时/未配置 ⇒ 保持原序。
+                            // 用**原查询**（`query_text`）而非 LLM 富化后的查询：
+                            // 重排判断的是"与用户真实意图的相关性"。
+                            {
+                                let rerank_cfg = llm_api.read().await.clone();
+                                rerank_enriched(
+                                    &rerank_cfg,
+                                    &query_text,
+                                    &mut memories,
+                                    &mut explanation_items,
+                                )
+                                .await;
+                            }
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(EnrichResponse {
                                 memories,
                                 fast_path_hits: fast_hits,
@@ -7249,9 +7344,15 @@ pub fn build_v1_router_with_trust(
                             })),
                         ));
                     };
+                    // 把**全部**已校验地址注入客户端（多 A/AAAA 记录不再被误杀）。
+                    // 连接器只会在这些地址中选择，不会重新解析域名 ⇒ DNS rebinding 防护仍成立。
+                    let resolved_addrs: Vec<std::net::SocketAddr> = resolved_ips
+                        .iter()
+                        .map(|ip| std::net::SocketAddr::new(*ip, endpoint_port))
+                        .collect();
                     let client = match reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(10))
-                        .resolve(endpoint_host, std::net::SocketAddr::new(resolved_ips[0], endpoint_port))
+                        .resolve_to_addrs(endpoint_host, &resolved_addrs)
                         .user_agent("loong-recall-llm-test")
                         // SSRF 防护：禁止自动重定向（防 302 跳转至内网/metadata）
                         .redirect(reqwest::redirect::Policy::none())

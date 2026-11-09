@@ -2210,6 +2210,33 @@ async fn handle_recall(
             // 写入去重拦不住同义改写，同一结论会以多种措辞入库；
             // 这里用已入库的语义向量做余弦折叠，只保留信息量最高的一条。
             let result = crate::v1_api::dedup_recall_result(result);
+
+            // ═══ 记录层联想补全（v0.9.8：真正的记忆联想）═══
+            //
+            // 上面所有通路（fast / deep / RRF / 状态机联想链）**全部是相似度驱动**，
+            // 只能在"语义相近"的记忆里找。本段补的是另一类：
+            // 由记录层（event_id 共同经历 / entities 共享实体 / source_ids 谱系）
+            // 推导出的、**语义可以毫不相似**的关联。
+            //
+            // 典型形态：用户查「游西湖」→ 补出同一次杭州之行的「吃楼外楼」。
+            // 这是任何相似度算法都给不出的连接，也是"记录层"存在的全部意义。
+            //
+            // 失败静默：联想是附加价值，不可因它失败而影响检索主结果
+            //（与详情页间接关联的处理一致）。
+            let seed_ids: Vec<String> = result.memories.iter().map(|m| m.id.clone()).collect();
+            let assoc = store
+                .expand_associations(&seed_ids, &filter, ASSOCIATION_EXPAND_MAX)
+                .unwrap_or_default();
+            // 锁在此处释放：LLM 重排与道体调用都是**网络等待**，绝不能持锁进行
+            //（否则网络挂起会阻塞所有记忆读写；与既有"先翻译再取锁"同一纪律）。
+            drop(store);
+
+            // ═══ LLM 重排（方案 B，门控 `LRC_RERANK=1`，默认关）═══
+            //
+            // 只重排头部候选（默认 20 条），失败/超时/未配置 ⇒ 保持原序。
+            // 重排是**精度层**：不改变召回集合，只改变"先给哪条"。
+            let result = crate::v1_api::rerank_recall_result(&llm_config, query, result).await;
+
             let mut text = format!(
                 "记忆检索结果 (共 {} 条匹配，记忆库共 {} 条，模式: {})\n\n",
                 result.memories.len(),
@@ -2275,28 +2302,10 @@ async fn handle_recall(
                 text.push_str("💡 在回复中引用记忆时，请使用「（根据记忆 #N）」的格式标注来源，让用户能看见和信任记忆的存在。\n");
             }
 
-            // ═══ 记录层联想补全（v0.9.8：真正的记忆联想）═══
-            //
-            // 上面所有通路（fast / deep / RRF / 状态机联想链）**全部是相似度驱动**，
-            // 只能在"语义相近"的记忆里找。本段补的是另一类：
-            // 由记录层（event_id 共同经历 / entities 共享实体 / source_ids 谱系）
-            // 推导出的、**语义可以毫不相似**的关联。
-            //
-            // 典型形态：用户查「游西湖」→ 补出同一次杭州之行的「吃楼外楼」。
-            // 这是任何相似度算法都给不出的连接，也是"记录层"存在的全部意义。
-            //
-            // 失败静默：联想是附加价值，不可因它失败而影响检索主结果
-            //（与详情页间接关联的处理一致）。
-            let seed_ids: Vec<String> = result.memories.iter().map(|m| m.id.clone()).collect();
-            let assoc = store
-                .expand_associations(&seed_ids, &filter, ASSOCIATION_EXPAND_MAX)
-                .unwrap_or_default();
+            // 记录层联想结果在锁外追加（联想本身已在锁内完成）
             if !assoc.is_empty() {
                 append_associated_memories(&mut text, &assoc);
             }
-            // 锁在此处释放：道体调用是**网络等待**，绝不能持锁进行
-            //（否则道体挂起会阻塞所有记忆读写；与既有"先翻译再取锁"同一纪律）。
-            drop(store);
 
             // ═══ 符号层联想（道体 §4.4 状态机循环 + §5.4 落边，v0.9.8）═══
             //

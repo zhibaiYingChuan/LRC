@@ -74,8 +74,6 @@ pub enum UrlSafetyError {
     },
     /// 域名解析无任何结果（fail-closed）
     DnsNoResult(String),
-    /// 域名解析到多个地址，HTTP 客户端无法无风险绑定完整校验结果（fail-closed）
-    DnsAmbiguous(String),
     /// 域名解析到受保护地址，疑似 DNS rebinding
     DnsRebinding {
         /// 被解析的主机名
@@ -101,10 +99,6 @@ impl std::fmt::Display for UrlSafetyError {
                 write!(f, "DNS 解析失败（{host}）: {detail}")
             }
             Self::DnsNoResult(host) => write!(f, "域名 {host} 解析无结果，已拒绝"),
-            Self::DnsAmbiguous(host) => write!(
-                f,
-                "域名 {host} 解析到多个地址，当前 HTTP 客户端无法无风险绑定完整校验结果，已拒绝"
-            ),
             Self::DnsRebinding { host, ip } => write!(
                 f,
                 "域名 {host} 解析到受保护地址（{ip}），已拒绝（疑似 DNS rebinding）"
@@ -228,12 +222,13 @@ pub async fn resolve_and_check_dns(url: &str) -> UrlSafetyResult<Vec<std::net::I
         return Err(UrlSafetyError::DnsNoResult(host));
     }
     let ips: Vec<IpAddr> = addrs.into_iter().map(|addr| addr.ip()).collect();
-    // reqwest 0.12 的 resolve(host, addr) 只提供单一覆盖地址；重复调用
-    // 不能可靠地表达经过校验的多地址候选集。为避免只绑定首个地址而把
-    // 其他候选留给连接器重新解析，这里对多地址结果 fail-closed。
-    if ips.len() > 1 {
-        return Err(UrlSafetyError::DnsAmbiguous(host));
-    }
+    // 多地址不再 fail-closed：调用方通过 `reqwest::ClientBuilder::resolve_to_addrs`
+    // 把**全部**已校验地址注入客户端，连接器只会在这些地址中选择，
+    // 不会重新解析域名 ⇒ DNS rebinding 防护仍然成立。
+    //
+    // 历史缺陷（2026-11-09 修复）：此前对 `ips.len() > 1` 直接拒绝，
+    // 导致解析到多个 A/AAAA 记录的合法域名（如 `api.commandcode.ai`）被误杀。
+    // 正确做法是**校验全部地址**，而不是拒绝多地址。
     for ip in &ips {
         if !is_safe_ip(*ip) {
             return Err(UrlSafetyError::DnsRebinding {
@@ -242,7 +237,14 @@ pub async fn resolve_and_check_dns(url: &str) -> UrlSafetyResult<Vec<std::net::I
             });
         }
     }
-    Ok(ips)
+    // 去重（同一 IP 可能因多端口/多记录重复出现），保持顺序
+    let mut unique: Vec<IpAddr> = Vec::with_capacity(ips.len());
+    for ip in ips {
+        if !unique.contains(&ip) {
+            unique.push(ip);
+        }
+    }
+    Ok(unique)
 }
 
 /// 从 URL authority 中提取主机名（兼容 host、host:port、[ipv6]:port 形式）。

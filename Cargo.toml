@@ -42,6 +42,11 @@ default = ["server"]
 # 启用 candle + CodeBERT 真实语义编码（体积大 ~200MB）
 # 仅在需要 Smart Match（离线语义搜索）时启用
 ml = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub", "ureq"]
+# 可选 GPU 加速：在 ml 基础上启用 candle 的 CUDA 后端。
+# 需要本机安装 CUDA Toolkit（nvcc）。**默认不启用**——普通用户零负担，
+# 只有想用 GPU 的用户显式 `--features server,ml,cuda` 构建。
+# 编码器用 `Device::cuda_if_available(0)` 自动选设备，无 GPU 时回退 CPU。
+cuda = ["ml", "candle-core/cuda"]
 # 启用 MCP HTTP 服务（axum + tokio）
 # v0.6.0+：ureq 用于嵌入模型管理 API 的镜像源连通性测试 + model_downloader 模块
 server = [

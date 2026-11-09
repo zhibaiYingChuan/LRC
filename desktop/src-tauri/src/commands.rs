@@ -1265,12 +1265,15 @@ pub async fn test_llm_connection(
     let endpoint_port = endpoint_url
         .port_or_known_default()
         .ok_or_else(|| "API 地址端口无效".to_string())?;
+    // 把**全部**已校验地址注入客户端（多 A/AAAA 记录不再被误杀）。
+    // 连接器只会在这些地址中选择，不会重新解析域名 ⇒ DNS rebinding 防护仍成立。
+    let resolved_addrs: Vec<std::net::SocketAddr> = resolved_ips
+        .iter()
+        .map(|ip| std::net::SocketAddr::new(*ip, endpoint_port))
+        .collect();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .resolve(
-            endpoint_host,
-            std::net::SocketAddr::new(resolved_ips[0], endpoint_port),
-        )
+        .resolve_to_addrs(endpoint_host, &resolved_addrs)
         // SSRF 防护：禁止自动重定向（防 302 跳转至内网/metadata）
         .redirect(reqwest::redirect::Policy::none())
         .build()
