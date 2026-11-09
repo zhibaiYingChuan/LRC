@@ -464,6 +464,38 @@ impl SemanticService {
         self.enabled && self.indexed() > 0
     }
 
+    /// 待索引条数（已入队但尚未落索引）。
+    ///
+    /// 口径：`total - indexed`，下限 0。`total` 是「已投递编码任务」的累计数，
+    /// `indexed` 是「已落索引」的条数，两者之差即 pending。
+    pub fn pending_count(&self) -> usize {
+        let total = self.total.load(Ordering::Relaxed);
+        total.saturating_sub(self.indexed())
+    }
+
+    /// 阻塞等待索引追平（覆盖率 ≥ 1.0），最多等 `timeout`。
+    ///
+    /// 返回 `true` 表示已追平；`false` 表示超时或本通路不可用。
+    ///
+    /// **为什么需要它**：写入与索引是异步的，调用方若「写完立刻按语义检索」，
+    /// 未索引的记忆不会参与打分。需要读己之写的调用方（基准测试、迁移脚本、
+    /// 用户手动触发的一致性检查）必须先过这道屏障。
+    pub fn wait_for_index(&self, timeout: std::time::Duration) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.pending_count() == 0 {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
     /// 取某条记忆的语义向量（未索引返回 None）。
     ///
     /// 向量在入库时已归一化，因此两向量点积即余弦相似度。
@@ -613,6 +645,44 @@ pub fn service() -> Option<&'static Arc<SemanticService>> {
 pub fn enqueue(id: &str, content: &str) {
     if let Some(service) = SERVICE.get() {
         service.enqueue(id, content);
+    }
+}
+
+/// 索引状态快照（供 `/v1/index/status` 与 MCP `lrc_status` 使用）。
+///
+/// 未初始化时返回 `enabled=false` 的全零快照，而不是 `None` ——
+/// 调用方需要区分「没开语义索引」与「服务没起来」，前者是正常配置。
+pub fn status() -> serde_json::Value {
+    match SERVICE.get() {
+        Some(s) => serde_json::json!({
+            "enabled": s.enabled,
+            "indexed": s.indexed(),
+            "total": s.total.load(Ordering::Relaxed),
+            "pending": s.pending_count(),
+            "coverage": s.coverage(),
+            "ready": s.is_ready(),
+        }),
+        None => serde_json::json!({
+            "enabled": false,
+            "indexed": 0,
+            "total": 0,
+            "pending": 0,
+            "coverage": 0.0,
+            "ready": false,
+        }),
+    }
+}
+
+/// 阻塞等待索引追平（供 `/v1/index/wait` 与基准测试使用）。
+///
+/// 返回 `(ready, coverage, pending)`；未初始化时 `ready=false`。
+pub fn wait_for_index(timeout: std::time::Duration) -> (bool, f32, usize) {
+    match SERVICE.get() {
+        Some(s) => {
+            let ready = s.wait_for_index(timeout);
+            (ready, s.coverage(), s.pending_count())
+        }
+        None => (false, 0.0, 0),
     }
 }
 

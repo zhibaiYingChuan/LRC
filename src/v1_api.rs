@@ -2399,6 +2399,41 @@ pub fn build_v1_router(
     )
 }
 
+/// `POST /v1/index/wait` 请求体（v0.10.4 P1）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct IndexWaitRequest {
+    /// 最长等待毫秒数（默认 30000，上限 600000）
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// 语义索引状态（非 ML 构建返回「未启用」快照）。
+#[cfg(feature = "ml")]
+fn index_status_json() -> serde_json::Value {
+    crate::semantic_index::status()
+}
+
+/// 语义索引状态（非 ML 构建返回「未启用」快照）。
+#[cfg(not(feature = "ml"))]
+fn index_status_json() -> serde_json::Value {
+    serde_json::json!({
+        "enabled": false, "indexed": 0, "total": 0,
+        "pending": 0, "coverage": 0.0, "ready": false,
+    })
+}
+
+/// 等待索引追平（非 ML 构建直接返回未就绪）。
+#[cfg(feature = "ml")]
+fn index_wait(timeout: std::time::Duration) -> (bool, f32, usize) {
+    crate::semantic_index::wait_for_index(timeout)
+}
+
+/// 等待索引追平（非 ML 构建直接返回未就绪）。
+#[cfg(not(feature = "ml"))]
+fn index_wait(_timeout: std::time::Duration) -> (bool, f32, usize) {
+    (false, 0.0, 0)
+}
+
 /// 同 [`build_v1_router`]，但**显式指定信任域**（v0.9.11 / G3 / CR-01）。
 ///
 /// 生产入口（`bin/server.rs`）以 [`crate::privacy::from_env`] 传入 ——
@@ -2477,6 +2512,36 @@ pub fn build_v1_router_with_trust(
             }
         }
     }))
+        // GET /v1/index/status — 语义索引状态（v0.10.4 P1）
+        //
+        // 返回 enabled / indexed / total / pending / coverage / ready。
+        // 未启用语义索引时返回 enabled=false 的全零快照，而非 404 ——
+        // 「没开」是正常配置，不是错误。
+        .route(
+            "/index/status",
+            get(|| async { Json(index_status_json()) }),
+        )
+        // POST /v1/index/wait — 等待索引追平（v0.10.4 P1）
+        //
+        // 写入与索引异步，需要「读己之写」的调用方（基准测试、迁移脚本）
+        // 必须先过这道屏障，否则刚写入的记忆不会参与语义打分。
+        .route(
+            "/index/wait",
+            post(|Json(req): Json<IndexWaitRequest>| async move {
+                let timeout = std::time::Duration::from_millis(
+                    req.timeout_ms.unwrap_or(30_000).min(600_000),
+                );
+                let (ready, coverage, pending) =
+                    tokio::task::spawn_blocking(move || index_wait(timeout))
+                        .await
+                        .unwrap_or((false, 0.0, 0));
+                Json(serde_json::json!({
+                    "ready": ready,
+                    "coverage": coverage,
+                    "pending": pending,
+                }))
+            }),
+        )
         // POST /v1/memories/consolidate — 接收表层记忆，触发结晶流程
         .route("/memories/consolidate", post({
             let store = consolidate_store;
