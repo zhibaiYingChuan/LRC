@@ -482,6 +482,22 @@ impl SemanticService {
         self.failed.load(Ordering::Relaxed)
     }
 
+    /// 同步写入路径记账：新记忆计入库内总数，失败项计入 `failed`。
+    ///
+    /// **为什么必须在这里记 `total`**：同步路径（`insert_precomputed_sync` /
+    /// `encode_batch_sync`）写入的是**此前未入队**的新记忆，`enqueue` 的
+    /// `total.fetch_add` 不会执行。漏记会让覆盖率分母偏小、`pending_count`
+    /// 提前归零（屏障形同虚设）。
+    fn record_sync(&self, inserted: usize, failed: usize) {
+        self.total.fetch_add(inserted + failed, Ordering::Relaxed);
+        self.failed.fetch_add(failed, Ordering::Relaxed);
+    }
+
+    /// 异步/回填路径记账：条目已由 `enqueue` 计入 `total`，这里**只记失败**。
+    fn record_failed(&self, failed: usize) {
+        self.failed.fetch_add(failed, Ordering::Relaxed);
+    }
+
     /// 阻塞等待索引追平（覆盖率 ≥ 1.0），最多等 `timeout`。
     ///
     /// 返回 `true` 表示已追平；`false` 表示超时或本通路不可用。
@@ -714,12 +730,7 @@ pub fn insert_precomputed_sync(items: &[(String, Vec<f32>)]) {
             break;
         }
         let (inserted, failed) = insert_precomputed(service, chunk);
-        // 同步路径写入的是**新记忆**（此前未入队），必须计入库内总数，
-        // 否则覆盖率分母偏小、`pending_count` 提前归零。
-        service
-            .total
-            .fetch_add(inserted + failed, Ordering::Relaxed);
-        service.failed.fetch_add(failed, Ordering::Relaxed);
+        service.record_sync(inserted, failed);
         done += chunk.len();
     }
     if done > 0 {
@@ -761,11 +772,7 @@ pub fn encode_batch_sync(items: &[(String, String)]) {
             break;
         }
         let (inserted, failed) = encode_and_insert(service, chunk);
-        // 同步路径写入的是**新记忆**（此前未入队），必须计入库内总数。
-        service
-            .total
-            .fetch_add(inserted + failed, Ordering::Relaxed);
-        service.failed.fetch_add(failed, Ordering::Relaxed);
+        service.record_sync(inserted, failed);
         done += chunk.len();
     }
     if done > 0 {
@@ -865,7 +872,7 @@ fn spawn_worker(service: Arc<SemanticService>, rx: Receiver<Job>) {
                                 Ok(Job::Insert(more)) => {
                                     // 已编码向量：直接插入，不参与本批编码
                                     let (inserted, failed) = insert_precomputed(&service, &more);
-                                    service.failed.fetch_add(failed, Ordering::Relaxed);
+                                    service.record_failed(failed);
                                     since_flush += inserted;
                                 }
                                 Ok(Job::Backfill(backfill)) => {
@@ -877,12 +884,12 @@ fn spawn_worker(service: Arc<SemanticService>, rx: Receiver<Job>) {
                             }
                         }
                         let (inserted, failed) = encode_and_insert(&service, &items);
-                        service.failed.fetch_add(failed, Ordering::Relaxed);
+                        service.record_failed(failed);
                         since_flush += inserted;
                     }
                     Ok(Job::Insert(items)) => {
                         let (inserted, failed) = insert_precomputed(&service, &items);
-                        service.failed.fetch_add(failed, Ordering::Relaxed);
+                        service.record_failed(failed);
                         since_flush += inserted;
                     }
                     Ok(Job::Backfill(items)) => {
@@ -891,7 +898,7 @@ fn spawn_worker(service: Arc<SemanticService>, rx: Receiver<Job>) {
                         let mut done = 0usize;
                         for chunk in items.chunks(ENCODE_BATCH) {
                             let (_, failed) = encode_and_insert(&service, chunk);
-                            service.failed.fetch_add(failed, Ordering::Relaxed);
+                            service.record_failed(failed);
                             done += chunk.len();
                             since_flush += chunk.len();
                             if since_flush >= FLUSH_EVERY {
@@ -1154,6 +1161,98 @@ mod tests {
 
     fn vec_of(values: &[f32]) -> Vec<f32> {
         values.to_vec()
+    }
+
+    /// 构造一个**不启动后台线程**的服务实例，用于验证记账逻辑。
+    ///
+    /// 编码器用 `new_statistical()`（无需模型），`insert_precomputed` 不调用编码器，
+    /// 故本实例只用于测试 `total` / `failed` / `pending_count` 的算术不变量。
+    fn test_service(dir: &Path) -> Arc<SemanticService> {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        Arc::new(SemanticService {
+            index: RwLock::new(SemanticIndex::default()),
+            encoder: Arc::new(
+                crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder::new_statistical(),
+            ),
+            data_dir: dir.to_path_buf(),
+            tx,
+            total: AtomicUsize::new(0),
+            failed: AtomicUsize::new(0),
+            dirty: AtomicBool::new(false),
+            pending: std::sync::Mutex::new(Vec::new()),
+            enabled: true,
+        })
+    }
+
+    /// 回归：维度不一致的预编码向量必须计为**失败**，不能当作「已索引跳过」。
+    ///
+    /// 若误判为跳过，`pending_count` 会把它当作已完成 ⇒ 屏障提前放行。
+    #[test]
+    fn 维度不一致的预编码向量计为失败而非跳过() {
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let svc = test_service(dir.path());
+        let (inserted, failed) = insert_precomputed(
+            &svc,
+            &[
+                ("ok".into(), vec![1.0, 0.0]),
+                ("bad".into(), vec![1.0, 0.0, 0.0]),
+            ],
+        );
+        assert_eq!(inserted, 1);
+        assert_eq!(failed, 1, "维度不一致必须计为失败");
+    }
+
+    /// 回归：同步写入路径必须把新记忆计入 `total`，且失败项从 `pending` 扣除。
+    ///
+    /// 漏记 `total` ⇒ 覆盖率分母偏小；不扣 `failed` ⇒ `wait_for_index` 永不归零。
+    #[test]
+    fn 同步记账后失败项从pending扣除() {
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let svc = test_service(dir.path());
+        let (inserted, failed) = insert_precomputed(
+            &svc,
+            &[
+                ("ok".into(), vec![1.0, 0.0]),
+                ("bad".into(), vec![1.0, 0.0, 0.0]),
+            ],
+        );
+        svc.record_sync(inserted, failed);
+        assert_eq!(
+            svc.total.load(Ordering::Relaxed),
+            2,
+            "同步写入必须计入库内总数"
+        );
+        assert_eq!(svc.pending_count(), 0, "失败项必须从 pending 扣除");
+        assert!(
+            svc.wait_for_index(Duration::from_millis(10)),
+            "pending=0 时屏障应立即放行"
+        );
+    }
+
+    /// 回归：异步/回填路径只记失败，**不得**重复累加 `total`（已由 enqueue 记过）。
+    #[test]
+    fn 异步记账只记失败不改总数() {
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let svc = test_service(dir.path());
+        // 模拟 enqueue 已为 3 条记忆记过 total
+        svc.total.fetch_add(3, Ordering::Relaxed);
+        let (inserted, failed) = insert_precomputed(
+            &svc,
+            &[
+                ("a".into(), vec![1.0, 0.0]),
+                ("b".into(), vec![0.0, 1.0]),
+                ("bad".into(), vec![1.0, 0.0, 0.0]),
+            ],
+        );
+        svc.record_failed(failed);
+        assert_eq!(inserted, 2);
+        assert_eq!(failed, 1);
+        assert_eq!(
+            svc.total.load(Ordering::Relaxed),
+            3,
+            "异步路径不得重复累加 total"
+        );
+        assert_eq!(svc.pending_count(), 0);
     }
 
     #[test]

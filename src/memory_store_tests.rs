@@ -1913,6 +1913,31 @@ mod tests {
         )
     }
 
+    /// 回归：`embeddings` 与 `memories` 长度不一致时必须**报错**，不能静默截断。
+    ///
+    /// 若静默截断（`zip` 语义），多出的记忆既不入语义索引、也不进回退队列，
+    /// 成为「写了但永远检索不到」的幽灵条目。
+    #[test]
+    fn 句向量数量与记忆数量不一致时返回错误() {
+        use crate::engine::luoshu_encoder::LuoShuVector;
+        let (_dir, store) = make_store();
+        let memories = vec![
+            make_test_memory("第一条记忆", MemoryType::Fact),
+            make_test_memory("第二条记忆", MemoryType::Fact),
+        ];
+        let luoshu = vec![LuoShuVector::zeros(); 2];
+        // 故意只给 1 个句向量（与 2 条记忆不一致）
+        let embeddings = vec![Some(vec![0.1f32; 4])];
+        let err = store
+            .remember_batch_preencoded_with_embeddings(memories, luoshu, embeddings)
+            .expect_err("长度不一致必须返回错误");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("句向量数量"),
+            "错误信息应指明句向量数量不一致，实际: {msg}"
+        );
+    }
+
     /// ★v0.9.11（F1 修复）：**合成快照必须能按分区裁剪**。
     ///
     /// 背景（实测）：`synthesis_snapshot()` 每次都对**全库**做 O(n²) 聚类
