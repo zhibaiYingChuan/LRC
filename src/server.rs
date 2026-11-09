@@ -20,6 +20,7 @@ use crate::{
 // `String` 收敛为带域分类的 [`crate::errors::LrcError`]（io / parse / config / crypto）。
 // `Display` 仅输出 message，故前端/日志文案**零漂移**。
 use crate::errors::{LrcError, LrcResult};
+use crate::lock_ext::MutexExt;
 use axum::{
     extract::State,
     http::{Request, StatusCode},
@@ -4177,6 +4178,13 @@ pub async fn update_rerank_config(
     )
 }
 
+/// wizard.json 读-改-写互斥。
+///
+/// LLM 配置与重排开关是**两个独立入口**，但都做「读整个文件 → 改一个字段 → 写回」。
+/// 并发保存时后写者会覆盖先写者的字段（例如刚保存的 API Key 被重排开关写回旧值）。
+/// 用进程内互斥把两次读-改-写串行化。
+static WIZARD_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// 保存 LLM API 配置到全局配置文件
 fn save_llm_to_config(llm_api: Option<&str>) -> crate::errors::LrcResult<()> {
     let mut cfg = crate::config::LrcConfig::load();
@@ -4211,6 +4219,7 @@ fn wizard_json_path() -> Option<std::path::PathBuf> {
 /// 仪表盘修改 LLM 配置后，同步到 wizard.json，确保桌面端和仪表盘配置一致。
 /// API Key 使用 AES-256-GCM 加密存储（与桌面端一致）。
 fn save_llm_to_wizard_json(llm_api: &str) -> LrcResult<()> {
+    let _guard = WIZARD_WRITE_LOCK.lock_recover();
     let wizard_path =
         wizard_json_path().ok_or_else(|| LrcError::config("读取 APPDATA 环境变量失败"))?;
 
@@ -4299,6 +4308,7 @@ fn save_llm_to_wizard_json(llm_api: &str) -> LrcResult<()> {
 
 /// 将 LLM 重排开关写入 wizard.json（保留其它字段）。
 fn save_rerank_to_wizard_json(enabled: bool) -> LrcResult<()> {
+    let _guard = WIZARD_WRITE_LOCK.lock_recover();
     let wizard_path =
         wizard_json_path().ok_or_else(|| LrcError::config("读取 APPDATA 环境变量失败"))?;
 

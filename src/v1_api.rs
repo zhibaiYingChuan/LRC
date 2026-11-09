@@ -845,7 +845,13 @@ pub(crate) async fn rerank_recall_result(
         scores.push(result.scores.get(idx).copied().unwrap_or(0.0));
     }
     result.memories = memories;
+    // 重排后：把原始分数按降序重新分配给新名次。
+    // 否则 MCP 文本的「相关度（相对 top1）」会出现 top1 < 100% 的矛盾
+    // （LLM 只给顺序、不给分数，原 RRF 分数已不再对应新名次）。
     result.scores = scores;
+    result
+        .scores
+        .sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     result
 }
 
@@ -877,6 +883,19 @@ async fn rerank_enriched(
         }
     }
     *memories = reordered;
+
+    // 重排后：原始分数按降序重新分配给新名次，并重算 score_norm。
+    // 否则前端「相关度」会出现 top1 < 100% 的矛盾（LLM 只给顺序、不给分数）。
+    let mut sorted_scores: Vec<f32> = memories.iter().map(|m| m.score).collect();
+    sorted_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    for (m, s) in memories.iter_mut().zip(sorted_scores) {
+        m.score = s;
+    }
+    let raw: Vec<f32> = memories.iter().map(|m| m.score).collect();
+    let norms = normalize_scores_relative(&raw);
+    for (m, n) in memories.iter_mut().zip(norms) {
+        m.score_norm = n;
+    }
 
     // 解释块按 id 跟随重排，并刷新 rank
     let mut by_id: HashMap<String, EnrichExplanationItem> = explanation
