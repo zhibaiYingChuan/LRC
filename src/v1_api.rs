@@ -7449,6 +7449,12 @@ pub fn build_v1_router_with_trust(
                 }
             }
         }))
+        // 方案 B：POST /v1/config/rerank — 更新 LLM 重排开关（默认关，桌面端可配）
+        .route("/config/rerank", post({
+            move |Json(body): Json<serde_json::Value>| async move {
+                crate::server::update_rerank_config(body).await
+            }
+        }))
         // v0.9.11（CR-32）：显式钉住请求体上限（见 `V1_MAX_REQUEST_BODY_BYTES` 文档）。
         // 放在链尾 ⇒ 对**全部**已注册路由生效；超限请求在进入 handler 前即 413。
         .layer(DefaultBodyLimit::max(V1_MAX_REQUEST_BODY_BYTES))

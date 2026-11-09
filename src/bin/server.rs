@@ -1123,6 +1123,15 @@ async fn try_run() -> LrcResult<()> {
         eprintln!("[索引] {msg}");
     });
 
+    // 方案 B：加载 LLM 重排开关（wizard.json 持久化值；环境变量 LRC_RERANK 仍可兜底）
+    {
+        let rerank_on = server::load_rerank_from_wizard_json();
+        code_memory::engine::llm_rerank::set_rerank_enabled(rerank_on);
+        if rerank_on {
+            log("  LLM 重排: 已启用（方案 B）");
+        }
+    }
+
     let state = Arc::new(server::AppState {
         manager: Arc::new(Mutex::new(Box::new(mgr))),
         memory_store: memory_store.clone(),

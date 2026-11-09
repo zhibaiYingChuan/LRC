@@ -5647,6 +5647,16 @@ async function loadSettings() {
     const providerName = inferProviderName(data.llm_type, data.llm_base_url);
     updateLlmStatusBadge(data.llm_configured, providerName);
 
+    // 方案 B：回填 LLM 重排开关，并绑定一次变更保存
+    const rerankEl = $('llm-rerank-enabled');
+    if (rerankEl) {
+      rerankEl.checked = !!data.rerank_enabled;
+      if (!rerankEl._bound) {
+        rerankEl._bound = true;
+        rerankEl.addEventListener('change', saveRerankConfig);
+      }
+    }
+
     // v0.5.5：根据当前配置自动选择提供商并填充表单
     if (data.llm_configured) {
       const providerKey = inferProviderKey(data.llm_type, data.llm_base_url);
@@ -5677,6 +5687,35 @@ async function loadSettings() {
     console.warn('[设置] 加载配置失败:', e.message);
     showToast('配置加载失败，已显示缓存数据', 'warning', 4000);
     updateLlmStatusBadge(false, 'none');
+  }
+}
+
+/**
+ * 方案 B：保存 LLM 重排开关（立即生效，无需重启）
+ */
+async function saveRerankConfig() {
+  const el = $('llm-rerank-enabled');
+  if (!el) return;
+  const enabled = !!el.checked;
+  try {
+    const resp = await fetchWithTimeout(API_BASE + '/v1/config/rerank', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled })
+    });
+    const data = await resp.json();
+    if (data.success) {
+      showToast(data.message || (enabled ? '已开启 LLM 重排' : '已关闭 LLM 重排'), 'success', 3000);
+    } else {
+      throw new Error(data.message || '保存失败');
+    }
+  } catch (e) {
+    // 失败回滚勾选状态，避免 UI 与服务端不一致
+    el.checked = !enabled;
+    const msg = (e.name === 'SidecarUnreachableError' || e.name === 'SidecarTimeoutError')
+      ? 'LRC 服务未运行，请先启动服务'
+      : e.message;
+    showToast('重排开关保存失败：' + msg, 'error', 4000);
   }
 }
 

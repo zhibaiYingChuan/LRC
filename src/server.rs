@@ -3943,6 +3943,8 @@ pub async fn get_llm_config_state(llm_api: &Arc<RwLock<LlmApiConfig>>) -> serde_
         "llm_type": llm_type,
         "llm_model": llm_model,
         "llm_base_url": llm_base_url,
+        // 方案 B：LLM 重排开关（默认关，桌面端可配）
+        "rerank_enabled": crate::engine::llm_rerank::rerank_enabled(),
     })
 }
 
@@ -4123,6 +4125,58 @@ async fn config_llm_handler(
     .await
 }
 
+/// POST /api/config/rerank — 更新 LLM 重排开关
+async fn config_rerank_handler(Json(body): Json<serde_json::Value>) -> impl IntoResponse {
+    update_rerank_config(body).await
+}
+
+/// 更新 LLM 重排开关（方案 B）。
+///
+/// 请求体: `{ "enabled": true }`
+/// 立即生效（进程级原子），并持久化到 wizard.json，重启后保持。
+pub async fn update_rerank_config(
+    body: serde_json::Value,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let enabled = match body.get("enabled").and_then(|v| v.as_bool()) {
+        Some(v) => v,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": "缺少布尔字段 enabled"
+                })),
+            );
+        }
+    };
+
+    crate::engine::llm_rerank::set_rerank_enabled(enabled);
+
+    // 持久化失败不阻断"已生效"——开关是运行时能力，落盘只是重启保持。
+    if let Err(e) = save_rerank_to_wizard_json(enabled) {
+        eprintln!("[配置] 重排开关已生效，但写入 wizard.json 失败: {}", e);
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "enabled": enabled,
+                "persisted": false,
+                "message": "重排开关已生效（持久化失败，重启后可能恢复默认）"
+            })),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "enabled": enabled,
+            "persisted": true,
+            "message": if enabled { "已开启 LLM 重排" } else { "已关闭 LLM 重排" }
+        })),
+    )
+}
+
 /// 保存 LLM API 配置到全局配置文件
 fn save_llm_to_config(llm_api: Option<&str>) -> crate::errors::LrcResult<()> {
     let mut cfg = crate::config::LrcConfig::load();
@@ -4241,6 +4295,48 @@ fn save_llm_to_wizard_json(llm_api: &str) -> LrcResult<()> {
         wizard_path.display()
     );
     Ok(())
+}
+
+/// 将 LLM 重排开关写入 wizard.json（保留其它字段）。
+fn save_rerank_to_wizard_json(enabled: bool) -> LrcResult<()> {
+    let wizard_path =
+        wizard_json_path().ok_or_else(|| LrcError::config("读取 APPDATA 环境变量失败"))?;
+
+    let mut wizard: serde_json::Value = if wizard_path.exists() {
+        let content = std::fs::read_to_string(&wizard_path)
+            .map_err(|e| LrcError::io(format!("读取 wizard.json 失败: {}", e)))?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    wizard["rerank_enabled"] = serde_json::json!(enabled);
+
+    if let Some(parent) = wizard_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| LrcError::io(format!("创建 wizard.json 目录失败: {}", e)))?;
+    }
+    let json_str = serde_json::to_string_pretty(&wizard)
+        .map_err(|e| LrcError::parse(format!("序列化 wizard.json 失败: {}", e)))?;
+    std::fs::write(&wizard_path, json_str)
+        .map_err(|e| LrcError::io(format!("写入 wizard.json 失败: {}", e)))?;
+    Ok(())
+}
+
+/// 启动时从 wizard.json 读取重排开关（缺省 false）。
+///
+/// 环境变量 `LRC_RERANK` 仍由 `rerank_enabled()` 作为或条件兜底。
+pub fn load_rerank_from_wizard_json() -> bool {
+    let Some(path) = wizard_json_path() else {
+        return false;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|v| v.get("rerank_enabled").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
 }
 
 // ==================== 嵌入模型管理 API（v0.6.0+） ====================
@@ -5044,6 +5140,7 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         // v0.8.1：以下路由保留向后兼容，新代码应使用 /v1/config 和 /v1/config/llm
         .route("/api/config", get(config_handler)) // deprecated, use /v1/config
         .route("/api/config/llm", post(config_llm_handler)) // deprecated, use /v1/config/llm
+        .route("/api/config/rerank", post(config_rerank_handler)) // deprecated, use /v1/config/rerank
         // V2: 项目信息 API
         .route("/api/project/info", get(project_info_handler))
         // V2: 项目列表 API（批量查询所有项目的元信息，供前端构建"指纹→名称"映射表）
