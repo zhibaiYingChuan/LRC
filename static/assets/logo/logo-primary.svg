@@ -1,3 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 60" width="200" height="60">
-  <text x="10" y="40" font-family="sans-serif" font-size="28" fill="#1a1a1a">LRC</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+<polyline points="760,760 264,760 264,264 760,264 760,560 464,560 464,464 560,464 560,512 512,512" fill="none" stroke="#D9A441" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="512" cy="512" r="40" fill="#F0D68A"/>
 </svg>

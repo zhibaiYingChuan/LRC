@@ -3695,6 +3695,43 @@ async fn logo_asset_handler(
     }
 }
 
+/// 品牌图标端点：`/favicon.svg`（矢量，现代浏览器优先）。
+///
+/// # 为什么要单独开一个端点（而不是复用 Logo 端点）
+///
+/// 修复前 `index.html` 的 `<link rel="icon">` 直接指向 `logo-horizontal.svg`
+/// —— 那是 2400×800、3:1 的横版组合标，缩到 16px 标签页宽度只剩几像素，
+/// 等于标签页没有图标。tech-handoff v1.0 §2.5 明确规定 favicon 用
+/// `logo-v2/icon/favicon.svg`（32px 简化版：方框 + 中心点）。
+async fn favicon_svg_handler() -> axum::response::Response<String> {
+    const FAVICON_SVG: &str = include_str!("../static/favicon.svg");
+    axum::response::Response::builder()
+        .header("Content-Type", "image/svg+xml; charset=utf-8")
+        // 图标可长期缓存：文件名固定、内容随版本发布变更
+        .header("Cache-Control", "public, max-age=86400")
+        .body(FAVICON_SVG.to_string())
+        .unwrap_or_else(|e| {
+            eprintln!("[server] favicon.svg 响应构建失败: {}", e);
+            axum::response::Response::new(String::new())
+        })
+}
+
+/// 品牌图标端点：`/favicon.ico`（旧浏览器回退）。
+///
+/// 返回**二进制** ICO —— 不能用 `include_str!`（会按 UTF-8 解码破坏字节），
+/// 必须用 `include_bytes!`。
+async fn favicon_ico_handler() -> impl axum::response::IntoResponse {
+    const FAVICON_ICO: &[u8] = include_bytes!("../static/favicon.ico");
+    (
+        [
+            ("Content-Type", "image/x-icon"),
+            // 图标可长期缓存：文件名固定、内容随版本发布变更
+            ("Cache-Control", "public, max-age=86400"),
+        ],
+        FAVICON_ICO,
+    )
+}
+
 /// 龙忆设计系统 v1.0 — 图标资源端点
 ///
 /// v0.6.0 UI 重构：仪表盘引用 /assets/icons/*.svg 作为导航和功能图标，
@@ -5197,7 +5234,10 @@ pub fn build_mcp_router(state: Arc<AppState>) -> Router {
         .route("/components.css", get(components_css_handler))
         // v0.6.0 龙忆设计系统：Logo 与图标 SVG 资源
         .route("/assets/logo/{filename}", get(logo_asset_handler))
-        .route("/assets/icons/{filename}", get(icon_asset_handler));
+        .route("/assets/icons/{filename}", get(icon_asset_handler))
+        // v0.10.4 品牌对齐：favicon（marketing logo-v2，tech-handoff v1.0 第 2.5 节）
+        .route("/favicon.svg", get(favicon_svg_handler))
+        .route("/favicon.ico", get(favicon_ico_handler));
 
     // 合并公开与受保护路由，再应用跨域/超时/并发限制
     Router::new()

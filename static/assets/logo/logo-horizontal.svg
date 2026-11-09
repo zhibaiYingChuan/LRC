@@ -1,3 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 60" width="320" height="60">
-  <text x="10" y="40" font-family="sans-serif" font-size="24" fill="#1a1a1a">Loong Recall</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2400 800" width="2400" height="800">
+  <g transform="translate(120,160) scale(0.46875)">
+<polyline points="760,760 264,760 264,264 760,264 760,560 464,560 464,464 560,464 560,512 512,512" fill="none" stroke="#0A0A0B" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
+<circle cx="512" cy="512" r="40" fill="#F0D68A"/>
+  </g>
+  <text x="680" y="360" font-family="'Noto Serif SC','Source Han Serif SC','SimSun',serif" font-size="220" font-weight="700" fill="#0A0A0B">龙忆</text>
+  <text x="684" y="520" font-family="Inter,'Segoe UI',sans-serif" font-size="90" letter-spacing="4" fill="#0A0A0B">Loong Recall</text>
 </svg>
