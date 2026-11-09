@@ -5411,6 +5411,18 @@ impl<P: Persistence> MemoryStore<P> {
                 memories.len()
             ))));
         }
+        // 句向量长度契约：`embeddings[i]` 必须与 `memories[i]` 一一对应。
+        // 若不校验，后续 `zip` 会**静默截断**——多出的记忆既不入语义索引、
+        // 也不进回退队列，成为"写了但永远检索不到"的幽灵条目。
+        if let Some(embs) = embeddings.as_ref() {
+            if embs.len() != memories.len() {
+                return Err(PersistenceError::Io(std::io::Error::other(format!(
+                    "句向量数量与记忆数量不一致（{} != {}）",
+                    embs.len(),
+                    memories.len()
+                ))));
+            }
+        }
 
         let mut results = Vec::with_capacity(memories.len());
         for (memory, luoshu_vec) in memories.into_iter().zip(luoshu_vecs) {

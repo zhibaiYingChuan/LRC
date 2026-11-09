@@ -436,6 +436,9 @@ pub struct SemanticService {
     tx: Sender<Job>,
     /// 库内记忆总数（覆盖率分母）
     total: AtomicUsize,
+    /// 编码失败累计条数（**必须从 pending 中扣除**，否则失败项会让
+    /// `wait_for_index` 永远等不到 0，屏障退化成固定超时）
+    failed: AtomicUsize,
     /// 是否有未落盘的增量
     dirty: AtomicBool,
     /// 自上次落盘以来**新增**的向量（flush 时只追加这些，不整份重写）
@@ -464,13 +467,19 @@ impl SemanticService {
         self.enabled && self.indexed() > 0
     }
 
-    /// 待索引条数（已入队但尚未落索引）。
+    /// 待索引条数（已入队但尚未落索引，且未失败）。
     ///
-    /// 口径：`total - indexed`，下限 0。`total` 是「已投递编码任务」的累计数，
-    /// `indexed` 是「已落索引」的条数，两者之差即 pending。
+    /// 口径：`total - indexed - failed`，下限 0。失败项必须扣除，
+    /// 否则一条编码失败就会让 `wait_for_index` 永远等不到 0。
     pub fn pending_count(&self) -> usize {
         let total = self.total.load(Ordering::Relaxed);
-        total.saturating_sub(self.indexed())
+        let failed = self.failed.load(Ordering::Relaxed);
+        total.saturating_sub(self.indexed()).saturating_sub(failed)
+    }
+
+    /// 编码失败累计条数。
+    pub fn failed_count(&self) -> usize {
+        self.failed.load(Ordering::Relaxed)
     }
 
     /// 阻塞等待索引追平（覆盖率 ≥ 1.0），最多等 `timeout`。
@@ -704,7 +713,13 @@ pub fn insert_precomputed_sync(items: &[(String, Vec<f32>)]) {
         if started.elapsed() >= SYNC_BUDGET {
             break;
         }
-        insert_precomputed(service, chunk);
+        let (inserted, failed) = insert_precomputed(service, chunk);
+        // 同步路径写入的是**新记忆**（此前未入队），必须计入库内总数，
+        // 否则覆盖率分母偏小、`pending_count` 提前归零。
+        service
+            .total
+            .fetch_add(inserted + failed, Ordering::Relaxed);
+        service.failed.fetch_add(failed, Ordering::Relaxed);
         done += chunk.len();
     }
     if done > 0 {
@@ -745,7 +760,12 @@ pub fn encode_batch_sync(items: &[(String, String)]) {
         if started.elapsed() >= SYNC_BUDGET {
             break;
         }
-        encode_and_insert(service, chunk);
+        let (inserted, failed) = encode_and_insert(service, chunk);
+        // 同步路径写入的是**新记忆**（此前未入队），必须计入库内总数。
+        service
+            .total
+            .fetch_add(inserted + failed, Ordering::Relaxed);
+        service.failed.fetch_add(failed, Ordering::Relaxed);
         done += chunk.len();
     }
     if done > 0 {
@@ -794,6 +814,7 @@ pub fn init(
         data_dir: data_dir.clone(),
         tx,
         total: AtomicUsize::new(total),
+        failed: AtomicUsize::new(0),
         dirty: AtomicBool::new(false),
         pending: std::sync::Mutex::new(Vec::new()),
         enabled,
@@ -843,7 +864,9 @@ fn spawn_worker(service: Arc<SemanticService>, rx: Receiver<Job>) {
                                 Ok(Job::Encode(more)) => items.extend(more),
                                 Ok(Job::Insert(more)) => {
                                     // 已编码向量：直接插入，不参与本批编码
-                                    since_flush += insert_precomputed(&service, &more);
+                                    let (inserted, failed) = insert_precomputed(&service, &more);
+                                    service.failed.fetch_add(failed, Ordering::Relaxed);
+                                    since_flush += inserted;
                                 }
                                 Ok(Job::Backfill(backfill)) => {
                                     // 回填任务不插队：放回队列，稍后处理
@@ -853,17 +876,23 @@ fn spawn_worker(service: Arc<SemanticService>, rx: Receiver<Job>) {
                                 Err(_) => break,
                             }
                         }
-                        since_flush += encode_and_insert(&service, &items);
+                        let (inserted, failed) = encode_and_insert(&service, &items);
+                        service.failed.fetch_add(failed, Ordering::Relaxed);
+                        since_flush += inserted;
                     }
                     Ok(Job::Insert(items)) => {
-                        since_flush += insert_precomputed(&service, &items);
+                        let (inserted, failed) = insert_precomputed(&service, &items);
+                        service.failed.fetch_add(failed, Ordering::Relaxed);
+                        since_flush += inserted;
                     }
                     Ok(Job::Backfill(items)) => {
                         let total = items.len();
                         let started = std::time::Instant::now();
                         let mut done = 0usize;
                         for chunk in items.chunks(ENCODE_BATCH) {
-                            done += encode_and_insert(&service, chunk);
+                            let (_, failed) = encode_and_insert(&service, chunk);
+                            service.failed.fetch_add(failed, Ordering::Relaxed);
+                            done += chunk.len();
                             since_flush += chunk.len();
                             if since_flush >= FLUSH_EVERY {
                                 service.flush();
@@ -991,9 +1020,9 @@ fn encode_windows_parallel(
 }
 
 /// 编码一批并插入索引，返回成功插入的**记忆条数**（不是窗口数）。
-fn encode_and_insert(service: &SemanticService, items: &[(String, String)]) -> usize {
+fn encode_and_insert(service: &SemanticService, items: &[(String, String)]) -> (usize, usize) {
     if items.is_empty() {
-        return 0;
+        return (0, 0);
     }
     // 1. 展开为窗口序列，并记录每个窗口属于哪条记忆
     let mut texts: Vec<String> = Vec::new();
@@ -1005,21 +1034,21 @@ fn encode_and_insert(service: &SemanticService, items: &[(String, String)]) -> u
         }
     }
     if texts.is_empty() {
-        return 0;
+        return (0, items.len());
     }
     // 2. 并行批量编码（按窗口分片，输出顺序与输入一致）
     let Some(vectors) = encode_windows_parallel(&service.encoder, &texts) else {
-        return 0;
+        return (0, items.len());
     };
     if vectors.len() != texts.len() {
-        return 0;
+        return (0, items.len());
     }
     let first_dim = vectors.first().map(|v| v.len()).unwrap_or(0);
     if first_dim == 0 {
-        return 0;
+        return (0, items.len());
     }
     let Ok(mut index) = service.index.write() else {
-        return 0;
+        return (0, items.len());
     };
     // 维度变更（换模型）⇒ 旧索引整体失效，先清空再重建
     if index.dim() != 0 && index.dim() != first_dim {
@@ -1059,23 +1088,28 @@ fn encode_and_insert(service: &SemanticService, items: &[(String, String)]) -> u
         p.extend(new_vectors);
         service.dirty.store(true, Ordering::Release);
     }
-    inserted_ids.len()
+    let inserted = inserted_ids.len();
+    let failed = items
+        .len()
+        .saturating_sub(inserted)
+        .saturating_sub(existing.len());
+    (inserted, failed)
 }
 
 /// 插入一批**已编码**的向量（写入路径「一次前向双产出」的产物）。
 ///
 /// 与 [`encode_and_insert`] 的差别：不展开窗口、不调用编码器，直接落索引。
 /// 维度变更清空、已索引跳过、增量日志记录三条契约与编码路径逐位一致。
-fn insert_precomputed(service: &SemanticService, items: &[(String, Vec<f32>)]) -> usize {
+fn insert_precomputed(service: &SemanticService, items: &[(String, Vec<f32>)]) -> (usize, usize) {
     if items.is_empty() {
-        return 0;
+        return (0, 0);
     }
     let first_dim = items.first().map(|(_, v)| v.len()).unwrap_or(0);
     if first_dim == 0 {
-        return 0;
+        return (0, items.len());
     }
     let Ok(mut index) = service.index.write() else {
-        return 0;
+        return (0, items.len());
     };
     // 维度变更（换模型）⇒ 旧索引整体失效，先清空再重建（与编码路径同口径）
     if index.dim() != 0 && index.dim() != first_dim {
@@ -1089,8 +1123,16 @@ fn insert_precomputed(service: &SemanticService, items: &[(String, Vec<f32>)]) -
     }
     let mut new_vectors: Vec<(String, Vec<f32>)> = Vec::new();
     let mut inserted = 0usize;
+    let mut failed = 0usize;
     for (id, vector) in items {
-        if vector.len() != first_dim || index.get(id).is_some() {
+        // 维度不一致：该条**无法**进入本向量空间，计为失败（不是"已索引跳过"），
+        // 否则 `pending_count` 会把它当作已完成，屏障提前放行。
+        if vector.len() != first_dim {
+            failed += 1;
+            continue;
+        }
+        // 已索引：并发编码/回填先完成者胜出，跳过且不计失败。
+        if index.get(id).is_some() {
             continue;
         }
         index.insert(id.clone(), vector.clone());
@@ -1103,7 +1145,7 @@ fn insert_precomputed(service: &SemanticService, items: &[(String, Vec<f32>)]) -
         p.extend(new_vectors);
         service.dirty.store(true, Ordering::Release);
     }
-    inserted
+    (inserted, failed)
 }
 
 #[cfg(test)]
