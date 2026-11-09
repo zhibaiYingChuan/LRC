@@ -15,6 +15,7 @@
 //
 // 启动后 IDE 可通过 MCP 配置连接此服务，AI 助手即可调用 search_code 工具。
 
+use code_memory::lock_ext::LockExt;
 use code_memory::{server, CodeMemoryManager, JsonPersistence, LlmApiConfig, MemoryStore};
 // v0.9.8：记忆图存储（记录层关系持久化）
 use code_memory::graph_store::GraphMemoryStore;
@@ -988,7 +989,7 @@ async fn try_run() -> LrcResult<()> {
 
         // --disable-dao-regulator：禁用道同构度调节器（基线 B）
         if disable_dao_regulator {
-            store.dao_regulator.write().unwrap().auto_regulate = false;
+            store.dao_regulator.write_recover().auto_regulate = false;
             log("   ⚠ 道同构度调节器: 已禁用（基线 B：no_evolution）");
         }
 

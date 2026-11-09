@@ -41,6 +41,7 @@
 //!
 //! ============================================================
 
+use crate::lock_ext::{LockExt, MutexExt};
 use std::sync::Arc;
 
 use crate::engine::audit_trail::{AuditEventType, AuditTrail};
@@ -1218,7 +1219,7 @@ impl<P: Persistence> MemoryGraphQuery for MemoryStore<P> {
             }
         }
         // 如果图存储可用，也查询图中的边关系
-        if let Some(ref graph) = *self.graph_store.read().unwrap() {
+        if let Some(ref graph) = *self.graph_store.read_recover() {
             for edge in graph.query_edges(memory_id) {
                 let other = if edge.source_id == memory_id {
                     &edge.target_id
@@ -1326,7 +1327,7 @@ impl<P: Persistence> MemoryInfoQuery for MemoryStore<P> {
 
     fn get_quality_score(&self, memory_id: &str) -> f32 {
         // 从合成日志中获取质量评分（通过命中记录计算）
-        let events = self.synthesis_journal.read().unwrap().get_events();
+        let events = self.synthesis_journal.read_recover().get_events();
         for event in &events {
             if event.synthesis_id == memory_id {
                 return event.avg_relevance;
@@ -2346,7 +2347,7 @@ impl<P: Persistence> MemoryStore<P> {
         }
         // ②/③ P8.2o 状态化方案：统计模式构造点**不加载磁盘状态与统计**，以空态起步。
         // （`new()` 会先加载再用，这里覆写为空；语义与修前一致，仅多一次磁盘读。）
-        *store.memory_state_machine.write().unwrap() = MemoryStateMachine::new();
+        *store.memory_state_machine.write_recover() = MemoryStateMachine::new();
         store.cache = crate::memory_store_cache::MemoryStoreCache::new(AssocFrequency::default());
         // 编码器已被替换 ⇒ 用存量语料重新定型 IDF（A+B+D）
         store.rebuild_encoder_idf();
@@ -2716,7 +2717,7 @@ impl<P: Persistence> MemoryStore<P> {
         &self,
         logger: crate::engine::exploration_log::ExplorationLogger,
     ) {
-        *self.exploration_logger.write().unwrap() = logger;
+        *self.exploration_logger.write_recover() = logger;
     }
 
     /// v0.5.5 P1-1：设置 LLM 配置状态
@@ -3014,7 +3015,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 启用后，写入冲突时会自动创建 Contradicts/Evolves 边，
     /// 递归合成时会自动创建 SynthesizesFrom 边。
     pub fn with_graph_store(self, graph_store: GraphMemoryStore) -> Self {
-        *self.graph_store.write().unwrap() = Some(graph_store);
+        *self.graph_store.write_recover() = Some(graph_store);
         self
     }
 
@@ -3025,7 +3026,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 而不是只断言返回值（返回值写图失败时仍可能正确，
     /// 只断言返回值会让"图化失效"静默通过）。
     pub fn graph_store_ref(&self) -> Option<GraphStoreReadGuard<'_>> {
-        let guard = self.graph_store.read().unwrap();
+        let guard = self.graph_store.read_recover();
         if guard.is_some() {
             Some(GraphStoreReadGuard(guard))
         } else {
@@ -3045,7 +3046,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 直写图（那正是 S3 要防的）。故此处显式标注 `_for_test` 并仅由单测调用。
     #[cfg(test)]
     pub fn graph_store_mut_for_test(&mut self) -> Option<GraphStoreWriteGuard<'_>> {
-        let guard = self.graph_store.write().unwrap();
+        let guard = self.graph_store.write_recover();
         if guard.is_some() {
             Some(GraphStoreWriteGuard(guard))
         } else {
@@ -3058,7 +3059,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 读路径（`expand_associations`）产生的边走 deferred 通道，只有这里
     /// 或后台 flush 任务把它们写到磁盘。返回是否真的写了盘。
     pub fn flush_graph_if_dirty(&self) -> Result<bool, PersistenceError> {
-        match self.graph_store.write().unwrap().as_mut() {
+        match self.graph_store.write_recover().as_mut() {
             Some(graph) => graph.flush_if_dirty(),
             None => Ok(false),
         }
@@ -3078,14 +3079,14 @@ impl<P: Persistence> MemoryStore<P> {
 
     /// 重新置图脏标记（后台 flush 写盘失败时补回）。
     pub fn mark_graph_dirty(&self) {
-        if let Some(graph) = self.graph_store.write().unwrap().as_mut() {
+        if let Some(graph) = self.graph_store.write_recover().as_mut() {
             graph.mark_dirty();
         }
     }
 
     /// 写盘失败时把增量边放回图存储（配合 [`Self::take_graph_snapshot`]）。
     pub fn restore_graph_pending(&self, edges: Vec<crate::graph_store::MemoryEdge>) {
-        if let Some(graph) = self.graph_store.write().unwrap().as_mut() {
+        if let Some(graph) = self.graph_store.write_recover().as_mut() {
             graph.restore_pending(edges);
         }
     }
@@ -3164,7 +3165,7 @@ impl<P: Persistence> MemoryStore<P> {
         if !self.has_memory_id(from_id)? || !self.has_memory_id(to_id)? {
             return Ok(false);
         }
-        let Some(ref mut graph) = *self.graph_store.write().unwrap() else {
+        let Some(ref mut graph) = *self.graph_store.write_recover() else {
             return Ok(false); // 未启用图存储：静默跳过（图是增强能力）
         };
         let before = graph.edge_count();
@@ -3257,7 +3258,7 @@ impl<P: Persistence> MemoryStore<P> {
         }
         let by_id: std::collections::HashMap<&str, &Memory> =
             all.iter().map(|m| (m.id.as_str(), m.as_ref())).collect();
-        let graph_guard = self.graph_store.read().unwrap();
+        let graph_guard = self.graph_store.read_recover();
         let Some(graph) = graph_guard.as_ref() else {
             return Ok(Vec::new()); // 未启用图存储：降态为空（图是增强能力）
         };
@@ -3370,7 +3371,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 对于中文文本（无空格分词），使用字符级 bigram 比较。
     /// 对于英文文本，使用空格分词比较。
     fn compute_jaccard(&self, a: &str, b: &str) -> f32 {
-        self.synthesis_engine.read().unwrap().compute_jaccard(a, b)
+        self.synthesis_engine.read_recover().compute_jaccard(a, b)
     }
 
     fn content_bigrams(content: &str) -> std::collections::HashSet<String> {
@@ -4086,7 +4087,7 @@ impl<P: Persistence> MemoryStore<P> {
             if !kept_ids.contains(synthesis_id.as_str()) {
                 continue;
             }
-            if let Some(ref mut graph) = *self.graph_store.write().unwrap() {
+            if let Some(ref mut graph) = *self.graph_store.write_recover() {
                 for sid in source_ids {
                     let _ =
                         graph.add_edge(synthesis_id, sid, EdgeType::SynthesizesFrom, *confidence);
@@ -4099,7 +4100,7 @@ impl<P: Persistence> MemoryStore<P> {
             if !kept_ids.contains(entry.synthesis_id.as_str()) {
                 continue;
             }
-            self.synthesis_journal.read().unwrap().record_synthesis(
+            self.synthesis_journal.read_recover().record_synthesis(
                 entry.synthesis_id.clone(),
                 &entry.trigger_source,
                 &entry.bagua_category,
@@ -4147,7 +4148,7 @@ impl<P: Persistence> MemoryStore<P> {
         let synthesize_start = std::time::Instant::now();
 
         // 同步引擎配置（确保 consolidation 等外部调用者设置的阈值生效）
-        *self.synthesis_engine.write().unwrap() = SynthesisEngine::new(SynthesisConfig {
+        *self.synthesis_engine.write_recover() = SynthesisEngine::new(SynthesisConfig {
             min_cluster: self
                 .synthesis_min_cluster
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -4171,7 +4172,7 @@ impl<P: Persistence> MemoryStore<P> {
         let result = self.apply_synthesis_plan(plan);
 
         // v0.6.0+ 参赛扩展：探索日志记录
-        self.exploration_logger.read().unwrap().log(
+        self.exploration_logger.read_recover().log(
             crate::engine::exploration_log::ExplorationEventType::Synthesize,
             serde_json::json!({
                 "engine": engine_kind,
@@ -4230,7 +4231,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 自动检测系统健康状态并生成调节动作。
     /// 返回调节动作的描述，供上层决策使用。
     pub fn regulate(&self) -> Option<RegulationAction> {
-        if !self.dao_regulator.read().unwrap().should_regulate() {
+        if !self.dao_regulator.read_recover().should_regulate() {
             return None;
         }
 
@@ -4266,7 +4267,7 @@ impl<P: Persistence> MemoryStore<P> {
         let snapshot =
             self.dao_metrics
                 .snapshot(total, crystallized, archived, avg_deviation, &bagua_counts);
-        let journal_snapshot = self.synthesis_journal.read().unwrap().snapshot();
+        let journal_snapshot = self.synthesis_journal.read_recover().snapshot();
 
         // v0.9.1 深度接线：记录调节前的灾难事件数与冻结状态，用于事后对比审计
         let catastrophic_before = self
@@ -4275,18 +4276,18 @@ impl<P: Persistence> MemoryStore<P> {
             .unwrap()
             .get_catastrophic_events()
             .len();
-        let was_frozen = self.dao_regulator.read().unwrap().is_frozen();
+        let was_frozen = self.dao_regulator.read_recover().is_frozen();
 
         // v0.6.0+ 参赛扩展：探索日志埋点（regulate 事件）
         let regulate_start = std::time::Instant::now();
 
-        let action = self.dao_regulator.write().unwrap().regulate(
+        let action = self.dao_regulator.write_recover().regulate(
             snapshot.dao_isomorphism_score,
             snapshot.bagua_entropy,
             snapshot.synthesis_ratio,
             avg_deviation,
             journal_snapshot.synthesis_rate_per_minute,
-            self.decay_config.read().unwrap().decay_rate,
+            self.decay_config.read_recover().decay_rate,
             self.synthesis_min_cluster
                 .load(std::sync::atomic::Ordering::Acquire),
         );
@@ -4305,7 +4306,7 @@ impl<P: Persistence> MemoryStore<P> {
                 "suggest_comprehensive_rebalance"
             }
         };
-        self.exploration_logger.read().unwrap().log_regulate(
+        self.exploration_logger.read_recover().log_regulate(
             snapshot.dao_isomorphism_score,
             snapshot.bagua_entropy,
             snapshot.synthesis_ratio,
@@ -4317,8 +4318,8 @@ impl<P: Persistence> MemoryStore<P> {
         // 执行调节动作（并记录审计：系统自主调节需可回溯）
         match &action {
             RegulationAction::AdjustDecayRate { new_rate, reason } => {
-                let old_rate = self.decay_config.read().unwrap().decay_rate;
-                self.decay_config.write().unwrap().decay_rate = *new_rate;
+                let old_rate = self.decay_config.read_recover().decay_rate;
+                self.decay_config.write_recover().decay_rate = *new_rate;
                 eprintln!(
                     "[LRC·调节] 衰减速率已调整: {:.2} → {:.2}（{}）",
                     old_rate, new_rate, reason
@@ -4350,7 +4351,7 @@ impl<P: Persistence> MemoryStore<P> {
                 self.synthesis_min_cluster
                     .store(clamped, std::sync::atomic::Ordering::Release);
                 // 同步更新合成引擎配置
-                *self.synthesis_engine.write().unwrap() = SynthesisEngine::new(SynthesisConfig {
+                *self.synthesis_engine.write_recover() = SynthesisEngine::new(SynthesisConfig {
                     min_cluster: clamped,
                     similarity: self.synthesis_similarity,
                 });
@@ -4427,7 +4428,7 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         // 灾难性/慢性恶化事件审计（系统自主守护行为的可回溯记录）
-        let catastrophic_events = self.dao_regulator.read().unwrap().get_catastrophic_events();
+        let catastrophic_events = self.dao_regulator.read_recover().get_catastrophic_events();
         for event in catastrophic_events.iter().skip(catastrophic_before) {
             let is_chronic = event.last_action_before_crash == "chronic_degradation";
             let event_type = if is_chronic {
@@ -4447,7 +4448,7 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         // 调节器冻结审计（连续无效调节触发冻结保护）
-        if !was_frozen && self.dao_regulator.read().unwrap().is_frozen() {
+        if !was_frozen && self.dao_regulator.read_recover().is_frozen() {
             self.record_audit(
                 AuditEventType::RegulatorFrozen,
                 "调节器已冻结（连续无效调节达到阈值）",
@@ -4479,7 +4480,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 自主记忆垃圾回收：标记为待执行，避免阻塞用户请求关键路径
         // 质疑三核心修复：GC 不在 regulate 中同步执行，而是设置延迟标记。
         // 实际的 GC 工作在 run_gc_if_pending() 中由外部调度触发。
-        if self.memory_gc.read().unwrap().should_run() {
+        if self.memory_gc.read_recover().should_run() {
             // v0.8.48 P0 修复：原子写入，Release 语义确保此前的写操作对执行 GC 的线程可见
             self.gc_pending
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -4545,7 +4546,7 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         // 2. 处理用户负面反馈 → 主动标记低质量合成
-        let stats = self.user_feedback.read().unwrap().get_stats();
+        let stats = self.user_feedback.read_recover().get_stats();
         if stats.negative_count > 0 {
             let all = match self.load_cached() {
                 Ok(m) => m,
@@ -4664,7 +4665,7 @@ impl<P: Persistence> MemoryStore<P> {
         reason: impl Into<String>,
         affected_memory_ids: Vec<String>,
     ) {
-        self.audit_trail.write().unwrap().record(
+        self.audit_trail.write_recover().record(
             event_type,
             description.into(),
             reason.into(),
@@ -4706,7 +4707,7 @@ impl<P: Persistence> MemoryStore<P> {
         let snapshots = MemorySnapshot::collect_all(self);
         let elapsed_ms = start.elapsed().as_millis() as f64;
         // 阶段二：GC 计算候选和待删除列表（仅可变借用 self.memory_gc）
-        let (gc_stats, to_delete) = self.memory_gc.write().unwrap().collect_garbage(&snapshots);
+        let (gc_stats, to_delete) = self.memory_gc.write_recover().collect_garbage(&snapshots);
         // 记录性能基线（质疑三：动态警告阈值，替代固定 500ms）
         self.memory_gc
             .write()
@@ -4826,7 +4827,7 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 返回被隔离的记忆数量。
     pub fn clean_low_quality_synthesis(&self) -> Result<usize, PersistenceError> {
-        let low_quality_ids = self.synthesis_journal.read().unwrap().get_low_quality_ids();
+        let low_quality_ids = self.synthesis_journal.read_recover().get_low_quality_ids();
         if low_quality_ids.is_empty() {
             return Ok(0);
         }
@@ -4853,7 +4854,7 @@ impl<P: Persistence> MemoryStore<P> {
                         if let Err(e) = self.forget(id) {
                             eprintln!("[LRC·隔离区] 归档后从活跃库删除 {} 失败: {}", id, e);
                         }
-                        self.synthesis_journal.read().unwrap().remove_event(id);
+                        self.synthesis_journal.read_recover().remove_event(id);
                         quarantined += 1;
                         quarantined_ids.push(id.clone());
                     }
@@ -4864,7 +4865,7 @@ impl<P: Persistence> MemoryStore<P> {
                 }
             } else {
                 // 记忆已不存在，仅清理日志
-                self.synthesis_journal.read().unwrap().remove_event(id);
+                self.synthesis_journal.read_recover().remove_event(id);
             }
         }
 
@@ -4995,7 +4996,7 @@ impl<P: Persistence> MemoryStore<P> {
             let mut no_op_memory = memory;
             no_op_memory.id = format!("zero_memory_{}", chrono::Utc::now().timestamp_millis());
             // 记录探索日志但不实际存储
-            self.exploration_logger.read().unwrap().log_remember(
+            self.exploration_logger.read_recover().log_remember(
                 &mem_type_str,
                 mem_importance,
                 &mem_tags,
@@ -5160,7 +5161,7 @@ impl<P: Persistence> MemoryStore<P> {
             // ⇒ 顺序改为「先落盘记忆，再写图」：记忆一定存在，边不会悬空。
             //   实现上把这批边**收集起来**，在 `save_memory` 之后统一写。
             let mut pending_edges: Vec<(EdgeType, f32)> = Vec::new();
-            if self.graph_store.read().unwrap().is_some() {
+            if self.graph_store.read_recover().is_some() {
                 let jaccard = self.compute_jaccard(&old_content, &merged.content);
                 // 内容实质不同的合并 → Contradicts 边（需要后续解决）
                 if jaccard < 0.9 {
@@ -5212,7 +5213,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 已经保存成功，再返回错误会让用户误以为"没记住"——那是更严重的误导）。
         if !pending_edges.is_empty() {
             if let Some(existing) = similar.as_ref() {
-                if let Some(ref mut graph) = *self.graph_store.write().unwrap() {
+                if let Some(ref mut graph) = *self.graph_store.write_recover() {
                     for (etype, weight) in &pending_edges {
                         if let Err(e) =
                             graph.add_edge(&result.id, &existing.id, etype.clone(), *weight)
@@ -5258,7 +5259,7 @@ impl<P: Persistence> MemoryStore<P> {
             .upsert(&result, self.persistence.source_fingerprint());
 
         // v0.6.0+ 参赛扩展：探索日志记录（remember 事件）
-        self.exploration_logger.read().unwrap().log_remember(
+        self.exploration_logger.read_recover().log_remember(
             &mem_type_str,
             mem_importance,
             &mem_tags,
@@ -5267,13 +5268,13 @@ impl<P: Persistence> MemoryStore<P> {
 
         // LRC 内置道体状态机：新写入的记忆代表"当前语境"，以重要性激活，
         // 让后续检索能感知"用户刚刚在记什么"，形成跨调用的话题延续。
-        self.memory_state_machine.write().unwrap().activate(
+        self.memory_state_machine.write_recover().activate(
             &result.id,
             (result.importance.value() as f32 / 10.0).clamp(0.0, 1.0),
         );
         let _ = self
             .persistence
-            .save_memory_state(&self.memory_state_machine.read().unwrap().snapshot());
+            .save_memory_state(&self.memory_state_machine.read_recover().snapshot());
 
         Ok(result)
     }
@@ -6360,7 +6361,7 @@ impl<P: Persistence> MemoryStore<P> {
             previous = Some(id.as_str());
         }
         self.persistence
-            .save_memory_state(&self.memory_state_machine.read().unwrap().snapshot())
+            .save_memory_state(&self.memory_state_machine.read_recover().snapshot())
     }
 
     /// LRC 内置道体状态机·激活快照：
@@ -6391,7 +6392,7 @@ impl<P: Persistence> MemoryStore<P> {
             .zip(scores.iter())
             .map(|(m, s)| (m.id.clone(), *s))
             .collect();
-        let mut queue = self.pending_recall_effects.lock().unwrap();
+        let mut queue = self.pending_recall_effects.lock_recover();
         // ★ 上限保护（审查 P2-3）：后台 flusher 用 `try_write`，长读持续时可能
         //   长期拿不到写锁 ⇒ 队列无界增长。满时丢弃**最旧**批次（激活是"最近"
         //   语义，旧批次价值最低），与 `pending_audit` 同口径。
@@ -6407,7 +6408,7 @@ impl<P: Persistence> MemoryStore<P> {
             return;
         }
         let ids: Vec<String> = memories.iter().map(|m| m.id.clone()).collect();
-        let mut queue = self.pending_recall_effects.lock().unwrap();
+        let mut queue = self.pending_recall_effects.lock_recover();
         if queue.len() >= PENDING_RECALL_EFFECTS_CAP {
             queue.remove(0);
         }
@@ -6430,7 +6431,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 返回实际应用的批次数（0 表示无待写回，调用方可据此跳过写锁）。
     pub fn flush_recall_side_effects(&self) -> usize {
         let effects: Vec<RecallSideEffect> = {
-            let mut queue = self.pending_recall_effects.lock().unwrap();
+            let mut queue = self.pending_recall_effects.lock_recover();
             if queue.is_empty() {
                 return 0;
             }
@@ -6449,7 +6450,7 @@ impl<P: Persistence> MemoryStore<P> {
                         .unwrap_or(0);
                     let mut changed = false;
                     for id in &ids {
-                        if self.lifecycle.write().unwrap().touch(id, now_ms) {
+                        if self.lifecycle.write_recover().touch(id, now_ms) {
                             changed = true;
                         }
                     }
@@ -6459,7 +6460,7 @@ impl<P: Persistence> MemoryStore<P> {
                     }
                 }
                 RecallSideEffect::GraphEdges { pending } => {
-                    if let Some(graph) = self.graph_store.write().unwrap().as_mut() {
+                    if let Some(graph) = self.graph_store.write_recover().as_mut() {
                         graph.add_edges_batch_deferred(&pending);
                     }
                 }
@@ -6470,7 +6471,7 @@ impl<P: Persistence> MemoryStore<P> {
 
     /// 是否存在待写回的读路径副作用（供调用方决定是否需要取写锁）。
     pub fn has_pending_recall_effects(&self) -> bool {
-        !self.pending_recall_effects.lock().unwrap().is_empty()
+        !self.pending_recall_effects.lock_recover().is_empty()
     }
 
     /// 读路径：把审计事件追加到待写队列（**不触碰 `audit_trail`**）。
@@ -6485,7 +6486,7 @@ impl<P: Persistence> MemoryStore<P> {
         affected_memory_ids: Vec<String>,
         metadata: std::collections::HashMap<String, String>,
     ) {
-        let mut queue = self.pending_audit.lock().unwrap();
+        let mut queue = self.pending_audit.lock_recover();
         if queue.len() >= PENDING_AUDIT_CAP {
             // 防御：后台长期拿不到锁时不无限增长；丢弃最旧一条并告警。
             queue.remove(0);
@@ -6506,7 +6507,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 应用待写审计事件（**必须在写锁下调用**）。返回实际写入条数。
     pub fn flush_pending_audit(&self) -> usize {
         let events: Vec<PendingAuditEvent> = {
-            let mut queue = self.pending_audit.lock().unwrap();
+            let mut queue = self.pending_audit.lock_recover();
             if queue.is_empty() {
                 return 0;
             }
@@ -6514,7 +6515,7 @@ impl<P: Persistence> MemoryStore<P> {
         };
         let count = events.len();
         for event in events {
-            self.audit_trail.write().unwrap().record(
+            self.audit_trail.write_recover().record(
                 event.event_type,
                 event.description,
                 event.reason,
@@ -6527,7 +6528,7 @@ impl<P: Persistence> MemoryStore<P> {
 
     /// 是否存在待写审计事件。
     pub fn has_pending_audit(&self) -> bool {
-        !self.pending_audit.lock().unwrap().is_empty()
+        !self.pending_audit.lock_recover().is_empty()
     }
 
     /// 联想确认（v0.9.7：用户在联想探索中点击"就是这个"）。
@@ -6555,7 +6556,7 @@ impl<P: Persistence> MemoryStore<P> {
             .transition(None, memory_id, 1.0, 1);
         let _ = self
             .persistence
-            .save_memory_state(&self.memory_state_machine.read().unwrap().snapshot());
+            .save_memory_state(&self.memory_state_machine.read_recover().snapshot());
         Ok(true)
     }
 
@@ -6690,7 +6691,7 @@ impl<P: Persistence> MemoryStore<P> {
         // 探索语义完全由原查询主导。
         let (query_words, expansion_boost) =
             if crate::engine::memory_state_machine::state_bias_enabled() && !filter.explore_pure {
-                let active_ids = self.memory_state_machine.read().unwrap().active_ids(8);
+                let active_ids = self.memory_state_machine.read_recover().active_ids(8);
                 if active_ids.is_empty() {
                     (query_words, Vec::<(String, f32)>::new())
                 } else {
@@ -7071,7 +7072,7 @@ impl<P: Persistence> MemoryStore<P> {
 
                         // 重要性加权（含衰减因子，使用可配置衰减曲线）
                         score += m
-                            .decayed_importance_with_config(&self.decay_config.read().unwrap())
+                            .decayed_importance_with_config(&self.decay_config.read_recover())
                             * 0.01;
 
                         // LRC 内置道体状态机·活性偏置：
@@ -7162,7 +7163,7 @@ impl<P: Persistence> MemoryStore<P> {
             if crate::lifecycle::decay_enabled() {
                 let now = crate::lifecycle::now_ms();
                 for (score, memory) in scored.iter_mut() {
-                    *score *= self.lifecycle.read().unwrap().decay_factor(&memory.id, now);
+                    *score *= self.lifecycle.read_recover().decay_factor(&memory.id, now);
                 }
             }
 
@@ -7309,7 +7310,7 @@ impl<P: Persistence> MemoryStore<P> {
 
         // v0.6.0+ 参赛扩展：探索日志记录（recall 事件）
         let recall_result_count = memories.len();
-        self.exploration_logger.read().unwrap().log_recall(
+        self.exploration_logger.read_recover().log_recall(
             query,
             recall_top_k,
             recall_result_count,
@@ -7334,7 +7335,7 @@ impl<P: Persistence> MemoryStore<P> {
 
     /// 生命周期表只读视图（供检索降权与诊断使用）。
     pub fn lifecycle(&self) -> std::sync::RwLockReadGuard<'_, crate::lifecycle::LifecycleTable> {
-        self.lifecycle.read().unwrap()
+        self.lifecycle.read_recover()
     }
 
     /// 标记旧记忆被新记忆取代（`superseded`）。返回 `true` 表示状态确有变化。
@@ -7458,7 +7459,7 @@ impl<P: Persistence> MemoryStore<P> {
 
     /// 清除一条记忆的寿命记录（恢复为 Active 且不再衰减）。
     pub fn clear_lifecycle(&self, memory_id: &str) -> bool {
-        let changed = self.lifecycle.write().unwrap().clear_entry(memory_id);
+        let changed = self.lifecycle.write_recover().clear_entry(memory_id);
         if changed {
             self.lifecycle_dirty
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -7488,10 +7489,10 @@ impl<P: Persistence> MemoryStore<P> {
             return Ok(false);
         }
         self.persistence
-            .save_lifecycle(&self.lifecycle.read().unwrap())?;
+            .save_lifecycle(&self.lifecycle.read_recover())?;
         self.lifecycle_dirty
             .store(false, std::sync::atomic::Ordering::Release);
-        *self.lifecycle_flushed_at.lock().unwrap() = std::time::Instant::now();
+        *self.lifecycle_flushed_at.lock_recover() = std::time::Instant::now();
         Ok(true)
     }
 
@@ -7528,7 +7529,7 @@ impl<P: Persistence> MemoryStore<P> {
             // **失败策略：显式告警但不阻断**（与 `expand_associations` 写图的
             // 静默策略一致——图是增强能力，删记忆这个主操作不该因图失败而失败）。
             // 但**不能静默**：残留边会持续占用遍历成本，用户需要知道。
-            if let Some(ref mut graph) = *self.graph_store.write().unwrap() {
+            if let Some(ref mut graph) = *self.graph_store.write_recover() {
                 match graph.remove_edges_of_memory(id) {
                     Ok(n) if n > 0 => {
                         eprintln!("[LRC-GRAPH] 已随记忆删除清理 {} 条关联边（id={}）", n, id);
@@ -8104,7 +8105,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 「借出期间再次取表」自锁。`Arc` 克隆是常数成本，且允许在持表期间继续写缓存。
     fn assoc_tables(&self, all: &[Arc<Memory>]) -> std::sync::Arc<AssocTables> {
         let version = self.cache.data_version();
-        if let Some(cached) = self.assoc_tables_cache.lock().unwrap().as_ref() {
+        if let Some(cached) = self.assoc_tables_cache.lock_recover().as_ref() {
             if cached.version == version {
                 return std::sync::Arc::clone(cached);
             }
@@ -8147,7 +8148,7 @@ impl<P: Persistence> MemoryStore<P> {
                 artifact_tabs: self.artifact_tables(all),
             }
         });
-        *self.assoc_tables_cache.lock().unwrap() = Some(std::sync::Arc::clone(&built));
+        *self.assoc_tables_cache.lock_recover() = Some(std::sync::Arc::clone(&built));
         built
     }
 
@@ -8158,7 +8159,7 @@ impl<P: Persistence> MemoryStore<P> {
     /// 只有正文真正变化的那几条会重新抽取。
     fn artifact_tables(&self, all: &[Arc<Memory>]) -> ArtifactTables {
         let started = std::time::Instant::now();
-        let mut cache = self.artifact_cache.lock().unwrap();
+        let mut cache = self.artifact_cache.lock_recover();
         let (tables, hits) = build_artifact_tables(all, &mut cache);
         if std::env::var("LRC_TIMING")
             .map(|v| v == "1")
@@ -9434,7 +9435,7 @@ impl<P: Persistence> MemoryStore<P> {
         //    因为符号层边**本就不该**由本段写入（它有自己的写入口
         //    `/v1/memories/external-edge`）。
         // ② 显式跳过自指，并**说明为什么**——避免下一位读者以为漏了 `evolved_from`。
-        if self.graph_store.read().unwrap().is_some() {
+        if self.graph_store.read_recover().is_some() {
             let mut pending: Vec<(String, String, EdgeType, f32)> = Vec::with_capacity(out.len());
             for a in &out {
                 // ★只写记录层：符号层边已在图中（本段是从图里读出来的）
@@ -9524,7 +9525,7 @@ impl<P: Persistence> MemoryStore<P> {
         //   **尾部**（纯记录层条目）等量让位。
         //   ⇒ 并入 0 条则让位 0 次（无收益必无损失）；有并入才让位（不空占席位）。
         let mut sym_merged: Vec<AssociatedMemory> = Vec::new();
-        let graph_guard = self.graph_store.read().unwrap();
+        let graph_guard = self.graph_store.read_recover();
         if let Some(graph) = graph_guard.as_ref() {
             // 只取种子节点**直接相邻**的边：多跳留给下次检索，
             // 避免一次检索把所有可达节点都拉进来（CP 成本 + 淹没主结果）。
@@ -10139,10 +10140,10 @@ impl<P: Persistence> MemoryStore<P> {
         );
 
         // 合成日志快照
-        let journal_snapshot = self.synthesis_journal.read().unwrap().snapshot();
+        let journal_snapshot = self.synthesis_journal.read_recover().snapshot();
 
         // 调节器状态
-        let regulator_state = self.dao_regulator.read().unwrap().get_state();
+        let regulator_state = self.dao_regulator.read_recover().get_state();
 
         // 低质量合成记忆数
         let low_quality = self
@@ -10153,10 +10154,10 @@ impl<P: Persistence> MemoryStore<P> {
             .len();
 
         // 垃圾回收器统计（质疑五：运维可观测性）
-        let gc_stats = self.memory_gc.read().unwrap().get_stats();
+        let gc_stats = self.memory_gc.read_recover().get_stats();
 
         // 用户反馈统计（质疑五：运维可观测性）
-        let feedback_stats = self.user_feedback.read().unwrap().get_stats();
+        let feedback_stats = self.user_feedback.read_recover().get_stats();
 
         // 复杂度预算（质疑五·终极：防止系统超出人类可理解范围）
         // 每次生成健康报告时更新复杂度预算，确保指标反映当前状态
@@ -10169,7 +10170,7 @@ impl<P: Persistence> MemoryStore<P> {
             .map(|c| c.depth)
             .max()
             .unwrap_or(5);
-        self.complexity_budget.write().unwrap().update(
+        self.complexity_budget.write_recover().update(
             20, // 核心模块数（src/engine/*.rs + src/memory_store.rs + src/memory_types.rs）
             self.count_public_api_surface(),
             self.count_cross_module_dependencies(),
@@ -10196,8 +10197,8 @@ impl<P: Persistence> MemoryStore<P> {
             bagua_distribution,
             gc_stats,
             feedback_stats,
-            self.complexity_budget.read().unwrap().clone(),
-            &mut self.hint_escalation.write().unwrap(),
+            self.complexity_budget.read_recover().clone(),
+            &mut self.hint_escalation.write_recover(),
             // v0.5.5 P1-1：传入 LLM 配置状态，LLM 配置后编码器不再视为降级
             llm_configured,
         ))
@@ -10415,9 +10416,9 @@ impl<P: Persistence> MemoryStore<P> {
             avg_deviation,
             &bagua_counts,
         );
-        let journal_snapshot = self.synthesis_journal.read().unwrap().snapshot();
-        let feedback_stats = self.user_feedback.read().unwrap().stats();
-        let regulator_state = self.dao_regulator.read().unwrap().get_state();
+        let journal_snapshot = self.synthesis_journal.read_recover().snapshot();
+        let feedback_stats = self.user_feedback.read_recover().stats();
+        let regulator_state = self.dao_regulator.read_recover().get_state();
 
         // 计算综合健康评分
         let bagua_health = (snapshot.bagua_entropy / 3.0).min(1.0);
@@ -10462,11 +10463,11 @@ impl<P: Persistence> MemoryStore<P> {
         };
 
         // 审计状态
-        let audit_chain_verification = self.audit_trail.read().unwrap().verify_integrity();
+        let audit_chain_verification = self.audit_trail.read_recover().verify_integrity();
         let audit_chain_valid = audit_chain_verification.is_valid;
 
         // 灾难性事件
-        let catastrophic_events = self.dao_regulator.read().unwrap().get_catastrophic_events();
+        let catastrophic_events = self.dao_regulator.read_recover().get_catastrophic_events();
         let catastrophic_event_count = catastrophic_events.len();
         let last_catastrophic_event = catastrophic_events.last().map(|e| e.diagnosis.clone());
 
@@ -10488,8 +10489,8 @@ impl<P: Persistence> MemoryStore<P> {
                 .read()
                 .unwrap()
                 .information_gain_threshold,
-            threshold_baseline: self.dao_regulator.read().unwrap().threshold_baseline(),
-            threshold_ema: self.dao_regulator.read().unwrap().threshold_ema(),
+            threshold_baseline: self.dao_regulator.read_recover().threshold_baseline(),
+            threshold_ema: self.dao_regulator.read_recover().threshold_ema(),
             synthesis_min_cluster: self
                 .synthesis_min_cluster
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -10504,13 +10505,13 @@ impl<P: Persistence> MemoryStore<P> {
                 .read()
                 .unwrap()
                 .is_implicit_feedback_enabled(),
-            consent_granted: self.user_feedback.read().unwrap().is_consent_granted(),
-            total_audit_events: self.audit_trail.read().unwrap().total_events(),
+            consent_granted: self.user_feedback.read_recover().is_consent_granted(),
+            total_audit_events: self.audit_trail.read_recover().total_events(),
             audit_chain_valid,
-            audit_persistence_enabled: self.audit_trail.read().unwrap().has_persistence(),
-            audit_seal_verified: self.audit_trail.read().unwrap().seal_verified(),
+            audit_persistence_enabled: self.audit_trail.read_recover().has_persistence(),
+            audit_seal_verified: self.audit_trail.read_recover().seal_verified(),
             gc_pending: self.gc_pending.load(std::sync::atomic::Ordering::Relaxed),
-            gc_last_run_ms: self.memory_gc.read().unwrap().last_run_ms(),
+            gc_last_run_ms: self.memory_gc.read_recover().last_run_ms(),
             synthesis_pending: self
                 .synthesis_pending
                 .load(std::sync::atomic::Ordering::Relaxed), // v0.5.4
@@ -10519,7 +10520,7 @@ impl<P: Persistence> MemoryStore<P> {
             total_memories: total,
             active_memories: active,
             expired_memories: expired,
-            decay_rate: self.decay_config.read().unwrap().decay_rate,
+            decay_rate: self.decay_config.read_recover().decay_rate,
         }
     }
 }

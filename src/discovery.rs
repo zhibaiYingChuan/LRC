@@ -861,6 +861,7 @@ pub fn record_feedback_and_save(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_ext::LockExt;
     use crate::memory_store::MemoryStore;
     use crate::memory_types::{Importance, Memory, MemoryType};
     use tempfile::TempDir;
@@ -972,11 +973,11 @@ mod tests {
             ))
             .expect("应成功记住");
 
-        let before = store.memory_state_machine.read().unwrap().snapshot();
+        let before = store.memory_state_machine.read_recover().snapshot();
         let mut filter = RecallFilter::new();
         filter.read_only = true;
         let _ = store.recall("离", &filter).expect("只读检索应成功");
-        let after = store.memory_state_machine.read().unwrap().snapshot();
+        let after = store.memory_state_machine.read_recover().snapshot();
 
         assert_eq!(
             format!("{:?}", before),
@@ -1003,11 +1004,11 @@ mod tests {
             ))
             .expect("应成功记住");
 
-        let before = store.memory_state_machine.read().unwrap().snapshot();
+        let before = store.memory_state_machine.read_recover().snapshot();
         let _ = store
             .recall("离", &RecallFilter::new())
             .expect("检索应成功");
-        let after = store.memory_state_machine.read().unwrap().snapshot();
+        let after = store.memory_state_machine.read_recover().snapshot();
 
         assert_ne!(
             format!("{:?}", before),

@@ -754,6 +754,7 @@ impl DefaultConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_ext::MutexExt;
 
     /// 测试: data_dir 不存在时自动创建并获取锁
     #[test]
@@ -933,7 +934,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 barrier.wait();
                 let result = SingletonLock::acquire(data_dir.as_ref(), 1);
-                results.lock().unwrap().push(result.is_ok());
+                results.lock_recover().push(result.is_ok());
                 result
             }));
         }

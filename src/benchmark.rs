@@ -8,6 +8,7 @@
 //! 道枢映射：中宫（五）— 统摄八方，基准测试如中宫之统摄
 //! ============================================================
 
+use crate::lock_ext::LockExt;
 use std::time::Instant;
 use tempfile::TempDir;
 
@@ -595,13 +596,13 @@ pub fn run_benchmark_l3_audit_tamper() -> Result<BenchmarkResult, BenchmarkError
     m2.privacy_level = PrivacyLevel::Global;
     store.remember(m1)?;
     store.remember(m2)?;
-    let total = store.audit_trail.read().unwrap().total_count();
-    let integrity = store.audit_trail.read().unwrap().verify_integrity();
-    let anchors = store.audit_trail.read().unwrap().get_anchors().to_vec();
+    let total = store.audit_trail.read_recover().total_count();
+    let integrity = store.audit_trail.read_recover().verify_integrity();
+    let anchors = store.audit_trail.read_recover().get_anchors().to_vec();
     let anchor_valid = if anchors.is_empty() {
         true
     } else {
-        store.audit_trail.read().unwrap().verify_anchor_chain()
+        store.audit_trail.read_recover().verify_anchor_chain()
     };
     let passed = integrity.is_valid && anchor_valid;
     let score = if passed { 1.0 } else { 0.5 };
@@ -714,7 +715,7 @@ pub fn run_benchmark_l3_complexity_redline() -> Result<BenchmarkResult, Benchmar
         mem.privacy_level = PrivacyLevel::Global;
         store.remember(mem)?;
     }
-    let redline = store.complexity_budget.read().unwrap().red_line_check();
+    let redline = store.complexity_budget.read_recover().red_line_check();
     let score = store
         .complexity_budget
         .read()

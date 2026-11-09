@@ -224,6 +224,13 @@ pub mod model_ids;
 ///   四处各自手写的"临时文件 + rename"实现为唯一实现。
 pub mod atomic_file;
 
+/// 中毒容忍的锁访问扩展（Layer 1）
+///
+/// 统一 `RwLock`/`Mutex` 的中毒恢复策略：持锁线程 panic 后锁永久中毒，
+/// 若继续 `.unwrap()` 会把一次局部故障放大为"该锁相关功能全挂"。
+/// 本模块把恢复策略收敛为一处定义，全项目统一使用。
+pub mod lock_ext;
+
 /// 记忆联想状态机（Layer 1）
 ///
 /// v0.9.7 修复（GLOBAL_CODE_REVIEW_REPORT P0-2「依赖倒置 Layer 1 → Layer 2」）：

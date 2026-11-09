@@ -31,6 +31,7 @@
 //!   绝不混用不同向量空间的分值。
 //! - **原子落盘**：任何时刻崩溃都不会留下半个文件（`write_atomic`）。
 
+use crate::lock_ext::LockExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -836,7 +837,7 @@ pub fn init(
     }
     // 待回填 = 快照中尚未索引的记忆
     let pending: Vec<(String, String)> = {
-        let index = service.index.read().expect("语义索引读锁");
+        let index = service.index.read_recover();
         snapshot
             .into_iter()
             .filter(|(id, _)| index.get(id).is_none())

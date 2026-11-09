@@ -20,6 +20,7 @@
 //!   GET  /v1/code/search            — 代码库搜索（查询参数: query, top_k, keywords）
 
 use crate::engine::audit_trail::{AuditEvent, AuditEventType, AuditQuery};
+use crate::lock_ext::LockExt;
 // v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：内部闭包/辅助函数错误收敛为 LrcError
 #[cfg(not(feature = "ml"))]
 use crate::engine::luoshu_encoder::LuoShuEncoder as HybridLuoShuEncoder;
@@ -1334,7 +1335,7 @@ fn run_association_explore(
             width,
             nodes,
             edges,
-            trail: store.memory_state_machine.read().unwrap().snapshot().trail,
+            trail: store.memory_state_machine.read_recover().snapshot().trail,
             total_expanded,
             interrupted,
             // 连起点都召不回（召回为空，或没有候选通过根节点实质共鸣门禁），
@@ -1423,7 +1424,7 @@ fn run_association_explore(
     // 关闭时为空表，候选顺序与现状逐字节一致（零影响承诺）。
     let edge_adjust: std::collections::HashMap<(String, String), f32> =
         if assoc_edge_feedback_enabled() {
-            store.user_feedback.read().unwrap().get_edge_adjustments()
+            store.user_feedback.read_recover().get_edge_adjustments()
         } else {
             std::collections::HashMap::new()
         };
@@ -1610,7 +1611,7 @@ fn run_association_explore(
         width,
         nodes,
         edges,
-        trail: store.memory_state_machine.read().unwrap().snapshot().trail,
+        trail: store.memory_state_machine.read_recover().snapshot().trail,
         total_expanded,
         interrupted,
         weak_match,
@@ -3327,7 +3328,7 @@ pub fn build_v1_router_with_trust(
                                 explanation_items.len().to_string(),
                             );
                             let state_snapshot =
-                                store.memory_state_machine.read().unwrap().snapshot();
+                                store.memory_state_machine.read_recover().snapshot();
                             let __t_snap = __t0.elapsed();
                             let mut regression_evidence = fast_result.regression_evidence.clone();
                             for (id, evidence) in &deep_result.regression_evidence {
@@ -3894,7 +3895,7 @@ pub fn build_v1_router_with_trust(
                                     "query".to_string(),
                                     query.unwrap_or_default(),
                                 );
-                                store.read().await.audit_trail.write().unwrap().record(
+                                store.read().await.audit_trail.write_recover().record(
                                     AuditEventType::AssociationConfirmed,
                                     format!("用户确认联想：「{}」", memory_id),
                                     "用户在联想探索中确认该记忆与意图相关，写入活跃锚点".to_string(),
@@ -4144,7 +4145,7 @@ pub fn build_v1_router_with_trust(
                                     status: status.to_string(),
                                     // P1 调节器心跳：随 dao 指标一起暴露（前端 loadDaoMetrics 直接读取）
                                     regulator_heartbeat: Some(
-                                        store.regulator_heartbeat.read().unwrap().clone(),
+                                        store.regulator_heartbeat.read_recover().clone(),
                                     ),
                                 },
                                 raw: DaoMetricsRaw {
@@ -4222,7 +4223,7 @@ pub fn build_v1_router_with_trust(
                                 // 前端系统状态卡据此展示"调节器心跳"（最近运行时间/最近动作）
                                 obj.insert(
                                     "regulator_heartbeat".to_string(),
-                                    serde_json::to_value(&*store.regulator_heartbeat.read().unwrap())
+                                    serde_json::to_value(&*store.regulator_heartbeat.read_recover())
                                         .unwrap_or_else(|_| serde_json::json!({})),
                                 );
                             }
@@ -4262,15 +4263,15 @@ pub fn build_v1_router_with_trust(
                         Ok(report) => {
                             // 补充调节器耦合趋势分析（仅详细端点提供）
                             let coupling_trend =
-                                store.dao_regulator.read().unwrap().analyze_coupling_trend();
+                                store.dao_regulator.read_recover().analyze_coupling_trend();
                             let catastrophic_events = store
                                 .dao_regulator
                                 .read()
                                 .unwrap()
                                 .get_catastrophic_events();
-                            let gc_candidates = store.memory_gc.read().unwrap().get_candidates();
+                            let gc_candidates = store.memory_gc.read_recover().get_candidates();
                             let pending_actions =
-                                store.user_feedback.read().unwrap().get_pending_actions();
+                                store.user_feedback.read_recover().get_pending_actions();
 
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                                 "health": report,
@@ -4541,7 +4542,7 @@ pub fn build_v1_router_with_trust(
                                     )
                             };
 
-                            let stats = store.user_feedback.read().unwrap().get_stats();
+                            let stats = store.user_feedback.read_recover().get_stats();
 
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                                 "success": true,
@@ -4589,7 +4590,7 @@ pub fn build_v1_router_with_trust(
                 async move {
                     let store = store.read().await;
 
-                    let stats = store.user_feedback.read().unwrap().get_association_stats();
+                    let stats = store.user_feedback.read_recover().get_association_stats();
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "total": stats.len(),
                         "stats": stats,
@@ -4618,7 +4619,7 @@ pub fn build_v1_router_with_trust(
                         memory_id: None,
                         limit: Some(1000),
                     };
-                    let audit_guard = store.audit_trail.read().unwrap();
+                    let audit_guard = store.audit_trail.read_recover();
                     let events = audit_guard.query(&q);
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
                         aggregate_association_activity(&events),
@@ -4645,7 +4646,7 @@ pub fn build_v1_router_with_trust(
                         event_types: Some(vec![AuditEventType::RetrievalExecuted]),
                         memory_id: None, limit: Some(1000),
                     };
-                    let audit_guard = store.audit_trail.read().unwrap();
+                    let audit_guard = store.audit_trail.read_recover();
                     let events = audit_guard.query(&query);
                     let filtered: Vec<&AuditEvent> = events.into_iter().filter(|event| {
                         let trail_len = event.metadata.get("trail").and_then(|v| serde_json::from_str::<Vec<serde_json::Value>>(v).ok()).map(|v| v.len()).unwrap_or(0);
@@ -4700,7 +4701,7 @@ pub fn build_v1_router_with_trust(
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "success": true,
                         "cleared": hidden,
-                        "hidden_total": store.audit_trail.read().unwrap().hidden_count(),
+                        "hidden_total": store.audit_trail.read_recover().hidden_count(),
                         "message": "联想记录已隐藏（审计完整性不受影响，重启后仍不显示）"
                     })))
                 }
@@ -5198,7 +5199,7 @@ pub fn build_v1_router_with_trust(
                         limit,
                     };
 
-                    let audit_guard = store.audit_trail.read().unwrap();
+                    let audit_guard = store.audit_trail.read_recover();
                     let events = audit_guard.query(&query);
                     let stats = audit_guard.type_statistics();
 
@@ -6490,7 +6491,7 @@ pub fn build_v1_router_with_trust(
                 let store = store.clone();
                 async move {
                     let store = store.read().await;
-                    let audit_guard = store.audit_trail.read().unwrap();
+                    let audit_guard = store.audit_trail.read_recover();
                     let total_events = audit_guard.total_count();
                     let integrity = audit_guard.verify_integrity();
                     let anchors = audit_guard.get_anchors();
@@ -6524,7 +6525,7 @@ pub fn build_v1_router_with_trust(
                     let health = store.health_report().ok();
                     let dao_snapshot = store.dao_metrics_snapshot().ok();
                     let stats = store.stats().ok();
-                    let audit_stats = store.audit_trail.read().unwrap().type_statistics();
+                    let audit_stats = store.audit_trail.read_recover().type_statistics();
 
                     // 生成船长日志报告
                     let mut report = String::new();
@@ -6887,9 +6888,9 @@ pub fn build_v1_router_with_trust(
                 async move {
                     let store = store.write().await;
 
-                    let was_frozen = store.dao_regulator.read().unwrap().is_frozen();
+                    let was_frozen = store.dao_regulator.read_recover().is_frozen();
                     if was_frozen {
-                        store.dao_regulator.write().unwrap().unfreeze();
+                        store.dao_regulator.write_recover().unfreeze();
                         // 记录审计：调节器手动解冻（用户干预行为的可回溯记录）
                         store.record_audit(
                             AuditEventType::RegulatorUnfrozen,
@@ -6899,7 +6900,7 @@ pub fn build_v1_router_with_trust(
                         );
                     }
 
-                    let state = store.dao_regulator.read().unwrap().get_state();
+                    let state = store.dao_regulator.read_recover().get_state();
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "ok": true,
                         "was_frozen": was_frozen,

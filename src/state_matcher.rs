@@ -1485,6 +1485,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lock_ext::LockExt;
     use crate::memory_store::MemoryStore;
     use crate::memory_types::{Importance, Memory, MemoryType};
     use tempfile::TempDir;
@@ -1823,12 +1824,12 @@ mod tests {
             .expect("应成功记住");
         // 先用一次正常 recall 建立活跃上下文（否则活跃集本就为空，对照无意义）
         let _ = store.recall("坎域记忆", &crate::memory_store_types::RecallFilter::new());
-        let before = store.memory_state_machine.read().unwrap().active_ids(64);
+        let before = store.memory_state_machine.read_recover().active_ids(64);
 
         let snap = snapshot_with(dist_focused(5, 0.9), false);
         let _ = run_state_driven_cycle(&store, &snap, dir.path());
 
-        let after = store.memory_state_machine.read().unwrap().active_ids(64);
+        let after = store.memory_state_machine.read_recover().active_ids(64);
         assert_eq!(
             before, after,
             "原则一：状态驱动匹配绝不写回状态机（本模块不调用 recall）"

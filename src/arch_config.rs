@@ -11,6 +11,7 @@
 //!
 //! 持久化格式：JSON 文件，存储在数据目录下的 `arch_config.json`
 
+use crate::lock_ext::LockExt;
 use crate::memory_types::DecayConfig;
 use serde::{Deserialize, Serialize};
 
@@ -215,7 +216,7 @@ impl ArchConfig {
         store: &mut crate::memory_store::MemoryStore<P>,
     ) {
         // 衰减曲线
-        *store.decay_config.write().unwrap() = self.decay.clone();
+        *store.decay_config.write_recover() = self.decay.clone();
 
         // 合成参数
         store.synthesis_min_cluster.store(
@@ -295,7 +296,7 @@ mod tests {
         };
 
         config.apply_to_store(&mut store);
-        assert_eq!(store.decay_config.read().unwrap().decay_rate, 0.15);
+        assert_eq!(store.decay_config.read_recover().decay_rate, 0.15);
         assert_eq!(
             store
                 .synthesis_min_cluster

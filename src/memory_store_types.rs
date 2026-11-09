@@ -391,7 +391,19 @@ pub struct RecallResult {
 
 impl RecallResult {
     /// 构造无回归证据的结果（兼容旧调用点）
+    ///
+    /// # 不变量
+    ///
+    /// `memories` 与 `scores` **必须等长**。下游多处用 `memories.into_iter().zip(scores)`
+    /// 合并两者（如 `v1_api` 的联想/排序路径），若长度不一致，`zip` 会**静默截断**——
+    /// 多出的记忆被丢弃且无任何报错。此处用 `debug_assert` 在测试/CI 中兜住该回归
+    /// （release 零成本）。
     pub fn basic(memories: Vec<Memory>, scores: Vec<f32>, total: usize) -> Self {
+        debug_assert_eq!(
+            memories.len(),
+            scores.len(),
+            "RecallResult 不变量：memories 与 scores 必须等长（否则下游 zip 静默截断）"
+        );
         Self {
             memories,
             scores,
