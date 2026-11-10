@@ -180,7 +180,14 @@ desktop/src-tauri/icons/Square*.png
 desktop/src-tauri/icons/StoreLogo.png
 desktop/src-tauri/icons/android/
 desktop/src-tauri/icons/ios/
-desktop/src-tauri/icons/icon.icns
+# ★v0.10.4：`icon.icns` **必须入库**（此前被误列为"生成产物"而忽略）。
+#
+# tauri-bundler 的行为：`bundle.icon` 列表里若有 `.icns` 就直接使用，
+# 否则用 PNG 现场生成。忽略它 ⇒ CI 每次都要现生成，而现场生成对源 PNG
+# 的尺寸/格式非常敏感——v0.10.4 更换品牌图标后 macOS 打包即报
+# `Failed to create app icon: No matching IconType`，整条 release 被阻断
+# （Windows/Linux 仍成功，因为只有 macOS 需要 icns）。
+# macOS 安装包离开它无法构建，它不是可再生的中间产物。
 desktop/src-tauri/icons/64x64.png
 
 # 根目录图标生成工具（开发者本地使用，不交付用户）
