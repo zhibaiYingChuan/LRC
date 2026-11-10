@@ -2899,23 +2899,55 @@ pub fn build_v1_router_with_trust(
                             .synthesis_pending
                             .swap(false, std::sync::atomic::Ordering::AcqRel)
                     };
-                    // ★v0.10.4：本轮消费了增量标记后，任何失败出口都必须恢复它，
-                    // 否则"快照之后才写入的那批记忆"会永久失去被合成的机会。
-                    // 为免在每个分支重复，这里统一用宏包裹错误出口。
-                    macro_rules! fail_with_pending_restore {
-                        ($err:expr) => {{
-                            if consumed_pending {
+                    // ★v0.10.4：RAII 守卫统一负责"失败/取消时还原增量标记"。
+                    //
+                    // 为什么不用逐个分支写 `return Err(...)`：
+                    //   · 外层 TimeoutLayer(30s) 到点会直接 **drop 本 future**，
+                    //     此时任何 `return` 语句都不会执行 ⇒ 标记永久丢失。
+                    //   · 分支繁多（快照失败 / 取消 / panic / 超时 / `?` 传播），
+                    //     逐个补漏容易再次遗漏。
+                    //
+                    // Drop 里不能 `await`，故 clone Arc 后 spawn 一个小任务去还原；
+                    // 正常完成时 `armed = false`，不触发。
+                    struct PendingRestoreGuard {
+                        store: SharedStore,
+                        armed: bool,
+                    }
+                    impl Drop for PendingRestoreGuard {
+                        fn drop(&mut self) {
+                            if !self.armed {
+                                return;
+                            }
+                            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                                // 无运行时（极端情况）：只能放弃，下一轮写入会重新置位
+                                return;
+                            };
+                            let store = self.store.clone();
+                            handle.spawn(async move {
                                 let s = store.read().await;
                                 s.synthesis_pending
                                     .store(true, std::sync::atomic::Ordering::Release);
-                            }
-                            return Err($err);
-                        }};
+                            });
+                        }
                     }
+                    let mut pending_guard = PendingRestoreGuard {
+                        store: store.clone(),
+                        armed: consumed_pending,
+                    };
                     let __t_pre_snap = std::time::Instant::now();
-                    let snapshot = {
+                    // ★v0.10.4：**先取快照结果、释放读锁，再处理错误**。
+                    //
+                    // 修前把 `fail_with_pending_restore!` 直接写在持锁块内，宏里的
+                    // `store.read().await` 会与块内的读守卫**叠加在同一把锁上**。
+                    // tokio `RwLock` 是写优先（fair）：只要有写者在排队，第二次读
+                    // 就会永久阻塞，而第一个守卫还在作用域内不会释放 ⇒ 自死锁。
+                    // 后果：存储异常时该请求挂到外层超时，且标记永不还原。
+                    //
+                    // 修法：块内只做快照并返回 Result，锁在块结束时释放，
+                    // 错误分支（含宏）在锁外执行。
+                    let snap_result = {
                         let store = store.read().await;
-                        let snap_result = if scoped_inline_synthesis {
+                        if scoped_inline_synthesis {
                             // 分区内合成（F1）：~65 条/用户 ⇒ 平方聚类可忽略；
                             // 详见 `MemoryStore::synthesis_snapshot_scoped` 的实测依据。
                             store.synthesis_snapshot_scoped(
@@ -2926,13 +2958,18 @@ pub fn build_v1_router_with_trust(
                             )
                         } else {
                             store.synthesis_snapshot()
-                        };
-                        match snap_result {
-                            Ok(s) => s,
-                            Err(e) => fail_with_pending_restore!((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                                "error": "consolidation_failed",
-                                "message": format!("合成快照失败: {}", e)
-                            })))),
+                        }
+                    };
+                    let snapshot = match snap_result {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "consolidation_failed",
+                                    "message": format!("合成快照失败: {}", e)
+                                })),
+                            ))
                         }
                     };
                     let synthesized_plan = {
@@ -2975,7 +3012,7 @@ pub fn build_v1_router_with_trust(
                             Ok(Ok((_plan, true))) => {
                                 // 被取消：计划不完整，绝不写回
                                 eprintln!("[v1/consolidate] 合成计算被协作式取消，本轮结果已丢弃");
-                                fail_with_pending_restore!((
+                                Err((
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     Json(serde_json::json!({
                                         "error": "consolidation_cancelled",
@@ -2985,7 +3022,7 @@ pub fn build_v1_router_with_trust(
                             }
                             Ok(Err(e)) => {
                                 eprintln!("[v1/consolidate] spawn_blocking panic: {}", e);
-                                fail_with_pending_restore!((
+                                Err((
                                     StatusCode::INTERNAL_SERVER_ERROR,
                                     Json(serde_json::json!({
                                         "error": "consolidation_internal_error",
@@ -3000,7 +3037,7 @@ pub fn build_v1_router_with_trust(
                                     "[v1/consolidate] 合成计算超时（60s），已通知取消；\
                                      底层阻塞任务将在下一个检查点提前返回"
                                 );
-                                fail_with_pending_restore!((
+                                Err((
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     Json(serde_json::json!({
                                         "error": "consolidation_timeout",
@@ -3014,6 +3051,8 @@ pub fn build_v1_router_with_trust(
                         let store = store.write().await;
                         store.apply_synthesis_plan(synthesized_plan)
                     };
+                    // 本轮合成已完整完成 ⇒ 解除守卫，不再还原标记。
+                    pending_guard.armed = false;
 
                     // Phase 3：重新持锁，取合成摘要与总数（**O(1)/O(N) 无深拷贝**）
                     //

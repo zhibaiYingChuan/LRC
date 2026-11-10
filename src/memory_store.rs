@@ -4079,6 +4079,17 @@ impl<P: Persistence> MemoryStore<P> {
         // 批量写入磁盘（单次序列化）
         if let Err(e) = self.persistence.save_memories(&batch) {
             eprintln!("[LRC·合成] 批量写入合成记忆失败: {}", e);
+            // ═══ v0.10.4：写回失败必须**重新置位**待合成标记 ═══
+            //
+            // 本函数返回 `usize`，失败与"无产物"都返回 0，调用方无法区分
+            // （`consolidation.rs` 把 `Ok(0)` 当成功 ⇒ `synthesis_completed = true`
+            //   ⇒ 不再恢复本轮在周期开始时消费掉的增量标记）。
+            // 于是这批"取走但没写成"的增量要等到**再下一次写入**才有机会重试。
+            //
+            // 在源头置位是幂等且安全的：本函数不清标记（消费权在调用方），
+            // 只在"确实有产物但没写成"时把标记重新点亮，交由下一轮重试。
+            self.synthesis_pending
+                .store(true, std::sync::atomic::Ordering::Release);
             return 0;
         }
 
@@ -4237,8 +4248,18 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 返回合成的记忆数量，无待合成任务时返回 0。
     pub fn run_pending_synthesis(&self) -> Result<usize, PersistenceError> {
-        // 原子 CAS：如果当前值为 true，设为 false 并返回 Ok(true) 表示"本线程获取执行权"
-        // 如果当前值已为 false，返回 Err(...) 表示"已有其他线程在执行或无需执行"
+        // ═══ v0.10.4：CAS 只做**互斥门闸**，不承担"消费"语义 ═══
+        //
+        // 修前：这里 `compare_exchange(true → false)` 先把标记清掉，再调
+        // `luoshu_synthesize()`；而后者内部也会 `swap(false)` 取增量 ——
+        // 此时必然读到 false ⇒ `consumed = false` ⇒ 它的失败恢复分支不生效。
+        // 于是"快照失败"时这批增量永久丢失（与 v1_api 同类缺陷）。
+        //
+        // 修法：CAS 仍用于 Leader Election（保证并发调用只有一个执行者），
+        // 但**立刻把标记还回去**，让真正拥有整轮周期的 `luoshu_synthesize`
+        // 去消费与恢复。两次原子操作之间无 await、无锁，不存在可观测的窗口
+        // 影响正确性（并发者若在此窗口内写入，其 `store(true)` 会被我们的
+        // `store(true)` 覆盖为 true —— 语义一致，都是"有待合成"）。
         use std::sync::atomic::Ordering;
         if self
             .synthesis_pending
@@ -4248,6 +4269,8 @@ impl<P: Persistence> MemoryStore<P> {
             // 其他线程已获取执行权，或当前无待合成任务
             return Ok(0);
         }
+        // 归还标记，交由 `luoshu_synthesize` 统一消费/恢复
+        self.synthesis_pending.store(true, Ordering::Release);
         self.luoshu_synthesize()
     }
 
@@ -4737,8 +4760,7 @@ impl<P: Persistence> MemoryStore<P> {
         let (gc_stats, to_delete) = self.memory_gc.write_recover().collect_garbage(&snapshots);
         // 记录性能基线（质疑三：动态警告阈值，替代固定 500ms）
         self.memory_gc
-            .write()
-            .unwrap()
+            .write_recover()
             .record_timing(elapsed_ms, snapshots.len());
         // 阶段三：执行删除（可变借用 self.persistence）
         for id in &to_delete {
@@ -10513,8 +10535,7 @@ impl<P: Persistence> MemoryStore<P> {
             coupling_score: regulator_state.coupling_score,
             information_gain_threshold: self
                 .dao_regulator
-                .read()
-                .unwrap()
+                .read_recover()
                 .information_gain_threshold,
             threshold_baseline: self.dao_regulator.read_recover().threshold_baseline(),
             threshold_ema: self.dao_regulator.read_recover().threshold_ema(),
@@ -10529,8 +10550,7 @@ impl<P: Persistence> MemoryStore<P> {
             positive_feedback_ratio: feedback_stats.positive_ratio,
             implicit_feedback_enabled: self
                 .user_feedback
-                .read()
-                .unwrap()
+                .read_recover()
                 .is_implicit_feedback_enabled(),
             consent_granted: self.user_feedback.read_recover().is_consent_granted(),
             total_audit_events: self.audit_trail.read_recover().total_events(),

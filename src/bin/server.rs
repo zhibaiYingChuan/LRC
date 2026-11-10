@@ -1079,12 +1079,28 @@ async fn try_run() -> LrcResult<()> {
     }
 
     // v0.5.5 P1-1：设置 MemoryStore 的 LLM 配置状态
-    // LLM 配置后替代本地 ML 模型提供语义理解能力，编码器不再视为"降级"
+    // 该标志只影响健康检查里的"编码器是否降级"判定（llm_configured=true
+    // 时强制不降级），**不改变向量编码行为** —— 见下方文案说明。
     {
         let store_guard = memory_store.write().await;
         store_guard.set_llm_configured(llm_api_configured);
+        // ═══ v0.10.4：文案必须与事实一致 ═══
+        //
+        // 修前此处打印「编码器模式: LLM 增强模式（语义理解由 LLM 提供）」，
+        // 会让人误以为向量编码改由 LLM 完成。实际 `set_llm_configured(true)`
+        // 只影响 `encoder_degraded` 健康标志（强制不降级），**不改变编码行为**：
+        // 语义向量仍由本地 candle 模型（bge/e5）逐条前向计算。
+        //
+        // LLM 在 LRC 中的职责只有三处，且都与向量编码正交：
+        //   ① 查询翻译（llm_translator）
+        //   ② 结果重排（llm_rerank）
+        //   ③ 结晶时写摘要（consolidation）
         if llm_api_configured {
-            log("  编码器模式: LLM 增强模式（语义理解由 LLM 提供）");
+            let encoder_kind = if ml_loaded { "本地 ML" } else { "基础" };
+            log(&format!(
+                "  编码器模式: {encoder_kind}（向量由本地模型产生）"
+            ));
+            log("  LLM 已配置 → 仅用于查询翻译 / 结果重排，不影响向量编码");
         } else if ml_loaded {
             log("  编码器模式: ML 语义模式（本地模型已加载）");
         } else {

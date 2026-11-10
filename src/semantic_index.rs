@@ -1163,8 +1163,25 @@ fn insert_precomputed(service: &SemanticService, items: &[(String, Vec<f32>)]) -
         if index.get(id).is_some() {
             continue;
         }
+        // ═══ v0.10.4 P0 修复：本路径必须与其它入库路径一样做 L2 归一化 ═══
+        //
+        // `encode_both_batch` 产出的是**原始 pooled 向量**（BERT CLS 池化，范数
+        // 常在 10~30），不是单位向量。而检索侧 `search()` 用的是裸点积
+        // `dot(&q, v)`、`vector_of` 的文档也写明"向量在入库时已归一化"。
+        //
+        // 漏归一化的后果（两条，都是静默的）：
+        //   ① 语义分被 `|v|` 放大 ⇒ 同一查询下，走本路径写入的记忆（短文本）
+        //      分数远高于走 `encode_and_insert` 的长文本，排序失真；
+        //   ② 更严重：`dedup_keep_indices_with`（默认阈值 0.90）用裸点积判近重复，
+        //      `dot(u_un, v_un) = |u||v|cos ≈ 100~900 × cos` ⇒ 任意两条都会被判
+        //      为"重复"而折叠掉，召回集被压成 1 条。
+        //
+        // 对照：`encode_and_insert`（1108 行）与 `enqueue_with_vector`（616 行）
+        // 都已 normalize，唯独本函数遗漏 —— 这是 P3「一次前向双产出」接入时
+        // 新增的第三条入库路径，未同步该契约。
+        let vector = normalize(vector.clone());
         index.insert(id.clone(), vector.clone());
-        new_vectors.push((id.clone(), vector.clone()));
+        new_vectors.push((id.clone(), vector));
         inserted += 1;
     }
     drop(index);
@@ -1257,6 +1274,50 @@ mod tests {
             pending: std::sync::Mutex::new(Vec::new()),
             enabled: true,
         })
+    }
+
+    /// ★v0.10.4 P0 回归：`insert_precomputed` 必须对向量做 L2 归一化。
+    ///
+    /// # 锁住的是什么
+    ///
+    /// `encode_both_batch` 产出的是**原始 pooled 向量**（BERT CLS 池化，范数
+    /// 常在 10~30），不是单位向量。全库检索与近重复折叠都用**裸点积**，
+    /// 契约是"入库即归一化"。本函数是第三条入库路径（P3「一次前向双产出」
+    /// 引入），修前唯独它漏了 normalize。
+    ///
+    /// 后果 ①：语义分被 `|v|` 放大，同查询下短文本记忆分数虚高，排序失真。
+    /// 后果 ②（更严重）：`dedup_keep_indices_with`（阈值 0.90）用裸点积判近重复，
+    ///   `dot(u,v) = |u||v|cos ≈ 100~900 × cos` ⇒ 任意两条都被判"重复"而折叠，
+    ///   召回集被压成 1 条。
+    ///
+    /// **鉴别力**：删掉 `insert_precomputed` 里的 `normalize(vector)`
+    /// ⇒ 本测试断言 `norm ≈ 1.0` 失败。
+    #[test]
+    fn 预编码向量入库时必须归一化() {
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let svc = test_service(dir.path());
+
+        // 构造一个"类 BERT 原始输出"的向量：方向 (3,4)，范数 5
+        let raw = vec![3.0f32, 4.0];
+        let (inserted, failed) = insert_precomputed(&svc, &[("m1".into(), raw)]);
+        assert_eq!(inserted, 1);
+        assert_eq!(failed, 0);
+
+        let v = {
+            let idx = svc.index.read().expect("读索引");
+            idx.get("m1").map(|s| s.to_vec()).expect("应已入库")
+        };
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "★入库向量必须是单位向量（L2 范数 1.0），实际 {norm}。\
+             未归一化会让裸点积语义分虚高、并让 0.90 的近重复折叠误杀全部结果"
+        );
+        // 方向不变：(3,4)/5 = (0.6, 0.8)
+        assert!(
+            (v[0] - 0.6).abs() < 1e-5 && (v[1] - 0.8).abs() < 1e-5,
+            "归一化不得改变方向，实际 {v:?}"
+        );
     }
 
     /// 回归：维度不一致的预编码向量必须计为**失败**，不能当作「已索引跳过」。

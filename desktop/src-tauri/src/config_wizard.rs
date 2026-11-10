@@ -583,12 +583,26 @@ impl WizardState {
         // 我方字段的 JSON 表示（权威来源是本进程内存中的 config）
         let owned = serde_json::to_value(&self.config).map_err(|e| e.to_string())?;
 
-        // 磁盘现有内容：存在且可解析则作为基底，否则以空对象为基底
-        // （解析失败时**不回退到空对象覆盖**，避免把损坏文件上的残留字段一并丢掉；
-        //   此处语义与 load() 的 corrupted 路径一致：宁可重建已知字段也不静默清空）
+        // 磁盘现有内容：存在且可解析则作为基底。
+        //
+        // ★v0.10.4：解析失败时**先备份损坏文件**，再以空对象为基底重建。
+        //
+        // 修前的注释声称"解析失败时不回退到空对象覆盖，避免把损坏文件上的残留
+        // 字段一并丢掉"，但代码实际是 `unwrap_or_else(|_| json!({}))` —— 直接
+        // 以空对象为基底，随后被本进程字段写满并落盘 ⇒ 损坏文件里 sidecar 拥有的
+        // 字段（`rerank_enabled` 等）**永久消失**，且原始内容无从追溯。
+        //
+        // 现在：损坏 ⇒ 复制一份带时间戳的 `.corrupted-<ts>` 备份（尽力而为，
+        // 失败不阻断写入），再重建。这样既能让保存继续完成，又保留取证/恢复能力。
         let mut merged = match std::fs::read_to_string(&self.config_path) {
-            Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-                .unwrap_or_else(|_| serde_json::json!({})),
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) if v.is_object() => v,
+                _ => {
+                    backup_corrupted(&self.config_path);
+                    serde_json::json!({})
+                }
+            },
+            // 文件不存在是正常首次保存；其它 IO 错误同样按空基底处理
             Err(_) => serde_json::json!({}),
         };
 
@@ -613,6 +627,28 @@ impl WizardState {
 
 /// 临时文件名唯一性计数器（`atomic_save` 用）。
 static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 把损坏的配置文件复制为带时间戳的备份（尽力而为，失败不阻断调用方）。
+///
+/// 供 `save()` 在"磁盘内容无法解析"时调用：既避免静默丢弃 sidecar 拥有的字段，
+/// 又给用户/支持人员留下可追溯的原始内容。
+fn backup_corrupted(path: &std::path::Path) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!("corrupted-{ts}.json"));
+    match std::fs::copy(path, &backup) {
+        Ok(_) => tracing::warn!(
+            "[配置向导] wizard.json 解析失败，已备份原文件到 {}",
+            backup.display()
+        ),
+        Err(e) => tracing::warn!(
+            "[配置向导] wizard.json 解析失败，且备份失败（{}）；将以已知字段重建",
+            e
+        ),
+    }
+}
 
 /// 在任意路径上以原子方式写入 JSON 配置。
 ///
