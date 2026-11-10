@@ -4126,10 +4126,18 @@ impl<P: Persistence> MemoryStore<P> {
 
         // v0.5.4 写操作后标记缓存为脏
         self.invalidate_cache();
-        // v0.9.1 三阶段锁解耦：合成写回完成后清除待合成标记，
-        // 由后台结晶流水线的三阶段合成（而非健康检查）负责消费此标记。
-        self.synthesis_pending
-            .store(false, std::sync::atomic::Ordering::Release);
+        // ★v0.10.4：本函数**不再**清除 `synthesis_pending`。
+        //
+        // 它只是 Phase 3 的写回原语（snapshot → 锁外计算 → 写回）。写回时刻
+        // 已经晚于 snapshot，此期间用户可能又写入新记忆（`remember` 置 true）。
+        // 若在写回末尾无条件置 false，这些"快照之后的新增"会被抹掉 ——
+        // 与 v0.9.1 的旧缺陷同类，只是窗口从"整轮"缩到"Phase 2 计算期间"。
+        //
+        // 增量标记的消费权因此**上移到调用方**（谁拥有这一轮 cycle，谁负责消费）：
+        //   · `luoshu_synthesize`（同步整轮 API）→ 自己消费；
+        //   · `/v1/memories/consolidate`（用户显式触发）→ 自己消费；
+        //   · `consolidation.rs` 后台流水线 → 周期开始时 `swap(false)` 消费，
+        //     失败/取消时恢复（见该文件「增量标记的收尾」段落）。
         synthesized
     }
 
@@ -4144,8 +4152,17 @@ impl<P: Persistence> MemoryStore<P> {
     ///
     /// 三阶段锁解耦（v0.9.1）：此兼容接口内部已拆分为 snapshot → plan → apply，
     /// 真正的锁外计算由 consolidation / v1_api 的三阶段调用实现。
+    ///
+    /// ★v0.10.4：本函数是**完整一轮**周期（拥有 snapshot → apply 全过程），
+    /// 故由它自己消费 `synthesis_pending`：开始时 `swap(false)` 取走、失败时恢复。
+    /// 理由见 [`Self::apply_synthesis_plan`] 中「消费权上移」的说明。
     pub fn luoshu_synthesize(&self) -> Result<usize, PersistenceError> {
         let synthesize_start = std::time::Instant::now();
+
+        // 本轮是否消费到增量标记（失败时必须恢复，否则这批新增永久丢失）
+        let consumed = self
+            .synthesis_pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
 
         // 同步引擎配置（确保 consolidation 等外部调用者设置的阈值生效）
         *self.synthesis_engine.write_recover() = SynthesisEngine::new(SynthesisConfig {
@@ -4156,7 +4173,17 @@ impl<P: Persistence> MemoryStore<P> {
         });
 
         // Phase 1：读快照
-        let snapshot = self.synthesis_snapshot()?;
+        let snapshot = match self.synthesis_snapshot() {
+            Ok(s) => s,
+            Err(e) => {
+                // 快照失败 ⇒ 本轮未完成，恢复标记交由下次重试
+                if consumed {
+                    self.synthesis_pending
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                return Err(e);
+            }
+        };
 
         // Phase 2：纯计算（洛书优先，失败降级 Jaccard）
         let engine = SynthesisEngine::new(snapshot.config);

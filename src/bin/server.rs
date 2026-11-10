@@ -1243,13 +1243,27 @@ async fn try_run() -> LrcResult<()> {
         // 使用空数据源：用户通过 HTTP API / MCP 工具直接写入的记忆已在 store 中
         // 结晶流水线仅负责定期执行合成（合并重复记忆）
         let source: Arc<dyn SurfaceMemorySource> = Arc::new(InMemorySource::new("api", vec![]));
-        tokio::spawn(async move {
-            run_consolidation_loop(pipeline, source, consolidation_shutdown_rx).await;
-        });
-        if llm_api.is_configured() {
-            log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，LLM embedding 合成模式）");
+        // ═══ v0.10.4：`--disable-synthesis` 必须**真正停掉后台线程** ═══
+        //
+        // 修前：该开关只设 `auto_synthesize=false`（跳过合成阶段），但
+        // `run_consolidation_loop` 照常每 300 秒唤醒一轮 `run_cycle`，仍会：
+        //   ① 为空数据源做一次拉取；
+        //   ② 进入 `run_cycle_inner` 后克隆全库、跑 O(n²) 聚类前的准备；
+        //   ③ 反复 `store.write().await` 抢写锁，与前台写入/语义编码争 CPU。
+        //
+        // 实测（ML 构建，574 条记忆）：单轮空转 58s，比整实例注入（48s）还长，
+        // 且 500 实例基准要重复 500 次。既然语义上就是"禁用"，线程不该存在。
+        if disable_synthesis {
+            log("   ⚠ 结晶流水线: 未启动（--disable-synthesis，后台线程不创建）");
         } else {
-            log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，本地统计合成模式，建议配置 LLM）");
+            tokio::spawn(async move {
+                run_consolidation_loop(pipeline, source, consolidation_shutdown_rx).await;
+            });
+            if llm_api.is_configured() {
+                log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，LLM embedding 合成模式）");
+            } else {
+                log("[LRC·结晶] 后台结晶流水线已启动（间隔 5 分钟，本地统计合成模式，建议配置 LLM）");
+            }
         }
     }
 

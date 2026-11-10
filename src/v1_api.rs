@@ -2886,6 +2886,32 @@ pub fn build_v1_router_with_trust(
                     };
 
                     // Phase 2：异步超时获取快照，锁外执行 CPU 聚类计算。
+                    //
+                    // ★v0.10.4：在取快照**之前**消费 `synthesis_pending`。
+                    //  `apply_synthesis_plan` 已不再自行清除标记（见其注释），
+                    //  消费权归本 handler。消费点选在 Phase 1 写入之后、快照之前：
+                    //  本轮的写入必被快照包含；快照之后的新写入会由 `remember`
+                    //  重新置 true ⇒ 下一轮再处理，不会丢。
+                    //  失败路径（快照失败/取消/超时/panic）必须恢复标记，见下方 match。
+                    let consumed_pending = {
+                        let store = store.read().await;
+                        store
+                            .synthesis_pending
+                            .swap(false, std::sync::atomic::Ordering::AcqRel)
+                    };
+                    // ★v0.10.4：本轮消费了增量标记后，任何失败出口都必须恢复它，
+                    // 否则"快照之后才写入的那批记忆"会永久失去被合成的机会。
+                    // 为免在每个分支重复，这里统一用宏包裹错误出口。
+                    macro_rules! fail_with_pending_restore {
+                        ($err:expr) => {{
+                            if consumed_pending {
+                                let s = store.read().await;
+                                s.synthesis_pending
+                                    .store(true, std::sync::atomic::Ordering::Release);
+                            }
+                            return Err($err);
+                        }};
+                    }
                     let __t_pre_snap = std::time::Instant::now();
                     let snapshot = {
                         let store = store.read().await;
@@ -2901,11 +2927,13 @@ pub fn build_v1_router_with_trust(
                         } else {
                             store.synthesis_snapshot()
                         };
-                        snap_result
-                            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        match snap_result {
+                            Ok(s) => s,
+                            Err(e) => fail_with_pending_restore!((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                                 "error": "consolidation_failed",
                                 "message": format!("合成快照失败: {}", e)
-                            }))))?
+                            })))),
+                        }
                     };
                     let synthesized_plan = {
                         // v0.9.7 审查修复（GLOBAL_CODE_REVIEW_REPORT P1-3）：
@@ -2947,7 +2975,7 @@ pub fn build_v1_router_with_trust(
                             Ok(Ok((_plan, true))) => {
                                 // 被取消：计划不完整，绝不写回
                                 eprintln!("[v1/consolidate] 合成计算被协作式取消，本轮结果已丢弃");
-                                Err((
+                                fail_with_pending_restore!((
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     Json(serde_json::json!({
                                         "error": "consolidation_cancelled",
@@ -2957,7 +2985,7 @@ pub fn build_v1_router_with_trust(
                             }
                             Ok(Err(e)) => {
                                 eprintln!("[v1/consolidate] spawn_blocking panic: {}", e);
-                                Err((
+                                fail_with_pending_restore!((
                                     StatusCode::INTERNAL_SERVER_ERROR,
                                     Json(serde_json::json!({
                                         "error": "consolidation_internal_error",
@@ -2972,7 +3000,7 @@ pub fn build_v1_router_with_trust(
                                     "[v1/consolidate] 合成计算超时（60s），已通知取消；\
                                      底层阻塞任务将在下一个检查点提前返回"
                                 );
-                                Err((
+                                fail_with_pending_restore!((
                                     StatusCode::SERVICE_UNAVAILABLE,
                                     Json(serde_json::json!({
                                         "error": "consolidation_timeout",

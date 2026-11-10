@@ -977,6 +977,29 @@ fn chunk_text(content: &str) -> Vec<String> {
 ///
 /// 编码器本身 `Sync`（既有 `semantic_similarities_impl` 已用同一范式跨线程
 /// 共享 `&encoder`），故此处直接 `thread::scope` 分片，输出顺序与输入严格一致。
+///
+/// # 并行度上限（v0.10.4：由硬编码 4 改为可配，默认仍为 4）
+///
+/// 原为 `.clamp(1, 4)`。之所以不能简单放到"等于核数"：
+/// candle 的 `forward` 内部还会用 Rayon 再并行（调用方常设
+/// `RAYON_NUM_THREADS=2`），于是 `外部片数 × 内部线程数` 很容易超过物理核数
+/// ⇒ 线程超订，实测反而更慢。
+///
+/// 因此改为环境变量 `LRC_ENCODE_PARALLELISM` 可覆盖，**默认仍为 4**（零行为变更），
+/// 便于在不改代码的前提下按机器实测调优。
+fn encode_parallelism() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    std::env::var("LRC_ENCODE_PARALLELISM")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        // 上限取核数：再多也只是纯超订
+        .map(|v| v.min(cores))
+        .unwrap_or_else(|| cores.clamp(1, 4))
+}
+
 fn encode_windows_parallel(
     encoder: &Arc<crate::engine::luoshu_encoder_ml::HybridLuoShuEncoder>,
     texts: &[String],
@@ -984,10 +1007,7 @@ fn encode_windows_parallel(
     if texts.is_empty() {
         return Some(Vec::new());
     }
-    let parallelism = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .clamp(1, 4);
+    let parallelism = encode_parallelism();
     if parallelism == 1 || texts.len() < 8 {
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         return encoder.encode_embedding_batch(&refs);
@@ -1162,6 +1182,60 @@ mod tests {
 
     fn vec_of(values: &[f32]) -> Vec<f32> {
         values.to_vec()
+    }
+
+    /// ★v0.10.4 回归：`LRC_ENCODE_PARALLELISM` 可覆盖并行度，且必须被核数钳住。
+    ///
+    /// # 锁住的是什么
+    ///
+    /// 修前并行度是硬编码 `.clamp(1, 4)`，6 核机器只能用 4 线程，无法按机器调优。
+    /// 现改为环境变量可覆盖，但**不允许超过物理核数**（超订只会更慢）。
+    ///
+    /// 注意：环境变量是进程级全局，本测试与其它并发测试共享进程，
+    /// 故对 `LRC_ENCODE_PARALLELISM` 的写入必须在本测试结束后还原。
+    /// 为免与其它用例互扰，这里只断言**函数自身的不变量**（返回值 ≥1 且 ≤ 核数），
+    /// 不去断言具体等于某个值。
+    #[test]
+    fn 并行度受环境变量控制且不超过核数() {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        // 未设置：默认路径，必须落在 [1, min(4, cores)]
+        let default_p = encode_parallelism();
+        assert!(default_p >= 1, "并行度至少为 1");
+        assert!(
+            default_p <= cores.min(4),
+            "默认并行度不得超过 min(4, 核数)，实际 {default_p}，核数 {cores}"
+        );
+
+        // 显式设置为一个超大值：必须被核数钳住（不允许超订）
+        // 用 RAII 还原，避免污染同进程的其它用例
+        struct EnvGuard(Option<std::ffi::OsString>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("LRC_ENCODE_PARALLELISM", v),
+                    None => std::env::remove_var("LRC_ENCODE_PARALLELISM"),
+                }
+            }
+        }
+        let _guard = EnvGuard(std::env::var_os("LRC_ENCODE_PARALLELISM"));
+
+        std::env::set_var("LRC_ENCODE_PARALLELISM", "9999");
+        let clamped = encode_parallelism();
+        assert_eq!(
+            clamped, cores,
+            "★超大并行度必须被钳到物理核数（{cores}），否则线程超订反而更慢"
+        );
+
+        // 非法值（0 / 非数字）应回退到默认路径，不得 panic
+        std::env::set_var("LRC_ENCODE_PARALLELISM", "0");
+        let zero = encode_parallelism();
+        assert!(zero >= 1, "非法值 0 必须回退到默认并行度，而不是 0 线程");
+        std::env::set_var("LRC_ENCODE_PARALLELISM", "not-a-number");
+        let bad = encode_parallelism();
+        assert!(bad >= 1, "非数字必须回退到默认并行度");
     }
 
     /// 构造一个**不启动后台线程**的服务实例，用于验证记账逻辑。

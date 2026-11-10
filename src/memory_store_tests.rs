@@ -2070,6 +2070,84 @@ mod tests {
         );
     }
 
+    /// ★v0.10.4 缺陷修复（**增量标记被写回路径抹掉**）：`apply_synthesis_plan`
+    /// 不得清除 `synthesis_pending`。
+    ///
+    /// **缺陷**：`apply_synthesis_plan` 是 Phase 3 的写回原语。它写回时已晚于
+    /// snapshot，此期间用户可能又写入新记忆（`remember` 置 true）。旧实现
+    /// 在写回末尾**无条件** `store(false)` ⇒ 这批"快照之后的新增"被抹掉，
+    /// 必须等到再下一次写入才有机会被合成（与 v0.9.1 的旧缺陷同类，
+    /// 只是窗口从"整轮"缩到"Phase 2 计算期间"）。
+    ///
+    /// **修法**：消费权上移到调用方（后台流水线在周期开始 `swap(false)`、
+    /// `/v1/memories/consolidate` 在快照前消费、`luoshu_synthesize` 自己消费），
+    /// 写回原语只写回、不碰标记。
+    ///
+    /// **鉴别力**：把 `apply_synthesis_plan` 末尾的无条件 `store(false)` 加回来
+    /// ⇒ 本测试断言失败。
+    #[test]
+    fn apply_synthesis_plan_must_not_clear_pending_flag() {
+        use crate::engine::synthesis_engine::SynthesisPlan;
+
+        let (_dir, store) = make_store();
+        let mut src = make_test_memory("PostgreSQL 索引优化", MemoryType::Fact);
+        let src_id = store.remember(src.clone()).expect("写入应成功").id;
+        src.id = src_id;
+
+        // 模拟"快照之后又发生了写入"：此刻 pending = true
+        store
+            .synthesis_pending
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let mut synth = make_test_memory("PostgreSQL 索引优化（汇总）", MemoryType::Synthesis);
+        synth.source_ids = vec![src.id.clone()];
+        let _ = store.apply_synthesis_plan(SynthesisPlan {
+            batch: vec![synth],
+            graph_edges: vec![],
+            journal_entries: vec![],
+            synthesized: 1,
+        });
+
+        assert!(
+            store
+                .synthesis_pending
+                .load(std::sync::atomic::Ordering::Acquire),
+            "★写回原语不得清除增量标记：清除会吞掉 Phase 2 期间的新写入"
+        );
+    }
+
+    /// ★v0.10.4：`luoshu_synthesize` 是完整一轮周期，必须自己消费标记。
+    ///
+    /// 它是同步的 snapshot → plan → apply 全过程，与后台流水线同构：
+    /// 开始时 `swap(false)` 取走，失败时恢复。否则（消费权上移后无人消费）
+    /// 标记会永远保持 true ⇒ 上层每次都误判"有增量"。
+    #[test]
+    fn luoshu_synthesize_consumes_pending_flag() {
+        let (_dir, store) = make_store();
+        for i in 0..3 {
+            let mut m = make_test_memory(&format!("Redis 缓存策略 {i}"), MemoryType::Fact);
+            m.luoshu_vector = Some([0.5; 9]);
+            m.bagua_index = Some(1);
+            store.remember(m).expect("写入应成功");
+        }
+        // remember 已把标记置 true；确认前置条件
+        assert!(
+            store
+                .synthesis_pending
+                .load(std::sync::atomic::Ordering::Acquire),
+            "前置：写入后标记应为 true"
+        );
+
+        let _ = store.luoshu_synthesize();
+
+        assert!(
+            !store
+                .synthesis_pending
+                .load(std::sync::atomic::Ordering::Acquire),
+            "★完整一轮周期结束后，标记应被消费为 false（否则每轮都误判有增量）"
+        );
+    }
+
     // ==================== 事件维度（共同经历）====================
 
     #[test]

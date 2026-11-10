@@ -464,113 +464,189 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
 
         // 3. 合成阶段
         let mut synthesis_completed = !self.config.auto_synthesize;
+        // 本轮是否"消费"了增量标记（供收尾时决定是否需要恢复）。
+        // 在块外声明：收尾逻辑在 `if` 块之后，需要读到它。
+        let mut consumed_increment = false;
         if self.config.auto_synthesize {
-            // 3a. v0.5.18 LLM embedding 合成路径（优先）
-            // 遵循三阶段锁安全模式：Phase 1 持锁加载 → Phase 2 无锁 LLM 调用 → Phase 3 持锁写入
-            let llm_succeeded: bool = if let Some(ref llm_config) = self.llm_config {
-                match self.llm_synthesize_cycle(llm_config).await {
-                    Ok(n) => {
-                        synthesis_completed = true;
-                        stats.synthesized = n;
-                        if n > 0 && self.config.verbose >= 1 {
-                            eprintln!("[LRC·结晶] LLM 合成完成，生成 {} 条合成记忆", n);
-                        }
-                        n > 0
-                    }
-                    Err(e) => {
-                        if self.config.verbose >= 1 {
-                            eprintln!("[LRC·结晶] LLM 合成失败，降级到洛书合成: {}", e);
-                        }
-                        false
-                    }
-                }
-            } else {
-                false
+            // ═══ v0.10.4 第 3 层：无增量则跳过合成（按需触发，而非定时必跑）═══
+            //
+            // 修前：本阶段**不看有无新写入**，每轮都克隆全库并跑 O(n²) 聚类。
+            // 实测本地库 8011 条（其中 1158 条已是合成产物）：单轮 58s，
+            // 期间反复抢 `store.write()`，把前台写入与语义编码一起拖慢。
+            //
+            // 判据用 `synthesis_pending`：`remember` / `remember_batch` 每次成功
+            // 写入都会置 `true`（见 memory_store.rs 的写入路径）。它是**现成的增量信号**，
+            // 此前只被"合成成功后置 false"，从未被读取来驱动调度。
+            //
+            // 为什么跳过是安全的：无新写入 ⇒ 全库状态与上轮完全相同 ⇒
+            // 聚类结果必然相同 ⇒ 本轮不可能产出新的合成记忆，跳过不丢任何合并机会。
+            //
+            // ═══ 竞态处理：标记在**开始时消费**，而非结束时清除 ═══
+            //
+            // 修前是「开始只读、成功后置 false」⇒ 合成进行中用户又写入时，
+            // `remember` 重新置 true，却被结尾无条件清成 false ⇒ 那批新记忆
+            // 永远不会被合并（要等到再下一次写入才有机会）。
+            //
+            // 现改为标准的生产者/消费者语义：`swap(false)` 原子地"取走"本轮要处理的增量；
+            // 合成期间若有新写入，`remember` 会重新置 true ⇒ 下一轮自然再跑。
+            // 本轮失败/超时/取消时**必须恢复 true**，否则这批增量永久丢失。
+            let has_increment = {
+                let store = self.store.read().await;
+                store
+                    .synthesis_pending
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
             };
+            consumed_increment = has_increment;
 
-            // 3b. 洛书合成（降级路径：仅当 LLM 未配置或失败时执行）
-            if !llm_succeeded {
-                let store_arc = self.store.clone();
-                let threshold = self.config.synthesis_threshold;
-                let similarity = self.config.synthesis_similarity;
-                // 把取消标志带进阻塞线程（v0.9.7 P1-3 补偿路径）。
-                // 计算方在循环内周期性自查该标志，超时后提前返回，不再跑满整个 O(n²)。
-                let cancel_for_task = cancel.clone();
-
-                // v0.9.1 三阶段锁解耦（根治 lock_busy）：
-                //   Phase 1（持锁读快照，极短）→ Phase 2（锁外 CPU 聚类计算）
-                //   → Phase 3（持锁写回，极短）。
-                //   消除 v0.9.0 中"blocking_lock 持锁执行 luoshu_synthesize
-                //   （含数秒~数十秒的聚类计算）"导致的读接口 lock_busy。
-                let result =
-                    tokio::task::spawn_blocking(move || -> Result<usize, PersistenceError> {
-                        // Phase 1：读快照（显式传入本轮阈值，不再临时改写全局配置）
-                        //
-                        // 读并发改造后，`synthesis_similarity` 为普通字段、无法经 `&self` 改写，
-                        //   故改用 `synthesis_snapshot_scoped` 显式传参 —— 语义等价
-                        //   （快照仍使用本轮 threshold/similarity），且不再需要"恢复"。
-                        let snapshot = store_arc
-                            .blocking_read()
-                            .synthesis_snapshot_scoped(None, None, threshold, similarity)?;
-
-                        // Phase 2：锁外 CPU 密集计算（可取消）
-                        let engine = SynthesisEngine::new(snapshot.config);
-                        let (mut plan, mut cancelled) = engine.plan_luoshu_cancellable(
-                            &snapshot.all,
-                            snapshot.information_gain_threshold,
-                            Some(cancel_for_task.as_ref()),
-                        );
-                        if !cancelled && plan.synthesized == 0 {
-                            let (jaccard_plan, jaccard_cancelled) = engine
-                                .plan_jaccard_cancellable(
-                                    &snapshot.all,
-                                    Some(cancel_for_task.as_ref()),
-                                );
-                            plan = jaccard_plan;
-                            cancelled = jaccard_cancelled;
+            if !has_increment {
+                if self.config.verbose >= 1 {
+                    eprintln!(
+                        "{} [LRC·结晶] 无新增记忆，跳过本轮合成（按需触发）",
+                        crate::obs::ts()
+                    );
+                }
+                // 本轮没有任何工作量：不进入任何取锁/聚类流程。
+                // 注意：走与正常结束相同的收尾路径（更新统计），不提前 return，
+                // 避免跳过 `total_stats` 累积与下面的标签恢复检查。
+                stats.last_run = Some(Utc::now());
+                stats.elapsed_ms = cycle_start.elapsed().as_millis() as u64;
+            } else {
+                // 3a. v0.5.18 LLM embedding 合成路径（优先）
+                // 三阶段锁安全模式：Phase 1 持锁加载 → Phase 2 无锁 LLM 调用 → Phase 3 持锁写入
+                let llm_succeeded: bool = if let Some(ref llm_config) = self.llm_config {
+                    match self.llm_synthesize_cycle(llm_config).await {
+                        Ok(n) => {
+                            synthesis_completed = true;
+                            stats.synthesized = n;
+                            if n > 0 && self.config.verbose >= 1 {
+                                eprintln!("[LRC·结晶] LLM 合成完成，生成 {} 条合成记忆", n);
+                            }
+                            n > 0
                         }
-
-                        // Phase 3：写回（写者由外层 `RwLock` 写锁串行）
-                        if cancelled {
-                            // 取消路径：丢弃**不完整计划**，且返回 TimedOut 而非 Ok(0)
-                            // —— 调用方的 Ok 分支会清除 `synthesis_pending`，而"被取消"
-                            // 意味着本轮未完成，必须保留待重试标记交由下轮重跑。
-                            return Err(PersistenceError::Io(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                "合成计算被协作式取消，待处理状态保留以便重试",
-                            )));
-                        }
-                        Ok(store_arc.blocking_write().apply_synthesis_plan(plan))
-                    })
-                    .await;
-
-                match result {
-                    Ok(Ok(n)) => {
-                        synthesis_completed = true;
-                        stats.synthesized = n;
-                        if n > 0 && self.config.verbose >= 1 {
-                            eprintln!("[LRC·结晶] 洛书合成完成，生成 {} 条合成记忆", n);
+                        Err(e) => {
+                            if self.config.verbose >= 1 {
+                                eprintln!("[LRC·结晶] LLM 合成失败，降级到洛书合成: {}", e);
+                            }
+                            false
                         }
                     }
-                    Ok(Err(e)) => {
-                        if self.config.verbose >= 1 {
-                            eprintln!("[LRC·结晶] 合成失败: {}", e);
+                } else {
+                    false
+                };
+
+                // 3b. 洛书合成（降级路径：仅当 LLM 未配置或失败时执行）
+                if !llm_succeeded {
+                    let store_arc = self.store.clone();
+                    // ═══ v0.10.4 第 2 层：阈值必须取自 **store 的真实配置** ═══
+                    //
+                    // 修前此处用的是 `self.config.synthesis_threshold`（来自
+                    // `ConsolidationConfig`，sidecar 硬编码为引擎默认 3）。而
+                    // `--disable-synthesis` 设的是 `store.synthesis_min_cluster = usize::MAX`。
+                    //
+                    // 两套阈值**互不相通** ⇒ "临时关闭合成"的开关形同虚设：
+                    // `plan_luoshu_cancellable` 的早退保护是
+                    // `candidates.len() < config.min_cluster`，它拿到的仍是 3，
+                    // 于是只要库里有 ≥3 条记忆就照跑完整 O(n²) 聚类，跑完无效再跑一次 Jaccard。
+                    //
+                    // 现改为：取 store 值与 config 值中的**较大者**——既尊重运行时开关
+                    // （`usize::MAX` 可真正短路），也保留 config 的下限语义。
+                    let threshold = {
+                        let store = self.store.read().await;
+                        store
+                            .synthesis_min_cluster
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            .max(self.config.synthesis_threshold)
+                    };
+                    let similarity = self.config.synthesis_similarity;
+                    // 把取消标志带进阻塞线程（v0.9.7 P1-3 补偿路径）。
+                    // 计算方在循环内周期性自查该标志，超时后提前返回，不再跑满整个 O(n²)。
+                    let cancel_for_task = cancel.clone();
+
+                    // v0.9.1 三阶段锁解耦（根治 lock_busy）：
+                    //   Phase 1（持锁读快照，极短）→ Phase 2（锁外 CPU 聚类计算）
+                    //   → Phase 3（持锁写回，极短）。
+                    //   消除 v0.9.0 中"blocking_lock 持锁执行 luoshu_synthesize
+                    //   （含数秒~数十秒的聚类计算）"导致的读接口 lock_busy。
+                    let result =
+                        tokio::task::spawn_blocking(move || -> Result<usize, PersistenceError> {
+                            // Phase 1：读快照（显式传入本轮阈值，不再临时改写全局配置）
+                            //
+                            // 读并发改造后，`synthesis_similarity` 为普通字段、无法经 `&self` 改写，
+                            //   故改用 `synthesis_snapshot_scoped` 显式传参 —— 语义等价
+                            //   （快照仍使用本轮 threshold/similarity），且不再需要"恢复"。
+                            let snapshot = store_arc
+                                .blocking_read()
+                                .synthesis_snapshot_scoped(None, None, threshold, similarity)?;
+
+                            // Phase 2：锁外 CPU 密集计算（可取消）
+                            let engine = SynthesisEngine::new(snapshot.config);
+                            let (mut plan, mut cancelled) = engine.plan_luoshu_cancellable(
+                                &snapshot.all,
+                                snapshot.information_gain_threshold,
+                                Some(cancel_for_task.as_ref()),
+                            );
+                            if !cancelled && plan.synthesized == 0 {
+                                let (jaccard_plan, jaccard_cancelled) = engine
+                                    .plan_jaccard_cancellable(
+                                        &snapshot.all,
+                                        Some(cancel_for_task.as_ref()),
+                                    );
+                                plan = jaccard_plan;
+                                cancelled = jaccard_cancelled;
+                            }
+
+                            // Phase 3：写回（写者由外层 `RwLock` 写锁串行）
+                            if cancelled {
+                                // 取消路径：丢弃**不完整计划**，且返回 TimedOut 而非 Ok(0)
+                                // —— 调用方的 Ok 分支会清除 `synthesis_pending`，而"被取消"
+                                // 意味着本轮未完成，必须保留待重试标记交由下轮重跑。
+                                return Err(PersistenceError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "合成计算被协作式取消，待处理状态保留以便重试",
+                                )));
+                            }
+                            Ok(store_arc.blocking_write().apply_synthesis_plan(plan))
+                        })
+                        .await;
+
+                    match result {
+                        Ok(Ok(n)) => {
+                            synthesis_completed = true;
+                            stats.synthesized = n;
+                            if n > 0 && self.config.verbose >= 1 {
+                                eprintln!("[LRC·结晶] 洛书合成完成，生成 {} 条合成记忆", n);
+                            }
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("[LRC·结晶] 合成任务 panic: {}", e);
+                        Ok(Err(e)) => {
+                            if self.config.verbose >= 1 {
+                                eprintln!("[LRC·结晶] 合成失败: {}", e);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[LRC·结晶] 合成任务 panic: {}", e);
+                        }
                     }
                 }
             }
         }
 
-        // 仅在完整成功时清除待合成标记；超时或失败必须保留以便下轮重试。
-        if synthesis_completed {
-            let store = self.store.write().await;
-            let _hold = crate::obs::HoldTimer::new("consolidate");
+        // 增量标记的收尾（配合上面的 `swap(false)` 消费语义）。
+        //
+        // - 成功：标记已在开始时被 `swap` 取走，**不需要再清**；
+        //   若合成期间有新写入，`remember` 已重新置 true ⇒ 下一轮会再跑。
+        // - 失败/超时/取消：必须**恢复 true**，否则本轮"取走但没处理完"的增量会永久丢失
+        //   （修前正是无条件置 false，属于同一类丢数据缺陷）。
+        if !synthesis_completed && consumed_increment {
+            let store = self.store.read().await;
             store
                 .synthesis_pending
-                .store(false, std::sync::atomic::Ordering::Release);
+                .store(true, std::sync::atomic::Ordering::Release);
+            if self.config.verbose >= 1 {
+                eprintln!(
+                    "{} [LRC·结晶] 本轮合成未完成，已恢复待合成标记（下轮重试）",
+                    crate::obs::ts()
+                );
+            }
         }
 
         // 4. 更新统计
@@ -1489,6 +1565,152 @@ mod tests {
             synthesis_count >= 1,
             "应有至少 1 条合成记忆，实际: {}",
             synthesis_count
+        );
+    }
+
+    /// ★v0.10.4 回归：无新增记忆时，合成阶段必须**不进入 O(n²) 聚类**。
+    ///
+    /// # 锁住的是什么
+    ///
+    /// 修前 `run_cycle_inner` 的注释写着「即使没有新的表层记忆，也继续执行合成步骤」，
+    /// 于是每 300 秒都克隆全库跑两轮 O(n²)。实测本地库 8011 条时单轮 58 秒，
+    /// 期间反复抢 `store.write()`，把前台写入与语义编码一起拖慢。
+    ///
+    /// 现在用 `synthesis_pending` 做增量判据：无新写入就跳过。
+    /// 本测试直接验证「pending=false 时，一轮周期不产出任何合成记忆」。
+    #[tokio::test]
+    async fn test_no_increment_skips_synthesis() {
+        let (_dir, store) = make_store();
+        // 预置 5 条高度相似的记忆，制造"只要跑合成就会产出"的条件
+        for i in 0..5 {
+            let mut m = Memory::new(
+                format!("PostgreSQL 数据库优化实践 {i}"),
+                MemoryType::Fact,
+                Some("loong".into()),
+                vec!["postgresql".into()],
+                Importance::new(6),
+                None,
+            );
+            m.luoshu_vector = Some([0.5; 9]);
+            m.bagua_index = Some(1);
+            store.remember(m).expect("预置记忆应成功");
+        }
+        let store = Arc::new(RwLock::new(store));
+
+        // 模拟"上一轮已处理完"：显式清掉 pending 标记
+        {
+            let s = store.read().await;
+            s.synthesis_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+
+        let mut pipeline = make_pipeline(store.clone());
+        // 空数据源 ⇒ 本轮无新增
+        let source = InMemorySource::new("empty", vec![]);
+        let stats = pipeline.run_cycle(&source).await.expect("周期应成功");
+
+        assert_eq!(stats.fetched, 0, "空源不应拉到任何表层记忆");
+        assert_eq!(
+            stats.synthesized, 0,
+            "★无增量时必须跳过合成，不得产出合成记忆（否则就是每 5 分钟空转 O(n²)）"
+        );
+    }
+
+    /// ★v0.10.4 回归：增量标记必须在**本轮开始时被消费**，合成期间的新写入不能丢。
+    ///
+    /// # 锁住的是一个丢数据竞态
+    ///
+    /// 修前是「开始只读、成功后无条件置 false」⇒ 合成进行中用户又写入时，
+    /// `remember` 重新置 true，却被结尾清成 false ⇒ 那批新记忆要等到
+    /// **再下一次**写入才可能被合并，期间一直处于"未合成"状态。
+    ///
+    /// 现在改为 `swap(false)` 消费：本轮开始时取走标记，期间新增会重新置 true。
+    /// 本测试验证「周期结束后，若期间有新增，pending 仍为 true」。
+    #[tokio::test]
+    async fn test_increment_consumed_at_start_not_cleared_at_end() {
+        let (_dir, store) = make_store();
+        let store = Arc::new(RwLock::new(store));
+
+        // 场景 1：开始时有增量 → 合成成功 → 标记被消费为 false
+        {
+            let s = store.read().await;
+            s.synthesis_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let mut pipeline = make_pipeline(store.clone());
+        let _ = pipeline
+            .run_cycle(&InMemorySource::new("empty", vec![]))
+            .await
+            .expect("周期应成功");
+        let after = {
+            let s = store.read().await;
+            s.synthesis_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        assert!(
+            !after,
+            "★本轮开始时消费的增量，若合成成功则不应残留 true（否则下轮会无谓重跑）"
+        );
+
+        // 场景 2：合成期间又发生写入 → 标记应重新变 true
+        {
+            let s = store.read().await;
+            s.synthesis_pending
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        let still = {
+            let s = store.read().await;
+            s.synthesis_pending
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        assert!(
+            still,
+            "★合成期间的新写入必须能让标记重新置位（生产者/消费者语义）"
+        );
+    }
+
+    /// ★v0.10.4 回归：`synthesis_min_cluster = usize::MAX` 必须能真正短路洛书合成。
+    ///
+    /// # 锁住的是"两套阈值互不相通"
+    ///
+    /// 修前：`--disable-synthesis` 设的是 `store.synthesis_min_cluster`，
+    /// 但合成阶段传给 `synthesis_snapshot_scoped` 的是 `config.synthesis_threshold`
+    /// （sidecar 硬编码 3）⇒ `plan_luoshu_cancellable` 的早退保护
+    /// `candidates.len() < config.min_cluster` 拿到的仍是 3 ⇒ 开关形同虚设。
+    ///
+    /// 现改为取 `max(store 值, config 值)`，`usize::MAX` 能真正短路。
+    #[tokio::test]
+    async fn test_store_threshold_max_short_circuits_synthesis() {
+        let (_dir, store) = make_store();
+        // 预置足够多的相似记忆（足以触发默认阈值 2）
+        for i in 0..5 {
+            let mut m = Memory::new(
+                format!("PostgreSQL 索引优化 {i}"),
+                MemoryType::Fact,
+                Some("loong".into()),
+                vec!["postgresql".into()],
+                Importance::new(6),
+                None,
+            );
+            m.luoshu_vector = Some([0.5; 9]);
+            m.bagua_index = Some(1);
+            store.remember(m).expect("预置记忆应成功");
+        }
+        // 模拟 `--disable-synthesis`：把 store 阈值拉到 usize::MAX
+        store
+            .synthesis_min_cluster
+            .store(usize::MAX, std::sync::atomic::Ordering::Release);
+        let store = Arc::new(RwLock::new(store));
+
+        let mut pipeline = make_pipeline(store.clone());
+        let stats = pipeline
+            .run_cycle(&InMemorySource::new("empty", vec![]))
+            .await
+            .expect("周期应成功");
+
+        assert_eq!(
+            stats.synthesized, 0,
+            "★store 阈值设为 usize::MAX 时，洛书合成必须被短路（不得产出合成记忆）"
         );
     }
 
