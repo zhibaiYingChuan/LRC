@@ -1325,3 +1325,168 @@ jobs:
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: artifacts/**/*
+
+  # ════════════════════════════════════════════════════════════
+  # Job 5: 同步插件稳定别名到国内镜像
+  #
+  # 为什么需要这个 job：
+  #   dsh-plugin-lrc 不硬编码版本号，按 `lrc-sidecar-<platform>-<arch>` 这个**稳定别名**
+  #   下载，版本靠同名 `.sha256` 识别。GitHub 侧由 `releases/latest/download/` 自动指向
+  #   最新 Release，无需任何维护；但国内镜像上的别名是**实体文件**，不随 GitHub 发版变化
+  #   —— 以前靠人工 copy，漏了就退化成「镜像永远停在旧版」。
+  #   本 job 让镜像跟随每次发版自动更新。
+  #
+  # 失败策略：
+  #   镜像只影响下载**速度**：插件查版本走 GitHub latest，且会跳过滞后镜像，
+  #   所以镜像同步失败不应该把「已经发布成功的 Release」标成失败。
+  #   代价是失败不会阻断流程——发版后需主动确认本 job 为绿色。
+  #
+  # 前置条件（仓库 Secrets，任一缺失则跳过并给出 warning）：
+  #   MIRROR_HOST / MIRROR_USER / MIRROR_PATH / MIRROR_SSH_KEY
+  #   可选 MIRROR_KNOWN_HOSTS（固定主机公钥，比 ssh-keyscan 更抗中间人）
+  #   可选 MIRROR_PUBLIC_BASE（默认 https://sfang.cc/xd/downloads）
+  # ════════════════════════════════════════════════════════════
+  sync-mirror:
+    name: Sync plugin aliases to mirror
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    continue-on-error: true
+    if: needs.release.result == 'success'
+
+    steps:
+      # 目标主机来自 Secret，无法写进 allowed-endpoints 白名单，故只能 audit。
+      # 该 job 只向外推送刚构建好的产物，不接受外部输入。
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      # 凭据检查放在最前面：未配置 Secret 时安静跳过，而不是让 fork / 本地试跑一片红。
+      # （secrets 上下文不能用于 job/step 的 if，故先落到 output 再判断。）
+      - name: Detect mirror credentials
+        id: cfg
+        env:
+          MIRROR_HOST: ${{ secrets.MIRROR_HOST }}
+          MIRROR_USER: ${{ secrets.MIRROR_USER }}
+          MIRROR_PATH: ${{ secrets.MIRROR_PATH }}
+          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+        run: |
+          if [ -n "$MIRROR_HOST" ] && [ -n "$MIRROR_USER" ] && [ -n "$MIRROR_PATH" ] && [ -n "$MIRROR_SSH_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::镜像同步已跳过：未配置 MIRROR_HOST / MIRROR_USER / MIRROR_PATH / MIRROR_SSH_KEY"
+          fi
+        shell: bash
+
+      - name: Download all build artifacts
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          path: artifacts
+
+      # 只取稳定别名：带版本号的 `lrc-v<ver>-*` 属于 GitHub Release 的产物，
+      # 镜像侧只放插件真正会请求的那几个文件 + 同名 .sha256。
+      - name: Collect and verify aliases
+        if: steps.cfg.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p mirror
+          find artifacts -type f -name 'lrc-sidecar-*' -exec cp {} mirror/ \;
+          echo "=== 待同步文件 ==="
+          ls -l mirror
+
+          # 一个都没找到说明 artifact 名称/路径变了，必须报错而不是「空同步成功」
+          if ! ls mirror/lrc-sidecar-* >/dev/null 2>&1; then
+            echo "::error::未在 artifacts 中找到任何 lrc-sidecar-* 稳定别名"
+            exit 1
+          fi
+
+          # 上传前先本地自校验：防止把「内容与 .sha256 不一致」的文件推上去
+          # （Windows 用 certutil 生成校验文件，格式与 sha256sum 不同，这里统一按哈希提取；
+          #   用 grep -m1 而非管道接 head，避免 pipefail 下 head 提前关闭触发 SIGPIPE）
+          for f in mirror/lrc-sidecar-*; do
+            case "$f" in *.sha256) continue ;; esac
+            if [ ! -f "$f.sha256" ]; then
+              echo "::error::缺少 $(basename "$f").sha256"
+              exit 1
+            fi
+            expected=$(grep -m1 -oE '[0-9a-fA-F]{64}' "$f.sha256" | tr 'A-Z' 'a-z')
+            actual=$(sha256sum "$f" | cut -d' ' -f1)
+            if [ "$expected" != "$actual" ]; then
+              echo "::error::$(basename "$f") 的 .sha256 与实际内容不符"
+              exit 1
+            fi
+            echo "  OK  $(basename "$f")  ${actual:0:12}"
+          done
+        shell: bash
+
+      - name: Set up SSH
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          MIRROR_HOST: ${{ secrets.MIRROR_HOST }}
+          MIRROR_SSH_KEY: ${{ secrets.MIRROR_SSH_KEY }}
+          MIRROR_KNOWN_HOSTS: ${{ secrets.MIRROR_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$MIRROR_SSH_KEY" > ~/.ssh/id_mirror
+          chmod 600 ~/.ssh/id_mirror
+
+          if [ -n "$MIRROR_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$MIRROR_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            # 未固定主机公钥时退化为首次连接信任；仍比 StrictHostKeyChecking=no 安全。
+            echo "::warning::未配置 MIRROR_KNOWN_HOSTS，本次以 ssh-keyscan 结果作为主机公钥"
+            ssh-keyscan -H "$MIRROR_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          fi
+          chmod 600 ~/.ssh/known_hosts
+        shell: bash
+
+      - name: Upload aliases
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          MIRROR_HOST: ${{ secrets.MIRROR_HOST }}
+          MIRROR_USER: ${{ secrets.MIRROR_USER }}
+          MIRROR_PATH: ${{ secrets.MIRROR_PATH }}
+        run: |
+          set -euo pipefail
+          # 服务器为 Windows OpenSSH，远端路径形如 C:/... （正斜杠，scp 可直接接受）
+          scp -i ~/.ssh/id_mirror \
+              -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+              mirror/lrc-sidecar-* "$MIRROR_USER@$MIRROR_HOST:$MIRROR_PATH"
+        shell: bash
+
+      # 上传成功不等于「用户真能下到」。以公网实际返回的 .sha256 与本地比对，
+      # 才能同时验证：文件落地位置对、nginx 映射对、内容是最新版本。
+      - name: Verify mirror serves the new aliases
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          MIRROR_PUBLIC_BASE: ${{ secrets.MIRROR_PUBLIC_BASE }}
+        run: |
+          set -euo pipefail
+          BASE="${MIRROR_PUBLIC_BASE:-https://sfang.cc/xd/downloads}"
+          BASE="${BASE%/}"
+          echo "校验基址：$BASE"
+
+          for f in mirror/lrc-sidecar-*.sha256; do
+            name=$(basename "$f")
+            want=$(grep -m1 -oE '[0-9a-fA-F]{64}' "$f" | tr 'A-Z' 'a-z')
+            got=""
+            for attempt in $(seq 1 10); do
+              body=$(curl -fsSL --max-time 20 "$BASE/$name" || true)
+              got=$(printf '%s' "$body" | grep -m1 -oE '[0-9a-fA-F]{64}' | tr 'A-Z' 'a-z' || true)
+              [ "$got" = "$want" ] && break
+              echo "  等待 CDN/缓存生效（第 ${attempt} 次未命中）..."
+              sleep 6
+            done
+            if [ "$got" != "$want" ]; then
+              echo "::error::$name 公网哈希与本次构建不一致（期望 ${want:0:12}，实际 ${got:0:12}）"
+              exit 1
+            fi
+            echo "  OK  $name  ${want:0:12}"
+          done
+        shell: bash
