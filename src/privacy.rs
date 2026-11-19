@@ -165,11 +165,15 @@ pub fn scoped(user_id: Option<&str>, session_id: Option<&str>) -> Option<ScopeTu
 /// **v0.9.11（CR-19）**：`user_id` 先经 [`namespace_owner`] 规范化 ——
 /// 多租户域下自动加「租户::」前缀，客户端无法通过自报 `user_id` 跨出租户。
 pub fn scope_from_args(args: &serde_json::Value) -> Option<ScopeTuple> {
-    let owner = namespace_owner(from_env(), args.get("user_id").and_then(|v| v.as_str()));
-    scoped(
-        owner.as_deref(),
+    // 复用 `resolve`：同时获得多租户域的 user 前缀命名空间与
+    // "Session 级必须带 user_id" 的约束（后者见 `resolve` 注释）。
+    resolve(
+        from_env(),
+        args.get("user_id").and_then(|v| v.as_str()),
         args.get("session_id").and_then(|v| v.as_str()),
     )
+    .ok()
+    .flatten()
 }
 
 /// 多租户域下**强制**要求 scope；本地可信域直接通过。
@@ -196,7 +200,17 @@ pub fn resolve(
     session_id: Option<&str>,
 ) -> Result<Option<ScopeTuple>, &'static str> {
     let owner = namespace_owner(mode, user_id);
-    let scope = scoped(owner.as_deref(), session_id);
+    let session = session_id.map(str::trim).filter(|s| !s.is_empty());
+    // 多租户域：Session 级归属必须同时给出 user_id。
+    //
+    // 原因：`user_id` 会加租户前缀（隔离键由凭据派生），而 `session_id`
+    // 是客户端自报、无法命名空间化。若允许"只有 session"的 scope，
+    // 不同租户可用同一 `session_id` 读到彼此的匿名 Session 记忆。
+    // 要求 user 后，隔离键 = 租户::user + session，跨租户不再可撞。
+    if mode == TrustMode::MultiTenant && session.is_some() && owner.is_none() {
+        return Err("user_required");
+    }
+    let scope = scoped(owner.as_deref(), session);
     require_scope(mode, &scope)?;
     Ok(scope)
 }
@@ -515,5 +529,34 @@ mod tests {
             .expect("有 scope 必须放行")
             .expect("应构造出上下文");
         assert_eq!(scope.0, PrivacyLevel::User);
+    }
+
+    /// v0.11：多租户域拒绝"只有 session、没有 user"的 scope。
+    ///
+    /// `session_id` 是客户端自报、无法命名空间化；若允许纯 session scope，
+    /// 不同租户可用同一 session_id 读到彼此的匿名 Session 记忆。
+    #[test]
+    fn resolve_multitenant_requires_user_for_session_scope() {
+        assert_eq!(
+            resolve(TrustMode::MultiTenant, None, Some("s1")),
+            Err("user_required")
+        );
+        assert_eq!(
+            resolve(TrustMode::MultiTenant, Some("  "), Some("s1")),
+            Err("user_required"),
+            "空白 user 等同缺失"
+        );
+        let scope = resolve(TrustMode::MultiTenant, Some("u1"), Some("s1"))
+            .expect("user + session 必须放行")
+            .expect("应构造出上下文");
+        assert_eq!(scope.0, PrivacyLevel::Session);
+        // 前缀是否加上取决于进程是否配置了 token（`current_tenant`）；
+        // 命名空间化本身由 `namespace_owner_namespaces_only_when_tenant_present` 覆盖，
+        // 此处只确认 user 归属未被丢弃。
+        assert!(scope.2.is_some(), "Session scope 必须保留 user");
+        // 本地可信域不受此约束（保持既有行为）
+        assert!(resolve(TrustMode::LocalTrusted, None, Some("s1"))
+            .expect("本地域放行")
+            .is_some());
     }
 }

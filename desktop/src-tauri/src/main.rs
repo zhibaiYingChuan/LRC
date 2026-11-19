@@ -655,6 +655,7 @@ fn main() {
                                 Option<String>,
                                 Option<u32>,
                                 Option<String>,
+                                Option<String>,
                             );
                             let mut recovered_handles: Vec<RecoveredHandle> = Vec::new();
                             // v0.8.9 G-001：心跳恢复使用独立的 cancel_flag，不与用户启动取消共享
@@ -671,19 +672,22 @@ fn main() {
                                     src_dir,
                                     multi_window,
                                     llm_api,
+                                    data_dir,
                                 } = info;
 
                                 // v0.8.37 开发模式使用独立数据目录
                                 // v0.9.0 修复：崩溃恢复在 dev 模式下也必须用 3111，
                                 // 而非 None→默认 3099，否则会复用稳定版 sidecar（违反开发/稳定隔离）。
                                 let is_dev = cfg!(debug_assertions);
+                                // v0.11：生产模式沿用实例原有的 data_dir；
+                                // dev 模式强制独立目录（保持开发/稳定隔离）。
                                 let _dev_dd = if is_dev {
                                     let home = std::env::var("USERPROFILE")
                                         .or_else(|_| std::env::var("HOME"))
                                         .unwrap_or_else(|_| ".".to_string());
                                     Some(format!("{}/.loong-recall/dev/data", home))
                                 } else {
-                                    None
+                                    data_dir.clone()
                                 };
                                 let target_port = if is_dev {
                                     3111
@@ -719,6 +723,7 @@ fn main() {
                                             src_dir,
                                             multi_window,
                                             llm_api,
+                                            data_dir,
                                         ));
                                     }
                                     Err(e) => {
@@ -736,7 +741,7 @@ fn main() {
                             if recovered_count > 0 {
                                 let state = monitor_handle.state::<AppStore>();
                                 let mut sidecar = state.sidecar.lock().await;
-                                for (key, child, port, src_dir, multi_window, llm_api) in
+                                for (key, child, port, src_dir, multi_window, llm_api, data_dir) in
                                     recovered_handles
                                 {
                                     sidecar.insert_handle(
@@ -746,6 +751,7 @@ fn main() {
                                         src_dir,
                                         multi_window,
                                         llm_api,
+                                        data_dir,
                                     );
                                 }
                             }

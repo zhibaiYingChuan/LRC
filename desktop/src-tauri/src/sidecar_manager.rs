@@ -540,6 +540,8 @@ pub struct DeadInstanceInfo {
     pub multi_window: Option<u32>,
     /// LLM API 配置
     pub llm_api: Option<String>,
+    /// v0.11：自定义数据目录 —— 恢复时必须原样带回
+    pub data_dir: Option<String>,
 }
 
 /// Sidecar 进程管理器（支持多项目）
@@ -573,6 +575,9 @@ struct SidecarHandle {
     src_dir: Option<String>,
     multi_window: Option<u32>,
     llm_api: Option<String>,
+    /// v0.11：保存自定义数据目录 —— 崩溃恢复若丢失该参数，
+    /// 带 `--data-dir` 的实例会落回默认目录，用户视角是「记忆丢了」。
+    data_dir: Option<String>,
 }
 
 /// Drop 守卫：确保所有子进程在管理器被销毁时被 kill 并回收
@@ -799,6 +804,7 @@ impl SidecarManager {
                     src_dir: handle.src_dir,
                     multi_window: handle.multi_window,
                     llm_api: handle.llm_api,
+                    data_dir: handle.data_dir,
                 });
             }
         }
@@ -1127,6 +1133,7 @@ impl SidecarManager {
         src_dir: Option<String>,
         multi_window: Option<u32>,
         llm_api: Option<String>,
+        data_dir: Option<String>,
     ) {
         let project_dir = src_dir.clone().unwrap_or_else(|| project_key.to_string());
         self.instances.insert(
@@ -1138,6 +1145,7 @@ impl SidecarManager {
                 src_dir,
                 multi_window,
                 llm_api,
+                data_dir,
             },
         );
     }
@@ -1683,6 +1691,7 @@ impl SidecarManager {
                 src_dir,
                 multi_window,
                 llm_api,
+                data_dir,
             } = info;
 
             // v0.5.4 修复：优先使用传入的最新 LLM 配置
@@ -1696,7 +1705,7 @@ impl SidecarManager {
                 llm_api: effective_llm.as_deref(),
                 cancel_flag,
                 progress_tx: None, // G-003：心跳恢复不需要进度反馈
-                data_dir: None,
+                data_dir: data_dir.as_deref(),
             };
             match Self::spawn_and_wait(&self.binary_path, &project_key, &start_opts).await {
                 Ok((child, port)) => {
@@ -1708,6 +1717,7 @@ impl SidecarManager {
                         src_dir,
                         multi_window,
                         effective_llm,
+                        data_dir,
                     );
                     recovered += 1;
                     tracing::info!(
@@ -1852,6 +1862,7 @@ mod tests {
             child,
             3099,
             Some("/test/dir".into()),
+            None,
             None,
             None,
         );
@@ -2146,6 +2157,7 @@ mod tests {
             Some("/test/dir".into()),
             Some(5),
             Some("openai||key".into()),
+            None,
         );
 
         // 等待子进程退出
@@ -2181,6 +2193,7 @@ mod tests {
             child,
             3099,
             Some("/test/dir".into()),
+            None,
             None,
             None,
         );

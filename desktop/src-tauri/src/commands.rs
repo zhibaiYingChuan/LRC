@@ -797,6 +797,7 @@ pub async fn start_sidecar(
                         effective_src_dir,
                         multi_window,
                         llm_api,
+                        _dev_dd.clone(),
                     );
                 }
 
@@ -991,6 +992,7 @@ pub async fn start_sidecar_for_project(
                         src_dir,
                         multi_window,
                         llm_api,
+                        _dev_dd.clone(),
                     );
                 }
 
@@ -2411,6 +2413,7 @@ pub async fn switch_project(
                     Some(project_dir.clone()),
                     multi_window,
                     llm_api,
+                    _dev_dd.clone(),
                 );
             }
 

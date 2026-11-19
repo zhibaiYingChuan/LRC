@@ -313,6 +313,10 @@ pub struct ListFilter {
     pub offset: usize,
     /// 隐私上下文：按隐私级别过滤
     pub privacy_context: Option<(PrivacyLevel, Option<String>, Option<String>)>,
+    /// v0.11：是否包含已过期记忆（默认 false）。
+    ///
+    /// 默认隐藏过期记忆；导出 / 清理场景可显式开启。
+    pub include_expired: bool,
 }
 
 impl ListFilter {
@@ -326,6 +330,7 @@ impl ListFilter {
             limit: 20,
             offset: 0,
             privacy_context: None,
+            include_expired: false,
         }
     }
 }

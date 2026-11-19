@@ -26,6 +26,183 @@ mod tests {
         (dir, MemoryStore::new(p))
     }
 
+    /// v0.11 安全回归：Session 级可见性必须同时绑定 user。
+    ///
+    /// 修复前只比对 `session_id`，导致「自己的 user_id + 他人的 session_id」
+    /// 就能跨用户读写会话级记忆。
+    #[test]
+    fn session_scope_binds_user_when_memory_has_owner() {
+        use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
+
+        let mut memory = Memory::new(
+            "session 级记忆".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        memory.privacy_level = PrivacyLevel::Session;
+        memory.session_id = Some("s1".to_string());
+        memory.user_id = Some("alice".to_string());
+
+        assert!(is_visible(&memory, &None), "本地可信域应放行");
+        assert!(
+            is_visible(
+                &memory,
+                &Some((
+                    PrivacyLevel::Session,
+                    Some("s1".into()),
+                    Some("alice".into())
+                ))
+            ),
+            "同 session 同 user 应可见"
+        );
+        assert!(
+            !is_visible(
+                &memory,
+                &Some((PrivacyLevel::Session, Some("s1".into()), Some("bob".into())))
+            ),
+            "同 session 但他人 user 不应可见（v0.11 修复点）"
+        );
+        assert!(
+            !is_visible(
+                &memory,
+                &Some((PrivacyLevel::Session, Some("s1".into()), None))
+            ),
+            "记忆带归属时缺 user 不应可见"
+        );
+
+        // 旧数据无 user_id：纯 session 上下文（请求方也无 user）保持兼容；
+        // 但请求方带 user_id 时必须拒绝（v0.11 独立审查修复：
+        // 否则多租户域可用「自己的 user + 他人的匿名 session」跨租户读取）。
+        memory.user_id = None;
+        assert!(
+            !is_visible(
+                &memory,
+                &Some((PrivacyLevel::Session, Some("s1".into()), Some("bob".into())))
+            ),
+            "匿名 Session 记忆不得被带 user 的请求读取"
+        );
+        assert!(
+            is_visible(
+                &memory,
+                &Some((PrivacyLevel::Session, Some("s1".into()), None))
+            ),
+            "纯 session 上下文（无 user）仍按 session 匹配"
+        );
+    }
+
+    /// v0.11：过期记忆在按 ID 的可见查询中不可见，但 `forget` 仍可清理。
+    #[test]
+    fn expired_memory_hidden_from_visible_lookup_but_deletable() {
+        use chrono::{Duration, Utc};
+
+        let (_dir, store) = make_store();
+        let mut memory = make_test_memory("过期测试记忆", MemoryType::Fact);
+        memory.created_at = Utc::now() - Duration::days(2);
+        memory.ttl_days = Some(1);
+        let saved = store.remember(memory).expect("写入应成功");
+
+        assert!(
+            store
+                .get_visible_memory(&saved.id, &None)
+                .expect("查询")
+                .is_none(),
+            "过期记忆不应出现在按 ID 的可见查询中"
+        );
+        assert!(
+            store
+                .get_visible_memory_including_expired(&saved.id, &None)
+                .expect("查询")
+                .is_some(),
+            "including_expired 应能找到过期记忆（供 forget 清理）"
+        );
+
+        // v0.11：list 默认排除过期，include_expired=true 才包含。
+        let default_list = store
+            .list_memories(&crate::memory_store_types::ListFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .expect("list");
+        assert!(
+            !default_list.0.iter().any(|m| m.id == saved.id),
+            "默认列表不应包含过期记忆"
+        );
+        let with_expired = store
+            .list_memories(&crate::memory_store_types::ListFilter {
+                limit: 100,
+                include_expired: true,
+                ..Default::default()
+            })
+            .expect("list");
+        assert!(
+            with_expired.0.iter().any(|m| m.id == saved.id),
+            "include_expired 应包含过期记忆"
+        );
+
+        assert!(store.forget(&saved.id).expect("删除"), "过期记忆应可删除");
+    }
+
+    /// v0.11：归档恢复/彻底删除的存储层语义。
+    ///
+    /// 覆盖 HTTP 用例之外的细节：TTL 覆盖、恢复后重新计时、重复恢复、
+    /// 彻底删除的幂等返回值。
+    #[test]
+    fn unarchive_and_purge_semantics() {
+        use chrono::{Duration, Utc};
+
+        let (_dir, store) = make_store();
+
+        // 1) 归档两条过期记忆
+        let mut first = make_test_memory("归档恢复一", MemoryType::Fact);
+        first.created_at = Utc::now() - Duration::days(2);
+        first.ttl_days = Some(1);
+        let first = store.remember(first).expect("写入");
+        let mut second = make_test_memory("归档恢复二", MemoryType::Fact);
+        second.created_at = Utc::now() - Duration::days(2);
+        second.ttl_days = Some(1);
+        let second = store.remember(second).expect("写入");
+        assert_eq!(store.archive_expired().expect("归档"), 2);
+
+        // 2) 恢复第一条并覆盖 TTL：必须重新计时且不立即过期
+        let restored = store
+            .unarchive_memory(&first.id, Some(30))
+            .expect("恢复")
+            .expect("归档中应存在");
+        assert_eq!(restored.ttl_days, Some(30), "TTL 覆盖必须生效");
+        assert!(!restored.is_expired(), "恢复后不得立即过期");
+        let live = store
+            .get_visible_memory(&first.id, &None)
+            .expect("查询")
+            .expect("恢复后应可见");
+        assert_eq!(live.ttl_days, Some(30));
+
+        // 3) 重复恢复 ⇒ None（已不在归档）
+        assert!(
+            store
+                .unarchive_memory(&first.id, None)
+                .expect("重复恢复")
+                .is_none(),
+            "重复恢复应返回 None"
+        );
+
+        // 4) 彻底删除第二条 ⇒ true；重复删除 ⇒ false（幂等）
+        assert!(store.purge_archived(&second.id).expect("清除"));
+        assert!(
+            !store.purge_archived(&second.id).expect("重复清除"),
+            "重复清除应返回 false"
+        );
+        assert!(
+            store
+                .get_visible_memory(&second.id, &None)
+                .expect("查询")
+                .is_none(),
+            "彻底删除后不得回到活跃库"
+        );
+    }
+
     /// A+B+D 接入验证：store 在**构造期**用存量语料定型 IDF 表。
     ///
     /// 判据（结构性质，不测语义）：

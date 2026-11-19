@@ -4611,7 +4611,7 @@ async function backupMemories() {
       fetchWithTimeout(API_BASE + '/v1/memories/list', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ limit: 10000 }),
+        body: JSON.stringify({ limit: 10000, include_expired: true }),
         signal: backupSignal
       }, 60000),
       fetchWithTimeout(API_BASE + '/v1/code/search?query=&top_k=100', { signal: backupSignal }, 60000),
@@ -4663,6 +4663,12 @@ async function backupMemories() {
       const chunksData = await chunksRes.value.json();
       // v0.9.0 修复：字段名对齐后端（/v1/code/search 返回 results，而非 chunks/data）
       exportData.chunks = chunksData.results || chunksData.chunks || chunksData.data || [];
+    }
+
+    // 归档数据（v0.11 修复：此前只发起请求，结果从未写入导出文件 ⇒ 备份缺归档）
+    if (archiveRes.status === 'fulfilled' && archiveRes.value.ok) {
+      const archiveData = await archiveRes.value.json();
+      exportData.archive = archiveData.archive || [];
     }
 
     // 创建下载

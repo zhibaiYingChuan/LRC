@@ -564,3 +564,6 @@ marketing/
 
 # 设计草稿（非交付资产，本地保留）
 static/assets/logo/LRC桌面端Logo设计-*.png
+
+# 本地测试临时目录（v0.11：CLI/联调脚本生成，不交付）
+.tmp_*/

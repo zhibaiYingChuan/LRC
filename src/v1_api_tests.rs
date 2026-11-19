@@ -7177,6 +7177,593 @@ mod context_endpoints_tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// v0.11：过期记忆在 REST 层的完整语义。
+    /// - list 默认不含，`include_expired=true` 才含
+    /// - forget 可以删除过期记忆（清理动作，不能「看得见删不掉」）
+    #[tokio::test]
+    async fn expired_memory_semantics_over_http() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use crate::privacy::TrustMode;
+        use chrono::{Duration, Utc};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_expired_http_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router_with_trust(
+            shared.clone(),
+            manager,
+            llm_api,
+            llm_ready,
+            false,
+            TrustMode::LocalTrusted,
+        );
+
+        // 直接写入一条已过期记忆（created_at 回拨 2 天，TTL 1 天）
+        let expired_id = {
+            let store = shared.write().await;
+            let mut memory = Memory::new(
+                "过期 HTTP 测试".to_string(),
+                MemoryType::Fact,
+                None,
+                vec![],
+                Importance::new(5),
+                Some(1),
+            );
+            memory.created_at = Utc::now() - Duration::days(2);
+            memory.ttl_days = Some(1);
+            store.remember(memory).expect("写入过期记忆").id
+        };
+
+        // 1) list 默认不含过期
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/list",
+            serde_json::json!({ "limit": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let default_items = body["memories"].as_array().expect("memories 应为数组");
+        assert!(
+            !default_items.iter().any(|m| m["id"] == expired_id),
+            "默认 list 不应包含过期记忆：{body}"
+        );
+
+        // 2) include_expired=true 应包含
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/list",
+            serde_json::json!({ "limit": 100, "include_expired": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let with_expired = body["memories"].as_array().expect("memories 应为数组");
+        assert!(
+            with_expired.iter().any(|m| m["id"] == expired_id),
+            "include_expired=true 应包含过期记忆：{body}"
+        );
+
+        // 3) forget 可删除过期记忆（否则就是「看得见删不掉」）
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/forget",
+            serde_json::json!({ "memory_id": expired_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["deleted"], true, "过期记忆应可被 forget 清理：{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.11：归档过期记忆的完整闭环（REST）。
+    /// - 本地域：archive-expired 归档后，活跃库（含 include_expired）不再返回，归档列表可见
+    /// - 多租户域：403 `admin_only`（全库操作会跨租户）
+    #[tokio::test]
+    async fn archive_expired_over_http() {
+        use crate::memory_types::{Importance, Memory, MemoryType};
+        use crate::privacy::TrustMode;
+        use chrono::{Duration, Utc};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_archive_expired_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let shared = Arc::new(RwLock::new(new_statistical_store(&dir_str)));
+        let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
+            Arc::new(Mutex::new(Box::new(NoopCodebase)));
+        let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
+        let llm_ready = Arc::new(AtomicBool::new(false));
+        let app = build_v1_router_with_trust(
+            shared.clone(),
+            manager.clone(),
+            llm_api.clone(),
+            llm_ready.clone(),
+            false,
+            TrustMode::LocalTrusted,
+        );
+
+        // 写入 3 条过期记忆（第 3 条用于"恢复 + 彻底删除"两条路径都覆盖）
+        {
+            let store = shared.write().await;
+            for index in 0..3 {
+                let mut memory = Memory::new(
+                    format!("过期归档测试 {index}"),
+                    MemoryType::Fact,
+                    None,
+                    vec![],
+                    Importance::new(5),
+                    Some(1),
+                );
+                memory.created_at = Utc::now() - Duration::days(2);
+                memory.ttl_days = Some(1);
+                store.remember(memory).expect("写入过期记忆");
+            }
+        }
+
+        // 1) 归档
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/archive-expired",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["archived"], 3, "应归档 3 条：{body}");
+
+        // 1b) 二次归档应返回 0（幂等）
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/archive-expired",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["archived"], 0, "二次归档应为 0：{body}");
+
+        // 2) 活跃库不再返回（include_expired 也不返回——已移出活跃存储）
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/list",
+            serde_json::json!({ "limit": 100, "include_expired": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let items = body["memories"].as_array().expect("memories 应为数组");
+        assert!(items.is_empty(), "归档后活跃库应为空：{body}");
+
+        // 3) 归档列表可见
+        let (status, body) =
+            post_json(app.clone(), "/memories/archive", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let archived_items = body["archive"].as_array().expect("archive 应为数组");
+        assert_eq!(archived_items.len(), 3, "归档列表应有 3 条：{body}");
+        let first_id = archived_items[0]["id"]
+            .as_str()
+            .expect("应有 id")
+            .to_string();
+        let second_id = archived_items[1]["id"]
+            .as_str()
+            .expect("应有 id")
+            .to_string();
+        let third_id = archived_items[2]["id"]
+            .as_str()
+            .expect("应有 id")
+            .to_string();
+
+        // 3b) 恢复一条：回到活跃库且不再过期（created_at 已重置）
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/unarchive",
+            serde_json::json!({ "memory_id": first_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["restored"], true, "{body}");
+        let (_, body) = post_json(
+            app.clone(),
+            "/memories/list",
+            serde_json::json!({ "limit": 100, "include_expired": true }),
+        )
+        .await;
+        let items = body["memories"].as_array().expect("memories 应为数组");
+        assert!(
+            items
+                .iter()
+                .any(|m| m["id"] == first_id.as_str() && m["expired"] == false),
+            "恢复后应在活跃库且未过期：{body}"
+        );
+
+        // 3b2) 重复恢复同一条 ⇒ 404（已不在归档中，不静默成功）
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/unarchive",
+            serde_json::json!({ "memory_id": first_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "重复恢复应 404：{body}");
+        assert_eq!(body["error"], "memory_not_found", "{body}");
+
+        // 3b3) 异常大的 ttl_days ⇒ 400（不得静默截断）
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/unarchive",
+            serde_json::json!({ "memory_id": second_id, "ttl_days": 9_999_999u64 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "超大 ttl 应 400：{body}");
+        assert_eq!(body["error"], "invalid_ttl_days", "{body}");
+
+        // 3b4) 恢复时覆盖 TTL ⇒ 新 TTL 必须真正落库
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/unarchive",
+            serde_json::json!({ "memory_id": second_id, "ttl_days": 365 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["restored"], true, "{body}");
+        {
+            let store = shared.read().await;
+            let restored = store
+                .get_visible_memory(&second_id, &None)
+                .expect("查询恢复后的记忆")
+                .expect("恢复后应可见");
+            assert_eq!(restored.ttl_days, Some(365), "覆盖的 TTL 必须落库");
+        }
+
+        // 3c) 彻底删除第三条；重复删除 ⇒ deleted=false（幂等，不报错）
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/purge-archived",
+            serde_json::json!({ "memory_id": third_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["deleted"], true, "{body}");
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/purge-archived",
+            serde_json::json!({ "memory_id": third_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "重复删除应幂等成功：{body}");
+        assert_eq!(body["deleted"], false, "重复删除应 deleted=false：{body}");
+        let (_, body) = post_json(app.clone(), "/memories/archive", serde_json::json!({})).await;
+        assert_eq!(
+            body["archive"].as_array().map(|a| a.len()).unwrap_or(0),
+            0,
+            "归档应已清空：{body}"
+        );
+
+        // 3d) 生命周期迁移必须留审计痕迹（归档 / 恢复 / 彻底删除）
+        {
+            use crate::engine::audit_trail::{AuditEventType, AuditQuery};
+            use crate::lock_ext::LockExt;
+            let store = shared.read().await;
+            let trail = store.audit_trail.read_recover();
+            let events = trail.query(&AuditQuery {
+                from_ms: None,
+                to_ms: None,
+                event_types: Some(vec![
+                    AuditEventType::MemoryArchived,
+                    AuditEventType::MemoryUnarchived,
+                    AuditEventType::MemoryPurged,
+                ]),
+                memory_id: None,
+                limit: Some(100),
+            });
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.event_type == AuditEventType::MemoryArchived),
+                "归档必须写审计事件 MemoryArchived"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.event_type == AuditEventType::MemoryUnarchived
+                        && e.affected_memory_ids.iter().any(|id| id == &first_id)),
+                "恢复必须写审计事件 MemoryUnarchived 且记录目标 id"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.event_type == AuditEventType::MemoryUnarchived
+                        && e.affected_memory_ids.iter().any(|id| id == &second_id)),
+                "覆盖 TTL 的恢复同样必须留审计"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.event_type == AuditEventType::MemoryPurged
+                        && e.affected_memory_ids.iter().any(|id| id == &third_id)),
+                "彻底删除必须写审计事件 MemoryPurged 且记录目标 id"
+            );
+            // 归档事件必须记录全部被归档的 id（本用例 3 条）
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.event_type == AuditEventType::MemoryArchived
+                        && e.affected_memory_ids.len() == 3),
+                "归档事件应记录 3 个受影响 id"
+            );
+        }
+
+        // 4) 多租户域禁止
+        let mt_app = build_v1_router_with_trust(
+            shared.clone(),
+            manager,
+            llm_api,
+            llm_ready,
+            false,
+            TrustMode::MultiTenant,
+        );
+        let (status, body) = post_json(
+            mt_app.clone(),
+            "/memories/archive-expired",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "多租户域必须 403：{body}");
+        assert_eq!(body["error"], "admin_only", "{body}");
+
+        // 恢复 / 彻底删除同样是全库运维能力，多租户域一律 403
+        let (status, body) = post_json(
+            mt_app.clone(),
+            "/memories/unarchive",
+            serde_json::json!({ "memory_id": first_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "恢复应 403：{body}");
+        assert_eq!(body["error"], "admin_only", "{body}");
+
+        let (status, body) = post_json(
+            mt_app,
+            "/memories/purge-archived",
+            serde_json::json!({ "memory_id": third_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "清除应 403：{body}");
+        assert_eq!(body["error"], "admin_only", "{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// v0.11 安全回归：按 ID 写入口在多租户域必须按 scope 隔离。
+    ///
+    /// 覆盖 forget / correct / external-edge：
+    /// - 缺 scope ⇒ 400 `scope_required`
+    /// - 跨用户 ⇒ not_found / already_deleted（不泄露存在性）
+    /// - 本人 ⇒ 成功
+    #[tokio::test]
+    async fn test_id_write_endpoints_enforce_scope() {
+        use crate::privacy::TrustMode;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let dir = std::env::temp_dir().join(format!("lrc_id_scope_{ts}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_str = dir.to_str().unwrap().to_string();
+
+        let app = make_app(&dir_str, TrustMode::MultiTenant);
+
+        async fn remember(app: axum::Router, content: &str, user: &str) -> String {
+            let (status, body) = post_json(
+                app,
+                "/memories/remember",
+                serde_json::json!({
+                    "content": content,
+                    "memory_type": "fact",
+                    "privacy_level": "user",
+                    "user_id": user,
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "写入失败: {body}");
+            body["memory_id"]
+                .as_str()
+                .expect("应返回 memory_id")
+                .to_string()
+        }
+
+        let alice_id = remember(app.clone(), "alice 的私有记忆", "alice").await;
+        let bob_id = remember(app.clone(), "bob 的私有记忆", "bob").await;
+
+        // 1) forget 缺 scope ⇒ 400
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/forget",
+            serde_json::json!({ "memory_id": alice_id }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "缺 scope 必须 400：{body}");
+        assert_eq!(body["error"], "scope_required", "{body}");
+
+        // 1b) correct 缺 scope ⇒ 400
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/correct",
+            serde_json::json!({ "memory_id": bob_id, "content": "无 scope 修正" }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "correct 缺 scope 必须 400：{body}"
+        );
+        assert_eq!(body["error"], "scope_required", "{body}");
+
+        // 2) bob 删 alice ⇒ 幂等成功但 deleted=false
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/forget",
+            serde_json::json!({ "memory_id": alice_id, "user_id": "bob" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["deleted"], false, "跨用户不得删除：{body}");
+
+        // 3) alice 删自己 ⇒ 成功
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/forget",
+            serde_json::json!({ "memory_id": alice_id, "user_id": "alice" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["deleted"], true, "本人应可删除：{body}");
+
+        // 4) correct 跨用户 ⇒ 404；本人 ⇒ 200 v2
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/correct",
+            serde_json::json!({
+                "memory_id": bob_id,
+                "content": "被篡改",
+                "user_id": "alice"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "跨用户修正必须 404：{body}");
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/correct",
+            serde_json::json!({
+                "memory_id": bob_id,
+                "content": "bob 修正后的内容",
+                "user_id": "bob"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "本人修正应成功：{body}");
+        assert_eq!(body["new_version"], 2, "{body}");
+
+        // 4b) external-edge 缺 scope ⇒ 400
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/external-edge",
+            serde_json::json!({
+                "from_id": bob_id,
+                "to_id": bob_id,
+                "rel_type": "coordinate"
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "external-edge 缺 scope 必须 400：{body}"
+        );
+        assert_eq!(body["error"], "scope_required", "{body}");
+
+        // 5) external-edge 跨用户 ⇒ 404；本人两端 ⇒ 200
+        let alice_second = remember(app.clone(), "alice 的第二条记忆", "alice").await;
+        let alice_third = remember(app.clone(), "alice 的第三条记忆", "alice").await;
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/external-edge",
+            serde_json::json!({
+                "from_id": alice_second,
+                "to_id": bob_id,
+                "rel_type": "coordinate",
+                "user_id": "alice"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "跨用户连边必须 404：{body}");
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/external-edge",
+            serde_json::json!({
+                "from_id": alice_second,
+                "to_id": alice_third,
+                "rel_type": "coordinate",
+                "user_id": "alice"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "本人两端应通过可见性校验：{body}");
+        // 不断言 `added=true`：图写入还有悬空/自环等业务校验，
+        // 本用例的目标是「scope 不误伤本人」，不是图语义。
+
+        // 6) Session 级：session 匹配但 user 不匹配 ⇒ 不可见（v0.11 修复点）
+        let (st, session_body) = post_json(
+            app.clone(),
+            "/memories/remember",
+            serde_json::json!({
+                "content": "alice 的 session 级记忆",
+                "memory_type": "fact",
+                "privacy_level": "session",
+                "session_id": "s1",
+                "user_id": "alice",
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "session 记忆写入失败: {session_body}");
+        let session_memory_id = session_body["memory_id"]
+            .as_str()
+            .expect("应返回 memory_id")
+            .to_string();
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/forget",
+            serde_json::json!({
+                "memory_id": session_memory_id,
+                "user_id": "bob",
+                "session_id": "s1"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["deleted"], false,
+            "同 session 但他人 user 不得删除：{body}"
+        );
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/forget",
+            serde_json::json!({
+                "memory_id": session_memory_id,
+                "user_id": "alice",
+                "session_id": "s1"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["deleted"], true, "本人应可删除 session 级记忆：{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

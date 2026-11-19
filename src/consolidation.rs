@@ -281,6 +281,38 @@ pub struct ConsolidationPipeline<P: Persistence> {
     pub total_stats: CycleStats,
 }
 
+/// 结晶路径的隐私继承（LLM / Embedding 两条路径共用）。
+///
+/// # 必须与 `MemoryStore::apply_synthesis_plan` 同口径（v0.11 独立审查修复）
+///
+/// 洛书路径对"全部来源都无 session/user 标识"的匿名记忆**原样放行**
+/// （见 `memory_store.rs` 的匿名来源分支）：否则默认单用户配置下
+/// （桌面端不写 `user_id`）合成会被整体禁用。
+///
+/// LLM / Embedding 路径此前直接调 `inherit_privacy`，而后者对
+/// "有约束（默认 User 级）但缺 `user_id`"的来源返回 `None` ⇒
+/// 匿名来源的合成**恒被丢弃**（LLM 调用白付）。本函数把三态收敛为一处：
+///
+/// | 来源集合 | 返回 |
+/// |---|---|
+/// | 空（异常） | `None` —— 声明了来源却解析不到，拒写 |
+/// | 全部匿名（无 session/user） | `Some((User, None, None))` —— 与洛书路径一致，放行 |
+/// | 其余 | `privacy::inherit_privacy`（交集 = 最严；跨域 ⇒ `None`） |
+fn inherit_scope_for_synthesis(
+    sources: &[Memory],
+) -> Option<(PrivacyLevel, Option<String>, Option<String>)> {
+    if sources.is_empty() {
+        return None;
+    }
+    if sources
+        .iter()
+        .all(|m| m.session_id.is_none() && m.user_id.is_none())
+    {
+        return Some((PrivacyLevel::User, None, None));
+    }
+    crate::privacy::inherit_privacy(sources)
+}
+
 impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     /// 创建新的结晶流水线
     pub fn new(config: ConsolidationConfig, store: Arc<RwLock<MemoryStore<P>>>) -> Self {
@@ -525,7 +557,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                         }
                         Err(e) => {
                             if self.config.verbose >= 1 {
-                                eprintln!("[LRC·结晶] LLM 合成失败，降级到洛书合成: {}", e);
+                                eprintln!("[LRC·结晶] LLM 合成未产出，降级到洛书合成: {}", e);
                             }
                             false
                         }
@@ -578,10 +610,74 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                                 .blocking_read()
                                 .synthesis_snapshot_scoped(None, None, threshold, similarity)?;
 
+                            // ★2026-11-17：取语义向量表（二层聚类的输入）。
+                            //
+                            // ## 为什么必须按 id 聚合（实测缺陷）
+                            //
+                            // 索引里**同一记忆有多个窗口向量**（首/中/尾三段）。
+                            // 实测 `semantic_vectors.bin` 18298 条索引条目只对应
+                            // 6349 条唯一记忆（`code-memory` 的 529 条记忆在其中
+                            // 出现三遍）。不聚合会让同一条记忆在簇里重复三次、
+                            // 把整簇占满。
+                            //
+                            // ## 为什么允许为空
+                            //
+                            // ML 不可用时 `service()` 返回 None ⇒ 空表 ⇒
+                            // `plan_luoshu_with_semantics` 退化为原 `plan_luoshu_cancellable`
+                            // （行为零变更），不会因缺向量而丢数据或失败。
+                            // `mut` 仅在 `ml` 特性开启时被用到（下面的 `if let` 会赋值）；
+                            // 无 ml 时保持默认空表，故需显式 allow 以免产生 unused_mut 警告。
+                            #[allow(unused_mut)]
+                            let mut semantic_vectors: crate::engine::synthesis_engine::SemanticVectorMap =
+                                Default::default();
+                            #[cfg(feature = "ml")]
+                            if let Some(svc) = crate::semantic_index::service() {
+                                use std::collections::HashMap;
+                                let mut acc: HashMap<String, (Vec<f32>, usize)> = HashMap::new();
+                                for m in &snapshot.all {
+                                    if m.memory_type == MemoryType::Synthesis || m.is_expired() {
+                                        continue;
+                                    }
+                                    let Some(v) = svc.vector_of(&m.id) else {
+                                        continue;
+                                    };
+                                    if v.is_empty() {
+                                        continue;
+                                    }
+                                    let slot =
+                                        acc.entry(m.id.clone()).or_insert_with(|| (vec![0.0; v.len()], 0));
+                                    if slot.0.len() == v.len() {
+                                        for (a, b) in slot.0.iter_mut().zip(v.iter()) {
+                                            *a += *b;
+                                        }
+                                        slot.1 += 1;
+                                    }
+                                }
+                                semantic_vectors = acc
+                                    .into_iter()
+                                    .filter(|(_, (_, n))| *n > 0)
+                                    .map(|(id, (mut v, n))| {
+                                        let inv = 1.0 / n as f32;
+                                        for x in v.iter_mut() {
+                                            *x *= inv;
+                                        }
+                                        (id, v)
+                                    })
+                                    .collect();
+                                if !semantic_vectors.is_empty() {
+                                    eprintln!(
+                                        "[LRC·结晶] 二层聚类：取得 {} 条语义向量（快照 {} 条记忆）",
+                                        semantic_vectors.len(),
+                                        snapshot.all.len()
+                                    );
+                                }
+                            }
+
                             // Phase 2：锁外 CPU 密集计算（可取消）
                             let engine = SynthesisEngine::new(snapshot.config);
-                            let (mut plan, mut cancelled) = engine.plan_luoshu_cancellable(
+                            let (mut plan, mut cancelled) = engine.plan_luoshu_with_semantics(
                                 &snapshot.all,
+                                &semantic_vectors,
                                 snapshot.information_gain_threshold,
                                 Some(cancel_for_task.as_ref()),
                             );
@@ -688,8 +784,32 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
     ///
     /// 失败时返回 Err，调用方应降级到洛书合成。
     async fn llm_synthesize_cycle(&self, llm_config: &LlmApiConfig) -> LrcResult<usize> {
+        // ★v0.11 独立审查修复（跨租户内容出网）：
+        //   本路径的候选集是**全库**（不区分租户），Phase 2 会把内容发送给外部 LLM。
+        //   多租户域下这等于把其他租户的私有记忆送去第三方 ⇒ 直接禁用 LLM 合成，
+        //   由调用方降级到**本地**洛书合成（跨用户簇在写回时 fail-closed）。
+        if crate::privacy::from_env() == crate::privacy::TrustMode::MultiTenant {
+            if self.config.verbose >= 1 {
+                eprintln!(
+                    "[LRC·结晶·LLM] 多租户域禁用 LLM 合成（避免跨租户内容出网），改用本地洛书合成"
+                );
+            }
+            // 用 Err 而非 Ok(0)：`Ok(0)` 会把 `synthesis_completed` 置 true，
+            // 导致随后洛书路径失败时**不再恢复** `synthesis_pending`（增量丢失）。
+            return Err(LrcError::config(
+                "多租户域禁用 LLM 合成（跨租户内容不得出网）",
+            ));
+        }
         // ===== Phase 1：持锁加载记忆列表 + 取本地编码器句柄（均 <1ms） =====
-        let (candidates, local_encoder): (Vec<(String, String)>, Arc<HybridLuoShuEncoder>) = {
+        //
+        // ★ v0.11 P0 修复（隐私继承 fail-open）：候选列表必须保留**完整 Memory**
+        //   对象，而不是只留 `(id, content)`。Phase 3 的隐私继承原先重新
+        //   `list_memories(&ListFilter::new())` 取"全库"，但该默认分页是 **limit=20**，
+        //   而本路径候选可达 300 条 ⇒ 大多数来源查不到 ⇒ `inherit_privacy(&[])`
+        //   返回 `Global` ⇒ 私有来源的合成产物被写成**全租户可见**（真实泄漏）。
+        //   现改为：Phase 3 直接使用本快照（产生摘要的同一份数据），
+        //   既消除分页截断，也消除两次读取之间的 TOCTOU 不一致。
+        let (candidates, local_encoder): (Vec<Memory>, Arc<HybridLuoShuEncoder>) = {
             let store = self.store.read().await;
             let _hold = crate::obs::HoldTimer::new("consolidate");
             let filter = ListFilter {
@@ -703,7 +823,6 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             let list = all
                 .into_iter()
                 .filter(|m| m.memory_type != MemoryType::Synthesis)
-                .map(|m| (m.id, m.content))
                 .collect::<Vec<_>>();
             // v0.9.14：句柄在短锁内取走，真正的编码放到锁外执行
             (list, store.luoshu_encoder_handle())
@@ -732,7 +851,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         // LLM 只负责生成文本。此前这里调用 `llm_config.embed_texts`
         // （即付费的 /v1/embeddings），一旦上游不提供该端点或按策略关闭，
         // 整条合成路径立即失败并退回 9 维洛书合成。
-        let texts_owned: Vec<String> = candidates.iter().map(|(_, c)| c.clone()).collect();
+        let texts_owned: Vec<String> = candidates.iter().map(|m| m.content.clone()).collect();
         let embeddings = timeout(
             EMBEDDING_TIMEOUT,
             tokio::task::spawn_blocking(move || {
@@ -796,7 +915,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             // 收集簇内记忆内容
             let cluster_memories: Vec<String> = cluster_indices
                 .iter()
-                .map(|&i| candidates[i].1.clone())
+                .map(|&i| candidates[i].content.clone())
                 .collect();
 
             // 调用 LLM chat API 生成合成内容
@@ -811,7 +930,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             // 收集源记忆 ID
             let source_ids: Vec<String> = cluster_indices
                 .iter()
-                .map(|&i| candidates[i].0.clone())
+                .map(|&i| candidates[i].id.clone())
                 .collect();
 
             if self.config.verbose >= 2 {
@@ -838,29 +957,29 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             let store = self.store.write().await;
             let _hold = crate::obs::HoldTimer::new("consolidate");
             let mut count = 0usize;
-            // v0.9.11（G3 / CR-04）：一次读全库建索引，供"来源隐私继承"使用。
-            // 合成摘要把多条来源的内容归纳进来 —— 必须在写入前算出继承后的可见性。
-            let by_id: std::collections::HashMap<String, Memory> = store
-                .list_memories(&crate::memory_store::ListFilter::new())
-                .map(|(v, _)| v)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|m| (m.id.clone(), m))
-                .collect();
+            // v0.9.11（G3 / CR-04）：合成摘要把多条来源的内容归纳进来 ——
+            // 必须在写入前算出继承后的可见性。
+            //
+            // ★ v0.11 P0 修复：来源必须取自**产生本轮摘要的同一份候选快照**。
+            //   此前重读 `ListFilter::new()`（默认 limit=20）⇒ 300 条候选中的多数
+            //   来源查不到 ⇒ `inherit_privacy(&[])` 回落 `Global` ⇒ 私有内容泄漏。
+            let by_id: std::collections::HashMap<&str, &Memory> =
+                candidates.iter().map(|m| (m.id.as_str(), m)).collect();
             for (source_ids, summary, info_gain) in synthesis_results {
                 // **派生记忆必须继承来源隐私**（交集 = 最严）。
                 // 跨可见性域 ⇒ `None` ⇒ **放弃该合成产物**（不写库），
                 // 因为"跨用户摘要"本身即泄漏；绝不回退为全可见。
                 let sources: Vec<Memory> = source_ids
                     .iter()
-                    .filter_map(|id| by_id.get(id).cloned())
+                    .filter_map(|id| by_id.get(id.as_str()).map(|m| (*m).clone()))
                     .collect();
-                let scope = match crate::privacy::inherit_privacy(&sources) {
+                // 与洛书路径同口径：匿名来源放行；跨域 / 不可解析 ⇒ 拒写
+                let scope = match inherit_scope_for_synthesis(&sources) {
                     Some(s) => s,
                     None => {
                         if self.config.verbose >= 1 {
                             eprintln!(
-                                "[LRC·结晶·LLM] 跳过跨可见性域的合成产物（来源分属不同 user/session）"
+                                "[LRC·结晶·LLM] 跳过跨可见性域或来源不可解析的合成产物（拒写以免越权可见）"
                             );
                         }
                         continue;
@@ -987,7 +1106,11 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         summarizer: Option<&LlmApiConfig>,
     ) -> LrcResult<usize> {
         // ===== Phase 1：持锁加载记忆列表 =====
-        let candidates: Vec<(String, String)> = {
+        //
+        // ★ v0.11 P0 修复（同 LLM 路径）：候选保留完整 Memory，供 Phase 3
+        //   用**同一快照**做隐私继承（此前 Phase 3 重读 limit=20 的默认分页，
+        //   导致 1000 条候选中绝大多数来源查不到 ⇒ 回落 Global ⇒ 泄漏）。
+        let candidates: Vec<Memory> = {
             let store = self.store.read().await;
             let _hold = crate::obs::HoldTimer::new("consolidate");
             let filter = ListFilter {
@@ -999,7 +1122,6 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
                 .map_err(|e| LrcError::io(format!("加载记忆列表失败: {}", e)))?;
             all.into_iter()
                 .filter(|m| m.memory_type != MemoryType::Synthesis)
-                .map(|m| (m.id, m.content))
                 .collect::<Vec<_>>()
         };
 
@@ -1024,7 +1146,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
         }
 
         // ===== Phase 2：无锁，embedding + 聚类 + 总结 =====
-        let texts: Vec<&str> = candidates.iter().map(|(_, c)| c.as_str()).collect();
+        let texts: Vec<&str> = candidates.iter().map(|m| m.content.as_str()).collect();
         let embeddings = timeout(EMBEDDING_TIMEOUT, embedder.embed(&texts))
             .await
             .map_err(|_| LrcError::timeout("Embedding 调用超时（60 秒）"))?
@@ -1070,7 +1192,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             // 收集簇内记忆内容
             let cluster_memories: Vec<String> = cluster_indices
                 .iter()
-                .map(|&i| candidates[i].1.clone())
+                .map(|&i| candidates[i].content.clone())
                 .collect();
 
             // 总结：有 LLM 用 LLM，否则用本地拼接降级
@@ -1086,7 +1208,7 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             // 收集源记忆 ID
             let source_ids: Vec<String> = cluster_indices
                 .iter()
-                .map(|&i| candidates[i].0.clone())
+                .map(|&i| candidates[i].id.clone())
                 .collect();
 
             if self.config.verbose >= 2 {
@@ -1113,26 +1235,26 @@ impl<P: Persistence + Send + 'static> ConsolidationPipeline<P> {
             let store = self.store.write().await;
             let _hold = crate::obs::HoldTimer::new("consolidate");
             let mut count = 0usize;
-            // v0.9.11（G3 / CR-04）：同 LLM 合成路径 —— 派生记忆必须继承来源隐私
-            let by_id: std::collections::HashMap<String, Memory> = store
-                .list_memories(&crate::memory_store::ListFilter::new())
-                .map(|(v, _)| v)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|m| (m.id.clone(), m))
-                .collect();
+            // v0.9.11（G3 / CR-04）：同 LLM 合成路径 —— 派生记忆必须继承来源隐私。
+            //
+            // ★ v0.11 P0 修复：来源取自**产生本轮摘要的同一份候选快照**；
+            //   此前重读 `ListFilter::new()`（默认 limit=20）⇒ 多数来源查不到
+            //   ⇒ `inherit_privacy(&[])` 回落 `Global` ⇒ 私有内容泄漏为全可见。
+            let by_id: std::collections::HashMap<&str, &Memory> =
+                candidates.iter().map(|m| (m.id.as_str(), m)).collect();
             for (source_ids, summary, info_gain) in synthesis_results {
                 // **继承来源隐私（交集 = 最严）；跨可见性域 ⇒ 放弃该合成产物**
                 let sources: Vec<Memory> = source_ids
                     .iter()
-                    .filter_map(|id| by_id.get(id).cloned())
+                    .filter_map(|id| by_id.get(id.as_str()).map(|m| (*m).clone()))
                     .collect();
-                let scope = match crate::privacy::inherit_privacy(&sources) {
+                // 与洛书路径同口径：匿名来源放行；跨域 / 不可解析 ⇒ 拒写
+                let scope = match inherit_scope_for_synthesis(&sources) {
                     Some(s) => s,
                     None => {
                         if self.config.verbose >= 1 {
                             eprintln!(
-                                "[LRC·结晶·Embed] 跳过跨可见性域的合成产物（来源分属不同 user/session）"
+                                "[LRC·结晶·Embed] 跳过跨可见性域或来源不可解析的合成产物（拒写以免越权可见）"
                             );
                         }
                         continue;
@@ -2168,6 +2290,209 @@ mod tests {
             all.iter().any(|m| m.memory_type == MemoryType::Synthesis
                 && m.source.as_deref() == Some("llm_synthesis")),
             "库中应存在 source=llm_synthesis 的合成记忆"
+        );
+    }
+
+    /// 确定性 mock 嵌入器（供隐私继承用例复用）。
+    ///
+    /// 私有向量两两余弦 ≥ 0.49（任意贪心顺序都会并入同一簇），
+    /// 且第 4 维全为 0 ⇒ 与公共向量 `[0,0,0,1]` 正交，不互相吸附。
+    struct MockClusterEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for MockClusterEmbedder {
+        async fn embed(
+            &self,
+            texts: &[&str],
+        ) -> Result<Vec<Vec<f32>>, crate::engine::embedder::EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|t| match *t {
+                    "private-0" | "anon-0" => vec![1.0, 0.0, 0.0, 0.0],
+                    "private-1" | "anon-1" => vec![0.7, 0.7, 0.0, 0.0],
+                    "private-2" | "anon-2" => vec![0.7, 0.0, 0.7, 0.0],
+                    // 公共记忆与私有簇正交，且彼此完全一致（信息增量 0 ⇒ 不合成）
+                    _ => vec![0.0, 0.0, 0.0, 1.0],
+                })
+                .collect())
+        }
+        fn dim(&self) -> usize {
+            4
+        }
+        fn model_id(&self) -> &str {
+            "mock-embedder"
+        }
+        fn source(&self) -> &'static str {
+            "local"
+        }
+    }
+
+    /// ★v0.11 回归：匿名来源（无 session/user 标识）的合成必须放行。
+    ///
+    /// 与洛书路径同口径：默认单用户配置（桌面端不写 `user_id`）下，
+    /// 若把匿名来源判为"归属不明 ⇒ 拒写"，LLM/Embedding 合成会**恒为 0**，
+    /// 而洛书路径却正常产出 —— 三条路径语义不一致。
+    #[tokio::test]
+    async fn anonymous_sources_still_produce_synthesis() {
+        let (_dir, store) = make_store();
+        let store = Arc::new(RwLock::new(store));
+        for i in 0..3 {
+            let m = Memory::new(
+                format!("anon-{i}"),
+                MemoryType::Fact,
+                None,
+                Vec::new(),
+                Importance::new(5),
+                None,
+            );
+            store.write().await.remember(m).expect("写入匿名记忆");
+        }
+
+        let config = ConsolidationConfig {
+            poll_interval_secs: 3600,
+            batch_size: 20,
+            synthesis_threshold: 3,
+            synthesis_similarity: 0.4,
+            run_on_start: false,
+            auto_synthesize: true,
+            verbose: 0,
+        };
+        let pipeline = ConsolidationPipeline::new(config, store.clone());
+        let written = pipeline
+            .embedding_synthesize_cycle(&MockClusterEmbedder, None)
+            .await
+            .expect("合成应成功");
+        assert!(
+            written >= 1,
+            "匿名来源应产出合成记忆（不得被误判为归属不明）"
+        );
+
+        let store = store.read().await;
+        let (all, _) = store
+            .list_memories(&ListFilter {
+                limit: 200,
+                ..ListFilter::new()
+            })
+            .expect("列出记忆");
+        let synth: Vec<&Memory> = all
+            .iter()
+            .filter(|m| m.memory_type == MemoryType::Synthesis)
+            .collect();
+        assert!(!synth.is_empty(), "库中必须存在合成记忆");
+        for m in synth {
+            assert_eq!(
+                m.privacy_level,
+                PrivacyLevel::User,
+                "匿名来源的合成产物应保持默认 User 级"
+            );
+            assert!(m.user_id.is_none(), "匿名来源不应凭空生成 user_id");
+        }
+    }
+
+    /// ★v0.11 P0 回归：私有来源的合成产物**绝不能**因分页截断回落为 `Global`。
+    ///
+    /// 背景（真实缺陷，非假设）：LLM / Embedding 两条合成路径的 Phase 3 原先
+    /// 重新 `list_memories(&ListFilter::new())` 取"全库"做隐私继承，但
+    /// `ListFilter::new()` 的默认分页是 **limit=20**，而候选集可达 300/1000 条
+    /// ⇒ 大多数来源查不到 ⇒ `inherit_privacy(&[])` 返回 `Global`
+    /// ⇒ 私有来源的摘要被写成**全租户可见**（越权可见，真实泄漏）。
+    ///
+    /// 本用例把 3 条私有来源做成**最旧**的记忆（必然排除在 newest-20 之外），
+    /// 用确定性 mock embedder 让它们单独成簇（公共记忆向量完全相同 ⇒
+    /// 信息增量为 0 被跳过，不干扰断言）。修复前：合成记忆为 `Global`；修复后：
+    /// 必须是 `User + user_id=alice`。
+    #[tokio::test]
+    async fn private_sources_outside_newest_page_still_inherit_privacy() {
+        let (_dir, store) = make_store();
+        let store = Arc::new(RwLock::new(store));
+        let old = Utc::now() - chrono::Duration::days(10);
+        for i in 0..3 {
+            let mut m = Memory::new(
+                format!("private-{i}"),
+                MemoryType::Fact,
+                None,
+                Vec::new(),
+                Importance::new(7),
+                None,
+            )
+            .with_privacy(PrivacyLevel::User, None, Some("alice".to_string()));
+            m.created_at = old + chrono::Duration::seconds(i);
+            m.updated_at = m.created_at;
+            m.last_accessed = m.created_at;
+            store.write().await.remember(m).expect("写入私有记忆");
+        }
+        for i in 0..22 {
+            let m = Memory::new(
+                format!("public-{i}"),
+                MemoryType::Fact,
+                None,
+                Vec::new(),
+                Importance::new(5),
+                None,
+            );
+            store.write().await.remember(m).expect("写入公共记忆");
+        }
+
+        let config = ConsolidationConfig {
+            poll_interval_secs: 3600,
+            batch_size: 20,
+            synthesis_threshold: 3,
+            synthesis_similarity: 0.4,
+            run_on_start: false,
+            auto_synthesize: true,
+            verbose: 0,
+        };
+        let pipeline = ConsolidationPipeline::new(config, store.clone());
+        let written = pipeline
+            .embedding_synthesize_cycle(&MockClusterEmbedder, None)
+            .await
+            .expect("合成应成功");
+        assert!(written >= 1, "私有簇应产出至少 1 条合成记忆");
+
+        let store = store.read().await;
+        let (all, _) = store
+            .list_memories(&ListFilter {
+                limit: 200,
+                ..ListFilter::new()
+            })
+            .expect("列出记忆");
+        let synth: Vec<&Memory> = all
+            .iter()
+            .filter(|m| m.memory_type == MemoryType::Synthesis)
+            .collect();
+        assert!(!synth.is_empty(), "库中必须存在合成记忆");
+        for m in synth {
+            assert_ne!(
+                m.privacy_level,
+                PrivacyLevel::Global,
+                "私有来源的合成产物不得回落为 Global（分页截断导致的越权可见）"
+            );
+            assert_eq!(
+                m.user_id.as_deref(),
+                Some("alice"),
+                "合成产物必须继承来源 user_id"
+            );
+        }
+    }
+
+    /// ★源码级守卫：合成路径的来源查询**不得**退回默认分页。
+    ///
+    /// `ListFilter::new()` 的默认分页是 `limit=20`。若用它查"来源记忆"，
+    /// 候选集（300/1000 条）中的多数来源会查不到 ⇒ `inherit_privacy(&[])`
+    /// 回落 `Global` ⇒ 私有内容越权可见。行为用例见
+    /// `private_sources_outside_newest_page_still_inherit_privacy`；
+    /// 本守卫防的是"未来重构时重新引入"。
+    #[test]
+    fn synthesis_privacy_lookup_must_not_use_default_pagination() {
+        let src = include_str!("consolidation.rs");
+        let production = src
+            .find("#[cfg(test)]")
+            .map(|idx| &src[..idx])
+            .unwrap_or(src);
+        assert!(
+            !production.contains("list_memories(&crate::memory_store::ListFilter::new())"),
+            "合成路径不得用 ListFilter::new()（默认 limit=20）查询来源：\
+             分页截断会让 inherit_privacy 回落 Global，导致私有内容越权可见"
         );
     }
 }

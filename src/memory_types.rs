@@ -555,7 +555,16 @@ impl Memory {
             if days == 0 {
                 return false;
             }
-            let deadline = self.created_at + chrono::Duration::days(days as i64);
+            // v0.11：用 checked_add 防止异常大的 ttl_days（如被截断/篡改的
+            // u32::MAX ≈ 1170 万年）让 chrono 越界 panic —— 该函数会在
+            // list / recall / stats 的持锁路径上被调用，panic 会拖垮整个服务。
+            // 溢出时按"永不过期"处理（保守：不误删数据）。
+            let Some(deadline) = self
+                .created_at
+                .checked_add_signed(chrono::Duration::days(days as i64))
+            else {
+                return false;
+            };
             Utc::now() > deadline
         } else {
             false
@@ -726,6 +735,25 @@ mod tests {
     fn test_memory_type_as_str() {
         assert_eq!(MemoryType::Fact.as_str(), "fact");
         assert_eq!(MemoryType::CodeContext.as_str(), "code_context");
+    }
+
+    /// v0.11：异常大的 TTL 不得让 `is_expired` 在持锁路径 panic。
+    #[test]
+    fn test_is_expired_tolerates_huge_ttl() {
+        let mut m = Memory::new(
+            "ttl 边界".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            Some(u32::MAX),
+        );
+        assert!(!m.is_expired(), "溢出应按永不过期处理");
+        m.ttl_days = Some(0);
+        assert!(!m.is_expired(), "0 表示永不过期");
+        m.ttl_days = Some(1);
+        m.created_at = Utc::now() - chrono::Duration::days(2);
+        assert!(m.is_expired(), "正常 TTL 仍应过期");
     }
 
     #[test]

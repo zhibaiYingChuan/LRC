@@ -92,6 +92,11 @@ pub struct BackupReport {
     pub total_backups: usize,
     /// 错误信息（如有）
     pub error: Option<String>,
+    /// 数据来源目录（哪个实例的库被备份）
+    ///
+    /// 为什么需要：备份文件集中存放于全局 `backups/`，多实例共享同一轮转池。
+    /// 没有来源标注时，用户无法判断某份快照属于哪个库。
+    pub source_data_dir: Option<String>,
 }
 
 /// 获取备份目录路径：~/.loong-recall/backups/
@@ -103,14 +108,6 @@ pub struct BackupReport {
 ///   并打印告警，避免"静默写入相对路径"。
 pub fn backups_dir() -> PathBuf {
     home_dir_or_fallback().join(".loong-recall").join("backups")
-}
-
-/// 获取全局数据目录路径：~/.loong-recall/global/data/
-fn global_data_dir() -> PathBuf {
-    home_dir_or_fallback()
-        .join(".loong-recall")
-        .join("global")
-        .join("data")
 }
 
 /// home 目录解析：优先 `home_dir()`，失败时退到系统临时目录（**不用 CWD**）并告警
@@ -143,7 +140,12 @@ fn backup_filename() -> String {
 /// ~/.loong-recall/backups/memories_YYYYMMDD_HHMMSS.json
 ///
 /// 自动清理超过 MAX_BACKUPS 份数的旧备份。
-pub fn create_backup() -> BackupReport {
+/// 备份**当前实例**的数据目录。
+///
+/// 为什么必须传入 `data_dir`：此前硬编码 `global_data_dir()`，
+/// 导致自定义 `--data-dir` 或项目模式实例调用备份时，备份的是**另一个库**
+/// （用户以为备份了当前数据，实际备份的是全局默认库）。
+pub fn create_backup(data_dir: &Path) -> BackupReport {
     let _operation_guard = BACKUP_OPERATION_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -152,7 +154,8 @@ pub fn create_backup() -> BackupReport {
     //   一旦取得，所有 JSON 落盘路径（持 writer_guard 读锁）都被排除 ⇒
     //   7 个文件取自**同一时刻**，兑现上方"必须与并发写互斥"的承诺。
     let _snapshot_guard = crate::atomic_file::snapshot_guard();
-    let report = create_backup_in(&global_data_dir(), &backups_dir());
+    let mut report = create_backup_in(data_dir, &backups_dir());
+    report.source_data_dir = Some(data_dir.to_string_lossy().to_string());
     // 数据操作日志只在**真实**入口记录：`create_backup_in` 供测试注入临时目录调用，
     // 不应把测试运行写进用户的 `~/.loong-recall/data_operations.log`。
     if report.success {
@@ -186,6 +189,7 @@ fn create_backup_in(data_dir: &Path, root: &Path) -> BackupReport {
         old_backups_removed: 0,
         total_backups: 0,
         error: None,
+        source_data_dir: None,
     };
     let data_dir = data_dir.to_path_buf();
     if !data_dir.join("memories.json").exists() {
@@ -323,7 +327,11 @@ fn count_backups(backups_dir: &Path) -> usize {
 }
 
 /// 从快照恢复全部运行时文件。
-pub fn restore_backup(snapshot_path: &Path) -> LrcResult<()> {
+/// 从快照恢复到**当前实例**的数据目录。
+///
+/// 与 [`create_backup`] 同源修正：此前恢复目标硬编码全局目录，
+/// 在项目模式或自定义 `--data-dir` 实例上会把全局库覆盖掉。
+pub fn restore_backup(snapshot_path: &Path, data_dir: &Path) -> LrcResult<()> {
     let _operation_guard = BACKUP_OPERATION_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -331,7 +339,7 @@ pub fn restore_backup(snapshot_path: &Path) -> LrcResult<()> {
     // v0.9.11（G5 / CR-37）：恢复同样要**独占**（锁序 [1] → [2]）。
     //   否则恢复进行到一半时，实时写会把"旧版本记忆"重新落盘 ⇒ 恢复结果被静默污染。
     let _snapshot_guard = crate::atomic_file::snapshot_guard();
-    restore_backup_in(snapshot_path, &backups_dir(), &global_data_dir())
+    restore_backup_in(snapshot_path, &backups_dir(), data_dir)
 }
 
 /// [`restore_backup`] 的**可注入路径内核**（v0.9.11 / G7 / CR-45）。
@@ -622,6 +630,7 @@ mod tests {
             old_backups_removed: 1,
             total_backups: 4,
             error: None,
+            source_data_dir: Some("/test/data".to_string()),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"success\":true"));
@@ -772,7 +781,7 @@ mod tests {
         let src = include_str!("backup.rs");
         let prod = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
         let pub_create = prod
-            .find("pub fn create_backup()")
+            .find("pub fn create_backup(")
             .expect("必须存在 create_backup");
         assert!(
             prod[pub_create..].contains("create_backup_in("),

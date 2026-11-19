@@ -1775,7 +1775,7 @@ pub type PrivacyScope = (PrivacyLevel, Option<String>, Option<String>);
 /// - User 级别：仅当 user_id 匹配时可见
 /// - Session 级别：仅当 session_id 匹配时可见
 /// - 无隐私上下文时：显示所有记忆（向后兼容）
-fn is_visible(memory: &Memory, context: &Option<PrivacyScope>) -> bool {
+pub(crate) fn is_visible(memory: &Memory, context: &Option<PrivacyScope>) -> bool {
     match context {
         None => true, // 无隐私上下文，全部可见
         Some((_level, session_id, user_id)) => {
@@ -1789,10 +1789,25 @@ fn is_visible(memory: &Memory, context: &Option<PrivacyScope>) -> bool {
                     }
                 }
                 PrivacyLevel::Session => {
-                    // Session 级别：需要匹配 session_id
-                    match (session_id, &memory.session_id) {
+                    // Session 级别：session_id 必须匹配；
+                    // 若记忆带 user_id，则 user 也必须匹配 —— 否则「自己的 user_id +
+                    // 他人的 session_id」就能越权读写他人的会话级记忆。
+                    let session_match = match (session_id, &memory.session_id) {
                         (Some(sid), Some(mid)) => sid == mid,
                         _ => false,
+                    };
+                    if !session_match {
+                        return false;
+                    }
+                    match (&memory.user_id, user_id) {
+                        (Some(mid), Some(uid)) => mid == uid,
+                        (Some(_), None) => false,
+                        // 旧数据可能没有 user_id：**纯 session 上下文**（请求方也没有
+                        // user）保持兼容；但请求方带了 user_id 时必须拒绝 ——
+                        // 否则多租户域下「自己的 user + 他人的匿名 session」
+                        // 仍可跨租户读取（v0.11 独立审查修复）。
+                        (None, None) => true,
+                        (None, Some(_)) => false,
                     }
                 }
             }
@@ -7545,6 +7560,43 @@ impl<P: Persistence> MemoryStore<P> {
         Ok(true)
     }
 
+    /// 按 ID 取一条**对当前 scope 可见**的记忆。
+    ///
+    /// 为什么需要：`forget` / `correct` 是按 ID 操作的高危入口。没有这个查询，
+    /// 多租户域下调用方可凭任意 ID 删除/改写其他租户的记忆（v0.11 CLI 暴露后放大）。
+    /// 返回 `None` 时调用方应统一按「不存在」处理，避免通过响应差异探测他人 ID。
+    pub fn get_visible_memory(
+        &self,
+        id: &str,
+        context: &Option<PrivacyScope>,
+    ) -> Result<Option<Memory>, PersistenceError> {
+        let snapshot = self.load_cached()?;
+        match snapshot.iter().find(|memory| memory.id == id) {
+            // v0.11：过期记忆在 recall / list 中已不可见，按 ID 操作也必须一致，
+            // 否则会出现「检索看不到、却能按 ID 删除/修正」的缝隙。
+            Some(memory) if !memory.is_expired() && is_visible(memory, context) => {
+                Ok(Some((**memory).clone()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// 按 ID 取一条对当前 scope 可见的记忆，**包含已过期**。
+    ///
+    /// 为什么单独存在：`forget` 是清理动作，过期记忆必须能被用户删除；
+    /// 而 correct / unfold / lifecycle 等「操作内容」的入口应拒绝过期记忆。
+    pub fn get_visible_memory_including_expired(
+        &self,
+        id: &str,
+        context: &Option<PrivacyScope>,
+    ) -> Result<Option<Memory>, PersistenceError> {
+        let snapshot = self.load_cached()?;
+        match snapshot.iter().find(|memory| memory.id == id) {
+            Some(memory) if is_visible(memory, context) => Ok(Some((**memory).clone())),
+            _ => Ok(None),
+        }
+    }
+
     /// 删除一条记忆
     pub fn forget(&self, id: &str) -> Result<bool, PersistenceError> {
         // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
@@ -7673,6 +7725,10 @@ impl<P: Persistence> MemoryStore<P> {
                 }
             }
             if !filter.tags.is_empty() && !filter.tags.iter().any(|t| m.tags.contains(t)) {
+                return false;
+            }
+            // v0.11：过期记忆默认不出现在列表；导出 / 清理场景可显式 include_expired。
+            if !filter.include_expired && m.is_expired() {
                 return false;
             }
             // 隐私权限过滤（Section 3.3）
@@ -8278,18 +8334,16 @@ impl<P: Persistence> MemoryStore<P> {
         scope: &Option<PrivacyScope>,
     ) -> Result<Vec<MemoryAssociation>, PersistenceError> {
         let all = self.associations(memory_id)?;
-        if scope.is_none() {
-            // 本地可信域：不做额外过滤，与既有行为**逐位一致**
-            return Ok(all);
-        }
         let memories = self.load_cached()?;
         let by_id: std::collections::HashMap<&str, &Memory> = memories
             .iter()
             .map(|m| (m.id.as_str(), m.as_ref()))
             .collect();
-        // anchor 不可见（或不存在）⇒ 空结果
+        // v0.11：过期记忆与不可见记忆同等处理（与 recall / list / stored-edges 一致）。
+        let visible = |m: &Memory| !m.is_expired() && is_visible(m, scope);
+        // anchor 不可见（或不存在、或已过期）⇒ 空结果
         match by_id.get(memory_id) {
-            Some(anchor) if is_visible(anchor, scope) => {}
+            Some(anchor) if visible(anchor) => {}
             _ => return Ok(Vec::new()),
         }
         Ok(all
@@ -8297,7 +8351,7 @@ impl<P: Persistence> MemoryStore<P> {
             .filter(|a| {
                 by_id
                     .get(a.memory_id.as_str())
-                    .map(|m| is_visible(m, scope))
+                    .map(|m| visible(m))
                     .unwrap_or(false) // 查不到 ⇒ 不可见（fail-closed）
             })
             .collect())
@@ -8315,17 +8369,16 @@ impl<P: Persistence> MemoryStore<P> {
         scope: &Option<PrivacyScope>,
     ) -> Result<AssociationGraph, PersistenceError> {
         let graph = self.association_graph(memory_id, max_nodes)?;
-        if scope.is_none() {
-            return Ok(graph);
-        }
         let memories = self.load_cached()?;
         let by_id: std::collections::HashMap<&str, &Memory> = memories
             .iter()
             .map(|m| (m.id.as_str(), m.as_ref()))
             .collect();
+        // v0.11：过期记忆与不可见记忆同等处理。
+        let is_live_visible = |m: &Memory| !m.is_expired() && is_visible(m, scope);
         if !by_id
             .get(memory_id)
-            .map(|m| is_visible(m, scope))
+            .map(|m| is_live_visible(m))
             .unwrap_or(false)
         {
             // anchor 不可见 ⇒ 空图（保留 root 便于调用方定位）
@@ -8339,7 +8392,7 @@ impl<P: Persistence> MemoryStore<P> {
             });
         }
         let visible =
-            |id: &str| -> bool { by_id.get(id).map(|m| is_visible(m, scope)).unwrap_or(false) };
+            |id: &str| -> bool { by_id.get(id).map(|m| is_live_visible(m)).unwrap_or(false) };
         let total_nodes = graph.nodes.len();
         let total_edges = graph.edges.len();
         let nodes: Vec<crate::memory_store_types::GraphNode> = graph
@@ -10085,10 +10138,89 @@ impl<P: Persistence> MemoryStore<P> {
         // 2026-09-01 C05 修复：改用 replace_all_memories 单端点原子写，
         // 消除旧 clear_memories+save_memory 两端点在重建中途崩溃丢全库的窗口。
         self.persistence.replace_all_memories(&active)?;
+        // v0.11：归档后清理图边与生命周期死行，避免悬空边/死行永久膨胀。
+        // 清理失败不阻断归档（与 forget 的策略一致：主操作不因增强能力失败），
+        // 但必须留下告警——否则悬空边会静默永久残留。
+        if let Some(ref mut graph) = *self.graph_store.write_recover() {
+            for memory in &expired {
+                if let Err(e) = graph.remove_edges_of_memory(&memory.id) {
+                    eprintln!(
+                        "[archive] 清理记忆 {} 的图边失败（归档已成功）: {}",
+                        memory.id, e
+                    );
+                }
+            }
+        }
+        for memory in &expired {
+            // `clear_lifecycle` 的 bool 表示"是否删掉了已有状态行"，
+            // 从未被访问过的记忆本就返回 false（正常情况，不是失败），故不告警。
+            self.clear_lifecycle(&memory.id);
+        }
         // v0.5.4 写操作后标记缓存为脏
         self.invalidate_cache();
+        // v0.11：归档是生命周期迁移（可恢复），必须留审计痕迹
+        self.record_audit(
+            AuditEventType::MemoryArchived,
+            format!("归档 {} 条过期记忆到冷存储", count),
+            "过期记忆不再参与检索/列表/统计，但可从归档恢复",
+            expired.iter().map(|m| m.id.clone()).collect(),
+        );
 
         Ok(count)
+    }
+
+    /// 从归档恢复一条记忆：**从现在重新计时**后写回活跃库。
+    ///
+    /// 为什么必须重置时间：归档的记忆都已过期，若沿用原 `created_at`/`ttl_days`，
+    /// 恢复后立刻又过期（`is_expired` 仍为 true），用户看到的是「恢复成功但查不到」。
+    pub fn unarchive_memory(
+        &self,
+        id: &str,
+        ttl_days: Option<u32>,
+    ) -> Result<Option<Memory>, PersistenceError> {
+        let archived = self.persistence.load_archived_memories()?;
+        let Some(mut memory) = archived.into_iter().find(|m| m.id == id) else {
+            return Ok(None);
+        };
+        let now = chrono::Utc::now();
+        memory.created_at = now;
+        memory.updated_at = now;
+        memory.ttl_days = ttl_days.or(memory.ttl_days);
+        // ★v0.11 独立审查修复（数据丢失窗口）：必须先写活跃库、再删归档。
+        //   反向顺序（先删归档）一旦 `save_memory` 失败（磁盘满 / I/O 错误），
+        //   记忆既不在归档也不在活跃库 ⇒ **永久丢失**；本顺序失败最多留下
+        //   "活跃 + 归档各一份"的重复，可再次 unarchive / purge 收敛。
+        self.persistence.save_memory(&memory)?;
+        self.persistence.delete_from_archive(id)?;
+        self.invalidate_cache();
+        self.record_audit(
+            AuditEventType::MemoryUnarchived,
+            format!("从归档恢复记忆 {}（重新计时）", id),
+            "恢复后从现在重新计时，避免恢复即再次过期",
+            vec![id.to_string()],
+        );
+        Ok(Some(memory))
+    }
+
+    /// 从归档彻底删除一条记忆（不可恢复）。
+    pub fn purge_archived(&self, id: &str) -> Result<bool, PersistenceError> {
+        let deleted = self.persistence.delete_from_archive(id)?;
+        if deleted {
+            // 归档时已清理过图边/生命周期；此处再清一次是**防御性**的：
+            // 若归档步骤曾部分失败（清理被 `let _ =` 吞掉），彻底删除是
+            // 最后一次补救机会，避免悬空边永久残留。
+            if let Some(ref mut graph) = *self.graph_store.write_recover() {
+                let _ = graph.remove_edges_of_memory(id);
+            }
+            let _ = self.clear_lifecycle(id);
+            self.record_audit(
+                AuditEventType::MemoryPurged,
+                format!("从归档彻底删除记忆 {}", id),
+                "用户显式清除归档内容，此操作不可恢复",
+                vec![id.to_string()],
+            );
+        }
+        Ok(deleted)
     }
 
     /// 道枢映射: 坤卦·地 (☷) — 地势坤，持久化如大地之承载记忆

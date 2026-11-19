@@ -391,6 +391,18 @@ fn make_response(id: Option<serde_json::Value>, result: serde_json::Value) -> Js
     }
 }
 
+/// v0.11：MCP 入口的 scope 强制（与 REST 的 `privacy::resolve` 对齐）。
+///
+/// `scope_from_args` 只负责构造上下文；多租户域缺 user_id/session_id 时
+/// 必须显式拒绝，否则 `is_visible` 拿到 `None` 会恒放行。
+fn enforce_mcp_scope(
+    arguments: &serde_json::Value,
+) -> Result<Option<crate::memory_store::PrivacyScope>, &'static str> {
+    let scope = crate::privacy::scope_from_args(arguments);
+    crate::privacy::require_scope(crate::privacy::from_env(), &scope)?;
+    Ok(scope)
+}
+
 fn make_error(id: Option<serde_json::Value>, code: i32, message: &str) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0".into(),
@@ -729,6 +741,11 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                         "type": "integer",
                         "description": "分页偏移（默认 0）",
                         "default": 0
+                    },
+                    "include_expired": {
+                        "type": "boolean",
+                        "description": "是否包含已过期记忆（默认 false；导出/清理场景可开启）",
+                        "default": false
                     }
                 }),
                 required: vec![],
@@ -893,6 +910,15 @@ async fn handle_recall_enhanced(
     arguments: &serde_json::Value,
     id: Option<serde_json::Value>,
 ) -> JsonRpcResponse {
+    // v0.11：多租户域必须提供 scope，与 REST 入口一致。
+    // 变量在下方 filter 构造前统一创建（此处只做强制校验）。
+    if let Err(code) = enforce_mcp_scope(arguments) {
+        return make_error(
+            id,
+            -32602,
+            &format!("{code}: 多租户模式必须提供 user_id 或 session_id"),
+        );
+    }
     let query = match arguments.get("query").and_then(|q| q.as_str()) {
         Some(q) => q,
         None => return make_error(id, -32602, "缺少参数: query"),
@@ -942,7 +968,17 @@ async fn handle_recall_enhanced(
     let tag_list = tags.clone();
     // v0.9.11（G3 / CR-02）：隐私上下文在**闭包外**构造并 `clone` 进入 `spawn_blocking`
     // —— 闭包要求 `'static`，不能借用 `arguments`（借用会在编译期报 E0521）。
-    let privacy_scope = crate::privacy::scope_from_args(arguments);
+    // v0.11：多租户域必须提供 scope，与 REST 入口一致。
+    let privacy_scope = match enforce_mcp_scope(arguments) {
+        Ok(scope) => scope,
+        Err(code) => {
+            return make_error(
+                id,
+                -32602,
+                &format!("{code}: 多租户模式必须提供 user_id 或 session_id"),
+            )
+        }
+    };
     // 联想补全用的过滤条件（v0.9.8）：与检索**同一套可见性规则**，
     // 由下面两个 filter 复用同一份字段，避免"检索过滤了、联想没过滤"的越权口子。
     let filter_for_expand = RecallFilter {
@@ -2043,6 +2079,17 @@ async fn handle_recall(
     arguments: &serde_json::Value,
     id: Option<serde_json::Value>,
 ) -> JsonRpcResponse {
+    // v0.11：多租户域必须提供 scope，与 REST 入口一致。
+    let privacy_scope = match enforce_mcp_scope(arguments) {
+        Ok(scope) => scope,
+        Err(code) => {
+            return make_error(
+                id,
+                -32602,
+                &format!("{code}: 多租户模式必须提供 user_id 或 session_id"),
+            )
+        }
+    };
     let query = match arguments.get("query").and_then(|q| q.as_str()) {
         Some(q) => q,
         None => return make_error(id, -32602, "缺少参数: query"),
@@ -2101,7 +2148,7 @@ async fn handle_recall(
         tags,
         min_importance,
         top_k,
-        privacy_context: crate::privacy::scope_from_args(arguments),
+        privacy_context: privacy_scope,
         explore_pure: false,
         regression_query: None,
         read_only: false,
@@ -2555,6 +2602,17 @@ async fn handle_list_memories(
     arguments: &serde_json::Value,
     id: Option<serde_json::Value>,
 ) -> JsonRpcResponse {
+    // v0.11：多租户域必须提供 scope，与 REST 入口一致。
+    let privacy_scope = match enforce_mcp_scope(arguments) {
+        Ok(scope) => scope,
+        Err(code) => {
+            return make_error(
+                id,
+                -32602,
+                &format!("{code}: 多租户模式必须提供 user_id 或 session_id"),
+            )
+        }
+    };
     let memory_type = arguments
         .get("memory_type")
         .and_then(|v| v.as_str())
@@ -2613,7 +2671,12 @@ async fn handle_list_memories(
         order,
         limit,
         offset,
-        privacy_context: crate::privacy::scope_from_args(arguments),
+        privacy_context: privacy_scope,
+        // v0.11：默认隐藏过期记忆；显式传 include_expired=true 可包含。
+        include_expired: arguments
+            .get("include_expired")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     };
 
     // v0.9.11（G4 / CR-11）：有界取锁（只读路径同样不得无限排队）
@@ -2628,11 +2691,13 @@ async fn handle_list_memories(
                 for m in &memories {
                     text.push_str(&format!("### {}\n", m.summary()));
                     text.push_str(&format!("ID: `{}`\n", m.id));
+                    let expired_tag = if m.is_expired() { " | 已过期" } else { "" };
                     text.push_str(&format!(
-                        "类型: {} | 重要性: {}/10 | 创建: {}\n",
+                        "类型: {} | 重要性: {}/10 | 创建: {}{}\n",
                         m.memory_type.as_str(),
                         m.importance.value(),
-                        m.created_at.format("%Y-%m-%d %H:%M")
+                        m.created_at.format("%Y-%m-%d %H:%M"),
+                        expired_tag
                     ));
                     if let Some(ref proj) = m.project {
                         text.push_str(&format!("项目: {}\n", proj));
@@ -2883,8 +2948,35 @@ async fn handle_tools_call(
                 None => return make_error(id, -32602, "缺少参数: memory_id"),
             };
 
+            // v0.11：与 REST 对齐，先按参数解析 scope 并强制（多租户域必须提供）。
+            let scope = match enforce_mcp_scope(&arguments) {
+                Ok(scope) => scope,
+                Err(code) => {
+                    return make_error(
+                        id,
+                        -32602,
+                        &format!("{code}: 多租户模式必须提供 user_id 或 session_id"),
+                    )
+                }
+            };
+            // 不可见与不存在统一按「未找到」返回，避免通过响应差异探测他人 ID。
             // v0.9.11（G4 / CR-11）：有界取锁
             let store = state.memory_store.write().await;
+            // 删除是清理动作：过期记忆允许删除。
+            match store.get_visible_memory_including_expired(memory_id, &scope) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let text = format!("未找到记忆: {}（可能已被删除）", memory_id);
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
+                    };
+                    return make_response(id, to_json_value_safe(&call_result));
+                }
+                Err(e) => return make_error(id, -32603, &format!("可见性校验失败: {}", e)),
+            }
             match store.forget(memory_id) {
                 Ok(true) => {
                     let text = format!("已删除记忆: {}", memory_id);
@@ -2924,8 +3016,33 @@ async fn handle_tools_call(
                 .and_then(|v| v.as_u64())
                 .map(|v| Importance::new(v as u8));
 
+            // v0.11：与 REST 对齐，先按参数解析 scope 并强制（多租户域必须提供）。
+            let scope = match enforce_mcp_scope(&arguments) {
+                Ok(scope) => scope,
+                Err(code) => {
+                    return make_error(
+                        id,
+                        -32602,
+                        &format!("{code}: 多租户模式必须提供 user_id 或 session_id"),
+                    )
+                }
+            };
             // v0.9.11（G4 / CR-11）：有界取锁
             let store = state.memory_store.write().await;
+            match store.get_visible_memory(memory_id, &scope) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let text = format!("未找到记忆: {}", memory_id);
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
+                    };
+                    return make_response(id, to_json_value_safe(&call_result));
+                }
+                Err(e) => return make_error(id, -32603, &format!("可见性校验失败: {}", e)),
+            }
             match store.update_memory(memory_id, new_content, new_importance) {
                 Ok(Some(old)) => {
                     let text = format!(
@@ -2971,8 +3088,18 @@ async fn handle_tools_call(
             let store = state.memory_store.read().await;
             // v0.9.11（G3 / CR-03）：MCP 侧同样按参数构造可见性作用域
             //（此前后端直调未过滤版本 ⇒ 跨 user 泄漏 peer 内容预览）
-            match store.associations_scoped(memory_id, &crate::privacy::scope_from_args(&arguments))
-            {
+            // v0.11：多租户域必须提供 scope。
+            let scope = match enforce_mcp_scope(&arguments) {
+                Ok(scope) => scope,
+                Err(code) => {
+                    return make_error(
+                        id,
+                        -32602,
+                        &format!("{code}: 多租户模式必须提供 user_id 或 session_id"),
+                    )
+                }
+            };
+            match store.associations_scoped(memory_id, &scope) {
                 Ok(all_assoc) => {
                     // hub 实体（泛化实体）清单：**让过滤可见**（§3.45.5）
                     let hubs = store.hub_entities().unwrap_or_default();
@@ -3057,11 +3184,18 @@ async fn handle_tools_call(
             // v0.9.11（G4 / CR-11）：有界取锁
             let store = state.memory_store.read().await;
             // v0.9.11（G3 / CR-03）：MCP 侧带可见性过滤
-            match store.association_graph_scoped(
-                memory_id,
-                max_nodes,
-                &crate::privacy::scope_from_args(&arguments),
-            ) {
+            // v0.11：多租户域必须提供 scope。
+            let scope = match enforce_mcp_scope(&arguments) {
+                Ok(scope) => scope,
+                Err(code) => {
+                    return make_error(
+                        id,
+                        -32602,
+                        &format!("{code}: 多租户模式必须提供 user_id 或 session_id"),
+                    )
+                }
+            };
+            match store.association_graph_scoped(memory_id, max_nodes, &scope) {
                 Ok(g) => {
                     if g.nodes.is_empty() {
                         let text = "未找到该记忆，或它没有任何关联。\n\n\
@@ -3234,6 +3368,10 @@ async fn handle_tools_call(
             }
         }
         "archive" => {
+            // v0.11：归档是全库运维操作，多租户域禁止（与 REST 备份族一致）。
+            if crate::privacy::from_env() == crate::privacy::TrustMode::MultiTenant {
+                return make_error(id, -32602, "多租户模式禁止全库归档（该操作会跨租户）");
+            }
             // v0.9.11（G4 / CR-11）：有界取锁
             let store = state.memory_store.write().await;
             match store.archive_expired() {
@@ -3430,8 +3568,33 @@ async fn handle_tools_call(
             };
             let reason = arguments.get("reason").and_then(|v| v.as_str());
 
+            // v0.11：与 REST 对齐，先按参数解析 scope 并强制（多租户域必须提供）。
+            let scope = match enforce_mcp_scope(&arguments) {
+                Ok(scope) => scope,
+                Err(code) => {
+                    return make_error(
+                        id,
+                        -32602,
+                        &format!("{code}: 多租户模式必须提供 user_id 或 session_id"),
+                    )
+                }
+            };
             // v0.9.11（G4 / CR-11）：有界取锁（用户修正属写路径，同样不得无限排队）
             let store = state.memory_store.write().await;
+            match store.get_visible_memory(memory_id, &scope) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let text = format!("未找到记忆: {}", memory_id);
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
+                    };
+                    return make_response(id, to_json_value_safe(&call_result));
+                }
+                Err(e) => return make_error(id, -32603, &format!("可见性校验失败: {}", e)),
+            }
             match store.correct_memory(memory_id, new_content, reason) {
                 Ok(Some(memory)) => {
                     let text = format!(

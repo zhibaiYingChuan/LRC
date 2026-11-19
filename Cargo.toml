@@ -121,6 +121,14 @@ name = "code-memory-benchmark"
 path = "src/bin/benchmark.rs"
 required-features = ["server"]
 
+# v0.11：命令行客户端。双层进程模型——本进程只做 HTTP 客户端，
+# 不加载语义模型；模型常驻在 lrc-sidecar（daemon）内。
+# 依赖 ureq（server feature），故 required-features 与 sidecar 一致。
+[[bin]]
+name = "lrc"
+path = "src/bin/lrc.rs"
+required-features = ["server"]
+
 # ★ 2026-10-30：受保护层的算法行为测试随源码迁入私有子模块 `core/lrc-algo`。
 #   它们断言的是核心引擎的行为（状态机、语义探针、锚点/缺口分解、基准），
 #   内容不宜公开；这里用显式 `[[test]]` 目标继续让 CI 编译并运行。
@@ -266,6 +274,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Threading",
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
+    # v0.11：lrc CLI 需要把控制台代码页切到 UTF-8（中文不乱码）
+    "Win32_System_Console",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",

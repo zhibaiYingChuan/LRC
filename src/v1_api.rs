@@ -98,6 +98,13 @@ type EnrichBlockingResult = (
 /// "做了机制却无法验证它是否有效"（详见 `daoti/PREREG_MEMORY_ASSOCIATION.md` §3.10）。
 const ASSOC_EXPAND_MAX_HTTP: usize = 3;
 
+/// 归档恢复允许的最大 TTL（天）。
+///
+/// 100 年足以覆盖任何真实场景；更大的值没有业务意义，且会逼近 chrono
+/// 的日期上界（`is_expired` 内部虽已用 `checked_add` 兜底，入口仍应拒绝
+/// 明显异常的输入，而不是把畸形数据写进库）。
+const MAX_RESTORE_TTL_DAYS: u64 = 36500;
+
 /// 关联补全在 `top_k` 中允许占用的**最大份额分母**（即最多占 `top_k / N`）。
 ///
 /// # 依据
@@ -407,6 +414,12 @@ pub struct ConfirmAssociationRequest {
     /// `LRC_ASSOC_EDGE_FEEDBACK=1` 下额外记录 (from→to) 正边。
     #[serde(default)]
     pub from_id: Option<String>,
+    /// v0.11：归属 —— 多租户域下必须提供
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// v0.11：来源会话
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// 联想探索响应：从起点开始的多跳联想树（有界 BFS）。
@@ -1919,6 +1932,12 @@ pub struct CorrectRequest {
     pub content: String,
     #[serde(default)]
     pub reason: Option<String>,
+    /// v0.11：归属 —— 多租户域下必须提供，否则 400 `scope_required`
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// v0.11：来源会话
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// /v1/memories/correct 响应体
@@ -1976,6 +1995,12 @@ pub struct UnfoldRequest {
     pub memory_id: String,
     #[serde(default = "default_min_activation")]
     pub min_activation: f32,
+    /// v0.11：归属 —— 多租户域下必须提供
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// v0.11：来源会话
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 fn default_min_activation() -> f32 {
@@ -2048,6 +2073,9 @@ pub struct MemoryListRequest {
     /// v0.9.11（G3 / CR-01）：来源会话
     #[serde(default)]
     pub session_id: Option<String>,
+    /// v0.11：是否包含已过期记忆（默认 false；导出场景可显式开启）
+    #[serde(default)]
+    pub include_expired: bool,
 }
 
 /// v0.6.0 新增：/v1/memories/remember 请求体
@@ -2101,6 +2129,12 @@ pub struct MemoryRememberRequest {
 pub struct ForgetRequest {
     /// 待删除的记忆 ID（必填）
     pub memory_id: String,
+    /// v0.11：归属 —— 多租户域下必须提供，否则 400 `scope_required`
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// v0.11：来源会话（比 user 更细的可见性粒度）
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -2206,6 +2240,12 @@ pub struct LifecycleRequest {
     /// 仅 `mark_superseded` 需要：取代它的新记忆 ID
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// v0.11：归属 —— 多租户域下必须提供
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// v0.11：来源会话
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// /v1/memories/associations 请求体
@@ -2274,6 +2314,12 @@ pub struct ExternalEdgeRequest {
     /// 置信度 0~1（缺省 0.5）
     #[serde(default)]
     pub weight: Option<f32>,
+    /// v0.11：归属 —— 多租户域下必须提供
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// v0.11：来源会话
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// /v1/memories/stored-edges 请求体（v0.9.8）
@@ -2458,7 +2504,7 @@ fn scope_required_error() -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({
             "error": "scope_required",
-            "message": "本服务已启用鉴权（多租户模式），读取入口必须提供 user_id 或 session_id"
+            "message": "本服务已启用鉴权（多租户模式），本入口必须提供 user_id；提供 session_id 时也必须同时提供 user_id"
         })),
     )
 }
@@ -4055,12 +4101,27 @@ pub fn build_v1_router_with_trust(
                     // v0.9.11（G4 / CR-13）：返回值加一层 `Option` —— `None` = 存储锁等待超时。
                     // 此前这里**无界自旋**（只 `sleep` 无 deadline）⇒ 锁被长任务持有时该阻塞
                     // 线程**永不返回**；与仓库其它取锁点"统一 2s 有界等待"的口径明显不一致。
+                    // v0.11：按信任域强制 scope，并在确认前校验目标可见性。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.session_id.as_deref(),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     let result = tokio::task::spawn_blocking(move || -> Option<LrcResult<bool>> {
                         // confirm_memory 的错误为 PersistenceError；本闭包错误仅用于
                         // 上位统一映射为 500 字符串响应，故按「内部」域收敛。
+                        let guard = blocking_store.blocking_write();
+                        match guard.get_visible_memory(&confirm_id, &scope) {
+                            Ok(Some(_)) => {}
+                            // 不可见与不存在同路：走既有的 404 分支，不泄露存在性。
+                            Ok(None) => return Some(Ok(false)),
+                            Err(e) => return Some(Err(LrcError::internal(e.to_string()))),
+                        }
                         Some(
-                            blocking_store
-                                .blocking_write()
+                            guard
                                 .confirm_memory(&confirm_id)
                                 .map_err(|e| LrcError::internal(e.to_string())),
                         )
@@ -4144,11 +4205,29 @@ pub fn build_v1_router_with_trust(
                 async move {
                     // v0.9.6 P1 修复：correct_memory 走跨进程写守卫，移入 spawn_blocking
                     // 避免守卫自旋占死 HTTP worker。
+                    // v0.11：按信任域强制 scope，并在改写前校验目标可见性。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.session_id.as_deref(),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     let memory_id = req.memory_id.clone();
                     let memory_id_for_task = memory_id.clone();
+                    let scope_for_task = scope;
                     let outcome = tokio::task::spawn_blocking(move || {
+                        let store = store.blocking_write();
+                        match store.get_visible_memory(&memory_id_for_task, &scope_for_task) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => return Err("not_found"),
+                            Err(e) => {
+                                eprintln!("[v1/correct] 可见性校验失败: {}", e);
+                                return Err("write_failed");
+                            }
+                        }
                         match store
-                            .blocking_write()
                             .correct_memory(&memory_id_for_task, &req.content, req.reason.as_deref())
                         {
                             Ok(Some(memory)) => Ok((memory.id, memory.version, memory.version_history.len())),
@@ -4212,11 +4291,29 @@ pub fn build_v1_router_with_trust(
                 let store = store.clone();
                 async move {
                     // v0.9.6 P1 修复：unfold_memory 走跨进程写守卫，移入 spawn_blocking
+                    // v0.11：按信任域强制 scope，并在拆解前校验目标可见性
+                    // （unfold 会回传源记忆拆解后的内容，属读写双泄漏面）。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.session_id.as_deref(),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     let memory_id = req.memory_id;
                     let memory_id_for_task = memory_id.clone();
                     let outcome = tokio::task::spawn_blocking(move || {
-                        match store
-                            .blocking_write()
+                        let guard = store.blocking_write();
+                        match guard.get_visible_memory(&memory_id_for_task, &scope) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => return Err("not_found"),
+                            Err(e) => {
+                                eprintln!("[v1/unfold] 可见性校验失败: {}", e);
+                                return Err("unfold_failed");
+                            }
+                        }
+                        match guard
                             .unfold_memory(&memory_id_for_task, req.min_activation)
                         {
                             Ok(Some((sub_memories, fidelity))) => {
@@ -4504,10 +4601,22 @@ pub fn build_v1_router_with_trust(
                         _ => FeedbackTarget::RetrievalResult,
                     };
 
+                    // v0.11：按信任域强制 scope；反馈与隔离请求都按 memory_id 操作。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        body.get("user_id").and_then(|v| v.as_str()),
+                        body.get("session_id").and_then(|v| v.as_str()),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
+
                     // 处理两阶段确认的特殊目标类型
                     match target_type {
                         FeedbackTarget::ConfirmAction => {
-                            // 阶段二：确认执行待处理操作
+                            // 阶段二：确认执行待处理操作。
+                            // 该分支按 `assessment_id`（UUID）定位，不涉及 memory_id 可见性；
+                            // scope 仍在此强制，保证多租户域必须声明归属。
                             let assessment_id = match body.get("assessment_id").and_then(|v| v.as_str()) {
                                 Some(id) => id,
                                 None => {
@@ -4625,8 +4734,32 @@ pub fn build_v1_router_with_trust(
                             }
 
                             let store = store.read().await;
+                            // v0.11：隔离请求会回传影响评估，必须先确认全部目标可见。
+                            for id in &memory_ids {
+                                match store.get_visible_memory(id, &scope) {
+                                    Ok(Some(_)) => {}
+                                    Ok(None) => {
+                                        return Err((
+                                            StatusCode::NOT_FOUND,
+                                            Json(serde_json::json!({
+                                                "error": "memory_not_found",
+                                                "message": format!("未找到记忆: {}", id)
+                                            })),
+                                        ))
+                                    }
+                                    Err(e) => {
+                                        return Err((
+                                            StatusCode::INTERNAL_SERVER_ERROR,
+                                            Json(serde_json::json!({
+                                                "error": "visibility_check_failed",
+                                                "message": format!("可见性校验失败: {}", e)
+                                            })),
+                                        ))
+                                    }
+                                }
+                            }
                             // MemoryStore 需要实现 MemoryGraphQuery trait
-                            let assessment = store
+                            let mut assessment = store
                                 .user_feedback
                                 .read()
                                 .unwrap()
@@ -4635,6 +4768,22 @@ pub fn build_v1_router_with_trust(
                                     &memory_ids,
                                     &*store,
                                 );
+                            // v0.11：影响评估会展开邻居，必须过滤掉不可见的记忆 ID，
+                            // 否则响应体会把其他租户的 ID 一并回传。
+                            assessment.affected_memories.retain(|info| {
+                                matches!(
+                                    store.get_visible_memory(&info.memory_id, &scope),
+                                    Ok(Some(_))
+                                )
+                            });
+                            assessment.second_order_affected.retain(|info| {
+                                matches!(
+                                    store.get_visible_memory(&info.memory_id, &scope),
+                                    Ok(Some(_))
+                                )
+                            });
+                            assessment.direct_neighbors = assessment.affected_memories.len();
+                            assessment.indirect_neighbors = assessment.second_order_affected.len();
 
                             Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                                 "action": "request_isolate",
@@ -4661,6 +4810,29 @@ pub fn build_v1_router_with_trust(
                             let note = body.get("note").and_then(|v| v.as_str());
 
                             let store = store.read().await;
+
+                            // v0.11：反馈写入同样按可见性约束，避免对他人记忆写反馈/隔离待办。
+                            match store.get_visible_memory(&memory_id, &scope) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {
+                                    return Err((
+                                        StatusCode::NOT_FOUND,
+                                        Json(serde_json::json!({
+                                            "error": "memory_not_found",
+                                            "message": format!("未找到记忆: {}", memory_id)
+                                        })),
+                                    ))
+                                }
+                                Err(e) => {
+                                    return Err((
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        Json(serde_json::json!({
+                                            "error": "visibility_check_failed",
+                                            "message": format!("可见性校验失败: {}", e)
+                                        })),
+                                    ))
+                                }
+                            }
 
                             // 阶段D：联想级反馈——解析联想上下文（排名、命中的检索通路）
                             // P7.2：新增 from_id（联想起点，可选）——携带时记录 (from→to) 边反馈
@@ -4815,6 +4987,15 @@ pub fn build_v1_router_with_trust(
             move |Query(params): Query<HashMap<String, String>>| {
                 let store = store.clone();
                 async move {
+                    // v0.11：检索轨迹可能含他人记忆 ID，按 scope 过滤。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        params.get("user_id").map(String::as_str),
+                        params.get("session_id").map(String::as_str),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     let store = store.read().await;
                     let from_ms = params.get("from_ms").and_then(|v| v.parse::<u64>().ok());
                     let to_ms = params.get("to_ms").and_then(|v| v.parse::<u64>().ok());
@@ -4827,17 +5008,93 @@ pub fn build_v1_router_with_trust(
                         event_types: Some(vec![AuditEventType::RetrievalExecuted]),
                         memory_id: None, limit: Some(1000),
                     };
+                    // v0.11：一次性构建可见 ID 集合，避免逐 ID 全库扫描。
+                    // 同时记录「可见但已过期」的 ID，供事件级标记使用。
+                    let (visible_id_set, expired_id_set): (
+                        std::collections::HashSet<String>,
+                        std::collections::HashSet<String>,
+                    ) = {
+                        let filter = crate::memory_store::ListFilter {
+                            limit: 50_000,
+                            privacy_context: scope.clone(),
+                            // 审计历史可以引用已过期记忆（过期 ≠ 删除），
+                            // 因此这里必须包含过期，只按隐私过滤。
+                            include_expired: true,
+                            ..Default::default()
+                        };
+                        match store.list_memories(&filter) {
+                            Ok((memories, _)) => {
+                                let mut visible = std::collections::HashSet::new();
+                                let mut expired = std::collections::HashSet::new();
+                                for memory in memories {
+                                    if memory.is_expired() {
+                                        expired.insert(memory.id.clone());
+                                    }
+                                    visible.insert(memory.id);
+                                }
+                                (visible, expired)
+                            }
+                            Err(_) => (
+                                std::collections::HashSet::new(),
+                                std::collections::HashSet::new(),
+                            ),
+                        }
+                    };
+                    let scope_restricted = scope.is_some();
+
                     let audit_guard = store.audit_trail.read_recover();
                     let events = audit_guard.query(&query);
+                    // v0.11：截断判断必须用**原始**事件数——filtered_len 是二次筛选后的，
+                    // 用它会把「原始已截断但筛选后不足 1000」误报为未截断。
+                    let raw_event_count = events.len();
                     let filtered: Vec<&AuditEvent> = events.into_iter().filter(|event| {
                         let trail_len = event.metadata.get("trail").and_then(|v| serde_json::from_str::<Vec<serde_json::Value>>(v).ok()).map(|v| v.len()).unwrap_or(0);
                         let has_evidence = event.metadata.get("regression_evidence").map(|v| v != "{}" && v != "null").unwrap_or(false);
                         (!multi_hop || trail_len > 1) && (!evidence_only || has_evidence)
                     }).collect();
-                    let total = filtered.len();
-                    let records: Vec<serde_json::Value> = filtered.into_iter().skip(offset).take(limit).map(|event| {
+
+                    // 先过滤可见性、再分页：否则不可见事件会占掉 offset/limit 名额。
+                    let visible_events: Vec<serde_json::Value> = filtered.into_iter().filter_map(|event| {
+                        let visible_ids: Vec<String> = event
+                            .affected_memory_ids
+                            .iter()
+                            .filter(|id| visible_id_set.contains(*id))
+                            .cloned()
+                            .collect();
+                        if !event.affected_memory_ids.is_empty() && visible_ids.is_empty() {
+                            return None;
+                        }
                         let md = &event.metadata;
-                        serde_json::json!({
+                        let trail = md
+                            .get("trail")
+                            .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+                            .unwrap_or_else(|| serde_json::json!([]));
+                        // 轨迹步骤里的 from_id/to_id 同样必须可见。
+                        let trail = if scope_restricted {
+                            let kept: Vec<serde_json::Value> = trail
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|step| {
+                                    let from_ok = step
+                                        .get("from_id")
+                                        .and_then(|v| v.as_str())
+                                        .map(|id| visible_id_set.contains(id))
+                                        .unwrap_or(true);
+                                    let to_ok = step
+                                        .get("to_id")
+                                        .and_then(|v| v.as_str())
+                                        .map(|id| visible_id_set.contains(id))
+                                        .unwrap_or(true);
+                                    from_ok && to_ok
+                                })
+                                .collect();
+                            serde_json::Value::Array(kept)
+                        } else {
+                            trail
+                        };
+                        Some(serde_json::json!({
                             "id": event.id,
                             "timestamp_ms": event.timestamp_ms,
                             "query_length": md.get("query_length").and_then(|v| v.parse::<u64>().ok()),
@@ -4845,14 +5102,35 @@ pub fn build_v1_router_with_trust(
                             "deep_hits": md.get("deep_hits").and_then(|v| v.parse::<u64>().ok()),
                             "total_candidates": md.get("total_candidates").and_then(|v| v.parse::<u64>().ok()),
                             "filtered_count": md.get("filtered_count").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
-                            "trail": md.get("trail").and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()).unwrap_or_else(|| serde_json::json!([])),
+                            "trail": trail,
                             "regression_evidence": md.get("regression_evidence").and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()).unwrap_or_else(|| serde_json::json!({})),
-                            "affected_memory_ids": event.affected_memory_ids,
-                            "description": event.description,
-                        })
+                            "affected_memory_ids": visible_ids,
+                            // v0.11：引用中是否含已过期记忆，供前端标注「点开可能为空」。
+                            "has_expired_refs": visible_ids
+                                .iter()
+                                .any(|id| expired_id_set.contains(id)),
+                            // 多租户域隐藏查询原文（description 含原文片段）。
+                            "description": if scope_restricted {
+                                serde_json::Value::Null
+                            } else {
+                                serde_json::json!(event.description)
+                            },
+                        }))
                     }).collect();
+                    let total = visible_events.len();
+                    let records: Vec<serde_json::Value> =
+                        visible_events.into_iter().skip(offset).take(limit).collect();
+                    // v0.11：显式标记截断，避免调用方把「被上限截掉」误读为「只有这些」。
+                    // - audit_truncated：审计查询本身只取了最近 1000 条
+                    // - truncated：当前页之后还有可见记录
+                    let truncated = total > offset.saturating_add(limit);
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
-                        "records": records, "total": total, "offset": offset, "limit": limit
+                        "records": records,
+                        "total": total,
+                        "offset": offset,
+                        "limit": limit,
+                        "truncated": truncated,
+                        "audit_truncated": raw_event_count >= 1000
                     })))
                 }
             }
@@ -5337,6 +5615,18 @@ pub fn build_v1_router_with_trust(
             move |Query(params): Query<HashMap<String, String>>| {
                 let store = store.clone();
                 async move {
+                    // 审计事件含跨租户的描述与受影响 id：多租户域仅限管理员。
+                    // （与备份族 / data-logs 同口径；租户级审计需要按可见 id 过滤，
+                    //   属后续能力，不能以"全量事件"代替。）
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "审计追踪仅限本地可信域"
+                            })),
+                        ));
+                    }
                     // v0.8.22 HCSE 修复：改用 try_lock，避免 lock_busy 期间超时
                     // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与 /health/system 一致）
                     let store = store.read().await;
@@ -5352,6 +5642,10 @@ pub fn build_v1_router_with_trust(
                                 "synthesis_created" => Some(AuditEventType::SynthesisCreated),
                                 "memory_deleted" => Some(AuditEventType::MemoryDeleted),
                                 "memory_isolated" => Some(AuditEventType::MemoryIsolated),
+                                // v0.11：归档生命周期事件（与 type_statistics 口径一致）
+                                "memory_archived" => Some(AuditEventType::MemoryArchived),
+                                "memory_unarchived" => Some(AuditEventType::MemoryUnarchived),
+                                "memory_purged" => Some(AuditEventType::MemoryPurged),
                                 "decay_rate_changed" => Some(AuditEventType::DecayRateChanged),
                                 "synthesis_threshold_changed" => Some(AuditEventType::SynthesisThresholdChanged),
                                 "retrieval_weights_adjusted" => Some(AuditEventType::RetrievalWeightsAdjusted),
@@ -5515,6 +5809,8 @@ pub fn build_v1_router_with_trust(
                                         "topological_depth": m.topological_depth,
                                         "event_id": m.event_id,
                                         "entities": m.entities,
+                                        // v0.11：显式标记过期，避免 include_expired 下列表无法区分死活。
+                                        "expired": m.is_expired(),
                                     })
                                 })
                                 .collect();
@@ -5573,6 +5869,8 @@ pub fn build_v1_router_with_trust(
                         sort_by: crate::memory_store::SortBy::CreatedAt,
                         order: crate::memory_store::SortOrder::Desc,
                         privacy_context: scope,
+                        // v0.11：默认隐藏过期记忆；导出场景可显式开启。
+                        include_expired: params.include_expired,
                         ..Default::default()
                     };
 
@@ -5595,6 +5893,8 @@ pub fn build_v1_router_with_trust(
                                         "daoti_preview_version": m.daoti_preview_version,
                                         "event_id": m.event_id,
                                         "entities": m.entities,
+                                        // v0.11：显式标记过期，避免 include_expired 下列表无法区分死活。
+                                        "expired": m.is_expired(),
                                     })
                                 })
                                 .collect();
@@ -5632,6 +5932,16 @@ pub fn build_v1_router_with_trust(
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(10);
 
+                    // v0.11：结晶内容同样受隐私域约束，不能跨用户返回。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        params.get("user_id").map(String::as_str),
+                        params.get("session_id").map(String::as_str),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
+
                     let store = store.read().await;
 
                     // 只在存储层过滤 Synthesis，减少传输量；纯函数内二次过滤保证契约
@@ -5640,6 +5950,7 @@ pub fn build_v1_router_with_trust(
                         limit: 50,
                         sort_by: crate::memory_store::SortBy::CreatedAt,
                         order: crate::memory_store::SortOrder::Desc,
+                        privacy_context: scope,
                         ..Default::default()
                     };
 
@@ -5661,14 +5972,269 @@ pub fn build_v1_router_with_trust(
             }
         }))
         //
+        // POST /v1/memories/archive-expired — 触发归档过期记忆（v0.11）
+        //
+        // 与 MCP `archive` 对齐；全库运维操作，多租户域禁止（会跨租户）。
+        .route("/memories/archive-expired", post({
+            let store = metrics_store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "全库归档仅限本地可信域"
+                            })),
+                        ));
+                    }
+                    let archived = tokio::task::spawn_blocking(move || {
+                        let guard = store.blocking_write();
+                        guard.archive_expired()
+                    })
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "archive_failed",
+                                "message": format!("归档任务异常终止: {}", e)
+                            })),
+                        )
+                    })?
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "archive_failed",
+                                "message": format!("归档失败: {}", e)
+                            })),
+                        )
+                    })?;
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                        "success": true,
+                        "archived": archived,
+                    })))
+                }
+            }
+        }))
+        // POST /v1/memories/unarchive — 从归档恢复单条记忆（v0.11）
+        //
+        // 恢复时**从现在重新计时**（重置 created_at），否则恢复即再次过期。
+        .route("/memories/unarchive", post({
+            let store = metrics_store.clone();
+            // 用 Bytes 而非 Json 提取器：多租户 403 必须发生在**请求体解析之前**
+            // （否则非法 JSON 会先得到 400/415，泄露"该端点存在"的差异化行为）。
+            move |body: axum::body::Bytes| {
+                let store = store.clone();
+                async move {
+                    // 全库运维操作：多租户域禁止（归档内容跨租户，恢复/清除同理）
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "归档恢复仅限本地可信域"
+                            })),
+                        ));
+                    }
+                    let body: serde_json::Value = match serde_json::from_slice(&body) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_json",
+                                    "message": "请求体必须是合法 JSON"
+                                })),
+                            ));
+                        }
+                    };
+                    let memory_id = body
+                        .get("memory_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    if memory_id.is_empty() {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "missing_memory_id",
+                                "message": "必须提供 memory_id"
+                            })),
+                        ));
+                    }
+                    // v0.11：ttl_days 必须是 0..=36500 的整数。
+                    // 非整数（负数/浮点/字符串）此前被 `as_u64` 静默忽略，
+                    // 与"超限报错"的严格姿态不一致，现统一 400。
+                    let ttl_days = match body.get("ttl_days") {
+                        None | Some(serde_json::Value::Null) => None,
+                        Some(v) => match v.as_u64() {
+                            Some(days) if days <= MAX_RESTORE_TTL_DAYS => Some(days as u32),
+                            _ => {
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({
+                                        "error": "invalid_ttl_days",
+                                        "message": format!(
+                                            "ttl_days 必须是 0..={} 的整数（收到 {}）",
+                                            MAX_RESTORE_TTL_DAYS, v
+                                        )
+                                    })),
+                                ));
+                            }
+                        },
+                    };
+                    // 本地可信域的管理员操作：按 id 直接恢复，不再按客户端自报
+                    // scope 过滤（多租户已在上面整体拒绝；本地域传 scope 只会
+                    // 让匿名归档记忆被误判为不可见）。
+                    let task_id = memory_id.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let guard = store.blocking_write();
+                        match guard.unarchive_memory(&task_id, ttl_days) {
+                            Ok(Some(_)) => Ok(()),
+                            Ok(None) => Err("not_found"),
+                            Err(_) => Err("unarchive_failed"),
+                        }
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(())) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                            serde_json::json!({
+                                "success": true,
+                                "memory_id": memory_id,
+                                "restored": true,
+                            }),
+                        )),
+                        Ok(Err("not_found")) => Err((
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({
+                                "error": "memory_not_found",
+                                "message": format!("归档中未找到记忆: {}", memory_id)
+                            })),
+                        )),
+                        Ok(Err(reason)) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": reason,
+                                "message": "恢复失败，请稍后重试"
+                            })),
+                        )),
+                        Err(join_error) => {
+                            eprintln!("[v1/unarchive] spawn_blocking panic: {}", join_error);
+                            Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "unarchive_failed",
+                                    "message": "恢复任务异常终止"
+                                })),
+                            ))
+                        }
+                    }
+                }
+            }
+        }))
+        // POST /v1/memories/purge-archived — 从归档彻底删除单条记忆（v0.11，不可恢复）
+        .route("/memories/purge-archived", post({
+            let store = metrics_store.clone();
+            // 同 unarchive：403 必须先于请求体解析。
+            move |body: axum::body::Bytes| {
+                let store = store.clone();
+                async move {
+                    // 全库运维操作：多租户域禁止（与 archive-expired / unarchive 一致）
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "归档清除仅限本地可信域"
+                            })),
+                        ));
+                    }
+                    let body: serde_json::Value = match serde_json::from_slice(&body) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return Err((
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_json",
+                                    "message": "请求体必须是合法 JSON"
+                                })),
+                            ));
+                        }
+                    };
+                    let memory_id = body
+                        .get("memory_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    if memory_id.is_empty() {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "missing_memory_id",
+                                "message": "必须提供 memory_id"
+                            })),
+                        ));
+                    }
+                    // 本地可信域的管理员操作：按 id 直接清除（理由同 unarchive）
+                    let task_id = memory_id.clone();
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        let guard = store.blocking_write();
+                        match guard.purge_archived(&task_id) {
+                            // 归档中不存在 ⇒ 幂等语义：deleted=false（不报错）
+                            Ok(deleted) => Ok(deleted),
+                            Err(_) => Err("purge_failed"),
+                        }
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(deleted)) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                            serde_json::json!({
+                                "success": true,
+                                "memory_id": memory_id,
+                                "deleted": deleted,
+                            }),
+                        )),
+                        Ok(Err(reason)) => Err((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": reason,
+                                "message": "清除失败，请稍后重试"
+                            })),
+                        )),
+                        Err(join_error) => {
+                            eprintln!("[v1/purge-archived] spawn_blocking panic: {}", join_error);
+                            Err((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(serde_json::json!({
+                                    "error": "purge_failed",
+                                    "message": "清除任务异常终止"
+                                })),
+                            ))
+                        }
+                    }
+                }
+            }
+        }))
         // v0.6.0 新增：POST /v1/memories/archive — 获取归档记忆列表（备份导出用）
         //
         // 返回已归档的记忆列表，供前端 backupMemories 导出完整备份。
         .route("/memories/archive", post({
             let store = metrics_store.clone();
-            move |_body: Json<serde_json::Value>| {
+            move |Json(body): Json<serde_json::Value>| {
                 let store = store.clone();
                 async move {
+                    // v0.11：归档内容同样受隐私域约束，不能跨用户返回。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        body.get("user_id").and_then(serde_json::Value::as_str),
+                        body.get("session_id").and_then(serde_json::Value::as_str),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     // v0.9.3 修复：锁获取超时保护
                     let store = store.read().await;
 
@@ -5677,6 +6243,7 @@ pub fn build_v1_router_with_trust(
                         Ok(archived_memories) => {
                             let archived: Vec<serde_json::Value> = archived_memories
                                 .iter()
+                                .filter(|memory| crate::memory_store::is_visible(memory, &scope))
                                 .map(|m| {
                                     serde_json::json!({
                                         "id": m.id,
@@ -5692,6 +6259,8 @@ pub fn build_v1_router_with_trust(
                                         "daoti_preview_version": m.daoti_preview_version,
                                         "event_id": m.event_id,
                                         "entities": m.entities,
+                                        // v0.11：显式标记过期，避免 include_expired 下列表无法区分死活。
+                                        "expired": m.is_expired(),
                                     })
                                 })
                                 .collect();
@@ -6149,10 +6718,30 @@ pub fn build_v1_router_with_trust(
                 async move {
                     // v0.9.6 P1 修复：forget 走跨进程写守卫（acquire_process_write_guard），
                     // 移入 spawn_blocking 避免守卫自旋占死 HTTP worker（与 remember/correct 同模式）。
+                    // v0.11：按信任域强制 scope，并在删除前校验目标可见性。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.session_id.as_deref(),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     let memory_id = req.memory_id;
                     let memory_id_for_task = memory_id.clone();
+                    let scope_for_task = scope;
                     let outcome = tokio::task::spawn_blocking(move || {
                         let store = store.blocking_write();
+                        // 不可见与不存在统一按 not_found，避免通过响应差异探测他人 ID。
+                        // 删除是清理动作：过期记忆允许删除（用 including_expired）。
+                        match store.get_visible_memory_including_expired(&memory_id_for_task, &scope_for_task) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => return Err("not_found"),
+                            Err(e) => {
+                                eprintln!("[v1/forget] 可见性校验失败: {}", e);
+                                return Err("forget_failed");
+                            }
+                        }
                         let forget_outcome = match store.forget(&memory_id_for_task) {
                             Ok(true) => Ok(()),
                             Ok(false) => Err("not_found"),
@@ -6230,8 +6819,26 @@ pub fn build_v1_router_with_trust(
                 async move {
                     let op = req.op.clone();
                     let memory_id = req.memory_id.clone();
+                    let memory_id_for_task = memory_id.clone();
+                    // v0.11：按信任域强制 scope，并在改写寿命状态前校验可见性。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.session_id.as_deref(),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     let outcome = tokio::task::spawn_blocking(move || {
                         let guard = store.blocking_write();
+                        match guard.get_visible_memory(&memory_id_for_task, &scope) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => return Err("not_found"),
+                            Err(e) => {
+                                eprintln!("[v1/lifecycle] 可见性校验失败: {}", e);
+                                return Err("lifecycle_failed");
+                            }
+                        }
                         let now = crate::lifecycle::now_ms();
                         // 注意：这里用 req.op（借用），不要用外层的 op —— 后者要在响应里使用。
                         let changed = match req.op.as_str() {
@@ -6281,6 +6888,13 @@ pub fn build_v1_router_with_trust(
                             Json(serde_json::json!({
                                 "error": "store_busy",
                                 "message": "记忆服务繁忙，请稍后重试"
+                            })),
+                        )),
+                        Ok(Err("not_found")) => Err((
+                            StatusCode::NOT_FOUND,
+                            Json(serde_json::json!({
+                                "error": "memory_not_found",
+                                "message": format!("未找到记忆: {}", memory_id)
                             })),
                         )),
                         Ok(Err(reason)) => Err((
@@ -6442,8 +7056,40 @@ pub fn build_v1_router_with_trust(
             move |Json(req): Json<ExternalEdgeRequest>| {
                 let store = store.clone();
                 async move {
+                    // v0.11：写图边必须两端都可见，避免把他人记忆连进自己的图。
+                    let scope = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.session_id.as_deref(),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     let weight = req.weight.unwrap_or(0.5).clamp(0.0, 1.0);
                     let store = store.write().await;
+                    for id in [&req.from_id, &req.to_id] {
+                        match store.get_visible_memory(id, &scope) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                return Err((
+                                    StatusCode::NOT_FOUND,
+                                    Json(serde_json::json!({
+                                        "error": "memory_not_found",
+                                        "message": format!("未找到记忆: {}", id)
+                                    })),
+                                ))
+                            }
+                            Err(e) => {
+                                return Err((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    Json(serde_json::json!({
+                                        "error": "visibility_check_failed",
+                                        "message": format!("可见性校验失败: {}", e)
+                                    })),
+                                ))
+                            }
+                        }
+                    }
                     match store.add_external_edge(&req.from_id, &req.to_id, &req.rel_type, weight) {
                         Ok(added) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
                             serde_json::json!({
@@ -7217,7 +7863,17 @@ pub fn build_v1_router_with_trust(
         }))
         // POST /v1/migrate — v0.8.0 "归一"：数据迁移与合并
         // 扫描所有已知老路径，按 memory.id 去重合并到 global 目录
-        .route("/migrate", post(|| async move {
+        .route("/migrate", post(move || async move {
+            // v0.11：迁移是全库运维操作，多租户域一律拒绝（与备份族一致）。
+            if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "admin_only",
+                        "message": "数据迁移仅限本地可信域"
+                    })),
+                ));
+            }
             // v0.8.0：迁移是同步文件 I/O 操作，用 spawn_blocking 避免阻塞 Tokio
             let report = tokio::task::spawn_blocking(|| {
                 crate::migration::execute_migration()
@@ -7237,24 +7893,45 @@ pub fn build_v1_router_with_trust(
             })))
         }))
         // POST /v1/backup — v0.8.0 "归一"：手动创建记忆备份
-        // 将 global/data/memories.json 复制到 ~/.loong-recall/backups/
-        .route("/backup", post(|| async move {
-            let report = tokio::task::spawn_blocking(|| {
-                crate::backup::create_backup()
-            })
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "success": false,
-                        "error": format!("备份任务执行失败: {}", e)
-                    })),
-                )
-            })?;
-            Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::to_value(&report).unwrap_or_else(|_| {
-                serde_json::json!({"success": false, "error": "序列化备份报告失败"})
-            })))
+        // v0.11 修正：备份**当前实例**的数据目录，而不是硬编码的全局目录。
+        //   此前在项目模式 / 自定义 --data-dir 实例上会备份错误的库。
+        .route("/backup", post({
+            let backup_store = metrics_store.clone();
+            move || {
+                let store = backup_store.clone();
+                async move {
+                    // v0.11：备份/恢复是本机运维能力，多租户域一律拒绝。
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "备份/恢复/运维接口仅限本地可信域"
+                            })),
+                        ));
+                    }
+                    let data_dir = {
+                        let guard = store.read().await;
+                        guard.persistence().data_dir().to_path_buf()
+                    };
+                    let report = tokio::task::spawn_blocking(move || {
+                        crate::backup::create_backup(&data_dir)
+                    })
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "success": false,
+                                "error": format!("备份任务执行失败: {}", e)
+                            })),
+                        )
+                    })?;
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::to_value(&report).unwrap_or_else(|_| {
+                        serde_json::json!({"success": false, "error": "序列化备份报告失败"})
+                    })))
+                }
+            }
         }))
         // POST /v1/backup/restore — 从快照恢复全部运行时文件
         // v0.9.7 审查修复（HCSE-P0）：
@@ -7266,13 +7943,38 @@ pub fn build_v1_router_with_trust(
         .route("/backup/restore", post({
             let restore_store = restore_store.clone();
             move |body: Json<serde_json::Value>| async move {
+            // v0.11：恢复是本机运维能力，多租户域一律拒绝。
+            if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "admin_only",
+                        "message": "备份/恢复/运维接口仅限本地可信域"
+                    })),
+                ));
+            }
             let path = body.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let result = tokio::task::spawn_blocking(move || crate::backup::restore_backup(std::path::Path::new(&path))).await
+            // 恢复全程持有**写锁**：否则恢复期间/之后的并发写会把旧内存数据重新落盘，
+            // 静默污染恢复结果（兑现上方注释的承诺）。拿不到锁返回 409 而非硬闯。
+            let guard = match restore_store.try_write() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": "记忆库正在被其他请求占用，请稍后重试"
+                        })),
+                    ))
+                }
+            };
+            // v0.11 修正：恢复到**当前实例**的数据目录（此前硬编码全局目录）。
+            let data_dir = guard.persistence().data_dir().to_path_buf();
+            let result = tokio::task::spawn_blocking(move || crate::backup::restore_backup(std::path::Path::new(&path), &data_dir)).await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"success": false, "error": e.to_string()}))))?;
             match result {
                 Ok(()) => {
                     // 失效缓存并立即从磁盘重载，保证后续读取看到恢复后的数据
-                    let guard = restore_store.write().await;
                     guard.invalidate_cache_after_external_restore();
                     let restored_count = guard.total_count().unwrap_or(0);
                     drop(guard);
@@ -7289,7 +7991,17 @@ pub fn build_v1_router_with_trust(
             }
         }}))
         // GET /v1/backups — v0.8.0 "归一"：列出所有备份文件
-        .route("/backups", get(|| async move {
+        .route("/backups", get(move || async move {
+            // v0.11：备份列表含绝对路径，仅限本地可信域。
+            if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "admin_only",
+                        "message": "备份/恢复/运维接口仅限本地可信域"
+                    })),
+                ));
+            }
             let backups = tokio::task::spawn_blocking(|| {
                 crate::backup::list_backups()
             })
@@ -7311,7 +8023,17 @@ pub fn build_v1_router_with_trust(
         }))
         // GET /v1/data-logs — v0.8.0 "归一"：数据操作日志
         // 返回最近 10 条数据操作记录（迁移、备份、导入等）
-        .route("/data-logs", get(|| async move {
+        .route("/data-logs", get(move || async move {
+            // v0.11：数据操作日志仅限本地可信域。
+            if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "admin_only",
+                        "message": "备份/恢复/运维接口仅限本地可信域"
+                    })),
+                ));
+            }
             let entries = tokio::task::spawn_blocking(|| {
                 crate::data_log::read_recent_operations(10)
             })
