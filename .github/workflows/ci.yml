@@ -534,7 +534,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # v0.11：固定 24.04（noble）而不是 ubuntu-latest。
+        # 根因：ubuntu-latest 已滚动到 26.04，而下方依赖步骤显式使用 noble 源，
+        # 基础镜像的 libgtk-3-0t64 版本高于 noble 的 libgtk-3-dev 依赖 ⇒ apt 无解。
+        os: [ubuntu-24.04, windows-latest, macos-latest]
     steps:
       # v0.8.24 修复：Windows runner 网络不稳定导致 git clone 失败，
       #   根因：GitHub Actions Windows runner 偶发 TCP 连接重置 / DNS 解析失败，
