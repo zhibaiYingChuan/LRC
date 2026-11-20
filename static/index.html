@@ -6,7 +6,7 @@
   <!-- 之前完全未配置 CSP，XSS/数据注入防御缺失，HCSE 安全不变量 INV-01 违规 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.openai.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="version" content="0.10.4">
+  <meta name="version" content="0.11.0">
   <!-- v0.9.0 开发模式隔离：注入 sidecar 端口号，前端通过此标签获取正确的 API 端点 -->
   <!-- 开发版默认 3111，稳定版打包时替换为 3099 -->
   <meta name="lrc-sidecar-port" content="3111">
@@ -405,6 +405,30 @@
           <span id="regulator-heartbeat-info" style="margin-left:auto;color:var(--lrc-墨韵-400);">等待首次运行...</span>
         </div>
         <div id="regulator-heartbeat-detail" style="line-height:1.7;color:var(--lrc-墨韵-500);">后台周期任务尚未触发。首次调节将在启动后一个周期自动执行。</div>
+      </div>
+      <!-- v0.11：可执行的维护建议（此前只显示"建议重新编码"，没有任何入口或解释） -->
+      <div id="health-guidance" class="health-guidance" style="margin-top:var(--space-4);padding:var(--space-3);border:1px solid var(--lrc-墨韵-200);border-radius:8px;background:var(--lrc-宣纸-50,#fffdf8);font-size:12px;line-height:1.7;">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+          <span style="font-weight:600;">记忆库维护</span>
+          <span id="health-guidance-source" style="margin-left:auto;color:var(--lrc-墨韵-400);"></span>
+        </div>
+        <div id="health-guidance-text" style="color:var(--lrc-墨韵-600);">正在读取维护建议...</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px;">
+          <button class="btn btn-outline btn-sm" id="btn-health-reencode" type="button">重新编码（重算坐标与八卦）</button>
+          <button class="btn btn-outline btn-sm" id="btn-health-archive" type="button">归档过期记忆</button>
+          <button class="btn btn-outline btn-sm" id="btn-health-backup" type="button">导出备份</button>
+        </div>
+        <div id="health-action-result" style="margin-top:8px;color:var(--lrc-墨韵-500);"></div>
+        <details style="margin-top:10px;color:var(--lrc-墨韵-500);">
+          <summary style="cursor:pointer;">这些指标是什么意思？什么时候需要维护？</summary>
+          <ul style="margin:8px 0 0 18px;padding:0;">
+            <li><b>综合健康</b>：道同构度、八卦均衡、洛书偏离、合成占比与调节器耦合度的加权结果；低于 50 分才需要关注。</li>
+            <li><b>洛书偏差</b>：9 维坐标偏离幻和约束的程度，越低越好；它反映编码结果的结构，不代表记忆内容有错。</li>
+            <li><b>重新编码</b>：用当前编码器重算全部记忆的坐标与八卦。只有在你<b>更换过嵌入模型</b>或编码器版本后才会改变结果；编码器没变时重算不会提升评分。</li>
+            <li><b>归档过期记忆</b>：把已过期的记忆移出检索范围（可在归档中恢复），不会删除原始内容。</li>
+            <li><b>导出备份</b>：把记忆、代码片段与归档一起导出为 JSON；建议在批量维护前先备份。</li>
+          </ul>
+        </details>
       </div>
       </div>
     </div>

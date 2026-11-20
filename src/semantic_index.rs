@@ -421,8 +421,8 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 /// 后台任务。
 enum Job {
-    /// 写入时编码（新记忆）
-    Encode(Vec<(String, String)>),
+    /// 写入时编码（新记忆）；`true` = 强制重编码（内容已变更，忽略"已索引"早退）
+    Encode(Vec<(String, String)>, bool),
     /// 写入时**已带向量**（一次前向双产出的产物），直接插入，不再编码
     Insert(Vec<(String, Vec<f32>)>),
     /// 存量回填（启动时一次性投递）
@@ -585,9 +585,35 @@ impl SemanticService {
             return;
         }
         self.total.fetch_add(1, Ordering::Relaxed);
-        let _ = self
-            .tx
-            .send(Job::Encode(vec![(id.to_string(), content.to_string())]));
+        let _ = self.tx.send(Job::Encode(
+            vec![(id.to_string(), content.to_string())],
+            false,
+        ));
+    }
+
+    /// 内容变更后的**强制重编码**（v0.11）。
+    ///
+    /// 与 [`Self::enqueue`] 的差别：跳过"已索引则忽略"的早退，追加新窗口向量。
+    /// 旧窗口不删除（索引是缓存，检索按活跃库 join）；max-pool 会让新旧向量
+    /// 共同参与，至少保证"改后的内容能被检索到"。
+    pub fn enqueue_force(&self, id: &str, content: &str) {
+        if !self.enabled || content.trim().is_empty() {
+            return;
+        }
+        // 只有"尚未索引"的 id 才增加覆盖率分母；已索引 id 的强制重编码
+        // 不改变库内记忆总数，否则 pending 永远无法归零、coverage 系统性偏低。
+        let already_indexed = self
+            .index
+            .read()
+            .map(|i| i.get(id).is_some())
+            .unwrap_or(false);
+        if !already_indexed {
+            self.total.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = self.tx.send(Job::Encode(
+            vec![(id.to_string(), content.to_string())],
+            true,
+        ));
     }
 
     /// 新记忆入队（**已带高维句向量**，跳过后台编码）。
@@ -671,6 +697,13 @@ pub fn service() -> Option<&'static Arc<SemanticService>> {
 pub fn enqueue(id: &str, content: &str) {
     if let Some(service) = SERVICE.get() {
         service.enqueue(id, content);
+    }
+}
+
+/// 内容变更后的强制重编码（v0.11；未初始化时静默忽略）。
+pub fn enqueue_force(id: &str, content: &str) {
+    if let Some(service) = SERVICE.get() {
+        service.enqueue_force(id, content);
     }
 }
 
@@ -772,7 +805,7 @@ pub fn encode_batch_sync(items: &[(String, String)]) {
         if started.elapsed() >= SYNC_BUDGET {
             break;
         }
-        let (inserted, failed) = encode_and_insert(service, chunk);
+        let (inserted, failed) = encode_and_insert(service, chunk, false);
         service.record_sync(inserted, failed);
         done += chunk.len();
     }
@@ -864,12 +897,15 @@ fn spawn_worker(service: Arc<SemanticService>, rx: Receiver<Job>) {
             let mut since_flush = 0usize;
             loop {
                 match rx.recv_timeout(IDLE_TICK) {
-                    Ok(Job::Encode(mut items)) => {
+                    Ok(Job::Encode(mut items, mut force)) => {
                         // 批量注入时会有大量单条 Encode 任务；这里**非阻塞地合并**
                         // 到一批再编码，避免"每条一次前向"的固定开销。
                         while items.len() < ENCODE_BATCH {
                             match rx.try_recv() {
-                                Ok(Job::Encode(more)) => items.extend(more),
+                                Ok(Job::Encode(more, more_force)) => {
+                                    items.extend(more);
+                                    force |= more_force;
+                                }
                                 Ok(Job::Insert(more)) => {
                                     // 已编码向量：直接插入，不参与本批编码
                                     let (inserted, failed) = insert_precomputed(&service, &more);
@@ -884,7 +920,7 @@ fn spawn_worker(service: Arc<SemanticService>, rx: Receiver<Job>) {
                                 Err(_) => break,
                             }
                         }
-                        let (inserted, failed) = encode_and_insert(&service, &items);
+                        let (inserted, failed) = encode_and_insert(&service, &items, force);
                         service.record_failed(failed);
                         since_flush += inserted;
                     }
@@ -898,7 +934,7 @@ fn spawn_worker(service: Arc<SemanticService>, rx: Receiver<Job>) {
                         let started = std::time::Instant::now();
                         let mut done = 0usize;
                         for chunk in items.chunks(ENCODE_BATCH) {
-                            let (_, failed) = encode_and_insert(&service, chunk);
+                            let (_, failed) = encode_and_insert(&service, chunk, false);
                             service.record_failed(failed);
                             done += chunk.len();
                             since_flush += chunk.len();
@@ -1048,7 +1084,11 @@ fn encode_windows_parallel(
 }
 
 /// 编码一批并插入索引，返回成功插入的**记忆条数**（不是窗口数）。
-fn encode_and_insert(service: &SemanticService, items: &[(String, String)]) -> (usize, usize) {
+fn encode_and_insert(
+    service: &SemanticService,
+    items: &[(String, String)],
+    force: bool,
+) -> (usize, usize) {
     if items.is_empty() {
         return (0, 0);
     }
@@ -1093,6 +1133,8 @@ fn encode_and_insert(service: &SemanticService, items: &[(String, String)]) -> (
     let mut inserted_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     // 已索引的 id 直接跳过：写入时编码与存量回填可能对同一条记忆**并发**编码，
     // 先完成者胜出，后完成者不得重复追加窗口（否则索引膨胀、内存翻倍）。
+    // v0.11：`force=true` 时**不跳过** —— 内容已变更，必须把新窗口写入索引，
+    // 否则"强制重编码"实际是 no-op（旧向量永远留在索引里）。
     let existing: std::collections::HashSet<String> = items
         .iter()
         .map(|(id, _)| id.clone())
@@ -1102,7 +1144,7 @@ fn encode_and_insert(service: &SemanticService, items: &[(String, String)]) -> (
     let mut new_vectors: Vec<(String, Vec<f32>)> = Vec::new();
     for (j, vector) in vectors.into_iter().enumerate() {
         let (id, _) = &items[owners[j]];
-        if existing.contains(id) {
+        if !force && existing.contains(id) {
             continue;
         }
         let normalized = normalize(vector);

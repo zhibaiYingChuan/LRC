@@ -392,6 +392,12 @@ pub struct AssociationExploreRequest {
     /// 缺省 "lrc-explore"。
     #[serde(default)]
     pub session_id: Option<String>,
+    /// v0.11：隐私归属（多租户域必填；本地域可缺省）。
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// v0.11：隐私会话归属（可选；与道体会话 `session_id` 分开，避免语义混用）。
+    #[serde(default)]
+    pub privacy_session_id: Option<String>,
 }
 
 fn default_association_depth() -> u8 {
@@ -1141,6 +1147,12 @@ fn assoc_suppress_lambda() -> Option<f32> {
 ///
 /// 探索本身复用 LRC 的 recall 入口，因此每一跳都会经过内置道体状态机、
 /// 联想导航和回归校验，而不是在 API 层另造一套排序逻辑。
+///
+/// 保留无 scope 的旧签名仅供测试；生产统一走 [`run_association_explore_scoped`]。
+///
+/// 注：这里用 `allow(dead_code)` 而不是测试条件编译 —— 后者会成为文件里
+/// 第一个测试属性，导致多个"源码级守卫"把生产段错误地截断到这里。
+#[allow(dead_code)]
 fn run_association_explore(
     store: &MemoryStore<JsonPersistence>,
     query: Option<&str>,
@@ -1151,6 +1163,27 @@ fn run_association_explore(
     // P3.2 导航信号（daoti_daemon 产出）。None = 无导航 → 现状 explore_pure 逐字节一致；
     // Some = 导航候选进入根节点门禁双通路（词面 + 语义旁路），CodeContext 过滤不豁免。
     navigation: Option<&crate::engine::navigation::NavigationSignal>,
+) -> AssociationExploreResponse {
+    // 兼容旧调用（测试/内部）：本地域无 scope，行为与历史逐字节一致。
+    run_association_explore_scoped(
+        store, query, memory_id, max_depth, width, cancel, navigation, None,
+    )
+}
+
+/// [`run_association_explore`] 的 scope 感知版本（v0.11）。
+///
+/// `privacy_context` 同时作用于：根节点（按 id 时校验可见性）、query 召回、
+/// 以及每一跳 `expand_associations` —— 保证"检索看不到的记忆，联想也不带出"。
+#[allow(clippy::too_many_arguments)]
+fn run_association_explore_scoped(
+    store: &MemoryStore<JsonPersistence>,
+    query: Option<&str>,
+    memory_id: Option<&str>,
+    max_depth: u8,
+    width: usize,
+    cancel: &AtomicBool,
+    navigation: Option<&crate::engine::navigation::NavigationSignal>,
+    privacy_context: Option<crate::privacy::ScopeTuple>,
 ) -> AssociationExploreResponse {
     use std::collections::{HashSet, VecDeque};
 
@@ -1165,7 +1198,7 @@ fn run_association_explore(
         tags: Vec::new(),
         min_importance: None,
         top_k: width,
-        privacy_context: None,
+        privacy_context: privacy_context.clone(),
         explore_pure: true,
         regression_query: None,
         read_only: false,
@@ -1196,7 +1229,9 @@ fn run_association_explore(
         store
             .memories_by_ids(&ids)
             .into_iter()
-            .next()
+            .find(|memory| {
+                !memory.is_expired() && crate::memory_store::is_visible(memory, &privacy_context)
+            })
             .map(|memory| (memory, 1.0f32, "root".to_string(), None))
     } else {
         query.and_then(|text| {
@@ -1794,6 +1829,7 @@ pub struct AssociationSuggestion {
 ///    诚实优于给用户点不通的假引导（承 §3.44「不得滑向编造」的原则）。
 pub fn build_association_suggestions<P: crate::persistence::Persistence>(
     store: &crate::memory_store::MemoryStore<P>,
+    privacy_context: &Option<crate::privacy::ScopeTuple>,
 ) -> Vec<AssociationSuggestion> {
     /// 示例条数上限：与前端示例区视觉容量一致（一行 chips）
     const MAX_SUGGESTIONS: usize = 4;
@@ -1802,6 +1838,7 @@ pub fn build_association_suggestions<P: crate::persistence::Persistence>(
 
     let Ok((all, _)) = store.list_memories(&crate::memory_store::ListFilter {
         limit: usize::MAX,
+        privacy_context: privacy_context.clone(),
         ..crate::memory_store::ListFilter::new()
     }) else {
         return Vec::new();
@@ -1813,6 +1850,7 @@ pub fn build_association_suggestions<P: crate::persistence::Persistence>(
         !m.is_expired()
             && m.memory_type != crate::memory_types::MemoryType::CodeContext
             && m.memory_type != crate::memory_types::MemoryType::Synthesis
+            && crate::memory_store::is_visible(m, privacy_context)
     };
     let incidents: Vec<&crate::memory_types::Memory> =
         all.iter().filter(|m| is_incident(m)).collect();
@@ -1962,6 +2000,16 @@ pub struct DaoMetricsData {
     pub luoshu_deviation: f32,
     pub bagua_balance: f32,
     pub synthesis_ratio: f32,
+    /// v0.11：**综合健康评分**（0-100）—— DaoRegulator 最近一次快照的真实评分
+    /// （道同构度 + 八卦熵 + 洛书偏离 + 合成比率 + 耦合度的加权）。
+    /// 调节器尚未运行时回退为道同构度，并由 `health_score_source` 如实标注。
+    pub health_score: f32,
+    /// 评分来源："regulator"（综合健康）| "dao_fallback"（回退道同构度）
+    pub health_score_source: String,
+    /// v0.11：洛书幻和**平均偏离度原始值**（0 ~ ≈2.05，越低越好）。
+    /// 此前前端用 `(1 - dao_isomorphism_score) * 100` 反推，与调节器文案的
+    /// 0.77 对不上；现直接给原始值。
+    pub avg_luoshu_deviation: f32,
     // 保留原始诊断字段（前端展示用）
     pub dao_isomorphism_score: f32,
     pub active_memories: usize,
@@ -3180,10 +3228,16 @@ pub fn build_v1_router_with_trust(
                     // 联想解释块需要保留查询原文（query 将被 move 进 spawn_blocking 闭包）
                     let query_text = req.query.clone();
                     let top_k = req.top_k.clamp(1, 100);
-                    let privacy_ctx = if req.user_id.is_some() {
-                        Some((PrivacyLevel::User, req.session_id.clone(), req.user_id.clone()))
-                    } else {
-                        None
+                    // ★v0.11 P0 修复：enrich 此前手工拼 privacy_ctx，且缺 user 时
+                    // 直接传 None ⇒ 多租户域可读全库；有 user 时又未做租户前缀
+                    // 命名空间化 ⇒ 读不到自己的数据。现统一走 privacy::resolve。
+                    let privacy_ctx = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.session_id.as_deref(),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
                     };
                     // 联想补全用的隐私上下文副本（v0.9.8）：与检索同源，
                     // 保证"检索看不到的记忆，联想也不许带出"。
@@ -3889,6 +3943,16 @@ pub fn build_v1_router_with_trust(
                     let cancellation_for_task = cancellation.clone();
                     let query = req.query.clone();
                     let memory_id = req.memory_id.clone();
+                    // v0.11：联想探索必须与检索同源 scope（此前硬编码 None ⇒ 多租户可读全库）
+                    let privacy_ctx = match crate::privacy::resolve(
+                        trust_mode,
+                        req.user_id.as_deref(),
+                        req.privacy_session_id.as_deref(),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
+                    let privacy_ctx_for_task = privacy_ctx.clone();
                     // P6/CL2：道体会话标识 —— deduce 与 reflect 绑定同会话，
                     // daemon 状态才能跨查询累积历史上下文（闭环的价值来源）。
                     let daoti_session = req
@@ -3961,7 +4025,7 @@ pub fn build_v1_router_with_trust(
                             // 优雅收敛不可达）。
                             // 阻塞线程内直接取读锁（spawn_blocking 中安全）
                             let store = store.blocking_read();
-                            Ok(run_association_explore(
+                            Ok(run_association_explore_scoped(
                                 &store,
                                 query.as_deref().and_then(|q| {
                                     let t = q.trim();
@@ -3975,6 +4039,7 @@ pub fn build_v1_router_with_trust(
                                 width,
                                 &cancellation_for_task,
                                 nav_signal.as_ref(),
+                                privacy_ctx_for_task,
                             ))
                         }),
                     ).await;
@@ -4063,11 +4128,20 @@ pub fn build_v1_router_with_trust(
         //    而不是显示点不通的假引导）——诚实优于凑数。
         .route("/associations/suggestions", get({
             let store = suggestions_store;
-            move || {
+            move |Query(params): Query<HashMap<String, String>>| {
                 let store = store.clone();
                 async move {
+                    // v0.11：示例由记忆正文生成，必须与检索同源 scope。
+                    let privacy_ctx = match crate::privacy::resolve(
+                        trust_mode,
+                        params.get("user_id").map(String::as_str),
+                        params.get("session_id").map(String::as_str),
+                    ) {
+                        Ok(scope) => scope,
+                        Err(_) => return Err(scope_required_error()),
+                    };
                     let result = tokio::task::spawn_blocking(move || {
-                        build_association_suggestions(&store.blocking_read())
+                        build_association_suggestions(&store.blocking_read(), &privacy_ctx)
                     })
                     .await;
                     let items = result.unwrap_or_default();
@@ -4395,9 +4469,21 @@ pub fn build_v1_router_with_trust(
                     let store = store.read().await;
                     match store.dao_metrics_snapshot() {
                         Ok(snapshot) => {
-                            let status = if snapshot.dao_isomorphism_score < 0.3 {
+                            // v0.11：主评分改为**综合健康**（DaoRegulator 最近快照）。
+                            // 调节器尚未运行时回退到道同构度，并用 health_score_source
+                            // 如实标注——绝不把单一维度伪装成"综合健康"。
+                            let composite = store
+                                .dao_regulator
+                                .read_recover()
+                                .latest_composite_health();
+                            let (health_0_1, health_source) = match composite {
+                                Some(v) => (v.clamp(0.0, 1.0), "regulator"),
+                                None => (snapshot.dao_isomorphism_score, "dao_fallback"),
+                            };
+                            let health_score = health_0_1 * 100.0;
+                            let status = if health_score < 30.0 {
                                 "critical"
-                            } else if snapshot.dao_isomorphism_score < 0.5 {
+                            } else if health_score < 50.0 {
                                 "warning"
                             } else {
                                 "healthy"
@@ -4417,6 +4503,9 @@ pub fn build_v1_router_with_trust(
                                     luoshu_deviation,
                                     bagua_balance,
                                     synthesis_ratio: synthesis_ratio_pct,
+                                    health_score,
+                                    health_score_source: health_source.to_string(),
+                                    avg_luoshu_deviation: snapshot.avg_luoshu_deviation,
                                     dao_isomorphism_score: snapshot.dao_isomorphism_score,
                                     active_memories: snapshot.active_memories,
                                     crystallized_memories: snapshot.crystallized_memories,
@@ -4941,6 +5030,16 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
+                    // v0.11：全库反馈聚合含跨租户信息，多租户域仅限管理员
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "联想反馈统计仅限本地可信域"
+                            })),
+                        ));
+                    }
                     let store = store.read().await;
 
                     let stats = store.user_feedback.read_recover().get_association_stats();
@@ -4963,6 +5062,17 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
+                    // v0.11：执行活动聚合覆盖全库审计链（含跨租户记忆 ID 与查询轨迹），
+                    // 与 association-stats 同口径，多租户域仅限管理员。
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "联想执行活动统计仅限本地可信域"
+                            })),
+                        ));
+                    }
                     let store = store.read().await;
 
                     let q = AuditQuery {
@@ -5182,6 +5292,16 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
+                    // v0.11：发现结果含记忆内容预览，多租户域仅限管理员
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "主动发现仅限本地可信域"
+                            })),
+                        ));
+                    }
                     // 门控关闭 → 直接返回跳过态（不发起任何网络/磁盘工作）
                     if !crate::discovery::active_discovery_enabled() {
                         return Ok::<_, (StatusCode, Json<serde_json::Value>)>(
@@ -5223,7 +5343,18 @@ pub fn build_v1_router_with_trust(
             }
         }))
         // GET /v1/discovery/drift — P7 可观测性：透传道体漂移状态（只读，不消费事件）
-        .route("/discovery/drift", get(|| async move {
+        .route("/discovery/drift", get(move || async move {
+            // v0.11：漂移状态是**进程级全局**信号（活跃卦/宫、待处理事件数），
+            // 不随 scope 变化；多租户域下与 state-driven 同口径，仅限管理员。
+            if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "admin_only",
+                        "message": "道体漂移状态仅限本地可信域"
+                    })),
+                ));
+            }
             match crate::discovery::fetch_drift_state().await {
                 Some(d) => Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
                     serde_json::json!({
@@ -5252,6 +5383,17 @@ pub fn build_v1_router_with_trust(
             move |Json(body): Json<serde_json::Value>| {
                 let store = store.clone();
                 async move {
+                    // v0.11：反馈账本是**全局单例**（按卦抑制 + 每日配额），
+                    // 多租户域写入会跨租户影响所有人的主动发现触发，仅限管理员。
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "主动发现反馈仅限本地可信域"
+                            })),
+                        ));
+                    }
                     let kind_raw = body
                         .get("kind")
                         .and_then(|v| v.as_str())
@@ -5325,6 +5467,16 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
+                    // v0.11：状态驱动发现含记忆内容预览，多租户域仅限管理员
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "状态驱动发现仅限本地可信域"
+                            })),
+                        ));
+                    }
                     if !crate::state_matcher::state_driven_enabled() {
                         return Ok::<_, (StatusCode, Json<serde_json::Value>)>(
                             Json(serde_json::json!(
@@ -5463,6 +5615,16 @@ pub fn build_v1_router_with_trust(
             move |Json(body): Json<serde_json::Value>| {
                 let store = store.clone();
                 async move {
+                    // v0.11：全库重编码是运维操作，多租户域仅限管理员
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "全库重编码仅限本地可信域"
+                            })),
+                        ));
+                    }
                     let limit = body
                         .get("limit")
                         .and_then(|v| v.as_u64())
@@ -5693,6 +5855,16 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
+                    // v0.11：全库统计含项目名/类型分布，多租户域仅限管理员
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "全库统计仅限本地可信域"
+                            })),
+                        ));
+                    }
                     // v0.8.19 P0-1b 修复：改用 try_lock，避免结晶流水线持锁时卡死
                     // v0.9.1 修复：lock_busy 时返回 200 + 降级数据而非 503（与 /health/system 一致）
                     let store = store.read().await;
@@ -6302,6 +6474,36 @@ pub fn build_v1_router_with_trust(
                     }
 
                     // 记忆类型解析改由 `MemoryWriteInput` 统一处理（无效即回退 `Fact`）
+                    // v0.11：多租户域下 Session 级写入必须带 user_id。
+                    //
+                    // 与 `privacy::resolve` 同一规则：`user_id` 会被加上「租户::」前缀
+                    // （隔离键由凭据派生），而 `session_id` 是客户端自报、无法命名空间化。
+                    // 若允许"只有 session"的 Session 级记忆落库，不同租户可用同一
+                    // session_id 撞到彼此的数据；且该记忆因缺少 owner 对任何 scope
+                    // 都不可见（静默丢失）。此处显式拒绝，避免写出"永远读不到"的数据。
+                    let session_level = params
+                        .privacy_level
+                        .as_deref()
+                        .and_then(PrivacyLevel::try_parse)
+                        == Some(PrivacyLevel::Session);
+                    let has_user = params
+                        .user_id
+                        .as_deref()
+                        .map(str::trim)
+                        .map(|v| !v.is_empty())
+                        .unwrap_or(false);
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant
+                        && session_level
+                        && !has_user
+                    {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "user_required",
+                                "message": "多租户域下 Session 级写入必须提供 user_id"
+                            })),
+                        ));
+                    }
                     // 解析重要性，限制 1-10
                     let importance = Importance::new(params.importance.unwrap_or(5));
 
@@ -7346,6 +7548,16 @@ pub fn build_v1_router_with_trust(
             move || {
                 let store = store.clone();
                 async move {
+                    // v0.11：船长日志汇总全库健康/统计，多租户域仅限管理员
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "船长日志仅限本地可信域"
+                            })),
+                        ));
+                    }
                     let store = store.read().await;
 
                     // 收集系统健康数据

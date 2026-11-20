@@ -64,8 +64,15 @@ static BACKUP_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// 备份保留份数（超出此数量的最旧备份将被删除）
 const MAX_BACKUPS: usize = 4;
-const SNAPSHOT_FILES: [&str; 7] = [
+/// 快照包含的文件清单。
+///
+/// ★v0.11 P0 修复：必须包含 `memories.journal.jsonl`。
+/// 写入走「基文件 + 追加日志」，只有压实（64MB 或基文件缺失）才重写基文件；
+/// 若备份只拷 `memories.json`，压实周期内的新增/修改**不在备份里**，
+/// 而恢复时旧日志又会被重放 ⇒ 恢复被静默回滚。日志必须与基文件同快照。
+const SNAPSHOT_FILES: [&str; 8] = [
     "memories.json",
+    "memories.journal.jsonl",
     "chunks.json",
     "archive.json",
     "audit.jsonl",
@@ -234,21 +241,9 @@ fn create_backup_in(data_dir: &Path, root: &Path) -> BackupReport {
     let backup_file = final_dir.join("memories.json");
     report.backup_size = fs::metadata(&backup_file).map(|m| m.len()).unwrap_or(0);
 
-    // 统计记忆数
-    if let Ok(content) = fs::read_to_string(&backup_file) {
-        if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
-            report.memory_count = if data.is_array() {
-                data.as_array().map(|a| a.len()).unwrap_or(0)
-            } else if data.is_object() {
-                data.get("memories")
-                    .and_then(|m| m.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-        }
-    }
+    // 统计记忆数：必须按「基文件 + 追加日志」的真实口径，
+    // 否则压实周期内的新增/修改不会被计入（报告少报）。
+    report.memory_count = count_memories_in_snapshot(&final_dir);
 
     report.backup_path = Some(final_dir.to_string_lossy().to_string());
 
@@ -260,6 +255,47 @@ fn create_backup_in(data_dir: &Path, root: &Path) -> BackupReport {
 
     report.success = true;
     report
+}
+
+/// 统计快照目录中的**有效记忆数**（基文件 + 追加日志，后写胜出）。
+///
+/// 只读取 `id` 与墓碑标记，不要求完整 `Memory` 结构 —— 备份计数不应因为
+/// 某个字段演进（新增必填字段）而失效。
+fn count_memories_in_snapshot(snapshot: &Path) -> usize {
+    use std::collections::HashSet;
+
+    let mut ids: HashSet<String> = HashSet::new();
+    if let Ok(content) = fs::read_to_string(snapshot.join("memories.json")) {
+        if let Ok(serde_json::Value::Array(items)) =
+            serde_json::from_str::<serde_json::Value>(&content)
+        {
+            for item in items {
+                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                    ids.insert(id.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(content) = fs::read_to_string(snapshot.join("memories.journal.jsonl")) {
+        for line in content.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(id) = value.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if value
+                .get("deleted")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                ids.remove(id);
+            } else {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    ids.len()
 }
 
 /// 清理旧备份，保留最近 MAX_BACKUPS 份
@@ -445,6 +481,13 @@ fn restore_backup_in(snapshot_path: &Path, allowed_root: &Path, data_dir: &Path)
         }
         fs::remove_dir_all(&rollback)
             .map_err(|e| LrcError::io(format!("清理恢复回滚目录失败: {}", e)))?;
+        // ★v0.11 P0：清除「日志作废」标记。若不清，`replay_journal` 见到该标记会
+        // 删除刚恢复的 journal —— 恢复被静默撤销（旧快照无 journal 时尤其明显）。
+        let invalidated = data_dir.join("memories.journal.jsonl.invalidated");
+        if invalidated.exists() {
+            fs::remove_file(&invalidated)
+                .map_err(|e| LrcError::io(format!("清除日志作废标记失败: {}", e)))?;
+        }
         Ok(())
     })();
     let _ = fs::remove_dir_all(&temp);
@@ -726,6 +769,49 @@ mod tests {
             "缺失文件应被恢复为空文件"
         );
         assert_eq!(fs::metadata(data.join("audit.jsonl")).unwrap().len(), 0);
+    }
+
+    /// ★v0.11 P0 回归：备份必须包含追加日志；恢复必须清掉「日志作废」标记。
+    ///
+    /// 背景：写入走「基文件 + 追加日志」，此前快照只拷基文件 ⇒ 压实周期内的
+    /// 新增记忆不在备份里；恢复后旧日志又被重放 ⇒ 恢复被静默撤销。
+    #[test]
+    fn backup_includes_journal_and_restore_clears_invalidated_marker() {
+        let (_tmp, data, backups) = setup_dirs();
+        fs::write(data.join("memories.json"), r#"[{"id":"base"}]"#).unwrap();
+        fs::write(
+            data.join("memories.journal.jsonl"),
+            "{\"id\":\"journaled\"}\n{\"id\":\"base\",\"deleted\":true}\n",
+        )
+        .unwrap();
+
+        let report = create_backup_in(&data, &backups);
+        assert!(report.success, "{:?}", report.error);
+        assert_eq!(
+            report.memory_count, 1,
+            "base 已被墓碑删除，有效记忆只剩 journaled"
+        );
+        let snapshot = std::path::PathBuf::from(report.backup_path.as_ref().unwrap());
+        assert_eq!(
+            fs::read_to_string(snapshot.join("memories.journal.jsonl")).unwrap(),
+            "{\"id\":\"journaled\"}\n{\"id\":\"base\",\"deleted\":true}\n",
+            "日志必须与基文件同快照"
+        );
+
+        // 恢复前数据目录里有「更新」的日志与作废标记
+        fs::write(data.join("memories.journal.jsonl"), "{\"id\":\"newer\"}\n").unwrap();
+        fs::write(data.join("memories.journal.jsonl.invalidated"), "").unwrap();
+
+        restore_backup_in(&snapshot, &backups, &data).expect("恢复应成功");
+        assert_eq!(
+            fs::read_to_string(data.join("memories.journal.jsonl")).unwrap(),
+            "{\"id\":\"journaled\"}\n{\"id\":\"base\",\"deleted\":true}\n",
+            "恢复后必须是快照里的日志（恢复点之后的旧日志不得残留）"
+        );
+        assert!(
+            !data.join("memories.journal.jsonl.invalidated").exists(),
+            "必须清除作废标记，否则 replay_journal 会删除刚恢复的日志"
+        );
     }
 
     /// **安全红线**：快照目录必须位于备份目录内，否则拒绝（路径穿越/越权写）

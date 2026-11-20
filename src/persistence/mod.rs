@@ -325,6 +325,23 @@ pub trait Persistence: Send + Sync {
     /// 按 ID 删除记忆，返回是否成功删除
     fn delete_memory(&self, id: &str) -> Result<bool, PersistenceError>;
 
+    /// 批量按 ID 删除（v0.11）。
+    ///
+    /// 为什么需要：归档等批量操作若用 `replace_all_memories` 重写全库，
+    /// 会把**其他进程**在此期间写入的记忆一并覆盖掉（跨进程丢写）。
+    /// 批量删除只追加墓碑，语义与 `delete_memory` 一致（后写胜出）。
+    ///
+    /// 默认实现逐条删除；JSON 后端覆盖为**单次**批量追加。
+    fn delete_memories(&self, ids: &[String]) -> Result<usize, PersistenceError> {
+        let mut deleted = 0usize;
+        for id in ids {
+            if self.delete_memory(id)? {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
     /// 清空所有记忆
     fn clear_memories(&self) -> Result<(), PersistenceError>;
 

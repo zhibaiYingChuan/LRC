@@ -270,6 +270,25 @@ impl JsonPersistence {
         Ok(())
     }
 
+    /// 批量追加墓碑（v0.11）：一次打开、一次 fsync，避免 N 次整库检查。
+    fn append_tombstones(&self, ids: &[String]) -> Result<(), PersistenceError> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.journal_file)?;
+        for id in ids {
+            let line = serde_json::to_string(&JournalTombstone {
+                id: id.clone(),
+                deleted: true,
+            })?;
+            file.write_all(line.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        file.flush()?;
+        file.sync_data()?;
+        Ok(())
+    }
+
     /// 日志作废标记：`truncate_journal` 删除失败时写入，加载侧见到即跳过重放。
     fn journal_invalidated_marker(&self) -> PathBuf {
         self.journal_file.with_extension("jsonl.invalidated")
@@ -915,6 +934,53 @@ impl Persistence for JsonPersistence {
         drop(cache);
         *self.loaded_fp.write().unwrap_or_else(|e| e.into_inner()) = self.disk_fingerprint();
         Ok(true)
+    }
+
+    /// 批量删除（v0.11）：单次刷新 + 单次墓碑追加，跨进程安全。
+    ///
+    /// 与 `replace_all_memories` 的关键差别：不会覆盖其他进程在本实例
+    /// 快照之后写入的记忆（那些 id 不在 `ids` 里，保持原样）。
+    fn delete_memories(&self, ids: &[String]) -> Result<usize, PersistenceError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_data_dir()?;
+        let _process_guard = self.acquire_process_write_guard()?;
+        self.refresh_cache_if_changed()?;
+        let mut cache = self.cache.write().unwrap_or_else(|e| e.into_inner());
+        let memories = cache.as_mut().ok_or_else(|| {
+            PersistenceError::Other(
+                "内存缓存未初始化（refresh_cache_from_disk 未生效）".to_string(),
+            )
+        })?;
+        let id_set: std::collections::HashSet<&str> = ids.iter().map(|id| id.as_str()).collect();
+        let before = memories.len();
+        memories.retain(|m| !id_set.contains(m.id.as_str()));
+        let deleted = before - memories.len();
+        if deleted == 0 {
+            return Ok(0);
+        }
+        if let Err(error) = self.append_tombstones(ids) {
+            // 追加失败 ⇒ 磁盘未变，丢弃缓存让下次从磁盘重建（安全方向）。
+            *cache = None;
+            drop(cache);
+            *self.loaded_fp.write().unwrap_or_else(|e| e.into_inner()) = None;
+            return Err(error);
+        }
+        if self.needs_compact() {
+            let json = serde_json::to_string_pretty(&*memories)?;
+            if let Err(error) = atomic_write(&self.memories_file, &json) {
+                eprintln!(
+                    "[json] ⚠ 批量删除已生效（墓碑已落盘），但日志压实失败：{}（下次写入会重试）",
+                    error
+                );
+            } else {
+                self.truncate_journal();
+            }
+        }
+        drop(cache);
+        *self.loaded_fp.write().unwrap_or_else(|e| e.into_inner()) = self.disk_fingerprint();
+        Ok(deleted)
     }
 
     fn clear_memories(&self) -> Result<(), PersistenceError> {

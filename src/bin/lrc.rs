@@ -696,7 +696,8 @@ fn sidecar_log_path() -> PathBuf {
 
 /// 查找 sidecar 可执行文件。
 ///
-/// 顺序：与本进程同目录 → `LRC_SIDECAR` → PATH 中的 `code-memory-server`。
+/// 顺序：与本进程同目录（通用名 → 发布稳定别名）→ `LRC_SIDECAR` →
+/// PATH 中的 `code-memory-server`。
 fn find_sidecar() -> Option<PathBuf> {
     let sidecar_name = if cfg!(windows) {
         "lrc-sidecar.exe"
@@ -709,6 +710,33 @@ fn find_sidecar() -> Option<PathBuf> {
             let candidate = dir.join(sidecar_name);
             if candidate.is_file() {
                 return Some(candidate);
+            }
+            // v0.11：发布资产使用平台稳定别名（见 release.yml 的 Publish plugin sidecar alias）。
+            // 用户把 CLI 与别名文件放同一目录即可，无需手动重命名。
+            let aliases: [&str; 3] = if cfg!(windows) {
+                [
+                    "lrc-sidecar-windows-x64.exe",
+                    "lrc-sidecar-windows-x86_64.exe",
+                    "lrc-sidecar.exe",
+                ]
+            } else if cfg!(target_os = "macos") {
+                [
+                    "lrc-sidecar-darwin-arm64",
+                    "lrc-sidecar-macos-arm64",
+                    "lrc-sidecar",
+                ]
+            } else {
+                [
+                    "lrc-sidecar-linux-x64",
+                    "lrc-sidecar-linux-x86_64",
+                    "lrc-sidecar",
+                ]
+            };
+            for name in aliases {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }

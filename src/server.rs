@@ -898,6 +898,27 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
         },
     ];
 
+    // ★v0.11：所有工具统一声明归属参数。
+    // 多租户域 `enforce_mcp_scope` 强制要求 user_id/session_id；若 schema 不声明，
+    // AI 客户端不会主动传，所有读/写调用会稳定 -32602（工具在 MT 下不可用）。
+    let mut tools = tools;
+    for tool in &mut tools {
+        if let Some(map) = tool.input_schema.properties.as_object_mut() {
+            map.entry("user_id").or_insert_with(|| {
+                serde_json::json!({
+                    "type": "string",
+                    "description": "多租户域必填：调用者用户标识（本地可信域可缺省）"
+                })
+            });
+            map.entry("session_id").or_insert_with(|| {
+                serde_json::json!({
+                    "type": "string",
+                    "description": "可选：会话标识（Session 级记忆隔离；多租户域需同时提供 user_id）"
+                })
+            });
+        }
+    }
+
     let result = ToolsListResult { tools };
     make_response(id, to_json_value_safe(&result))
 }
@@ -3695,17 +3716,14 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
         (None, None)
     };
 
-    // 获取记忆库统计（读锁）
-    let (memory_total, memory_lock_busy) = (
-        state
-            .memory_store
-            .read()
-            .await
-            .stats()
-            .map(|s| s.total_memories)
-            .unwrap_or(0),
-        false,
-    );
+    // 获取记忆库统计（读锁）。
+    // ★v0.11 P0 修复：此前是 `.read().await` 且 lock_busy 硬编码 false ——
+    //   结晶/合成长持写锁时探针会阻塞到外层超时，桌面端据此误判 sidecar 死亡。
+    //   现改为 try_read：拿不到锁立即返回降级值并如实置 lock_busy。
+    let (memory_total, memory_lock_busy) = match state.memory_store.try_read() {
+        Ok(store) => (store.stats().map(|s| s.total_memories).unwrap_or(0), false),
+        Err(_) => (0, true),
+    };
 
     lock_busy |= memory_lock_busy;
 

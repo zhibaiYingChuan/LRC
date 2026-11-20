@@ -2,7 +2,7 @@
 
 > **给 AI 装上记忆的本地服务** — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定与决策。
 >
-> 版本：**v0.9.10** | 适用于：Trae / Trae CN / Cursor / VS Code / Windsurf / Claude Desktop 等支持 MCP 协议的 AI 工具
+> 版本：**v0.11.0** | 适用于：Trae / Trae CN / Cursor / VS Code / Windsurf / Claude Desktop 等支持 MCP 协议的 AI 工具
 >
 > 本文面向**使用者**。想了解实现原理与能力实测数据，请看 [README](../README.md)；想了解本版本的修复内容，见 [CHANGELOG](../CHANGELOG.md)。
 
@@ -456,7 +456,6 @@ cargo build --release --features server,ml
 | [变更日志](../CHANGELOG.md) | 逐版本变更记录 |
 | [使用场景](USE_CASES.md) | 典型应用场景与最佳实践 |
 | [Smart Match 离线安装](OFFLINE_MODEL_GUIDE.md) | 内网/离线环境配置 |
-| [性能测试指南](../benchmarks/comparative/BENCHMARK_GUIDE.md) | 基准测试方法与历史数据（以当前版本实测为准） |
-| [基准测试报告](../benchmarks/V0.9.7_BENCHMARK_REPORT.md) | 联想能力验证（含全部反例与边界） |
+| [基准数据](BENCHMARK_v0.10.3.md) | 检索与联想能力的历史实测数据（以当前版本实测为准） |
 
 > 算法概述文档受 DaoTi Research License 保护，不公开分发。如需了解算法原理，请参阅源码 `src/engine/` 目录下的相关模块。

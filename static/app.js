@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.10.4';
+const APP_VERSION = '0.11.0';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -4591,8 +4591,11 @@ async function backupMemories() {
   const backupController = new AbortController();
   const backupSignal = backupController.signal;
   const btns = document.querySelectorAll('[data-action="backupMemories"]');
+  const healthBackupBtn = document.getElementById('btn-health-backup');
+  if (healthBackupBtn) healthBackupBtn.disabled = true;
   // v0.8.0：同时更新设置页 backup-result 和信任中心 trust-backup-result
-  const resultEls = [$('backup-result'), $('trust-backup-result')].filter(Boolean);
+  // v0.11：健康面板的维护结果也复用同一状态位
+  const resultEls = [$('backup-result'), $('trust-backup-result'), $('health-action-result')].filter(Boolean);
   const updateResult = (text, cls) => {
     resultEls.forEach(el => {
       el.style.display = '';
@@ -4714,6 +4717,7 @@ async function backupMemories() {
     }
   } finally {
     btns.forEach(b => b.disabled = false);
+    if (healthBackupBtn) healthBackupBtn.disabled = false;
   }
 }
 
@@ -4777,11 +4781,15 @@ async function importMemories(event) {
 
     const memoryCount = Array.isArray(exportData.memories) ? exportData.memories.length : 0;
     const chunkCount = Array.isArray(exportData.chunks) ? exportData.chunks.length : 0;
+    // v0.11：备份已包含归档；导入时把归档条目恢复到活跃库（当前无"直接写归档"端点）
+    const archiveCount = Array.isArray(exportData.archive) ? exportData.archive.length : 0;
+    const restoreTotal = memoryCount + archiveCount;
 
     // v0.8.3 Step 4 批次 5：confirm→await showConfirm（修复 G001-G003）
     const importConfirmed = await showConfirm(
       '确认导入以下数据？\n\n' +
       '  记忆：' + memoryCount + ' 条\n' +
+      '  归档记忆：' + archiveCount + ' 条（恢复到活跃库）\n' +
       '  代码片段：' + chunkCount + ' 个\n' +
       '  来源：' + (exportData.source || '未知') + '\n' +
       '  格式版本：' + exportData.version + '\n' +
@@ -4797,7 +4805,7 @@ async function importMemories(event) {
     }
 
     // 调用后端 API 写入数据
-    if (memoryCount > 0) {
+    if (restoreTotal > 0) {
       let imported = 0;
       let failed = 0;
       // v0.6.1 P1-2 修复: memory_type 枚举统一
@@ -4816,7 +4824,13 @@ async function importMemories(event) {
         return lower; // 已是后端合法类型则原样返回
       }
 
-      for (const mem of exportData.memories) {
+      // v0.11：归档条目一并恢复；隐私/归属/源时间必须透传，
+      // 否则备份恢复会把私有记忆变成默认可见、并丢失原始发生时间。
+      const toRestore = [
+        ...(Array.isArray(exportData.memories) ? exportData.memories : []),
+        ...(Array.isArray(exportData.archive) ? exportData.archive : []),
+      ];
+      for (const mem of toRestore) {
         try {
           await fetchWithTimeout(API_BASE + '/v1/memories/remember', {
             method: 'POST',
@@ -4831,13 +4845,20 @@ async function importMemories(event) {
               // 否则恢复后的记忆无法参与关联推导（字段静默丢失）
               event_id: mem.event_id || null,
               entities: mem.entities || [],
+              // v0.11：隐私与归属透传（多租户域必须保留原归属）
+              privacy_level: mem.privacy_level || undefined,
+              user_id: mem.user_id || undefined,
+              session_id: mem.session_id || undefined,
+              source_timestamp_ms: mem.created_at
+                ? Date.parse(mem.created_at)
+                : undefined,
               metadata: mem
             }),
           }, 30000);
           imported++;
           // 每 50 条更新一次进度
           if (imported % 50 === 0 && resultEls.length > 0) {
-            updateResult('导入中... ' + imported + '/' + memoryCount + ' 条');
+            updateResult('导入中... ' + imported + '/' + restoreTotal + ' 条');
           }
         } catch (e) {
           failed++;
@@ -5092,10 +5113,14 @@ let _reclassifyPollCount = 0;
 
 function _renderReclassify(text, cls) {
   const el = $('reclassify-result');
-  if (!el) return;
-  el.style.display = '';
-  el.className = cls || 'form-result';
-  el.textContent = text;
+  if (el) {
+    el.style.display = '';
+    el.className = cls || 'form-result';
+    el.textContent = text;
+  }
+  // v0.11：健康面板的"重新编码"按钮复用同一任务，进度同步显示在那里
+  const healthEl = $('health-action-result');
+  if (healthEl) healthEl.textContent = text;
 }
 
 async function startReclassifyBagua() {
@@ -5155,6 +5180,8 @@ async function pollReclassifyProgress() {
         'form-result form-result-success'
       );
       showToast('八卦重分类完成', 'success', 4000);
+      // v0.11：重编码完成后刷新健康面板（评分/偏差可能变化）
+      loadDaoMetrics();
     } else if (status === 'failed') {
       _renderReclassify('重分类失败：' + (data.error || '未知错误'), 'form-result form-result-error');
     } else {
@@ -8998,6 +9025,129 @@ function renderRegulatorHeartbeat(hb) {
 }
 
 /**
+ * v0.11：把健康面板的"建议重新编码"变成可执行动作，并给出维护解释。
+ *
+ * 背景：调节器只会写"建议重新编码"，但此前没有任何入口；用户看到 62 分
+ * 却不知道能做什么，也不知道重编码是否真的有用（编码器未变时重算结果不变）。
+ *
+ * @param {object} m /v1/health/dao_metrics 的 data 段
+ */
+function renderHealthGuidance(m) {
+  const textEl = document.getElementById('health-guidance-text');
+  const sourceEl = document.getElementById('health-guidance-source');
+  if (!textEl) return;
+
+  const hb = m.regulator_heartbeat || null;
+  const dev = Number(m.avg_luoshu_deviation);
+  const synthesisPct = Number(m.synthesis_ratio);
+  const needReencode = !!(hb && hb.last_action === 'suggest_reencoding');
+
+  if (sourceEl) {
+    sourceEl.textContent = m.health_score_source === 'dao_fallback'
+      ? '综合健康待调节器更新，当前为结构评分'
+      : '评分来源：综合健康';
+  }
+
+  const parts = [];
+  if (needReencode) {
+    const devText = Number.isFinite(dev) ? dev.toFixed(2) : '--';
+    parts.push(
+      `检测到洛书几何偏离偏高（${devText}，调节器阈值 0.5）。` +
+      '若你最近更换过嵌入模型或编码器版本，建议执行一次重新编码；' +
+      '若编码器没变，重算结果不变，评分也不会变化。'
+    );
+  } else {
+    parts.push(
+      '当前没有必须执行的重编码建议。评分反映的是记忆结构，不代表内容损坏；' +
+      '原始记忆不会因评分变化被自动删除。'
+    );
+  }
+  if (Number.isFinite(synthesisPct) && synthesisPct > 30) {
+    parts.push(`合成记忆占比 ${synthesisPct.toFixed(1)}%（建议 < 30%）：建议在设置中检查合成阈值，或归档低价值记忆。`);
+  }
+  textEl.textContent = parts.join(' ');
+
+  // 绑定与数据解耦：首屏/降级时也要可用（见 bindHealthActions）
+  bindHealthActions();
+}
+
+/**
+ * 绑定「记忆库维护」三个按钮（幂等，可在首屏/降级/数据刷新时重复调用）。
+ *
+ * v0.11 独立审查修复：此前 handler 只在健康数据**成功**分支里绑定，
+ * 首屏索引期/服务不可达时按钮全死，却宣称"维护操作仍可执行"。
+ */
+function bindHealthActions() {
+  const setResult = (text, isError) => {
+    const el = document.getElementById('health-action-result');
+    if (!el) return;
+    el.textContent = text;
+    el.style.color = isError ? 'var(--lrc-朱砂-500, #b23a2f)' : 'var(--lrc-墨韵-500)';
+  };
+
+  const reencodeBtn = document.getElementById('btn-health-reencode');
+  if (reencodeBtn && !reencodeBtn.dataset.bound) {
+    reencodeBtn.dataset.bound = '1';
+    reencodeBtn.onclick = async () => {
+      const ok = await showConfirm(
+        '重新编码会用当前编码器重算全部记忆的洛书坐标与八卦，可能持续数分钟，期间检索质量可能短暂波动。\n\n' +
+        '若你最近没有更换嵌入模型或编码器版本，重算结果不会变化。确定继续？',
+        '重新编码'
+      );
+      if (!ok) return;
+      setResult('正在启动重新编码任务...');
+      await startReclassifyBagua();
+    };
+  }
+
+  const archiveBtn = document.getElementById('btn-health-archive');
+  if (archiveBtn && !archiveBtn.dataset.bound) {
+    archiveBtn.dataset.bound = '1';
+    archiveBtn.onclick = async () => {
+      const ok = await showConfirm(
+        '归档会把“已过期”的记忆移出检索范围（可在归档中恢复），不会删除原始内容。确定继续？',
+        '归档过期记忆'
+      );
+      if (!ok) return;
+      setResult('正在归档过期记忆...');
+      try {
+        const res = await fetchWithTimeout(API_BASE + '/v1/memories/archive-expired', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        }, 60000);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.success === false) {
+          throw new Error(data.message || data.error || ('HTTP ' + res.status));
+        }
+        const n = Number(data.archived || 0);
+        setResult(`已归档 ${n} 条过期记忆。`);
+        showToast(`已归档 ${n} 条过期记忆`, 'success', 4000);
+        loadDaoMetrics();
+      } catch (e) {
+        setResult('归档失败：' + e.message, true);
+      }
+    };
+  }
+
+  const backupBtn = document.getElementById('btn-health-backup');
+  if (backupBtn && !backupBtn.dataset.bound) {
+    backupBtn.dataset.bound = '1';
+    backupBtn.onclick = () => {
+      setResult('正在准备备份文件...');
+      backupMemories();
+    };
+  }
+}
+
+// 首屏即绑定（不依赖健康数据是否可用）
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', bindHealthActions);
+} else {
+  bindHealthActions();
+}
+
+/**
  * 加载道同构度数据并渲染
  * v0.8.11：超时从 5s 延长到 10s + 自动重试退避（sidecar 索引期间 dao_metrics 响应慢）
  */
@@ -9033,28 +9183,35 @@ async function loadDaoMetrics() {
       // v0.8.13 C1: 清除降级横幅（避免与正常数据矛盾显示）
       const fallbackBanner = document.querySelector('.dao-fallback-banner');
       if (fallbackBanner) fallbackBanner.remove();
-      const rawScore = Number(m.dao_isomorphism_score);
-      const score = Number.isFinite(rawScore)
-        ? Math.round(Math.max(0, Math.min(1, rawScore)) * 100)
-        : null;
+      // v0.11：主评分 = 后端**综合健康**（DaoRegulator 快照）；
+      // 调节器尚未运行时后端回退为道同构度，并用 health_score_source 标注。
+      const rawHealth = Number(m.health_score);
+      const rawDao = Number(m.dao_isomorphism_score);
+      const score = Number.isFinite(rawHealth)
+        ? Math.round(Math.max(0, Math.min(100, rawHealth)))
+        : (Number.isFinite(rawDao)
+          ? Math.round(Math.max(0, Math.min(1, rawDao)) * 100)
+          : null);
       const statusEl = document.getElementById('dao-health-status');
       const explanationEl = document.getElementById('dao-health-explanation');
       const status = m.status || (score !== null && score >= 80 ? 'healthy' : 'warning');
       const statusText = { healthy: '状态稳定', warning: '需要关注', critical: '建议处理' }[status] || '状态评估中';
       if (statusEl) statusEl.textContent = score === null ? statusText : `${statusText} · ${score}分`;
       if (explanationEl) {
+        const fallbackNote = m.health_score_source === 'dao_fallback'
+          ? '（调节器综合健康暂未更新，当前分数为道同构度）'
+          : '';
         const explanation = score === null
           ? '当前数据不足以完成可信评估，系统不会自动执行高风险操作。'
           : status === 'healthy'
-            ? '当前记忆结构稳定，搜索和结晶可以正常使用。系统会继续自动观察变化。'
+            ? `当前记忆结构稳定（综合健康 ${score} 分），搜索和结晶可以正常使用。系统会继续自动观察变化。${fallbackNote}`
             : status === 'warning'
-              ? `当前存在轻微结构偏离（${score}分），通常不会影响基本搜索；系统会优先执行非破坏性检查。`
-              : `当前结构偏离较明显（${score}分），可能影响结晶质量或排序稳定性。原始记忆不会因评分降低而被删除，系统会先进行安全诊断。`;
+              ? `当前存在结构性偏离（综合健康 ${score} 分），通常不会影响基本搜索；可在下方“记忆库维护”查看建议动作。${fallbackNote}`
+              : `当前结构偏离较明显（综合健康 ${score} 分），可能影响结晶质量或排序稳定性。原始记忆不会因评分降低而被删除；建议先备份，再按下方建议处理。${fallbackNote}`;
         explanationEl.hidden = false;
         explanationEl.textContent = explanation;
       }
-      // 后端 dao_isomorphism_score 是唯一主评分源，前端不重复推导评分。
-      // 子指标保留后端真实的 0 值，不使用会覆盖 0 的 || 默认值。
+      // 主评分来自后端综合健康；子指标保留后端真实值（0 不覆盖）。
       drawDaoRing(score ?? 0);
       const scoreEl = document.getElementById('dao-ring-score');
       if (scoreEl) scoreEl.textContent = score ?? '--';
@@ -9065,13 +9222,23 @@ async function loadDaoMetrics() {
         if (el) el.textContent = val;
       };
       setText('dao-yin-yang', (Number(m.yin_yang_balance ?? 0) / 100).toFixed(2));
-      setText('dao-luoshu-deviation', Number(m.luoshu_deviation ?? 0).toFixed(2));
+      // v0.11：洛书偏差显示**原始平均偏离度**（与调节器文案同一口径，如 0.77）。
+      // 旧实现显示 (1 - 道同构度) * 100（如 37.86），与 0.5 阈值无法直接比较。
+      const devRaw = Number(m.avg_luoshu_deviation);
+      setText(
+        'dao-luoshu-deviation',
+        Number.isFinite(devRaw)
+          ? devRaw.toFixed(2)
+          : Number(m.luoshu_deviation ?? 0).toFixed(2)
+      );
       setText('dao-bagua-balance', (Number(m.bagua_balance ?? 0) / 100).toFixed(2));
       setText('dao-synthesis-ratio', Number(m.synthesis_ratio ?? 0).toFixed(1) + '%');
 
       // P1 调节器心跳：渲染 DaoRegulator 后台周期任务的活性状态。
       // 数据源为 /v1/health/system 的 dao_metrics（后端注入 regulator_heartbeat）。
       renderRegulatorHeartbeat(m.regulator_heartbeat);
+      // v0.11：把"建议重新编码"变成可执行动作，并解释每个指标的含义。
+      renderHealthGuidance(m);
 
       console.log(`[LRC v${APP_VERSION}]道同构度加载完成，健康评分: ${score}`);
     } else {
@@ -9201,6 +9368,12 @@ function _applyDaoMetricsFallback(reason) {
     const el = document.getElementById(id);
     if (el) el.textContent = '--';
   });
+
+  // v0.11：健康数据不可用时，维护入口仍然可用（备份/归档/重编码不依赖评分）
+  const guidanceText = document.getElementById('health-guidance-text');
+  if (guidanceText) {
+    guidanceText.textContent = '暂时无法读取健康数据；下方的维护操作仍可执行（建议先导出备份）。';
+  }
 
   // 显示降级提示横幅（含重试按钮，便于用户主动重试）
   const panel = document.querySelector('.dao-metrics-panel')

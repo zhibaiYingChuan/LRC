@@ -5300,8 +5300,10 @@ impl<P: Persistence> MemoryStore<P> {
         // 语义向量：写入后**异步入队**编码（不阻塞写路径、不持锁编码）。
         // 这是"缓存随库增长"的唯一入口——没有它，语义索引只能靠回填追赶，
         // 而回填速率结构性追不上持续写入（历史缺陷的根因）。
+        // v0.11：用 force 版本 —— `remember` 的相似合并会改写正文，
+        // 普通 enqueue 因"已索引"早退会让语义检索永远停留在旧向量。
         #[cfg(feature = "ml")]
-        crate::semantic_index::enqueue(&result.id, &result.content);
+        crate::semantic_index::enqueue_force(&result.id, &result.content);
 
         // 记录指标：编码 + 1
         self.dao_metrics.record_encoding();
@@ -7692,6 +7694,9 @@ impl<P: Persistence> MemoryStore<P> {
                 self.replace_memory_in_index(old_memory, new_memory);
             }
         }
+        // v0.11：正文已变更 ⇒ 强制重编码，避免语义检索继续用旧向量。
+        #[cfg(feature = "ml")]
+        crate::semantic_index::enqueue_force(id, new_content);
         // 更新后仅刷新记忆快照，保留已完成的增量索引。
         self.mark_cache_dirty_preserving_index();
 
@@ -10118,12 +10123,13 @@ impl<P: Persistence> MemoryStore<P> {
         // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
         let all = self.load_cached()?;
 
-        // 筛选过期记忆与活跃记忆（★ v0.9.13 建议二：只克隆需要的条目归属，
-        //   分卷集合本身必须拥有数据，与修前同样一次全库克隆）
-        let (expired, active): (Vec<Memory>, Vec<Memory>) = all
+        // 筛选过期记忆（v0.11：不再同时构造 active 列表 —— 归档改为按 id
+        // 批量删除，避免 `replace_all_memories` 覆盖其他进程的新写入）。
+        let expired: Vec<Memory> = all
             .iter()
+            .filter(|m| m.is_expired())
             .map(|m| m.as_ref().clone())
-            .partition(|m| m.is_expired());
+            .collect();
 
         if expired.is_empty() {
             return Ok(0);
@@ -10134,10 +10140,9 @@ impl<P: Persistence> MemoryStore<P> {
         // 归档过期记忆到冷存储
         self.persistence.add_to_archive(&expired)?;
 
-        // 从活跃存储中重建（仅保留活跃记忆）
-        // 2026-09-01 C05 修复：改用 replace_all_memories 单端点原子写，
-        // 消除旧 clear_memories+save_memory 两端点在重建中途崩溃丢全库的窗口。
-        self.persistence.replace_all_memories(&active)?;
+        // 从活跃存储中删除（追加墓碑，跨进程安全；不再整库重写）
+        let expired_ids: Vec<String> = expired.iter().map(|m| m.id.clone()).collect();
+        self.persistence.delete_memories(&expired_ids)?;
         // v0.11：归档后清理图边与生命周期死行，避免悬空边/死行永久膨胀。
         // 清理失败不阻断归档（与 forget 的策略一致：主操作不因增强能力失败），
         // 但必须留下告警——否则悬空边会静默永久残留。
@@ -10503,39 +10508,27 @@ impl<P: Persistence> MemoryStore<P> {
     ) -> Result<Option<Memory>, PersistenceError> {
         // 写者互斥由外层 `RwLock` 写锁保证（`SharedStore` 层）。
         let all = self.load_cached()?;
-        let mut found: Option<Memory> = None;
-
-        let updated: Vec<Memory> = all
-            .iter()
-            .map(|m| m.as_ref().clone())
-            .map(|mut m| {
-                if m.id == id {
-                    // 使用版本追踪更新（自动保存历史版本）
-                    let reason_str = reason.unwrap_or("用户修正").to_string();
-                    m.update_content_with_reason(new_content.to_string(), reason_str);
-                    // 追加修正标记到 source
-                    m.source = Some(format!("corrected: {}", reason.unwrap_or("未提供原因")));
-                    found = Some(m.clone());
-                    m
-                } else {
-                    m
-                }
-            })
-            .collect();
-
-        // 重新写入
-        // 2026-09-01 C05 修复：改用 replace_all_memories 单端点原子写，
-        // 消除旧 clear_memories+save_memory 两端点在重写中途崩溃丢全库的窗口。
-        self.persistence.replace_all_memories(&updated)?;
+        // v0.11：只重写被修正的那一条。
+        // 此前用 `replace_all_memories` 重写全库 —— 会把其他进程在快照之后
+        // 写入的记忆一并覆盖掉（跨进程丢写），且代价随库规模线性增长。
+        let Some(mut target) = all.iter().find(|m| m.id == id).map(|m| m.as_ref().clone()) else {
+            return Ok(None);
+        };
+        let reason_str = reason.unwrap_or("用户修正").to_string();
+        target.update_content_with_reason(new_content.to_string(), reason_str);
+        // 追加修正标记到 source
+        target.source = Some(format!("corrected: {}", reason.unwrap_or("未提供原因")));
+        self.persistence.save_memory(&target)?;
+        // v0.11：修正正文后强制重编码，避免语义检索继续用旧向量。
+        #[cfg(feature = "ml")]
+        crate::semantic_index::enqueue_force(&target.id, &target.content);
         // v0.5.4 写操作后标记缓存为脏
         self.invalidate_cache();
 
         // 记录指标：修正 + 1
-        if found.is_some() {
-            self.dao_metrics.record_correction();
-        }
+        self.dao_metrics.record_correction();
 
-        Ok(found)
+        Ok(Some(target))
     }
 
     /// 生成系统健康聚合报告（质疑五·可理解性）

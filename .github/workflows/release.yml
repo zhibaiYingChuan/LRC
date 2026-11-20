@@ -138,6 +138,7 @@ jobs:
         run: |
           cargo check --bin code-memory-server --features server
           cargo check --bin code-memory-benchmark --features server
+          cargo check --bin lrc --features server
 
       # 5. 关键持久化后端编译矩阵
       - name: Compile persistence backends
@@ -492,14 +493,22 @@ jobs:
 
           cargo build --release --bin code-memory-server --features server,ml --target ${{ matrix.target }}
           cargo build --release --bin code-memory-benchmark --features server,ml --target ${{ matrix.target }}
+          # v0.11：独立 CLI（此前从未构建/上传 ⇒ Release 无 CLI 资产）
+          cargo build --release --bin lrc --features server,ml --target ${{ matrix.target }}
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp target/${{ matrix.target }}/release/code-memory-server.exe "${BIN_NAME}"
+            CLI_NAME="lrc-cli-${VERSION}-${PLATFORM}.exe"
+            cp target/${{ matrix.target }}/release/lrc.exe "${CLI_NAME}"
           else
             cp target/${{ matrix.target }}/release/code-memory-server "${BIN_NAME}"
+            CLI_NAME="lrc-cli-${VERSION}-${PLATFORM}"
+            cp target/${{ matrix.target }}/release/lrc "${CLI_NAME}"
           fi
+          echo "CLI_NAME=${CLI_NAME}" >> $GITHUB_ENV
           test -s "${BIN_NAME}"
+          test -s "${CLI_NAME}"
           test -s "${BIN_NAME}.sha256" 2>/dev/null || true
-          echo "Built: ${BIN_NAME}"
+          echo "Built: ${BIN_NAME} / ${CLI_NAME}"
         shell: bash
 
       # v0.8.39 新增：编译产物版本校验（防御性门禁）
@@ -534,8 +543,10 @@ jobs:
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             certutil -hashfile $BIN_NAME SHA256 > $BIN_NAME.sha256
+            certutil -hashfile $CLI_NAME SHA256 > $CLI_NAME.sha256
           else
             sha256sum $BIN_NAME > $BIN_NAME.sha256
+            sha256sum $CLI_NAME > $CLI_NAME.sha256
           fi
         shell: bash
 
@@ -566,6 +577,8 @@ jobs:
           path: |
             ${{ env.BIN_NAME }}
             ${{ env.BIN_NAME }}.sha256
+            ${{ env.CLI_NAME }}
+            ${{ env.CLI_NAME }}.sha256
             lrc-sidecar-*
 
   # ════════════════════════════════════════════════════════════
@@ -921,8 +934,12 @@ jobs:
           if [ "${{ runner.os }}" = "Windows" ]; then
             export CARGO_HTTP_CHECK_REVOKE=false
             echo "已禁用 SSL 证书吊销检查 (CARGO_HTTP_CHECK_REVOKE=false)"
+            # v0.11：只出 NSIS。配置里的 "targets": "all" 会同时尝试 MSI/WiX，
+            # 而发布流程只收集 NSIS —— WiX 下载失败会白赔整条 Windows 构建。
+            cargo tauri build --target ${{ matrix.target }} --bundles nsis
+          else
+            cargo tauri build --target ${{ matrix.target }}
           fi
-          cargo tauri build --target ${{ matrix.target }}
         shell: bash
 
       # 步骤 5: macOS Ad-Hoc 签名
@@ -1164,20 +1181,27 @@ jobs:
           echo "==============================================="
 
           VERSION="${1:-latest}"
-          BASE_URL="https://github.com/zhibaiYingChuan/LRC/releases/${VERSION}/download"
-          DOWNLOAD_VERSION="${VERSION}"
+          # v0.11 修复：latest 必须先解析成真实 tag —— 资产名含版本号，
+          # 旧实现拼出 `lrc-linux-x86_64`（不存在）⇒ 默认安装路径必然 404。
+          # 同时修正 GitHub 资产 URL 格式：releases/download/<tag>/<asset>。
           if [ "$VERSION" = "latest" ]; then
-            DOWNLOAD_VERSION=""
+            VERSION=$(curl -fsSL https://api.github.com/repos/zhibaiYingChuan/LRC/releases/latest \
+              | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+            if [ -z "$VERSION" ]; then
+              echo "  无法解析最新版本（GitHub API 不可达或被限流），请显式传入版本号，如: v0.11.0"
+              exit 1
+            fi
           fi
+          BASE_URL="https://github.com/zhibaiYingChuan/LRC/releases/download/${VERSION}"
 
           # Detect OS and architecture
           OS=$(uname -s)
           ARCH=$(uname -m)
 
           if [ "$OS" = "Linux" ]; then
-            BINARY="lrc-${DOWNLOAD_VERSION:+${DOWNLOAD_VERSION}-}linux-x86_64"
+            BINARY="lrc-${VERSION}-linux-x86_64"
           elif [ "$OS" = "Darwin" ]; then
-            BINARY="lrc-${DOWNLOAD_VERSION:+${DOWNLOAD_VERSION}-}macos-arm64"
+            BINARY="lrc-${VERSION}-macos-arm64"
           else
             echo "Unsupported OS: $OS"
             exit 1
@@ -1262,6 +1286,23 @@ jobs:
           RELEASE_VERSION: ${{ github.event.inputs.version }}
         shell: bash
 
+      # v0.11：把 CHANGELOG 对应版本的条目作为 Release 正文（"更新日志放在新版本页面"）。
+      - name: Extract release notes from CHANGELOG
+        run: |
+          TAG="${{ steps.release_version.outputs.TAG }}"
+          VER="${TAG#v}"
+          awk -v ver="$VER" '
+            $0 ~ "^## \\[" ver "\\]" {flag=1; next}
+            flag && /^## \[/ {exit}
+            flag {print}
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "该版本的详细变更见 [CHANGELOG.md](https://github.com/zhibaiYingChuan/LRC/blob/main/CHANGELOG.md)。" > RELEASE_NOTES.md
+          fi
+          echo "Release notes extracted for ${TAG}:"
+          head -20 RELEASE_NOTES.md
+        shell: bash
+
       - name: Create Release
         # v0.9.3 修复：workflow_dispatch 不在 tag ref 上运行，必须显式传入 release tag
         # 否则 softprops/action-gh-release 会报 GitHub Releases requires a tag
@@ -1271,11 +1312,12 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: ${{ steps.release_version.outputs.TAG }}
+          body_path: RELEASE_NOTES.md
           files: |
             artifacts/**/*
             install.sh
             REPRODUCIBLE_BUILDS.md
-          generate_release_notes: true
+          generate_release_notes: false
           draft: false
           prerelease: false
         env:

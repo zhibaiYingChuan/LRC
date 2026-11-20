@@ -478,6 +478,9 @@ mod api_contracts_tests {
                 luoshu_deviation: 14.5,
                 bagua_balance: 97.9,
                 synthesis_ratio: 30.0,
+                health_score: 62.0,
+                health_score_source: "regulator".to_string(),
+                avg_luoshu_deviation: 0.77,
                 dao_isomorphism_score: 0.855,
                 active_memories: 100,
                 crystallized_memories: 30,
@@ -504,6 +507,13 @@ mod api_contracts_tests {
         assert!(approx_eq(data["luoshu_deviation"].as_f64().unwrap(), 14.5));
         assert!(approx_eq(data["bagua_balance"].as_f64().unwrap(), 97.9));
         assert!(approx_eq(data["synthesis_ratio"].as_f64().unwrap(), 30.0));
+        // v0.11：综合健康与洛书偏差原始值（前端健康面板直接依赖）
+        assert!(approx_eq(data["health_score"].as_f64().unwrap(), 62.0));
+        assert_eq!(data["health_score_source"], "regulator");
+        assert!(approx_eq(
+            data["avg_luoshu_deviation"].as_f64().unwrap(),
+            0.77
+        ));
         assert!(approx_eq(
             data["dao_isomorphism_score"].as_f64().unwrap(),
             0.855

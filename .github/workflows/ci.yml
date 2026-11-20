@@ -615,6 +615,7 @@ jobs:
         run: |
           cargo check --bin code-memory-server --features server
           cargo check --bin code-memory-benchmark --features server
+          cargo check --bin lrc --features server
 
       # v0.8.8 新增：桌面端跨平台编译验证（防止 macOS/Linux 桌面端 CI 失败）
       # v0.8.23 CI 修复：禁用 apt 镜像列表探测（避免 harden-runner 阻断未知镜像域名导致挂起），
