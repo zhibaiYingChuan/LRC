@@ -4346,7 +4346,9 @@ impl<P: Persistence> MemoryStore<P> {
         // v0.6.0+ 参赛扩展：探索日志埋点（regulate 事件）
         let regulate_start = std::time::Instant::now();
 
-        let action = self.dao_regulator.write_recover().regulate(
+        // v0.11：把编码器模式传给调节器 —— 语义编码下 dao/偏离度是 9 维投影的
+        // 结构特性（实测中位数≈1.84），不能据此建议"重新编码"或压低综合健康。
+        let action = self.dao_regulator.write_recover().regulate_with_encoder(
             snapshot.dao_isomorphism_score,
             snapshot.bagua_entropy,
             snapshot.synthesis_ratio,
@@ -4355,6 +4357,7 @@ impl<P: Persistence> MemoryStore<P> {
             self.decay_config.read_recover().decay_rate,
             self.synthesis_min_cluster
                 .load(std::sync::atomic::Ordering::Acquire),
+            self.is_ml_encoder(),
         );
 
         // v0.6.0+ 参赛扩展：探索日志记录（regulate 事件）

@@ -480,6 +480,8 @@ mod api_contracts_tests {
                 synthesis_ratio: 30.0,
                 health_score: 62.0,
                 health_score_source: "regulator".to_string(),
+                encoder_mode: "statistical".to_string(),
+                structural_score_applicable: true,
                 avg_luoshu_deviation: 0.77,
                 dao_isomorphism_score: 0.855,
                 active_memories: 100,
@@ -510,6 +512,8 @@ mod api_contracts_tests {
         // v0.11：综合健康与洛书偏差原始值（前端健康面板直接依赖）
         assert!(approx_eq(data["health_score"].as_f64().unwrap(), 62.0));
         assert_eq!(data["health_score_source"], "regulator");
+        assert_eq!(data["encoder_mode"], "statistical");
+        assert_eq!(data["structural_score_applicable"], true);
         assert!(approx_eq(
             data["avg_luoshu_deviation"].as_f64().unwrap(),
             0.77

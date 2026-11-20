@@ -2000,12 +2000,19 @@ pub struct DaoMetricsData {
     pub luoshu_deviation: f32,
     pub bagua_balance: f32,
     pub synthesis_ratio: f32,
-    /// v0.11：**综合健康评分**（0-100）—— DaoRegulator 最近一次快照的真实评分
-    /// （道同构度 + 八卦熵 + 洛书偏离 + 合成比率 + 耦合度的加权）。
-    /// 调节器尚未运行时回退为道同构度，并由 `health_score_source` 如实标注。
+    /// v0.11：**综合健康评分**（0-100）。
+    /// 优先取 DaoRegulator 与当前编码器模式一致且新鲜的快照；否则用当前指标
+    /// **即时计算**（同一公式），来源由 `health_score_source` 如实标注。
     pub health_score: f32,
-    /// 评分来源："regulator"（综合健康）| "dao_fallback"（回退道同构度）
+    /// 评分来源："regulator"（调节器快照）| "computed"（即时计算）|
+    /// "dao_fallback"（回退道同构度，仅当无法计算综合健康时）
     pub health_score_source: String,
+    /// v0.11：当前编码器模式（"ml" 语义编码 | "statistical" 统计编码）。
+    /// 语义编码下道同构度/偏离度是 9 维投影的结构特性，前端据此改写文案。
+    pub encoder_mode: String,
+    /// v0.11：道同构度指标是否适用于当前编码器。
+    /// 语义编码下为 false（结构指标长期饱和，不代表记忆质量）。
+    pub structural_score_applicable: bool,
     /// v0.11：洛书幻和**平均偏离度原始值**（0 ~ ≈2.05，越低越好）。
     /// 此前前端用 `(1 - dao_isomorphism_score) * 100` 反推，与调节器文案的
     /// 0.77 对不上；现直接给原始值。
@@ -4469,17 +4476,33 @@ pub fn build_v1_router_with_trust(
                     let store = store.read().await;
                     match store.dao_metrics_snapshot() {
                         Ok(snapshot) => {
-                            // v0.11：主评分改为**综合健康**（DaoRegulator 最近快照）。
-                            // 调节器尚未运行时回退到道同构度，并用 health_score_source
-                            // 如实标注——绝不把单一维度伪装成"综合健康"。
-                            let composite = store
-                                .dao_regulator
-                                .read_recover()
-                                .latest_composite_health();
-                            let (health_0_1, health_source) = match composite {
-                                Some(v) => (v.clamp(0.0, 1.0), "regulator"),
-                                None => (snapshot.dao_isomorphism_score, "dao_fallback"),
+                            // v0.11：主评分改为**综合健康**。
+                            // 调节器快照与当前编码器模式一致且新鲜 ⇒ 直接用；
+                            // 否则用当前指标**即时计算**（同一公式），避免回退到
+                            // 单一 dao 分把结构指标伪装成综合健康。
+                            let encoder_is_semantic = store.is_ml_encoder();
+                            let encoder_mode = if encoder_is_semantic {
+                                "ml"
+                            } else {
+                                "statistical"
                             };
+                            let regulator = store.dao_regulator.read_recover();
+                            let (health_0_1, health_source) =
+                                match regulator.latest_composite_health(encoder_is_semantic) {
+                                    Some(v) => (v.clamp(0.0, 1.0), "regulator"),
+                                    None => (
+                                        regulator
+                                            .preview_composite_health(
+                                                snapshot.dao_isomorphism_score,
+                                                snapshot.bagua_entropy,
+                                                snapshot.synthesis_ratio,
+                                                snapshot.avg_luoshu_deviation,
+                                                encoder_is_semantic,
+                                            )
+                                            .clamp(0.0, 1.0),
+                                        "computed",
+                                    ),
+                                };
                             let health_score = health_0_1 * 100.0;
                             let status = if health_score < 30.0 {
                                 "critical"
@@ -4505,6 +4528,8 @@ pub fn build_v1_router_with_trust(
                                     synthesis_ratio: synthesis_ratio_pct,
                                     health_score,
                                     health_score_source: health_source.to_string(),
+                                    encoder_mode: encoder_mode.to_string(),
+                                    structural_score_applicable: !encoder_is_semantic,
                                     avg_luoshu_deviation: snapshot.avg_luoshu_deviation,
                                     dao_isomorphism_score: snapshot.dao_isomorphism_score,
                                     active_memories: snapshot.active_memories,

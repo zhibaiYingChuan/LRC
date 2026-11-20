@@ -8989,7 +8989,7 @@ window.daoAbortController = null;
  * @param {object|null} hb 后端注入的 regulator_heartbeat 对象
  *   { last_run_ms, last_action, run_count, last_reason }
  */
-function renderRegulatorHeartbeat(hb) {
+function renderRegulatorHeartbeat(hb, encoderMode) {
   const dot = document.getElementById('heartbeat-dot');
   const infoEl = document.getElementById('regulator-heartbeat-info');
   const detailEl = document.getElementById('regulator-heartbeat-detail');
@@ -9016,10 +9016,17 @@ function renderRegulatorHeartbeat(hb) {
     adjust_information_gain_threshold: '调整信息增益阈值',
     suggest_comprehensive_rebalance: '建议综合再平衡',
   };
+  // v0.11：语义编码下"建议重新编码"是历史心跳的遗留动作（结构指标不适用），
+  // 面板不得再把它当作可执行建议展示。
+  const isMl = encoderMode === 'ml';
+  if (isMl && hb.last_action === 'suggest_reencoding') {
+    actionMap.suggest_reencoding = '无需处理（语义编码结构特性）';
+  }
   infoEl.textContent = `最近运行 ${timeText}`;
   if (detailEl) {
     const actionName = actionMap[hb.last_action] || hb.last_action || 'unknown';
-    const reason = hb.last_reason ? `（${hb.last_reason}）` : '';
+    const showReason = !(isMl && hb.last_action === 'suggest_reencoding');
+    const reason = showReason && hb.last_reason ? `（${hb.last_reason}）` : '';
     detailEl.textContent = `累计心跳 ${hb.run_count || 0} 次 · 最近动作：${actionName}${reason}`;
   }
 }
@@ -9040,16 +9047,31 @@ function renderHealthGuidance(m) {
   const hb = m.regulator_heartbeat || null;
   const dev = Number(m.avg_luoshu_deviation);
   const synthesisPct = Number(m.synthesis_ratio);
-  const needReencode = !!(hb && hb.last_action === 'suggest_reencoding');
+  const isMl = m.encoder_mode === 'ml';
+  // v0.11：语义编码下"重新编码"无法降低结构偏离（重编码只会得到同一投影），
+  // 因此即使调节器心跳里还有历史遗留的建议，也不把它当作可执行动作。
+  const needReencode = !isMl && !!(hb && hb.last_action === 'suggest_reencoding');
 
   if (sourceEl) {
     sourceEl.textContent = m.health_score_source === 'dao_fallback'
       ? '综合健康待调节器更新，当前为结构评分'
-      : '评分来源：综合健康';
+      : (m.health_score_source === 'computed'
+        ? '评分来源：综合健康（即时计算）'
+        : '评分来源：综合健康');
   }
 
   const parts = [];
-  if (needReencode) {
+  if (isMl) {
+    const devText = Number.isFinite(dev) ? dev.toFixed(2) : '--';
+    parts.push(
+      `当前使用语义编码（ML）。洛书偏离度 ${devText} 是 9 维语义投影的结构特性` +
+      '（本库实测中位数约 1.8），不代表记忆质量下降，也不影响检索与结晶；' +
+      '重新编码只会让坐标与当前模型对齐，不会降低该值。'
+    );
+    if (m.health_score_source === 'dao_fallback') {
+      parts.push('综合健康评分需等调节器下一轮快照，当前环图显示的是结构评分。');
+    }
+  } else if (needReencode) {
     const devText = Number.isFinite(dev) ? dev.toFixed(2) : '--';
     parts.push(
       `检测到洛书几何偏离偏高（${devText}，调节器阈值 0.5）。` +
@@ -9091,7 +9113,8 @@ function bindHealthActions() {
     reencodeBtn.onclick = async () => {
       const ok = await showConfirm(
         '重新编码会用当前编码器重算全部记忆的洛书坐标与八卦，可能持续数分钟，期间检索质量可能短暂波动。\n\n' +
-        '若你最近没有更换嵌入模型或编码器版本，重算结果不会变化。确定继续？',
+        '若你最近没有更换嵌入模型或编码器版本，重算结果不会变化。\n' +
+        '当前为语义编码（ML）时，重编码只用于让坐标与当前模型对齐，不会改变结构评分。确定继续？',
         '重新编码'
       );
       if (!ok) return;
@@ -9194,20 +9217,31 @@ async function loadDaoMetrics() {
           : null);
       const statusEl = document.getElementById('dao-health-status');
       const explanationEl = document.getElementById('dao-health-explanation');
+      // v0.11：语义编码下道同构度/偏离度是投影结构特性，环图不把它标成"健康"。
+      const isMl = m.encoder_mode === 'ml';
+      const ringLabelEl = document.getElementById('dao-ring-label');
+      if (ringLabelEl) {
+        ringLabelEl.textContent = m.health_score_source === 'dao_fallback' ? '结构评分' : '健康评分';
+      }
       const status = m.status || (score !== null && score >= 80 ? 'healthy' : 'warning');
       const statusText = { healthy: '状态稳定', warning: '需要关注', critical: '建议处理' }[status] || '状态评估中';
       if (statusEl) statusEl.textContent = score === null ? statusText : `${statusText} · ${score}分`;
       if (explanationEl) {
         const fallbackNote = m.health_score_source === 'dao_fallback'
-          ? '（调节器综合健康暂未更新，当前分数为道同构度）'
+          ? '（调节器综合健康暂未更新，当前分数为结构评分）'
+          : '';
+        const mlNote = isMl
+          ? '当前为语义编码（ML）：洛书偏离是该投影的结构特性，不代表记忆损坏或检索质量下降。'
           : '';
         const explanation = score === null
           ? '当前数据不足以完成可信评估，系统不会自动执行高风险操作。'
           : status === 'healthy'
-            ? `当前记忆结构稳定（综合健康 ${score} 分），搜索和结晶可以正常使用。系统会继续自动观察变化。${fallbackNote}`
+            ? `当前记忆结构稳定（综合健康 ${score} 分），搜索和结晶可以正常使用。系统会继续自动观察变化。${mlNote}${fallbackNote}`
             : status === 'warning'
-              ? `当前存在结构性偏离（综合健康 ${score} 分），通常不会影响基本搜索；可在下方“记忆库维护”查看建议动作。${fallbackNote}`
-              : `当前结构偏离较明显（综合健康 ${score} 分），可能影响结晶质量或排序稳定性。原始记忆不会因评分降低而被删除；建议先备份，再按下方建议处理。${fallbackNote}`;
+              ? `当前存在结构性偏离（综合健康 ${score} 分），通常不会影响基本搜索；可在下方“记忆库维护”查看建议动作。${mlNote}${fallbackNote}`
+              : isMl
+                ? `当前结构偏离较明显（综合健康 ${score} 分）。${mlNote}原始记忆不会因评分降低而被删除；无需专门处理，保持观察即可。${fallbackNote}`
+                : `当前结构偏离较明显（综合健康 ${score} 分），可能影响结晶质量或排序稳定性。原始记忆不会因评分降低而被删除；建议先备份，再按下方建议处理。${fallbackNote}`;
         explanationEl.hidden = false;
         explanationEl.textContent = explanation;
       }
@@ -9236,7 +9270,7 @@ async function loadDaoMetrics() {
 
       // P1 调节器心跳：渲染 DaoRegulator 后台周期任务的活性状态。
       // 数据源为 /v1/health/system 的 dao_metrics（后端注入 regulator_heartbeat）。
-      renderRegulatorHeartbeat(m.regulator_heartbeat);
+      renderRegulatorHeartbeat(m.regulator_heartbeat, m.encoder_mode);
       // v0.11：把"建议重新编码"变成可执行动作，并解释每个指标的含义。
       renderHealthGuidance(m);
 
