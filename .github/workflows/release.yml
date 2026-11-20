@@ -275,7 +275,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # v0.11：固定 24.04（noble）而不是 ubuntu-latest。
+          # 根因：ubuntu-latest 已滚动到 26.04，而下方 apt 源被显式改写为 noble，
+          # 基础镜像的 libgtk-3-0t64 版本高于 noble 的 libgtk-3-dev 依赖 ⇒ apt 无解。
+          # 同时保持与历史发布一致的 glibc 下限。
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: lrc-linux-x86_64
             continue-on-error: false
@@ -466,7 +470,7 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.VER }}"
           case "${{ matrix.os }}" in
-            ubuntu-latest)   PLATFORM="linux-x86_64" ;;
+            ubuntu-24.04)    PLATFORM="linux-x86_64" ;;
             macos-latest)    PLATFORM="macos-arm64" ;;
             windows-latest)  PLATFORM="windows-x86_64" ;;
             *)               PLATFORM="unknown" ;;
@@ -604,7 +608,8 @@ jobs:
             artifact-prefix: lrc-desktop-macos
             continue-on-error: false
           # v0.5.7 新增：Linux 桌面端构建（AppImage + deb）
-          - os: ubuntu-latest
+          # v0.11：固定 24.04（noble）—— 见 build-sidecar 矩阵处的根因说明。
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact-prefix: lrc-desktop-linux
             continue-on-error: false
