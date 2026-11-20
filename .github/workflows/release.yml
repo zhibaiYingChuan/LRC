@@ -1479,6 +1479,17 @@ jobs:
             fi
             echo "  OK  $(basename "$f")  ${actual:0:12}"
           done
+
+          # 生成发版清单：官网在运行时读取它（ISR 5 分钟），发版后无需改源码重新构建。
+          VERSION="${{ inputs.version || github.ref_name }}"
+          WIN=$(basename "$(ls mirror/lrc-desktop-*-windows-x86_64-setup.exe | head -1)")
+          MAC=$(basename "$(ls mirror/lrc-desktop-*-macos-arm64.dmg | head -1)")
+          LIN=$(basename "$(ls mirror/lrc-desktop-*-linux-amd64.deb | head -1)")
+          cat > mirror/lrc-latest.json <<JSON
+          {"version":"${VERSION}","windows":"${WIN}","macos":"${MAC}","linux":"${LIN}","published_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+          JSON
+          echo "=== 发版清单 ==="
+          cat mirror/lrc-latest.json
         shell: bash
 
       - name: Set up SSH
@@ -1515,7 +1526,7 @@ jobs:
           # 服务器为 Windows OpenSSH，远端路径形如 C:/... （正斜杠，scp 可直接接受）
           scp -i ~/.ssh/id_mirror \
               -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
-              mirror/lrc-sidecar-* mirror/lrc-desktop-* "$MIRROR_USER@$MIRROR_HOST:$MIRROR_PATH"
+              mirror/lrc-sidecar-* mirror/lrc-desktop-* mirror/lrc-latest.json "$MIRROR_USER@$MIRROR_HOST:$MIRROR_PATH"
         shell: bash
 
       # 上传成功不等于「用户真能下到」。以公网实际返回的 .sha256 与本地比对，
@@ -1547,4 +1558,20 @@ jobs:
             fi
             echo "  OK  $name  ${want:0:12}"
           done
+
+          # 发版清单：必须公网可达，且版本与本次发版一致
+          want_ver="${{ inputs.version || github.ref_name }}"
+          got_ver=""
+          for attempt in $(seq 1 10); do
+            body=$(curl -fsSL --max-time 20 "$BASE/lrc-latest.json" || true)
+            got_ver=$(printf '%s' "$body" | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p')
+            [ "$got_ver" = "$want_ver" ] && break
+            echo "  等待发版清单生效（第 ${attempt} 次未命中）..."
+            sleep 6
+          done
+          if [ "$got_ver" != "$want_ver" ]; then
+            echo "::error::lrc-latest.json 版本与本次发版不一致（期望 ${want_ver}，实际 ${got_ver}）"
+            exit 1
+          fi
+          echo "  OK  lrc-latest.json  ${got_ver}"
         shell: bash
