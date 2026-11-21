@@ -855,10 +855,13 @@ mod tests {
     /// `LRC_BACKUPS_DIR` 必须能隔离 3111 测试实例，避免污染生产备份池。
     #[test]
     fn backups_dir_honors_override() {
-        assert_eq!(
-            backups_dir_with(Some("C:\\tmp\\lrc-backups")),
-            PathBuf::from("C:\\tmp\\lrc-backups")
-        );
+        // 绝对路径的写法必须按平台区分：`C:\tmp\...` 在 Unix 上不是绝对路径，
+        // CI（Linux）会正确判定为非法并回退（v0.11.1 发布门禁修复）。
+        #[cfg(windows)]
+        let absolute = "C:\\tmp\\lrc-backups";
+        #[cfg(not(windows))]
+        let absolute = "/tmp/lrc-backups";
+        assert_eq!(backups_dir_with(Some(absolute)), PathBuf::from(absolute));
         assert_eq!(
             backups_dir_with(Some("   ")),
             home_dir_or_fallback().join(".loong-recall").join("backups"),
