@@ -1328,6 +1328,35 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # v0.11.1 发布策略：**只保留最新版本**的 Release 与 tag。
+      # 用户要求：旧版本的安装包与标签一律清理，避免下载页/仓库里堆积历史产物。
+      # 放在 Create Release 之后：任一构建或发布失败都走不到这里，不会误删唯一可用版本。
+      # 删除失败只告警，不让"清理"把已成功的发版判成失败。
+      - name: Prune older releases and tags
+        run: |
+          KEEP="${{ steps.release_version.outputs.TAG }}"
+          echo "保留版本: $KEEP；清理其余 Release 与 tag"
+          gh release list --limit 200 --json tagName --jq '.[].tagName' | while read -r tag; do
+            [ -z "$tag" ] && continue
+            [ "$tag" = "$KEEP" ] && continue
+            echo "  删除 Release: $tag"
+            gh release delete "$tag" --yes --cleanup-tag || echo "::warning::删除 Release $tag 失败（继续）"
+          done
+          # 没有对应 Release 的旧 tag 也要删（cleanup-tag 只处理有 Release 的）。
+          git ls-remote --tags origin \
+            | sed -n 's#.*refs/tags/\(v[0-9][0-9A-Za-z.-]*\)$#\1#p' \
+            | sort -u \
+            | while read -r tag; do
+                [ -z "$tag" ] && continue
+                [ "$tag" = "$KEEP" ] && continue
+                echo "  删除 tag: $tag"
+                git push origin ":refs/tags/$tag" || echo "::warning::删除 tag $tag 失败（继续）"
+              done
+          echo "清理完成，仅保留 $KEEP"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+
   # ════════════════════════════════════════════════════════════
   # Job 4: 构建产物 attestation 生成（v0.8.23 S1-REL-01 修复）
   # 使用 actions/attest-build-provenance 生成构建来源证明
@@ -1574,4 +1603,39 @@ jobs:
             exit 1
           fi
           echo "  OK  lrc-latest.json  ${got_ver}"
+        shell: bash
+
+      # v0.11.1 发布策略：镜像目录同样**只保留最新版本**（与 GitHub Release 一致）。
+      # 只删带版本号的桌面安装包 / sidecar，保留：
+      #   - 本次版本（文件名含 KEEP）；
+      #   - 稳定别名 `lrc-sidecar-<platform>-<arch>`（插件按别名下载）；
+      #   - `lrc-latest.json` / `install.sh`。
+      # 远端是 Windows OpenSSH，用 PowerShell 执行；失败只告警，不影响已完成的发版。
+      - name: Prune older installers on mirror
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          MIRROR_HOST: ${{ secrets.MIRROR_HOST }}
+          MIRROR_USER: ${{ secrets.MIRROR_USER }}
+          MIRROR_PATH: ${{ secrets.MIRROR_PATH }}
+        run: |
+          KEEP="${{ inputs.version || github.ref_name }}"
+          ssh -i ~/.ssh/id_mirror \
+              -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+              "$MIRROR_USER@$MIRROR_HOST" "powershell -NoProfile -Command -" <<POWERSHELL || {
+            echo "::warning::镜像旧安装包清理失败（不影响本次发版）"
+            exit 0
+          }
+          \$path = '$MIRROR_PATH'
+          \$keep = '$KEEP'
+          Get-ChildItem -LiteralPath \$path -File |
+            Where-Object { (\$_.Name -like 'lrc-desktop-v*' -or \$_.Name -like 'lrc-v*') -and (\$_.Name -notlike ('*' + \$keep + '*')) } |
+            ForEach-Object {
+              Write-Output ('  删除 ' + \$_.Name)
+              Remove-Item -LiteralPath \$_.FullName -Force -ErrorAction SilentlyContinue
+            }
+          Write-Output '镜像现有安装包：'
+          Get-ChildItem -LiteralPath \$path -File |
+            Where-Object { \$_.Name -like 'lrc-desktop-*' -or \$_.Name -like 'lrc-sidecar-*' -or \$_.Name -like 'lrc-v*' } |
+            Select-Object -ExpandProperty Name
+          POWERSHELL
         shell: bash
