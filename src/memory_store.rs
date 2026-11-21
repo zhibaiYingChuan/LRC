@@ -896,6 +896,39 @@ pub fn encode_luoshu_batch(
     vecs
 }
 
+/// 判定**旧格式洛书合成空壳**（2026-11-17 前的产物）。
+///
+/// 旧格式只有一句标题、没有成员内容预览：
+/// ```text
+/// 「洛书合成·变动触发」823 条相关记忆的几何融合结果。
+/// ```
+/// 当前 `build_luoshu_summary` 生成的是
+/// `「洛书合成·X」N 条记忆的融合结果。` + 多行成员预览，措辞与结构都不同。
+/// 因此用「相关记忆的几何融合结果」+ **单行** 双重判定：
+/// 既不误伤新格式，也不误伤带预览的「合成知识」摘要。
+fn is_legacy_synthesis_shell(content: &str) -> bool {
+    let text = content.trim();
+    // 旧格式是单行；新格式恒带成员预览（多行）。
+    if text.contains('\n') {
+        return false;
+    }
+    let Some(rest) = text.strip_prefix("「洛书合成·") else {
+        return false;
+    };
+    let Some((_category, tail)) = rest.split_once('」') else {
+        return false;
+    };
+    // 容忍数字前后的空白差异（外部导入可能删掉空格），但后缀必须精确。
+    // 只认 ASCII 数字：旧数据由 `format!("{}", len)` 产出，必为半角；
+    // 不用 `char::is_numeric` 是因为全角数字按字符计数会破坏下面的字节切片。
+    let tail = tail.trim_start();
+    let digits = tail.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 {
+        return false;
+    }
+    tail[digits..].trim_start() == "条相关记忆的几何融合结果。"
+}
+
 /// FNV-1a 64 位哈希（带种子）：MinHash 用，零依赖、跨平台稳定。
 fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ seed;
@@ -10359,6 +10392,53 @@ impl<P: Persistence> MemoryStore<P> {
         })
     }
 
+    /// 归档**旧格式洛书合成空壳**（v0.11.1 数据治理）。
+    ///
+    /// 旧格式（2026-11-17 前）的洛书合成只有一句标题、没有成员内容预览，
+    /// 召回时是零信息噪声；当前 `build_luoshu_summary` 已改为带成员预览。
+    /// 归档是**可恢复**的生命周期迁移（`unarchive` 可找回），不是删除。
+    ///
+    /// - `limit`：最多处理多少条（0 表示不限）；最旧优先，便于分块执行
+    /// - `dry_run`：只返回命中清单，不实际归档
+    pub fn archive_legacy_synthesis_shells(
+        &self,
+        limit: usize,
+        dry_run: bool,
+    ) -> Result<ArchiveByTagReport, PersistenceError> {
+        let all = self.load_cached()?;
+        let mut matched: Vec<Memory> = all
+            .iter()
+            .filter(|m| m.memory_type == MemoryType::Synthesis)
+            .filter(|m| is_legacy_synthesis_shell(&m.content))
+            .map(|m| m.as_ref().clone())
+            .collect();
+        matched.sort_by_key(|m| m.created_at);
+        if limit > 0 {
+            matched.truncate(limit);
+        }
+        let matched_count = matched.len();
+        let memory_ids: Vec<String> = matched.iter().map(|m| m.id.clone()).collect();
+        if dry_run || matched.is_empty() {
+            return Ok(ArchiveByTagReport {
+                matched: matched_count,
+                archived: 0,
+                memory_ids,
+            });
+        }
+        self.archive_selected(
+            matched,
+            format!(
+                "归档旧格式洛书合成空壳 {} 条（无成员内容预览）",
+                matched_count
+            ),
+        )?;
+        Ok(ArchiveByTagReport {
+            matched: matched_count,
+            archived: matched_count,
+            memory_ids,
+        })
+    }
+
     /// 归档一组**已筛选**的记忆（`archive_expired` / `archive_by_tag` 共用）。
     fn archive_selected(
         &self,
@@ -10378,14 +10458,16 @@ impl<P: Persistence> MemoryStore<P> {
         // v0.11：归档后清理图边与生命周期死行，避免悬空边/死行永久膨胀。
         // 清理失败不阻断归档（与 forget 的策略一致：主操作不因增强能力失败），
         // 但必须留下告警——否则悬空边会静默永久残留。
+        // 必须**批量**清理：逐条调用会对 200MB+ 的图做 N 次全量落盘，
+        // 大批量归档（如 2000+ 条旧合成空壳）必然触发 HTTP 超时。
         if let Some(ref mut graph) = *self.graph_store.write_recover() {
-            for memory in &selected {
-                if let Err(e) = graph.remove_edges_of_memory(&memory.id) {
-                    eprintln!(
-                        "[archive] 清理记忆 {} 的图边失败（归档已成功）: {}",
-                        memory.id, e
-                    );
-                }
+            let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            if let Err(e) = graph.remove_edges_of_memories(&id_refs) {
+                eprintln!(
+                    "[archive] 批量清理 {} 条记忆的图边失败（归档已成功）: {}",
+                    ids.len(),
+                    e
+                );
             }
         }
         for memory in &selected {

@@ -9101,4 +9101,68 @@ mod tests {
             "应归档 2 条，保留 manual 与 1 条未达 limit 的 auto-summary"
         );
     }
+
+    /// v0.11.1 数据治理：只归档旧格式洛书合成空壳，新格式与普通记忆不受影响。
+    #[test]
+    fn archive_legacy_synthesis_shells_only_matches_old_format() {
+        let (_dir, store) = make_store_with_threshold(0.99);
+        // 显式拉开时间：验证 limit 截断时确实最旧优先。
+        let mut oldest = make_test_memory(
+            "「洛书合成·变动触发」823 条相关记忆的几何融合结果。",
+            MemoryType::Synthesis,
+        );
+        oldest.created_at = Utc::now() - Duration::days(3);
+        let oldest_id = oldest.id.clone();
+        let mut newer = make_test_memory(
+            "「洛书合成·愉悦表达」14 条相关记忆的几何融合结果。",
+            MemoryType::Synthesis,
+        );
+        newer.created_at = Utc::now() - Duration::days(1);
+        let newer_id = newer.id.clone();
+        let new_format = make_test_memory(
+            "「洛书合成·变动触发」2 条记忆的融合结果。\n- 成员甲的内容\n- 成员乙的内容",
+            MemoryType::Synthesis,
+        );
+        // 普通记忆即使正文与旧空壳相同，也不能被当成合成空壳
+        let fact = make_test_memory(
+            "「洛书合成·变动触发」823 条相关记忆的几何融合结果。用户笔记",
+            MemoryType::Fact,
+        );
+        for memory in [oldest, newer, new_format, fact] {
+            store.remember(memory).expect("写入");
+        }
+
+        let dry = store
+            .archive_legacy_synthesis_shells(1, true)
+            .expect("dry-run");
+        assert_eq!(dry.matched, 1, "limit 应生效");
+        assert_eq!(dry.memory_ids, vec![oldest_id.clone()], "应最旧优先");
+        assert_eq!(dry.archived, 0, "dry-run 不得归档");
+        assert_eq!(
+            store.stats().expect("统计").total_memories,
+            4,
+            "dry-run 不得改变活跃库"
+        );
+
+        let done = store
+            .archive_legacy_synthesis_shells(0, false)
+            .expect("归档");
+        assert_eq!(done.matched, 2, "只应命中两条旧格式合成");
+        assert_eq!(done.archived, 2);
+        assert_eq!(
+            done.memory_ids,
+            vec![oldest_id, newer_id],
+            "按创建时间升序归档"
+        );
+        assert_eq!(
+            store.stats().expect("统计").total_memories,
+            2,
+            "新格式合成与普通记忆应保留"
+        );
+        let archived = store
+            .persistence()
+            .load_archived_memories()
+            .expect("归档列表");
+        assert_eq!(archived.len(), 2, "归档可恢复，必须真的进归档");
+    }
 }

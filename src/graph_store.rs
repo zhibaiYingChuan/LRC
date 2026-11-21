@@ -621,9 +621,25 @@ impl GraphMemoryStore {
     /// `remove_edge` 每次调用都 `save()`（全量序列化），逐条删是 O(E²) 写盘。
     /// 本方法只保存一次，与 `add_edges_batch` 的纪律一致。
     pub fn remove_edges_of_memory(&mut self, memory_id: &str) -> Result<usize, PersistenceError> {
+        self.remove_edges_of_memories(&[memory_id])
+    }
+
+    /// 批量删除与一组记忆相关的边：只 `retain` 一次、只重建索引一次、只落盘一次。
+    ///
+    /// 为什么需要批量：`remove_edges_of_memory` 每次命中都会 `save()` 全量图
+    /// （生产库 200MB+）。批量归档 2000+ 条记忆时逐条调用会把一次维护变成
+    /// 数千次全量写盘，HTTP 请求必然超时。
+    pub fn remove_edges_of_memories(
+        &mut self,
+        memory_ids: &[&str],
+    ) -> Result<usize, PersistenceError> {
+        if memory_ids.is_empty() {
+            return Ok(0);
+        }
+        let ids: std::collections::HashSet<&str> = memory_ids.iter().copied().collect();
         let len_before = self.edges.len();
         self.edges
-            .retain(|e| e.source_id != memory_id && e.target_id != memory_id);
+            .retain(|e| !ids.contains(e.source_id.as_str()) && !ids.contains(e.target_id.as_str()));
         let removed = len_before - self.edges.len();
         if removed > 0 {
             self.rebuild_edge_keys();
@@ -1142,6 +1158,25 @@ mod tests {
         let removed = store.remove_edge(&edge_id).unwrap();
         assert!(removed);
         assert_eq!(store.edge_count(), 0);
+    }
+
+    /// 批量删除：任一端命中即删除，无关边保留；只落盘一次。
+    #[test]
+    fn test_remove_edges_of_memories_batch() {
+        let (_dir, mut store) = make_graph_store();
+        store.add_edge("a", "b", EdgeType::RelatedTo, 0.5).unwrap();
+        store.add_edge("b", "c", EdgeType::RelatedTo, 0.5).unwrap();
+        store.add_edge("c", "d", EdgeType::RelatedTo, 0.5).unwrap();
+        store.add_edge("x", "y", EdgeType::RelatedTo, 0.5).unwrap();
+
+        let removed = store.remove_edges_of_memories(&["a", "c"]).unwrap();
+        assert_eq!(removed, 3, "任一端命中即删除");
+        assert_eq!(store.edge_count(), 1, "无关边必须保留");
+        assert_eq!(
+            store.remove_edges_of_memories(&[]).unwrap(),
+            0,
+            "空输入必须直接返回 0，不落盘"
+        );
     }
 
     #[test]

@@ -194,6 +194,10 @@ LRC 的「联想」不是内容相似度，而是**记录下来的关系**——
   `include_synthesis` 便于确认实际范围。
 - **批量归档**：`lrc archive --auto-summary`（REST `POST /v1/memories/archive-by-tag`）
   按标签 / 天数 / 条数批量归档，支持 `--dry-run` 先预览；归档可恢复。
+- **旧合成空壳清理**：`lrc archive --legacy-synthesis`
+  （REST `POST /v1/memories/archive-legacy-synthesis`）把 2026-11-17 前生成、
+  只有标题没有成员预览的洛书合成移入归档（可恢复），支持 `--dry-run` 与 `--limit`。
+  本地可信域下按**全库**范围执行；多租户域禁止。
 - **归档过期记忆**：把过期记忆移出检索范围（可恢复），不会删除原始内容。
 - **导出备份**：把记忆、代码片段与归档一起导出为 JSON，建议在批量维护前先备份。
 

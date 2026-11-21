@@ -66,6 +66,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "duplicates",
     "include-synthesis",
     "auto-summary",
+    "legacy-synthesis",
 ];
 
 /// 需要取值的选项。
@@ -214,7 +215,9 @@ fn print_usage() {
   lrc reclassify [选项]              全库重编码（默认异步启动）
                                      --progress 查看进度 / --cancel 取消
                                      --resume 从上次进度点续跑
-  lrc archive [--auto-summary]       归档过期记忆；--auto-summary 按标签批量归档
+  lrc archive [--auto-summary | --legacy-synthesis]
+                                     归档过期记忆；--auto-summary 按标签批量归档；
+                                     --legacy-synthesis 归档旧格式合成空壳（可恢复）
   lrc unarchive <memory_id> [--ttl-days N]
                                      从归档恢复一条记忆（从现在重新计时；
                                      --ttl-days 0 表示永不过期，上限 36500）
@@ -2451,11 +2454,48 @@ fn cmd_archive(args: &[String]) -> Result<u8, CliError> {
         print_usage();
         return Ok(EXIT_OK);
     }
+    // 两种批量归档模式互斥。放在连接 daemon 之前：参数错误不应先等健康探测。
+    if parsed.flag("legacy-synthesis") && parsed.flag("auto-summary") {
+        return Err(CliError::Arg(
+            "--legacy-synthesis 与 --auto-summary 只能二选一".to_string(),
+        ));
+    }
 
     // 全库运维操作：不做邻域扫描、不自动拉起。
     let mut client = build_client(&parsed, Duration::from_secs(60))?;
     client.explicit_base = true;
     ensure_daemon(&mut client, false)?;
+
+    // v0.11.1 数据治理：归档旧格式洛书合成空壳（只有标题、无成员内容预览）。
+    if parsed.flag("legacy-synthesis") {
+        let body = json!({
+            "limit": parsed.value_usize("limit", 0)?,
+            "dry_run": parsed.flag("dry-run"),
+        });
+        let started = Instant::now();
+        let response = client.send("POST", "/v1/memories/archive-legacy-synthesis", Some(&body))?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let matched = response.get("matched").and_then(Value::as_u64).unwrap_or(0);
+        let archived = response
+            .get("archived")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if parsed.flag("json") {
+            print_json(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "ok": true,
+                "matched": matched,
+                "archived": archived,
+                "dry_run": parsed.flag("dry-run"),
+                "elapsed_ms": elapsed_ms,
+            }))?;
+        } else if parsed.flag("dry-run") {
+            println!("将归档 {matched} 条旧格式合成空壳（dry-run，未执行）");
+        } else {
+            println!("已归档 {archived} 条旧格式合成空壳（{elapsed_ms}ms）");
+        }
+        return Ok(EXIT_OK);
+    }
 
     // C6：按标签批量归档（典型用途：清理 auto-summary 自动摘要）。
     if parsed.flag("auto-summary") {
@@ -3265,5 +3305,23 @@ mod parse_args_tests {
             Err(_) => panic!("内联取值应解析成功"),
         };
         assert_eq!(parsed.value("project"), Some("dsh"));
+    }
+
+    /// 旧格式合成空壳归档：开关、dry-run 与 limit 都能落位。
+    #[test]
+    fn archive_legacy_synthesis_options_are_parsed() {
+        let parsed = match parse_args(&argv(&[
+            "archive",
+            "--legacy-synthesis",
+            "--dry-run",
+            "--limit",
+            "10",
+        ])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("合法参数应解析成功"),
+        };
+        assert!(parsed.flag("legacy-synthesis"));
+        assert!(parsed.flag("dry-run"));
+        assert_eq!(parsed.value("limit"), Some("10"));
     }
 }

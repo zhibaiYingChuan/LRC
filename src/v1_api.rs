@@ -6615,6 +6615,80 @@ pub fn build_v1_router_with_trust(
                 }
             }
         }))
+        // POST /v1/memories/archive-legacy-synthesis — 归档旧格式合成空壳（v0.11.1）
+        //
+        // 旧格式洛书合成只有标题、没有成员内容预览，召回时是零信息噪声。
+        // 归档是**可恢复**的生命周期迁移（unarchive 可找回），不是删除。
+        // 多租户域禁止（跨租户批量操作）。
+        .route("/memories/archive-legacy-synthesis", post({
+            let store = metrics_store.clone();
+            move |Json(body): Json<serde_json::Value>| {
+                let store = store.clone();
+                async move {
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "归档旧格式合成空壳仅限本地可信域"
+                            })),
+                        ));
+                    }
+                    // 参数校验：类型不对必须 400，不能静默当成"不限量"。
+                    let limit = match body.get("limit") {
+                        None | Some(serde_json::Value::Null) => 0usize,
+                        Some(raw) => raw.as_u64().ok_or_else(|| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_param",
+                                    "message": "limit 需要非负整数（0 表示不限）"
+                                })),
+                            )
+                        })? as usize,
+                    };
+                    let dry_run = match body.get("dry_run") {
+                        None | Some(serde_json::Value::Null) => false,
+                        Some(raw) => raw.as_bool().ok_or_else(|| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_param",
+                                    "message": "dry_run 需要布尔值"
+                                })),
+                            )
+                        })?,
+                    };
+                    let report = tokio::task::spawn_blocking(move || {
+                        let guard = store.blocking_write();
+                        guard.archive_legacy_synthesis_shells(limit, dry_run)
+                    })
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "archive_failed",
+                                "message": format!("归档任务异常终止: {}", e)
+                            })),
+                        )
+                    })?
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "archive_failed",
+                                "message": format!("归档失败: {}", e)
+                            })),
+                        )
+                    })?;
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                        serde_json::to_value(report)
+                            .unwrap_or_else(|_| serde_json::json!({ "archived": 0 })),
+                    ))
+                }
+            }
+        }))
         //
         // POST /v1/memories/archive-expired — 触发归档过期记忆（v0.11）
         //

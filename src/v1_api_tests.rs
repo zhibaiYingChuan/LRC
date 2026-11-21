@@ -8629,6 +8629,86 @@ mod context_endpoints_tests {
         let _ = std::fs::remove_dir_all(&mt_dir);
     }
 
+    /// v0.11.1 数据治理：归档旧格式合成空壳端点——dry-run 不写、非法参数 400、
+    /// 只命中旧格式，多租户域禁止。
+    #[tokio::test]
+    async fn archive_legacy_synthesis_endpoint_dry_run_then_archives() {
+        let dir = temp_dir("ctx_archive_legacy_syn");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let rows = [
+            "「洛书合成·变动触发」823 条相关记忆的几何融合结果。",
+            "「洛书合成·变动触发」2 条记忆的融合结果。\n- 成员甲的内容\n- 成员乙的内容",
+        ];
+        for content in rows {
+            let (status, body) = post_json(
+                app.clone(),
+                "/memories/remember",
+                serde_json::json!({ "content": content, "memory_type": "synthesis" }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        let (status, dry) = post_json(
+            app.clone(),
+            "/memories/archive-legacy-synthesis",
+            serde_json::json!({ "dry_run": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{dry}");
+        assert_eq!(dry["matched"], 1, "只应命中旧格式: {dry}");
+        assert_eq!(dry["archived"], 0, "dry-run 不得归档: {dry}");
+        let (_, list) = post_json(app.clone(), "/memories/list", serde_json::json!({})).await;
+        assert_eq!(list["total"], 2, "dry-run 后应仍有 2 条: {list}");
+
+        for bad in [
+            serde_json::json!({ "limit": -1 }),
+            serde_json::json!({ "limit": "10" }),
+            serde_json::json!({ "dry_run": "true" }),
+        ] {
+            let (status, invalid) = post_json(
+                app.clone(),
+                "/memories/archive-legacy-synthesis",
+                bad.clone(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "应拒绝非法参数 {bad}: {invalid}"
+            );
+        }
+
+        let (status, done) = post_json(
+            app.clone(),
+            "/memories/archive-legacy-synthesis",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{done}");
+        assert_eq!(done["archived"], 1, "{done}");
+        let (_, list) = post_json(app.clone(), "/memories/list", serde_json::json!({})).await;
+        assert_eq!(list["total"], 1, "只保留新格式合成: {list}");
+
+        let mt_dir = temp_dir("ctx_archive_legacy_syn_mt");
+        let mt_app = make_app(
+            mt_dir.to_str().unwrap(),
+            crate::privacy::TrustMode::MultiTenant,
+        );
+        let (status, denied) = post_json(
+            mt_app,
+            "/memories/archive-legacy-synthesis",
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&mt_dir);
+    }
+
     /// 列表类型过滤：`memory_type` 必须生效；非法类型必须 400。
     #[tokio::test]
     async fn list_filters_by_memory_type_and_rejects_unknown() {

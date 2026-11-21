@@ -79,6 +79,21 @@
 - **行为变更**：默认结果集不再包含 synthesis，历史用法若依赖全量扫描需显式加
   `--include-synthesis`。
 
+### 0.11.1 同版本补充 · 2026-11-22
+
+**旧格式合成空壳清理**
+
+- 新增 `POST /v1/memories/archive-legacy-synthesis` 与
+  `lrc archive --legacy-synthesis`：把 2026-11-17 前生成、只有标题没有成员预览的
+  洛书合成移入归档（`unarchive` 可恢复），支持 `dry_run` / `limit`；
+  多租户域禁止（跨租户批量操作）。
+- 判定条件为「洛书合成」标题 + 「条相关记忆的几何融合结果」+ **单行**：
+  新格式（带成员内容预览）与普通记忆不会命中。
+- **批量归档不再逐条重写图边**：`archive_selected` 改为调用
+  `remove_edges_of_memories`（一次 retain、一次重建索引、一次落盘）。
+  修前逐条 `remove_edges_of_memory` 会在每次命中时全量写 200MB+ 的图，
+  2065 条旧空壳归档必然触发 30s HTTP 超时；修后 3111 副本实测 11.4s 完成。
+
 ## [0.11.0] - 2026-11-20
 
 > 本版摘要：**独立 CLI + 归档生命周期闭环 + 隐私/scope 全局加固 + 健康面板可维护化**。
