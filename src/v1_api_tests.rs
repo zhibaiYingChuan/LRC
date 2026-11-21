@@ -8374,6 +8374,181 @@ mod context_endpoints_tests {
         let _ = std::fs::remove_dir_all(&mt_dir);
     }
 
+    /// C6：duplicates 必须按 project 过滤，并在默认口径排除 synthesis。
+    #[tokio::test]
+    async fn duplicates_endpoint_filters_project_and_synthesis() {
+        use crate::persistence::Persistence;
+
+        let dir = temp_dir("ctx_duplicates_project");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let (app, shared) = make_app_with_shared(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+        {
+            let store = shared.write().await;
+            let rows = [
+                (
+                    "dsh-a",
+                    "dsh 项目的数据库连接池最大连接数应设为 CPU 核数的两倍",
+                    "dsh",
+                    crate::memory_types::MemoryType::Fact,
+                ),
+                (
+                    "dsh-b",
+                    "dsh 项目的数据库连接池最大连接数应设为 CPU 核数的两倍。",
+                    "dsh",
+                    crate::memory_types::MemoryType::Fact,
+                ),
+                (
+                    "other-a",
+                    "other 项目的缓存过期时间应设为一小时并开启预热",
+                    "other",
+                    crate::memory_types::MemoryType::Fact,
+                ),
+                (
+                    "other-b",
+                    "other 项目的缓存过期时间应设为一小时并开启预热。",
+                    "other",
+                    crate::memory_types::MemoryType::Fact,
+                ),
+                (
+                    "syn-a",
+                    "「洛书合成·变动触发」10 条相关记忆的几何融合结果。",
+                    "dsh",
+                    crate::memory_types::MemoryType::Synthesis,
+                ),
+                (
+                    "syn-b",
+                    "「洛书合成·变动触发」11 条相关记忆的几何融合结果。",
+                    "dsh",
+                    crate::memory_types::MemoryType::Synthesis,
+                ),
+            ];
+            for (id, content, project, mt) in rows {
+                let mut memory = crate::memory_types::Memory::new(
+                    content.to_string(),
+                    mt,
+                    Some(project.to_string()),
+                    vec![],
+                    crate::memory_types::Importance::new(5),
+                    None,
+                );
+                memory.id = id.to_string();
+                store.persistence().save_memory(&memory).expect("播种");
+            }
+        }
+
+        let (status, dsh) = get_json(
+            app.clone(),
+            "/memories/duplicates?threshold=0.85&project=dsh",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{dsh}");
+        assert_eq!(dsh["total"], 2, "dsh 默认只应含两条用户记忆: {dsh}");
+        assert_eq!(dsh["scanned"], 2, "{dsh}");
+        assert_eq!(dsh["project"], "dsh", "{dsh}");
+        assert_eq!(dsh["include_synthesis"], false, "{dsh}");
+        assert_eq!(dsh["groups"].as_array().expect("groups").len(), 1, "{dsh}");
+        let ids = dsh["groups"][0]["memory_ids"].as_array().expect("ids");
+        assert!(ids
+            .iter()
+            .all(|id| id.as_str().unwrap().starts_with("dsh-")));
+        assert!(!ids
+            .iter()
+            .any(|id| id.as_str().unwrap().starts_with("syn-")));
+
+        let (status, with_syn) = get_json(
+            app.clone(),
+            "/memories/duplicates?threshold=0.85&project=dsh&include_synthesis=true",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{with_syn}");
+        assert_eq!(
+            with_syn["total"], 4,
+            "显式纳入后应含两条 synthesis: {with_syn}"
+        );
+        assert_eq!(with_syn["include_synthesis"], true, "{with_syn}");
+        assert_eq!(
+            with_syn["groups"].as_array().expect("groups").len(),
+            2,
+            "{with_syn}"
+        );
+
+        let (status, other) = get_json(
+            app.clone(),
+            "/memories/duplicates?threshold=0.85&project=other",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{other}");
+        assert_eq!(other["total"], 2, "{other}");
+        assert_eq!(other["project"], "other", "{other}");
+        let other_ids = other["groups"][0]["memory_ids"].as_array().expect("ids");
+        assert!(other_ids
+            .iter()
+            .all(|id| id.as_str().unwrap().starts_with("other-")));
+
+        let (status, all) = get_json(app.clone(), "/memories/duplicates?threshold=0.85").await;
+        assert_eq!(status, StatusCode::OK, "{all}");
+        assert_eq!(all["total"], 4, "全库默认应排除两条 synthesis: {all}");
+        assert!(all["project"].is_null(), "{all}");
+
+        // project 空串 = 不过滤；两侧空白要 trim；大小写敏感。
+        for uri in [
+            "/memories/duplicates?threshold=0.85&project=",
+            "/memories/duplicates?threshold=0.85&project=%20%20",
+        ] {
+            let (status, body) = get_json(app.clone(), uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert_eq!(body["total"], 4, "{uri}: {body}");
+            assert!(body["project"].is_null(), "{uri}: {body}");
+        }
+        let (status, trimmed) = get_json(
+            app.clone(),
+            "/memories/duplicates?threshold=0.85&project=%20dsh%20",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{trimmed}");
+        assert_eq!(trimmed["total"], 2, "{trimmed}");
+        assert_eq!(trimmed["project"], "dsh", "{trimmed}");
+
+        let (status, upper) = get_json(
+            app.clone(),
+            "/memories/duplicates?threshold=0.85&project=DSH",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{upper}");
+        assert_eq!(upper["total"], 0, "project 必须大小写敏感: {upper}");
+
+        // 空值 / 0 / false 都应回到默认 false，而不是 400。
+        for raw in ["", "0", "false", "no"] {
+            let uri =
+                format!("/memories/duplicates?threshold=0.85&project=dsh&include_synthesis={raw}");
+            let (status, body) = get_json(app.clone(), &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert_eq!(body["total"], 2, "{uri}: {body}");
+            assert_eq!(body["include_synthesis"], false, "{uri}: {body}");
+        }
+
+        // max_scan=1 会被既有 clamp 抬到 100；本用例只锁定口径不谎报截断。
+        let (status, clamped) = get_json(
+            app.clone(),
+            "/memories/duplicates?threshold=0.85&project=dsh&max_scan=1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{clamped}");
+        assert_eq!(clamped["total"], 2, "{clamped}");
+        assert_eq!(clamped["scanned"], 2, "{clamped}");
+        assert_eq!(clamped["truncated"], false, "{clamped}");
+
+        let (status, invalid) = get_json(
+            app.clone(),
+            "/memories/duplicates?threshold=0.85&include_synthesis=maybe",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{invalid}");
+        assert_eq!(invalid["error"], "invalid_param", "{invalid}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// C6：按标签归档——dry_run 不改库、真实归档后列表为空；多租户域 403。
     #[tokio::test]
     async fn archive_by_tag_endpoint_dry_run_then_archives() {

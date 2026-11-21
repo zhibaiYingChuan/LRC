@@ -6392,7 +6392,7 @@ pub fn build_v1_router_with_trust(
         }))
         // GET /v1/memories/duplicates — 近重复报告（v0.11.1 / C6）
         //
-        // 全库运维视图：内容高度相似但未在写入时合并的记忆组。
+        // 默认全库（仅排除 synthesis）；传 `project` 才收窄到项目范围。
         // 多租户域禁止（跨租户内容预览）。
         .route("/memories/duplicates", get({
             let store = metrics_store.clone();
@@ -6455,10 +6455,38 @@ pub fn build_v1_router_with_trust(
                         })?,
                         None => 0,
                     };
+                    // project 为空串按「不过滤」处理，避免 `?project=` 被误当成
+                    // 精确匹配项目名 ""；非空值大小写敏感，与 ListFilter 一致。
+                    let project = params
+                        .get("project")
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string());
+                    let include_synthesis = match params.get("include_synthesis") {
+                        None => false,
+                        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+                            // 空值按默认 false：部分客户端会把未设置布尔值序列化成 `?x=`
+                            "" | "0" | "false" | "no" => false,
+                            "1" | "true" | "yes" => true,
+                            _ => {
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({
+                                        "error": "invalid_param",
+                                        "message": "include_synthesis 需要 true / false"
+                                    })),
+                                ));
+                            }
+                        },
+                    };
                     let report = tokio::task::spawn_blocking(move || {
-                        store
-                            .blocking_read()
-                            .near_duplicate_groups(threshold, limit, max_scan)
+                        store.blocking_read().near_duplicate_groups(
+                            threshold,
+                            limit,
+                            max_scan,
+                            project.as_deref(),
+                            include_synthesis,
+                        )
                     })
                     .await
                     .map_err(|e| {

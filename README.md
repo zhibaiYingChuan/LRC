@@ -187,6 +187,11 @@ LRC 的「联想」不是内容相似度，而是**记录下来的关系**——
   任务可取消、可续跑，进度会落盘，重启后 `--resume` 从断点继续。
 - **近重复报告**：`lrc list --duplicates`（REST `GET /v1/memories/duplicates`）
   按 MinHash-LSH 找出内容高度重叠的记忆组，先看报告再决定合并或归档。
+  默认**排除 synthesis（合成记忆）**且覆盖全库；加 `--project dsh` 只看单个项目
+  （大小写敏感、精确匹配，也可用 `LRC_PROJECT` 环境变量），
+  加 `--include-synthesis` 才把合成记忆纳入扫描。
+  响应里的 `total` / `scanned` 都是**过滤后**的条数，并回显 `project` /
+  `include_synthesis` 便于确认实际范围。
 - **批量归档**：`lrc archive --auto-summary`（REST `POST /v1/memories/archive-by-tag`）
   按标签 / 天数 / 条数批量归档，支持 `--dry-run` 先预览；归档可恢复。
 - **归档过期记忆**：把过期记忆移出检索范围（可恢复），不会删除原始内容。

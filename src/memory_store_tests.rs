@@ -8924,7 +8924,9 @@ mod tests {
                 .expect("写入");
         }
 
-        let report = store.near_duplicate_groups(0.85, 10, 0).expect("报告");
+        let report = store
+            .near_duplicate_groups(0.85, 10, 0, None, false)
+            .expect("报告");
         assert_eq!(report.total, 3);
         assert_eq!(report.scanned, 3);
         assert_eq!(report.groups.len(), 1, "应只发现一对近重复: {report:?}");
@@ -8938,11 +8940,123 @@ mod tests {
         assert!(!joined.contains("天气"), "无关条目不得入组: {report:?}");
     }
 
+    /// C6：project 过滤与 synthesis 默认排除必须在 total/scanned 之前生效。
+    #[test]
+    fn near_duplicate_groups_filters_project_and_synthesis() {
+        let (_dir, store) = make_store_with_threshold(0.99);
+        let rows = [
+            (
+                "dsh-a",
+                "dsh 项目的数据库连接池最大连接数应设为 CPU 核数的两倍",
+                "dsh",
+                MemoryType::Fact,
+            ),
+            (
+                "dsh-b",
+                "dsh 项目的数据库连接池最大连接数应设为 CPU 核数的两倍。",
+                "dsh",
+                MemoryType::Fact,
+            ),
+            (
+                "other-a",
+                "other 项目的缓存过期时间应设为一小时并开启预热",
+                "other",
+                MemoryType::Fact,
+            ),
+            (
+                "other-b",
+                "other 项目的缓存过期时间应设为一小时并开启预热。",
+                "other",
+                MemoryType::Fact,
+            ),
+            (
+                "syn-a",
+                "「洛书合成·变动触发」10 条相关记忆的几何融合结果。",
+                "dsh",
+                MemoryType::Synthesis,
+            ),
+            (
+                "syn-b",
+                "「洛书合成·变动触发」11 条相关记忆的几何融合结果。",
+                "dsh",
+                MemoryType::Synthesis,
+            ),
+        ];
+        for (id, content, project, mt) in rows {
+            let mut memory = make_test_memory(content, mt);
+            memory.id = id.to_string();
+            memory.project = Some(project.to_string());
+            store.remember(memory).expect("写入");
+        }
+
+        let dsh = store
+            .near_duplicate_groups(0.85, 10, 0, Some("dsh"), false)
+            .expect("dsh 报告");
+        assert_eq!(dsh.total, 2, "dsh 默认只应含两条用户记忆: {dsh:?}");
+        assert_eq!(dsh.scanned, 2);
+        assert_eq!(dsh.project.as_deref(), Some("dsh"));
+        assert!(!dsh.include_synthesis);
+        assert_eq!(dsh.groups.len(), 1, "dsh 应只有一对用户重复: {dsh:?}");
+        let dsh_ids = &dsh.groups[0].memory_ids;
+        assert!(dsh_ids.iter().all(|id| id.starts_with("dsh-")), "{dsh:?}");
+
+        let dsh_with_syn = store
+            .near_duplicate_groups(0.85, 10, 0, Some("dsh"), true)
+            .expect("dsh+synthesis 报告");
+        assert_eq!(
+            dsh_with_syn.total, 4,
+            "显式纳入后应含两条 synthesis: {dsh_with_syn:?}"
+        );
+        assert!(dsh_with_syn.include_synthesis);
+        assert_eq!(dsh_with_syn.groups.len(), 2, "{dsh_with_syn:?}");
+
+        let other = store
+            .near_duplicate_groups(0.85, 10, 0, Some("other"), false)
+            .expect("other 报告");
+        assert_eq!(other.total, 2);
+        assert_eq!(other.groups.len(), 1);
+        assert!(other.groups[0]
+            .memory_ids
+            .iter()
+            .all(|id| id.starts_with("other-")));
+
+        let all = store
+            .near_duplicate_groups(0.85, 10, 0, None, false)
+            .expect("全库报告");
+        assert_eq!(all.total, 4, "全库默认应排除两条 synthesis: {all:?}");
+        assert_eq!(all.groups.len(), 2, "{all:?}");
+        assert!(all.project.is_none());
+
+        let all_with_syn = store
+            .near_duplicate_groups(0.85, 10, 0, None, true)
+            .expect("全库+synthesis 报告");
+        assert_eq!(all_with_syn.total, 6, "{all_with_syn:?}");
+        assert_eq!(all_with_syn.groups.len(), 3, "{all_with_syn:?}");
+
+        // project 是精确、大小写敏感匹配；空串不等于「不过滤」。
+        assert_eq!(
+            store
+                .near_duplicate_groups(0.85, 10, 0, Some("DSH"), false)
+                .expect("大小写报告")
+                .total,
+            0
+        );
+        assert_eq!(
+            store
+                .near_duplicate_groups(0.85, 10, 0, Some(""), false)
+                .expect("空项目报告")
+                .total,
+            0
+        );
+    }
+
     /// C6：空库必须返回空组，而不是报错。
     #[test]
     fn near_duplicate_groups_empty_store() {
         let (_dir, store) = make_store();
-        let report = store.near_duplicate_groups(0.85, 10, 0).expect("空库报告");
+        let report = store
+            .near_duplicate_groups(0.85, 10, 0, None, false)
+            .expect("空库报告");
         assert_eq!(report.total, 0);
         assert!(report.groups.is_empty());
         assert!(!report.truncated);

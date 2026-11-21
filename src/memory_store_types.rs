@@ -34,9 +34,13 @@ pub struct DuplicateGroup {
 /// 近重复报告（`GET /v1/memories/duplicates`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DuplicateReport {
-    /// 实际参与比较的记忆数
+    /// 过滤范围：None=全库，Some=精确项目（与 ListFilter.project 同义）
+    pub project: Option<String>,
+    /// 是否把派生 synthesis 记忆纳入报告
+    pub include_synthesis: bool,
+    /// 实际参与比较的记忆数（已按 project / include_synthesis 过滤）
     pub scanned: usize,
-    /// 当前库内记忆总数（用于判断是否因 `max_scan` 截断）
+    /// 过滤范围内的记忆总数（不是全库总数；用于判断是否因 `max_scan` 截断）
     pub total: usize,
     /// 近重复组（按组大小降序）
     pub groups: Vec<DuplicateGroup>,

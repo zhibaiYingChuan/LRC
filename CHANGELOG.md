@@ -60,6 +60,25 @@
 - 数据格式向后兼容；absorb 复用现有 distill / migrate 的字段与幂等语义。
 - 新增端点全部纳入 scope 过滤；管理类操作（近重复、批量归档）在多租户域仅限本地可信域。
 
+### 0.11.1 同版本补充 · 2026-11-21
+
+**近重复报告的作用域修复**（插件侧报告 `?project=dsh` 仍返回全库 11513 条）。
+
+- **`project` 参数真正生效**：此前 `GET /v1/memories/duplicates` 只解析
+  `threshold` / `limit` / `max_scan`，`project` 被静默忽略，`scanned == total` 恒等于全库。
+  现在按 `project` 精确（大小写敏感）过滤，空串 / 纯空白视为不过滤；
+  过滤发生在 `total` / `scanned` 统计**之前**，两者改为过滤后口径。
+- **默认排除 synthesis**：合成记忆是成员内容的几何融合，天然高度相似，
+  全库 2380 条 synthesis 中 1876 条被判近重复，报告被噪声淹没。
+  默认 `include_synthesis=false`；显式传 `1/true/yes` 才纳入，非法值返回 400。
+- **响应自描述**：`DuplicateReport` 新增 `project` / `include_synthesis` 字段回显实际范围，
+  避免再次出现「以为在查项目、其实在查全库」。
+- **CLI 对齐**：`lrc list --duplicates` 新增 `--project`（优先级高于 `LRC_PROJECT`）
+  与 `--include-synthesis`；开关不接受 `--flag=value` 写法（防止
+  `--include-synthesis=false` 被静默当成 true）。
+- **行为变更**：默认结果集不再包含 synthesis，历史用法若依赖全量扫描需显式加
+  `--include-synthesis`。
+
 ## [0.11.0] - 2026-11-20
 
 > 本版摘要：**独立 CLI + 归档生命周期闭环 + 隐私/scope 全局加固 + 健康面板可维护化**。

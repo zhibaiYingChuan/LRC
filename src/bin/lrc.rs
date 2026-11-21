@@ -64,6 +64,7 @@ const KNOWN_FLAGS: &[&str] = &[
     "cancel",
     "resume",
     "duplicates",
+    "include-synthesis",
     "auto-summary",
 ];
 
@@ -197,7 +198,7 @@ fn print_usage() {
   lrc recall <查询文本> [选项]       三路融合检索记忆
   lrc remember <内容|->  [选项]      写入一条记忆（`-` 表示从 stdin 读取）
   lrc search <查询文本> [选项]       检索代码库
-  lrc list [选项]                    列出记忆（--duplicates 近重复报告）
+  lrc list [选项]                    列出记忆（--duplicates 近重复报告；--project dsh 只看项目）
   lrc stats [选项]                   记忆库统计
   lrc doctor [选项]                  自检（daemon / 版本 / 模型 / 数据目录）
                                      --capture [N] 附带最近 N 次 absorb 的结果
@@ -331,6 +332,13 @@ fn parse_args(args: &[String]) -> Result<Parsed, CliError> {
             };
 
             if KNOWN_FLAGS.contains(&key) {
+                // `--flag=value` 此前会被静默当成 `--flag`，例如
+                // `--include-synthesis=false` 反而开启。开关不接受取值。
+                if let Some(value) = inline {
+                    return Err(CliError::Arg(format!(
+                        "选项 --{key} 不接受取值（收到 `{value}`）"
+                    )));
+                }
                 parsed.flags.insert(key.to_string());
                 index += 1;
                 continue;
@@ -1141,9 +1149,17 @@ fn cmd_list(args: &[String]) -> Result<u8, CliError> {
         };
         let limit = parsed.value_usize("limit", 50)?;
         let max_scan = parsed.value_usize("max-scan", 0)?;
-        let uri = format!(
-            "/v1/memories/duplicates?threshold={threshold}&limit={limit}&max_scan={max_scan}"
-        );
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query.append_pair("threshold", &threshold.to_string());
+        query.append_pair("limit", &limit.to_string());
+        query.append_pair("max_scan", &max_scan.to_string());
+        if let Some(project) = resolve_filter_project(&parsed) {
+            query.append_pair("project", &project);
+        }
+        if parsed.flag("include-synthesis") {
+            query.append_pair("include_synthesis", "true");
+        }
+        let uri = format!("/v1/memories/duplicates?{}", query.finish());
         let started = Instant::now();
         let response = client.send("GET", &uri, None)?;
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -1158,6 +1174,11 @@ fn cmd_list(args: &[String]) -> Result<u8, CliError> {
                 "ok": true,
                 "scanned": response.get("scanned").and_then(Value::as_u64).unwrap_or(0),
                 "total": response.get("total").and_then(Value::as_u64).unwrap_or(0),
+                "project": response.get("project").cloned().unwrap_or(Value::Null),
+                "include_synthesis": response
+                    .get("include_synthesis")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 "truncated": response.get("truncated").and_then(Value::as_bool).unwrap_or(false),
                 "method": response.get("method").and_then(Value::as_str).unwrap_or("?"),
                 "groups": groups,
@@ -3194,3 +3215,55 @@ fn force_utf8_console() {
 
 #[cfg(not(windows))]
 fn force_utf8_console() {}
+
+#[cfg(test)]
+mod parse_args_tests {
+    use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 开关型选项**不接受** `--flag=value`：`--include-synthesis=false`
+    /// 曾被静默当成 `--include-synthesis`（反而开启），必须直接报参数错误。
+    #[test]
+    fn flag_rejects_inline_value() {
+        match parse_args(&argv(&[
+            "list",
+            "--duplicates",
+            "--include-synthesis=false",
+        ])) {
+            Err(CliError::Arg(_)) => {}
+            Err(_) => panic!("应为参数错误"),
+            Ok(_) => panic!("开关带取值必须报错"),
+        }
+    }
+
+    /// 近重复报告的三个参数按预期落位：`--project` 取值、`--include-synthesis` 为开关。
+    #[test]
+    fn duplicates_options_are_parsed() {
+        let parsed = match parse_args(&argv(&[
+            "list",
+            "--duplicates",
+            "--project",
+            "dsh",
+            "--include-synthesis",
+        ])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("合法参数应解析成功"),
+        };
+        assert!(parsed.flag("duplicates"));
+        assert!(parsed.flag("include-synthesis"));
+        assert_eq!(parsed.value("project"), Some("dsh"));
+    }
+
+    /// 取值型选项支持 `--project=dsh` 写法（与 `--project dsh` 等价）。
+    #[test]
+    fn value_option_accepts_inline_form() {
+        let parsed = match parse_args(&argv(&["list", "--duplicates", "--project=dsh"])) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("内联取值应解析成功"),
+        };
+        assert_eq!(parsed.value("project"), Some("dsh"));
+    }
+}

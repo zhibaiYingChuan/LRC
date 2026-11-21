@@ -10419,7 +10419,9 @@ impl<P: Persistence> MemoryStore<P> {
     ///   threshold=0.85 时漏报率约 0.05%，threshold=0.5 时约 6% ——
     ///   报告是近似结果，不是全量精确比对；
     /// - 单桶超过 500 条时跳过（避免退化桶导致 O(k²)），并置 `truncated=true`；
-    /// - `max_scan` 只扫描前 N 条（默认全库），截断时 `truncated=true`。
+    /// - `max_scan` 只扫描前 N 条（默认全库），截断时 `truncated=true`；
+    /// - **过滤先于统计**：`project` 精确匹配、`include_synthesis=false` 时排除
+    ///   派生合成记忆；`total/scanned` 是过滤后的口径，不是全库口径。
     ///
     /// 返回的组按成员数降序；`similarity` 为组内**实际计算过的最高相似度**。
     pub fn near_duplicate_groups(
@@ -10427,8 +10429,19 @@ impl<P: Persistence> MemoryStore<P> {
         threshold: f32,
         max_groups: usize,
         max_scan: usize,
+        project: Option<&str>,
+        include_synthesis: bool,
     ) -> Result<DuplicateReport, PersistenceError> {
-        let snapshot = self.load_cached()?;
+        let all = self.load_cached()?;
+        // 过滤必须在 total/scanned 之前：否则报告会声称「扫描了全库」，
+        // 而调用方以为拿到的是项目范围。`project` 语义与 ListFilter 一致：
+        // None=全库，Some(p)=精确匹配（大小写敏感）。
+        let snapshot: Vec<&Memory> = all
+            .iter()
+            .map(|m| m.as_ref())
+            .filter(|m| include_synthesis || m.memory_type != MemoryType::Synthesis)
+            .filter(|m| project.map_or(true, |p| m.project.as_deref() == Some(p)))
+            .collect();
         let total = snapshot.len();
         let threshold = threshold.clamp(0.5, 1.0);
         let max_groups = max_groups.clamp(1, 100);
@@ -10443,8 +10456,8 @@ impl<P: Persistence> MemoryStore<P> {
         let mut terms: Vec<std::collections::HashSet<String>> = Vec::with_capacity(scanned);
         let mut buckets: std::collections::HashMap<(u8, u64), Vec<usize>> =
             std::collections::HashMap::new();
-        for index in 0..scanned {
-            let set = Self::content_bigrams(&snapshot[index].content);
+        for (index, memory) in snapshot.iter().enumerate().take(scanned) {
+            let set = Self::content_bigrams(&memory.content);
             if set.is_empty() {
                 terms.push(set);
                 continue;
@@ -10526,6 +10539,8 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         Ok(DuplicateReport {
+            project: project.map(str::to_string),
+            include_synthesis,
             scanned,
             total,
             groups,
