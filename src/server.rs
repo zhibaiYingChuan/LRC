@@ -896,6 +896,39 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                 required: vec!["memory_id".into()],
             },
         },
+        ToolDefinition {
+            name: "absorb".into(),
+            description: "任务结束自动沉淀 — 把本轮最终回复（或模型声明的结论条目）解析、过滤、去重后写入记忆库。供无 shell 的宿主兜底（有 shell 的宿主优先用 `lrc absorb`）。与 remember 的区别：remember 写用户显式要求记住的内容；absorb 只收**结论**（decision / constraint / preference / conclusion / error），自动打 auto-summary 标签、importance ≤4、绝不写 Global，命中删除语义时整轮跳过。支持 dry_run 预览判定结果。".into(),
+            input_schema: ToolInputSchema {
+                schema_type: "object".into(),
+                properties: serde_json::json!({
+                    "text": {
+                        "type": "string",
+                        "description": "本轮最终回复（可含 [LRC] 结论块）"
+                    },
+                    "items": {
+                        "type": "array",
+                        "description": "模型直接声明的结论条目（优先于 text）",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string", "description": "decision | constraint | preference | conclusion | error | fact | code_context" },
+                                "content": { "type": "string" },
+                                "supersedes": { "type": "string", "description": "可选：被本条修正的旧内容关键词（仅打标签，不删除）" }
+                            },
+                            "required": ["type", "content"]
+                        }
+                    },
+                    "project": { "type": "string", "description": "归属项目（缺省不归属）" },
+                    "host": { "type": "string", "description": "宿主标识（trae / codex / cursor / claude-code / generic）" },
+                    "source": { "type": "string", "description": "来源：model_declared | auto_distill（缺省按解析结果判定）" },
+                    "importance_cap": { "type": "integer", "description": "重要性上限（默认 4，最大 6）" },
+                    "max_items": { "type": "integer", "description": "单次最多处理条数（默认 10，最大 50）" },
+                    "dry_run": { "type": "boolean", "description": "只返回判定结果，不写库" }
+                }),
+                required: vec![],
+            },
+        },
     ];
 
     // ★v0.11：所有工具统一声明归属参数。
@@ -3279,6 +3312,108 @@ async fn handle_tools_call(
                     make_response(id, to_json_value_safe(&call_result))
                 }
                 Err(e) => make_error(id, -32603, &format!("关联图构造失败: {}", e)),
+            }
+        }
+
+        // === 上下文沉淀（无 shell 宿主的 MCP 兜底通道）===
+        "absorb" => {
+            let items = match arguments.get("items") {
+                None | Some(serde_json::Value::Null) => Vec::new(),
+                Some(value) => match serde_json::from_value::<
+                    Vec<crate::context_absorb::DeclaredItem>,
+                >(value.clone())
+                {
+                    Ok(items) => items,
+                    Err(e) => return make_error(id, -32602, &format!("items 格式非法: {e}")),
+                },
+            };
+            let input = crate::absorb_service::AbsorbInput {
+                text: arguments
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                items,
+                session_id: arguments
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                user_id: arguments
+                    .get("user_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                project: arguments
+                    .get("project")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                host: arguments
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                source: arguments
+                    .get("source")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                importance_cap: arguments
+                    .get("importance_cap")
+                    .and_then(|v| v.as_u64())
+                    // 先夹取再转 u8：`as u8` 会把 256 截成 0（审查 P2-I）。
+                    .map(|v| v.clamp(1, 6) as u8),
+                max_items: arguments
+                    .get("max_items")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize),
+                dry_run: arguments
+                    .get("dry_run")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            };
+            // 与 REST 共用同一实现（absorb_service）：解析/过滤/去重/隐私/批量编码
+            // 只维护一份，避免 MCP 与 HTTP 两套口径漂移。
+            match crate::absorb_service::absorb(
+                state.memory_store.clone(),
+                crate::privacy::from_env(),
+                input,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    let mut text = format!(
+                        "沉淀完成（host={} source={}）\n候选 {} / 写入 {} / 跳过 {} / 失败 {}",
+                        outcome.host,
+                        outcome.source,
+                        outcome.candidates,
+                        outcome.written,
+                        outcome.skipped,
+                        outcome.failed
+                    );
+                    if outcome.dry_run {
+                        text.push_str("\n（dry_run：未写库）");
+                    }
+                    for item in &outcome.items {
+                        text.push_str(&format!("\n- [{}] {}", item.reason, item.content));
+                    }
+                    for reason in &outcome.dropped {
+                        text.push_str(&format!("\n- [dropped] {}", reason));
+                    }
+                    let call_result = ToolCallResult {
+                        content: vec![TextContent {
+                            content_type: "text".into(),
+                            text,
+                        }],
+                    };
+                    make_response(id, to_json_value_safe(&call_result))
+                }
+                Err(crate::absorb_service::AbsorbError::InvalidInput(message)) => {
+                    make_error(id, -32602, &message)
+                }
+                Err(crate::absorb_service::AbsorbError::ScopeRequired(code)) => make_error(
+                    id,
+                    -32602,
+                    &format!("{code}: 多租户模式必须提供 user_id 或 session_id"),
+                ),
+                Err(crate::absorb_service::AbsorbError::Internal(message)) => {
+                    make_error(id, -32603, &message)
+                }
             }
         }
 
@@ -6614,8 +6749,8 @@ mod tests {
             .expect("tools/list 响应中 tools 应为数组，检查工具注册逻辑");
         assert_eq!(
             tools.len(),
-            15,
-            "应注册 15 个工具（9 个记忆 + 2 个代码 + 4 个新增）"
+            16,
+            "应注册 16 个工具（9 个记忆 + 2 个代码 + 5 个新增，含 absorb）"
         );
 
         // 验证记忆工具存在
@@ -6675,6 +6810,10 @@ mod tests {
         assert!(
             tool_names.contains(&"associations"),
             "缺少 associations 工具"
+        );
+        assert!(
+            tool_names.contains(&"absorb"),
+            "缺少 absorb 工具（任务结束自动沉淀的 MCP 兜底通道）"
         );
     }
 
@@ -6858,6 +6997,88 @@ mod tests {
         let json = to_json(&resp);
 
         assert!(json["error"].is_object(), "缺少 content 应返回错误");
+        assert_eq!(json["error"]["code"], -32602);
+    }
+
+    // ---- absorb 自动沉淀工具测试（B3 契约）----
+
+    #[tokio::test]
+    async fn test_absorb_dry_run_does_not_write() {
+        let state = test_state();
+        let params = serde_json::json!({
+            "name": "absorb",
+            "arguments": {
+                "text": "做完了。\n[LRC]\n- decision: 采用 RwLock，读并发优先",
+                "host": "cursor",
+                "dry_run": true
+            }
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(300.into()))).await;
+        let json = to_json(&resp);
+        let text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("absorb 应返回文本结果");
+        assert!(text.contains("dry_run"), "必须明示 dry_run: {}", text);
+        assert!(text.contains("would_write"), "应给出写入预览: {}", text);
+
+        let total = state
+            .memory_store
+            .read()
+            .await
+            .stats()
+            .expect("统计失败")
+            .total_memories;
+        assert_eq!(total, 0, "dry_run 不得写库");
+    }
+
+    #[tokio::test]
+    async fn test_absorb_items_writes() {
+        let state = test_state();
+        let params = serde_json::json!({
+            "name": "absorb",
+            "arguments": {
+                "items": [{
+                    "type": "decision",
+                    "content": "数据库选 PostgreSQL，因为需要事务"
+                }],
+                "host": "codex"
+            }
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(301.into()))).await;
+        let json = to_json(&resp);
+        let text = json["result"]["content"][0]["text"]
+            .as_str()
+            .expect("absorb 应返回文本结果");
+        assert!(text.contains("写入 1"), "应写入 1 条: {}", text);
+        assert!(
+            text.contains("source=model_declared"),
+            "items 路径应标模型声明: {}",
+            text
+        );
+
+        let total = state
+            .memory_store
+            .read()
+            .await
+            .stats()
+            .expect("统计失败")
+            .total_memories;
+        assert_eq!(total, 1, "非 dry_run 应落库");
+    }
+
+    #[tokio::test]
+    async fn test_absorb_requires_input() {
+        let state = test_state();
+        let params = serde_json::json!({
+            "name": "absorb",
+            "arguments": {}
+        });
+        let resp =
+            handle_tools_call(&state, &params, Some(serde_json::Value::Number(302.into()))).await;
+        let json = to_json(&resp);
+        assert!(json["error"].is_object(), "空输入应返回错误");
         assert_eq!(json["error"]["code"], -32602);
     }
 

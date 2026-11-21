@@ -2119,6 +2119,9 @@ pub struct MemoryListRequest {
     pub limit: Option<usize>,
     /// 按项目过滤
     pub project: Option<String>,
+    /// 按记忆类型过滤（fact / preference / decision / code_context / conversation / experience / synthesis）
+    #[serde(default)]
+    pub memory_type: Option<String>,
     /// 按标签过滤（任一标签匹配）
     #[serde(default)]
     pub tags: Vec<String>,
@@ -2248,6 +2251,61 @@ pub struct ContextMigrateRequest {
     /// 归属项目（缺省不归属）
     #[serde(default)]
     pub project: Option<String>,
+}
+
+/// `POST /v1/context/absorb` 请求体（v0.11.1）。
+///
+/// 与 `migrate` 的差别：`absorb` 面向"任务结束自动沉淀"，
+/// 自带语义过滤、批内去重、跨轮去重（阈值 0.85）、删除守卫与 dry-run。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextAbsorbRequest {
+    /// 最终回复（可含 `[LRC]` 结论块）
+    #[serde(default)]
+    pub text: Option<String>,
+    /// 模型直接声明的结论条目（优先于 text）
+    #[serde(default)]
+    pub items: Vec<crate::context_absorb::DeclaredItem>,
+    /// 宿主会话 ID
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// 用户 ID（多租户域必填）
+    #[serde(default)]
+    pub user_id: Option<String>,
+    /// 归属项目
+    #[serde(default)]
+    pub project: Option<String>,
+    /// 宿主标识（trae / codex / cursor / claude-code / generic）
+    #[serde(default)]
+    pub host: Option<String>,
+    /// 来源：model_declared | auto_distill
+    #[serde(default)]
+    pub source: Option<String>,
+    /// 自动摘要的重要性上限（默认 4，最大 6）
+    #[serde(default)]
+    pub importance_cap: Option<u8>,
+    /// 单次最多处理条数（默认 10，最大 50）
+    #[serde(default)]
+    pub max_items: Option<usize>,
+    /// 只返回判定结果，不写库
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl From<ContextAbsorbRequest> for crate::absorb_service::AbsorbInput {
+    fn from(req: ContextAbsorbRequest) -> Self {
+        Self {
+            text: req.text,
+            items: req.items,
+            session_id: req.session_id,
+            user_id: req.user_id,
+            project: req.project,
+            host: req.host,
+            source: req.source,
+            importance_cap: req.importance_cap,
+            max_items: req.max_items,
+            dry_run: req.dry_run,
+        }
+    }
 }
 
 /// `GET /v1/context/index` 查询参数。
@@ -2562,6 +2620,30 @@ fn scope_required_error() -> (StatusCode, Json<serde_json::Value>) {
             "message": "本服务已启用鉴权（多租户模式），本入口必须提供 user_id；提供 session_id 时也必须同时提供 user_id"
         })),
     )
+}
+
+/// 把共享沉淀服务的错误映射为 REST 错误响应（REST 与 MCP 的错误码口径分离）。
+fn absorb_error_response(
+    error: crate::absorb_service::AbsorbError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::absorb_service::AbsorbError;
+    match error {
+        AbsorbError::InvalidInput(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_input",
+                "message": message
+            })),
+        ),
+        AbsorbError::ScopeRequired(_) => scope_required_error(),
+        AbsorbError::Internal(message) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "absorb_failed",
+                "message": message
+            })),
+        ),
+    }
 }
 
 /// v1 REST 路由的**请求体上限**（v0.9.11 / CR-32：把隐式契约变显式）。
@@ -5659,6 +5741,13 @@ pub fn build_v1_router_with_trust(
                         .get("async")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                        // 续跑：仅当上一轮处于 cancelled / failed，或 `--limit`
+                        // 分块完成（Completed 且 processed < total）时生效；
+                        // 全量完成后的 `resume` 从 0 开始（重编码幂等）。
+                        let resume = body
+                        .get("resume")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
 
                     if is_async {
                         let batch_size = body
@@ -5692,7 +5781,35 @@ pub fn build_v1_router_with_trust(
 
                         let task_id = uuid::Uuid::new_v4().to_string();
                         let job = crate::reclassify_job::global_job();
-                        if let Err(existing) = job.try_start(task_id.clone(), total, before) {
+                        let data_dir = {
+                            let guard = store.read().await;
+                            guard
+                                .persistence()
+                                .data_dir_path()
+                                .map(std::path::Path::to_path_buf)
+                        };
+                        // 续跑锚点：cancelled/failed 或 --limit 分块完成；
+                        // 若进程刚重启（内存快照 Idle），读取落盘进度。
+                        let resume_offset = if resume {
+                            let previous = job.snapshot();
+                            if previous.resumable() {
+                                previous.processed
+                            } else if previous.status == crate::reclassify_job::JobStatus::Idle {
+                                data_dir
+                                    .as_deref()
+                                    .and_then(crate::reclassify_job::load_progress)
+                                    .filter(|p| p.resumable())
+                                    .map(|p| p.processed)
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        if let Err(existing) =
+                            job.try_start_from(task_id.clone(), total, before, resume_offset)
+                        {
                             return Err((
                                 StatusCode::CONFLICT,
                                 Json(serde_json::json!({
@@ -5702,15 +5819,23 @@ pub fn build_v1_router_with_trust(
                                 })),
                             ));
                         }
+                        // 立即落盘新任务的起点：避免"新任务刚启动、进程崩溃"时
+                        // 误用上一轮遗留的旧锚点。
+                        if let Some(dir) = data_dir.as_deref() {
+                            crate::reclassify_job::save_progress(dir, &job.snapshot());
+                        }
 
                         // 后台推进：按 offset 分批、每批持锁处理完即释放
                         let store_bg = store.clone();
+                        let data_dir_bg = data_dir.clone();
                         tokio::task::spawn_blocking(move || {
                             crate::reclassify_job::run_reclassify_job(
                                 crate::reclassify_job::global_job(),
                                 &store_bg,
                                 batch_size,
                                 crate::reclassify_job::DEFAULT_RECLASSIFY_BUSY_RETRIES,
+                                limit,
+                                data_dir_bg.as_deref(),
                             );
                         });
 
@@ -5721,6 +5846,7 @@ pub fn build_v1_router_with_trust(
                                 "async": true,
                                 "task_id": task_id,
                                 "total": total,
+                                "resume_from": resume_offset,
                                 "status": "running",
                                 "poll": "/v1/memories/reclassify-bagua/progress"
                             })),
@@ -5762,29 +5888,98 @@ pub fn build_v1_router_with_trust(
         }))
         // GET /v1/memories/reclassify-bagua/progress — 异步重分类任务进度
         //
-        // 恒返回 200；`status` ∈ idle / running / completed / failed。
+        // 恒返回 200；`status` ∈ idle / running / completed / cancelled / failed。
         // 空闲时返回 { "status": "idle" }，其余字段为零值，便于前端统一处理。
         .route("/memories/reclassify-bagua/progress", get({
+            let store = reclassify_store.clone();
+            move || {
+                let store = store.clone();
+                async move {
+                    let snap = crate::reclassify_job::global_job().snapshot();
+                    // 进程重启后内存快照为 Idle：读取落盘进度，供 CLI/面板提示"可续跑"。
+                    let persisted = if snap.status == crate::reclassify_job::JobStatus::Idle {
+                        let data_dir = {
+                            let guard = store.read().await;
+                            guard
+                                .persistence()
+                                .data_dir_path()
+                                .map(std::path::Path::to_path_buf)
+                        };
+                        data_dir
+                            .as_deref()
+                            .and_then(crate::reclassify_job::load_progress)
+                    } else {
+                        None
+                    };
+                    let percent = if snap.total == 0 {
+                        0.0f64
+                    } else {
+                        (snap.processed as f64 / snap.total as f64 * 100.0).min(100.0)
+                    };
+                    Json(serde_json::json!({
+                        "status": snap.status.as_str(),
+                        "task_id": snap.task_id,
+                        "total": snap.total,
+                        "processed": snap.processed,
+                        "changed": snap.changed,
+                        "before": snap.before,
+                        "after": snap.after,
+                        // 显式给出分布求和：运行中新增记忆时它可能小于 total，
+                        // 让调用方看到"未归类"而不是自行猜一个分母。
+                        "before_total": snap.before.iter().sum::<usize>(),
+                        "after_total": snap.after.iter().sum::<usize>(),
+                        "percent": percent,
+                        "resume_offset": snap.processed,
+                        "resumable": snap.resumable(),
+                        "persisted": persisted,
+                        "started_ms": snap.started_ms,
+                        "finished_ms": snap.finished_ms,
+                        "error": snap.error,
+                    }))
+                }
+            }
+        }))
+        // POST /v1/memories/reclassify-bagua/cancel — 取消正在运行的重分类任务
+        //
+        // 取消在**批次边界**生效：返回 202 只代表"已登记取消"，后台循环会在
+        // 下一批结束后把状态置为 cancelled，并保留 processed 作为续跑锚点。
+        .route("/memories/reclassify-bagua/cancel", post({
             move || async move {
-                let snap = crate::reclassify_job::global_job().snapshot();
-                let percent = if snap.total == 0 {
-                    0.0f64
-                } else {
-                    (snap.processed as f64 / snap.total as f64 * 100.0).min(100.0)
-                };
-                Json(serde_json::json!({
-                    "status": snap.status.as_str(),
-                    "task_id": snap.task_id,
-                    "total": snap.total,
-                    "processed": snap.processed,
-                    "changed": snap.changed,
-                    "before": snap.before,
-                    "after": snap.after,
-                    "percent": percent,
-                    "started_ms": snap.started_ms,
-                    "finished_ms": snap.finished_ms,
-                    "error": snap.error,
-                }))
+                if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "error": "admin_only",
+                            "message": "全库重编码仅限本地可信域"
+                        })),
+                    ));
+                }
+                let job = crate::reclassify_job::global_job();
+                let snap = job.snapshot();
+                // 原子判定：校验 task_id 与 Running 状态后置位，避免"旧任务刚完成、
+                // 新任务已启动"的窗口把取消打到新任务上（审查 P2-E）。
+                if snap.status != crate::reclassify_job::JobStatus::Running
+                    || !job.request_cancel_if_task(&snap.task_id)
+                {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "not_running",
+                            "status": job.snapshot().status.as_str(),
+                            "message": "当前没有运行中的重分类任务"
+                        })),
+                    ));
+                }
+                Ok((
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "success": true,
+                        "task_id": snap.task_id,
+                        "status": "cancelling",
+                        "resume_offset": snap.processed,
+                        "poll": "/v1/memories/reclassify-bagua/progress"
+                    })),
+                ))
             }
         }))
         // GET /v1/audit-trail — 审计追踪（质疑五：透明度与信任）
@@ -6058,7 +6253,35 @@ pub fn build_v1_router_with_trust(
                         Ok(s) => s,
                         Err(_) => return Err(scope_required_error()),
                     };
+                    // 类型过滤：非法值必须显式报错，不能静默忽略
+                    //（历史缺陷：CLI 的 `--type` 根本没传到服务端，导致列表恒为全库）。
+                    let memory_type = match params
+                        .memory_type
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|raw| !raw.is_empty())
+                    {
+                        Some(raw) if raw.eq_ignore_ascii_case("all") || raw == "*" => None,
+                        Some(raw) => match crate::MemoryType::try_parse(raw) {
+                            Some(ty) => Some(ty),
+                            None => {
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({
+                                        "error": "invalid_memory_type",
+                                        "message": format!(
+                                            "未知记忆类型 `{}`，可选：{}",
+                                            raw,
+                                            crate::MemoryType::valid_values().join(", ")
+                                        )
+                                    })),
+                                ))
+                            }
+                        },
+                        None => None,
+                    };
                     let filter = crate::memory_store::ListFilter {
+                        memory_type,
                         project: params.project.clone(),
                         tags: params.tags.clone(),
                         limit,
@@ -6068,7 +6291,6 @@ pub fn build_v1_router_with_trust(
                         privacy_context: scope,
                         // v0.11：默认隐藏过期记忆；导出场景可显式开启。
                         include_expired: params.include_expired,
-                        ..Default::default()
                     };
 
                     match store.list_memories(&filter) {
@@ -6165,6 +6387,203 @@ pub fn build_v1_router_with_trust(
                             })),
                         )),
                     }
+                }
+            }
+        }))
+        // GET /v1/memories/duplicates — 近重复报告（v0.11.1 / C6）
+        //
+        // 全库运维视图：内容高度相似但未在写入时合并的记忆组。
+        // 多租户域禁止（跨租户内容预览）。
+        .route("/memories/duplicates", get({
+            let store = metrics_store.clone();
+            move |Query(params): Query<HashMap<String, String>>| {
+                let store = store.clone();
+                async move {
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "近重复报告仅限本地可信域"
+                            })),
+                        ));
+                    }
+                    let threshold = match params.get("threshold") {
+                        Some(raw) => raw.parse::<f32>().map_err(|_| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_param",
+                                    "message": format!("threshold 需要 0.5~1.0 的小数，收到 `{raw}`")
+                                })),
+                            )
+                        })?,
+                        None => 0.85,
+                    };
+                    // NaN / Infinity 能通过 `parse::<f32>()`，而 NaN 参与比较恒为 false，
+                    // 会让桶内任意两条都被判成"近重复"；越界值也不能静默夹取。
+                    if !threshold.is_finite() || !(0.5..=1.0).contains(&threshold) {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "invalid_param",
+                                "message": "threshold 需要 0.5~1.0 的有限小数"
+                            })),
+                        ));
+                    }
+                    let limit = match params.get("limit") {
+                        Some(raw) => raw.parse::<usize>().map_err(|_| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_param",
+                                    "message": format!("limit 需要整数，收到 `{raw}`")
+                                })),
+                            )
+                        })?,
+                        None => 50,
+                    };
+                    let max_scan = match params.get("max_scan") {
+                        Some(raw) => raw.parse::<usize>().map_err(|_| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_param",
+                                    "message": format!("max_scan 需要整数，收到 `{raw}`")
+                                })),
+                            )
+                        })?,
+                        None => 0,
+                    };
+                    let report = tokio::task::spawn_blocking(move || {
+                        store
+                            .blocking_read()
+                            .near_duplicate_groups(threshold, limit, max_scan)
+                    })
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "duplicates_failed",
+                                "message": format!("近重复任务异常终止: {}", e)
+                            })),
+                        )
+                    })?
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "duplicates_failed",
+                                "message": format!("近重复检测失败: {}", e)
+                            })),
+                        )
+                    })?;
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                        serde_json::to_value(report)
+                            .unwrap_or_else(|_| serde_json::json!({ "groups": [] })),
+                    ))
+                }
+            }
+        }))
+        // POST /v1/memories/archive-by-tag — 按标签批量归档（v0.11.1 / C6）
+        //
+        // 典型用途：把 `auto-summary` 自动摘要批量移出活跃库（可 unarchive 恢复）。
+        // 多租户域禁止（跨租户批量操作）。
+        .route("/memories/archive-by-tag", post({
+            let store = metrics_store.clone();
+            move |Json(body): Json<serde_json::Value>| {
+                let store = store.clone();
+                async move {
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "按标签批量归档仅限本地可信域"
+                            })),
+                        ));
+                    }
+                    let tag = body
+                        .get("tag")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_param",
+                                    "message": "tag 不能为空"
+                                })),
+                            )
+                        })?
+                        .to_string();
+                    // 参数校验：出现但类型不对必须 400，不能静默当成"不限量/不限时间"——
+                    // 那会让一次误传把该标签下的记忆整批归档（v0.11.1 审查 P1）。
+                    let older_than_days = match body.get("older_than_days") {
+                        None | Some(serde_json::Value::Null) => None,
+                        Some(raw) => Some(raw.as_u64().ok_or_else(|| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_param",
+                                    "message": "older_than_days 需要非负整数"
+                                })),
+                            )
+                        })?),
+                    };
+                    let limit = match body.get("limit") {
+                        None | Some(serde_json::Value::Null) => 0usize,
+                        Some(raw) => raw.as_u64().ok_or_else(|| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_param",
+                                    "message": "limit 需要非负整数（0 表示不限）"
+                                })),
+                            )
+                        })? as usize,
+                    };
+                    let dry_run = match body.get("dry_run") {
+                        None | Some(serde_json::Value::Null) => false,
+                        Some(raw) => raw.as_bool().ok_or_else(|| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_param",
+                                    "message": "dry_run 需要布尔值"
+                                })),
+                            )
+                        })?,
+                    };
+                    let report = tokio::task::spawn_blocking(move || {
+                        let guard = store.blocking_write();
+                        guard.archive_by_tag(&tag, older_than_days, limit, dry_run)
+                    })
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "archive_failed",
+                                "message": format!("归档任务异常终止: {}", e)
+                            })),
+                        )
+                    })?
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "error": "archive_failed",
+                                "message": format!("归档失败: {}", e)
+                            })),
+                        )
+                    })?;
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                        serde_json::to_value(report)
+                            .unwrap_or_else(|_| serde_json::json!({ "archived": 0 })),
+                    ))
                 }
             }
         }))
@@ -6863,6 +7282,85 @@ pub fn build_v1_router_with_trust(
                             })),
                         )),
                     }
+                }
+            }
+        }))
+        // POST /v1/context/absorb — 任务结束自动沉淀（v0.11.1）
+        //
+        // 与 migrate 的分工：
+        //   - migrate：调用方已拿到提炼结果，只负责**幂等写入**；
+        //   - absorb ：面向 Stop 钩子/CLI，自己完成解析、过滤、去重、隐私与 dry-run。
+        //
+        // 关键约束（见 docs/LRC_上下文沉淀_方案_2026-11-21.md）：
+        //   - 自动摘要永不用 Global；有 session 用 Session，否则 User；
+        //   - 跨轮去重阈值 0.85（高于默认 0.5），不吞并用户显式写入的记忆；
+        //   - 删除语义守卫命中时整轮跳过，绝不复活已删除内容。
+                .route("/context/absorb", post({
+            let store = context_store.clone();
+            move |Json(req): Json<ContextAbsorbRequest>| {
+                let store = store.clone();
+                async move {
+                    // REST 与 MCP 共用同一实现（absorb_service）：解析/过滤/去重/
+                    // 隐私/批量编码/诊断日志只维护一份，避免两套口径漂移。
+                    let outcome = crate::absorb_service::absorb(store, trust_mode, req.into())
+                        .await
+                        .map_err(absorb_error_response)?;
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+                        serde_json::to_value(outcome)
+                            .unwrap_or_else(|_| serde_json::json!({ "ok": false })),
+                    ))
+                }
+            }
+        }))
+        // GET /v1/context/absorb/log — 最近 N 次沉淀的诊断记录（B4）
+        //
+        // 只读本地 JSONL 日志；无数据时返回空数组（诚实空态）。
+        // 多租户域仅限管理员：日志含会话标识，属于跨租户可见的运维信息。
+        .route("/context/absorb/log", get({
+            let store = context_store.clone();
+            move |Query(params): Query<HashMap<String, String>>| {
+                let store = store.clone();
+                async move {
+                    if trust_mode == crate::privacy::TrustMode::MultiTenant {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": "admin_only",
+                                "message": "沉淀诊断日志仅限本地可信域"
+                            })),
+                        ));
+                    }
+                    let limit = match params.get("limit") {
+                        Some(raw) => raw.parse::<usize>().map_err(|_| {
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": "invalid_param",
+                                    "message": format!("limit 需要非负整数，收到 `{raw}`")
+                                })),
+                            )
+                        })?,
+                        None => 20,
+                    };
+                    let data_dir = {
+                        let guard = store.read().await;
+                        guard
+                            .persistence()
+                            .data_dir_path()
+                            .map(std::path::Path::to_path_buf)
+                    };
+                    let records = match data_dir {
+                        Some(dir) => tokio::task::spawn_blocking(move || {
+                            crate::absorb_service::read_recent_captures(&dir, limit)
+                        })
+                        .await
+                        .unwrap_or_default(),
+                        None => Vec::new(),
+                    };
+                    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
+                        "total": records.len(),
+                        "records": records,
+                    })))
                 }
             }
         }))
@@ -8134,7 +8632,7 @@ pub fn build_v1_router_with_trust(
         //   此前在项目模式 / 自定义 --data-dir 实例上会备份错误的库。
         .route("/backup", post({
             let backup_store = metrics_store.clone();
-            move || {
+            move |body: axum::body::Bytes| {
                 let store = backup_store.clone();
                 async move {
                     // v0.11：备份/恢复是本机运维能力，多租户域一律拒绝。
@@ -8147,12 +8645,46 @@ pub fn build_v1_router_with_trust(
                             })),
                         ));
                     }
+                    // 请求体可选：空体 = 默认 full；`{"mode":"core"}` 走轻量快照。
+                    let mode = if body.is_empty() {
+                        crate::backup::BackupMode::default()
+                    } else {
+                        let value: serde_json::Value = match serde_json::from_slice(&body) {
+                            Ok(value) => value,
+                            Err(e) => {
+                                return Err((
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({
+                                        "success": false,
+                                        "error": "invalid_body",
+                                        "message": format!("请求体不是合法 JSON: {}", e)
+                                    })),
+                                ))
+                            }
+                        };
+                        match value.get("mode").and_then(|v| v.as_str()) {
+                            None => crate::backup::BackupMode::default(),
+                            Some(raw) => match crate::backup::BackupMode::parse(raw) {
+                                Some(mode) => mode,
+                                None => {
+                                    return Err((
+                                        StatusCode::BAD_REQUEST,
+                                        Json(serde_json::json!({
+                                            "success": false,
+                                            "error": "invalid_mode",
+                                            "message": "mode 只能是 full 或 core"
+                                        })),
+                                    ))
+                                }
+                            },
+                        }
+                    };
                     let data_dir = {
                         let guard = store.read().await;
                         guard.persistence().data_dir().to_path_buf()
                     };
                     let report = tokio::task::spawn_blocking(move || {
-                        crate::backup::create_backup(&data_dir)
+                        crate::backup::create_backup_with_mode(&data_dir, mode)
                     })
                     .await
                     .map_err(|e| {
@@ -8215,9 +8747,17 @@ pub fn build_v1_router_with_trust(
                     guard.invalidate_cache_after_external_restore();
                     let restored_count = guard.total_count().unwrap_or(0);
                     drop(guard);
+                    // 语义索引（全局 OnceLock）与联想图（内存态）不在本次失效范围内：
+                    // 必须显式告知调用方重启，避免继续用恢复前的向量/图返回结果。
+                    eprintln!(
+                        "[备份恢复] 已恢复 {} 条记忆；语义索引/联想图仍为内存态，需重启 LRC 后完全生效",
+                        restored_count
+                    );
                     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({
                         "success": true,
-                        "restored_memories": restored_count
+                        "restored_memories": restored_count,
+                        "needs_restart": true,
+                        "message": "恢复完成。语义索引与联想图仍为内存态，请重启 LRC 以完全生效。"
                     })))
                 }
                 Err(e) => {

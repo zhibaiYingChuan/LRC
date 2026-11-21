@@ -6513,6 +6513,10 @@ mod api_contracts_tests {
     // ============================================================
 
     /// async=true 立即返回 202 + task_id；轮询进度至 completed；缺省仍为同步 200。
+    // ★串行锁必须**跨 await 持有**：`global_job()` 是进程级单例，用例内的
+    //   异步请求要整段互斥，否则并发用例会看到彼此的任务状态（409/进度串扰）。
+    //   std MutexGuard 跨 await 在此是有意为之——测试串行执行，不存在死锁风险。
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn test_reclassify_bagua_async_returns_202_then_completes() {
         use crate::persistence::Persistence;
@@ -6521,6 +6525,10 @@ mod api_contracts_tests {
         use std::sync::atomic::AtomicBool;
         use std::time::{SystemTime, UNIX_EPOCH};
         use tower::ServiceExt;
+
+        // 进程级单例任务的串行保护：重编码 `global_job()` 是进程单例，
+        // 多个 HTTP 用例并行会互相看到对方的任务状态（409/进度串扰）。
+        let _guard = crate::test_env::serial_guard();
 
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6618,6 +6626,35 @@ mod api_contracts_tests {
         );
         // before 为全落 index=0 的伪造分布
         assert_eq!(final_body["before"][0], contents.len(), "{final_body}");
+        // C2：进度端点必须暴露续跑契约字段（完成态不可续跑）
+        assert_eq!(
+            final_body["resume_offset"],
+            contents.len(),
+            "resume_offset 应等于已处理条数: {final_body}"
+        );
+        assert_eq!(
+            final_body["resumable"], false,
+            "completed 任务不得标记为可续跑: {final_body}"
+        );
+
+        // C2：任务完成后取消必须返回 409（而非误报成功）
+        let request = Request::builder()
+            .method("POST")
+            .uri("/memories/reclassify-bagua/cancel")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().into_service().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "无运行中任务时取消应返回 409"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let cancel_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            cancel_body["error"], "not_running",
+            "409 必须给出可判定的错误码: {cancel_body}"
+        );
 
         // 3) 向后兼容：缺省 async 仍走同步 200，且已幂等（changed=0）
         let request = Request::builder()
@@ -6949,13 +6986,22 @@ mod context_endpoints_tests {
         dir
     }
 
-    fn make_app(dir: &str, trust: crate::privacy::TrustMode) -> axum::Router {
+    fn make_app_with_shared(
+        dir: &str,
+        trust: crate::privacy::TrustMode,
+    ) -> (axum::Router, Arc<RwLock<MemoryStore<JsonPersistence>>>) {
         let shared = Arc::new(RwLock::new(new_statistical_store(dir)));
         let manager: Arc<Mutex<Box<dyn IndexedCodebase>>> =
             Arc::new(Mutex::new(Box::new(NoopCodebase)));
         let llm_api = Arc::new(RwLock::new(crate::LlmApiConfig::default()));
         let llm_ready = Arc::new(AtomicBool::new(false));
-        build_v1_router_with_trust(shared, manager, llm_api, llm_ready, false, trust)
+        let app =
+            build_v1_router_with_trust(shared.clone(), manager, llm_api, llm_ready, false, trust);
+        (app, shared)
+    }
+
+    fn make_app(dir: &str, trust: crate::privacy::TrustMode) -> axum::Router {
+        make_app_with_shared(dir, trust).0
     }
 
     async fn post_json(
@@ -7775,6 +7821,723 @@ mod context_endpoints_tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["deleted"], true, "本人应可删除 session 级记忆：{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ════════════════════════════════════════════════════════════
+    // /context/absorb —— 任务结束自动沉淀（v0.11.1）
+    // ════════════════════════════════════════════════════════════
+
+    /// dry-run：只返回判定原因，不写库。
+    #[tokio::test]
+    async fn absorb_dry_run_does_not_write() {
+        let dir = temp_dir("ctx_absorb_dry");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/context/absorb",
+            serde_json::json!({
+                "text": "[LRC]\n- decision: 采用 RwLock，读并发优先\n- constraint: 不要提交 secrets",
+                "session_id": "sess-dry",
+                "project": "demo",
+                "host": "trae",
+                "dry_run": true
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "absorb 应成功：{body}");
+        assert_eq!(body["dry_run"], true, "{body}");
+        assert_eq!(body["candidates"], 2, "应解析出 2 条候选：{body}");
+        assert_eq!(body["written"], 0, "dry-run 不得写库：{body}");
+        let items = body["items"].as_array().expect("items 应为数组");
+        assert_eq!(items.len(), 2, "{body}");
+        assert!(
+            items.iter().all(|item| item["reason"] == "would_write"),
+            "dry-run 应标记 would_write：{body}"
+        );
+
+        // 负向对照：库里必须还是空的。
+        let (status, list) = post_json(
+            app,
+            "/memories/list",
+            serde_json::json!({ "project": "demo" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list["total"], 0, "dry-run 后不应有记忆：{list}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 写入路径：会话标签、event_id、importance 上限都必须落到存储。
+    #[tokio::test]
+    async fn absorb_writes_with_session_tags_and_importance_cap() {
+        let dir = temp_dir("ctx_absorb_write");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/context/absorb",
+            serde_json::json!({
+                "text": "[LRC]\n- decision: 采用 RwLock，读并发优先\n- conclusion: 健康评分修复在 3ae886a",
+                "session_id": "sess-1",
+                "project": "demo",
+                "host": "trae"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["written"], 2, "应写入 2 条：{body}");
+        assert_eq!(
+            body["source"], "model_declared",
+            "文本含 [LRC] 块应标 model_declared：{body}"
+        );
+
+        let (status, list) = post_json(
+            app,
+            "/memories/list",
+            serde_json::json!({ "project": "demo" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        assert_eq!(list["total"], 2, "{list}");
+        let memories = list["memories"].as_array().expect("memories 应为数组");
+        for memory in memories {
+            assert!(
+                memory["importance"].as_u64().unwrap_or(99) <= 4,
+                "自动摘要 importance 不得超过 4：{memory}"
+            );
+            assert_eq!(
+                memory["event_id"], "session:sess-1",
+                "自动摘要应复用会话 event_id：{memory}"
+            );
+            let tags: Vec<&str> = memory["tags"]
+                .as_array()
+                .expect("tags 应为数组")
+                .iter()
+                .filter_map(|tag| tag.as_str())
+                .collect();
+            for expected in [
+                "auto-summary",
+                "host:trae",
+                "source:model_declared",
+                "session:sess-1",
+            ] {
+                assert!(tags.contains(&expected), "缺少标签 {expected}：{memory}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 跨轮去重：同一结论第二次提交必须被 0.85 阈值拦住，不产生第二版。
+    #[tokio::test]
+    async fn absorb_dedupes_repeated_turn() {
+        let dir = temp_dir("ctx_absorb_dedupe");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+        let payload = serde_json::json!({
+            "text": "[LRC]\n- decision: 采用 RwLock 保护记忆库读并发",
+            "session_id": "sess-dup",
+            "project": "demo",
+            "host": "trae"
+        });
+
+        let (status, first) = post_json(app.clone(), "/context/absorb", payload.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["written"], 1, "首轮应写入：{first}");
+
+        let (status, second) = post_json(app.clone(), "/context/absorb", payload).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["written"], 0, "重复轮次不得再写：{second}");
+        assert_eq!(second["skipped"], 1, "重复轮次应计入 skipped：{second}");
+        let items = second["items"].as_array().expect("items 应为数组");
+        assert_eq!(items[0]["reason"], "duplicate", "{second}");
+
+        let (_, list) = post_json(
+            app,
+            "/memories/list",
+            serde_json::json!({ "project": "demo" }),
+        )
+        .await;
+        assert_eq!(list["total"], 1, "库里应只有一条：{list}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 删除守卫：含删除语义的轮次整轮跳过，绝不复活已删除内容。
+    #[tokio::test]
+    async fn absorb_skips_turn_with_deletion_intent() {
+        let dir = temp_dir("ctx_absorb_delete");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, body) = post_json(
+            app,
+            "/context/absorb",
+            serde_json::json!({
+                "text": "[LRC]\n- decision: 已从记忆库删除旧结论，改为采用 RwLock",
+                "session_id": "sess-del",
+                "project": "demo",
+                "host": "trae"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["candidates"], 0, "删除守卫应整轮跳过：{body}");
+        assert_eq!(body["written"], 0, "{body}");
+        let dropped = body["dropped"].as_array().expect("dropped 应为数组");
+        assert!(
+            dropped.iter().any(|reason| reason == "deletion_guard"),
+            "应记录 deletion_guard：{body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 输入校验：text 与 items 都不给时 400；多租户缺 user_id 时 400。
+    #[tokio::test]
+    async fn absorb_rejects_empty_input_and_missing_scope() {
+        let dir = temp_dir("ctx_absorb_guard");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let local = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, body) = post_json(local, "/context/absorb", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "空输入应 400：{body}");
+        assert_eq!(body["error"], "invalid_input", "{body}");
+
+        let tenant = make_app(&dir_str, crate::privacy::TrustMode::MultiTenant);
+        let (status, body) = post_json(
+            tenant,
+            "/context/absorb",
+            serde_json::json!({ "text": "[LRC]\n- decision: 多租户缺 user_id 必须被拒" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "缺 scope 应 400：{body}");
+        assert_eq!(body["error"], "scope_required", "{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 模型输出了 `[LRC]` 但条目全被过滤时，禁止回退全文规则提炼。
+    #[tokio::test]
+    async fn absorb_does_not_fall_back_when_block_is_present() {
+        let dir = temp_dir("ctx_absorb_no_fallback");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        // 前半句能被规则提炼命中（"决定"）；若发生回退，会被写入 1 条。
+        let (status, body) = post_json(
+            app,
+            "/context/absorb",
+            serde_json::json!({
+                "text": "我们决定采用 RwLock，禁止在请求路径上 panic。\n[LRC]\n- 非法类型: 这条应被丢弃",
+                "session_id": "sess-nofb",
+                "project": "demo",
+                "host": "trae"
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["candidates"], 0,
+            "命中 [LRC] 后不得回退全文提炼：{body}"
+        );
+        assert_eq!(body["written"], 0, "{body}");
+        let dropped = body["dropped"].as_array().expect("dropped 应为数组");
+        assert!(
+            dropped.iter().any(|reason| reason
+                .as_str()
+                .unwrap_or("")
+                .starts_with("type_not_allowed")),
+            "应保留丢弃原因：{body}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// items 直传路径：同样打 auto-summary 标签，并同样受删除守卫约束。
+    #[tokio::test]
+    async fn absorb_items_path_tags_and_deletion_guard() {
+        let dir = temp_dir("ctx_absorb_items");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/context/absorb",
+            serde_json::json!({
+                "items": [{"type": "decision", "content": "采用 RwLock，读并发优先"}],
+                "session_id": "sess-items",
+                "project": "demo",
+                "host": "codex"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["written"], 1, "{body}");
+        assert_eq!(body["source"], "model_declared", "{body}");
+
+        let (_, list) = post_json(
+            app.clone(),
+            "/memories/list",
+            serde_json::json!({ "project": "demo" }),
+        )
+        .await;
+        let memory = &list["memories"][0];
+        let tags: Vec<&str> = memory["tags"]
+            .as_array()
+            .expect("tags 应为数组")
+            .iter()
+            .filter_map(|tag| tag.as_str())
+            .collect();
+        assert!(tags.contains(&"auto-summary"), "{memory}");
+        assert!(tags.contains(&"host:codex"), "{memory}");
+
+        // items 路径的删除守卫：不能因为没传 text 就绕过。
+        let (status, body) = post_json(
+            app.clone(),
+            "/context/absorb",
+            serde_json::json!({
+                "items": [{"type": "decision", "content": "已从记忆库删除旧结论，不要复活"}],
+                "session_id": "sess-items",
+                "project": "demo"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["candidates"], 0, "{body}");
+        assert_eq!(body["written"], 0, "{body}");
+
+        // items + text 同时传入：text 里的删除语义同样必须命中守卫。
+        let (status, body) = post_json(
+            app,
+            "/context/absorb",
+            serde_json::json!({
+                "text": "已从记忆库删除旧结论，本轮不要写入任何内容。",
+                "items": [{"type": "decision", "content": "采用 RwLock，读并发优先"}],
+                "session_id": "sess-items",
+                "project": "demo"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["candidates"], 0, "text 的删除语义不得漏判：{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 匿名轮次的跨轮去重：没有 session/user 时也必须能认出自己上一轮写的内容。
+    #[tokio::test]
+    async fn absorb_anonymous_dedupes_repeated_turn() {
+        let dir = temp_dir("ctx_absorb_anon_dedupe");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+        let payload = serde_json::json!({
+            "text": "[LRC]\n- decision: 采用 RwLock 保护记忆库读并发",
+            "project": "demo",
+            "host": "generic"
+        });
+
+        let (status, first) = post_json(app.clone(), "/context/absorb", payload.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["written"], 1, "首轮应写入：{first}");
+
+        let (status, second) = post_json(app.clone(), "/context/absorb", payload).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["written"], 0, "匿名轮次第二轮应识别为重复：{second}");
+        assert_eq!(second["skipped"], 1, "{second}");
+
+        let (_, list) = post_json(
+            app,
+            "/memories/list",
+            serde_json::json!({ "project": "demo" }),
+        )
+        .await;
+        assert_eq!(list["total"], 1, "库里应只有一条：{list}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 匿名轮次（无 user/session）不得合并进他人的 Session 级记忆。
+    #[tokio::test]
+    async fn absorb_anonymous_does_not_merge_into_session_memory() {
+        let dir = temp_dir("ctx_absorb_anon");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, created) = post_json(
+            app.clone(),
+            "/memories/remember",
+            serde_json::json!({
+                "content": "采用 RwLock，读并发优先",
+                "memory_type": "decision",
+                "importance": 5,
+                "privacy_level": "session",
+                "session_id": "sess-other",
+                "project": "demo"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        let session_memory_id = created["memory_id"].as_str().unwrap().to_string();
+
+        // 匿名 absorb：内容完全相同，但没有任何归属标识。
+        let (status, body) = post_json(
+            app.clone(),
+            "/context/absorb",
+            serde_json::json!({
+                "text": "[LRC]\n- decision: 采用 RwLock，读并发优先",
+                "project": "demo",
+                "host": "generic"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["written"], 1,
+            "匿名轮次必须新建，不得合并进他人 Session 记忆：{body}"
+        );
+
+        let (_, list) = post_json(
+            app,
+            "/memories/list",
+            serde_json::json!({ "project": "demo" }),
+        )
+        .await;
+        assert_eq!(list["total"], 2, "应存在两条独立记忆：{list}");
+        let memories = list["memories"].as_array().expect("memories 应为数组");
+        let original = memories
+            .iter()
+            .find(|memory| memory["id"] == session_memory_id.as_str())
+            .expect("原始 session 记忆应仍在");
+        let original_tags: Vec<&str> = original["tags"]
+            .as_array()
+            .expect("tags 应为数组")
+            .iter()
+            .filter_map(|tag| tag.as_str())
+            .collect();
+        assert!(
+            !original_tags.contains(&"auto-summary"),
+            "他人 Session 记忆不得被自动摘要合并：{original}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// B4 契约：无数据时诚实空态；有数据时字段齐全；多租户域仅管理员可读。
+    #[tokio::test]
+    async fn absorb_log_is_empty_then_reports_records_and_is_admin_only_in_multi_tenant() {
+        let dir = temp_dir("ctx_absorb_log");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, empty) = get_json(app.clone(), "/context/absorb/log").await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert_eq!(empty["total"], 0, "无数据必须诚实空态：{empty}");
+        assert!(
+            empty["records"]
+                .as_array()
+                .expect("records 应为数组")
+                .is_empty(),
+            "{empty}"
+        );
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/context/absorb",
+            serde_json::json!({
+                "text": "[LRC]\n- decision: B4 诊断日志必须记录计数",
+                "session_id": "sess-log",
+                "project": "demo",
+                "host": "trae"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["written"], 1, "{body}");
+
+        let (status, log) = get_json(app, "/context/absorb/log?limit=10").await;
+        assert_eq!(status, StatusCode::OK, "{log}");
+        assert_eq!(log["total"], 1, "{log}");
+        let record = &log["records"][0];
+        for key in [
+            "ts_ms",
+            "host",
+            "source",
+            "candidates",
+            "written",
+            "skipped",
+            "failed",
+            "elapsed_ms",
+            "dry_run",
+        ] {
+            assert!(
+                record.get(key).is_some(),
+                "诊断记录缺少字段 {key}: {record}"
+            );
+        }
+        assert_eq!(record["host"], "trae", "{record}");
+        assert_eq!(record["written"], 1, "{record}");
+
+        // 多租户域：诊断日志含会话标识，仅管理员可读
+        let mt_dir = temp_dir("ctx_absorb_log_mt");
+        let mt_app = make_app(
+            mt_dir.to_str().unwrap(),
+            crate::privacy::TrustMode::MultiTenant,
+        );
+        let (status, denied) = get_json(mt_app, "/context/absorb/log").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        assert_eq!(denied["error"], "admin_only", "{denied}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&mt_dir);
+    }
+    /// C6：近重复报告必须返回组；多租户域仅管理员可读。
+    #[tokio::test]
+    async fn duplicates_endpoint_reports_groups_and_is_admin_only() {
+        use crate::persistence::Persistence;
+
+        let dir = temp_dir("ctx_duplicates");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let (app, shared) = make_app_with_shared(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+        {
+            let store = shared.write().await;
+            for (id, content) in [
+                (
+                    "dup-a",
+                    "数据库连接池的最大连接数应设为 CPU 核数的两倍，并在生产环境开启连接复用与超时回收",
+                ),
+                (
+                    "dup-b",
+                    "数据库连接池的最大连接数应设为 CPU 核数的两倍，并在生产环境开启连接复用与超时回收。",
+                ),
+                ("other", "今天天气不错，适合出门散步"),
+            ] {
+                let mut memory = crate::memory_types::Memory::new(
+                    content.to_string(),
+                    crate::memory_types::MemoryType::Fact,
+                    None,
+                    vec![],
+                    crate::memory_types::Importance::new(5),
+                    None,
+                );
+                memory.id = id.to_string();
+                store.persistence().save_memory(&memory).expect("播种");
+            }
+        }
+
+        let (status, body) =
+            get_json(app.clone(), "/memories/duplicates?threshold=0.85&limit=10").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 3, "{body}");
+        assert_eq!(
+            body["groups"].as_array().expect("groups").len(),
+            1,
+            "应只发现一对近重复: {body}"
+        );
+        let ids = body["groups"][0]["memory_ids"]
+            .as_array()
+            .expect("memory_ids");
+        assert!(ids.iter().any(|value| value == "dup-a"), "{body}");
+        assert!(ids.iter().any(|value| value == "dup-b"), "{body}");
+
+        // 参数校验（v0.11.1 审查 P2）：NaN / Infinity 能通过 f32 解析，
+        // 但 NaN 参与比较恒为 false，会让桶内任意两条都被判成近重复。
+        for bad in ["NaN", "inf", "0.1", "1.5"] {
+            let (status, invalid) = get_json(
+                app.clone(),
+                &format!("/memories/duplicates?threshold={bad}"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "threshold={bad} 应拒绝: {invalid}"
+            );
+        }
+
+        let mt_dir = temp_dir("ctx_duplicates_mt");
+        let mt_app = make_app(
+            mt_dir.to_str().unwrap(),
+            crate::privacy::TrustMode::MultiTenant,
+        );
+        let (status, denied) = get_json(mt_app, "/memories/duplicates").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        assert_eq!(denied["error"], "admin_only", "{denied}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&mt_dir);
+    }
+
+    /// C6：按标签归档——dry_run 不改库、真实归档后列表为空；多租户域 403。
+    #[tokio::test]
+    async fn archive_by_tag_endpoint_dry_run_then_archives() {
+        let dir = temp_dir("ctx_archive_tag");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/context/absorb",
+            serde_json::json!({
+                "items": [
+                    {"type": "decision", "content": "自动摘要归档测试一：采用方案 A"},
+                    {"type": "decision", "content": "自动摘要归档测试二：采用方案 B"}
+                ],
+                "host": "test"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["written"], 2, "{body}");
+
+        let (status, dry) = post_json(
+            app.clone(),
+            "/memories/archive-by-tag",
+            serde_json::json!({ "tag": "auto-summary", "dry_run": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{dry}");
+        assert_eq!(dry["matched"], 2, "{dry}");
+        assert_eq!(dry["archived"], 0, "dry-run 不得归档: {dry}");
+        let (_, list) = post_json(app.clone(), "/memories/list", serde_json::json!({})).await;
+        assert_eq!(list["total"], 2, "dry-run 后应仍有 2 条: {list}");
+
+        // 参数校验（v0.11.1 审查 P1）：类型不对必须 400，
+        // 不能静默当成"不限量/不限时间"而把整批记忆归档。
+        for bad in [
+            serde_json::json!({ "tag": "auto-summary", "limit": -1 }),
+            serde_json::json!({ "tag": "auto-summary", "older_than_days": "7" }),
+            serde_json::json!({ "tag": "auto-summary", "dry_run": "true" }),
+        ] {
+            let (status, invalid) =
+                post_json(app.clone(), "/memories/archive-by-tag", bad.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "应拒绝非法参数 {bad}: {invalid}"
+            );
+        }
+        let (_, still) = post_json(app.clone(), "/memories/list", serde_json::json!({})).await;
+        assert_eq!(still["total"], 2, "非法参数不得改动库: {still}");
+
+        let (status, done) = post_json(
+            app.clone(),
+            "/memories/archive-by-tag",
+            serde_json::json!({ "tag": "auto-summary" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{done}");
+        assert_eq!(done["archived"], 2, "{done}");
+        let (_, list) = post_json(app, "/memories/list", serde_json::json!({})).await;
+        assert_eq!(list["total"], 0, "归档后活跃库应为空: {list}");
+
+        let mt_dir = temp_dir("ctx_archive_tag_mt");
+        let mt_app = make_app(
+            mt_dir.to_str().unwrap(),
+            crate::privacy::TrustMode::MultiTenant,
+        );
+        let (status, denied) = post_json(
+            mt_app,
+            "/memories/archive-by-tag",
+            serde_json::json!({ "tag": "auto-summary" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&mt_dir);
+    }
+
+    /// 列表类型过滤：`memory_type` 必须生效；非法类型必须 400。
+    #[tokio::test]
+    async fn list_filters_by_memory_type_and_rejects_unknown() {
+        let dir = temp_dir("list_type_filter");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        for (content, memory_type) in [("事实一条", "fact"), ("偏好一条", "preference")] {
+            let (status, body) = post_json(
+                app.clone(),
+                "/memories/remember",
+                serde_json::json!({
+                    "content": content,
+                    "memory_type": memory_type,
+                    "importance": 5
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/list",
+            serde_json::json!({ "memory_type": "preference" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 1, "只应返回 preference：{body}");
+        let memories = body["memories"].as_array().expect("memories 应为数组");
+        assert_eq!(memories[0]["memory_type"], "preference", "{body}");
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/memories/list",
+            serde_json::json!({ "memory_type": "not_a_type" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "非法类型应 400：{body}");
+        assert_eq!(body["error"], "invalid_memory_type", "{body}");
+
+        // 兼容既有调用方：`all` / `*` 视为不过滤。
+        let (status, body) = post_json(
+            app,
+            "/memories/list",
+            serde_json::json!({ "memory_type": "all" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["total"], 2, "`all` 应返回全部：{body}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// /backup 的参数校验：非法 mode / 非法 JSON 都必须 400，且不创建快照。
+    #[tokio::test]
+    async fn backup_rejects_invalid_mode_and_body() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+
+        let dir = temp_dir("backup_api_guard");
+        let dir_str = dir.to_str().unwrap().to_string();
+        let app = make_app(&dir_str, crate::privacy::TrustMode::LocalTrusted);
+
+        let (status, body) = post_json(
+            app.clone(),
+            "/backup",
+            serde_json::json!({ "mode": "nope" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_mode", "{body}");
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/backup")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("{"))
+            .unwrap();
+        let response = app.into_service().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_body", "{body}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

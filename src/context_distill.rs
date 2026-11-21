@@ -147,6 +147,40 @@ const CONVENTION_WORDS: &[&str] = &[
 /// 其它信号才能过阈值，避免把普通技术句大量收进记忆库。
 const WEAK_CONVENTION_WORDS: &[&str] = &["必须", "应当", "must", "always"];
 
+/// 偏好词：用户明确表达"我更喜欢 / 我习惯 / 优先用"。
+///
+/// 与约束词（否定式）互补：约束记"不要什么"，偏好记"更想要什么"。
+/// 只收**用法导向**的多字短语，避免裸"喜欢"把过程叙述里的
+/// "喜欢这个设计"误收成长期偏好。
+const PREFERENCE_WORDS: &[&str] = &[
+    "我喜欢用",
+    "我更喜欢用",
+    "我偏好用",
+    "我习惯用",
+    "我通常用",
+    "我一般用",
+    "我平时用",
+    "我常用",
+    "我习惯",
+    "我偏好",
+    "更喜欢用",
+    "优先用",
+    "倾向于用",
+    "宁愿用",
+    "偏爱",
+    "i prefer",
+    "i usually",
+    "i tend to",
+    "i like to use",
+    "favorite",
+];
+
+/// 一次性语境标记：出现这些词说明句子在描述"这一次"，不是长期习惯。
+///
+/// 处理策略：命中时**不把偏好词计入偏好分类**（宁可漏，不可把一次性选择
+/// 固化成长期偏好）。句子仍可凭决策/约束/结论词按其它类型入库。
+const ONE_OFF_MARKERS: &[&str] = &["这次", "本次", "此次", "今天", "临时", "下次"];
+
 /// 否定约束词：出现即说明"这条路被排除了"。
 ///
 /// 代码场景里 `Don't` / `shouldn't` / `never` 常单独出现（不带 `use`），
@@ -165,6 +199,9 @@ const NEGATION_WORDS: &[&str] = &[
     "放弃",
     "不允许",
     "不再",
+    "不优先用",
+    "不偏爱",
+    "不倾向于",
     "杜绝",
     "don't",
     "do not",
@@ -427,6 +464,8 @@ pub fn build_index_line(items: &[DistilledItem], project: &str) -> String {
 enum Kind {
     Decision,
     Constraint,
+    /// 正向偏好（"我喜欢用 pnpm"），与约束（"不要用 npm"）互补
+    Preference,
     Conclusion,
     CodeContext,
     /// 客观事实（含「过程叙述冒充结论」被降级的条目）
@@ -440,6 +479,7 @@ impl Kind {
         match self {
             Kind::Decision => "决策",
             Kind::Constraint => "约束",
+            Kind::Preference => "偏好",
             Kind::Conclusion => "结论",
             Kind::CodeContext => "代码",
             Kind::Fact => "事实",
@@ -451,6 +491,7 @@ impl Kind {
         match self {
             Kind::Decision => "decision",
             Kind::Constraint => "constraint",
+            Kind::Preference => "preference",
             Kind::Conclusion => "conclusion",
             Kind::CodeContext => "code",
             Kind::Fact => "fact",
@@ -462,6 +503,7 @@ impl Kind {
         match self {
             Kind::Decision => "decision",
             Kind::Constraint => "preference",
+            Kind::Preference => "preference",
             Kind::Conclusion => "fact",
             Kind::CodeContext => "code_context",
             Kind::Fact => "fact",
@@ -615,6 +657,7 @@ fn explicit_kind(sentence: &str) -> Option<Kind> {
         ("决策", Kind::Decision),
         ("决定", Kind::Decision),
         ("约束", Kind::Constraint),
+        ("偏好", Kind::Preference),
         ("结论是", Kind::Conclusion),
         ("结论", Kind::Conclusion),
     ] {
@@ -635,9 +678,11 @@ fn explicit_kind(sentence: &str) -> Option<Kind> {
 
 /// 打分并判定类别。
 ///
-/// 类别优先级：决策 > 约束 > 结论 > 代码。
+/// 类别优先级：决策 > 约束 > 偏好 > 结论 > 代码。
 /// 理由：一句话同时含"决定"和"所以"时，它首先是决策，结论只是修饰；
 /// 含"结论是"又带文件路径时，它是结论（路径只是细节）。
+/// **约束优先于偏好**：`不要优先用 npm` / `必须优先用 pnpm` 含偏好词，
+/// 但语义是否定或强制约定，必须按约束记，否则偏好检索会把禁令当成偏好。
 fn score_sentence(sentence: &str) -> (f32, Kind) {
     // 行首显式声明优先：作者已经标了类别，不再靠关键词猜。
     // 固定给 3.0（高于阈值 2.0），避免"结论：…"因为只有一个结论词被挡掉。
@@ -649,6 +694,18 @@ fn score_sentence(sentence: &str) -> (f32, Kind) {
     let decision_hits = count_hits(&lower, DECISION_WORDS);
     let convention_hits = count_hits(&lower, CONVENTION_WORDS);
     let weak_convention_hits = count_hits(&lower, WEAK_CONVENTION_WORDS);
+    let preference_hits = if ONE_OFF_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        // 混合句按分句判定：只统计**不含一次性标记**的分句里的偏好词。
+        // 例：「我平时用 pnpm，这次临时改用 npm」仍保留长期偏好；
+        //     「这次用 8 线程，下次再调」所有分句都是一次性 ⇒ 0 分。
+        lower
+            .split(['，', '。', '；', ',', ';', '但'])
+            .filter(|clause| !ONE_OFF_MARKERS.iter().any(|marker| clause.contains(marker)))
+            .map(|clause| count_hits(clause, PREFERENCE_WORDS))
+            .sum()
+    } else {
+        count_hits(&lower, PREFERENCE_WORDS)
+    };
     let negation_hits = count_hits(&lower, NEGATION_WORDS);
     let conclusion_hits = count_hits(&lower, CONCLUSION_WORDS);
     let proper_hits = count_proper_nouns(sentence);
@@ -659,6 +716,8 @@ fn score_sentence(sentence: &str) -> (f32, Kind) {
     score += 2.0 * convention_hits as f32;
     // 弱约定词降权：单独出现不足以过阈值（见 WEAK_CONVENTION_WORDS 文档）
     score += 1.0 * weak_convention_hits as f32;
+    // 正向偏好与否定约束同权：一句"我喜欢用 pnpm"就应能独立过阈值
+    score += 2.0 * preference_hits as f32;
     score += 2.0 * negation_hits as f32;
     score += 1.0 * conclusion_hits as f32;
     score += 1.0 * proper_hits as f32;
@@ -669,7 +728,10 @@ fn score_sentence(sentence: &str) -> (f32, Kind) {
     let kind = if decision_hits > 0 {
         Kind::Decision
     } else if negation_hits > 0 || convention_hits > 0 || weak_convention_hits > 0 {
+        // 否定/强制约定优先于正向偏好：`不要优先用 npm` 是约束，不是偏好。
         Kind::Constraint
+    } else if preference_hits > 0 {
+        Kind::Preference
     } else if conclusion_hits > 0 {
         Kind::Conclusion
     } else {
@@ -982,6 +1044,73 @@ mod tests {
         assert_eq!(items.len(), 1, "应产出 1 条，实际 {:?}", items);
         assert_eq!(items[0].memory_type, "preference");
         assert!(items[0].content.starts_with("[约束]"));
+    }
+
+    /// 正向偏好：应识别为 preference，且标签是 preference 而不是 constraint。
+    #[test]
+    fn distills_positive_preference() {
+        for text in [
+            "我喜欢用 pnpm 作为包管理器。",
+            "我习惯用 3111 做测试，3099 保持生产。",
+            "I prefer to keep the cache local.",
+            "提交前优先用 cargo fmt。",
+        ] {
+            let items = distill_transcript(text, &cfg());
+            assert_eq!(items.len(), 1, "正向偏好应产出：{:?} -> {:?}", text, items);
+            assert_eq!(items[0].memory_type, "preference", "输入 {:?}", text);
+            assert!(
+                items[0].tags.iter().any(|t| t == "preference"),
+                "输入 {:?} 的 tags 应含 preference：{:?}",
+                text,
+                items[0].tags
+            );
+            assert!(
+                !items[0].tags.iter().any(|t| t == "constraint"),
+                "正向偏好不应打 constraint 标签：{:?}",
+                items[0]
+            );
+        }
+    }
+
+    /// 否定/强制约定优先于偏好：含偏好词也不能标成正向偏好。
+    #[test]
+    fn negation_and_convention_override_preference() {
+        for text in ["不要优先用 npm。", "必须优先用 pnpm。", "不优先用 npm。"] {
+            let items = distill_transcript(text, &cfg());
+            assert_eq!(items.len(), 1, "{text} -> {items:?}");
+            assert_eq!(items[0].memory_type, "preference", "{text}");
+            assert!(
+                items[0].tags.iter().any(|t| t == "constraint"),
+                "{text} 应打 constraint 标签：{:?}",
+                items[0].tags
+            );
+            assert!(
+                !items[0].tags.iter().any(|t| t == "preference"),
+                "{text} 不应打 preference 标签：{:?}",
+                items[0].tags
+            );
+        }
+
+        // 否定习惯 / 全一次性叙述不得当成长期偏好。
+        for text in ["我不习惯用 npm。", "这次用 8 线程，下次再调。"] {
+            let items = distill_transcript(text, &cfg());
+            assert!(
+                items
+                    .iter()
+                    .all(|item| !item.tags.iter().any(|t| t == "preference")),
+                "{text} -> {items:?}"
+            );
+        }
+
+        // 混合句：一次性分句被排除，但长期偏好分句仍应保留。
+        // 刻意不含"改用/决定"等决策词，避免被更高的决策优先级接管。
+        let mixed = distill_transcript("我平时用 pnpm，这次临时用 npm。", &cfg());
+        assert!(
+            mixed
+                .iter()
+                .any(|item| item.tags.iter().any(|t| t == "preference")),
+            "混合句应保留长期偏好：{mixed:?}"
+        );
     }
 
     /// 单条完整禁令（无其他信号）必须能独立过阈值。

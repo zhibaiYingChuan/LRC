@@ -464,12 +464,7 @@ type ArtifactExtractCache = std::collections::HashMap<String, (u64, std::sync::A
 /// 逐路径挂钩必然漏（漏一处即产生"用旧正文算出的 artifact 关联"这种静默错误）。
 /// 指纹校验把正确性收敛到"内容相同 ⇒ 复用"，与哪条路径改的无关。
 fn artifact_content_hash(text: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
+    fnv1a(0, text.as_bytes())
 }
 
 /// 单次遍历构建 artifact 两张表（并复用 `cache` 中"正文未变"的抽取结果）
@@ -859,9 +854,9 @@ pub(crate) fn is_record_edge_type(rel: &str) -> bool {
 /// 在此重导出以保持 `crate::memory_store::Xxx` 既有路径与
 /// `use crate::memory_store::*` 调用方**零改动**。
 pub use crate::memory_store_types::{
-    AssociatedMemory, AssociationGraph, GraphEdge, GraphNode, ListFilter, MemoryAssociation,
-    MemoryStats, RecallFilter, RecallResult, RegulatorHeartbeat, SortBy, SortOrder, StoredEdge,
-    SynthesisSnapshot,
+    ArchiveByTagReport, AssociatedMemory, AssociationGraph, DuplicateGroup, DuplicateReport,
+    GraphEdge, GraphNode, ListFilter, MemoryAssociation, MemoryStats, RecallFilter, RecallResult,
+    RegulatorHeartbeat, SortBy, SortOrder, StoredEdge, SynthesisSnapshot,
 };
 
 /// 批量编码（**纯函数 / 无泛型**，可在存储锁之外调用）：记忆文本 → 洛书向量。
@@ -899,6 +894,42 @@ pub fn encode_luoshu_batch(
         }
     }
     vecs
+}
+
+/// FNV-1a 64 位哈希（带种子）：MinHash 用，零依赖、跨平台稳定。
+fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+/// 字符二元组集合的 Jaccard 相似度（近重复报告用）。
+fn jaccard_sets(
+    left: &std::collections::HashSet<String>,
+    right: &std::collections::HashSet<String>,
+) -> f32 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    let inter = left.intersection(right).count() as f32;
+    let union = left.union(right).count() as f32;
+    if union == 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+/// 并查集查找（路径压缩）。
+fn dsu_find(parent: &mut [usize], mut index: usize) -> usize {
+    while parent[index] != index {
+        parent[index] = parent[parent[index]];
+        index = parent[index];
+    }
+    index
 }
 
 pub struct MemoryStore<P: Persistence> {
@@ -1782,9 +1813,13 @@ pub(crate) fn is_visible(memory: &Memory, context: &Option<PrivacyScope>) -> boo
             match memory.privacy_level {
                 PrivacyLevel::Global => true,
                 PrivacyLevel::User => {
-                    // User 级别：需要匹配 user_id
+                    // User 级别：需要匹配 user_id。
+                    // `(None, None)` 表示"匿名上下文 ↔ 匿名记忆"：二者都没有
+                    // user_id，语义上属于同一匿名域，允许互相合并去重。
+                    // 多租户域不会走到这里（请求必须带 user_id），不存在跨租户风险。
                     match (user_id, &memory.user_id) {
                         (Some(uid), Some(mid)) => uid == mid,
+                        (None, None) => true,
                         _ => false,
                     }
                 }
@@ -1813,6 +1848,52 @@ pub(crate) fn is_visible(memory: &Memory, context: &Option<PrivacyScope>) -> boo
             }
         }
     }
+}
+
+/// 查询是否在问"偏好"。
+///
+/// 只影响**加分**，不做硬过滤：命中偏好问法时给 `preference` 类型 +0.25，
+/// 避免因为库里暂时没有 preference 记忆而返回空结果。
+fn is_preference_query(query_lower: &str) -> bool {
+    // 否定问法不算偏好意图："我不喜欢什么" 更像排除/对比查询，
+    // 给 preference 类型加分会把结果拉向无关条目。
+    const NEGATED: &[&str] = &[
+        "不喜欢",
+        "不常用",
+        "不习惯",
+        "不偏好",
+        "不优先用",
+        "不偏爱",
+        "不倾向于",
+        "not prefer",
+        "don't like",
+        "do not like",
+    ];
+    const CUES: &[&str] = &[
+        "偏好",
+        "prefer",
+        "喜欢",
+        "习惯",
+        "常用",
+        "倾向",
+        "偏爱",
+        "平时用",
+        "通常用",
+        "一般用",
+        "优先用",
+        "usually",
+        "tend to",
+    ];
+    // 按分句判定：`不喜欢 A 但喜欢 B` 仍应识别为偏好意图；
+    // 纯否定问法（单分句且被否定）返回 false。
+    query_lower
+        .split(['，', '。', '；', ',', ';', '？', '?', '但'])
+        .any(|clause| {
+            if NEGATED.iter().any(|cue| clause.contains(cue)) {
+                return false;
+            }
+            CUES.iter().any(|cue| clause.contains(cue))
+        })
 }
 
 /// 写入去重（`remember` 相似合并）所用的 Jaccard 相似度阈值。
@@ -2184,6 +2265,8 @@ pub struct RememberAnalysisData {
     luoshu_vec: LuoShuVector,
     encoded_content: String,
     snapshot_version: u64,
+    /// 本次写入使用的相似合并阈值（提交侧并发重检必须沿用，不能回落到全局默认）
+    threshold: f32,
     privacy: Option<PrivacyScope>,
     started_at: std::time::Instant,
     mem_type_str: String,
@@ -2202,57 +2285,95 @@ impl RememberAnalysis {
             RememberAnalysis::Ready(data) => data.similar.is_some(),
         }
     }
+
+    /// 是否为 `LRC_DISABLE_MEMORY` 对照实验的空操作。
+    ///
+    /// 调用方据此**不得**把本条计入 `written`——NoOp 不会落盘
+    /// （见 `commit_remember` 的 NoOp 分支直接返回）。
+    pub fn is_noop(&self) -> bool {
+        matches!(self, RememberAnalysis::NoOp(_))
+    }
 }
 
 impl RememberPrep {
+    /// 是否为 `LRC_DISABLE_MEMORY` 对照实验的空操作。
+    ///
+    /// 调用方据此可跳过昂贵的批量编码（NoOp 不会落盘，编码结果也无处使用）。
+    pub fn is_noop(&self) -> bool {
+        matches!(self, RememberPrep::NoOp(_))
+    }
+
     /// 阶段 2：**锁外**执行编码与候选扫描（纯 CPU，不触碰存储）
     pub fn analyze(self) -> RememberAnalysis {
         match self {
             RememberPrep::NoOp(memory) => RememberAnalysis::NoOp(memory),
             RememberPrep::Ready(data) => {
                 let data = *data;
-                let similarity_start = std::time::Instant::now();
                 // v0.10.4（P0）：同一段文本只编码一次。
                 // 修前此处对 `data.memory.content` 调了两次 `encode_text`——
                 // 一次算八卦（桶路由），一次算洛书向量（落盘字段）。输入与函数完全相同，
                 // 纯属重复计算；ML 编码器下单条写入因此白花一倍时间。
                 let luoshu_vec = data.encoder.encode_text(&data.memory.content);
-                let query_bagua = data
-                    .buckets
-                    .as_ref()
-                    .map(|_| mirror_project(&luoshu_vec).best_index % 8);
-                let similar = scan_candidates(
-                    &data.snapshot,
-                    &data.candidates,
-                    &data.query_terms,
-                    data.threshold,
-                    &data.privacy,
-                    data.buckets.as_deref(),
-                    query_bagua,
-                    data.scope_project.as_deref(),
-                    Some(&data.cached_terms),
-                );
-                if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
-                    eprintln!(
-                        "[LRC_PROFILING] remember similarity_lookup_ms={:.3} found={}",
-                        similarity_start.elapsed().as_secs_f64() * 1000.0,
-                        similar.is_some()
-                    );
-                }
-                RememberAnalysis::Ready(Box::new(RememberAnalysisData {
-                    encoded_content: data.memory.content.clone(),
-                    memory: data.memory,
-                    similar,
-                    luoshu_vec,
-                    snapshot_version: data.snapshot_version,
-                    privacy: data.privacy,
-                    started_at: data.started_at,
-                    mem_type_str: data.mem_type_str,
-                    mem_importance: data.mem_importance,
-                    mem_tags: data.mem_tags,
-                }))
+                Self::analyze_ready(data, luoshu_vec)
             }
         }
+    }
+
+    /// 阶段 2（**预编码变体**）：用调用方批量算好的洛书向量，跳过逐条 `encode_text`。
+    ///
+    /// # 契约
+    ///
+    /// `luoshu_vec` 必须由**同一编码器、同一角色（`Passage`）** 对
+    /// `memory.content` 编码得到。批量编码与逐条编码的输出逐位一致
+    /// （见 `HybridLuoShuEncoder::encode_text_batch` 文档），因此本入口
+    /// **不改变任何写入语义**，只把固定开销从 N 次前向摊薄为 1 次。
+    ///
+    /// `RememberPrep::NoOp`（`LRC_DISABLE_MEMORY` 对照实验）忽略该参数。
+    pub fn analyze_with_luoshu(self, luoshu_vec: LuoShuVector) -> RememberAnalysis {
+        match self {
+            RememberPrep::NoOp(memory) => RememberAnalysis::NoOp(memory),
+            RememberPrep::Ready(data) => Self::analyze_ready(*data, luoshu_vec),
+        }
+    }
+
+    /// `analyze` 与 `analyze_with_luoshu` 的公共后半段（候选扫描 + 产物组装）。
+    fn analyze_ready(data: RememberPrepData, luoshu_vec: LuoShuVector) -> RememberAnalysis {
+        let similarity_start = std::time::Instant::now();
+        let query_bagua = data
+            .buckets
+            .as_ref()
+            .map(|_| mirror_project(&luoshu_vec).best_index % 8);
+        let similar = scan_candidates(
+            &data.snapshot,
+            &data.candidates,
+            &data.query_terms,
+            data.threshold,
+            &data.privacy,
+            data.buckets.as_deref(),
+            query_bagua,
+            data.scope_project.as_deref(),
+            Some(&data.cached_terms),
+        );
+        if std::env::var_os("LRC_PROFILE_REMEMBER").is_some() {
+            eprintln!(
+                "[LRC_PROFILING] remember similarity_lookup_ms={:.3} found={}",
+                similarity_start.elapsed().as_secs_f64() * 1000.0,
+                similar.is_some()
+            );
+        }
+        RememberAnalysis::Ready(Box::new(RememberAnalysisData {
+            encoded_content: data.memory.content.clone(),
+            memory: data.memory,
+            similar,
+            luoshu_vec,
+            snapshot_version: data.snapshot_version,
+            threshold: data.threshold,
+            privacy: data.privacy,
+            started_at: data.started_at,
+            mem_type_str: data.mem_type_str,
+            mem_importance: data.mem_importance,
+            mem_tags: data.mem_tags,
+        }))
     }
 }
 
@@ -3639,7 +3760,13 @@ impl<P: Persistence> MemoryStore<P> {
         privacy_context: &Option<(PrivacyLevel, Option<String>, Option<String>)>,
     ) -> Result<Option<Memory>, PersistenceError> {
         let all = self.load_cached()?;
-        Ok(self.find_similar_in_snapshot(&all, content, scope, privacy_context))
+        Ok(self.find_similar_in_snapshot(
+            &all,
+            content,
+            scope,
+            privacy_context,
+            self.similarity_threshold,
+        ))
     }
 
     /// 在**给定快照**上做相似检查（不触发 `load_cached` 的指纹重载）。
@@ -3657,6 +3784,7 @@ impl<P: Persistence> MemoryStore<P> {
         content: &str,
         scope: Option<&Memory>,
         privacy_context: &Option<(PrivacyLevel, Option<String>, Option<String>)>,
+        threshold: f32,
     ) -> Option<Memory> {
         // P3：查询侧集合只算一次（全库扫描时不再重复 lowercase + 建集合）
         let query_jaccard_terms = JaccardTerms::new(content);
@@ -3676,7 +3804,7 @@ impl<P: Persistence> MemoryStore<P> {
             all,
             &candidates,
             &query_jaccard_terms,
-            self.similarity_threshold,
+            threshold,
             privacy_context,
             buckets.as_deref(),
             query_bagua,
@@ -5051,10 +5179,51 @@ impl<P: Persistence> MemoryStore<P> {
     /// 调用方应在释放存储锁后调用 [`RememberPrep::analyze`]，
     /// 再重新取锁调用 [`Self::commit_remember`]。
     pub fn prepare_remember(&self, memory: Memory) -> Result<RememberPrep, PersistenceError> {
+        self.prepare_remember_with_threshold(memory, self.similarity_threshold)
+    }
+
+    /// 与 [`Self::prepare_remember`] 相同，但**显式指定相似合并阈值**。
+    ///
+    /// 供 `/v1/context/absorb` 使用：自动沉淀必须用更高的阈值（0.85），
+    /// 避免把用户显式写入的高价值记忆按默认 0.5 合并掉。
+    pub fn prepare_remember_with_threshold(
+        &self,
+        memory: Memory,
+        threshold: f32,
+    ) -> Result<RememberPrep, PersistenceError> {
+        // 隐私隔离：从待写入记忆自身派生隐私上下文，相似检查只合并
+        // 对当前上下文可见的记忆，避免跨 session/user 污染。
+        // 注意：仅当记忆携带真实归属标识（session_id/user_id）时才启用过滤——
+        // 无标识的匿名记忆（含默认 User 级但未设 user_id）保持既有合并行为，
+        // 避免默认配置下自动合并功能被隐私过滤意外禁用（回归）。
+        let privacy = if memory.session_id.is_none() && memory.user_id.is_none() {
+            None
+        } else {
+            Some((
+                memory.privacy_level,
+                memory.session_id.clone(),
+                memory.user_id.clone(),
+            ))
+        };
+        self.prepare_remember_with_privacy(memory, threshold, privacy)
+    }
+
+    /// 与 [`Self::prepare_remember_with_threshold`] 相同，但**显式指定隐私上下文**。
+    ///
+    /// 供 `/v1/context/absorb` 的匿名轮次使用：无 `user_id`/`session_id` 时
+    /// 必须传 `Some((User, None, None))`，否则 `is_visible` 恒真，
+    /// 自动摘要可能合并进他人的 Session/User 级记忆。
+    pub fn prepare_remember_with_privacy(
+        &self,
+        memory: Memory,
+        threshold: f32,
+        privacy: Option<PrivacyScope>,
+    ) -> Result<RememberPrep, PersistenceError> {
         let started_at = std::time::Instant::now();
         let mem_type_str = memory.memory_type.as_str().to_string();
         let mem_importance = memory.importance.value();
         let mem_tags = memory.tags.clone();
+        let threshold = threshold.clamp(0.0, 1.0);
 
         // v0.6.0+ 参赛扩展：基线 A（zero_memory）支持
         // 当 --disable-memory 启用时，remember 直接返回原始记忆但不持久化
@@ -5072,20 +5241,6 @@ impl<P: Persistence> MemoryStore<P> {
             return Ok(RememberPrep::NoOp(Box::new(no_op_memory)));
         }
 
-        // 隐私隔离：从待写入记忆自身派生隐私上下文，相似检查只合并
-        // 对当前上下文可见的记忆，避免跨 session/user 污染。
-        // 注意：仅当记忆携带真实归属标识（session_id/user_id）时才启用过滤——
-        // 无标识的匿名记忆（含默认 User 级但未设 user_id）保持既有合并行为，
-        // 避免默认配置下自动合并功能被隐私过滤意外禁用（回归）。
-        let privacy = if memory.session_id.is_none() && memory.user_id.is_none() {
-            None
-        } else {
-            Some((
-                memory.privacy_level,
-                memory.session_id.clone(),
-                memory.user_id.clone(),
-            ))
-        };
         let snapshot = self.load_cached()?;
         let domain_index = Self::domain_index_enabled();
         let scope_project = if domain_index {
@@ -5121,7 +5276,7 @@ impl<P: Persistence> MemoryStore<P> {
             memory,
             snapshot: subset,
             candidates,
-            threshold: self.similarity_threshold,
+            threshold,
             privacy,
             buckets,
             scope_project,
@@ -5148,6 +5303,7 @@ impl<P: Persistence> MemoryStore<P> {
             luoshu_vec,
             encoded_content,
             snapshot_version,
+            threshold,
             privacy,
             started_at,
             mem_type_str,
@@ -5174,7 +5330,9 @@ impl<P: Persistence> MemoryStore<P> {
             //   `load_cached()` 会整库重解析 25MB（实测 commit P50 650ms、P99 90s）。
             //   写路径已持外层写锁，`cache.snapshot()` 即最新一致视图。
             let all = self.cache.snapshot();
-            self.find_similar_in_snapshot(&all, &memory.content, scope, &privacy)
+            // 必须沿用本次写入的阈值：absorb 用 0.85，若这里回落到全局默认 0.5，
+            // 并发写入时会把自动摘要合并进用户显式记忆。
+            self.find_similar_in_snapshot(&all, &memory.content, scope, &privacy, threshold)
         } else {
             analyzed_similar
         };
@@ -6748,6 +6906,8 @@ impl<P: Persistence> MemoryStore<P> {
         // v0.5.4 P1-9 修复：使用智能分词替代 split_whitespace()
         // 对中文文本使用 bigram 分词，解决中文检索精度问题
         let query_lower = query.to_lowercase();
+        // 偏好问法：命中时只做类型加分（+0.25），不硬过滤。
+        let preference_intent = is_preference_query(&query_lower);
         let query_words: Vec<String> = tokenize_query(query);
 
         // LRC 内置道体状态机·联想导航（查询扩展）：
@@ -7161,14 +7321,20 @@ impl<P: Persistence> MemoryStore<P> {
                         }
 
                         // 类型匹配加权
-                        if (query_lower.contains("偏好") || query_lower.contains("prefer"))
+                        //
+                        // 偏好问法只做**软加权**，且必须要求该记忆与原查询有词面
+                        // 重叠（`original_overlap > 0`）：否则零命中的 preference
+                        // 记忆会被整体抬升，挤掉真正相关的条目。
+                        if preference_intent
+                            && original_overlap > 0
                             && m.memory_type == MemoryType::Preference
                         {
-                            score += 0.2;
+                            score += 0.25;
                         }
                         if (query_lower.contains("决定")
                             || query_lower.contains("选择")
                             || query_lower.contains("decision"))
+                            && original_overlap > 0
                             && m.memory_type == MemoryType::Decision
                         {
                             score += 0.2;
@@ -10139,18 +10305,81 @@ impl<P: Persistence> MemoryStore<P> {
         }
 
         let count = expired.len();
+        self.archive_selected(expired, format!("归档 {} 条过期记忆到冷存储", count))?;
+        Ok(count)
+    }
 
-        // 归档过期记忆到冷存储
-        self.persistence.add_to_archive(&expired)?;
+    /// 按标签批量归档（v0.11.1 / C6）。
+    ///
+    /// - `tag`：目标标签（如 `auto-summary`）
+    /// - `older_than_days`：只归档创建时间早于 N 天的记忆（`None` = 不限）
+    /// - `limit`：最多处理条数（`0` = 不限；按 `created_at` 从旧到新）
+    /// - `dry_run`：只返回命中清单，不实际归档
+    ///
+    /// 归档是**可恢复**的生命周期迁移（`unarchive` 可找回），不是删除。
+    pub fn archive_by_tag(
+        &self,
+        tag: &str,
+        older_than_days: Option<u64>,
+        limit: usize,
+        dry_run: bool,
+    ) -> Result<ArchiveByTagReport, PersistenceError> {
+        let all = self.load_cached()?;
+        let cutoff = older_than_days.map(|days| {
+            chrono::Utc::now() - chrono::Duration::days(days.min(i64::MAX as u64) as i64)
+        });
+        let mut matched: Vec<Memory> = all
+            .iter()
+            .filter(|m| m.tags.iter().any(|t| t == tag))
+            .filter(|m| cutoff.map(|c| m.created_at < c).unwrap_or(true))
+            .map(|m| m.as_ref().clone())
+            .collect();
+        // 最旧优先：分块归档时先清理历史积压。
+        matched.sort_by_key(|m| m.created_at);
+        if limit > 0 {
+            matched.truncate(limit);
+        }
+        let matched_count = matched.len();
+        let memory_ids: Vec<String> = matched.iter().map(|m| m.id.clone()).collect();
+        if dry_run || matched.is_empty() {
+            return Ok(ArchiveByTagReport {
+                matched: matched_count,
+                archived: 0,
+                memory_ids,
+            });
+        }
+        self.archive_selected(
+            matched,
+            format!("按标签 `{}` 归档 {} 条记忆", tag, matched_count),
+        )?;
+        Ok(ArchiveByTagReport {
+            matched: matched_count,
+            archived: matched_count,
+            memory_ids,
+        })
+    }
+
+    /// 归档一组**已筛选**的记忆（`archive_expired` / `archive_by_tag` 共用）。
+    fn archive_selected(
+        &self,
+        selected: Vec<Memory>,
+        description: String,
+    ) -> Result<usize, PersistenceError> {
+        if selected.is_empty() {
+            return Ok(0);
+        }
+        let count = selected.len();
+        // 归档到冷存储
+        self.persistence.add_to_archive(&selected)?;
 
         // 从活跃存储中删除（追加墓碑，跨进程安全；不再整库重写）
-        let expired_ids: Vec<String> = expired.iter().map(|m| m.id.clone()).collect();
-        self.persistence.delete_memories(&expired_ids)?;
+        let ids: Vec<String> = selected.iter().map(|m| m.id.clone()).collect();
+        self.persistence.delete_memories(&ids)?;
         // v0.11：归档后清理图边与生命周期死行，避免悬空边/死行永久膨胀。
         // 清理失败不阻断归档（与 forget 的策略一致：主操作不因增强能力失败），
         // 但必须留下告警——否则悬空边会静默永久残留。
         if let Some(ref mut graph) = *self.graph_store.write_recover() {
-            for memory in &expired {
+            for memory in &selected {
                 if let Err(e) = graph.remove_edges_of_memory(&memory.id) {
                     eprintln!(
                         "[archive] 清理记忆 {} 的图边失败（归档已成功）: {}",
@@ -10159,7 +10388,7 @@ impl<P: Persistence> MemoryStore<P> {
                 }
             }
         }
-        for memory in &expired {
+        for memory in &selected {
             // `clear_lifecycle` 的 bool 表示"是否删掉了已有状态行"，
             // 从未被访问过的记忆本就返回 false（正常情况，不是失败），故不告警。
             self.clear_lifecycle(&memory.id);
@@ -10169,12 +10398,140 @@ impl<P: Persistence> MemoryStore<P> {
         // v0.11：归档是生命周期迁移（可恢复），必须留审计痕迹
         self.record_audit(
             AuditEventType::MemoryArchived,
-            format!("归档 {} 条过期记忆到冷存储", count),
-            "过期记忆不再参与检索/列表/统计，但可从归档恢复",
-            expired.iter().map(|m| m.id.clone()).collect(),
+            description,
+            "归档记忆不再参与检索/列表/统计，但可从归档恢复",
+            ids,
         );
 
         Ok(count)
+    }
+
+    /// 近重复报告（v0.11.1 / C6）。
+    ///
+    /// # 算法（MinHash-LSH）
+    ///
+    /// 全库两两比较是 O(N²)，11k 库不可接受。这里对每条记忆的字符二元组集合
+    /// 计算 4 个独立 MinHash，按 `(band, minhash)` 分桶——Jaccard ≥ 0.85 的
+    /// 两条记忆几乎必然在至少一个桶中相遇。桶内再做精确 Jaccard 校验。
+    ///
+    /// 已知边界：
+    /// - **近似召回**：4 个单元素 band 的相遇概率为 `1-(1-s)^4`；
+    ///   threshold=0.85 时漏报率约 0.05%，threshold=0.5 时约 6% ——
+    ///   报告是近似结果，不是全量精确比对；
+    /// - 单桶超过 500 条时跳过（避免退化桶导致 O(k²)），并置 `truncated=true`；
+    /// - `max_scan` 只扫描前 N 条（默认全库），截断时 `truncated=true`。
+    ///
+    /// 返回的组按成员数降序；`similarity` 为组内**实际计算过的最高相似度**。
+    pub fn near_duplicate_groups(
+        &self,
+        threshold: f32,
+        max_groups: usize,
+        max_scan: usize,
+    ) -> Result<DuplicateReport, PersistenceError> {
+        let snapshot = self.load_cached()?;
+        let total = snapshot.len();
+        let threshold = threshold.clamp(0.5, 1.0);
+        let max_groups = max_groups.clamp(1, 100);
+        let max_scan = if max_scan == 0 {
+            total
+        } else {
+            max_scan.clamp(100, 50_000)
+        };
+        let scanned = total.min(max_scan);
+        let mut truncated = scanned < total;
+
+        let mut terms: Vec<std::collections::HashSet<String>> = Vec::with_capacity(scanned);
+        let mut buckets: std::collections::HashMap<(u8, u64), Vec<usize>> =
+            std::collections::HashMap::new();
+        for index in 0..scanned {
+            let set = Self::content_bigrams(&snapshot[index].content);
+            if set.is_empty() {
+                terms.push(set);
+                continue;
+            }
+            for band in 0..4u8 {
+                let hash = set
+                    .iter()
+                    .map(|term| fnv1a(band as u64 + 1, term.as_bytes()))
+                    .min()
+                    .unwrap_or(u64::MAX);
+                buckets.entry((band, hash)).or_default().push(index);
+            }
+            terms.push(set);
+        }
+
+        let mut parent: Vec<usize> = (0..scanned).collect();
+        let mut max_sim: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+        for members in buckets.values() {
+            if members.len() < 2 {
+                continue;
+            }
+            if members.len() > 500 {
+                // 退化桶（如全库同一模板）：跳过并如实标记截断。
+                truncated = true;
+                continue;
+            }
+            for a in 0..members.len() {
+                for b in (a + 1)..members.len() {
+                    let left = members[a];
+                    let right = members[b];
+                    // 先算精确相似度再判连通：若先判同根就 continue，
+                    // 组内后续高相似对不会计入 max_sim，报告的组相似度会偏低
+                    // （v0.11.1 审查 P2）。
+                    let sim = jaccard_sets(&terms[left], &terms[right]);
+                    if sim < threshold {
+                        continue;
+                    }
+                    let root_left = dsu_find(&mut parent, left);
+                    let root_right = dsu_find(&mut parent, right);
+                    if root_left != root_right {
+                        parent[root_right] = root_left;
+                        if let Some(previous) = max_sim.remove(&root_right) {
+                            let entry = max_sim.entry(root_left).or_insert(previous);
+                            *entry = entry.max(previous);
+                        }
+                    }
+                    let root = dsu_find(&mut parent, left);
+                    let entry = max_sim.entry(root).or_insert(sim);
+                    *entry = entry.max(sim);
+                }
+            }
+        }
+
+        let mut grouped: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for index in 0..scanned {
+            let root = dsu_find(&mut parent, index);
+            grouped.entry(root).or_default().push(index);
+        }
+        let mut groups: Vec<DuplicateGroup> = grouped
+            .into_iter()
+            .filter(|(_, members)| members.len() > 1)
+            .map(|(root, members)| DuplicateGroup {
+                memory_ids: members
+                    .iter()
+                    .map(|&index| snapshot[index].id.clone())
+                    .collect(),
+                contents: members
+                    .iter()
+                    .map(|&index| snapshot[index].content.chars().take(200).collect())
+                    .collect(),
+                similarity: max_sim.get(&root).copied().unwrap_or(threshold),
+            })
+            .collect();
+        groups.sort_by_key(|a| std::cmp::Reverse(a.memory_ids.len()));
+        if groups.len() > max_groups {
+            truncated = true;
+            groups.truncate(max_groups);
+        }
+
+        Ok(DuplicateReport {
+            scanned,
+            total,
+            groups,
+            truncated,
+            method: "minhash_lsh".to_string(),
+        })
     }
 
     /// 从归档恢复一条记忆：**从现在重新计时**后写回活跃库。

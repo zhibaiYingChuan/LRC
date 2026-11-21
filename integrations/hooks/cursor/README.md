@@ -1,6 +1,11 @@
-# Cursor 接入（P0-2）
+# Cursor 接入（P0-2 + B2）
 
-一个 Hook：模型即将 Read / Grep / Shell 之前，若参数明显在"翻历史"，提示先 `recall`。
+两个 Hook：
+
+| 事件 | 脚本 | 职责 |
+|---|---|---|
+| `beforeReadFile` / `beforeShellExecution` | `lrc-pre-tool-use.sh` | 模型即将 Read / Grep / Shell 之前，若参数明显在"翻历史"，提示先 `recall` |
+| `stop` | `lrc-stop.sh` | 一轮回复结束，把最终回复交给 `lrc absorb` 沉淀（WAL） |
 
 ## 适用版本（先读这段）
 
@@ -19,10 +24,15 @@ Cursor 的 hooks 事件名与输出字段**随版本变化**。本模板按
 # 1) 脚本放到项目的 .cursor/hooks/ 目录（项目级，不污染全局）
 mkdir -p .cursor/hooks
 cp pre-tool-use.sh .cursor/hooks/lrc-pre-tool-use.sh
-chmod +x .cursor/hooks/lrc-pre-tool-use.sh
+cp stop.sh .cursor/hooks/lrc-stop.sh
+chmod +x .cursor/hooks/lrc-pre-tool-use.sh .cursor/hooks/lrc-stop.sh
 
 # 2) 合并 hooks.json 到 .cursor/hooks.json（合并，不要覆盖）
 ```
+
+> `stop` 钩子依赖 `lrc` 在 PATH 中（或用 `LRC_BIN` 指定绝对路径），
+> **不需要 jq**：载荷原样交给 CLI，字段兼容由 `host_payload` 统一处理。
+> PreToolUse 钩子仍需要 jq。未安装 `lrc` 时脚本静默退出，不影响对话。
 
 ## 两种模式
 
@@ -48,15 +58,27 @@ echo '{"tool_name":"Grep","tool_input":{"pattern":"fn main"}}' \
 # 3) deny 模式
 echo '{"tool_name":"Grep","tool_input":{"pattern":"历史决策"}}' \
   | LRC_HOOK_MODE=deny bash .cursor/hooks/lrc-pre-tool-use.sh
+
+# 4) Stop 钩子：应写入一条摘要（stdout 为空）
+echo '{"conversation_id":"conv-1","workspace_roots":["/tmp/code-memory"],"last_assistant_message":"已完成。\n[LRC]\n- decision: 采用 RwLock，读并发优先"}' \
+  | LRC_BASE=http://127.0.0.1:3111 LRC_HOOK_LOG=/tmp/lrc-hook.log bash .cursor/hooks/lrc-stop.sh
+cat /tmp/lrc-hook.log   # 应看到 exit=0
 ```
+
+> Stop 钩子的文本字段按 `last_assistant_message` → `lastAssistantMessage` →
+> `text` → `response` 依次尝试。若你的 Cursor 版本在 `stop` 里**不提供回复正文**
+> （只给 `transcript_path`），脚本会静默跳过——此时改用 `afterAgentResponse`
+> 事件指向同一脚本（该事件带 `text`）。
 
 ## 降级路径
 
 | 情况 | 行为 |
 |---|---|
 | Cursor 版本不支持 hooks | 改用 `integrations/rules/.cursorrules` |
-| 没有 `jq` | 脚本静默退出（`exit 0`），不阻断任何调用 |
+| 没有 `jq` | PreToolUse 静默退出（`exit 0`）；Stop 钩子不受影响（零 jq 依赖） |
+| 没有 `lrc` | Stop 钩子静默退出；PreToolUse 不受影响 |
 | 字段名与模板不符 | 脚本对 `tool_name/toolName`、`tool_input/toolInput` 都做了兼容；仍不符则静默放行 |
+| `stop` 不含回复正文 | 静默跳过（不猜、不读 transcript）；改用 `afterAgentResponse` |
 
 ## 已知限制
 

@@ -7,6 +7,59 @@
 > 同一版本内**分日期的补充说明**一律用 `###` 子标题，例如 `### 0.9.8 同版本补充 · 2026-09-17`。
 > （历史欠账：`[0.9.8]` 曾出现 3 次、`[0.8.23]` 曾出现 2 次，已按本约定降级为子标题。）
 
+## [0.11.1] - 2026-11-21
+
+> 本版摘要：**任务结束自动沉淀 + 记忆库可维护性收口**。
+> 核心是把「这一轮得出的结论」自动存进记忆库（三种接法：MCP / CLI / 宿主钩子），
+> 并给长期运行的库补上近重复报告、批量归档与可续跑的重编码。
+
+### 新增
+
+- **任务结束自动沉淀（absorb）**：`POST /v1/context/absorb`、MCP `absorb`、
+  `lrc absorb` 三个入口共用同一实现（`absorb_service`）：
+  解析模型声明的结论块 → 过滤 Markdown 噪声 / 过程叙述 / 删除意图 → 批内与库内去重 →
+  按隐私级别写库。无有效内容时直接跳过（NoOp 不写库）。
+- **宿主钩子**：新增 Codex 钩子，补齐 Cursor / Trae 的 Stop 钩子；
+  钩子输入支持宿主 JSON（自动提取 `last_assistant_message` / `session_id`）。
+- **`lrc doctor --capture [N]`**：回看最近 N 次 absorb 的结果，确认钩子是否真的在工作。
+- **近重复报告（C6）**：`GET /v1/memories/duplicates` / `lrc list --duplicates`，
+  MinHash-LSH 分桶找出内容高度重叠的记忆组（桶上限 500，避免长尾拖慢）。
+- **按标签批量归档（C6）**：`POST /v1/memories/archive-by-tag` /
+  `lrc archive --auto-summary`，支持标签 / 天数 / 条数 / `--dry-run`；复用单条归档路径。
+- **重编码可续跑**：进度落盘到 `reclassify_progress.json`（原子写），
+  重启后 `lrc reclassify --resume` 从断点继续；进度接口新增 `persisted` /
+  `before_total` / `after_total`，CLI 显示「上次中断进度」。
+
+### 修复
+
+- **重编码 `after` 口径**：`after_total` 统计的是重算后的实际条目数，
+  不再把「进行中」的中间状态当成完成数。
+- **`doctor --capture` 在多租户域被误判为失败**：403 改为 WARN（这是预期的权限边界，
+  不是故障），不再把健康自检整体判 FAIL。
+- **宿主负载误判**：`looks_like_host_payload` 只认宿主独有字段 + JSON 冒号结构，
+  普通文本里出现 `session_id` 等词不再被当成钩子 JSON。
+- **批量编码不再为 NoOp 条目做无意义前向**：`RememberPrep::is_noop` 提前短路。
+- **测试串扰**：跨模块串行锁统一为 `crate::test_env::serial_guard()`，
+  避免某个模块的私锁守卫失败导致整组测试互相干扰。
+- **健康告警刷屏（C3，子模块）**：同一根因（category + 建议前缀）在一次报告中只保留一条，
+  严重度取最高；对外文案不再携带轮询次数（此前桌面端每秒轮询会写成
+  「已连续 6903 次出现此警告」）；无建议的告警改用消息指纹，避免被误聚合。
+- **独立审查修复（P1/P2）**：
+  - Trae Stop 钩子在畸形 JSON / 无文本字段时不再把整段 JSON 当正文提交；
+  - `[LRC]` 结论块不再按 `\n[` 粗暴截断（JSON 数组与方括号行不再被整块丢弃），
+    只在 Markdown 标题 / 分隔线 / 下一个标记行处截断；
+  - `archive-by-tag` 的 `limit` / `older_than_days` / `dry_run` 类型非法时返回 400，
+    不再静默当成「不限量 / 不限时间」；近重复 `threshold` 拒绝 NaN / 越界值；
+  - absorb 部分写入失败时 `ok=false`，`max_items` 截断计入 `dropped`；
+  - Core 快照恢复会移除旧的语义向量 / 图边（等待按恢复出的记忆重建），
+    快照清单只允许已知数据文件（防止篡改清单覆盖其他文件）；
+  - 重编码 `resumable` 的内存态与落盘态口径统一；近重复组相似度改为组内实际最高值。
+
+### 兼容性
+
+- 数据格式向后兼容；absorb 复用现有 distill / migrate 的字段与幂等语义。
+- 新增端点全部纳入 scope 过滤；管理类操作（近重复、批量归档）在多租户域仅限本地可信域。
+
 ## [0.11.0] - 2026-11-20
 
 > 本版摘要：**独立 CLI + 归档生命周期闭环 + 隐私/scope 全局加固 + 健康面板可维护化**。

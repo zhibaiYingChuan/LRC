@@ -681,6 +681,31 @@ async fn try_run() -> LrcResult<()> {
         multi_window
     ));
 
+    // v0.11.1：清理崩溃残留的 *.tmp（1 小时阈值，保护正在写入的临时文件）。
+    // 必须在取得单例锁**之后**执行：否则第二个实例会删掉运行中实例的临时文件。
+    let min_age = std::time::Duration::from_secs(3600);
+    let data_cleanup = code_memory::atomic_file::cleanup_orphan_temp_files(
+        std::path::Path::new(&data_dir),
+        min_age,
+    );
+    let backups_cleanup = code_memory::atomic_file::cleanup_orphan_temp_files(
+        &code_memory::backup::backups_dir(),
+        min_age,
+    );
+    let removed_files = data_cleanup.removed_files + backups_cleanup.removed_files;
+    let removed_dirs = data_cleanup.removed_dirs + backups_cleanup.removed_dirs;
+    let bytes_freed = data_cleanup.bytes_freed + backups_cleanup.bytes_freed;
+    let cleanup_errors = data_cleanup.errors + backups_cleanup.errors;
+    if removed_files + removed_dirs > 0 || cleanup_errors > 0 {
+        log(&format!(
+            "   临时文件清理: 删除 {} 文件 / {} 目录，释放 {:.1} MB（失败 {}）",
+            removed_files,
+            removed_dirs,
+            bytes_freed as f64 / (1024.0 * 1024.0),
+            cleanup_errors
+        ));
+    }
+
     // 前置验证：源码目录必须存在且为目录
     let src_path = std::path::Path::new(&src_dir);
     if !src_path.exists() {

@@ -1,6 +1,7 @@
 # Trae 接入（P0-2）
 
-两个 Hook：会话启动注入记忆索引、每次提交 prompt 前重新强调规则（"稀释"）。
+三个 Hook：会话启动注入记忆索引、每次提交 prompt 前重新强调规则（"稀释"）、
+每轮结束把结论沉淀进记忆库（WAL，`/v1/context/absorb`）。
 
 ## 一、Trae 确实支持 Hook（已核实）
 
@@ -27,6 +28,7 @@
 New-Item -ItemType Directory -Force .\.trae\hooks | Out-Null
 Copy-Item .\session-start.ps1      .\.trae\hooks\lrc-session-start.ps1
 Copy-Item .\user-prompt-submit.ps1 .\.trae\hooks\lrc-user-prompt-submit.ps1
+Copy-Item .\stop.ps1               .\.trae\hooks\lrc-stop.ps1
 
 # 2) 把 hooks.json 复制到项目根
 Copy-Item .\hooks.json .\.trae\hooks.json
@@ -38,6 +40,7 @@ Copy-Item .\hooks.json .\.trae\hooks.json
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.trae-cn\hooks" | Out-Null
 Copy-Item .\session-start.ps1      "$env:USERPROFILE\.trae-cn\hooks\lrc-session-start.ps1"
 Copy-Item .\user-prompt-submit.ps1 "$env:USERPROFILE\.trae-cn\hooks\lrc-user-prompt-submit.ps1"
+Copy-Item .\stop.ps1               "$env:USERPROFILE\.trae-cn\hooks\lrc-stop.ps1"
 # 再把 hooks.json 合并进 $env:USERPROFILE\.trae-cn\hooks.json
 ```
 
@@ -53,6 +56,9 @@ Copy-Item .\user-prompt-submit.ps1 "$env:USERPROFILE\.trae-cn\hooks\lrc-user-pro
     ],
     "UserPromptSubmit": [
       { "hooks": [ { "type": "command", "command": "powershell ... -File .\\.trae\\hooks\\lrc-user-prompt-submit.ps1", "timeout": 10 } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "powershell ... -File .\\.trae\\hooks\\lrc-stop.ps1", "timeout": 8 } ] }
     ]
   }
 }
@@ -70,6 +76,8 @@ Copy-Item .\user-prompt-submit.ps1 "$env:USERPROFILE\.trae-cn\hooks\lrc-user-pro
 | `LRC_PROJECT` | 缺省取当前目录名 |
 | `LRC_ALWAYS_REMIND` | 默认 `1`（每轮注入一行提醒）。设 `0` 则只在命中关键词时注入 |
 | `LRC_INDEX_LIMIT` | 索引条数，默认 8 |
+| `LRC_ABSORB_DRY_RUN` | 设 `1` 时 Stop 钩子只做 dry-run，不写库（观察期用） |
+| `LRC_HOOK_LOG` | 设置后把 Stop 钩子的成功/失败写入该日志文件 |
 
 ## 五、prompt 的三条输入通道
 
@@ -102,6 +110,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\.trae\hooks\lrc-session-st
 
 # 4) UserPromptSubmit 不命中：只输出一行提醒
 '{"prompt":"帮我写个快排"}' | powershell -NoProfile -ExecutionPolicy Bypass -File .\.trae\hooks\lrc-user-prompt-submit.ps1
+
+# 5) Stop：dry-run（不写库，验证解析与 HTTP 链路；应 exit 0 且无输出）
+$env:LRC_ABSORB_DRY_RUN='1'
+$payload = @{ session_id='s1'; stop_hook_active=$false; last_assistant_message="[LRC]`n- decision: 采用 RwLock" } | ConvertTo-Json -Compress
+$payload | powershell -NoProfile -ExecutionPolicy Bypass -File .\.trae\hooks\lrc-stop.ps1
 ```
 
 实测结果（本机 Trae + 3099 真实库）：
@@ -129,3 +142,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\.trae\hooks\lrc-session-st
 - 每轮注入一行提醒会占用少量 token。长会话里这是刻意的取舍：规则被稀释的代价更高。
 - 索引内容用 `Invoke-WebRequest` + 显式 UTF-8 解码获取。
   直接用 `Invoke-RestMethod` 会因 PS 5.1 按 ISO-8859-1 解码而中文乱码（实测）。
+- 多租户域（设了 `LRC_API_TOKEN`）下，Stop 钩子不携带 `user_id`，服务端会返回
+  `400 scope_required` 并静默跳过。此时应改用规则 + MCP/CLI
+  （`lrc absorb --user-id ...`），或只在本地可信域启用 Stop 钩子。
+- Stop 钩子只沉淀**结论**：自动摘要 `importance ≤ 4`、带 `auto-summary` 标签，
+  不会与用户显式 `remember` 抢权重；关闭钩子即可回滚。

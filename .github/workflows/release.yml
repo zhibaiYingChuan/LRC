@@ -1193,7 +1193,7 @@ jobs:
             VERSION=$(curl -fsSL https://api.github.com/repos/zhibaiYingChuan/LRC/releases/latest \
               | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
             if [ -z "$VERSION" ]; then
-              echo "  无法解析最新版本（GitHub API 不可达或被限流），请显式传入版本号，如: v0.11.0"
+              echo "  无法解析最新版本（GitHub API 不可达或被限流），请显式传入版本号，如: v0.11.1"
               exit 1
             fi
           fi

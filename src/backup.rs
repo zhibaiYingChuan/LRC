@@ -20,6 +20,7 @@
 // v0.9.7（GLOBAL_CODE_REVIEW_REPORT P1-6）：恢复路径（安全关键）已由
 // 不可判别的 String 收敛为带域分类的 LrcError（io / not_found / invalid_input）。
 // 「快照越界」归 invalid_input、「路径/文件缺失」归 not_found，便于调用方与测试判别。
+use crate::atomic_file::dir_size;
 use crate::errors::{LrcError, LrcResult};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,13 +65,17 @@ static BACKUP_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// 备份保留份数（超出此数量的最旧备份将被删除）
 const MAX_BACKUPS: usize = 4;
-/// 快照包含的文件清单。
+
+/// 快照清单文件名。v0.11.1 起每份快照带清单，恢复时**只覆盖清单列出的文件**。
+const MANIFEST_FILE: &str = "manifest.json";
+/// 清单格式版本。
+const MANIFEST_FORMAT_VERSION: u32 = 2;
+
+/// v0.11.1 之前的快照只含这 8 个文件（无清单）。
 ///
-/// ★v0.11 P0 修复：必须包含 `memories.journal.jsonl`。
-/// 写入走「基文件 + 追加日志」，只有压实（64MB 或基文件缺失）才重写基文件；
-/// 若备份只拷 `memories.json`，压实周期内的新增/修改**不在备份里**，
-/// 而恢复时旧日志又会被重放 ⇒ 恢复被静默回滚。日志必须与基文件同快照。
-const SNAPSHOT_FILES: [&str; 8] = [
+/// 恢复旧快照时保持原语义：存在的复制、缺失的置空；
+/// **不触碰**清单外的新增大文件（语义向量/图边），避免旧快照把新数据清空。
+const LEGACY_SNAPSHOT_FILES: [&str; 8] = [
     "memories.json",
     "memories.journal.jsonl",
     "chunks.json",
@@ -80,6 +85,119 @@ const SNAPSHOT_FILES: [&str; 8] = [
     "audit.jsonl.anchors.jsonl",
     "feedback.jsonl",
 ];
+
+/// 核心快照：记忆 + 小型状态文件；语义向量与图边可在恢复后重建。
+const CORE_SNAPSHOT_FILES: [&str; 11] = [
+    "memories.json",
+    "memories.journal.jsonl",
+    "chunks.json",
+    "archive.json",
+    "audit.jsonl",
+    "audit.jsonl.seal",
+    "audit.jsonl.anchors.jsonl",
+    "feedback.jsonl",
+    "memory_state.json",
+    "lifecycle.json",
+    "assoc_frequency.json",
+];
+
+/// 完整快照：核心 + 语义向量 + 图边（恢复后语义检索/联想不降级）。
+const FULL_SNAPSHOT_FILES: [&str; 15] = [
+    "memories.json",
+    "memories.journal.jsonl",
+    "chunks.json",
+    "archive.json",
+    "audit.jsonl",
+    "audit.jsonl.seal",
+    "audit.jsonl.anchors.jsonl",
+    "feedback.jsonl",
+    "memory_state.json",
+    "lifecycle.json",
+    "assoc_frequency.json",
+    "semantic_vectors.bin",
+    "semantic_vectors.journal.bin",
+    "graph_edges.json",
+    "graph_edges.journal.jsonl",
+];
+
+/// 快照模式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackupMode {
+    /// 完整：包含语义向量与图边（默认）
+    #[default]
+    Full,
+    /// 核心：不包含语义向量与图边（体积小，恢复后需重建）
+    Core,
+}
+
+impl BackupMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Core => "core",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "core" => Some(Self::Core),
+            _ => None,
+        }
+    }
+
+    fn files(self) -> &'static [&'static str] {
+        match self {
+            Self::Full => &FULL_SNAPSHOT_FILES,
+            Self::Core => &CORE_SNAPSHOT_FILES,
+        }
+    }
+}
+
+/// 快照清单：记录本份快照实际包含的文件，恢复时以此为准。
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SnapshotManifest {
+    format_version: u32,
+    created_at_ms: i64,
+    mode: BackupMode,
+    files: Vec<String>,
+    /// 本模式应有、但备份时**不存在**的文件。
+    ///
+    /// 恢复时必须把目标目录里的同名文件移除：否则「快照时没有日志、恢复时目标有日志」
+    /// 会让 `replay_journal` 把恢复点之后的记忆重新写回，恢复被静默部分撤销。
+    #[serde(default)]
+    absent: Vec<String>,
+}
+
+/// 清单里的文件名必须是**单层普通文件名**，防止路径穿越与 Windows 特殊名。
+fn is_safe_snapshot_file(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    // 拒绝分隔符、盘符、ADS（`file:stream`）与 `..`
+    if name.contains('/') || name.contains('\\') || name.contains(':') || name.contains("..") {
+        return false;
+    }
+    // Windows 会静默去掉结尾的空格/点 ⇒ 可能别名到另一个文件
+    if name.ends_with(' ') || name.ends_with('.') {
+        return false;
+    }
+    // Windows 保留设备名（含带扩展名形式）
+    let stem = name.split('.').next().unwrap_or(name);
+    const RESERVED: &[&str] = &[
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
+        return false;
+    }
+    // 必须恰好是一个 Normal 路径分量
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
 static BACKUP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// 备份结果报告
@@ -104,6 +222,10 @@ pub struct BackupReport {
     /// 为什么需要：备份文件集中存放于全局 `backups/`，多实例共享同一轮转池。
     /// 没有来源标注时，用户无法判断某份快照属于哪个库。
     pub source_data_dir: Option<String>,
+    /// 快照模式：full | core
+    pub mode: String,
+    /// 本份快照实际包含的文件清单（与 manifest 一致）
+    pub files_included: Vec<String>,
 }
 
 /// 获取备份目录路径：~/.loong-recall/backups/
@@ -114,6 +236,21 @@ pub struct BackupReport {
 ///   备份（含全部记忆明文快照）会落到非预期位置。改为显式回退到系统临时目录，
 ///   并打印告警，避免"静默写入相对路径"。
 pub fn backups_dir() -> PathBuf {
+    backups_dir_with(std::env::var("LRC_BACKUPS_DIR").ok().as_deref())
+}
+
+/// 备份目录解析（可注入）。
+///
+/// `LRC_BACKUPS_DIR` 供 3111 测试实例隔离使用：不设置时仍落到
+/// `~/.loong-recall/backups`，生产行为零变化。
+fn backups_dir_with(override_dir: Option<&str>) -> PathBuf {
+    if let Some(dir) = override_dir.map(str::trim).filter(|dir| !dir.is_empty()) {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            return path;
+        }
+        eprintln!("[备份][告警] LRC_BACKUPS_DIR 必须是绝对路径，已忽略: {dir}（回退默认备份目录）");
+    }
     home_dir_or_fallback().join(".loong-recall").join("backups")
 }
 
@@ -153,23 +290,33 @@ fn backup_filename() -> String {
 /// 导致自定义 `--data-dir` 或项目模式实例调用备份时，备份的是**另一个库**
 /// （用户以为备份了当前数据，实际备份的是全局默认库）。
 pub fn create_backup(data_dir: &Path) -> BackupReport {
+    create_backup_with_mode(data_dir, BackupMode::default())
+}
+
+/// 按指定模式创建备份。
+///
+/// - `Full`（默认）：包含语义向量与图边，恢复后检索/联想不降级；
+/// - `Core`：只含记忆与小型状态文件，体积小，恢复后需重建语义向量/图边。
+pub fn create_backup_with_mode(data_dir: &Path, mode: BackupMode) -> BackupReport {
     let _operation_guard = BACKUP_OPERATION_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     // v0.9.11（G5 / CR-37）：取**独占**快照闸门（锁序 [1] → [2]）。
     //   一旦取得，所有 JSON 落盘路径（持 writer_guard 读锁）都被排除 ⇒
-    //   7 个文件取自**同一时刻**，兑现上方"必须与并发写互斥"的承诺。
+    //   文件组取自**同一时刻**，兑现"必须与并发写互斥"的承诺。
     let _snapshot_guard = crate::atomic_file::snapshot_guard();
-    let mut report = create_backup_in(data_dir, &backups_dir());
+    let mut report = create_backup_in(data_dir, &backups_dir(), mode);
     report.source_data_dir = Some(data_dir.to_string_lossy().to_string());
     // 数据操作日志只在**真实**入口记录：`create_backup_in` 供测试注入临时目录调用，
     // 不应把测试运行写进用户的 `~/.loong-recall/data_operations.log`。
     if report.success {
         let details = format!(
-            "备份 {} 条记忆至 {}（清理 {} 份旧备份，当前共 {} 份）",
+            "备份 {} 条记忆至 {}（模式 {}，{} 个文件，清理 {} 份旧备份，当前共 {} 份）",
             report.memory_count,
             report.backup_path.as_deref().unwrap_or("未知路径"),
+            report.mode,
+            report.files_included.len(),
             report.old_backups_removed,
             report.total_backups
         );
@@ -187,7 +334,7 @@ pub fn create_backup(data_dir: &Path) -> BackupReport {
 ///
 /// **调用方契约**：本函数**不取任何锁** —— 锁由 [`create_backup`] 在同一临界区内持有。
 /// 生产代码不得直接调用它（`fn` 私有即为此）。
-fn create_backup_in(data_dir: &Path, root: &Path) -> BackupReport {
+fn create_backup_in(data_dir: &Path, root: &Path, mode: BackupMode) -> BackupReport {
     let mut report = BackupReport {
         success: false,
         backup_path: None,
@@ -197,6 +344,8 @@ fn create_backup_in(data_dir: &Path, root: &Path) -> BackupReport {
         total_backups: 0,
         error: None,
         source_data_dir: None,
+        mode: mode.as_str().to_string(),
+        files_included: Vec::new(),
     };
     let data_dir = data_dir.to_path_buf();
     if !data_dir.join("memories.json").exists() {
@@ -217,29 +366,53 @@ fn create_backup_in(data_dir: &Path, root: &Path) -> BackupReport {
         ".{}.tmp",
         BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    let result = (|| -> LrcResult<()> {
+    let result = (|| -> LrcResult<Vec<String>> {
         fs::create_dir(&temp_dir).map_err(|e| LrcError::io(format!("创建临时快照失败: {}", e)))?;
-        for file in SNAPSHOT_FILES {
+        let mut included = Vec::new();
+        let mut absent = Vec::new();
+        for file in mode.files() {
             let source = data_dir.join(file);
-            let target = temp_dir.join(file);
-            if source.exists() {
-                fs::copy(&source, &target)
-                    .map_err(|e| LrcError::io(format!("备份 {} 失败: {}", file, e)))?;
-            } else {
-                fs::write(&target, b"")
-                    .map_err(|e| LrcError::io(format!("创建空文件 {} 失败: {}", file, e)))?;
+            // 只复制**实际存在**的文件：不再为空文件占位。
+            // 占位会在恢复时把新数据（语义向量/图边）清空，属静默数据损失。
+            if !source.exists() {
+                absent.push((*file).to_string());
+                continue;
             }
+            let target = temp_dir.join(file);
+            fs::copy(&source, &target)
+                .map_err(|e| LrcError::io(format!("备份 {} 失败: {}", file, e)))?;
+            included.push((*file).to_string());
         }
-        fs::rename(&temp_dir, &final_dir).map_err(|e| LrcError::io(format!("提交快照失败: {}", e)))
+        // 清单与实际内容同批提交：恢复时只覆盖清单列出的文件，
+        // 并删除 `absent` 里记录的"快照时不存在"的文件。
+        let manifest = SnapshotManifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+            mode,
+            files: included.clone(),
+            absent,
+        };
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| LrcError::io(format!("序列化快照清单失败: {}", e)))?;
+        fs::write(temp_dir.join(MANIFEST_FILE), manifest_bytes)
+            .map_err(|e| LrcError::io(format!("写入快照清单失败: {}", e)))?;
+        fs::rename(&temp_dir, &final_dir)
+            .map_err(|e| LrcError::io(format!("提交快照失败: {}", e)))?;
+        Ok(included)
     })();
-    if let Err(e) = result {
-        let _ = fs::remove_dir_all(&temp_dir);
-        // BackupReport.error 是对外 JSON 字段，仍为 String 契约：取 message。
-        report.error = Some(String::from(e));
-        return report;
-    }
-    let backup_file = final_dir.join("memories.json");
-    report.backup_size = fs::metadata(&backup_file).map(|m| m.len()).unwrap_or(0);
+    let included = match result {
+        Ok(files) => files,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&temp_dir);
+            // BackupReport.error 是对外 JSON 字段，仍为 String 契约：取 message。
+            report.error = Some(String::from(e));
+            return report;
+        }
+    };
+    report.files_included = included;
+    // 体积按**整份快照**统计，而不是只看 memories.json
+    //（否则 200MB 的图边快照会被报告成 60MB）。
+    report.backup_size = dir_size(&final_dir);
 
     // 统计记忆数：必须按「基文件 + 追加日志」的真实口径，
     // 否则压实周期内的新增/修改不会被计入（报告少报）。
@@ -387,7 +560,7 @@ pub fn restore_backup(snapshot_path: &Path, data_dir: &Path) -> LrcResult<()> {
 fn restore_backup_in(snapshot_path: &Path, allowed_root: &Path, data_dir: &Path) -> LrcResult<()> {
     // v0.9.7 审查修复（HCSE-P0 安全）：快照目录必须位于本工具的备份目录内。
     // 端点默认无 token 保护，若不约束路径，本机任意进程可把任意目录内容
-    // （SNAPSHOT_FILES 同名文件）覆盖进全局数据目录，属路径穿越/越权写。
+    // （清单/legacy 同名文件）覆盖进全局数据目录，属路径穿越/越权写。
     let canonical_snapshot = snapshot_path.canonicalize().map_err(|e| {
         LrcError::not_found(format!(
             "快照路径无法解析: {} ({})",
@@ -426,6 +599,74 @@ fn restore_backup_in(snapshot_path: &Path, allowed_root: &Path, data_dir: &Path)
         )));
     }
     let snapshot_path = canonical_snapshot.as_path();
+    // 清单优先：v0.11.1 起的快照带 manifest，恢复时**只覆盖清单列出的文件**；
+    // 旧快照无清单，按 legacy 8 文件处理（保持"缺失置空"语义，但不碰新增大文件）。
+    let manifest_path = snapshot_path.join(MANIFEST_FILE);
+    let (files, absent, legacy) = if manifest_path.is_file() {
+        let raw = fs::read_to_string(&manifest_path)
+            .map_err(|e| LrcError::io(format!("读取快照清单失败: {}", e)))?;
+        let manifest: SnapshotManifest = serde_json::from_str(&raw)
+            .map_err(|e| LrcError::invalid_input(format!("快照清单损坏: {}", e)))?;
+        if manifest.format_version != MANIFEST_FORMAT_VERSION {
+            return Err(LrcError::invalid_input(format!(
+                "不支持快照清单版本 {}（当前 {}）",
+                manifest.format_version, MANIFEST_FORMAT_VERSION
+            )));
+        }
+        if manifest.files.is_empty() {
+            return Err(LrcError::invalid_input("快照清单为空，拒绝恢复"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for file in manifest.files.iter().chain(manifest.absent.iter()) {
+            if !is_safe_snapshot_file(file) {
+                return Err(LrcError::invalid_input(format!(
+                    "快照清单含非法文件名: {}",
+                    file
+                )));
+            }
+            // 白名单：只允许恢复已知数据文件。否则被篡改的清单（仍放在
+            // 备份目录内）可以覆盖 `reclassify_progress.json`、`absorb_log.jsonl`
+            // 等数据目录文件（v0.11.1 审查 P2）。
+            if !FULL_SNAPSHOT_FILES.contains(&file.as_str()) {
+                return Err(LrcError::invalid_input(format!(
+                    "快照清单含未知文件: {}",
+                    file
+                )));
+            }
+            if !seen.insert(file.as_str()) {
+                return Err(LrcError::invalid_input(format!(
+                    "快照清单含重复文件: {}",
+                    file
+                )));
+            }
+        }
+        if !manifest.files.iter().any(|file| file == "memories.json") {
+            return Err(LrcError::invalid_input(
+                "快照清单缺少 memories.json，拒绝恢复",
+            ));
+        }
+        let mut absent = manifest.absent;
+        // Core 快照**不含**语义向量与图边：恢复时必须移除目标目录里的旧文件，
+        // 否则旧向量仍指向恢复点之后的记忆 ID —— 看似有索引、实际错位。
+        // 移除后由启动流程按恢复出的记忆重建（v0.11.1 审查 P2）。
+        if manifest.mode == BackupMode::Core {
+            for file in FULL_SNAPSHOT_FILES {
+                if !manifest.files.iter().any(|f| f == file) && !absent.iter().any(|f| f == file) {
+                    absent.push((*file).to_string());
+                }
+            }
+        }
+        (manifest.files, absent, false)
+    } else {
+        (
+            LEGACY_SNAPSHOT_FILES
+                .iter()
+                .map(|file| (*file).to_string())
+                .collect::<Vec<_>>(),
+            Vec::new(),
+            true,
+        )
+    };
     fs::create_dir_all(data_dir).map_err(|e| LrcError::io(format!("创建数据目录失败: {}", e)))?;
     let temp = data_dir.join(format!(
         ".restore-{}.tmp",
@@ -433,18 +674,25 @@ fn restore_backup_in(snapshot_path: &Path, allowed_root: &Path, data_dir: &Path)
     ));
     fs::create_dir(&temp).map_err(|e| LrcError::io(format!("创建恢复临时目录失败: {}", e)))?;
     let result = (|| -> LrcResult<()> {
-        for file in SNAPSHOT_FILES {
+        for file in &files {
             let source = snapshot_path.join(file);
             if source.exists() {
                 fs::copy(&source, temp.join(file))
                     .map_err(|e| LrcError::io(format!("恢复 {} 失败: {}", file, e)))?;
-            } else {
+            } else if legacy {
+                // 旧快照没有清单，保持历史"缺失置空"语义（仅限 legacy 8 文件）。
                 fs::write(temp.join(file), b"")
                     .map_err(|e| LrcError::io(format!("恢复空文件 {} 失败: {}", file, e)))?;
+            } else {
+                // 清单说有、实际没有 ⇒ 快照损坏，必须显式失败，不能静默少恢复。
+                return Err(LrcError::not_found(format!(
+                    "快照清单列出的文件缺失: {}",
+                    file
+                )));
             }
         }
         let rollback = data_dir.join(format!(
-            ".restore-{}-rollback",
+            ".restore-{}-rollback.tmp",
             BACKUP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&rollback)
@@ -452,8 +700,12 @@ fn restore_backup_in(snapshot_path: &Path, allowed_root: &Path, data_dir: &Path)
         let mut originals = Vec::new();
         let mut committed = Vec::new();
         let commit_result = (|| -> LrcResult<()> {
-            for file in SNAPSHOT_FILES {
+            for file in &files {
                 let target = data_dir.join(file);
+                // 防御纵深：文件名已校验为单层，这里再断言父目录未被改写。
+                if target.parent() != Some(data_dir) {
+                    return Err(LrcError::invalid_input(format!("恢复目标越界: {}", file)));
+                }
                 if target.exists() {
                     let saved = rollback.join(file);
                     fs::rename(&target, &saved)
@@ -463,6 +715,21 @@ fn restore_backup_in(snapshot_path: &Path, allowed_root: &Path, data_dir: &Path)
                 fs::rename(temp.join(file), &target)
                     .map_err(|e| LrcError::io(format!("提交 {} 失败: {}", file, e)))?;
                 committed.push(target);
+            }
+            // `absent`：快照时不存在、但目标目录现在有的文件必须移除，
+            // 否则旧日志会被重放，恢复点之后的记忆重新写回（静默部分撤销）。
+            for file in &absent {
+                let target = data_dir.join(file);
+                if target.parent() != Some(data_dir) {
+                    return Err(LrcError::invalid_input(format!("恢复目标越界: {}", file)));
+                }
+                if target.exists() {
+                    let saved = rollback.join(file);
+                    fs::rename(&target, &saved).map_err(|e| {
+                        LrcError::io(format!("移除快照外文件 {} 失败: {}", file, e))
+                    })?;
+                    originals.push((target.clone(), saved));
+                }
             }
             Ok(())
         })();
@@ -477,6 +744,8 @@ fn restore_backup_in(snapshot_path: &Path, allowed_root: &Path, data_dir: &Path)
             for (target, saved) in originals.iter().rev() {
                 let _ = fs::rename(saved, target);
             }
+            // 回滚完成后清理空目录，避免失败路径留下 `.restore-*-rollback.tmp`。
+            let _ = fs::remove_dir_all(&rollback);
             return Err(LrcError::io(format!("{}；已尝试回滚恢复文件", error)));
         }
         fs::remove_dir_all(&rollback)
@@ -520,7 +789,12 @@ pub fn list_backups() -> Vec<BackupInfo> {
                     continue;
                 }
                 if let Ok(meta) = entry.metadata() {
-                    let size = meta.len();
+                    // 快照是目录：必须递归统计，否则 Windows 上目录元数据长度恒为 0。
+                    let size = if meta.is_dir() {
+                        dir_size(&path)
+                    } else {
+                        meta.len()
+                    };
                     let size_human = if size > 1024 * 1024 {
                         format!("{:.1} MB", size as f64 / (1024.0 * 1024.0))
                     } else if size > 1024 {
@@ -576,6 +850,29 @@ mod tests {
     fn test_backups_dir_path() {
         let dir = backups_dir();
         assert!(dir.to_string_lossy().contains("backups"));
+    }
+
+    /// `LRC_BACKUPS_DIR` 必须能隔离 3111 测试实例，避免污染生产备份池。
+    #[test]
+    fn backups_dir_honors_override() {
+        assert_eq!(
+            backups_dir_with(Some("C:\\tmp\\lrc-backups")),
+            PathBuf::from("C:\\tmp\\lrc-backups")
+        );
+        assert_eq!(
+            backups_dir_with(Some("   ")),
+            home_dir_or_fallback().join(".loong-recall").join("backups"),
+            "空白覆盖值应回退默认目录"
+        );
+        assert_eq!(
+            backups_dir_with(Some("relative\\backups")),
+            home_dir_or_fallback().join(".loong-recall").join("backups"),
+            "相对路径必须被忽略（与 CWD 回退同类风险）"
+        );
+        assert!(
+            backups_dir_with(None).ends_with(Path::new(".loong-recall").join("backups")),
+            "未设置覆盖时必须仍是默认目录"
+        );
     }
 
     #[test]
@@ -674,6 +971,8 @@ mod tests {
             total_backups: 4,
             error: None,
             source_data_dir: Some("/test/data".to_string()),
+            mode: "full".to_string(),
+            files_included: vec!["memories.json".to_string()],
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"success\":true"));
@@ -697,42 +996,323 @@ mod tests {
         (tmp, data, backups)
     }
 
-    /// 快照必须覆盖 `SNAPSHOT_FILES` **全清单**：存在的复制、缺失的置空
+    /// 快照只包含**实际存在**的文件，并写入清单；缺失文件不再置空。
     #[test]
-    fn create_backup_in_snapshots_all_files() {
+    fn create_backup_in_snapshots_existing_files_with_manifest() {
         let (_tmp, data, backups) = setup_dirs();
         fs::write(data.join("memories.json"), r#"[{"id":"m1"},{"id":"m2"}]"#).unwrap();
         fs::write(data.join("audit.jsonl"), "{\"a\":1}\n").unwrap();
-        // 其余 5 个文件故意不创建
+        // 其余文件故意不创建
 
-        let report = create_backup_in(&data, &backups);
+        let report = create_backup_in(&data, &backups, BackupMode::Core);
         assert!(report.success, "备份应成功：{:?}", report.error);
         assert_eq!(report.memory_count, 2, "应数出 2 条记忆");
+        assert_eq!(report.mode, "core");
         let snapshot = std::path::PathBuf::from(report.backup_path.as_ref().unwrap());
-        for file in SNAPSHOT_FILES {
-            assert!(
-                snapshot.join(file).exists(),
-                "快照必须包含 {file}（缺失也要置空）"
+        assert!(snapshot.join("memories.json").exists());
+        assert!(snapshot.join("audit.jsonl").exists());
+        assert!(
+            !snapshot.join("archive.json").exists(),
+            "缺失文件不得置空（否则恢复时会误覆盖现有数据）"
+        );
+        let manifest: SnapshotManifest =
+            serde_json::from_str(&fs::read_to_string(snapshot.join(MANIFEST_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(manifest.mode, BackupMode::Core);
+        assert!(manifest.files.contains(&"memories.json".to_string()));
+        assert!(manifest.files.contains(&"audit.jsonl".to_string()));
+        assert!(!manifest.files.contains(&"archive.json".to_string()));
+        assert_eq!(report.files_included.len(), 2);
+        assert_eq!(report.total_backups, 1);
+    }
+
+    /// 完整快照必须包含语义向量与图边；核心快照必须排除它们。
+    #[test]
+    fn full_backup_includes_vectors_and_graph_core_excludes_them() {
+        let (_tmp, data, backups) = setup_dirs();
+        fs::write(data.join("memories.json"), r#"[{"id":"m1"}]"#).unwrap();
+        fs::write(data.join("semantic_vectors.bin"), b"vectors").unwrap();
+        fs::write(data.join("graph_edges.json"), b"edges").unwrap();
+        fs::write(data.join("memory_state.json"), b"{}").unwrap();
+
+        let full = create_backup_in(&data, &backups, BackupMode::Full);
+        assert!(full.success, "{:?}", full.error);
+        let full_dir = std::path::PathBuf::from(full.backup_path.as_ref().unwrap());
+        assert!(full_dir.join("semantic_vectors.bin").exists());
+        assert!(full_dir.join("graph_edges.json").exists());
+        assert!(full_dir.join("memory_state.json").exists());
+        assert!(full.backup_size >= 7, "体积应统计整份快照");
+
+        let core = create_backup_in(&data, &backups, BackupMode::Core);
+        assert!(core.success, "{:?}", core.error);
+        let core_dir = std::path::PathBuf::from(core.backup_path.as_ref().unwrap());
+        assert!(!core_dir.join("semantic_vectors.bin").exists());
+        assert!(!core_dir.join("graph_edges.json").exists());
+        assert!(core_dir.join("memory_state.json").exists());
+    }
+
+    /// Core 快照恢复必须移除旧的语义向量/图边（否则旧向量指向已不存在的记忆）。
+    #[test]
+    fn restore_core_snapshot_removes_stale_vectors_and_graph() {
+        let (_tmp, data, backups) = setup_dirs();
+        fs::write(data.join("memories.json"), r#"[{"id":"old"}]"#).unwrap();
+        fs::write(data.join("semantic_vectors.bin"), b"stale-vectors").unwrap();
+        fs::write(data.join("graph_edges.json"), b"stale-edges").unwrap();
+
+        let core = create_backup_in(&data, &backups, BackupMode::Core);
+        assert!(core.success, "{:?}", core.error);
+        let core_dir = std::path::PathBuf::from(core.backup_path.as_ref().unwrap());
+
+        // 备份后再写入"恢复点之后"的运行时文件，模拟目标目录比快照更新。
+        fs::write(data.join("semantic_vectors.bin"), b"newer-vectors").unwrap();
+        fs::write(data.join("graph_edges.json"), b"newer-edges").unwrap();
+
+        restore_backup_in(&core_dir, &backups, &data).expect("恢复应成功");
+        assert!(
+            !data.join("semantic_vectors.bin").exists(),
+            "Core 恢复应移除旧向量，等待按恢复出的记忆重建"
+        );
+        assert!(
+            !data.join("graph_edges.json").exists(),
+            "Core 恢复应移除旧图边，等待重建"
+        );
+    }
+
+    /// 清单里出现未知文件必须拒绝恢复（防止篡改清单覆盖数据目录其他文件）。
+    #[test]
+    fn restore_rejects_manifest_with_unknown_files() {
+        let (_tmp, data, backups) = setup_dirs();
+        let snapshot = backups.join("memories_20260101_000003.snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("memories.json"), r#"[{"id":"m1"}]"#).unwrap();
+        let manifest = serde_json::json!({
+            "format_version": MANIFEST_FORMAT_VERSION,
+            "created_at_ms": 0,
+            "mode": "core",
+            "files": ["memories.json", "reclassify_progress.json"],
+            "absent": []
+        });
+        fs::write(
+            snapshot.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = restore_backup_in(&snapshot, &backups, &data).expect_err("必须拒绝");
+        assert!(
+            error.to_string().contains("未知文件"),
+            "错误信息应指出未知文件：{error}"
+        );
+    }
+
+    /// 恢复旧快照（无清单）不得清空新增的大文件（语义向量/图边）。
+    #[test]
+    fn restore_legacy_snapshot_keeps_new_runtime_files() {
+        let (_tmp, data, backups) = setup_dirs();
+        let snapshot = backups.join("memories_20260101_000002.snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("memories.json"), r#"[{"id":"restored"}]"#).unwrap();
+        fs::write(data.join("memories.json"), r#"[{"id":"stale"}]"#).unwrap();
+        fs::write(data.join("semantic_vectors.bin"), b"keep-vectors").unwrap();
+        fs::write(data.join("graph_edges.json"), b"keep-edges").unwrap();
+
+        restore_backup_in(&snapshot, &backups, &data).expect("恢复应成功");
+        assert_eq!(
+            fs::read_to_string(data.join("memories.json")).unwrap(),
+            r#"[{"id":"restored"}]"#
+        );
+        assert_eq!(
+            fs::read(data.join("semantic_vectors.bin")).unwrap(),
+            b"keep-vectors",
+            "旧快照不得清空语义向量"
+        );
+        assert_eq!(
+            fs::read(data.join("graph_edges.json")).unwrap(),
+            b"keep-edges",
+            "旧快照不得清空图边"
+        );
+    }
+
+    /// 带清单的快照只覆盖清单列出的文件；未列出的文件保持原样。
+    #[test]
+    fn restore_manifest_snapshot_only_touches_listed_files() {
+        let (_tmp, data, backups) = setup_dirs();
+        let snapshot = backups.join("memories_20260101_000003.snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("memories.json"), r#"[{"id":"restored"}]"#).unwrap();
+        let manifest = SnapshotManifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            created_at_ms: 0,
+            // Full 模式：清单未列出的文件保持原样（Core 会主动移除旧向量/图边，
+            // 见 `restore_core_snapshot_removes_stale_vectors_and_graph`）。
+            mode: BackupMode::Full,
+            files: vec!["memories.json".to_string()],
+            absent: Vec::new(),
+        };
+        fs::write(
+            snapshot.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(data.join("memories.json"), r#"[{"id":"stale"}]"#).unwrap();
+        fs::write(data.join("graph_edges.json"), b"keep-edges").unwrap();
+
+        restore_backup_in(&snapshot, &backups, &data).expect("恢复应成功");
+        assert_eq!(
+            fs::read_to_string(data.join("memories.json")).unwrap(),
+            r#"[{"id":"restored"}]"#
+        );
+        assert_eq!(
+            fs::read(data.join("graph_edges.json")).unwrap(),
+            b"keep-edges",
+            "清单未列出的文件不得被覆盖"
+        );
+    }
+
+    /// 清单路径穿越必须被拒绝。
+    #[test]
+    fn restore_rejects_manifest_with_path_traversal() {
+        let (_tmp, data, backups) = setup_dirs();
+        let snapshot = backups.join("memories_20260101_000004.snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("memories.json"), r#"[{"id":"restored"}]"#).unwrap();
+        let manifest = SnapshotManifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            created_at_ms: 0,
+            mode: BackupMode::Core,
+            files: vec!["../evil.json".to_string()],
+            absent: Vec::new(),
+        };
+        fs::write(
+            snapshot.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(data.join("memories.json"), r#"[{"id":"keep"}]"#).unwrap();
+
+        let err = restore_backup_in(&snapshot, &backups, &data).expect_err("必须拒绝路径穿越");
+        assert!(err.to_string().contains("非法文件名"), "实际 {err}");
+        assert_eq!(
+            fs::read_to_string(data.join("memories.json")).unwrap(),
+            r#"[{"id":"keep"}]"#
+        );
+    }
+
+    /// Windows 盘符/ADS/保留名/结尾点都必须被拒绝。
+    #[test]
+    fn restore_rejects_windows_unsafe_manifest_names() {
+        for name in ["C:evil", "memories.json:ads", "CON", "aux.txt", "trailing."] {
+            let (_tmp, data, backups) = setup_dirs();
+            let snapshot = backups.join("memories_20260101_000005.snapshot");
+            fs::create_dir_all(&snapshot).unwrap();
+            fs::write(snapshot.join("memories.json"), r#"[{"id":"restored"}]"#).unwrap();
+            let manifest = SnapshotManifest {
+                format_version: MANIFEST_FORMAT_VERSION,
+                created_at_ms: 0,
+                mode: BackupMode::Core,
+                files: vec!["memories.json".to_string(), name.to_string()],
+                absent: Vec::new(),
+            };
+            fs::write(
+                snapshot.join(MANIFEST_FILE),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            fs::write(data.join("memories.json"), r#"[{"id":"keep"}]"#).unwrap();
+
+            let err =
+                restore_backup_in(&snapshot, &backups, &data).expect_err("必须拒绝不安全文件名");
+            assert!(err.to_string().contains("非法文件名"), "{name}: {err}");
+            assert_eq!(
+                fs::read_to_string(data.join("memories.json")).unwrap(),
+                r#"[{"id":"keep"}]"#
             );
         }
-        assert_eq!(
-            fs::read_to_string(snapshot.join("memories.json")).unwrap(),
-            r#"[{"id":"m1"},{"id":"m2"}]"#,
-            "内容必须逐字节一致"
+    }
+
+    /// `absent` 记录的文件必须在恢复时移除，防止旧日志被重放。
+    #[test]
+    fn restore_manifest_absent_removes_target_journal() {
+        let (_tmp, data, backups) = setup_dirs();
+        let snapshot = backups.join("memories_20260101_000006.snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("memories.json"), r#"[{"id":"restored"}]"#).unwrap();
+        let manifest = SnapshotManifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            created_at_ms: 0,
+            mode: BackupMode::Full,
+            files: vec!["memories.json".to_string()],
+            absent: vec!["memories.journal.jsonl".to_string()],
+        };
+        fs::write(
+            snapshot.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(data.join("memories.json"), r#"[{"id":"stale"}]"#).unwrap();
+        fs::write(
+            data.join("memories.journal.jsonl"),
+            "{\"id\":\"after-backup\"}\n",
+        )
+        .unwrap();
+
+        restore_backup_in(&snapshot, &backups, &data).expect("恢复应成功");
+        assert!(
+            !data.join("memories.journal.jsonl").exists(),
+            "快照时缺失的日志必须在恢复时移除，否则会被重放"
         );
         assert_eq!(
-            fs::metadata(snapshot.join("archive.json")).unwrap().len(),
-            0,
-            "缺失的文件必须落成空文件（否则恢复会把它当成'不存在'）"
+            fs::read_to_string(data.join("memories.json")).unwrap(),
+            r#"[{"id":"restored"}]"#
         );
-        assert_eq!(report.total_backups, 1);
+    }
+
+    /// 清单必须包含 memories.json；未知格式版本必须拒绝。
+    #[test]
+    fn restore_manifest_requires_base_file_and_known_version() {
+        // 缺 memories.json
+        let (_tmp, data, backups) = setup_dirs();
+        let snapshot = backups.join("memories_20260101_000007.snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("memories.json"), r#"[{"id":"restored"}]"#).unwrap();
+        let manifest = SnapshotManifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            created_at_ms: 0,
+            mode: BackupMode::Core,
+            files: vec!["lifecycle.json".to_string()],
+            absent: Vec::new(),
+        };
+        fs::write(
+            snapshot.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(data.join("memories.json"), r#"[{"id":"keep"}]"#).unwrap();
+        let err = restore_backup_in(&snapshot, &backups, &data).expect_err("缺基文件必须拒绝");
+        assert!(err.to_string().contains("memories.json"), "{err}");
+
+        // 未知版本
+        let manifest = SnapshotManifest {
+            format_version: 999,
+            created_at_ms: 0,
+            mode: BackupMode::Core,
+            files: vec!["memories.json".to_string()],
+            absent: Vec::new(),
+        };
+        fs::write(
+            snapshot.join(MANIFEST_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let err = restore_backup_in(&snapshot, &backups, &data).expect_err("未知版本必须拒绝");
+        assert!(err.to_string().contains("不支持快照清单版本"), "{err}");
     }
 
     /// 无 `memories.json` ⇒ **明确失败**并给出可读原因（不得静默造出空快照）
     #[test]
     fn create_backup_in_fails_loudly_without_memories_file() {
         let (_tmp, data, backups) = setup_dirs();
-        let report = create_backup_in(&data, &backups);
+        let report = create_backup_in(&data, &backups, BackupMode::Full);
         assert!(!report.success, "缺 memories.json 时不得报告成功");
         assert!(
             report
@@ -785,7 +1365,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = create_backup_in(&data, &backups);
+        let report = create_backup_in(&data, &backups, BackupMode::Full);
         assert!(report.success, "{:?}", report.error);
         assert_eq!(
             report.memory_count, 1,

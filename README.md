@@ -25,14 +25,14 @@ AI 本身不会跨会话记住这些；LRC 就是给它补上这块记忆。
 
 ## 30 秒上手
 
-到 [v0.11.0 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.11.0)
+到 [v0.11.1 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.11.1)
 下载对应平台的桌面安装包：
 
 | 平台 | 安装包 |
 |---|---|
-| Windows | `lrc-desktop-v0.11.0-windows-x86_64-setup.exe` |
-| macOS（Apple 芯片） | `lrc-desktop-v0.11.0-macos-arm64.dmg` |
-| Linux | `lrc-desktop-v0.11.0-linux-amd64.deb` 或 `lrc-desktop-v0.11.0-linux-x86_64.AppImage` |
+| Windows | `lrc-desktop-v0.11.1-windows-x86_64-setup.exe` |
+| macOS（Apple 芯片） | `lrc-desktop-v0.11.1-macos-arm64.dmg` |
+| Linux | `lrc-desktop-v0.11.1-linux-amd64.deb` 或 `lrc-desktop-v0.11.1-linux-x86_64.AppImage` |
 
 安装后打开 LRC Desktop：
 
@@ -57,11 +57,11 @@ AI 本身不会跨会话记住这些；LRC 就是给它补上这块记忆。
 `lrc` 是一个**纯客户端**：它不加载模型，只通过 HTTP 调用常驻的 sidecar。
 把下面两个文件下载到**同一个目录**即可使用：
 
-- CLI：`lrc-cli-v0.11.0-windows-x86_64.exe` / `lrc-cli-v0.11.0-macos-arm64` / `lrc-cli-v0.11.0-linux-x86_64`
+- CLI：`lrc-cli-v0.11.1-windows-x86_64.exe` / `lrc-cli-v0.11.1-macos-arm64` / `lrc-cli-v0.11.1-linux-x86_64`
 - Sidecar（稳定别名）：`lrc-sidecar-windows-x64.exe` / `lrc-sidecar-darwin-arm64` / `lrc-sidecar-linux-x64`
 
 CLI 会在同目录自动识别这些稳定别名；若你下载的是带版本号的 sidecar
-（`lrc-v0.11.0-*`），把它重命名为 `lrc-sidecar`（Windows 为 `lrc-sidecar.exe`）即可。
+（`lrc-v0.11.1-*`），把它重命名为 `lrc-sidecar`（Windows 为 `lrc-sidecar.exe`）即可。
 
 ```bash
 lrc doctor                      # 检查 daemon、版本、模型与数据目录
@@ -77,17 +77,20 @@ lrc search "MemoryStore"
 |---|---|
 | `lrc recall <查询>` | 检索记忆（默认三路融合） |
 | `lrc remember <内容>` / `-` | 写入一条记忆（`-` 从 stdin 读取） |
-| `lrc list` / `lrc stats` | 列出记忆 / 查看统计 |
+| `lrc list` / `lrc stats` | 列出记忆 / 查看统计；`--duplicates` 输出近重复报告 |
 | `lrc search <关键词>` | 搜索已索引的代码片段 |
 | `lrc forget <id> --yes` | 删除一条记忆（不可撤销） |
 | `lrc correct <id> <新内容>` | 修正一条记忆（保留历史版本） |
 | `lrc associations <id>` | 查看一条记忆的关联 |
 | `lrc distill [文本\|--transcript 文件]` | 从对话提炼候选记忆（不写库） |
+| `lrc absorb [文本\|-]` | 任务结束自动沉淀：过滤噪声、去重、写库 |
 | `lrc migrate < - \| --file 文件>` | 把提炼结果批量写入（幂等） |
-| `lrc backup` | 为当前实例创建记忆快照 |
-| `lrc archive` | 归档已过期记忆到冷存储 |
+| `lrc backup [--mode full\|core]` | 为当前实例创建记忆快照（默认 full） |
+| `lrc reclassify` | 全库重编码（`--progress` 看进度 / `--cancel` 取消 / `--resume` 续跑） |
+| `lrc archive [--auto-summary]` | 归档已过期记忆；`--auto-summary` 按标签批量归档 |
 | `lrc unarchive <id> [--ttl-days N]` | 从归档恢复（从现在重新计时） |
 | `lrc purge-archived <id> --yes` | 从归档彻底删除（不可恢复） |
+| `lrc doctor [--capture [N]]` | 自检 daemon / 模型 / 数据目录；`--capture` 附带最近沉淀结果 |
 | `lrc daemon start\|stop\|status` | 管理常驻 sidecar |
 | `lrc mcp` | 把 stdio MCP 请求桥接到本地 sidecar |
 
@@ -105,17 +108,19 @@ LRC 的 sidecar 暴露标准 MCP 端点：
 http://127.0.0.1:3099/mcp
 ```
 
-把该地址配置到支持 MCP 的 AI 工具中，即可使用以下工具：
+把该地址配置到支持 MCP 的 AI 工具中，即可使用以下 16 个工具：
 
 | 工具 | 用途 |
 |---|---|
 | `remember` / `batch_remember` | 写入单条 / 批量记忆 |
+| `absorb` | 任务结束自动沉淀（宿主钩子直接调用，自动过滤与去重） |
 | `recall` / `recall_enhanced` | 检索记忆（标准 / 增强） |
 | `list_memories` | 分页列出与过滤 |
 | `update_memory` / `correct_memory` | 更新 / 修正 |
 | `forget` | 删除 |
-| `associations` / `association_graph` | 查看关联 / 联想图 |
-| `memory_stats` / `system_health` | 统计 / 健康 |
+| `associations` / `association_graph` | 查看关联 / 多跳联想图 |
+| `search_code` / `codebase_stats` | 代码片段检索 / 索引统计 |
+| `memory_stats` / `system_health` | 记忆统计 / 系统健康 |
 | `archive` | 归档过期记忆 |
 
 多租户部署（设置了 `LRC_API_TOKEN`）时，所有工具都需要同时提供 `user_id`；
@@ -133,11 +138,42 @@ http://127.0.0.1:3099/mcp
 - **过期与归档**：可为记忆设置存活天数；过期后默认不再出现在检索与列表中，
   可一键归档到冷存储；归档可恢复（从现在重新计时），也可彻底删除。
 
+### 记忆联想
+
+LRC 的「联想」不是内容相似度，而是**记录下来的关系**——两条记忆为什么相关，
+是有依据可查的，不是猜的。
+
+| 关系类型 | 含义 |
+|---|---|
+| `same_event` | 同一次经历产生（知情者断言，证据最强） |
+| `same_event_auto` | 系统按会话自动推断的同经历关系（与断言分开标注） |
+| `shared_entity` | 共享人 / 地 / 时 / 物等实体 |
+| `derived_from` | 派生来源（合成记忆 → 原始记忆） |
+| `same_artifact` | 指向同一代码文件 / 提交等产物 |
+
+- **内容不相似也能关联**：一次出行里「游西湖」与「吃楼外楼」语义毫不相关，
+  但同属一个 `event_id`，因此能互相联想。
+- **多跳扩散**：从一条记忆或一个查询出发做有界多跳探索，返回路径与「为什么相关」。
+- **入口**：桌面端「联想探索」、`lrc associations <id>`、MCP
+  `associations` / `association_graph`、REST `/v1/associations/explore`。
+
+### 上下文沉淀
+
+把「这一轮任务得出的结论」自动存进记忆库，不必手动整理：
+
+- **三种接法**：MCP `absorb` 工具、`lrc absorb`、宿主钩子（Trae / Codex / Cursor / Claude Code，
+  见 [integrations/](integrations/)）。
+- **自动降噪**：过滤 Markdown 表格 / 标题 / 纯链接与闲聊，只留决策、约束、结论、报错根因。
+- **幂等去重**：同内容重复沉淀走合并，不会膨胀；无有效内容时直接跳过（NoOp 不写库）。
+- **可回看**：`lrc doctor --capture` 查看最近几次沉淀的结果，确认钩子是否真的在工作。
+
+与 `distill` / `migrate` 的分工：`distill` 只提炼、不写库；`absorb` 提炼 + 过滤 + 写库一步到位；
+`migrate` 用于把已有提炼结果批量幂等导入。
+
 ### 检索
 
 - **三路融合**：关键词快路 + 深度语义路 + 语义向量路，按结果融合排序。
 - **代码搜索**：对项目代码建立片段索引，按关键词检索文件、函数与行号。
-- **联想探索**：从一条记忆或一个查询出发，做有界多跳扩散，并给出「为什么相关」。
 - **可解释**：检索结果带通路来源与分数分解，便于判断「为什么是这几条」。
 
 ### 健康与维护
@@ -148,6 +184,11 @@ http://127.0.0.1:3099/mcp
 - **洛书偏差**：9 维坐标偏离幻和约束的程度，越低越好。
 - **重新编码**：用当前编码器重算全部记忆的坐标与八卦。
   **只有在你更换过嵌入模型或编码器版本后才会改变结果**；编码器没变时重算不会提升评分。
+  任务可取消、可续跑，进度会落盘，重启后 `--resume` 从断点继续。
+- **近重复报告**：`lrc list --duplicates`（REST `GET /v1/memories/duplicates`）
+  按 MinHash-LSH 找出内容高度重叠的记忆组，先看报告再决定合并或归档。
+- **批量归档**：`lrc archive --auto-summary`（REST `POST /v1/memories/archive-by-tag`）
+  按标签 / 天数 / 条数批量归档，支持 `--dry-run` 先预览；归档可恢复。
 - **归档过期记忆**：把过期记忆移出检索范围（可恢复），不会删除原始内容。
 - **导出备份**：把记忆、代码片段与归档一起导出为 JSON，建议在批量维护前先备份。
 

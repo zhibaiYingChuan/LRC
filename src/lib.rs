@@ -100,6 +100,19 @@ pub mod test_env {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    static GLOBAL_SERIAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    /// 进程级**单例**测试的串行锁（如重编码 `global_job()`）。
+    ///
+    /// 与 env 锁分离：只影响"共享同一进程级单例"的用例，
+    /// 不阻塞其他无关测试。
+    pub fn serial_guard() -> MutexGuard<'static, ()> {
+        GLOBAL_SERIAL_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// ★守卫（v0.9.11 / G6 / CR-20）：**env 锁必须全 crate 唯一**。
     ///
     /// ## 为什么必须
@@ -274,6 +287,10 @@ pub mod semantic_index;
 #[cfg(feature = "server")]
 pub mod reclassify_job;
 
+// 上下文沉淀的共享执行层（REST / MCP 共用同一实现，v0.11.1 B3/B4）。
+#[cfg(feature = "server")]
+pub mod absorb_service;
+
 // === Layer 2: 受保护核心引擎（专有研究许可） ===
 // ⚠️ 2026-10-30 起核心引擎源码**不再随公开仓库分发**：
 //   受保护层代码已迁入私有仓库，公开仓库通过 git submodule（`core/lrc-algo`）
@@ -285,7 +302,10 @@ pub mod engine;
 // === Layer 1: 对话提炼规则引擎（Apache 2.0，P1-1） ===
 // 纯规则、零外部依赖、不写库：输入对话文本，输出待写入的结构化记忆。
 // 与 `memory_write::parse_forget_intent` 同属"规则式意图解析"范式。
+pub mod context_absorb;
 pub mod context_distill;
+// 宿主钩子载荷解析（Trae / Codex / Cursor / Claude Code）：字段名兼容的唯一真源。
+pub mod host_payload;
 
 // === Layer 1: MCP 服务层 (Apache 2.0) ===
 #[cfg(feature = "server")]

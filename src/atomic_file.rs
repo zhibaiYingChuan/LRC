@@ -15,8 +15,10 @@
 //!     （见 `persistence/json.rs` 的「锁序契约」）。
 //!   - 返回 `std::io::Result<()>`，调用方按自身错误类型 `map_err` 转换。
 
+use std::fs;
 use std::path::Path;
 use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, SystemTime};
 
 /// **快照一致性闸门**（v0.9.11 / G5 / CR-37）—— 让"某一时刻的一致快照"从**承诺**变成**机制**。
 ///
@@ -127,6 +129,91 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 递归统计目录占用（备份体积、清理报告共用）。
+pub(crate) fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            // 不跟随符号链接：避免恶意链接导致递归不收敛或越界统计。
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                total += dir_size(&entry.path());
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+/// 孤儿临时文件清理报告。
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct TempCleanupReport {
+    pub removed_files: usize,
+    pub removed_dirs: usize,
+    pub bytes_freed: u64,
+    pub errors: usize,
+}
+
+/// 清理数据目录中**超过 `min_age` 的孤儿 `*.tmp` 文件/目录**。
+///
+/// 只删除名字以 `.tmp` 结尾的条目，不碰正式数据文件。
+/// `min_age` 用于避免误删正在写入的临时文件（原子写通常毫秒级完成，
+/// 1 小时阈值足以覆盖长事务，同时能清掉崩溃残留）。
+pub fn cleanup_orphan_temp_files(data_dir: &Path, min_age: Duration) -> TempCleanupReport {
+    let mut report = TempCleanupReport::default();
+    let Ok(entries) = fs::read_dir(data_dir) else {
+        return report;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".tmp") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            report.errors += 1;
+            continue;
+        };
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .unwrap_or_default();
+        if age < min_age {
+            continue;
+        }
+        if meta.is_dir() {
+            let size = dir_size(&path);
+            match fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    report.removed_dirs += 1;
+                    report.bytes_freed += size;
+                }
+                Err(_) => report.errors += 1,
+            }
+        } else {
+            let size = meta.len();
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    report.removed_files += 1;
+                    report.bytes_freed += size;
+                }
+                Err(_) => report.errors += 1,
+            }
+        }
+    }
+    report
+}
+
 #[cfg(test)]
 mod snapshot_gate_tests {
     use super::*;
@@ -170,5 +257,44 @@ mod snapshot_gate_tests {
             body.contains("writer_guard()"),
             "write_atomic 必须取 writer_guard()，否则备份一致性承诺会再次变成空话（CR-37）"
         );
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    /// min_age=0：所有 `.tmp` 文件/目录都应被清理，正式文件保留。
+    #[test]
+    fn cleanup_removes_old_tmp_entries_only() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("keep.json"), b"data").unwrap();
+        fs::write(root.join("old.tmp"), b"junk").unwrap();
+        fs::write(root.join("fresh.tmp"), b"junk").unwrap();
+        fs::create_dir(root.join(".restore-1.tmp")).unwrap();
+        fs::write(root.join(".restore-1.tmp").join("x"), b"junk").unwrap();
+
+        let report = cleanup_orphan_temp_files(root, Duration::ZERO);
+        assert_eq!(report.removed_files, 2, "{report:?}");
+        assert_eq!(report.removed_dirs, 1, "{report:?}");
+        assert!(report.bytes_freed > 0, "{report:?}");
+        assert_eq!(report.errors, 0, "{report:?}");
+        assert!(root.join("keep.json").exists());
+        assert!(!root.join("old.tmp").exists());
+        assert!(!root.join("fresh.tmp").exists());
+        assert!(!root.join(".restore-1.tmp").exists());
+    }
+
+    /// 阈值大于文件年龄时不得删除（保护正在写入的临时文件）。
+    #[test]
+    fn cleanup_keeps_fresh_tmp_when_min_age_is_large() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("fresh.tmp"), b"junk").unwrap();
+
+        let report = cleanup_orphan_temp_files(root, Duration::from_secs(3600));
+        assert_eq!(report.removed_files, 0, "{report:?}");
+        assert!(root.join("fresh.tmp").exists());
     }
 }

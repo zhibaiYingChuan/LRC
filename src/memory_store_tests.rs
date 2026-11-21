@@ -26,6 +26,108 @@ mod tests {
         (dir, MemoryStore::new(p))
     }
 
+    /// 偏好问法线索：常见口语与英文都必须命中；普通技术问法不得误判。
+    #[test]
+    fn preference_query_cues_cover_common_phrasings() {
+        for q in [
+            "我的包管理器偏好是什么",
+            "我喜欢用什么数据库",
+            "我习惯用什么并发锁",
+            "平时用哪个工具",
+            "what do i prefer for caching",
+            "which tool do i usually use",
+        ] {
+            assert!(
+                crate::memory_store::is_preference_query(&q.to_lowercase()),
+                "应识别为偏好问法：{q}"
+            );
+        }
+        for q in ["如何修复这个 panic", "RwLock 并发模型", "上次的报错是什么"] {
+            assert!(
+                !crate::memory_store::is_preference_query(&q.to_lowercase()),
+                "不应识别为偏好问法：{q}"
+            );
+        }
+        // 否定问法不加偏好分（否则会把无关 preference 拉进结果）。
+        for q in [
+            "我不喜欢用什么",
+            "不常用哪个工具",
+            "我不优先用什么",
+            "i do not prefer this",
+        ] {
+            assert!(
+                !crate::memory_store::is_preference_query(&q.to_lowercase()),
+                "否定问法不应识别为偏好：{q}"
+            );
+        }
+        // 分句判定：前一分句否定、后一分句肯定，仍属偏好意图。
+        assert!(crate::memory_store::is_preference_query(
+            &"不喜欢 A 但喜欢 B".to_lowercase()
+        ));
+    }
+
+    /// 匿名上下文只匹配匿名记忆；Session 级记忆必须不可见。
+    ///
+    /// 锁定 `/context/absorb` 匿名轮次的隐私语义：`Some((User, None, None))`
+    /// 只能与同为匿名的 User 级记忆合并，不得触碰他人的 Session 级记忆。
+    #[test]
+    fn anonymous_user_context_matches_only_anonymous_memories() {
+        use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
+
+        let mut anonymous = Memory::new(
+            "匿名记忆".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        anonymous.privacy_level = PrivacyLevel::User;
+        assert!(is_visible(
+            &anonymous,
+            &Some((PrivacyLevel::User, None, None))
+        ));
+
+        let mut session = Memory::new(
+            "会话记忆".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        session.privacy_level = PrivacyLevel::Session;
+        session.session_id = Some("s1".to_string());
+        assert!(!is_visible(
+            &session,
+            &Some((PrivacyLevel::User, None, None))
+        ));
+
+        // 边界（v0.11.1 审查 P2）：User 级、无 user_id、但带 session_id 的匿名记忆，
+        // 对匿名 User(None,None) 上下文仍可见 —— 这是**有意放宽**：
+        // 本地可信域的匿名记忆同属一个匿名域，允许跨会话去重合并；
+        // 多租户域请求必须带 user_id，走不到 (None, None) 分支。
+        let mut anonymous_with_session = Memory::new(
+            "带会话标签的匿名记忆".to_string(),
+            MemoryType::Fact,
+            None,
+            vec![],
+            Importance::new(5),
+            None,
+        );
+        anonymous_with_session.privacy_level = PrivacyLevel::User;
+        anonymous_with_session.session_id = Some("s1".to_string());
+        assert!(is_visible(
+            &anonymous_with_session,
+            &Some((PrivacyLevel::User, None, None))
+        ));
+        // 但带 user_id 的上下文不得读取它。
+        assert!(!is_visible(
+            &anonymous_with_session,
+            &Some((PrivacyLevel::User, None, Some("u1".to_string())))
+        ));
+    }
+
     /// v0.11 安全回归：Session 级可见性必须同时绑定 user。
     ///
     /// 修复前只比对 `session_id`，导致「自己的 user_id + 他人的 session_id」
@@ -8804,6 +8906,85 @@ mod tests {
             hit,
             k,
             early.len()
+        );
+    }
+
+    /// C6：近重复报告必须找出高相似条目，且不把无关条目拉进来。
+    #[test]
+    fn near_duplicate_groups_finds_similar_pairs() {
+        // 阈值 0.99：避免 remember 在写入时把 A/B 合并掉，从而保留"近重复"样本。
+        let (_dir, store) = make_store_with_threshold(0.99);
+        let a = "数据库连接池的最大连接数应设为 CPU 核数的两倍，并在生产环境开启连接复用与超时回收";
+        let b =
+            "数据库连接池的最大连接数应设为 CPU 核数的两倍，并在生产环境开启连接复用与超时回收。";
+        let c = "今天天气不错，适合出门散步";
+        for text in [a, b, c] {
+            store
+                .remember(make_test_memory(text, MemoryType::Fact))
+                .expect("写入");
+        }
+
+        let report = store.near_duplicate_groups(0.85, 10, 0).expect("报告");
+        assert_eq!(report.total, 3);
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.groups.len(), 1, "应只发现一对近重复: {report:?}");
+        assert_eq!(report.groups[0].memory_ids.len(), 2);
+        assert!(
+            report.groups[0].similarity >= 0.85,
+            "相似度应达到阈值: {report:?}"
+        );
+        let joined = report.groups[0].contents.join("|");
+        assert!(joined.contains("数据库连接池"));
+        assert!(!joined.contains("天气"), "无关条目不得入组: {report:?}");
+    }
+
+    /// C6：空库必须返回空组，而不是报错。
+    #[test]
+    fn near_duplicate_groups_empty_store() {
+        let (_dir, store) = make_store();
+        let report = store.near_duplicate_groups(0.85, 10, 0).expect("空库报告");
+        assert_eq!(report.total, 0);
+        assert!(report.groups.is_empty());
+        assert!(!report.truncated);
+    }
+
+    /// C6：按标签批量归档——dry_run 不写、limit 生效、无关标签不受影响。
+    #[test]
+    fn archive_by_tag_dry_run_and_limit() {
+        let (_dir, store) = make_store_with_threshold(0.99);
+        for i in 0..3 {
+            let mut memory = make_test_memory(
+                &format!("自动摘要候选 {i}：这是第 {i} 条独立内容"),
+                MemoryType::Fact,
+            );
+            memory.tags = vec!["auto-summary".to_string()];
+            memory.created_at = Utc::now() - Duration::days(10 + i as i64);
+            store.remember(memory).expect("写入");
+        }
+        let mut manual = make_test_memory("用户显式写入的重要记忆", MemoryType::Decision);
+        manual.tags = vec!["manual".to_string()];
+        store.remember(manual).expect("写入");
+
+        let dry = store
+            .archive_by_tag("auto-summary", Some(1), 2, true)
+            .expect("dry-run");
+        assert_eq!(dry.matched, 2, "limit 应生效");
+        assert_eq!(dry.archived, 0, "dry-run 不得归档");
+        assert_eq!(
+            store.stats().expect("统计").total_memories,
+            4,
+            "dry-run 不得改变活跃库"
+        );
+
+        let done = store
+            .archive_by_tag("auto-summary", Some(1), 2, false)
+            .expect("归档");
+        assert_eq!(done.matched, 2);
+        assert_eq!(done.archived, 2);
+        assert_eq!(
+            store.stats().expect("统计").total_memories,
+            2,
+            "应归档 2 条，保留 manual 与 1 条未达 limit 的 auto-summary"
         );
     }
 }

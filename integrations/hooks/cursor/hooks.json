@@ -1,5 +1,5 @@
 {
-  "$schema_note": "Cursor hooks 配置模板（P0-2）。事件名与字段以你的 Cursor 版本为准，安装前先看 README 的『适用版本』。",
+  "$schema_note": "Cursor hooks 配置模板（P0-2 + B2）。事件名与字段以你的 Cursor 版本为准，安装前先看 README 的『适用版本』。",
   "version": 1,
   "hooks": {
     "beforeReadFile": [
@@ -12,6 +12,13 @@
       {
         "command": "bash .cursor/hooks/lrc-pre-tool-use.sh",
         "timeout": 10
+      }
+    ],
+    "stop": [
+      {
+        "command": "bash .cursor/hooks/lrc-stop.sh",
+        "timeout": 5,
+        "loop_limit": 3
       }
     ]
   }

@@ -20,6 +20,43 @@ use crate::engine::synthesis_engine::SynthesisConfig;
 use crate::memory_types::{Importance, Memory, MemoryType, PrivacyLevel};
 use serde::{Deserialize, Serialize};
 
+/// 近重复组（v0.11.1 / C6）：一组内容高度相似但未在写入时合并的记忆。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateGroup {
+    /// 组内记忆 ID（按扫描顺序）
+    pub memory_ids: Vec<String>,
+    /// 组内内容预览（与 `memory_ids` 一一对应，最多 200 字符）
+    pub contents: Vec<String>,
+    /// 组内观察到的最高的字符二元组 Jaccard 相似度
+    pub similarity: f32,
+}
+
+/// 近重复报告（`GET /v1/memories/duplicates`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuplicateReport {
+    /// 实际参与比较的记忆数
+    pub scanned: usize,
+    /// 当前库内记忆总数（用于判断是否因 `max_scan` 截断）
+    pub total: usize,
+    /// 近重复组（按组大小降序）
+    pub groups: Vec<DuplicateGroup>,
+    /// 是否因 `max_scan` / `max_groups` 截断
+    pub truncated: bool,
+    /// 检测方法标识（当前为 `minhash_lsh`，便于报告口径可追溯）
+    pub method: String,
+}
+
+/// 按标签批量归档的结果（v0.11.1 / C6）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveByTagReport {
+    /// 命中的记忆数（`dry_run` 时即为"将会归档"的数量）
+    pub matched: usize,
+    /// 实际归档数（`dry_run` 恒为 0）
+    pub archived: usize,
+    /// 命中的记忆 ID（供调用方预览/审计）
+    pub memory_ids: Vec<String>,
+}
+
 /// 由检索结果**联想补全**出的一条记忆（v0.9.8）
 ///
 /// 与 [`MemoryAssociation`] 的区别：后者描述"某条记忆的关联"（详情页用），

@@ -21,6 +21,17 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File .\\.trae\\hooks\\lrc-stop.ps1",
+            "timeout": 8
+          }
+        ]
+      }
     ]
   }
 }

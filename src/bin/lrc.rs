@@ -30,6 +30,7 @@
 //! | 4 | 超时 |
 //! | 5 | 无结果（服务正常，只是没命中） |
 
+use code_memory::host_payload::{parse_host_payload, resolve_turn_text};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Read, Write};
@@ -50,7 +51,21 @@ const EXIT_TIMEOUT: u8 = 4;
 const EXIT_EMPTY: u8 = 5;
 
 /// 无取值的开关型选项（全局统一，未知选项直接报错，避免拼写错误被静默忽略）。
-const KNOWN_FLAGS: &[&str] = &["json", "full", "help", "no-spawn", "yes", "include-expired"];
+const KNOWN_FLAGS: &[&str] = &[
+    "json",
+    "full",
+    "help",
+    "no-spawn",
+    "yes",
+    "include-expired",
+    "dry-run",
+    "capture",
+    "progress",
+    "cancel",
+    "resume",
+    "duplicates",
+    "auto-summary",
+];
 
 /// 需要取值的选项。
 const KNOWN_VALUES: &[&str] = &[
@@ -73,6 +88,13 @@ const KNOWN_VALUES: &[&str] = &[
     "max-items",
     "transcript",
     "ttl-days",
+    "host",
+    "source",
+    "mode",
+    "batch-size",
+    "threshold",
+    "max-scan",
+    "older-than-days",
 ];
 
 /// CLI 统一错误。携带退出码语义，便于 main 直接映射。
@@ -146,8 +168,10 @@ fn run(args: &[String]) -> Result<u8, CliError> {
         "correct" => cmd_correct(rest),
         "associations" => cmd_associations(rest),
         "distill" => cmd_distill(rest),
+        "absorb" => cmd_absorb(rest),
         "migrate" => cmd_migrate(rest),
         "backup" => cmd_backup(rest),
+        "reclassify" => cmd_reclassify(rest),
         "archive" => cmd_archive(rest),
         "unarchive" => cmd_unarchive(rest),
         "purge-archived" => cmd_purge_archived(rest),
@@ -173,18 +197,23 @@ fn print_usage() {
   lrc recall <查询文本> [选项]       三路融合检索记忆
   lrc remember <内容|->  [选项]      写入一条记忆（`-` 表示从 stdin 读取）
   lrc search <查询文本> [选项]       检索代码库
-  lrc list [选项]                    列出记忆
+  lrc list [选项]                    列出记忆（--duplicates 近重复报告）
   lrc stats [选项]                   记忆库统计
   lrc doctor [选项]                  自检（daemon / 版本 / 模型 / 数据目录）
+                                     --capture [N] 附带最近 N 次 absorb 的结果
   lrc mcp [选项]                     以 stdio MCP server 运行（桥接到常驻 daemon）
   lrc daemon <start|stop|status>     管理常驻 daemon
   lrc forget <memory_id> --yes       删除一条记忆（不可撤销，必须显式确认）
   lrc correct <memory_id> <内容|->   修正一条记忆（保留版本历史）
   lrc associations <memory_id>       查看一条记忆的结构化关联
   lrc distill [文本|--transcript P]  从对话提炼候选记忆（不写库）
+  lrc absorb [文本|-] [选项]         任务结束自动沉淀（过滤/去重/写库）
   lrc migrate < - | --file P >       把提炼结果批量写入（幂等，自动分批）
-  lrc backup                         为当前实例创建记忆快照
-  lrc archive                        归档当前实例的过期记忆到冷存储
+  lrc backup [--mode full|core]     为当前实例创建记忆快照（默认 full）
+  lrc reclassify [选项]              全库重编码（默认异步启动）
+                                     --progress 查看进度 / --cancel 取消
+                                     --resume 从上次进度点续跑
+  lrc archive [--auto-summary]       归档过期记忆；--auto-summary 按标签批量归档
   lrc unarchive <memory_id> [--ttl-days N]
                                      从归档恢复一条记忆（从现在重新计时；
                                      --ttl-days 0 表示永不过期，上限 36500）
@@ -210,6 +239,14 @@ remember 选项:
   --tags <a,b,c>
   --event-id <ID>
   --privacy <L>       session|user|global，默认 user
+
+absorb 选项:
+  --session-id <S>    宿主会话 ID（自动摘要会打 session 标签与 event_id）
+  --host <H>          宿主标识：trae|codex|cursor|claude-code|generic
+  --source <S>        model_declared|auto_distill（缺省按输入自动判断）
+  --max-items <N>     单次最多处理条数，默认 10
+  --dry-run           只返回判定结果，不写库
+  输入为宿主钩子 JSON 时，自动提取 last_assistant_message / session_id
 
 forget / correct 选项:
   --user-id <U>       用户级隔离（多租户域必填）
@@ -601,12 +638,30 @@ fn scan_for_daemon(token: Option<&str>) -> Option<String> {
 
 /// 确保 daemon 可用：探测 → 扫描复用 → 必要时拉起 → 轮询就绪。
 fn ensure_daemon(client: &mut Client, spawn_allowed: bool) -> Result<(), CliError> {
+    // 探测超时不能写死 2s：后台重编码/合成会短时吃满 CPU，健康检查可能
+    // 在 2s 内回不来，导致"daemon 明明在跑却报未运行"（实测于 reclassify）。
+    // 普通命令放宽到 5s；钩子（--timeout 4000）仍保持 2s 上限，避免
+    // "探测 + 请求"叠加超出 4s 钩子预算。
+    let probe_timeout = if client.timeout <= Duration::from_secs(4) {
+        client.timeout.min(Duration::from_secs(2))
+    } else {
+        client.timeout.min(Duration::from_secs(5))
+    }
+    .max(Duration::from_secs(1));
     let probe = Client {
-        timeout: Duration::from_secs(2),
+        timeout: probe_timeout,
         ..client.clone()
     };
 
-    if let Ok(health) = probe.send("GET", "/health", None) {
+    // 单次重试：后台长任务（重编码/结晶）偶发让监听短暂无响应——
+    // 实测 reclassify 结束后一次探测失败、紧接着即恢复。钩子路径
+    //（timeout ≤ 4s）不重试，保持快速失败预算。
+    let mut health = probe.send("GET", "/health", None);
+    if health.is_err() && client.timeout > Duration::from_secs(4) {
+        std::thread::sleep(Duration::from_millis(200));
+        health = probe.send("GET", "/health", None);
+    }
+    if let Ok(health) = health {
         let service = health
             .get("service")
             .and_then(Value::as_str)
@@ -1076,10 +1131,86 @@ fn cmd_list(args: &[String]) -> Result<u8, CliError> {
     let mut client = build_client(&parsed, Duration::from_secs(15))?;
     ensure_daemon(&mut client, allow_spawn(&parsed))?;
 
+    // 近重复报告（C6）：内容高度相似但未在写入时合并的记忆组。
+    if parsed.flag("duplicates") {
+        let threshold = match parsed.value("threshold") {
+            Some(raw) => raw.parse::<f32>().map_err(|_| {
+                CliError::Arg(format!("--threshold 需要 0.5~1.0 的小数，收到 `{raw}`"))
+            })?,
+            None => 0.85,
+        };
+        let limit = parsed.value_usize("limit", 50)?;
+        let max_scan = parsed.value_usize("max-scan", 0)?;
+        let uri = format!(
+            "/v1/memories/duplicates?threshold={threshold}&limit={limit}&max_scan={max_scan}"
+        );
+        let started = Instant::now();
+        let response = client.send("GET", &uri, None)?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let groups = response
+            .get("groups")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if parsed.flag("json") {
+            print_json(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "ok": true,
+                "scanned": response.get("scanned").and_then(Value::as_u64).unwrap_or(0),
+                "total": response.get("total").and_then(Value::as_u64).unwrap_or(0),
+                "truncated": response.get("truncated").and_then(Value::as_bool).unwrap_or(false),
+                "method": response.get("method").and_then(Value::as_str).unwrap_or("?"),
+                "groups": groups,
+                "elapsed_ms": elapsed_ms,
+            }))?;
+        } else if groups.is_empty() {
+            println!("未发现近重复组（阈值 {threshold}）");
+        } else {
+            for (index, group) in groups.iter().enumerate() {
+                let ids = group
+                    .get("memory_ids")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let similarity = group
+                    .get("similarity")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                println!(
+                    "组 {}：{} 条，最高相似度 {:.3}",
+                    index + 1,
+                    ids.len(),
+                    similarity
+                );
+                for content in group
+                    .get("contents")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    println!("  - {}", truncate(content.as_str().unwrap_or(""), 160));
+                }
+            }
+            if response
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                println!("（结果不完整：扫描上限或退化分桶导致，可调大 --max-scan / --limit）");
+            }
+        }
+        return Ok(if groups.is_empty() {
+            EXIT_EMPTY
+        } else {
+            EXIT_OK
+        });
+    }
+
     let started = Instant::now();
     let body = json!({
         "limit": parsed.value_usize("limit", 20)?,
         "project": resolve_filter_project(&parsed),
+        "memory_type": parsed.value("type"),
         "user_id": parsed.value("user-id"),
         "session_id": parsed.value("session-id"),
         // v0.11：默认隐藏过期记忆；导出/清理场景可显式包含。
@@ -1407,13 +1538,66 @@ fn cmd_doctor(args: &[String]) -> Result<u8, CliError> {
         }
     }
 
+    // 5) 沉淀诊断（B4，可选）：--capture 显示最近 N 次 absorb 的结果。
+    // 无数据是**正常状态**（宿主还没调用过 absorb），必须诚实空态而非报错。
+    let mut captures: Option<Vec<Value>> = None;
+    if parsed.flag("capture") && is_lrc {
+        // 支持两种写法：`--capture`（默认 10 条）与 `--capture N`。
+        // 手写解析把 `N` 收进 positional，这里显式消费，避免"写了 20 却静默用 10"。
+        let limit = match parsed.positional.first() {
+            Some(raw) => raw
+                .parse::<usize>()
+                .map_err(|_| CliError::Arg(format!("--capture 需要非负整数，收到 `{raw}`")))?,
+            None => parsed.value_usize("limit", 10)?,
+        };
+        match client.send(
+            "GET",
+            &format!("/v1/context/absorb/log?limit={limit}"),
+            None,
+        ) {
+            Ok(value) => {
+                let records = value
+                    .get("records")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                record(
+                    &mut checks,
+                    "capture",
+                    "ok",
+                    format!("最近 {} 条沉淀记录", records.len()),
+                );
+                captures = Some(records);
+            }
+            Err(error) => {
+                let message = error.message().to_string();
+                // 多租户域下该端点仅管理员可读：这是**权限边界**，不是故障。
+                // 记为 WARN 并继续，避免 `--capture` 把整次自检拉成失败。
+                if message.contains("HTTP 403") {
+                    record(
+                        &mut checks,
+                        "capture",
+                        "warn",
+                        "多租户域仅管理员可读（已跳过）".to_string(),
+                    );
+                } else {
+                    failed = true;
+                    record(&mut checks, "capture", "fail", message);
+                }
+            }
+        }
+    }
+
     if parsed.flag("json") {
-        let output = json!({
+        let mut output = json!({
             "schema_version": SCHEMA_VERSION,
             "ok": !failed,
             "base": client.base,
             "checks": checks,
         });
+        if let Some(records) = &captures {
+            output["captures"] = json!(records);
+        }
         print_json(&output)?;
     } else {
         println!("LRC 自检（base: {}）", client.base);
@@ -1427,6 +1611,35 @@ fn cmd_doctor(args: &[String]) -> Result<u8, CliError> {
                 _ => "FAIL",
             };
             println!("[{tag}] {name:<10} {detail}");
+        }
+        if let Some(records) = &captures {
+            if records.is_empty() {
+                println!("最近沉淀: 无记录（宿主尚未调用 absorb，或数据目录为空）");
+            } else {
+                println!("最近沉淀（{} 条）:", records.len());
+                for record in records {
+                    let ts = record.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
+                    let stamp = chrono::DateTime::from_timestamp_millis(ts as i64)
+                        .map(|dt| dt.format("%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| ts.to_string());
+                    println!(
+                        "  {stamp} host={} source={} 候选{} 写入{} 跳过{} 失败{} {}ms",
+                        record.get("host").and_then(Value::as_str).unwrap_or("?"),
+                        record.get("source").and_then(Value::as_str).unwrap_or("?"),
+                        record
+                            .get("candidates")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        record.get("written").and_then(Value::as_u64).unwrap_or(0),
+                        record.get("skipped").and_then(Value::as_u64).unwrap_or(0),
+                        record.get("failed").and_then(Value::as_u64).unwrap_or(0),
+                        record
+                            .get("elapsed_ms")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    );
+                }
+            }
         }
         if failed {
             println!("结论: 存在问题，请按上面 FAIL 项排查。");
@@ -1747,6 +1960,268 @@ fn cmd_distill(args: &[String]) -> Result<u8, CliError> {
     })
 }
 
+/// `lrc absorb` —— 任务结束自动沉淀（通用宿主入口）。
+///
+/// 宿主载荷的字段兼容（Trae snake_case / Codex kebab-case / Cursor）收敛在
+/// [`code_memory::host_payload`]（唯一真源），本函数只做参数与输出适配。
+///
+/// 与 `distill` 的分工：`distill` 只提炼不写库；`absorb` 自己完成过滤、
+/// 批内/跨轮去重、删除守卫与写入，供各宿主 Stop 钩子直接调用。
+fn cmd_absorb(args: &[String]) -> Result<u8, CliError> {
+    let parsed = parse_args(args)?;
+    if parsed.flag("help") {
+        print_usage();
+        return Ok(EXIT_OK);
+    }
+    if parsed.positional.len() > 1 {
+        return Err(CliError::Arg(
+            "内容包含空格时请用引号包住；多行文本请用 `-` 从 stdin 读取".to_string(),
+        ));
+    }
+
+    // 位置参数优先；`-` 或无位置参数都读 stdin（钩子场景 stdin 是唯一通道）。
+    let raw = match parsed.positional.first() {
+        Some(raw) if raw == "-" => read_stdin()?,
+        Some(raw) => raw.clone(),
+        None => read_stdin()?,
+    };
+
+    let payload = parse_host_payload(&raw);
+    // 文本收敛规则（含 stop_hook_active 防循环、畸形 JSON 不提炼）收敛在
+    // `host_payload::resolve_turn_text`，CLI 不再维护第二份判定。
+    let text = resolve_turn_text(&raw);
+
+    let session_id = parsed
+        .value("session-id")
+        .map(str::to_string)
+        .or_else(|| payload.as_ref().and_then(|p| p.session_id.clone()));
+    let host = parsed
+        .value("host")
+        .map(str::to_string)
+        .or_else(|| payload.as_ref().and_then(|p| p.host.clone()))
+        .unwrap_or_else(|| "generic".to_string());
+    let project = parsed
+        .value("project")
+        .map(str::to_string)
+        .or_else(|| payload.as_ref().and_then(|p| p.project.clone()))
+        // Codex notify 会带 `cwd`（工作目录），优先用它推断项目名，
+        // 避免钩子进程的当前目录与项目目录不一致时归属写错。
+        .or_else(|| {
+            payload
+                .as_ref()
+                .and_then(|p| p.cwd.as_deref())
+                .and_then(|cwd| Path::new(cwd).file_name())
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .or_else(|| resolve_write_project(&parsed));
+
+    if text.trim().is_empty() {
+        // 空回复（或 JSON 无文本字段）静默退出，不打扰对话。
+        if parsed.flag("json") {
+            print_json(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "ok": true,
+                "candidates": 0,
+                "written": 0,
+                "skipped": 0,
+                "failed": 0,
+                "items": [],
+            }))?;
+        }
+        return Ok(EXIT_EMPTY);
+    }
+
+    let mut client = build_client(&parsed, Duration::from_secs(15))?;
+    ensure_daemon(&mut client, allow_spawn(&parsed))?;
+
+    let started = Instant::now();
+    let body = json!({
+        "text": text,
+        "session_id": session_id,
+        "user_id": parsed.value("user-id"),
+        "project": project,
+        "host": host,
+        "source": parsed.value("source"),
+        "max_items": parsed.value_usize("max-items", 10)?,
+        "dry_run": parsed.flag("dry-run"),
+    });
+    let response = client.send("POST", "/v1/context/absorb", Some(&body))?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    let count = |key: &str| response.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let candidates = count("candidates");
+    let written = count("written");
+    let skipped = count("skipped");
+    let failed = count("failed");
+    let items: Vec<Value> = response
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let dropped: Vec<Value> = response
+        .get("dropped")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if parsed.flag("json") {
+        print_json(&json!({
+            "schema_version": SCHEMA_VERSION,
+            "ok": failed == 0,
+            "dry_run": response.get("dry_run").and_then(Value::as_bool).unwrap_or(false),
+            "candidates": candidates,
+            "written": written,
+            "skipped": skipped,
+            "failed": failed,
+            "dropped": dropped,
+            "items": items,
+            "elapsed_ms": elapsed_ms,
+        }))?;
+    } else {
+        for item in &items {
+            let reason = item.get("reason").and_then(Value::as_str).unwrap_or("?");
+            let content = item.get("content").and_then(Value::as_str).unwrap_or("");
+            println!("[{reason}] {}", truncate(content, 160));
+        }
+        for reason in &dropped {
+            println!("[dropped] {}", reason.as_str().unwrap_or(""));
+        }
+        println!(
+            "候选 {candidates} / 写入 {written} / 跳过 {skipped} / 失败 {failed}，用时 {elapsed_ms}ms"
+        );
+    }
+
+    Ok(if failed > 0 {
+        EXIT_ERROR
+    } else if candidates == 0 {
+        EXIT_EMPTY
+    } else {
+        EXIT_OK
+    })
+}
+
+/// `lrc reclassify` —— 全库重编码（C2：异步启动 / 进度 / 取消 / 续跑）。
+///
+/// 默认**异步启动后立即返回**：11k 库在单核上需数分钟，CLI 不应阻塞终端。
+fn cmd_reclassify(args: &[String]) -> Result<u8, CliError> {
+    let parsed = parse_args(args)?;
+    if parsed.flag("help") {
+        print_usage();
+        return Ok(EXIT_OK);
+    }
+    if !parsed.positional.is_empty() {
+        return Err(CliError::Arg(
+            "reclassify 不接受位置参数；请用 --progress / --cancel / --resume".to_string(),
+        ));
+    }
+
+    let mut client = build_client(&parsed, Duration::from_secs(15))?;
+    // 运维操作：不做邻域扫描、不自动拉起（与 backup 一致）。
+    client.explicit_base = true;
+
+    // 进度/取消是**只读状态查询**：不经过 ensure_daemon 的探测门。
+    // 后台重编码吃满 CPU 时探测可能误判"未运行"，而真正的请求本身有 15s 超时。
+    if parsed.flag("progress") {
+        let value = client.send("GET", "/v1/memories/reclassify-bagua/progress", None)?;
+        if parsed.flag("json") {
+            print_json(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "ok": true,
+                "progress": value,
+            }))?;
+            return Ok(EXIT_OK);
+        }
+        let status = value.get("status").and_then(Value::as_str).unwrap_or("?");
+        let total = value.get("total").and_then(Value::as_u64).unwrap_or(0);
+        let processed = value.get("processed").and_then(Value::as_u64).unwrap_or(0);
+        let changed = value.get("changed").and_then(Value::as_u64).unwrap_or(0);
+        let percent = value.get("percent").and_then(Value::as_f64).unwrap_or(0.0);
+        println!("状态 {status}：{processed}/{total}（{percent:.1}%），已变更 {changed} 条");
+        if value
+            .get("resumable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            println!("可从进度点续跑：lrc reclassify --resume");
+        }
+        // 进程重启后内存快照为 idle：展示落盘进度，避免误以为"从没跑过"。
+        if status == "idle" {
+            if let Some(persisted) = value.get("persisted").filter(|v| v.is_object()) {
+                let p_processed = persisted
+                    .get("processed")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let p_total = persisted.get("total").and_then(Value::as_u64).unwrap_or(0);
+                println!(
+                    "检测到上次中断的进度：{p_processed}/{p_total}（落盘于 {}），可 `--resume` 继续",
+                    persisted.get("status").and_then(Value::as_str).unwrap_or("?")
+                );
+            }
+        }
+        if let Some(error) = value.get("error").and_then(Value::as_str) {
+            println!("错误: {error}");
+        }
+        return Ok(if status == "idle" {
+            EXIT_EMPTY
+        } else {
+            EXIT_OK
+        });
+    }
+
+    if parsed.flag("cancel") {
+        let value = client.send(
+            "POST",
+            "/v1/memories/reclassify-bagua/cancel",
+            Some(&json!({})),
+        )?;
+        if parsed.flag("json") {
+            print_json(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "ok": true,
+                "cancel": value,
+            }))?;
+        } else {
+            let offset = value
+                .get("resume_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            println!("已登记取消（当前进度 {offset} 条）；用 --progress 确认状态。");
+        }
+        return Ok(EXIT_OK);
+    }
+
+    // 启动/续跑：先确认 daemon 身份，避免把任务提交到别的服务。
+    ensure_daemon(&mut client, false)?;
+    let limit = parsed.value_usize("limit", 0)?;
+    let batch_size = parsed.value_usize("batch-size", 0)?;
+    let body = json!({
+        "async": true,
+        "limit": limit,
+        "batch_size": batch_size,
+        "resume": parsed.flag("resume"),
+    });
+    let value = client.send("POST", "/v1/memories/reclassify-bagua", Some(&body))?;
+    if parsed.flag("json") {
+        print_json(&json!({
+            "schema_version": SCHEMA_VERSION,
+            "ok": true,
+            "task": value,
+        }))?;
+    } else {
+        let task_id = value.get("task_id").and_then(Value::as_str).unwrap_or("?");
+        let total = value.get("total").and_then(Value::as_u64).unwrap_or(0);
+        let resume_from = value
+            .get("resume_from")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        println!(
+            "已启动重编码任务 {task_id}（total={total}，从 offset {resume_from} 开始）。\n\
+             用 `lrc reclassify --progress` 查看进度；`--cancel` 可随时取消。"
+        );
+    }
+    Ok(EXIT_OK)
+}
+
 fn cmd_migrate(args: &[String]) -> Result<u8, CliError> {
     let parsed = parse_args(args)?;
     if parsed.flag("help") {
@@ -1883,13 +2358,29 @@ fn cmd_backup(args: &[String]) -> Result<u8, CliError> {
         return Ok(EXIT_OK);
     }
 
-    let mut client = build_client(&parsed, Duration::from_secs(60))?;
+    // Full 快照可能数百 MB，60s 不够；给 5 分钟，避免 CLI 先超时、
+    // 服务端却仍在后台完成，让用户误判失败。
+    let mut client = build_client(&parsed, Duration::from_secs(300))?;
     // 运维操作：不做邻域扫描、不自动拉起（与 archive 一致）。
     client.explicit_base = true;
     ensure_daemon(&mut client, false)?;
 
     let started = Instant::now();
-    let response = client.send("POST", "/v1/backup", None)?;
+    // 备份模式：缺省由服务端决定（full）。显式给出时先做本地校验，
+    // 避免把拼写错误发给服务端再回来一个 400。
+    let body = match parsed.value("mode") {
+        Some(raw) => {
+            let mode = raw.trim().to_ascii_lowercase();
+            if mode != "full" && mode != "core" {
+                return Err(CliError::Arg(
+                    "--mode 只能是 full（含语义向量/图边）或 core（轻量）".to_string(),
+                ));
+            }
+            Some(json!({ "mode": mode }))
+        }
+        None => None,
+    };
+    let response = client.send("POST", "/v1/backup", body.as_ref())?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     let success = response
@@ -1944,6 +2435,45 @@ fn cmd_archive(args: &[String]) -> Result<u8, CliError> {
     let mut client = build_client(&parsed, Duration::from_secs(60))?;
     client.explicit_base = true;
     ensure_daemon(&mut client, false)?;
+
+    // C6：按标签批量归档（典型用途：清理 auto-summary 自动摘要）。
+    if parsed.flag("auto-summary") {
+        let older_than_days = match parsed.value("older-than-days") {
+            Some(raw) => Some(raw.parse::<u64>().map_err(|_| {
+                CliError::Arg(format!("--older-than-days 需要非负整数，收到 `{raw}`"))
+            })?),
+            None => None,
+        };
+        let body = json!({
+            "tag": "auto-summary",
+            "older_than_days": older_than_days,
+            "limit": parsed.value_usize("limit", 0)?,
+            "dry_run": parsed.flag("dry-run"),
+        });
+        let started = Instant::now();
+        let response = client.send("POST", "/v1/memories/archive-by-tag", Some(&body))?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let matched = response.get("matched").and_then(Value::as_u64).unwrap_or(0);
+        let archived = response
+            .get("archived")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if parsed.flag("json") {
+            print_json(&json!({
+                "schema_version": SCHEMA_VERSION,
+                "ok": true,
+                "matched": matched,
+                "archived": archived,
+                "dry_run": parsed.flag("dry-run"),
+                "elapsed_ms": elapsed_ms,
+            }))?;
+        } else if parsed.flag("dry-run") {
+            println!("将归档 {matched} 条 auto-summary 记忆（dry-run，未执行）");
+        } else {
+            println!("已归档 {archived} 条 auto-summary 记忆（{elapsed_ms}ms）");
+        }
+        return Ok(EXIT_OK);
+    }
 
     let started = Instant::now();
     let response = client.send("POST", "/v1/memories/archive-expired", None)?;
