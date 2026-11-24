@@ -2004,15 +2004,45 @@ function renderDashboard(system, detailed, dao) {
   const sysProjectCount = $('sys-project-count');
   const sysMode = $('sys-mode');
 
-  // 服务状态：基于 dao_isomorphism_score 判断
-  // v0.9.0 修复：dao 数据不可用时显示"部分不可用"而非误导性的健康评分
-  const daoScore = health.dao ? (daoMetrics.dao_isomorphism_score ?? 0) : null;
+  // 服务状态：优先使用**综合健康**（与「系统健康评分」面板同一口径）
+  //
+  // ★v0.11.1 修复（用户可见误报）：此前只看 dao_isomorphism_score（结构指标）。
+  //   语义编码（ML）下洛书偏离是 9 维投影的结构特性，实测该分常停在 0.16 左右，
+  //   于是「系统信息」卡片把健康系统标成「待优化」，而同页健康面板显示
+  //   78 分「状态稳定」—— 同一时刻两处结论相反，用户也不知道该点什么去"优化"。
+  //   现改为：综合健康 > 后端 system_mode > 结构指标（且语义编码下不据此判故障）。
+  const compositeScore = Number(dao?.data?.health_score);
+  const encoderIsMl =
+    dao?.data?.encoder_mode === 'ml' || system?.encoder?.mode === 'ml';
+  let sysLevel = null; // healthy | warning | critical
+  if (Number.isFinite(compositeScore)) {
+    sysLevel = compositeScore >= 50 ? 'healthy' : (compositeScore >= 30 ? 'warning' : 'critical');
+  } else if (system?.system_mode) {
+    sysLevel = ({
+      healthy: 'healthy',
+      degraded: 'warning',
+      misaligned: 'warning',
+      oscillating: 'warning',
+      drifting: 'warning',
+      frozen: 'critical',
+      overloaded: 'critical',
+    })[system.system_mode] || null;
+  }
+  if (!sysLevel && health.dao) {
+    const daoScore = daoMetrics.dao_isomorphism_score ?? 0;
+    // 语义编码下结构指标长期偏低属投影特性，不能据此判「待优化」。
+    if (encoderIsMl) {
+      sysLevel = 'healthy';
+    } else {
+      sysLevel = daoScore >= 0.5 ? 'healthy' : (daoScore >= 0.3 ? 'warning' : 'critical');
+    }
+  }
   if (sysHealthStatus) {
-    if (daoScore === null) {
+    if (!sysLevel) {
       sysHealthStatus.innerHTML = '<span class="badge warning"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">部分数据暂不可用</span>';
-    } else if (daoScore >= 0.5) {
+    } else if (sysLevel === 'healthy') {
       sysHealthStatus.innerHTML = '<span class="badge healthy"><img class="inline-icon" src="/assets/icons/icon-check.svg" width="14" height="14" alt="">正常运行</span>';
-    } else if (daoScore >= 0.3) {
+    } else if (sysLevel === 'warning') {
       sysHealthStatus.innerHTML = '<span class="badge warning"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">需关注</span>';
     } else {
       sysHealthStatus.innerHTML = '<span class="badge critical"><img class="inline-icon" src="/assets/icons/icon-warning.svg" width="14" height="14" alt="">待优化</span>';
@@ -3482,13 +3512,29 @@ async function generateCaptainLog() {
     }
 
     log += '\n━━━ 状态摘要 ━━━\n';
-    const daoScore = daoMetrics.dao_isomorphism_score || 0;
-    if (daoScore >= 0.5) {
-      log += '  [良好] 系统健康 — 道同构度良好，各子系统运行正常。\n';
-    } else if (daoScore >= 0.3) {
-      log += '  [警告] 系统警告 — 道同构度偏低，建议关注编码质量和合成比率。\n';
+    // 与仪表盘同口径：优先综合健康，其次后端 system_mode；
+    // 语义编码下不再按结构指标判「需关注/严重」（结构指标是投影特性）。
+    const compositeForLog = Number(dao?.data?.health_score ?? daoMetrics.health_score);
+    const logEncoderMl = (dao?.data?.encoder_mode || system?.encoder?.mode) === 'ml';
+    if (Number.isFinite(compositeForLog)) {
+      if (compositeForLog >= 50) {
+        log += '  [良好] 系统健康 — 综合健康 ' + compositeForLog.toFixed(0) + ' 分，各子系统运行正常。\n';
+      } else if (compositeForLog >= 30) {
+        log += '  [警告] 系统警告 — 综合健康 ' + compositeForLog.toFixed(0) + ' 分，可在仪表盘「记忆库维护」查看建议。\n';
+      } else {
+        log += '  [关注] 系统需关注 — 综合健康 ' + compositeForLog.toFixed(0) + ' 分，建议先导出备份再按维护建议处理。\n';
+      }
     } else {
-      log += '  [严重] 系统需关注 — 道同构度严重偏低，建议检查编码器状态和训练数据。\n';
+      const daoScore = daoMetrics.dao_isomorphism_score || 0;
+      if (logEncoderMl) {
+        log += '  [良好] 语义编码模式 — 道同构度是 9 维投影的结构特性，不作为健康判据。\n';
+      } else if (daoScore >= 0.5) {
+        log += '  [良好] 系统健康 — 道同构度良好，各子系统运行正常。\n';
+      } else if (daoScore >= 0.3) {
+        log += '  [警告] 系统警告 — 道同构度偏低，建议关注编码质量和合成比率。\n';
+      } else {
+        log += '  [严重] 系统需关注 — 道同构度严重偏低，建议检查编码器状态和训练数据。\n';
+      }
     }
 
     log += '\n═══════════════════════════════════════════\n';

@@ -127,6 +127,12 @@ def scan_file(filepath: Path, verbose: bool = False) -> list[dict]:
         # 受保护的是 "道同构"（无"度"字），实际算法在 src/engine/ 受保护文件中
         if re.search(r'道同构度', line):
             continue
+        # 跳过指标快照的**只读字段名**引用（如 snapshot.avg_luoshu_deviation）。
+        # 这些是 engine 层 DaoMetricsSnapshot 的公开数据契约字段：产品侧只读取
+        # 并展示数值，不包含任何编码/投影算法；同 dao_isomorphism_score 先例。
+        # ★v0.11.1：MCP system_health 改为输出综合健康时会读到该字段。
+        if re.search(r'\b(avg_luoshu_deviation|luoshu_deviation|dao_isomorphism_score)\b', line):
+            continue
         # 跳过注释中的图标名称列表（如 "baga/health/decay/luoshu/memory/..."）
         # 这些是静态资源文件名引用，不是算法泄露
         if re.search(r'//.*\b\w+/\w+/\w+.*(luoshu|bagua)', line, re.IGNORECASE):

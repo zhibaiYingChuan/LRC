@@ -20,7 +20,7 @@ use crate::{
 // `String` 收敛为带域分类的 [`crate::errors::LrcError`]（io / parse / config / crypto）。
 // `Display` 仅输出 message，故前端/日志文案**零漂移**。
 use crate::errors::{LrcError, LrcResult};
-use crate::lock_ext::MutexExt;
+use crate::lock_ext::{LockExt, MutexExt};
 use axum::{
     extract::State,
     http::{Request, StatusCode},
@@ -3661,14 +3661,40 @@ async fn handle_tools_call(
             let store = state.memory_store.read().await;
             match store.dao_metrics_snapshot() {
                 Ok(snapshot) => {
+                    // v0.11.1：与面板同口径 —— 主指标是**综合健康**，
+                    // 语义编码下道同构度是 9 维投影的结构特性，不能据此建议"检查编码器"。
+                    let encoder_is_semantic = store.is_ml_encoder();
+                    let regulator = store.dao_regulator.read_recover();
+                    let composite = match regulator.latest_composite_health(encoder_is_semantic) {
+                        Some(v) => v,
+                        None => regulator.preview_composite_health(
+                            snapshot.dao_isomorphism_score,
+                            snapshot.bagua_entropy,
+                            snapshot.synthesis_ratio,
+                            snapshot.avg_luoshu_deviation,
+                            encoder_is_semantic,
+                        ),
+                    }
+                    .clamp(0.0, 1.0);
+
                     let mut text = String::from("═══════════════════════════════════\n");
                     text.push_str("  系统健康度监控仪表\n");
                     text.push_str("═══════════════════════════════════\n\n");
 
                     text.push_str("### 核心指标\n");
+                    text.push_str(&format!("- 综合健康评分: {:.1}%\n", composite * 100.0));
                     text.push_str(&format!(
-                        "- 一致性评分: {:.1}%\n",
-                        snapshot.dao_isomorphism_score * 100.0
+                        "- 结构一致性评分: {:.1}%{}\n",
+                        snapshot.dao_isomorphism_score * 100.0,
+                        if encoder_is_semantic {
+                            "（语义编码投影特性，不作健康判据）"
+                        } else {
+                            ""
+                        }
+                    ));
+                    text.push_str(&format!(
+                        "- 结构平均偏离度: {:.2}\n",
+                        snapshot.avg_luoshu_deviation
                     ));
                     text.push_str(&format!(
                         "- 分布熵: {:.3} (最大 3.0)\n",
@@ -3693,8 +3719,18 @@ async fn handle_tools_call(
                     text.push_str(&format!("- 检索次数: {}\n", snapshot.recalls_total));
                     text.push_str(&format!("- 修正次数: {}\n", snapshot.corrections_total));
 
-                    if snapshot.dao_isomorphism_score < 0.5 {
-                        text.push_str("\n⚠️ 一致性评分偏低，建议检查编码器或增加训练数据。\n");
+                    // 建议按**综合健康**给出；语义编码下不再因结构分低建议"检查编码器"
+                    // （那会让用户去做一件不会改变结果的事）。
+                    if composite < 0.5 && !encoder_is_semantic {
+                        text.push_str("\n⚠️ 综合健康偏低，建议检查编码器状态或增加高质量记忆。\n");
+                    } else if composite < 0.3 && encoder_is_semantic {
+                        text.push_str(
+                            "\n⚠️ 综合健康偏低，建议在仪表盘「记忆库维护」查看建议动作。\n",
+                        );
+                    } else if encoder_is_semantic && snapshot.avg_luoshu_deviation > 0.0 {
+                        text.push_str(
+                            "\nℹ️ 语义编码模式：结构偏离是 9 维投影的特性，不代表记忆损坏。\n",
+                        );
                     }
                     if snapshot.bagua_entropy < 0.5 && snapshot.active_memories > 10 {
                         text.push_str("\n⚠️ 分布过于集中，记忆可能存在类别偏差。\n");
