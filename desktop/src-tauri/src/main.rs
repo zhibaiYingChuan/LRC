@@ -130,6 +130,8 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        // v0.11.2：自动更新（清单与安装包走自有服务器）
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // 注册 IPC 命令（契约：前端通过 invoke 调用）
         .invoke_handler(tauri::generate_handler![
             commands::get_sidecar_status,
@@ -183,6 +185,8 @@ fn main() {
             commands::get_scan_cache_metadata,    // v0.8.31 S-05：获取扫描缓存元数据（时间戳+TTL）
             commands::force_invalidate_scan_cache, // v0.8.31 S-05：前端「重新扫描」按钮强制失效缓存
             commands::get_proxy_configuration, // v0.9.7 修复：前端代理检测（app.js:285）此前调用未注册命令
+            commands::check_update,            // v0.11.2：检查更新（自有服务器清单）
+            commands::install_update,          // v0.11.2：下载并安装更新
         ])
         .manage(app_store)
         // v0.5.4 P2-16 调试：页面加载事件追踪

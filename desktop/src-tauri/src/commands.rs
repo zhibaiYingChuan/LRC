@@ -162,6 +162,51 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
             }
         }
     }
+
+    // 3. Trae 全局自动记忆钩子（v0.11.2）
+    //
+    // 规则文件只能"建议" AI 使用记忆；真正让每轮结论自动落库的是 Stop 钩子。
+    // 幂等合并用户已有 hooks（probe / gate 等），失败只告警，不影响桌面端。
+    // 国际版 Trae 与 Trae CN 的全局目录不同（~/.trae vs ~/.trae-cn），必须分别安装。
+    // 非 Windows 暂不支持（脚本为 PowerShell），用 cfg 避免每次启动刷告警。
+    #[cfg(windows)]
+    if let Some(home) = dirs::home_dir() {
+        for tool_id in ["trae", "trae-cn"] {
+            if !installed_agent_ids.iter().any(|id| id == tool_id) {
+                continue;
+            }
+            let home = home.clone();
+            let tool = tool_id.to_string();
+            let install_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || {
+                    crate::hooks_installer::install_trae_hooks(&home, &tool)
+                }),
+            )
+            .await;
+            match install_result {
+                Ok(Ok(Ok(report))) => tracing::info!(
+                    "[sidecar] {} 自动记忆钩子已就绪（changed={}, {}）",
+                    tool_id,
+                    report.changed,
+                    report.hooks_path.display()
+                ),
+                Ok(Ok(Err(e))) => tracing::warn!(
+                    "[sidecar] {} 钩子安装失败（不影响 sidecar）: {}",
+                    tool_id,
+                    e
+                ),
+                Ok(Err(_)) => tracing::warn!(
+                    "[sidecar] {} 钩子安装 spawn_blocking panic（不影响 sidecar）",
+                    tool_id
+                ),
+                Err(_) => tracing::warn!(
+                    "[sidecar] {} 钩子安装超时（5s，不影响 sidecar）",
+                    tool_id
+                ),
+            }
+        }
+    }
 }
 
 /// 在主窗口 iframe 中显示仪表盘（统一入口，消除 2 处重复的 JS 注入逻辑）
@@ -2873,6 +2918,58 @@ pub fn get_proxy_configuration() -> ProxyConfigInfo {
             proxy_type: String::new(),
         },
     }
+}
+
+// ════════════════════════════════════════════════════════════
+// v0.11.2：自动更新（清单与安装包走自有服务器）
+// ════════════════════════════════════════════════════════════
+
+/// 可用的更新信息（前端展示用）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UpdateInfo {
+    pub version: String,
+    pub current_version: String,
+    pub notes: Option<String>,
+    pub date: Option<String>,
+}
+
+/// 检查更新：返回 None 表示已是最新。
+#[tauri::command]
+pub async fn check_update(app: tauri::AppHandle) -> Result<Option<UpdateInfo>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app
+        .updater()
+        .map_err(|e| format!("更新器初始化失败: {e}"))?;
+    match updater.check().await {
+        Ok(Some(update)) => Ok(Some(UpdateInfo {
+            version: update.version.clone(),
+            current_version: update.current_version.clone(),
+            notes: update.body.clone(),
+            date: update.date.map(|d| d.to_string()),
+        })),
+        Ok(None) => Ok(None),
+        Err(e) => Err(format!("检查更新失败: {e}")),
+    }
+}
+
+/// 下载并安装更新；成功后由前端提示重启。
+#[tauri::command]
+pub async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app
+        .updater()
+        .map_err(|e| format!("更新器初始化失败: {e}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("检查更新失败: {e}"))?
+        .ok_or_else(|| "当前已是最新版本".to_string())?;
+    let version = update.version.clone();
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|e| format!("下载或安装失败: {e}"))?;
+    Ok(version)
 }
 
 #[cfg(test)]

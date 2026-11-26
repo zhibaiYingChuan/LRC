@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.11.1';
+const APP_VERSION = '0.11.2';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -1266,8 +1266,9 @@ const SidecarHealthMonitor = {
       apiButtons.forEach(btn => {
         const action = btn.getAttribute('data-action');
         // v0.8.16：启动服务按钮不禁用（data-action 改为 handleStartServiceClick）
-        if (action === 'handleStartServiceClick' || action === 'openStartServiceModal' || action === 'closeStartServiceModal') {
-          return;  // 启动/关闭服务按钮不禁用
+        // v0.11.2：检查更新走 Rust 侧网络，不依赖 sidecar，服务离线时也必须可用。
+        if (action === 'handleStartServiceClick' || action === 'openStartServiceModal' || action === 'closeStartServiceModal' || action === 'checkForUpdates') {
+          return;  // 启动/关闭服务、检查更新按钮不禁用
         }
         btn.classList.add('btn-disabled-api');
         btn.setAttribute('title', '服务未运行，请先启动 LRC 服务');
@@ -7297,6 +7298,49 @@ window.saveConfiguredAgents = saveConfiguredAgents;
 window.scanIdeProjects = scanIdeProjects;
 window.openSettings = openSettings;
 window.markComplete = markComplete;
+/**
+ * v0.11.2：检查桌面端更新。
+ *
+ * 更新清单与安装包走自有服务器（https://sfang.cc/xd/downloads/latest.json），
+ * 不依赖 GitHub Release 的连通性。浏览器环境没有 Tauri IPC，直接提示不可用。
+ */
+async function checkForUpdates() {
+  const statusEl = document.getElementById('update-status');
+  const setStatus = (text) => {
+    if (statusEl) statusEl.textContent = text;
+  };
+  // 变量名必须是 invokeFn：scripts/validate_frontend_contract.js 只识别
+  // invokeFn('...') / invokeWithTimeout(...)，否则新命令会被判成"未申报孤儿"。
+  const invokeFn = window.__TAURI__?.core?.invoke || window.__TAURI__?.invoke;
+  if (!invokeFn) {
+    setStatus('仅桌面端支持自动更新（浏览器环境不可用）');
+    return;
+  }
+  try {
+    setStatus('正在检查更新...');
+    const info = await invokeFn('check_update');
+    if (!info) {
+      setStatus(`当前已是最新版本（v${APP_VERSION}）`);
+      return;
+    }
+    const notes = info.notes ? `\n\n${info.notes}` : '';
+    // macOS WKWebView 对原生 confirm 支持不稳定，统一用异步 showConfirm。
+    const ok = await showConfirm(
+      `发现新版本 v${info.version}（当前 v${info.current_version}）${notes}\n\n是否立即下载并安装？`,
+      '软件更新'
+    );
+    if (!ok) {
+      setStatus(`发现 v${info.version}，已暂不更新`);
+      return;
+    }
+    setStatus(`正在下载并安装 v${info.version}...`);
+    await invokeFn('install_update');
+    setStatus(`v${info.version} 安装完成，请关闭并重新打开 LRC Desktop`);
+  } catch (e) {
+    setStatus('检查更新失败: ' + (e?.message || e));
+  }
+}
+window.checkForUpdates = checkForUpdates;
 window.verifySetup = verifySetup;
 // v0.6.1 P0-3: 高级管理面板展开/折叠
 window.toggleAdvancedManagement = toggleAdvancedManagement;

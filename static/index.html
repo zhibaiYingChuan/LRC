@@ -6,7 +6,7 @@
   <!-- 之前完全未配置 CSP，XSS/数据注入防御缺失，HCSE 安全不变量 INV-01 违规 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.openai.com; frame-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="version" content="0.11.1">
+  <meta name="version" content="0.11.2">
   <!-- v0.9.0 开发模式隔离：注入 sidecar 端口号，前端通过此标签获取正确的 API 端点 -->
   <!-- 开发版默认 3111，稳定版打包时替换为 3099 -->
   <meta name="lrc-sidecar-port" content="3111">
@@ -2001,6 +2001,11 @@
               <button class="btn btn-outline" data-action="detectInstalledAgents">已安装 Agent</button>
               <button class="btn btn-outline" data-action="setProjectDir">设置项目目录</button>
               <button class="btn btn-outline" data-action="getProjectDir">查询项目目录</button>
+              <!-- v0.11.2：自动更新（清单与安装包走自有服务器） -->
+              <button class="btn btn-outline" data-action="checkForUpdates">检查更新</button>
+            </div>
+            <div id="update-status" style="margin-top: 8px; color: var(--lrc-墨韵-500); font-size: 0.85em;">
+              点击「检查更新」获取最新版本（仅桌面端可用）
             </div>
           </div>
           <!-- v0.9.14：低频管理整组默认折叠（原生 details，无需额外 JS），

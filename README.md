@@ -25,14 +25,14 @@ AI 本身不会跨会话记住这些；LRC 就是给它补上这块记忆。
 
 ## 30 秒上手
 
-到 [v0.11.1 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.11.1)
+到 [v0.11.2 Releases](https://github.com/zhibaiYingChuan/LRC/releases/tag/v0.11.2)
 下载对应平台的桌面安装包：
 
 | 平台 | 安装包 |
 |---|---|
-| Windows | `lrc-desktop-v0.11.1-windows-x86_64-setup.exe` |
-| macOS（Apple 芯片） | `lrc-desktop-v0.11.1-macos-arm64.dmg` |
-| Linux | `lrc-desktop-v0.11.1-linux-amd64.deb` 或 `lrc-desktop-v0.11.1-linux-x86_64.AppImage` |
+| Windows | `lrc-desktop-v0.11.2-windows-x86_64-setup.exe` |
+| macOS（Apple 芯片） | `lrc-desktop-v0.11.2-macos-arm64.dmg` |
+| Linux | `lrc-desktop-v0.11.2-linux-amd64.deb` 或 `lrc-desktop-v0.11.2-linux-x86_64.AppImage` |
 
 安装后打开 LRC Desktop：
 
@@ -57,11 +57,11 @@ AI 本身不会跨会话记住这些；LRC 就是给它补上这块记忆。
 `lrc` 是一个**纯客户端**：它不加载模型，只通过 HTTP 调用常驻的 sidecar。
 把下面两个文件下载到**同一个目录**即可使用：
 
-- CLI：`lrc-cli-v0.11.1-windows-x86_64.exe` / `lrc-cli-v0.11.1-macos-arm64` / `lrc-cli-v0.11.1-linux-x86_64`
+- CLI：`lrc-cli-v0.11.2-windows-x86_64.exe` / `lrc-cli-v0.11.2-macos-arm64` / `lrc-cli-v0.11.2-linux-x86_64`
 - Sidecar（稳定别名）：`lrc-sidecar-windows-x64.exe` / `lrc-sidecar-darwin-arm64` / `lrc-sidecar-linux-x64`
 
 CLI 会在同目录自动识别这些稳定别名；若你下载的是带版本号的 sidecar
-（`lrc-v0.11.1-*`），把它重命名为 `lrc-sidecar`（Windows 为 `lrc-sidecar.exe`）即可。
+（`lrc-v0.11.2-*`），把它重命名为 `lrc-sidecar`（Windows 为 `lrc-sidecar.exe`）即可。
 
 ```bash
 lrc doctor                      # 检查 daemon、版本、模型与数据目录

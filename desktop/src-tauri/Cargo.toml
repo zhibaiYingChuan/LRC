@@ -1,6 +1,6 @@
 [package]
 name = "lrc-desktop"
-version = "0.11.1"
+version = "0.11.2"
 description = "LRC Desktop — 本地优先的 AI 代码记忆桌面应用"
 authors = ["LRC Team"]
 edition = "2021"
@@ -28,6 +28,9 @@ server = []
 # 修复：启用 custom-protocol feature，使 dev=false，正确嵌入前端资源
 tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
 tauri-plugin-shell = "2"
+# v0.11.2：自动更新。更新清单与安装包走自有服务器（sfang.cc），
+# 不依赖 GitHub Release 的连通性；签名公钥在 tauri.conf.json 的 plugins.updater。
+tauri-plugin-updater = "2"
 # 序列化
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

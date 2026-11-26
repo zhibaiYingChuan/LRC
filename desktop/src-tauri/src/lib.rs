@@ -48,6 +48,7 @@ pub mod agent_detector;
 pub mod commands;
 pub mod config_wizard;
 pub mod crypto;
+pub mod hooks_installer;
 pub mod integrity;
 pub mod rate_limiter;
 pub mod sidecar_manager;
