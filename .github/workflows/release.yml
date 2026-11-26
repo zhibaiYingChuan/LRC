@@ -974,21 +974,36 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          APP_PATH=$(find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.app" -type d | head -1)
+          # pipefail 下 find 被 head 提前关闭会返回 141，加 || true 防偶发失败
+          APP_PATH=$(find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.app" -type d | head -1 || true)
           if [ -n "$APP_PATH" ]; then
+            # v0.11.2 修复：find 返回的是仓库根目录下的相对路径，
+            # 而重打 tarball 需要先 cd 到 bundle/macos —— 相对路径会失效
+            # （CI 实测 tar: Failed to open）。此处统一转为绝对路径。
+            APP_DIR="$(cd "$(dirname "$APP_PATH")" && pwd)"
+            APP_PATH="$APP_DIR/$(basename "$APP_PATH")"
+
             codesign --sign - --force --deep --timestamp=none "$APP_PATH" 2>/dev/null || \
               echo "  Ad-Hoc signing complete"
 
             # v0.11.2：createUpdaterArtifacts 在 build 阶段就生成了 .app.tar.gz，
             # 此时 app 还未 ad-hoc 签名。必须重打 tarball 并重签，否则自动更新
             # 装上的 app 是未签名版本（macOS 可能拦截启动）。
-            TARGZ=$(find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.app.tar.gz" | head -1)
+            TARGZ=$(find desktop/src-tauri/target/${{ matrix.target }}/release/bundle -name "*.app.tar.gz" | head -1 || true)
             if [ -n "$TARGZ" ]; then
+              TARGZ="$(cd "$(dirname "$TARGZ")" && pwd)/$(basename "$TARGZ")"
               rm -f "$TARGZ" "$TARGZ.sig"
-              ( cd "$(dirname "$APP_PATH")" && tar -czf "$TARGZ" "$(basename "$APP_PATH")" )
+              ( cd "$APP_DIR" && tar -czf "$TARGZ" "$(basename "$APP_PATH")" )
               cargo tauri signer sign "$TARGZ"
               test -s "$TARGZ.sig"
+              echo "✅ macOS updater tarball 已重打并重新签名"
+            else
+              echo "ERROR: 未找到 .app.tar.gz，无法生成 macOS 自动更新包"
+              exit 1
             fi
+          else
+            echo "ERROR: 未找到 .app，macOS 构建产物缺失"
+            exit 1
           fi
         shell: bash
 
