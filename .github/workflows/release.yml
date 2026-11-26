@@ -1801,26 +1801,36 @@ jobs:
           MIRROR_PATH: ${{ secrets.MIRROR_PATH }}
         run: |
           KEEP="${{ inputs.version || github.ref_name }}"
-          # 修复：原写法把 `|| {` 与 heredoc 混在一行，bash 解析时
-          # heredoc 正文吞掉了 `{` 的收尾，直接报 "unexpected end of file from `{'".
-          # 改为先关 errexit 再捕获退出码，失败只告警。
-          set +e
-          ssh -i ~/.ssh/id_mirror \
-              -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
-              "$MIRROR_USER@$MIRROR_HOST" "powershell -NoProfile -Command -" <<POWERSHELL
+          # v0.11.2 修复：`ssh ... <<POWERSHELL || { ... }` 中 heredoc 正文会吞掉
+          # `{` 的收尾，bash 直接报 "unexpected end of file from `{'".
+          # 同时 `powershell -Command -` 读 stdin 在 Windows OpenSSH 下实测不执行
+          # （无输出、文件未删）。改为 -EncodedCommand 规避多层引号问题，
+          # 并用 set +e 捕获退出码：清理失败只告警，不影响已完成的发版。
+          if [[ ! "$KEEP" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::KEEP 版本格式无效: $KEEP"
+            exit 1
+          fi
+          SCRIPT=$(cat <<EOF
+          \$ErrorActionPreference = 'Stop'
           \$path = '$MIRROR_PATH'
           \$keep = '$KEEP'
           Get-ChildItem -LiteralPath \$path -File |
             Where-Object { (\$_.Name -like 'lrc-desktop-v*' -or \$_.Name -like 'lrc-v*') -and (\$_.Name -notlike ('*' + \$keep + '*')) } |
             ForEach-Object {
-              Write-Output ('  删除 ' + \$_.Name)
-              Remove-Item -LiteralPath \$_.FullName -Force -ErrorAction SilentlyContinue
+              Write-Output ('  Delete ' + \$_.Name)
+              Remove-Item -LiteralPath \$_.FullName -Force
             }
-          Write-Output '镜像现有安装包：'
+          Write-Output 'Remaining installers:'
           Get-ChildItem -LiteralPath \$path -File |
             Where-Object { \$_.Name -like 'lrc-desktop-*' -or \$_.Name -like 'lrc-sidecar-*' -or \$_.Name -like 'lrc-v*' } |
             Select-Object -ExpandProperty Name
-          POWERSHELL
+          EOF
+          )
+          ENCODED=$(printf '%s' "$SCRIPT" | iconv -f UTF-8 -t UTF-16LE | base64 -w 0)
+          set +e
+          ssh -i ~/.ssh/id_mirror \
+              -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
+              "$MIRROR_USER@$MIRROR_HOST" "powershell -NoProfile -NonInteractive -EncodedCommand $ENCODED"
           RC=$?
           set -e
           if [ "$RC" -ne 0 ]; then
