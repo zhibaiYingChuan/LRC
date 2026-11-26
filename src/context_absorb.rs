@@ -110,6 +110,11 @@ pub fn parse_model_block(text: &str) -> ParsedBlock {
     let block = &text[pos + MODEL_BLOCK_MARKER.len()..];
     // 只取到下一个一级标题 / 分隔线 / 另一个 `[LRC]` 标记行，避免把后续正文吃进来。
     let block = trim_at_block_boundary(block).trim();
+    // 同行冒号（`[LRC]: - decision: ...`）只是分隔符，不是块内容。
+    let block = block
+        .strip_prefix([':', '：'])
+        .map(str::trim)
+        .unwrap_or(block);
     if block.is_empty() {
         // 命中标记但块为空：模型明确表示"本轮无结论"，禁止回退规则提炼。
         return ParsedBlock {
@@ -214,13 +219,34 @@ fn is_second_marker(trimmed: &str) -> bool {
     let Some(rest) = trimmed.strip_prefix(MODEL_BLOCK_MARKER) else {
         return false;
     };
-    match rest.chars().next() {
-        None => true,
-        Some(ch) => ch.is_whitespace() || matches!(ch, '：' | ':' | '{' | '['),
-    }
+    marker_tail_starts_block(rest)
 }
 
-/// 标记是否独立成行（允许行首缩进，标记后可跟空白/冒号/JSON 起始符）。
+/// 标记行剩余部分是否**确实是结论块的开始**。
+///
+/// v0.11.2（审查残留 P2）：此前只要标记后跟空白就算标记行，
+/// 于是散文「[LRC] 块是模型声明」会被当成声明块 ⇒ `found=true` 且 0 条，
+/// 整轮**静默漏沉淀**。现在只接受四种形态：
+///   - 行尾（空块，模型明确表示本轮无结论）；
+///   - `:` / `：` 后为空，或后接块起始符；
+///   - 同一行的 JSON（`{` / `[`）；
+///   - 同一行的列表项（`-` / `*` / `•`）。
+///
+/// 其他同行文字一律视为散文，不命中标记 ⇒ 调用方回退规则提炼。
+/// 宁可回退（数据不丢），也不把散文当块（静默漏沉淀）。
+fn marker_tail_starts_block(rest: &str) -> bool {
+    let tail = rest.trim();
+    let tail = match tail.strip_prefix([':', '：']) {
+        Some(after) => after.trim(),
+        None => tail,
+    };
+    if tail.is_empty() {
+        return true;
+    }
+    tail.starts_with(['{', '[', '-', '*', '•'])
+}
+
+/// 标记是否独立成行（允许行首缩进，标记后必须是空行/冒号/JSON/列表项）。
 ///
 /// 行内出现（如 `` `[LRC]` `` 或「讨论 [LRC] 标记」）不算声明块。
 fn is_marker_line(text: &str, pos: usize) -> bool {
@@ -233,10 +259,7 @@ fn is_marker_line(text: &str, pos: usize) -> bool {
     let Some(rest) = line.strip_prefix(MODEL_BLOCK_MARKER) else {
         return false;
     };
-    match rest.chars().next() {
-        None => true,
-        Some(ch) => ch.is_whitespace() || matches!(ch, '：' | ':' | '{' | '['),
-    }
+    marker_tail_starts_block(rest)
 }
 
 /// 把一条声明规范化后放入结果；非法类型/空内容/过程叙述在这里丢弃。
@@ -537,6 +560,68 @@ mod tests {
             assert_eq!(parsed.items.len(), 1, "边界后内容不应进入块：{text}");
             assert!(parsed.items[0].content.contains("RwLock"));
         }
+    }
+
+    #[test]
+    fn parse_ignores_prose_after_marker() {
+        // v0.11.2（审查残留 P2）：同行散文不是声明块。
+        // 旧实现只要标记后跟空白就算命中 ⇒ found=true 且 0 条 ⇒ 整轮静默漏沉淀。
+        for text in [
+            "[LRC] 块是模型声明，不是结论",
+            "[LRC]: 说明一下这个标记的用途",
+            "结论如下 [LRC] 这是行内提及",
+        ] {
+            let parsed = parse_model_block(text);
+            assert!(!parsed.found, "同行散文不得当作标记：{text}");
+        }
+    }
+
+    #[test]
+    fn parse_accepts_same_line_block_forms() {
+        // 同行 JSON / 同行列表项 / 同行冒号仍是合法声明块；冒号后为空 = 空块。
+        let json = parse_model_block(
+            "[LRC] {\"items\":[{\"type\":\"decision\",\"content\":\"采用 RwLock，读并发优先\"}]}",
+        );
+        assert!(json.found);
+        assert_eq!(json.items.len(), 1, "{:?}", json.dropped);
+
+        let json_array = parse_model_block(
+            "[LRC] [{\"type\":\"decision\",\"content\":\"采用 RwLock，读并发优先\"}]",
+        );
+        assert!(json_array.found);
+        assert_eq!(json_array.items.len(), 1, "{:?}", json_array.dropped);
+
+        for text in [
+            "[LRC] - decision: 采用 RwLock，读并发优先",
+            "[LRC]- decision: 采用 RwLock，读并发优先",
+            "[LRC]• decision: 采用 RwLock，读并发优先",
+            "[LRC]: - decision: 采用 RwLock，读并发优先",
+            "[LRC]：- decision: 采用 RwLock，读并发优先",
+        ] {
+            let parsed = parse_model_block(text);
+            assert!(parsed.found, "应识别为声明块：{text}");
+            assert_eq!(
+                parsed.items.len(),
+                1,
+                "应解析出 1 条：{text} / {:?}",
+                parsed.dropped
+            );
+        }
+
+        for text in ["[LRC]:", "[LRC]："] {
+            let empty = parse_model_block(text);
+            assert!(empty.found, "冒号空块必须 found：{text}");
+            assert!(empty.items.is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn prose_like_second_marker_does_not_truncate_block() {
+        // 块内出现散文型 `[LRC] 说明…` 时，它不是边界，后续合法条目仍应被解析。
+        let parsed = parse_model_block(
+            "[LRC]\n- decision: 采用 RwLock，读并发优先\n[LRC] 说明一下这个标记\n- conclusion: 健康评分修复在 3ae886a",
+        );
+        assert_eq!(parsed.items.len(), 2, "{:?}", parsed.dropped);
     }
 
     #[test]
