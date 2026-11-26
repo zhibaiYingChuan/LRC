@@ -255,7 +255,9 @@ fn ensure_entry(
     Ok(())
 }
 
-#[cfg(test)]
+// 钩子安装仅支持 Windows（脚本为 PowerShell），非 Windows 平台调用会返回 Err，
+// 因此测试也只在 Windows 上编译运行，避免 macOS/Linux CI 误报失败。
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 
