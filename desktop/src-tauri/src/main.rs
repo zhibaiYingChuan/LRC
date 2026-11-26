@@ -187,6 +187,7 @@ fn main() {
             commands::get_proxy_configuration, // v0.9.7 修复：前端代理检测（app.js:285）此前调用未注册命令
             commands::check_update,            // v0.11.2：检查更新（自有服务器清单）
             commands::install_update,          // v0.11.2：下载并安装更新
+            commands::restart_app,             // v0.11.3：安装后立即重启生效
         ])
         .manage(app_store)
         // v0.5.4 P2-16 调试：页面加载事件追踪

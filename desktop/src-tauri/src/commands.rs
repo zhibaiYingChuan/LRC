@@ -2972,6 +2972,15 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<String, String> {
     Ok(version)
 }
 
+/// v0.11.3：安装更新后立即重启应用。
+///
+/// updater 安装完成后必须重启才生效；`restart()` 会退出当前进程并拉起新实例，
+/// 因此该命令不会正常返回（前端无需等待返回值）。
+#[tauri::command]
+pub fn restart_app(app: tauri::AppHandle) {
+    app.restart();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

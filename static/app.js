@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.11.2';
+const APP_VERSION = '0.11.3';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -4453,6 +4453,11 @@ async function init() {
   // v0.8.2：启动 Sidecar 健康监测（对应审计 G005）
   SidecarHealthMonitor.start();
 
+  // v0.11.3：启动后自动检查更新（延迟 20s，避开启动阶段的服务探测与规则提示弹窗）
+  if (isTauriEnv) {
+    setTimeout(autoCheckUpdates, 20000);
+  }
+
   // v0.8.25 修复：在页面初始化阶段立即获取后端版本号，而非仅在 loadDashboard 中调用
   // 确保状态栏版本号尽早更新，减少硬编码版本号的显示窗口期
   fetchBackendVersion();
@@ -7298,6 +7303,9 @@ window.saveConfiguredAgents = saveConfiguredAgents;
 window.scanIdeProjects = scanIdeProjects;
 window.openSettings = openSettings;
 window.markComplete = markComplete;
+// v0.11.3：自动/手动检查更新互斥，避免并发弹窗与重复安装
+let _updateCheckInFlight = false;
+
 /**
  * v0.11.2：检查桌面端更新。
  *
@@ -7316,6 +7324,11 @@ async function checkForUpdates() {
     setStatus('仅桌面端支持自动更新（浏览器环境不可用）');
     return;
   }
+  if (_updateCheckInFlight) {
+    setStatus('正在检查更新...');
+    return;
+  }
+  _updateCheckInFlight = true;
   try {
     setStatus('正在检查更新...');
     const info = await invokeFn('check_update');
@@ -7323,11 +7336,13 @@ async function checkForUpdates() {
       setStatus(`当前已是最新版本（v${APP_VERSION}）`);
       return;
     }
-    const notes = info.notes ? `\n\n${info.notes}` : '';
+    const notes = info.notes ? `\n\n${String(info.notes).slice(0, 500)}` : '';
     // macOS WKWebView 对原生 confirm 支持不稳定，统一用异步 showConfirm。
+    // timeoutMs=0：超时会被当成“拒绝”，这里要求用户明确选择。
     const ok = await showConfirm(
       `发现新版本 v${info.version}（当前 v${info.current_version}）${notes}\n\n是否立即下载并安装？`,
-      '软件更新'
+      '软件更新',
+      0
     );
     if (!ok) {
       setStatus(`发现 v${info.version}，已暂不更新`);
@@ -7335,12 +7350,92 @@ async function checkForUpdates() {
     }
     setStatus(`正在下载并安装 v${info.version}...`);
     await invokeFn('install_update');
+    const restart = await showConfirm(
+      `v${info.version} 已安装完成，是否立即重启 LRC 以完成更新？`,
+      '软件更新',
+      0
+    );
+    if (restart) {
+      // restart_app 会直接退出并重启进程，invoke 不会正常返回
+      await invokeFn('restart_app');
+      return;
+    }
     setStatus(`v${info.version} 安装完成，请关闭并重新打开 LRC Desktop`);
   } catch (e) {
     setStatus('检查更新失败: ' + (e?.message || e));
+  } finally {
+    _updateCheckInFlight = false;
   }
 }
 window.checkForUpdates = checkForUpdates;
+
+/**
+ * v0.11.3：启动后自动检查更新。
+ *
+ * 新版本发布后无需用户手动点“检查更新”：启动 20s 后静默检查一次，
+ * 有更新则弹窗确认；用户选择“暂不更新”会记住该版本，避免每次启动重复打扰。
+ * 检查失败静默处理（网络/服务器异常不应影响正常使用）。
+ */
+async function autoCheckUpdates() {
+  const invokeFn = window.__TAURI__?.core?.invoke || window.__TAURI__?.invoke;
+  if (!invokeFn) return;
+  if (_updateCheckInFlight) return;
+  _updateCheckInFlight = true;
+  try {
+    const info = await invokeFn('check_update');
+    if (!info) return;
+    let skipped = null;
+    try {
+      skipped = localStorage.getItem('lrc_skipped_update_version');
+    } catch (e) {
+      // 隐私模式 / 存储被禁用时忽略，不影响更新检查
+    }
+    if (skipped === info.version) return;
+    const notes = info.notes ? `\n\n${String(info.notes).slice(0, 500)}` : '';
+    // timeoutMs=0：避免超时被误判为“用户拒绝”而永久跳过该版本
+    const ok = await showConfirm(
+      `发现新版本 v${info.version}（当前 v${info.current_version}）${notes}\n\n是否立即下载并安装？`,
+      '软件更新',
+      0
+    );
+    if (!ok) {
+      try {
+        localStorage.setItem('lrc_skipped_update_version', info.version);
+      } catch (e) {
+        // 存储不可用时只是下次启动再问一次，不影响功能
+      }
+      showToast(`已跳过 v${info.version}，可在“设置 → 高级管理”手动检查更新`, 'warning', 5000);
+      return;
+    }
+    showToast(`正在下载并安装 v${info.version}，请稍候…`, 'warning', 60000);
+    try {
+      await invokeFn('install_update');
+    } catch (e) {
+      showToast('更新安装失败：' + (e?.message || e), 'error', 6000);
+      return;
+    }
+    try {
+      localStorage.removeItem('lrc_skipped_update_version');
+    } catch (e) {
+      // 忽略：不影响已完成的安装
+    }
+    const restart = await showConfirm(
+      `v${info.version} 已安装完成，是否立即重启 LRC 以完成更新？`,
+      '软件更新',
+      0
+    );
+    if (restart) {
+      await invokeFn('restart_app');
+    } else {
+      showToast(`v${info.version} 已安装，下次启动生效`, 'success', 6000);
+    }
+  } catch (e) {
+    console.warn('[LRC] 自动检查更新失败（不影响使用）:', e);
+  } finally {
+    _updateCheckInFlight = false;
+  }
+}
+window.autoCheckUpdates = autoCheckUpdates;
 window.verifySetup = verifySetup;
 // v0.6.1 P0-3: 高级管理面板展开/折叠
 window.toggleAdvancedManagement = toggleAdvancedManagement;
