@@ -1801,12 +1801,13 @@ jobs:
           MIRROR_PATH: ${{ secrets.MIRROR_PATH }}
         run: |
           KEEP="${{ inputs.version || github.ref_name }}"
+          # 修复：原写法把 `|| {` 与 heredoc 混在一行，bash 解析时
+          # heredoc 正文吞掉了 `{` 的收尾，直接报 "unexpected end of file from `{'".
+          # 改为先关 errexit 再捕获退出码，失败只告警。
+          set +e
           ssh -i ~/.ssh/id_mirror \
               -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
-              "$MIRROR_USER@$MIRROR_HOST" "powershell -NoProfile -Command -" <<POWERSHELL || {
-            echo "::warning::镜像旧安装包清理失败（不影响本次发版）"
-            exit 0
-          }
+              "$MIRROR_USER@$MIRROR_HOST" "powershell -NoProfile -Command -" <<POWERSHELL
           \$path = '$MIRROR_PATH'
           \$keep = '$KEEP'
           Get-ChildItem -LiteralPath \$path -File |
@@ -1820,4 +1821,9 @@ jobs:
             Where-Object { \$_.Name -like 'lrc-desktop-*' -or \$_.Name -like 'lrc-sidecar-*' -or \$_.Name -like 'lrc-v*' } |
             Select-Object -ExpandProperty Name
           POWERSHELL
+          RC=$?
+          set -e
+          if [ "$RC" -ne 0 ]; then
+            echo "::warning::镜像旧安装包清理失败（不影响本次发版，rc=$RC）"
+          fi
         shell: bash
