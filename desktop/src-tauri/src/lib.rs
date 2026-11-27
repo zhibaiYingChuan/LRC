@@ -53,4 +53,5 @@ pub mod integrity;
 pub mod rate_limiter;
 pub mod sidecar_manager;
 pub mod tray;
+pub mod universal_integrations;
 pub mod url_safety;

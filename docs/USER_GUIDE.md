@@ -2,7 +2,7 @@
 
 > **给 AI 装上记忆的本地服务** — 接入 IDE，AI 就能按需检索代码、跨会话记住关键约定与决策。
 >
-> 版本：**v0.11.4** | 适用于：Trae / Trae CN / Cursor / VS Code / Windsurf / Claude Desktop 等支持 MCP 协议的 AI 工具
+> 版本：**v0.11.5** | 适用于：Trae / Trae CN / Cursor / VS Code / Windsurf / Claude Desktop 等支持 MCP 协议的 AI 工具
 >
 > 本文面向**使用者**。想了解实现原理与能力实测数据，请看 [README](../README.md)；想了解本版本的修复内容，见 [CHANGELOG](../CHANGELOG.md)。
 

@@ -7,6 +7,28 @@
 > 同一版本内**分日期的补充说明**一律用 `###` 子标题，例如 `### 0.9.8 同版本补充 · 2026-09-17`。
 > （历史欠账：`[0.9.8]` 曾出现 3 次、`[0.8.23]` 曾出现 2 次，已按本约定降级为子标题。）
 
+## [0.11.5] - 2026-11-28
+
+> 本版摘要：**规则注入覆盖所有工具，不依赖 hook**。
+> Codex / WorkBuddy / DSH 强制覆盖；无钩子宿主通过 MCP `absorb` 或 `lrc absorb` 兜底沉淀。
+
+### 新增
+
+- **通用规则注入**：启动时写入 `~/.agents/AGENTS.md`（DSH 及其他读取 AGENTS.md 的宿主），
+  并覆盖 Codex `~/.codex/AGENTS.md`、WorkBuddy `~/.codebuddy/rules/lrc-memory.md`；
+  合并时保留用户已有内容，幂等、首次备份、原子写入。
+- **Codex 自动接入**：写入 `~/.codex/config.toml` 的 `[mcp_servers.lrc-memory]`，
+  并在检测到 `lrc` CLI 且用户未配置 `notify` 时安装 `lrc absorb` 自动沉淀
+  （找不到 CLI 则不写，避免写坏配置）。
+- **WorkBuddy 自动接入**：写入 `~/.workbuddy/mcp.json` 的 `lrc-memory` 服务器。
+- **无钩子上下文兜底**：MCP instructions 与规则新增「任务结束必须调用 `absorb`」；
+  没有 MCP 的宿主可用 `lrc absorb "<最终回复>" --host <工具名>`。
+
+### 兼容性
+
+- DSH 继续使用 dsh-plugin-lrc 插件，规则文件只是补充。
+- 所有写入失败只告警，不影响桌面端启动；开发模式跳过，避免触碰稳定版用户配置。
+
 ## [0.11.4] - 2026-11-27
 
 > 本版摘要：**更新清单与勘合彻底隔离**。

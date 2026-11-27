@@ -71,3 +71,18 @@
 - 已被用户 `forget` / `correct` 的内容**禁止**再写回。
 - 本轮已用 `remember` 显式写入的内容，不要在块里重复。
 - 该块是自动沉淀的**唯一高置信信号**；缺失时 LRC 回退到规则提炼，精度明显下降。
+
+## 六、无钩子宿主必须主动调用 `absorb`（强制）
+
+任务结束前，**必须**把本轮最终回复或 `[LRC]` 结论块交给 LRC：
+
+- 宿主提供 `absorb` 工具时，调用 `absorb(text="<本轮最终回复>")`；
+- 没有 `absorb` 但提供 `remember` 时，用 `remember` 记录本轮结论
+  （decision / preference / fact / code_context，最多 3 条）；
+- 只能执行 shell、没有 absorb/remember 的宿主，运行
+  `lrc absorb "<本轮最终回复>" --host <工具名>`；
+- 宿主有 Stop / notify 钩子时由钩子自动采集，但你仍必须输出 `[LRC]` 块；
+- 这一步与第五节同时执行，不能以“钩子会处理”为由跳过。
+
+**为什么强制**：没有钩子的工具（Codex / WorkBuddy / 其他 MCP 宿主）不会自动保存上下文，
+不主动调用 `absorb` 就等于这一轮的结论从未存在。

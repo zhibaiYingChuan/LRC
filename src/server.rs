@@ -442,7 +442,14 @@ fn context_instructions() -> String {
    不要依赖宿主的自动摘要（它会丢失约束与指代锚点）。
 
 5. 检索结果为空时，才允许回退到内置搜索；回退时必须在回复中说明
-   "LRC 未命中，已回退内置搜索"。"#
+   "LRC 未命中，已回退内置搜索"。
+
+6. 任务结束前，必须把本轮结论交给 LRC：宿主提供 `absorb` 工具时，调用
+   `absorb(text="<本轮最终回复>")`；没有 `absorb` 时，用 `remember` 记录
+   decision / preference / fact / code_context（最多 3 条）；只能执行 shell 时，
+   运行 `lrc absorb "<本轮最终回复>" --host <工具名>`。宿主有 Stop/notify
+   钩子时由钩子自动采集，但你仍必须输出 `[LRC]` 结论块。没有钩子的宿主
+   （Codex / WorkBuddy / 其他 MCP 客户端）不主动调用，就等于这一轮的结论从未存在。"#
         .to_string()
 }
 
@@ -6770,6 +6777,10 @@ mod tests {
         assert!(
             instructions.contains("recall") && instructions.contains("remember"),
             "instructions 必须点名 recall / remember 两个工具"
+        );
+        assert!(
+            instructions.contains("absorb"),
+            "instructions 必须包含无钩子宿主的 absorb 兜底规则（v0.11.5）"
         );
     }
 

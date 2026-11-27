@@ -1,6 +1,6 @@
 [package]
 name = "lrc-desktop"
-version = "0.11.4"
+version = "0.11.5"
 description = "LRC Desktop — 本地优先的 AI 代码记忆桌面应用"
 authors = ["LRC Team"]
 edition = "2021"
@@ -34,6 +34,9 @@ tauri-plugin-updater = "2"
 # 序列化
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# v0.11.5：Codex CLI 的 MCP 配置是 TOML（~/.codex/config.toml），
+# 用 toml_edit 做保留注释的幂等更新（已是 tauri 的传递依赖，不新增版本）。
+toml_edit = "0.20"
 # 运行时
 tokio = { version = "1", features = ["full"] }
 # 日志

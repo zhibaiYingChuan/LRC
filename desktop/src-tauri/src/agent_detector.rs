@@ -242,13 +242,49 @@ const KNOWN_TOOLS: &[KnownTool] = &[
         name: "OpenAI Codex CLI",
         icon: "🤖",
         category: "cli",
-        supports_mcp: false,
+        // v0.11.5：Codex 支持 MCP（~/.codex/config.toml），但配置文件是 TOML，
+        // 不能走 JSON 合并器；由 universal_integrations 专用写入器处理。
+        supports_mcp: true,
         primary_marker: ".codex",
+        secondary_markers: &[],
+        mcp_config_template: None,
+        mcp_transport: "http",
+        binary_paths: &[],
+        exe_names: &["codex", "codex.exe"],
+    },
+    // v0.11.5：腾讯 WorkBuddy（办公 Agent，与 CodeBuddy 同源）
+    // MCP 用户级配置：~/.workbuddy/mcp.json；规则与 CodeBuddy 共用 ~/.codebuddy/rules/
+    KnownTool {
+        id: "workbuddy",
+        name: "WorkBuddy",
+        icon: "🤝",
+        category: "ai-assistant",
+        supports_mcp: true,
+        primary_marker: ".workbuddy",
+        secondary_markers: &[".workbuddy-ai"],
+        mcp_config_template: None,
+        mcp_transport: "http",
+        binary_paths: &[
+            "%LOCALAPPDATA%/Programs/WorkBuddy/WorkBuddy.exe",
+            "%PROGRAMFILES%/WorkBuddy/WorkBuddy.exe",
+        ],
+        exe_names: &["WorkBuddy.exe"],
+    },
+    // v0.11.5：DeepSeek Harness（DSH）
+    // 没有 MCP 客户端，规则由 ~/.agents/AGENTS.md / $DSH_HOME/AGENTS.md 注入；
+    // 上下文管理由 dsh-plugin-lrc 插件负责。
+    KnownTool {
+        id: "dsh",
+        name: "DeepSeek Harness (DSH)",
+        icon: "🐋",
+        category: "ai-assistant",
+        supports_mcp: false,
+        primary_marker: ".dsh",
         secondary_markers: &[],
         mcp_config_template: None,
         mcp_transport: "stdio",
         binary_paths: &[],
-        exe_names: &["codex"],
+        exe_names: &["DSH.exe", "dsh.exe"],
     },
     // ═══ AI 编码助手类 ═══
     KnownTool {
@@ -684,6 +720,26 @@ const SPECIAL_DETECTOR_IDS: &[&str] = &["trae", "trae-cn", "claude-desktop", "ge
 ///   - 替代方案说明（如 REST API）
 pub fn get_manual_config_guide(tool_id: &str) -> Option<&'static str> {
     match tool_id {
+        // ── v0.11.5：已自动接入的工具 ──
+        "codex-cli" => Some(
+            "Codex 由 LRC 自动接入：\n\
+             1. 规则：~/.codex/AGENTS.md\n\
+             2. MCP：~/.codex/config.toml 的 [mcp_servers.lrc-memory]\n\
+             3. 自动沉淀：用户未配置 notify 时写入 lrc absorb\n\n\
+             若未生效，请重启 Codex，并确认 ~/.codex/config.toml 语法正确。",
+        ),
+        "workbuddy" => Some(
+            "WorkBuddy 由 LRC 自动接入：\n\
+             1. 规则：~/.codebuddy/rules/lrc-memory.md\n\
+             2. MCP：~/.workbuddy/mcp.json 的 lrc-memory 服务器\n\n\
+             若未生效，请在 WorkBuddy 的 MCP 设置中确认 lrc-memory 已连接。",
+        ),
+        "dsh" => Some(
+            "DSH 没有 MCP 客户端，LRC 通过两条通道接入：\n\
+             1. 规则：~/.agents/AGENTS.md（DSH 每次新会话自动读取）\n\
+             2. 上下文管理：dsh-plugin-lrc 插件\n\n\
+             若规则未生效，请确认 DSH 读取的是 ~/.agents/AGENTS.md 或 $DSH_HOME/AGENTS.md。",
+        ),
         // ── 国产 AI 编码助手 ──
         "tongyi-lingma" => Some(
             "通义灵码暂不支持 MCP 协议自动配置。\n\n\
@@ -795,16 +851,6 @@ pub fn get_manual_config_guide(tool_id: &str) -> Option<&'static str> {
         ),
 
         // ── CLI 工具 ──
-        "codex-cli" => Some(
-            "OpenAI Codex CLI 暂不支持 MCP 协议。\n\n\
-             **替代方案**：\n\
-             1. 使用 LRC 的 REST API（http://127.0.0.1:3099）手动集成\n\
-             2. 通过 `codex --config` 参数传递配置\n\
-             3. 官方文档：https://github.com/openai/codex\n\n\
-             **配置示例**：\n\
-             在终端运行 Codex CLI 时，可通过环境变量传递 LRC 端点：\n\
-             `LRC_ENDPOINT=http://127.0.0.1:3099 codex`",
-        ),
         "deepseek-coder" => Some(
             "DeepSeek Coder 暂不支持 MCP 协议。\n\n\
              **替代方案**：\n\
@@ -2309,6 +2355,11 @@ impl AgentDetectorRegistry {
         self.lrc_binary_path = Some(path);
     }
 
+    /// v0.11.5：供通用集成模块读取 lrc 可执行文件路径（Codex notify 需要绝对路径）。
+    pub fn lrc_binary_path(&self) -> Option<&str> {
+        self.lrc_binary_path.as_deref()
+    }
+
     /// 创建用于后台扫描的独立注册表快照。
     /// 注册表中的检测器是无状态策略对象，后台扫描不应长期持有应用状态锁。
     pub fn snapshot_for_scan(&self) -> Self {
@@ -2509,6 +2560,53 @@ impl AgentDetectorRegistry {
                         info.name,
                         guide
                     );
+                    continue;
+                }
+
+                // v0.11.5：Codex / WorkBuddy 的配置文件不是通用 JSON 结构
+                // （Codex 是 TOML，WorkBuddy 是专用用户级 mcp.json），
+                // 交给 universal_integrations 的专用写入器。
+                if matches!(info.id.as_str(), "codex-cli" | "workbuddy") {
+                    let Some(home) = dirs::home_dir() else {
+                        tracing::warn!("[MCP配置] {} — 无法获取用户主目录，跳过", info.name);
+                        continue;
+                    };
+                    let report = crate::universal_integrations::inject_mcp_config_for(
+                        &info.id,
+                        &home,
+                        port,
+                        crate::universal_integrations::resolve_lrc_cli().as_deref(),
+                    );
+                    match report.error {
+                        Some(err) => tracing::warn!(
+                            "[MCP配置] {} — 专用配置失败: {}",
+                            info.name,
+                            err
+                        ),
+                        None if report.action == "skipped" => {
+                            tracing::info!(
+                                "[MCP配置] {} — 未安装（{} 不存在），跳过",
+                                info.name,
+                                report.path
+                            );
+                        }
+                        None => {
+                            tracing::info!(
+                                "[MCP配置] {} — 专用配置写入成功（{}）: {}",
+                                info.name,
+                                report.action,
+                                report.path
+                            );
+                            if let Err(e) = Self::write_ai_rules(&info.id) {
+                                tracing::warn!(
+                                    "[AI规则] {} — 规则写入失败（不影响 MCP）: {}",
+                                    info.name,
+                                    e
+                                );
+                            }
+                            configured.push(format!("{} (全局配置)", info.name));
+                        }
+                    }
                     continue;
                 }
 
@@ -3028,6 +3126,12 @@ impl AgentDetectorRegistry {
             // 参考：用户反馈 CodeBuddy 全局规则路径为 C:\Users\<用户名>\.codebuddy\rules\
             //       .mdc 文件需要 frontmatter（description, alwaysApply, enabled）
             "codebuddy" => Some(".codebuddy/rules/lrc-memory.mdc"),
+            // v0.11.5：Codex 全局指令文件（官方 AGENTS.md 层级）
+            "codex-cli" => Some(".codex/AGENTS.md"),
+            // v0.11.5：WorkBuddy 与 CodeBuddy 共用规则目录
+            "workbuddy" => Some(".codebuddy/rules/lrc-memory.md"),
+            // v0.11.5：DSH 读取 ~/.agents/AGENTS.md
+            "dsh" => Some(".agents/AGENTS.md"),
             // v0.5.7 修复：Cline 全局规则目录为 ~/Documents/Cline/Rules/（非 .cline/clinerules）
             // 官方文档：https://docs.cline.bot/customization/cline-rules
             // .clinerules 是项目级，全局规则在 Documents/Cline/Rules/
@@ -3056,7 +3160,7 @@ impl AgentDetectorRegistry {
     /// v0.5.5 修复内容：
     /// - Trae: 添加 YAML frontmatter（`alwaysApply: true`），确保规则在所有对话中始终生效
     /// - Cursor: 添加 MDC frontmatter（`alwaysApply: true`），确保规则始终生效
-    fn generate_ai_rules_content(tool_id: &str) -> String {
+    pub(crate) fn generate_ai_rules_content(tool_id: &str) -> String {
         // v0.5.5 增强：傻瓜式 AI 规则自动注入
         // 用户无需手动配置任何 rule，LRC 配置 MCP 时自动写入
         // 规则核心：会话开始必须 recall + 任务感知 recall + 完成后自动同步
@@ -3067,6 +3171,7 @@ impl AgentDetectorRegistry {
             "trae" | "trae-cn" => "---\nalwaysApply: true\ndescription: LRC 记忆系统规则 — 会话开始时先 recall 检索项目记忆（新用户自动降级），完成任务后自动同步记忆库\n---\n\n",
             "cursor" => "---\ndescription: LRC 记忆系统规则 — 会话开始时先 recall，新用户自动降级，完成任务后自动同步记忆\nalwaysApply: true\n---\n\n",
             "codebuddy" => "---\ndescription: LRC 记忆系统规则 — 会话开始时先 recall 检索项目记忆，完成任务后自动同步记忆库\nalwaysApply: true\nenabled: true\n---\n\n",
+            "workbuddy" => "---\ndescription: LRC 记忆系统规则 — 会话开始时先 recall 检索项目记忆，完成任务后自动同步记忆库\nalwaysApply: true\nenabled: true\n---\n\n",
             _ => "",
         };
 
@@ -3074,6 +3179,9 @@ impl AgentDetectorRegistry {
             "cursor" => "# Cursor AI Rules — LRC 记忆系统自动配置",
             "trae" | "trae-cn" => "# Trae AI Rules — LRC 记忆系统自动配置",
             "codebuddy" => "# CodeBuddy Rules — LRC 记忆系统自动配置",
+            "workbuddy" => "# WorkBuddy Rules — LRC 记忆系统自动配置",
+            "codex-cli" => "# Codex AGENTS.md — LRC 记忆系统自动配置",
+            "dsh" => "# DSH AGENTS.md — LRC 记忆系统自动配置",
             "cline" => "# Cline Rules — LRC 记忆系统自动配置",
             "windsurf" => "# Windsurf Rules — LRC 记忆系统自动配置",
             "roo-code" => "# Roo Code Rules — LRC 记忆系统自动配置", // v0.5.7 修复：ID 从 "roo" 改为 "roo-code"
@@ -3084,6 +3192,7 @@ impl AgentDetectorRegistry {
 
         format!(
             r#"{frontmatter}{header}
+<!-- LRC_RULES_BEGIN -->
 <!-- LRC_RULES_VERSION: {LRC_RULES_VERSION} -->
 <!-- LRC_RULES_GENERATED: 2026-07-29 -->
 <!-- 本文件由 LRC Desktop v{LRC_RULES_VERSION} "归一" 自动生成，请勿手动删除 LRC 相关规则 -->
@@ -3212,6 +3321,22 @@ recall(query="<模块名或关键词>", top_k=3)
 
 ---
 
+### 规则 6：无钩子宿主必须主动调用 `absorb`（强制）
+
+任务结束前，**必须**把本轮最终回复或 `[LRC]` 结论块交给 LRC：
+
+- 宿主提供 `absorb` 工具时，调用 `absorb(text="<本轮最终回复>")`；
+- 没有 `absorb` 但提供 `remember` 时，用 `remember` 记录本轮结论（decision / preference / fact / code_context，最多 3 条）；
+- 只能执行 shell、没有 absorb/remember 的宿主，运行
+  `lrc absorb "<本轮最终回复>" --host <工具名>`；
+- 宿主有 Stop / notify 钩子时由钩子自动采集，但你仍必须输出 `[LRC]` 块；
+- 这一步与「规则 5」同时执行，不能以“钩子会处理”为由跳过。
+
+**为什么强制**：没有钩子的工具（Codex / WorkBuddy / 其他 MCP 宿主）不会自动保存上下文，
+不主动调用 `absorb` 就等于这一轮的结论从未存在。
+
+---
+
 ### v0.6.0~v0.8.0 新功能说明
 
 **v0.6.0 合成引擎与道同构度**：
@@ -3294,6 +3419,8 @@ AI：已完成用户登录 API，新增了 POST /api/auth/login 端点
 AI：（自动同步）remember(content="用户登录 API：POST /api/auth/login → AuthHandler::login，使用 JWT 签发 token", memory_type="code_context", tags=["auth", "api", "login"], importance=7)
 AI：已记录登录 API 到记忆库
 ```
+
+<!-- LRC_RULES_END -->
 "#
         )
     }
@@ -3381,130 +3508,70 @@ AI：已记录登录 API 到记忆库
         // v0.8.0 "归一"：基于版本号的规则升级逻辑
         // 替代旧的字符串匹配（"v0.5.12 自动生成"），实现语义化版本比较
         if rules_path.exists() {
-            let existing = std::fs::read_to_string(&rules_path).unwrap_or_default();
+            // v0.11.5：非 UTF-8 文件不覆盖（可能是用户自己的编码文件）
+            let bytes = std::fs::read(&rules_path)
+                .map_err(|e| format!("读取规则文件失败: {} ({})", rules_path.display(), e))?;
+            let existing = String::from_utf8(bytes).map_err(|_| {
+                format!(
+                    "规则文件不是 UTF-8，已跳过（不覆盖用户内容）: {}",
+                    rules_path.display()
+                )
+            })?;
 
             // 解析现有规则文件的版本号
             let file_version = parse_rules_version(&existing);
-
-            match file_version {
-                Some(ref ver) => {
-                    // 版本比较：当前版本 >= LRC_RULES_VERSION → 跳过（幂等）
-                    if compare_versions(ver, LRC_RULES_VERSION) != std::cmp::Ordering::Less {
-                        tracing::info!(
-                            "[AI规则] {} — 规则文件版本 {} 已是最新（{}），跳过: {}",
-                            tool_id,
-                            ver,
-                            LRC_RULES_VERSION,
-                            rules_path.display()
-                        );
-                        return Ok(());
-                    }
-
-                    // 版本较低 → 需要升级
+            if let Some(ref ver) = file_version {
+                if compare_versions(ver, LRC_RULES_VERSION) != std::cmp::Ordering::Less {
                     tracing::info!(
-                        "[AI规则] {} — 规则文件版本 {} 低于当前版本 {}，开始升级: {}",
+                        "[AI规则] {} — 规则文件版本 {} 已是最新（{}），跳过: {}",
                         tool_id,
                         ver,
                         LRC_RULES_VERSION,
                         rules_path.display()
                     );
-
-                    // v0.8.0 安全措施：升级前备份旧文件到 .bak
-                    let bak_path = rules_path.with_extension("md.bak");
-                    if bak_path.extension().is_none() {
-                        // 非 .md 文件（如 .mdc）的备份路径处理
-                        let bak_path = format!("{}.bak", rules_path.display());
-                        let _ = std::fs::copy(&rules_path, &bak_path);
-                    } else {
-                        let _ = std::fs::copy(&rules_path, &bak_path);
-                    }
-
-                    // 保留用户自定义内容（LRC 规则之外的部分）
-                    let merged = if existing.contains("## LRC 记忆系统") {
-                        // 提取 LRC 规则之前的用户内容
-                        if let Some(_pos) = existing.find("## LRC 记忆系统") {
-                            // 查找 LRC 规则的起始位置（包括前面的注释和 frontmatter）
-                            let lrc_start = existing
-                                .find("# AI Rules — LRC")
-                                .or_else(|| existing.find("# Trae AI Rules"))
-                                .or_else(|| existing.find("# Cursor AI Rules"))
-                                .or_else(|| existing.find("# CodeBuddy Rules"))
-                                .or_else(|| existing.find("# Cline Rules"))
-                                .or_else(|| existing.find("# Windsurf Rules"))
-                                .or_else(|| existing.find("# Roo Code Rules"))
-                                .or_else(|| existing.find("# GitHub Copilot"))
-                                .or_else(|| existing.find("# Comate Rules"))
-                                .unwrap_or(0);
-
-                            // 也查找 frontmatter 起始
-                            let frontmatter_start = if existing.starts_with("---\n") {
-                                existing.find("\n---\n").map(|p| p + 5).unwrap_or(0)
-                            } else {
-                                lrc_start
-                            };
-
-                            let user_content = existing[..frontmatter_start].trim_end();
-                            if user_content.is_empty() {
-                                lrc_rules.clone()
-                            } else {
-                                format!("{}\n\n{}", user_content, lrc_rules)
-                            }
-                        } else {
-                            // 有 "## LRC 记忆系统" 但找不到标题，全覆盖
-                            lrc_rules.clone()
-                        }
-                    } else {
-                        // 不包含 LRC 规则标记，可能是纯用户文件，追加 LRC 规则
-                        format!("{}\n\n{}", existing.trim_end(), lrc_rules)
-                    };
-
-                    std::fs::write(&rules_path, &merged).map_err(|e| {
-                        format!("升级规则文件失败: {} ({})", rules_path.display(), e)
-                    })?;
-                    tracing::info!(
-                        "[AI规则] {} — 已升级规则文件到 v{}: {}",
-                        tool_id,
-                        LRC_RULES_VERSION,
-                        rules_path.display()
-                    );
+                    return Ok(());
                 }
-                None => {
-                    // 版本号解析失败 → 降级为全覆盖（备份后写入）
-                    tracing::warn!(
-                        "[AI规则] {} — 无法解析规则文件版本，降级为全覆盖策略: {}",
-                        tool_id,
-                        rules_path.display()
-                    );
-
-                    // 备份旧文件
-                    let bak_path = format!("{}.bak", rules_path.display());
-                    let _ = std::fs::copy(&rules_path, &bak_path);
-
-                    // 检查是否包含 LRC 规则标记
-                    if existing.contains("LRC 记忆系统") {
-                        // 包含 LRC 标记但无法解析版本，全覆盖
-                        std::fs::write(&rules_path, &lrc_rules).map_err(|e| {
-                            format!("覆盖规则文件失败: {} ({})", rules_path.display(), e)
-                        })?;
-                        tracing::info!(
-                            "[AI规则] {} — 已全覆盖写入规则文件: {}",
-                            tool_id,
-                            rules_path.display()
-                        );
-                    } else {
-                        // 不包含 LRC 标记，追加
-                        let merged = format!("{}\n\n{}", existing.trim_end(), lrc_rules);
-                        std::fs::write(&rules_path, &merged).map_err(|e| {
-                            format!("追加规则文件失败: {} ({})", rules_path.display(), e)
-                        })?;
-                        tracing::info!(
-                            "[AI规则] {} — 已追加 LRC 规则到现有文件: {}",
-                            tool_id,
-                            rules_path.display()
-                        );
-                    }
-                }
+                tracing::info!(
+                    "[AI规则] {} — 规则文件版本 {} 低于当前版本 {}，开始升级: {}",
+                    tool_id,
+                    ver,
+                    LRC_RULES_VERSION,
+                    rules_path.display()
+                );
+            } else {
+                tracing::warn!(
+                    "[AI规则] {} — 无法解析规则文件版本，按标记合并（保留用户内容）: {}",
+                    tool_id,
+                    rules_path.display()
+                );
             }
+
+            // 升级前备份旧文件（覆盖 .bak，保留最近一次）
+            let bak_path = format!("{}.bak", rules_path.display());
+            let _ = std::fs::copy(&rules_path, &bak_path);
+
+            // v0.11.5：统一走 merge_rules（标记替换 / 旧版兼容 / 追加），
+            // 不再整文件覆盖，避免丢失用户自定义内容与 frontmatter。
+            let (merged, action) =
+                crate::universal_integrations::merge_rules(&existing, &lrc_rules);
+            if merged == existing {
+                tracing::info!(
+                    "[AI规则] {} — 规则内容已是最新，跳过: {}",
+                    tool_id,
+                    rules_path.display()
+                );
+                return Ok(());
+            }
+            std::fs::write(&rules_path, &merged).map_err(|e| {
+                format!("升级规则文件失败: {} ({})", rules_path.display(), e)
+            })?;
+            tracing::info!(
+                "[AI规则] {} — 已{}规则文件到 v{}: {}",
+                tool_id,
+                if action == "appended" { "追加" } else { "升级" },
+                LRC_RULES_VERSION,
+                rules_path.display()
+            );
         } else {
             // 创建新文件
             std::fs::write(&rules_path, &lrc_rules)
@@ -3895,8 +3962,11 @@ mod tests {
 
         // 指引内容应包含关键信息
         let guide = get_manual_config_guide("codex-cli").unwrap();
-        assert!(guide.contains("Codex CLI"), "Codex CLI 指引应包含工具名");
-        assert!(guide.contains("127.0.0.1:3099"), "指引应包含 LRC 端点");
+        assert!(guide.contains("Codex"), "Codex 指引应包含工具名");
+        assert!(
+            guide.contains("~/.codex/config.toml"),
+            "Codex 指引应说明自动写入的配置文件"
+        );
     }
 
     /// v0.6.0 测试：验证 get_manual_config_guide 对支持 MCP 的工具返回 None

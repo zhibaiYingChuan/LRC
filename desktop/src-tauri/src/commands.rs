@@ -207,6 +207,94 @@ async fn post_sidecar_start(store: &State<'_, AppStore>, port: u16, project_key:
             }
         }
     }
+
+    // 4. 通用 MCP 配置（v0.11.5）：Codex / WorkBuddy
+    //
+    // 这两个工具没有 LRC 钩子，但都能通过 MCP 使用 recall/remember/absorb。
+    // 写入需要真实端口，因此放在 sidecar 启动后；失败只告警。
+    if let Some(home) = dirs::home_dir() {
+        // Codex notify 必须用 lrc CLI（lrc-sidecar 没有 absorb 子命令）。
+        let lrc_cli = crate::universal_integrations::resolve_lrc_cli();
+        let config_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                crate::universal_integrations::inject_mcp_configs(
+                    &home,
+                    port,
+                    lrc_cli.as_deref(),
+                )
+            }),
+        )
+        .await;
+        match config_result {
+            Ok(Ok(reports)) => {
+                for report in reports {
+                    match report.error {
+                        Some(err) => tracing::warn!(
+                            "[通用集成] {} — {} 失败: {}",
+                            report.tool,
+                            report.path,
+                            err
+                        ),
+                        None => tracing::info!(
+                            "[通用集成] {} — {} ({})",
+                            report.tool,
+                            report.path,
+                            report.action
+                        ),
+                    }
+                }
+            }
+            Ok(Err(_)) => {
+                tracing::warn!("[通用集成] MCP 配置 spawn_blocking panic（不影响 sidecar）")
+            }
+            Err(_) => tracing::warn!("[通用集成] MCP 配置超时（5s，不影响 sidecar）"),
+        }
+    }
+}
+
+/// v0.11.5：启动时注入通用规则文件（不依赖 sidecar / 工具检测 / hook）。
+///
+/// 覆盖 Codex（`~/.codex/AGENTS.md`）、DSH（`~/.agents/AGENTS.md`）、
+/// WorkBuddy（`~/.codebuddy/rules/lrc-memory.md`）以及通用 AGENTS.md 兜底。
+pub async fn inject_universal_rules_on_startup() {
+    if is_dev_mode() {
+        tracing::info!("[开发模式] 跳过通用规则注入（避免触碰稳定版用户配置）");
+        return;
+    }
+    let Some(home) = dirs::home_dir() else {
+        tracing::warn!("[通用集成] 无法获取用户主目录，跳过规则注入");
+        return;
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || {
+            crate::universal_integrations::inject_universal_rules(&home)
+        }),
+    )
+    .await;
+    match result {
+        Ok(Ok(reports)) => {
+            for report in reports {
+                match report.error {
+                    Some(err) => tracing::warn!(
+                        "[通用规则] {} — {} 失败: {}",
+                        report.tool,
+                        report.path,
+                        err
+                    ),
+                    None => tracing::info!(
+                        "[通用规则] {} — {} ({})",
+                        report.tool,
+                        report.path,
+                        report.action
+                    ),
+                }
+            }
+        }
+        Ok(Err(_)) => tracing::warn!("[通用规则] 注入 spawn_blocking panic"),
+        Err(_) => tracing::warn!("[通用规则] 注入超时（10s）"),
+    }
 }
 
 /// 在主窗口 iframe 中显示仪表盘（统一入口，消除 2 处重复的 JS 注入逻辑）

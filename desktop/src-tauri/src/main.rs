@@ -278,6 +278,15 @@ fn main() {
             });
 
             // ════════════════════════════════════════════════════════════════
+            // v0.11.5：通用规则注入（不依赖工具检测 / hook）
+            // Codex → ~/.codex/AGENTS.md；DSH → ~/.agents/AGENTS.md；
+            // WorkBuddy → ~/.codebuddy/rules/lrc-memory.md；另写通用 AGENTS.md 兜底。
+            // ════════════════════════════════════════════════════════════════
+            tauri::async_runtime::spawn(async move {
+                commands::inject_universal_rules_on_startup().await;
+            });
+
+            // ════════════════════════════════════════════════════════════════
             // v0.5.4 P2-14 新增：Sidecar 心跳检测协程
             // 每 10 秒检测 sidecar 进程是否存活，崩溃后自动恢复。
             // 连续 3 次恢复失败后，通过 Tauri 事件通知前端"服务异常"。
