@@ -5,7 +5,7 @@
 // ============================================================
 // v0.8.5 Step 18：版本号常量（CDP 测试与运行时查询使用）
 // v0.8.25：保留硬编码版本号作为 fallback，启动时异步从后端获取真实版本号
-const APP_VERSION = '0.11.3';
+const APP_VERSION = '0.11.4';
 window.__LRC_VERSION__ = APP_VERSION;
 
 /**
@@ -7309,7 +7309,7 @@ let _updateCheckInFlight = false;
 /**
  * v0.11.2：检查桌面端更新。
  *
- * 更新清单与安装包走自有服务器（https://sfang.cc/xd/downloads/latest.json），
+ * 更新清单与安装包走自有服务器（https://sfang.cc/xd/downloads/lrc-updater.json），
  * 不依赖 GitHub Release 的连通性。浏览器环境没有 Tauri IPC，直接提示不可用。
  */
 async function checkForUpdates() {

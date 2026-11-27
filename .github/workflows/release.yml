@@ -204,6 +204,28 @@ jobs:
           echo "  OK  更新签名密钥已配置"
         shell: bash
 
+      # v0.11.4：更新清单必须使用 LRC 专属文件名。
+      # 根因：共享下载目录里的 latest.json 属于勘合个人版，LRC 曾把它覆盖，
+      # 导致勘合客户端误报「可升级到 LRC v0.11.3」。此门禁防止回归。
+      - name: Updater endpoint isolation check
+        run: |
+          # 1) 客户端端点绝不能指向共享的 latest.json（勘合个人版在用）
+          if grep -q 'latest\.json' desktop/src-tauri/tauri.conf.json; then
+            echo "ERROR: 更新清单不能使用共享的 latest.json（勘合在用），请用 lrc-updater.json"
+            exit 1
+          fi
+          # 2) 发版脚本也不能再生成/上传 latest.json（事故正是这里写出来的）
+          if grep -nE 'open\("(mirror/)?latest\.json"' .github/workflows/release.yml; then
+            echo "ERROR: release.yml 仍在生成 latest.json，请改用 lrc-updater.json"
+            exit 1
+          fi
+          if grep -nE 'mirror/latest\.json([^a-z]|$)' .github/workflows/release.yml; then
+            echo "ERROR: release.yml 仍在上传 latest.json，请改用 lrc-updater.json"
+            exit 1
+          fi
+          echo "  OK  更新清单使用 LRC 专属文件名"
+        shell: bash
+
       - name: MSRV consistency check
         run: |
           MAIN_MSRV=$(grep '^rust-version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
@@ -1391,8 +1413,9 @@ jobs:
           head -20 RELEASE_NOTES.md
         shell: bash
 
-      # v0.11.2：生成 Tauri updater 清单（客户端只认这个文件）
-      # 安装包 URL 指向自有服务器，避免依赖 GitHub Release 连通性。
+      # v0.11.4：生成 Tauri updater 清单（客户端只认这个文件）
+      # 文件名必须是 LRC 专属的 lrc-updater.json —— 共享目录里的 latest.json
+      # 属于勘合个人版，写它会覆盖勘合的自动更新（v0.11.3 事故根因）。
       - name: Generate Tauri updater manifest
         run: |
           set -euo pipefail
@@ -1426,9 +1449,9 @@ jobs:
               "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "platforms": platforms,
           }
-          with open("latest.json", "w", encoding="utf-8") as f:
+          with open("lrc-updater.json", "w", encoding="utf-8") as f:
               json.dump(manifest, f, ensure_ascii=False, indent=2)
-          print(open("latest.json", encoding="utf-8").read())
+          print(open("lrc-updater.json", encoding="utf-8").read())
           PY
         shell: bash
 
@@ -1446,7 +1469,7 @@ jobs:
             artifacts/**/*
             install.sh
             REPRODUCIBLE_BUILDS.md
-            latest.json
+            lrc-updater.json
           generate_release_notes: false
           draft: false
           prerelease: false
@@ -1557,7 +1580,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    continue-on-error: true
+    # v0.11.4：镜像同步失败必须让整次发版失败。
+    # 自动更新清单只在镜像上，静默失败会让所有客户端永远收不到新版本。
+    continue-on-error: false
     if: needs.release.result == 'success'
 
     steps:
@@ -1652,7 +1677,8 @@ jobs:
           echo "=== 发版清单 ==="
           cat mirror/lrc-latest.json
 
-          # v0.11.2：Tauri updater 清单（桌面端自动更新只认这个文件）
+          # v0.11.4：Tauri updater 清单（桌面端自动更新只认这个文件）。
+          # 必须用 lrc-updater.json：latest.json 属于勘合个人版，共用会互相覆盖。
           python3 - "$VERSION" "https://sfang.cc/xd/downloads" <<'PY'
           import datetime, glob, json, os, sys
           tag, base = sys.argv[1], sys.argv[2]
@@ -1680,9 +1706,9 @@ jobs:
               "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "platforms": platforms,
           }
-          with open("mirror/latest.json", "w", encoding="utf-8") as f:
+          with open("mirror/lrc-updater.json", "w", encoding="utf-8") as f:
               json.dump(manifest, f, ensure_ascii=False, indent=2)
-          print(open("mirror/latest.json", encoding="utf-8").read())
+          print(open("mirror/lrc-updater.json", encoding="utf-8").read())
           PY
         shell: bash
 
@@ -1720,7 +1746,7 @@ jobs:
           # 服务器为 Windows OpenSSH，远端路径形如 C:/... （正斜杠，scp 可直接接受）
           scp -i ~/.ssh/id_mirror \
               -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=20 \
-              mirror/lrc-sidecar-* mirror/lrc-desktop-* mirror/lrc-latest.json mirror/latest.json "$MIRROR_USER@$MIRROR_HOST:$MIRROR_PATH"
+              mirror/lrc-sidecar-* mirror/lrc-desktop-* mirror/lrc-latest.json mirror/lrc-updater.json "$MIRROR_USER@$MIRROR_HOST:$MIRROR_PATH"
         shell: bash
 
       # 上传成功不等于「用户真能下到」。以公网实际返回的 .sha256 与本地比对，
@@ -1769,29 +1795,43 @@ jobs:
           fi
           echo "  OK  lrc-latest.json  ${got_ver}"
 
-          # v0.11.2：Tauri updater 清单也必须公网可达且版本一致
-          # 注意：latest.json 的 version 是纯 semver（无 v），want_ver 含 v。
+          # v0.11.4：Tauri updater 清单也必须公网可达且版本一致。
+          # 注意：lrc-updater.json 的 version 是纯 semver（无 v），want_ver 含 v。
           want_update_ver="${want_ver#v}"
           got_update_ver=""
           for attempt in $(seq 1 10); do
-            body=$(curl -fsSL --max-time 20 "$BASE/latest.json" || true)
+            body=$(curl -fsSL --max-time 20 "$BASE/lrc-updater.json?t=$(date +%s)" || true)
             got_update_ver=$(printf '%s' "$body" | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -1)
             [ "$got_update_ver" = "$want_update_ver" ] && break
             echo "  等待 updater 清单生效（第 ${attempt} 次未命中）..."
             sleep 6
           done
           if [ "$got_update_ver" != "$want_update_ver" ]; then
-            echo "::error::latest.json 版本与本次发版不一致（期望 ${want_update_ver}，实际 ${got_update_ver}）"
+            echo "::error::lrc-updater.json 版本与本次发版不一致（期望 ${want_update_ver}，实际 ${got_update_ver}）"
             exit 1
           fi
-          echo "  OK  latest.json  ${got_update_ver}"
+          echo "  OK  lrc-updater.json  ${got_update_ver}"
+
+          # v0.11.4 事故防线：共享目录的 latest.json 必须仍然属于其他产品。
+          # 如果它等于本次 LRC 版本，说明我们又把它覆盖了。
+          other_body=$(curl -fsSL --max-time 20 "$BASE/latest.json?t=$(date +%s)" || true)
+          other_ver=$(printf '%s' "$other_body" | sed -n 's/.*"version" *: *"\([^"]*\)".*/\1/p' | head -1)
+          if [ -z "$other_ver" ]; then
+            echo "::error::共享目录的 latest.json 不存在或无法解析（勘合清单缺失）"
+            exit 1
+          fi
+          if [ "$other_ver" = "$want_update_ver" ]; then
+            echo "::error::latest.json 仍被 LRC 覆盖（version=$other_ver），必须立即还原为勘合清单"
+            exit 1
+          fi
+          echo "  OK  latest.json 属于其他产品（version=${other_ver:-未知}），未被覆盖"
         shell: bash
 
       # v0.11.1 发布策略：镜像目录同样**只保留最新版本**（与 GitHub Release 一致）。
       # 只删带版本号的桌面安装包 / sidecar，保留：
       #   - 本次版本（文件名含 KEEP）；
       #   - 稳定别名 `lrc-sidecar-<platform>-<arch>`（插件按别名下载）；
-      #   - `lrc-latest.json` / `install.sh`。
+      #   - `lrc-latest.json` / `lrc-updater.json`（官网与自动更新清单）。
       # 远端是 Windows OpenSSH，用 PowerShell 执行；失败只告警，不影响已完成的发版。
       - name: Prune older installers on mirror
         if: steps.cfg.outputs.enabled == 'true'
