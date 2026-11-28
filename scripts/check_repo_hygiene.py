@@ -37,6 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # 「要进仓库」必须是一个主动决定，而不是默认结果。
 DOCS_ALLOW = {
     "docs/BENCHMARK_v0.10.3.md",
+    "docs/HEALTH_SCORE.md",
     "docs/OFFLINE_MODEL_GUIDE.md",
     "docs/USER_GUIDE.md",
     "docs/USE_CASES.md",

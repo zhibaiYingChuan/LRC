@@ -2005,13 +2005,13 @@ function renderDashboard(system, detailed, dao) {
   const sysProjectCount = $('sys-project-count');
   const sysMode = $('sys-mode');
 
-  // 服务状态：优先使用**综合健康**（与「系统健康评分」面板同一口径）
+  // 服务状态：优先使用**综合结构分**（与「结构观察」面板同一口径）
   //
   // ★v0.11.1 修复（用户可见误报）：此前只看 dao_isomorphism_score（结构指标）。
   //   语义编码（ML）下洛书偏离是 9 维投影的结构特性，实测该分常停在 0.16 左右，
-  //   于是「系统信息」卡片把健康系统标成「待优化」，而同页健康面板显示
+  //   于是「系统信息」卡片把健康系统标成「待优化」，而同页结构观察面板显示
   //   78 分「状态稳定」—— 同一时刻两处结论相反，用户也不知道该点什么去"优化"。
-  //   现改为：综合健康 > 后端 system_mode > 结构指标（且语义编码下不据此判故障）。
+  //   现改为：综合结构分 > 后端 system_mode > 结构指标（且语义编码下不据此判故障）。
   const compositeScore = Number(dao?.data?.health_score);
   const encoderIsMl =
     dao?.data?.encoder_mode === 'ml' || system?.encoder?.mode === 'ml';
@@ -3494,7 +3494,7 @@ async function generateCaptainLog() {
     log += '  检索次数：    ' + num(daoMetrics.recalls_total || 0) + '\n';
     log += '  修正次数：    ' + num(daoMetrics.corrections_total || 0) + '\n';
 
-    log += '\n━━━ 系统健康总结 ━━━\n';
+    log += '\n━━━ 结构观察总结 ━━━\n';
     log += '  系统模式：' + mode + '\n';
     if (modeDesc) log += '  模式描述：' + modeDesc + '\n';
     log += '  编码器：  ' + (encoder.model_name || 'LuoShuEncoder') + ' (' + (encoder.mode || 'statistical') + ')\n';
@@ -3513,28 +3513,28 @@ async function generateCaptainLog() {
     }
 
     log += '\n━━━ 状态摘要 ━━━\n';
-    // 与仪表盘同口径：优先综合健康，其次后端 system_mode；
+    // 与仪表盘同口径：优先综合结构分，其次后端 system_mode；
     // 语义编码下不再按结构指标判「需关注/严重」（结构指标是投影特性）。
     const compositeForLog = Number(dao?.data?.health_score ?? daoMetrics.health_score);
     const logEncoderMl = (dao?.data?.encoder_mode || system?.encoder?.mode) === 'ml';
     if (Number.isFinite(compositeForLog)) {
       if (compositeForLog >= 50) {
-        log += '  [良好] 系统健康 — 综合健康 ' + compositeForLog.toFixed(0) + ' 分，各子系统运行正常。\n';
+        log += '  [良好] 结构观察 — 综合结构分 ' + compositeForLog.toFixed(0) + ' 分，记忆结构稳定。\n';
       } else if (compositeForLog >= 30) {
-        log += '  [警告] 系统警告 — 综合健康 ' + compositeForLog.toFixed(0) + ' 分，可在仪表盘「记忆库维护」查看建议。\n';
+        log += '  [警告] 结构观察 — 综合结构分 ' + compositeForLog.toFixed(0) + ' 分，可在仪表盘「记忆库维护」查看建议。\n';
       } else {
-        log += '  [关注] 系统需关注 — 综合健康 ' + compositeForLog.toFixed(0) + ' 分，建议先导出备份再按维护建议处理。\n';
+        log += '  [关注] 结构观察 — 综合结构分 ' + compositeForLog.toFixed(0) + ' 分，建议先导出备份再按维护建议处理。\n';
       }
     } else {
       const daoScore = daoMetrics.dao_isomorphism_score || 0;
       if (logEncoderMl) {
         log += '  [良好] 语义编码模式 — 道同构度是 9 维投影的结构特性，不作为健康判据。\n';
       } else if (daoScore >= 0.5) {
-        log += '  [良好] 系统健康 — 道同构度良好，各子系统运行正常。\n';
+        log += '  [良好] 结构观察 — 道同构度良好，记忆结构稳定。\n';
       } else if (daoScore >= 0.3) {
-        log += '  [警告] 系统警告 — 道同构度偏低，建议关注编码质量和合成比率。\n';
+        log += '  [警告] 结构观察 — 道同构度偏低，建议关注编码质量和合成比率。\n';
       } else {
-        log += '  [严重] 系统需关注 — 道同构度严重偏低，建议检查编码器状态和训练数据。\n';
+        log += '  [严重] 结构观察 — 道同构度严重偏低，建议检查编码器状态和训练数据。\n';
       }
     }
 
@@ -9099,7 +9099,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
 /**
  * 绘制道同构度环形仪表盘
- * @param {number} score - 健康评分 (0-100)
+ * @param {number} score - 结构评分 (0-100)
  */
 function drawDaoRing(score) {
   const canvas = document.getElementById('dao-ring-canvas');
@@ -9178,7 +9178,7 @@ function renderRegulatorHeartbeat(hb, encoderMode) {
   const dot = document.getElementById('heartbeat-dot');
   const infoEl = document.getElementById('regulator-heartbeat-info');
   const detailEl = document.getElementById('regulator-heartbeat-detail');
-  if (!infoEl) return; // 系统健康评分卡片可能尚未挂载
+  if (!infoEl) return; // 结构观察卡片可能尚未挂载
 
   if (!hb || !hb.last_run_ms) {
     // 心跳尚未触发：诚实展示"等待首次运行"
@@ -9217,7 +9217,7 @@ function renderRegulatorHeartbeat(hb, encoderMode) {
 }
 
 /**
- * v0.11：把健康面板的"建议重新编码"变成可执行动作，并给出维护解释。
+ * v0.11：把结构观察面板的"建议重新编码"变成可执行动作，并给出维护解释。
  *
  * 背景：调节器只会写"建议重新编码"，但此前没有任何入口；用户看到 62 分
  * 却不知道能做什么，也不知道重编码是否真的有用（编码器未变时重算结果不变）。
@@ -9239,10 +9239,10 @@ function renderHealthGuidance(m) {
 
   if (sourceEl) {
     sourceEl.textContent = m.health_score_source === 'dao_fallback'
-      ? '综合健康待调节器更新，当前为结构评分'
+      ? '综合结构分待调节器更新，当前为结构评分'
       : (m.health_score_source === 'computed'
-        ? '评分来源：综合健康（即时计算）'
-        : '评分来源：综合健康');
+        ? '评分来源：综合结构分（即时计算）'
+        : '评分来源：综合结构分');
   }
 
   const parts = [];
@@ -9254,7 +9254,7 @@ function renderHealthGuidance(m) {
       '重新编码只会让坐标与当前模型对齐，不会降低该值。'
     );
     if (m.health_score_source === 'dao_fallback') {
-      parts.push('综合健康评分需等调节器下一轮快照，当前环图显示的是结构评分。');
+      parts.push('综合结构分需等调节器下一轮快照，当前环图显示的是结构评分。');
     }
   } else if (needReencode) {
     const devText = Number.isFinite(dev) ? dev.toFixed(2) : '--';
@@ -9391,7 +9391,7 @@ async function loadDaoMetrics() {
       // v0.8.13 C1: 清除降级横幅（避免与正常数据矛盾显示）
       const fallbackBanner = document.querySelector('.dao-fallback-banner');
       if (fallbackBanner) fallbackBanner.remove();
-      // v0.11：主评分 = 后端**综合健康**（DaoRegulator 快照）；
+      // v0.11：主评分 = 后端**综合结构分**（DaoRegulator 快照）；
       // 调节器尚未运行时后端回退为道同构度，并用 health_score_source 标注。
       const rawHealth = Number(m.health_score);
       const rawDao = Number(m.dao_isomorphism_score);
@@ -9402,18 +9402,17 @@ async function loadDaoMetrics() {
           : null);
       const statusEl = document.getElementById('dao-health-status');
       const explanationEl = document.getElementById('dao-health-explanation');
-      // v0.11：语义编码下道同构度/偏离度是投影结构特性，环图不把它标成"健康"。
+      // v0.11：这里展示的是记忆结构指标，不是内容健康/检索质量评分；
+      // 语义编码下道同构度/偏离度不参与综合分。
       const isMl = m.encoder_mode === 'ml';
       const ringLabelEl = document.getElementById('dao-ring-label');
-      if (ringLabelEl) {
-        ringLabelEl.textContent = m.health_score_source === 'dao_fallback' ? '结构评分' : '健康评分';
-      }
+      if (ringLabelEl) ringLabelEl.textContent = '结构评分';
       const status = m.status || (score !== null && score >= 80 ? 'healthy' : 'warning');
       const statusText = { healthy: '状态稳定', warning: '需要关注', critical: '建议处理' }[status] || '状态评估中';
       if (statusEl) statusEl.textContent = score === null ? statusText : `${statusText} · ${score}分`;
       if (explanationEl) {
         const fallbackNote = m.health_score_source === 'dao_fallback'
-          ? '（调节器综合健康暂未更新，当前分数为结构评分）'
+          ? '（调节器综合结构分暂未更新，当前分数为结构评分）'
           : '';
         const mlNote = isMl
           ? '当前为语义编码（ML）：洛书偏离是该投影的结构特性，不代表记忆损坏或检索质量下降。'
@@ -9421,16 +9420,16 @@ async function loadDaoMetrics() {
         const explanation = score === null
           ? '当前数据不足以完成可信评估，系统不会自动执行高风险操作。'
           : status === 'healthy'
-            ? `当前记忆结构稳定（综合健康 ${score} 分），搜索和结晶可以正常使用。系统会继续自动观察变化。${mlNote}${fallbackNote}`
+            ? `当前记忆结构稳定（综合结构分 ${score} 分），搜索和结晶可以正常使用。该分数只反映结构，不代表内容健康。${mlNote}${fallbackNote}`
             : status === 'warning'
-              ? `当前存在结构性偏离（综合健康 ${score} 分），通常不会影响基本搜索；可在下方“记忆库维护”查看建议动作。${mlNote}${fallbackNote}`
+              ? `当前存在结构性偏离（综合结构分 ${score} 分），通常不会影响基本搜索；可在下方“记忆库维护”查看建议动作。${mlNote}${fallbackNote}`
               : isMl
-                ? `当前结构偏离较明显（综合健康 ${score} 分）。${mlNote}原始记忆不会因评分降低而被删除；无需专门处理，保持观察即可。${fallbackNote}`
-                : `当前结构偏离较明显（综合健康 ${score} 分），可能影响结晶质量或排序稳定性。原始记忆不会因评分降低而被删除；建议先备份，再按下方建议处理。${fallbackNote}`;
+                ? `当前结构偏离较明显（综合结构分 ${score} 分）。${mlNote}原始记忆不会因评分降低而被删除；无需专门处理，保持观察即可。${fallbackNote}`
+                : `当前结构偏离较明显（综合结构分 ${score} 分），可能影响结晶质量或排序稳定性。原始记忆不会因评分降低而被删除；建议先备份，再按下方建议处理。${fallbackNote}`;
         explanationEl.hidden = false;
         explanationEl.textContent = explanation;
       }
-      // 主评分来自后端综合健康；子指标保留后端真实值（0 不覆盖）。
+      // 主评分来自后端综合结构分；子指标保留后端真实值（0 不覆盖）。
       drawDaoRing(score ?? 0);
       const scoreEl = document.getElementById('dao-ring-score');
       if (scoreEl) scoreEl.textContent = score ?? '--';
@@ -9459,7 +9458,7 @@ async function loadDaoMetrics() {
       // v0.11：把"建议重新编码"变成可执行动作，并解释每个指标的含义。
       renderHealthGuidance(m);
 
-      console.log(`[LRC v${APP_VERSION}]道同构度加载完成，健康评分: ${score}`);
+      console.log(`[LRC v${APP_VERSION}]道同构度加载完成，综合结构分: ${score}`);
     } else {
       // v0.8.4 Step 4：降级分支补全 4 个小指标（修复 G020 + CDP 测试 #2）
       // 之前仅设 score=85 但 4 个指标保持空值，导致矛盾状态和 CDP 检测失败

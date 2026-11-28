@@ -335,7 +335,7 @@
     <details class="advanced-dashboard-section home-more-panel" id="home-advanced-details">
       <summary class="advanced-dashboard-summary">
         <img src="/assets/icons/icon-health.svg" alt="" width="20" height="20"> 技术细节
-        <span class="text-sm text-dim">检索执行、健康评分与系统运行明细（技术向）</span>
+        <span class="text-sm text-dim">检索执行、结构观察与系统运行明细（技术向）</span>
       </summary>
 
     <!-- ── 分组一：运行观测（本机检索引擎的执行与状态） ── -->
@@ -360,18 +360,19 @@
       <p class="text-sm text-dim" style="margin-top:12px;">这些记录只保存在本机，不会上传。详细足迹见联想中心。</p>
     </div>
 
-    <!-- 系统健康评分：单一数据主题 = 道法术健康度（总分环 + 四个分项指标） -->
+    <!-- 结构观察：单一数据主题 = 记忆结构指标（总分环 + 四个分项指标）。
+         它不是内容健康/检索质量评分，语义编码下道同构度与洛书偏离不参与综合分。 -->
     <div class="dao-metrics-section">
       <div class="dao-metrics-panel">
       <div class="card-title" style="margin-bottom: var(--space-4);">
-        <img src="/assets/icons/icon-health.svg" alt="" width="20" height="20"> 系统健康评分
-        <span id="dao-health-status" style="margin-left:auto;font-size:11px;color:var(--lrc-墨韵-300);font-weight:normal;">实时健康评分</span>
+        <img src="/assets/icons/icon-health.svg" alt="" width="20" height="20"> 结构观察（非内容健康）
+        <span id="dao-health-status" style="margin-left:auto;font-size:11px;color:var(--lrc-墨韵-300);font-weight:normal;">实时结构指标</span>
       </div>
       <div class="dao-ring-container">
         <canvas id="dao-ring-canvas" width="200" height="200"></canvas>
         <div class="dao-ring-center">
           <div class="dao-ring-score" id="dao-ring-score">--</div>
-          <div class="dao-ring-label" id="dao-ring-label">健康评分</div>
+          <div class="dao-ring-label" id="dao-ring-label">结构评分</div>
         </div>
       </div>
       <div id="dao-health-explanation" style="margin:0 0 var(--space-4);font-size:12px;color:var(--lrc-墨韵-500);line-height:1.6;" hidden></div>
@@ -422,7 +423,7 @@
         <details style="margin-top:10px;color:var(--lrc-墨韵-500);">
           <summary style="cursor:pointer;">这些指标是什么意思？什么时候需要维护？</summary>
           <ul style="margin:8px 0 0 18px;padding:0;">
-            <li><b>综合健康</b>：道同构度、八卦均衡、洛书偏离、合成占比与调节器耦合度的加权结果；低于 50 分才需要关注。</li>
+            <li><b>综合结构分</b>：道同构度、八卦均衡、洛书偏离、合成占比与调节器耦合度的加权结果；它反映记忆结构，不代表内容健康或检索质量。语义编码下只按八卦均衡 / 合成占比 / 调节器耦合度归一化。</li>
             <li><b>洛书偏差</b>：9 维坐标偏离幻和约束的程度，越低越好；它反映编码结果的结构，不代表记忆内容有错。</li>
             <li><b>重新编码</b>：用当前编码器重算全部记忆的坐标与八卦。只有在你<b>更换过嵌入模型</b>或编码器版本后才会改变结果；编码器没变时重算不会提升评分。</li>
             <li><b>归档过期记忆</b>：把已过期的记忆移出检索范围（可在归档中恢复），不会删除原始内容。</li>
@@ -1487,7 +1488,7 @@
               <td class="cell-fail"><img src="/assets/icons/icon-error-circle.svg" width="12" height="12" alt=""></td>
             </tr>
             <tr>
-              <td>内禀健康监控</td>
+              <td>内禀结构监控</td>
               <td class="cell-unique"><img class="inline-icon" src="/assets/icons/icon-check.svg" width="12" height="12" alt="">道同构度</td>
               <td class="cell-fail"><img src="/assets/icons/icon-error-circle.svg" width="12" height="12" alt=""></td>
               <td class="cell-fail"><img src="/assets/icons/icon-error-circle.svg" width="12" height="12" alt=""></td>
@@ -1553,7 +1554,7 @@
     <div class="section">
       <div class="section-header">
         <h2 class="section-title">系统状态</h2>
-        <p class="section-subtitle">实时监控龙忆 LRC 系统运行状态与健康指标</p>
+        <p class="section-subtitle">实时监控龙忆 LRC 系统运行状态与结构指标</p>
       </div>
     </div>
 
