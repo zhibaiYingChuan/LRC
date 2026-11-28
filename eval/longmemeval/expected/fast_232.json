@@ -1,0 +1,56 @@
+{
+  "protocol": "LongMemEval-S",
+  "mode": "fast",
+  "description": "500 实例取前 250，跳过 18 条 abstention，有效 232；Top-K=10；统一 importance=5；不使用 ground truth；禁用后台合成。",
+  "n_evaluated": 232,
+  "session_recall_at_10": 0.9224,
+  "turn_recall_at_10": 0.8319,
+  "session_mrr": 0.8221,
+  "turn_mrr": 0.5546,
+  "tolerance_pp": 1.3,
+  "per_type": {
+    "multi-session": {
+      "n": 121,
+      "session_recall_at_10": 0.9587,
+      "turn_recall_at_10": 0.8843,
+      "session_mrr": 0.8527,
+      "turn_mrr": 0.5383
+    },
+    "single-session-preference": {
+      "n": 30,
+      "session_recall_at_10": 0.6333,
+      "turn_recall_at_10": 0.4667,
+      "session_mrr": 0.394,
+      "turn_mrr": 0.2037
+    },
+    "single-session-user": {
+      "n": 64,
+      "session_recall_at_10": 0.9687,
+      "turn_recall_at_10": 0.8906,
+      "session_mrr": 0.9427,
+      "turn_mrr": 0.6939
+    },
+    "temporal-reasoning": {
+      "n": 17,
+      "session_recall_at_10": 1.0,
+      "turn_recall_at_10": 0.8823,
+      "session_mrr": 0.9059,
+      "turn_mrr": 0.7647
+    }
+  },
+  "build": "cargo build --release --features server（必须不带 ml）",
+  "provenance": {
+    "shard_logs": [
+      "logs/v0103_fast_250_s0.txt",
+      "logs/v0103_fast_250_s1.txt",
+      "logs/v0103_fast_250_s2.txt"
+    ],
+    "aggregation": "按各分片评估实例数加权平均；与三份日志逐项可复核。"
+  },
+  "caveats": [
+    "fast = TF-IDF/BM25 词面快路 + 洛书几何；不是三路融合，也不代表 deep/语义能力。",
+    "与 30 实例 deep 的 90% 不是同一口径，不能相加、不能互相替代。",
+    "LongMemEval 只测检索召回，不测写入正确性、合成污染或错忆代价。",
+    "±1.3pp 是三分片波动参考；机器、线程数、模型/数据集版本变化需重新标定。"
+  ]
+}

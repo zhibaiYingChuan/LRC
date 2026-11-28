@@ -12,16 +12,20 @@
 
 ## 〇、结论摘要
 
-| 指标 | v0.10.3（232 实例） | v0.5.6（470 实例） | 变化 |
-|---|---:|---:|---:|
-| Session Recall@10 | **92.24%** | 85.74% | +6.50pp |
-| Turn Recall@10 | **83.19%** | 61.70% | +21.49pp |
-| Session MRR | **0.8221** | 0.5499 | +0.2722 |
-| Turn MRR | **0.5546** | 0.2864 | +0.2682 |
-| 平均注入耗时 / 实例 | 0.417s | 2.789s | 快 6.7× |
-| 平均检索耗时 / 实例 | 0.085s | 3.494s | 快 41× |
+本报告主指标是 **232 fast**（非 ML 构建、TF-IDF + 洛书几何）：
 
-**一句话**：在 fast + TF-IDF 口径下，v0.10.3 的 Session Recall@10 从 85.74% 提升到 92.24%，Turn Recall@10 从 61.70% 提升到 83.19%，同时注入与检索都显著变快。
+| 指标 | 值 |
+|---|---:|
+| Session Recall@10 | **92.24%** |
+| Turn Recall@10 | **83.19%** |
+| Session MRR | **0.8221** |
+| Turn MRR | **0.5546** |
+| 平均注入耗时 / 实例 | 0.417s |
+| 平均检索耗时 / 实例 | 0.085s |
+
+> 历史 470 口径（v0.5.6，公平 v3）为 Session 85.74% / Turn 61.70%。
+> 样本量、版本、编码器与注入策略都不同，**不构成“提升”**，也不能与本报告相加或并列比较。
+> 三套口径的读法见 [`BENCHMARKS.md`](../BENCHMARKS.md)。
 
 ---
 
@@ -92,7 +96,7 @@ ML 构建（`--features server,ml`）在**写入时强制做语义编码**，实
 
 ---
 
-## 四、与历史口径对照
+## 四、与历史口径对照（仅参考，不可比较）
 
 | 口径 | 版本 | 样本 | 模式 | Session R@10 | Turn R@10 |
 |---|---|---|---:|---:|---:|
@@ -136,15 +140,17 @@ ML 构建（`--features server,ml`）在**写入时强制做语义编码**，实
 # 1. 构建非 ML 二进制
 cargo build --release --bin code-memory-server --features server
 
-# 2. 运行 250 实例（3 分片）
-cd G:\LongMemEval
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_v0103_fast_250.ps1
+# 2. 下载数据（自动校验 SHA256）
+python eval/longmemeval/scripts/download_data.py
 
-# 3. 结果
-#    G:\LongMemEval\results\v0103_fast_250_s{0,1,2}.log
+# 3. 运行 232 有效实例（3 分片）
+pwsh eval/longmemeval/scripts/run_fast_232.ps1 -Exe target/release/code-memory-server.exe
+
+# 4. 结果
+#    eval/longmemeval/logs/fast_232_s{0,1,2}.log
 ```
 
-评测脚本：`G:\LongMemEval\lrc_fair_eval_v3.py`（公平评估 v3）
+评测脚本与分片清单见 [`eval/longmemeval/`](../eval/longmemeval/README.md)（公平评估 v3）。
 
 ---
 

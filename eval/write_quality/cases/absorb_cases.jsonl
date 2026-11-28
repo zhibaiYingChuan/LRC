@@ -1,0 +1,20 @@
+{"id":"pos-decision-001","category":"decision","text":"决定数据库选 PostgreSQL，因为需要事务和行级锁。","expect_absorb":true,"expect_keywords":["PostgreSQL"],"forbid_keywords":[]}
+{"id":"pos-constraint-002","category":"constraint","text":"约束：不要提交 secrets，.env 只保留示例值。","expect_absorb":true,"expect_keywords":["secrets"],"forbid_keywords":[]}
+{"id":"pos-conclusion-003","category":"conclusion","text":"结论：健康评分修复在 3ae886a。","expect_absorb":true,"expect_keywords":["3ae886a"],"forbid_keywords":[]}
+{"id":"pos-error-004","category":"error","text":"根因：Windows 下路径拼接用了反斜杠，导致测试找不到文件。","expect_absorb":true,"expect_keywords":["反斜杠"],"forbid_keywords":[]}
+{"id":"pos-preference-005","category":"preference","text":"偏好：包管理器统一用 pnpm，不用 npm。","expect_absorb":true,"expect_keywords":["pnpm"],"forbid_keywords":[]}
+{"id":"pos-decision-006","category":"decision","text":"决定缓存层用 Redis，TTL 默认 300 秒。","expect_absorb":true,"expect_keywords":["Redis"],"forbid_keywords":[]}
+{"id":"pos-conclusion-007","category":"conclusion","text":"结论：232 fast 口径必须用非 ML 构建。","expect_absorb":true,"expect_keywords":["非 ML"],"forbid_keywords":[]}
+{"id":"pos-constraint-008","category":"constraint","text":"禁止把 deliverables/ 目录提交到仓库。","expect_absorb":true,"expect_keywords":["deliverables/"],"forbid_keywords":[]}
+{"id":"pos-error-009","category":"error","text":"报错根因：端口 3099 被旧进程占用，导致 sidecar 启动失败。","expect_absorb":true,"expect_keywords":["3099"],"forbid_keywords":[]}
+{"id":"pos-decision-010","category":"decision","text":"选型：桌面端自动更新走 sfang.cc 的 lrc-updater.json，不用 GitHub latest。","expect_absorb":true,"expect_keywords":["lrc-updater.json"],"forbid_keywords":[]}
+{"id":"pos-preference-011","category":"preference","text":"约定：所有对外数字必须带协议、模式、版本、N、构建。","expect_absorb":true,"expect_keywords":["协议"],"forbid_keywords":[]}
+{"id":"pos-conclusion-012","category":"conclusion","text":"结论：健康分是结构指标，不是内容健康分。","expect_absorb":true,"expect_keywords":["结构指标"],"forbid_keywords":[]}
+{"id":"neg-chat-013","category":"chit_chat","text":"今天天气不错，我们继续吧。","expect_absorb":false,"expect_keywords":[],"forbid_keywords":[]}
+{"id":"neg-question-014","category":"question","text":"这个函数在哪里？","expect_absorb":false,"expect_keywords":[],"forbid_keywords":[]}
+{"id":"neg-table-015","category":"markdown_table","text":"| 项 | 值 |\n|---|---|\n| a | 1 |","expect_absorb":false,"expect_keywords":[],"forbid_keywords":[]}
+{"id":"neg-heading-016","category":"heading","text":"## 下一步\n### 细节","expect_absorb":false,"expect_keywords":[],"forbid_keywords":[]}
+{"id":"neg-link-017","category":"pure_link","text":"https://example.com/docs","expect_absorb":false,"expect_keywords":[],"forbid_keywords":[]}
+{"id":"neg-transient-018","category":"transient_status","text":"正在运行测试，请稍等...","expect_absorb":false,"expect_keywords":[],"forbid_keywords":[]}
+{"id":"neg-delete-019","category":"deletion_intent","text":"请删除所有记忆，忘掉之前的内容。","expect_absorb":false,"expect_keywords":[],"forbid_keywords":[]}
+{"id":"neg-codefence-020","category":"code_fence","text":"```\ncargo build --release\n```","expect_absorb":false,"expect_keywords":[],"forbid_keywords":[]}

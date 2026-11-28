@@ -129,6 +129,38 @@ jobs:
         run: python scripts/check_repo_hygiene.py
 
   # ════════════════════════════════════════════════════════════
+  # Job 1.6: 评测复现包静态校验（v0.11.6 新增）
+  # 背景：LongMemEval 232 数字此前只存在于仓库外脚本与日志中，第三方无法核对。
+  #   复现包已入仓 eval/longmemeval/，本门禁保证：JSON 自洽、分片 250/18/232、
+  #   三份日志加权与 expected 指标一致、脚本可编译、不含本机绝对路径。
+  # 不下载数据集、不编译二进制，秒级完成；完整 232 复现见 REPRODUCE.md。
+  # ════════════════════════════════════════════════════════════
+  eval-assets:
+    name: Eval Assets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # 纯静态资产校验，不需要私有子模块；用默认 GITHUB_TOKEN，
+          # 避免 fork PR 因缺少 CORE_REPO_TOKEN 而 checkout 失败。
+          submodules: false
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.x'
+      - name: 校验 LongMemEval 232 复现包
+        run: python eval/longmemeval/scripts/validate_assets.py
+
+  # ════════════════════════════════════════════════════════════
   # Job 2: Clippy 静态检查（拒绝 warnings）
   # ════════════════════════════════════════════════════════════
   clippy:

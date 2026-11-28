@@ -1,0 +1,25 @@
+{
+  "protocol": "longmemeval-fast-232",
+  "mode": "fast",
+  "top_k": 10,
+  "max_instances": 250,
+  "n_shards": 3,
+  "importance": 5,
+  "use_ground_truth": false,
+  "disable_synthesis": true,
+  "llm_api": null,
+  "max_inject_seconds": 30,
+  "dataset": "longmemeval_s_cleaned.json",
+  "dataset_sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+  "split_manifest": "../splits/fast_232.json",
+  "expected": "../expected/fast_232.json",
+  "build": {
+    "command": "cargo build --release --features server",
+    "must_not_enable": ["ml", "cuda"],
+    "why": "ML 构建在写入时强制语义编码；fast 口径下会出现 404s/实例的假慢，且与发布版语义路径混在一起。"
+  },
+  "env": {
+    "RUST_LOG": "warn",
+    "RAYON_NUM_THREADS": "2"
+  }
+}
